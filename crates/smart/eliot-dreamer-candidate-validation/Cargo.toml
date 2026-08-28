@@ -18,7 +18,7 @@ functional_cell = "smart.dreamer.candidate_validation"
 source_layer = "C1"
 runtime_layer = "R6"
 runtime_bundle = "eliot-dreamer"
-agent_order = 13
+agent_order = 5
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }

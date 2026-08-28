@@ -1,47 +1,65 @@
-schema_version = 5
+schema_version = 6
 wave_id = "cognitive-micromodules-wave-01"
 status = "PROTOTYPE_ASSIGNMENT_READY_AFTER_STATIC_REVIEW"
-base_commit = "ce05a82500093681862727909f00483522e600f8"
+base_commit = "7f075ddf5d168f3d2ad3144807b7f0b9d4f0bb61"
 normative_pair = "ELIOT Architecture 4.5-draft + Implementation 0.29-draft; English edition 2026-08-28"
-purpose = "Keep D1 capture ownership in Governor, deliver D3a Basic Dreamer Orientation, then D3b reactive context, then bounded candidate-only curation."
+purpose = "Keep D1 capture ownership in Governor, close a minimal D3a Orientation pulse, add independent Clarification/self-query handlers, then D3b reactive context and bounded candidate-only curation."
 integration_owner = "cognitive-wave-integrator"
-agent_rule = "One agent receives one module manifest, frozen one-hop contracts, old failure, discriminator, exact write scope, proof ceiling and Product Pulse."
-workspace_rule = "Prototype packages stay outside the root workspace until implementation, package proof, affected Edge proof, current-main rebind and integration review."
+agent_rule = "One agent receives one active module manifest, frozen one-hop contracts, old failure, discriminator, exact write scope, proof ceiling and named Product Pulse or Edge proof."
+workspace_rule = "Prototype packages stay outside the root workspace until implementation, package proof, affected Edge proof, current-main ancestry and integration review."
 size_rule = "10000 LOC is a review signal only; causal cohesion, state ownership, proof, change closure and replacement boundary decide topology."
 authority_rule = "No prototype owns canonical state, runtime scheduling, evaluator state, policy, authority, finish or external effects."
+dependency_rule = "Assignment depends_on lists logical implementation prerequisites; Cargo dependencies are narrower and exist only for public types actually imported."
 supersession_rule = "The stale cognitive-crates-prototypes-01 branch is not an assignment source."
 
 [[stage]]
 id = "D1_CAPTURE_OWNER_REPAIR"
 orders = [1, 1]
-gate = "Keep first-pass classification inside existing Governor observation owner."
+gate = "Keep first-pass classification inside the existing Governor observation owner."
 
 [[stage]]
 id = "D3A_ORIENTATION_FIRST_VALUE"
-orders = [2, 9]
-gate = "Current Epistemic Position and candidate-only Orientation before D3b."
+orders = [2, 6]
+gate = "Current Epistemic Position, bounded bundle, common validation and candidate-only Orientation close the first useful D3a pulse."
+
+[[stage]]
+id = "D3A_COMPANION_JOB_HANDLERS"
+orders = [7, 9]
+gate = "Clarification and Architecture/self query remain independent job handlers and do not become prerequisites of basic Orientation or D3b."
 
 [[stage]]
 id = "D3B_REACTIVE_CONTEXT_NEXT_VALUE"
 orders = [10, 19]
-gate = "Cue binding/index/activation, context admission/assembly and pure delivery planning."
+gate = "Cue binding/index/activation, context admission/assembly and pure delivery planning; may start once order 6 passes."
 
 [[stage]]
 id = "D3A_BOUNDED_CURATION_EXPANSION"
 orders = [20, 31]
-gate = "Assign only after Orientation Product Pulse shows useful value."
+gate = "Assign only after the Orientation Product Pulse shows useful value."
 
 [[product_pulse]]
 id = "D1_CAPTURE_CLASSIFICATION_EDGE_01"
-scenario = "Misleading/ambiguous hint is preserved once by Governor as a deterministic family or cold candidate."
+scenario = "A misleading or ambiguous hint is preserved once by Governor as a deterministic family or cold ObservationCandidate."
+status = "NOT_EXECUTED"
+proof_ceiling = "Exact-scenario Edge proof only"
+
+[[product_pulse]]
+id = "D3A_ORIENTATION_PULSE_01"
+scenario = "One current goal yields a source-linked DreamPacket with Current Epistemic Position handles, rivals, unknowns, hidden relation candidates and probes; no self-query brief is required."
 status = "NOT_EXECUTED"
 proof_ceiling = "Exact-scenario Product proof only"
 
 [[product_pulse]]
-id = "D3A_ORIENTATION_PULSE_01"
-scenario = "One current goal yields a source-linked DreamPacket with epistemic position, separate Architecture/Implementation briefs, rivals, unknowns and probes."
+id = "D3A_CLARIFICATION_EDGE_01"
+scenario = "One material ambiguity yields exactly one discriminative question, why it matters and a safe unanswered fallback; no delivery effect occurs in the handler."
 status = "NOT_EXECUTED"
-proof_ceiling = "Exact-scenario Product proof only"
+proof_ceiling = "Exact-scenario Edge proof only"
+
+[[product_pulse]]
+id = "D3A_SELF_QUERY_EDGE_01"
+scenario = "An ELIOT self-query yields separate ArchitectureBrief and ImplementationBrief candidates bound to exact accepted source digests and current conformance evidence; Architecture precedence remains visible."
+status = "NOT_EXECUTED"
+proof_ceiling = "Exact-scenario Edge proof only"
 
 [[product_pulse]]
 id = "D3B_REACTIVE_CONTEXT_PULSE_01"
@@ -97,34 +115,34 @@ package_action = "create_prototype_crate"
 
 [[assignment]]
 order = 6
-crate = "eliot-dreamer-clarification"
-manifest = "crates/smart/eliot-dreamer-clarification/module.toml"
-depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crate = "eliot-dreamer-orientation"
+manifest = "crates/smart/eliot-dreamer-orientation/module.toml"
+depends_on = ["eliot-epistemic", "eliot-dreamer-contracts", "eliot-dreamer-bundle", "eliot-dreamer-candidate-validation"]
 product_pulse = "D3A_ORIENTATION_PULSE_01"
 package_action = "create_prototype_crate"
 
 [[assignment]]
 order = 7
-crate = "eliot-dreamer-architecture-brief"
-manifest = "crates/smart/eliot-dreamer-architecture-brief/module.toml"
+crate = "eliot-dreamer-clarification"
+manifest = "crates/smart/eliot-dreamer-clarification/module.toml"
 depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
-product_pulse = "D3A_ORIENTATION_PULSE_01"
+product_pulse = "D3A_CLARIFICATION_EDGE_01"
 package_action = "create_prototype_crate"
 
 [[assignment]]
 order = 8
-crate = "eliot-dreamer-implementation-brief"
-manifest = "crates/smart/eliot-dreamer-implementation-brief/module.toml"
+crate = "eliot-dreamer-architecture-brief"
+manifest = "crates/smart/eliot-dreamer-architecture-brief/module.toml"
 depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
-product_pulse = "D3A_ORIENTATION_PULSE_01"
+product_pulse = "D3A_SELF_QUERY_EDGE_01"
 package_action = "create_prototype_crate"
 
 [[assignment]]
 order = 9
-crate = "eliot-dreamer-orientation"
-manifest = "crates/smart/eliot-dreamer-orientation/module.toml"
-depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation", "eliot-dreamer-architecture-brief", "eliot-dreamer-implementation-brief"]
-product_pulse = "D3A_ORIENTATION_PULSE_01"
+crate = "eliot-dreamer-implementation-brief"
+manifest = "crates/smart/eliot-dreamer-implementation-brief/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_SELF_QUERY_EDGE_01"
 package_action = "create_prototype_crate"
 
 [[assignment]]
@@ -155,7 +173,7 @@ package_action = "create_prototype_crate"
 order = 13
 crate = "eliot-cue-index"
 manifest = "crates/smart/eliot-cue-index/module.toml"
-depends_on = ["eliot-cue-contracts", "eliot-cue-normalizer"]
+depends_on = ["eliot-cue-contracts", "eliot-cue-normalizer", "eliot-cue-binding"]
 product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
 package_action = "create_prototype_crate"
 
@@ -163,7 +181,7 @@ package_action = "create_prototype_crate"
 order = 14
 crate = "eliot-cue-activation"
 manifest = "crates/smart/eliot-cue-activation/module.toml"
-depends_on = ["eliot-cue-contracts"]
+depends_on = ["eliot-cue-contracts", "eliot-cue-normalizer", "eliot-cue-index"]
 product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
 package_action = "create_prototype_crate"
 
@@ -179,7 +197,7 @@ package_action = "create_prototype_crate"
 order = 16
 crate = "eliot-context-candidates"
 manifest = "crates/smart/eliot-context-candidates/module.toml"
-depends_on = ["eliot-cue-contracts", "eliot-epistemic", "eliot-context-contracts"]
+depends_on = ["eliot-cue-contracts", "eliot-cue-activation", "eliot-epistemic", "eliot-context-contracts"]
 product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
 package_action = "create_prototype_crate"
 
@@ -203,7 +221,7 @@ package_action = "create_prototype_crate"
 order = 19
 crate = "eliot-reactive-context-plan"
 manifest = "crates/smart/eliot-reactive-context-plan/module.toml"
-depends_on = ["eliot-context-contracts", "eliot-cue-contracts"]
+depends_on = ["eliot-context-contracts", "eliot-cue-contracts", "eliot-cue-activation", "eliot-context-assembly"]
 product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
 package_action = "create_prototype_crate"
 
@@ -307,9 +325,9 @@ package_action = "create_prototype_crate"
 required = ["implementation in declared scope", "package/module proof", "affected Edge proof", "named Product Pulse when applicable", "donor trace", "ContractChallenges", "merge/remove recommendation"]
 
 [[deferred]]
-capability = "Dreamer Research synthesis"
-activation = "Researcher-owned ResearchPack, Evidence Grade, evidence freeze and coverage denominator"
+capability = "Dreamer Research synthesis and Concilium planning"
+activation = "Researcher-owned ResearchPack, Evidence Grade, evidence freeze, provider independence and coverage denominator"
 
 [[deferred]]
 capability = "D3c structural/causal depth"
-activation = "accepted exact code/behavioral/causal projections and Product Pulse value"
+activation = "accepted exact code, behavioral and causal projections plus demonstrated Product Pulse value"

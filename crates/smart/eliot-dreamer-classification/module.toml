@@ -1,4 +1,4 @@
-schema_version = 3
+schema_version = 4
 module_id = "smart.dreamer.classification"
 crate = "eliot-dreamer-classification"
 status = "PROTOTYPE"
@@ -14,23 +14,23 @@ hot_path = false
 lifecycle_owner = "smart.dreamer.classification"
 loc_soft_ceiling = 10000
 loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
-product_objective = "Dreamer curation proposes one reversible, lineage-preserving memory transformation without changing canonical state."
-causal_property = "semantic record-family classification"
-old_failure_or_missing_capability = "the legacy Dreamer generator treats semantic record-family classification as one generic candidate item with no independent falsifier"
-discriminator = "the classification handler accepts/rejects its exact subtype independently and preserves every source branch on failure"
-primary_responsibility = "Propose one semantic family/subtype with scope, evidence, alternatives and abstention."
+product_objective = "After capture and admission, Dreamer may propose one reversible semantic subtype without taking over Governor first-pass classification."
+causal_property = "post-admission semantic record-family classification candidate"
+old_failure_or_missing_capability = "The legacy generator treats semantic classification as a generic item and risks duplicating Governor capture classification."
+discriminator = "The handler accepts only already admitted target handles and emits a candidate; it cannot choose ObservationCandidate family, hot/cold status, lifecycle or canonical type."
+primary_responsibility = "Propose one semantic family or subtype for one admitted record, with scope, evidence, alternatives and abstention."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["Curation draft item kind=classification", "target record and current type handles"]
-outputs = ["ClassificationCandidate", "alternatives", "abstention/unknown manifest"]
+inputs = ["validated curation item kind=classification", "admitted target record and current semantic-type handles"]
+outputs = ["ClassificationCandidate", "alternative classifications", "abstention and unknown manifest"]
 depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
-providers = ["validated Dreamer draft", "admitted memory/evidence handles"]
+providers = ["validated Dreamer draft", "admitted memory and evidence handles"]
 consumers = ["eliot-dreamer-curation"]
-non_goals = ["deterministic Governor first-pass classification", "relation proposal", "ontology redesign"]
-invariants = ["never raises epistemic/authority status", "one target per candidate", "ambiguous roles retain alternatives"]
-failure_behavior = "Return unsupported/inconclusive classification candidate with exact missing evidence; original records remain unchanged."
-proof_surface = ["wrong caller hint", "existing-type conflict", "unknown subtype/abstention"]
-proof_ceiling = "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+non_goals = ["Governor first-pass observation classification", "capture admission", "hot or cold disposition", "relation proposal", "ontology redesign"]
+invariants = ["target was already captured and admitted", "candidate never raises epistemic or authority status", "one target per candidate", "ambiguous roles retain alternatives or abstain"]
+failure_behavior = "Return unsupported or inconclusive classification candidate with exact missing evidence; original records and Governor classification remain unchanged."
+proof_surface = ["wrong caller hint", "attempt to classify an unadmitted observation", "existing-type conflict", "unknown subtype and abstention"]
+proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
 product_pulse = "D3A_CURATION_PULSE_01"
 replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
 merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
@@ -38,22 +38,22 @@ split_trigger = "a second causal responsibility, mutable owner, independent proo
 
 [[donor]]
 path = "crates/smart/eliot-memory/src/lib.rs"
-disposition = "extract only applicable pure logic"
+disposition = "extract only post-admission pure classification heuristics"
 
 [[donor]]
 path = "ELIOT_IMPLEMENTATION I9.6-I9.7"
-disposition = "authoritative contract"
+disposition = "authoritative curation-candidate and preservation contract"
 
 [agent_task]
-objective = "Implement one candidate-only classification handler over the common validator."
+objective = "Implement one post-admission candidate-only semantic classification handler over the common validator."
 write_scope = ["crates/smart/eliot-dreamer-classification/**"]
-deliverables = ["public contract/core implementation", "property/adversarial fixtures", "affected edge fixtures"]
-acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+deliverables = ["classification candidate core", "first-pass ownership and abstention fixtures", "curation Edge fixtures"]
+acceptance = ["already admitted target only", "Governor first-pass state untouched", "alternatives and abstention preserved"]
 forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
-stop_condition = "Stop and return ContractChallenge when the work needs another owner, unbounded traversal, model call or hidden state."
+stop_condition = "Stop if the task needs capture classification, canonical type mutation, ontology redesign or another curation subtype."
 challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
 integration_owner = "cognitive-wave-integrator"
 implementation_language = "Rust 2024"
-required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
 writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
-workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"

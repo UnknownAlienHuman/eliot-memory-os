@@ -18,7 +18,7 @@ functional_cell = "smart.dreamer.bundle"
 source_layer = "C1"
 runtime_layer = "R6"
 runtime_bundle = "eliot-dreamer"
-agent_order = 12
+agent_order = 4
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }

@@ -1,6 +1,6 @@
-schema_version = 2
-map_id = "cognitive-donor-map-2026-08-28-rev5"
-current_main_commit = "7d7f03259cc3d3d90b2fe1af7a6175b13808ece2"
+schema_version = 3
+map_id = "cognitive-donor-map-2026-08-28-rev6"
+current_main_commit = "7f075ddf5d168f3d2ad3144807b7f0b9d4f0bb61"
 superseded_prototype_branch_commit = "b35e4a489d45d81f172ef7d5b44bea165438cb1c"
 rule = "Reuse requires one current causal owner, current documentation fit, a pure or reconstructible boundary, exact donor anchors, an independent proof path and an explicit rejected-overgeneralization."
 source_status = "STATIC_REVIEW_ONLY"
@@ -30,15 +30,15 @@ rejected_overgeneralization = "Independent mutable Understanding State or a seco
 path = "crates/smart/eliot-cues"
 disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
 targets = ["eliot-cue-contracts", "eliot-cue-normalizer", "eliot-cue-binding", "eliot-cue-index", "eliot-cue-activation"]
-rationale = "Retain deterministic matching, bounded spreading and trace shape; split canonical normalization, binding proposals, projection construction and hot evaluation."
-rejected_overgeneralization = "Destructive canonical-path lowercasing, session delivery state in the pure evaluator, or graph-edge minimums for exact firing."
+rationale = "Retain deterministic matching, bounded spreading and trace shape; split canonical normalization, binding proposals, admitted projection construction and hot evaluation."
+rejected_overgeneralization = "Destructive canonical-path lowercasing, candidate bindings bypassing Governor admission, session delivery state in the pure evaluator, or graph-edge minimums for exact firing."
 
 [[donor]]
 path = "crates/smart/eliot-dreamer-core"
 disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
-targets = ["eliot-dreamer-contracts", "eliot-dreamer-bundle", "eliot-dreamer-candidate-validation", "eliot-dreamer-clarification", "eliot-dreamer-architecture-brief", "eliot-dreamer-implementation-brief", "eliot-dreamer-orientation", "eliot-dreamer-classification", "eliot-dreamer-relation", "eliot-dreamer-episode", "eliot-dreamer-concept", "eliot-dreamer-procedure", "eliot-dreamer-failure", "eliot-dreamer-structure-repair", "eliot-dreamer-reconsolidation", "eliot-dreamer-accessibility", "eliot-dreamer-memory-repair", "eliot-dreamer-curation", "eliot-dreamer-conflict-analysis", "eliot-dreamer-development-diagnosis", "eliot-dreamer-maintenance-plan", "eliot-dreamer-configuration-plan", "eliot-dreamer-orchestration-plan"]
-rationale = "Retain candidate-only ceiling, bounded draft validation, lineage and preservation concepts; update the job surface and move each transformation/planning function behind an independent handler."
-rejected_overgeneralization = "One generator that mixes job contracts, bundle construction, validation, subtype semantics, scheduling or promotion."
+targets = ["eliot-dreamer-contracts", "eliot-dreamer-bundle", "eliot-dreamer-candidate-validation", "eliot-dreamer-orientation", "eliot-dreamer-clarification", "eliot-dreamer-architecture-brief", "eliot-dreamer-implementation-brief", "eliot-dreamer-classification", "eliot-dreamer-relation", "eliot-dreamer-episode", "eliot-dreamer-concept", "eliot-dreamer-procedure", "eliot-dreamer-failure", "eliot-dreamer-structure-repair", "eliot-dreamer-reconsolidation", "eliot-dreamer-accessibility", "eliot-dreamer-memory-repair", "eliot-dreamer-curation", "eliot-dreamer-conflict-analysis", "eliot-dreamer-development-diagnosis", "eliot-dreamer-maintenance-plan", "eliot-dreamer-configuration-plan", "eliot-dreamer-orchestration-plan"]
+rationale = "Retain candidate-only ceiling, bounded draft validation, lineage and preservation concepts; separate top-level job classes from shared sub-handlers and move each transformation, diagnosis or planning function behind an independent boundary."
+rejected_overgeneralization = "One generator that mixes job contracts, bundle construction, validation, self-query authority domains, subtype semantics, scheduling or promotion."
 
 [[donor]]
 path = "crates/smart/eliot-epistemic"
@@ -72,8 +72,8 @@ rejected_overgeneralization = "A second self-memory owner, relation store or lif
 path = "crates/meta/eliot-improvement"
 disposition = "RETAIN_AND_HARDEN_IN_PLACE"
 targets = ["meta.learning.closure", "meta.improvement.promotion_input"]
-rationale = "The advisory-only candidate and external promotion-input ceiling are useful. Add activation/adherence, retention/transfer, evaluator validity, Product Pulse, rollback and explicit no-change closure semantics."
-rejected_overgeneralization = "Direct promotion, self-selected evaluator, automatic policy/source rewrite or one aggregate learning score."
+rationale = "The advisory-only candidate and external promotion-input ceiling are useful. Add activation/adherence, retention/transfer, evaluator validity, Product Pulse, rollback and explicit no-change closure semantics through non-overlapping source cells."
+rejected_overgeneralization = "Direct promotion, self-selected evaluator, automatic policy/source rewrite, overlapping agent write scopes or one aggregate learning score."
 
 [[donor]]
 path = "branch:cognitive-crates-prototypes-01"

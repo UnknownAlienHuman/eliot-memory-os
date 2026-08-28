@@ -1,4 +1,4 @@
-schema_version = 3
+schema_version = 4
 module_id = "smart.dreamer.memory_repair"
 crate = "eliot-dreamer-memory-repair"
 status = "PROTOTYPE"
@@ -14,46 +14,46 @@ hot_path = false
 lifecycle_owner = "smart.dreamer.memory_repair"
 loc_soft_ceiling = 10000
 loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
-product_objective = "Dreamer curation proposes one reversible, lineage-preserving memory transformation without changing canonical state."
-causal_property = "semantic memory repair"
-old_failure_or_missing_capability = "the legacy Dreamer generator treats semantic memory repair as one generic candidate item with no independent falsifier"
-discriminator = "the memory-repair handler accepts/rejects its exact subtype independently and preserves every source branch on failure"
-primary_responsibility = "Propose one bounded repair for missing provenance, contaminated influence, false relation, stale derived view or representation gap."
+product_objective = "Dreamer may propose one reversible semantic lineage, influence or derived-view repair while execution, identity surgery and operational repair remain elsewhere."
+causal_property = "semantic memory repair candidate"
+old_failure_or_missing_capability = "The legacy generator uses one generic repair item that can blur semantic repair, merge/split identity repair and Doctor/runtime repair."
+discriminator = "The handler emits only a MemoryRepairCandidate over admitted semantic handles; it cannot merge identities, execute repair, quarantine, revoke or touch operational state."
+primary_responsibility = "Propose one bounded semantic repair for missing provenance, contaminated derived influence, false relation, stale projection or representation gap."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["Curation draft item kind=repair", "provenance/influence/disclosure/projection evidence"]
-outputs = ["MemoryRepairCandidate", "affected dependency closure", "verification/rollback/quarantine recommendation"]
+inputs = ["validated curation item kind=repair", "provenance, influence, disclosure and projection evidence"]
+outputs = ["MemoryRepairCandidate", "affected semantic dependency closure", "verification, rollback and quarantine recommendation"]
 depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
-providers = ["validated Dreamer draft", "admitted memory/evidence handles"]
+providers = ["validated Dreamer draft", "admitted memory and evidence handles"]
 consumers = ["eliot-dreamer-curation"]
-non_goals = ["Doctor infrastructure repair", "merge/split identity repair", "automatic quarantine/revocation"]
-invariants = ["history and forensic lineage remain", "repair follows explicit closure", "unknown lineage narrows not globally deletes"]
-failure_behavior = "Return unsupported/inconclusive memory-repair candidate with exact missing evidence; original records remain unchanged."
-proof_surface = ["poisoned source closure", "incomplete lineage", "false relation", "independent support survival"]
-proof_ceiling = "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+non_goals = ["Doctor or infrastructure repair", "merge or split identity repair", "canonical relation mutation", "automatic quarantine, revocation or influence change"]
+invariants = ["history and forensic lineage remain", "repair follows an explicit semantic dependency closure", "unknown lineage narrows rather than globally deletes", "identity surgery routes to structure-repair and operational repair routes to Doctor or the owning runtime"]
+failure_behavior = "Return unsupported or inconclusive MemoryRepairCandidate with exact missing evidence; original semantic and operational state remains unchanged."
+proof_surface = ["poisoned source closure", "incomplete lineage", "false relation", "independent support survival", "Doctor and merge-split boundary"]
+proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
 product_pulse = "D3A_CURATION_PULSE_01"
 replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
 merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
 split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
 
 [[donor]]
-path = "ELIOT_IMPLEMENTATION I12.20/I12.36"
-disposition = "extract only applicable pure logic"
+path = "ELIOT_IMPLEMENTATION I12.20 and I12.36"
+disposition = "reuse semantic closure/threat-shape ideas only; reject operational execution"
 
 [[donor]]
 path = "ELIOT_IMPLEMENTATION I9.6-I9.7"
-disposition = "authoritative contract"
+disposition = "authoritative candidate and transformation-validation contract"
 
 [agent_task]
-objective = "Implement one candidate-only memory-repair handler over the common validator."
+objective = "Implement one candidate-only semantic memory-repair handler over the common validator."
 write_scope = ["crates/smart/eliot-dreamer-memory-repair/**"]
-deliverables = ["public contract/core implementation", "property/adversarial fixtures", "affected edge fixtures"]
-acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+deliverables = ["MemoryRepairCandidate core", "semantic-versus-identity-versus-Doctor boundary fixtures", "curation Edge fixtures"]
+acceptance = ["semantic candidate only", "no identity surgery or operational repair", "lineage, rollback and uncertainty preserved"]
 forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
-stop_condition = "Stop and return ContractChallenge when the work needs another owner, unbounded traversal, model call or hidden state."
+stop_condition = "Stop and route the work if it requires merge/split identity changes, Doctor/runtime repair, canonical mutation, quarantine or influence enforcement."
 challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
 integration_owner = "cognitive-wave-integrator"
 implementation_language = "Rust 2024"
-required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
 writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
-workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"

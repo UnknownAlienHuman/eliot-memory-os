@@ -1,9 +1,9 @@
-schema_version = 2
+schema_version = 4
 module_id = "smart.dreamer.clarification"
 crate = "eliot-dreamer-clarification"
 status = "PROTOTYPE"
 wave = "cognitive-micromodules-wave-01"
-agent_order = 16
+agent_order = 7
 plane = "Smart"
 runtime_layer = "R6"
 delivery_depth = "D3a"
@@ -13,39 +13,47 @@ state_class = "stateless"
 hot_path = false
 lifecycle_owner = "smart.dreamer.clarification"
 loc_soft_ceiling = 10000
-loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
-primary_responsibility = "Select and render one concise discriminative clarification question, why it matters, and the safe fallback if unanswered."
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "One material ambiguity yields one discriminative question and safe fallback without becoming part of basic Orientation or owning delivery."
+causal_property = "single discriminative clarification candidate"
+old_failure_or_missing_capability = "Clarification was ordered as an Orientation prerequisite and its task was mixed with mailbox delivery concerns."
+discriminator = "The handler emits exactly one question or an explicit no-question disposition, and basic Orientation can pass without it."
+primary_responsibility = "Select and render one concise discriminative clarification question, why it matters and the safe fallback if unanswered."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["DreamJobInput class=Clarification", "ValidatedDreamDraft", "active-agent/Human-boundary projection"]
+inputs = ["DreamJobInput class=Clarification", "ValidatedDreamDraft", "active-agent or Human-boundary projection"]
 outputs = ["ClarificationCandidate", "delivery-target recommendation", "safe fallback and expiry"]
 depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+providers = ["Governor-admitted Dreamer bundle", "active attention boundary"]
 consumers = ["agent mailbox compiler", "Human attention proposal"]
-non_goals = ["notification delivery", "attention ownership", "task decision", "inventing an answer"]
-invariants = ["exactly one question", "question changes a material classification/scope/outcome/reuse decision", "Human interruption is proposed only at a Human-owned boundary", "absence preserves the unknown and declared fallback"]
-failure_behavior = "Return no-question/inconclusive with the original ambiguity; never generate a questionnaire or silently assume an answer."
-proof_surface = ["one-question cardinality", "task-local versus Human routing", "unanswered fallback", "repeated ambiguity deduplication input"]
-replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
-split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+non_goals = ["notification delivery", "attention ownership", "task decision", "inventing an answer", "basic Orientation synthesis"]
+invariants = ["exactly one question", "the answer would change a material classification, scope, outcome or reuse decision", "Human interruption is only recommended at a Human-owned boundary", "unanswered state preserves the unknown and declared fallback"]
+failure_behavior = "Return no-question or inconclusive with the original ambiguity; never generate a questionnaire or assume an answer."
+proof_surface = ["one-question cardinality", "task-local versus Human routing", "unanswered fallback", "no dependency from basic Orientation"]
+proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+product_pulse = "D3A_CLARIFICATION_EDGE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
 
 [[donor]]
 path = "crates/smart/eliot-dreamer-core/src/lib.rs"
-disposition = "reuse_contract_only"
-scope = "Clarification candidate kind and bounded text validation"
+disposition = "reuse bounded clarification contract only"
 
 [[donor]]
 path = "ELIOT_IMPLEMENTATION I9.3 and I9.11-I9.12"
-disposition = "authoritative_contract"
-scope = "question content and routing boundary"
+disposition = "authoritative question and routing boundary"
 
 [agent_task]
-objective = "Implement clarification as one narrow handler, leaving mailbox/attention delivery to their owners."
+objective = "Implement Clarification as one independent handler, leaving mailbox and attention delivery to their owners."
 write_scope = ["crates/smart/eliot-dreamer-clarification/**"]
-deliverables = ["question selector/renderer", "routing recommendation", "cardinality and boundary tests"]
+deliverables = ["question selector and renderer", "routing recommendation", "cardinality and fallback tests"]
 acceptance = ["one concise question only", "no state mutation or delivery side effect", "safe fallback remains explicit"]
-forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
-stop_condition = "Stop if selecting a question requires deciding the underlying fact; preserve competing questions and return no selection."
-integration_owner = "cognitive-wave-01-integrator"
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop if selecting a question requires deciding the underlying fact; retain the ambiguity and return no selection."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
 implementation_language = "Rust 2024"
-required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
-workspace_admission = "forbidden until src/lib.rs, package proof, affected edge proof, current-main rebase and integration-owner review"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"

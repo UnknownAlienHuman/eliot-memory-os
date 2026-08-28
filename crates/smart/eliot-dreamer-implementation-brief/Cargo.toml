@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Produce an ImplementationBrief candidate from exact accepted Implementation handles plus current conformance evidence, without upgrading target prose to support."
+description = "ImplementationBrief candidate from exact accepted Implementation handles and current conformance evidence"
 
 [lib]
 path = "src/lib.rs"
@@ -18,7 +18,7 @@ functional_cell = "smart.dreamer.implementation_brief"
 source_layer = "C1"
 runtime_layer = "R6"
 runtime_bundle = "eliot-dreamer"
-agent_order = 8
+agent_order = 9
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
