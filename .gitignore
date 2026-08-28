@@ -8,13 +8,20 @@ dist/
 !crates/**/src/bin/
 !crates/**/src/bin/**
 
-# Runtime state
+# Runtime and machine-local state
+.eliot/
 .eliot-dev/
 .eliot-governor/
 **/.eliot-governor/
+.codebase-memory/
 logs/
 reports/
 runtime/
+
+# Investigation/donor material and retired swarm state
+/research/
+/swarm/
+/*_PROGRESS.md
 
 # Environment and credentials
 .env
@@ -42,10 +49,6 @@ id_ed25519
 .codex/config.local.toml
 .codex/cargo_metadata.json
 history.txt
-
-# Generated code-understanding state
-.codebase-memory/artifact.json
-.codebase-memory/graph.db.zst
 
 # Local databases / WAL / crash files
 *.redb
