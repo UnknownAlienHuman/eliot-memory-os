@@ -95,14 +95,17 @@ create authority by itself.
 
 ## Active implementation programmes
 
-- Core/daemon issues #13–#24:
+- Core/daemon issues #13–#24 use fresh issue-numbered branches and
   `workstreams/core-daemons/AGENTS.md`.
-- Existing cognitive candidate PR #26:
-  retained on `cognitive-micromodules-wave-01`, but marked non-mutable until it
-  is refreshed from current `main`.
+- Cognitive prototype PR #26 is the sole active nonstandard branch. Merged PR
+  #31 refreshed `cognitive-micromodules-wave-01` from current `main`; mutation is
+  restricted to the prototype-manifest/assignment paths declared in
+  `workstreams/ACTIVE.toml`. It is not a general repair branch.
 
 There is no shared long-lived core/daemon branch. Each issue starts a fresh
-branch when an agent is assigned.
+branch when an agent is assigned. Every nonstandard branch not listed in
+`workstreams/ACTIVE.toml` is read-only archaeology and is retired after its
+candidate is integrated, rejected, or superseded.
 
 ## Evidence boundary
 
