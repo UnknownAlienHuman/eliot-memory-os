@@ -6,6 +6,13 @@
 
 Нормативная пара: [Architecture](./ELIOT_ARCHITECTURE.md) `4.5-draft` + [Implementation](./ELIOT_IMPLEMENTATION.md) `0.29-draft`. Быстрый вход: [README](./README.md).
 
+English final edition (2026-08-28):
+[Architecture](./ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md),
+[Implementation](./ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md).
+Edition SHA-256 and authority boundaries are recorded in
+[`README.md`](./README.md) and
+[`../ARCHITECTURE_CONTRACT.md`](../ARCHITECTURE_CONTRACT.md).
+
 ## Как пользоваться
 
 - `E:` — сущность или owner; `F:` — сквозной flow; `T:` — предметный вопрос.
@@ -19,6 +26,22 @@
 rg -n -i 'canonical-write|receipt' INDEX.md
 rg -n -g 'ELIOT_*.md' '^#{1,2} (A12\.3|I5\.19)\.' .
 ```
+
+## English edition 2026-08-28: structural delta
+
+Ниже перечислены edition-specific маршруты. Остальные записи этого индекса
+используют стабильные `A*` / `I*` handles общей пары; если маршрут включает
+вынесенный appendix detail, English Implementation указывает соответствующую
+publication projection прямо в верхнем уровне приложения.
+
+| Вопрос | Architecture English final | Implementation English final |
+|---|---|---|
+| Confirmatory/exploratory inquiry, evidence freeze, coverage denominator | `A5.7` | `I21.2–I21.9` |
+| Researcher plane и provider boundaries | `A5.7`, `A10`, `A12` | `I21.1–I21.13` |
+| Portable skill package | `A7.10`, `A12.7` | `I7.29` |
+| Messaging bridge | `A10.1–A10.3`, `A12.6` | `I10.23` |
+| User automation | `A11`, `A12.2` | `I11.12` |
+| Rust topology и crate-fleet economics | `A2.3`, `A14.8` | start `I2.1`, `I2.3–I2.8`, `I2.10–I2.23`, `I2.25` → expand `I18.33` |
 
 ## Статус и authority
 

@@ -17,6 +17,25 @@ routing into the pair. Architecture prevails over Implementation when their
 meaning conflicts. Neither document proves that a target mechanism exists or is
 running.
 
+## Published English final edition
+
+The repository publishes the supplied 2026-08-28 English final files without
+changing their distribution bytes:
+
+| Edition artifact | Internal revision | SHA-256 |
+|---|---|---|
+| [`ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md`](architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md) | `4.5-draft`; English edition `2026-08-28` | `C6932EAF26935E752EEFB4DE591AFC91EA1A7180BE5A8FF0005554B8029BAC1A` |
+| [`ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md`](architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md) | `0.29-draft`; English edition `2026-08-28` | `7805BF238FE91819ABA50D7E13AA86A8B977561195DBB98AA979F986E2FAB063` |
+
+These are dated edition artifacts, not a silent byte-level replacement of the
+canonical pair above. In particular, the English Implementation has a distinct
+section topology and references retained/generated publication projections that
+are not part of this two-file delivery. The dated English filename is not the
+byte-identical canonical “published versioned copy” described inside the
+Implementation, and this delivery does not create such a copy. Use
+[`docs/architecture/README.md`](architecture/README.md) and
+[`docs/architecture/INDEX.md`](architecture/INDEX.md) for bounded routing.
+
 ## Current-system truth
 
 Current source files, Cargo manifests and lockfile, generated metadata, compiler

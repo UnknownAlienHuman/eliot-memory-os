@@ -9,6 +9,12 @@ governance schemas, host integrations, deterministic tests, migrations, and the
 operator application. [`docs/ARCHITECTURE_CONTRACT.md`](docs/ARCHITECTURE_CONTRACT.md)
 routes to the external Architecture 4.5 / Implementation 0.29 normative pair
 and separates target contracts from current source and runtime evidence.
+The dated 2026-08-28 English final editions are published as
+[ELIOT Architecture — English final](docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md)
+and
+[ELIOT Implementation — English final](docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md);
+their edition identity and relationship to the normative pair are recorded in
+the architecture contract and its [documentation index](docs/architecture/README.md).
 Current project routing and the honest Runtime Live V3 boundary are summarized
 in [`docs/PROJECT_MAP.md`](docs/PROJECT_MAP.md) and
 [`reports/audit/RUNTIME_LIVE_V3_STATUS_2026-08-24.md`](reports/audit/RUNTIME_LIVE_V3_STATUS_2026-08-24.md);

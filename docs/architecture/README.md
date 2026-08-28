@@ -16,6 +16,24 @@
 
 При смысловом конфликте Architecture выше Implementation. Каноничность каталога не меняет статусы ревизий: Architecture — кандидат на принятие; Implementation — `TARGET`; code/runtime/data conformance неизвестно; product — `NOT_ACCEPTED / UNVERIFIED`.
 
+## English final edition — 2026-08-28
+
+Репозиторий также публикует неизменённые байты датированной English-final
+редакции:
+
+| Книга | Edition artifact | SHA-256 |
+|---|---|---|
+| Architecture | [`ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md`](./ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md) | `C6932EAF26935E752EEFB4DE591AFC91EA1A7180BE5A8FF0005554B8029BAC1A` |
+| Implementation | [`ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md`](./ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md) | `7805BF238FE91819ABA50D7E13AA86A8B977561195DBB98AA979F986E2FAB063` |
+
+Обе книги сохраняют внутренние labels `4.5-draft` / `0.29-draft`, но English
+Implementation имеет отдельную section topology: добавлены `I7.29`, `I10.23`,
+`I11.12`, `I21.1–I21.13`, а часть детальных приложений вынесена в
+publication projections. Поэтому edition-файлы не подменяют canonical hashes и
+`docs/normative`; датированный English filename также не является
+byte-identical canonical “published versioned copy”, описанной внутри
+Implementation. Точные English-маршруты приведены в [INDEX.md](./INDEX.md).
+
 ## Минимальный вход
 
 - Общее понимание: введение Architecture, `A1`, `A16.3`.

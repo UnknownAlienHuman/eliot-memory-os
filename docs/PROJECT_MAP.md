@@ -8,8 +8,14 @@ This is a routing map, not an acceptance record. Current source, `Cargo.toml`,
 `Cargo.lock`, Cargo diagnostics, and live machine readback outrank this file.
 The normative architecture sources are the external pair routed by
 [`docs/ARCHITECTURE_CONTRACT.md`](ARCHITECTURE_CONTRACT.md) and the Runtime Live
-V3 task document. The persistent CodeCortex snapshot currently reports 54,134
-nodes and 268,208 edges; it is useful for navigation only and may lag source.
+V3 task document. The repository also publishes the dated
+[Architecture English final](architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md)
+and
+[Implementation English final](architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md);
+use the [architecture documentation index](architecture/README.md) to distinguish
+those edition files from the canonical normative pair. The persistent CodeCortex
+snapshot currently reports 54,134 nodes and 268,208 edges; it is useful for
+navigation only and may lag source.
 
 ## Workspace shape
 
