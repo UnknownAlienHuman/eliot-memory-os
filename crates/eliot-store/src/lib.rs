@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod blob_store;
+mod blob_validation;
 pub mod canonical_projection;
 mod canonical_record;
 pub mod canonical_store;

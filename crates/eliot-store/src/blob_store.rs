@@ -1,4 +1,5 @@
 use crate::StoreError;
+use crate::blob_validation::{expected_blob_relative_path, validate_blob_ref};
 use eliot_types::secret_boundary::MAX_SECRET_BOUNDARY_BYTES;
 use eliot_types::{
     BlobRef, BlobStoreConfig, CANONICAL_MEMORY_SCHEMA_VERSION,
@@ -442,32 +443,6 @@ fn inspect_blob_secret_bytes(bytes: &[u8]) -> Result<(), StoreError> {
         })?;
     }
     Ok(())
-}
-
-fn validate_blob_ref(blob: &BlobRef) -> Result<(), StoreError> {
-    if blob.algorithm != "blake3"
-        || blob.digest_hex.len() != 64
-        || !blob
-            .digest_hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(StoreError::PolicyViolation(
-            "blob reference algorithm or digest is invalid".to_owned(),
-        ));
-    }
-    let expected = expected_blob_relative_path(&blob.digest_hex);
-    if Path::new(&blob.relative_path) != expected {
-        return Err(StoreError::PolicyViolation(
-            "blob reference path is not the canonical digest path".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn expected_blob_relative_path(digest_hex: &str) -> PathBuf {
-    let (prefix, suffix) = digest_hex.split_at(2);
-    PathBuf::from(prefix).join(format!("{suffix}.blob"))
 }
 
 fn invalid_blob(message: impl Into<String>) -> StoreError {
