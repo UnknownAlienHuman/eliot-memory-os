@@ -37,9 +37,8 @@ use eliot_types::{
     MetaPolicyExecutionReceipt, MinorityPressureRecord, ObservabilityKind,
     ObservabilityWriteEnvelope, ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId,
     ProjectSequence, RecallL0Request, RecallL0Response, SessionId, SleepCandidateArtifact,
-    SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig, TaintClass, TaskContract,
-    TaskId, ToolObservation, VerificationId, VerificationRun, Visibility, WriteId, WriteReceipt,
-    WriteStatus,
+    SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig, TaskContract, TaskId,
+    ToolObservation, VerificationId, VerificationRun, WriteId, WriteReceipt, WriteStatus,
 };
 use recall_ranking::{is_default_visible_lifecycle, rank_recall_candidates};
 use serde::de::DeserializeOwned;
@@ -1439,38 +1438,7 @@ pub struct CanonicalStore {
     blob_store: Option<BlobStore>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct CanonicalToolObservation {
-    pub observation_id: String,
-    pub project_id: ProjectId,
-    pub task_id: Option<TaskId>,
-    pub scope: String,
-    pub authority: String,
-    pub tool_name: String,
-    pub observation: String,
-    pub payload: Value,
-    pub memory_revision: MemoryRevision,
-    pub project_sequence: ProjectSequence,
-    pub write_id: WriteId,
-}
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct CanonicalClaimCard {
-    pub claim_id: ClaimId,
-    pub project_id: ProjectId,
-    pub task_id: Option<TaskId>,
-    pub scope: String,
-    pub status: EpistemicStatus,
-    pub lifecycle_status: LifecycleStatus,
-    pub visibility: Visibility,
-    pub taint: TaintClass,
-    pub authority: String,
-    pub statement: String,
-    pub payload: Value,
-    pub memory_revision: MemoryRevision,
-    pub project_sequence: ProjectSequence,
-    pub write_id: WriteId,
-}
+pub use crate::canonical_observation_models::{CanonicalClaimCard, CanonicalToolObservation};
 
 impl CanonicalStore {
     pub fn new(config: SurrealServerConfig) -> Self {

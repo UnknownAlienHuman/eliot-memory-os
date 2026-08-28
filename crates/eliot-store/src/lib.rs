@@ -5,6 +5,7 @@ mod blob_validation;
 mod canonical_activation_graph_models;
 mod canonical_cognitive_projection;
 mod canonical_meta_integrity_records;
+mod canonical_observation_models;
 pub mod canonical_projection;
 mod canonical_record;
 pub mod canonical_store;
