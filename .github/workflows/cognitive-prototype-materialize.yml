@@ -7,12 +7,17 @@ on:
     paths:
       - ".github/workflows/cognitive-prototype-materialize.yml"
       - ".github/cognitive-prototype-payload/**"
+  pull_request:
+    branches:
+      - cognitive-micromodules-wave-01
+    paths:
+      - ".github/cognitive-prototype-payload/**"
 
 permissions:
   contents: write
 
 concurrency:
-  group: cognitive-prototype-materialize
+  group: cognitive-prototype-materialize-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -22,6 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref || github.ref_name }}
 
       - name: Materialize and validate prototype files
         shell: bash
@@ -52,7 +58,6 @@ jobs:
               if target.exists():
                   target.unlink()
 
-          # Validate every materialized TOML file.
           parsed = {}
           for relative, content in payload["files"].items():
               if relative.endswith(".toml"):
@@ -104,19 +109,16 @@ jobs:
           if "Cargo.toml" in payload["files"]:
               raise SystemExit("root workspace modification is forbidden")
 
-          # The prototypes intentionally contain no Rust implementation.
+          prototype_prefixes = tuple(
+              f"{entry['manifest'].rsplit('/', 1)[0]}/"
+              for entry in assignments
+              if entry["package_action"] == "create_prototype_crate"
+          )
           unexpected_rs = [
-              str(path)
+              str(path).replace("\\", "/")
               for path in root.glob("crates/**/src/lib.rs")
-              if str(path).replace("\\", "/").startswith(
-                  tuple(
-                      f"{entry['manifest'].rsplit('/', 1)[0]}/"
-                      for entry in assignments
-                      if entry["package_action"] == "create_prototype_crate"
-                  )
-              )
+              if str(path).replace("\\", "/").startswith(prototype_prefixes)
           ]
-          # Existing donor crates have src/lib.rs; new prototype paths must not.
           if unexpected_rs:
               raise SystemExit(f"Rust implementation already present in prototype paths: {unexpected_rs}")
           generated_rs = [relative for relative in payload["files"] if relative.endswith(".rs")]
@@ -137,4 +139,8 @@ jobs:
           git add -A
           git diff --cached --check
           git commit -m "prototype(cognitive): materialize audited assignment waves"
-          git push
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+          else
+            git push
+          fi
