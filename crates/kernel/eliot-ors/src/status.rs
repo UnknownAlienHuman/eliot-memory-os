@@ -7,6 +7,9 @@ use eliot_runtime_contracts::{
 use redb::{ReadOnlyDatabase, ReadableDatabase, TableDefinition};
 use serde::de::DeserializeOwned;
 
+use crate::status_projection::{
+    OrsSupervisionStatusError, SupervisionStatusProjection, SupervisionStatusReason,
+};
 use crate::{SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt};
 
 const SUPERVISION_LEASE_STAGED: TableDefinition<&str, &str> =
@@ -20,52 +23,6 @@ const SUPERVISION_LEASE_RESULTS: TableDefinition<&str, &str> =
 
 const MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HISTORY: u16 = 8;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OrsSupervisionStatusError {
-    Missing(String),
-    AccessDenied(String),
-    MigrationRequired(String),
-    Corrupt(String),
-    Unknown(String),
-}
-
-impl std::fmt::Display for OrsSupervisionStatusError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Missing(r) => write!(f, "missing: {r}"),
-            Self::AccessDenied(r) => write!(f, "access denied: {r}"),
-            Self::MigrationRequired(r) => write!(f, "migration required: {r}"),
-            Self::Corrupt(r) => write!(f, "corrupt: {r}"),
-            Self::Unknown(r) => write!(f, "unknown: {r}"),
-        }
-    }
-}
-
-impl std::error::Error for OrsSupervisionStatusError {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SupervisionStatusReason {
-    Healthy,
-    MissingCurrent,
-    StagedOnly,
-    Expired,
-    SignatureInvalid(String),
-    BindingMismatch(String),
-    CorruptRecord(String),
-    VerificationFailed(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SupervisionStatusProjection {
-    pub lease_id: String,
-    pub health: HealthDimension,
-    pub heartbeat: HealthDimension,
-    pub reason: SupervisionStatusReason,
-    pub current: Option<SupervisionLeaseSnapshot>,
-    pub staged: Option<SupervisionLeaseStageReceipt>,
-    pub history: Vec<SupervisionLeaseSnapshot>,
-}
 
 #[allow(clippy::needless_pass_by_value)]
 fn map_io_error(err: std::io::Error) -> OrsSupervisionStatusError {

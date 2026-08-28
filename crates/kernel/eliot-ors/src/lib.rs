@@ -9,6 +9,7 @@
 
 mod model;
 mod status;
+mod status_projection;
 mod store;
 
 #[cfg(feature = "test-support")]
@@ -16,8 +17,10 @@ pub mod test_support;
 
 pub use model::*;
 pub use status::{
-    OrsSupervisionStatusError, SupervisionStatusProjection, SupervisionStatusReason,
     observe_supervision_status, open_existing_read_only, read_current_supervision_lease_read_only,
+};
+pub use status_projection::{
+    OrsSupervisionStatusError, SupervisionStatusProjection, SupervisionStatusReason,
 };
 pub use store::{
     CanonicalEvidenceProvider, OperationalRecoveryStore, OrsCoordinator, RedbRecoveryStore,
