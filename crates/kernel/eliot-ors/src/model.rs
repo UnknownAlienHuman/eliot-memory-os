@@ -1991,69 +1991,6 @@ impl RecoveryInboxReceipt {
     }
 }
 
-/// Bounded logical ORS export request. It never copies a live redb file.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OrsSnapshotRequest {
-    pub after_order: u64,
-    pub limit: u16,
-    pub snapshot_at_ms: i64,
-}
-
-impl OrsSnapshotRequest {
-    pub fn new(after_order: u64, limit: u16, snapshot_at_ms: i64) -> Result<Self, OrsError> {
-        if limit == 0 || limit > MAX_RECOVERY_PAGE {
-            return Err(OrsError::InvalidCursorLimit);
-        }
-        Ok(Self {
-            after_order,
-            limit,
-            snapshot_at_ms,
-        })
-    }
-}
-
-/// Store-issued logical snapshot receipt with retained evidence bindings.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct OrsSnapshotReceipt {
-    snapshot_at_ms: i64,
-    entry_refs: Vec<String>,
-    snapshot_sha256: String,
-    next_after_order: Option<u64>,
-}
-
-impl OrsSnapshotReceipt {
-    pub const fn snapshot_at_ms(&self) -> i64 {
-        self.snapshot_at_ms
-    }
-
-    pub fn entry_refs(&self) -> &[String] {
-        &self.entry_refs
-    }
-
-    pub fn snapshot_sha256(&self) -> &str {
-        &self.snapshot_sha256
-    }
-
-    pub const fn next_after_order(&self) -> Option<u64> {
-        self.next_after_order
-    }
-
-    pub(crate) fn issue(
-        snapshot_at_ms: i64,
-        entry_refs: Vec<String>,
-        snapshot_sha256: String,
-        next_after_order: Option<u64>,
-    ) -> Result<Self, OrsError> {
-        validate_digest(&snapshot_sha256, "ors_snapshot_sha256")?;
-        Ok(Self {
-            snapshot_at_ms,
-            entry_refs,
-            snapshot_sha256,
-            next_after_order,
-        })
-    }
-}
-
 /// Exact terminal reservation sequence disposition retained for gap/readback proof.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
