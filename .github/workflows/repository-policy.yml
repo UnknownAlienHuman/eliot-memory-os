@@ -8,6 +8,8 @@ on:
 
 permissions:
   contents: read
+  issues: read
+  pull-requests: read
 
 jobs:
   branch-and-authority-policy:
@@ -17,23 +19,38 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Validate branch identity and current-main ancestry
+      - name: Validate branch identity, issue, and current-main ancestry
         shell: bash
         env:
           HEAD_BRANCH: ${{ github.head_ref || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          pattern='^(work|fix|docs|chore|refactor|test)/[0-9]+-[a-z0-9]+(-[a-z0-9]+)*$'
+          pattern='^(work|fix|docs|chore|refactor|test)/([0-9]+)-[a-z0-9]+(-[a-z0-9]+)*$'
           legacy='cognitive-micromodules-wave-01'
 
-          if [[ "$HEAD_BRANCH" != 'main' && "$HEAD_BRANCH" != "$legacy" && ! "$HEAD_BRANCH" =~ $pattern ]]; then
-            echo "Branch '$HEAD_BRANCH' is not issue-numbered."
-            echo "Use <work|fix|docs|chore|refactor|test>/<issue>-<slug>."
-            exit 1
+          if [[ "$HEAD_BRANCH" == 'main' ]]; then
+            exit 0
+          fi
+
+          if [[ "$HEAD_BRANCH" != "$legacy" ]]; then
+            if [[ ! "$HEAD_BRANCH" =~ $pattern ]]; then
+              echo "Branch '$HEAD_BRANCH' is not issue-numbered."
+              echo "Use <work|fix|docs|chore|refactor|test>/<issue>-<slug>."
+              exit 1
+            fi
+
+            issue_number="${BASH_REMATCH[2]}"
+            issue_state="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${issue_number}" --jq '.state')"
+            issue_is_pr="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${issue_number}" --jq 'has("pull_request")')"
+            if [[ "$issue_state" != 'open' || "$issue_is_pr" != 'false' ]]; then
+              echo "Branch issue #${issue_number} is not an open issue."
+              exit 1
+            fi
           fi
 
           git fetch --no-tags origin main
-          if [[ "$HEAD_BRANCH" != 'main' ]] && ! git merge-base --is-ancestor origin/main HEAD; then
+          if ! git merge-base --is-ancestor origin/main HEAD; then
             echo "Current origin/main is not an ancestor of this branch."
             echo "Refresh from main before additional mutation or integration."
             exit 1
@@ -55,8 +72,10 @@ jobs:
           assert pair['status'] == 'accepted'
           assert pair['repository_authority_branch'] == 'main'
           assert active['authority_branch'] == 'main'
+          assert active['branch_policy']['standard_branch_requires_open_issue'] is True
           assert active['branch_policy']['requires_current_main_ancestor'] is True
           assert active['branch_policy']['one_issue_one_branch_one_pr'] is True
+          assert active['branch_policy']['nonstandard_branch_requires_explicit_exception'] is True
           assert inventory['authority']['branch'] == 'main'
           PY
 

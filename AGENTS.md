@@ -10,9 +10,9 @@ Read, in order:
 
 1. [`WORKFLOW.md`](WORKFLOW.md);
 2. [`workstreams/ACTIVE.toml`](workstreams/ACTIVE.toml);
-3. the owning GitHub issue and current PR, when one exists;
+3. the owning open GitHub issue and current PR, when one exists;
 4. [`docs/ARCHITECTURE_CONTRACT.md`](docs/ARCHITECTURE_CONTRACT.md) and only the
-   applicable sections of the canonical Architecture/Implementation pair;
+   applicable canonical Architecture/Implementation sections;
 5. the exact source, contracts, tests, and one-hop dependencies for the work.
 
 ## Mandatory preflight
@@ -28,8 +28,8 @@ git rev-parse HEAD
 git rev-parse origin/main
 ```
 
-The two revisions must match and the worktree must be clean. Then create a new
-branch from that exact commit:
+The revisions must match and the worktree must be clean. Create a fresh branch
+from that exact commit:
 
 ```powershell
 git switch -c <kind>/<issue>-<short-slug>
@@ -37,10 +37,13 @@ git switch -c <kind>/<issue>-<short-slug>
 
 Allowed kinds: `work`, `fix`, `docs`, `chore`, `refactor`, `test`.
 
-Do not continue in a branch merely because it already exists locally or was
-mentioned by another agent. An existing branch is usable only when it is listed
-as mutable in `workstreams/ACTIVE.toml`, still has its owning open issue/PR, and
-contains current `main` as an ancestor. Otherwise stop and create a fresh branch.
+Do not continue in a branch merely because it exists locally or was mentioned
+by another agent. A standard issue-numbered branch is mutable only while its
+owning issue is open, its current PR is open when one exists, and current
+`origin/main` is an ancestor. A nonstandard, shared, or long-lived branch is
+mutable only when `workstreams/ACTIVE.toml` names it as an explicit exception.
+Otherwise stop, preserve any candidate through its issue/PR, and create a fresh
+branch from current `main`.
 
 ## Work ownership
 
@@ -48,7 +51,7 @@ contains current `main` as an ancestor. Otherwise stop and create a fresh branch
 - One mutable path scope has one writer.
 - A worker does not merge its own work or modify the oracle to make a patch pass.
 - Branches are disposable execution state; accepted work lives in `main`.
-- Documentation changes use the same issue/branch/PR path as source changes.
+- Documentation follows the same issue/branch/PR path as source.
 - Core/daemon work follows [`workstreams/core-daemons/AGENTS.md`](workstreams/core-daemons/AGENTS.md).
 - Dreamer is not part of the core/daemon workstream.
 
@@ -57,7 +60,7 @@ contains current `main` as an ancestor. Otherwise stop and create a fresh branch
 Do not commit:
 
 - research packages, donor dumps, downloaded archives, or copied external
-  project documentation;
+  product documentation;
 - dated audit reports, progress diaries, recovery-program transcripts, swarm
   chat/results, or generated certificates;
 - `.eliot/`, `.codebase-memory/`, runtime databases, logs, reports, build output,
@@ -65,7 +68,8 @@ Do not commit:
 
 Use issue/PR comments for investigation findings, CI artifacts for generated
 reports, and external repositories for Eliot Search or Eliot Research product
-documentation. Git history preserves retired repository material.
+documentation. Git history preserves retired material without exposing it as
+current authority.
 
 ## Verification
 

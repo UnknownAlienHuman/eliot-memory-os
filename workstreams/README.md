@@ -1,32 +1,32 @@
 # Active workstreams
 
-This directory is the only checked-in registry of current implementation work.
-It does not replace GitHub issues or the canonical Architecture/Implementation
-pair.
+This directory routes current implementation programmes. It does not replace
+GitHub issues, pull requests, or the canonical Architecture/Implementation pair.
 
 Rules:
 
 - `main` is the sole authority branch.
-- A new implementation branch is created fresh from current `main` for one
-  issue; it is not pre-created here.
-- `ACTIVE.toml` lists active workstreams and any exceptional retained branch.
-- A branch not listed as mutable is not a place to continue work.
+- Ordinary work uses a fresh issue-numbered branch from current `main`.
+- The owning issue/PR is the live record for that ephemeral branch.
+- `ACTIVE.toml` lists programmes and exceptional nonstandard/long-lived
+  branches; it does not duplicate every normal issue branch.
+- A nonstandard branch not listed as an exception is read-only archaeology.
 - Investigation results live in issues/PRs; only bounded reusable briefs and
   routing metadata live here.
 
-## Current work
+## Current programmes
 
 ### Core and daemons
 
 Issues #13–#24 cover Host, Kernel, `eliotd`, Watchdog, Doctor, storage,
 testd, WASM/native contours, User Broker, and Researcher provider execution.
 Use [`core-daemons/AGENTS.md`](core-daemons/AGENTS.md). Dreamer is excluded.
-Each issue receives a new issue-numbered branch from current `main` when an
-agent actually starts it.
+Each issue receives a new issue-numbered branch when an agent actually starts
+that work.
 
 ### Cognitive micro-modules
 
 PR #26 preserves the current candidate on the legacy branch
-`cognitive-micromodules-wave-01`. The branch is retained, but it is stale after
-the documentation/main cutover and is not mutable until refreshed from current
-`main`. No other legacy cognitive/Dreamer branch is active.
+`cognitive-micromodules-wave-01`. It is the only retained nonstandard branch and
+is explicitly non-mutable until refreshed from current `main`. No other legacy
+cognitive/Dreamer branch is active.

@@ -12,14 +12,14 @@ Canonical navigation:
 - Architecture authority: `docs/ARCHITECTURE_CONTRACT.md`;
 - exact pair identity: `docs/normative-pair.toml`;
 - product/source map: `docs/PROJECT_MAP.md`;
-- active work: `workstreams/ACTIVE.toml`;
+- active programmes and exceptional branches: `workstreams/ACTIVE.toml`;
 - repository agent rules: `AGENTS.md`.
 
 ## Work lifecycle
 
 ```text
 open issue with owner, causal property, scope, proof, and non-goals
-→ update main locally with fetch/prune + fast-forward only
+→ fetch/prune and fast-forward main only
 → create a fresh issue-numbered branch from exact origin/main
 → claim one mutable path scope
 → implement and run Module/Edge/Product proof as applicable
@@ -28,40 +28,45 @@ open issue with owner, causal property, scope, proof, and non-goals
 → close issue and retire the branch
 ```
 
-The normal branch form is:
+Normal branch form:
 
 ```text
 <kind>/<issue-number>-<short-slug>
 ```
 
-Allowed kinds are `work`, `fix`, `docs`, `chore`, `refactor`, and `test`.
+Allowed kinds: `work`, `fix`, `docs`, `chore`, `refactor`, `test`.
 Provider-generated names, random adjective names, personal namespaces, and dated
 campaign branches are not accepted for new work.
 
-## Branch rules
+## Branch validity
 
-1. A branch has one open issue and at most one open PR.
-2. A branch is mutable only while listed as mutable in
-   `workstreams/ACTIVE.toml`.
-3. Current `origin/main` must be an ancestor before mutation and before merge.
-4. Do not repair an old branch in place after its work was superseded. Start a
-   fresh branch and carry only the reviewed change.
-5. A merged, closed, superseded, or abandoned branch is retired immediately.
-6. Branch content never outranks `main`, even when it contains newer-looking
-   dates or more documentation.
-7. A local worktree whose branch is not current and active is read-only until
-   discarded or explicitly recovered through a new issue.
+A standard issue-numbered branch is valid only when:
 
-The temporary legacy branch for PR #26 is listed separately in the active
-registry. It is retained only to preserve that candidate and is not mutable
-until refreshed from current `main`.
+1. the branch issue is open and describes the current causal change;
+2. the branch was created from current `origin/main`;
+3. current `origin/main` remains an ancestor before further mutation and merge;
+4. its PR is open when one exists;
+5. the declared mutable path scope has no other writer.
+
+`workstreams/ACTIVE.toml` lists programmes and exceptional nonstandard/long-lived
+branches. It intentionally does **not** duplicate every ephemeral issue branch;
+the issue and PR own that current state. A nonstandard branch absent from the
+exception registry is read-only archaeology.
+
+Do not repair a superseded branch in place. Start a fresh branch and carry only
+the reviewed change. A merged, closed, abandoned, or superseded branch is
+retired. Branch content never outranks `main`, even when it contains newer dates
+or more prose.
+
+The temporary legacy branch for PR #26 is preserved as a candidate, but it is
+not mutable until refreshed from current `main` and revalidated.
 
 ## Worktrees and writers
 
 Use one worktree per mutating branch. Record the primary path scope in the issue
 or PR. Two agents may read the same files, but they do not mutate the same scope
 concurrently. Contract changes land before dependent implementation waves, and
-the integration owner revalidates all consumers after the contract changes.
+the integration owner revalidates consumers after the contract change.
 
 ## Documentation and evidence placement
 
@@ -72,7 +77,7 @@ Keep in Git:
 - ADRs for accepted load-bearing decisions;
 - generated projections only when an active consumer and regeneration check
   exist;
-- active workstream briefs and machine-readable routing.
+- bounded reusable workstream briefs and routing metadata.
 
 Do not keep in the active tree:
 
