@@ -9,24 +9,27 @@ use std::collections::BTreeSet;
 use crate::SurrealStoreAdapter;
 use crate::config::{SchemaGeneration, SurrealAdapterConfig};
 use crate::error::AdapterError;
-use crate::health::{AdapterAvailability, AdapterHealth, ProviderHealth};
 use crate::plan::{
     self, ApplyPlan, build_receipt, validate_receipt_identity, validate_revision_heads,
 };
 use crate::readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
 use crate::{client, schema};
-use eliot_store_api::{
-    CONTRACT_VERSION, OrderingHead, OrderingHeadExpectation, OrderingScopeId, RecoveryRecord,
-    RevisionHead, RevisionHeadExpectation, RevisionKey, StateFence, StoreError, StoreHealth,
-    StoreHealthStatus, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
-};
 #[cfg(test)]
-use eliot_store_api::{OperationId, StoreGenesisRequest, validate_genesis_receipt_envelope};
+use eliot_store_api::{
+    CONTRACT_VERSION, OperationId, StoreGenesisRequest, validate_genesis_receipt_envelope,
+};
+use eliot_store_api::{
+    OrderingHead, OrderingHeadExpectation, OrderingScopeId, RecoveryRecord, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, StateFence, StoreError, StoreRecoveryRequest,
+    StoreRecoverySnapshot, WriteReceipt,
+};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 
 mod empty_migration;
 mod genesis;
+#[path = "health_probe.rs"]
+mod health_probe;
 mod read_boundary;
 mod receipt_reconciliation;
 mod recovery;
@@ -38,6 +41,7 @@ use genesis::{
     GenesisState, build_genesis_bindings, build_genesis_sql, genesis_receipt,
     validate_fresh_genesis_state, validate_replayed_genesis_state,
 };
+pub(crate) use health_probe::{adapter_health, health};
 #[cfg(test)]
 use read_boundary::{READ_VALIDATION_SNAPSHOT, build_validation_snapshot};
 pub(crate) use read_boundary::{
@@ -518,41 +522,6 @@ pub(crate) async fn apply_migration(
     }
 }
 
-/// Bounded bridge health observation.
-///
-/// `Available` is deliberately withheld until the semantic readiness probe
-/// confirms both the expected schema generation and the canonical fence. A
-/// reachable provider with missing/mismatched schema remains unavailable to
-/// Store callers.
-pub(crate) async fn adapter_health(adapter: &SurrealStoreAdapter) -> AdapterHealth {
-    match probe_readiness(adapter).await {
-        Ok(SemanticReadiness::Ready { generation }) => AdapterHealth {
-            protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
-            availability: AdapterAvailability::Available,
-            provider: ProviderHealth::Reachable,
-            schema_generation: Some(generation.to_string()),
-        },
-        Ok(SemanticReadiness::MigrationRequired { observed, .. }) => AdapterHealth {
-            protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
-            availability: AdapterAvailability::MigrationUnavailable,
-            provider: ProviderHealth::Reachable,
-            schema_generation: observed,
-        },
-        Ok(SemanticReadiness::Unavailable) => AdapterHealth {
-            protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
-            availability: AdapterAvailability::Unavailable,
-            provider: ProviderHealth::Unknown,
-            schema_generation: None,
-        },
-        Err(_) => AdapterHealth {
-            protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
-            availability: AdapterAvailability::ProviderUnavailable,
-            provider: ProviderHealth::Unavailable,
-            schema_generation: None,
-        },
-    }
-}
-
 /// Atomically applies one exact S-01 transition and returns its immutable receipt.
 /// Projection publications and outbox intents are derived by the shared
 /// transition planner, matching the in-memory reference implementation.
@@ -722,24 +691,6 @@ pub(crate) async fn recovery(
         &request.state_fence,
         &request.records,
     )
-}
-
-/// Maps the bridge availability to the bounded store health status.
-pub(crate) async fn health(adapter: &SurrealStoreAdapter) -> Result<StoreHealth, StoreError> {
-    let health = adapter_health(adapter).await;
-    let status = match health.availability {
-        AdapterAvailability::Available => StoreHealthStatus::Ready,
-        AdapterAvailability::MigrationUnavailable | AdapterAvailability::ProviderUnavailable => {
-            StoreHealthStatus::Unavailable
-        }
-        AdapterAvailability::Unavailable => StoreHealthStatus::Degraded,
-    };
-    let digest = adapter.operation_manifest.digest.clone();
-    Ok(StoreHealth {
-        status,
-        contract_version: CONTRACT_VERSION,
-        manifest_digest: digest,
-    })
 }
 
 /// Persists one fully planned transaction atomically.
