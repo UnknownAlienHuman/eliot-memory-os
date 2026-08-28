@@ -14,11 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
 use eliot_governor::{
     CompositionError, CompositionReadiness, GovernorComposition, GovernorLaunchConfig,
-    KernelDurableJobPort, KernelGenerationPort, KernelGenerationSnapshot,
-    KernelGenerationSnapshotProvider, KernelPortError, KernelServiceObservationPort,
-    KernelServiceRecovery, QueueLimits,
+    KernelGenerationPort, QueueLimits,
 };
-use eliot_maintenance::MaintenanceJob;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
 use eliot_protocol::{AgentActivationResolutionDecision, AgentActivationResolutionTicket};
 use serde::{Deserialize, Serialize};
@@ -36,6 +33,7 @@ use std::sync::atomic::Ordering;
 mod activation_projection;
 mod daemon_config;
 mod daemon_kernel_client;
+mod daemon_kernel_port_adapters;
 mod kernel_recovery_client;
 mod kernel_transition_client;
 
@@ -53,6 +51,7 @@ pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_
 pub(crate) use daemon_kernel_client::{
     is_pre_admission_pending_rejection, retry_pre_admission, validate_server_hello,
 };
+pub(crate) use daemon_kernel_port_adapters::kind_value;
 
 /// Stable daemon identity.
 pub const SERVICE_NAME: &str = "eliotd";
@@ -103,67 +102,6 @@ pub enum DaemonError {
     /// A second daemon owner cannot be admitted in this process.
     #[error("daemon lifecycle: {0}")]
     Lifecycle(String),
-}
-
-fn kind_value(
-    value: &serde_json::Value,
-    expected_kind: &str,
-) -> Result<serde_json::Value, KernelPortError> {
-    let object = value.as_object().ok_or_else(|| {
-        KernelPortError::Contract("Kernel typed application value is not an object".to_owned())
-    })?;
-    if object.get("kind").and_then(serde_json::Value::as_str) != Some(expected_kind) {
-        return Err(KernelPortError::Contract(format!(
-            "Kernel returned unexpected application kind; expected {expected_kind}"
-        )));
-    }
-    object.get("value").cloned().ok_or_else(|| {
-        KernelPortError::Contract("Kernel typed value is missing payload".to_owned())
-    })
-}
-
-impl KernelGenerationSnapshotProvider for DaemonKernelClient {
-    fn snapshot(&self) -> &KernelGenerationSnapshot {
-        &self.snapshot
-    }
-}
-
-impl KernelServiceObservationPort for DaemonKernelClient {
-    fn services(
-        &self,
-        state_fence: &StateFence,
-        protected_snapshot_digest: &str,
-    ) -> Result<Vec<KernelServiceRecovery>, KernelPortError> {
-        let value = self.request_blocking(
-            "services",
-            serde_json::json!({
-                "state_fence": state_fence,
-                "protected_snapshot_digest": protected_snapshot_digest,
-            }),
-        )?;
-        let value = kind_value(&value, "services")?;
-        serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
-    }
-}
-
-impl KernelDurableJobPort for DaemonKernelClient {
-    fn load_durable_job(
-        &self,
-        job_id: &str,
-        state_fence: &StateFence,
-    ) -> Result<Option<MaintenanceJob>, KernelPortError> {
-        let value = self.request_blocking(
-            "load_durable_job",
-            serde_json::json!({ "job_id": job_id, "state_fence": state_fence }),
-        )?;
-        let value = kind_value(&value, "durable_job")?;
-        serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
-    }
-
-    fn save_durable_job(&self, job: &MaintenanceJob) -> Result<(), KernelPortError> {
-        let _ = self.request_blocking("save_durable_job", serde_json::json!({ "job": job }))?;
-        Ok(())
-    }
 }
 
 fn unix_ms() -> u64 {
