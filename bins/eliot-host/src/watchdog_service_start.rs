@@ -1,11 +1,19 @@
-use std::{
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{path::Path, time::Duration};
 
 use super::{
     HostError, PlatformHandle, ProcessIdentity, RequestMetadata, ServiceRegistrationRequest,
     ServiceState, WindowsPlatform, windows_paths_equal,
+};
+
+#[cfg(windows)]
+#[path = "watchdog_start_timing.rs"]
+mod watchdog_start_timing;
+
+#[cfg(windows)]
+use watchdog_start_timing::{SystemWatchdogStartClock, watchdog_unknown_wait};
+#[cfg(windows)]
+pub(super) use watchdog_start_timing::{
+    WATCHDOG_START_TIMEOUT_MS, WatchdogStartClock, watchdog_start_wait,
 };
 
 #[cfg(windows)]
@@ -34,62 +42,6 @@ impl InstalledWatchdogStartControl for WindowsPlatform {
     ) -> eliot_platform::PortOutcome<eliot_platform::ServiceObservation> {
         eliot_platform::ServicePort::execute(self, request)
     }
-}
-
-#[cfg(windows)]
-pub(super) trait WatchdogStartClock {
-    fn now_ms(&mut self) -> u64;
-
-    fn sleep(&mut self, duration: Duration);
-}
-
-#[cfg(windows)]
-struct SystemWatchdogStartClock {
-    origin: Instant,
-}
-
-#[cfg(windows)]
-impl SystemWatchdogStartClock {
-    fn new() -> Self {
-        Self {
-            origin: Instant::now(),
-        }
-    }
-}
-
-#[cfg(windows)]
-impl WatchdogStartClock for SystemWatchdogStartClock {
-    fn now_ms(&mut self) -> u64 {
-        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
-    }
-
-    fn sleep(&mut self, duration: Duration) {
-        std::thread::sleep(duration);
-    }
-}
-
-#[cfg(windows)]
-pub(super) const WATCHDOG_START_TIMEOUT_MS: u64 = 30_000;
-
-#[cfg(windows)]
-const WATCHDOG_START_MIN_WAIT_MS: u64 = 25;
-
-#[cfg(windows)]
-const WATCHDOG_START_MAX_WAIT_MS: u64 = 250;
-
-#[cfg(windows)]
-const WATCHDOG_START_UNKNOWN_WAIT_MS: u64 = 50;
-
-#[cfg(windows)]
-pub(super) fn watchdog_start_wait(wait_hint_ms: u32) -> Duration {
-    let wait_ms =
-        u64::from(wait_hint_ms).clamp(WATCHDOG_START_MIN_WAIT_MS, WATCHDOG_START_MAX_WAIT_MS);
-    Duration::from_millis(wait_ms)
-}
-
-#[cfg(windows)]
-fn watchdog_unknown_wait() -> Duration {
-    Duration::from_millis(WATCHDOG_START_UNKNOWN_WAIT_MS)
 }
 
 #[cfg(windows)]
