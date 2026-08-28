@@ -10,7 +10,9 @@ use eliot_types::{
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 
-pub struct MetricRegistryService;
+#[path = "metrics_registry.rs"]
+mod metrics_registry;
+pub use metrics_registry::MetricRegistryService;
 pub struct MetricRecorderService;
 pub struct TelemetryEventService;
 pub struct MetricRollupService;
@@ -20,48 +22,6 @@ pub struct QualitySignalService;
 pub struct RuntimeDashboardService;
 pub struct MetricsDoctorIntegration;
 pub struct MetricsMcpBoundaryService;
-
-impl MetricRegistryService {
-    #[must_use]
-    pub fn definitions(&self) -> Vec<MetricDefinition> {
-        builtin_metric_definitions()
-    }
-
-    pub fn validate_definition(&self, definition: &MetricDefinition) -> Result<(), EngineError> {
-        for label in &definition.labels {
-            if label.secret_risk {
-                return Err(rejected(
-                    "metric-registry",
-                    &format!("secret-risk metric label rejected: {}", label.name),
-                ));
-            }
-            if label.high_cardinality {
-                return Err(rejected(
-                    "metric-registry",
-                    &format!("high-cardinality metric label rejected: {}", label.name),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn find(&self, metric_id: &str) -> Result<MetricDefinition, EngineError> {
-        self.definitions()
-            .into_iter()
-            .find(|definition| definition.metric_id == metric_id)
-            .ok_or_else(|| rejected("metric-registry", &format!("unknown metric: {metric_id}")))
-    }
-
-    #[must_use]
-    pub fn categories(&self) -> Vec<String> {
-        self.definitions()
-            .into_iter()
-            .map(|definition| definition.component)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
-}
 
 impl MetricRecorderService {
     pub fn record_sample(
