@@ -2,11 +2,10 @@ use crate::EngineError;
 use eliot_types::{
     CredentialDiagnosticsReport, CredentialProviderKind, CredentialPurpose, CredentialRef,
     DataRootValidationStatus, IpcConfig, IpcFrame, IpcFrameKind, IpcHandshake,
-    IpcHandshakeDecision, IpcHandshakeReason, IpcStatusReport, RuntimeMode, ServiceAccountRef,
-    ServiceInstallAction, ServiceInstallReceipt, ServiceInstallStatus, ServiceReadinessCheck,
+    IpcHandshakeDecision, IpcHandshakeReason, IpcStatusReport, RuntimeMode, ServiceReadinessCheck,
     ServiceReadinessProbe, ServiceReadinessStatus, ServiceRestartPolicy, ServiceRestartReason,
-    ServiceRestartReceipt, ServiceRestartStatus, ServiceStartType, ServiceStatusReport,
-    StartupRecoveryReceipt, StartupRecoveryStatus, WindowsServiceConfig,
+    ServiceRestartReceipt, ServiceRestartStatus, ServiceStatusReport, StartupRecoveryReceipt,
+    StartupRecoveryStatus, WindowsServiceConfig,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -16,156 +15,9 @@ use time::OffsetDateTime;
 
 const H1_PROTOCOL_VERSION: &str = "eliot-ipc-v1";
 
-pub struct WindowsServiceManager {
-    config: WindowsServiceConfig,
-}
-
-impl WindowsServiceManager {
-    #[must_use]
-    pub fn new(config: WindowsServiceConfig) -> Self {
-        Self { config }
-    }
-
-    #[must_use]
-    pub fn default_config(data_root: &Path, executable_path: &Path) -> WindowsServiceConfig {
-        WindowsServiceConfig {
-            service_name: "EliotGovernor".to_owned(),
-            display_name: "ELIOT Governor".to_owned(),
-            description: "Local ELIOT Governor production runtime service".to_owned(),
-            executable_path: executable_path.display().to_string(),
-            arguments: vec!["service".to_owned(), "run".to_owned()],
-            account: ServiceAccountRef::CurrentUser,
-            start_type: ServiceStartType::Manual,
-            restart_policy: ServiceRestartPolicy::default(),
-            data_root: data_root.display().to_string(),
-            log_root: data_root.join("logs").display().to_string(),
-            ipc: default_ipc_config(data_root),
-        }
-    }
-
-    #[must_use]
-    pub fn config(&self) -> &WindowsServiceConfig {
-        &self.config
-    }
-
-    #[must_use]
-    pub fn validate(&self) -> ServiceInstallReceipt {
-        let (warnings, errors) = validate_service_config(&self.config);
-        let status = if errors.is_empty() {
-            ServiceInstallStatus::Succeeded
-        } else {
-            ServiceInstallStatus::Failed
-        };
-        self.receipt(ServiceInstallAction::Validate, status, warnings, errors)
-    }
-
-    #[must_use]
-    pub fn install(&self, dry_run: bool) -> ServiceInstallReceipt {
-        let (mut warnings, errors) = validate_service_config(&self.config);
-        if !errors.is_empty() {
-            return self.receipt(
-                ServiceInstallAction::Install,
-                ServiceInstallStatus::Failed,
-                warnings,
-                errors,
-            );
-        }
-        if dry_run {
-            return self.receipt(
-                ServiceInstallAction::Install,
-                ServiceInstallStatus::DryRun,
-                warnings,
-                errors,
-            );
-        }
-
-        warnings.push(
-            "H1 engine does not mutate Windows SCM; use admin service runner for real install"
-                .to_owned(),
-        );
-        self.receipt(
-            ServiceInstallAction::Install,
-            ServiceInstallStatus::SucceededWithWarnings,
-            warnings,
-            errors,
-        )
-    }
-
-    #[must_use]
-    pub fn uninstall(&self, dry_run: bool) -> ServiceInstallReceipt {
-        let status = if dry_run {
-            ServiceInstallStatus::DryRun
-        } else {
-            ServiceInstallStatus::SucceededWithWarnings
-        };
-        let warnings = if dry_run {
-            Vec::new()
-        } else {
-            vec![
-                "H1 engine reports uninstall intent only; SCM mutation is admin CLI only"
-                    .to_owned(),
-            ]
-        };
-        self.receipt(
-            ServiceInstallAction::Uninstall,
-            status,
-            warnings,
-            Vec::new(),
-        )
-    }
-
-    #[must_use]
-    pub fn control(&self, action: ServiceInstallAction) -> ServiceInstallReceipt {
-        let warnings = vec![
-            "H1 does not start/stop SCM from ordinary process; admin CLI boundary is preserved"
-                .to_owned(),
-        ];
-        self.receipt(
-            action,
-            ServiceInstallStatus::SucceededWithWarnings,
-            warnings,
-            Vec::new(),
-        )
-    }
-
-    #[must_use]
-    pub fn status(&self) -> ServiceStatusReport {
-        let receipt = self.receipt(
-            ServiceInstallAction::Status,
-            ServiceInstallStatus::SucceededWithWarnings,
-            vec!["SCM query is bounded to local status report in H1 tests".to_owned()],
-            Vec::new(),
-        );
-        ServiceStatusReport {
-            component: "service_status".to_owned(),
-            config: self.config.clone(),
-            installed: false,
-            running: false,
-            install_receipt: receipt,
-            generated_at: OffsetDateTime::now_utc(),
-        }
-    }
-
-    fn receipt(
-        &self,
-        action: ServiceInstallAction,
-        status: ServiceInstallStatus,
-        warnings: Vec<String>,
-        errors: Vec<String>,
-    ) -> ServiceInstallReceipt {
-        let created_at = OffsetDateTime::now_utc();
-        ServiceInstallReceipt {
-            receipt_id: id("service-receipt", created_at),
-            service_name: self.config.service_name.clone(),
-            action,
-            status,
-            config_ref: config_ref(&self.config),
-            warnings,
-            errors,
-            created_at,
-        }
-    }
-}
+#[path = "service_manager.rs"]
+mod service_manager;
+pub use service_manager::WindowsServiceManager;
 
 pub struct NamedPipeIpcServer {
     config: IpcConfig,
