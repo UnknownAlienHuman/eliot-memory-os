@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Stable Active Understanding View, context atom, recipe, and selection-integrity contracts"
+description = "Own minimal public context atom, recipe, candidate, admission, omission, selection-integrity and view schemas."
 
 [lib]
 path = "src/lib.rs"
@@ -18,7 +18,7 @@ functional_cell = "smart.context.contracts"
 source_layer = "C0"
 runtime_layer = "R5"
 runtime_bundle = "eliotd"
-agent_order = 7
+agent_order = 15
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }

@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Role-preserving Active Understanding View and decision-local-tail assembly"
+description = "Render one admitted set into semantic sections, reversible omission manifest and decision-local tail without re-running admission."
 
 [lib]
 path = "src/lib.rs"
@@ -18,9 +18,10 @@ functional_cell = "smart.context.assembly"
 source_layer = "C1"
 runtime_layer = "R5"
 runtime_bundle = "eliotd"
-agent_order = 10
+agent_order = 18
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }
 eliot-context-contracts = { path = "../eliot-context-contracts" }
 eliot-context-admission = { path = "../eliot-context-admission" }

@@ -1,11 +1,11 @@
 [package]
-name = "eliot-observation-classifier"
+name = "eliot-learning-state-view"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Deterministic first-pass classification of admitted observations into candidate record roles"
+description = "Compile one immutable CampaignLearningStateView from exact existing owner revisions and a declared recipe."
 
 [lib]
 path = "src/lib.rs"
@@ -14,13 +14,13 @@ path = "src/lib.rs"
 prototype = true
 source_status = "NOT_IMPLEMENTED"
 workspace_admission = "pending_agent_implementation_and_proof"
-functional_cell = "smart.observation.classifier"
+functional_cell = "smart.learning.state_view"
 source_layer = "C1"
 runtime_layer = "R5"
 runtime_bundle = "eliotd"
-agent_order = 1
+agent_order = 33
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
 eliot-evidence = { path = "../../foundation/eliot-evidence" }
-eliot-observation-contracts = { path = "../../foundation/eliot-observation-contracts" }
+eliot-learning-contracts = { path = "../eliot-learning-contracts" }

@@ -1,0 +1,25 @@
+[package]
+name = "eliot-learning-contracts"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Own provider-neutral contracts for CampaignLearningStateView, AttemptLearningDelta, CampaignHarnessOverlay candidate, activation/adherence assessment and closure inputs."
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "NOT_IMPLEMENTED"
+workspace_admission = "pending_agent_implementation_and_proof"
+functional_cell = "smart.learning.contracts"
+source_layer = "C0"
+runtime_layer = "R5"
+runtime_bundle = "eliotd"
+agent_order = 32
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }

@@ -1,0 +1,59 @@
+schema_version = 3
+module_id = "smart.context.reactive_delivery_plan"
+crate = "eliot-reactive-context-plan"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 19
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "smart.context.reactive_delivery_plan"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Relevant context reaches the next available host boundary once, while Critical Attention remains sticky and delivery limitations stay visible."
+causal_property = "reactive delivery planning and session dedup disposition"
+old_failure_or_missing_capability = "the prior activation cell incorrectly owned session dedup and no cell owned the activation-to-injection decision"
+discriminator = "same session snapshot/view yields deterministic pending injection; actual delivery and receipt remain Governor/host effects"
+primary_responsibility = "Plan one bounded context injection/delivery from an assembled view, cue result and immutable session delivery snapshot."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["ActiveUnderstandingView", "CueActivationResult", "SessionDeliverySnapshot", "CriticalAttention projection", "IntegrationCoverageProfile"]
+outputs = ["PendingContextInjectionPlan", "per-item delivery disposition", "required DeliveryReceipt intent"]
+depends_on = ["eliot-context-contracts", "eliot-cue-contracts"]
+providers = ["context assembly", "cue activation", "Governor session projection"]
+consumers = ["Host event/reactive delivery service"]
+non_goals = ["actual delivery", "Session state mutation", "Attention resolution", "authority decision"]
+invariants = ["normal items dedup only against explicit snapshot", "critical items remain sticky", "tool-only degradation is visible"]
+failure_behavior = "Return delayed/advisory/unsupported delivery plan with exact host gap; never claim prevention or acknowledgement."
+proof_surface = ["repeat-session dedup", "critical sticky item", "event-integrated versus tool-only host", "stale view/session fence"]
+proof_ceiling = "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I7.10/I7.19"
+disposition = "authoritative contract"
+
+[[donor]]
+path = "crates/smart/eliot-cues/src/lib.rs"
+disposition = "reject session state from evaluator"
+
+[agent_task]
+objective = "Create the missing pure activation-to-delivery planning seam."
+write_scope = ["crates/smart/eliot-reactive-context-plan/**"]
+deliverables = ["public contract/core implementation", "property/adversarial fixtures", "affected edge fixtures"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, unbounded traversal, model call or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"

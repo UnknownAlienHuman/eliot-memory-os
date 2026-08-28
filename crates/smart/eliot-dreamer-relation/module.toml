@@ -1,9 +1,9 @@
-schema_version = 2
+schema_version = 3
 module_id = "smart.dreamer.relation"
 crate = "eliot-dreamer-relation"
 status = "PROTOTYPE"
 wave = "cognitive-micromodules-wave-01"
-agent_order = 18
+agent_order = 22
 plane = "Smart"
 runtime_layer = "R6"
 delivery_depth = "D3a"
@@ -13,39 +13,47 @@ state_class = "stateless"
 hot_path = false
 lifecycle_owner = "smart.dreamer.relation"
 loc_soft_ceiling = 10000
-loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
-primary_responsibility = "Propose one typed directed relation between admitted endpoints with provenance, epistemic status, scope, time, and invalidation conditions."
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Dreamer curation proposes one reversible, lineage-preserving memory transformation without changing canonical state."
+causal_property = "typed relation proposal"
+old_failure_or_missing_capability = "the legacy Dreamer generator treats typed relation proposal as one generic candidate item with no independent falsifier"
+discriminator = "the relation handler accepts/rejects its exact subtype independently and preserves every source branch on failure"
+primary_responsibility = "Propose one typed directed relation between admitted endpoints with provenance, scope, time and invalidation."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["DreamJobInput class=Curation", "ValidatedDreamDraft item kind=relation", "admitted endpoint and relation-registry handles"]
-outputs = ["RelationCandidate", "endpoint/registry validation report", "rival relation candidates"]
+inputs = ["Curation draft item kind=relation", "endpoint and relation-registry handles"]
+outputs = ["RelationCandidate", "endpoint/registry report", "rival relation candidates"]
 depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+providers = ["validated Dreamer draft", "admitted memory/evidence handles"]
 consumers = ["eliot-dreamer-curation"]
-non_goals = ["graph persistence", "causal promotion from similarity", "endpoint creation", "broad graph traversal"]
-invariants = ["both endpoints are exact admitted handles", "direction/type/scope/time are explicit", "similarity/co-change/sequence remain non-causal", "rival relations are preserved"]
-failure_behavior = "Reject only the invalid relation candidate and preserve the source statement; never invent an endpoint or causal edge."
-proof_surface = ["unknown endpoint", "direction reversal", "similarity-to-causality negative case", "scope/time mismatch"]
-replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
-split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+non_goals = ["graph persistence", "endpoint creation", "causality from similarity"]
+invariants = ["exact admitted endpoints", "direction/type/scope/time explicit", "rival relations preserved"]
+failure_behavior = "Return unsupported/inconclusive relation candidate with exact missing evidence; original records remain unchanged."
+proof_surface = ["unknown endpoint", "direction reversal", "similarity-to-causality", "scope/time mismatch"]
+proof_ceiling = "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+product_pulse = "D3A_CURATION_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
 
 [[donor]]
 path = "crates/smart/eliot-system-experience/src/lib.rs"
-disposition = "extract_pure_only"
-scope = "validated relation shape, not owner state"
+disposition = "extract only applicable pure logic"
 
 [[donor]]
-path = "ELIOT_IMPLEMENTATION I5.18 and I12.9"
-disposition = "authoritative_contract"
-scope = "relation registry and graph evidence semantics"
+path = "ELIOT_IMPLEMENTATION I9.6-I9.7"
+disposition = "authoritative contract"
 
 [agent_task]
-objective = "Implement relation proposal as a typed micro-handler, not as graph ownership."
+objective = "Implement one candidate-only relation handler over the common validator."
 write_scope = ["crates/smart/eliot-dreamer-relation/**"]
-deliverables = ["relation candidate builder", "registry/endpoint checks", "causal-laundering negative tests"]
-acceptance = ["no graph mutation", "typed relation and invalidation always present", "invalid endpoint cannot be silently repaired"]
-forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
-stop_condition = "Stop if the relation requires source acquisition, graph mutation, or causal verification; return the applicable requirement."
-integration_owner = "cognitive-wave-01-integrator"
+deliverables = ["public contract/core implementation", "property/adversarial fixtures", "affected edge fixtures"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, unbounded traversal, model call or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
 implementation_language = "Rust 2024"
-required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
-workspace_admission = "forbidden until src/lib.rs, package proof in an isolated candidate workspace, affected edge proof, current-main rebase and integration-owner review"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"

@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Candidate-only semantic classification handler for admitted observations and records"
+description = "Propose one semantic family/subtype with scope, evidence, alternatives and abstention."
 
 [lib]
 path = "src/lib.rs"
@@ -18,7 +18,7 @@ functional_cell = "smart.dreamer.classification"
 source_layer = "C1"
 runtime_layer = "R6"
 runtime_bundle = "eliot-dreamer"
-agent_order = 17
+agent_order = 21
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }

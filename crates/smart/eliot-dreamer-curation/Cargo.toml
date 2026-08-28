@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Typed curation dispatch and aggregation facade over independently testable handlers"
+description = "Dispatch each validated curation item to exactly one declared subtype handler and assemble a lineage-preserving candidate set without semantic recomputation."
 
 [lib]
 path = "src/lib.rs"
@@ -18,10 +18,11 @@ functional_cell = "smart.dreamer.curation"
 source_layer = "C1"
 runtime_layer = "R6"
 runtime_bundle = "eliot-dreamer"
-agent_order = 27
+agent_order = 31
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }
 eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
 eliot-dreamer-candidate-validation = { path = "../eliot-dreamer-candidate-validation" }
 eliot-memory-curation-screen = { path = "../eliot-memory-curation-screen" }

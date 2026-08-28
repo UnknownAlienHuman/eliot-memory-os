@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Deterministic construction of a fenced ContextCandidateSet from already admitted projections"
+description = "Map immutable task, attention, epistemic, cue, negative-memory, evidence and affordance projections into whole context candidates with lineage."
 
 [lib]
 path = "src/lib.rs"
@@ -18,10 +18,11 @@ functional_cell = "smart.context.candidates"
 source_layer = "C1"
 runtime_layer = "R5"
 runtime_bundle = "eliotd"
-agent_order = 8
+agent_order = 16
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }
 eliot-cue-contracts = { path = "../eliot-cue-contracts" }
 eliot-epistemic = { path = "../eliot-epistemic" }
 eliot-context-contracts = { path = "../eliot-context-contracts" }

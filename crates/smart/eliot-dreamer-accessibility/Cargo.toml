@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Accessibility, activation, and forgetting candidate handler"
+description = "Propose one reversible accessibility or influence adjustment independently of support and physical erasure."
 
 [lib]
 path = "src/lib.rs"
@@ -18,7 +18,7 @@ functional_cell = "smart.dreamer.accessibility"
 source_layer = "C1"
 runtime_layer = "R6"
 runtime_bundle = "eliot-dreamer"
-agent_order = 25
+agent_order = 29
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }

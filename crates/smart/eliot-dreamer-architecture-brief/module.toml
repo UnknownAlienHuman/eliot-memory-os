@@ -1,0 +1,59 @@
+schema_version = 3
+module_id = "smart.dreamer.architecture_brief"
+crate = "eliot-dreamer-architecture-brief"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 7
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.architecture_brief"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Dreamer returns bounded, source-linked candidates that improve orientation or maintenance without becoming an owner or authority."
+causal_property = "ArchitectureBrief projection"
+old_failure_or_missing_capability = "the legacy eliot-dreamer-core combines ArchitectureBrief projection with unrelated job contracts, validation or subtype semantics"
+discriminator = "the handler proves ArchitectureBrief projection through its public contract while source state and authority remain unchanged"
+primary_responsibility = "Produce an ArchitectureBrief candidate from exact accepted Architecture handles, preserving intent, rationale, Hard Boundaries and unresolved questions."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["Architecture/self query", "ValidatedDreamDraft", "accepted Architecture source handles and pair identity"]
+outputs = ["ArchitectureBriefCandidate", "normative coverage manifest", "invalidation conditions"]
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+providers = ["Governor-admitted handles", "Dreamer common contracts"]
+consumers = ["Dreamer orientation", "ELIOT self-scope Product Pulse"]
+non_goals = ["Implementation interpretation", "Architecture change", "runtime conformance claim", "source acquisition"]
+invariants = ["only accepted Architecture bytes define constitutional meaning", "exact quotations remain exact", "missing scope is visible"]
+failure_behavior = "Return partial, rejected or unsupported ArchitectureBrief projection with exact gaps; never fabricate evidence or promotion."
+proof_surface = ["wrong digest", "mixed revision", "Implementation prose attempting to override Architecture", "coverage omission"]
+proof_ceiling = "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I9.3 Architecture/self query"
+disposition = "authoritative contract"
+
+[[donor]]
+path = "ELIOT_ARCHITECTURE A6.7"
+disposition = "self-knowledge boundary"
+
+[agent_task]
+objective = "Implement the Architecture side of self-query as a separate authority-preserving handler."
+write_scope = ["crates/smart/eliot-dreamer-architecture-brief/**"]
+deliverables = ["typed ArchitectureBrief projection handler", "negative/adversarial fixtures", "provider/consumer contract fixtures"]
+acceptance = ["candidate-only output", "all material statements retain admitted lineage", "no state mutation or external effect"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop if ArchitectureBrief projection requires source acquisition, authority, canonical transition or another handler's semantic responsibility."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"

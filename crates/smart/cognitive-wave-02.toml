@@ -1,0 +1,169 @@
+schema_version = 4
+wave_id = "cognitive-micromodules-wave-02"
+status = "PROTOTYPE_ASSIGNMENT_GATED"
+base_commit = "7d7f03259cc3d3d90b2fe1af7a6175b13808ece2"
+normative_architecture = "ELIOT Architecture 4.5-draft / English edition 2026-08-28"
+normative_implementation = "ELIOT Implementation 0.29-draft / English edition 2026-08-28"
+purpose = "Add the cross-plane online-learning inner loop and later advisory Dreamer planning handlers without creating new task, scheduler, evaluator, promotion or authority owners."
+prerequisite = "D1 capture/read/finish and D3B Context Compiler edges are current enough to compile task-local learning; exact attempt/evaluator/overlay owners must exist."
+integration_owner = "cognitive-wave-integrator"
+agent_rule = "One agent receives exactly one active module manifest, its frozen contract revision, one-hop providers/consumers, old failure, discriminator, exact write scope, proof ceiling and Product Pulse."
+workspace_rule = "Prototype Cargo manifests remain outside the root workspace until implementation, isolated package proof, affected edge proof, current-main rebase and integration review."
+size_rule = "10000 LOC is a soft review ceiling only; causal cohesion, context/build/test closure, state ownership, proof and replacement boundaries decide split or merge."
+source_rule = "Current source, Cargo metadata/diagnostics and exact runtime evidence outrank prototype manifests; manifests are assignments, not support claims."
+old_branch_rule = "cognitive-crates-prototypes-01 is superseded as an assignment source; only individually revalidated donor ideas may be reused."
+gate = "Orders 32-38 require current attempt/evaluator/context edges and D3B_REACTIVE_CONTEXT_PULSE_01. Orders 39-43 require D3A_ORIENTATION_PULSE_01 plus exact Problem/Config/AgentCoordinator provider contracts. Research synthesis remains deferred to Researcher."
+
+[global_boundaries]
+forbidden = ["second canonical, operational, task, scheduler, evaluator or promotion owner", "Dreamer source acquisition or Researcher denominator/freeze ownership", "provider/model SDK in pure cognitive cores", "job scheduling, process supervision or route reservation", "truth/support/authority/policy/finish/effect promotion", "unbounded hot-path work", "similarity as exact applicability, causality or proof", "active generation self-modification", "facade semantic recomputation", "implicit scope/disclosure widening"]
+required = ["one causal responsibility", "one lifecycle owner or explicit statelessness", "one owner for every mutable state", "typed provider/consumer ports", "independent proof surface and proof ceiling", "local visible degradation", "replacement/removal and merge/rejoin boundary", "Product Objective and exact discriminator"]
+
+[[stage]]
+id = "ONLINE_LEARNING_INNER_LOOP"
+orders = [32, 38]
+gate = "Attempt outcome must change the next compatible attempt through a bounded local overlay or record an evidence-backed no-change disposition; broader influence stays candidate-only."
+
+[[stage]]
+id = "ADVISORY_DREAMER_PLANNING_HANDLERS"
+orders = [39, 43]
+gate = "Conflict, diagnosis, maintenance, configuration and orchestration plans remain typed candidates consumed by existing owners."
+
+[[product_pulse]]
+id = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+scenario = "One consequential attempt produces an evidence-linked AttemptLearningDelta, Governor-admitted task-local overlay, exact next-attempt retrieval/delivery/activation/adherence assessment, and closure or explicit no-change; no cross-task promotion occurs without external owner proof."
+required_observables = ["attempt/evaluator evidence exact", "unchanged retry requires declared reason", "overlay cannot change objective/authority/evaluator", "activation and adherence remain orthogonal", "closure/promotion owner external"]
+status = "NOT_EXECUTED"
+proof_ceiling = "Product proof only for the exact scenario/Product Identity; does not establish release or global conformance"
+
+[[product_pulse]]
+id = "D3A_ADVISORY_PLANNING_PULSE_01"
+scenario = "One bounded self-scope problem yields typed conflict/diagnosis/maintenance/configuration/orchestration candidates that preserve rivals, exact owners, budgets and rollback while executing nothing."
+required_observables = ["one handler per causal output", "no task graph mutation", "no config publication", "no maintenance execution", "no problem closure by prose"]
+status = "NOT_EXECUTED"
+proof_ceiling = "Product proof only for the exact scenario/Product Identity; does not establish release or global conformance"
+
+[[assignment]]
+order = 32
+crate = "eliot-learning-contracts"
+functional_cell = "smart.learning.contracts"
+manifest = "crates/smart/eliot-learning-contracts/module.toml"
+depends_on = []
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 33
+crate = "eliot-learning-state-view"
+functional_cell = "smart.learning.state_view"
+manifest = "crates/smart/eliot-learning-state-view/module.toml"
+depends_on = ["eliot-learning-contracts"]
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 34
+crate = "eliot-learning-delta"
+functional_cell = "smart.learning.delta"
+manifest = "crates/smart/eliot-learning-delta/module.toml"
+depends_on = ["eliot-learning-contracts"]
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 35
+crate = "eliot-learning-overlay"
+functional_cell = "smart.learning.overlay"
+manifest = "crates/smart/eliot-learning-overlay/module.toml"
+depends_on = ["eliot-learning-contracts"]
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 36
+crate = "eliot-learning-activation-assessment"
+functional_cell = "meta.learning.activation_assessment"
+manifest = "crates/meta/eliot-learning-activation-assessment/module.toml"
+depends_on = ["eliot-learning-contracts"]
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 37
+crate = "eliot-improvement"
+functional_cell = "meta.learning.closure"
+manifest = "crates/meta/eliot-improvement/learning-closure.module.toml"
+depends_on = ["eliot-learning-contracts"]
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+package_action = "implement_cell_in_existing_crate"
+
+[[assignment]]
+order = 38
+crate = "eliot-improvement"
+functional_cell = "meta.improvement.promotion_input"
+manifest = "crates/meta/eliot-improvement/promotion.module.toml"
+depends_on = ["eliot-learning-contracts"]
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+package_action = "implement_cell_in_existing_crate"
+
+[[assignment]]
+order = 39
+crate = "eliot-dreamer-conflict-analysis"
+functional_cell = "smart.dreamer.conflict_analysis"
+manifest = "crates/smart/eliot-dreamer-conflict-analysis/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_ADVISORY_PLANNING_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 40
+crate = "eliot-dreamer-development-diagnosis"
+functional_cell = "smart.dreamer.development_diagnosis"
+manifest = "crates/smart/eliot-dreamer-development-diagnosis/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_ADVISORY_PLANNING_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 41
+crate = "eliot-dreamer-maintenance-plan"
+functional_cell = "smart.dreamer.maintenance_plan"
+manifest = "crates/smart/eliot-dreamer-maintenance-plan/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_ADVISORY_PLANNING_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 42
+crate = "eliot-dreamer-configuration-plan"
+functional_cell = "smart.dreamer.configuration_plan"
+manifest = "crates/smart/eliot-dreamer-configuration-plan/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_ADVISORY_PLANNING_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 43
+crate = "eliot-dreamer-orchestration-plan"
+functional_cell = "smart.dreamer.orchestration_plan"
+manifest = "crates/smart/eliot-dreamer-orchestration-plan/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_ADVISORY_PLANNING_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[deferred]]
+next_order = 44
+capability = "Dreamer Research synthesis"
+activation = "Researcher-owned ResearchPack, Evidence Grade, evidence freeze and coverage denominator"
+
+[[deferred]]
+next_order = 45
+capability = "D3c structural/causal depth"
+activation = "accepted exact code/behavioral/causal projections and Product Pulse value"
+
+[[deferred]]
+next_order = 46
+capability = "Cross-task/global learning promotion automation"
+activation = "retention/transfer/evaluator/ProductPulse/authority/rollback proof and existing Governor owner"
+
+[assignment_output]
+required = ["implementation limited to declared entrypoints", "ModuleContractKit/CrateContextCapsule/ModuleTestCapsule evidence at the applicable stage", "package/module proof", "affected edge proof", "named Product Pulse evidence when applicable", "donor reuse/rewrite/reject trace", "unresolved ContractChallenges", "merge/remove recommendation"]

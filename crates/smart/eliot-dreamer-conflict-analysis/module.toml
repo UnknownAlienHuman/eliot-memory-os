@@ -1,0 +1,55 @@
+schema_version = 3
+module_id = "smart.dreamer.conflict_analysis"
+crate = "eliot-dreamer-conflict-analysis"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-02"
+agent_order = 39
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.conflict_analysis"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Consequential work changes the next compatible attempt through inspectable local learning, or records why no change is justified."
+causal_property = "ConflictBrief/Concilium-plan synthesis"
+old_failure_or_missing_capability = "the legacy/core wave has no independently assignable ConflictBrief/Concilium-plan synthesis handler"
+discriminator = "the handler emits its exact candidate and can fail independently without starting work or changing state"
+primary_responsibility = "Frame one conflict into observations, rival interpretations, shared lineage, strongest objections, discriminative probes and decision owner."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["Conflict Analysis job", "ValidatedDreamDraft", "ConflictSet/evidence handles"]
+outputs = ["ConflictBrief candidate", "ConciliumPlan candidate", "invalidation/revision conditions"]
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+providers = ["Governor-admitted Dreamer bundle"]
+consumers = ["Dreamer surface", "Governor/Task Controller named disposition"]
+non_goals = ["vote tally", "decision resolution", "Attention mutation"]
+invariants = ["dissent preserved", "independence/common lineage explicit", "worker/controller actions separated"]
+failure_behavior = "Return explicit inconclusive/no-change/unsupported output with exact missing evidence; never fabricate learning or promotion."
+proof_surface = ["majority wrong", "shared evidence dependence", "local conflict", "no discriminative probe"]
+proof_ceiling = "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+product_pulse = "D3A_ADVISORY_PLANNING_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I9.3"
+disposition = "authoritative contract"
+
+[agent_task]
+objective = "Implement candidate-only ConflictBrief/Concilium-plan synthesis after the first D3a/D3b Product Pulses."
+write_scope = ["crates/smart/eliot-dreamer-conflict-analysis/**"]
+deliverables = ["typed pure core/contract", "negative and lifecycle fixtures", "affected edge fixtures"]
+acceptance = ["task-local/candidate-only ceiling is explicit", "no evaluator/authority ownership", "missing observability remains unknown"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop if the change would alter user objective, acceptance, authority, privacy, evaluator, sealed holdout, active production generation or its own promotion."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"

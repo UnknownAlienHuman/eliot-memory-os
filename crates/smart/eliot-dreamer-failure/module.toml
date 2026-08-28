@@ -1,9 +1,9 @@
-schema_version = 2
+schema_version = 3
 module_id = "smart.dreamer.failure"
 crate = "eliot-dreamer-failure"
 status = "PROTOTYPE"
 wave = "cognitive-micromodules-wave-01"
-agent_order = 22
+agent_order = 26
 plane = "Smart"
 runtime_layer = "R6"
 delivery_depth = "D3a"
@@ -13,39 +13,47 @@ state_class = "stateless"
 hot_path = false
 lifecycle_owner = "smart.dreamer.failure"
 loc_soft_ceiling = 10000
-loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
-primary_responsibility = "Propose one scoped FailureFingerprint/negative-memory candidate from reproducible failure evidence, failed path, violated invariant, reopen condition, and extinction condition."
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Dreamer curation proposes one reversible, lineage-preserving memory transformation without changing canonical state."
+causal_property = "FailureFingerprint candidate"
+old_failure_or_missing_capability = "the legacy Dreamer generator treats FailureFingerprint candidate as one generic candidate item with no independent falsifier"
+discriminator = "the failure handler accepts/rejects its exact subtype independently and preserves every source branch on failure"
+primary_responsibility = "Propose one exact negative-memory fingerprint with failed action, outcome, invariant, reopen and extinction conditions."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["DreamJobInput class=Curation", "ValidatedDreamDraft item kind=failure", "Failure Capsule, attempt, verifier and outcome handles"]
-outputs = ["FailureCandidate", "exact trigger/signature proposal", "reopen/extinction conditions"]
+inputs = ["Curation draft item kind=failure", "failure/attempt/evidence handles"]
+outputs = ["FailureFingerprintCandidate", "exact-trigger report", "reopen/extinction plan"]
 depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
-consumers = ["eliot-dreamer-curation", "negative-memory projection owner"]
-non_goals = ["hard block creation", "similarity-based prohibition", "Problem closure", "retry scheduling"]
-invariants = ["exact deterministic trigger is distinct from semantic similarity", "failed path and observed outcome are both anchored", "reopen/extinction are mandatory", "one failure remains scoped"]
-failure_behavior = "Return a warning-level or incomplete candidate; never create a blocking trigger from semantic resemblance or model confidence."
-proof_surface = ["exact versus similar signature", "missing outcome", "changed-environment reopen", "false-positive extinction case"]
-replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
-split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+providers = ["validated Dreamer draft", "admitted memory/evidence handles"]
+consumers = ["eliot-dreamer-curation"]
+non_goals = ["hard block from semantic similarity", "incident decision", "automatic suppression"]
+invariants = ["only exact deterministic trigger may support block candidate", "false activation history preserved", "reopen condition mandatory"]
+failure_behavior = "Return unsupported/inconclusive failure candidate with exact missing evidence; original records remain unchanged."
+proof_surface = ["near-match positive control", "exact repeat", "environment changed", "missing invariant"]
+proof_ceiling = "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+product_pulse = "D3A_CURATION_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
 
 [[donor]]
 path = "crates/smart/eliot-memory/src/lib.rs"
-disposition = "extract_pure_only"
-scope = "failure record/cue ideas, not state"
+disposition = "extract only applicable pure logic"
 
 [[donor]]
-path = "ELIOT_IMPLEMENTATION I12.19, I14.4 and I17"
-disposition = "authoritative_contract"
-scope = "negative memory and Failure Capsule grounding"
+path = "ELIOT_IMPLEMENTATION I9.6-I9.7"
+disposition = "authoritative contract"
 
 [agent_task]
-objective = "Implement failure-memory synthesis without granting block or retry authority."
+objective = "Implement one candidate-only failure handler over the common validator."
 write_scope = ["crates/smart/eliot-dreamer-failure/**"]
-deliverables = ["FailureFingerprint candidate builder", "trigger/reopen/extinction model", "false-positive and transfer tests"]
-acceptance = ["candidate-only output", "exact trigger proof is explicit", "semantic match never becomes a hard block"]
-forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
-stop_condition = "Stop if the proposed fingerprint cannot distinguish the old failed path from a safe nearby case."
-integration_owner = "cognitive-wave-01-integrator"
+deliverables = ["public contract/core implementation", "property/adversarial fixtures", "affected edge fixtures"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, unbounded traversal, model call or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
 implementation_language = "Rust 2024"
-required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
-workspace_admission = "forbidden until src/lib.rs, package proof in an isolated candidate workspace, affected edge proof, current-main rebase and integration-owner review"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"

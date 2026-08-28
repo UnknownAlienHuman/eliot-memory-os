@@ -1,0 +1,63 @@
+schema_version = 3
+module_id = "governor.observation.classifier"
+crate = "eliot-observation"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 1
+plane = "Harness/Memory OS"
+runtime_layer = "R3"
+delivery_depth = "D1"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "governor.observation.admission"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Natural capture preserves material observations without requiring ontology knowledge or creating false semantic status."
+causal_property = "deterministic first-pass observation classification and safe ObservationCandidate fallback"
+old_failure_or_missing_capability = "classification lived in a duplicate Smart memory owner and could compete with Governor admission"
+discriminator = "the same input through the production capture path yields one Governor-owned class/fallback and no second state owner"
+primary_responsibility = "Classify one admitted capture input into a deterministic first-pass family or explicit ObservationCandidate fallback inside the existing Governor observation crate."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["ObservationInput", "capture metadata and caller hint", "current observation-contract revision"]
+outputs = ["FirstPassClassification", "fallback reason", "typed ambiguity/cold-capture disposition"]
+depends_on = []
+providers = ["eliot-observation-contracts", "Governor capture path"]
+consumers = ["Governor observation admission", "cue-binding candidate builder"]
+non_goals = ["semantic Dreamer classification", "epistemic promotion", "memory lifecycle ownership"]
+invariants = ["uncertain input is preserved rather than rejected", "caller hint is evidence not authority", "classification does not mint support or influence"]
+failure_behavior = "Preserve the raw observation as cold candidate with exact ambiguity; never select a reusable semantic type by convenience."
+proof_surface = ["table-driven family classification", "wrong-hint adversarial cases", "empty/ambiguous safe fallback", "production capture edge fixture"]
+proof_ceiling = "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+product_pulse = "D1_CAPTURE_CLASSIFICATION_EDGE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-memory/src/lib.rs"
+disposition = "pure heuristic only; reject state owner"
+
+[[donor]]
+path = "crates/governor/eliot-observation/src/lib.rs"
+disposition = "current production owner and integration seam"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.2-I12.3"
+disposition = "authoritative contract"
+
+[agent_task]
+objective = "Extract/harden a private classifier module in the existing Governor crate; do not create a new package."
+write_scope = ["crates/governor/eliot-observation/src/classifier.rs", "crates/governor/eliot-observation/src/lib.rs", "crates/governor/eliot-observation/tests/**"]
+deliverables = ["private classifier module", "typed classification result", "capture-path fixtures"]
+acceptance = ["one Governor owner remains", "safe capture survives ambiguity", "no Smart or store ownership"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and challenge any request to infer truth, support, lifecycle or reusable influence during first-pass capture."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"

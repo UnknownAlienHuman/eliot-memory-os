@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Rebuildable immutable per-scope cue projection and invalidation compiler"
+description = "Build and validate one immutable rebuildable CueSnapshot from admitted binding projections and typed activation edges."
 
 [lib]
 path = "src/lib.rs"
@@ -18,9 +18,10 @@ functional_cell = "smart.cue.index"
 source_layer = "C1"
 runtime_layer = "R5"
 runtime_bundle = "eliotd"
-agent_order = 4
+agent_order = 13
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }
 eliot-cue-contracts = { path = "../eliot-cue-contracts" }
 eliot-cue-normalizer = { path = "../eliot-cue-normalizer" }

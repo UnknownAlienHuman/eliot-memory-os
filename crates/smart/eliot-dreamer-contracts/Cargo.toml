@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Candidate-only Dreamer job, bundle, handler result, and preservation contracts"
+description = "Own provider-neutral job, bundle, draft, candidate, preservation and result schemas shared by all Dreamer handlers."
 
 [lib]
 path = "src/lib.rs"
@@ -18,7 +18,7 @@ functional_cell = "smart.dreamer.contracts"
 source_layer = "C0"
 runtime_layer = "R6"
 runtime_bundle = "eliot-dreamer"
-agent_order = 11
+agent_order = 3
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }

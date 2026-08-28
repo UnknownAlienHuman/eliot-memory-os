@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Stable cue, projection snapshot, activation trace, and invalidation contracts"
+description = "Own the minimal provider-neutral cue, binding, snapshot, activation and invalidation schemas."
 
 [lib]
 path = "src/lib.rs"
@@ -15,10 +15,10 @@ prototype = true
 source_status = "NOT_IMPLEMENTED"
 workspace_admission = "pending_agent_implementation_and_proof"
 functional_cell = "smart.cue.contracts"
-source_layer = "C0"
+source_layer = "C1"
 runtime_layer = "R5"
 runtime_bundle = "eliotd"
-agent_order = 2
+agent_order = 10
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }

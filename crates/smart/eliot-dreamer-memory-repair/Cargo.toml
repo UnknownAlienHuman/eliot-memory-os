@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Provenance, contamination, and derived-memory repair candidate handler"
+description = "Propose one bounded repair for missing provenance, contaminated influence, false relation, stale derived view or representation gap."
 
 [lib]
 path = "src/lib.rs"
@@ -14,11 +14,11 @@ path = "src/lib.rs"
 prototype = true
 source_status = "NOT_IMPLEMENTED"
 workspace_admission = "pending_agent_implementation_and_proof"
-functional_cell = "smart.dreamer.memory.repair"
+functional_cell = "smart.dreamer.memory_repair"
 source_layer = "C1"
 runtime_layer = "R6"
 runtime_bundle = "eliot-dreamer"
-agent_order = 26
+agent_order = 30
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }

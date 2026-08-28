@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Grounded Dreamer Orientation handler and first D3a product pulse"
+description = "Convert a validated Orientation draft and optional authority-separated self briefs into a DreamPacket with evidence, rivals, hidden relations, gaps and probes."
 
 [lib]
 path = "src/lib.rs"
@@ -18,9 +18,12 @@ functional_cell = "smart.dreamer.orientation"
 source_layer = "C1"
 runtime_layer = "R6"
 runtime_bundle = "eliot-dreamer"
-agent_order = 14
+agent_order = 9
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }
 eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
 eliot-dreamer-candidate-validation = { path = "../eliot-dreamer-candidate-validation" }
+eliot-dreamer-architecture-brief = { path = "../eliot-dreamer-architecture-brief" }
+eliot-dreamer-implementation-brief = { path = "../eliot-dreamer-implementation-brief" }

@@ -1,9 +1,9 @@
-schema_version = 2
+schema_version = 3
 module_id = "smart.dreamer.accessibility"
 crate = "eliot-dreamer-accessibility"
 status = "PROTOTYPE"
 wave = "cognitive-micromodules-wave-01"
-agent_order = 25
+agent_order = 29
 plane = "Smart"
 runtime_layer = "R6"
 delivery_depth = "D3a"
@@ -13,39 +13,47 @@ state_class = "stateless"
 hot_path = false
 lifecycle_owner = "smart.dreamer.accessibility"
 loc_soft_ceiling = 10000
-loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
-primary_responsibility = "Propose one reversible accessibility/activation/forgetting change based on cue utility, stale reuse, gravity, cost, regret, and protected-evidence constraints without changing epistemic support."
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Dreamer curation proposes one reversible, lineage-preserving memory transformation without changing canonical state."
+causal_property = "accessibility/forgetting candidate"
+old_failure_or_missing_capability = "the legacy Dreamer generator treats accessibility/forgetting candidate as one generic candidate item with no independent falsifier"
+discriminator = "the accessibility handler accepts/rejects its exact subtype independently and preserves every source branch on failure"
+primary_responsibility = "Propose one reversible accessibility or influence adjustment independently of support and physical erasure."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["DreamJobInput class=Curation", "ValidatedDreamDraft item kind=accessibility", "memory ecology, influence/use and protected-role evidence"]
-outputs = ["AccessibilityCandidate", "utility/harm/cost evidence vector", "restore/review/extinction conditions"]
+inputs = ["Curation draft item kind=accessibility", "memory ecology/use/false-activation handles"]
+outputs = ["AccessibilityCandidate", "influence/accessibility delta", "restore/review condition"]
 depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
-consumers = ["eliot-dreamer-curation", "memory lifecycle decision owner"]
-non_goals = ["belief revision", "privacy erasure", "record deletion", "automatic suppression"]
-invariants = ["accessibility and epistemic support remain separate", "low use does not mean false", "frequent retrieval does not mean true", "protected/minority/counterexample evidence is not erased"]
-failure_behavior = "Return no-change or review candidate; never suppress evidence from popularity, one complaint, or writer-supplied utility."
-proof_surface = ["low-use protected record", "high-use harmful narrative", "memory gravity", "restore/review condition"]
-replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
-split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+providers = ["validated Dreamer draft", "admitted memory/evidence handles"]
+consumers = ["eliot-dreamer-curation"]
+non_goals = ["privacy purge", "support revision", "automatic deletion"]
+invariants = ["low use does not reduce support", "retrieval does not reinforce", "minority evidence protected"]
+failure_behavior = "Return unsupported/inconclusive accessibility candidate with exact missing evidence; original records remain unchanged."
+proof_surface = ["low-use supported fact", "memory gravity", "false activation", "restore condition"]
+proof_ceiling = "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+product_pulse = "D3A_CURATION_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
 
 [[donor]]
 path = "crates/smart/eliot-memory-curation/src/lib.rs"
-disposition = "extract_protection_only"
-scope = "protected roles and low-utility non-authority"
+disposition = "extract only applicable pure logic"
 
 [[donor]]
-path = "ELIOT_IMPLEMENTATION I12.21 and Architecture A14.4"
-disposition = "authoritative_contract"
-scope = "memory ecology and forgetting separation"
+path = "ELIOT_IMPLEMENTATION I9.6-I9.7"
+disposition = "authoritative contract"
 
 [agent_task]
-objective = "Implement reversible memory-ecology proposals while keeping belief revision and erasure outside the cell."
+objective = "Implement one candidate-only accessibility handler over the common validator."
 write_scope = ["crates/smart/eliot-dreamer-accessibility/**"]
-deliverables = ["accessibility candidate builder", "multi-axis utility/harm vector", "protected/minority and gravity tests"]
-acceptance = ["no lifecycle effect", "support unchanged", "restore and review path always present"]
-forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
-stop_condition = "Stop if the request is privacy erasure or epistemic revision; route it to the corresponding owner."
-integration_owner = "cognitive-wave-01-integrator"
+deliverables = ["public contract/core implementation", "property/adversarial fixtures", "affected edge fixtures"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, unbounded traversal, model call or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
 implementation_language = "Rust 2024"
-required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
-workspace_admission = "forbidden until src/lib.rs, package proof in an isolated candidate workspace, affected edge proof, current-main rebase and integration-owner review"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"

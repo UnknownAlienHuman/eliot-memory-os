@@ -1,0 +1,480 @@
+schema_version = 2
+decision_set = "cognitive-crate-decisions-2026-08-28-rev6"
+status = "UNVALIDATED_PROTOTYPE_TOPOLOGY"
+rule = "A crate exists only for a real contract, dependency, context, proof or replacement seam; package count and LOC are counter-metrics, not goals."
+common_rejoin_condition = "Merge, rejoin or keep in place when the seam disappears, glue dominates, or affected Edge/Product Pulse outcomes regress."
+common_evidence_status = "UNVALIDATED_PROTOTYPE"
+runtime_authority = "NONE"
+
+[[decision]]
+order = 1
+functional_cell = "governor.observation.classifier"
+crate = "eliot-observation"
+package_action = "implement_cell_in_existing_crate"
+causal_property = "deterministic first-pass observation classification and safe ObservationCandidate fallback"
+proof_entrypoint = "table-driven family classification"
+first_consumer = "Governor observation admission"
+depends_on = []
+product_pulse = "D1_CAPTURE_CLASSIFICATION_EDGE_01"
+
+[[decision]]
+order = 2
+functional_cell = "smart.epistemic.position"
+crate = "eliot-epistemic"
+package_action = "implement_cell_in_existing_crate"
+causal_property = "resolve one explicit question over one admitted fenced evidence set"
+proof_entrypoint = "fresh-outlier conflict"
+first_consumer = "Dreamer bundle"
+depends_on = []
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+
+[[decision]]
+order = 3
+functional_cell = "smart.dreamer.contracts"
+crate = "eliot-dreamer-contracts"
+package_action = "create_prototype_crate"
+causal_property = "Dreamer contract representation"
+proof_entrypoint = "schema roundtrip"
+first_consumer = "all Dreamer handlers"
+depends_on = []
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+
+[[decision]]
+order = 4
+functional_cell = "smart.dreamer.bundle"
+crate = "eliot-dreamer-bundle"
+package_action = "create_prototype_crate"
+causal_property = "bounded Dreamer input assembly"
+proof_entrypoint = "invented handle"
+first_consumer = "Dreamer runtime adapter"
+depends_on = ["eliot-dreamer-contracts"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+
+[[decision]]
+order = 5
+functional_cell = "smart.dreamer.candidate_validation"
+crate = "eliot-dreamer-candidate-validation"
+package_action = "create_prototype_crate"
+causal_property = "common Dreamer candidate validation"
+proof_entrypoint = "invented handle"
+first_consumer = "all specialized Dreamer handlers"
+depends_on = ["eliot-dreamer-contracts"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+
+[[decision]]
+order = 6
+functional_cell = "smart.dreamer.clarification"
+crate = "eliot-dreamer-clarification"
+package_action = "create_prototype_crate"
+causal_property = "single discriminative clarification"
+proof_entrypoint = "one-question cardinality"
+first_consumer = "agent mailbox compiler"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+
+[[decision]]
+order = 7
+functional_cell = "smart.dreamer.architecture_brief"
+crate = "eliot-dreamer-architecture-brief"
+package_action = "create_prototype_crate"
+causal_property = "ArchitectureBrief projection"
+proof_entrypoint = "wrong digest"
+first_consumer = "Dreamer orientation"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+
+[[decision]]
+order = 8
+functional_cell = "smart.dreamer.implementation_brief"
+crate = "eliot-dreamer-implementation-brief"
+package_action = "create_prototype_crate"
+causal_property = "ImplementationBrief projection"
+proof_entrypoint = "mixed digest"
+first_consumer = "Dreamer orientation"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+
+[[decision]]
+order = 9
+functional_cell = "smart.dreamer.orientation"
+crate = "eliot-dreamer-orientation"
+package_action = "create_prototype_crate"
+causal_property = "problem-oriented DreamPacket synthesis"
+proof_entrypoint = "model-authored confirmation attempt"
+first_consumer = "Main Agent/Human Dreamer surface"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation", "eliot-dreamer-architecture-brief", "eliot-dreamer-implementation-brief"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+
+[[decision]]
+order = 10
+functional_cell = "smart.cue.contracts"
+crate = "eliot-cue-contracts"
+package_action = "create_prototype_crate"
+causal_property = "cue contract representation"
+proof_entrypoint = "schema roundtrip"
+first_consumer = "cue normalizer"
+depends_on = []
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+
+[[decision]]
+order = 11
+functional_cell = "smart.cue.normalizer"
+crate = "eliot-cue-normalizer"
+package_action = "create_prototype_crate"
+causal_property = "shared cue normalization"
+proof_entrypoint = "capture/fire symmetry"
+first_consumer = "cue binding"
+depends_on = ["eliot-cue-contracts"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+
+[[decision]]
+order = 12
+functional_cell = "smart.cue.binding"
+crate = "eliot-cue-binding"
+package_action = "create_prototype_crate"
+causal_property = "cue-binding candidate construction"
+proof_entrypoint = "touched-file derivation"
+first_consumer = "Governor binding transition"
+depends_on = ["eliot-cue-contracts", "eliot-cue-normalizer"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+
+[[decision]]
+order = 13
+functional_cell = "smart.cue.index"
+crate = "eliot-cue-index"
+package_action = "create_prototype_crate"
+causal_property = "cue projection construction"
+proof_entrypoint = "deterministic rebuild"
+first_consumer = "cue activation"
+depends_on = ["eliot-cue-contracts", "eliot-cue-normalizer"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+
+[[decision]]
+order = 14
+functional_cell = "smart.cue.activation"
+crate = "eliot-cue-activation"
+package_action = "create_prototype_crate"
+causal_property = "bounded cue matching and spreading activation"
+proof_entrypoint = "zero-edge exact firing"
+first_consumer = "context candidates"
+depends_on = ["eliot-cue-contracts"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+
+[[decision]]
+order = 15
+functional_cell = "smart.context.contracts"
+crate = "eliot-context-contracts"
+package_action = "create_prototype_crate"
+causal_property = "context contract representation"
+proof_entrypoint = "schema compatibility"
+first_consumer = "context candidates"
+depends_on = []
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+
+[[decision]]
+order = 16
+functional_cell = "smart.context.candidates"
+crate = "eliot-context-candidates"
+package_action = "create_prototype_crate"
+causal_property = "context candidate construction"
+proof_entrypoint = "missing provider"
+first_consumer = "context admission"
+depends_on = ["eliot-cue-contracts", "eliot-epistemic", "eliot-context-contracts"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+
+[[decision]]
+order = 17
+functional_cell = "smart.context.admission"
+crate = "eliot-context-admission"
+package_action = "create_prototype_crate"
+causal_property = "bounded context admission and selection integrity"
+proof_entrypoint = "permutation invariance"
+first_consumer = "context assembly"
+depends_on = ["eliot-context-contracts"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+
+[[decision]]
+order = 18
+functional_cell = "smart.context.assembly"
+crate = "eliot-context-assembly"
+package_action = "create_prototype_crate"
+causal_property = "context assembly and decision-local rendering"
+proof_entrypoint = "role order"
+first_consumer = "reactive context plan"
+depends_on = ["eliot-context-contracts", "eliot-context-admission"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+
+[[decision]]
+order = 19
+functional_cell = "smart.context.reactive_delivery_plan"
+crate = "eliot-reactive-context-plan"
+package_action = "create_prototype_crate"
+causal_property = "reactive delivery planning and session dedup disposition"
+proof_entrypoint = "repeat-session dedup"
+first_consumer = "Host event/reactive delivery service"
+depends_on = ["eliot-context-contracts", "eliot-cue-contracts"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+
+[[decision]]
+order = 20
+functional_cell = "smart.memory.curation_screen"
+crate = "eliot-memory-curation-screen"
+package_action = "create_prototype_crate"
+causal_property = "deterministic read-only curation screening"
+proof_entrypoint = "protected records"
+first_consumer = "curation facade"
+depends_on = []
+product_pulse = "D3A_CURATION_PULSE_01"
+
+[[decision]]
+order = 21
+functional_cell = "smart.dreamer.classification"
+crate = "eliot-dreamer-classification"
+package_action = "create_prototype_crate"
+causal_property = "semantic record-family classification"
+proof_entrypoint = "wrong caller hint"
+first_consumer = "eliot-dreamer-curation"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+
+[[decision]]
+order = 22
+functional_cell = "smart.dreamer.relation"
+crate = "eliot-dreamer-relation"
+package_action = "create_prototype_crate"
+causal_property = "typed relation proposal"
+proof_entrypoint = "unknown endpoint"
+first_consumer = "eliot-dreamer-curation"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+
+[[decision]]
+order = 23
+functional_cell = "smart.dreamer.episode"
+crate = "eliot-dreamer-episode"
+package_action = "create_prototype_crate"
+causal_property = "episode reconstruction"
+proof_entrypoint = "out-of-order events"
+first_consumer = "eliot-dreamer-curation"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+
+[[decision]]
+order = 24
+functional_cell = "smart.dreamer.concept"
+crate = "eliot-dreamer-concept"
+package_action = "create_prototype_crate"
+causal_property = "concept abstraction candidate"
+proof_entrypoint = "single-example overgeneralization"
+first_consumer = "eliot-dreamer-curation"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+
+[[decision]]
+order = 25
+functional_cell = "smart.dreamer.procedure"
+crate = "eliot-dreamer-procedure"
+package_action = "create_prototype_crate"
+causal_property = "procedure/Skill candidate"
+proof_entrypoint = "lucky success"
+first_consumer = "eliot-dreamer-curation"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+
+[[decision]]
+order = 26
+functional_cell = "smart.dreamer.failure"
+crate = "eliot-dreamer-failure"
+package_action = "create_prototype_crate"
+causal_property = "FailureFingerprint candidate"
+proof_entrypoint = "near-match positive control"
+first_consumer = "eliot-dreamer-curation"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+
+[[decision]]
+order = 27
+functional_cell = "smart.dreamer.structure_repair"
+crate = "eliot-dreamer-structure-repair"
+package_action = "create_prototype_crate"
+causal_property = "identity structure merge/split repair"
+proof_entrypoint = "false merge"
+first_consumer = "eliot-dreamer-curation"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+
+[[decision]]
+order = 28
+functional_cell = "smart.dreamer.reconsolidation"
+crate = "eliot-dreamer-reconsolidation"
+package_action = "create_prototype_crate"
+causal_property = "reconsolidation candidate"
+proof_entrypoint = "contrary outcome"
+first_consumer = "eliot-dreamer-curation"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+
+[[decision]]
+order = 29
+functional_cell = "smart.dreamer.accessibility"
+crate = "eliot-dreamer-accessibility"
+package_action = "create_prototype_crate"
+causal_property = "accessibility/forgetting candidate"
+proof_entrypoint = "low-use supported fact"
+first_consumer = "eliot-dreamer-curation"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+
+[[decision]]
+order = 30
+functional_cell = "smart.dreamer.memory_repair"
+crate = "eliot-dreamer-memory-repair"
+package_action = "create_prototype_crate"
+causal_property = "semantic memory repair"
+proof_entrypoint = "poisoned source closure"
+first_consumer = "eliot-dreamer-curation"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+
+[[decision]]
+order = 31
+functional_cell = "smart.dreamer.curation"
+crate = "eliot-dreamer-curation"
+package_action = "create_prototype_crate"
+causal_property = "typed curation dispatch and candidate-set assembly"
+proof_entrypoint = "routing completeness"
+first_consumer = "Governor candidate disposition"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation", "eliot-memory-curation-screen", "eliot-dreamer-classification", "eliot-dreamer-relation", "eliot-dreamer-episode", "eliot-dreamer-concept", "eliot-dreamer-procedure", "eliot-dreamer-failure", "eliot-dreamer-structure-repair", "eliot-dreamer-reconsolidation", "eliot-dreamer-accessibility", "eliot-dreamer-memory-repair"]
+product_pulse = "D3A_CURATION_PULSE_01"
+
+[[decision]]
+order = 32
+functional_cell = "smart.learning.contracts"
+crate = "eliot-learning-contracts"
+package_action = "create_prototype_crate"
+causal_property = "online-learning contract representation"
+proof_entrypoint = "schema roundtrip"
+first_consumer = "learning state view"
+depends_on = []
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+
+[[decision]]
+order = 33
+functional_cell = "smart.learning.state_view"
+crate = "eliot-learning-state-view"
+package_action = "create_prototype_crate"
+causal_property = "campaign learning-state reconstruction"
+proof_entrypoint = "owner drift"
+first_consumer = "learning delta"
+depends_on = ["eliot-learning-contracts"]
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+
+[[decision]]
+order = 34
+functional_cell = "smart.learning.delta"
+crate = "eliot-learning-delta"
+package_action = "create_prototype_crate"
+causal_property = "attempt-to-next-attempt learning delta"
+proof_entrypoint = "unchanged retry none"
+first_consumer = "learning overlay"
+depends_on = ["eliot-learning-contracts"]
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+
+[[decision]]
+order = 35
+functional_cell = "smart.learning.overlay"
+crate = "eliot-learning-overlay"
+package_action = "create_prototype_crate"
+causal_property = "task-local behavioral overlay construction"
+proof_entrypoint = "forbidden evaluator change"
+first_consumer = "Governor local admission"
+depends_on = ["eliot-learning-contracts"]
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+
+[[decision]]
+order = 36
+functional_cell = "meta.learning.activation_assessment"
+crate = "eliot-learning-activation-assessment"
+package_action = "create_prototype_crate"
+causal_property = "learning activation and adherence observation"
+proof_entrypoint = "not delivered"
+first_consumer = "Meta closure"
+depends_on = ["eliot-learning-contracts"]
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+
+[[decision]]
+order = 37
+functional_cell = "meta.learning.closure"
+crate = "eliot-improvement"
+package_action = "implement_cell_in_existing_crate"
+causal_property = "campaign learning closure"
+proof_entrypoint = "no reusable delta"
+first_consumer = "improvement promotion cell"
+depends_on = ["eliot-learning-contracts"]
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+
+[[decision]]
+order = 38
+functional_cell = "meta.improvement.promotion_input"
+crate = "eliot-improvement"
+package_action = "implement_cell_in_existing_crate"
+causal_property = "outer-loop promotion input preparation"
+proof_entrypoint = "missing activation"
+first_consumer = "Governor/Human promotion owner"
+depends_on = ["eliot-learning-contracts"]
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+
+[[decision]]
+order = 39
+functional_cell = "smart.dreamer.conflict_analysis"
+crate = "eliot-dreamer-conflict-analysis"
+package_action = "create_prototype_crate"
+causal_property = "ConflictBrief/Concilium-plan synthesis"
+proof_entrypoint = "majority wrong"
+first_consumer = "Dreamer surface"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_ADVISORY_PLANNING_PULSE_01"
+
+[[decision]]
+order = 40
+functional_cell = "smart.dreamer.development_diagnosis"
+crate = "eliot-dreamer-development-diagnosis"
+package_action = "create_prototype_crate"
+causal_property = "development diagnosis candidate"
+proof_entrypoint = "local-green/product-fail"
+first_consumer = "Dreamer surface"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_ADVISORY_PLANNING_PULSE_01"
+
+[[decision]]
+order = 41
+functional_cell = "smart.dreamer.maintenance_plan"
+crate = "eliot-dreamer-maintenance-plan"
+package_action = "create_prototype_crate"
+causal_property = "MaintenancePlanCandidate synthesis"
+proof_entrypoint = "no trigger"
+first_consumer = "Dreamer surface"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_ADVISORY_PLANNING_PULSE_01"
+
+[[decision]]
+order = 42
+functional_cell = "smart.dreamer.configuration_plan"
+crate = "eliot-dreamer-configuration-plan"
+package_action = "create_prototype_crate"
+causal_property = "ConfigurationChangeIntent synthesis"
+proof_entrypoint = "presentation-only"
+first_consumer = "Dreamer surface"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_ADVISORY_PLANNING_PULSE_01"
+
+[[decision]]
+order = 43
+functional_cell = "smart.dreamer.orchestration_plan"
+crate = "eliot-dreamer-orchestration-plan"
+package_action = "create_prototype_crate"
+causal_property = "CognitiveWorkPlanCandidate synthesis"
+proof_entrypoint = "one strong agent better"
+first_consumer = "Dreamer surface"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_ADVISORY_PLANNING_PULSE_01"

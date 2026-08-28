@@ -1,0 +1,55 @@
+schema_version = 3
+module_id = "smart.learning.state_view"
+crate = "eliot-learning-state-view"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-02"
+agent_order = 33
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D4"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "smart.learning.state_view"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Consequential work changes the next compatible attempt through inspectable local learning, or records why no change is justified."
+causal_property = "campaign learning-state reconstruction"
+old_failure_or_missing_capability = "without a current view, attempts can read transcripts or stale summaries and silently repeat strategy"
+discriminator = "missing/stale owner refs produce PARTIAL/STALE/BLOCKED; no field is filled from conversational convenience"
+primary_responsibility = "Compile one immutable CampaignLearningStateView from exact existing owner revisions and a declared recipe."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["task/attempt/admission/context/evaluator/memory owner projections", "declared recipe and State Fence"]
+outputs = ["CampaignLearningStateView", "completeness/missing-owner manifest", "invalidation reasons"]
+depends_on = ["eliot-learning-contracts"]
+providers = ["Governor/Agent Coordinator/Context/evaluator projections"]
+consumers = ["learning delta", "learning overlay", "Context Compiler"]
+non_goals = ["mutable campaign aggregate", "history copy", "scheduler", "conflict resolution"]
+invariants = ["one exact fence", "owner disagreement preserved", "COMPLETE means recipe-complete only"]
+failure_behavior = "Return explicit inconclusive/no-change/unsupported output with exact missing evidence; never fabricate learning or promotion."
+proof_surface = ["owner drift", "partial non-load-bearing case", "stale evaluator", "transcript substitution negative case"]
+proof_ceiling = "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.24 CampaignLearningStateView"
+disposition = "authoritative contract"
+
+[agent_task]
+objective = "Implement deterministic reconstruction before any learned overlay can influence an attempt."
+write_scope = ["crates/smart/eliot-learning-state-view/**"]
+deliverables = ["typed pure core/contract", "negative and lifecycle fixtures", "affected edge fixtures"]
+acceptance = ["task-local/candidate-only ceiling is explicit", "no evaluator/authority ownership", "missing observability remains unknown"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop if the change would alter user objective, acceptance, authority, privacy, evaluator, sealed holdout, active production generation or its own promotion."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
