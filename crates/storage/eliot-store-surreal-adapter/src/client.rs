@@ -15,9 +15,11 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+
+mod rpc_parse;
+use rpc_parse::{parse_response, provider_version_from_rpc, rpc_result};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -68,20 +70,6 @@ impl fmt::Debug for RpcTransport {
             .field("provider_process_identity", &self.provider_process_identity)
             .finish()
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct RpcResponse {
-    id: Option<Value>,
-    result: Option<Value>,
-    error: Option<RpcErrorBody>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RpcErrorBody {
-    code: i64,
-    message: String,
-    data: Option<Value>,
 }
 
 /// Decoded results of one parameterized provider query.  Each entry is the
@@ -684,109 +672,6 @@ fn provider_environment(
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ProviderVersion {
-    major: u16,
-    minor: u16,
-    patch: u16,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProviderVersionObject {
-    version: String,
-    build: String,
-    timestamp: String,
-}
-
-fn provider_version_from_rpc(value: &Value) -> Result<ProviderVersion, AdapterError> {
-    match value {
-        Value::String(version) => {
-            let numeric = version
-                .strip_prefix("surrealdb-")
-                .ok_or_else(|| invalid_provider_version("legacy string lacks surrealdb- prefix"))?;
-            let parsed = parse_provider_semver(numeric)?;
-            if parsed.major != 3 || parsed.minor != 1 {
-                return Err(invalid_provider_version(
-                    "legacy string is only valid for the documented 3.1 response",
-                ));
-            }
-            Ok(parsed)
-        }
-        Value::Object(_) => {
-            let response: ProviderVersionObject = serde_json::from_value(value.clone())
-                .map_err(|_| invalid_provider_version("3.2 object shape is invalid"))?;
-            if response.build.trim().is_empty()
-                || response.timestamp.trim().is_empty()
-                || response.build.chars().any(char::is_control)
-                || response.timestamp.chars().any(char::is_control)
-            {
-                return Err(invalid_provider_version(
-                    "3.2 object build and timestamp must be non-empty text",
-                ));
-            }
-            let parsed = parse_provider_semver(&response.version)?;
-            if parsed.major != 3 || parsed.minor != 2 {
-                return Err(invalid_provider_version(
-                    "object response is only valid for the documented 3.2 response",
-                ));
-            }
-            Ok(parsed)
-        }
-        _ => Err(invalid_provider_version(
-            "result is neither the 3.1 string nor the 3.2 object",
-        )),
-    }
-}
-
-fn parse_provider_semver(value: &str) -> Result<ProviderVersion, AdapterError> {
-    let mut parts = value.split('.');
-    let major = parse_version_component(parts.next(), "major")?;
-    let minor = parse_version_component(parts.next(), "minor")?;
-    let patch = parse_version_component(parts.next(), "patch")?;
-    if parts.next().is_some() {
-        return Err(invalid_provider_version("version has extra components"));
-    }
-    Ok(ProviderVersion {
-        major,
-        minor,
-        patch,
-    })
-}
-
-fn parse_version_component(value: Option<&str>, field: &str) -> Result<u16, AdapterError> {
-    let value = value.ok_or_else(|| invalid_provider_version(&format!("missing {field}")))?;
-    if value.is_empty()
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-        || (value.len() > 1 && value.starts_with('0'))
-    {
-        return Err(invalid_provider_version(&format!(
-            "{field} component is not canonical decimal"
-        )));
-    }
-    value
-        .parse::<u16>()
-        .map_err(|_| invalid_provider_version(&format!("{field} component is out of range")))
-}
-
-fn invalid_provider_version(reason: &str) -> AdapterError {
-    AdapterError::Config(format!(
-        "SurrealDB version RPC returned an incompatible fail-closed response: {reason}"
-    ))
-}
-
-fn parse_response(text: &str) -> Result<RpcResponse, AdapterError> {
-    serde_json::from_str(text).map_err(|error| AdapterError::Serialization(error.to_string()))
-}
-
-fn rpc_result(response: RpcResponse) -> Result<Value, AdapterError> {
-    if let Some(error) = response.error {
-        let _ = (error.code, error.message, error.data);
-        return Err(AdapterError::ProviderUnavailable);
-    }
-    Ok(response.result.unwrap_or(Value::Null))
-}
-
 const fn millis(ms: u64) -> Duration {
     Duration::from_millis(if ms == 0 { 1 } else { ms })
 }
@@ -799,6 +684,7 @@ mod tests {
     use std::sync::Mutex as SyncMutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use super::rpc_parse::{ProviderVersion, provider_version_from_rpc};
     use super::*;
 
     fn config() -> SurrealAdapterConfig {
