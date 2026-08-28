@@ -22,12 +22,27 @@ brief = "workstreams/core-daemons/AGENTS.md"
 inventory = "workstreams/core-daemons/inventory.json"
 excluded_capabilities = ["dreamer"]
 
+[[workstream]]
+id = "cognitive-micromodules"
+status = "active_draft_pr"
+branch_strategy = "single_declared_exception_branch"
+pr = 26
+scope = "prototype manifests and assignment contour only; no Rust implementation or unrelated repair"
+integration_owner = "PR #26 owner/reviewer"
+
 [[exception_branch]]
 branch = "cognitive-micromodules-wave-01"
-workstream_id = "cognitive-micromodules-wave-01"
-status = "active_pr_stale_base"
+workstream_id = "cognitive-micromodules"
+status = "active_draft_pr"
 pr = 26
-mutation_allowed = false
-refresh_from_current_main_required = true
+mutation_allowed = true
+current_main_ancestor_required = true
+allowed_path_scope = [
+  "crates/smart/**",
+  "crates/meta/eliot-learning-activation-assessment/**",
+  "crates/meta/eliot-improvement/*.module.toml",
+  "crates/governor/eliot-observation/classifier.module.toml"
+]
+no_unrelated_repairs = true
 retire_after_pr_disposition = true
-reason = "Preserve the existing candidate without allowing agents to continue work on an obsolete base."
+reason = "The candidate was refreshed from current main through merged PR #31; it remains a bounded draft contour, not a general development branch."

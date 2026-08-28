@@ -10,7 +10,8 @@ Rules:
 - The owning issue/PR is the live record for that ephemeral branch.
 - `ACTIVE.toml` lists programmes and exceptional nonstandard/long-lived
   branches; it does not duplicate every normal issue branch.
-- A nonstandard branch not listed as an exception is read-only archaeology.
+- A nonstandard branch absent from the exception registry is read-only
+  archaeology.
 - Investigation results live in issues/PRs; only bounded reusable briefs and
   routing metadata live here.
 
@@ -26,7 +27,9 @@ that work.
 
 ### Cognitive micro-modules
 
-PR #26 preserves the current candidate on the legacy branch
-`cognitive-micromodules-wave-01`. It is the only retained nonstandard branch and
-is explicitly non-mutable until refreshed from current `main`. No other legacy
-cognitive/Dreamer branch is active.
+PR #26 is the sole active nonstandard branch. Merged PR #31 refreshed
+`cognitive-micromodules-wave-01` from current `main`. Mutation is permitted only
+inside the exact prototype-manifest/assignment scope declared in
+`ACTIVE.toml`; the branch is not a place for unrelated fixes, implementation,
+or general Dreamer development. It is retired when PR #26 is merged, closed, or
+superseded.
