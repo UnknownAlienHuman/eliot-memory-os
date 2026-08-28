@@ -93,6 +93,9 @@ jobs:
             'scripts/gen-unimplemented.ps1'
             'scripts/verify-unimplemented.ps1'
             'scripts/measure-stu.ps1'
+            'scripts/run-cognitive-field-certification.ps1'
+            'scripts/run-runtime017-primary.ps1'
+            'scripts/run-ul-cross-agent-certification.ps1'
           )
 
           for path in "${forbidden[@]}"; do
