@@ -6,10 +6,15 @@ use crate::{
     StoreError, SurqlTemplateRegistry,
 };
 
+mod capacity;
 mod recall_ranking;
 mod replay_view;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
+use capacity::{
+    capacity_manifests, is_blake3_hex, is_lower_blake3_hex, strongest_retention,
+    validate_capacity_receipt,
+};
 use eliot_types::{
     AutonomyRunContract, AutonomyRunTransitionReceipt, BlobReachabilityRef, BlobReferenceSnapshot,
     BlobRetentionClass, BlobRetentionRef, CanonicalMemoryL2Page, CanonicalMemoryManifest,
@@ -24,7 +29,7 @@ use eliot_types::{
     ProjectSequence, RecallL0Request, RecallL0Response, SessionId, SleepCandidateArtifact,
     SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig, TaintClass, TaskContract,
     TaskId, ToolObservation, VerificationId, VerificationRun, Visibility, WriteId, WriteReceipt,
-    WriteStatus, cue_binding_page_id,
+    WriteStatus,
 };
 use recall_ranking::{is_default_visible_lifecycle, rank_recall_candidates};
 use serde::de::DeserializeOwned;
@@ -4686,24 +4691,6 @@ fn typed_blob_retention(object: &serde_json::Map<String, Value>) -> Option<BlobR
         })
 }
 
-fn strongest_retention(
-    left: Option<BlobRetentionClass>,
-    right: Option<BlobRetentionClass>,
-) -> Option<BlobRetentionClass> {
-    [left, right]
-        .into_iter()
-        .flatten()
-        .max_by_key(|class| match class {
-            BlobRetentionClass::Standard => 0,
-            BlobRetentionClass::AuditRetained => 1,
-            BlobRetentionClass::LegalHold => 2,
-        })
-}
-
-fn is_blake3_hex(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
 fn canonical_payloads(envelope: &MemoryWriteEnvelope) -> Result<Vec<Value>, StoreError> {
     envelope
         .tool_observations
@@ -4770,29 +4757,6 @@ fn capacity_record_id<'a>(receipt_kind: Option<&str>, body: &'a Value) -> Option
         Some("memory_blob_manifest") => body.get("manifest_id").and_then(Value::as_str),
         _ => None,
     }
-}
-
-fn capacity_manifests(
-    envelope: &MemoryWriteEnvelope,
-) -> Result<Vec<CanonicalMemoryManifest>, StoreError> {
-    envelope
-        .tool_observations
-        .iter()
-        .filter(|observation| {
-            observation
-                .payload
-                .get("receipt_kind")
-                .and_then(Value::as_str)
-                == Some("memory_blob_manifest")
-        })
-        .map(|observation| {
-            let body = observation.payload.get("receipt_body").ok_or_else(|| {
-                StoreError::Decode("capacity manifest omitted receipt_body".to_owned())
-            })?;
-            serde_json::from_value(body.clone())
-                .map_err(|error| StoreError::Decode(error.to_string()))
-        })
-        .collect()
 }
 
 fn relation_payloads(envelope: &MemoryWriteEnvelope) -> Vec<Value> {
@@ -4863,136 +4827,6 @@ fn canonical_subject_ref<'a>(receipt_kind: Option<&str>, body: &'a Value) -> Opt
     ]
     .into_iter()
     .find_map(|field| body.get(field).and_then(Value::as_str))
-}
-
-fn validate_capacity_receipt(receipt_kind: Option<&str>, body: &Value) -> Result<(), StoreError> {
-    match receipt_kind {
-        Some("memory_blob_manifest") => {
-            let manifest: CanonicalMemoryManifest = serde_json::from_value(body.clone())
-                .map_err(|error| StoreError::Decode(error.to_string()))?;
-            if manifest.schema_version != eliot_types::CANONICAL_MEMORY_SCHEMA_VERSION
-                || manifest.memory_handle.trim().is_empty()
-                || manifest.memory_handle.len() > 512
-                || manifest.logical_kind.trim().is_empty()
-                || manifest.media_type.trim().is_empty()
-                || manifest.segment_count == 0
-                || usize::try_from(manifest.segment_target_bytes).ok()
-                    != Some(eliot_types::CANONICAL_MEMORY_SEGMENT_TARGET_BYTES)
-                || !is_lower_blake3_hex(&manifest.segment_set_hash_blake3)
-                || !is_lower_blake3_hex(&manifest.cue_page_set_hash_blake3)
-            {
-                return Err(StoreError::PolicyViolation(
-                    "canonical memory manifest failed typed validation".to_owned(),
-                ));
-            }
-            validate_capacity_blob_ref(&manifest.blob)?;
-        }
-        Some("memory_blob_segment") => {
-            let segment: CanonicalMemorySegment = serde_json::from_value(body.clone())
-                .map_err(|error| StoreError::Decode(error.to_string()))?;
-            validate_capacity_blob_ref(&segment.blob)?;
-            let range_len = segment
-                .byte_end_exclusive
-                .checked_sub(segment.byte_start)
-                .ok_or_else(|| {
-                    StoreError::PolicyViolation(
-                        "canonical memory segment range is reversed".to_owned(),
-                    )
-                })?;
-            let expected_id = capacity_segment_id(&segment);
-            if segment.schema_version != eliot_types::CANONICAL_MEMORY_SCHEMA_VERSION
-                || segment.parent_handle.trim().is_empty()
-                || segment.parent_handle.len() > 512
-                || segment.logical_kind.trim().is_empty()
-                || segment.segment_count == 0
-                || segment.ordinal >= segment.segment_count
-                || !is_lower_blake3_hex(&segment.segment_set_hash_blake3)
-                || segment.byte_end_exclusive > segment.blob.size_bytes
-                || range_len
-                    > u64::try_from(eliot_types::CANONICAL_MEMORY_SEGMENT_TARGET_BYTES)
-                        .unwrap_or(u64::MAX)
-                || segment.search_text.len() > eliot_types::CANONICAL_MEMORY_SEGMENT_TARGET_BYTES
-                || segment.preview_text.len() > eliot_types::CANONICAL_MEMORY_SEGMENT_TARGET_BYTES
-                || !is_lower_blake3_hex(&segment.segment_hash_blake3)
-                || segment.segment_id != expected_id
-            {
-                return Err(StoreError::PolicyViolation(
-                    "canonical memory segment failed typed validation".to_owned(),
-                ));
-            }
-        }
-        Some("cue_binding_page") => {
-            let page: CueBindingPage = serde_json::from_value(body.clone())
-                .map_err(|error| StoreError::Decode(error.to_string()))?;
-            validate_capacity_blob_ref(&page.blob)?;
-            let has_none_note = page
-                .cue_bindings
-                .iter()
-                .any(|binding| binding.expected_reuse_note.is_none());
-            let schema_matches_note_domain = (page.schema_version
-                == eliot_types::CUE_BINDING_PAGE_SCHEMA_VERSION_V1
-                && !has_none_note)
-                || (page.schema_version == eliot_types::CUE_BINDING_PAGE_SCHEMA_VERSION_V2
-                    && has_none_note);
-            if !(page.schema_version == eliot_types::CUE_BINDING_PAGE_SCHEMA_VERSION_V1
-                || page.schema_version == eliot_types::CUE_BINDING_PAGE_SCHEMA_VERSION_V2)
-                || !schema_matches_note_domain
-                || page.parent_handle.trim().is_empty()
-                || page.parent_handle.len() > 512
-                || page.page_count == 0
-                || page.page_ordinal >= page.page_count
-                || !is_lower_blake3_hex(&page.page_set_hash_blake3)
-                || page.cue_bindings.is_empty()
-                || page.cue_bindings.len() > eliot_types::MAX_CUE_BINDINGS_PER_PAGE
-                || page.page_id
-                    != cue_binding_page_id(
-                        &page.parent_handle,
-                        &page.blob,
-                        page.page_ordinal,
-                        &page.cue_bindings,
-                    )
-            {
-                return Err(StoreError::PolicyViolation(
-                    "canonical cue binding page failed typed validation".to_owned(),
-                ));
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn validate_capacity_blob_ref(blob: &eliot_types::BlobRef) -> Result<(), StoreError> {
-    if blob.algorithm != "blake3" || !is_lower_blake3_hex(&blob.digest_hex) {
-        return Err(StoreError::PolicyViolation(
-            "canonical memory blob reference failed algorithm/digest validation".to_owned(),
-        ));
-    }
-    let expected_path = format!("{}/{}.blob", &blob.digest_hex[..2], &blob.digest_hex[2..]);
-    if blob.relative_path.replace('\\', "/") != expected_path {
-        return Err(StoreError::PolicyViolation(
-            "canonical memory blob reference is not content-addressed".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn is_lower_blake3_hex(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn capacity_segment_id(segment: &CanonicalMemorySegment) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(segment.parent_handle.as_bytes());
-    hasher.update(segment.blob.digest_hex.as_bytes());
-    hasher.update(&segment.ordinal.to_le_bytes());
-    hasher.update(&segment.byte_start.to_le_bytes());
-    hasher.update(&segment.byte_end_exclusive.to_le_bytes());
-    hasher.update(segment.segment_hash_blake3.as_bytes());
-    format!("memory-segment:{}", hasher.finalize().to_hex())
 }
 
 fn string_fragments(value: &str) -> Vec<String> {
