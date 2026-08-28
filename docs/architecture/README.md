@@ -1,9 +1,8 @@
 # ELIOT normative documentation
 
-> **Status:** canonical navigation entrypoint. This file is not a third
-> normative book.
+> Canonical navigation entrypoint. This file is not a third normative book.
 
-ELIOT has one accepted normative pair:
+ELIOT has one accepted normative pair on `main`:
 
 | Role | Canonical file | Revision / edition | SHA-256 |
 |---|---|---|---|
@@ -11,11 +10,9 @@ ELIOT has one accepted normative pair:
 | Owners, contracts, defaults, failure behavior, migration | [ELIOT Implementation](./ELIOT_IMPLEMENTATION.md) | `0.29-draft` / `2026-08-28` | `7805BF238FE91819ABA50D7E13AA86A8B977561195DBB98AA979F986E2FAB063` |
 
 Machine identity and adoption status are in
-[`../normative-pair.toml`](../normative-pair.toml); authority rules are in
-[`../ARCHITECTURE_CONTRACT.md`](../ARCHITECTURE_CONTRACT.md). The dated
-[Architecture](./ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md) and
-[Implementation](./ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md) filenames
-are byte-identical publication aliases.
+[`../normative-pair.toml`](../normative-pair.toml); authority and branch rules
+are in [`../ARCHITECTURE_CONTRACT.md`](../ARCHITECTURE_CONTRACT.md). There are
+no alternate dated copies or predecessor books in the active checkout.
 
 Use [INDEX.md](./INDEX.md) to route by entity, flow, or question. Do not load
 both books in full for ordinary work.
@@ -32,9 +29,5 @@ both books in full for ordinary work.
   source/build/runtime/store evidence.
 
 Architecture outranks Implementation on semantic conflict. Canonical
-documentation does not prove that code exists, is installed, is running, or is
+Documentation does not prove that code exists, is installed, running, or
 accepted. The honest product status remains `NOT_ACCEPTED / UNVERIFIED`.
-
-`../normative/` contains predecessor-bound historical projections used by the
-earlier recovery programme. It is not the current authority surface and must
-not be mixed with this pair.

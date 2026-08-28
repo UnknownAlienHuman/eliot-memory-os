@@ -1,0 +1,105 @@
+name: repository-policy
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  branch-and-authority-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate branch identity and current-main ancestry
+        shell: bash
+        env:
+          HEAD_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          pattern='^(work|fix|docs|chore|refactor|test)/[0-9]+-[a-z0-9]+(-[a-z0-9]+)*$'
+          legacy='cognitive-micromodules-wave-01'
+
+          if [[ "$HEAD_BRANCH" != "$legacy" && ! "$HEAD_BRANCH" =~ $pattern ]]; then
+            echo "Branch '$HEAD_BRANCH' is not issue-numbered."
+            echo "Use <work|fix|docs|chore|refactor|test>/<issue>-<slug>."
+            exit 1
+          fi
+
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor origin/main HEAD; then
+            echo "Current origin/main is not an ancestor of this branch."
+            echo "Refresh from main before additional mutation or integration."
+            exit 1
+          fi
+
+      - name: Validate authority receipts and active work registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pathlib
+          import tomllib
+
+          pair = tomllib.loads(pathlib.Path('docs/normative-pair.toml').read_text(encoding='utf-8'))
+          active = tomllib.loads(pathlib.Path('workstreams/ACTIVE.toml').read_text(encoding='utf-8'))
+
+          assert pair['status'] == 'accepted'
+          assert pair['repository_authority_branch'] == 'main'
+          assert active['authority_branch'] == 'main'
+          assert active['branch_policy']['requires_current_main_ancestor'] is True
+          assert active['branch_policy']['one_issue_one_branch_one_pr'] is True
+          PY
+
+      - name: Reject retired authority surfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden=(
+            '.eliot'
+            '.codebase-memory'
+            'research'
+            'reports'
+            'swarm'
+            'docs/tasks'
+            'docs/normative'
+            'docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md'
+            'docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md'
+            'COGNITIVE_COMPLETION_RECOVERY_PROGRESS.md'
+            'UL_PROGRESS.md'
+          )
+
+          for path in "${forbidden[@]}"; do
+            if [[ -e "$path" ]]; then
+              echo "Retired authority surface is present: $path"
+              exit 1
+            fi
+          done
+
+      - name: Reject stale links in current routing surfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            README.md
+            AGENTS.md
+            WORKFLOW.md
+            docs/ARCHITECTURE_CONTRACT.md
+            docs/PROJECT_MAP.md
+            docs/architecture/README.md
+            docs/architecture/INDEX.md
+            workstreams/README.md
+            workstreams/ACTIVE.toml
+            workstreams/core-daemons/AGENTS.md
+          )
+
+          if grep -nE 'reports/audit/|docs/normative/|RECOVERY_PROGRAM_v1|ELIOT_(ARCHITECTURE|IMPLEMENTATION)_ENGLISH_FINAL_2026-08-28' "${files[@]}"; then
+            echo 'Stale authority/reference detected in a current routing surface.'
+            exit 1
+          fi

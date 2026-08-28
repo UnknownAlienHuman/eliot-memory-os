@@ -36,12 +36,6 @@ verify:
 verify-list:
     pwsh -NoProfile -File scripts/verify.ps1 -List
 
-verify-w1:
-    pwsh -NoProfile -File scripts/verify-w1.ps1
-
-verify-w1-list:
-    pwsh -NoProfile -File scripts/verify-w1.ps1 -List
-
 unimplemented:
     pwsh -NoProfile -File scripts/gen-unimplemented.ps1
 

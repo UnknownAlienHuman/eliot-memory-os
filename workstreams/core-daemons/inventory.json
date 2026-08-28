@@ -1,0 +1,72 @@
+{
+  "schema": "eliot.core-daemon-workstream.v2",
+  "updated_at": "2026-08-28",
+  "authority": {
+    "branch": "main",
+    "normative_pair_receipt": "docs/normative-pair.toml",
+    "architecture_sha256": "c6932eaf26935e752eefb4fc5818ec49dc784f23f246f42dc9d3ca5843196b",
+    "implementation_sha256": "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063",
+    "product_status": "NOT_ACCEPTED_UNVERIFIED"
+  },
+  "scope": {
+    "included": [
+      "host",
+      "kernel",
+      "governor_daemon",
+      "watchdog",
+      "doctor",
+      "store_bridge",
+      "surreal_dependency",
+      "blob_store",
+      "testd",
+      "wasm_host",
+      "native_worker",
+      "user_broker",
+      "notify",
+      "agent_bridge",
+      "research_provider_process"
+    ],
+    "excluded": ["dreamer"]
+  },
+  "branch_policy": {
+    "shared_workstream_branch": false,
+    "fresh_issue_branch_from_current_main": true,
+    "one_issue_one_branch_one_pr": true
+  },
+  "cross_cutting": [
+    {
+      "issue": 13,
+      "priority": "P0",
+      "property": "generated capability-cell ownership, proof surfaces, and current normative-pair bindings"
+    },
+    {
+      "issue": 11,
+      "priority": "P0",
+      "property": "live Windows operational spine and Product Pulse"
+    }
+  ],
+  "units": [
+    {"id":"host","issue":14,"source":"present","support":"PARTIAL","disposition":"REWORK"},
+    {"id":"kernel","issue":15,"source":"present","support":"PARTIAL","disposition":"REWORK"},
+    {"id":"governor_daemon","issue":18,"source":"present","support":"CURRENT_UNVERIFIED","disposition":"REWORK"},
+    {"id":"watchdog","issue":16,"source":"present","support":"PARTIAL","disposition":"REWORK"},
+    {"id":"doctor","issue":17,"source":"present","support":"CURRENT_UNVERIFIED","disposition":"REWORK"},
+    {"id":"store_bridge","issue":19,"source":"present","support":"PARTIAL","disposition":"REWORK","related_issues":[7,8,9]},
+    {"id":"surreal_dependency","issue":19,"source":"external_declared","support":"TARGET","disposition":"VERIFY"},
+    {"id":"blob_store","issue":19,"source":"present","support":"CURRENT_UNVERIFIED","disposition":"REWORK"},
+    {"id":"testd","issue":20,"source":"present","support":"PARTIAL","disposition":"REWORK"},
+    {"id":"wasm_host","issue":21,"source":"present","support":"PARTIAL","disposition":"REWORK"},
+    {"id":"native_worker","issue":22,"source":"present","support":"CURRENT_UNVERIFIED","disposition":"REWORK"},
+    {"id":"user_broker","issue":23,"source":"present","support":"CURRENT_UNVERIFIED","disposition":"REWORK"},
+    {"id":"notify","issue":13,"source":"present","support":"CURRENT_UNVERIFIED","disposition":"KEEP_AND_BIND"},
+    {"id":"agent_bridge","issue":13,"source":"present","support":"CURRENT_UNVERIFIED","disposition":"KEEP_AND_BIND"},
+    {"id":"research_provider_process","issue":24,"source":"present","support":"PARTIAL","disposition":"REWORK"}
+  ],
+  "evidence_ceiling": {
+    "source_inventory": "OBSERVED",
+    "build": "NOT_EXECUTED",
+    "runtime": "NOT_EXECUTED",
+    "store": "NOT_EXECUTED",
+    "product_pulse": "NOT_EXECUTED"
+  }
+}
