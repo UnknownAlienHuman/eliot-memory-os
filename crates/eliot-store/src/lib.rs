@@ -2,6 +2,7 @@
 
 pub mod blob_store;
 mod blob_validation;
+mod canonical_cognitive_projection;
 pub mod canonical_projection;
 mod canonical_record;
 pub mod canonical_store;

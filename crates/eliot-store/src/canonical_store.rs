@@ -9,6 +9,15 @@ use crate::{
 mod capacity;
 mod recall_ranking;
 mod replay_view;
+pub use crate::canonical_cognitive_projection::{
+    CognitiveProjectionBacklog, CognitiveProjectionFamily, CognitiveProjectionFamilyCounts,
+    CognitiveProjectionFamilyState, CognitiveProjectionIntentReceipt, CognitiveProjectionLease,
+    CognitiveProjectionProject, CognitiveProjectionProjectPage,
+    CognitiveProjectionPublicationStatus,
+};
+use crate::canonical_cognitive_projection::{
+    CognitiveProjectionClaimLoad, CognitiveProjectionMutationResult,
+};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use capacity::{
@@ -201,146 +210,6 @@ struct CanonicalMemoryAdmissionChildLoad {
 struct CanonicalMemoryProjectionRecord {
     record_id: String,
     receipt_body: CanonicalMemorySegment,
-}
-
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum CognitiveProjectionFamily {
-    Search,
-    Cue,
-    DependencyDirty,
-    Utility,
-}
-
-impl CognitiveProjectionFamily {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Search => "search",
-            Self::Cue => "cue",
-            Self::DependencyDirty => "dependency_dirty",
-            Self::Utility => "utility",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct CognitiveProjectionIntentReceipt {
-    pub event_id: String,
-    pub project_id: ProjectId,
-    pub updated_revision: MemoryRevision,
-    pub families: Vec<CognitiveProjectionFamily>,
-    pub status: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct CognitiveProjectionLease {
-    pub lease_id: String,
-    pub lease_owner: String,
-    pub project_id: ProjectId,
-    pub through_revision: MemoryRevision,
-    pub write_ids: Vec<String>,
-    pub families: Vec<CognitiveProjectionFamily>,
-    pub claimed_rows: usize,
-    pub max_attempt_count: u32,
-    #[serde(with = "time::serde::rfc3339")]
-    pub lease_expires_at: OffsetDateTime,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct CognitiveProjectionFamilyCounts {
-    pub search: u64,
-    pub cue: u64,
-    pub dependency_dirty: u64,
-    pub utility: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct CognitiveProjectionBacklog {
-    pub pending: u64,
-    pub leased: u64,
-    pub retryable: u64,
-    pub blocked: u64,
-    #[serde(default, with = "time::serde::rfc3339::option")]
-    pub oldest_created_at: Option<OffsetDateTime>,
-    pub family_counts: CognitiveProjectionFamilyCounts,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct CognitiveProjectionProject {
-    pub project_id: ProjectId,
-    pub head_revision: MemoryRevision,
-    pub search_applied_revision: Option<MemoryRevision>,
-    pub search_projection_format: Option<String>,
-    #[serde(default)]
-    pub pending: u64,
-    #[serde(default)]
-    pub leased: u64,
-    #[serde(default)]
-    pub retryable: u64,
-    #[serde(default)]
-    pub blocked: u64,
-    #[serde(default, with = "time::serde::rfc3339::option")]
-    pub oldest_pending_created_at: Option<OffsetDateTime>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct CognitiveProjectionProjectPage {
-    pub projects: Vec<CognitiveProjectionProject>,
-    pub truncated: bool,
-    pub next_start: Option<usize>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CognitiveProjectionPublicationStatus {
-    Published,
-    Stale,
-    Blocked,
-    Unavailable,
-}
-
-impl CognitiveProjectionPublicationStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Published => "published",
-            Self::Stale => "stale",
-            Self::Blocked => "blocked",
-            Self::Unavailable => "unavailable",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct CognitiveProjectionFamilyState {
-    pub project_id: ProjectId,
-    pub family: CognitiveProjectionFamily,
-    pub target_revision: MemoryRevision,
-    pub applied_revision: Option<MemoryRevision>,
-    pub status: CognitiveProjectionPublicationStatus,
-    pub last_error: Option<String>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: OffsetDateTime,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct CognitiveProjectionOutboxRow {
-    write_id: String,
-    project_id: ProjectId,
-    updated_revision: MemoryRevision,
-    families: Vec<CognitiveProjectionFamily>,
-    attempt_count: u32,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct CognitiveProjectionClaimLoad {
-    rows: Vec<CognitiveProjectionOutboxRow>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct CognitiveProjectionMutationResult {
-    rows_updated: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
