@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "journal_termination_tests.rs"]
+mod journal_termination_tests;
+
 use super::*;
 use eliot_host_state::{
     BackendError, BackendReconcileState, DurableImage, FaultPoint, MemoryBackend, PreparedAppend,
@@ -146,84 +150,6 @@ fn test_host() -> HostInstallationEpoch {
         None,
     )
     .unwrap_or_else(|_| unreachable!())
-}
-
-#[test]
-fn production_termination_binding_rejects_root_and_authority_substitution() -> TestResult {
-    let job = KernelJobBinding {
-        job_name: PlatformHandle::new("eliot-kernel-job")?,
-        owner: PlatformHandle::new("Kernel")?,
-        root_pid: 42,
-        root_start_time_100ns: 10,
-        root_image_path: PlatformHandle::new("C:\\eliot\\eliot-kernel.exe")?,
-        root_volume_serial_number: 7,
-        root_file_index: 11,
-    };
-    let process = ServiceProcessRecord {
-        process_id: "pid:42:start:10".to_owned(),
-        owner: "Kernel".to_owned(),
-        state: ServiceProcessState::Starting,
-        health: HealthVector::healthy(),
-        authority_epoch: AuthorityEpoch::new(7)?,
-    };
-    let matches = |process_id, start_time, image, job_name, expected| {
-        exact_termination_binding_matches(&job, expected, process_id, start_time, image, job_name)
-    };
-    assert!(matches(
-        42,
-        10,
-        "C:\\eliot\\eliot-kernel.exe",
-        "eliot-kernel-job",
-        &process,
-    ));
-    assert!(!matches(
-        43,
-        10,
-        "C:\\eliot\\eliot-kernel.exe",
-        "eliot-kernel-job",
-        &process,
-    ));
-    assert!(!matches(
-        42,
-        11,
-        "C:\\eliot\\eliot-kernel.exe",
-        "eliot-kernel-job",
-        &process,
-    ));
-    assert!(!matches(
-        42,
-        10,
-        "C:\\eliot\\substituted.exe",
-        "eliot-kernel-job",
-        &process,
-    ));
-    assert!(!matches(
-        42,
-        10,
-        "C:\\eliot\\eliot-kernel.exe",
-        "substituted-job",
-        &process,
-    ));
-
-    let mut substituted_authority = process.clone();
-    substituted_authority.owner = "Store".to_owned();
-    assert!(!matches(
-        42,
-        10,
-        "C:\\eliot\\eliot-kernel.exe",
-        "eliot-kernel-job",
-        &substituted_authority,
-    ));
-    let mut substituted_process_id = process.clone();
-    substituted_process_id.process_id = "pid:99:start:10".to_owned();
-    assert!(!matches(
-        42,
-        10,
-        "C:\\eliot\\eliot-kernel.exe",
-        "eliot-kernel-job",
-        &substituted_process_id,
-    ));
-    Ok(())
 }
 
 #[test]
