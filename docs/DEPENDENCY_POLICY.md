@@ -18,10 +18,11 @@ supersedes the older 1.89 planning baseline in ADR 0001 for this workspace.
 
 ## Why this version
 
-The canonical implementation profile names `wasmtime-47.x-pending-RGF-
-COMPONENT-SANDBOX` as the runtime candidate (`docs/ELIOT Arhitecture/ELIOT_IMPLEMENTATION.md`,
-`wasm.runtime_candidate` anchor, line 19741 in the canonical source). Version 47.0.4 is the smallest exact
-release that satisfies the recovery gate's current security evidence:
+The canonical implementation profile names the Wasmtime 47.x component-runtime
+candidate in
+[`ELIOT_IMPLEMENTATION.md` I0.2](architecture/ELIOT_IMPLEMENTATION.md#i02-current-compatibility-baseline).
+Version 47.0.4 is the smallest exact release that satisfies the recovery gate's
+current security evidence:
 
 - RustSec [RUSTSEC-2026-0222](https://rustsec.org/advisories/RUSTSEC-2026-0222.html)
   marks `>=47.0.3` as patched.

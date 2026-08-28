@@ -13,20 +13,21 @@ This is a routing map, not an acceptance record. Current source, `Cargo.toml`,
 `Cargo.lock`, Cargo diagnostics, installed artifact identities, and live machine
 readback outrank this file. Product status remains `NOT_ACCEPTED / UNVERIFIED`.
 
-The architecture authority route is
-[`docs/ARCHITECTURE_CONTRACT.md`](ARCHITECTURE_CONTRACT.md). The two documents
-used for the 2026-08-28 core/daemon source audit are byte-identical to the
-published English final artifacts:
+The accepted architecture authority is defined by
+[`docs/ARCHITECTURE_CONTRACT.md`](ARCHITECTURE_CONTRACT.md) and the
+machine-bindable [`docs/normative-pair.toml`](normative-pair.toml):
 
-- [Architecture English final](architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md),
-  SHA-256 `C6932EAF26935E752EEFB4DE591AFC91EA1A7180BE5A8FF0005554B8029BAC1A`;
-- [Implementation English final](architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md),
-  SHA-256 `7805BF238FE91819ABA50D7E13AA86A8B977561195DBB98AA979F986E2FAB063`.
+- [ELIOT Architecture](architecture/ELIOT_ARCHITECTURE.md), revision
+  `4.5-draft`, English edition `2026-08-28`, SHA-256
+  `C6932EAF26935E752EEFB4DE591AFC91EA1A7180BE5A8FF0005554B8029BAC1A`;
+- [ELIOT Implementation](architecture/ELIOT_IMPLEMENTATION.md), revision
+  `0.29-draft`, English edition `2026-08-28`, SHA-256
+  `7805BF238FE91819ABA50D7E13AA86A8B977561195DBB98AA979F986E2FAB063`.
 
-`ARCHITECTURE_CONTRACT.md` currently points to a different external canonical
-pair identity. This is an explicit document-authority gap, tracked by
-[#25](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/25); no worker
-may silently combine the two pair identities.
+The dated English-final filenames in `docs/architecture/` are byte-identical
+publication aliases. The predecessor pair and `docs/normative/` projection
+remain historical evidence; predecessor-bound generated artefacts are `STALE`
+for current authority until regenerated against the accepted pair.
 
 ## Workspace shape
 
@@ -60,7 +61,9 @@ Agent work-unit rules:
 
 This inventory is `SOURCE_INVENTORY_ONLY`; every runtime row is
 `NOT_EXECUTED` until exact installed/runtime evidence exists. Dreamer is excluded
-because it is owned by a separate workstream.
+because it is owned by a separate workstream. The inventory's original
+document-authority finding records the pre-adoption state; current authority is
+the receipt above.
 
 | Process/capability | Source disposition | Primary work item |
 |---|---|---|

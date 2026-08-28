@@ -1,25 +1,26 @@
 # ELIOT Implementation
-## Конкретная реализация живучей Memory OS, Harness, Smart и Meta на Rust
+## Concrete implementation of a resilient Memory OS, Harness, Smart, and Meta in Rust
 
-**Версия:** 0.29-draft
-**Дата:** 2026-08-14
-**Статус:** target implementation contract; product `NOT_ACCEPTED / UNVERIFIED`; code/runtime/data conformance неизвестно; repository cutover и удаление старых книг не приняты
-**Нормативная пара:** `ELIOT_ARCHITECTURE.md` + `ELIOT_IMPLEMENTATION.md`
-**Приоритет:** при смысловом конфликте эта книга подчиняется Architecture 4.5-draft; локальная реализация не может молча изменить архитектурное намерение
-**Основная платформа:** Windows 11 x64
-**Язык control plane:** Rust 2024 edition
-**Первый canonical substrate:** отдельный SurrealDB server через сменяемый storage bridge
-**Основной режим эксплуатации:** local-first, demand-start, single-machine primary-user installation; multi-agent и multi-project внутри одного локального ELIOT
-**Development constraint:** нормативная детализация и количество тестов не считаются прогрессом; каждый agent change замыкает одну causal property через independently testable module cell, реальный Instrument evidence, affected edge proof и bounded product pulse, если изменение может затронуть общий результат
-**Crate strategy:** ELIOT является crate-rich и process-sparse: много independently selectable source/build units, меньше runtime bundles/processes и ровно один lifecycle owner каждого mutable state; crate/source ownership не выводит runtime authority; каждый agent получает route-qualified bounded causal workset, а численные context/size profiles остаются измеряемыми и заменяемыми Empirical Profiles, не пределами Module или системы
+**Version:** 0.29-draft
+**Date:** 2026-08-14
+**Status:** target implementation contract; product `NOT_ACCEPTED / UNVERIFIED`; code, runtime, and data conformance unknown; repository cutover and removal of old books not accepted
+**Normative pair:** `ELIOT_ARCHITECTURE.md` + `ELIOT_IMPLEMENTATION.md`
+**English edition:** 2026-08-28; English revision with the final ownership, liveness, privacy, and residency closures incorporated
+**Precedence:** On semantic conflict, this book is subordinate to Architecture 4.5-draft; local implementation cannot silently alter architectural intent
+**Primary platform:** Windows 11 x64
+**Control-plane language:** Rust 2024 edition
+**Initial canonical substrate:** separate SurrealDB server through a replaceable storage bridge
+**Primary operating mode:** local-first, demand-start, single-machine primary-user installation; multi-agent and multi-project within one local ELIOT
+**Development constraint:** Normative detail and test count are not progress. Every agent change closes one causal property through an independently testable Module cell, real Instrument evidence, affected Edge Proof, and a bounded Product Pulse when the change can affect the overall result
+**Crate strategy:** ELIOT is crate-rich and process-sparse: many independently selectable source/build units, fewer runtime bundles and processes, and exactly one lifecycle owner for each mutable state. Crate or source ownership grants no runtime authority. Each agent receives a route-qualified bounded causal workset; numeric context and size profiles remain measurable, replaceable Empirical Profiles—not Module or system limits
 
 ---
 
-# Краткое решение
+# Concise decision
 
-ELIOT реализуется не как один большой исполняемый файл и не как россыпь DLL. Он состоит из небольшого живучего control kernel, заменяемого application daemon и сменяемых process-модулей. Ниже показана целевая production topology; ранние delivery depths могут временно co-locate capability за тем же публичным contract, если это явно разрешено разделом слоя и не создаёт второго owner.
+ELIOT is implemented neither as one large executable nor as a scatter of DLLs. It consists of a small resilient control Kernel, a replaceable application daemon, and replaceable process Modules. The target production topology appears below; early delivery depths may temporarily co-locate a capability behind the same public contract when its layer explicitly permits this and no second owner is created.
 
-Source topology при этом намеренно состоит из многих узких Cargo crates. Crate является обычной границей compilation, package-selective testing, dependency containment и agent delivery. Causal/lifecycle ownership принадлежит `FunctionalCapabilityCell`/service contract и явно отображается в manifest; несколько тесно связанных cells могут делить один crate. Process generation — более крупная граница failure, authority и hot replacement. ELIOT не превращает каждый crate в microservice.
+Source topology intentionally contains many narrow Cargo crates. A crate is an ordinary boundary for compilation, package-selective testing, dependency containment, and agent delivery. Causal and lifecycle ownership belongs to the `FunctionalCapabilityCell` or service contract and is mapped explicitly in the manifest; several tightly coupled cells may share one crate. A process generation is a broader boundary for failure, authority, and hot replacement. ELIOT does not turn every crate into a microservice.
 
 ```text
 Windows Service Control Manager
@@ -29,7 +30,7 @@ Windows Service Control Manager
 │  │     │                        canonical transition gateway, recovery
 │  │     ├─ `eliot-store-surreal.exe` ── client of the canonical-store process
 │  │     ├─ BlobStore capability   co-located initially; optional `eliot-blob.exe` after isolation proof
-│  │     ├─ `eliotd.exe`          основной Governor application daemon
+│  │     ├─ `eliotd.exe`          primary Governor application daemon
 │  │     ├─ `eliot-testd.exe`     isolated build/test/simulation plane, on demand
 │  │     ├─ `eliot-wasm-host.exe` capability-limited Component Model generations, on demand
 │  │     ├─ `eliot-native-worker-*.exe` OS-heavy or promoted native generations
@@ -52,9 +53,9 @@ Authorized interactive user session
 
 SCM owns only the stable Host and Watchdog services. Host owns OS process lifecycle for two isolated branches: Kernel and the canonical-store dependency. It starts `surreal.exe` as a supervised console/server process from an approved immutable manifest; ELIOT does not assume that the upstream binary implements the Windows service-control protocol. The SurrealDB process owns database files, while Host owns only start/stop/restart and Job Object containment. Kernel requests dependency lifecycle through Host and physically supervises `eliotd` and replaceable child generations. `eliotd` owns desired module state and semantic scheduling; Kernel performs generation routing, switch and fencing. Subscription- or desktop-bound runtimes are launched through a per-user `eliot-user-broker.exe`; the service identity never impersonates user-owned credentials or interactive desktop state.
 
-Логический Governor состоит из Kernel и `eliotd`, но canonical application authority остаётся одной. Kernel — переживающая отказ часть Governor, а не второй Governor.
+Logical Governor consists of Kernel and `eliotd`, but canonical application authority remains singular. Kernel is the failure-surviving part of Governor, not a second Governor.
 
-Главный путь обновления:
+Primary update path:
 
 ```text
 immutable artifact
@@ -71,20 +72,20 @@ immutable artifact
 → retire or perform a new forward/rollback cutover.
 ```
 
-Главный путь разработки:
+Primary development path:
 
 ```text
-маленький работающий vertical spine
-→ реальные observations и performance
-→ отдельные modules
+small working vertical spine
+→ real observations and performance
+→ separate Modules
 → affected tests
-→ canary в текущей работе
+→ canary in current work
 → Improvement Candidate
 → controlled promotion
-→ полный release gate только для релиза или load-bearing изменения.
+→ full release gate only for a release or load-bearing change.
 ```
 
-Полная пересборка workspace и полный набор тестов не являются обычной реакцией на локальное изменение. Они запускаются только при соответствующем blast radius либо при выпуске релиза.
+A full workspace rebuild and full test suite are not the normal response to a local change. They run only for a matching blast radius or release.
 
 Runtime extensions and agent-generated components use three execution contours:
 
@@ -101,7 +102,7 @@ static native bundle
 
 A Cargo crate is not automatically a process, and a process is not automatically a Windows service. In-process Rust dynamic libraries are not a normal promotion route: Rust ABI, shared heap, callbacks, threads and unload semantics do not provide the failure isolation required by ELIOT.
 
-Agent Execution Fabric не является новым control plane. Это execution-проекция существующих Governor, Host Broker и Agent Coordinator:
+Agent Execution Fabric is not a new control plane. It is an execution projection of the existing Governor, Host Broker, and Agent Coordinator:
 
 ```text
 Human / Main Agent
@@ -111,9 +112,9 @@ Human / Main Agent
 → ELIOT reconciles evidence, audits disagreement and owns durable task state.
 ```
 
-Унифицируются task intent, lifecycle, evidence, authority, recovery и decision gates. Внутреннее устройство Codex, OpenCode, ACP, Claude, Antigravity и будущих agents остаётся различным и сохраняется в route/provenance records.
+Task intent, lifecycle, evidence, authority, recovery, and decision gates are unified. The internals of Codex, OpenCode, ACP, Claude, Antigravity, and future agents remain distinct and are preserved in route and provenance records.
 
-Instrument Plane является детерминированной опорой разработки и grounding, а не ещё одной agent-системой:
+Instrument Plane is the deterministic foundation for development and grounding, not another agent system:
 
 ```text
 ELIOT task / memory / authority
@@ -126,13 +127,13 @@ ELIOT task / memory / authority
 → CodeCortex / verifier / Diagnostic Brief / Active View.
 ```
 
-Агент не получает десятки сырых инструментов и не сочиняет shell-команды verifier. Он запрашивает намерение `verify`, `inspect`, `assist` или `evidence`; ELIOT выбирает профиль, запускает точные инструменты, сохраняет raw evidence и возвращает компактный проверяемый результат. Instrument Plane не владеет задачами, памятью, архитектурой или completion.
+An agent receives neither dozens of raw tools nor permission to invent shell verifier commands. It requests the intent `verify`, `inspect`, `assist`, or `evidence`; ELIOT selects a profile, runs exact instruments, preserves raw evidence, and returns a compact verifiable result. Instrument Plane owns neither tasks, memory, Architecture, nor completion.
 
 ---
 
-# Как читать эту книгу
+# How to read this book
 
-Эта книга организована слоями.
+This book is organized in layers.
 
 ```text
 Delivery Depth D0 — bootstrap evidence/brief, Host/Kernel front door, ORS, independent deterministic Watchdog and process-grounding skeleton.
@@ -143,39 +144,39 @@ Delivery Depth D4 — advanced Watchdog analysis, Doctor recipes, backup/restore
 Delivery Depth D5 — durable portfolio/swarm, Researcher and optional advanced domains.
 ```
 
-Каждый принятый delivery milestone обязан приносить самостоятельную пользовательскую или операционную ценность. Чистый infrastructure-extraction track может идти параллельно, но не считается завершённой глубиной продукта без связанного working capability/proof. Следующая глубина расширяет предыдущую; она не переписывает Kernel и canonical history без migration reason.
+Every accepted delivery milestone must provide independent user or operational value. A pure infrastructure-extraction track may proceed in parallel, but is not a completed product depth without a connected working capability and proof. Each subsequent depth extends the previous one; it does not rewrite Kernel or canonical history without a migration reason.
 
-Машиноисполняемая нормативная сила не выводится из слов `MUST`, `cannot`, «запрещено» или других модальных глаголов. Они помогают человеку читать prose, но runtime/agent может блокировать, разрешать или оспаривать действие только по `RuleCatalogueEntry`/`RuleBinding`, где явно указаны class, owner, scope, rationale, observable property и challenge path.
+Machine-enforceable normative force is not inferred from `MUST`, `cannot`, “prohibited,” or other modal verbs. They aid human reading, but runtime or agent may block, permit, or challenge an action only through a `RuleCatalogueEntry` or `RuleBinding` that explicitly states class, owner, scope, rationale, observable property, and challenge path.
 
 ```text
 HardBoundary
-  → существует только при ссылке на Architecture Hard Boundary/authority/privacy/proof invariant;
-  → fail closed; ImplementationDeviation неприменима.
+  → exists only when linked to an Architecture Hard Boundary or an authority, privacy, or proof invariant;
+  → fail closed; ImplementationDeviation does not apply.
 
 Contract
-  → наблюдаемое обязательство конкретной capability;
-  → при отсутствии возвращается typed degraded/unsupported state.
+  → observable obligation of a specific capability;
+  → when absent, returns a typed degraded or unsupported state.
 
 Guardrail / Default
-  → challengeable и заменяемы через evidence-backed ImplementationDeviation.
+  → challengeable and replaceable through an evidence-backed ImplementationDeviation.
 
 Experiment
-  → обратимая гипотеза с discriminator, budget, stop и rollback.
+  → reversible hypothesis with discriminator, budget, stop, and rollback.
 
 Policy
   → human-owned privacy/cost/risk/model decision.
 ```
 
-Незарегистрированная пояснительная проза не является самостоятельным blocker, permission или source of authority. Один классифицированный rule block может охватывать несколько поясняющих предложений; разметка каждого модального слова запрещена как буквоедская proxy-работа. Documentation lint проверяет не глаголы, а то, что каждый реально применённый reason code, directive, block или deviation ссылается на существующий classified rule. Скрытый обход остаётся недопустимым.
+Unregistered explanatory prose is not an independent blocker, permission, or source of authority. One classified rule block may cover several explanatory sentences; marking every modal word is prohibited as literalist proxy work. Documentation lint checks not verbs, but that every applied reason code, directive, block, or deviation references an existing classified rule. Hidden bypass remains prohibited.
 
 ---
 
-## Рабочие маршруты чтения
+## Working reading routes
 
-Полный документ не является prompt для каждого агента. Governor/Context Compiler выдаёт только применимые sections, contracts и exact handles.
+The full document is not a prompt for every agent. Governor and Context Compiler issue only applicable sections, contracts, and exact handles.
 
 ```text
-первый vertical spine
+first vertical spine
   → I0, I1.1–I1.8, I2.1–I2.5, I5.1–I5.7, I7, I14, I17–I18;
 
 Kernel/recovery work
@@ -185,7 +186,7 @@ process Module or bridge
   → I2.1–I2.25, I6.4–I6.5, I7.1–I7.5, I10, I14.14, I18;
 
 instrument, verification or Rust code-understanding work
-  → I2.9–I2.25, I10.8–I10.10, I12.9–I12.10, I16.17, I17, I18, Appendices J/P plus accepted contract-catalogue handles;
+  → I2.10–I2.23, I2.25, I10.8–I10.10, I12.9–I12.10, I16.17, I17, I18, Appendices J/P plus accepted contract-catalogue handles;
 
 agent/runtime/swarm integration
   → I3, I7, I10.15–I10.18, I13–I14, I16, I18.16–I18.17;
@@ -200,7 +201,7 @@ migration/release
   → I0.8–I0.9, I18–I20, Appendices G–P plus the non-normative donor migration audit.
 ```
 
-Имена вида `component:state`, `component:context` и `component:authority` обозначают логических owners в conformance map. Они не являются требованием создать Cargo crate или process с таким именем. Source/runtime extraction определяется I2, а не диаграммой.
+Names such as `component:state`, `component:context`, and `component:authority` denote logical owners in the conformance map. They do not require a Cargo crate or process with that name. Source and runtime extraction are defined by I2, not by the diagram.
 
 ## Compiled recovery/development brief
 
@@ -410,34 +411,34 @@ Promotion to a deeper delivery depth never changes an earlier receipt or semanti
 
 ---
 
-# I0. Статус, compatibility matrix и change policy
+# I0. Status, compatibility matrix, and change policy
 
-## I0.1. Три контура разработки
+## I0.1. Three development contours
 
-### Контур 1 — Architecture
+### Contour 1 — Architecture
 
-Определяет назначение, инварианты, границы authority и rationale. Меняется при смене парадигмы или значительном изменении AI-среды.
+Defines purpose, invariants, authority boundaries, and rationale. Changes when the paradigm or AI environment changes materially.
 
-### Контур 2 — Implementation
+### Contour 2 — Implementation
 
-Определяет текущий стек, процессы, contracts, defaults, fallbacks, compatibility, operating limits и проверяемые replacement points. Эта книга может изменяться чаще Architecture.
+Defines current stack, processes, contracts, defaults, fallbacks, compatibility, operating limits, and verifiable replacement points. This book may change more often than Architecture.
 
-### Контур 3 — Code and runtime
+### Contour 3 — Code and runtime
 
-Живёт в Git branches/worktrees и локальной installation. Может меняться ежедневно. Отклонение от Implementation допустимо только как зарегистрированный experiment/deviation с результатом.
+Lives in Git branches and worktrees and the local installation. It may change daily. Deviation from Implementation is allowed only as a registered experiment or deviation with a result.
 
-## I0.2. Текущая compatibility baseline
+## I0.2. Current compatibility baseline
 
-| Surface | Текущая линия | Статус | Fallback / правило замены |
+| Surface | Current line | Status | Fallback or replacement rule |
 |---|---|---|---|
-| Architecture source | `ELIOT_ARCHITECTURE.md` 4.5-draft, SHA-256 `58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8` | priority semantic baseline | any different digest is a new Architecture revision or an untrusted copy; conformance and self-knowledge projections become stale |
-| Rust toolchain | Rust 1.97.1, edition 2024 | source-verified DEFAULT candidate in the external compatibility ledger; local admission still absent | exact patch фиксируется `rust-toolchain.toml`; обновление после affected suite |
-| Windows | Windows 11 x64 | target production platform | Linux не заявляется поддержанным до отдельного CI и acceptance |
+| Architecture source | `ELIOT_ARCHITECTURE.md` 4.5-draft; exact path, version and digest are emitted after freeze in `docs/normative-pair.toml` | priority semantic baseline | a missing/mismatched pair receipt, different digest or mixed revision makes dependent conformance and self-knowledge projections stale/untrusted |
+| Rust toolchain | Rust 1.97.1, edition 2024 | source-verified DEFAULT candidate in the external compatibility ledger; local admission still absent | exact patch is pinned in `rust-toolchain.toml`; update after affected suite |
+| Windows | Windows 11 x64 | target production platform | Linux is unsupported until separate CI and acceptance exist |
 | MCP | final specification 2026-07-28; stateless core | source-verified target line in the external compatibility ledger; local conformance still absent | compatibility adapter for 2025-11-25; ELIOT Session remains application state in both profiles |
 | Rust MCP SDK | official `rmcp` 3.1.x line; 3.1.2 candidate | source-verified beta/primary candidate in the external compatibility ledger; local bridge/conformance absent | exact patch is pinned in `Cargo.lock` only after dual-version bridge/conformance tests; SDK remains isolated in `eliot-mcp` and cannot define domain/session semantics |
 | Canonical DB | SurrealDB 3.2.x compatibility line; 3.2.3 candidate, not yet admitted | source-verified provisional target in the external compatibility ledger; local workload/crash/restore proof absent | active patch is selected only after current-system audit, workload/crash/restore proof and RGF-STORAGE-MIGRATION; rollback uses the last actually verified generation |
 | Host state journal | `redb`, separate Host-owned file | target default | replacement requires torn-write/recovery equivalence and no semantic-state leakage |
-| Operational recovery DB | `redb`, Kernel-owned ORS file | target default | сменяем только через ORS export/import proof |
+| Operational recovery DB | `redb`, Kernel-owned ORS file | target default | replaceable only through ORS export/import proof |
 | Internal process protocol | EBP/1 over named pipes; JSON-first encoding | target default | `protobuf-v1` — RGF-PROTOCOL-TRANSPORT profile; Unix domain socket reuse the same messages |
 | In-process supervision | plain Tokio behind `eliot-runtime`; `ractor` is an unpinned research candidate | baseline + RGF-RUNTIME-RESILIENCE | exact candidate/version comes only from the current compatibility receipt and lockfile; Kernel/domain never depend on actor-framework semantics and a framework becomes default only after measured simplification without ownership drift |
 | WASM component runtime | Wasmtime 47.x compatibility line; 47.0.3 candidate; Component Model + `wasm32-wasip2` | source-verified PROVISIONAL candidate in the external compatibility ledger; local security/Windows conformance absent | exact patch is resolved only from the current compatibility receipt and lockfile after security/Windows conformance; WASI 0.3/`wasm32-wasip3` remains a laboratory lane |
@@ -445,7 +446,7 @@ Promotion to a deeper delivery depth never changes an earlier receipt or semanti
 | Deterministic simulation | pure ELIOT event simulator first; Loom plus admitted Shuttle/Turmoil/MadSim adapters | staged / RGF-INSTRUMENT-TESTING | no simulator becomes operational truth; seeds, schedules, failpoints and cassettes are immutable artifacts |
 | Windows Human UI | WinUI 3 desktop client on the stable Windows App SDK 2.3.1 line; optional Ratatui terminal board | source-verified TARGET; local UI/usability/recovery conformance absent | thin non-authoritative user-session client over the role-filtered ControlBoard/Operator API; CLI remains the mandatory recovery fallback; browser UI is optional, not the primary surface |
 
-`Cargo.lock`, `compatibility.toml`, module manifests и service manifest являются точным источником patch versions. Эта таблица задаёт совместимые линии, а не подменяет lockfile.
+`Cargo.lock`, `compatibility.toml`, Module manifests, and service manifest are the exact source of patch versions. This table defines compatible lines; it does not replace the lockfile.
 
 The table is a reviewed compatibility baseline, not an updater or a current-installation claim. `checked_at`, source identities and local admission live in the external `CompatibilityEvidenceRecord`; immutable manifests and lockfiles remain authoritative for the installed generation.
 
@@ -490,16 +491,16 @@ unknown or contradictory version evidence remains visible and blocks only the de
 
 A route is identified by the full `RouteFingerprint`, not by a model ID or vendor label. Every line above is `PROVISIONAL` until exact-version conformance and current-account probes produce evidence. The research sources for this baseline are non-normative and are recorded in I0.3; the current primary-source checks and admission status live in the content-addressed compatibility-evidence receipt bound by the normative-pair identity.
 
-### Решение по SurrealDB
+### SurrealDB decision
 
-SurrealDB используется первым, потому что graph, document, temporal и structured representations доступны под одним transaction boundary. Риск лицензии и vendor dependence признаётся заранее. Поэтому:
+SurrealDB is first because graph, document, temporal, and structured representations are available under one transaction boundary. License risk and vendor dependence are acknowledged in advance. Therefore:
 
 ```text
-eliotd не импортирует SurrealDB SDK;
-DB credentials принадлежат только storage bridge;
-все операции выражаются store-neutral semantic API;
-полный canonical export обязателен;
-shadow migration к другому store является штатным сценарием.
+`eliotd` does not import the SurrealDB SDK;
+database credentials belong only to the storage bridge;
+all operations use a store-neutral semantic API;
+full canonical export is mandatory;
+shadow migration to another store is a normal scenario.
 ```
 
 The choice remains an empirical Default, not a reward for using more SurrealDB-specific syntax. After D1, a `StorageValueProfile` is compiled from the actual named-operation registry:
@@ -524,7 +525,7 @@ If the real workload gains little from the hybrid transaction/query model, simpl
 
 The first supported topology is one installation with one logical canonical owner on one primary machine. Two installations do not become replicas merely because they share documents, a provider account or exported files. Cross-device canonical replication, offline multi-writer merge and automatic multi-node failover are not current capabilities. Until a future distributed contract is accepted, transfer between installations uses explicit export/import or migration receipts, and each installation remains an independent authority lineage. Optional remote workers may execute bounded jobs but never become another canonical owner.
 
-## I0.3. Источники решений
+## I0.3. Decision sources
 
 Authority and evidence classes are stable; filenames and audit chronology are not part of the normative contract:
 
@@ -536,20 +537,20 @@ Authority and evidence classes are stable; filenames and audit chronology are no
 
 A named report, date, vendor document or prior assistant answer never acquires standing by being listed here. The active evidence ledger supplies exact digests and current dispositions; chronological audit prose remains outside this book.
 
-## I0.4. Классы изменения
+## I0.4. Change classes
 
-| Класс | Пример | Кто принимает | Минимальная проверка |
+| Class | Example | Decider | Minimum verification |
 |---|---|---|---|
-| Local | текст UI, isolated parser, report format | module owner | module checks |
-| Compatible module | новая generation модуля без state migration | module owner + supervisor policy | contract + affected integration + canary |
+| Local | UI text, isolated parser, report format | Module owner | Module checks |
+| Compatible Module | new Module generation without state migration | Module owner + supervisor policy | contract + affected integration + canary |
 | Cross-module | protocol field, shared contract, dependency edge | integration owner | affected graph + compatibility suite |
 | Load-bearing | Kernel, store semantics, authority, ORS, security boundary | System Owner + architecture/conformance review | dedicated fault/migration suite |
-| Release | опубликованная installation | release owner | полный release gate |
-| Architecture-impacting | меняет Intent/Hard Boundary | Architecture Owner | Architecture revision before code promotion |
+| Release | published installation | release owner | full release gate |
+| Architecture-impacting | changes Intent or Hard Boundary | Architecture Owner | Architecture revision before code promotion |
 
 ### Normative pair and evidence artifact identity
 
-Только `ELIOT_ARCHITECTURE.md` и `ELIOT_IMPLEMENTATION.md` образуют нормативную пару. Audit, research, migration, benchmark и generated projection являются evidence artifacts: они могут опровергнуть support claim, открыть gap или предложить изменение, но не получают нормативную силу от имени, даты, полноты или количества ссылок.
+Only `ELIOT_ARCHITECTURE.md` and `ELIOT_IMPLEMENTATION.md` form the normative pair. Audits, research, migrations, benchmarks, and generated projections are evidence artifacts: they may disprove a support claim, open a gap, or propose a change, but gain no normative force from name, date, completeness, or citation count.
 
 ```yaml
 NormativePairDocumentIdentity:
@@ -606,21 +607,23 @@ EvidenceExecutionStatus
 
 A detailed schema, trait, command or state machine in this book is `TARGET` unless exact current source handles and current Product Identity evidence say otherwise. `TARGET` is a design obligation, not evidence that a capability exists. A source implementation can be `CURRENT_UNVERIFIED`; a generated report cannot promote it.
 
-Canonical evidence binds every support claim to an exact Product Identity and invalidation set. `docs/conformance.toml` is a generated, read-only projection:
+Canonical evidence binds every support claim to an exact Product Identity and invalidation set. `docs/conformance.toml` is the deterministic, read-only **documentation projection** of M1 Architecture IDs and Appendix H. It proves mapping completeness only; it is not runtime/source support evidence and cannot promote any row above `TARGET` / `NOT_EXECUTED` without separate exact evidence. Each row preserves the exact human Appendix-H owner cell as `owner_projection`; that field is unparsed documentation text, not an executable owner registry or authority grant:
 
 ```toml
+projection_status = "DOCUMENTATION_TARGET"
+runtime_evidence_status = "NOT_EVIDENCE"
+normative_pair_receipt = "docs/normative-pair.toml"
+
 [[requirement]]
 id = "ARCH-MOD-01"
-owner = "eliot-kernel"
-mechanisms = ["module_catalog", "generation_registry", "generation_router", "host_supervisor"]
-failure_behavior = "optional module quarantined; kernel remains responsive"
+owner_projection = "I1, I2, I14.14–I14.16"
+observable_proof_family = "optional module crash while Kernel remains healthy"
 contract_maturity = "SKELETON"
 implementation_support = "TARGET"
-product_identity_ref = "product:..."
+evidence_execution_status = "NOT_EXECUTED"
 source_handles = []
 evidence_refs = []
-invalidation = ["kernel_artifact", "host_artifact", "generation_contract", "supervision_policy"]
-notes = ""
+notes = "documentation mapping only; exact runtime/source support remains unproven"
 ```
 
 Rules:
@@ -657,8 +660,11 @@ CurrentSystemEvidenceSnapshot:
     integrations: OBSERVED | NOT_RUNNING | UNAVAILABLE | UNKNOWN | STALE | CONFLICTED
   capability_support_rows:
     - contract_ref:
+      support_claim_ref:
+      support_observation_state: OBSERVED | NOT_RUNNING | UNAVAILABLE | UNKNOWN | STALE | CONFLICTED
+      contract_maturity:
       implementation_support:
-      execution_status:
+      evidence_execution_status:
       source_handles:
       evidence_refs:
       blind_or_unobserved_boundaries:
@@ -667,57 +673,59 @@ CurrentSystemEvidenceSnapshot:
   generated_at_expiry_and_invalidation:
 ```
 
+Each capability row carries the exact three I0.5 dimensions. `support_observation_state` describes observation availability/state only; it is not an `ImplementationSupport` value. `UNKNOWN`, `UNAVAILABLE`, `NOT_RUNNING` or `CONFLICTED` observation cannot be copied into support, maturity or evidence execution. A bound support claim remains at the strongest state actually justified by exact evidence: absent source evidence stays `TARGET` / `NOT_EXECUTED`; present but behavior-unproven source may be `CURRENT_UNVERIFIED`; incomplete behavior may be `PARTIAL` or `DEGRADED`; invalidated evidence is `STALE`. A report may render these values only from `support_claim_ref`; manual report text cannot promote them.
+
 `CurrentSystemEvidenceCompiler` is a D0 FunctionalCapabilityCell with no canonical mutable state. Its source-maintenance owner is the first-party `eliot-bootstrap` crate; its D0 execution owner is the short-lived `eliot.exe` command `eliot system snapshot`. After InstrumentRunner exists, the same pure compiler core executes as a typed Instrument profile and Governor admits the immutable artifact. The crate also contains the bootstrap-only adapters required to read exact repository/worktree identity, build artifacts, service/process manifests, config/policy, optional runtime/store probes and integration manifests; platform/tool adapters remain behind narrow ports. It never infers a running system from prose or a PID alone, and it does not become a daemon, store or status owner.
 
 The compiler has an independent ModuleTestCapsule covering partial source trees, absent runtime/store, stale manifests, conflicting identities, forged support statuses and interrupted probes. A Human-provided fact is preserved as an attributed observation; it cannot directly set `CURRENT_VERIFIED` or `EXECUTED`. Manual YAML editing is not an admitted producer.
 
-The snapshot is regenerated after any source/runtime/data change and before a repair campaign, repository cutover, old-document deletion or product claim. Missing domains remain explicit and leave only dependent support `UNKNOWN`; an absent runtime is `NOT_RUNNING`, not a global compiler failure. Absence or staleness never promotes a target contract to current support.
+The snapshot is regenerated after any source/runtime/data change and before a repair campaign, repository cutover, old-document deletion or product claim. Missing domains remain explicit as `support_observation_state = NOT_RUNNING | UNKNOWN | UNAVAILABLE | STALE | CONFLICTED`; they never create an `ImplementationSupport` value. An absent runtime is `NOT_RUNNING`, not a global compiler failure. Dependent support remains at the strongest state justified by exact current evidence; absence or staleness never promotes a target contract to current support.
 
 ## I0.6. Decision records
 
-ADR требуется только если решение:
+An ADR is required only when a decision:
 
 ```text
-меняет load-bearing default;
-создаёт новую authority или state owner;
-добавляет hard dependency Kernel;
-меняет canonical format/protocol;
-отклоняется от Architecture;
-делает эксперимент production default.
+changes a load-bearing default;
+creates a new authority or state owner;
+adds a Kernel hard dependency;
+changes a canonical format or protocol;
+deviates from Architecture;
+makes an experiment the production default.
 ```
 
-Обычная реализация существующего contract не требует ADR.
+Ordinary implementation of an existing contract does not require an ADR.
 
-## I0.7. Правило остановки документационного цикла
+## I0.7. Documentation-cycle stopping rule
 
-Implementation считается достаточно определённой для начала code work, когда:
+Implementation is sufficiently defined for code work when:
 
 ```text
-определён owner каждого процесса и mutable state;
-определены protocol и failure behavior первого vertical spine;
-нет скрытого второго write path;
-можно построить, запустить, проверить и остановить систему;
-локальное изменение имеет понятный affected-test path;
-неизвестные детали обозначены Research Gate, а не замаскированы догадкой.
+an owner exists for every process and mutable state;
+the protocol and failure behavior of the first vertical spine are defined;
+there is no hidden second write path;
+the system can be built, started, verified, and stopped;
+a local change has a clear affected-test path;
+unknown details are marked as a Research Gate rather than disguised as guesses.
 ```
 
-Документ не обязан заранее определить каждую структуру данных. Конкретная структура появляется тогда, когда она нужна ближайшему слою.
+The document need not define every data structure in advance. A concrete structure appears when required by the next layer.
 
-После достижения этих условий новый prose-блок допускается только если он закрывает нерешённое решение ближайшего executable slice. Wire schemas, error registries, state tables, test inventories, compatibility matrices и contract indexes по мере реализации переходят в generated artifacts; в книге остаются rationale, owners, failure behavior и links.
+After these conditions are met, new prose is allowed only when it closes an unresolved decision in the next executable slice. As implementation proceeds, wire schemas, error registries, state tables, test inventories, compatibility matrices, and contract indexes move to generated artifacts; the book retains rationale, owners, failure behavior, and links.
 
-`ContractSurfaceProfile` отслеживает не «качество документа» одним числом, а эксплуатационную цену:
+`ContractSurfaceProfile` measures not “document quality” with one number, but operational cost:
 
 ```text
-число contracts, фактически применимых к одному work unit;
+number of contracts actually applicable to one work unit;
 serialized instruction/contract token cost;
-число expansion handles и stale projections;
-change fan-out одного contract;
-время orientation и частоту Contract Challenge;
-ошибки agents из-за конфликтующих или перегруженных instructions;
-долю prose, уже дублирующую executable schema/code.
+number of expansion handles and stale projections;
+change fan-out of one contract;
+orientation time and Contract Challenge frequency;
+agent errors caused by conflicting or overloaded instructions;
+share of prose already duplicating executable schema or code.
 ```
 
-Рост этой поверхности без Product/Recovery delta запускает simplification/merge/generation review, а не новую документационную кампанию.
+Growth of this surface without Product or Recovery delta triggers simplification, merge, or generation review—not another documentation campaign.
 
 ---
 
@@ -967,26 +975,26 @@ The D0 `BootstrapRuleCatalogueCompiler` is a third pure FunctionalCapabilityCell
 
 ## I0.11. Research, donor and audit evidence policy
 
-Research papers, external projects, legacy books and model audits are evidence and mechanism donors. Они не являются третьей нормативной книгой и не получают runtime authority.
+Research papers, external projects, legacy books, and model audits are evidence and mechanism donors. They are not a third normative book and receive no runtime authority.
 
-Три разных результата нельзя смешивать:
+Three distinct results must not be conflated:
 
 ```text
 Source inventory
-  — источник действительно прочитан и его самостоятельные идеи перечислены;
+  — the source was actually read and its independent ideas listed;
 
 Semantic disposition
-  — каждая применимая идея получила RETAIN / MERGE / SUPERSEDE /
-    DEFER / REJECT с rationale;
+  — every applicable idea received RETAIN, MERGE, SUPERSEDE,
+    DEFER, or REJECT with rationale;
 
 Implementation support
-  — механизм существует в exact source/runtime/data identity и прошёл
-    применимый executed proof.
+  — the mechanism exists in exact source, runtime, and data identity and passed
+    applicable executed proof.
 ```
 
-Количество headings, keywords, catalogue rows или mapped findings доказывает только inventory/traceability. Оно не доказывает semantic correctness и тем более support кодом.
+Counts of headings, keywords, catalogue rows, or mapped findings prove only inventory and traceability. They do not prove semantic correctness, much less code support.
 
-Каждая принятая donor-идея имеет:
+Every accepted donor idea has:
 
 ```text
 pinned source identity;
@@ -997,13 +1005,13 @@ support status and invalidation set;
 explicitly rejected overgeneralization.
 ```
 
-Audit chronology, source inventories and detailed dispositions живут во внешнем content-addressed evidence ledger. Эта книга хранит только текущий договор. Изменение Implementation не считается закрытым новым отчётом: audit/evidence must be rebound to the exact new bytes.
+Audit chronology, source inventories, and detailed dispositions live in an external content-addressed evidence ledger. This book stores only the current contract. An Implementation change is not closed by a new report: audit and evidence must be rebound to the exact new bytes.
 
 ## I0.12. Prototype and execution-contour policy
 
-ELIOT является crate-rich, process-sparse и owner-sparse. Source decomposition, execution isolation и deployment lifecycle являются разными решениями.
+ELIOT is crate-rich, process-sparse, and owner-sparse. Source decomposition, execution isolation, and deployment lifecycle are separate decisions.
 
-Текущие execution defaults:
+Current execution defaults:
 
 ```text
 pure bounded experimental logic
@@ -1016,17 +1024,17 @@ measured trusted hot path
   → static native release generation only after evidence.
 ```
 
-Для default no-authority component contour `PrototypeContourDecision` генерируется автоматически из Module contract и manifest. Ручное rationale обязательно только когда prototype:
+For the default no-authority component contour, `PrototypeContourDecision` is generated automatically from the Module contract and manifest. Manual rationale is mandatory only when a prototype:
 
 ```text
-выбирает non-default contour;
-получает credentials, authority или external effects;
-переходит в canary/active traffic;
-изменяет state/migration/recovery semantics;
-претендует на static-native promotion.
+selects a non-default contour;
+receives credentials, authority, or external effects;
+enters canary or active traffic;
+changes state, migration, or recovery semantics;
+claims static-native promotion.
 ```
 
-Promotion остаётся поколенческим:
+Promotion remains generational:
 
 ```text
 contract/conformance
@@ -1037,13 +1045,13 @@ contract/conformance
 → drain / forward rollback.
 ```
 
-Ни WASM, ни process isolation, ни static linking не создают semantic authority. Один contour-independent core и conformance corpus проверяют эквивалентность допустимых backends.
+Neither WASM, process isolation, nor static linking creates semantic authority. One contour-independent core and conformance corpus test equivalence across admissible backends.
 
 ## I0.13. Current support, conformance and product status
 
-Architecture определяет смысл; Implementation — текущий target contract; exact code/runtime/data evidence показывает поддержку.
+Architecture defines meaning; Implementation defines the current target contract; exact code, runtime, and data evidence demonstrates support.
 
-Каждый load-bearing contract имеет независимый `ImplementationSupport`:
+Every load-bearing contract has independent `ImplementationSupport`:
 
 ```text
 CURRENT_VERIFIED;
@@ -1058,9 +1066,9 @@ STALE;
 NOT_APPLICABLE.
 ```
 
-Prose type, CLI example, schema, report or generated catalogue row по умолчанию является `TARGET`, если отсутствуют exact source handles, Product Identity, executed evidence, verifier и invalidation set.
+A prose type, CLI example, schema, report, or generated catalogue row is `TARGET` by default unless exact source handles, Product Identity, executed evidence, verifier, and invalidation set exist.
 
-Текущий product status:
+Current product status:
 
 ```text
 Architecture direction: accepted for continued design;
@@ -1071,7 +1079,7 @@ live store/data revision: UNKNOWN;
 product: NOT_ACCEPTED / UNVERIFIED.
 ```
 
-Ни audit package, ни manifest, ни число тестов не могут повысить этот статус без Product Proof.
+No audit package, manifest, or test count can elevate this status without Product Proof.
 
 ## I0.14. Documentation and evidence-build integrity
 
@@ -1151,31 +1159,31 @@ Only the two document digests form `pair_key`. Requirements ledgers, contract ca
 
 The Implementation never contains its own final digest as authority. Handshakes, cutovers and audits use the external pair receipt. A normal working-draft edit needs no content-addressed package until one of the freeze/publication triggers occurs.
 
-# I1. Конкретная process topology
+# I1. Concrete process topology
 
-## I1.1. Принцип процессов
+## I1.1. Process principle
 
-Process boundary используется там, где требуется хотя бы одно:
+A process boundary is used when at least one of these is required:
 
 ```text
-независимый restart;
+independent restart;
 hot replacement;
-изоляция crash/native code;
-изоляция credentials;
-ограничение resource usage;
-подключение неизменённого стороннего проекта;
-независимое security observation.
+isolation of crashes or native code;
+credential isolation;
+resource-use limits;
+connection of an unchanged third-party project;
+independent security observation.
 ```
 
-Pure computation с безопасной cancellation остаётся in-process task/crate. Не каждое понятие Architecture становится процессом.
+Pure computation with safe cancellation remains an in-process task or crate. Not every Architecture concept becomes a process.
 
-## I1.2. Обязательные процессы первого полного runtime
+## I1.2. Required processes of the first complete runtime
 
 ### 1. `eliot-host.exe`
 
-Минимальный Windows service и внешний Host Supervisor.
+Minimal Windows service and external Host Supervisor.
 
-**Владеет:**
+**Owns:**
 
 ```text
 installation root;
@@ -1185,25 +1193,25 @@ start/stop/restart Kernel;
 start/stop isolated managed dependency branches, including the canonical store process;
 request start/stop of the independent Watchdog service through SCM;
 last-known-good selection for managed Kernel/dependency artifacts;
-минимальный recovery/rollback command channel.
+minimal recovery and rollback command channel.
 
 Host does not select or replace its own service binary while running; Host-service replacement belongs to the installer/SCM procedure of I14.
 ```
 
-**Не владеет:** project semantics, canonical memory, sessions, tasks, model routing, repairs, architecture decisions.
+**Does not own:** project semantics, canonical memory, Sessions, tasks, model routing, repairs, or Architecture decisions.
 
-Код должен быть мал, dependency-light и редко изменяться. Он не загружает SurrealDB SDK, MCP, HTTP UI или model clients.
+The code must remain small, dependency-light, and rarely changed. It loads no SurrealDB SDK, MCP, HTTP UI, or model clients.
 
 ### 2. `eliot-kernel.exe`
 
-Живучая часть Governor.
+Resilient part of Governor.
 
-**Владеет:**
+**Owns:**
 
 ```text
 local front-door IPC;
 principal/session binding;
-Authority Epochs и fencing;
+Authority Epochs and fencing;
 Operational Recovery State;
 Control Reserve;
 Module/daemon generation routing;
@@ -1213,17 +1221,17 @@ startup/drain orchestration;
 connection to store bridge.
 ```
 
-**Не выполняет:** semantic curation, Dreamer jobs, code graphs, UI, full task planning, broad retrieval.
+**Does not perform:** semantic curation, Dreamer jobs, code graphs, UI, full task planning, or broad retrieval.
 
 ### 3. `eliotd.exe`
 
-Основной application daemon Governor.
+Primary Governor application daemon.
 
-**Владеет:**
+**Owns:**
 
 ```text
 WorkScopes;
-tasks и current plan revisions;
+tasks and current plan revisions;
 write admission;
 read models;
 Context Compiler;
@@ -1231,18 +1239,18 @@ Agent Coordinator;
 Durable Jobs;
 problem/conflict/attention application state;
 module orchestration;
-reports и normal API behavior.
+reports and normal API behavior.
 ```
 
-Он hot-replaceable Kernel-ом. Его restart не меняет canonical owner и не легализует старые leases.
+Kernel can hot-replace it. Its restart changes neither canonical owner nor the validity of stale leases.
 
 ### 4. `eliot-watchdog.exe`
 
-Независимый supervision daemon, установленный как отдельный SCM-managed service/process. Host запрашивает его start/stop через SCM, но не владеет его Job Object или kill-on-close handle. Поэтому crash Host/Kernel/`eliotd` не уничтожает Watchdog автоматически. Watchdog сохраняет минимальный независимый signal spool и audit anchor.
+Independent supervision daemon installed as a separate SCM-managed service or process. Host requests start and stop through SCM, but owns neither its Job Object nor a kill-on-close handle. A Host, Kernel, or `eliotd` crash therefore does not automatically terminate Watchdog. Watchdog preserves a minimal independent signal spool and audit anchor.
 
 ### 5. `eliot-store-surreal.exe`
 
-Storage bridge. Единственный ELIOT-процесс с SurrealDB credentials и SDK.
+Storage bridge. The only ELIOT process with SurrealDB credentials and SDK.
 
 ```text
 Kernel / eliotd
@@ -1252,7 +1260,7 @@ Kernel / eliotd
 → SurrealDB server.
 ```
 
-Bridge принимает только закрытые semantic store operations и named queries. Raw SurrealQL через runtime protocol запрещён.
+Bridge accepts only closed semantic store operations and named queries. Raw SurrealQL over the runtime protocol is prohibited.
 
 ### 6. BlobStore capability; optional `eliot-blob.exe` generation
 
@@ -1271,21 +1279,21 @@ The target process boundary isolates untrusted large payloads, compression/nativ
 
 ### 7. `surreal.exe`
 
-Отдельный Host-managed dependency process в собственном Job Object, владеющий database files. Он может запускаться demand-start и переживает restart `eliot-kernel`/`eliotd`, потому что не находится в Kernel Job Object. Host запускает его по immutable process manifest и наблюдает process exit; Kernel/store bridge проверяют database readiness и semantic compatibility. ELIOT не требует от upstream `surreal.exe` реализации Windows SCM service protocol и не вводит сторонний service-wrapper как обязательную часть topology.
+Separate Host-managed dependency process in its own Job Object, owning the database files. It may start on demand and survives restart of `eliot-kernel` or `eliotd` because it is not in the Kernel Job Object. Host starts it from an immutable process manifest and observes process exit; Kernel and store bridge check database readiness and semantic compatibility. ELIOT does not require upstream `surreal.exe` to implement the Windows SCM service protocol and does not make a third-party service wrapper mandatory.
 
-## I1.3. Optional и on-demand processes
+## I1.3. Optional and on-demand processes
 
 ### `eliot-dreamer.exe`
 
-Отдельный AI service/server. Запускается при первом Dreamer job либо в maintenance window. После idle period останавливается.
+Separate AI service or server. Starts with the first Dreamer job or in a maintenance window, then stops after an idle period.
 
 ### `eliot-doctor.exe`
 
-Короткоживущий diagnostic/repair worker. Обычно `eliotd` запрашивает его запуск, но физически его может запустить Kernel по Recovery Manifest, когда application daemon недоступен. Постоянный Doctor agent запрещён. Любой canonical результат Doctor применяет только через Kernel/Governor recovery gateway.
+Short-lived diagnostic and repair worker. `eliotd` usually requests its start, but Kernel may cause it to start through Recovery Manifest when the application daemon is unavailable. A persistent Doctor agent is prohibited. Any canonical Doctor result applies only through the Kernel or Governor recovery gateway.
 
 ### `eliot-mod-<id>.exe`
 
-Process-модули: code graph, LSP bridge, Researcher, external tool, cloud laboratory, model provider, report renderer и другие optional capabilities.
+Process Modules: code graph, LSP bridge, Researcher provider, external tool, cloud laboratory, model provider, report renderer, and other optional capabilities.
 
 ### `eliot-ui.exe`
 
@@ -1334,21 +1342,21 @@ eliot ui
 eliot dashboard
 ```
 
-`eliotctl` and `eliot-dev` are not canonical command names. Temporary migration shims, if shipped, only forward to `eliot` and are excluded from generated help/contracts after their declared expiry. Appendix J is generated from the same command catalogue and `eliot --help`; prose cannot define a second CLI.
+`eliotctl` and `eliot-dev` are not canonical command names. Temporary migration shims, if shipped, only forward to `eliot` and are excluded from generated help/contracts after their declared expiry. The current Appendix J artifact is a bootstrap retained candidate catalogue; only a future admitted command catalogue plus compiled `eliot --help`, exact source handles and execution receipts can establish support. Prose cannot define a second CLI.
 
 ### `eliot-notify.exe`
 
 Per-user, one-shot notification adapter. Normal launch is through the authorized User Broker. For control-plane loss, installation may register a signed Task Scheduler fallback that launches it in an existing authorized user session to read only the signed Watchdog notification envelope. It owns no canonical state and cannot execute repair or authority transitions. Its processes belong to the User Broker Job Object or the installer-owned one-shot scheduled-task boundary and terminate after delivery.
 
 
-Тонкие процессы `eliot-agent-bridge.exe --profile <id>`. Они:
+Thin processes `eliot-agent-bridge.exe --profile <id>`. They:
 
 ```text
-при необходимости запускают ELIOT через SCM;
-подключаются к Kernel pipe;
-переводят host protocol в EBP/MCP;
-не содержат durable state;
-не получают DB credentials.
+start ELIOT through SCM when needed;
+connect to the Kernel pipe;
+translate the host protocol into EBP or MCP;
+contain no durable state;
+receive no database credentials.
 ```
 
 ### `eliot-testd.exe`
@@ -1412,48 +1420,48 @@ Authorized interactive Windows user session
 
 The User Broker branch is deliberately outside SCM and Host Job Objects. It is supervised in the interactive user's security context, while Kernel owns only registration, route admission, scoped launch leases and reconciliation. Exactly one active broker registration is allowed per installation + Windows SID + interactive session; a new `UserBrokerEpoch` fences the previous registration, and processes from an old broker epoch cannot receive new effect authority.
 
-Watchdog является SCM-owned sibling service. Kernel и canonical-store process находятся в разных Host-owned Job Objects: restart Kernel/daemon не обязан останавливать database process, а падение Host завершает обе Host lineages, после чего SCM/Watchdog запускают recovery. Kernel всегда принадлежит ровно одному `HostInstallationEpoch` и dedicated Job Object. Unexpected Kernel exit causes Host to close/terminate the entire Kernel Job Object lineage before any replacement Kernel can activate; surviving child PIDs are never adopted as the new lineage. The separate canonical-store branch may remain running, but no bridge/daemon/module from the failed Kernel branch retains authority. Потеря Host process закрывает Job Objects и завершает управляемые process lineages; detached Kernel или store process не считаются продолжающими действующую supervision/authority. Если OS не позволяет доказать завершение, Watchdog помечает lineage как suspect, normal admission закрывается, а новый Host сначала выполняет containment/fencing и store-integrity probe.
+Watchdog is an SCM-owned sibling service. Kernel and the canonical-store process reside in separate Host-owned Job Objects: restarting Kernel or daemon need not stop the database process, while Host failure terminates both Host lineages, after which SCM and Watchdog initiate recovery. Kernel always belongs to exactly one `HostInstallationEpoch` and dedicated Job Object. Unexpected Kernel exit causes Host to close or terminate the entire Kernel Job Object lineage before any replacement Kernel can activate; surviving child PIDs are never adopted as the new lineage. The separate canonical-store branch may remain running, but no bridge, daemon, or Module from the failed Kernel branch retains authority. Loss of the Host process closes Job Objects and terminates managed process lineages; a detached Kernel or store process is not treated as continuing active supervision or authority. If the OS cannot prove termination, Watchdog marks the lineage suspect, closes normal admission, and requires the new Host to perform containment, fencing, and a store-integrity probe first.
 
-`eliotd` принимает semantic lifecycle decisions; Kernel физически выполняет start/stop/switch/fence. Service-safe Process Modules, Dreamer, Doctor and service-safe agent jobs are Kernel-supervised siblings of the current `eliotd`, so a daemon restart does not destroy them automatically or leave them with old authority. The native UI and subscription/desktop-bound agent jobs belong to the authenticated User Broker lineage; Kernel owns only their registration, admission, leases and reconciliation.
+`eliotd` makes semantic lifecycle decisions; Kernel physically performs start, stop, switch, and fence. Service-safe Process Modules, Dreamer, Doctor, and service-safe agent jobs are Kernel-supervised siblings of the current `eliotd`, so daemon restart neither destroys them automatically nor leaves them with old authority. Native UI and subscription or desktop-bound agent jobs belong to the authenticated User Broker lineage; Kernel owns only their registration, admission, leases, and reconciliation.
 
-На loss active daemon generation Kernel немедленно отзывает daemon-issued effect leases. Read-only/rebuildable Modules могут остаться warm, но новые результаты удерживаются как unbound observations до нового compatible daemon/fence. Effect-capable Modules и agent jobs checkpoint, pause или terminate по manifest.
+On loss of the active daemon generation, Kernel immediately revokes daemon-issued effect leases. Read-only or rebuildable Modules may remain warm, but new results are held as unbound observations until a new compatible daemon and fence exist. Effect-capable Modules and agent jobs checkpoint, pause, or terminate according to manifest.
 
-Restart semantics являются ELIOT contracts, а не требованием использовать Erlang runtime/framework:
+Restart semantics are ELIOT contracts, not a requirement to use an Erlang runtime or framework:
 
 ```text
 restart_self
-  — локальный restart одной независимой generation;
+  — local restart of one independent generation;
 
 restart_dependents
-  — restart только downstream capabilities, чьё state/fence зависит от failed upstream;
+  — restart only downstream capabilities whose state or fence depends on the failed upstream;
 
 restart_branch
-  — restart маленькой tightly coupled branch, если partial state опаснее краткого outage;
+  — restart a small tightly coupled branch when partial state is more dangerous than a brief outage;
 
 quarantine
-  — после restart budget capability отключается, Problem State остаётся open.
+  — after restart-budget exhaustion, disable the capability while Problem State remains open.
 ```
 
-Hard-dependency graph задаёт startup/drain/restart order и остаётся ацикличным. Siblings без invalidated dependency не перезапускаются.
+The hard-dependency graph defines startup, drain, and restart order and remains acyclic. Siblings without an invalidated dependency are not restarted.
 
-### Современное `let it crash`
+### Modern `let it crash`
 
-`Let it crash` применяется к изолированному вычислителю, а не к данным, authority или необратимому effect.
+`Let it crash` applies to an isolated executor—not to data, authority, or an irreversible effect.
 
 ```text
-ожидаемая ошибка
-→ typed result и Recovery Directive;
+expected error
+→ typed result and Recovery Directive;
 
-неожиданный internal defect
-→ task/process generation завершается;
-→ supervisor фиксирует evidence;
-→ stale Authority Epoch отсекается;
-→ replacement начинает с canonical/checkpointed state;
-→ неизвестный внешний outcome reconciles по receipt;
-→ повторяющийся crash ведёт к quarantine и escalation.
+unexpected internal defect
+→ task or process generation terminates;
+→ supervisor records evidence;
+→ stale Authority Epoch is rejected;
+→ replacement starts from canonical or checkpointed state;
+→ an unknown external outcome is reconciled by receipt;
+→ repeated crash leads to quarantine and escalation.
 ```
 
-Запрещено ловить panic и продолжать с неизвестным mutable state, бесконечно перезапускать child, повторять effect без idempotency/reconciliation, считать restart resolution Problem State или ронять независимые branches из-за optional Module.
+It is prohibited to catch a panic and continue with unknown mutable state, restart a child indefinitely, repeat an effect without idempotency and reconciliation, treat restart as resolution of Problem State, or terminate independent branches because an optional Module failed.
 
 ## I1.5. Demand-start, observable use, supervision and idle shutdown
 
@@ -1635,16 +1643,16 @@ Windows Task Scheduler invokes a bounded maintenance command only from an admitt
 DEFAULT:
 
 ```text
-отдельный Job Object создаётся на каждый failure domain/Module generation;
-Watchdog и Kernel не находятся в одном child-kill domain;
-все дочерние процессы помещаются в соответствующий Windows Job Object;
+a separate Job Object is created for each failure domain and Module generation;
+Watchdog and Kernel do not share a child-kill domain;
+all child processes enter the applicable Windows Job Object;
 Kernel descendants remain inside the Host-owned Kernel Job Object and MAY additionally enter nested per-Module/per-attempt Job Objects for tighter limits; startup probes verify the required nesting and kill-on-close semantics on the supported Windows build;
-process tree получает kill-on-close at the outer ownership boundary;
-CPU/memory/process limits задаются по Module Manifest;
+the process tree receives kill-on-close at its outer ownership boundary;
+CPU, memory, and process limits are set by Module Manifest;
 `system_service` uses a dedicated low-privilege service identity; `user_mode` runs under the current user without pretending to be an SCM service;
-named pipes имеют explicit ACL;
-модели и third-party modules не наследуют secrets по умолчанию;
-versioned binaries никогда не заменяются in-place во время исполнения.
+named pipes use explicit ACLs;
+models and third-party Modules do not inherit secrets by default;
+versioned binaries are never replaced in place while running.
 ```
 
 ### User-session isolation
@@ -1657,7 +1665,7 @@ Logout, session termination, policy change or broker loss revokes broker-bound e
 
 ## I1.7. Linux portability boundary
 
-Linux не является supported target первой линии, но следующие свойства запрещено связывать с Windows:
+Linux is not a supported first-line target, but the following properties must not be coupled to Windows:
 
 ```text
 module protocol messages;
@@ -1669,7 +1677,7 @@ job/checkpoint model;
 agent interaction contracts.
 ```
 
-Platform layer изолирует:
+The platform layer isolates:
 
 | Windows | Future Linux |
 |---|---|
@@ -1680,7 +1688,7 @@ Platform layer изолирует:
 | DPAPI / Credential Manager | keyring / secret service |
 | Windows notifications | desktop notification adapter |
 
-Linux support начинается только после CI, packaging и fault tests на реальной Linux installation.
+Linux support begins only after CI, packaging, and fault tests on a real Linux installation.
 
 ---
 
@@ -1936,26 +1944,26 @@ If the User Broker is unavailable, only user-session-bound routes are deferred o
 
 ---
 
-# I2. Rust workspace, crate fleet, ownership и hot path
+# I2. Rust workspace, crate fleet, ownership, and hot path
 
-## I2.1. Основное решение: crate-rich, process-sparse, owner-sparse
+## I2.1. Primary decision: crate-rich, process-sparse, owner-sparse
 
-ELIOT использует **много небольших crates** как нормальную единицу сборки, package-selective testing, dependency containment и агентного контекста. Crate может иметь source-maintenance owner, но сам по себе не создаёт lifecycle, mutable-state или authority owner; эти владельцы принадлежат `FunctionalCapabilityCell`/service contract и могут охватывать несколько crates.
+ELIOT uses **many small crates** as the normal unit of build, package-selective testing, dependency containment, and agent context. A crate may have a source-maintenance owner, but creates no lifecycle, mutable-state, or authority owner by itself; those owners belong to the `FunctionalCapabilityCell` or service contract and may span several crates.
 
-Ограничивать систему несколькими крупными crates неправильно. Cargo workspace умеет выбирать packages через `-p`, `--workspace` и `default-members`, параллельно компилирует независимые units и переиспользует metadata/incremental artifacts. Практический предел определяется не количеством строк в `[workspace].members`, а качеством dependency graph, feature sets, proc-macros/build scripts, linker load, test binaries, ownership и контекстом агента.
+Restricting the system to a few large crates is incorrect. Cargo workspaces select packages through `-p`, `--workspace`, and `default-members`, compile independent units in parallel, and reuse metadata and incremental artifacts. The practical limit is determined not by the number of lines in `[workspace].members`, but by dependency-graph quality, feature sets, proc macros and build scripts, linker load, test binaries, ownership, and agent context.
 
-Целевая формула:
+Target formula:
 
 ```text
-много source/build crates
-+ существенно меньше runtime bundles/processes
-+ один владелец каждого mutable state
-+ один canonical semantic path.
+many source and build crates
++ substantially fewer runtime bundles and processes
++ one owner for each mutable state
++ one canonical semantic path.
 ```
 
-Crate не является microservice и не создаёт IPC сам по себе. Десятки crates могут быть статически слинкованы в один быстрый `eliotd.exe`. Process boundary появляется только ради отдельного failure/resource/credential/update boundary.
+A crate is not a microservice and does not create IPC by itself. Dozens of crates may be statically linked into one fast `eliotd.exe`. A process boundary appears only for a separate failure, resource, credential, or update boundary.
 
-### Три независимые величины
+### Three independent quantities
 
 ```text
 crate count
@@ -1968,13 +1976,13 @@ process count
   independently crashable, supervised and hot-replaceable runtime generations.
 ```
 
-Их запрещено отождествлять.
+They must not be conflated.
 
-### Четыре уровня модульности
+### Four levels of modularity
 
 ```text
 Rust module
-  минимальная source-навигация внутри одного owner;
+  minimum source navigation within one owner;
 
 Cargo crate
   independently selectable build/test/context/contract boundary;
@@ -1986,11 +1994,11 @@ deployment/service unit
   OS installation, activation, upgrade and rollback boundary.
 ```
 
-Переход на следующий уровень требует отдельного основания. Хороший Rust module не обязан становиться crate; хороший crate не обязан становиться процессом; процесс не обязан становиться постоянно работающей службой.
+Moving to the next level requires separate justification. A good Rust module need not become a crate; a good crate need not become a process; a process need not become a permanently running service.
 
 ### Migration baseline
 
-Пять текущих source owners сохраняются как migration facades, а не как вечная целевая структура:
+The five current source owners remain migration facades, not permanent target structure:
 
 ```text
 eliot-types
@@ -2000,11 +2008,11 @@ eliot-windows-ipc
 eliot-app
 ```
 
-Новая capability сначала получает ELIOT-owned contract и test seam. Затем код извлекается в отдельный crate без big-bang rewrite. Старый crate временно re-export-ит новый contract или вызывает новый service, пока callers не мигрированы.
+A new capability first receives an ELIOT-owned contract and test seam. Code is then extracted into a separate crate without a big-bang rewrite. The old crate temporarily re-exports the new contract or invokes the new service until callers migrate.
 
-Прежнее donor-решение «четыре/пять крупных crates» сохраняется только как карта исходных responsibility owners и migration facades. Как целевая physical source topology оно superseded этой crate-rich strategy: крупные responsibility domains остаются, но разбиваются на independently selectable contract/core/service/adapter crates.
+The previous donor decision of “four or five large crates” is retained only as a map of initial responsibility owners and migration facades. As target physical source topology, it is superseded by this crate-rich strategy: large responsibility domains remain, but split into independently selectable contract, core, service, and adapter crates.
 
-Запрещено создавать параллельные:
+Do not create parallel:
 
 ```text
 task graph;
@@ -2016,7 +2024,7 @@ finish authority;
 recovery path.
 ```
 
-Микромодульность изменяет физическую упаковку, но не размножает смысловых владельцев.
+Micro-modularity changes physical packaging, but does not multiply semantic owners.
 
 ### Workspace capacity is measured, not planned by crate count
 
@@ -2039,90 +2047,35 @@ Delivery Depth names capability families, not package counts. The same depth may
 
 ### Performance model
 
-Many-crate layout даёт:
+A many-crate layout provides:
 
 ```text
-меньшую единицу invalidation для private changes;
-больше независимых rustc jobs и package-selective commands;
-меньший agent source/context workset;
-раздельные vendor/feature dependencies;
-меньший merge, test и ownership blast radius.
+a smaller invalidation unit for private changes;
+more independent `rustc` jobs and package-selective commands;
+a smaller agent source and context workset;
+separated vendor and feature dependencies;
+a smaller merge, test, and ownership blast radius.
 ```
 
-Цена:
+Costs:
 
 ```text
-фиксированный rustc/metadata overhead на crate;
-больше incremental artifacts и rust-analyzer crate nodes;
-public API change пересобирает reverse closure;
-generic/monomorphized code может компилироваться в consumers;
-слишком мелкие crates создают manifests/glue/context fragmentation;
-общий target root может стать lock/I/O bottleneck;
-proc-macro/build-script dependency умножает compile cost по fan-out.
+fixed `rustc` and metadata overhead per crate;
+more incremental artifacts and rust-analyzer crate nodes;
+a public API change rebuilds its reverse closure;
+generic or monomorphized code may compile in consumers;
+overly small crates create manifest, glue, and context fragmentation;
+a shared target root may become a lock or I/O bottleneck;
+a proc-macro or build-script dependency multiplies compile cost across fan-out.
 ```
 
-Оптимум определяется не максимальным числом crates, а минимальным typical change closure при приемлемом fixed overhead. I2.16, I2.24 и CrateBuildProfile измеряют обе стороны.
+The optimum is not the maximum crate count, but the smallest typical change closure with acceptable fixed overhead. I2.16, I2.23, and CrateBuildProfile measure both sides.
 
-## I2.2. Когда capability становится отдельным crate
-
-Для ELIOT отдельный crate является **предпочтительным**, когда существует исполнимый contract/test/context seam и `CrateExtractionDecision` показывает ожидаемую пользу. Одного красивого имени или будущего плана недостаточно. Сильные основания:
-
-```text
-самостоятельный публичный или межслойный contract;
-самостоятельный unit/property/model test seam;
-отдельный owner или независимый agent work item;
-другой dependency/security/license profile;
-существенно другой change cadence;
-несколько consumers;
-тяжёлую optional dependency island;
-измеримый context/rebuild blast radius;
-отдельную возможность замены реализации;
-собственную pure state machine или causal responsibility.
-```
-
-Отдельный crate особенно предпочтителен, когда агент должен суметь:
-
-```text
-прочитать его целиком вместе с contract и тестами;
-изменить одну причинную ответственность;
-запустить package-local proof;
-увидеть one-hop consumers/providers;
-не загружать соседние подсистемы.
-```
-
-### Что остаётся обычным Rust module
-
-```text
-private helper без самостоятельного contract;
-маленькая группа типов, используемая одним parent module;
-реализация, которая всегда изменяется и тестируется вместе с owner;
-файл, выделенный только ради навигации;
-внутренний algorithm fragment без самостоятельной причины изменения.
-```
-
-### Когда crates следует объединить
-
-Crates объединяются, если одновременно наблюдается большинство признаков:
-
-```text
-они почти всегда меняются одним change unit;
-нет самостоятельного consumer или test selector;
-один crate является пустым pass-through другого;
-manifest/API overhead больше контекстной экономии;
-между ними постоянно протаскивается private state;
-boundary создаёт циклические adapter/facade конструкции;
-разделение не уменьшает build, fault, dependency или agent blast radius.
-```
-
-Crate-per-file и crate-per-type не являются целью. Для новой нетривиальной capability маленький crate является Default **после** появления исполнимого seam; до этого capability может жить как source micro-module в owning crate.
-
-The single normative `CrateExtractionDecision` shape is owned by I2.23. I2.2 supplies its admission criteria; it does not define a second record. A new package without a real consumer/test seam is rejected unless it is an explicitly time-bounded migration facade with an expiry and removal test. This prevents placeholder proliferation without restoring the old few-crate monolith.
-
-## I2.3. Workspace topology и dependency direction
+## I2.3. Workspace topology and dependency direction
 
 ### Root core workspace
 
-Первый production workspace содержит crates, необходимые для ежедневной разработки и нормального local runtime. Он использует:
+The first production workspace contains crates required for daily development and normal local runtime. It uses:
 
 ```toml
 [workspace]
@@ -2133,23 +2086,23 @@ default-members = [
 ]
 ```
 
-`default-members` не равен всем members. Обычный root command не должен случайно собирать fuzzing, mutation, cloud SDKs, all vendors и laboratory tools.
+`default-members` is not all members. A normal root command must not accidentally build fuzzing, mutation, cloud SDKs, all vendors, and laboratory tools.
 
 ### Federated workspaces
 
-Отдельный Cargo workspace создаётся не из-за большого числа crates, а при наличии dependency island:
+A separate Cargo workspace is created not because there are many crates, but when a dependency island exists:
 
 ```text
-другой toolchain или target;
-WASM/fuzz/Miri/Kani/nightly-only контур;
-тяжёлый vendor SDK, который инвалидирует core cache;
-upstream project, сохраняемый без переписывания;
-несовместимый dependency/MSRV/license profile;
-экспериментальная distributed/actor/runtime ветка;
-независимый release cadence optional module family.
+a different toolchain or target;
+a WASM, fuzz, Miri, Kani, or nightly-only contour;
+a heavy vendor SDK that invalidates the core cache;
+an upstream project preserved without rewriting;
+an incompatible dependency, MSRV, or license profile;
+an experimental distributed, actor, or runtime branch;
+an independent release cadence for an optional Module family.
 ```
 
-Стартовая repository topology:
+Initial repository topology:
 
 ```text
 /workspace/core         # root production workspace and daily default-members
@@ -2159,18 +2112,18 @@ upstream project, сохраняемый без переписывания;
 /upstream               # unchanged external source/bundles where applicable
 ```
 
-Физически эти каталоги вводятся по мере появления первого реального consumer. До доказанного cache/dependency конфликта допускается один root workspace.
+These directories appear physically as their first real consumer appears. One root workspace is allowed until a cache or dependency conflict is demonstrated.
 
-Cross-workspace связь идёт через:
+Cross-workspace connection uses:
 
 ```text
 versioned EBP/protocol schema;
 immutable artifact manifest;
-public ELIOT contract crate или generated schema package;
+a public ELIOT contract crate or generated schema package;
 contract digest and compatibility receipt;
 ```
 
-Один lockfile не является архитектурной целью. Один semantic owner и один causal order важнее одного Cargo workspace.
+One lockfile is not an architectural objective. One semantic owner and one causal order matter more than one Cargo workspace.
 
 ### Source layers
 
@@ -2191,103 +2144,103 @@ C4 process/surface composition
   binaries, service hosts, CLI, UI, bridges.
 ```
 
-Dependency direction только наружу:
+Dependency direction is outward only:
 
 ```text
 C4 → C3 → C2 → C1 → C0
 ```
 
-Допустима зависимость на более глубокий стабильный contract, но не на implementation более высокого слоя. Cycles в Cargo graph запрещены.
+A dependency on a deeper stable contract is allowed, but not on higher-layer implementation. Cargo graph cycles are prohibited.
 
 ### Contract hubs
 
-Crate с большим reverse-dependency fan-out является load-bearing hub. Он обязан:
+A crate with large reverse-dependency fan-out is a load-bearing hub. It must:
 
 ```text
-иметь минимальные dependencies;
-не содержать vendor/framework types;
-меняться редко;
-отделять additive schema change от breaking change;
-иметь public-contract digest и consumer tests;
-не становиться свалкой общих типов.
+have minimal dependencies;
+contain no vendor or framework types;
+change rarely;
+separate additive schema change from breaking change;
+have a public-contract digest and consumer tests;
+not become a dumping ground for common types.
 ```
 
-Нестабильная логика размещается ближе к leaf crates, а не в `eliot-common` или `eliot-types`.
+Unstable logic belongs near leaf crates, not in `eliot-common` or `eliot-types`.
 
-### Runtime control не меняет source ownership
+### Runtime control does not change source ownership
 
 ```text
-Host запускает Kernel;
-Kernel запускает generations;
-Governor планирует Modules;
-Watchdog наблюдает процессы;
-Modules возвращают candidates/events.
+Host starts Kernel;
+Kernel starts generations;
+Governor schedules Modules;
+Watchdog observes processes;
+Modules return candidates and events.
 ```
 
-Эти runtime arrows не разрешают импортировать внутренние типы управляемого компонента. Callback не передаёт ownership вызывающей стороне.
+These runtime arrows do not authorize importing the managed component's internal types. A callback does not transfer ownership to the caller.
 
 ### Lessons from Rust microservice systems
 
-ELIOT заимствует:
+ELIOT adopts:
 
 ```text
-малые стабильные contract crates;
-одного mutable-state owner на service;
-тонкие binary/composition crates;
-явные health/readiness/capacity surfaces;
+small stable contract crates;
+one mutable-state owner per service;
+thin binary and composition crates;
+explicit health, readiness, and capacity surfaces;
 composable timeout/load-shed/rate-limit/observability middleware;
 idempotent request/effect identity;
 consumer/provider contract tests;
-process deployment только на реальной failure boundary.
+process deployment only at a real failure boundary.
 ```
 
-ELIOT не заимствует:
+ELIOT does not adopt:
 
 ```text
-network hop между каждым source module;
+a network hop between every source module;
 service-per-entity/table;
-отдельную database для helper capability;
+a separate database for each helper capability;
 chatty distributed transactions;
-Kubernetes/gRPC как обязательную local baseline;
-protocol-generated types как единственный domain model.
+Kubernetes or gRPC as mandatory local baseline;
+protocol-generated types as the sole domain model.
 ```
 
-Tower-like `Service`/`Layer` composition допускается внутри transport/service crates. Tonic-like multi-crate organization полезна как пример раздельных contract/codegen/health/transport packages. Но local Windows ELIOT остаётся process-sparse: большая часть source micro-modularity статически линкуется в несколько supervised runtime bundles.
+Tower-like `Service` and `Layer` composition is allowed inside transport and service crates. Tonic-like multi-crate organization is useful as an example of separate contract, codegen, health, and transport packages. But local Windows ELIOT remains process-sparse: most source micro-modularity is statically linked into a few supervised runtime bundles.
 
-## I2.4. Erlang/OTP principles в Rust runtime
+## I2.4. Erlang/OTP principles in the Rust runtime
 
-ELIOT перенимает не синтаксис BEAM, а эксплуатационные принципы:
+ELIOT adopts operational principles, not BEAM syntax:
 
 ```text
-маленькие state owners;
-message passing вместо shared mutable cross-module state;
+small state owners;
+message passing instead of shared mutable cross-Module state;
 supervision tree;
 crash containment;
 bounded restart intensity;
-явные child classes;
+explicit child classes;
 immutable release generations;
 state migration before cutover;
-наблюдаемый recovery outcome.
+observable recovery outcome.
 ```
 
 ### Supervision strategies
 
-Два ортогональных поля используют тот же canonical vocabulary, что I14.10:
+Two orthogonal fields use the same canonical vocabulary as I14.10:
 
-| Поле | Значения | Применение |
+| Field | Values | Use |
 |---|---|---|
-| group strategy | `one_for_one` | restart только независимого failed child; DEFAULT |
-| group strategy | `rest_for_one` | restart failed child и явно объявленных downstream dependents |
-| group strategy | `one_for_all` | редко; только small inseparable supervision group |
-| child class | `temporary` | не перезапускать автоматически после завершения/отказа |
-| child class | `transient` | restart только после abnormal exit |
-| child class | `permanent` | restart после любого не-retirement exit в пределах policy |
+| group strategy | `one_for_one` | restart only the independent failed child; DEFAULT |
+| group strategy | `rest_for_one` | restart failed child and explicitly declared downstream dependents |
+| group strategy | `one_for_all` | rare; only for a small inseparable supervision group |
+| child class | `temporary` | do not restart automatically after completion or failure |
+| child class | `transient` | restart only after abnormal exit |
+| child class | `permanent` | restart after any non-retirement exit within policy |
 
-Стратегия объявляется в Module/Service manifest. Supervisor не угадывает её по имени процесса.
+The strategy is declared in the Module or Service manifest. Supervisor does not infer it from process name.
 
 ### Restart intensity
 
-Каждый supervisor branch имеет:
+Every supervisor branch has:
 
 ```text
 attempt budget;
@@ -2299,31 +2252,31 @@ escalation target;
 Problem State and receipts.
 ```
 
-Повторяющееся падение не создаёт вечный restart loop. После исчерпания budget ветка quarantined или escalation поднимается уровнем выше.
+Repeated failure does not create an endless restart loop. After budget exhaustion, the branch is quarantined or escalation moves one level higher.
 
 ### Rust boundary
 
-Rust не предоставляет безопасной общей замены произвольного машинного кода внутри живого процесса с сохранением state, как BEAM. Поэтому:
+Rust provides no safe general replacement of arbitrary machine code inside a live process while preserving state, as BEAM does. Therefore:
 
 ```text
 source crate
-  независимо собирается и тестируется;
+  built and tested independently;
 
 in-process service
-  заменяется restart текущей disposable service либо новым `eliotd` generation;
+  replaced by restarting the current disposable service or by a new `eliotd` generation;
 
 process Module
-  заменяется индивидуальной side-by-side process generation;
+  replaced by an individual side-by-side process generation;
 
 Kernel/Host
-  заменяются внешним supervisor cutover.
+  replaced by an external-supervisor cutover.
 ```
 
-Rust `cdylib` unloading и arbitrary in-process code injection не являются production plugin mechanism.
+Rust `cdylib` unloading and arbitrary in-process code injection are not production plugin mechanisms.
 
 ### Actor implementation
 
-ELIOT-owned supervision semantics находятся за `eliot-runtime` facade. DEFAULT — supervised Tokio tasks и typed bounded mailboxes. `ractor` может использоваться для подходящих service trees только после empirical gate и не определяет:
+ELIOT-owned supervision semantics remain behind the `eliot-runtime` facade. The DEFAULT is supervised Tokio tasks and typed bounded mailboxes. `ractor` may be used for suitable service trees only after an empirical gate and does not define:
 
 ```text
 authority;
@@ -2334,11 +2287,11 @@ cluster semantics;
 canonical task lifecycle.
 ```
 
-Distributed actor cluster library не является production dependency до отдельного conformance/failure proof.
+A distributed actor-cluster library is not a production dependency without separate conformance and failure proof.
 
 ### Graceful stop
 
-Каждая supervised task/process проходит:
+Every supervised task or process passes through:
 
 ```text
 stop admission
@@ -2353,76 +2306,76 @@ stop admission
 
 ## I2.5. `unsafe` policy
 
-`unsafe` разрешён только в явно перечисленных crates:
+`unsafe` is allowed only in explicitly listed crates:
 
 ```text
 eliot-platform-windows;
 eliot-platform-unix;
-при необходимости отдельный audited FFI bridge.
+when necessary, a separate audited FFI bridge.
 ```
 
-Каждый unsafe block имеет `// SAFETY:` rationale, local invariant test и владеющего reviewer. Domain, contract и Kernel pure-core crates используют `#![forbid(unsafe_code)]`.
+Every unsafe block has a `// SAFETY:` rationale, local invariant test, and owning reviewer. Domain, contract, and Kernel pure-core crates use `#![forbid(unsafe_code)]`.
 
 ## I2.6. Error and crash model
 
 ```text
 library crates
-  typed errors через `thiserror`;
+  typed errors through `thiserror`;
 
 process/protocol boundaries
   stable ErrorCode + structured RecoveryDirective;
 
 binaries
-  `anyhow` допустим только после преобразования domain error в operator context;
+  `anyhow` is allowed only after a domain error is converted into operator context;
 
 panic
-  implementation defect, а не normal control flow.
+  an implementation defect, not normal control flow.
 ```
 
-Error сохраняет:
+An error preserves:
 
 ```text
 operation identity;
 module/crate/generation;
-State Fence и Authority Epoch;
+State Fence and Authority Epoch;
 causal chain;
 retryability semantics;
 known/unknown effect status;
 raw evidence handle.
 ```
 
-In-process panic допускает local restart только при выполнении условий I2.4/I14. Иначе завершается generation. Process crash является нормальной supervision event, но не считается успешным recovery без verifier.
+An in-process panic permits local restart only under I2.4 and I14. Otherwise the generation terminates. A process crash is a normal supervision event, but not successful recovery without a verifier.
 
-## I2.7. Build profiles и compilation modes
+## I2.7. Build profiles and compilation modes
 
-ELIOT не использует один Cargo profile для всех целей.
+ELIOT does not use one Cargo profile for every purpose.
 
 ### `dev-local`
 
 ```text
 incremental = true;
-отдельный target root на worktree/build fingerprint;
-package-local `cargo check -p` и focused tests;
-максимально быстрый feedback активному agent;
-sccache не предполагается эффективным, пока incremental включён.
+separate target root per worktree or build fingerprint;
+package-local `cargo check -p` and focused tests;
+fastest possible feedback to the active agent;
+`sccache` is not assumed effective while incremental compilation is enabled.
 ```
 
 ### `dev-shared`
 
 ```text
 incremental = false;
-`sccache` MAY использоваться через ProcessExecutor;
-контентно адресуемый BuildFingerprint;
-подходит для повторяющихся builds разных worktrees/agents;
-не является proof без фактического test/verifier run.
+`sccache` MAY be used through ProcessExecutor;
+content-addressed BuildFingerprint;
+suitable for repeated builds across worktrees or agents;
+is not proof without an actual test or verifier run.
 ```
 
 ### `edge`
 
 ```text
 real adapter/process/store/protocol boundary;
-отдельная fixture namespace и resource lease;
-codegen/linking errors проверяются реальным build, а не только `cargo check`.
+separate fixture namespace and resource lease;
+codegen and linking errors are checked by a real build, not only `cargo check`.
 ```
 
 ### `product-pulse`
@@ -2430,9 +2383,9 @@ codegen/linking errors проверяются реальным build, а не т
 ```text
 actual front door;
 accepted owner path;
-минимальный real artifact/effect;
+minimum real artifact or effect;
 bounded frequency;
-может выполняться на candidate generation рядом с live stable generation.
+may run on a candidate generation beside the live stable generation.
 ```
 
 ### `release`
@@ -2448,18 +2401,18 @@ full release proof.
 ### Rules
 
 ```text
-`cargo check` даёт быстрый Shape/Module signal, но не доказывает codegen/link/runtime;
-`cargo build --timings` регулярно измеряет compiler units, critical path и parallelism;
-profile identity входит в BuildFingerprint;
-result одного profile не переименовывается в proof другого;
-cache hit ускоряет compilation, но не переносит test verdict.
+`cargo check` provides a fast Shape or Module signal, but does not prove codegen, linking, or runtime;
+`cargo build --timings` regularly measures compiler units, critical path, and parallelism;
+profile identity belongs to BuildFingerprint;
+a result from one profile is not renamed as proof for another;
+a cache hit accelerates compilation but transfers no test verdict.
 ```
 
-Release binaries строятся из thin binary crates; substantial logic находится в library crates. Это улучшает independently cached/tested source units и не даёт bin crate стать integration monolith.
+Release binaries are built from thin binary crates; substantial logic lives in library crates. This improves independently cached and tested source units and prevents a binary crate from becoming an integration monolith.
 
 ## I2.8. Package metadata, source ownership and generated registry
 
-Отдельный `OWNER.toml` на каждый маленький crate создаёт file ceremony. Выводимые source/build metadata размещаются в `Cargo.toml`; causal/lifecycle ownership остаётся у `FunctionalCapabilityCell` и Module/service contracts.
+A separate `OWNER.toml` for every small crate creates file ceremony. Derivable source and build metadata lives in `Cargo.toml`; causal and lifecycle ownership remains with `FunctionalCapabilityCell` and Module or service contracts.
 
 ```toml
 [package.metadata.eliot]
@@ -2472,7 +2425,7 @@ contract_refs = ["..."]
 component_contract_ref = "" # only when a real multi-contour component exists
 ```
 
-Из `cargo metadata`, source annotations, contract catalogue, test inventory и runtime manifests генерируется `CrateRegistry`:
+`CrateRegistry` is generated from `cargo metadata`, source annotations, the contract catalogue, test inventory, and runtime manifests:
 
 ```text
 crate identity and version;
@@ -2488,81 +2441,7 @@ hot-path participation derived per cell;
 current conformance evidence.
 ```
 
-`state_class`, `effect_class`, failure/replacement boundary и runtime authority не выводятся из package name или source owner: они принадлежат referenced functional cells/Module manifests. Private Rust module не получает отдельный manifest. Transient agent, редактирующий crate, получает WorkLease и не становится ни source owner, ни lifecycle owner.
-
-## I2.9. Package sets, default-members и workspace scale
-
-### Daily default set
-
-Root `default-members` содержит только packages, необходимые для:
-
-```text
-primary binaries;
-contracts;
-Kernel/Governor core;
-store API/primary bridge;
-Instrument Plane baseline;
-первого agent route;
-коротких local proofs.
-```
-
-Следующие families не входят в default root command без необходимости:
-
-```text
-все vendor bridges;
-coverage/mutation/fuzz;
-heavy code-index pilots;
-cloud/AWS;
-Researcher acquisition;
-professional domain modules;
-bench corpora;
-experimental actor/WASM/distributed routes.
-```
-
-### Capability families and workspace scale
-
-The fleet is grouped by responsibility only to keep dependencies and test ownership understandable:
-
-```text
-foundation/contracts;
-Host/Kernel/platform;
-Governor/task/state;
-store/blob/migration;
-Instrument Plane;
-Memory/Smart/context;
-Meta/recovery;
-Agent Fabric/swarm;
-surfaces/tools;
-optional vendor/research/professional islands.
-```
-
-No family has a target number of crates. `WorkspaceScaleProfile` is an empirical vector over the actual workspace:
-
-```yaml
-WorkspaceScaleProfile:
-  package_target_feature_and_build_script_counts:
-  metadata_and_rust_analyzer_load:
-  clean_incremental_and_package_selective_build_distributions:
-  reverse_fanout_and_typical_change_closure:
-  test_inventory_and_sharding_cost:
-  shared_target_cache_and_io_contention:
-  parallel_agent_throughput_and_merge_cost:
-  manifest_contract_and_orientation_burden:
-  validity_scope_expiry_and_countermetrics:
-```
-
-The profile selects `default-members`, cache policy, workspace-hack experiments, CI sharding and possible workspace federation. It has no universal `small/medium/large` count threshold.
-
-`WorkspaceScaleReview` запускается при измеримом ухудшении:
-
-```text
-package-selective build регулярно затрагивает широкую долю workspace;
-Cargo metadata/rust-analyzer load мешает interactive work;
-shared target/cache создаёт lock or I/O contention;
-feature unification вызывает повторные несовместимые builds;
-типичный change closure пересекает много owners;
-parallel-agent throughput перестаёт расти при добавлении lanes.
-```
+`state_class`, `effect_class`, failure and replacement boundaries, and runtime authority are not inferred from package name or source owner: they belong to referenced functional cells and Module manifests. A private Rust module receives no separate manifest. A transient agent editing a crate receives a WorkLease and becomes neither source owner nor lifecycle owner.
 
 ## I2.10. Runtime module and state classes
 
@@ -2691,20 +2570,20 @@ The decision and rejected alternatives are recorded in the Module Catalog. A lat
 
 ## I2.11. Independent build, proof and release units
 
-Каждый first-party crate должен иметь independently selectable proof surface, соответствующий его реальному proof ceiling:
+Every first-party crate must have an independently selectable proof surface that matches its actual proof ceiling:
 
 ```text
-`cargo check -p <crate>` или эквивалентный shape/build proof;
-behavioral unit/property/model tests только там, где crate действительно владеет behavior;
-contract/facade/data-only crate может иметь compile/schema/consumer-contract proof вместо искусственных unit tests;
+`cargo check -p <crate>` or equivalent shape or build proof;
+behavioral unit, property, or model tests only where the crate actually owns behavior;
+a contract, facade, or data-only crate may use compile, schema, or consumer-contract proof instead of artificial unit tests;
 public contract selector when applicable;
 source/context/build metrics and clear reverse-dependency impact;
 explicit declaration of behavior that cannot be proved package-locally.
 ```
 
-Отсутствие бессмысленного package-local test не является дефектом, если proof ceiling и обязательный consumer/edge profile указаны. Но отсутствие независимо вызываемого proof вообще делает capability `CURRENT_UNVERIFIED`/`TARGET`, а не supported.
+Absence of a meaningless package-local test is not a defect when the proof ceiling and mandatory consumer or edge profile are stated. But absence of any independently invocable proof makes the capability `CURRENT_UNVERIFIED` or `TARGET`, not supported.
 
-Release unit может содержать несколько crates:
+A release unit may contain several crates:
 
 ```text
 eliotd bundle;
@@ -2715,51 +2594,51 @@ agent bridge bundle;
 optional Module bundle.
 ```
 
-Runtime bundle manifest фиксирует exact crate/artifact graph, protocol range, SBOM, symbols, license report и rollback compatibility.
+Runtime bundle manifest records the exact crate and artifact graph, protocol range, SBOM, symbols, license report, and rollback compatibility.
 
-### Когда нужен отдельный workspace/lockfile
+### When a separate workspace or lockfile is required
 
 ```text
-heavy dependency island вызывает measured cache invalidation;
-другая toolchain/target/profile required;
-upstream должен оставаться в поставляемом виде;
-module выпускается независимо;
-лицензия или MSRV требует containment;
-core workspace feature unification становится нестабильной.
+a heavy dependency island causes measured cache invalidation;
+a different toolchain, target, or profile is required;
+an upstream project must remain in delivered form;
+a Module is released independently;
+license or MSRV requires containment;
+core-workspace feature unification becomes unstable.
 ```
 
-Отдельный workspace не получает собственный ELIOT authority. Compatibility проверяется через protocol/schema/artifact digests и integration proofs.
+A separate workspace receives no ELIOT authority of its own. Compatibility is checked through protocol, schema, and artifact digests and integration proofs.
 
 ## I2.12. Third-party Rust adoption rule
 
-Перед написанием subsystem maintainers ищут подходящий upstream project. Adoption требует:
+Before implementing a subsystem, maintainers search for a suitable upstream project. Adoption requires:
 
 ```text
-совместимую лицензию;
-приемлемую maintenance/frozen risk;
-Windows support требуемого пути;
+compatible licensing;
+acceptable maintenance and frozen-project risk;
+Windows support for the required path;
 bounded dependency/security footprint;
-понятную failure semantics;
+clear failure semantics;
 thin facade/process bridge;
 export/removal path;
-отсутствие upstream types в публичных ELIOT contracts.
+no upstream types in public ELIOT contracts.
 ```
 
-Порядок:
+Order of preference:
 
 ```text
-использовать upstream unchanged behind facade;
-обернуть executable/service behind EBP;
+use upstream unchanged behind a facade;
+wrap an executable or service behind EBP;
 contribute upstream;
 fork only with explicit divergence ownership;
 write from scratch only for genuinely unique ELIOT contract.
 ```
 
-Upstream project не диктует crate topology ELIOT. Его source может жить отдельным workspace/bundle.
+An upstream project does not dictate ELIOT crate topology. Its source may live in a separate workspace or bundle.
 
 ## I2.13. No framework ownership of architecture
 
-Tokio, ractor, axum, rmcp, SurrealDB, nextest, sccache и будущие frameworks реализуют local mechanics. Ни один не определяет:
+Tokio, ractor, axum, rmcp, SurrealDB, nextest, sccache, and future frameworks implement local mechanics. None defines:
 
 ```text
 authority;
@@ -2773,26 +2652,26 @@ supervision policy ELIOT;
 swarm decision authority.
 ```
 
-Framework всегда находится за ELIOT-owned crate contract и removal boundary.
+A framework always remains behind an ELIOT-owned crate contract and removal boundary.
 
-## I2.14. Cargo feature, dependency, codegen и cache hygiene
+## I2.14. Cargo feature, dependency, codegen, and cache hygiene
 
-Много crates ускоряют разработку только при дисциплинированном graph.
+Many crates accelerate development only under a disciplined graph.
 
 ### Feature policy
 
 ```text
-workspace-wide `full` feature запрещён без измеренного основания;
-Tokio features выбираются per crate;
-vendor SDK features заканчиваются в bridge implementation;
-platform/storage/provider feature sets не протекают в domain crates;
-default features отключаются, если тянут ненужные runtimes/TLS/storage;
-feature flag не меняет authority или semantic meaning скрыто.
+a workspace-wide `full` feature is prohibited without measured justification;
+Tokio features are selected per crate;
+vendor SDK features terminate at bridge implementation;
+platform, storage, and provider feature sets do not leak into domain crates;
+default features are disabled when they pull unused runtimes, TLS, or storage;
+a feature flag does not silently change authority or semantic meaning.
 ```
 
 ### Expensive-unit isolation
 
-Отдельно изолируются:
+The following are isolated separately:
 
 ```text
 proc-macro crates;
@@ -2804,27 +2683,27 @@ heavy dev/test dependencies;
 nightly/fuzz/mutation crates.
 ```
 
-Proc-macro, binary и linker-invoking crates не рассматриваются как обычные cacheable units. Binary wrapper остаётся thin.
+Proc-macro, binary, and linker-invoking crates are not treated as ordinary cacheable units. A binary wrapper remains thin.
 
 ### Generic boundaries
 
-Generic-heavy public API может переносить monomorphization в каждого consumer. Поэтому:
+A generic-heavy public API may shift monomorphization into every consumer. Therefore:
 
 ```text
-generic algorithm по возможности остаётся в leaf/core crate;
-contract hub экспортирует concrete data and narrow traits;
-`dyn`/erasure допускается на cold or replaceable boundary после измерения;
-`#[inline]` и LTO не используются как догма;
-compile-time и runtime trade-off измеряется.
+a generic algorithm stays in a leaf or core crate where practical;
+a contract hub exports concrete data and narrow traits;
+`dyn` or erasure is allowed at a cold or replaceable boundary after measurement;
+`#[inline]` and LTO are not doctrine;
+compile-time and runtime trade-offs are measured.
 ```
 
 ### Dependency diagnostics
 
-Каждый dependency-changing unit выполняет:
+Every dependency-changing unit runs:
 
 ```text
 `cargo tree -d`;
-`cargo tree -e features` для affected packages;
+`cargo tree -e features` for affected packages;
 license/advisory/source review;
 compile-time and binary-size delta;
 removal-boundary check;
@@ -2833,7 +2712,7 @@ feature-set stability check.
 
 ### Workspace-hack / cargo-hakari
 
-`workspace-hack` не является Default с первого дня. Он допускается после Research Gate, если BuildTimings/BuildFingerprints показывают повторную сборку common dependencies из-за разных feature sets. Promotion требует measured improvement на Windows, generated manifest, verify step и removal path.
+`workspace-hack` is not a day-one Default. It is allowed after a Research Gate when BuildTimings or BuildFingerprints show repeated compilation of common dependencies because of divergent feature sets. Promotion requires measured Windows improvement, a generated manifest, a verification step, and a removal path.
 
 ## I2.15. Hot-path modularity
 
@@ -2850,7 +2729,7 @@ IPC/frame receive
 → compact response/receipt.
 ```
 
-Hot-path crates могут быть многочисленными: static linkage не добавляет runtime hop. Their contracts require:
+Hot-path crates may be numerous: static linkage adds no runtime hop. Their contracts require:
 
 ```text
 no model call;
@@ -2865,22 +2744,22 @@ explicit stale/degraded result;
 cheap tracing with raw expansion by handle.
 ```
 
-Hot data публикуется через immutable snapshots/atomic generation swap. Writer/cold services готовят projections асинхронно; hot path только читает compatible revision.
+Hot data is published through immutable snapshots or atomic generation swap. Writer and cold services prepare projections asynchronously; the hot path only reads a compatible revision.
 
 ### Dependency shape
 
-Нет фиксированного максимума crate layers. Review запускается по наблюдаемым причинам:
+There is no fixed maximum crate-layer count. Review starts for observed causes:
 
 ```text
-latency trace показывает material overhead;
-build critical path и reverse fan-out замедляют change loop;
-agent workset теряет Decision Safety Floor или complete causal closure;
-dependency cycle или heavy adapter enters the hot path;
-high-churn contract hub заставляет unrelated crates постоянно пересобираться;
-ownership/recovery boundary становится неясной.
+latency trace shows material overhead;
+build critical path and reverse fan-out slow the change loop;
+the agent workset loses the Decision Safety Floor or complete causal closure;
+a dependency cycle or heavy adapter enters the hot path;
+a high-churn contract hub forces unrelated crates to rebuild continually;
+ownership or recovery boundary becomes unclear.
 ```
 
-Contract hubs должны быть стабильными; heavy adapters, UI, Researcher, Dreamer, vendor SDK и test frameworks остаются вне hot path. Thin composition root является Default, а не числовым правилом глубины.
+Contract hubs must remain stable; heavy adapters, UI, Researcher, Dreamer, vendor SDKs, and test frameworks stay outside the hot path. A thin composition root is the Default, not a numerical depth rule.
 
 ### Cold path
 
@@ -2896,54 +2775,54 @@ repair/migration;
 full report rendering.
 ```
 
-Cold path никогда скрыто не блокирует action gate. Он создаёт Durable Job и позже обновляет projection.
+The cold path never blocks an action gate silently. It creates a Durable Job and later updates a projection.
 
-## I2.16. Crate size и Agent Context Envelope
+## I2.16. Crate size and Agent Context Envelope
 
-### Почему LOC недостаточно
+### Why LOC is insufficient
 
-Agent ломает модуль не потому, что crate содержит определённое число строк, а потому что для изменения ему не помещаются одновременно:
+An agent breaks a Module not because a crate has a certain line count, but because the following cannot fit together for the change:
 
 ```text
-цель и invariants;
+goal and invariants;
 public contract;
 owned state machine;
 production source;
 relevant tests;
 one-hop providers/consumers;
 real diagnostics;
-место в product path.
+position in the product path.
 ```
 
-Поэтому Implementation различает три размера:
+Implementation therefore distinguishes three sizes:
 
 ```text
 Physical Crate Size
-  весь human-authored source и ordinary tests package;
+  all Human-authored source and ordinary package tests;
 
 Loaded Crate Slice
-  production source и focused tests, реально загруженные в один agent episode;
+  production source and focused tests actually loaded in one agent episode;
 
 Agent Workset
   Loaded Crate Slice + module-specific contract, one-hop interfaces,
-  FailureFingerprints, diagnostics и Product Pulse context.
+  FailureFingerprints, diagnostics, and Product Pulse context.
 ```
 
-Physical crate может быть больше одного episode только при наличии independently testable internal cells и доказанной полноты loaded slice. Arbitrary file chunking полнотой не считается.
+A physical crate may exceed one episode only when it contains independently testable internal cells and the loaded slice is demonstrably complete. Arbitrary file chunking is not completeness.
 
-### Детерминированная оценка
+### Deterministic estimate
 
 ```text
 STU (Source Token Unit) = ceil(UTF-8 bytes / 3)
 ```
 
-STU — консервативная fallback-оценка для Rust/Markdown source planning. При наличии exact route tokenizer используется его значение; quality curves хранятся в Effective Context Profile.
+STU is a conservative fallback estimate for planning Rust and Markdown source. When the exact route tokenizer is available, use it; quality curves live in the Effective Context Profile.
 
 ### Candidate envelopes and selection rule
 
-ELIOT не планирует обычную implementation-задачу на nominal provider maximum. Bands `100k`, `130k` и `150k` ниже являются reference candidate profiles, а не закрытым перечнем и не одной универсальной starting band. Installation may qualify smaller or intermediate bands when exact route evidence supports them. Planner выбирает **наименьший `QUALIFIED_FOR_PROFILE` envelope**, в который помещаются Decision Safety Floor, governing instructions, advertised tool surface, evidence/diagnostics, protected reasoning/review reserve и полный causal workset. Если ни одна полоса ещё не квалифицирована, выбор остаётся provisional и обязан показывать uncertainty; номинальный размер route не является основанием брать самый большой envelope или автоматически делить Module.
+ELIOT does not plan ordinary implementation work against a provider's nominal maximum. The `100k`, `130k`, and `150k` bands below are reference candidate profiles, not a closed list or one universal starting band. An installation may qualify smaller or intermediate bands when exact route evidence supports them. Planner selects the **smallest `QUALIFIED_FOR_PROFILE` envelope** that contains the Decision Safety Floor, governing instructions, advertised tool surface, evidence and diagnostics, protected reasoning and review reserve, and the complete causal workset. If no band is qualified yet, selection remains provisional and exposes uncertainty; nominal route size is not grounds to choose the largest envelope or split a Module automatically.
 
-Ориентировочное распределение:
+Reference allocation:
 
 | Total active context | system/tools | task/Architecture/contracts | evidence/diagnostics | reasoning/edit/review reserve | margin | primary source + focused tests |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -2951,7 +2830,7 @@ ELIOT не планирует обычную implementation-задачу на no
 | 130k | 18k | 22k | 8k | 35k | 12k | ≈35k |
 | 150k | 20k | 24k | 10k | 40k | 13k | ≈43k |
 
-Это planning profile, а не обещание равномерной model usability. Tool output, history growth и failed attempts расходуют тот же envelope; source allowance не заполняется заранее до края.
+This is a planning profile, not a promise of uniform model usability. Tool output, history growth, and failed attempts consume the same envelope; source allowance is not prefilled to its limit.
 
 ```yaml
 ContextEnvelopeSelectionReceipt:
@@ -2973,7 +2852,7 @@ The receipt prevents a planning number from becoming an invisible law. A larger 
 
 ```text
 100k route
-  один узкий crate/cell; Loaded Crate Slice target 20–30k STU;
+  one narrow crate or cell; Loaded Crate Slice target 20–30k STU;
 
 130k route
   normal mode; Loaded Crate Slice target 30–45k STU;
@@ -2985,24 +2864,24 @@ The receipt prevents a planning number from becoming an invisible law. A larger 
   explicit route experiment, cross-crate integration or reconstruction episode;
 
 250k+
-  никогда не является default implementation mode только из-за nominal capacity.
+  never the default implementation mode merely because of nominal capacity.
 ```
 
 ### Route-specific Agent Workset
 
-`Agent Workset` включает module-specific часть task/contracts/evidence и поэтому больше одного source slice. Его ceiling выводится из total envelope, а не задаётся одним числом для всех routes.
+`Agent Workset` includes the task, contract, and evidence portion specific to the Module and is therefore larger than one source slice. Its ceiling derives from the total envelope, not one number for all routes.
 
-| Total active context | Workset target | Upper review band | Оставшийся protected reserve |
+| Total active context | Workset target | Upper review band | Remaining protected reserve |
 |---:|---:|---:|---:|
 | 100k | 45–55k STU | 65k STU | system/tools + >=25k reasoning/review + margin |
 | 130k | 60–75k STU | 90k STU | system/tools + >=30k reasoning/review + margin |
 | 150k | 70–90k STU | 105k STU | system/tools + >=35k reasoning/review + margin |
 
-Выход за upper review band является наблюдением, а не самостоятельным триггером запрета или обязательной церемонии. `ContextScaleReview` открывается только когда вместе с размером обнаружены неполный causal workset, потерянные edges, недостаточный reasoning/review reserve, повторная ошибка агента, неприемлемая стоимость или Product-Pulse degradation. Planner тогда рассматривает contract/module/edge decomposition, более точную projection или иной квалифицированный route. Task Controller может оставить cohesive work unit, если Decision Safety Floor, one-hop effects, verifier и review reserve помещаются по exact tokenizer profile, а Product Pulse и counter-metrics не показывают деградацию. Такое решение остаётся scoped evidence, а не новым постоянным default.
+Exceeding the upper review band is an observation, not an independent prohibition or mandatory ceremony trigger. `ContextScaleReview` opens only when size coincides with an incomplete causal workset, lost edges, insufficient reasoning or review reserve, repeated agent error, unacceptable cost, or Product-Pulse degradation. Planner then considers contract, Module, or Edge decomposition; a more exact projection; or another qualified route. Task Controller may retain a cohesive work unit when the Decision Safety Floor, one-hop effects, verifier, and review reserve fit under the exact tokenizer profile and Product Pulse and counter-metrics show no degradation. That decision remains scoped evidence, not a new permanent Default.
 
 ### Physical crate size profiles
 
-Считаются human-authored production source + ordinary tests. Generated code, large golden corpora, vendor source и raw fixtures имеют отдельный profile и не загружаются целиком.
+Count Human-authored production source and ordinary tests. Generated code, large golden corpora, vendor source, and raw fixtures have separate profiles and are not loaded in full.
 
 | Crate class | Starting target | Review band | Legacy high-review band |
 |---|---:|---:|---:|
@@ -3014,15 +2893,15 @@ The receipt prevents a planning number from becoming an invisible law. A larger 
 | facade/composition/binary | 5–15k | 25k | 40k |
 | shared test-support | 10–30k | 45k | 70k |
 
-`Legacy high-review band` существует только для migration и не является целью нового кода. Все диапазоны являются Empirical Profiles. Crossing a numeric band alone records profile evidence; `CrateScaleReview` becomes active only when a representative task must load an unsafe or incomplete slice, proof/build/fan-out cost degrades, ownership becomes ambiguous, or agent/Product-Pulse outcomes regress. An unqualified full-crate task may be withheld from automatic scheduling, but the crate is not failed or split by size. Cohesion, edge cost, public-contract quality, independently selectable cells and measured outcomes decide. A cohesive control crate may remain physically larger than one Loaded Slice when the actual workset is complete and independently provable.
+`Legacy high-review band` exists only for migration and is not a target for new code. All ranges are Empirical Profiles. Crossing a numeric band alone records profile evidence; `CrateScaleReview` becomes active only when a representative task must load an unsafe or incomplete slice, proof, build, or fan-out cost degrades, ownership becomes ambiguous, or agent or Product-Pulse outcomes regress. An unqualified full-crate task may be withheld from automatic scheduling, but the crate is neither failed nor split by size. Cohesion, edge cost, public-contract quality, independently selectable cells, and measured outcomes decide. A cohesive control crate may remain physically larger than one Loaded Slice when the actual workset is complete and independently provable.
 
-Для грубой ориентации при fallback `bytes/3`: 5k STU ≈ 15 KiB UTF-8 source, 12k ≈ 36 KiB, 25k ≈ 75 KiB, 35k ≈ 105 KiB, 60k ≈ 180 KiB. LOC намеренно не нормируется: generated formatting, comments, schemas и test style дают слишком разный bytes-per-line.
+For rough orientation using fallback `bytes/3`: 5k STU ≈ 15 KiB UTF-8 source, 12k ≈ 36 KiB, 25k ≈ 75 KiB, 35k ≈ 105 KiB, 60k ≈ 180 KiB. LOC is intentionally not normalized: generated formatting, comments, schemas, and test style produce very different bytes per line.
 
-Crate size не оценивается отдельно от change closure. Маленький contract hub с огромным reverse fan-out может быть дороже крупного leaf crate; большой service crate может оставаться временно, если agent видит independently testable internal cells и extraction ещё увеличивает риск.
+Crate size is not evaluated apart from change closure. A small contract hub with huge reverse fan-out may cost more than a large leaf crate; a large service crate may remain temporarily when an agent can see independently testable internal cells and extraction would still increase risk.
 
 ### Mandatory context around a local change
 
-Даже маленький crate нельзя отдавать агенту в изоляции от смысла. Workset всегда содержит:
+Even a small crate cannot be assigned to an agent without semantic context. The workset always contains:
 
 ```text
 Product Objective / causal property;
@@ -3036,7 +2915,7 @@ smallest Product Pulse;
 explicit non-goals.
 ```
 
-Это предотвращает оптимизацию локального выражения ценой архитектуры.
+This prevents optimization of a local expression at the expense of Architecture.
 
 ### Qualification of context and crate profiles
 
@@ -3082,37 +2961,37 @@ SerializedContextMeasurement:
 
 ## I2.17. Parallel agent development contract
 
-Agent swarm разрабатывает FunctionalCapabilityCells параллельно только после freezing применимого contract revision; crates являются source/build containers.
+An agent swarm develops FunctionalCapabilityCells in parallel only after freezing the applicable contract revision; crates are source and build containers.
 
 ```text
 Contract/Evidence wave
   owner, public API, old failure, discriminator, fixtures;
 
 Module-cell wave
-  disjoint FunctionalCapabilityCells реализуются параллельно внутри bounded source packages;
+  disjoint FunctionalCapabilityCells are implemented in parallel within bounded source packages;
 
 Edge wave
-  independent integrators проверяют реальные границы;
+  independent integrators verify real boundaries;
 
 Product Pulse
-  shortest actual front-door path ловит architectural drift.
+  the shortest actual front-door path catches architectural drift.
 ```
 
 ### Assignment rule
 
-Один AgentWorkUnitBrief по умолчанию содержит:
+One `AgentWorkUnitBrief` contains by default:
 
 ```text
-одна primary FunctionalCapabilityCell;
+one primary FunctionalCapabilityCell;
 bounded support closure, justified by one-hop contracts/effects and measured context;
-одну causal property;
-один discriminator;
-один contract revision;
-одного integration owner;
-Agent Workset в пределах I2.16.
+one causal property;
+one discriminator;
+one contract revision;
+one integration owner;
+an Agent Workset within I2.16.
 ```
 
-Cross-crate defect делится на:
+A cross-crate defect is decomposed into:
 
 ```text
 contract change unit;
@@ -3121,31 +3000,31 @@ edge integration unit;
 product pulse.
 ```
 
-Агент не получает giant task «исправить всю подсистему» и не получает бессмысленную atomized task «поменять одну строку» без product context.
+An agent receives neither a giant task such as “fix the entire subsystem” nor a meaningless atomized task such as “change one line” without product context.
 
 ### ContractChallenge
 
-Agent обязан вернуть challenge вместо proxy optimization, если:
+An agent must return a challenge instead of proxy optimization when:
 
 ```text
-primary owner выбран неверно;
-discriminator не падает на старом production path;
-contract противоречив;
-нужно скрыто изменить oracle;
-decision-sufficient workset не помещается ни в один применимый квалифицированный Context Envelope;
-локальная правка разрушает product invariant;
-несколько tasks конфликтуют по public contract или state owner.
+the primary owner is wrong;
+the discriminator does not fail on the old production path;
+the contract is contradictory;
+the oracle would need a hidden change;
+a decision-sufficient workset fits no applicable qualified Context Envelope;
+a local edit would break a product invariant;
+several tasks conflict over a public contract or state owner.
 ```
 
 ### Write isolation
 
-Каждый mutating lane имеет worktree, write/path claims, BuildFingerprint, test resource namespace и IntegrationCandidate. Worker не интегрирует собственный result.
+Every mutating lane has a worktree, write and path claims, BuildFingerprint, test-resource namespace, and IntegrationCandidate. A worker does not integrate its own result.
 
 ## I2.18. Build, test and artifact graph
 
 `BuildTestGraph` is the agent-planning/affected-proof projection over the narrower `BuildExecutionGraph`, `VerifierCoverageGraph`, public contracts, runtime bundles and failure history. It is not a third graph owner and never invents build/test edges not present in those sources.
 
-`BuildTestGraph` компилируется из:
+`BuildTestGraph` is compiled from:
 
 ```text
 Cargo metadata package/target/feature graph;
@@ -3197,15 +3076,15 @@ process/protocol/state migration change
   affected runtime bundle, recovery edge and Product Pulse.
 ```
 
-Cargo сам решает, какие compiler units перестроить; ELIOT решает, какие proofs нужны. Эти решения не смешиваются.
+Cargo decides which compiler units to rebuild; ELIOT decides which proofs are required. These decisions remain distinct.
 
 ### Single-flight builds
 
-Один exact BuildFingerprint имеет одного producer. Остальные lanes становятся waiters и получают тот же artifact/evidence. Failed producer не запускается каждым агентом заново без нового hypothesis/identity.
+One exact BuildFingerprint has one producer. Other lanes become waiters and receive the same artifact and evidence. A failed producer is not restarted by every agent without a new hypothesis or identity.
 
 ## I2.19. Layered module cell
 
-Каждая нетривиальная capability имеет внутреннюю направленность:
+Every nontrivial capability has an internal direction:
 
 ```text
 L0 Contract
@@ -3227,17 +3106,17 @@ L5 Surface
   MCP, IPC, CLI, UI, EBP translation.
 ```
 
-Это logical layers. Они становятся отдельными crates, когда создают самостоятельный context/test/dependency seam. Для маленькой capability L0–L2 могут находиться в одном pure crate, L3 — в adapter crate, L4–L5 — в composition crate.
+These are logical layers. They become separate crates when they create an independent context, test, or dependency seam. For a small capability, L0–L2 may remain in one pure crate, L3 in an adapter crate, and L4–L5 in a composition crate.
 
 Hard rules:
 
 ```text
-Core не импортирует Adapter/Surface;
-Service зависит от Ports;
-Adapter не решает task truth/policy/finish;
-Surface не обходит Service/Governor admission;
-fake-port proof не выдаётся за real-edge proof;
-public contract не принадлежит vendor library.
+Core does not import Adapter or Surface;
+Service depends on Ports;
+Adapter does not decide task truth, policy, or finish;
+Surface does not bypass Service or Governor admission;
+fake-port proof is not represented as real-edge proof;
+the public contract is not owned by a vendor library.
 ```
 
 ### Portable component cell
@@ -3266,7 +3145,7 @@ The adapter is intentionally boring: decode, validate, call core, encode. It can
 
 A component that has only one justified contour need not create empty adapter crates. The structure is introduced when a second backend, portability proof or independent sandbox boundary is real.
 
-## I2.20. Module Contract Kit, Crate Context Capsule и Module Test Capsule
+## I2.20. Module Contract Kit, Crate Context Capsule, and Module Test Capsule
 
 ### `FunctionalCapabilityCell`
 
@@ -3382,7 +3261,7 @@ ModuleTestCapsule:
   expected_nonzero_test_count:
 ```
 
-Capsules генерируются из Cargo/test/instrument metadata и дополняются только невыводимыми semantic fields. Crate/cell без executable `ModuleTestCapsule` может исследоваться, но не считается independently supported.
+Capsules are generated from Cargo, test, and instrument metadata and supplemented only with non-derivable semantic fields. A crate or cell without an executable `ModuleTestCapsule` may be investigated, but is not independently supported.
 
 ### Generated local agent surfaces
 
@@ -3400,9 +3279,11 @@ Agent-working projection
 
 The normal surface is a resource/handle compiled into the Agent Workset. `CONTRACT.md` and `AGENTS.md` are optional materializations only for host tools that require local files; ELIOT does not create two files per crate by default. Projections are not separate normative sources. They carry the source contract digest and generator version; stale projections are rejected. Handwritten rationale belongs in Architecture/Implementation records, while commands/test inventory are generated from Cargo and Instrument metadata.
 
+The triad `ModuleContractKit` + `CrateContextCapsule` + `ModuleTestCapsule` is mandatory, not advisory. A capability missing any element cannot have `ImplementationSupport` above `CURRENT_UNVERIFIED`, regardless of code quality or test count: without a contract kit the boundary is undefined; without a context capsule the agent lacks a decision-sufficient workset; without a test capsule there is no independently invocable proof. This directly violates `ARCH-MOD-03`.
+
 ## I2.21. Crate and boundary validation
 
-`eliot dev crate validate` проверяет:
+`eliot dev crate validate` checks:
 
 ```text
 layer direction and cycles;
@@ -3423,21 +3304,21 @@ forbidden direct process/store calls;
 Cargo feature duplication and profile drift.
 ```
 
-Validation возвращает evidence и recommendation. Она не объявляет архитектуру правильной только потому, что dependency graph чист.
+Validation returns evidence and a recommendation. It does not declare the Architecture correct merely because the dependency graph is clean.
 
 ### `CrateScaleReview`
 
-Review запускается при любом:
+Review starts on any of:
 
 ```text
 physical review/high-review band on the applicable profile;
 Agent Workset upper review band or absence of a qualified complete envelope;
 high compile critical-path cost;
 high reverse-dependency fan-out × change frequency;
-двух независимых fixture/test families;
-повторном defect escape за crate boundary;
-систематическом co-change с соседним crate;
-появлении второй причинной ответственности.
+two independent fixture or test families;
+repeated defect escape across the crate boundary;
+systematic co-change with a neighboring crate;
+the appearance of a second causal responsibility.
 ```
 
 Outcome:
@@ -3455,7 +3336,7 @@ run experiment before change.
 
 ## I2.22. Parallel build, cache, artifact and environment lanes
 
-Каждый mutating work item получает:
+Each mutating work item receives:
 
 ```text
 worktree;
@@ -3474,27 +3355,27 @@ candidate identity.
 %LOCALAPPDATA%\Eliot\build\<workspace-id>\<worktree-id>\<build-mode>\<fingerprint>
 ```
 
-Repository `target/` не используется governed instruments по умолчанию.
+Governed instruments do not use the repository `target/` directory by default.
 
 ### Cache modes
 
 ```text
 interactive incremental
-  отдельный worktree target; лучший повторный feedback одной lane;
+  separate worktree target; best repeated feedback within one lane;
 
 shared non-incremental + sccache
-  reuse между agents/worktrees при exact normalized fingerprint;
+  reuse across agents and worktrees under an exact normalized fingerprint;
 
 release
-  locked/declared cache; proof зависит от source/tool/run identity,
-  а не от факта cache hit.
+  locked and declared cache; proof depends on source, tool, and run identity,
+  not on the fact of a cache hit.
 ```
 
-Incremental и sccache не включаются одновременно как магическая универсальная оптимизация. Instrument Plane измеряет hit rate, cold/warm time, cache size и invalidation.
+Incremental compilation and sccache are not enabled together as a universal magic optimization. Instrument Plane measures hit rate, cold and warm time, cache size, and invalidation.
 
 ### Derived-cache trust and reuse
 
-Любой derived cache/artifact reuse связывается с exact dependency closure:
+Any reuse of a derived cache or artifact is bound to exact dependency closure:
 
 ```text
 source and generated-input digests;
@@ -3506,7 +3387,7 @@ format/schema revision;
 content integrity digest;
 ```
 
-Правила:
+Rules:
 
 ```text
 checksum detects corruption but does not authenticate producer or root;
@@ -3523,13 +3404,13 @@ The cache layer is rebuildable and may improve performance only after equality c
 
 ### Test concurrency
 
-Test groups декларируют resource weight и exclusive resources. Nextest partitioning/filtersets распределяют независимые tests между lanes; stateful ports/services/DB volumes получают отдельные leases. Worktree не изолирует runtime resources.
+Test groups declare resource weight and exclusive resources. Nextest partitioning and filtersets distribute independent tests across lanes; stateful ports, services, and database volumes receive separate leases. A worktree does not isolate runtime resources.
 
-Verification имеет приоритет над background indexing, coverage, mutation и Dreamer jobs. Background build не может вытеснить Kernel/Watchdog/Control Reserve или interactive product work.
+Verification has priority over background indexing, coverage, mutation, and Dreamer jobs. A background build cannot displace Kernel, Watchdog, Control Reserve, or interactive product work.
 
 ## I2.23. Capability-family topology and crate extraction decisions
 
-Implementation fixes responsibility families, not a target list of crate names. The current families are:
+Implementation fixes responsibility families, not a target count or frozen list of crate names. The current families are:
 
 ```text
 foundation and public contracts;
@@ -3540,10 +3421,55 @@ Instrument/test execution and evidence normalization;
 memory, context, understanding and derived projections;
 Watchdog, Doctor, Dreamer and Meta;
 agent routes, coordination and bounded swarm;
-human/agent surfaces and optional domain/vendor contours.
+human/agent surfaces and optional domain/vendor/research contours.
 ```
 
-A new crate is created only through an explicit `CrateExtractionDecision`:
+Root `default-members` contains only primary binaries, contracts, Kernel/Governor core, primary store path, Instrument Plane baseline, the first agent route and short local proofs. Vendor bridges, coverage/mutation/fuzz, heavy code-index pilots, cloud/AWS, Researcher providers, professional modules, benchmark corpora and experimental actor/WASM/distributed routes remain outside the root default command unless a current work profile needs them.
+
+### Crate admission and merge criteria
+
+A separate crate is preferred only when an executable contract/test/context seam exists and an explicit `CrateExtractionDecision` predicts net benefit. Strong admission grounds are:
+
+```text
+independent public or inter-layer contract;
+independent unit/property/model-test seam;
+separate owner or bounded agent work item;
+different dependency, security or license profile;
+materially different change cadence;
+multiple real consumers;
+heavy optional dependency island;
+measurable context/rebuild blast-radius reduction;
+replaceable implementation boundary;
+own pure state machine or causal responsibility.
+```
+
+The expected agent seam is concrete: a bounded route can read the capability with its contract/tests, change one causal responsibility, run package-local proof, see one-hop consumers/providers and avoid loading unrelated subsystems.
+
+The following normally remains an ordinary Rust module:
+
+```text
+private helper without an independent contract;
+small type group used by one parent;
+implementation always changed and tested with its owner;
+file split only for navigation;
+algorithm fragment without an independent reason to change.
+```
+
+Crates should merge when most of these conditions hold:
+
+```text
+they almost always change in one work unit;
+no independent consumer or test selector exists;
+one is a pass-through of the other;
+manifest/API overhead exceeds context savings;
+private mutable state is repeatedly threaded across the boundary;
+the split creates cyclic adapter/facade construction;
+there is no measured build, fault, dependency or agent blast-radius benefit.
+```
+
+Crate-per-file and crate-per-type are prohibited proxy goals. A new package without a real consumer/test seam is rejected unless it is a time-bounded migration facade with an owner, expiry and removal test.
+
+### Canonical extraction decision
 
 ```yaml
 CrateExtractionDecision:
@@ -3562,70 +3488,54 @@ CrateExtractionDecision:
   disposition: keep | split | merge | extract_contract | isolate_dependency | experiment
 ```
 
-A proposed name or presence in a research document is not an implementation task. Detailed candidate names and historical extraction hypotheses live in the external cold backlog and are activated only by a current measured change closure. Crate topology remains a Meta candidate evaluated by agent outcome, build/test economics, dependency fan-out, failure isolation and Product Pulse.
+A proposed name or presence in a research document is not an implementation task. Historical names and extraction hypotheses live in the external cold backlog until a measured change closure activates them.
 
-## I2.24. Crate fleet health: split, merge and build economics
+### Workspace and fleet evidence
 
-ELIOT не оптимизирует crate count как proxy. Crate fleet оценивается вектором:
+`WorkspaceScaleProfile` is an empirical vector over the actual workspace; it has no universal `small/medium/large` package-count threshold:
 
-```text
-source/context footprint;
-public API surface;
-change frequency;
-co-change with neighbors;
-reverse-dependency fan-out;
-cold/warm compile time;
-critical-path blocking time;
-test discovery/execution cost;
-dependency and feature weight;
-defect attribution;
-agent success/repair escape rate;
-runtime bundle mapping.
+```yaml
+WorkspaceScaleProfile:
+  package_target_feature_and_build_script_counts:
+  metadata_and_rust_analyzer_load:
+  clean_incremental_and_package_selective_build_distributions:
+  reverse_fanout_and_typical_change_closure:
+  test_inventory_and_sharding_cost:
+  shared_target_cache_and_io_contention:
+  parallel_agent_throughput_and_merge_cost:
+  manifest_contract_and_orientation_burden:
+  validity_scope_expiry_and_countermetrics:
 ```
 
-Generated `CrateFleetReport` показывает hotspots и recommendations. Один scalar score может использоваться только для sorting, не как automatic split/merge authority.
+Generated `CrateFleetReport` adds source/context footprint, public API surface, change/co-change frequency, reverse fan-out, cold/warm compile and critical-path time, test discovery/execution cost, dependency/feature weight, defect attribution, agent success/repair escapes and runtime-bundle mapping. Its `ContractSurfaceProfile` records applicable contracts/owners, agent-visible contract tokens, one-hop edges, generated/manual duplication, proof latency, Product Pulse dependency and wrong-owner incidents.
 
-The report also includes `ContractSurfaceProfile` for the affected work family:
+`WorkspaceScaleReview` opens when package-selective work repeatedly reaches a wide closure, metadata/rust-analyzer latency blocks interactive work, target/cache contention appears, feature unification causes incompatible rebuilds, typical changes cross many owners, or added parallel lanes no longer improve throughput.
 
-```text
-number of applicable public contracts and owners;
-agent-visible contract/instruction tokens;
-one-hop dependency and test-edge count;
-contract-change fan-out and generated/manual duplication;
-proof latency and Product Pulse dependency;
-agent repair escapes, challenges and wrong-owner incidents.
-```
+A scalar may sort candidates but cannot authorize split or merge. A split is rejected when it reduces source size while increasing contract surface, ceremony or wrong-owner rate. A merge is rejected when it removes independent proof or replacement. Topology changes are admitted only when context/build/test/ownership outcomes improve without material regression in Product Pulse, dependency clarity, recovery or agent correctness.
 
-A split that reduces source size but increases contract surface, cross-crate ceremony or wrong-owner rate is a regression. A merge that reduces ceremony but destroys independent proof/replacement is also a regression.
+### Capability cell registry
 
-### Хорошая граница
+`FunctionalCapabilityCell` is enumerable, not only referenced. A generated `CapabilityCellRegistry` is compiled from `[package.metadata.eliot].functional_cell_refs`, Module/service manifests and the contract catalogue:
 
 ```text
-coherent source-maintenance ownership and explicit lifecycle owners for every mutable state;
-one bounded responsibility set whose complete workset is available to the agent;
-public contract меньше реализации;
-package-local tests различают old/new behavior;
-heavy dependencies локализованы;
-consumer impact видим;
-изменение редко требует unrelated crates;
-runtime process boundary при необходимости остаётся независимой.
+cell id and revision;
+one-line causal responsibility;
+owns: contract surface, mutable state or explicit statelessness, effects;
+must not own: explicit non-responsibilities;
+runtime layer and execution contour;
+replacement class and iteration lane;
+independently invokable proof entrypoint;
+one-hop providers and consumers;
+current support and invalidation set.
 ```
 
-### Плохая граница
+The registry is the answer to “how many cells exist and who owns what” without reading this chapter. It is generated: prose never maintains a parallel list. A cell without a proof entrypoint, with an undeclared state owner or with a second owner for the same mutable state is a registry defect, not an acceptable variant.
 
-```text
-crate только переименовывает типы другого;
-common crate меняется при любой feature;
-public API раскрывает private/vendor implementation;
-тесты запускают весь продукт из-за отсутствия seam;
-несколько crates всегда модифицируются вместе;
-маленький local patch требует гигантский context;
-разделение заставляет передавать shared mutable state.
-```
+A crate may host several cells and one cohesive cell may span several crates; the registry keeps both mappings explicit so source packaging and causal ownership never silently merge.
 
-## I2.25. Улучшение системы во время реальной работы
+## I2.25. Improving the system during real work
 
-Работающий stable generation не редактируется и не пересобирается на месте.
+The running stable generation is neither edited nor rebuilt in place.
 
 ```text
 real workload creates Problem/Improvement Candidate
@@ -3643,18 +3553,18 @@ real workload creates Problem/Improvement Candidate
 Rules:
 
 ```text
-background compilation имеет lower resource class;
-real project state не используется как незащищённая test fixture;
-canary effects read-only либо отдельно authorized;
-самообучение не означает self-writing source без owner;
-agent/model route policy и budget задаются человеком;
-failed experiment не повреждает stable generation;
-новое evidence может изменить crate split/merge decision.
+background compilation has a lower resource class;
+real project state is not used as an unprotected test fixture;
+canary effects are read-only or separately authorized;
+self-learning does not mean self-writing source without an owner;
+agent and model-route policy and budget are Human-defined;
+a failed experiment does not damage the stable generation;
+new evidence may change a crate split or merge decision.
 ```
 
-Таким образом ELIOT может улучшаться во время эксплуатации, но production hot path остаётся на известной generation, пока candidate не прошёл свой proof.
+ELIOT can therefore improve during operation, while the production hot path remains on a known generation until the candidate passes its proof.
 
-# I3. First-run installation, survey и registry
+# I3. First-run installation, survey, and registry
 
 ## I3.1. Installation form
 
@@ -3671,8 +3581,8 @@ Profile paths:
 | Profile | Immutable binaries | Durable/service data | User config/cache |
 |---|---|---|---|
 | `system_service` | `%ProgramFiles%\Eliot\<component>\<version>` | `%ProgramData%\Eliot` | `%LocalAppData%\Eliot` |
-| `user_mode` | `%LocalAppData%\Programs\Eliot\<component>\<version>` | `%LocalAppData%\Eliot\data` | `%LocalAppData%\Eliot\config|cache` |
-| `portable_dev` | repository `target/eliot-dev/<generation>` | repository `.eliot-dev/state` | repository `.eliot-dev/config|cache` |
+| `user_mode` | `%LocalAppData%\Programs\Eliot\<component>\<version>` | `%LocalAppData%\Eliot\data` | `%LocalAppData%\Eliot\config\|cache` |
+| `portable_dev` | repository `target/eliot-dev/<generation>` | repository `.eliot-dev/state` | repository `.eliot-dev/config\|cache` |
 
 Mutable data is never stored beside immutable versioned binaries, except inside the explicitly disposable `portable_dev` profile. CLI/agent bridges are added to the current user's PATH or registered through the selected host integration.
 
@@ -3686,30 +3596,30 @@ For `system_service`, installer configures a narrow service DACL: authorized loc
 
 ## I3.2. Deterministic setup before agents
 
-Trust root создаётся без модели:
+The trust root is created without a model:
 
 ```text
-1. пользователь подтверждает installation identity;
-2. создаётся System Owner principal;
-3. генерируются local service keys/tokens;
-4. устанавливаются ACL;
-5. выбирается privacy mode;
-6. storage запускается и проверяется;
-7. создаётся первый signed configuration snapshot.
+1. user confirms the installation identity;
+2. System Owner principal is created;
+3. local service keys and tokens are generated;
+4. ACLs are installed;
+5. privacy mode is selected;
+6. storage starts and is verified;
+7. the first signed configuration snapshot is created.
 ```
 
-Setup Agent может объяснять параметры после этого, но не создаёт authority.
+Setup Agent may explain settings after this point, but creates no authority.
 
 ## I3.3. Installation Survey
 
-Survey безопасно ищет:
+Survey safely discovers:
 
 ```text
 Codex CLI/Desktop;
 Claude Code/Desktop;
 OpenCode;
 Antigravity/agy;
-Git и Git worktrees;
+Git and Git worktrees;
 VS Code / JetBrains;
 Rust toolchain;
 LSP servers;
@@ -3721,16 +3631,16 @@ SurrealDB installations;
 optional cloud CLIs.
 ```
 
-Порядок проверки:
+Probe order:
 
 ```text
-known config paths и manifests;
+known configuration paths and manifests;
 PATH metadata;
 file version/signature;
-только затем safe --version/init probe без secrets и elevated rights.
+only then a safe `--version` or initialization probe without secrets or elevated rights.
 ```
 
-Найденный executable не запускается как trusted module автоматически.
+A discovered executable is not started automatically as a trusted Module.
 
 Existing SurrealDB processes/installations are observations or import candidates, not implicit members of the ELIOT store lineage. Setup never kills, adopts or reuses an unrelated process merely because its port or binary name matches. The installer chooses and records an installation-owned loopback endpoint/data root, verifies the owning PID/artifact/HostState lineage before every start/reconnect, and returns a Recovery Directive on collision. Legacy data enters only through an explicit read-only inspection/import/migration path.
 
@@ -3813,11 +3723,11 @@ The generic environment planner never updates the active canonical store, Host, 
 
 This is the Governor-owned evidence view from I1.9. It is neither the Module Catalog nor the Kernel Generation Registry.
 
-Registry stores evidence-linked facts, not vendor labels and booleans. Он разделяет пять identity layers:
+Registry stores evidence-linked facts, not vendor labels and booleans. It separates five identity layers:
 
 ```text
 host family       — codex, opencode, claude, antigravity, acp-agent, ...;
-adapter            — конкретная ELIOT integration implementation/bundle;
+adapter            — exact ELIOT integration implementation or bundle;
 protocol/transport — App Server+stdio, HTTP+SSE, ACP+stdio, sidecar+NDJSON, ...;
 runtime instance   — exact executable/package version and hash;
 route              — provider/model/auth/billing/feature configuration.
@@ -4081,31 +3991,31 @@ CapabilityOutcome:
 
 Promotion to a broader degradation scope requires evidence that the broader owner or generation is defective. A call-scoped fallback remains visible in the attempt receipt and cannot become a sticky global capability flag. Conversely, a generation-level challenge failure cannot be hidden as one harmless call error.
 
-## I3.5. Пользовательские решения первого запуска
+## I3.5. First-run user decisions
 
-Wizard спрашивает только то, что меняет privacy, cost, authority или автоматическую эксплуатацию. Advanced configuration остаётся необязательной; все defaults видимы и обратимы.
+Wizard asks only questions that change privacy, cost, authority, or automatic operation. Advanced configuration remains optional; every Default is visible and reversible.
 
 ```text
-какие roots/resources можно обнаруживать и наблюдать автоматически;
-какие agent/runtime families разрешено регистрировать и запускать;
-какие model providers/local runtimes использовать по ролям:
-  Main Agent, Worker, Auditor, Verifier-model, Watchdog Agent, Dreamer и Research;
-какие данные можно отправлять каждому route или ELIOT Research;
-monthly/daily/per-job budgets, subscription windows и scarce-resource ceilings;
-предпочтительный assurance/cost/privacy preset;
-разрешены ли automatic Watchdog/Dreamer jobs;
-разрешены ли swarms, native recursive delegation и их верхние envelopes;
-режим работы полного stack: demand-start или explicitly always-on;
-режим lightweight supervision активных WorkScopes;
+which roots and resources may be discovered and observed automatically;
+which agent and runtime families may be registered and started;
+which model providers and local runtimes to use by role:
+  Main Agent, Worker, Auditor, Verifier-model, Watchdog Agent, Dreamer, and Research;
+which data may be sent to each route or ELIOT Research;
+monthly, daily, and per-job budgets; subscription windows; and scarce-resource ceilings;
+preferred assurance, cost, and privacy preset;
+whether automatic Watchdog and Dreamer jobs are allowed;
+whether swarms and native recursive delegation are allowed and their upper envelopes;
+full-stack mode: demand-start or explicitly always-on;
+lightweight supervision mode for active WorkScopes;
 maintenance mode:
   suggest_only | manual | idle_only | scheduled | continuous_bounded;
-разрешены ли background curation, backup rehearsal, reindex и capability survey;
-разрешены ли remote Dreamer queries;
-настроен ли ELIOT Research endpoint и какие exchange classes разрешены;
-какие installation/update operations требуют отдельного Human approval.
+whether background curation, backup rehearsal, reindexing, and capability survey are allowed;
+whether remote Dreamer queries are allowed;
+whether an ELIOT Research endpoint is configured and which exchange classes are allowed;
+which installation and update operations require separate Human approval.
 ```
 
-Если пользователь пропускает выбор модели для отдельной роли, route остаётся `UNASSIGNED` либо использует явно показанный local/economy default; Dreamer/Watchdog не получают скрытый paid route. Если automation выключена, система сохраняет deduplicated maintenance/requalification recommendations в Human board вместо молчаливого запуска.
+When the user omits model selection for a role, the route remains `UNASSIGNED` or uses an explicitly displayed local or economy Default; Dreamer and Watchdog receive no hidden paid route. When automation is disabled, the system stores deduplicated maintenance and requalification recommendations on the Human board instead of starting them silently.
 
 ## I3.6. Model, Route and Portfolio Policy
 
@@ -4161,7 +4071,7 @@ Dreamer, Watchdog, child agents and native runtimes cannot expand this policy or
 
 ## I3.7. Plugin registration
 
-Setup устанавливает bridge/plugin только после preview:
+Setup installs a bridge or plugin only after preview:
 
 ```text
 files to modify;
@@ -4173,11 +4083,11 @@ rollback copy;
 expected IntegrationCoverageProfile.
 ```
 
-`eliot doctor integration <profile>` после установки проверяет hash, active registrations, hook events и handshake. Успех установки не равен runtime liveness.
+After installation, `eliot doctor integration <profile>` checks hash, active registrations, hook events, and handshake. Installation success is not runtime liveness.
 
 ## I3.8. Updates
 
-Update packages помещаются в versioned directories. Installer никогда не перезаписывает running binary.
+Update packages are placed in versioned directories. Installer never overwrites a running binary.
 
 Channels:
 
@@ -4408,11 +4318,11 @@ This contract applies equally to `system_service`, `user_mode`, Module bundles, 
 
 ---
 
-# I4. WorkScopeResolver и BootstrapScanner
+# I4. WorkScopeResolver and BootstrapScanner
 
 ## I4.1. WorkScope identity
 
-`WorkScope` — не alias Git repository. Runtime type:
+`WorkScope` is not an alias for a Git repository. Runtime type:
 
 ```yaml
 WorkScopeDescriptor:
@@ -4438,7 +4348,7 @@ WorkScopeDescriptor:
   lifecycle: provisional | active | suspended | archived
 ```
 
-Identity fingerprint вычисляется из stable resources, а не из display name. Git branch/commit входят в generation, но не определяют WorkScope целиком.
+Identity fingerprint derives from stable resources, not display name. Git branch and commit belong to the generation, but do not define the WorkScope alone.
 
 ### Repository lineage, workspace instance and similar-repository conflicts
 
@@ -4495,7 +4405,7 @@ Legacy records that carry only a display name, old path or repository URL are no
 
 ## I4.2. Resolution order
 
-`WorkScopeResolver` применяет evidence-first порядок:
+`WorkScopeResolver` uses an evidence-first order:
 
 ```text
 1. current authenticated Session/Task binding with exact WorkspaceInstance identity;
@@ -4557,9 +4467,9 @@ A mismatching cwd, open file, process root or worktree does not silently move th
 
 ## I4.3. BootstrapScanner
 
-Scanner — deterministic fast pass. Он должен завершаться без model call.
+Scanner is a deterministic fast pass. It must complete without a model call.
 
-Собирает:
+It collects:
 
 ```text
 canonical paths and filesystem identity;
@@ -4595,7 +4505,7 @@ ProvisionalScopeProfile:
   scan_evidence_refs:
 ```
 
-## I4.3.1. Authenticated WorkScope proposal and scan boundary
+### I4.3.1. Authenticated WorkScope proposal and scan boundary
 
 An explicit path, project name or host hint is evidence, not scope authority. Resolution uses a `WorkScopeProposal` and produces a durable `WorkScopeResolutionReceipt`:
 
@@ -4678,7 +4588,7 @@ calibration history;
 deep Dreamer synthesis.
 ```
 
-Level 0 обязан быть достаточным до scope-sensitive durable promotion или Material effect. Initial exploration, safe capture and the probes that build Level 0 may begin earlier in the provisional scope. Levels 2–3 запускаются только при value/budget reason и могут работать в фоне.
+Level 0 must be sufficient before scope-sensitive durable promotion or a Material effect. Initial exploration, safe capture, and probes that construct Level 0 may begin earlier in the provisional scope. Levels 2–3 start only for a value or budget reason and may run in the background.
 
 Onboarding is a checkpointed Durable Job:
 
@@ -4795,7 +4705,7 @@ The receipt also proposes, but does not silently start, useful first maintenance
 
 ## I4.5. Generation vector and State Fence
 
-Один глобальный integer generation запрещён. `StateFence` содержит только load-bearing dependencies.
+One global integer generation is prohibited. `StateFence` contains only load-bearing dependencies.
 
 ```yaml
 StateFence:
@@ -4809,11 +4719,54 @@ StateFence:
   created_at:
 ```
 
-Dependency может быть добавлена compiler/admission. Удаление observed или policy-required dependency ради сохранения authority запрещено.
+Compiler or admission may add a dependency. Removing an observed or policy-required dependency to preserve authority is prohibited.
+
+`ScopeSnapshot` — immutable operation-local resolution of a scope expression for retrieval, research or another bounded information job:
+
+```yaml
+ScopeSnapshot:
+  snapshot_id_and_revision:
+  resolved_scope_expression:
+  participant_scope_and_project_generations:
+  member_source_revision_refs:
+  policy_authority_and_disclosure_closure:
+  purge_ledger_revision:
+  state_fence_ref:
+  digest_created_at_and_expiry:
+```
+
+Every model call, artifact and citation that claims this resolved scope binds the snapshot digest. A purge or newly applicable deny invalidates every dependent snapshot immediately. A member revision purged before execution is excluded when the snapshot is refreshed and cannot re-enter through an older index, cache or summary. The snapshot does not mint scope, authority or source admissibility; it records the exact closure selected by existing owners. When load-bearing, its digest enters `StateFence.revision_heads`.
+
+`SourceView` answers what “current” means before planning or readback. It is selected explicitly rather than inferred from whichever bytes happen to be easiest to open:
+
+```yaml
+SourceView:
+  kind: working_tree_current | git_index | git_commit | imported_snapshot | retained_revision
+  workspace_instance_id:
+  workspace_view_revision_ref:
+  git_commit_oid:
+  imported_snapshot_id:
+  retained_revision_id:
+
+WorkspaceViewRevision:
+  workspace_instance_id:
+  root_filesystem_identity:
+  repository_lineage_id:
+  head_commit_and_branch:
+  git_index_identity:
+  inventory_revision:
+  worktree_observation_cursor:
+  authenticated_ide_overlay_revision:
+  ignore_and_source_admission_policy_revision:
+```
+
+For `working_tree_current`, precedence is authenticated unsaved IDE buffer, then confirmed saved worktree revision, then the selected published base representation. One compound query uses one workspace-view revision across all branches. Drift forces replan or an explicit stale/incomplete result; results from two revisions are never merged as one coherent answer. These view objects are operation-local dependencies inside the existing State Fence, not a second workspace, publication or canonical-state owner.
+
+An authenticated unsaved IDE overlay is an ephemeral read surface. Unless an explicit save or governed admission creates a new `SourceRevision`, `EvidenceHandle`, or `ArtifactRevision` with a receipt, its bytes MUST NOT enter CanonicalStore, BlobStore, Operational Recovery State, backups, telemetry payloads, provider caches, experience corpora, `AttemptLearningDelta`, `CampaignHarnessOverlay`, Skill or procedure candidates, or any promotion input. Policy may retain only non-reconstructive metadata required to fence the view—digest, size, editor or Session identity, and invalidation cursor. Closing, replacing, or losing authentication for the overlay invalidates every dependent view.
 
 ## I4.6. Change detection
 
-Источники:
+Sources:
 
 ```text
 filesystem watcher (`notify`) as hint;
@@ -4825,9 +4778,9 @@ module outbox event;
 manual Human declaration.
 ```
 
-Watcher event сам по себе не является canonical fact. Он инициирует bounded reconciliation.
+A watcher event is not a canonical fact by itself. It starts bounded reconciliation.
 
-Изменение:
+A change:
 
 ```text
 increment affected resource generation;
@@ -4836,6 +4789,14 @@ mark derived capsules/graphs dirty;
 keep independent scopes active;
 queue context delta and attention if material.
 ```
+
+Every current-state observation carries an orthogonal freshness value:
+
+```yaml
+observation_freshness: current_confirmed | observed_with_age | gap_detected | unknown
+```
+
+A watcher/USN overflow, missing cursor interval or unresolved editor-overlay gap prevents the claim “current workspace state”. The system reconciles within budget or returns `OBSERVATION_GAP`; it does not relabel an old index as current. A bounded non-strict read may use `observed_with_age` only when the age and limitation are exposed. Exact absence, completeness and current-state claims require `current_confirmed`. Historical/frozen views may deliberately use retained immutable bytes and state that view explicitly.
 
 ## I4.7. Scope transition
 
@@ -4852,11 +4813,11 @@ Expand/contract/merge/split/move:
 8. commit receipt.
 ```
 
-Cross-scope atomicity не обещается. Используется saga с visible partial outcomes.
+Cross-scope atomicity is not promised. Use a saga with visible partial outcomes.
 
 ## I4.8. ELIOT self-scope and immediate system-experience bank
 
-`kind = eliot_system` связывает:
+`kind = eliot_system` binds:
 
 ```text
 accepted Architecture revision;
@@ -4955,7 +4916,7 @@ Before a Material change to ELIOT, the self-scope compiler adds applicable `ARCH
 
 ## I5.1. Storage boundary
 
-Domain system видит интерфейс `CanonicalStoreService`, а не SurrealDB.
+The domain system sees the `CanonicalStoreService` interface, not SurrealDB.
 
 ```text
 writes:
@@ -4985,7 +4946,7 @@ cannot invent semantic transitions.
 
 ### Canonical Store
 
-Содержит:
+Contains:
 
 ```text
 cognitive inheritance;
@@ -5043,7 +5004,7 @@ The installation secret provider owns the key reference. `expires_at` is a clean
 
 The store-neutral `BlobStore` contract has exactly one active data-root owner. The default early topology keeps it co-located behind the store/daemon contract; an independent `eliot-blob.exe` generation is a measured isolation/replacement option, not an automatic D2 obligation. During D1 the owner MAY be an explicitly declared internal backend in `eliot-store-surreal` or `eliotd` under the same contract, bounded resources and extractable on-disk format. An internal and process backend may never own the same root concurrently. The capability has no canonical semantic or DB authority and exposes only scoped stage/read/reachability/GC operations.
 
-Content-addressed immutable storage для больших payloads:
+Content-addressed immutable storage for large payloads:
 
 ```text
 raw tool outputs produced by governed task activity;
@@ -5055,7 +5016,7 @@ export segments;
 report attachments.
 ```
 
-Blob Store is a payload substrate, not a corpus-ingestion pipeline. D0–D4 do not watch directories and dump documents, logs or media into ELIOT automatically. Bulk acquisition, parsing, indexing and RAG belong to the future Researcher module. Ordinary task execution may spool exact large tool output/log evidence when a canonical observation or trace references it. An unreferenced external corpus is not cognitive memory merely because its bytes exist in Blob Store.
+Blob Store is a payload substrate, not a corpus-ingestion pipeline. D0–D4 do not watch directories and dump documents, logs or media into ELIOT automatically. Bulk acquisition, parsing, indexing and RAG are governed by Researcher and executed only by admitted providers (I21); Blob Store never becomes the ingestion owner. Ordinary task execution may spool exact large tool output/log evidence when a canonical observation or trace references it. An unreferenced external corpus is not cognitive memory merely because its bytes exist in Blob Store.
 
 ## I5.3. Store-neutral semantic API
 
@@ -5073,7 +5034,7 @@ module/config/lifecycle and recovery;
 audit/telemetry evidence.
 ```
 
-Exact variants exist only in the active generated contract catalogue. This summary cannot create a command or public surface.
+Exact executable variants exist only in an admitted contract catalogue bound to the current normative-pair receipt. Bootstrap retained projections under `docs/generated/` preserve design coverage but remain `ImplementationSupport = TARGET` with `EvidenceExecutionStatus = NOT_EXECUTED`; they cannot create a command, handler or public surface.
 
 ### Named reads (summary; physical/query profile is defined by I5.20 and Appendix N)
 
@@ -5093,7 +5054,7 @@ GetAuditRange
 ResolveWriteReceipt
 ```
 
-Ни одна команда не содержит raw query string.
+No command contains a raw query string.
 
 `GetGenerationRegistryView`, active Session/User Broker bindings, ORS operation state and live process health are Kernel/control reads, not canonical-store named reads. `CapabilityRegistryView` is composed by Governor from canonical manifests/evidence plus Kernel Generation Registry, current health, policy and Watchdog supervision; the store supplies only `GetCapabilityEvidenceState`. A store implementation therefore cannot become the owner of active process state or current capability admission.
 
@@ -5111,7 +5072,7 @@ outbox intent;
 audit chain fields.
 ```
 
-Всё коммитится одной DB transaction. Notification никогда не объявляет commit до receipt.
+Everything commits in one database transaction. Notification never announces a commit before its receipt.
 
 ## I5.5. Write envelope
 
@@ -5146,7 +5107,7 @@ CanonicalWriteEnvelope:
   response_mode: wait_for_commit | accept_after_stage
 ```
 
-Agent-provided semantic label является только предложением. Governor может понизить запрошенный epistemic effect, но не отбрасывает исходное observation. `operation_id` is globally unique within the installation. `idempotency_key` identifies the same logical transition across retries: the same key plus the same canonical request hash resolves to the same submission/receipt; the same key with a different hash is rejected as an identity conflict.
+An agent-provided semantic label is only a proposal. Governor may reduce the requested epistemic effect, but never discards the original observation. `operation_id` is globally unique within the installation. `idempotency_key` identifies the same logical transition across retries: the same key with the same canonical request hash resolves to the same submission and receipt; the same key with a different hash is rejected as an identity conflict.
 
 One envelope belongs to one WorkScope and one atomic semantic transition. Multiple commands or batch items are allowed only when they share the same causal intent, authority, privacy boundary and complete `ordering_scopes` set. The envelope commits or rejects as a unit. Cross-WorkScope atomic writes, hidden partial success and a command that silently creates a second transition are forbidden.
 
@@ -5271,7 +5232,7 @@ Kernel does not reinterpret project meaning. It verifies identity, authority, fe
 
 ## I5.7. Ordering and parallelism
 
-`OrderingScope` выбирается по state whose preconditions can mutually invalidate.
+`OrderingScope` is selected by the state whose preconditions may mutually invalidate.
 
 DEFAULT classes:
 
@@ -5284,7 +5245,7 @@ principal:<principal_id>
 config:<config_domain>
 ```
 
-Один `OrderingScope` имеет один active writer epoch и одну in-flight canonical transition. Independent Ordering Scopes execute concurrently.
+One `OrderingScope` has one active writer epoch and one in-flight canonical transition. Independent Ordering Scopes execute concurrently.
 
 Multi-scope transition:
 
@@ -5349,7 +5310,7 @@ These are runtime defaults and are tuned by real store workload. Increasing them
 
 ## I5.8. Canonical event and projections
 
-Event journal является audit/rebuild source, но normal reads используют projections.
+The event journal is the audit and rebuild source, while normal reads use projections.
 
 ```yaml
 CanonicalEvent:
@@ -5373,7 +5334,7 @@ CanonicalEvent:
 
 A transition touching several Ordering Scopes has one immutable semantic event identity and one chain link per affected scope. Each link hashes the same event identity/payload plus its scope, sequence and previous link. This preserves one atomic transition without pretending that several causal streams share one head.
 
-Projection rebuild — Doctor recipe, не normal write path.
+Projection rebuild is a Doctor recipe, not a normal write path.
 
 Every derived projection is published through one `ProjectionPublicationRecord`:
 
@@ -5453,11 +5414,11 @@ RocksDB-backed single-node service until measured replacement;
 logical backup/export only; no copying live DB files.
 ```
 
-The accessible audited source lineage remains non-conformant because generic payload round-trip, admission and migration guarantees are not proven. `SCHEMALESS` by itself is not the defect: a flexible payload is admissible only behind a tagged/versioned codec, required-field constraints, property-based round-trip tests and explicit migration. Stable records normally use SCHEMAFULL or equivalent generated constraints.
+The retained audited source lineage did not prove generic payload round-trip, admission or migration guarantees. That result is regression evidence, not a current repository verdict: current support is classified only by an exact I0.5 `CurrentSystemEvidenceSnapshot`. `SCHEMALESS` by itself is not the defect: a flexible payload is admissible only behind a tagged/versioned codec, required-field constraints, property-based round-trip tests and explicit migration. Stable records normally use SCHEMAFULL or equivalent generated constraints.
 
 ### Compatibility gate
 
-SurrealDB 3.2.x допускается в production после:
+SurrealDB 3.2.x is admissible in production after:
 
 ```text
 schema/migration rehearsal;
@@ -5468,7 +5429,7 @@ query latency on real ELIOT fixture;
 no regression against fallback line.
 ```
 
-До этого installation может использовать только последнюю локально квалифицированную fallback generation, независимо от minor-line label. `compatibility.toml` показывает active decision.
+Until then, an installation may use only its latest locally qualified fallback generation, regardless of minor-line label. `compatibility.toml` exposes the active decision.
 
 ### Store connection generations
 
@@ -5480,7 +5441,7 @@ write clients      — canonical transactions under WriteCoordinator limit;
 health/admin client— isolated version/schema/backup/health operations.
 ```
 
-Primary transport is the current supported remote RPC/WebSocket path. HTTP/admin fallback may be used only for supported health/recovery operations. CLI/offline access requires stopped store and maintenance authority. Raw database MCP/passthrough is forbidden.
+The target primary transport is the remote RPC/WebSocket path admitted by the exact current compatibility profile. Without that evidence, transport support remains unqualified. HTTP/admin fallback may be used only when separately admitted for the exact health/recovery operation. CLI/offline access requires a stopped store and maintenance authority. Raw database MCP/passthrough is forbidden.
 
 Each client set has a generation, deadlines and bounded reconnect backoff. A broken generation is replaced explicitly; an in-flight write with unknown outcome is resolved by `WriteReceipt` before any replay.
 
@@ -5506,20 +5467,20 @@ Two server processes never open the same production data root. A server crash du
 
 ## I5.10. Canonical Exchange Format
 
-`ECXF/1` обеспечивает замену DB.
+`ECXF/1` enables database replacement.
 
 ```text
 manifest.json
 schema/
 events/*.ndjson.zst
 projections/*.ndjson.zst
-blobs/<hash>.blob
+blobs/<residency-key-digest>/<content-digest>.blob
 receipts/*.ndjson.zst
 integrity.json
 privacy-purge-ledger.json
 ```
 
-Manifest содержит:
+The manifest contains:
 
 ```text
 format version;
@@ -5527,17 +5488,18 @@ source store adapter/version;
 Architecture source digest plus externally sealed NormativePairIdentity receipt;
 scope/revision ranges;
 checksums;
+opaque blob residency identities plus retention/erasure domains;
 encryption/compression;
 missing/unsupported features;
 purge state;
 export receipt.
 ```
 
-Экспорт не зависит от SurrealQL.
+Export is independent of SurrealQL.
 
 ### Consistent export boundary
 
-An ECXF export is tied to an `ExportFence` containing schema/store generation, scope revisions, Ordering Heads, event range and blob reachability manifest. The bridge uses a database-supported consistent snapshot/transaction when available. Otherwise it records a base fence, exports immutable history/projections, tails canonical events to a final fence and briefly quiesces affected writes for final reconciliation. If neither route can prove a coherent boundary, the export fails; mixing unrelated table moments into one “backup” is forbidden.
+An ECXF export is tied to an `ExportFence` containing schema/store generation, scope revisions, Ordering Heads, event range and blob residency/reachability manifest. The bridge uses a database-supported consistent snapshot/transaction when available. Otherwise it records a base fence, exports immutable history/projections, tails canonical events to a final fence and briefly quiesces affected writes for final reconciliation. If neither route can prove a coherent boundary, the export fails; mixing unrelated table moments into one “backup” is forbidden.
 
 ## I5.11. Storage replacement
 
@@ -5561,17 +5523,28 @@ Rollback switches generation back only if no irreversible migration/effect occur
 
 `BlobStore` is a vendor-neutral CAS contract with one active root owner. A co-located or process backend MUST implement the same contract, receipt format, encryption lineage, reachability rules and conformance suite. Kernel routes process-backed requests; `eliotd` decides whether a payload is admissible and later references only a completed `BlobReadyReceipt`. A component that is not the declared active owner never writes the blob filesystem directly. Extraction from an internal backend to `eliot-blob.exe` is a generation cutover: quiesce stages, reconcile temp/ready receipts, fence the old owner, switch the route, then resume.
 
-Path:
+Logical object identity is scoped by deletion and retention obligations:
 
 ```text
-C:\ProgramData\Eliot\blobs\<prefix>\<blake3>.blob
+ObjectResidencyKey = scope_domain_id + access_domain_id + confidentiality_domain_id +
+                     encryption_key_domain_id + retention_domain_id + erasure_domain_id +
+                     content_digest
+```
+
+`content_digest` includes the active Blob format's algorithm and version; the current default is BLAKE3, but the ownership rule is algorithm-neutral. `scope_domain_id` binds the lawful WorkScope or source namespace; access and confidentiality domains bind principals and disclosure; `encryption_key_domain_id` binds the permitted key lineage; retention and erasure domains bind lifecycle and purge closure. Equal bytes deduplicate only when **all** residency-domain identities are equivalent. Byte equality never permits cross-domain physical co-residency, ciphertext reuse, encryption-key reuse, or coupling of retention and erasure obligations. Moving content between domains is an explicit copy or re-encryption transition with a receipt and an explicit disposition for the old copy—not a metadata relabel.
+
+Physical path is derived from the full residency identity, not from a global content digest alone:
+
+```text
+C:\ProgramData\Eliot\blobs\<residency-key-digest>\<prefix>\<content-digest>.blob
 ```
 
 Algorithm:
 
 ```text
 stream through privacy/redaction policy;
-hash the exact post-policy canonical bytes that will be stored;
+compute the versioned digest of the exact post-policy canonical bytes;
+resolve scope, access, confidentiality, encryption-key, retention and erasure domains and derive the residency key;
 retain a separate protected source checksum only when policy permits;
 compress and AEAD-encrypt to a temp envelope;
 flush and fsync ciphertext plus metadata;
@@ -5585,7 +5558,7 @@ The live set is the union of canonical references under a stable revision fence,
 
 Encryption uses a random installation master key protected by the platform secret provider and filesystem ACL for the ELIOT service identity; only the Blob Store code path receives the materialized key handle. Blob payloads use versioned per-object/per-scope AEAD envelopes; the master key, plaintext data keys and secrets never enter TOML, canonical memory or logs. This limits accidental exposure but is not claimed as a hard boundary against arbitrary code already compromised under the same privileged OS identity; `dpapi-machine` alone is never treated as authorization. Key rotation creates a new key lineage and background rewrap job; missing key material degrades reads/recovery visibly and never causes plaintext fallback.
 
-`BlobReadyReceipt` binds content hash, stored length, compression/encryption format, key lineage, privacy/retention class, durable path generation and operation identity. It proves durable payload availability only; admissibility and semantic meaning remain the later canonical transition.
+`BlobReadyReceipt` binds the logical residency identity, versioned content digest, stored length, compression/encryption format, key lineage, privacy/retention class, erasure domain, durable path generation and operation identity. It proves durable payload availability only; admissibility and semantic meaning remain the later canonical transition.
 
 Inline threshold DEFAULT: 32 KiB. Exact value lives in config/profile.
 
@@ -5630,7 +5603,9 @@ Backup existence is not recovery proof. Scheduled restore rehearsal is a release
 
 A portable/full backup may not merely copy installation-encrypted blob files and assume the destination owns the key. It either re-encrypts payloads into the backup envelope or records a separately protected wrapped-key manifest and restoration receipt. The backup contains key lineage and format metadata, never plaintext master/data keys. Missing or unverifiable key material makes the affected blob set unrestorable and fails `full_recovery` proof.
 
-A `full_recovery` backup receipt requires one manifest binding the ECXF `ExportFence`, every referenced blob hash, a self-consistent `OrsSnapshotFence`, purge-ledger revision, configuration/policy/module and approved Host/dependency build manifests, integrity anchors and any unreconciled critical Watchdog signals/intents under a `WatchdogSpoolFence`. If a `HostStateAuditFence` is attached, it contains only a logical forensic digest/snapshot of installation lineage and observed dispositions; it is optional for recovery because cutover creates a new Host lineage, and it is never restored as active authority. Watchdog/Host operational snapshots restore only as forensic/suspended evidence and never as active supervision or authority. Missing blobs, an unexplained revision gap or an incoherent ORS fence fails that class rather than producing a partial “successful” backup. `canonical_only_degraded` uses a different explicit receipt/status and cannot satisfy normal restore-readiness policy. Incremental backups preserve the base snapshot and exact canonical event interval needed for replay.
+Export and backup never merge blob records solely because their content digests match. Every entry preserves the opaque residency-key digest, versioned content digest, retention/erasure domains and purge-ledger revision. Equal bytes under different obligations remain distinct logical objects; restore applies the current purge ledger and may not coalesce them into a shared residency object.
+
+A `full_recovery` backup receipt requires one manifest binding the ECXF `ExportFence`, every referenced blob residency identity and content digest, a self-consistent `OrsSnapshotFence`, purge-ledger revision, configuration/policy/module and approved Host/dependency build manifests, integrity anchors and any unreconciled critical Watchdog signals/intents under a `WatchdogSpoolFence`. If a `HostStateAuditFence` is attached, it contains only a logical forensic digest/snapshot of installation lineage and observed dispositions; it is optional for recovery because cutover creates a new Host lineage, and it is never restored as active authority. Watchdog/Host operational snapshots restore only as forensic/suspended evidence and never as active supervision or authority. Missing blobs, an unexplained revision gap or an incoherent ORS fence fails that class rather than producing a partial “successful” backup. `canonical_only_degraded` uses a different explicit receipt/status and cannot satisfy normal restore-readiness policy. Incremental backups preserve the base snapshot and exact canonical event interval needed for replay.
 
 `OrsSnapshotFence` is a logical Kernel export, not a copy of a live redb file. It records Host/Kernel authority lineage, last reconciled canonical receipt/event/outbox cursors, pending-operation identities and hashes, job checkpoints, generation cutovers and snapshot time. The ORS and canonical export are not claimed to be one cross-store transaction: the manifest records their relation, and restore imports every ORS item as `suspended_recovery` for receipt/effect reconciliation. If Kernel cannot produce a self-consistent logical ORS snapshot, only a `canonical_only_degraded` receipt may be issued; it preserves canonical data but is not advertised as a full backup or normal operational-recovery point.
 
@@ -5648,13 +5623,22 @@ Route Continuation State;
 provider-side data when API supports deletion.
 ```
 
+Evidence handles expose one closed availability axis, orthogonal to epistemic status, execution/evaluation and source admissibility:
+
+```text
+EvidenceHandleAvailability:
+  LIVE | STALE | COLD_RESTORABLE | REDACTED | RETENTION_BLOCKED | BROKEN_INTEGRITY
+```
+
+These are not all terminal states. `STALE` may be revalidated, `COLD_RESTORABLE` may be restored through a qualified path, and the retention-blocked state records a hold/policy reference plus next review or expiry while ordinary use remains unavailable where policy permits. `REDACTED` returns no deleted content—only a non-revealing tombstone/purge reference. It is not `BROKEN_INTEGRITY` and cannot be silently substituted by a summary, cached excerpt or other derivative. `BROKEN_INTEGRITY` means required bytes/digest lineage cannot be proven and never masquerades as privacy erasure.
+
 Erasure produces purge receipt and non-revealing tombstone/digest when policy permits. Restore refuses to resurrect purged payload.
 
 ---
 
 ## I5.15. Canonical contract catalogue
 
-The versioned contract catalogue/IDL is the single catalogue of load-bearing public and durable contracts. **No generated authoritative catalogue exists yet; current status is `TARGET / NOT_ACTIVATED`.** Until a real generated catalogue is consumed by source/tests, the owning I-section remains authoritative for meaning, owner, behavior and failure semantics.
+The versioned contract catalogue/IDL is the single catalogue of load-bearing public and durable contracts. **No generated authoritative catalogue exists yet; `ImplementationSupport = TARGET` and `EvidenceExecutionStatus = NOT_EXECUTED`.** Until a real generated catalogue is consumed by current source/tests and bound evidence, the owning I-section remains authoritative for meaning, owner, behavior and failure semantics.
 
 Appendices N/P/H are target/discoverability projections. They cannot override an owning I-section, create support by presence, or become a second field-level schema owner.
 
@@ -6247,13 +6231,13 @@ Database idempotency and external-effect idempotency remain separate. An externa
 
 ## I6.1. Purpose
 
-Контракты должны давать агенту достаточную определённость без ритуала. Глубина зависит от impact и uncertainty, а не от желания системы заполнить поля.
+Contracts must give the agent sufficient certainty without ritual. Depth follows impact and uncertainty, not a desire to fill fields.
 
 ## I6.2. Four levels
 
 ### Primitive
 
-Для read-only, reversible, локального и очевидного действия.
+For a read-only, reversible, local, obvious action.
 
 ```text
 intent;
@@ -6264,7 +6248,7 @@ one stop condition.
 
 ### Standard
 
-Для обычной разработки одного module/work item.
+For ordinary development of one Module or work item.
 
 ```text
 goal and acceptance;
@@ -6277,7 +6261,7 @@ writeback requirement.
 
 ### Deep
 
-Для Material/Critical, cross-module, migration, security, stateful change.
+For Material or Critical, cross-Module, migration, security, or stateful change.
 
 ```text
 competing options and rationale;
@@ -6292,7 +6276,7 @@ explicit residual unknowns.
 
 ### Release
 
-Для public installation/release.
+For a public installation or release.
 
 ```text
 compatibility matrix;
@@ -7455,6 +7439,17 @@ Claim only the exact scope actually proven.
 
 Host-specific skill adds only host limitations and exact tool names. Skills do not restate Architecture.
 
+Skill context is paid at three separate points and each has its own budget:
+
+```text
+index     name and one-line trigger description of every route/profile/policy-eligible Skill;
+          paid every session for that eligible catalogue;
+body      the Skill instruction itself; paid on activation; kept intent-dense;
+runtime   references, scripts and assets; paid only when actually read or executed.
+```
+
+The trigger description states **when to load**, not what the Skill can do; it is evaluated by activation precision, activation recall and forbidden activation. A verbose body is not a local cost: several Skills may be active at once, so one oversized Skill degrades unrelated capabilities. Adding a Skill can regress another Skill without modifying it, which is why the catalogue is evaluated as shared behavioral surface rather than as isolated documentation (I7.25).
+
 ## I7.13. Skill validation and promotion
 
 All Skills pass cheap structural checks:
@@ -7704,7 +7699,7 @@ reason_code (open versioned registry):
   exact machine-readable cause from Appendix D.
 ```
 
-Appendix D is the current human-readable projection of an additive reason-code registry, not a giant control-state enum that every bridge or agent must understand. The generated registry owns the exact current count; bridge-only legacy aliases remain separate. Unknown future reason codes are preserved verbatim and handled through the stable disposition and typed directive; they do not break decoding or silently become success. Aliases are accepted only at migration/compatibility boundaries and are not members of the current reason catalogue. Agent surfaces group reasons without changing their exact identity:
+Appendix D and `docs/generated/reason-codes.md` are the current human/machine-readable documentation projections of the additive reason-code set, not a giant control-state enum that every bridge or agent must understand. I7.20 owns the exact current documentation set; a future generated runtime registry must match it. Until exact runtime source and execution evidence exists, the projected registry remains `ImplementationSupport = TARGET` with `EvidenceExecutionStatus = NOT_EXECUTED`. Bridge-only legacy aliases remain separate. Unknown future reason codes are preserved verbatim and handled through the stable disposition and typed directive; they do not break decoding or silently become success. Aliases are accepted only at migration/compatibility boundaries and are not members of the current reason catalogue. Agent surfaces group reasons without changing their exact identity:
 
 ```text
 request/identity     — INVALID_ARGUMENT, AUTHENTICATION_REQUIRED, WORKSCOPE_UNAUTHENTICATED,
@@ -7714,8 +7709,8 @@ request/identity     — INVALID_ARGUMENT, AUTHENTICATION_REQUIRED, WORKSCOPE_UN
                        RESOURCE_IDENTITY_CHANGED, RESOURCE_LEASE_REPLAYED;
 authority/policy     — AUTHORITY_REQUIRED, POLICY_DENIED, ACTION_LEASE_REQUIRED,
                        WRITESET_VIOLATION, IMPACT_ESCALATION_REQUIRED;
-state/conflict       — STALE_STATE_FENCE, STALE_AUTHORITY_EPOCH, STALE_PROJECTION, SCOPE_CONFLICT,
-                       CONFLICT_OPEN, CRITICAL_ATTENTION_OPEN, SEQUENCE_GAP_OPEN, TRANSITION_DIGEST_MISMATCH,
+state/conflict       — STALE_STATE_FENCE, STALE_AUTHORITY_EPOCH, STALE_PROJECTION, OBSERVATION_GAP,
+                       SCOPE_CONFLICT, CONFLICT_OPEN, CRITICAL_ATTENTION_OPEN, SEQUENCE_GAP_OPEN, TRANSITION_DIGEST_MISMATCH,
                        AMBIGUOUS_RESULT, DESCENDANT_CLOSURE_INCOMPLETE;
 cognition/proof      — NEEDS_REASONING_CANDIDATE, CUE_BINDING_REQUIRED,
                        PACKET_REFRESH_REQUIRED, PROBE_REQUIRED, NOT_ONBOARDED,
@@ -7757,7 +7752,7 @@ security/recovery    — PRIVACY_DENIED, DISCLOSURE_CLOSURE_INCOMPLETE,
                        CUTOVER_BLOCKED_INFLIGHT_EFFECT, INCIDENT_LOCKDOWN.
 ```
 
-Every non-success response includes `disposition`, exact `reason_code`, the applicable Recovery or Conflict Directive and the same operation identity when one exists. Bridges switch on the stable disposition and MAY specialize known reason codes; they may not require an exhaustive compile-time match over the entire additive reason registry. Legacy names translate only through Appendix D and never create host-specific semantic control enums. Silence, raw deserialization output and generic internal-error prose are not normal control behavior.
+Every non-success response includes `disposition`, exact `reason_code`, the applicable Recovery or Conflict Directive and the same operation identity when one exists. Bridges switch on the stable disposition and MAY specialize known reason codes; they may not require an exhaustive compile-time match over the entire additive reason registry. Legacy names translate only through the bridge-alias mapping projected in `docs/generated/reason-codes.md` and never create host-specific semantic control enums. Silence, raw deserialization output and generic internal-error prose are not normal control behavior.
 
 ## I7.21. Default agent role capability profiles
 
@@ -7916,6 +7911,7 @@ README/handshake claims do not make a tool available without capability evidence
 Tool Definition changes invalidate dependent Skills, profiles, packets and competence evidence;
 repeated calls without new evidence, state transition or effect create a tool-loop signal;
 tool-count reduction is not a goal if it removes a load-bearing capability;
+an unavailable or forbidden capability is absent from the advertised surface, not merely discouraged in prose;
 no model-authored tool choice creates authority to execute the tool.
 ```
 
@@ -7978,6 +7974,8 @@ SkillLifecycleView:
   applies_when_and_does_not_apply_when:
   dependency_and_tool_definition_versions:
   delivered_expanded_and_executed_counts:
+  eligibility_activation_and_activation_latency:
+  adherence_at_early_mid_and_final_checkpoints:
   verified_success_failure_and_uncertain_outcomes:
   observed_decision_or_verifier_delta:
   false_activation_and_distractor_history:
@@ -7991,6 +7989,8 @@ Rules:
 
 ```text
 installed != delivered != executed != useful;
+eligible != activated != adhered: an update may be eligible and never retrieved, retrieved and never used, used early and abandoned by the final turn;
+silence about adherence is unknown, not compliance;
 retrieval, repetition and model agreement do not reinforce a Skill;
 Skill execution is linked to exact steps, artifacts and verifiers when observable;
 shared success may remain distributed or uncertain rather than being assigned to one Skill;
@@ -8000,7 +8000,7 @@ dependency or Tool Definition change marks the Skill stale before Material use;
 Dreamer/Curator may propose lifecycle changes, but they remain reversible candidates until governed promotion.
 ```
 
-A `SkillExecutionEvidence` can show that a procedure was followed and what happened; it cannot prove that the Skill alone caused the result. A `SkillInteractionView` records conflicts, required ordering and mutual exclusion only when observed or explicitly specified.
+A `SkillExecutionEvidence` can show that a procedure was followed and what happened; it cannot prove that the Skill alone caused the result. Per-attempt eligibility, packet position, retrieval, delivery, observable activation and adherence for a Skill/overlay/procedure are bound by the `HarnessActivationReceipt` in I12.24; aggregate lifecycle counts never substitute for that exact receipt. A `SkillInteractionView` records conflicts, required ordering and mutual exclusion only when observed or explicitly specified.
 
 Skill curation is selective and batch-oriented. It examines actual usage, failure, transfer and distractor evidence; it does not rewrite the hot Skill after every task. Low observed utility changes exposure or review priority, not epistemic status or authority.
 
@@ -8036,9 +8036,10 @@ Algorithm:
    material shortened view.
 3. Apply a typed reducer or deterministic range selection.
 4. Preserve errors, failure signatures, exit status and exact anchors first.
-5. Return preview + omission handle + completeness metadata.
-6. Expansion reads the stored source; it never re-executes the original tool/effect.
-7. Expired/missing source yields `OMITTED_SOURCE_UNAVAILABLE` with an explicit unavailable/partial result; the original effect is never re-executed.
+5. Preserve exact quoted spans that carry evidential weight before any generative restatement.
+6. Return preview + omission handle + completeness metadata.
+7. Expansion reads the stored source; it never re-executes the original tool/effect.
+8. Expired/missing source yields `OMITTED_SOURCE_UNAVAILABLE` with an explicit unavailable/partial result; the original effect is never re-executed.
 ```
 
 If a material omitted portion cannot be durably preserved, the response cannot claim completeness or satisfy proof. It returns an evidence-incomplete/truncated disposition with a Recovery Directive. For non-material convenience views, an explicit partial preview is allowed but never promoted.
@@ -8067,11 +8068,19 @@ EvidenceStatus:
   execution: NOT_EXECUTED | SIMULATED | EXECUTED | UNKNOWN_OUTCOME
   parsing: RAW | PARSED | PARSE_FAILED | NOT_APPLICABLE
   evaluation: UNASSESSED | PASS | FAIL | INCONCLUSIVE | STALE
-  independence: SELF_REPORTED | SAME_PATH | DISTINCT_OBSERVATION_ROUTE |
-                DISTINCT_FAILURE_DOMAIN | HUMAN_OBSERVATION
+  independence: SELF_REPORTED | SAME_PATH | SAME_ROUTE_NEW_PROMPT |
+                DISTINCT_MODEL_SAME_EVIDENCE | DISTINCT_OBSERVATION_ROUTE |
+                DISTINCT_IMPLEMENTATION_OR_TOOLCHAIN | DISTINCT_FAILURE_DOMAIN |
+                DISTINCT_ANALYST_OR_TEAM | HUMAN_OBSERVATION | INDEPENDENT_FORMAL_CHECKER
   artifact_binding: UNBOUND | BOUND_EXACT | BOUND_PARTIAL
+  attribution: OBSERVED_ASSOCIATION | SUPPORTED_CONTRIBUTION | OBSERVED_UNDER_INTERVENTION |
+               COMPOSITE_BENEFIT | CONTRADICTED | UNKNOWN
   scope_and_state_fence:
 ```
+
+Independence is a non-ordinal failure-domain profile, not a proof ladder. It names what actually changed; multiple labels may apply. A different prompt on the same route is the weakest variation and never satisfies an independent-verification requirement by itself. A different model that shares the same evidence, parent context or evaluator remains dependent on those domains, and no independence label proves correctness.
+
+`attribution` asks not “was a result obtained?” but “was the mechanism demonstrated?” A composite change may legitimately be used operationally as `COMPOSITE_BENEFIT`, but its narrative explanation is not a demonstrated mechanism without separation or control.
 
 Synthetic plan/profile records use `NOT_EXECUTED`; they may test shape and scheduling only. A real verifier requires `EXECUTED`, exact executable/config/artifact identity, immutable raw evidence handles and an applicable Evaluation Contract. Parser success is not execution; execution is not independent verification; independence is not correctness.
 
@@ -8140,11 +8149,68 @@ tool_friction / instruction_conflict
 
 These are current-session recovery actions, not proof that the agent’s diagnosis is correct. The feedback path updates the self-scope observation bank, Context/Memory quality projections and, when useful, a bounded Meta/Dreamer diagnostic job. A single complaint does not rewrite ContextRecipe, Skill, route policy or memory. Repeated supported feedback produces a Problem/ImprovementCandidate with exact packet, cost, omission, decision and outcome evidence.
 
+## I7.29. PortableSkillPackage
+
+`PortableSkillPackage` is the user-facing portable packaging contract for one or more Skills. Each package revision is an immutable user-owned artifact; it is not a Skill-utility state, Tool Definition, capability grant, scheduler or authority boundary.
+
+```text
+<package>/
+  manifest.yaml
+  SKILL.md
+  references/      optional
+  scripts/         optional
+  assets/          optional
+```
+
+```yaml
+PortableSkillPackageRevision:
+  package_id_revision_and_supersedes:
+  canonical_tree_digest_algorithm_and_value:
+  source:
+    kind: profile_local | project_local | shared_external_directory |
+          git_or_hub_url | eliot_generated_candidate
+    locator_retained_snapshot_source_digest_and_lock:
+    source_view_workscope_and_provenance:
+  manifest_format_and_compatibility_profile:
+  skill_entries_bundles_and_optional_short_aliases:
+  declared_dependencies_and_required_capability_refs:
+  tool_definition_and_configuration_requirements:
+  applies_when_where_not_apply_stop_and_escalation:
+  verification_entrypoint_ref:
+  reference_script_and_asset_inventory:
+  write_policy: protected_human_only | governed_candidate_writeback
+  package_admission_disposition: DISCOVERED_UNTRUSTED | QUARANTINED |
+                                 TRUSTED_SCOPED | REJECTED | RETIRED
+  trust_scope_principal_receipt_expiry_and_recheck_rule:
+```
+
+Discovery/import pipeline:
+
+```text
+resolve SourceAdmissionPolicy and exact SourceView;
+capture a retained immutable snapshot of regular package files;
+reject path traversal, symlink/reparse escape and mutable external references;
+compute a versioned digest over normalized relative path, file type and exact bytes;
+validate manifest, dependency/capability names, secrets and executable supply chain;
+record provenance/lock data and quarantine or request scoped trust;
+compile only the admitted Skill entries for the current route/profile/policy catalogue.
+```
+
+A Git/Hub URL is an acquisition locator only; executable use always binds the retained snapshot and digest. Project-local trust binds exact WorkScope/root identity, source-view revision, package digest and trust principal. Any byte, dependency declaration or path-identity change creates a new revision, triggers rescan and does not inherit trust from the old path. Profile-local and shared packages follow the same revision rule; location alone is never trust.
+
+`SKILL.md` becomes eligible instruction content only after package admission. Large `references/` are loaded on demand through the index/body/runtime budget of I7.12 and remain source material, not authority. Presence under `scripts/` does not register a tool or permit execution: every script and verification entrypoint requires an admitted Tool Definition, exact capability grant, sandbox/effect policy and execution receipt. Import/discovery therefore has zero execution authority.
+
+Dependency, host, contract or Tool Definition drift marks the compiled Skill stale under I7.13/I7.25 before Material use; it does not rewrite historical package trust or outcomes. Quarantine/trust describes package admission only. I7.25 remains the sole owner of installed/delivered/executed/useful evidence, and causal-helpfulness still requires the applicable decision/verifier/outcome proof rather than package load, citation or successful transport.
+
+An agent or `/learn` surface may propose a new package or immutable revision from a URL, directory, conversation, notes or document. ELIOT-generated material starts untrusted/quarantined. Writeback is an exact governed diff against the current revision with source provenance, verifier and Human/policy approval; a protected package rejects agent edits. No difficult task, repeated wording or successful import automatically promotes or rewrites a user package.
+
+Retirement prevents future activation but preserves revision history, provenance, execution evidence and rollback/restore inspection. Short aliases and bundles are namespaced surface entries resolved against the active eligible catalogue; alias selection does not widen package trust, capability or task authority.
+
 # I8. Watchdog implementation contract
 
 ## I8.1. Process and authority
 
-`eliot-watchdog.exe` — отдельный Windows service/process outside the Host/Kernel failure domain. Its run policy is dual: while a valid `SupervisionLease` exists for an observable Session, AgentAttempt, Durable Job, protected effect, maintenance/recovery operation or explicit supervision policy, the minimal deterministic sensor remains running even if Kernel/`eliotd` sleep; a dormant registered WorkScope alone is insufficient. Outside that active interval it stops after persisting journal cursors and wake intents. Host/CLI/SCM can demand-start it. Watchdog never becomes a Host/Kernel child and remains independently observable during `eliotd` failure.
+`eliot-watchdog.exe` is a separate Windows service or process outside the Host and Kernel failure domain. Its run policy is dual: while a valid `SupervisionLease` exists for an observable Session, AgentAttempt, Durable Job, protected effect, maintenance or recovery operation, or explicit supervision policy, the minimal deterministic sensor remains running even if Kernel and `eliotd` sleep; a dormant registered WorkScope alone is insufficient. Outside that active interval it stops after persisting journal cursors and wake intents. Host, CLI, or SCM may start it on demand. Watchdog never becomes a Host or Kernel child and remains independently observable during `eliotd` failure.
 
 This is the direct Implementation of Architecture 4.5: Watchdog is continuous and independent for every interval in which ELIOT is observably used or claims supervision. When there is no active Session, job, effect, maintenance/recovery obligation or user-enabled supervision policy, the interval is closed, cursors/wake state are persisted and Watchdog may stop. There is no claim of machine-wide observation outside such an interval and no Architecture conflict.
 
@@ -8561,22 +8627,22 @@ Two Watchdog generations may observe simultaneously, but only one active supervi
 
 ## I8.16. Development drift supervision
 
-Watchdog наблюдает не «правильность кода», а признаки подмены product objective локальными proxy:
+Watchdog observes not “code correctness,” but signs that local proxies have displaced the product objective:
 
 ```text
-рост commits/tests/reports без нового product evidence;
-повторный repair одного failure class без новой hypothesis/discriminator;
-PASS с нулём реально запущенных tests;
-локальный green result при stale/другом source, config или installed generation;
-частое создание status/certificate prose при открытых blockers;
+growth in commits, tests, or reports without new product evidence;
+repeated repair of one failure class without a new hypothesis or discriminator;
+PASS with zero tests actually run;
+a local green result against stale or different source, configuration, or installed generation;
+frequent status or certificate prose while blockers remain open;
 branch/worktree/install/DB/docs identity divergence;
-large cross-owner diff без одного named causal property;
-повторённая ошибка, не породившая FailureFingerprint, discriminator
-или Improvement Candidate;
-activity продолжается, но Agent перестал писать observations/outcomes.
+a large cross-owner diff without one named causal property;
+a repeated error that produced no FailureFingerprint, discriminator,
+or Improvement Candidate;
+activity continues, but the agent stops reporting observations and outcomes.
 ```
 
-Watchdog создаёт `DevelopmentDriftSignal` и Diagnostic Brief. Repeated repair is keyed by a normalized `FailureClassIdentity` derived from affected property, actual owner/path, violated invariant, observable symptom and failing boundary — not by test name or prose label. Детерминированный detector не объявляет намерение агента, reward hacking или root cause фактом. Dreamer/аудитор может предложить объяснения; Task Controller или Human решает, сузить работу, потребовать Mechanism Review, сменить route или продолжить.
+Watchdog creates a `DevelopmentDriftSignal` and Diagnostic Brief. Repeated repair is keyed by a normalized `FailureClassIdentity` derived from affected property, actual owner and path, violated invariant, observable symptom, and failing boundary—not by test name or prose label. The deterministic detector does not declare agent intent, reward hacking, or root cause as fact. Dreamer or an auditor may propose explanations; Task Controller or Human decides whether to narrow work, require Mechanism Review, change route, or continue.
 
 ---
 
@@ -8712,7 +8778,7 @@ Concilium plan;
 research brief with uncertainty.
 ```
 
-Acquisition/parsing/indexing belongs to future Researcher module.
+Acquisition/parsing/indexing is governed by Researcher and executed by admitted providers (I21); Dreamer receives only governed source handles and bundles.
 
 `ResearchPack` is the acquisition/synthesis boundary:
 
@@ -8755,30 +8821,30 @@ Architecture has semantic precedence. Implementation explains the currently acce
 
 ### Development diagnosis
 
-Анализирует bounded набор development evidence:
+Analyzes a bounded set of development evidence:
 
 ```text
-Product Objective и current product gap;
-последовательность repairs и changed paths;
+Product Objective and current product gap;
+sequence of repairs and changed paths;
 failed/passed discriminators;
 actual runtime/source identities;
 open conformance gaps;
-activity artifacts без product delta;
-related FailureFingerprints и prior attempts.
+activity artifacts without product delta;
+related FailureFingerprints and prior attempts.
 ```
 
-Возвращает:
+Returns:
 
 ```text
 rival root-cause hypotheses;
 common-mode assumptions;
-вероятные proxy metrics и local-optimum loops;
-минимальный discriminative experiment;
-предлагаемый repair scope и owner;
-какие guardrails/rules следует challenge, narrow или retain.
+likely proxy metrics and local-optimum loops;
+minimum discriminating experiment;
+proposed repair scope and owner;
+which guardrails or rules should be challenged, narrowed, or retained.
 ```
 
-Output остаётся candidate. Dreamer не создаёт feature freeze, не меняет rule class, не закрывает defect и не присваивает product status.
+Output remains a candidate. Dreamer creates no feature freeze, changes no rule class, closes no defect, and assigns no product status.
 
 ### System maintenance and self-improvement planning
 
@@ -9068,130 +9134,17 @@ Remote input always instruction-tainted data. Gateway can be disabled independen
 
 ## I9.14. Researcher boundary
 
-The current line already accepts governed `ResearchPack`, `SourceRecord`, foreign-code snapshot and bounded log-window handles supplied manually or by an admitted bridge. It can preserve, retrieve and synthesize those sources without pretending that automated acquisition exists.
-
-The optional Researcher module owns automation and scale for:
+Researcher is defined in I21. Dreamer relationship only:
 
 ```text
-web/document acquisition;
-parsing/OCR;
-chunking/indexing/RAG;
-source snapshots;
-bulk document/log corpora;
-retrieval handles and corpus maintenance.
+Dreamer may request an inquiry at a declared evidence grade;
+Dreamer receives governed sources, evidence bundles and bounded briefs;
+Dreamer interprets and proposes; it does not select the coverage denominator,
+  admit a source, freeze evidence or close an inquiry disposition;
+a Dreamer synthesis never upgrades the evidence grade of the material it used.
 ```
 
-Researcher is not required for the first cognitive spine and does not become a second memory owner. Dreamer owns interpretation/synthesis. Governor owns provenance/lifecycle/admission. Watchdog owns security supervision. Absence of Researcher reports acquisition and coverage gaps; it does not erase externally supplied governed sources.
-
-
-### Reference firewall and unsupported precision
-
-Every Dreamer, Researcher, audit, local-model and external-model job receives an `AllowedReferenceManifest` bound to the exact run and State Fence:
-
-```yaml
-AllowedReferenceManifest:
-  run_job_and_root_context_revision:
-  allowed_source_record_evidence_artifact_and_url_handles:
-  allowed_tool_definition_and_verifier_refs:
-  allowed_anchor_or_coordinate_precision:
-  scope_disclosure_and_retention_classes:
-  stale_or_revoked_entries:
-  expansion_routes:
-  manifest_digest_and_state_fence:
-```
-
-A model may quote, summarize or select only entries in this manifest. It cannot mint a valid citation, URL, source ID, line range, artifact handle or support relation through prose. A syntactically plausible but absent/stale/wrong-scope reference remains unsupported text and produces a candidate diagnostic rather than an evidence edge.
-
-A newly mentioned external URL or identifier may be captured as an untrusted `ObservationCandidate` for later acquisition, but it is not treated as an allowed source or citation for the current run until Researcher/Governor resolves, snapshots and admits it.
-
-```yaml
-UnsupportedPrecisionItem:
-  asserted_reference_or_coordinate:
-  highest_supported_precision:
-  source_and_coverage_basis:
-  risk_of_false_precision:
-  required_probe_or_narrower_wording:
-```
-
-A source that supports a file-level or document-level claim does not automatically support a symbol, line, causal mechanism or population-wide statement. Reference validation occurs before candidate promotion and again when a result is packed into a shared packet or exported to another route.
-
-The firewall does not censor model reasoning. It separates free-form hypotheses from support that ELIOT is allowed to represent as anchored evidence.
-
-
-Research/inquiry completion is also typed. An empty answer or exhausted search is not silently promoted to “question answered”:
-
-```text
-ANSWERED_WITH_SUPPORTED_RESULT;
-NO_MATCH_IN_COMPLETE_SCOPE;
-NO_NEW_USEFUL_EVIDENCE;
-SOURCE_UNAVAILABLE;
-STALE_SOURCE_OR_INDEX;
-POLICY_OR_DISCLOSURE_DENIED;
-INCOMPLETE_COVERAGE;
-INCONCLUSIVE;
-CANCELLED.
-```
-
-The disposition binds query, source portfolio, coverage denominator, reference manifest, State Fence and unresolved precision items. Only `ANSWERED_WITH_SUPPORTED_RESULT` or a properly scoped `NO_MATCH_IN_COMPLETE_SCOPE` may close the corresponding inquiry item; all other outcomes preserve a next probe, narrower claim or explicit unknown.
-
-### I9.14.1. ELIOT Research federation channel
-
-`ELIOT Research` is a separate external cognitive/research system with its own database, acquisition/indexing stack, tools, agents and lifecycle. It is not the optional in-process Researcher Module and never shares ELIOT’s canonical database or authority lineage.
-
-The Research endpoint, bridge, protocol and exchange classes are admitted through the normal `RuntimeInstallation`/`HostAdapterManifest`/`CapabilityEvidenceRecord` path. Endpoint reachability or a successful login proves neither source coverage nor permission to disclose a bundle. Each exchange binds the exact Research system/bridge generation, dynamic capability pulse, principal, disclosure policy and retention contract; stale or unqualified evidence blocks only the dependent exchange.
-
-The bridge exposes an ELIOT-owned `ResearchExchangeContract` through a replaceable module/process adapter:
-
-```yaml
-ResearchQueryRequest:
-  exchange_id_protocol_bridge_and_idempotency:
-  requester_principal_authority_and_state_fence:
-  question_scope_and_expected_decision:
-  source_classes_and_coverage_goal:
-  ELIOT evidence/report handles allowed for export:
-  privacy_disclosure_retention_and_license:
-  budget_deadline_stop_and_progress_contract:
-  required result schema_and_citations:
-
-ResearchEvidenceBundle:
-  exchange_request_job_system_and_version:
-  immutable_bundle_digest_and_origin_authentication:
-  source_catalog_snapshots_and_exact_citations:
-  claim_counterclaim_and_independence_matrix:
-  bounded excerpts_and_artifact_handles:
-  coverage_unknowns_and_failed_acquisition:
-  synthesis_as_candidate:
-  disclosure_and_invalidation:
-
-ResearchExportBundle:
-  exchange_id_protocol_and_ELIOT_product_identity:
-  large ELIOT report_trace_or_service dossier:
-  exact artifact/source handles and redactions:
-  purpose_allowed_use_retention_and_return_channel:
-  disclosure_decision_and_export_receipt:
-```
-
-Dreamer may query Research when local cognitive inheritance lacks external knowledge, and may submit an important large report or service dossier for deeper processing. Returned material enters ELIOT as governed sources, evidence candidates and bounded briefs; it does not become Current Epistemic Position or a procedure automatically. Persistent large documents, corpora, embeddings and document-processing intermediates belong in Research. Main ELIOT BlobStore may retain only bounded operational artifacts/log segments under explicit retention or transfer policy; it is not a long-term research corpus. Main Cognitive Inheritance stores source cards, exact handles, bounded excerpts, decisions, outcomes and the compact knowledge needed for hot work.
-
-A deterministic `CorpusPlacementDecision` prevents accidental corpus growth:
-
-```text
-cognitive_hot
-  source card, bounded excerpt, claim/decision/failure/procedure needed for current work;
-
-operational_evidence
-  immutable artifact/log segment retained for exact proof, replay or transfer;
-
-research_corpus
-  source set requiring persistent bulk storage, OCR/parsing, repeated full-text/vector/RAG,
-  document-level synthesis or long-horizon research maintenance.
-```
-
-The decision is based on purpose, access pattern, processing lifecycle, retention/privacy and expected cognitive use—not one universal byte threshold. A payload placed in Research remains reachable by governed handle and can later yield a compact ELIOT candidate; it is not silently copied back in full.
-
-The federation is asynchronous and durable: jobs expose progress, cancellation, partial results, source coverage and terminal disposition. Research may internally use its own agents/swarms, but ELIOT controls only the admitted external job boundary unless the protocol exposes verifiable descendant lineage. Unobserved internal agents receive no independence credit and cannot create ELIOT authority or proof. Research failure degrades external knowledge only. Direct remote DB access, shared credentials, implicit bidirectional replication and Research-initiated ELIOT writes are forbidden.
-
-When a current task depends on a Research-held source, ELIOT may use only a still-valid bounded excerpt/evidence bundle already admitted under its State Fence. It does not invent the missing content or silently fall back to a stale summary. If the required bundle cannot be fetched or its disclosure/source generation cannot be verified, the dependent inquiry returns `RESEARCH_SOURCE_UNAVAILABLE` or `INCOMPLETE_COVERAGE`, while unrelated local cognitive work continues. Pending exports/imports remain durable exchange jobs and resume by idempotency identity rather than duplicate transfer.
+Reference firewall: I21.7 · Dispositions: I21.9 · Federation: I21.11 · Providers: I20.5.
 
 ## I9.15. Dreamer failure
 
@@ -9480,7 +9433,7 @@ Instrument Plane has no LLM, memory owner, scheduler or architecture authority. 
 
 ### I10.8.2. IP0 — one Windows ProcessExecutor
 
-All governed external processes use one public facade and one audited Windows semantic implementation. This means one contract/reference code path, **not** one global executor process, thread or mutable operation owner. Kernel owns daemon/module generations, `eliot-testd` owns its build/test descendants, User Broker owns interactive-user descendants, and an admitted module supervisor may own its isolated workers; each uses the same `eliot-process-windows` implementation and evidence format. The only normative Rust signature is owned by Appendix P.12; this section owns behavior, not a second copy of the trait. Its semantic operations are `start`, `inspect`, `cancel` and `reconcile`; `start` receives the governed evidence sink defined by that interface. A generated interface digest must match the Appendix P.12/catalogue owner before an implementation is admitted.
+All governed external processes use one public facade and one audited Windows semantic implementation. This means one contract/reference code path, **not** one global executor process, thread or mutable operation owner. Kernel owns daemon/module generations, `eliot-testd` owns its build/test descendants, User Broker owns interactive-user descendants, and an admitted module supervisor may own its isolated workers; each uses the same `eliot-process-windows` implementation and evidence format. This section owns the normative behavior. `docs/generated/rust-boundary-interfaces.md` §P.12 preserves one bootstrap **candidate Rust mapping** and is not a second contract owner or proof of source support. The semantic operations are `start`, `inspect`, `cancel` and `reconcile`; `start` receives a governed evidence sink. Only a future interface generated from the admitted catalogue and matched to exact source/API evidence may become an implementation-admission input.
 
 The production Windows implementation is backed by the audited `eliot-windows-ipc` process guardian and provides:
 
@@ -10166,7 +10119,7 @@ Every graph/index query is bound to the canonical `GraphRevisionFence` and publi
 
 `STALE`, `SPLIT_VIEW`, `FAILED` or unknown coverage cannot prove absence, non-impact or safe deletion. The caller either falls back to exact source/build/verifier evidence, widens the proof tier or returns an explicit unknown.
 
-Scope, authority and disclosure are enforced **before candidate generation and at every structural transformation**, not only when the final packet is rendered. A `SelectionIntegrityReceipt` covers:
+Scope, authority and disclosure are enforced **before candidate generation and at every structural transformation**, not only when the final packet is rendered. The selection-integrity chain receipt defined in I12.13 covers:
 
 ```text
 initial source/candidate set;
@@ -10359,6 +10312,22 @@ RepoWise is especially valuable as a donor/pilot arm for session episodes, Git b
 AGPL or other restrictive code is not copied into ELIOT. Process separation is an architectural isolation boundary, not a license exemption. Redistribution, packaging or hosted use requires a separate license review; until admitted, a pilot uses a user-supplied or maintainer-local pinned artifact and publishes no donor code. Selected mechanisms are reimplemented clean-room in first-party contracts.
 
 
+### Bulk mechanics execute as a program, not as model turns
+
+When a task requires many similar operations — fan-out over queries, filtering, joins, deduplication, normalization or per-item extraction — a turn-per-operation loop is the wrong shape. Each operation costs one inference round trip, intermediate candidates pollute context, one failure can end the whole trajectory, and mechanical work is performed semantically.
+
+The admitted shape separates three responsibilities:
+
+```text
+the route proposes the semantic strategy and the shape of the result;
+a deterministic bounded program executes the repetitive mechanics inside the Instrument Plane;
+only samples, aggregates, errors and selected evidence return to the model context.
+```
+
+The program is an instrument invocation with the normal contract: exact executable identity, bounded resources, cancellation, per-item failure isolation, durable intermediate artifacts and an `EvidenceEnvelope`. It receives no ambient authority, and per-branch failure never discards successful siblings.
+
+This shifts mechanics out of the model loop; it does not remove the need for evidence, coverage accounting or verification. A generated program can be efficient and still retrieve the wrong sources.
+
 ## I10.9. Git bridge
 
 Uses typed Git instrument/bridge operations through the shared ProcessExecutor (or an admitted in-process read-only library facade):
@@ -10547,7 +10516,7 @@ The default physical split is:
 training worker generation;
 clean export/quantization/calibration worker generation;
 inference/local-subagent worker generation;
-optional Researcher/RAG worker generation.
+optional Researcher-provider/RAG worker generation.
 ```
 
 Modes that require incompatible global Python imports, patches, compiler state or device libraries use clean process generations rather than a mutable “toggle” in one giant daemon. Shared model/download CAS is allowed; interpreter/module state is not silently transferred.
@@ -10717,6 +10686,7 @@ ReductionPlan
 RoleProfileManifest
   semantic role, allowed operations/effects, required competence and independence,
   input/output contract, stop/escalation and visibility limits;
+  learning_role: actor | refiner | evaluator | promotion_owner | not_applicable;
 
 RecipeManifest
   ordered/parallel stages, work-item templates, dependency/merge rules,
@@ -10784,8 +10754,20 @@ NegotiatedInterdependentInvestigation
   cross-review/selective replan → lineage-aware synthesis and verification;
 
 ImplementThenBlindAudit
-  one writer → tests → blind cross-family reviewer → correction/probe → final gate.
+  one writer → tests → blind cross-family reviewer → correction/probe → final gate;
+
+LiveLearningCampaign
+  bounded attempt → instrumented outcome → AttemptLearningDelta →
+  admitted task-local overlay revision → exact CampaignLearningStateView →
+  next attempt compilation + HarnessActivationReceipt →
+  periodic consolidation, promotion or honest stop.
 ```
+
+`LiveLearningCampaign` is selected when work is long or multi-step, feedback is frequent and competent enough to change strategy, and the next attempt is expected to use the previous outcome. Its minimum profile is one actor, one lineage and one local overlay; population search is not required. Before each materially comparable attempt, Context Compiler builds the exact derived learning-state view from existing owner revisions, then records retrieval/delivery/observable activation against that view. A missing/stale load-bearing owner ref blocks only the dependent compilation. The recipe adds no scheduler, task graph, attempt journal or authority path: the task-local overlay defined in I12.24 is admitted by Governor like any other bounded state, and terminal campaign dispositions never equal task `VERIFIED_COMPLETE`.
+
+Campaign admission records `closure_due_at`, `expires_at`, `closure_owner_ref`, and `terminalization_policy_ref` on the existing Task or Durable Job state; it creates no new scheduler or mutable campaign owner. A campaign cannot remain active indefinitely. At `closure_due_at`, the owner emits `CampaignLearningClosure` or an explicit delayed or inconclusive disposition. At `expires_at`, Governor rejects new overlay revisions and inherited attempts, then terminalizes the campaign to the strongest evidence-supported closure disposition. A missing closure owner is reassigned or escalated; it never leaves an immortal active campaign.
+
+Four functions are separated even when one model performs them sequentially: Actor solves the current task; Refiner analyses experience and proposes the local delta; Evaluator measures the declared property; Promotion Owner decides scope of influence. Role transition creates a new bounded context and capability envelope. Refiner cannot finish the task or promote its own update; Actor cannot edit the evaluator or the retention set. Same-model operation is allowed and explicitly lowers the recorded `IndependenceProfile`.
 
 Later, only after route and recipe evidence:
 
@@ -11405,6 +11387,56 @@ The same agent may perform several roles only when the Evaluation Contract permi
 
 Approach changes are recorded as a new revision with rationale, preserved partial artifacts and impact on acceptance. A bridge may suggest a fallback application or file format; it cannot silently substitute one.
 
+## I10.23. MessagingBridge
+
+`MessagingBridge` is an optional user-channel adapter contract over existing ELIOT principals, Sessions, tasks, Human Control, mailbox/outbox and delivery receipts. It does not own task semantics, memory, schedule, approval authority, route policy or completion. Local UI/CLI operation remains available when every messaging adapter is absent.
+
+```yaml
+MessagingBridgeProfile:
+  bridge_generation_platform_and_adapter_fingerprint:
+  enrolled_principal_binding_and_access_policy:
+  chat_thread_session_task_and_workscope_binding:
+  negotiated_capability_profile:
+  inbound_media_contract:
+  outbound_delivery_contract:
+  session_command_surface_and_version:
+  approval_and_attention_surface:
+  scheduled_delivery_target_ref:
+  canonical_outbox_and_sink_receipt_projection:
+  reconnect_replay_duplicate_and_freshness_policy:
+```
+
+A platform account, chat or thread is a transport locator, not an ELIOT principal or Session. Enrollment binds the exact platform identity fingerprint to an existing principal under revocable access policy. Every inbound turn resolves an explicit Session, WorkScope and Task or creates a typed `OperatorIntentCandidate`; transport reconnect does not infer continuity from chat history alone. Platform message/update identity plus adapter generation and principal binding form one replay-safe inbound event identity, so webhook/polling duplicates cannot create a second task or approval.
+
+Commands compile to typed existing operations such as session create/resume/status/stop, approval/denial, route selection, automation inspection and Skill invocation. A command never exposes a generic shell/database path or bypasses its owning contract. Approval binds the exact action/effect digest, scope, State Fence, Authority Epoch, principal and expiry; `/approve` is not session-wide authority and a replay after expiry or revision change is rejected.
+
+The capability profile is negotiated and evidenced per adapter generation: text limits, threads, editing/streaming, reactions, inbound/outbound media, file size/type, idempotency keys, acknowledgement/readback and duplicate behavior are never assumed. Unsupported capability yields an explicit degraded result or another Human surface; it is not silently emulated with weaker guarantees.
+
+Inbound files/media are admitted through `SourceAdmissionPolicy`, privacy scanning and Blob Store as immutable handles before model/tool exposure. Outbound files/media resolve from immutable artifact handles through disclosure closure and recipient policy; a local filesystem path is never sent as if it were the artifact. Revocation stops future delivery where enforceable and preserves the historical delivery receipt.
+
+The “durable delivery ledger” is a read model over the canonical outbox row and sink-owned phases from I5.21, not a second store or lifecycle owner. The logical message binds principal, chat/thread target, task/result/artifact refs, adapter generation, disclosure decision, freshness window and stable sink operation identity.
+
+Crash/reconnect behavior is exact:
+
+```text
+result committed and send not started
+  → the existing outbox item is claimed and delivered after restart;
+
+send started and acknowledgement/readback lost
+  → sink state remains UNKNOWN and is reconciled by platform idempotency/readback;
+
+no reconciliation surface and policy chooses at-least-once resend
+  → create a new marked delivery attempt for the same logical message,
+    expose possible_duplicate, preserve the old UNKNOWN attempt and freshness limit;
+
+in every case
+  → never re-execute the agent turn, model call, tool call or task effect merely to deliver.
+```
+
+Scheduled delivery is authored by `UserAutomation` or another existing Durable Job owner and committed through the outbox; the bridge only validates the target and performs delivery. Delivery, recipient acknowledgement, task completion, approval resolution, public use and outcome-helpfulness remain separate observations. A delivered “done” message cannot close a task, and a completed task is not represented as delivered until the sink receipt says so.
+
+Telegram is the first implementation `Experiment`, not a core dependency. Promotion to a Default requires Product Proof of principal/session binding, text plus file delivery, restart between result commit and send, visible unknown/duplicate handling, access revocation and non-reexecution of task effects. A second adapter is admitted only after the same common-contract proof, so adapter count cannot substitute for reliability.
+
 ---
 
 # I11. Human control plane and notifications
@@ -11683,6 +11715,68 @@ Pre-attach changes are candidate artifacts/observations and cannot become proof,
 
 A first-run “recommended integrations” page is generated from the discovery catalogue and current evidence. It may offer installation/registration plans for supported tools, SurrealDB or a code-intelligence pilot, but nothing is installed, updated or granted credentials without the applicable Human policy and visible transaction.
 
+## I11.12. UserAutomation
+
+`UserAutomation` is a first-class user-owned one-shot or recurring intent/configuration object over the existing Task Scheduler, `WakeIntent` and Durable Job contracts. It is a product capability, not `MaintenanceAutomationMode`, and it creates no scheduler, task graph, attempt journal, route owner, canonical writer or authority path.
+
+```yaml
+UserAutomationRevision:
+  automation_id_revision_and_supersedes:
+  owner_principal_and_workscope:
+  natural_language_intent:
+  normalized_schedule:
+    kind: one_shot | recurring
+    expression_and_calendar:
+    timezone_and_dst_fold_gap_policy:
+    start_end_and_next_occurrence_projection:
+  mode: agent | deterministic_process
+  task_template_or_qualified_script_ref:
+  portable_skill_package_revision_refs:
+  workdir_and_workscope_binding:
+  route_reasoning_and_cost_policy:
+  expected_provider_model_and_adapter_fingerprints_or_allowed_set:
+  delivery_target:
+  preflight_contract_revision:
+  budget_deadline_and_resource_ceiling:
+  concurrency_policy: forbid_overlap | queue_one | coalesce_latest
+  recursion_policy_and_max_child_depth:
+  configuration_state: active | paused | blocked_config | retired
+  current_execution_refs:
+  execution_history_query_ref:
+```
+
+The original natural-language request remains visible, but the normalized schedule is the trigger contract. Before activation the Human surface shows timezone, DST fold/gap behavior, next occurrences, work scope, route/cost ceiling and delivery target. An ambiguous calendar phrase is not silently guessed. An edit creates a new immutable revision and invalidates not-yet-admitted wake intents of the superseded revision.
+
+Every trigger compiles one stable `AutomationOccurrenceIdentity` from the automation revision and exact calendar occurrence; `run-now` uses an explicit manual nonce and does not mutate the schedule. Duplicate wake/restart events resolve to the same occurrence. Task Scheduler may wake Host only from the admitted intent; the `WakeIntent` itself grants no task, route, tool, effect or delivery authority.
+
+Before any model call, a deterministic `AutomationPreflightReceipt` validates:
+
+```text
+current configuration state and occurrence claim;
+principal, WorkScope, workdir and State Fence;
+task template or qualified script identity;
+exact trusted/current Skill package revisions and Tool Definitions;
+provider/model/adapter fingerprint, credentials and Human route/cost policy;
+delivery capability and disclosure policy;
+budget, deadline, overlap, recursion and unresolved-prior-effect rules.
+```
+
+A configuration failure enters `blocked_config`, makes zero model calls and updates one deduplicated actionable notification. Unexpected provider/model drift fails closed unless the Human policy already admitted the observed compatible set; there is no silent route substitution. Transient capacity failure may defer the occurrence without rewriting configuration truth.
+
+Agent mode creates the normal admitted task/attempt/job path. Deterministic mode executes only a qualified script/process whose capability profile excludes model-provider access; it never calls an LLM directly, indirectly or through a fallback. Exact stdout/stderr are delivered verbatim when within policy/size limits, otherwise through the reversible payload contract of I7.26; neither path uses model summarization, and bytes are evidence rather than implicit truth. In both modes, route/effect authority and verification remain with their existing owners.
+
+Configuration state and execution state are separate. `active` may coexist with one currently running occurrence; `current_execution_refs` is a projection of the canonical Durable Job lifecycle in I14.20, not another lifecycle. The execution history remains immutable Durable Job/effect/receipt history. `pause` stops future admission but does not silently cancel an already admitted job; cancellation is an explicit operation. `remove` retires/tombstones the automation, cancels only unadmitted future wakes and preserves history plus outstanding reconciliation obligations.
+
+Supported user operations are:
+
+```text
+create; list/status/history; pause/resume; edit; run-now; remove; inspect last failure.
+```
+
+The same occurrence is never blindly rerun after `UNKNOWN_OUTCOME`; I14.21 reconciliation decides its disposition. A later calendar occurrence is a different identity but is blocked when unresolved prior effects violate the declared overlap policy. By default an automation execution cannot create, edit, resume or trigger another automation; scheduling authority requires a separate exact Human-approved operation, so scheduler jobs cannot recursively manufacture scheduler jobs.
+
+Delivery is requested through the declared target and canonical outbox; delivery failure does not rerun the task/model/tool effects and does not rewrite job completion. A repeated failure class updates one persistent notification keyed by automation revision and failure fingerprint. It does not emit one alert per occurrence; a material revision, verified recovery or Human disposition reopens that notification key.
+
 # I12. Understanding, memory classification, curation and retrieval
 
 ## I12.1. State model
@@ -11766,6 +11860,7 @@ Implementation uses a compact set of canonical families, not one table per cogni
 SourceRecord       — immutable origin/snapshot/blob lineage;
 ObservationRecord  — what a route observed;
 Interpretation     — claim/hypothesis/model with support/counterevidence;
+AssumptionRecord   — load-bearing assumption with origin, necessity, failure mode and dependents;
 DecisionRecord     — chosen action/policy/task decision and rationale;
 ExperienceRecord   — episode/action/outcome/failure/procedure candidate;
 CommitmentRecord   — future obligation/deadline/trigger;
@@ -11775,6 +11870,8 @@ ArtifactRecord     — produced or evaluated artifact;
 ProjectionRecord   — capsule/graph/index/context manifest;
 AuditRecord        — immutable transition/receipt/security history.
 ```
+
+An assumption is a first-class record because retraction must be mechanical. When an assumption is refuted, its dependents are **withdrawn**, not rewritten: a proposition records under which minimal assumption set it holds, and loses current support when that set fails. This preserves history and makes conflicting contexts coexist without premature consensus.
 
 Typed payloads discriminate subtypes. Storage adapter may use normalized tables/relations, but API stays family-based.
 
@@ -11790,6 +11887,16 @@ superseded;
 rejected;
 unknown.
 ```
+
+A rendered material statement also carries an object-local label set; the labels do not replace the canonical status above and are not mutually exclusive truth states:
+
+```yaml
+StatementLabelSet:
+  basis: SOURCE_SUPPORTED | DERIVED_INFERENCE | HYPOTHESIS | EDITORIAL_RECOMMENDATION
+  conditions: [CONTESTED | UNRESOLVED | REDACTED_DEPENDENCY]
+```
+
+`basis` states how the sentence is being presented; `conditions` state why it cannot be read as an uncontested live assertion. A source-supported statement may also be contested, and a hypothesis may remain unresolved. `REDACTED_DEPENDENCY` means a load-bearing support handle was purged/redacted and forces withdrawal or revalidation under the existing dependency graph. Citation eligibility remains owned by the exact evidence/reference path in I21.7: model prose cannot mint a citation identifier, and every emitted citation resolves to an admitted live evidence handle and allowed reference entry.
 
 `verified` requires applicable Evaluation Contract and current VerificationRun. Model summary cannot upgrade.
 
@@ -12180,6 +12287,30 @@ block only the dependent decision/effect.
 It may not silently mix exact and degraded fields in a way that makes the logical unit appear complete. Enrichment is additive: derived summaries, graph hints and generated prose never replace the exact retained source or reduce its disclosure/influence lineage.
 
 For multi-source packets, bounded evidence allocation prevents one verbose source/agent/tool from exhausting the entire view before load-bearing rivals, unknowns or negative evidence are represented. Allocation policy remains a versioned `ContextRecipe` and is evaluated by decision/outcome delta rather than equal-token aesthetics.
+
+### Selection integrity
+
+`ARCH-CTX-04` requires that retrieval proposes and the compiler admits. The risk is that untrusted content changes **membership** rather than instructions: a document that inflates its own relevance, a tool result that displaces a competing source, or a summary that quietly drops the counterexample.
+
+Every membership-changing transformation — ranking, pruning, deduplication, summarization, context compilation and export — appends an immutable stage to one chain receipt:
+
+```yaml
+SelectionIntegrityReceipt:
+  receipt_identity_root_context_recipe_and_state_fence:
+  initial_candidate_count_digest_and_taint_summary:
+  transform_stages:
+    - ordinal_transformer_identity_and_config_digest:
+      input_membership_count_and_digest:
+      output_membership_count_and_digest:
+      admitted_and_rejected_candidates_with_reason:
+      untrusted_input_influenced_membership: true | false | unknown
+      suppressed_counterevidence_or_minority_items:
+      budget_or_policy_forced_omissions:
+  final_selected_set_count_digest_and_packet_or_export_ref:
+  expansion_handles:
+```
+
+A stage may append but never overwrite an earlier membership decision. `untrusted_input_influenced_membership = unknown` is admissible and is itself a finding: it lowers the claim ceiling of the resulting packet instead of being resolved by assumption.
 
 ## I12.14. Hot path
 
@@ -12644,6 +12775,21 @@ No automatic repair chooses among those meanings. Main Agent or Human decision a
 
 ELIOT improves through evidence-backed advice, agent work and reversible experiments. It never silently rewrites code, policy or memory authority.
 
+Learning has two loops (A14.5). The existing `ImprovementCandidate` pipeline below is the **outer** loop. The inner loop runs inside one active task and is represented by three durable learning records plus one immutable derived state view and one immutable activation receipt in this section. None becomes an owner: both loops reuse Durable Jobs, `AgentAttempt`, canonical records, registered evaluators, Context Compiler delivery and Governor admission. Neither loop creates a second task graph, attempt journal, scheduler, memory owner or authority path.
+
+Mutable behavioral state is layered, and a lower layer never acquires authority over a higher one:
+
+```text
+Frozen Constitutional Anchor  user objective, values, Architecture, Hard Boundaries,
+                              authority/privacy/cost ceilings, canonical write and finish semantics;
+Stable Product Harness        accepted ELIOT generation and contracts;
+Task-Family Harness           validated reusable recipe/profile for a compatible task class;
+Campaign Overlay              rapidly changing task-local executable/behavioral state;
+Attempt Working State         ephemeral reasoning, scratch artifacts and next action.
+```
+
+`Frozen` means fixed for the exact campaign/task-definition revision. An authorized change to objective, Architecture, boundaries or ceilings supersedes that baseline, creates a new State Fence and forces revalidation; it does not make Architecture globally immutable.
+
 ```yaml
 ImprovementCandidate:
   candidate_id:
@@ -12675,6 +12821,9 @@ accepted `ImplementationDeviation`;
 Human/agent complaint;
 security incident;
 Architecture/Implementation/runtime conformance gap;
+positive surprise with plausible reusable value: unexpected success, cheaper path, correct abstention,
+  useful environment discovery, better decomposition or verifier choice;
+successful transfer or evidence that an existing procedure is unnecessary;
 Dreamer/Watchdog/Concilium suggestion.
 ```
 
@@ -12720,7 +12869,222 @@ schema/authority/verifier/privacy/Architecture/destructive forgetting
 
 External research or foreign-project findings enter this pipeline only as `KnowledgeTransferCandidate`, a typed view of `ImprovementCandidate` that binds source scope/population, transfer limits, local discriminator, target task family, expiry and forbidden direct instruction use. It may yield a Skill, procedure, Default, FailureFingerprint or rejected transfer only after local evidence; source repetition or prose quality does not promote it.
 
+### `CampaignLearningStateView`
+
+Compact immutable view from which the next materially comparable attempt is compiled. It is generated from exact existing owner revisions; it is not a transcript, mutable campaign aggregate, scheduler, journal or new semantic owner.
+
+```yaml
+CampaignLearningStateView:
+  view_id_revision_and_built_at:
+  campaign_task_recipe_and_state_fence:
+  source_owner_revisions:
+    task_controller_objective_acceptance_plan_and_open_items:
+    agent_attempt_lineage_and_latest_outcomes:
+    governor_admission_authority_epoch_and_policy_snapshot:
+    context_compiler_recipe_tool_surface_and_delivery_revision:
+    evaluator_contract_holdout_and_result_refs:
+    memory_experience_and_artifact_projection_refs:
+  frozen_anchor_digest:
+  stable_and_task_family_harness_refs:
+  active_campaign_overlay_ref:
+  current_position:
+    objective_acceptance_open_items_and_next_safe_action:
+    active_hypotheses_rivals_unknowns_and_confounders:
+    active_candidate_parent_branch_and_next_discriminator:
+  experience_position:
+    attempt_lineage_failure_signatures_and_exact_trace_handles:
+    relevant_prior_campaign_or_task_family_learning_refs:
+    bounded_campaign_experience_retrieval_plan_refs:
+    preserved_success_set_or_constraints_ref:
+  adaptation_position:
+    latest_attempt_learning_delta_and_changed_surfaces:
+    local_updates_pending_revalidation:
+    reusable_candidate_and_rejected_or_expired_update_refs:
+  evaluation_position:
+    applicable_gate_results_noise_uncertainty_and_holdout_integrity:
+  economics_and_progress:
+    tokens_cost_wallclock_tools_human_attention_and_verified_delta_history:
+    equivalent_retry_failure_plateau_and_intervention_state:
+  completeness_scope_and_required_fields_ref:
+  completeness: COMPLETE_FOR_DECLARED_RECIPE | PARTIAL | STALE | BLOCKED
+  missing_or_stale_owner_refs:
+  invalidation_expiry_and_rebuild_reason:
+```
+
+The history slice is compiled through one or more campaign-scoped `RetrievalPlan` records from I12.26. It may expose exact handles, bounded summaries, diffs or raw slices permitted by disclosure/retention policy, but it never copies the full campaign into a second store. A future object named `CampaignExperienceView` may be admitted only as a read-only generated projection over the same canonical records after its P2 Product Proof; it cannot become a memory owner or mutable campaign aggregate.
+
+`COMPLETE_FOR_DECLARED_RECIPE` means only that every field required by the bound recipe/revision and State Fence is present and current; it never means complete history, complete world knowledge or complete evidence. The view never accepts writes and never resolves disagreement between owners. Context Compiler verifies every load-bearing revision and State Fence before use. `PARTIAL` may support a narrower safe attempt only when omitted fields are explicitly non-load-bearing; `STALE`/`BLOCKED` cannot be silently filled from a transcript, model memory or a convenient current file. A new owner revision rebuilds the view rather than mutating it in place.
+
+### `AttemptLearningDelta`
+
+The durable edge from one consequential attempt to the next materially related attempt. Without this edge an attempt may store a failure, open a candidate and still repeat the same strategy.
+
+```yaml
+AttemptLearningDelta:
+  delta_id_revision_campaign_attempt_and_state_fence:
+  actor_route_overlay_and_artifact_identity:
+  before:
+    hypothesis_prediction_and_selected_strategy:
+    expected_observable_and_verifier:
+  observed:
+    raw_trace_and_artifact_refs:
+    evaluator_outcome_and_actual_effect:
+    coverage_noise_and_unknowns:
+  interpretation:
+    supported_and_contradicted_mechanisms:
+    confounders_and_shared_changed_surfaces:
+    attribution_ceiling:
+  next_behavior_delta:
+    changed_hypothesis_strategy_or_abstraction:
+    changed_context_memory_skill_tool_or_route_use:
+    changed_candidate_parent_verifier_order_or_search_probe_stop_condition:
+  retry_relation:
+    materially_equivalent_to_prior_attempt: true | false | unknown
+    unchanged_retry_reason: replication | noise_estimation | controlled_comparison |
+                            exact_reproduction | recovery_proof | verifier_calibration | none
+  persistence:
+    overlay_revision_ref_and_reusable_candidate_refs:
+    activation_scope_expiry_and_rollback_condition:
+  disposition: LOCAL_UPDATE_ADMITTED | NEXT_PROBE_CHANGED | REUSABLE_CANDIDATE_OPENED |
+               NO_JUSTIFIED_CHANGE | INCONCLUSIVE | INVALID_EVIDENCE
+```
+
+Actor/Refiner may propose interpretation and next-behavior fields; immutable attempt/evidence owners supply their references, and Governor admission is required before any behavioral effect. The record is not a second attempt journal and cannot rewrite source evidence, task truth or evaluator state.
+
+A consequential boundary is a material implementation attempt, a verifier outcome, a substantial recovery attempt, a repeated failure signature, a campaign checkpoint or plateau, a route/model handoff, an accepted artifact outcome, a finish/cancel/supersession, or a delayed regression. A `read_file` or `grep` is not consequential. Most fields are derived from existing attempt and evidence records; the agent is not required to author prose after every step.
+
+### `CampaignHarnessOverlay`
+
+Versioned task-local behavioral artifact that the next attempt is compiled from.
+
+```yaml
+CampaignHarnessOverlay:
+  overlay_id_revision_parent_and_state_fence:
+  stable_and_task_family_harness_base_refs:
+  task_framing_and_local_context_recipe_delta:
+  task_local_memory_and_working_rules:
+  local_skills_checklists_and_helpers:
+  tool_surface_and_invocation_delta:
+  decomposition_route_and_abstraction_delta:
+  verification_order_and_search_probe_stop_rules_delta:
+  source_attempt_learning_delta_refs:
+  changed_surfaces_and_exact_artifact_refs:
+  intended_mechanism_predeclared_prediction_and_expected_observable:
+  expected_fixed_tasks_or_failure_signatures:
+  possible_regressions_confounders_and_co_changes:
+  next_discriminator:
+  preserved_success_constraints:
+  allowed_effect_and_authority_ceiling:
+  validation_status_and_results:
+  expiry_invalidation_and_rollback:
+```
+
+Actor/Refiner proposes the artifact; Governor admits its local effect; Context Compiler activates it for a compatible attempt. Task Controller and Governor retain objective, plan-revision and authority ownership. The artifact has no independent authority. For every nontrivial revision, the changed-artifact, intended-mechanism, prediction, expected-observable, regression/confounder, preserved-success and next-discriminator fields are frozen **before** evaluation. Together with the source `AttemptLearningDelta`, activation receipt and closure lineage, they carry the donor `HarnessChangeManifest` semantics; no separate mutable manifest or second change owner is created.
+
+Lifecycle:
+
+```text
+PROPOSED → SHAPE_VALIDATED → LOCAL_ADMITTED → ACTIVE_FOR_NEXT_ATTEMPT → OBSERVED
+→ RETAIN_LOCAL | OPEN_REUSABLE_CANDIDATE | REVISE | ROLLBACK | EXPIRE | INVALIDATE
+```
+
+Local admission requires the same user objective and acceptance revision, no authority/privacy widening, no evaluator or sealed-holdout modification, reversible local effect, a named source delta and parent, a next discriminator and a rollback path. An overlay is not canonical doctrine and is not visible to unrelated tasks. It cannot change the user objective, Architecture, Hard Boundaries, authority/privacy/cost ceilings, canonical write or finish semantics, the oracle used to promote the same candidate, sealed holdout answers, the stable production generation, provider identity while claiming a same-route comparison, or its own promotion decision. It may open a candidate to change any of these; it may not apply one as a local shortcut.
+
+A local overlay may change only bounded search or probe stopping rules and verification ordering within the current task plan. It cannot change task-level stop, finish, acceptance, cancellation, budget, or authority policy. Any task-level policy change remains an Improvement or plan candidate, requires a Task Controller plan revision plus Governor admission through the normal authority path, and is never applied by Context Compiler alone.
+
+### `HarnessActivationReceipt`
+
+Immutable per-attempt evidence that records whether the admitted learning surface was eligible, compiled, retrieved and delivered, whether qualifying observable activation occurred, and whether its prescription was followed or violated. Receipt existence never implies successful delivery, use, adherence or benefit. It does not grant authority, schedule an attempt or infer causal benefit.
+
+```yaml
+HarnessActivationReceipt:
+  receipt_id_revision:
+  campaign_attempt_actor_route_and_state_fence:
+  compiled_from_campaign_learning_state_view_ref:
+  context_compiler_and_render_profile_revision:
+  exact_stable_task_family_overlay_skill_memory_and_procedure_refs:
+  preserved_success_set_or_constraints_ref:
+  eligibility_and_retrieval_reason:
+  retrieval:
+    status: NOT_ELIGIBLE | ELIGIBLE_NOT_RETRIEVED | RETRIEVED | EXPANDED | UNKNOWN
+    expansion_or_tool_query_refs:
+  delivery:
+    status: NOT_DELIVERED | FULL | PARTIAL | MISSING
+    packet_position_serialized_digest_bytes_and_actual_tokens:
+  activation:
+    status: NOT_ASSESSED | NOT_OBSERVED | OBSERVED | UNKNOWN
+    acknowledgement_ref:
+    observation_limit_reason:
+    first_qualifying_observable_use_ref:
+  adherence:
+    status: NOT_ASSESSED | OBSERVED_FOLLOWED | OBSERVED_PARTIAL | OBSERVED_VIOLATED | UNKNOWN
+    early_mid_final_checkpoint_refs:
+    prescribed_or_avoided_action_and_required_verifier_refs:
+  conflicts_suppression_or_compaction_loss:
+  downstream_decision_action_artifact_and_verifier_refs:
+  receipt_completeness_and_missing_fields:
+  invalidation_expiry_and_missingness:
+```
+
+Retrieval, delivery, observable activation, adherence and outcome remain orthogonal; the fields are not a success ladder. A retrieved update may not be delivered, a delivered update may have no qualifying use observation, and an observed use may violate the prescription or be harmful. An acknowledgement is a delivery/attention signal only and never substitutes for `first_qualifying_observable_use_ref`. `activation.status = NOT_OBSERVED` means only that no qualifying activation evidence was observed; it does not prove non-use. No activation receipt proves adherence, attribution, benefit or promotion. Exact downstream benefit remains subject to I7.27 and I12.34. Missing or inconclusive observability remains `UNKNOWN`, never presumed compliance.
+
+### `CampaignLearningClosure`
+
+Terminal or major-checkpoint consolidation for one campaign.
+
+```yaml
+CampaignLearningClosure:
+  closure_id_revision_campaign_and_state_fence:
+  closure_due_at_expiry_and_terminalized_at:
+  closure_owner_and_terminalization_policy_ref:
+  starting_and_final_harness_stack:
+  outcome_summary:
+    artifacts_effects_verifiers_and_solved_scope:
+    cost_time_and_human_attention:
+    delayed_outcome_status:
+  learning_summary:
+    validated_local_adaptations_and_rejected_updates:
+    failure_mechanisms_closed_or_open:
+    preserved_success_and_regression_results:
+    activation_and_adherence_findings:
+    attribution_and_confounders:
+  inheritance_actions:
+    first_order_epistemic_updates:
+    retained_campaign_local_state:
+    reusable_and_structural_candidates:
+    negative_memory_and_reopen_conditions:
+  disposition: LOCAL_LEARNING_RETAINED | REUSABLE_CANDIDATE_OPENED | SCOPED_UPDATE_PROMOTED |
+               NO_REUSABLE_DELTA | INCONCLUSIVE | DEFERRED_OUTCOME | REJECTED_TRANSFER | ROLLED_BACK
+  future_activation_scope_retention_and_revalidation:
+  owner_receipts_and_expiry:
+```
+
+Closure is assembled through existing Meta, Memory OS and Governor paths from canonical evidence. Its disposition records, but never performs, a promotion; `SCOPED_UPDATE_PROMOTED` is valid only with the separate authorized owner receipt it references.
+
+`NO_REUSABLE_DELTA` is a legitimate and explicit disposition: one-off external event, insufficient evidence, existing procedure already covered the case, mechanism not identified, update cost above expected value, unsafe transfer, task too unique, or immature product outcome. Silence is not a disposition, because it hides lost learning.
+
+Closure does not block the finish ceremony. A task may reach an honest `FinishDecision` while learning closure completes asynchronously, provided raw evidence is durable, the next task cannot silently use an unclosed candidate, learning debt is visible and an owner/review condition exists. A consequential episode is not learning-closed until it has a disposition.
+
+Before closure, only the exact non-expired `LOCAL_ADMITTED` overlay of the active campaign may influence a compatible attempt. A draft delta, unclosed reusable candidate, expired overlay, or ownerless learning record is ineligible for retrieval, delivery, compilation, or use by another task. Cross-task carryover requires a new governed admission that revalidates scope, authority, retention, evaluator, and rollback. Expiry invalidates influence; it does not silently retain the last behavior.
+
 Active candidate backlog is bounded by target surface and value. Duplicates merge by evidence lineage; stale/ownerless low-value candidates are summarized and archived. Advice quality is measured by adoption, verified delta, regressions, false positives, Human/agent attention cost and rollback rate. Repeatedly disproven advice loses priority; report polish creates no weight.
+
+### D1 named-record disposition and rollout gates
+
+The D1 donor's named objects are not silently dropped or implicitly admitted. The following table is the authoritative disposition for those names; it separates preservation of a mechanism from admission of a new schema/owner.
+
+| D1 name | Disposition | Current normative mechanism | Admission/rollout boundary |
+|---|---|---|---|
+| `CampaignLearningState` | **MERGED / RENAMED** | immutable generated `CampaignLearningStateView` over exact existing owner revisions | P1 target contract; no mutable aggregate, store, scheduler or journal |
+| `CampaignExperienceView` + `ExperienceQuery` | query mechanism **MERGED**; separately named view **DEFERRED** | campaign-scoped `RetrievalPlan` in I12.26 plus bounded result handles in `CampaignLearningStateView` | named read-only view may be admitted at P2 only after measured need/Product Proof; never a canonical memory owner |
+| `HarnessChangeManifest` | **MERGED** | pre-evaluation frozen fields on `CampaignHarnessOverlay`, source `AttemptLearningDelta`, activation receipt and closure lineage | no separate mutable manifest or change authority |
+| `FailureMechanismCluster` | named schema **DEFERRED** | exact failure signatures, supported/contradicted mechanism hypotheses, rivals, confounders and next discriminators remain in existing attempt/delta/evidence records | P2 only after clustering precision, correction path and owner seam are proved; similarity alone cannot create mechanism truth |
+| `PreservedSuccessSet` | mechanism **REQUIRED where applicable**; separately named view **DEFERRED** | `preserved_success_set_or_constraints_ref`, frozen regression constraints and existing evaluator/holdout owners | P3 admission requires a bounded selection rule, sealed-case handling, expiry/requalification and demonstrated forgetting detection |
+| `TaskFamilyHarnessPortfolio` | **DEFERRED** | current stable/task-family harness revision references and existing router/profile evidence | P3 only after bidirectional transfer, retention, routing and complexity/cost evidence; no portfolio owner is implied now |
+| `LearningPlateauSignal` | **MERGED** | `CampaignLearningStateView.economics_and_progress`, I16.23 no-progress telemetry, Watchdog observation, Task Controller plan revision and Governor admission | no new mutable signal owner; a later generated view must preserve the same owner separation |
+| `LiveLearningDevelopmentCampaign` | alias **REJECTED** | canonical recipe name is `LiveLearningCampaign` | a second recipe/task/scheduler identity is forbidden |
+
+`DEFERRED` above applies to the named schema/rollout level, not to the underlying requirement. Exact history access, pre-evaluation change lineage, preserved-success constraints, plateau detection and task-family boundaries remain represented by their current owners. Equivalent fields do not authorize an undeclared root record, table, scheduler, task graph, evaluator, promotion authority or global harness state.
 
 ## I12.25. Canonical cognitive record semantics
 
@@ -12749,12 +13113,23 @@ RetrievalPlan:
   optional_routes: typed_relations | lexical | dense | graph | episode | Dreamer
   order_or_parallelism_and_reason:
   source_projection_fences:
+  campaign_experience_query:
+    campaign_or_task_family_scope:
+    intent: NONE | FIND_SIMILAR_FAILURE | COMPARE_CANDIDATES | TRACE_DECISION |
+            LOCATE_INFORMATION_LOSS | INSPECT_TOOL_LOOP | FIND_REGRESSION |
+            FIND_PRIOR_SUCCESS | INSPECT_PARENT_LINEAGE | TEST_CONFOUND | RETRIEVE_RAW_SLICE
+    exact_handles_and_filters:
+    artifact_step_tool_error_and_metric_predicates:
+    temporal_and_lineage_range:
+    output_mode: INDEX | SUMMARY_WITH_HANDLES | DIFF | RAW_SLICE | GRAPH_NEIGHBORHOOD
+    token_byte_and_time_budget:
+    disclosure_retention_and_hidden-reasoning_fence:
   coverage_and_negative-claim requirements:
   budget_and_stop_conditions:
   fallback_or_abstention:
 ```
 
-There is no universal `lexical → dense → graph` order. A hidden structural task may use a bounded graph route early; a known exact handle bypasses broad retrieval. Every route remains subject to the same admission, disclosure and proof ceilings.
+There is no universal `lexical → dense → graph` order. A hidden structural task may use a bounded graph route early; a known exact handle bypasses broad retrieval. `campaign_experience_query` is optional and `NONE` outside the applicable campaign/task-family scope. When present, it selects a bounded history slice from existing canonical attempt, memory, artifact, journal and Blob-handle owners; it does not create a `CampaignExperienceView` store, retain hidden provider reasoning or authorize full-history dumping. Every route remains subject to the same admission, disclosure, retention and proof ceilings, and its selected result/coverage handles are bound into `CampaignLearningStateView`.
 
 `MemoryAdmissionDecision` evaluates:
 
@@ -12795,6 +13170,8 @@ INCOMPLETE_COVERAGE.
 ```
 
 It records scope and `TaskSelectionEvidence`, source/projection revisions and State Fence, freshness/coverage/assurance ceiling, visible and suppressed counts, route costs, a short agent-facing reason and the full rank-trace handle. Historical `LOW_CONFIDENCE` output maps to `ADMITTED_WEAK`; it is not a separate canonical disposition.
+
+Before a retrieved candidate is projected or cited, coherent readback reopens the exact admitted source revision under the same `SourceView`, workspace-view revision and State Fence; verifies digest and byte length; resolves the requested anchor through its exact coordinate/native mapping; and verifies the selected unit or excerpt digest. Bytes currently present at a path cannot be cited as an earlier revision. Index/vector payload text may be shown as a non-authoritative preview, but citation and support require governed source readback. A missing revision, mapping or digest produces a narrower unsupported result, replan or typed gap—never a citation to convenient current bytes.
 
 Before exact cue firing, source/projection revisions and the State Fence are compared. A mismatch yields `STALE_PROJECTION`, `PACKET_REFRESH_REQUIRED` or `PROBE_REQUIRED`; stale projection data is never silently injected into a Material decision.
 
@@ -13067,7 +13444,7 @@ Applicable evaluation profiles include held-out/compositional, intervention/coun
 
 ## I12.34. Cognitive proof ladder and ecological field proof
 
-Нижний уровень proof не повышается до верхнего по названию suite или красивому report:
+A lower proof level is not elevated by suite name or a polished report:
 
 ```text
 TransportProof
@@ -13084,10 +13461,21 @@ DecisionDeltaProof
 
 OutcomeBenefitProof
   changed decision improved real artifact/verifier outcome
-  relative to a matched control or strong counterfactual.
+  relative to a matched control or strong counterfactual;
+
+RetentionProof
+  benefit remains after the declared delay/restart/requalification window
+  and preserved previously verified behavior does not regress;
+
+TransferProof
+  benefit survives revalidation on a new declared scope, task or route.
 ```
 
-`seen_but_not_used` закрывает только delivery observability. Exact-handle read является forensic capability. Marker recovery не является project understanding.
+Different claims have different ceilings. A task-local correction may legitimately stop at `UseProof` or `DecisionDeltaProof`. A reusable Skill, procedure, or system policy is not promoted without `OutcomeBenefitProof` and `RetentionProof`. A general portability claim requires `TransferProof`.
+
+Intermediate learning states form neither a second ladder nor one aggregate status. Their lineage is typed: capture and interpretation use `AttemptLearningDelta`; admitted adaptation uses `CampaignHarnessOverlay`; eligibility, retrieval, delivery, observable activation, and adherence use exact per-attempt `HarnessActivationReceipt`; campaign disposition uses `CampaignLearningClosure`; aggregated Skill history uses `SkillLifecycleView`; execution, evaluation, and attribution use applicable `EvidenceStatus` fields. These records explain why a proof step was or was not reached, but do not elevate it by themselves.
+
+A receipt with `retrieval.status = RETRIEVED | EXPANDED` and `delivery.status = FULL`, but `activation.status = NOT_ASSESSED | NOT_OBSERVED | UNKNOWN`, proves only bounded retrieval and delivery—not `UseProof`. `activation.status = OBSERVED` requires `first_qualifying_observable_use_ref` and proves only observable use at the declared boundary; acknowledgement is insufficient. Even observed activation proves neither adherence, decision delta, attribution, nor benefit. Exact-handle read is a forensic capability. Marker recovery is not project understanding.
 
 Product-level Understanding acceptance uses an ecological A/B field test:
 
@@ -13366,6 +13754,8 @@ ConflictSet:
   common_mode_failures:
   resolved_parts:
   unresolved_residue:
+  argument_acceptability:
+  minimal_supporting_assumption_sets_and_defeated_argument_refs:
   discriminative_probe:
   decision_owner:
   affected_actions:
@@ -13373,6 +13763,22 @@ ConflictSet:
 ```
 
 Conflict is localized state, not global failure.
+
+Claim acceptability is structured, not scalar:
+
+```text
+GROUNDED               supported by an admitted, undefeated argument;
+CONTESTED              coherent support and an undefeated attack coexist;
+DEFEATED               support invalidated;
+ASSUMPTION_DEPENDENT   valid only under a named assumption set;
+UNDECIDED              no sufficient argument either way.
+```
+
+This `argument_acceptability` axis describes support/attack relations inside one Conflict Set. It is orthogonal to I12.5 epistemic status, I7.27 evidence execution/evaluation and the Conflict Set lifecycle state; it does not create another global status dictionary.
+
+A single confidence number is not a substitute: it does not say which assumptions were used, which evidence is independent, what happens if one source is retracted, or who produced the number. `CONTESTED` and `UNDECIDED` are legitimate terminal argumentative states while the Conflict Set itself may remain open, decided or resolved; the system is not obliged to pick a winner when the available evidence is non-diagnostic.
+
+This is a semantics of relations, not an instruction to build a graph database (I12.9).
 
 ## I13.3. Conflict Directive
 
@@ -15128,6 +15534,8 @@ may be quarantined from agents but retained for forensics;
 dependent influence can be revoked.
 ```
 
+Final-result filtering is defense in depth, not an access-control boundary. Content that was unauthorized or revoked may already have influenced candidate generation, rank/IDF statistics, counts, diversity, summaries or traces. If such content participated in a retrieval/scoring branch, the whole contaminated branch—including dependent synthesis/model work—is discarded and replanned under the latest grant/policy; deleting only forbidden candidates cannot sanitize the ordering or erase prior influence. A branch proven not to have touched the revoked population may remain. If safe re-execution cannot finish within budget, the result returns the applicable denial/revocation reason and `INCOMPLETE_COVERAGE`, exposing none of the contaminated ranking.
+
 ## I15.8. Direct write protection
 
 ```text
@@ -15139,7 +15547,28 @@ raw DB admin path requires maintenance mode + Human confirmation;
 any bypass result is observation, not canonical transition.
 ```
 
-## I15.9. Module supply chain
+## I15.9. Source admission and executable supply chain
+
+### Source admission before materialization
+
+Root registration is necessary but not sufficient. Every file/object membership is evaluated before materialization, indexing or model disclosure under one contract compiled from the System Owner baseline and applicable WorkScope Owner/Human-policy narrowing; providers enforce it but do not own or widen it.
+
+```yaml
+SourceAdmissionPolicy:
+  policy_revision_and_owner:
+  admitted_roots_and_final-handle_escape_policy:
+  denied_system_locations_and_file_format_classes:
+  credential_private_key_and_token_detector_profiles:
+  generated_vendor_archive_binary_policy:
+  file_archive_and_materialization_limits:
+  sensitivity_classes_and_grant_ceiling:
+  explicit_override_authority_scope_and_expiry:
+  disclosure_logging_and_index_payload_policy:
+```
+
+OS/browser credential stores, private-key locations and known token files are deny-by-default. A symlink/reparse/final-handle escape is checked against the resolved target, not the display path. Sensitive repository material requires explicit compatible policy and grant ceiling. Detection returns only a class, bounded coordinate and reason/receipt; it never copies the secret into logs, indexes, vector payloads, diagnostics or model packets. An override is narrow, expiring and auditable and cannot silently widen inference/client disclosure.
+
+### Executable module supply chain
 
 Production artifact requires:
 
@@ -15161,21 +15590,21 @@ Default license policy:
 
 ```text
 permissive licenses (MIT, Apache-2.0, BSD, ISC, Zlib, CC0)
-→ обычный dependency review;
+→ ordinary dependency review;
 
 weak copyleft / file-level obligations
-→ explicit compatibility review и containment;
+→ explicit compatibility review and containment;
 
-AGPL, SSPL, BUSL/BSL, source-available или иная ограничительная лицензия
-→ не связывается с Kernel/daemon как библиотека без отдельного решения;
-→ отдельный process bridge предпочтителен только как engineering isolation,
-  но не считается license exemption;
-→ redistribution, packaging, hosted use и network-service obligations проходят
-  отдельный legal/license review;
-→ фиксируются replacement/export path и пользовательские ограничения.
+AGPL, SSPL, BUSL or BSL, source-available, or another restrictive license
+→ is not linked into Kernel or daemon as a library without a separate decision;
+→ a separate process bridge is preferred only as engineering isolation,
+  but is not treated as a license exemption;
+→ redistribution, packaging, hosted use, and network-service obligations receive
+  separate legal and license review;
+→ replacement and export path and user restrictions are recorded.
 ```
 
-SurrealDB является явным временным source-available exception, изолированным storage bridge и обязательным ECXF export path. Exception не расширяется на другие dependencies автоматически.
+SurrealDB is an explicit temporary source-available exception, isolated behind the storage bridge and mandatory ECXF export path. The exception does not extend automatically to other dependencies.
 
 ## I15.10. Sandboxing
 
@@ -15923,16 +16352,22 @@ These reports prevent deletion of useful old material without making old books n
 ```yaml
 OwnerRequirementTraceReport:
   requirement_source_digest_and_item_id:
+  preserved_intent_and_failure_mode:
+  current_Architecture_ids:
   current_Architecture_intent_or_anchor:
   current_Implementation_owner_and_sections:
   disposition: preserved | clarified | superseded | challenged | unresolved
   document_support: present | partial | absent
-  implementation_support: current_verified | current_unverified | target | blocked | unknown
+  support_claim_and_snapshot_ref:
+  support_observation_state: OBSERVED | NOT_RUNNING | UNAVAILABLE | UNKNOWN | STALE | CONFLICTED
+  contract_maturity:
+  implementation_support:
+  evidence_execution_status:
   failure_or_regression_evidence:
   next_discriminative_artifact:
 ```
 
-Keyword presence, heading counts and a broad section link do not close a requirement. A trace row must explain the retained intent, current owner, any intentional narrowing and the observable proof. The report becomes stale when the source requirement ledger, Architecture or Implementation digest changes.
+Keyword presence, heading counts and a broad section link do not close a requirement. A trace row must explain the retained intent, current owner, any intentional narrowing and the observable proof. Its maturity, support and evidence fields use the exact I0.5 enums and must equal the bound support claim; `support_observation_state` alone carries observation availability/state and never contains or creates conformance support. The report becomes stale when the source requirement ledger, Architecture, Implementation or bound evidence snapshot digest changes.
 
 ## I16.16. No-progress, loop and external telemetry projections
 
@@ -16209,6 +16644,20 @@ SelfQualityInterventionReceipt:
 
 Recurring failure without a changed hypothesis or discriminator opens Mechanism Review; activity, summary volume or maintenance completion alone cannot close the loop.
 
+### Learning bottleneck diagnosis
+
+One aggregate self-learning score is prohibited. The observed combination locates the bottleneck:
+
+| Observation | Bottleneck |
+|---|---|
+| update quality high, activation low | retrieval, cue, trigger, or context budget |
+| activation high, adherence low | route competence, instruction wording, or state loss between turns |
+| adherence high, no decision delta | update irrelevant or too weak |
+| decision delta present, outcome worse | bad lesson, bad evaluator, or unresolved confounder |
+| immediate gain, retention regression | overfitting and harness-level forgetting |
+
+Diagnosis selects the intervention: change delivery, route, update, evaluator, or roll back.
+
 # I17. Development sequence
 
 ## I17.1. Development doctrine
@@ -16245,7 +16694,7 @@ No universal team size or calendar threshold is frozen in this book. The Request
 
 ## I17.2. Current recovery priority and promotion gate
 
-Historical failure audits are regression donors, not the current migration baseline. The only current baseline is the latest `CurrentSystemEvidenceSnapshot` bound to exact source, build, installed runtime, policy, schema, integrations and live store revision. Until that snapshot exists, current support is `UNKNOWN`; historical failures remain active candidate regressions where the affected path has not been re-proved.
+Historical failure audits are regression donors, not the current migration baseline. The only current baseline is the latest `CurrentSystemEvidenceSnapshot` bound to exact source, build, installed runtime, policy, schema, integrations and live store revision. Until that snapshot exists, `support_observation_state = UNKNOWN`; absent exact source/runtime evidence leaves dependent capabilities `TARGET` / `NOT_EXECUTED`, while any previously stronger but invalidated claim is `STALE`. Historical failures remain active candidate regressions where the affected path has not been re-proved.
 
 Until the affected recovery obligations close, the following are prohibited **only on paths that depend on them**:
 
@@ -16593,7 +17042,7 @@ Ready Queue and portfolio scheduling;
 read-only micro-audit portfolios before many writers;
 blind challenge/synthesis with Evidence Lineage;
 controller/coordinator recovery;
-Researcher and cloud/lab modules when justified.
+Researcher-provider and cloud/lab modules when justified.
 ```
 
 No large autonomous **mutating** swarm is admitted before Operational Spine Proof 1 and the memory rehabilitation gate. Earlier development may still use a bounded number of parallel mutating workers on disjoint FunctionalCapabilityCells when contracts are frozen, worktrees/effect scopes do not overlap, each cell has an independent `ModuleTestCapsule`, and one Integration owner serializes shared-contract changes. Read-only audit/research swarms may also be used earlier when their cost, lineage and synthesis are explicit. One writer per mutable scope or deliverable remains the default; the restriction limits uncontrolled fan-out, not micro-modular parallel development.
@@ -16642,7 +17091,7 @@ The agent returns `ContractChallenge` when the discriminator measures a proxy, t
 
 ## I17.15. Agent Task Compiler and development waves
 
-`AgentDevelopmentPlanner` — детерминированная capability Agent Coordinator/Governor. Он не создаёт второй task graph.
+`AgentDevelopmentPlanner` is a deterministic Agent Coordinator and Governor capability. It does not create a second task graph.
 
 Inputs:
 
@@ -16657,7 +17106,7 @@ available agents/routes/budget/context profiles;
 integration and Product Pulse dependencies.
 ```
 
-Output — canonical WorkItems в четырёх bounded waves:
+Output is canonical WorkItems in four bounded waves:
 
 ```text
 Contract/Evidence wave
@@ -16948,6 +17397,16 @@ T3 — selected authority/data/security/recovery/concurrency/migration/product p
 T4 — release matrix, long-running recovery, installer/update and full supported profile.
 ```
 
+A tier says how broadly a change is checked; a **fidelity level** says how well the check represents the target. The two are orthogonal and both travel with the evidence:
+
+```text
+F0 schema/syntax/static   F1 unit/property   F2 reduced model or toy simulation
+F3 realistic simulation or integration       F4 held-out representative workload
+F5 shadow or independent environment         F6 physical/external replication
+```
+
+Escalation is budget-aware: a higher fidelity level is used after a cheaper level has narrowed the candidate set, when the remaining uncertainty is decision-relevant, and when expected value exceeds the added cost. Every result carries its fidelity level, represented target, omitted factors, validated range and transfer boundary. A high tier of low-fidelity checks does not become a high-fidelity proof.
+
 T3 is triggered only by relevant load-bearing impact. A UI font/style change runs UI build, template/snapshot and accessibility smoke; it does not run database restore, Kernel split-brain or every route.
 
 A full workspace suite may be requested for diagnosis or release, but it is not the default response to local change.
@@ -17053,7 +17512,9 @@ resource groups and cache/target identity.
 
 The receipt makes false-negative selection auditable and allows replay after an escaped regression.
 
-## I18.7. Independently testable crate and micro-module contract
+## I18.7. Independently testable capability cell contract
+
+Owner of this contract is the `FunctionalCapabilityCell`, not the crate; a crate may host several cells and remains only the normal Cargo compilation/publication container.
 
 Every production crate or independently scheduled capability cell has an executable `ModuleTestCapsule`; the package-selective profile is the normal Cargo entrypoint. Private micro-modules inside the crate may have narrower selectors, but the crate is the normal unit of Cargo compilation, contract publication and agent delivery. Mutable-state/lifecycle ownership remains attached to FunctionalCapabilityCell/service contracts rather than inferred from package membership.
 
@@ -17733,38 +18194,6 @@ TestSelectionValidityReceipt:
 
 No published selection percentage becomes a portable threshold. Selection accelerates local feedback; it never replaces an independent release proof, and an unknown/flaky comparator cannot be silently scored as a selector success.
 
-## I18.29. Verification budget and escalation
-
-Testing consumes time, CPU, disk, model attention and developer opportunity. Each work item has a verification envelope:
-
-```text
-mandatory Module/Edge proof;
-conditional profiles by impact/risk;
-maximum local attempts before Mechanism Review;
-product-pulse trigger;
-release-only groups;
-Human approval for unusually expensive/destructive proof.
-```
-
-Budget exhaustion never converts incomplete proof to PASS. It yields PARTIAL/BLOCKED plus the cheapest remaining discriminator. The system prefers one stronger discriminating test over many weak proxies.
-
-## I18.30. Product pulse against local optimization
-
-After a meaningful contract/edge wave—and before many additional local units are admitted—ELIOT runs the smallest product pulse that can expose architectural drift.
-
-A product pulse:
-
-```text
-uses the actual front door and accepted owner path;
-contains at least one real artifact/effect or decision outcome;
-checks current Product Identity and State Fence;
-uses module outputs without answer-shaped fixtures;
-records whether the user/agent property changed;
-can fail even when every module-local test is green.
-```
-
-Watchdog raises DevelopmentDriftSignal when module/test activity grows while product pulses remain absent, stale or repeatedly fail. The response is to revisit decomposition, contract or mechanism—not to add another local test campaign.
-
 ## I18.31. Verification-system self-change bootstrap
 
 A changed verifier cannot be the sole authority proving its own correctness. Changes to ProcessExecutor, InstrumentRunner, profile selection, parsers, evidence normalization, test discovery or FinishService use an asymmetric bootstrap:
@@ -17856,216 +18285,76 @@ stateful isolation is observed, not asserted by a synthetic report.
 
 The lease is a testing/resource boundary, not project authority. It cannot grant access to canonical production state or make a test result applicable outside its exact environment.
 
-## I18.33. Crate-local verification profiles
+## I18.33. Crate fleet build and verification economics
 
-Every first-party crate exposes one generated local command through Instrument Plane:
+Crate topology is verified as a development-system property. Every first-party crate exposes one generated Instrument Plane entrypoint:
 
 ```text
 eliot dev crate check <package>
 ```
 
-It resolves the current `ModuleTestCapsule` and runs only applicable stages:
+The command resolves the current `ModuleTestCapsule` and runs only applicable contract/schema/format checks, exact-package Cargo check or Clippy, unit/property/model/golden tests, nextest selectors, declared compile-fail/doctest/parser corpora and local restart/fault cases for service crates. Its receipt records selected/executed counts, `BuildFingerprint`, target root, `CrateContextProfile`, `CrateBuildProfile`, raw/normalized evidence, proof ceiling and mandatory consumer/edge checks not yet run.
+
+Crate-local PASS proves only the crate contract. Public-contract changes schedule direct-consumer compatibility and affected reverse-dependency checks; process/module promotion additionally requires its cohort and real-edge profile.
+
+### Fleet conformance
+
+The generated `crate-fleet` profile checks:
 
 ```text
-contract/schema/format checks;
-`cargo check -p` or Clippy for the exact package/feature set;
-crate-local unit/property/model/golden tests;
-nextest package/filter selection;
-compile-fail/doctest target where declared;
-parser/profile corpus where declared;
-local restart/fault cases for service/process crates.
-```
-
-It records:
-
-```text
-discovered/selected/executed counts;
-BuildFingerprint and target root;
-CrateContextProfile and CrateBuildProfile revision;
-raw and normalized evidence;
-proof ceiling;
-mandatory consumer/edge checks not yet run.
-```
-
-Crate-local PASS proves only the crate contract. Public contract change schedules direct consumer compatibility tests and affected reverse-dependency checks. Process/module promotion additionally requires its cohort/edge profile.
-
-A source module inside a migration crate may have a narrower selector, but the crate remains the smallest ordinary Cargo promotion boundary.
-
-## I18.34. Crate fleet conformance
-
-Crate topology is checked as a development-system property, not reviewed only by eye.
-
-`crate-fleet` profile checks:
-
-```text
-Cargo workspace/member/default-member discovery;
-C0–C4 dependency direction and cycles;
-contract-hub churn and reverse-dependency fan-out;
-source and Agent Workset measurements/review profiles from I2.16;
+workspace members/default-members and C0–C4 dependency direction;
+contract-hub churn, reverse fan-out and measured workset profiles;
 FunctionalCapabilityCell and EffectiveMicroModuleManifest coverage;
-public contract digests, unique ContractCatalogueEntry and consumer coverage;
+public contract digests, unique catalogue entries and consumer coverage;
 crate-to-runtime-bundle mapping and ModuleReplacementClass;
-independent `ModuleTestCapsule` entrypoint and ProofLatencyProfile for automatic iteration lanes;
-zero-test and stale-test metadata;
-feature/dependency duplicates;
-proc-macro/build-script/native-link islands;
-direct process/store/vendor calls outside owning adapters;
-package metadata and owner completeness.
+independent ModuleTestCapsule and ProofLatencyProfile;
+zero-test/stale-test metadata and feature/dependency duplication;
+proc-macro, build-script and native-link islands;
+forbidden direct process/store/vendor calls;
+package owner and metadata completeness.
 ```
 
-A slow or unmeasured proof does not make a crate semantically invalid. It yields `MANUAL_OR_SLOW_LANE` and blocks only automatic interactive scheduling until a profile exists. A missing contract-catalogue entry or stale generated manifest yields `PARTIAL` conformance; a second state owner is a hard failure.
+Outcomes are `PASS`, `PARTIAL`, `REVIEW_REQUIRED` and `FAIL`. Missing or stale catalogue/manifest/graph/context evidence is PARTIAL; crossed empirical ranges open `CrateScaleReview`; cycles, a second mutable-state owner, missing lifecycle owner/test seam, forbidden layer edges, public vendor leakage or absent required proof fail the applicable admission. A correct but slow proof is `MANUAL_OR_SLOW_LANE`, not semantic invalidity; it leaves the crate eligible for explicit slow/manual proof but blocks automatic interactive scheduling until a measured profile admits it.
 
-Outcomes:
+### Build modes and cache evidence
+
+ELIOT measures three distinct modes:
 
 ```text
-PASS
-  no required boundary violation in declared scope;
+interactive incremental
+  one worktree/BuildFingerprint target root, Cargo incremental and focused selectors;
 
-PARTIAL
-  graph/context evidence incomplete, with exact unknowns;
+shared non-incremental
+  incremental off, optional pinned sccache and exact compiler/profile/feature/environment identity;
 
-REVIEW_REQUIRED
-  size, fan-out, build, context or ownership defaults crossed;
-
-FAIL
-  cycle, missing owner/test seam, forbidden layer edge,
-  public vendor leakage or missing required proof.
+clean/release
+  locked inputs, declared cache state and real codegen/link/runtime proof.
 ```
 
-Crossing a planning range does not automatically fail release. It opens `CrateScaleReview`. Hard Boundary or independent-proof failure does block applicable admission.
+A cache hit never substitutes for execution. Each build-mode experiment records cold/warm time, Cargo critical units and parallelism, cache hit/miss/eviction, memory/disk, target-lock wait, representative rebuild fan-out and artifact identity. Incremental and shared-cache paths remain separate empirical profiles; unknown cache identity forces rebuild.
 
-## I18.35. Compilation modes, target directories and cache proof
+### Test-binary organization and sharding
 
-ELIOT measures three separate compilation modes.
-
-### Interactive incremental
+Default organization per production crate is:
 
 ```text
-one active worktree/BuildFingerprint target root;
-Cargo incremental enabled;
-focused `cargo check -p` and nextest selector;
-optimized for repeated edits by one agent lane.
+unit/property tests beside private core logic;
+one public-contract integration harness at `tests/contract.rs` with submodules under `tests/contract/`;
+at most one separate edge harness when the crate owns a real process/store/protocol edge;
+large scenarios in dedicated scenario/edge crates;
+shared fixture crate only when multiple packages reuse it;
+explicit harness/oracle for compile-fail and UI tests.
 ```
 
-### Shared non-incremental
+A source file does not automatically become a top-level integration-test binary. Heavy dev-dependencies are isolated; binary crates remain thin; doctests are admitted only for short public examples and nextest does not replace them. Stable test identity drives nextest partitions/shards, and every shard contributes to one `TestSelectionReceipt`; missing, zero-test or parser-failed shards prevent aggregate PASS.
 
-```text
-incremental disabled;
-optional pinned `sccache`;
-exact compiler/profile/features/environment fingerprint;
-optimized for repeated equivalent builds across agents/worktrees.
-```
+### Many-crate performance profile
 
-### Clean/release
+Required measurements include Cargo metadata graph/latency, cold/warm package-selective and workspace builds, `cargo --timings` critical path, reverse-dependency fan-out, process link time, proc-macro/build-script cost, incremental target size and lock waits, shared-cache behavior, nextest archive/reuse/partition cost, and rust-analyzer latency/memory.
 
-```text
-locked inputs;
-declared empty or admitted cache state;
-real codegen/link/runtime proof;
-cache hit never substitutes for execution evidence.
-```
+Representative edits cover leaf implementation, high-fan-out contract, compatible refactor, additive/breaking public contract, feature/dependency, root manifest/lock/toolchain and simultaneous worktrees.
 
-A build-mode experiment records:
-
-```text
-cold and warm elapsed time;
-critical compiler units and available parallelism from Cargo timings;
-cache hit/miss/eviction;
-peak memory and disk;
-target lock wait;
-rebuild fan-out after representative private/public changes;
-artifact identity.
-```
-
-ELIOT does not assume that incremental compilation and `sccache` compose beneficially. Incremental local work and shared clean/swarm work are separate empirical profiles.
-
-Target roots and build classes follow I2.7/I2.22. Unknown cache identity forces rebuild.
-
-## I18.36. Rust test-binary organization and sharding
-
-Cargo compiles every top-level file in `tests/` as a separate integration-test crate. Therefore source micro-crates do not create dozens of tiny top-level integration binaries by default.
-
-DEFAULT per production crate:
-
-```text
-unit/property tests
-  next to private core logic;
-
-one public-contract integration harness
-  `tests/contract.rs` with submodules under `tests/contract/`;
-
-optional one edge harness
-  only when the crate owns a real process/store/protocol edge;
-
-large cross-crate scenarios
-  dedicated scenario/edge crate, not copied into each participant;
-
-shared fixture helpers
-  test-support crate only when reused by multiple packages;
-  otherwise private test module.
-```
-
-Rules:
-
-```text
-one new test source file is not automatically one new test binary;
-heavy dev-dependencies are isolated when they inflate normal builds;
-internal binary crates remain thin; library behavior is tested through libraries;
-short public examples MAY use admitted doctests;
-nextest does not replace doctest execution;
-compile-fail/UI tests use an explicit harness and oracle.
-```
-
-For large independent sets, nextest partitions/shards by stable test identity. Every shard contributes to one `TestSelectionReceipt`; missing, zero-test or parser-failed shard prevents aggregate PASS.
-
-Test-binary count, link time, peak memory and archive/reuse cost are part of `CrateBuildProfile`.
-
-## I18.37. Many-crate build performance and workspace-scale experiments
-
-The workspace is profiled rather than assuming that more or fewer crates are inherently faster.
-
-Required measurements:
-
-```text
-cargo metadata latency and graph size;
-cold/warm package-selective check/build/test;
-workspace cold/warm build;
-cargo --timings critical path and compiler parallelism;
-reverse-dependency rebuild fan-out;
-link time of process artifacts;
-proc-macro/build-script cost;
-incremental target size and lock waits;
-sccache hit/miss time in non-incremental profile;
-nextest build/archive/reuse/partition cost;
-rust-analyzer load/index latency and memory.
-```
-
-Representative changes:
-
-```text
-leaf implementation edit;
-high-fan-out contract edit;
-public-API-compatible internal refactor;
-breaking/additive public contract change;
-feature/dependency change;
-root Cargo.toml/Cargo.lock/toolchain change;
-one, several and many simultaneous worktrees.
-```
-
-When `WorkspaceScaleProfile` shows one of the measured degradation conditions of I2.9, a bounded scale review may:
-
-```text
-change default-members;
-extract a heavy optional/federated workspace;
-admit shared non-incremental cache;
-admit cargo-hakari/workspace-hack after proof;
-split a compile/context bottleneck crate;
-merge ineffective micro-crates;
-shard CI/nextest;
-change WIP/resource limits.
-```
-
-Topology change is accepted only when intended context/build/test/ownership outcomes improve without material regression in product pulse, dependency clarity, recovery or agent correctness.
+When `WorkspaceScaleProfile` crosses a condition in I2.23, a bounded review may change `default-members`, extract a heavy optional workspace, admit shared non-incremental cache or workspace-hack only after proof, split a compile/context bottleneck, merge ineffective micro-crates, shard CI/nextest or change WIP/resource limits. The change is accepted only when intended context/build/test/ownership outcomes improve without material regression in Product Pulse, dependency clarity, recovery or agent correctness.
 
 ## I18.38. Agent-context and crate-size falsification suite
 
@@ -18421,9 +18710,13 @@ correctness/invariants
 
 Zero-copy formats, custom allocators, shared memory, thread-per-core runtimes or a second build system are Research Gate decisions, not default remedies.
 
-## I18.47. Evaluator, benchmark and credit-assignment integrity
+## I18.47. Evaluator, benchmark, budget and credit-assignment integrity
 
-An evaluator measures a declared property; it does not inherit authority from the benchmark name, model role or report format. Every load-bearing evaluation produces an `EvaluationIntegrityReceipt` with:
+An evaluator measures a declared property; it does not inherit authority from a benchmark name, model role or report format. Every work item has a verification envelope naming mandatory Module/Edge proof, conditional risk profiles, maximum local attempts before Mechanism Review, Product Pulse trigger, release-only groups and any Human approval required for expensive or destructive proof. Budget exhaustion never converts incomplete proof to PASS: it yields PARTIAL/BLOCKED and the cheapest remaining discriminator.
+
+After a meaningful contract/edge wave—and before many more local units are admitted—ELIOT runs the smallest Product Pulse that crosses the real front door and owner path, produces a real artifact/effect or decision outcome, checks Product Identity and State Fence, avoids answer-shaped fixtures and can fail while all module-local tests are green. Missing, stale or repeatedly failing pulses raise `DevelopmentDriftSignal` and force review of decomposition, contract or mechanism.
+
+Every load-bearing evaluation produces an `EvaluationIntegrityReceipt` with:
 
 ```text
 property/construct, oracle owner and acceptance relation;
@@ -18436,12 +18729,12 @@ raw results, aggregation method and excluded/failed trials;
 criterion/ecological/temporal/transfer limits;
 counter-metrics, known shortcuts and invalidation conditions;
 production, measurement and optimization-feedback roles;
-mutation survivors and historical escapes;
-false-pass/false-fail evidence and OOD set;
+mutation survivors, historical escapes and OOD set;
+false-pass/false-fail evidence;
 actual/requested route, resource and oracle dependency;
 effective independent evidence N and collusion/shared-lineage limits;
 second route and/or Human disposition where required;
-`BudgetEquivalenceLedger` and `ComplexityEconomicsDelta`;
+BudgetEquivalenceLedger and ComplexityEconomicsDelta;
 assertability, ground-truth origin and artifact binding.
 ```
 
@@ -18449,21 +18742,20 @@ Rules:
 
 ```text
 benchmark score is not ProductProof;
-post-hoc evaluator changes may change a score but cannot rewrite the already observed outcome;
-model judge is never the sole proof for factual, authority, safety or completion claims;
-reference isolation is verified when the task requires blind work;
+post-hoc evaluator change cannot rewrite an observed outcome;
+a model judge is not sole proof for factual, authority, safety or completion claims;
+blind/reference isolation is verified when required;
 visible tests and agent-authored fixtures do not define the full oracle;
 zero tests, skipped cases and unknown outcomes remain explicit;
-credit is distributed and uncertain: use/influence receipts may support contribution hypotheses, not automatic reinforcement of one memory, prompt or agent;
-evaluation improvements are scoped to the exact stack and become stale when load-bearing dependencies change;
-replay/simulation calibrates an oracle but cannot alone promote it for live Product Proof;
-false-pass/false-fail, OOD and collusion evidence are measured separately from nominal accuracy.
+credit is distributed and uncertain rather than automatically assigned to one memory/prompt/agent;
+replay or simulation calibrates an oracle but cannot alone promote live Product Proof;
+false-pass, false-fail, OOD and collusion evidence are measured separately;
+one strong discriminator is preferred over many weak proxies.
 ```
 
-For development of ELIOT itself, each benchmark/eval report must name the `UserOutcomeObjectiveState` and the causal property it can disprove. If it measures only shape, activity or a local proxy, that proof ceiling is shown in the report and conformance projection.
+For ELIOT development, the report names `UserOutcomeObjectiveState`, the causal property it can disprove and its proof ceiling.
 
-
-Measured verifier validity is a scoped matrix, not a prose judgment:
+### Measured verifier validity
 
 ```yaml
 MeasuredValidityMatrix:
@@ -18479,11 +18771,9 @@ MeasuredValidityMatrix:
   uncertainty_and_invalidation:
 ```
 
-A missing denominator, inadequate sample or unresolved adjudication is `INCONCLUSIVE/UNKNOWN`, not zero error. Where adaptation is evaluated, `EvaluationStackAttribution` records `memory_only | parameter_update | mixed`, parameter digests and memory revisions before/after; improvement from external memory is not described as weight training.
+A missing denominator, inadequate sample or unresolved adjudication is `INCONCLUSIVE/UNKNOWN`, never zero error. Any load-bearing change to model/route, harness/tool schema, evaluator/oracle, task/source subset, environment, policy, budget class or Product Identity marks the dependent result `STALE` until the declared equivalence or re-execution is proved.
 
 ### Budget and complexity equivalence
-
-A load-bearing comparative claim binds a `BudgetEquivalenceLedger` and `ComplexityEconomicsDelta`:
 
 ```yaml
 BudgetEquivalenceLedger:
@@ -18506,55 +18796,40 @@ ComplexityEconomicsDelta:
   validity_scope_and_retirement_condition:
 ```
 
-A mechanism may still be selected when budgets are intentionally unequal, but the result is an operating-point decision, not a causal claim that the mechanism itself is superior.
+Intentionally unequal budgets may support an operating-point choice, not a causal superiority claim.
 
-### Delayed product outcome observation
+`ProductOutcomeObservationWindow` links an accepted task/artifact/release to recurrence, pass-to-pass and fail-to-pass behavior, downstream regressions, rework, maintenance, exposure/censoring, evaluator revision, rollback and irreversible residue. The original receipt remains immutable; the durability claim stays `RESIDUAL_WINDOW_OPEN`, becomes `MATURED`, or is narrowed/rolled back.
 
-`ProductOutcomeObservationWindow` links the accepted task/artifact/release to recurrence, pass-to-pass and fail-to-pass behavior, downstream regressions, rework, maintenance, exposure/censoring, evaluator revision, rollback and irreversible residue. The original task receipt remains immutable; the broader product/durability claim stays `RESIDUAL_WINDOW_OPEN`, becomes `MATURED`, or is narrowed/rolled back when later evidence arrives.
+### Composite attribution and comparison forms
 
-## I18.48. Composite benchmark attribution and experienced-colleague evaluation
+`EvaluationStackAttribution` records the exact composite path and adaptation mode (`memory_only | parameter_update | mixed`), parameter/memory revisions, task subset/source revision, model/provider/route, harness/Active View/Skills/tools, environment/resources/policy, evaluator boundary, Human intervention and missing capabilities.
 
-I18.47 defines evaluation integrity. This section defines the comparison forms retained from the Canonical Master.
+`BenchmarkEcologyRecord` records construct, shortcuts/proxies, contamination, harness assumptions, local relevance, transfer limits, primary metric, counter-metrics, falsification, ground-truth origin (`seeded_script | human | extracted | mixed`), answerability/exclusions, synthetic/real boundary, tuning exposure, cluster/replicate unit, horizon controls and artifact digests. A leaderboard name is not capability proof.
 
-`EvaluationStackAttribution` records the exact composite path and adaptation mode (`memory_only | parameter_update | mixed`) with parameter digests and memory revisions before/after:
+`MemoryOutcomeBenchmark` compares a candidate memory/context mechanism with a matched memory-free or prior-policy control and reports stored/available/delivered/acknowledged/used, DecisionDelta or avoided failure, artifact/verifier outcome, latency/cost/context/Human attention and uncertainty/scope.
 
-```text
-task distribution/subset and source revision;
-actual model/provider/route and continuation kind;
-harness/adapter, Active View, memory, Skills and tool surface;
-runtime/environment/resource and policy/budget profile;
-evaluator/RewardInputBoundary and Human intervention;
-code/data/profile digests and known missing capabilities.
+`SameModelHarnessComparison` holds model, harness, tools, task family and evaluator stable where possible, varies the candidate mechanism and uses held-out/compositional cases. Cross-model comparison answers a routing question and cannot isolate memory benefit.
+
+`ExperiencedColleagueEval` checks whether a cold competent route recovers goal/current path/paused alternatives/next boundary, finds relevant prior decisions without answer-shaped cues, prefers current evidence, selects the verifier, avoids known repeated failure and matches or exceeds the control artifact/outcome. These comparison forms may update empirical profiles or open `ImprovementCandidate` records; none is itself Product Proof, promotion authority or permission to alter the compared mechanism.
+
+### Oracle and evidence-family lineage
+
+```yaml
+OracleLineage:
+  oracle_id_and_version:
+  construct_measured:
+  source_of_authority:
+  implementation_and_fixture_digests:
+  dependency_and_shared_failure_domains:
+  historical_escape_and_mutation_refs:
+  simulation_or_real_edge_domain:
+  applicable_scope_and_proof_ceiling:
+  invalidation_conditions:
 ```
 
-`BenchmarkEcologyRecord` states what a benchmark actually measures, known shortcuts/proxy paths, answer contamination risk, harness assumptions, local relevance, transfer limits, primary metric, counter-metrics and falsification conditions. It also records ground-truth origin (`seeded_script | human | extracted | mixed`), answerability validation/exclusion, synthetic/real boundary, tuning exposure, cluster unit, replicate kind, horizon checkpoints, full-history/token-matched controls and artifact availability/digest. A name or leaderboard score is not a capability proof.
+A simulator proves only represented properties. Differential agreement is not independent when both sides share an oracle/parser/source; Product/Release proof requires real-edge corroboration where the claim crosses a real process, store, tool, provider or Human boundary.
 
-`MemoryOutcomeBenchmark` compares a candidate memory/context mechanism with a matched memory-free or prior-policy control and reports the whole ladder:
-
-```text
-stored/available/delivered/acknowledged/used;
-DecisionDelta or avoided failure;
-artifact/verifier outcome;
-latency, cost, context and Human attention;
-uncertainty and scope limit.
-```
-
-When claiming that memory, context layout, a Skill or a tool policy improved performance, ELIOT prefers `SameModelHarnessComparison`: keep model, harness, tools, task family and evaluator stable where possible, vary the candidate mechanism and use held-out/compositional cases. Cross-model comparison answers a routing question and cannot isolate memory benefit.
-
-`ExperiencedColleagueEval` asks whether a cold competent route behaves as if a reliable colleague had handed over the work:
-
-```text
-recovers goal, current path, paused/killed alternatives and next boundary;
-finds the relevant prior decision/failure without answer-shaped cues;
-uses current evidence over stale recall;
-selects the applicable verifier;
-avoids a known repeated failure;
-produces an artifact/outcome at least as good as the matched control.
-```
-
-These evaluations feed empirical profiles and Improvement Candidates. They never replace Product Proof or authorize automatic promotion.
-
-
+`EvidenceFamilyLineage` hashes every material shared prompt/context, dataset/snapshot, harness/tool schema, memory/retrieved evidence, model/route, oracle/environment and prior narrative exposed before first pass. Evidence is grouped by family before aggregation. Blind first pass, source obfuscation and null/random controls are preserved where applicable; effective evidence N is reported only with estimator assumptions, sample unit and uncertainty. Missing lineage is correlated/advisory or unknown, never independent confirmation.
 
 ## I18.49. Active conformance obligations
 
@@ -18590,40 +18865,6 @@ human/product outcome and delayed regressions.
 
 Existence in an audit, donor project or backlog does not activate a test. Every selected obligation must explain what additional failure class or proof it can distinguish; otherwise it is omitted. Historical exact IDs and cases are preserved in the external cold backlog for traceability.
 
-## I18.50. Oracle lineage and proof ceilings
-
-Every oracle/evaluator records its lineage:
-
-```yaml
-OracleLineage:
-  oracle_id_and_version:
-  construct_measured:
-  source_of_authority:
-  implementation_and_fixture_digests:
-  dependency_and_shared_failure_domains:
-  historical_escape_and_mutation_refs:
-  simulation_or_real_edge_domain:
-  applicable_scope_and_proof_ceiling:
-  invalidation_conditions:
-```
-
-A simulator proves only properties represented by its model. Differential agreement does not help when both sides share the same oracle, parser or source. Product/Release proof requires real-edge corroboration where the claimed property crosses a real process, store, tool, provider or Human boundary. Mutation and historical-escape corpora test whether the oracle can detect known defect classes; model judges remain supplemental unless the construct itself is intrinsically human/model-judged.
-
-
-For multi-agent/model evidence, `EvidenceFamilyLineage` hashes every material shared input and dependency:
-
-```text
-prompt/task and visible context;
-dataset/corpus/snapshot;
-harness/adapter/tool schemas;
-memory/root packet and retrieved evidence;
-model/provider/route and continuation;
-verifier/oracle/container/environment;
-author narrative or sibling findings exposed before first pass.
-```
-
-Evidence is grouped into families before aggregation. Blind first-pass, source obfuscation and random/null controls are preserved where applicable. Task-specific error dependence and effective evidence N may be reported only with the estimator assumptions, sample unit and uncertainty. Missing/unmeasured lineage is `correlated/advisory` or `unknown`; agreement never becomes correctness.
-
 ## I18.51. External falsification and regression ledger
 
 Detailed audit question IDs, donor-source headings, historical finding numbers and reproduction transcripts live in an external content-addressed evidence ledger, not in this normative book. The active Implementation sees only compiled obligations whose current owner and trigger are known:
@@ -18642,7 +18883,7 @@ FalsificationObligation:
 
 An audit inventory or numbered research question does not become a test merely because it exists. The ledger compiler deduplicates obligations by causal property/owner, preserves each source lineage and emits only `ACTIVE` obligations into the affected `ModuleTestCapsule` or `ProductEvaluationPlan`. Historical names such as W4/F/D identifiers remain evidence handles and never appear in the agent hotset unless the current work unit needs the underlying counterexample.
 
-Coverage counts prove only that source findings were dispositioned. Closure requires an executable discriminator on the exact current identity, or an explicit `TARGET_UNVERIFIED`/`STALE` disposition.
+Coverage counts prove only that source findings were dispositioned. Closure requires an executable discriminator on the exact current identity, or an explicit disposition of `ImplementationSupport = TARGET` with `EvidenceExecutionStatus = NOT_EXECUTED`, or `ImplementationSupport = STALE`.
 
 
 ## I18.52. Donor-specific fault corpora
@@ -19163,24 +19404,30 @@ network partition/fencing/consensus are explicit new Architecture-impacting work
 local-first single-node path remains supported.
 ```
 
-## I20.5. ELIOT Research federation and optional local Researcher
+## I20.5. Researcher providers and external federation
 
-ELIOT Research is planned as a separate external research system, not a larger mode of the hot-path ELIOT installation. It may own a large research database, document/object corpus, acquisition/OCR/indexing/RAG stack, research agents and long-running investigations. It has no direct access to ELIOT’s canonical database, task authority, secrets or finish path.
-
-The current line implements only the `ResearchExchangeContract` and replaceable bridge of I9.14.1. This allows Dreamer/Human/Main Agent to submit a question or large report, monitor a durable external job and import a bounded evidence bundle with exact citations. ELIOT may export selected reports, traces or service dossiers under disclosure/retention policy. Large sources, persistent corpora and bulk logs remain outside main Cognitive Inheritance. The local BlobStore is limited to bounded operational evidence with retention/transfer policy; ELIOT keeps source cards, handles, bounded excerpts and the conclusions/decisions actually needed for work.
-
-A local optional Researcher process family may later provide a smaller on-machine subset:
+Researcher is defined in I21. This section states only the replacement boundary of its providers.
 
 ```text
-source acquisition;
-document parsers/OCR;
-content store/index;
-RAG/full-text/vector;
-source catalog and snapshots;
-research corpus lifecycle.
+P1  manually or bridge-supplied sources
+    current accepted line; no additional runtime required;
+
+P2  local search/preparation provider
+    separate product and repository; owns source identity/revisions, safe reads,
+    materialization, unitization and exact/lexical/structural/semantic projections;
+    reached through a typed provider contract, never through canonical credentials;
+
+P3  external research federation
+    separate product and repository; owns large corpora, acquisition/OCR/indexing,
+    long-running investigations and research publications;
+    reached through the current `ResearchExchangeContract` of I21.11.
 ```
 
-Whether local or federated, Researcher acquires; Dreamer interprets; Governor governs. Outputs are sources/evidence candidates, never direct epistemic promotion. Failure of Research leaves external knowledge unavailable or partial but cannot stop the core hot path.
+For every admitted source namespace, exactly one component is the authoritative mutable owner of source identity and source revisions. The local provider owns local source namespaces it ingests; an external federation owns its own namespaces; a manual import remains owned by the importing source adapter until an explicit cutover. ELIOT canonical state owns admission, handles, provenance, and allowed influence—not mutation of provider source history. Researcher, Dreamer, Context Compiler, Memory OS, and other providers hold immutable references or derived projections only. Provider replacement requires an explicit source-owner cutover with identity mapping, fencing, compatibility verification, and a receipt; a second mutable source catalogue or revision lineage is prohibited.
+
+No provider is required for the first cognitive spine. A provider supplies candidates, coverage and freshness; it never receives task authority, canonical write access, Context Compiler admission or finish authority. Absence or failure of a provider narrows declared coverage and is reported as a gap; it does not stop the core hot path and does not transfer its responsibility to Dreamer.
+
+A provider is replaced through its own contract, conformance corpus and capability descriptor. Replacing a provider never changes Researcher semantics, evidence grade, dispositions or coverage accounting.
 
 ## I20.6. WASM module tier
 
@@ -19214,9 +19461,9 @@ The component boundary remains replaceable. Wasmtime types never leak into domai
 
 CloudBridge remains optional. It can provide ephemeral agents/labs, not remote canonical owner. Remote output imports as source/evidence/artifact.
 
-## I20.8. Four distinct adaptation contracts
+## I20.8. Distinct adaptation contracts
 
-ELIOT does not call every improvement “learning”. Four mechanisms remain separate:
+ELIOT does not call every improvement “learning”. Nine contracts keep mutable surfaces and proof ceilings distinct:
 
 ```text
 1. Episodic/canonical memory update
@@ -19225,13 +19472,31 @@ ELIOT does not call every improvement “learning”. Four mechanisms remain sep
 2. Retrieval/context policy adaptation
    ranking, admission, packet layout, trigger and routing candidates;
 
-3. Skill/prompt/procedure adaptation
-   versioned behavioral artifacts, replay, holdout, shadow/canary and rollback;
+3. Intra-task strategy and search adaptation
+   hypothesis order, probe choice, parent/candidate selection and stop boundary;
 
-4. Parametric weight training
+4. Decomposition and workflow adaptation
+   work-unit shape, recipe choice, wave structure and integration ownership;
+
+5. Tool exposure and middleware adaptation
+   advertised surface, invocation strategy, output reducers and evidence handles;
+
+6. Active abstraction adaptation
+   the representation the route works in: what is named, grouped and hidden;
+
+7. Route and evaluator-cadence adaptation
+   route selection inside policy, verification order and probe frequency;
+
+8. Skill/prompt/procedure and structural harness adaptation
+   versioned behavioral artifacts and executable harness structure, with replay,
+   holdout, shadow/canary and rollback;
+
+9. Parametric weight training
    future optional training product with its own dataset rights, provenance,
    deduplication, contamination controls, objective, evaluation, rollback and erasure limits.
 ```
+
+The inner loop may originate scoped updates across contracts 1–8, but it directly changes only admitted task-local surfaces. Canonical memory writes under contract 1 and any reusable, system-wide, production or normative influence under contracts 2–8 remain with their existing owners and the outer promotion loop. Task-local Skill/procedure variants may live in the overlay; their reusable or structural form is contract 8 and requires promotion. Contract 9 remains `DEFERRED`.
 
 Success in one mechanism is not evidence for another. Retrieval benefit is not a weight change; better wording is not acquired capability; a fine-tune does not replace public cognitive inheritance or canonical provenance. Parametric training remains `DEFERRED` until a separately approved product objective and data/evaluation governance exist. Supervised, preference and reward-optimized candidates additionally require an explicit reward/target contract, frozen base/control, dataset and license lineage, contamination and leakage checks, adversarial reward-gaming probes, held-out product evaluation, capability-specific rollback and an external authority boundary. Training score, reward or benchmark gain never grants canonical influence, tool authority, route independence or product acceptance by itself.
 
@@ -19320,6 +19585,375 @@ Local changes build and test only affected modules; releases prove the whole sys
 Every strategic dependency can be replaced through a thin bridge and verified migration.
 ```
 
+# I21. Researcher plane, inquiry discipline and evidence grade
+
+## I21.1. Researcher is a plane, not a future module
+
+Researcher is the governed information-work plane of ELIOT. It is **not** a fifth architectural plane: it is a capability plane inside Smart and occupies `R6` in the runtime layer model. It is not a scheduler, a memory owner, a second Governor or an agent framework.
+
+```text
+OWNS
+  research-domain resolution and revision of the versioned inquiry profile and Evidence Grade
+    inside the current Task Controller definition and Governor admission;
+  source-admissibility disposition for every external source proposed to an inquiry evidence set;
+  source portfolio, coverage denominator and coverage accounting;
+  confirmatory/exploratory lane discipline;
+  evidence freeze, claim audit and research debts;
+  reference firewall and unsupported-precision control;
+  research/inquiry dispositions and reopen conditions.
+
+DOES NOT OWN
+  interpretation and synthesis                    → Dreamer;
+  canonical transition, Current Epistemic Position and finish → Governor through existing canonical/finish paths;
+  task objective, work-graph semantics or plan revisions       → Task Controller;
+  admitted staffing and execution coordination                 → Agent Coordinator;
+  budget policy/ceilings → Requester or System Owner; delegated allocation → Task Controller;
+  budget admission/accounting → Governor and Agent Coordinator;
+  local corpus preparation and retrieval                        → local search provider;
+  large external corpora and investigations                     → research federation;
+  verification execution                                        → Instrument Plane.
+```
+
+Source admissibility is not canonical promotion. Researcher records whether a source is eligible, ineligible or pending for one inquiry evidence set, with scope, taint, provenance and limits; Governor applies any governed state transition through the sole canonical writer. Researcher never writes canonical state directly and never promotes its own output to Current Epistemic Position. Its output classes are unchanged: governed sources, evidence candidates, bounded briefs and typed dispositions.
+
+Providers are pluggable and none is required for the first cognitive spine (I20.5). Absence of a provider narrows declared coverage and is reported as a gap; it never transfers Researcher responsibility to Dreamer and never blocks unrelated local work.
+
+## I21.2. Evidence grade
+
+Depth of information work is a selected level of rigour, not a separate feature. One contour serves a quick lookup and a full investigation; the difference is the declared grade.
+
+```text
+E0 ORIENTING
+   bounded exact/cached answer; no claim of coverage; not admissible for a Material decision;
+
+E1 GROUNDED
+   every material statement resolves to an exact source handle;
+   observation, interpretation and assumption are distinguished;
+
+E2 CORROBORATED
+   independent source families or an independent observation route;
+   rivals and counterevidence represented; coverage denominator declared;
+
+E3 SCIENCE GRADE
+   E2 plus a declared lane, frozen protocol/evaluator where confirmatory,
+   evidence freeze before synthesis, claim-level audit and explicit research debts.
+```
+
+Selection, not inheritance:
+
+```text
+proposed by  Task Controller, Dreamer or the requesting route as part of ExecutionIntent;
+resolved by  Researcher into a versioned inquiry profile under the current task definition;
+admitted by  Governor together with budget, privacy and route policy;
+enforced by  Context Compiler (I12.13), Evaluation Contract (I6.7),
+             finish gate (I7.9) and swarm admission (I10.15).
+```
+
+A grade may be raised prospectively at any point in a task. Evidence already exposed retains the grade and lane under which it was produced; raising the requirement does not retroactively turn exploratory evidence into confirmation. A confirmatory E3 claim after exposure requires fresh held-out, independent or preregistered evidence, replication, formal proof or another sufficient truth surface. Lowering an already declared grade for an unchanged claim is a supersession with a reason, not a silent adjustment. A claim carries the grade it was produced under; a later reader may not upgrade it by quoting it.
+
+Grade is orthogonal to `EvidenceStatus` (I7.27): grade states how much rigour was **required**, status states what execution, parsing, evaluation, independence and attribution were **observed**. The cognitive proof ladder (I12.34) limits what a result can establish; test tier (I18.4) states breadth; fidelity level (I18.4) states representativeness. None can be inferred from another or collapsed into one scalar.
+
+## I21.3. Inquiry protocol selection
+
+A single generic pipeline for every question is the most common failure of research automation. The protocol is chosen from the structure of the question.
+
+```yaml
+InquiryProtocolProfile:
+  profile_id_and_revision:
+  question_and_intended_decision_or_artifact:
+  protocol:
+    lookup | evidence_review | causal_diagnosis | formal_proof |
+    program_synthesis | architecture_decision | algorithm_search |
+    empirical_discovery | theory_development | decision_support
+  evidence_grade:
+  lane: confirmatory | exploratory | mixed_with_declared_split
+  truth_surfaces_and_admissible_providers:
+  coverage_goal: exploratory | representative | high_recall | exhaustive
+  hypothesis_policy: alternatives_required | counter_search_required | falsification_required
+  independence_and_blinding_policy:
+  fidelity_ceiling:
+  budget_deadline_and_stop_rule:
+  output_contract_and_reopen_conditions:
+```
+
+Selection inputs are task features, not task vocabulary: sequential dependency, branch independence, shared mutable state, verifier cost and strength, specialist discoverability, horizon, uncertainty and risk. The same inputs feed `RecipePlanner` (I10.15), so protocol and staffing are chosen consistently rather than by two competing heuristics.
+
+Protocol choice is a Default, not a Hard Boundary: it may be changed mid-run with a recorded reason, and the change invalidates only obligations that depended on the previous protocol. In a confirmatory lane, a change outside registered deviations also invalidates the registration; subsequent analysis is exploratory until a new registration is frozen before new outcome exposure.
+
+## I21.4. Confirmatory and exploratory lanes
+
+Executable form of A5.7.
+
+```yaml
+LaneRegistration:                    # required for a confirmatory lane or confirmatory partition
+  contract_protocol_hypothesis_and_evaluator_digests:
+  primary_outcome_and_decision_rule:
+  exclusions_and_quality_controls:
+  blinded_fields:
+  allowed_deviations:
+  registered_before_outcome_exposure:
+  registered_at_and_state_fence:
+```
+
+After registration the run may not change the primary metric, exclude a case without a stated rule, weaken the proposition, replace the evaluator after seeing results or hide failed attempts. Declared deviations are preserved and shown with the result. Any later analysis is labelled exploratory. Acceptance is outcome-neutral: a compliant negative result is a valid confirmatory result.
+
+Exploratory results are stored as `EXPLORATORY_FINDING`. Under `ARCH-EPI-03`, evidence that generated or tuned a hypothesis cannot confirm it on the same exposure. Promotion to a confirmatory claim requires a new holdout, an independent run, a preregistered test, replication, formal proof or another sufficient truth surface. A mixed lane freezes an explicit partition; evidence may not silently cross from the exploratory side into the confirmatory evaluator.
+
+`blinded_fields` names one leakage channel to close, not a universal mask. Typical fields: preferred hypothesis, condition labels, parent conclusion, holdout expected score, candidate author, source prestige. Blinding interacts with the non-ordinal independence profile (I7.27) and with the sealed-mapping phase of `NegotiatedInterdependentInvestigation` (I10.15); it does not create a second independence model.
+
+## I21.5. Inquiry obligations and acceptance certificates
+
+An inquiry item is not a task description but a statement of what must become true and what will show it. Obligations are compiled into the existing work graph by `TaskGraphCompiler` (I10.15); no second graph exists.
+
+```yaml
+InquiryObligation:
+  obligation_id_and_parent_question:
+  goal_and_protocol_ref:
+  dependencies_and_assumptions:
+  acceptance_certificate_kind:
+    kernel_checked_proof | reproducible_build_and_contract_tests |
+    immutable_inputs_and_raw_measurements | exact_source_identity_and_passage |
+    protocol_compliance_qc_and_raw_data | accepted_evidence_revision_and_authority_signature
+  information_boundary:
+  responsible_role_and_verifier:
+  budget_and_stop_condition:
+  status: STUB | READY | RUNNING | BLOCKED | SUBMITTED | VERIFIED |
+          REJECTED | INVALIDATED | CANCELLED
+  invalidated_by_reason_resources_spent_and_reusable_artifacts:
+  reopen_conditions:
+```
+
+An obligation is satisfied by its certificate, never by a worker's report that it is done.
+
+Planning is receding-horizon: only obligations that current observations can determine are materialised. Information-dependent futures remain `STUB` and are expanded when the upstream result arrives. Invalidated obligations are not deleted: they retain the invalidating cause, spent resources and any reusable artifacts, so that repeated planning cost becomes visible.
+
+The planner wakes on: depletion of the ready frontier, a new contradiction, a verifier counterexample, a changed contract, a budget phase transition, stale evidence, a new dependency, a repeated local failure, evidence that changes decision ranking, or a Human semantic interrupt. It is not invoked after every tool call.
+
+## I21.6. Source portfolio, coverage denominator and CoverageReceipt
+
+```yaml
+SourcePortfolio:
+  primary_sources_and_specifications:
+  reviews_and_secondary_analyses:
+  operational_and_measured_evidence:
+  independent_implementations:
+  critical_or_negative_sources:
+  missing_source_classes_and_reason:
+  independence:
+    source_family | provider_family | evaluator_family |
+    shared_context_ancestor | shared_assumptions
+```
+
+Ten pages from one vendor are not ten independent sources. Two outputs are dependent when they share a source, restate one primary work, run on one model family, saw one parent summary, use one evaluator or inherit one mistaken assumption.
+
+```yaml
+CoverageReceipt:
+  requested_scope_and_frozen_scope_snapshot:
+  eligible_represented_cited_and_omitted_sources:
+  unknown_coverage_and_reason:
+  source_families_and_independence_profile:
+  routes_used_stale_and_skipped:
+  provider_degradation_and_redacted_dependencies:
+  counter_search_status:
+  denominator_kind: complete_scope | sampled_with_method | unknown
+  budget_limitations:
+  terminal_disposition:
+```
+
+`denominator_kind = complete_scope` is the only basis on which a scoped absence may be claimed. An indexed top-k result never narrows the denominator of an exact negative claim: it proposes candidates, and completeness is proved on the frozen scope. Retrieval quality and citation quality are separate obligations — see I21.8.
+
+## I21.7. Reference firewall and unsupported precision
+
+Every Dreamer, Researcher, audit, local-model and external-model job receives an `AllowedReferenceManifest` bound to the exact run and State Fence:
+
+```yaml
+AllowedReferenceManifest:
+  run_job_and_root_context_revision:
+  allowed_source_record_evidence_artifact_and_url_handles:
+  allowed_tool_definition_and_verifier_refs:
+  allowed_anchor_or_coordinate_precision:
+  scope_disclosure_and_retention_classes:
+  stale_or_revoked_entries:
+  expansion_routes:
+  manifest_digest_and_state_fence:
+```
+
+A model may quote, summarize or select only entries in this manifest. It cannot mint a valid citation, URL, source ID, line range, artifact handle or support relation through prose. A syntactically plausible but absent/stale/wrong-scope reference remains unsupported text and produces a candidate diagnostic rather than an evidence edge.
+
+A newly mentioned external URL or identifier may be captured as an untrusted `ObservationCandidate` for later acquisition, but it is not treated as an allowed source or citation for the current run until an admitted provider resolves and snapshots it, Researcher records its source-admissibility disposition, and Governor applies the resulting `SourceRecord` transition through the sole canonical writer.
+
+```yaml
+UnsupportedPrecisionItem:
+  asserted_reference_or_coordinate:
+  highest_supported_precision:
+  source_and_coverage_basis:
+  risk_of_false_precision:
+  required_probe_or_narrower_wording:
+```
+
+A source that supports a file-level or document-level claim does not automatically support a symbol, line, causal mechanism or population-wide statement. Reference validation occurs before candidate promotion and again when a result is packed into a shared packet or exported to another route.
+
+The firewall does not censor model reasoning. It separates free-form hypotheses from support that ELIOT is allowed to represent as anchored evidence.
+
+## I21.8. Evidence freeze, synthesis and claim audit
+
+Before prose synthesis the accepted evidence revision is frozen:
+
+```yaml
+EvidenceFreeze:
+  freeze_id_and_state_fence:
+  contract_and_protocol_digests:
+  included_evidence_refs:
+  excluded_evidence_and_reasons:
+  unresolved_contradictions:
+  open_research_debts:
+  frozen_at:
+```
+
+A synthesis author may not silently acquire a new fact and include it without admission. Any new material reopens the freeze with a recorded reason.
+
+Every material statement of a released artifact carries a resolved chain:
+
+```text
+claim → evidence handle → source revision → run/measurement → transformation → statement.
+```
+
+`ClaimAudit` checks four independent properties: reference verification, value/measurement verification, specification compliance and method–artifact alignment. Its output classifies each claim as `SUPPORTED`, `PARTIALLY_SUPPORTED`, `UNSUPPORTED`, `CONTRADICTED` or `NOT_VERIFIABLE_IN_SCOPE`; uncertainty and scope limits are preserved rather than smoothed.
+
+Retrieval quality and citation quality are separate obligations and are reported separately:
+
+```text
+source_satisfies_requirement    the admitted source genuinely contains the required evidence;
+excerpt_supports_requirement    the supplied exact excerpts alone are sufficient for a careful
+                                reader to verify the requirement.
+```
+
+A result may satisfy the first and fail the second. Failure modes of the second are explicit: fabrication, paraphrase that shifts meaning, stitching across sections, cropping that removes a hedge or negation, a search snippet presented as a page quote, and an excerpt absent from the admitted revision.
+
+A model cannot mint a citation, source ID, URL, line range or support relation through prose; this is the reference firewall of I21.7.
+
+## I21.9. Inquiry dispositions and reopen
+
+Research/inquiry completion is also typed. An empty answer or exhausted search is not silently promoted to “question answered”:
+
+```text
+ANSWERED_WITH_SUPPORTED_RESULT;
+NO_MATCH_IN_COMPLETE_SCOPE;
+NO_NEW_USEFUL_EVIDENCE;
+SOURCE_UNAVAILABLE;
+STALE_SOURCE_OR_INDEX;
+POLICY_OR_DISCLOSURE_DENIED;
+INCOMPLETE_COVERAGE;
+INCONCLUSIVE;
+CANCELLED.
+```
+
+The disposition binds query, source portfolio, coverage denominator, reference manifest, State Fence and unresolved precision items. Only `ANSWERED_WITH_SUPPORTED_RESULT` or a properly scoped `NO_MATCH_IN_COMPLETE_SCOPE` may close the corresponding inquiry item; all other outcomes preserve a next probe, narrower claim or explicit unknown.
+
+## I21.10. Local search provider
+
+The local provider prepares and retrieves local data. For each local namespace it admits, it is the sole authoritative mutable owner of source identity and revisions, safe no-execute reads, materialization, unitization, exact, lexical, structural, and optional semantic projections, publication, and coherent readback. ELIOT stores immutable `SourceRevisionRef` values and governed admission or influence records; it does not mint a competing source revision. The provider is a separate product with its own repository, contracts, and delivery gates.
+
+The ELIOT-facing boundary is fixed here:
+
+```text
+ELIOT compiles a typed request and a scoped read grant;
+the provider returns candidates, coverage, freshness, provider assurance and reason codes;
+the provider never receives canonical credentials, task authority, admission or finish authority;
+the provider never returns an ELIOT memory disposition;
+provider availability is planning information, not permission.
+```
+
+A capability descriptor supplies supported recipes, available profiles, visible-scope readiness, observation freshness and degraded reason codes. Coverage claimed by ELIOT is bounded by what the descriptor actually supports; an unavailable provider produces an explicit gap, never a silent narrowing.
+
+## I21.11. Research federation provider
+
+`ELIOT Research` is a separate external cognitive/research system with its own database, acquisition/indexing stack, tools, agents and lifecycle. It is not the Researcher plane or a privileged in-process owner and never shares ELIOT’s canonical database or authority lineage.
+
+The Research endpoint, bridge, protocol and exchange classes are admitted through the normal `RuntimeInstallation`/`HostAdapterManifest`/`CapabilityEvidenceRecord` path. Endpoint reachability or a successful login proves neither source coverage nor permission to disclose a bundle. Each exchange binds the exact Research system/bridge generation, dynamic capability pulse, principal, disclosure policy and retention contract; stale or unqualified evidence blocks only the dependent exchange.
+
+The bridge exposes an ELIOT-owned `ResearchExchangeContract` through a replaceable module/process adapter:
+
+```yaml
+ResearchQueryRequest:
+  exchange_id_protocol_bridge_and_idempotency:
+  requester_principal_authority_and_state_fence:
+  question_scope_and_expected_decision:
+  source_classes_and_coverage_goal:
+  ELIOT evidence/report handles allowed for export:
+  privacy_disclosure_retention_and_license:
+  budget_deadline_stop_and_progress_contract:
+  required result schema_and_citations:
+
+ResearchEvidenceBundle:
+  exchange_request_job_system_and_version:
+  immutable_bundle_digest_and_origin_authentication:
+  source_catalog_snapshots_and_exact_citations:
+  claim_counterclaim_and_independence_matrix:
+  bounded excerpts_and_artifact_handles:
+  coverage_unknowns_and_failed_acquisition:
+  synthesis_as_candidate:
+  disclosure_and_invalidation:
+
+ResearchExportBundle:
+  exchange_id_protocol_and_ELIOT_product_identity:
+  large ELIOT report_trace_or_service dossier:
+  exact artifact/source handles and redactions:
+  purpose_allowed_use_retention_and_return_channel:
+  disclosure_decision_and_export_receipt:
+```
+
+Dreamer may query Research when local cognitive inheritance lacks external knowledge, and may submit an important large report or service dossier for deeper processing. Returned material enters ELIOT as governed sources, evidence candidates and bounded briefs; it does not become Current Epistemic Position or a procedure automatically. Persistent large documents, corpora, embeddings and document-processing intermediates belong in Research. Main ELIOT BlobStore may retain only bounded operational artifacts/log segments under explicit retention or transfer policy; it is not a long-term research corpus. Main Cognitive Inheritance stores source cards, exact handles, bounded excerpts, decisions, outcomes and the compact knowledge needed for hot work.
+
+A deterministic `CorpusPlacementDecision` prevents accidental corpus growth:
+
+```text
+cognitive_hot
+  source card, bounded excerpt, claim/decision/failure/procedure needed for current work;
+
+operational_evidence
+  immutable artifact/log segment retained for exact proof, replay or transfer;
+
+research_corpus
+  source set requiring persistent bulk storage, OCR/parsing, repeated full-text/vector/RAG,
+  document-level synthesis or long-horizon research maintenance.
+```
+
+The decision is based on purpose, access pattern, processing lifecycle, retention/privacy and expected cognitive use—not one universal byte threshold. A payload placed in Research remains reachable by governed handle and can later yield a compact ELIOT candidate; it is not silently copied back in full.
+
+The federation is asynchronous and durable: jobs expose progress, cancellation, partial results, source coverage and terminal disposition. Research may internally use its own agents/swarms, but ELIOT controls only the admitted external job boundary unless the protocol exposes verifiable descendant lineage. Unobserved internal agents receive no independence credit and cannot create ELIOT authority or proof. Research failure degrades external knowledge only. Direct remote DB access, shared credentials, implicit bidirectional replication and Research-initiated ELIOT writes are forbidden.
+
+When a current task depends on a Research-held source, ELIOT may use only a still-valid bounded excerpt/evidence bundle already admitted under its State Fence. It does not invent the missing content or silently fall back to a stale summary. If the required bundle cannot be fetched or its disclosure/source generation cannot be verified, the dependent inquiry returns `RESEARCH_SOURCE_UNAVAILABLE` or `INCOMPLETE_COVERAGE`, while unrelated local cognitive work continues. Pending exports/imports remain durable exchange jobs and resume by idempotency identity rather than duplicate transfer.
+
+## I21.12. Research debts
+
+An unmet obligation is a typed object, not a caveat at the end of a report.
+
+```text
+epistemic       a load-bearing assumption is unverified        blocks a strong claim;
+verification    a candidate lacks a sufficient verifier        blocks release;
+replication     no independent failure domain                  blocks generalization;
+coverage        a material question branch is unclosed         blocks completeness;
+contradiction   a conflict is unresolved and unscoped          blocks a unified conclusion;
+fidelity        the evaluator poorly represents the target     blocks decision confidence;
+provenance      a raw artifact or lineage is missing           blocks audit;
+authority       a trade-off was not accepted by its owner      blocks the final decision.
+```
+
+Debts are registered in the Problem Registry (I13.9) with owner, review condition and expiry. A release that carries open debts states them; it does not describe them as minor limitations.
+
+## I21.13. Failure, degradation and honest closure
+
+```text
+provider unavailable        → declared coverage narrows; dependent inquiry returns a typed gap;
+frozen scope unavailable    → no completeness or absence claim; exact-handle work may continue;
+evaluator invalid or stale  → confirmatory lane cannot close; exploratory work may continue;
+budget exhausted            → checkpoint, partial coverage and next probe are preserved;
+contradiction unresolved    → legitimate unresolved state with a named discriminator.
+```
+
+An empty answer, an exhausted search, a stopped agent or an approaching budget limit never promote themselves to `ANSWERED_WITH_SUPPORTED_RESULT`. Only that disposition or a properly scoped `NO_MATCH_IN_COMPLETE_SCOPE` may close an inquiry item (I21.9); every other outcome preserves a next probe, a narrower claim or an explicit unknown.
+
 ---
 
 # Appendix A. ModuleGeneration lifecycle projection
@@ -19354,625 +19988,59 @@ The canonical restart classes, group strategies, intensity budgets and quarantin
 ---
 # Appendix B. Core EBP service profiles
 
-> **Status: TARGET MESSAGE-VOCABULARY PROJECTION.** Owning I-sections and the active generated contract catalogue define semantics. Presence here does not prove an implemented method or authorize a handler.
+> **Projection lifecycle label (artifact-local):** `BOOTSTRAP_RETAINED_TARGET`. **Projected I0.5 support/evidence:** `TARGET` / `NOT_EXECUTED`. **Runtime load policy:** `DOCUMENTATION_ONLY`. The detailed active documentation projection is `docs/generated/ebp-profiles.md`. It is deterministically assembled from the exact pre-extraction appendix snapshot plus an explicit post-integration coverage supplement. It is not evidence that handlers, transport schemas or a runtime catalogue exist.
 
-## B.0. Host ↔ Kernel and managed dependencies
+Owners: I7.1 and the section owning each service boundary. Manifest: `docs/generated/PROJECTION_MANIFEST.json`. Exact historical source: `_REVIEW/baseline_sections/Appendix_B.md`.
 
-```text
-StartKernelCandidate
-PrepareKernelHandoff
-IssueKernelActivationNonce
-KernelReadyReceipt
-KernelActivationFailed
-StartManagedDependency
-StopManagedDependency
-ManagedDependencyStatus
-ManagedDependencyExit
-RequestWatchdogServiceState
-HostRecoveryStatus
-```
-
-Host protocol carries only installation/process lineage, immutable artifact/config hashes, activation nonce, Job Object identity, restart budget, pre-registered containment action identity and observed process state. It cannot transport project semantics, claims, task decisions or canonical authority. Kernel activation and managed-dependency lifecycle use separate records and failure domains.
-
-## B.1. Kernel ↔ Daemon
+Rules that remain normative here:
 
 ```text
-AttachDaemonGeneration
-InstallKernelExecutionManifest
-LoadApplicationState
-AdmitRequest
-ApplicationResponse
-StageAdmissionReservation
-ActivateAdmissionReservation
-ReleaseAdmissionReservation
-CanonicalTransitionRequest
-ModuleCommand
-CheckpointAll
-Quiesce
-DaemonReady
-DaemonFatal
+owning I-sections and an admitted contract catalogue define semantics and authority;
+a retained message name is a TARGET vocabulary item, not implemented support;
+large streams use immutable Blob handles and bounded summaries;
+service output cannot activate its own generation, commit canonical state or create external-effect authority;
+unknown or incompatible control variants fail before effects;
+process and transport mappings may change without changing semantic ownership;
+later-wave capabilities absent from the retained vocabulary are unsupported until explicitly catalogued, never inferred.
 ```
-
-Admission-reservation messages implement the I10.15/I14.6 fail-closed saga. `Stage` is inactive, `Activate` requires the exact canonical admission receipt and current fence/epoch, and `Release` cannot terminate an already running attempt without its own governed cancellation/reconciliation. They are Kernel operational commands, not a second work-item lifecycle.
-
-## B.2. Kernel ↔ Store
-
-```text
-StoreHello
-ExecuteMutationPlan
-NamedRead
-ResolveReceipt
-StreamExport
-ImportSegment
-HealthSchema
-QuiesceStore
-```
-
-## B.3. Kernel/Daemon ↔ Blob Store
-
-```text
-StageBlob
-BlobReadyReceipt
-ReadBlobRange
-ResolveBlobRef
-ReachabilitySnapshot
-QuarantineOrphan
-RunBlobGc
-BlobHealthCapacity
-QuiesceBlobStore
-```
-
-Stage/read requests carry principal, WorkScope, privacy, content type, payload hash/length budget and operation identity. Blob Store never admits semantic state or creates a canonical reference without a later governed transition.
-
-## B.4. Daemon ↔ Module
-
-```text
-RegisterCapability
-ExecuteCapability
-SubscribeEvents
-CheckpointDerivedState
-InvalidateDependencies
-HealthFreshness
-```
-
-## B.5. Watchdog
-
-```text
-IndependentHeartbeat
-SignalEnvelope
-RequestKernelContainment
-RequestHostContainment
-ContainmentReceipt
-ProblemIntent
-AuditAnchor
-SupervisionStatus
-```
-
-## B.6. Dreamer
-
-```text
-SubmitDreamJob
-DreamJobAccepted
-InputBundleHandle
-DreamResultCandidate
-ClarificationRequest
-UsageReceipt
-CancelDreamJob
-```
-
-## B.7. Doctor
-
-```text
-SubmitDiagnosticJob
-DiagnosticBriefCandidate
-AuthorizeRepairRecipe
-ExecuteRepairEffect
-RepairAttemptReceipt
-VerifyRepair
-QuarantineRecipeOrComponent
-EscalateRecovery
-CancelRepairJob
-```
-
-Doctor messages carry a Problem/Incident or recovery-intent identity, recipe version, RecoveryLease/Authority Epoch, State Fence, budget and verification contract. No Doctor message is a direct canonical semantic mutation.
 
 ---
-
-## B.8. Kernel ↔ User Broker
-
-```text
-AttachUserBroker
-UserBrokerReady
-LaunchUserExecution
-UserExecutionEvent
-UserExecutionUsage
-CancelUserExecution
-UserExecutionExit
-UserBrokerHealth
-DetachUserBroker
-```
-
-Every message carries installation/user SID, interactive-session identity, `UserBrokerEpoch`, exact broker/runtime generation, scoped capability/effect envelope, privacy/budget, State Fence and EventEnvelope stream identity. User Broker never receives Module Catalog or canonical-write credentials.
-
----
-
-## B.9. Daemon ↔ Test execution plane
-
-```text
-TestdHello / TestdReady;
-SubmitTestdJob;
-TestdJobAccepted;
-StageStarted / StageEvent / StageCheckpoint;
-ArtifactReady;
-VerificationReceiptCandidate;
-CancelTestdJob;
-ReconcileTestdJob;
-TestdJobTerminal;
-TestdHealth / TestdDraining.
-```
-
-Messages carry exact job/profile/toolchain/worktree/build trust/fence identities. Testd returns observations and candidate receipts; it cannot mutate task/finish state. Large streams use Blob handles and bounded event summaries.
-
-## B.10. Daemon/Kernel ↔ Component hosts and native workers
-
-```text
-ComponentHostHello;
-PrepareGeneration;
-InspectInterface;
-RunConformance;
-StartShadow;
-ShadowObservation;
-StartCanary;
-GenerationCandidateReady;
-QuiesceGeneration;
-ComponentStateExport / ComponentStateImport;
-GenerationTerminal;
-
-NativeWorkerHello;
-ExecuteTypedRequest;
-WorkerEvent;
-WorkerCheckpoint;
-WorkerCancel;
-WorkerResultCandidate;
-WorkerHealth / WorkerDraining.
-```
-
-Kernel owns generation/epoch routing. `eliotd` owns desired policy and work. Host/worker outputs cannot activate their own generation or commit an external effect.
 
 # Appendix C. Default runtime configuration
 
-> **Status: CANDIDATE_PROFILE.** Values below are planning hypotheses until qualified under I2.16/I14.28; they are not current runtime facts or universal defaults.
+> **Projection lifecycle label (artifact-local):** `BOOTSTRAP_RETAINED_CANDIDATE`. **Projected I0.5 support/evidence:** `TARGET` / `NOT_EXECUTED`. **Runtime load policy:** `FORBIDDEN`. The detailed profile is `docs/generated/default-runtime-configuration.md`; the machine candidate is `config/defaults.generated.toml`. Both are deterministically retained planning projections. The TOML contains a mandatory rejection guard and is not an admitted runtime config.
 
-This is the first complete configuration profile, not an Architecture invariant. Effective configuration is versioned, visible in ControlBoard and may change through measured Implementation updates.
+Owners: I2.16, I14.28 and Human policy surfaces. Manifest: `docs/generated/PROJECTION_MANIFEST.json`. Exact historical source: `_REVIEW/baseline_sections/Appendix_C.md`.
 
-```toml
-schema_version = 1
-install_profile = "system_service" # user_mode/portable_dev override paths and supervision through I3.1
+Rules that remain normative here:
 
-[system]
-mode = "on_demand"
-instance_name = "eliot-local"
-idle_shutdown_after = "5m"
-shutdown_grace = "5s"
-bounded_blocking_slots = 8
-normative_pair_identity_ref = "external-content-addressed-receipt" # resolves exact Architecture/Implementation revisions and digests; config does not duplicate them
-
-[paths]
-data_root = "C:/ProgramData/Eliot"
-host_state_root = "C:/ProgramData/Eliot/host"
-blob_root = "C:/ProgramData/Eliot/blobs"
-log_root = "C:/ProgramData/Eliot/logs"
-report_root = "C:/ProgramData/Eliot/reports"
-backup_root = "C:/ProgramData/Eliot/backups"
-module_root = "C:/ProgramData/Eliot/modules"
-service_worktree_root = "C:/ProgramData/Eliot/worktrees"
-user_worktree_root = "%LocalAppData%/Eliot/worktrees"
-user_broker_root = "%LocalAppData%/Eliot/user-broker"
-
-[protocol]
-ebp = "1"
-encoding_primary = "json-v1"
-encoding_candidates = ["protobuf-v1"]
-mcp_primary = "2026-07-28"
-mcp_compat = ["2025-11-25"]
-max_frame_bytes = 4194304
-hot_response_bytes = 65536
-hard_structured_response_bytes = 262144
-durable_event_ack_timeout = "2s"
-durable_event_replay_page = 256
-best_effort_telemetry_drop_signal = true
-
-[user_broker]
-enabled = true
-execution_identity = "interactive_user"
-registration_scope = "explicit_authorized_sid"
-idle_shutdown_after = "5m"
-max_authorized_users = 1 # first-line primary-user profile; wider local multi-user support is explicit policy
-max_brokers_per_user = 1
-allow_subscription_routes_without_session = false
-
-[host_state]
-backend = "redb"
-path = "C:/ProgramData/Eliot/host/host-state.redb"
-single_writer = "eliot-host"
-
-[storage]
-adapter = "surreal"
-target_line = "3.2.x"
-install_candidate = "3.2.3-pending-RGF-STORAGE-MIGRATION"
-fallback_policy = "last_verified_generation"
-endpoint = "ws://127.0.0.1:8123"
-namespace = "eliot"
-database = "system"
-credential_ref = "eliot/surreal/runtime"
-connect_timeout = "2s"
-query_timeout = "2s"
-
-[storage_process]
-process_id = "canonical-store-surreal"
-binary_ref = "vendor/surreal/active"
-owner = "eliot-host"
-job_object = "eliot-store-lineage"
-storage_engine = "rocksdb" # conservative candidate; SurrealKV remains RGF-STORAGE-MIGRATION research-only
-storage_path = "C:/ProgramData/Eliot/data/surrealdb"
-bind = "127.0.0.1:8123"
-bind_policy = "installation_reserved" # installer may choose another loopback port; never adopt/kill an unrelated listener
-owner_identity_check = "hoststate+pid+artifact+job"
-restart_budget = "1/15m"
-legacy_import_paths = []
-
-[blob]
-contract = "eliot-blob-api/v1"
-backend = "co_located_default" # `eliot-store-surreal` or `eliotd` under one declared root owner
-optional_process_id = "eliot-blob" # activated only after an isolation/replacement proof
-active_owner = "declared_by_generation_registry"
-root = "C:/ProgramData/Eliot/blobs"
-temp_root = "C:/ProgramData/Eliot/blobs/.tmp"
-compression = "zstd"
-encryption = "aead-per-object+service-protected-master-key"
-inline_fallback_bytes = 32768
-process_extraction_gate = "measured contention|native-code risk|independent GC/restart|credential isolation"
-gc_grace = "24h"
-
-[ors]
-path = "C:/ProgramData/Eliot/data/operational.redb"
-backup_mode = "logical_fenced_export"
-max_pending_items = 10000
-max_pending_bytes = 536870912
-microbatch_max_items = 64
-microbatch_max_wait = "1ms"
-
-[ors.partitions]
-pending_operations = true
-authority_snapshots = true
-authority_revocations = true
-generation_registry = true
-generation_cutovers = true
-session_bindings = true
-user_broker_registry = true
-durable_event_delivery = true
-job_checkpoints = true
-recovery_intents = true
-
-[capture]
-max_batch_items = 256
-max_batch_bytes = 1048576
-max_single_item_bytes = 262144
-server_split_forbidden = true
-
-[write]
-executor_count = 0 # auto: max(1, min(4, logical CPUs))
-one_inflight_per_ordering_scope = true
-interactive_commit_wait = "1s"
-max_retry_age = "5m"
-
-[read]
-interactive_concurrency = 32
-background_concurrency = 4
-stable_scope_retries = 1
-q0_default_hits = 12
-q2_max_atoms = 200
-packet_cache_items = 256
-packet_cache_bytes = 67108864
-
-[queues]
-interactive_items = 512
-verification_items = 512
-canonical_write_items = 2048
-background_items = 1024
-report_items = 128
-adapter_items_per_module = 64
-
-[control_reserve]
-control_slots = 8
-last_resort_slots = 1
-reserved_for = ["cancel", "fence", "health", "critical_telemetry", "attention", "problem", "shutdown", "recovery"]
-
-[modules]
-default_restart_attempts = 3
-restart_window = "10m"
-quarantine_after_budget = true
-default_idle_ttl = "15m"
-
-[context]
-boot_target_tokens = 1200
-reactive_target_tokens = 400
-hook_context_bytes = 8192
-decision_local_tail_required = true
-
-
-[instrument]
-process_executor = "windows-job-object-v1"
-allow_direct_process_spawn = false
-profile_registry = "canonical"
-raw_output_store = "blob"
-stream_parse = true
-system_concurrency = 4
-per_instrument_concurrency_from_manifest = true
-
-[instrument.paths]
-target_root = "%LocalAppData%/Eliot/build"
-temp_root = "%LocalAppData%/Eliot/instruments/tmp"
-raw_evidence_root = "C:/ProgramData/Eliot/blobs"
-repository_target_forbidden = true
-
-[instrument.profiles]
-dev_fast = ["cargo-metadata", "cargo-clippy", "nextest-list", "nextest-run", "rustfmt-check"]
-architecture = ["git", "cargo-metadata", "rust-analyzer-scip"]
-codebase_memory_pilot_enabled = false
-persistent_lsp_enabled = false
-
-[instrument.output]
-preview_bytes = 65536
-raw_bytes_per_stream = 268435456
-max_parser_events = 1000000
-record_truncation = true
-
-[testd]
-mode = "on_demand_process"
-separate_from_control_reserve = true
-allow_freeform_shell = false
-build_trust_default = "T0_first_party"
-network_default = "deny_except_acquisition_phase"
-idle_shutdown_after = "10m"
-
-[wasm]
-enabled = false
-runtime_candidate = "wasmtime-47.x-pending-RGF-COMPONENT-SANDBOX"
-guest_target = "wasm32-wasip2"
-wasi_0_3_lane = "lab_only"
-component_model = true
-allow_raw_process = false
-allow_network = false
-allow_secrets = false
-
-[simulation]
-backend = "eliot-sim-core"
-seed_artifacts = true
-model_tool_cassettes = true
-loom = "targeted"
-shuttle = "research_gate"
-turmoil = "research_gate"
-madsim = "research_gate"
-
-[testing]
-discovery = "nextest-json"
-metadata_overlay = "canonical"
-select_affected_by_default = true
-full_workspace_on_local_change = false
-ci_uses_same_profiles = true
-zero_tests_is_failure_when_nonempty_expected = true
-singleflight_identical_builds = true
-max_cargo_producers_per_target_root = 1
-shared_readonly_base_artifacts = true
-compiler_cache_bridge = "disabled"
-stateful_environment_leases = true
-production_data_roots_denied = true
-cleanup_residue_verification = true
-
-[hooks]
-pre_action_timeout = "150ms"
-post_action_spool_timeout = "50ms"
-boundary_timeout = "500ms"
-fail_closed_for_enforceable_material_effect = true
-
-[model_translation]
-primary_ir = "eliot-owned-v1"
-switchyard_codec_pilot = false
-diagnostics_required = true
-loss_policy_default = "agent_tooling"
-preservation_invalidation = "automatic"
-header_forwarding = "explicit_allowlist"
-dynamic_routing = false
-
-[ml_contours]
-unsloth_enabled = false
-worker_profile = "isolated-pinned"
-allow_canonical_db_credentials = false
-allow_task_finish = false
-allow_recursive_agent_spawn = false
-
-[agent_http]
-enabled = false
-bind = "127.0.0.1:8765"
-remote_bind = false
-
-[supervision]
-watchdog_start_policy = "with_observable_eliot_use"
-always_on = false
-material_work_requires_ready_watchdog = true
-doctor_mode = "on_demand"
-
-[dreamer]
-interactive_enabled = true
-background_mode = "idle_only"
-auto_external_models = false
-
-[swarm]
-enabled = true
-auto_launch = false
-default_max_active_agents = 4
-
-[logging]
-level = "info"
-rotate_bytes = 104857600
-retention_days = 14
-error_retention_days = 30
-
-[metrics]
-enabled = true
-loopback_only = true
-
-[maintenance]
-backup_schedule = "03:00 daily when policy enables"
-blob_gc_schedule = "03:30 weekly"
-lease_sweep = "30s"
-session_expiry = "10m"
-
-[ui]
-loopback_only = true
-bind = "127.0.0.1:8766"
-bind_policy = "installation_reserved" # collision selects/records another loopback endpoint; no unrelated process takeover
-start_on_demand = true
-browser_token_ttl = "5m"
-csrf_required = true
-exact_origin_required = true
+```text
+configuration schema and defaults remain replaceable projections, not Architecture invariants;
+effective configuration is immutable, versioned and visible through its snapshot/receipt;
+defaults never silently widen authority, privacy, cost, disclosure or external access;
+unknown or invalid load-bearing configuration fails to a typed degraded/blocked state;
+configuration changes run affected contract, recovery and Product Pulse checks;
+measured profiles replace candidate values rather than accumulating prose overrides;
+absence of a post-integration feature default means disabled, unqualified or unsupported—not permissive implicit behavior.
 ```
-
-Values are Defaults. Changes are applied through immutable Config/Policy snapshots and affected tests; they do not silently widen authority, privacy, cost or external access.
 
 ---
 
 # Appendix D. Reason codes and directive dispositions
 
-> **Status: TARGET / EVENTUALLY GENERATED PROJECTION.** I7.20 and the active generated reason-code registry are canonical. Manual presence here cannot create runtime behavior or a new lifecycle state.
+> **Projection lifecycle label (artifact-local):** `CURRENT_DOCUMENTATION_PROJECTION`. **Projected I0.5 support/evidence:** `TARGET` / `NOT_EXECUTED`. **Runtime load policy:** `DOCUMENTATION_ONLY`. `docs/generated/reason-codes.md` is generated from the exact current I7.20 registry and includes bridge-only migration aliases. The projection proves documentation-set equality, not runtime implementation.
 
-The closed wire-level `AgentResponseDisposition` is defined in I7.20. The following reason codes are additive, versioned and preserved when unknown; they refine a disposition but do not create a second task or lifecycle state.
+Owner: I7.20. Manifest: `docs/generated/PROJECTION_MANIFEST.json`. Historical source: `_REVIEW/baseline_sections/Appendix_D.md`.
 
-```text
-INVALID_ARGUMENT
-AUTHENTICATION_REQUIRED
-WORKSCOPE_UNAUTHENTICATED
-SCAN_PRIVACY_BOUNDARY_REQUIRED
-IDENTITY_CONFLICT
-TASK_SELECTION_REQUIRED
-TASK_SCOPE_INCOMPATIBLE
-DISPATCH_PERMIT_REQUIRED
-AUTHORITY_REQUIRED
-POLICY_DENIED
-ACTION_LEASE_REQUIRED
-WRITESET_VIOLATION
-IMPACT_ESCALATION_REQUIRED
-STALE_STATE_FENCE
-STALE_AUTHORITY_EPOCH
-STALE_PROJECTION
-SCOPE_CONFLICT
-AMBIGUOUS_RESULT
-CONFLICT_OPEN
-CRITICAL_ATTENTION_OPEN
-DESCENDANT_CLOSURE_INCOMPLETE
-NEEDS_REASONING_CANDIDATE
-CUE_BINDING_REQUIRED
-PACKET_REFRESH_REQUIRED
-PROBE_REQUIRED
-NOT_ONBOARDED
-CAPSULE_STALE
-VERIFIER_REQUIRED
-VERIFIER_STALE
-TRACE_INCOMPLETE
-BUSY
-STATE_CHURN
-DEADLINE_EXCEEDED
-STORAGE_BACKPRESSURE
-ACCEPTED_PENDING
-DB_UNAVAILABLE
-INSTRUMENT_UNAVAILABLE
-INSTRUMENT_FAILED
-INSTRUMENT_PARSER_INCOMPATIBLE
-INSTRUMENT_EVIDENCE_INCOMPLETE
-INSTRUMENT_OUTPUT_TRUNCATED
-PROCESS_TREE_CLEANUP_FAILED
-TESTD_UNAVAILABLE
-TESTD_JOB_FAILED
-BUILD_SANDBOX_UNPROVEN
-COMPONENT_INTERFACE_INCOMPATIBLE
-COMPONENT_CAPABILITY_DENIED
-COMPONENT_TRAP
-COMPONENT_DIVERGENCE
-COMPONENT_MIGRATION_REQUIRED
-SIMULATION_REPLAY_MISMATCH
-GENERATION_PROMOTION_BLOCKED
-TEST_INVENTORY_STALE
-TEST_POLICY_INCOMPLETE
-NEGATIVE_RESULT_UNPROVEN
-EVIDENCE_STALE
-EVIDENCE_COVERAGE_PARTIAL
-CAPABILITY_UNAVAILABLE
-SUPERVISION_UNAVAILABLE
-CAPABILITY_UNVERIFIED
-CAPABILITY_GRANT_REVOKED
-CAPABILITY_INTRODUCTION_REQUIRED
-CAPABILITY_DEGRADED
-ROUTE_UNAVAILABLE
-ROUTE_MISMATCH
-RESEARCH_SOURCE_UNAVAILABLE
-EXTERNAL_ATTACH_RECONCILIATION_REQUIRED
-ADAPTER_UNAVAILABLE
-ADAPTER_INCOMPATIBLE
-RUNTIME_FAILED
-CANCELLATION_UNCONFIRMED
-ENVIRONMENT_UNAVAILABLE
-DEFERRED_CAPACITY
-NO_PROGRESS
-DRY_RUN_UNSUPPORTED
-SEQUENCE_GAP_OPEN
-CUTOVER_BLOCKED_INFLIGHT_EFFECT
-RECOVERY_LOCK_UNAVAILABLE
-MODULE_QUARANTINED
-PROTOCOL_INCOMPATIBLE
-PROVIDER_QUOTA
-BUDGET_EXHAUSTED
-PRIVACY_DENIED
-DISCLOSURE_CLOSURE_INCOMPLETE
-OMITTED_SOURCE_UNAVAILABLE
-SOURCE_QUARANTINED
-TRANSITION_DIGEST_MISMATCH
-VERIFICATION_NOT_EXECUTED
-LEGACY_FINISH_INPUT_REJECTED
-DECISION_CONTEXT_INCOMPLETE
-CONTEXT_PROFILE_UNVALIDATED
-ORIGIN_AUTHENTICATION_FAILED
-MIGRATION_MAPPING_INCOMPLETE
-UNKNOWN_COMMIT
-UNKNOWN_OUTCOME
-RECOVERY_REQUIRED
-INCIDENT_LOCKDOWN
-PROCESS_OWNERSHIP_UNPROVEN
-RESOURCE_LEASE_REQUIRED
-RESOURCE_IDENTITY_CHANGED
-RESOURCE_LEASE_REPLAYED
-REFERENCE_NOT_ALLOWED
-UNSUPPORTED_PRECISION
-TRANSLATION_LOSS_FORBIDDEN
-STREAM_SEMANTIC_ORDER_VIOLATION
-MODEL_ATTEMPT_UNKNOWN_OUTCOME
-EXECUTABLE_DEPENDENCY_UNAPPROVED
-```
-
-All codes return structured next action. Raw internal error is logged by handle, not dumped into agent context.
-
-Legacy compatibility aliases are translated at the bridge boundary only:
+Rules that remain normative here:
 
 ```text
-UNAUTHENTICATED → AUTHENTICATION_REQUIRED
-FORBIDDEN → AUTHORITY_REQUIRED | POLICY_DENIED | PRIVACY_DENIED
-SCOPE_MISMATCH → SCOPE_CONFLICT
-STALE_REVISION → STALE_STATE_FENCE
-PACKET_STALE → PACKET_REFRESH_REQUIRED
-UNDERSTANDING_REQUIRED → PROBE_REQUIRED | PACKET_REFRESH_REQUIRED
-CURRENT_TRUTH_CONFLICT → CONFLICT_OPEN
-BUSY_STATE_CHURN → STATE_CHURN
-INCIDENT_MODE → INCIDENT_LOCKDOWN
+codes are additive and versioned;
+a code is never reused with different meaning;
+unknown codes preserve their raw identity and degrade through the stable AgentResponseDisposition;
+an unresolved unknown code opens a Problem rather than inventing a lifecycle state;
+a directive names the code, preserved state and next admissible action;
+legacy aliases are translated only at a bridge boundary and never become canonical names.
 ```
 
 ---
@@ -19993,38 +20061,6 @@ observed failures and resource limits.
 ```
 
 Generated items use ordinary WorkItem IDs, owners, evidence, verifier and stop conditions. No separate F/K/C phase state is persisted.
-
-# Appendix F. Architecture conformance map summary
-
-> **Status: EVIDENCE-DERIVED PROJECTION.** Section presence and 58↔58 ID counts are navigation checks, not semantic or runtime conformance.
-
-Names prefixed `component:` are logical owners in the conformance model, not mandated crates/processes.
-
-| Architecture intent | Primary implementation owner |
-|---|---|
-| Understanding continuity | `component:state`, `component:context`, canonical store |
-| Four planes, one loop | `eliotd` orchestration + Module Catalog / Generation Registry / Capability Registry |
-| Explicit/fenced authority | Kernel + `component:authority` |
-| Small living Kernel | Host/Kernel process split |
-| Replaceable organs | EBP + module/store/agent bridges |
-| Capture first | `eliot.observe` + classification pipeline |
-| Semantic fallibility/revision | canonical event/history + candidate status |
-| Reality correction | truth/verifier adapters |
-| Grounded understanding | CodeCortex/graphs/artifacts/verifiers |
-| Proactive context | cue index + hooks + pending context delta |
-| Critical attention | attention registry + gates + board |
-| Independent supervision | Watchdog daemon |
-| Dreamer intelligence | Dreamer service + Agent Coordinator |
-| Swarm evidence pipeline | durable work graph + lineage |
-| Long work | Durable Jobs/checkpoints/epochs |
-| Proof-bearing finish | verification + finish service |
-| Assume compromise/recovery | source assurance, isolation, revocation, backup |
-| Fail locally | module processes/supervision/quarantine |
-| Parallel/ordered execution | Ordering Scopes + bounded pools |
-| Learning/advisory Meta | Improvement Candidate ledger + canary |
-| Depth by layers | I17 delivery sequence |
-
-The target machine-readable projection is generated as `docs/conformance.toml` from the accepted contract catalogue and current evidence. Until an exact CurrentSystemEvidenceSnapshot proves that generated artifact on the audited source identity, it remains `TARGET` and cannot be cited as repository or runtime support. Package/process extraction follows I2.
 
 # Appendix G. Research Gate families
 
@@ -20067,13 +20103,14 @@ A family is not a single giant gate. Activation compiles one narrow question for
 
 > **Status: TARGET/CONFORMANCE MAP.** Every row requires current source handles, an observable discriminator, evidence artifact and negative case before support can be `CURRENT_VERIFIED`.
 
-This table is the human-readable projection. Machine source is `docs/conformance.toml`.
+This table is the human-readable normative mapping. `docs/conformance.toml` is its deterministic machine-readable documentation projection generated from the same M1/M2 rows; it is not runtime/source conformance evidence.
 
 | Architecture ID | Primary implementation sections / owner | Observable proof family |
 |---|---|---|
 | `ARCH-INTENT-01` | I0.4–I0.6; `ImplementationDeviation` | deviation outcome and review receipt |
 | `ARCH-CONCIL-01` | I13.2–I13.4; Agent Coordinator | conflict scenario preserves dissent and tests rivals |
 | `ARCH-DEV-01` | I17–I18 | D1 real-task demonstration; affected test plan |
+| `ARCH-CORE-00` | I7.25, I10.15, I12.24, I12.34, I16.23 | consequential attempt yields an explicit learning delta or justified no-change disposition; next compatible attempt activation/adherence/decision delta is observable |
 | `ARCH-CORE-01` | I7, I12; state/context owners | cold/resume task continuity scenario |
 | `ARCH-CORE-02` | I1, I2, I12, I16 | four-plane process/state trace forms one loop |
 | `ARCH-HELP-01` | I3, I7, I11, I12 | user/agent effort and reconstruction comparison |
@@ -20082,6 +20119,7 @@ This table is the human-readable projection. Machine source is `docs/conformance
 | `ARCH-AUTH-01` | Kernel, I5.5–I5.7, I6.3, I6.15 | stale/missing epoch, grant-lineage narrowing/revocation and introduction-scope denial tests |
 | `ARCH-MOD-01` | I1, I2, I14.14–I14.16 | optional module crash while Kernel remains healthy |
 | `ARCH-MOD-02` | I2, I14.27, I17–I20 | independently understandable/testable micro-modules, portable blueprints and add/replace without Kernel/state rewrite; size and physical form remain empirical |
+| `ARCH-MOD-03` | I2.20, I2.23, I6.4, I18.7 | generated cell registry; independently invokable cell proof; single-owner-per-mutable-state and replacement-boundary negative tests |
 | `ARCH-PORT-01` | I2 execution contours, I7 EBP, I10 bridges, I20 | swap provider/tool/store/sandbox contour through the same capability, conformance and migration contracts |
 | `ARCH-SCOPE-01` | I4, I12 | wrong-scope reuse rejection/revalidation |
 | `ARCH-MEM-01` | I12.2–I12.3 | natural observation accepted as candidate |
@@ -20091,6 +20129,8 @@ This table is the human-readable projection. Machine source is `docs/conformance
 | `ARCH-MEM-04` | I5.25, I12.5, I12.21 | cache/retrieval/repetition does not increase support and invalidation removes current influence |
 | `ARCH-EPI-01` | I12.12 | fresh outlier/conflict and revalidation scenario |
 | `ARCH-EPI-02` | I12.18, I12.22, I12.29, I18.47 | theory weight changes through discriminative outcomes, calibrated evidence, evaluator integrity and staleness |
+| `ARCH-EPI-03` | I7.27, I12.34, I18.4, I21.2–I21.4, I21.8 | exploratory-origin evidence cannot self-confirm; independent/held-out/preregistered proof is required for promotion |
+| `ARCH-EPI-04` | I7.23, I12.13, I21.6, I21.8, I21.13 | coverage/absence is rejected without a frozen recheckable denominator; top-k and budget exhaustion are not completeness |
 | `ARCH-UND-01` | I12.1, I12.10–I12.13 | decision reconstructed from public evidence/model/unknowns |
 | `ARCH-GROUND-01` | I10.8–I10.10, I10.20–I10.22, I12.9–I12.10, I12.35–I12.37 | exact source/build/test/verifier, professional, multimodal, artifact and episode anchors with explicit coverage/ambiguity |
 | `ARCH-UND-02` | I12.18 | discriminative prediction matched to outcome |
@@ -20104,7 +20144,7 @@ This table is the human-readable projection. Machine source is `docs/conformance
 | `ARCH-WDG-01` | I1, I8 | Watchdog sees daemon failure via independent route |
 | `ARCH-WDG-02` | I8.4–I8.8 | missing hooks/bypass/injection becomes evidence-backed signal |
 | `ARCH-DRM-01` | I9.1–I9.7 | Dreamer result remains candidate; no direct write |
-| `ARCH-DRM-04` | I9.14, I10 | acquisition/synthesis/governance process separation |
+| `ARCH-DRM-04` | I21, I10 | acquisition/synthesis/governance process separation |
 | `ARCH-DRM-02` | I9.3–I9.7 | orientation/research output preserves rivals and unknowns |
 | `ARCH-DRM-03` | I3.6, I9.8–I9.10 | denied over-budget/unapproved model or swarm launch |
 | `ARCH-ACT-01` | I6.3, I6.6 | deterministic impact classification and authority gate |
@@ -20126,6 +20166,7 @@ This table is the human-readable projection. Machine source is `docs/conformance
 | `ARCH-RES-04` | I7.10, I14.4–I14.12 | degraded capability visible and only dependent effect blocked |
 | `ARCH-RES-05` | I13.9–I13.11, I14.25, I12.24 | recovery outcome produces evidence-backed failure/repair/improvement candidate |
 | `ARCH-LEARN-01` | I12.18–I12.24, I12.30 | grounded outcome changes external epistemic/procedural/meta inheritance through governed candidates |
+| `ARCH-LEARN-02` | I7.25, I10.15, I12.24, I12.34, I16.23, I20.8 | task-local overlay remains bounded and reversible; broader influence requires activation/outcome, retention/transfer where claimed, evaluator validity, Product Pulse, authority and rollback proof |
 | `ARCH-META-01` | I12.21, I12.24, I17, I18.12, I18.47 | improvement remains outcome-linked, isolated, advisory/experimental, evaluator-scoped, replayed, canaried and rollbackable; active generation does not rewrite itself |
 | `ARCH-ECON-01` | I3.6, I9.8–I9.10, I14.4 | budget denial/checkpoint and disclosed route/cost |
 | `ARCH-DEV-02` | I17, I18, I20 | capability depth added through independently testable modules, affected-edge proofs and Product Pulses while core intent/contracts remain |
@@ -20189,82 +20230,22 @@ Kernel dependency set remains minimal.
 
 # Appendix J. Developer commands
 
-> **Status: TARGET COMMAND-SURFACE PROJECTION.** Owning CLI/Instrument contracts define semantics. Command names become supported only when generated/compiled source handles, help/schema output and execution receipts are registered.
+> **Projection lifecycle label (artifact-local):** `BOOTSTRAP_RETAINED_TARGET`. **Projected I0.5 support/evidence:** `TARGET` / `NOT_EXECUTED`. **Runtime load policy:** `DOCUMENTATION_ONLY`. The detailed candidate catalogue is `docs/generated/developer-commands.md`, assembled from the exact pre-extraction snapshot plus a post-integration support note. It is not compiled help and cannot make a command supported.
 
-Candidate first-line commands:
+Owners: I10.8 and the owning capability contract of each command. Manifest: `docs/generated/PROJECTION_MANIFEST.json`. Exact historical source: `_REVIEW/baseline_sections/Appendix_J.md`.
+
+Rules that remain normative here:
 
 ```text
-eliot system snapshot
-  compile a partial/full CurrentSystemEvidenceSnapshot from exact executed evidence;
-
-eliot bootstrap brief --work-unit <file-or-id>
-  compile the D0/D1 route-bounded brief and NormativeCoverageManifest;
-
-eliot recovery status
-  inspect the authenticated RecoveryView/fallback surface without requiring the native UI;
-
-eliot ui
-  start or attach the authenticated User Broker and launch the native WinUI client;
-
-eliot dashboard
-  open the role-filtered terminal dashboard when supported;
-
-eliot dev impact --changed
-  build affected dependency/test/canary plan;
-
-eliot dev check --changed
-  run T0 checks for changed crates/modules;
-
-eliot dev test --changed
-  execute selected Module/Edge/Scenario profiles and store TestSelectionReceipt;
-
-eliot dev pulse --objective <objective-id>
-  run the smallest admitted Product pulse for the current development wave;
-
-eliot instrument run --profile <profile> [--scope <scope>]
-  submit a durable Instrument profile job and return/poll its handle;
-
-eliot module validate <module-id>
-  validate ownership, dependency direction, contract and independent test selector;
-
-eliot module test <module-id>
-  execute the generated ModuleTestCapsule;
-
-eliot module contract-test <module-id> --against <revision>
-  run provider/consumer golden compatibility fixtures;
-
-eliot module edge-test <edge-id>
-  exercise the real declared process/store/protocol edge;
-
-eliot module build <module-id>
-  build immutable module artifact and manifest;
-
-eliot module stage <artifact>
-  verify and register candidate generation;
-
-eliot module canary <module-id> --scope <scope>
-  start bounded candidate traffic;
-
-eliot module promote <module-id> <generation>
-  perform quiesce/switch/fence/drain;
-
-eliot module rollback <module-id>
-  return to compatible retained generation;
-
-eliot release verify
-  run T4 release gate;
-
-eliot doctor integration <profile>
-  verify plugin/hooks/protocol/runtime coverage;
-
-eliot backup create | verify | restore-test
-  manage recovery artifacts;
-
-eliot maintenance run
-  execute allowed curation/backup/meta jobs and stop.
+one admitted command catalogue defines supported CLI surfaces;
+a command uses the same Kernel/Governor/Instrument contracts as every other front door;
+help/schema output and execution receipts identify the exact supported revision;
+expiring migration shims cannot define different semantics or authority;
+missing command support returns a typed unsupported state rather than a prose promise;
+no later-wave capability receives a CLI command merely because the capability is documented.
 ```
 
-Commands are projections of one generated command catalogue and `eliot --help`. `eliotctl`/`eliot-dev` may exist only as expiring migration shims and never define different semantics. Commands use the same Kernel/Governor contracts and do not create alternate authority paths.
+---
 
 # Appendix K. Legacy and target contract inventory pointer
 
@@ -20301,403 +20282,23 @@ Detailed legacy object and alias disposition is maintained in the same non-norma
 
 # Appendix N. First SurrealDB physical schema profile
 
-> **Status: TARGET / PHYSICAL PROFILE HYPOTHESIS; CURRENT SUPPORT ABSENT/PARTIAL.** The accessible audited source lineage lacks proven payload round-trip, generated validation and migration guarantees. The presence of SCHEMALESS tables alone is not the conformance verdict.
+> **Projection lifecycle label (artifact-local):** `BOOTSTRAP_RETAINED_PHYSICAL_PROFILE`. **Projected I0.5 support/evidence:** `TARGET` / `NOT_EXECUTED`. **Runtime load policy:** `DOCUMENTATION_ONLY`; the companion `store/schema.generated.sql` policy is `MUST_NOT_APPLY`. The detailed active documentation profile is `docs/generated/surrealdb-physical-schema-profile.md`, including post-integration logical-to-physical ownership mapping. `store/schema.generated.sql` is an intentional rejection sentinel until a real migration/catalogue generator emits executable schema with checksums and proof.
 
-This appendix gives the first concrete store profile so implementation agents do not invent table ownership after the donor books are retired. It is a DEFAULT for the SurrealDB bridge, not the canonical semantic API. Storage replacement preserves accepted canonical contracts and ECXF, not these table names or cold inventory shapes.
+Owners: I5.4–I5.7, I5.17 and the migration role. Manifest: `docs/generated/PROJECTION_MANIFEST.json`. Exact historical source: `_REVIEW/baseline_sections/Appendix_N.md`.
 
-The table list is a **physical decomposition hypothesis**, not a requirement to create one table per conceptual record. The bridge may combine or split tables when a measured workload, transaction boundary, migration or index need justifies it, provided logical contract identities, owners, history, round-trip semantics and ECXF remain unchanged.
-
-## N.1. Schema ownership
+Rules that remain normative here:
 
 ```text
-only the migration role defines or alters schema;
-only the store bridge owns SurrealDB credentials;
-stable record fields use SCHEMAFULL or equivalent generated constraints; flexible/tagged payload fields may remain schema-flexible only behind versioned codecs and round-trip/property tests;
-all runtime writes are named parameterized operations generated from PreparedTransition;
-large payload bodies remain in Blob Store;
-projection/index tables are rebuildable and marked derived;
-no agent-visible operation names a table or field.
-```
-
-`schema_meta` stores schema generation, migration IDs/checksums, compatible bridge range and last verified backup/restore receipt.
-
-## N.2. D1 core tables
-
-### Identity, scope and policy
-
-```text
-system_installation
-principal
-agent_session
-session_binding_receipt
-user_broker_authorization
-capability_token                 # transport/compatibility projection
-capability_grant                 # canonical delegation lineage
-facet_manifest
-credential_use_binding
-observation_domain
-authority_activation_record
-authority_revocation_record
-approval_request
-approval_record
-config_snapshot
-policy_snapshot
-policy_decision
-work_scope
-revision_head
-scope_revision_view
-ordering_head
-```
-
-### Task and continuity
-
-```text
-task_contract
-acceptance_item
-active_decision_state
-work_item
-unknown_item
-handoff_artifact
-context_packet
-```
-
-### Source, memory and artifacts
-
-```text
-source_snapshot
-observation_record
-evidence_atom
-interpretation_record       # claim | hypothesis | theory-model
-decision_record
-experience_record           # episode | failure | tried-path | procedure candidate
-commitment_record
-artifact_record
-blob_ref
-```
-
-### Action, instruments and finish
-
-```text
-action_attempt
-outcome_receipt
-instrument_profile
-instrument_run
-verification_profile_run
-test_inventory_snapshot
-test_metadata_overlay
-change_impact_plan
-verification_run
-finish_attempt
-finish_decision
-```
-
-### Canonical control
-
-```text
-canonical_event
-write_receipt
-outbox_event
-audit_record
-purge_ledger
-problem_state
-critical_attention
-operation_job
-sequence_gap
-sequence_disposition
-module_catalog
-integration_candidate
-```
-
-D1 may initially leave optional fields/record subtypes unused, but it may not create alternate tables that bypass these owners.
-
-## N.3. D2 coordination, supervision and module tables
-
-```text
-task_controller_lease
-work_lease
-swarm_plan_definition
-swarm_plan_admission
-swarm_execution_state
-swarm_coordinator_lease
-worktree_lease
-action_lease
-integration_lease
-mailbox_message
-coordination_event
-blackboard_item
-agent_result
-conflict_set
-signal_record
-incident_record
-module_health_snapshot
-tool_definition
-capability_profile
-evaluation_contract
-repair_recipe
-repair_attempt_receipt
-adapter_observation
-notification_item
-report_manifest
-runtime_installation
-host_adapter_manifest
-runtime_route
-capability_evidence
-route_receipt                  # routing | actual
-run_attempt
-run_event                      # raw/normalized refs + cursor/ack disposition
-host_usage_record
-quota_window
-role_profile_manifest
-recipe_manifest
-capability_introduction_receipt
-capability_blueprint
-blueprint_instance
-code_intelligence_manifest
-ready_work_item                # derived projection
-execution_environment_lease
-route_outcome_profile          # derived
-process_origin_evidence
-behavioral_capability_challenge
-static_capability_attestation
-dynamic_capability_pulse
-native_resource_lease
-executable_dependency_closure
-model_translation_receipt
-physical_model_attempt_receipt
-route_failure_fingerprint
-stage_recovery_receipt
-parkable_resource_sublease
-```
-
-Watchdog's independent spool is not one of these tables. It remains a separate failure-domain store and reconciles through signal/problem intents.
-
-Kernel Generation Registry, `ActiveSessionBinding`, active `UserBrokerRegistration`, active `CapabilityIntroduction` handles and `EffectiveCapabilitySnapshot` enforcement records are stored in ORS, not SurrealDB. `capability_grant` and introduction/activation/revocation receipts remain canonical history. `session_binding_receipt` is canonical attach/detach history, `module_catalog` is canonical desired state and `user_broker_authorization` is canonical consent/policy. `module_health_snapshot` and `capability_evidence` are observations/projections and never become process ownership.
-
-## N.4. D3 Smart/Meta derived and cognitive tables
-
-```text
-cue_binding
-cue_index                   # derived
-concept_node
-projection_record           # charter | map | capsule | card | architecture brief
-projection_dependency
-code_cortex_report
-failure_fingerprint
-skill_card
-prediction_record
-calibration_score
-influence_record
-influence_dependency
-context_delivery_receipt
-theory_model
-improvement_candidate
-harness_experiment_record
-memory_ecology_projection
-skill_lifecycle_projection
-environment_runbook
-step_outcome_record
-evaluation_stack_record
-disclosure_dependency_closure    # derived, revisioned
-disclosure_decision
-declassification_receipt
-code_intelligence_projection     # source/build/verifier/behavior/history kinds
-omitted_payload_ref
-allowed_reference_manifest
-unsupported_precision_item
-boundary_metadata_envelope
-```
-
-`projection_record` carries kind-specific validated payload and dependency manifest; it avoids a separate physical table for every projection while preserving distinct semantic kinds. `SessionEpisode` remains an `experience_record` subtype keyed by session/attempt/source availability rather than a parallel episode store. BuildExecutionGraph and VerifierCoverageGraph may initially share `code_intelligence_projection` with a closed kind and exact source/tool fence. Hot indexes may later split after measured query evidence.
-
-## N.5. Relation tables
-
-The first profile uses explicit relation tables for load-bearing semantics and a constrained derived relation table for lower-risk graph projections.
-
-```text
-supports
-contradicts
-verified_by
-supersedes
-belongs_to
-derived_from
-depends_on
-produces
-consumes
-blocks
-unblocks
-resolved_by
-authorized_by
-satisfies
-reopens
-included_in
-used_for
-suppressed_by
-invalidates_influence
-derived_disclosure_from
-declassified_by
-grant_parent
-introduced_as
-bound_with_credential
-assigned_to
-```
-
-Derived structural/behavioral relations use `derived_relation` with a closed `kind` enum such as `calls`, `reads`, `writes`, `implements`, `covers`, `co_change`, `resembles`,
-`diverges_from`, `builds`, `emits_artifact`, `executes_test`, `covers_code` and
-`verifies_property`. Every row still carries scope, build/source, epistemic status and invalidation. A derived relation cannot satisfy an authority, verification or causal proof query unless promoted through a typed transition into the appropriate load-bearing relation.
-
-## N.6. Required indexes
-
-At minimum:
-
-```text
-write_receipt(operation_id) UNIQUE;
-write_receipt(idempotency_key) UNIQUE;
-revision_head(scope_id, revision_key) UNIQUE;
-scope_revision_view(scope_id) UNIQUE;
-ordering_head(ordering_scope) UNIQUE;
-agent_session(session_id) UNIQUE;
-session_binding_receipt(session_id, created_at);
-user_broker_authorization(installation_id, user_sid) UNIQUE;
-task_contract(scope_id, state, updated_at);
-active_decision_state(task_id) UNIQUE;
-unknown_item(task_id, state, updated_at);
-task_controller_lease(task_id, state, expires_at, authority_epoch);
-work_lease(work_item_id, state, expires_at, authority_epoch);
-swarm_coordinator_lease(swarm_id, state, expires_at, authority_epoch);
-worktree_lease(scope_id, resource_key, state, expires_at, authority_epoch);
-action_lease(task_id, effect_hash, state, expires_at, authority_epoch);
-source_snapshot(scope_id, locator, version_or_checksum);
-evidence_atom(scope_id, anchor_checksum);
-interpretation_record(scope_id, subject_key, kind, epistemic_status, lifecycle_status);
-observation_record(scope_id, observation_kind, normalized_signature, lifecycle_status, observed_at);
-instrument_profile(profile_id, profile_revision) UNIQUE;
-instrument_run(scope_id, candidate_identity, instrument_id, finished_at);
-verification_profile_run(task_id, profile_id, candidate_identity, status, finished_at);
-test_inventory_snapshot(scope_id, candidate_identity, created_at);
-test_metadata_overlay(scope_id, test_identity) UNIQUE;
-change_impact_plan(task_id, candidate_identity, created_at);
-verification_run(task_id, verifier_id, status, finished_at);
-finish_decision(finish_attempt_id) UNIQUE;
-swarm_plan_definition(task_id, definition_status, updated_at);
-swarm_plan_admission(task_id, definition_revision, admission_status, updated_at);
-swarm_execution_state(swarm_id, execution_status, updated_at);
-mailbox_message(recipient_session_id, recipient_sequence) UNIQUE;
-problem_state(scope_id, state, severity, updated_at);
-critical_attention(scope_id, resolution_state, severity, updated_at);
-conflict_set(scope_id, lifecycle_status, updated_at);
-incident_record(scope_id, state, severity, opened_at);
-module_catalog(module_id) UNIQUE;
-integration_candidate(target_scope, lifecycle, updated_at);
-integration_lease(target_scope, state, expires_at, authority_epoch);
-runtime_installation(host_family, runtime_hash) UNIQUE;
-host_adapter_manifest(adapter_id, adapter_hash) UNIQUE;
-runtime_route(route_id, route_fingerprint) UNIQUE;
-capability_evidence(capability, scope_fingerprint, status, expires_at);
-capability_grant(holder_principal_session_attempt_or_component, status, expires_at, authority_epoch);
-capability_grant(parent_grant_id, status);
-facet_manifest(facet_id_and_semver, interface_schema_or_wit_digest) UNIQUE;
-credential_use_binding(resource_or_facet, acting_principal, status, expires_at);
-capability_introduction_receipt(holder_ref, status, created_at);
-capability_blueprint(blueprint_id_and_version, package_digest) UNIQUE;
-blueprint_instance(scope_id, blueprint_digest, lifecycle_status, updated_at);
-observation_domain(domain_id) UNIQUE;
-disclosure_dependency_closure(subject_ref, revision) UNIQUE;
-disclosure_decision(subject_ref, recipient_principal_or_route, state_fence) UNIQUE;
-declassification_receipt(output_hash, transformation_id_and_version) UNIQUE;
-code_intelligence_manifest(adapter_id, adapter_generation, source_fence) UNIQUE;
-code_intelligence_projection(scope_id, projection_kind, source_fence, created_at);
-experience_record(record_kind, session_id, observed_at);
-omitted_payload_ref(source_checksum, renderer_and_budget_profile, created_at);
-route_receipt(attempt_id, kind) UNIQUE;
-run_attempt(work_item_id, attempt_id) UNIQUE;
-run_event(attempt_id, stream_id, sequence) UNIQUE;
-coordination_event(recipient_or_stream, recipient_sequence) UNIQUE;
-host_usage_record(attempt_id, observed_at);
-quota_window(route_or_auth_scope, kind, reset_at);
-ready_work_item(state, not_before, priority, created_at);
-execution_environment_lease(resource_key, state, expires_at);
-route_outcome_profile(route_fingerprint, task_class, recipe_id, validity_scope);
-tool_definition(tool_id, version) UNIQUE;
-evaluation_contract(verifier_id, scope_id, version);
-repair_recipe(problem_class, component_id, version, lifecycle_status);
-repair_attempt_receipt(problem_id, recipe_id, started_at);
-operation_job(owner_principal, execution_state, updated_at);
-outbox_event(state, created_at);
-cue_index(scope_id, cue_kind, normalized_value);
-projection_dependency(scope_id, dependency_key);
-prediction_record(target_ref, resolved_at);
-calibration_score(target_ref, window_end);
-influence_dependency(source_or_tool_id, dependent_record_id);
-derived_disclosure_from(source_or_domain_id, dependent_subject_id);
-grant_parent(parent_grant_id, child_grant_id) UNIQUE.
-```
-
-Full-text indexes may cover interpretation, decision, failure and artifact text after a real corpus exists. Vector indexes remain disabled until RG/benchmark evidence shows exact/full-text/graph recall misses useful material.
-
-## N.7. Named query/mutation registry
-
-Hot reads include:
-
-```text
-revision_heads_by_keys
-scope_revision_view_by_id
-ordering_heads_by_id
-task_state_by_id
-active_session_bindings
-user_broker_routes
-current_epistemic_inputs
-exact_observation_or_evidence
-interpretations_by_subject
-active_failures_by_trigger
-attention_problem_conflict_view
-packet_dependencies
-leases_by_task_or_scope
-mailbox_after_sequence
-receipt_by_operation
-module_catalog_snapshot
-generation_reconciliation_inputs
-capability_registry_snapshot
-effective_capability_grants_by_holder
-capability_grant_descendants_for_revocation
-active_introductions_by_holder
-facet_manifest_by_id
-disclosure_closure_by_subject
-disclosure_decision_by_subject_and_recipient
-code_intelligence_projection_by_intent_and_fence
-session_episodes_by_scope_or_session
-omitted_payload_by_handle
-blueprint_and_instance_state
-ready_work_items
-run_attempt_composite
-host_events_after_cursor
-coordination_events_after_sequence
-integration_candidates_ready
-active_integration_lease
-route_capability_and_outcome_inputs
-repair_recipes_for_problem
-repair_attempts_by_problem
-instrument_profile_by_id
-instrument_runs_by_candidate
-verification_profile_runs_by_task
-current_test_inventory
-change_impact_plan_by_candidate
-cue_hits
-projection_dependencies
-influence_dependents
-```
-
-Named mutations are generated from the active contract-catalogue variants admitted under I5.17. Appendix N does not define command vocabulary. Query/mutation names are versioned in the store-bridge compatibility manifest; removing or changing semantics requires migration and shadow compatibility proof.
-
-## N.8. Physical schema evolution
-
-```text
-additive field/index first;
-backfill as checkpointed Durable Job;
-new bridge reads old+new during compatibility window;
-write new representation only after shadow comparison;
-destructive rewrite requires backup/restore rehearsal and explicit approval;
-old fields/tables retire only after no active bridge/rollback generation requires them;
-ECXF export remains independent of table layout.
+only the migration role changes physical schema and only the store bridge holds credentials;
+stable fields use generated constraints; flexible payloads require versioned codecs and round-trip/property proof;
+large bodies remain in Blob Store and projections/indexes remain explicitly rebuildable;
+runtime access uses named parameterized operations produced from PreparedTransition;
+no agent-visible operation names a table or field;
+additive migration precedes backfill and destructive retirement;
+backfill is a checkpointed Durable Job with shadow compatibility and rollback evidence;
+old representation retires only after no active or rollback generation requires it;
+ECXF export and canonical record identity remain independent of table layout;
+the sentinel file must never be applied as DDL.
 ```
 
 ---
@@ -20934,550 +20535,23 @@ Cached time and divergence targets are measured per machine/module and live in p
 
 # Appendix P. Rust public boundary interfaces
 
-> **Status: TARGET INTERFACE PROJECTION.** Owning I-sections and the active contract catalogue define ownership/effects. Traits below are candidate Rust mappings and become binding only when generated/implemented and consumed by compile/conformance evidence.
+> **Projection lifecycle label (artifact-local):** `BOOTSTRAP_RETAINED_CANDIDATE_MAPPING`. **Projected I0.5 support/evidence:** `TARGET` / `NOT_EXECUTED`. **Runtime load policy:** `DOCUMENTATION_ONLY`. `docs/generated/rust-boundary-interfaces.md` preserves the detailed pre-extraction candidate mappings, including stable section P.12, plus a post-integration coverage-gap supplement. Candidate Rust syntax is not a normative signature, generated source or implementation proof.
 
-These interfaces illustrate the intended service boundaries without creating a second contract owner. Exact Rust syntax may use generated EBP clients, `async_trait` or boxed futures inside the owning facade; callers may not bypass an admitted boundary once that contract is active.
+Owners: the I-section owning each boundary and a future admitted `eliot-contracts` catalogue for normalized serialization. Manifest: `docs/generated/PROJECTION_MANIFEST.json`. Exact historical source: `_REVIEW/baseline_sections/Appendix_P.md`.
 
-## P.1. Identity and request context
-
-Foundation crates expose data-only request metadata:
-
-```rust
-pub struct RequestMeta {
-    pub operation_id: OperationId,
-    pub trace_id: TraceId,
-    pub principal: PrincipalRef,
-    pub session_id: Option<SessionId>,
-    pub session_binding_id: Option<SessionBindingId>,
-    pub scope_id: Option<ScopeId>,
-    pub task_id: Option<TaskId>,
-    pub policy_snapshot_id: PolicySnapshotId,
-    pub state_fence: Option<StateFence>,
-    pub deadline: DeadlineSpec,
-    pub payload_budget: PayloadBudget,
-}
-```
-
-Runtime-local code combines it with cancellation/deadline handles. No service reads a global mutable “current task”, “current principal” or “current scope”. Canonical IDs are newtypes; naked strings are accepted only at external boundaries and validated immediately. `AuthorityEpoch`, `HostInstallationEpoch`, `UserBrokerEpoch` and module/daemon epochs wrap `EpochId { lineage_id, sequence }`; code may not compare epochs from different lineages as integers.
-
-## P.2. Host state boundary
-
-```rust
-pub trait HostStateStore: Send + Sync {
-    fn load_installation(&self) -> Result<HostInstallationState, HostStateError>;
-    fn commit_activation(&self, transition: HostActivationTransition) -> Result<HostActivationReceipt, HostStateError>;
-    fn record_dependency(&self, transition: ManagedDependencyTransition) -> Result<ManagedDependencyReceipt, HostStateError>;
-    fn mark_clean_shutdown(&self, marker: HostShutdownMarker) -> Result<(), HostStateError>;
-}
-```
-
-Only `eliot-host` opens this store for write. The interface exposes operational installation/process lineage only; it cannot stage canonical transitions, issue project authority or query semantic state.
-
-## P.3. Kernel control boundary
-
-```rust
-pub trait KernelControlClient: Send + Sync {
-    async fn attach_session(&self, req: SessionAttachRequest) -> Result<SessionAttachReceipt, KernelError>;
-    async fn authorize(&self, req: AuthorityCheckRequest) -> Result<AuthorityDecision, KernelError>;
-    async fn stage_transition(&self, req: StageTransitionRequest) -> Result<WriteSubmission, KernelError>;
-    async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, KernelError>;
-    async fn route_module(&self, req: ModuleRouteRequest) -> Result<ModuleRouteReceipt, KernelError>;
-    async fn generation_registry(&self, req: GenerationRegistryRequest) -> Result<GenerationRegistryView, KernelError>;
-    async fn request_user_execution(&self, req: UserExecutionRequest) -> Result<UserExecutionReceipt, KernelError>;
-    async fn control(&self, req: ControlRequest) -> Result<ControlReceipt, KernelError>;
-    async fn recovery_view(&self, req: RecoveryViewRequest) -> Result<RecoveryView, KernelError>;
-}
-```
-
-Kernel accepts only registered contract IDs, hashes and bounded operation plans. It does not infer project meaning or invent a semantic transition.
-
-## P.4. Operational Recovery State boundary
-
-```rust
-pub trait OperationalRecoveryStore: Send + Sync {
-    fn stage(&self, op: StagedOperation) -> Result<StageReceipt, OrsError>;
-    fn mark_applying(&self, operation_id: OperationId) -> Result<(), OrsError>;
-    fn record_outcome(&self, receipt: &WriteReceipt) -> Result<(), OrsError>;
-    fn schedule_retry(&self, operation_id: OperationId, retry: RetryState) -> Result<(), OrsError>;
-
-    fn checkpoint_job(&self, checkpoint: JobCheckpoint) -> Result<(), OrsError>;
-    fn record_delivery_cursor(&self, cursor: DeliveryCursorState) -> Result<DeliveryCursorReceipt, OrsError>;
-    fn acknowledge_delivery(&self, ack: DeliveryAcknowledgement) -> Result<DeliveryCursorReceipt, OrsError>;
-
-    fn stage_admission_reservation(&self, reservation: AdmissionReservation) -> Result<AdmissionReservationReceipt, OrsError>;
-    fn activate_admission_reservation(&self, activation: AdmissionReservationActivation) -> Result<AdmissionReservationReceipt, OrsError>;
-    fn release_admission_reservation(&self, release: AdmissionReservationRelease) -> Result<AdmissionReservationReceipt, OrsError>;
-
-    fn apply_generation_transition(&self, transition: GenerationTransition) -> Result<GenerationTransitionReceipt, OrsError>;
-    fn commit_generation_cutover(&self, cutover: GenerationCutoverRecord) -> Result<GenerationCutoverReceipt, OrsError>;
-
-    fn bind_session(&self, binding: ActiveSessionBinding) -> Result<SessionBindingReceipt, OrsError>;
-    fn detach_session(&self, detach: SessionDetach) -> Result<SessionBindingReceipt, OrsError>;
-    fn register_user_broker(&self, registration: UserBrokerRegistration) -> Result<UserBrokerRegistrationReceipt, OrsError>;
-    fn fence_user_broker(&self, fence: UserBrokerFence) -> Result<UserBrokerRegistrationReceipt, OrsError>;
-
-    fn commit_authority_snapshot(&self, snapshot: KernelAuthoritySnapshot) -> Result<AuthoritySnapshotReceipt, OrsError>;
-    fn revoke_authority(&self, revocation: AuthorityRevocation) -> Result<AuthorityRevocationReceipt, OrsError>;
-    fn activate_capability_grant(&self, activation: CapabilityGrantActivation) -> Result<AuthorityActivationReceipt, OrsError>;
-    fn revoke_capability_grant(&self, revocation: CapabilityGrantRevocation) -> Result<AuthorityRevocationReceipt, OrsError>;
-    fn activate_capability_introduction(&self, activation: CapabilityIntroductionActivation) -> Result<CapabilityIntroductionReceipt, OrsError>;
-    fn fence_capability_introduction(&self, fence: CapabilityIntroductionFence) -> Result<CapabilityIntroductionReceipt, OrsError>;
-    fn logical_snapshot(&self, request: OrsSnapshotRequest) -> Result<OrsSnapshotReceipt, OrsError>;
-    fn scan_pending(&self, cursor: RecoveryCursor, limit: u32) -> Result<PendingOperationPage, OrsError>;
-}
-```
-
-One ORS coordinator owns redb write transactions. Other crates do not open redb directly. Recovery is cursor-based and bounded; startup never loads an unbounded outage backlog into RAM. ORS values are operational envelopes/checkpoints, never queryable semantic memory.
-
-## P.5. Blob Store boundary
-
-```rust
-pub trait BlobStoreClient: Send + Sync {
-    async fn stage(&self, req: BlobStageRequest) -> Result<BlobReadyReceipt, BlobError>;
-    async fn read(&self, req: BlobReadRequest) -> Result<BlobReadChunk, BlobError>;
-    async fn reachability(&self, req: BlobReachabilityRequest) -> Result<BlobReachabilityView, BlobError>;
-    async fn gc(&self, req: BlobGcRequest) -> Result<BlobGcReceipt, BlobError>;
-    async fn health(&self) -> Result<BlobHealth, BlobError>;
-}
-```
-
-The blob boundary owns immutable payload bytes and their integrity/retention metadata only. A `BlobReadyReceipt` is not a semantic/canonical write receipt.
-
-## P.6. Canonical store boundary
-
-```rust
-pub trait CanonicalStoreClient: Send + Sync {
-    async fn apply_prepared(
-        &self,
-        ctx: &RequestMeta,
-        transition: PreparedTransition,
-        expected_revision_heads: Vec<RevisionHeadExpectation>,
-        expected_ordering_heads: Vec<OrderingHeadExpectation>,
-    ) -> Result<WriteReceipt, StoreError>;
-
-    async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError>;
-    async fn revision_heads(&self, keys: Vec<RevisionKey>) -> Result<Vec<RevisionHead>, StoreError>;
-    async fn scope_revision_view(&self, scope_id: ScopeId) -> Result<ScopeRevisionView, StoreError>;
-    async fn ordering_heads(&self, scopes: Vec<OrderingScopeId>) -> Result<Vec<OrderingHead>, StoreError>;
-    async fn execute_named(&self, query: NamedReadRequest) -> Result<NamedReadResponse, StoreError>;
-    async fn health(&self) -> Result<StoreHealth, StoreError>;
-}
-```
-
-Only store-API types cross this boundary. SurrealDB SDK types, query strings, credentials and physical table names remain inside `eliot-store-surreal`.
-
-## P.7. Governor application services
-
-```rust
-pub trait WriteAdmissionApi: Send + Sync {
-    async fn prepare(
-        &self,
-        ctx: &RequestMeta,
-        envelope: CanonicalWriteEnvelope,
-        mode: WriteResponseMode,
-    ) -> Result<PreparedTransition, AdmissionError>;
-}
-
-pub trait ReadApi: Send + Sync {
-    async fn state(&self, ctx: &RequestMeta, req: StateRequest) -> Result<CurrentStateView, ReadError>;
-    async fn query(&self, ctx: &RequestMeta, req: QueryRequest) -> Result<QueryResult, ReadError>;
-    async fn resource(&self, ctx: &RequestMeta, uri: EliotResourceUri) -> Result<ResourceContent, ReadError>;
-}
-
-pub trait ContextApi: Send + Sync {
-    async fn compile(&self, ctx: &RequestMeta, req: PacketCompileRequest) -> Result<CompiledContext, ContextError>;
-}
-
-pub trait GateApi: Send + Sync {
-    async fn evaluate_action(&self, ctx: &RequestMeta, req: ActionFrame) -> Result<DecisionEnvelope<ActionDecision>, GateError>;
-    async fn evaluate_finish(&self, ctx: &TaskAuthorityBoundMeta, draft: FinishAttemptDraft) -> Result<FinishDecisionReceipt, GateError>;
-    async fn evaluate_lifecycle(&self, ctx: &RequestMeta, req: LifecycleRequest) -> Result<DecisionEnvelope<LifecycleDecision>, GateError>;
-}
-```
-
-`CompiledContext` returns packet manifest, rendered projection, provenance/rank trace, State Fence and quality scorecard together. Rendering may change without changing the canonical packet manifest.
-
-## P.8. Module and adapter boundary
-
-```rust
-pub trait ModuleClient: Send + Sync {
-    async fn handshake(&self, req: ModuleHandshake) -> Result<ModuleHandshakeAck, ModuleError>;
-    async fn health(&self) -> Result<ModuleHealth, ModuleError>;
-    async fn execute(&self, ctx: &RequestMeta, req: ModuleRequest) -> Result<ModuleResponse, ModuleError>;
-    async fn checkpoint(&self, req: CheckpointRequest) -> Result<CheckpointReceipt, ModuleError>;
-    async fn quiesce(&self, deadline: DeadlineSpec) -> Result<QuiesceReceipt, ModuleError>;
-    async fn shutdown(&self, deadline: DeadlineSpec) -> Result<(), ModuleError>;
-}
-
-pub trait AdapterClient: Send + Sync {
-    fn manifest(&self) -> &AdapterManifest;
-    async fn health(&self) -> AdapterHealth;
-    async fn execute(&self, ctx: &RequestMeta, req: AdapterRequest) -> Result<AdapterObservation, AdapterError>;
-}
-```
-
-```rust
-pub trait ModuleCatalogApi: Send + Sync {
-    async fn desired(&self, module_id: ModuleId) -> Result<Option<ModuleCatalogEntry>, ModuleError>;
-    async fn propose_change(&self, ctx: &RequestMeta, req: ModuleCatalogChange) -> Result<PreparedTransition, ModuleError>;
-    async fn snapshot(&self, req: ModuleCatalogSnapshotRequest) -> Result<ModuleCatalogSnapshot, ModuleError>;
-}
-
-pub trait DurableEventStream: Send + Sync {
-    async fn publish(&self, event: EventEnvelope) -> Result<EventPublishReceipt, ProtocolError>;
-    async fn replay(&self, req: EventReplayRequest) -> Result<EventPage, ProtocolError>;
-    async fn acknowledge(&self, req: EventAckRequest) -> Result<EventAckReceipt, ProtocolError>;
-}
-
-pub trait UserBrokerClient: Send + Sync {
-    async fn attach(&self, req: UserBrokerAttachRequest) -> Result<UserBrokerAttachReceipt, HostError>;
-    async fn launch(&self, req: UserExecutionRequest) -> Result<UserExecutionReceipt, HostError>;
-    async fn cancel(&self, req: UserExecutionCancel) -> Result<CancellationReceipt, HostError>;
-    async fn health(&self) -> Result<UserBrokerHealth, HostError>;
-}
-```
-
-The process protocol includes request/response/cancel/heartbeat/checkpoint/health frames. A module cannot return an authoritative canonical mutation; it returns observations, candidates, artifacts or an effect receipt within its granted lease.
-
-## P.9. Host Broker and Execution Fabric boundary
-
-```rust
-pub trait HostBrokerApi: Send + Sync {
-    async fn discover(&self, req: HostDiscoveryRequest) -> Result<HostDiscoveryReport, HostError>;
-    async fn probe(&self, req: HostConformanceRequest) -> Result<CapabilityEvidenceSet, HostError>;
-    async fn launch(&self, req: AdmittedRunRequest) -> Result<RunAttemptReceipt, HostError>;
-    async fn inspect(&self, run_id: RunId) -> Result<CompositeRunView, HostError>;
-    async fn cancel(&self, req: CancelRunRequest) -> Result<CancellationReceipt, HostError>;
-    async fn reconcile(&self, run_id: RunId) -> Result<RunReconciliationReceipt, HostError>;
-}
-
-pub trait ExecutionFabricApi: Send + Sync {
-    async fn plan(&self, req: ExecutionIntent) -> Result<StaffingPlanCandidate, CoordinationError>;
-    async fn request_admission(&self, req: StaffingPlanAdmissionRequest) -> Result<ReadyAdmissionReceipt, CoordinationError>;
-    async fn audit(&self, req: AuditRequest) -> Result<DurableJobHandle, CoordinationError>;
-    async fn compare(&self, req: CandidateComparisonRequest) -> Result<DurableJobHandle, CoordinationError>;
-}
-```
-
-`plan` returns a Candidate. `request_admission`, `audit` and `compare` are facades over the same TaskController/AgentCoordinator canonical commands and Durable Jobs; they cannot mutate `ReadyWorkItem`, create an attempt, reserve quota or advance work independently. Both APIs use the same leases, attempt journal, route evidence, worktree/environment and result receipts. They do not own a second task graph or canonical writer.
-
-## P.10. Coordination boundary
-
-```rust
-pub trait AgentCoordinatorApi: Send + Sync {
-    async fn register_session(&self, req: RegisterSession) -> Result<AgentSession, CoordinationError>;
-    async fn acquire_work(&self, req: WorkLeaseRequest) -> Result<WorkLeaseDecision, CoordinationError>;
-    async fn heartbeat(&self, req: AgentHeartbeat) -> Result<HeartbeatAck, CoordinationError>;
-    async fn send_message(&self, req: MailboxMessageDraft) -> Result<MailboxReceipt, CoordinationError>;
-    async fn submit_result(&self, req: AgentResultDraft) -> Result<AgentResultReceipt, CoordinationError>;
-    async fn submit_integration_candidate(&self, req: IntegrationCandidateDraft) -> Result<IntegrationCandidateReceipt, CoordinationError>;
-    async fn acquire_integration(&self, req: IntegrationLeaseRequest) -> Result<IntegrationLeaseDecision, CoordinationError>;
-    async fn checkpoint(&self, req: WorkCheckpoint) -> Result<CheckpointReceipt, CoordinationError>;
-    async fn admit_ready(&self, req: ReadyAdmissionRequest) -> Result<ReadyAdmissionReceipt, CoordinationError>;
-    async fn reassign(&self, req: ReassignWorkRequest) -> Result<WorkLeaseDecision, CoordinationError>;
-    async fn record_coordination_event(&self, req: CoordinationEventDraft) -> Result<CoordinationEventReceipt, CoordinationError>;
-}
-```
-
-The coordinator owns durable work assignment and ordering, not the substantive truth of worker conclusions.
-
-## P.11. Dreamer, Watchdog and Doctor boundaries
-
-```rust
-pub trait DreamerJobApi: Send + Sync {
-    async fn submit(&self, req: DreamerJobRequest) -> Result<DurableJobHandle, DreamerError>;
-    async fn cancel(&self, job_id: JobId) -> Result<CancellationReceipt, DreamerError>;
-}
-
-pub trait WatchdogSignalSink: Send + Sync {
-    fn append_signal(&self, signal: WatchdogSignalEnvelope) -> Result<SignalSpoolReceipt, WatchdogError>;
-    fn anchor_integrity(&self, anchor: IntegrityAnchor) -> Result<AnchorReceipt, WatchdogError>;
-}
-
-pub trait DoctorApi: Send + Sync {
-    async fn diagnose(&self, req: DiagnosticRequest) -> Result<DiagnosticBriefCandidate, DoctorError>;
-    async fn execute_recipe(&self, req: AuthorizedRepairRequest) -> Result<RepairAttemptReceipt, DoctorError>;
-}
-```
-
-Dreamer emits candidate artifacts; Watchdog writes only its independent signal/anchor spool; Doctor emits diagnosis/repair evidence and cannot commit semantic state.
-
-The boundary types above are ownership contracts. Implementations may split them into smaller traits, but they may not merge Module Catalog, Generation Registry and Capability Registry ownership or bypass the event replay/ack and integration-leasing semantics.
-
-
-## P.12. Instrument Plane boundaries
-
-```rust
-pub trait ProcessExecutor {
-    async fn start(
-        &self,
-        request: ProcessRequest,
-        sink: Arc<dyn ProcessEvidenceSink>,
-    ) -> Result<ProcessStartReceipt, ProcessExecutionError>;
-
-    async fn inspect(
-        &self,
-        operation_id: OperationId,
-    ) -> Result<ProcessExecutionView, ProcessExecutionError>;
-
-    async fn cancel(
-        &self,
-        operation_id: OperationId,
-    ) -> Result<CancellationReceipt, ProcessExecutionError>;
-
-    async fn reconcile(
-        &self,
-        operation_id: OperationId,
-    ) -> Result<ProcessEvidence, ProcessExecutionError>;
-}
-
-pub trait InstrumentRegistry {
-    async fn resolve_profile(
-        &self,
-        profile: &InstrumentProfileId,
-        ctx: &RequestMeta,
-    ) -> Result<InstrumentProfile, InstrumentError>;
-
-    async fn resolve_instrument(
-        &self,
-        kind: &InstrumentKindId,
-        ctx: &RequestMeta,
-    ) -> Result<InstrumentSpec, InstrumentError>;
-
-    async fn resolve_parser(
-        &self,
-        parser: &ParserId,
-        ctx: &RequestMeta,
-    ) -> Result<ParserDescriptor, InstrumentError>;
-}
-
-pub trait InstrumentJobApi {
-    async fn submit_profile(
-        &self,
-        request: InstrumentProfileRequest,
-        ctx: &RequestMeta,
-    ) -> Result<DurableJobHandle, InstrumentError>;
-
-    async fn inspect_profile(
-        &self,
-        job_id: JobId,
-        ctx: &RequestMeta,
-    ) -> Result<InstrumentProfileRunView, InstrumentError>;
-
-    async fn cancel_profile(
-        &self,
-        job_id: JobId,
-        ctx: &RequestMeta,
-    ) -> Result<CancellationReceipt, InstrumentError>;
-
-    async fn result(
-        &self,
-        job_id: JobId,
-        ctx: &RequestMeta,
-    ) -> Result<Option<VerificationProfileRun>, InstrumentError>;
-}
-
-pub trait CodeIntelligenceBackend {
-    async fn query(
-        &self,
-        request: CodeIntelligenceRequest,
-        ctx: &RequestMeta,
-    ) -> Result<CodeIntelligenceResult, InstrumentError>;
-}
-
-pub trait DisclosureApi {
-    async fn compile_closure(
-        &self,
-        subject: DisclosureSubjectRef,
-        ctx: &RequestMeta,
-    ) -> Result<DisclosureDependencyClosure, DisclosureError>;
-
-    async fn decide(
-        &self,
-        request: DisclosureRequest,
-        ctx: &RequestMeta,
-    ) -> Result<DisclosureDecision, DisclosureError>;
-
-    async fn register_declassification(
-        &self,
-        receipt: VerifiedDeclassificationDraft,
-        ctx: &RequestMeta,
-    ) -> Result<DeclassificationReceipt, DisclosureError>;
-}
-
-pub trait CapabilityAuthorityApi {
-    async fn propose_grant(
-        &self,
-        request: CapabilityGrantRequest,
-        ctx: &RequestMeta,
-    ) -> Result<CapabilityGrantDecision, AuthorityError>;
-
-    async fn preview_revoke(
-        &self,
-        grant_id: CapabilityGrantId,
-        ctx: &RequestMeta,
-    ) -> Result<GrantRevocationPreview, AuthorityError>;
-
-    async fn request_revoke(
-        &self,
-        request: CapabilityGrantRevocationRequest,
-        ctx: &RequestMeta,
-    ) -> Result<AuthorityRevocationReceipt, AuthorityError>;
-
-    async fn compile_introductions(
-        &self,
-        request: IntroductionCompileRequest,
-        ctx: &RequestMeta,
-    ) -> Result<IntroductionSet, AuthorityError>;
-}
-
-pub trait EpisodeIngestApi {
-    async fn ingest(
-        &self,
-        request: EpisodeIngestRequest,
-        ctx: &RequestMeta,
-    ) -> Result<EpisodeIngestReceipt, EpisodeError>;
-
-    async fn checkpoint(
-        &self,
-        source: TranscriptSourceRef,
-        ctx: &RequestMeta,
-    ) -> Result<IngestionCursorReceipt, EpisodeError>;
-}
-
-pub trait CapabilityBlueprintApi {
-    async fn register(
-        &self,
-        request: BlueprintRegistrationRequest,
-        ctx: &RequestMeta,
-    ) -> Result<BlueprintRegistrationReceipt, BlueprintError>;
-
-    async fn instantiate(
-        &self,
-        request: BlueprintInstantiationRequest,
-        ctx: &RequestMeta,
-    ) -> Result<DurableJobHandle, BlueprintError>;
-
-    async fn inspect_instance(
-        &self,
-        instance_id: BlueprintInstanceId,
-        ctx: &RequestMeta,
-    ) -> Result<BlueprintInstanceView, BlueprintError>;
-}
-```
-
-Rules:
+Rules that remain normative here:
 
 ```text
-Every production process tree is created through the ProcessExecutor contract/reference implementation; operation/tree ownership remains with the calling Kernel/testd/UserBroker/module supervisor;
-process start, inspect, cancel and reconcile survive caller/runner restart;
-InstrumentJobApi uses Durable Jobs and never hides a long run in one transport call;
-profiles are typed and immutable; arbitrary shell commands are not production verifier authority;
-registries return revisioned definitions;
-backends return evidence with freshness/coverage/provenance;
-CodeCortex composes evidence but never changes its authority;
-DisclosureApi cannot declassify without a registered verifier/receipt;
-CapabilityAuthorityApi is a Governor facade and Kernel enforcement remains separate;
-EpisodeIngestApi owns no independent cursor store or semantic promotion path;
-CapabilityBlueprintApi changes catalogue/desired state only; generation activation remains Kernel/Governor-owned;
-all canonical writes still pass through Governor admission;
-raw evidence is stored by handle, not injected automatically.
+public types carry explicit contract/schema versions and validated newtype identities;
+major incompatibility fails before effects; additive minor compatibility is declared explicitly;
+authority, scope, effect, privacy, ordering and receipt fields are never silently defaulted;
+closed control variants fail when unknown; additive reason/telemetry values preserve Unknown(raw);
+canonical hashes use normalized versioned serialization;
+public signatures do not leak vendor/upstream types;
+in-process and process-boundary implementations must produce equivalent receipts and failures;
+no boundary may read implicit global mutable current principal, scope or task state;
+later-wave interfaces remain uncovered TARGET gaps until generated from an admitted catalogue and proven against source.
 ```
-
-### Test execution plane
-
-```rust
-pub trait TestExecutionPlane {
-    async fn submit(
-        &self,
-        request: TestdJobRequest,
-        ctx: &RequestMeta,
-    ) -> Result<DurableJobHandle, TestdError>;
-
-    async fn inspect(
-        &self,
-        job_id: JobId,
-        ctx: &RequestMeta,
-    ) -> Result<TestdJobView, TestdError>;
-
-    async fn cancel(
-        &self,
-        job_id: JobId,
-        ctx: &RequestMeta,
-    ) -> Result<CancellationReceipt, TestdError>;
-
-    async fn reconcile(
-        &self,
-        job_id: JobId,
-        ctx: &RequestMeta,
-    ) -> Result<TestdJobResult, TestdError>;
-}
-```
-
-### Component host boundary
-
-```rust
-pub trait ComponentHostApi {
-    async fn prepare_generation(
-        &self,
-        manifest: GenerationManifest,
-        ctx: &RequestMeta,
-    ) -> Result<GenerationCandidateReceipt, ComponentHostError>;
-
-    async fn execute_shadow(
-        &self,
-        request: ComponentInvocation,
-        ctx: &RequestMeta,
-    ) -> Result<ComponentObservation, ComponentHostError>;
-
-    async fn export_state(
-        &self,
-        generation: GenerationId,
-        ctx: &RequestMeta,
-    ) -> Result<ComponentStateArtifact, ComponentHostError>;
-}
-```
-
-Activation/cutover is deliberately absent from `ComponentHostApi`; it belongs to Kernel/Governor generation services.
-
-### Deterministic simulation boundary
-
-```rust
-pub trait SimulationApi {
-    async fn run(
-        &self,
-        scenario: SimulationScenario,
-        seed: SimulationSeed,
-        ctx: &RequestMeta,
-    ) -> Result<SimulationResult, SimulationError>;
-
-    async fn replay(
-        &self,
-        artifact: SimulationSeedArtifactRef,
-        ctx: &RequestMeta,
-    ) -> Result<SimulationResult, SimulationError>;
-}
-```
-
-Domain cores consume explicit Clock/Rng/Id/Transport/Store ports; they do not import a specific simulator runtime.
-
-## P.13. Serialization and compatibility rules
-
-```text
-all wire/durable types carry major/minor schema or contract version;
-major mismatch fails before side effects;
-minor additive optional fields may be ignored or round-tripped only by an explicit compatibility rule;
-unknown variants of closed control enums fail; additive reason-code and telemetry registries preserve `Unknown(raw)` together with the stable disposition/class;
-removing a required field or changing authority/effect meaning requires a new major version;
-fields affecting authority, scope, effect, privacy, ordering or receipt are never silently defaulted;
-canonical hashes use normalized versioned serialization owned by `eliot-contracts`;
-floating point is excluded from authority, sequence, revision and lifecycle decisions;
-timestamps are UTC plus monotonic/sequence context where ordering matters;
-paths preserve canonical normalized identity and original display form;
-no upstream/vendor type appears in an ELIOT public signature.
-```
-
-Public trait and EBP semantic fixtures are generated from the same contract catalogue. A bridge implementation is conformant only if both in-process and process-boundary tests produce equivalent receipts and failure semantics.
 
 ---
 
