@@ -4,13 +4,12 @@ use eliot_types::{
     CanonicalMetaMetricEvidence, CanonicalReplayExecutionRecord, CommandContext, EvalBaseline,
     EvalBudget, EvalCandidateComparison, EvalCase, EvalCaseId, EvalCaseResult, EvalCaseStatus,
     EvalComparisonVerdict, EvalComponentCoverage, EvalCoverageMatrix, EvalCoverageStatus,
-    EvalCriterion, EvalDatasetManifest, EvalDatasetManifestId, EvalFailureCluster,
-    EvalFailureClusterId, EvalFamily, EvalFamilyCoverage, EvalFamilyDelta, EvalFamilyScore,
-    EvalFamilyThreshold, EvalFamilyTrend, EvalFixtureChecksum, EvalFixtureStabilityReport,
-    EvalGateDecision, EvalGateDecisionKind, EvalMeasurementKind, EvalMeasurementResult,
-    EvalMeasurementSpec, EvalRegressionGateProfile, EvalRegressionSeverity, EvalRiskCoverage,
-    EvalRun, EvalRunId, EvalRunProfile, EvalRunStatus, EvalSuite, EvalSuiteId, EvalTrendDirection,
-    EvalTrendReport, EvalVerdict, EvalVerdictId, EvalVerdictStatus,
+    EvalCriterion, EvalDatasetManifest, EvalDatasetManifestId, EvalFamily, EvalFamilyCoverage,
+    EvalFamilyDelta, EvalFamilyThreshold, EvalFamilyTrend, EvalFixtureChecksum,
+    EvalFixtureStabilityReport, EvalGateDecision, EvalGateDecisionKind, EvalMeasurementKind,
+    EvalMeasurementResult, EvalMeasurementSpec, EvalRegressionGateProfile, EvalRegressionSeverity,
+    EvalRiskCoverage, EvalRun, EvalRunId, EvalRunProfile, EvalRunStatus, EvalSuite, EvalSuiteId,
+    EvalTrendDirection, EvalTrendReport, EvalVerdict, EvalVerdictId, EvalVerdictStatus,
     ExperimentalMetaPolicyCandidate, ExperimentalMetaPolicyPayload, ExperimentalMetaPolicyState,
     HarnessExperimentRecord, HarnessExperimentRecordId, LifecycleStatus, MetaCandidateChangeClass,
     MetaExperimentDecision, MetaIsolationFence, MetaIsolationRejectionRecord,
@@ -25,6 +24,9 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{WriteAdmissionService, WriterHandle};
+
+mod eval_verdict;
+pub use eval_verdict::EvalVerdictService;
 
 #[derive(Clone, Debug)]
 pub struct EvalCaseInput {
@@ -881,112 +883,6 @@ impl EvalMeasurementService {
             },
             evidence_refs: case.expected_evidence_refs.clone(),
         }
-    }
-}
-
-pub struct EvalVerdictService;
-
-impl EvalVerdictService {
-    pub fn verdict(run: &EvalRun) -> EvalVerdict {
-        let all_passed = run
-            .case_results
-            .iter()
-            .all(|result| result.status == EvalCaseStatus::Passed);
-        let failure_clusters = Self::failure_clusters(run);
-        let status = match run.status {
-            EvalRunStatus::Completed if all_passed => EvalVerdictStatus::Pass,
-            EvalRunStatus::BlockedInvalidDataset
-            | EvalRunStatus::BlockedMutationAttempt
-            | EvalRunStatus::BlockedUnsafeProfile => EvalVerdictStatus::Blocked,
-            EvalRunStatus::Completed | EvalRunStatus::Failed => EvalVerdictStatus::Fail,
-            _ => EvalVerdictStatus::Inconclusive,
-        };
-        EvalVerdict {
-            eval_verdict_id: EvalVerdictId::new_v7(),
-            eval_run_id: run.eval_run_id,
-            status,
-            family_scores: Self::family_scores(&run.case_results),
-            failure_clusters,
-            grants_authority: false,
-            mutates_current_truth: false,
-            mutates_memory_lifecycle: false,
-            mutates_skills: false,
-            mutates_policy: false,
-            mutates_action_permissions: false,
-            mutates_completion_state: false,
-            reasons: vec!["eval verdict is report-only and grants no authority".to_owned()],
-            created_at: OffsetDateTime::now_utc(),
-        }
-    }
-
-    pub fn failure_clusters(run: &EvalRun) -> Vec<EvalFailureCluster> {
-        run.case_results
-            .iter()
-            .filter(|result| result.status != EvalCaseStatus::Passed)
-            .map(|result| EvalFailureCluster {
-                eval_failure_cluster_id: EvalFailureClusterId::new_v7(),
-                eval_run_id: run.eval_run_id,
-                family: result.family,
-                case_refs: vec![result.eval_case_id],
-                reason: format!("eval case {:?} did not pass", result.family),
-                evidence_refs: result
-                    .measurements
-                    .iter()
-                    .flat_map(|measurement| measurement.evidence_refs.clone())
-                    .collect(),
-                created_at: OffsetDateTime::now_utc(),
-            })
-            .collect()
-    }
-
-    pub fn fixture_failure_cluster(eval_run_id: EvalRunId) -> EvalFailureCluster {
-        EvalFailureCluster {
-            eval_failure_cluster_id: EvalFailureClusterId::new_v7(),
-            eval_run_id,
-            family: EvalFamily::Bench,
-            case_refs: Vec::new(),
-            reason: "intentional fixture failure generated a failure cluster".to_owned(),
-            evidence_refs: vec!["fixture:intentional-failure".to_owned()],
-            created_at: OffsetDateTime::now_utc(),
-        }
-    }
-
-    fn family_scores(results: &[EvalCaseResult]) -> Vec<EvalFamilyScore> {
-        let mut by_family: BTreeMap<EvalFamily, Vec<&EvalCaseResult>> = BTreeMap::new();
-        for result in results {
-            by_family.entry(result.family).or_default().push(result);
-        }
-        by_family
-            .into_iter()
-            .map(|(family, family_results)| {
-                let total = u32_count(family_results.len());
-                let passed = u32_count(
-                    family_results
-                        .iter()
-                        .filter(|result| result.status == EvalCaseStatus::Passed)
-                        .count(),
-                );
-                let failed = u32_count(
-                    family_results
-                        .iter()
-                        .filter(|result| result.status == EvalCaseStatus::Failed)
-                        .count(),
-                );
-                let blocked = total.saturating_sub(passed).saturating_sub(failed);
-                let score_percent = passed
-                    .saturating_mul(100)
-                    .checked_div(total)
-                    .map_or(0, u8_count);
-                EvalFamilyScore {
-                    family,
-                    passed,
-                    failed,
-                    blocked,
-                    total,
-                    score_percent,
-                }
-            })
-            .collect()
     }
 }
 
