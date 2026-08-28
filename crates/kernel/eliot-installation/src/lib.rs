@@ -124,6 +124,7 @@ mod plan;
 mod profile_roots;
 mod redb_state;
 mod registry_wire;
+mod runtime_root_contract;
 mod scm_approval;
 mod signed_activation;
 mod transaction;
@@ -202,11 +203,7 @@ pub use plan::{
     PackageArtifactDigest, PlannedChange, SupervisionAuthorityProvisionPlan,
 };
 use plan::{validate_effect_profile, validate_installer_effects, validate_phase_b_effect_bindings};
-pub use profile_roots::{
-    InstallationProfile, InstallationRoots, RuntimeRootLease, RuntimeRootLeaseProvider,
-    RuntimeStateRoots, ValidatedRuntimeRootLeases, WindowsRuntimeRootLease,
-    WindowsRuntimeRootLeaseProvider,
-};
+pub use profile_roots::InstallationRoots;
 pub use redb_state::{
     RedbInstallationTransactionStore, SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
     SourceBundlePublicationJournal, SourceBundlePublicationJournalState,
@@ -214,6 +211,10 @@ pub use redb_state::{
     source_bundle_publication_operation_id,
 };
 use registry_wire::decode_registry_bytes;
+pub use runtime_root_contract::{
+    InstallationProfile, RuntimeRootLease, RuntimeRootLeaseProvider, RuntimeStateRoots,
+    ValidatedRuntimeRootLeases, WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider,
+};
 pub use scm_approval::{InstallerServiceControlGrantReceipt, InstallerServiceRegistrationApproval};
 #[cfg(test)]
 use transaction::decode_installation_transaction_json;
