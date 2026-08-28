@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 
 mod runtime_loop;
 
+#[cfg(windows)]
+mod watchdog_service_status;
+
 use runtime_loop::run_watchdog;
 
 use eliot_platform_windows::ServiceBootstrapArguments;
@@ -16,6 +19,11 @@ use eliot_platform_windows::{ServiceRegistrationRequest, WindowsPlatform};
 use eliot_watchdog::{
     SERVICE_NAME, WatchdogRuntimeReadback, WatchdogSelfAdmissionProbe, WatchdogSelfAdmissionStatus,
     project_service_runtime_inspection,
+};
+#[cfg(windows)]
+use watchdog_service_status::{
+    SERVICE_STATUS_HANDLE, publish_service_status, set_service_status_running,
+    set_service_status_stopped,
 };
 
 static PROCESS_BOOTSTRAP: OnceLock<Result<Option<ServiceBootstrapArguments>, String>> =
@@ -92,10 +100,6 @@ impl WatchdogSelfAdmissionStatus for ScmWatchdogSelfAdmissionStatus {
 
 #[cfg(windows)]
 static SERVICE_STOP_REQUESTED: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
-
-#[cfg(windows)]
-static SERVICE_STATUS_HANDLE: std::sync::atomic::AtomicIsize =
-    std::sync::atomic::AtomicIsize::new(0);
 
 #[cfg(windows)]
 fn run_as_scm_service() -> Result<bool, u32> {
@@ -238,61 +242,6 @@ unsafe fn service_launch_options(
     }
     let value = unsafe { std::slice::from_raw_parts(pointer.cast_const(), length) };
     eliot_watchdog::validate_watchdog_service_main_argv([OsString::from_wide(value)])
-}
-
-#[cfg(windows)]
-fn set_service_status_running() {
-    let raw = SERVICE_STATUS_HANDLE.load(Ordering::Acquire);
-    if raw != 0 {
-        publish_service_status(
-            raw as _,
-            windows_sys::Win32::System::Services::SERVICE_RUNNING,
-            windows_sys::Win32::System::Services::SERVICE_ACCEPT_STOP
-                | windows_sys::Win32::System::Services::SERVICE_ACCEPT_SHUTDOWN
-                | windows_sys::Win32::System::Services::SERVICE_ACCEPT_PRESHUTDOWN,
-            0,
-            0,
-            0,
-        );
-    }
-}
-
-#[cfg(windows)]
-fn set_service_status_stopped() {
-    let raw = SERVICE_STATUS_HANDLE.load(Ordering::Acquire);
-    if raw != 0 {
-        publish_service_status(
-            raw as _,
-            windows_sys::Win32::System::Services::SERVICE_STOPPED,
-            0,
-            0,
-            0,
-            0,
-        );
-    }
-}
-
-#[cfg(windows)]
-fn publish_service_status(
-    handle: windows_sys::Win32::System::Services::SERVICE_STATUS_HANDLE,
-    state: u32,
-    controls: u32,
-    error: u32,
-    checkpoint: u32,
-    wait_hint: u32,
-) {
-    use windows_sys::Win32::System::Services::{SERVICE_STATUS, SetServiceStatus};
-    let status = SERVICE_STATUS {
-        dwServiceType: 0x0000_0010,
-        dwCurrentState: state,
-        dwControlsAccepted: controls,
-        dwWin32ExitCode: error,
-        dwServiceSpecificExitCode: 0,
-        dwCheckPoint: checkpoint,
-        dwWaitHint: wait_hint,
-    };
-    // SAFETY: the handle is either SCM-provided or zero-checked by callers.
-    unsafe { SetServiceStatus(handle, &raw const status) };
 }
 
 #[cfg(windows)]
