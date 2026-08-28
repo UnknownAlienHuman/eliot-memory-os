@@ -10,9 +10,13 @@ use eliot_types::{
     WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState, WorktreeLeaseId,
     WorktreeLeaseState, WriteId, WriteReceiptRef,
 };
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use time::{Duration, OffsetDateTime};
+
+#[path = "collective_stop_gate.rs"]
+mod collective_stop_gate;
+
+pub use collective_stop_gate::{StopCoordinationDecision, StopCoordinationGate};
 
 #[derive(Clone, Debug)]
 pub struct BlackboardAddInput {
@@ -42,15 +46,6 @@ pub struct MailboxSendInput {
     pub expires_at: Option<OffsetDateTime>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StopCoordinationDecision {
-    pub allow: bool,
-    pub reasons: Vec<String>,
-    pub unacknowledged_control_messages: Vec<MailboxMessageId>,
-    pub unresolved_blackboard_items: Vec<BlackboardItemId>,
-    pub unresolved_work_conflicts: Vec<String>,
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BlackboardService;
 
@@ -62,9 +57,6 @@ pub struct LostAgentRecoveryService;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CollectiveTraceService;
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StopCoordinationGate;
 
 pub struct CollectiveMemoryWriter;
 
@@ -428,86 +420,6 @@ impl CollectiveTraceService {
         };
         state.collective_traces.push(trace.clone());
         trace
-    }
-}
-
-impl StopCoordinationGate {
-    #[must_use]
-    pub fn evaluate(
-        &self,
-        state: &WorkState,
-        project_id: Option<ProjectId>,
-        task_id: Option<TaskId>,
-    ) -> StopCoordinationDecision {
-        let unacknowledged_control_messages = state
-            .mailbox_messages
-            .iter()
-            .filter(|message| {
-                project_id.is_none_or(|project_id| message.project_id == project_id)
-                    && task_id.is_none_or(|task_id| message.task_id == task_id)
-                    && message.requires_ack
-                    && matches!(
-                        message.status,
-                        MailboxMessageStatus::Pending | MailboxMessageStatus::Delivered
-                    )
-            })
-            .map(|message| message.message_id)
-            .collect::<Vec<_>>();
-        let unresolved_blackboard_items = state
-            .blackboard_items
-            .iter()
-            .filter(|item| {
-                project_id.is_none_or(|project_id| item.project_id == project_id)
-                    && task_id.is_none_or(|task_id| item.task_id == task_id)
-                    && matches!(
-                        item.kind,
-                        BlackboardItemKind::Blocker
-                            | BlackboardItemKind::ConflictNotice
-                            | BlackboardItemKind::DecisionRequest
-                    )
-                    && matches!(
-                        item.status,
-                        BlackboardItemStatus::Open | BlackboardItemStatus::Acknowledged
-                    )
-            })
-            .map(|item| item.blackboard_item_id)
-            .collect::<Vec<_>>();
-        let unresolved_work_conflicts = state
-            .conflicts
-            .iter()
-            .filter(|conflict| {
-                conflict.resolution.is_none()
-                    && state.work_items.iter().any(|item| {
-                        item.work_item_id == conflict.work_item_id
-                            && project_id.is_none_or(|project_id| item.project_id == project_id)
-                            && task_id.is_none_or(|task_id| item.task_id == task_id)
-                    })
-            })
-            .map(|conflict| conflict.conflict_id.clone())
-            .collect::<Vec<_>>();
-        let allow = unacknowledged_control_messages.is_empty()
-            && unresolved_blackboard_items.is_empty()
-            && unresolved_work_conflicts.is_empty();
-        let mut reasons = Vec::new();
-        if !unacknowledged_control_messages.is_empty() {
-            reasons.push("unacknowledged_control_messages".to_owned());
-        }
-        if !unresolved_blackboard_items.is_empty() {
-            reasons.push("unresolved_blackboard_items".to_owned());
-        }
-        if !unresolved_work_conflicts.is_empty() {
-            reasons.push("unresolved_work_conflicts".to_owned());
-        }
-        if allow {
-            reasons.push("collective_coordination_clear".to_owned());
-        }
-        StopCoordinationDecision {
-            allow,
-            reasons,
-            unacknowledged_control_messages,
-            unresolved_blackboard_items,
-            unresolved_work_conflicts,
-        }
     }
 }
 
