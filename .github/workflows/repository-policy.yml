@@ -44,17 +44,20 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
+          import json
           import pathlib
           import tomllib
 
           pair = tomllib.loads(pathlib.Path('docs/normative-pair.toml').read_text(encoding='utf-8'))
           active = tomllib.loads(pathlib.Path('workstreams/ACTIVE.toml').read_text(encoding='utf-8'))
+          inventory = json.loads(pathlib.Path('workstreams/core-daemons/inventory.json').read_text(encoding='utf-8'))
 
           assert pair['status'] == 'accepted'
           assert pair['repository_authority_branch'] == 'main'
           assert active['authority_branch'] == 'main'
           assert active['branch_policy']['requires_current_main_ancestor'] is True
           assert active['branch_policy']['one_issue_one_branch_one_pr'] is True
+          assert inventory['authority']['branch'] == 'main'
           PY
 
       - name: Reject retired authority surfaces
@@ -69,10 +72,27 @@ jobs:
             'swarm'
             'docs/tasks'
             'docs/normative'
+            'docs/conformance.toml'
+            'docs/UNIMPLEMENTED.md'
             'docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md'
             'docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md'
+            'docs/operations/BRANCH_INTEGRATION_CLEANUP_HANDOFF_2026-08-28.md'
+            'docs/operations/M5_OPERATIONS_RUNBOOK.md'
+            'docs/operations/PRODUCTION_CUTOVER_RUNBOOK.md'
+            'docs/operations/RUNTIME_LIVE_V3_HANDOFF_2026-08-22.md'
             'COGNITIVE_COMPLETION_RECOVERY_PROGRESS.md'
             'UL_PROGRESS.md'
+            'scripts/gen-composition-roots.ps1'
+            'scripts/verify-composition-roots.ps1'
+            'scripts/gen-conformance.ps1'
+            'scripts/verify-conformance.ps1'
+            'scripts/gen-contour-cut.ps1'
+            'scripts/verify-contour-cut.ps1'
+            'scripts/gen-module-manifests.ps1'
+            'scripts/verify-module-manifests.ps1'
+            'scripts/gen-unimplemented.ps1'
+            'scripts/verify-unimplemented.ps1'
+            'scripts/measure-stu.ps1'
           )
 
           for path in "${forbidden[@]}"; do
@@ -81,6 +101,10 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Verify canonical normative identity
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/verify-normative.ps1
 
       - name: Reject stale links in current routing surfaces
         shell: bash
@@ -94,6 +118,7 @@ jobs:
             docs/PROJECT_MAP.md
             docs/architecture/README.md
             docs/architecture/INDEX.md
+            docs/operations/README.md
             workstreams/README.md
             workstreams/ACTIVE.toml
             workstreams/core-daemons/AGENTS.md

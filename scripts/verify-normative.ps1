@@ -8,124 +8,138 @@ function Fail([string] $Message) {
     throw "VERIFY_NORMATIVE_FAIL: $Message"
 }
 
+function Read-Receipt([string] $Path) {
+    $values = @{}
+    foreach ($line in (Get-Content -LiteralPath $Path)) {
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#')) {
+            continue
+        }
+        $match = [regex]::Match(
+            $trimmed,
+            '^(?<key>[A-Za-z0-9_]+)\s*=\s*"(?<value>[^"]*)"\s*$'
+        )
+        if (-not $match.Success) {
+            Fail "unsupported normative-pair TOML record: $trimmed"
+        }
+        $key = $match.Groups['key'].Value
+        if ($values.ContainsKey($key)) {
+            Fail "duplicate normative-pair key: $key"
+        }
+        $values[$key] = $match.Groups['value'].Value
+    }
+    return $values
+}
+
+function Sha256([string] $Path) {
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
 try {
     $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-    $projectionRoot = Join-Path $repoRoot 'docs/normative'
-    $manifestPath = Join-Path $projectionRoot 'projection-manifest.tsv'
+    $receiptPath = Join-Path $repoRoot 'docs/normative-pair.toml'
     $contractPath = Join-Path $repoRoot 'docs/ARCHITECTURE_CONTRACT.md'
 
-    foreach ($requiredPath in @($projectionRoot, $manifestPath, $contractPath)) {
-        if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf) -and
-            -not (Test-Path -LiteralPath $requiredPath -PathType Container)) {
-            Fail "required path is missing: $requiredPath"
+    foreach ($requiredPath in @($receiptPath, $contractPath)) {
+        if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+            Fail "required file is missing: $requiredPath"
         }
     }
 
-    $expectedFiles = @(
-        'ELIOT_ARCHITECTURE.md',
-        'ELIOT_IMPLEMENTATION.md',
-        'INDEX.md',
-        'README.md'
+    $receipt = Read-Receipt $receiptPath
+    $requiredKeys = @(
+        'schema_version',
+        'status',
+        'repository_authority_branch',
+        'pair_key_algorithm',
+        'pair_key',
+        'architecture_path',
+        'architecture_sha256',
+        'implementation_path',
+        'implementation_sha256'
     )
-    $expectedSet = @{}
-    foreach ($fileName in $expectedFiles) {
-        $expectedSet[$fileName.ToLowerInvariant()] = $fileName
+    foreach ($key in $requiredKeys) {
+        if (-not $receipt.ContainsKey($key) -or [string]::IsNullOrWhiteSpace($receipt[$key])) {
+            Fail "normative-pair receipt is missing: $key"
+        }
     }
 
-    $metaSeen = @{}
-    $manifestFiles = @{}
-    foreach ($line in (Get-Content -LiteralPath $manifestPath)) {
-        if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith('#')) {
-            continue
-        }
-        $parts = $line.Split([char]9, [System.StringSplitOptions]::None)
-        $kind = $parts[0]
-        if ($kind -eq 'projection_file') {
-            if ($parts.Count -ne 3) {
-                Fail "projection_file record must have exactly 3 TSV fields"
-            }
-            $fileName = $parts[1]
-            $hash = $parts[2].ToUpperInvariant()
-            $key = $fileName.ToLowerInvariant()
-            if (-not $expectedSet.ContainsKey($key)) {
-                Fail "manifest contains an unexpected projection file: $fileName"
-            }
-            if ($manifestFiles.ContainsKey($key)) {
-                Fail "manifest contains a duplicate projection file: $fileName"
-            }
-            if ($hash -notmatch '^[0-9A-F]{64}$') {
-                Fail "manifest contains an invalid SHA-256 for $fileName"
-            }
-            $manifestFiles[$key] = [pscustomobject]@{ Name = $expectedSet[$key]; Hash = $hash }
-            continue
-        }
-        if ($parts.Count -ne 2 -or [string]::IsNullOrWhiteSpace($kind) -or
-            [string]::IsNullOrWhiteSpace($parts[1])) {
-            Fail "invalid manifest record: $line"
-        }
-        if ($metaSeen.ContainsKey($kind)) {
-            Fail "manifest contains a duplicate metadata key: $kind"
-        }
-        $metaSeen[$kind] = $parts[1]
+    if ($receipt['schema_version'] -ne 'eliot-normative-pair-v1') {
+        Fail 'unsupported normative-pair schema'
+    }
+    if ($receipt['status'] -ne 'accepted') {
+        Fail 'normative pair is not accepted'
+    }
+    if ($receipt['repository_authority_branch'] -ne 'main') {
+        Fail 'main is not the declared authority branch'
+    }
+    if ($receipt['pair_key_algorithm'] -ne 'sha256-domain-separated-v1') {
+        Fail 'unsupported pair-key algorithm'
     }
 
-    foreach ($requiredMeta in @('schema_version', 'kind', 'authority_status')) {
-        if (-not $metaSeen.ContainsKey($requiredMeta)) {
-            Fail "manifest metadata is missing: $requiredMeta"
+    $expectedArchitecturePath = 'docs/architecture/ELIOT_ARCHITECTURE.md'
+    $expectedImplementationPath = 'docs/architecture/ELIOT_IMPLEMENTATION.md'
+    if ($receipt['architecture_path'] -ne $expectedArchitecturePath -or
+        $receipt['implementation_path'] -ne $expectedImplementationPath) {
+        Fail 'normative paths are not the stable canonical repository paths'
+    }
+
+    $architecturePath = Join-Path $repoRoot $receipt['architecture_path']
+    $implementationPath = Join-Path $repoRoot $receipt['implementation_path']
+    foreach ($path in @($architecturePath, $implementationPath)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            Fail "canonical normative file is missing: $path"
         }
     }
-    if ($metaSeen['schema_version'] -ne 'eliot-normative-projection-v1') {
-        Fail 'unsupported projection manifest schema'
+
+    $architectureHash = Sha256 $architecturePath
+    $implementationHash = Sha256 $implementationPath
+    if ($architectureHash -ne $receipt['architecture_sha256'].ToLowerInvariant()) {
+        Fail "Architecture digest mismatch: expected $($receipt['architecture_sha256']), actual $architectureHash"
     }
-    if ($metaSeen['kind'] -ne 'non_authority_projection' -or
-        $metaSeen['authority_status'] -ne 'NOT_AUTHORITY') {
-        Fail 'projection is not explicitly marked NOT_AUTHORITY'
+    if ($implementationHash -ne $receipt['implementation_sha256'].ToLowerInvariant()) {
+        Fail "Implementation digest mismatch: expected $($receipt['implementation_sha256']), actual $implementationHash"
     }
-    if ($manifestFiles.Count -ne $expectedFiles.Count) {
-        Fail "manifest must contain exactly $($expectedFiles.Count) projection files"
+
+    $pairInput =
+        'eliot-normative-pair-v1' + [char]0 +
+        $architectureHash + [char]0 +
+        $implementationHash + [char]0
+    $pairBytes = [Text.Encoding]::UTF8.GetBytes($pairInput)
+    $pairDigest = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData($pairBytes)
+    ).ToLowerInvariant()
+    $expectedPairKey = "sha256:$pairDigest"
+    if ($receipt['pair_key'].ToLowerInvariant() -ne $expectedPairKey) {
+        Fail "pair key mismatch: expected $expectedPairKey, receipt $($receipt['pair_key'])"
     }
 
     $contractText = Get-Content -Raw -LiteralPath $contractPath
-    function Get-ContractHash([string] $FileName) {
-        $needle = '`' + $FileName + '`'
-        $rows = @($contractText -split "`r?`n" | Where-Object {
-            $_.Contains('|') -and $_.Contains($needle)
-        })
-        if ($rows.Count -ne 1) {
-            Fail "contract must contain exactly one hash row for $FileName"
-        }
-        $hashes = @([regex]::Matches($rows[0], '(?i)(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])'))
-        if ($hashes.Count -ne 1) {
-            Fail "contract hash row is missing or ambiguous for $FileName"
-        }
-        return $hashes[0].Value.ToUpperInvariant()
-    }
-
-    foreach ($fileName in $expectedFiles) {
-        $key = $fileName.ToLowerInvariant()
-        $path = Join-Path $projectionRoot $fileName
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-            Fail "projection file is missing: $fileName"
-        }
-        $matches = @(Get-ChildItem -LiteralPath $projectionRoot -Recurse -File |
-            Where-Object { $_.Name -ieq $fileName })
-        if ($matches.Count -ne 1 -or $matches[0].FullName -ne (Resolve-Path -LiteralPath $path).Path) {
-            Fail "projection file is duplicated or moved: $fileName"
-        }
-        $actualHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToUpperInvariant()
-        $manifestHash = $manifestFiles[$key].Hash
-        if ($actualHash -ne $manifestHash) {
-            Fail "manifest hash mismatch for ${fileName}: expected $manifestHash, actual $actualHash"
-        }
-        if ($fileName -in @('ELIOT_ARCHITECTURE.md', 'ELIOT_IMPLEMENTATION.md')) {
-            $contractHash = Get-ContractHash $fileName
-            if ($actualHash -ne $contractHash) {
-                Fail "contract hash mismatch for ${fileName}: expected $contractHash, actual $actualHash"
-            }
+    foreach ($requiredText in @(
+        $expectedArchitecturePath,
+        $expectedImplementationPath,
+        $architectureHash.ToUpperInvariant(),
+        $implementationHash.ToUpperInvariant(),
+        $expectedPairKey
+    )) {
+        if (-not $contractText.Contains($requiredText)) {
+            Fail "architecture contract is missing current identity: $requiredText"
         }
     }
 
-    Write-Output "NORMATIVE_VERIFY: PASS projection=docs/normative files=$($expectedFiles.Count) authority=NOT_AUTHORITY"
+    $retiredPaths = @(
+        'docs/normative',
+        'docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md',
+        'docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md'
+    )
+    foreach ($relativePath in $retiredPaths) {
+        $path = Join-Path $repoRoot $relativePath
+        if (Test-Path -LiteralPath $path) {
+            Fail "retired normative authority surface is present: $relativePath"
+        }
+    }
+
+    Write-Output "NORMATIVE_VERIFY: PASS pair=$expectedPairKey authority=main"
     exit 0
 }
 catch {
