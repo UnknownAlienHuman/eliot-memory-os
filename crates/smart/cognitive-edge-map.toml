@@ -1,0 +1,103 @@
+schema_version = 1
+map_id = "cognitive-contract-edges-2026-08-28"
+status = "ACTIVE_PROTOTYPE_EDGE_AUTHORITY"
+wave = "cognitive-micromodules-wave-01"
+rule = "Execution order and compile-time linkage are different. Functional cells exchange only owner-neutral versioned contracts; a consumer must not link the concrete algorithm that produced an already validated value."
+composition_owner = "runtime composition root outside Smart; Codex-owned daemon/runtime code wires concrete implementations"
+fixture_rule = "Every edge has producer, consumer, version/fence, omission/failure and replacement fixtures before workspace admission."
+
+[[edge]]
+producer = "eliot-cue-normalizer"
+contract = "eliot-cue-contracts::NormalizedCueSet"
+consumer = "eliot-cue-index, eliot-cue-activation"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-epistemic"
+contract = "eliot-epistemic-contracts::CurrentEpistemicPosition"
+consumer = "eliot-context-candidates, Dreamer handlers"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-context-candidates"
+contract = "eliot-context-contracts::ContextCandidateSet"
+consumer = "eliot-context-admission"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-context-admission"
+contract = "eliot-context-contracts::AdmittedContextSet"
+consumer = "eliot-context-assembly"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-context-assembly"
+contract = "eliot-context-contracts::ActiveUnderstandingView"
+consumer = "eliot-dreamer-bundle, Governor decision path"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-dreamer-bundle"
+contract = "eliot-dreamer-contracts::DreamInputBundle"
+consumer = "model-route adapter, eliot-dreamer-claim-grounding"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-dreamer-claim-grounding"
+contract = "eliot-dreamer-contracts::GroundedDreamDraft"
+consumer = "eliot-dreamer-candidate-validation"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-dreamer-candidate-validation"
+contract = "eliot-dreamer-contracts::ValidatedDreamDraft"
+consumer = "all Dreamer semantic handlers"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-dreamer-rival-model, eliot-dreamer-probe-plan"
+contract = "eliot-dreamer-contracts::RivalModelSet, ProbePlan"
+consumer = "eliot-dreamer-orientation"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-memory-curation-screen"
+contract = "eliot-memory-curation-contracts::CurationScreenResult"
+consumer = "eliot-dreamer-curation"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "all typed curation handlers"
+contract = "eliot-dreamer-contracts::TypedCurationHandlerResult"
+consumer = "eliot-dreamer-curation"
+compile_link = "contract_only"
+
+[[forbidden_compile_edge]]
+from = "eliot-cue-index"
+to = "eliot-cue-normalizer"
+reason = "index consumes NormalizedCueSet, not the normalization algorithm"
+
+[[forbidden_compile_edge]]
+from = "eliot-context-assembly"
+to = "eliot-context-admission"
+reason = "assembly consumes AdmittedContextSet, not the ranking algorithm"
+
+[[forbidden_compile_edge]]
+from = "eliot-context-candidates"
+to = "eliot-epistemic"
+reason = "candidate projection consumes CurrentEpistemicPosition from the contract crate"
+
+[[forbidden_compile_edge]]
+from = "Dreamer semantic handler"
+to = "eliot-dreamer-candidate-validation or eliot-dreamer-claim-grounding"
+reason = "handler consumes a grounded and validated draft; orchestration owns sequencing"
+
+[[forbidden_compile_edge]]
+from = "eliot-dreamer-curation"
+to = "concrete curation handler crates"
+reason = "runtime composition supplies typed outcomes/registry; facade must remain open to replacement and extension"
+
+[[forbidden_compile_edge]]
+from = "any Smart cognitive crate"
+to = "storage adapter, kernel/daemon implementation, provider SDK, scheduler or effect executor"
+reason = "Smart handlers are deterministic/stateless or rebuildable projections and have no operational authority"
