@@ -12,7 +12,16 @@ use eliot_contracts::sha256_hex;
 use eliot_platform_windows::ProtectedRuntimePathLease;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
-use crate::{GapRecoveryReason, SERVICE_NAME, SpoolError, WatchdogRuntimeBinding, current_unix_ms};
+use crate::{SERVICE_NAME, SpoolError, WatchdogRuntimeBinding, current_unix_ms};
+
+mod codec;
+
+pub use codec::{WatchdogSpoolEntry, WatchdogSpoolPayload};
+pub(crate) use codec::{WatchdogSpoolHeader, encode_entry, encode_high_water, validate_header};
+use codec::{
+    collect_entries, decode_header, decode_high_water, encode_header, read_high_water,
+    validate_high_water,
+};
 
 pub(crate) const SPOOL_SCHEMA_VERSION: u16 = 1;
 pub(crate) const SPOOL_HEADER_KEY: u64 = 0;
@@ -25,63 +34,6 @@ pub(crate) const SPOOL_TABLE: TableDefinition<u64, &[u8]> =
 pub(crate) const SPOOL_HIGH_WATER_KEY: u64 = 0;
 pub(crate) const SPOOL_HIGH_WATER_TABLE: TableDefinition<u64, &[u8]> =
     TableDefinition::new("eliot_watchdog_spool_high_water_v1");
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct WatchdogSpoolHeader {
-    pub(crate) schema_version: u16,
-    pub(crate) next_sequence: u64,
-    pub(crate) first_sequence: u64,
-    pub(crate) record_count: u64,
-    pub(crate) bytes: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct WatchdogSpoolHighWater {
-    pub(crate) schema_version: u16,
-    pub(crate) high_water_sequence: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(tag = "record_type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum WatchdogSpoolPayload {
-    Heartbeat {
-        service: String,
-        lease_id: String,
-        scope_ref: String,
-        kernel_epoch: u64,
-        watchdog_epoch: u64,
-        payload_digest: String,
-        envelope_digest: String,
-        signer_id: String,
-        key_id: String,
-        signature_algorithm: String,
-        signature: String,
-        public_key_fingerprint: String,
-        lease_revision: u64,
-    },
-    Gap {
-        service: String,
-        reason: GapRecoveryReason,
-        coverage_claimed: bool,
-    },
-    Recovery {
-        service: String,
-        reason: String,
-        corrupt_sequence: Option<u64>,
-        corrupt_digest: String,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct WatchdogSpoolEntry {
-    pub schema_version: u16,
-    pub sequence: u64,
-    pub observed_at_ms: u64,
-    pub payload: WatchdogSpoolPayload,
-}
 
 #[derive(Debug)]
 pub(crate) struct WatchdogSpool {
@@ -146,8 +98,7 @@ impl WatchdogSpool {
             .get(SPOOL_HEADER_KEY)
             .map_err(|error| SpoolError::Database(error.to_string()))?
             .ok_or_else(|| SpoolError::Corrupt("spool header is missing".to_owned()))?;
-        let header: WatchdogSpoolHeader = serde_json::from_slice(header.value())
-            .map_err(|error| SpoolError::Corrupt(format!("invalid spool header: {error}")))?;
+        let header = decode_header(header.value())?;
         let entries = collect_entries(&table)?;
         validate_header(&header, &entries)?;
         let high_water = read.open_table(SPOOL_HIGH_WATER_TABLE).map_err(|error| {
@@ -184,7 +135,7 @@ impl WatchdogSpool {
         let entries = collect_entries(&table);
         let parsed_header = header
             .as_ref()
-            .and_then(|value| serde_json::from_slice::<WatchdogSpoolHeader>(value.value()).ok());
+            .and_then(|value| decode_header(value.value()).ok());
         let high_water_table = match read.open_table(SPOOL_HIGH_WATER_TABLE) {
             Ok(table) => Some(table),
             Err(redb::TableError::TableDoesNotExist(_)) => None,
@@ -230,8 +181,7 @@ impl WatchdogSpool {
     }
 
     fn write_header(&self, header: &WatchdogSpoolHeader) -> Result<(), SpoolError> {
-        let bytes = serde_json::to_vec(header)
-            .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+        let bytes = encode_header(header)?;
         let high_water = header.next_sequence.saturating_sub(1);
         let high_water_bytes = encode_high_water(high_water)?;
         let write = self
@@ -309,8 +259,7 @@ impl WatchdogSpool {
             record_count: 1,
             bytes: bytes.len() as u64,
         };
-        let header_bytes = serde_json::to_vec(&header)
-            .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+        let header_bytes = encode_header(&header)?;
         {
             let mut table = write
                 .open_table(SPOOL_TABLE)
@@ -378,8 +327,7 @@ impl WatchdogSpool {
             .map_err(|error| SpoolError::Database(error.to_string()))?
             .map(|value| value.value().to_vec())
             .ok_or_else(|| SpoolError::Corrupt("spool header is missing".to_owned()))?;
-        let mut header: WatchdogSpoolHeader = serde_json::from_slice(&header_bytes)
-            .map_err(|error| SpoolError::Corrupt(format!("invalid spool header: {error}")))?;
+        let mut header = decode_header(&header_bytes)?;
         let entries = collect_entries(&table)?;
         validate_header(&header, &entries)?;
         let high_water = high_water_table
@@ -444,8 +392,7 @@ impl WatchdogSpool {
             .bytes
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| SpoolError::Corrupt("spool byte counter overflow".to_owned()))?;
-        let header_bytes = serde_json::to_vec(&header)
-            .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+        let header_bytes = encode_header(&header)?;
         table
             .insert(SPOOL_HEADER_KEY, header_bytes.as_slice())
             .map_err(|error| SpoolError::Database(error.to_string()))?;
@@ -463,138 +410,4 @@ impl WatchdogSpool {
 
 pub(crate) fn watchdog_spool_path(watchdog_state_root: &Path) -> PathBuf {
     watchdog_state_root.join(WATCHDOG_SPOOL_FILE_NAME)
-}
-
-pub(crate) fn encode_entry(entry: &WatchdogSpoolEntry) -> Result<Vec<u8>, SpoolError> {
-    let bytes =
-        serde_json::to_vec(entry).map_err(|error| SpoolError::Serialization(error.to_string()))?;
-    if bytes.len() > SPOOL_MAX_RECORD_BYTES {
-        return Err(SpoolError::Serialization(
-            "watchdog spool record exceeds the bounded frame size".to_owned(),
-        ));
-    }
-    Ok(bytes)
-}
-
-pub(crate) fn encode_high_water(sequence: u64) -> Result<Vec<u8>, SpoolError> {
-    serde_json::to_vec(&WatchdogSpoolHighWater {
-        schema_version: SPOOL_SCHEMA_VERSION,
-        high_water_sequence: sequence,
-    })
-    .map_err(|error| SpoolError::Serialization(error.to_string()))
-}
-
-pub(crate) fn decode_high_water(bytes: &[u8]) -> Result<u64, SpoolError> {
-    let high_water: WatchdogSpoolHighWater = serde_json::from_slice(bytes)
-        .map_err(|error| SpoolError::Corrupt(format!("invalid high-water metadata: {error}")))?;
-    if high_water.schema_version != SPOOL_SCHEMA_VERSION {
-        return Err(SpoolError::Corrupt(
-            "high-water metadata schema is unsupported".to_owned(),
-        ));
-    }
-    Ok(high_water.high_water_sequence)
-}
-
-pub(crate) fn read_high_water<T>(table: &T) -> Result<Option<u64>, SpoolError>
-where
-    T: ReadableTable<u64, &'static [u8]>,
-{
-    table
-        .get(SPOOL_HIGH_WATER_KEY)
-        .map_err(|error| SpoolError::Database(error.to_string()))?
-        .map(|value| decode_high_water(value.value()))
-        .transpose()
-}
-
-pub(crate) fn collect_entries<T>(table: &T) -> Result<Vec<WatchdogSpoolEntry>, SpoolError>
-where
-    T: ReadableTable<u64, &'static [u8]>,
-{
-    let mut entries = Vec::new();
-    for item in table
-        .iter()
-        .map_err(|error| SpoolError::Database(error.to_string()))?
-    {
-        let (key, value) = item.map_err(|error| SpoolError::Database(error.to_string()))?;
-        if key.value() == SPOOL_HEADER_KEY {
-            continue;
-        }
-        if value.value().len() > SPOOL_MAX_RECORD_BYTES {
-            return Err(SpoolError::Corrupt(format!(
-                "record {} exceeds the bounded frame size",
-                key.value()
-            )));
-        }
-        let entry: WatchdogSpoolEntry = serde_json::from_slice(value.value()).map_err(|error| {
-            SpoolError::Corrupt(format!("record {} is invalid: {error}", key.value()))
-        })?;
-        if entry.schema_version != SPOOL_SCHEMA_VERSION || entry.sequence != key.value() {
-            return Err(SpoolError::Corrupt(format!(
-                "record {} has an invalid schema or sequence",
-                key.value()
-            )));
-        }
-        entries.push(entry);
-    }
-    entries.sort_by_key(|entry| entry.sequence);
-    Ok(entries)
-}
-
-pub(crate) fn validate_header(
-    header: &WatchdogSpoolHeader,
-    entries: &[WatchdogSpoolEntry],
-) -> Result<(), SpoolError> {
-    if header.schema_version != SPOOL_SCHEMA_VERSION
-        || header.next_sequence == 0
-        || header.first_sequence == 0
-        || header.record_count != entries.len() as u64
-        || header.record_count > SPOOL_MAX_RECORDS
-        || header.bytes > SPOOL_MAX_BYTES
-        || entries
-            .iter()
-            .map(|entry| serde_json::to_vec(entry).map(|bytes| bytes.len() as u64))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| SpoolError::Serialization(error.to_string()))?
-            .into_iter()
-            .sum::<u64>()
-            != header.bytes
-    {
-        return Err(SpoolError::Corrupt(
-            "spool header counters or schema are inconsistent".to_owned(),
-        ));
-    }
-    let expected_first = entries
-        .first()
-        .map_or(header.next_sequence, |entry| entry.sequence);
-    if header.first_sequence != expected_first
-        || entries
-            .windows(2)
-            .any(|window| window[1].sequence <= window[0].sequence)
-        || entries
-            .last()
-            .is_some_and(|entry| entry.sequence >= header.next_sequence)
-    {
-        return Err(SpoolError::Corrupt(
-            "spool sequence ordering is inconsistent".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_high_water(
-    header: &WatchdogSpoolHeader,
-    entries: &[WatchdogSpoolEntry],
-    high_water: u64,
-) -> Result<(), SpoolError> {
-    let expected = header
-        .next_sequence
-        .checked_sub(1)
-        .ok_or_else(|| SpoolError::Corrupt("spool header next sequence is invalid".to_owned()))?;
-    let last = entries.last().map_or(0, |entry| entry.sequence);
-    if high_water != expected || high_water < last {
-        return Err(SpoolError::Corrupt(
-            "high-water metadata does not bind the spool sequence".to_owned(),
-        ));
-    }
-    Ok(())
 }
