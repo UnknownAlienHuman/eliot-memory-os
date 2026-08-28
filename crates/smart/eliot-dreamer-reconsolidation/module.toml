@@ -1,0 +1,46 @@
+schema_version = 2
+module_id = "smart.dreamer.reconsolidation"
+crate = "eliot-dreamer-reconsolidation"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 24
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.reconsolidation"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
+primary_responsibility = "Propose one forward revision to derived knowledge after reactivation plus new evidence/outcome, preserving the prior record, changed fields, support delta, scope, and invalidation conditions."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["DreamJobInput class=Curation", "ValidatedDreamDraft item kind=reconsolidation", "reactivated record plus new evidence/outcome handles"]
+outputs = ["ReconsolidationCandidate", "before/after semantic delta", "support/scope and dependent-review manifest"]
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+consumers = ["eliot-dreamer-curation"]
+non_goals = ["raw episode rewrite", "canonical status update", "automatic broad transfer", "retrieval reinforcement"]
+invariants = ["prior record remains immutable history", "new evidence changes only supported fields/scope", "retrieval/repetition is not support", "dependent views are named"]
+failure_behavior = "Return no-change or local-only candidate with reasons; never rewrite the active record in place."
+proof_surface = ["one-outcome local delta", "contradictory outcome", "retrieval-only non-reinforcement", "dependent invalidation"]
+replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.21-I12.22 and I12.24"
+disposition = "authoritative_contract"
+scope = "reconsolidation, practical weighting and learning delivery"
+
+[agent_task]
+objective = "Implement reconsolidation as a forward candidate delta, not a mutable memory update."
+write_scope = ["crates/smart/eliot-dreamer-reconsolidation/**"]
+deliverables = ["reconsolidation delta builder", "dependency-review manifest", "local-versus-transfer tests"]
+acceptance = ["old record remains reopenable", "support changes require evidence", "broad promotion is outside the handler"]
+forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
+stop_condition = "Stop if no new outcome/evidence exists or if the requested change belongs to canonical transition ownership."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
+workspace_admission = "forbidden until src/lib.rs, package proof in an isolated candidate workspace, affected edge proof, current-main rebase and integration-owner review"

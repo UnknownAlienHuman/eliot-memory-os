@@ -1,0 +1,51 @@
+schema_version = 2
+module_id = "smart.dreamer.procedure"
+crate = "eliot-dreamer-procedure"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 21
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.procedure"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
+primary_responsibility = "Propose one reusable procedure candidate with trigger, prerequisites, ordered actions, verifier, transfer boundary, stop/escalation, and negative cases."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["DreamJobInput class=Curation", "ValidatedDreamDraft item kind=procedure", "admitted successful/failed episode and verifier handles"]
+outputs = ["ProcedureCandidate", "applicability/transfer manifest", "SkillProjectionCandidate input"]
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+consumers = ["eliot-dreamer-curation", "Skill projection owner"]
+non_goals = ["Skill installation", "tool execution", "policy/authority creation", "procedure promotion from one lucky outcome"]
+invariants = ["procedure is grounded in outcome-linked evidence", "verifier and stop condition are mandatory", "failed/negative cases remain attached", "transfer requires revalidation"]
+failure_behavior = "Return an exploratory procedure candidate with a low proof ceiling or no candidate; never publish instructions lacking applicability and verifier."
+proof_surface = ["single-success overgeneralization", "missing verifier", "failed transfer", "unsafe instruction and stop-path cases"]
+replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-memory-curation/src/lib.rs"
+disposition = "reuse_protection_only"
+scope = "unsafe-instruction/protected-evidence signals"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I7.12-I7.13, I7.25 and I12.21"
+disposition = "authoritative_contract"
+scope = "Skill/procedure evidence and lifecycle boundaries"
+
+[agent_task]
+objective = "Implement evidence-grounded procedure synthesis while leaving Skill packaging and promotion to their owners."
+write_scope = ["crates/smart/eliot-dreamer-procedure/**"]
+deliverables = ["procedure candidate builder", "applicability/transfer report", "negative and unsafe-case tests"]
+acceptance = ["no executable effect", "procedure source/outcome lineage is complete", "one success cannot establish transfer"]
+forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
+stop_condition = "Stop if no outcome-linked support or verifier exists; preserve a hypothesis instead of a procedure."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
+workspace_admission = "forbidden until src/lib.rs, package proof in an isolated candidate workspace, affected edge proof, current-main rebase and integration-owner review"

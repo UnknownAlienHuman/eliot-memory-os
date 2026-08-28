@@ -19,7 +19,7 @@ rationale = "Good deterministic base; rewrite path normalization to preserve can
 [[donor]]
 path = "crates/smart/eliot-dreamer-core"
 disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
-targets = ["eliot-dreamer-contracts", "eliot-dreamer-bundle", "eliot-dreamer-candidate-validation", "eliot-dreamer-orientation", "eliot-dreamer-clarification", "eliot-dreamer-curation"]
+targets = ["eliot-dreamer-contracts", "eliot-dreamer-bundle", "eliot-dreamer-candidate-validation", "eliot-dreamer-orientation", "eliot-dreamer-clarification", "eliot-dreamer-classification", "eliot-dreamer-relation", "eliot-dreamer-episode", "eliot-dreamer-concept", "eliot-dreamer-procedure", "eliot-dreamer-failure", "eliot-dreamer-structure-repair", "eliot-dreamer-reconsolidation", "eliot-dreamer-accessibility", "eliot-dreamer-memory-repair", "eliot-dreamer-curation"]
 rationale = "Good candidate-only invariant and validation core; outdated job surface and too many responsibilities in one generator."
 
 [[donor]]
@@ -31,7 +31,7 @@ rationale = "Already one coherent stateless resolver; add missing assumption, ve
 [[donor]]
 path = "crates/smart/eliot-memory-curation"
 disposition = "PARTIAL_REUSE"
-targets = ["eliot-memory-curation-screen", "eliot-dreamer-curation"]
+targets = ["eliot-memory-curation-screen", "eliot-dreamer-structure-repair", "eliot-dreamer-accessibility", "eliot-dreamer-curation"]
 rationale = "Keep bounded read-only screen/protection logic; remove duplicate domain enums and never carry lifecycle/action ownership."
 
 [[donor]]

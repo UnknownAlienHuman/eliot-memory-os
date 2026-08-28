@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Model-assisted curation handler producing reversible CurationCandidateSet only"
+description = "Typed curation dispatch and aggregation facade over independently testable handlers"
 
 [lib]
 path = "src/lib.rs"
@@ -18,10 +18,20 @@ functional_cell = "smart.dreamer.curation"
 source_layer = "C1"
 runtime_layer = "R6"
 runtime_bundle = "eliot-dreamer"
-agent_order = 17
+agent_order = 27
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
 eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
 eliot-dreamer-candidate-validation = { path = "../eliot-dreamer-candidate-validation" }
 eliot-memory-curation-screen = { path = "../eliot-memory-curation-screen" }
+eliot-dreamer-classification = { path = "../eliot-dreamer-classification" }
+eliot-dreamer-relation = { path = "../eliot-dreamer-relation" }
+eliot-dreamer-episode = { path = "../eliot-dreamer-episode" }
+eliot-dreamer-concept = { path = "../eliot-dreamer-concept" }
+eliot-dreamer-procedure = { path = "../eliot-dreamer-procedure" }
+eliot-dreamer-failure = { path = "../eliot-dreamer-failure" }
+eliot-dreamer-structure-repair = { path = "../eliot-dreamer-structure-repair" }
+eliot-dreamer-reconsolidation = { path = "../eliot-dreamer-reconsolidation" }
+eliot-dreamer-accessibility = { path = "../eliot-dreamer-accessibility" }
+eliot-dreamer-memory-repair = { path = "../eliot-dreamer-memory-repair" }

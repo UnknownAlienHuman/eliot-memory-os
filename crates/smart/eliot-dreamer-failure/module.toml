@@ -1,0 +1,51 @@
+schema_version = 2
+module_id = "smart.dreamer.failure"
+crate = "eliot-dreamer-failure"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 22
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.failure"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
+primary_responsibility = "Propose one scoped FailureFingerprint/negative-memory candidate from reproducible failure evidence, failed path, violated invariant, reopen condition, and extinction condition."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["DreamJobInput class=Curation", "ValidatedDreamDraft item kind=failure", "Failure Capsule, attempt, verifier and outcome handles"]
+outputs = ["FailureCandidate", "exact trigger/signature proposal", "reopen/extinction conditions"]
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+consumers = ["eliot-dreamer-curation", "negative-memory projection owner"]
+non_goals = ["hard block creation", "similarity-based prohibition", "Problem closure", "retry scheduling"]
+invariants = ["exact deterministic trigger is distinct from semantic similarity", "failed path and observed outcome are both anchored", "reopen/extinction are mandatory", "one failure remains scoped"]
+failure_behavior = "Return a warning-level or incomplete candidate; never create a blocking trigger from semantic resemblance or model confidence."
+proof_surface = ["exact versus similar signature", "missing outcome", "changed-environment reopen", "false-positive extinction case"]
+replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-memory/src/lib.rs"
+disposition = "extract_pure_only"
+scope = "failure record/cue ideas, not state"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.19, I14.4 and I17"
+disposition = "authoritative_contract"
+scope = "negative memory and Failure Capsule grounding"
+
+[agent_task]
+objective = "Implement failure-memory synthesis without granting block or retry authority."
+write_scope = ["crates/smart/eliot-dreamer-failure/**"]
+deliverables = ["FailureFingerprint candidate builder", "trigger/reopen/extinction model", "false-positive and transfer tests"]
+acceptance = ["candidate-only output", "exact trigger proof is explicit", "semantic match never becomes a hard block"]
+forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
+stop_condition = "Stop if the proposed fingerprint cannot distinguish the old failed path from a safe nearby case."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
+workspace_admission = "forbidden until src/lib.rs, package proof in an isolated candidate workspace, affected edge proof, current-main rebase and integration-owner review"

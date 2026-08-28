@@ -1,0 +1,46 @@
+schema_version = 2
+module_id = "smart.dreamer.concept"
+crate = "eliot-dreamer-concept"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 20
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.concept"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
+primary_responsibility = "Propose one concept or concept-boundary refinement from admitted examples, counterexamples, relations, and transfer limits."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["DreamJobInput class=Curation", "ValidatedDreamDraft item kind=concept", "admitted examples/counterexamples and concept registry handles"]
+outputs = ["ConceptCandidate", "boundary and counterexample manifest", "transfer/revalidation conditions"]
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+consumers = ["eliot-dreamer-curation"]
+non_goals = ["ontology migration", "automatic merge of concepts", "truth promotion", "similarity-only concept creation"]
+invariants = ["examples and counterexamples are both retained", "scope/transfer boundary is explicit", "concept label does not create entity identity", "minority examples cannot be removed for neatness"]
+failure_behavior = "Return a provisional/ambiguous concept candidate or no candidate; never generalize beyond the admitted examples silently."
+proof_surface = ["counterexample preservation", "near-duplicate concepts", "scope transfer failure", "label-versus-identity negative case"]
+replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.4, I12.11 and I12.28"
+disposition = "authoritative_contract"
+scope = "concept records, pyramid and concept build artifacts"
+
+[agent_task]
+objective = "Implement concept formation as one falsifiable candidate transformation."
+write_scope = ["crates/smart/eliot-dreamer-concept/**"]
+deliverables = ["concept candidate builder", "boundary/transfer manifest", "counterexample and false-merge tests"]
+acceptance = ["source examples remain reopenable", "transfer is candidate-only", "no ontology write or migration"]
+forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
+stop_condition = "Stop if the change requires global ontology/schema authority; emit a bounded architecture/contract candidate instead."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
+workspace_admission = "forbidden until src/lib.rs, package proof in an isolated candidate workspace, affected edge proof, current-main rebase and integration-owner review"

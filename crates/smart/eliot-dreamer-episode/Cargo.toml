@@ -1,11 +1,11 @@
 [package]
-name = "eliot-memory-curation-screen"
+name = "eliot-dreamer-episode"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Deterministic read-only screening of a fenced memory snapshot for bounded curation work"
+description = "Evidence-anchored episode reconstruction candidate handler"
 
 [lib]
 path = "src/lib.rs"
@@ -14,12 +14,14 @@ path = "src/lib.rs"
 prototype = true
 source_status = "NOT_IMPLEMENTED"
 workspace_admission = "pending_agent_implementation_and_proof"
-functional_cell = "smart.memory.curation_screen"
+functional_cell = "smart.dreamer.episode"
 source_layer = "C1"
 runtime_layer = "R6"
 runtime_bundle = "eliot-dreamer"
-agent_order = 15
+agent_order = 19
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
 eliot-evidence = { path = "../../foundation/eliot-evidence" }
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
+eliot-dreamer-candidate-validation = { path = "../eliot-dreamer-candidate-validation" }

@@ -3,7 +3,7 @@ module_id = "smart.dreamer.curation"
 crate = "eliot-dreamer-curation"
 status = "PROTOTYPE"
 wave = "cognitive-micromodules-wave-01"
-agent_order = 17
+agent_order = 27
 plane = "Smart"
 runtime_layer = "R6"
 delivery_depth = "D3a"
@@ -14,43 +14,38 @@ hot_path = false
 lifecycle_owner = "smart.dreamer.curation"
 loc_soft_ceiling = 10000
 loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
-primary_responsibility = "Convert a validated Curation draft and optional deterministic screen into lineage-preserving classification/relation/episode/concept/procedure/failure/merge/split/reconsolidation/accessibility/repair candidates."
+primary_responsibility = "Dispatch validated curation items to exactly one declared handler and assemble a lineage-preserving CurationCandidateSet without semantic recomputation."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["DreamJobInput class=Curation", "DreamInputBundle", "ValidatedDreamDraft", "optional CurationScreenResult"]
-outputs = ["CurationCandidateSet", "per-candidate preservation report", "coverage/uncertainty/rollback manifest"]
-depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation", "eliot-memory-curation-screen"]
+inputs = ["DreamJobInput class=Curation", "DreamInputBundle", "ValidatedDreamDraft", "optional CurationScreenResult", "typed handler registry"]
+outputs = ["CurationCandidateSet", "per-item handler/coverage disposition", "batch atomicity and preservation manifest"]
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation", "eliot-memory-curation-screen", "eliot-dreamer-classification", "eliot-dreamer-relation", "eliot-dreamer-episode", "eliot-dreamer-concept", "eliot-dreamer-procedure", "eliot-dreamer-failure", "eliot-dreamer-structure-repair", "eliot-dreamer-reconsolidation", "eliot-dreamer-accessibility", "eliot-dreamer-memory-repair"]
 consumers = ["Governor candidate disposition path", "maintenance review"]
-non_goals = ["canonical write", "lifecycle/support/influence transition", "automatic merge/split", "background scheduling"]
-invariants = ["original records remain intact", "every semantic transformation retains source/counterevidence/uncertainty", "merge/split/repair has verifier or replay plus rollback", "candidate type never grants promotion authority"]
-failure_behavior = "Reject the affected candidate or whole batch according to atomicity profile; retain sources and emit exact preservation failures."
-proof_surface = ["false merge and minority-loss cases", "procedure without applicability/verifier", "rollback-required transformations", "screen/model disagreement preservation"]
+non_goals = ["semantic transformation logic", "canonical write", "lifecycle/support/influence transition", "background scheduling"]
+invariants = ["each item has exactly one semantic handler or explicit unsupported disposition", "facade does not repair or reinterpret child output", "partial results preserve item identity and dissent", "batch atomicity is explicit"]
+failure_behavior = "Reject or retain individual handler results according to the declared atomicity profile; never synthesize a fallback candidate in the facade."
+proof_surface = ["handler routing completeness", "unsupported kind", "child disagreement and partial failure", "no semantic recomputation golden tests"]
 replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
 split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
 
 [[donor]]
 path = "crates/smart/eliot-dreamer-core/src/lib.rs"
-disposition = "extract_and_expand"
-scope = "candidate generation and preservation report"
-
-[[donor]]
-path = "crates/smart/eliot-memory-curation/src/lib.rs"
-disposition = "reuse_screen_evidence_only"
-scope = "protected/candidate finding patterns, not state or duplicate enums"
+disposition = "reuse_facade_shape_only"
+scope = "packet/candidate assembly, not subtype semantics"
 
 [[donor]]
 path = "ELIOT_IMPLEMENTATION I9.3 and I9.6-I9.8"
 disposition = "authoritative_contract"
-scope = "curation job, candidate kinds and transformation validation"
+scope = "CurationCandidateSet and validation boundary"
 
 [agent_task]
-objective = "Implement one candidate-only curation handler after the Orientation pulse passes."
+objective = "Implement the thin curation facade only after all active subtype handlers and the Orientation Product Pulse pass."
 write_scope = ["crates/smart/eliot-dreamer-curation/**"]
-deliverables = ["typed handler for all current curation candidate kinds", "preservation/rollback manifest", "adversarial transformation tests"]
-acceptance = ["no canonical or lifecycle effect", "every candidate is independently rejectable and traceable", "screen disagreement is visible rather than overwritten"]
+deliverables = ["typed dispatch table", "candidate-set assembler", "routing/partial-failure/atomicity tests"]
+acceptance = ["facade contains no subtype semantics", "every item disposition is visible", "no canonical or lifecycle effect"]
 forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
-stop_condition = "Stop if Orientation Product Pulse is not green or if a candidate lacks reversible lineage; do not compensate by adding more handler crates."
+stop_condition = "Stop if a missing subtype tempts generic prose-to-candidate fallback; leave it unsupported or assign a new function-bounded handler."
 integration_owner = "cognitive-wave-01-integrator"
 implementation_language = "Rust 2024"
 required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
-workspace_admission = "forbidden until src/lib.rs, package proof, affected edge proof, current-main rebase and integration-owner review"
+workspace_admission = "forbidden until src/lib.rs, package proof in an isolated candidate workspace, affected edge proof, current-main rebase and integration-owner review"
