@@ -1,13 +1,19 @@
 use crate::StoreError;
 use eliot_types::{
-    AdapterCircuitState, ControlWalConfig, MemoryRevision, MemoryWriteEnvelope,
-    OperationRestartWindow, OperationRuntimeCheckpoint, ProjectId, ProjectRevisionSummary,
-    ProjectSequence, SCHEMA_VERSION, SealStagingCheckpoint, WriteId, WriteReceipt,
-    WriteRejectReason, WriteStatus,
+    AdapterCircuitState, ControlWalConfig, MemoryWriteEnvelope, OperationRestartWindow,
+    OperationRuntimeCheckpoint, ProjectRevisionSummary, SCHEMA_VERSION, SealStagingCheckpoint,
+    WriteId, WriteReceipt, WriteRejectReason, WriteStatus,
 };
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+#[path = "control_wal_records.rs"]
+mod control_wal_records;
+
+pub use control_wal_records::{
+    WalDeadLetter, WalFailedWrite, WalPendingWrite, WalProjectHead, WalWriteState,
+};
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("control_wal_meta");
 const PENDING_WRITES: TableDefinition<&str, &str> = TableDefinition::new("pending_writes");
@@ -666,46 +672,6 @@ impl ControlWal {
         }
         Ok(count)
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WalPendingWrite {
-    pub envelope: MemoryWriteEnvelope,
-    pub status: WriteStatus,
-    pub attempts: u32,
-    pub last_error: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WalFailedWrite {
-    pub write_id: WriteId,
-    pub status: WriteStatus,
-    pub pending: Option<WalPendingWrite>,
-    pub receipt: Option<WriteReceipt>,
-    pub error: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WalDeadLetter {
-    pub write_id: WriteId,
-    pub pending: Option<WalPendingWrite>,
-    pub reason: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WalProjectHead {
-    pub project_id: ProjectId,
-    pub memory_revision: MemoryRevision,
-    pub project_sequence: ProjectSequence,
-    pub last_write_id: WriteId,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum WalWriteState {
-    Pending(Box<WalPendingWrite>),
-    Committed(Box<WriteReceipt>),
-    Failed(Box<WalFailedWrite>),
-    DeadLetter(Box<WalDeadLetter>),
 }
 
 fn encode<T>(value: &T) -> Result<String, StoreError>
