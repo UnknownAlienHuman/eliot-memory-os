@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod model;
+mod reservation_model;
 mod status;
 mod status_projection;
 mod store;
@@ -16,6 +17,10 @@ mod store;
 pub mod test_support;
 
 pub use model::*;
+pub use reservation_model::{
+    ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
+    ScopeReservationRequest, WriterReservationToken,
+};
 pub use status::{
     observe_supervision_status, open_existing_read_only, read_current_supervision_lease_read_only,
 };

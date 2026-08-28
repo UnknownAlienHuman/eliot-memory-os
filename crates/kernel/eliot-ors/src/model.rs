@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, canonical_json_bytes};
 use eliot_platform::{PlatformHandle, SecretReference};
 use eliot_receipts::ReceiptEnvelope;
@@ -17,6 +15,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::reservation_model::ReservationRecord;
 use crate::{CONTRACT_VERSION, MAX_RECOVERY_PAGE};
 
 /// A validated opaque label that carries no semantic authority.
@@ -1518,109 +1517,9 @@ impl ExpectedOrderingHead {
     }
 }
 
-/// One requested scope and the canonical head it must extend.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ScopeReservationRequest {
-    pub scope: OrderingScope,
-    pub expected_head: ExpectedOrderingHead,
-}
-
-/// Atomic reservation request. All scopes are reserved or none are.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReservationRequest {
-    pub reservation_id: OperationIdentity,
-    pub envelope: RecoveryPayloadEnvelope,
-    pub writer_epoch: EpochLineage,
-    pub scopes: Vec<ScopeReservationRequest>,
-    pub prepared_transition_sha256: String,
-    pub expires_at_ms: i64,
-    pub recovery_owner: RecoveryOwner,
-}
-
-impl ReservationRequest {
-    pub(crate) fn validate(&self) -> Result<(), OrsError> {
-        self.envelope.validate()?;
-        self.writer_epoch.validate()?;
-        validate_digest(
-            &self.prepared_transition_sha256,
-            "prepared_transition_sha256",
-        )?;
-        if self.writer_epoch.current != self.envelope.authority_epoch.current {
-            return Err(OrsError::EpochMismatch);
-        }
-        if self.scopes.is_empty() {
-            return Err(OrsError::EmptyScopeSet);
-        }
-        if self.scopes.len() > usize::from(MAX_RECOVERY_PAGE) {
-            return Err(OrsError::InvalidCursorLimit);
-        }
-        let mut seen = BTreeSet::new();
-        for scope in &self.scopes {
-            scope.expected_head.validate()?;
-            if !seen.insert(scope.scope.clone()) {
-                return Err(OrsError::DuplicateScope);
-            }
-        }
-        if self.expires_at_ms <= self.envelope.created_at_ms {
-            return Err(OrsError::InvalidExpiry);
-        }
-        Ok(())
-    }
-}
-
-/// One scope sequence allocated by the coordinator.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReservedScope {
-    pub scope: OrderingScope,
-    pub reserved_sequence: u64,
-    pub expected_head: ExpectedOrderingHead,
-}
-
-/// Immutable token checked throughout the writer lifecycle.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WriterReservationToken {
-    pub reservation_id: OperationIdentity,
-    pub operation_id: OperationIdentity,
-    pub writer_epoch: EpochLineage,
-    pub state_fence: StateFenceSnapshot,
-    pub reservation_order: u64,
-    pub scopes: Vec<ReservedScope>,
-    pub prepared_transition_sha256: String,
-    pub expires_at_ms: i64,
-    pub recovery_owner: RecoveryOwner,
-}
-
-/// Durable reservation lifecycle. Terminal states never become executable again.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ReservationState {
-    Reserved,
-    Eligible,
-    Executing,
-    Reconciling,
-    Finalized,
-    Released,
-}
-
-impl ReservationState {
-    pub(crate) const fn is_terminal(self) -> bool {
-        matches!(self, Self::Finalized | Self::Released)
-    }
-}
-
-/// Durable reservation record recovered after restart.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReservationRecord {
-    pub token: WriterReservationToken,
-    pub state: ReservationState,
-    pub unknown_reason: Option<OpaqueLabel>,
-    pub terminal_receipt_id: Option<OpaqueLabel>,
-}
+// Mechanical split: reservation data-contracts moved to `reservation_model.rs`
+// (`model.rs:1524-1627`, parent `07a391d`). Data contracts only; no canonical
+// authority or recovery logic — see `reservation_model.rs` header.
 
 /// Bounded restart-recovery cursor. `after_order` is exclusive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
