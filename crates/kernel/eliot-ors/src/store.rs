@@ -10,12 +10,18 @@ use eliot_runtime_contracts::{
     SignedSupervisionLease, VerifiedSupervisionLease, VerifiedSupervisionLeaseTerminalTransition,
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 #[path = "persistence_codec.rs"]
 mod persistence_codec;
 use persistence_codec::{decode, decode_named, encode};
+
+#[path = "store/persistence_models.rs"]
+mod persistence_models;
+use persistence_models::{
+    DurableInboxRecord, DurableOperationalRecord, DurableSupervisionLeaseResult, OperationalKind,
+    ScopeReservationHead,
+};
 
 mod recovery_projection;
 
@@ -96,15 +102,6 @@ fn current_unix_ms_u64() -> Result<u64, OrsError> {
         .map_err(|_| OrsError::Storage("system clock is before Unix epoch".to_owned()))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct ScopeReservationHead {
-    writer_epoch: EpochIdentity,
-    canonical_head: crate::ExpectedOrderingHead,
-    last_reserved_sequence: u64,
-    last_terminal_sequence: u64,
-    recovery_blocked: bool,
-}
-
 /// Composition-injected canonical/readback authenticator. `Ok(())` is trusted only because
 /// composition owns this provider; caller-created receipts never bypass it.
 pub trait CanonicalEvidenceProvider: Send + Sync {
@@ -157,79 +154,6 @@ impl CanonicalEvidenceProvider for RejectUnboundEvidence {
             "recovery inbox signer provider is not bound".to_owned(),
         ))
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum OperationalKind {
-    Operation,
-    Retry,
-    JobCheckpoint,
-    DeliveryCursor,
-    AdmissionReservation,
-    GenerationTransition,
-    GenerationCutover,
-    SessionBinding,
-    UserBroker,
-    AuthoritySnapshot,
-    AuthorityRevocation,
-    CapabilityGrant,
-    CapabilityIntroduction,
-}
-
-impl OperationalKind {
-    const fn key_prefix(self) -> &'static str {
-        match self {
-            Self::Operation => "operation",
-            Self::Retry => "retry",
-            Self::JobCheckpoint => "job_checkpoint",
-            Self::DeliveryCursor => "delivery_cursor",
-            Self::AdmissionReservation => "admission_reservation",
-            Self::GenerationTransition => "generation_transition",
-            Self::GenerationCutover => "generation_cutover",
-            Self::SessionBinding => "session_binding",
-            Self::UserBroker => "user_broker",
-            Self::AuthoritySnapshot => "authority_snapshot",
-            Self::AuthorityRevocation => "authority_revocation",
-            Self::CapabilityGrant => "capability_grant",
-            Self::CapabilityIntroduction => "capability_introduction",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DurableOperationalRecord {
-    kind: OperationalKind,
-    input: OperationalRecordInput,
-    phase: OperationalPhase,
-    operation_order: u64,
-    terminal_receipt_id: Option<OpaqueLabel>,
-    terminal_receipt_sha256: Option<String>,
-    /// Typed generation evidence is carried by the same canonical
-    /// operational current/history records as every other ORS subject.
-    /// `default` keeps older canonical records readable without granting the
-    /// retired generation tables any authority.
-    #[serde(default)]
-    generation_cutover: Option<RuntimeGenerationCutoverRecord>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DurableInboxRecord {
-    item: RecoveryInboxItem,
-    disposition: RecoveryInboxDisposition,
-    operation_order: u64,
-    terminal_receipt_id: Option<OpaqueLabel>,
-    terminal_receipt_sha256: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DurableSupervisionLeaseResult {
-    ticket: SupervisionLeaseCommitTicket,
-    artifact: SignedSupervisionLease,
-    snapshot: SupervisionLeaseSnapshot,
 }
 
 /// Durable operational store boundary. Implementations must preserve atomic method semantics.
@@ -2852,7 +2776,7 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
-    pub(crate) fn next_operational_order(write: &redb::WriteTransaction) -> Result<u64, OrsError> {
+    pub(super) fn next_operational_order(write: &redb::WriteTransaction) -> Result<u64, OrsError> {
         let mut meta = write.open_table(META).map_err(storage)?;
         let prior = meta
             .get(NEXT_GLOBAL_ORDER)
