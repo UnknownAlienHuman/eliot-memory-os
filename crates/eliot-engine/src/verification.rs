@@ -14,13 +14,14 @@ use time::OffsetDateTime;
 mod test_cost;
 pub use test_cost::TestCostService;
 
+mod report_clusters;
+pub use report_clusters::{FlakeDetectionService, StatefulDbTestIsolationService};
+
 pub struct TestInventoryService;
 pub struct VerificationProfileService;
 pub struct VerificationPlannerService;
 pub struct VerificationRunnerService;
 pub struct VerificationVerdictService;
-pub struct FlakeDetectionService;
-pub struct StatefulDbTestIsolationService;
 pub struct VerificationDoctorIntegration;
 
 impl TestInventoryService {
@@ -219,57 +220,6 @@ impl VerificationVerdictService {
             warnings,
             required_followups,
             created_at: OffsetDateTime::now_utc(),
-        }
-    }
-}
-
-impl FlakeDetectionService {
-    #[must_use]
-    pub fn report(&self, profile_id: &str, repeat: u64, inventory: &TestInventory) -> FlakeReport {
-        let stable_tests = inventory
-            .tests
-            .iter()
-            .filter(|test| test.required_profiles.iter().any(|id| id == profile_id))
-            .map(|test| test.test_id.clone())
-            .collect::<Vec<_>>();
-        FlakeReport {
-            report_id: new_id("flake"),
-            generated_at: OffsetDateTime::now_utc(),
-            repeated_profile: profile_id.to_owned(),
-            repeated_runs: repeat,
-            stable_tests,
-            flaky_tests: Vec::new(),
-            blocked_tests: Vec::new(),
-            skipped_reason: if repeat < 2 {
-                Some("repeat count below flake-detection threshold".to_owned())
-            } else {
-                None
-            },
-        }
-    }
-}
-
-impl StatefulDbTestIsolationService {
-    #[must_use]
-    pub fn report(&self, inventory: &TestInventory) -> StatefulDbIsolationReport {
-        let shared_db_tests = inventory
-            .tests
-            .iter()
-            .filter(|test| test.statefulness == TestStatefulness::LocalDbSharedSerial)
-            .map(|test| test.test_id.clone())
-            .collect::<Vec<_>>();
-        StatefulDbIsolationReport {
-            report_id: new_id("db-isolation"),
-            generated_at: OffsetDateTime::now_utc(),
-            serial_required: !shared_db_tests.is_empty(),
-            isolated_fixture_roots: vec![
-                "target/test-*".to_owned(),
-                ".eliot-governor/test-roots".to_owned(),
-            ],
-            shared_db_tests,
-            stale_locks_before: Vec::new(),
-            stale_locks_after: Vec::new(),
-            status: "serial_stateful_tests_documented".to_owned(),
         }
     }
 }
