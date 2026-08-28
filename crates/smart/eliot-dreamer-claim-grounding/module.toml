@@ -1,0 +1,51 @@
+schema_version = 2
+module_id = "smart.dreamer.claim_grounding"
+crate = "eliot-dreamer-claim-grounding"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 14
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.claim_grounding"
+loc_soft_ceiling = 10000
+primary_responsibility = "Bind every decision-bearing claim in a bounded model draft to exact authorized references and emit a claim-level support/conflict/unknown ledger."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["DreamInputBundle", "ReferenceManifest", "ModelDraft"]
+outputs = ["GroundedDreamDraft", "ClaimGroundingLedger", "unsupported/conflicted claim dispositions"]
+depends_on = ["eliot-dreamer-contracts"]
+consumers = ["eliot-dreamer-candidate-validation"]
+non_goals = ["retrieve or grade sources", "resolve truth", "rewrite claims to sound supported", "call a model"]
+invariants = ["aggregate packet lineage never substitutes for claim lineage", "only handles authorized by the bundle may bind", "unsupported and conflicted claims remain visible", "grounding does not promote epistemic status"]
+failure_behavior = "Reject unauthorized references; retain unsupported/conflicted claims as explicit non-assertable entries rather than silently dropping or polishing them."
+proof_surface = ["per-claim coverage", "unauthorized and stale handle fixtures", "conflicting evidence", "claim-order permutation invariance"]
+replacement_boundary = "pure claim-to-reference binding algorithm behind GroundedDreamDraft"
+split_trigger = "source admissibility or evidence grading appears; those belong to the source/evidence owner"
+rust_contract_dependencies = ["eliot-dreamer-contracts"]
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-core/src/lib.rs"
+disposition = "extract_and_harden"
+scope = "source_handles/counterevidence validation and preservation report; replace aggregate-only coverage with claim-level bindings"
+
+[[donor]]
+path = "ELIOT Architecture/Implementation English edition 2026-08-28"
+disposition = "authoritative_contract"
+scope = "grounding, provenance, evidence preservation and candidate-only authority ceiling"
+
+[agent_task]
+objective = "Implement deterministic claim-level grounding before any Dreamer semantic handler can consume a draft."
+write_scope = ["crates/smart/eliot-dreamer-claim-grounding/**"]
+deliverables = ["claim/reference binder", "grounding ledger", "unsupported/conflict/adversarial tests"]
+acceptance = ["every assertable claim has exact authorized handles", "no source fetch or truth decision", "unsupported material remains typed and visible"]
+forbidden = ["canonical writes", "provider/model SDKs", "source acquisition", "evidence grading", "semantic candidate generation", "model self-verification"]
+stop_condition = "Stop if the draft has no claim-addressable representation; require a contract/schema correction rather than grounding whole prose by association."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package proof", "bundle/validator edge fixtures", "Orientation Product Pulse"]
+workspace_admission = "forbidden until src/lib.rs, package proof and Orientation Product Pulse pass"
