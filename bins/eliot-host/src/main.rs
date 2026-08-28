@@ -1,3 +1,5 @@
+mod host_console_protocol;
+
 use std::io::{self, BufRead, Write};
 use std::sync::OnceLock;
 
@@ -7,34 +9,9 @@ use eliot_host::{
     HostComposition, HostError, HostLaunchOptions, HostPhaseBRequestQueue, PROTOCOL_VERSION,
     SERVICE_NAME,
 };
-use serde::{Deserialize, Serialize};
+use host_console_protocol::{Request, Response, write_response};
 
 static PROCESS_BOOTSTRAP: OnceLock<Result<HostLaunchOptions, String>> = OnceLock::new();
-
-#[derive(Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-enum Request {
-    Status,
-    Stop,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum Response {
-    Ready {
-        service: &'static str,
-        protocol: &'static str,
-    },
-    State {
-        running: bool,
-        active_process: bool,
-        managed_dependencies: usize,
-    },
-    Stopped,
-    Error {
-        error: String,
-    },
-}
 
 fn main() {
     let _ = PROCESS_BOOTSTRAP.set(parse_process_bootstrap(std::env::args_os().skip(1)));
@@ -172,14 +149,6 @@ fn finish_console_shutdown(host: &mut HostComposition, cause: &str) -> bool {
             false
         }
     }
-}
-
-fn write_response(response: &Response) -> bool {
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-    serde_json::to_writer(&mut output, response).is_ok()
-        && output.write_all(b"\n").is_ok()
-        && output.flush().is_ok()
 }
 
 #[cfg(windows)]
