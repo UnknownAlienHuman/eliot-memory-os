@@ -4,90 +4,17 @@
 //! parse shell output or infer ownership from endpoint liveness. Only the
 //! exact IPv4/IPv6 loopback socket requested by the caller is admitted.
 
-use std::fmt;
+#[path = "tcp_listener_owner_models.rs"]
+mod tcp_listener_owner_models;
+
+#[cfg(windows)]
+use tcp_listener_owner_models::OwnerTable;
+pub use tcp_listener_owner_models::{TcpListenerOwnerError, TcpListenerOwnerObservation};
+
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// Hard upper bound for one IP Helper listener table allocation.
 const MAX_TCP_TABLE_BYTES: usize = 1024 * 1024;
-
-#[cfg(windows)]
-struct OwnerTable {
-    words: Vec<usize>,
-    byte_len: usize,
-}
-
-/// Exact OS observation for one loopback TCP listener.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TcpListenerOwnerObservation {
-    endpoint: SocketAddr,
-    process_id: u32,
-}
-
-impl TcpListenerOwnerObservation {
-    /// Returns the exact loopback endpoint used for the owner query.
-    #[must_use]
-    pub const fn endpoint(&self) -> SocketAddr {
-        self.endpoint
-    }
-
-    /// Returns the unique owning process identifier reported by Windows.
-    #[must_use]
-    pub const fn process_id(&self) -> u32 {
-        self.process_id
-    }
-}
-
-/// Failure to prove a unique owner for one exact loopback listener.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TcpListenerOwnerError {
-    /// The requested endpoint was not exact IPv4/IPv6 localhost with a port.
-    InvalidEndpoint,
-    /// No exact listener row existed.
-    Missing,
-    /// More than one exact listener row existed, even when PIDs were equal.
-    Ambiguous,
-    /// Windows denied the ownership observation.
-    AccessDenied,
-    /// The table size changed between the sizing and retrieval calls.
-    SizeRace,
-    /// The required allocation exceeded the explicit bound.
-    BufferLimitExceeded,
-    /// The returned table length, row count, port, or PID was malformed.
-    MalformedTable,
-    /// The API or address family is unsupported.
-    UnsupportedPlatform,
-    /// Another Win32 status prevented a trustworthy classification.
-    Windows { code: u32 },
-}
-
-impl fmt::Display for TcpListenerOwnerError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidEndpoint => {
-                formatter.write_str("TCP owner endpoint is not exact loopback")
-            }
-            Self::Missing => formatter.write_str("exact TCP listener owner is missing"),
-            Self::Ambiguous => formatter.write_str("exact TCP listener owner is ambiguous"),
-            Self::AccessDenied => formatter.write_str("TCP listener owner observation was denied"),
-            Self::SizeRace => formatter.write_str("TCP listener table changed during observation"),
-            Self::BufferLimitExceeded => {
-                formatter.write_str("TCP listener table exceeds the bounded allocation")
-            }
-            Self::MalformedTable => formatter.write_str("TCP listener table is malformed"),
-            Self::UnsupportedPlatform => {
-                formatter.write_str("TCP listener ownership observation is unsupported")
-            }
-            Self::Windows { code } => {
-                write!(
-                    formatter,
-                    "TCP listener owner observation failed with Win32 status {code}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for TcpListenerOwnerError {}
 
 /// Observes the unique PID owning one exact IPv4 or IPv6 localhost listener.
 ///
@@ -109,10 +36,7 @@ pub fn observe_loopback_tcp_listener_owner(
         SocketAddr::V4(endpoint) => query_ipv4(*endpoint.ip(), endpoint.port())?,
         SocketAddr::V6(endpoint) => query_ipv6(*endpoint.ip(), endpoint.port())?,
     };
-    Ok(TcpListenerOwnerObservation {
-        endpoint,
-        process_id,
-    })
+    Ok(TcpListenerOwnerObservation::new(endpoint, process_id))
 }
 
 /// Off-Windows builds retain the typed API but never claim ownership.
