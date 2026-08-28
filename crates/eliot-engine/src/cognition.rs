@@ -7,87 +7,15 @@ use eliot_types::{
     MemoryValueComparison, MemoryValueExperiment, OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind,
     ObservabilityWriteEnvelope, ObservabilityWriteReceipt, PlanningDecisionRecord, ProjectId,
     SemanticCommand, SessionId, TaintClass, TaskId, ToolObservationRecordCommand,
-    UnderstandingOutcome, UnderstandingOutcomeRecord, VerificationResult, Visibility, WriteId,
-    WriteReceiptRef,
+    UnderstandingOutcomeRecord, Visibility, WriteId, WriteReceiptRef,
 };
 use serde::Serialize;
 use serde_json::json;
 use std::str::FromStr;
 use time::OffsetDateTime;
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct UnderstandingOutcomeService;
-
-impl UnderstandingOutcomeService {
-    pub fn validate(record: &UnderstandingOutcomeRecord) -> Result<(), EngineError> {
-        for (field, value) in [
-            ("packet_id", record.packet_id.as_str()),
-            (
-                "selected_owner_or_module",
-                record.selected_owner_or_module.as_str(),
-            ),
-            ("predicted_observable", record.predicted_observable.as_str()),
-            (
-                "selected_probe_or_action",
-                record.selected_probe_or_action.as_str(),
-            ),
-            ("selected_verifier", record.selected_verifier.as_str()),
-            ("actual_observation", record.actual_observation.as_str()),
-        ] {
-            if value.trim().is_empty() {
-                return Err(EngineError::WriteRejected(format!(
-                    "understanding outcome is missing {field}"
-                )));
-            }
-        }
-        if record.proposed_causal_bridge.is_empty()
-            || record.exact_handles_used.is_empty()
-            || record.evidence_refs.is_empty()
-        {
-            return Err(EngineError::WriteRejected(
-                "understanding outcome requires a causal bridge, exact handles, and observable evidence"
-                    .to_owned(),
-            ));
-        }
-        let selected = record
-            .selected_write_set
-            .iter()
-            .map(|path| normalize_path(path))
-            .collect::<Vec<_>>();
-        if record
-            .actual_changed_artifacts
-            .iter()
-            .map(|path| normalize_path(path))
-            .any(|path| !selected.contains(&path))
-        {
-            return Err(EngineError::WriteRejected(
-                "actual changed artifact escaped the selected write set".to_owned(),
-            ));
-        }
-        match record.outcome {
-            UnderstandingOutcome::Validated => {
-                if record.verifier_result != VerificationResult::Passed
-                    || !record.causal_bridge_validated
-                    || record.expected_owner_or_module != record.selected_owner_or_module
-                {
-                    return Err(EngineError::WriteRejected(
-                        "validated understanding must match the expected owner and pass its causal verifier"
-                            .to_owned(),
-                    ));
-                }
-            }
-            UnderstandingOutcome::Revised if !record.revision_required => {
-                return Err(EngineError::WriteRejected(
-                    "revised understanding must mark revision_required".to_owned(),
-                ));
-            }
-            UnderstandingOutcome::Revised
-            | UnderstandingOutcome::Refuted
-            | UnderstandingOutcome::Inconclusive => {}
-        }
-        Ok(())
-    }
-}
+mod understanding_outcome;
+pub use understanding_outcome::UnderstandingOutcomeService;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MemoryInfluenceTraceService;
@@ -508,15 +436,12 @@ fn deterministic_uuid_text(domain: &[u8], material: &[u8]) -> String {
     )
 }
 
-fn normalize_path(path: &str) -> String {
-    path.replace('\\', "/").to_ascii_lowercase()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use eliot_types::{
         CausalBridgeHop, MemoryAdmissionDecision, MemoryDecisionReceipt, UnderstandingOutcome,
+        VerificationResult,
     };
 
     fn decision(task_id: TaskId, admission: MemoryAdmissionDecision) -> MemoryDecisionReceipt {
