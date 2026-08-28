@@ -6,14 +6,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(windows)]
 use std::time::{Duration, Instant};
 
+mod runtime_loop;
+
+use runtime_loop::run_watchdog;
+
 use eliot_platform_windows::ServiceBootstrapArguments;
 #[cfg(windows)]
 use eliot_platform_windows::{ServiceRegistrationRequest, WindowsPlatform};
 use eliot_watchdog::{
-    FileWatchdogAdmission, INSTALLATION_REGISTRY_FILE_NAME, IndependentKernelSensor,
-    LiveHostObservationSource, SERVICE_NAME, WatchdogAdmissionSource, WatchdogComposition,
-    WatchdogConfig, WatchdogRuntimeReadback, WatchdogSelfAdmissionProbe,
-    WatchdogSelfAdmissionStatus, inspect_approved_host_registration,
+    SERVICE_NAME, WatchdogRuntimeReadback, WatchdogSelfAdmissionProbe, WatchdogSelfAdmissionStatus,
     project_service_runtime_inspection,
 };
 
@@ -38,84 +39,6 @@ fn main() {
         let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {error}");
         std::process::exit(1);
     }
-}
-
-fn run_watchdog(
-    stop_signal: Arc<AtomicBool>,
-    scm_launch: Option<&eliot_watchdog::ValidatedWatchdogScmLaunch>,
-) -> Result<(), String> {
-    let bootstrap = scm_launch
-        .map(|launch| launch.bootstrap().clone())
-        .ok_or_else(|| "SCM bootstrap is required for Runtime contour selection".to_owned())?;
-    let host_state_root = bootstrap
-        .host_state_root()
-        .ok_or_else(|| "SCM bootstrap omitted the installer-approved Host state root".to_owned())?;
-    let registry_path = host_state_root.join(INSTALLATION_REGISTRY_FILE_NAME);
-    // The lease is issued by the Host/Kernel contour.  There is deliberately
-    // no genesis/default lease in this process.  A stale or missing lease
-    // starts a gap-only sensor so the Watchdog can remain alive and record a
-    // bounded observation; the sensor gains heartbeat authority only after a
-    // later, freshly verified lease.  The source is retained by the
-    // composition and reloaded before every observation.
-    let admission_source = Arc::new(
-        FileWatchdogAdmission::from_registry(registry_path, bootstrap)
-            .map_err(|error| error.to_string())?,
-    );
-    let binding = admission_source.runtime_binding();
-    inspect_approved_host_registration(&binding).map_err(|error| error.to_string())?;
-    let initial_admission = admission_source.reload().ok();
-    let sensor = Arc::new(
-        match initial_admission {
-            Some(admission) => IndependentKernelSensor::open_runtime_binding(
-                binding.clone(),
-                admission.watchdog_epoch().value(),
-            ),
-            None => IndependentKernelSensor::open_runtime_binding_without_epoch(binding.clone()),
-        }
-        .map_err(|error| error.to_string())?,
-    );
-    let composition = WatchdogComposition::start_with_shutdown_and_host(
-        WatchdogConfig::default(),
-        admission_source,
-        sensor,
-        Arc::new(LiveHostObservationSource::from_binding(&binding)),
-        stop_signal,
-    )
-    .map_err(|error| error.to_string())?;
-    #[cfg(windows)]
-    if let Some(launch) = scm_launch {
-        let root = launch
-            .registration()
-            .binary_path()
-            .parent()
-            .ok_or_else(|| "approved Watchdog image has no package root".to_owned())?;
-        let platform = WindowsPlatform::new(root.to_path_buf())
-            .map_err(|error| format!("Watchdog self-admission platform root: {error}"))?;
-        let mut probe = WindowsWatchdogSelfAdmissionProbe {
-            platform,
-            request: launch.registration(),
-            started_at: Instant::now(),
-        };
-        let mut status = ScmWatchdogSelfAdmissionStatus;
-        eliot_watchdog::admit_watchdog_self_start(&mut probe, &mut status)
-            .map_err(|error| error.to_string())?;
-    }
-    let readiness = composition.readiness();
-    serde_json::to_writer(&mut io::stdout().lock(), &readiness)
-        .map_err(|error| format!("{error:?}"))?;
-    writeln!(io::stdout().lock()).map_err(|error| error.to_string())?;
-    #[cfg(windows)]
-    set_service_status_running();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())?;
-    runtime
-        .block_on(composition.run_until_shutdown())
-        .map_err(|error| format!("{error:?}"))?;
-    #[cfg(windows)]
-    set_service_status_stopped();
-    Ok(())
 }
 
 #[cfg(windows)]
