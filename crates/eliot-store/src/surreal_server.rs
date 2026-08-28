@@ -544,6 +544,8 @@ impl SurrealServerSupervisor {
     }
 
     fn read_windows_credential(&self) -> Result<Option<SecretString>, StoreError> {
+        eliot_windows_ipc::validate_credential_id(&self.config.credential_id)
+            .map_err(|error| StoreError::PolicyViolation(error.to_string()))?;
         let Some(bytes) = credential_read_current_user(&self.config.credential_id)? else {
             return Ok(None);
         };
@@ -566,6 +568,10 @@ impl SurrealServerSupervisor {
                 == Ok(self.config.password_file.as_str());
         if test_override {
             return Ok(CredentialProviderKind::LegacyPasswordFile);
+        }
+        if self.config.credential_provider == CredentialProviderKind::WindowsCredentialManager {
+            eliot_windows_ipc::validate_credential_id(&self.config.credential_id)
+                .map_err(|error| StoreError::PolicyViolation(error.to_string()))?;
         }
         if self.config.credential_provider == CredentialProviderKind::LegacyPasswordFile
             && std::env::var("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION").as_deref() != Ok("1")
@@ -855,12 +861,11 @@ impl SurrealServerSupervisor {
 }
 
 fn generate_password() -> String {
-    STANDARD_NO_PAD.encode(format!(
-        "{}{}{}",
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-        Uuid::new_v4()
-    ))
+    let mut entropy = [0u8; 48];
+    entropy[0..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    entropy[16..32].copy_from_slice(Uuid::new_v4().as_bytes());
+    entropy[32..48].copy_from_slice(Uuid::new_v4().as_bytes());
+    STANDARD_NO_PAD.encode(entropy)
 }
 
 fn resolve_executable_path(configured: &str) -> Option<PathBuf> {

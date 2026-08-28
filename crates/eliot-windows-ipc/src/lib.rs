@@ -1877,7 +1877,16 @@ fn nul_terminated_wide(value: &OsStr) -> io::Result<Vec<u16>> {
     Ok(wide.into_iter().chain(std::iter::once(0)).collect())
 }
 
-fn credential_target(credential_id: &str) -> io::Result<Vec<u16>> {
+/// Validates an Eliot credential identifier against the bounded logical grammar.
+///
+/// The grammar is: nonempty, `<=` 240 bytes, no leading or trailing `'/'`,
+/// no empty or `"."` / `".."` segments, and only ASCII alphanumeric or
+/// `'-'` `'_'` `'.'` `'/'`.
+///
+/// # Errors
+///
+/// Returns `InvalidInput` when the identifier violates the grammar.
+pub fn validate_credential_id(credential_id: &str) -> io::Result<()> {
     let valid = !credential_id.is_empty()
         && credential_id.len() <= 240
         && !credential_id.starts_with('/')
@@ -1894,6 +1903,11 @@ fn credential_target(credential_id: &str) -> io::Result<Vec<u16>> {
             "credential id must be a bounded logical identifier",
         ));
     }
+    Ok(())
+}
+
+fn credential_target(credential_id: &str) -> io::Result<Vec<u16>> {
+    validate_credential_id(credential_id)?;
     nul_terminated_wide(OsStr::new(&format!("EliotGovernor/{credential_id}")))
 }
 
