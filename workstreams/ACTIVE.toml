@@ -11,6 +11,7 @@ requires_current_main_ancestor = true
 one_issue_one_branch_one_pr = true
 nonstandard_branch_requires_explicit_exception = true
 merged_or_closed_branch_is_retired = true
+unlisted_branch_mutation_allowed = false
 
 [[workstream]]
 id = "core-daemons"
@@ -46,3 +47,20 @@ allowed_path_scope = [
 no_unrelated_repairs = true
 retire_after_pr_disposition = true
 reason = "The candidate must contain current main as an ancestor before mutation or integration; administrative refresh merges do not change the cognitive prototype payload."
+
+[retired_refs]
+status = "non_mutable_aliases_of_main"
+physical_delete_supported = false
+rule = "These refs may remain visible by name because the connected GitHub surface cannot delete refs. Their pointers are forced to current main and they are never valid work branches."
+branches = [
+  "audit/core-daemon-conformance-20260828",
+  "chore/28-repository-hygiene",
+  "chore/32-finalize-branch-state",
+  "chore/32-retire-stale-branches",
+  "claude/codex-swarm-audit-p576l9",
+  "claude/eliot-search-architecture-45fdpe",
+  "claude/loving-wozniak-tw3r2s",
+  "cognitive-crates-prototypes-01",
+  "cognitive-materialize-run",
+  "docs/related-repositories"
+]
