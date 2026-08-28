@@ -1,4 +1,5 @@
 use crate::StoreError;
+use crate::db_client_metrics::MetricCounters;
 use crate::surql::{NamedSurqlOp, SurqlAccessClass};
 use crate::surreal_rpc::SurrealRpcTransport;
 use crate::surreal_server::{ReadySurrealServer, SurrealServerSupervisor, SurrealShutdown};
@@ -6,34 +7,17 @@ use eliot_types::SurrealServerConfig;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard, Semaphore, SemaphorePermit, oneshot, watch};
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
+pub use crate::db_client_metrics::DbClientSetMetrics;
+
 pub const DEFAULT_DB_READ_POOL_SIZE: usize = 4;
 
 static ABANDONED_STARTUP_CLEANUP_FAILURES: AtomicU64 = AtomicU64::new(0);
-
-/// A stable observation of the persistent database sessions and bounded read
-/// concurrency owned by one [`DbClientSet`] generation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
-pub struct DbClientSetMetrics {
-    pub generation_id: Uuid,
-    pub read_pool_size: usize,
-    pub sessions_opened: u64,
-    pub reconnect_attempts: u64,
-    pub reconnect_successes: u64,
-    pub transport_invalidations: u64,
-    pub read_queries: u64,
-    pub write_queries: u64,
-    pub admin_queries: u64,
-    pub active_readers: usize,
-    pub peak_readers: usize,
-    pub rejected_after_shutdown: u64,
-    pub shutdown_completed: bool,
-}
 
 /// One daemon-owned generation of persistent, authenticated `SurrealDB` RPC
 /// clients. Clones share the same server lease, transports, ordering locks and
@@ -116,29 +100,10 @@ enum StoredShutdown {
     Failed(String),
 }
 
-#[derive(Debug)]
-struct MetricCounters {
-    sessions_opened: AtomicU64,
-    reconnect_attempts: AtomicU64,
-    reconnect_successes: AtomicU64,
-    transport_invalidations: AtomicU64,
-    read_queries: AtomicU64,
-    write_queries: AtomicU64,
-    admin_queries: AtomicU64,
-    active_readers: AtomicUsize,
-    peak_readers: AtomicUsize,
-    rejected_after_shutdown: AtomicU64,
-    shutdown_completed: AtomicBool,
-}
-
 struct ReadLease<'a> {
     pool: &'a ReadPool,
     index: usize,
     _permit: SemaphorePermit<'a>,
-}
-
-struct ReadActivity<'a> {
-    metrics: &'a MetricCounters,
 }
 
 impl DbClientSet {
@@ -560,54 +525,6 @@ impl StoredShutdown {
             Self::Success(shutdown) => Ok(*shutdown),
             Self::Failed(message) => Err(StoreError::ClientSetShutdownFailed(message.clone())),
         }
-    }
-}
-
-impl MetricCounters {
-    const fn new(sessions_opened: u64) -> Self {
-        Self {
-            sessions_opened: AtomicU64::new(sessions_opened),
-            reconnect_attempts: AtomicU64::new(0),
-            reconnect_successes: AtomicU64::new(0),
-            transport_invalidations: AtomicU64::new(0),
-            read_queries: AtomicU64::new(0),
-            write_queries: AtomicU64::new(0),
-            admin_queries: AtomicU64::new(0),
-            active_readers: AtomicUsize::new(0),
-            peak_readers: AtomicUsize::new(0),
-            rejected_after_shutdown: AtomicU64::new(0),
-            shutdown_completed: AtomicBool::new(false),
-        }
-    }
-
-    fn begin_read(&self) -> ReadActivity<'_> {
-        let active = self.active_readers.fetch_add(1, Ordering::AcqRel) + 1;
-        self.peak_readers.fetch_max(active, Ordering::AcqRel);
-        ReadActivity { metrics: self }
-    }
-
-    fn snapshot(&self, generation_id: Uuid, read_pool_size: usize) -> DbClientSetMetrics {
-        DbClientSetMetrics {
-            generation_id,
-            read_pool_size,
-            sessions_opened: self.sessions_opened.load(Ordering::Relaxed),
-            reconnect_attempts: self.reconnect_attempts.load(Ordering::Relaxed),
-            reconnect_successes: self.reconnect_successes.load(Ordering::Relaxed),
-            transport_invalidations: self.transport_invalidations.load(Ordering::Relaxed),
-            read_queries: self.read_queries.load(Ordering::Relaxed),
-            write_queries: self.write_queries.load(Ordering::Relaxed),
-            admin_queries: self.admin_queries.load(Ordering::Relaxed),
-            active_readers: self.active_readers.load(Ordering::Acquire),
-            peak_readers: self.peak_readers.load(Ordering::Acquire),
-            rejected_after_shutdown: self.rejected_after_shutdown.load(Ordering::Relaxed),
-            shutdown_completed: self.shutdown_completed.load(Ordering::Acquire),
-        }
-    }
-}
-
-impl Drop for ReadActivity<'_> {
-    fn drop(&mut self) {
-        self.metrics.active_readers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

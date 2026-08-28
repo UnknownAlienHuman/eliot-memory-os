@@ -5,6 +5,7 @@ pub mod canonical_projection;
 mod canonical_record;
 pub mod canonical_store;
 pub mod control_wal;
+mod db_client_metrics;
 pub mod db_client_set;
 pub mod error;
 pub mod migration;
