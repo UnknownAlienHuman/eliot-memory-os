@@ -1,3 +1,12 @@
+#[path = "replay_inputs.rs"]
+mod replay_inputs;
+
+pub use replay_inputs::{
+    CanonicalReplayExecutionInput, CanonicalTraceCompletenessInput, ReplayCaseInput,
+    ReplayCaseObservation, ReplaySealBundle, ReplaySealInput, ReplaySetInput, SealedReplayInput,
+    SleepRunInput, TraceCompletenessInput,
+};
+
 use crate::{EngineError, WorkState, WriteAdmissionService, WriterHandle};
 use eliot_types::{
     AgentId, AgentSessionId, BlackboardItem, BlackboardItemId, BlackboardItemKind,
@@ -8,120 +17,19 @@ use eliot_types::{
     LifecycleStatus, MailboxMessage, MailboxMessageId, MailboxMessageKind, MailboxMessageStatus,
     MailboxRecipient, MemoryRevision, MemorySynthesisTaint, MemorySynthesisTaintReason,
     MissingTracePart, ProhibitedDreamEffect, ProjectId, ReplayAudit, ReplayCase, ReplayCaseId,
-    ReplayCaseKind, ReplayCaseResult, ReplayCaseStatus, ReplayDecision, ReplayInputSnapshot,
-    ReplayMeasurement, ReplayMeasurementResult, ReplayRun, ReplayRunId, ReplayRunProfile,
-    ReplayRunStatus, ReplaySet, ReplaySetId, ReplaySetRole, ReplaySuccessCriterion, ReplayVerdict,
-    SealedReplayCaseRecord, SealedReplayInputSnapshotRecord, SealedReplaySetRecord,
-    SemanticCommand, SkillReplayRequirement, SleepCandidateArtifact, SleepCandidateArtifactKind,
+    ReplayCaseResult, ReplayCaseStatus, ReplayDecision, ReplayInputSnapshot, ReplayMeasurement,
+    ReplayMeasurementResult, ReplayRun, ReplayRunId, ReplayRunProfile, ReplayRunStatus, ReplaySet,
+    ReplaySetId, ReplaySetRole, ReplaySuccessCriterion, ReplayVerdict, SealedReplayCaseRecord,
+    SealedReplayInputSnapshotRecord, SealedReplaySetRecord, SemanticCommand,
+    SkillReplayRequirement, SleepCandidateArtifact, SleepCandidateArtifactKind,
     SleepConsolidationBundle, SleepConsolidationRun, SleepConsolidationStatus, SleepInputScope,
-    SleepOutputKind, SleepOutputRef, SleepTrigger, TaintClass, TaskId,
-    ToolObservationRecordCommand, TraceCompletenessContract, Visibility, WriteId, WriteReceiptRef,
+    SleepOutputKind, SleepOutputRef, TaintClass, TaskId, ToolObservationRecordCommand,
+    TraceCompletenessContract, Visibility, WriteId, WriteReceiptRef,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
 use uuid::Uuid;
-
-#[derive(Clone, Debug)]
-pub struct TraceCompletenessInput {
-    pub project_id: ProjectId,
-    pub task_id: Option<TaskId>,
-    pub trace_ref: String,
-    pub present_refs: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct CanonicalTraceCompletenessInput {
-    pub project_id: ProjectId,
-    pub task_id: TaskId,
-    pub source_task_revision: MemoryRevision,
-    pub trace_ref: String,
-    pub evidence: Vec<CanonicalTraceEvidence>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ReplaySealInput {
-    pub set: ReplaySet,
-    pub role: ReplaySetRole,
-    pub version: u64,
-    pub evaluator_version: String,
-    pub context_version: String,
-    pub cases: Vec<ReplayCase>,
-    pub snapshots: Vec<ReplayInputSnapshot>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ReplaySealBundle {
-    pub set: SealedReplaySetRecord,
-    pub cases: Vec<SealedReplayCaseRecord>,
-    pub snapshots: Vec<SealedReplayInputSnapshotRecord>,
-}
-
-#[derive(Clone, Debug)]
-pub struct CanonicalReplayExecutionInput {
-    pub sealed_set: SealedReplaySetRecord,
-    pub cases: Vec<SealedReplayCaseRecord>,
-    pub snapshots: Vec<SealedReplayInputSnapshotRecord>,
-    pub trace_contracts: Vec<CanonicalTraceCompletenessContract>,
-    pub observations: Vec<CanonicalReplayObservationEvidence>,
-    pub baseline_ref: String,
-    pub candidate_ref: String,
-    pub candidate_version: String,
-    pub mutation_attempt: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ReplayCaseInput {
-    pub project_id: ProjectId,
-    pub source_task_id: Option<TaskId>,
-    pub case_kind: ReplayCaseKind,
-    pub trace_contract_ref: String,
-    pub input_snapshot_refs: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ReplaySetInput {
-    pub project_id: ProjectId,
-    pub name: String,
-    pub purpose: String,
-    pub cases: Vec<ReplayCaseId>,
-    pub fixed: bool,
-    pub holdout: bool,
-    pub created_from_refs: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct SleepRunInput {
-    pub project_id: ProjectId,
-    pub trigger: SleepTrigger,
-    pub dry_run: bool,
-    pub input_traces: Vec<String>,
-    pub max_input_bytes: u32,
-    pub reasoning_retry_limit: u8,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ReplayCaseObservation {
-    pub replay_case_id: ReplayCaseId,
-    pub produced_refs: Vec<String>,
-    pub denied_actions: Vec<String>,
-    pub taint_preserved: bool,
-    pub duration_ms: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct SealedReplayInput {
-    pub project_id: ProjectId,
-    pub set: ReplaySet,
-    pub cases: Vec<ReplayCase>,
-    pub trace_contracts: Vec<TraceCompletenessContract>,
-    pub observations: Vec<ReplayCaseObservation>,
-    pub baseline_ref: String,
-    pub candidate_ref: String,
-    pub candidate_version: String,
-    pub sealed_context_version: String,
-    pub mutation_attempt: Option<String>,
-}
 
 pub struct TraceCompletenessService;
 
