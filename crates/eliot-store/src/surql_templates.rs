@@ -580,7 +580,7 @@ fn template(
 #[cfg(test)]
 mod tests {
     use super::SurqlTemplateRegistry;
-    use crate::surql::{NamedSurqlOp, SurqlAccessClass};
+    use crate::surql::SurqlAccessClass;
 
     #[test]
     fn access_classes_are_exhaustive_and_have_expected_counts() {
