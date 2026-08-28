@@ -3,7 +3,8 @@ status = "accepted"
 adopted_at = "2026-08-28"
 decision_ref = "github:UnknownAlienHuman/eliot-memory-os#25"
 
-pair_key_algorithm = "sha256(UTF-8 'eliot-normative-pair-v1\0' + lowercase architecture sha256 + '\0' + lowercase implementation sha256 + '\0')"
+pair_key_algorithm = "sha256-domain-separated-v1"
+pair_key_input = "UTF-8 domain tag eliot-normative-pair-v1 and lowercase document digests separated and terminated by NUL bytes"
 pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
 
 architecture_path = "docs/architecture/ELIOT_ARCHITECTURE.md"
