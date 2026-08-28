@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
 use eliot_contracts::sha256_hex;
 use eliot_installation::InstallationError;
 use eliot_installation::InstallationTransactionStore;
