@@ -29,6 +29,7 @@
 
 pub mod authority;
 pub mod authority_controller;
+mod authority_snapshot;
 pub mod error;
 pub mod module;
 
