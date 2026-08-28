@@ -8,6 +8,7 @@ pub mod db_client_set;
 pub mod error;
 pub mod migration;
 pub mod surql;
+mod surql_templates;
 mod surreal_rpc;
 pub mod surreal_server;
 pub mod surreal_store;
