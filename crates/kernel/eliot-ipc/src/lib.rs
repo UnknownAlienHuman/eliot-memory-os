@@ -10,11 +10,15 @@ use std::time::Duration;
 
 use eliot_protocol::{
     AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge,
-    ClientHello, EncodingProfile, Frame, FrameKind, JsonCodec, MessageType, ProtocolError,
-    ProtocolPayload, ProtocolRange, ProtocolVersion, ServerHello, negotiate,
+    ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolError, ProtocolPayload,
+    ProtocolRange, ProtocolVersion, ServerHello, negotiate,
 };
 use eliot_runtime_contracts::ModuleGeneration;
 use thiserror::Error;
+
+mod frame_codec;
+
+pub use frame_codec::{FrameDecoder, decode_frame, encode_frame};
 
 /// A provider-neutral peer result. A PID or pipe name is not an identity proof.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1272,89 +1276,6 @@ impl AdmissionQueue {
     }
 }
 
-/// Incremental decoder that preserves bytes after a partial read for recovery.
-#[derive(Debug)]
-pub struct FrameDecoder {
-    bytes: Vec<u8>,
-}
-
-impl FrameDecoder {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self { bytes: Vec::new() }
-    }
-
-    /// Adds a read fragment and returns at most one complete frame.
-    pub fn push(
-        &mut self,
-        fragment: &[u8],
-        limits: TransportLimits,
-    ) -> Result<Option<Frame>, TransportError> {
-        let limits = limits.validate()?;
-        if fragment.is_empty() {
-            return Ok(None);
-        }
-        // Inspect the prefix before admitting attacker-controlled bytes.  A
-        // giant fragment must never be appended merely to discover that it is
-        // oversized.
-        let declared = if self.bytes.len() < 4 {
-            if self.bytes.len() + fragment.len() < 4 {
-                self.bytes.extend_from_slice(fragment);
-                return Ok(None);
-            }
-            let mut prefix = [0_u8; 4];
-            let existing = self.bytes.len();
-            prefix[..existing].copy_from_slice(&self.bytes);
-            prefix[existing..].copy_from_slice(&fragment[..4 - existing]);
-            usize::try_from(u32::from_le_bytes(prefix)).map_err(|_| {
-                TransportError::Protocol(ProtocolError::OversizeFrame {
-                    actual: usize::MAX,
-                    maximum: limits.max_frame_bytes,
-                })
-            })?
-        } else {
-            usize::try_from(u32::from_le_bytes([
-                self.bytes[0],
-                self.bytes[1],
-                self.bytes[2],
-                self.bytes[3],
-            ]))
-            .map_err(|_| {
-                TransportError::Protocol(ProtocolError::OversizeFrame {
-                    actual: usize::MAX,
-                    maximum: limits.max_frame_bytes,
-                })
-            })?
-        };
-        if declared == 0 || declared > limits.max_frame_bytes {
-            self.bytes.clear();
-            return Err(TransportError::Protocol(ProtocolError::OversizeFrame {
-                actual: declared,
-                maximum: limits.max_frame_bytes,
-            }));
-        }
-        let total = 4 + declared;
-        if self.bytes.len() + fragment.len() > total {
-            return Err(TransportError::Backpressure);
-        }
-        self.bytes.extend_from_slice(fragment);
-        if self.bytes.len() < 4 {
-            return Ok(None);
-        }
-        if self.bytes.len() < total {
-            return Ok(None);
-        }
-        let wire: Vec<u8> = self.bytes.drain(..total).collect();
-        decode_frame(&wire, limits).map(Some)
-    }
-}
-
-impl Default for FrameDecoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Replay disposition for at-least-once control/event delivery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayDisposition {
@@ -1601,22 +1522,6 @@ impl CancellationRegistry {
             None => CancellationDisposition::Unknown,
         }
     }
-}
-
-/// Encodes one validated semantic frame using the negotiated bounded profile.
-pub fn encode_frame(frame: &Frame, limits: TransportLimits) -> Result<Vec<u8>, TransportError> {
-    let limits = limits.validate()?;
-    JsonCodec::with_max_frame_bytes(limits.max_frame_bytes)
-        .encode(frame)
-        .map_err(TransportError::Protocol)
-}
-
-/// Decodes one complete frame and rejects trailing or partial bytes.
-pub fn decode_frame(wire: &[u8], limits: TransportLimits) -> Result<Frame, TransportError> {
-    let limits = limits.validate()?;
-    JsonCodec::with_max_frame_bytes(limits.max_frame_bytes)
-        .decode(wire)
-        .map_err(TransportError::Protocol)
 }
 
 /// Maps an uncertain write boundary without fabricating application proof.
