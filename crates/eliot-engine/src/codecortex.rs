@@ -1,13 +1,18 @@
-use crate::{EngineError, WriteAdmissionService, WriterHandle};
+use crate::EngineError;
+#[cfg(test)]
+use crate::WriteAdmissionService;
 use eliot_types::{
     AgentId, BlastRadiusView, CodeCortexPacketView, CodeCortexReport, CodeCortexRequest,
     CodeCortexScopeBinding, CodeEvidenceSource, CommandContext, DiagnosticEvidence, FileEvidence,
     InvariantCard, LifecycleStatus, OperationStatus, ProjectId, SemanticCommand, SessionId,
     SymbolEvidence, TaintClass, TaskId, ToolObservationRecordCommand, VerifierEvidence, Visibility,
-    WriteId, WriteReceiptRef,
+    WriteId,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+
+mod memory_writer;
+pub use memory_writer::CodeCortexMemoryWriter;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -292,53 +297,6 @@ fn dirty_state_hash(repo_root: &Path) -> Result<String, EngineError> {
 
 fn normalized_path(path: &str) -> String {
     path.replace('\\', "/").to_ascii_lowercase()
-}
-
-pub struct CodeCortexMemoryWriter;
-
-impl CodeCortexMemoryWriter {
-    pub async fn write_report(
-        handle: &WriterHandle,
-        admission: &WriteAdmissionService,
-        report: &mut CodeCortexReport,
-    ) -> Result<WriteReceiptRef, EngineError> {
-        Self::write_report_with_scope(handle, admission, report, None).await
-    }
-
-    pub async fn write_report_scoped(
-        handle: &WriterHandle,
-        admission: &WriteAdmissionService,
-        report: &mut CodeCortexReport,
-        session_id: SessionId,
-        project_id: ProjectId,
-        task_id: TaskId,
-    ) -> Result<WriteReceiptRef, EngineError> {
-        Self::write_report_with_scope(
-            handle,
-            admission,
-            report,
-            Some((session_id, project_id, task_id)),
-        )
-        .await
-    }
-
-    async fn write_report_with_scope(
-        handle: &WriterHandle,
-        admission: &WriteAdmissionService,
-        report: &mut CodeCortexReport,
-        scope: Option<(SessionId, ProjectId, TaskId)>,
-    ) -> Result<WriteReceiptRef, EngineError> {
-        let payload = bounded_codecortex_memory_payload(report)?;
-        let command = codecortex_observation_command(report, payload, scope);
-        let envelope = admission.admit(&command)?;
-        let receipt = handle.submit(envelope).await?;
-        let receipt_ref = WriteReceiptRef {
-            receipt_id: receipt.receipt_id,
-            write_id: receipt.write_id,
-        };
-        report.memory_receipt = Some(receipt_ref.clone());
-        Ok(receipt_ref)
-    }
 }
 
 fn codecortex_observation_command(
