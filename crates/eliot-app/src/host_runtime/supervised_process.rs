@@ -8,15 +8,13 @@ use eliot_types::{
     DescendantsAtRootExit, DescendantsAtRootExitFailed, DescendantsCaptureErrorKind,
     OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION, OperationCancellationState, OperationPhase,
     OperationReconciliationState, OperationRuntimeCheckpoint, ProcessReapReceipt,
-    ProviderDispatchState, ProviderTimeoutClass, ProviderTimeoutProfile,
+    ProviderDispatchState, ProviderTimeoutClass,
 };
 use eliot_windows_ipc::{RecoverableJobObject, SuspendedJobChild};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -33,91 +31,13 @@ const SUPERVISED_TERMINATION_CODE: u32 = 0xE110_7001;
 // rejecting a peer that accepts the request and never replies.
 const DAEMON_OPERATION_RUNTIME_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(
-    dead_code,
-    reason = "the complete child taxonomy is part of the runtime supervision contract"
-)]
-pub enum SupervisedChildKind {
-    McpPreflight,
-    Provider,
-    TruthAdapter,
-    Verifier,
-    Maintenance,
-}
+#[path = "supervised_process_contract.rs"]
+mod supervised_process_contract;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(
-    dead_code,
-    reason = "all criticality levels are contract values even before every caller is migrated"
-)]
-pub enum ChildCriticality {
-    Optional,
-    InvocationDependency,
-    CoreDependency,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RestartStrategy {
-    Never,
-    OneForOne,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProcessRestartPolicy {
-    pub strategy: RestartStrategy,
-    pub max_restarts: u32,
-    pub restart_window_seconds: u64,
-    pub base_backoff_ms: u64,
-    pub pre_dispatch_only: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct SupervisedProcessSpec {
-    pub operation_id: String,
-    pub invocation_id: Option<String>,
-    pub generation: u64,
-    pub child_kind: SupervisedChildKind,
-    pub criticality: ChildCriticality,
-    pub restart_policy: ProcessRestartPolicy,
-    pub executable: PathBuf,
-    pub args: Vec<OsString>,
-    pub cwd: PathBuf,
-    pub environment: BTreeMap<OsString, OsString>,
-    pub stdin_payload: Option<Vec<u8>>,
-    pub stdout_limit_bytes: u64,
-    pub stderr_limit_bytes: u64,
-    pub timeout_profile: ProviderTimeoutProfile,
-    pub runtime_contract_sha256: Option<String>,
-    pub role_lease_id: Option<String>,
-    pub role_lease_epoch: Option<u64>,
-}
-
-#[derive(Clone, Debug)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "these independent receipt facts mirror the runtime supervision contract"
-)]
-pub struct SupervisedProcessOutput {
-    pub exit_code: Option<i32>,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub stdout_total_bytes: u64,
-    pub stderr_total_bytes: u64,
-    pub stdout_truncated: bool,
-    pub stderr_truncated: bool,
-    pub timed_out: bool,
-    pub timeout_class: Option<ProviderTimeoutClass>,
-    pub cancelled: bool,
-    pub worker_error: Option<String>,
-    pub observed_processes: Vec<eliot_windows_ipc::ProcessImageIdentity>,
-    pub process_started_at: OffsetDateTime,
-    pub first_output_at: Option<OffsetDateTime>,
-    pub last_output_at: Option<OffsetDateTime>,
-    pub process_exit_at: Option<OffsetDateTime>,
-    pub cleanup_completed_at: OffsetDateTime,
-    pub reap_receipt: ProcessReapReceipt,
-}
+pub use supervised_process_contract::{
+    ChildCriticality, ProcessRestartPolicy, RestartStrategy, SupervisedChildKind,
+    SupervisedProcessOutput, SupervisedProcessSpec,
+};
 
 #[derive(Clone, Debug)]
 enum ProcessProgress {
