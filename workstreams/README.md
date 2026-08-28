@@ -27,9 +27,9 @@ that work.
 
 ### Cognitive micro-modules
 
-PR #26 is the sole active nonstandard branch. Merged PR #31 refreshed
-`cognitive-micromodules-wave-01` from current `main`. Mutation is permitted only
-inside the exact prototype-manifest/assignment scope declared in
-`ACTIVE.toml`; the branch is not a place for unrelated fixes, implementation,
-or general Dreamer development. It is retired when PR #26 is merged, closed, or
-superseded.
+PR #26 is the sole active nonstandard branch. Its branch must contain current
+`main` as an ancestor before any mutation or integration. Administrative refresh
+merges do not alter the cognitive prototype payload. Mutation is permitted only
+inside the exact prototype-manifest/assignment scope declared in `ACTIVE.toml`;
+the branch is not a place for unrelated fixes, implementation, or general
+Dreamer development. It is retired when PR #26 is merged, closed, or superseded.
