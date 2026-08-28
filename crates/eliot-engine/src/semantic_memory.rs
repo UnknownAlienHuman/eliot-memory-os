@@ -8,13 +8,17 @@ use eliot_types::{
     ExperienceCase, ExperienceFormationResult, ExperienceMaturity, ExperienceMaturityState,
     ExperiencePattern, ExperienceRecallRequest, ExperienceRecallResponse, ExperienceUseOutcome,
     FusedRankRoute, FusedRankTrace, GraphHealthResponse, MemoryApplicabilityDecision,
-    MemoryCorpusProfile, MemoryExposureMode, MemoryKind, MemoryNeed, MemoryNeedDecision,
-    NegativeTransferHarm, NegativeTransferLifecycleAction, NegativeTransferRecord,
-    TaskMeaningFrame, VerificationResult, VerifiedEpisodeProjection, WriteId,
+    MemoryExposureMode, MemoryKind, MemoryNeed, MemoryNeedDecision, NegativeTransferHarm,
+    NegativeTransferLifecycleAction, NegativeTransferRecord, TaskMeaningFrame, VerificationResult,
+    VerifiedEpisodeProjection, WriteId,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use time::OffsetDateTime;
+
+mod corpus_profile;
+
+pub use corpus_profile::CorpusProfileService;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -697,112 +701,6 @@ impl ContextReinstatementService {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct CorpusProfileService;
-
-impl CorpusProfileService {
-    pub fn profile(input: &CorpusProfileInput) -> MemoryCorpusProfile {
-        let mut profile = MemoryCorpusProfile {
-            verified_episode_count: input.verified_episode_count,
-            reconstructed_case_count: u64::try_from(input.cases.len()).unwrap_or(u64::MAX),
-            contrastive_case_group_count: u64::try_from(input.patterns.len()).unwrap_or(u64::MAX),
-            physical_case_record_count: input.physical_case_record_count,
-            physical_pattern_record_count: input.physical_pattern_record_count,
-            superseded_or_duplicate_case_record_count: input
-                .physical_case_record_count
-                .saturating_sub(u64::try_from(input.cases.len()).unwrap_or(u64::MAX)),
-            superseded_or_duplicate_pattern_record_count: input
-                .physical_pattern_record_count
-                .saturating_sub(u64::try_from(input.patterns.len()).unwrap_or(u64::MAX)),
-            transfer_validated_count: input
-                .patterns
-                .iter()
-                .filter(|pattern| {
-                    matches!(
-                        pattern.maturity.state,
-                        ExperienceMaturityState::TransferValidated
-                            | ExperienceMaturityState::ProcedureCandidate
-                            | ExperienceMaturityState::ActiveProcedure
-                    )
-                })
-                .count()
-                .try_into()
-                .unwrap_or(u64::MAX),
-            active_procedure_count: input.active_procedure_count,
-            ..MemoryCorpusProfile::default()
-        };
-        if let Some(health) = &input.graph_health {
-            let total = health.verified_claims + health.supported_claims + health.weak_claims;
-            profile.weak_claim_fraction = fraction(health.weak_claims, total);
-            profile
-                .counts_by_epistemic_status
-                .insert("verified".to_owned(), health.verified_claims);
-            profile
-                .counts_by_epistemic_status
-                .insert("supported".to_owned(), health.supported_claims);
-            profile
-                .counts_by_epistemic_status
-                .insert("weak".to_owned(), health.weak_claims);
-            for count in &health.records_by_lifecycle_status {
-                profile
-                    .counts_by_lifecycle
-                    .insert(count.name.clone(), count.count);
-            }
-            profile
-                .counts_by_kind
-                .insert("claim_card".to_owned(), total);
-        }
-        profile.counts_by_kind.insert(
-            "experience_case".to_owned(),
-            profile.reconstructed_case_count,
-        );
-        profile.counts_by_kind.insert(
-            "experience_pattern".to_owned(),
-            profile.contrastive_case_group_count,
-        );
-        for case in &input.cases {
-            *profile
-                .counts_by_maturity
-                .entry(format!("{:?}", case.maturity.state).to_ascii_lowercase())
-                .or_default() += 1;
-            *profile
-                .mechanism_family_distribution
-                .entry(case.causal_model.mechanism.clone())
-                .or_default() += 1;
-        }
-        for pattern in &input.patterns {
-            *profile
-                .counts_by_maturity
-                .entry(format!("{:?}", pattern.maturity.state).to_ascii_lowercase())
-                .or_default() += 1;
-        }
-        profile.exact_evidence_coverage = coverage(&input.cases, |case| {
-            !case.authority.exact_source_refs.is_empty()
-        });
-        profile.applies_when_coverage = coverage(&input.cases, |case| {
-            !case.transfer_boundary.applies_when.is_empty()
-        });
-        profile.does_not_apply_when_coverage = coverage(&input.cases, |case| {
-            !case.transfer_boundary.does_not_apply_when.is_empty()
-        });
-        profile.counterexample_coverage = coverage(&input.cases, |case| {
-            !case.transfer_boundary.counterexample_refs.is_empty()
-        });
-        profile.verifier_link_coverage = coverage(&input.cases, |case| {
-            !case.intervention_and_outcome.verifier_refs.is_empty()
-        });
-        profile.cross_agent_source_diversity = input
-            .cases
-            .iter()
-            .flat_map(|case| case.source_agent_sessions.iter().copied())
-            .collect::<BTreeSet<_>>()
-            .len()
-            .try_into()
-            .unwrap_or(u64::MAX);
-        profile
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
 pub struct NegativeTransferService;
 
 impl NegativeTransferService {
@@ -1225,22 +1123,6 @@ fn dedup(values: &mut Vec<String>) {
 
 fn non_empty(value: &str) -> bool {
     !value.trim().is_empty()
-}
-
-fn coverage(cases: &[ExperienceCase], predicate: impl Fn(&ExperienceCase) -> bool) -> f64 {
-    if cases.is_empty() {
-        0.0
-    } else {
-        cases.iter().filter(|case| predicate(case)).count() as f64 / cases.len() as f64
-    }
-}
-
-fn fraction(numerator: u64, denominator: u64) -> f64 {
-    if denominator == 0 {
-        0.0
-    } else {
-        numerator as f64 / denominator as f64
-    }
 }
 
 fn fraction_usize(numerator: usize, denominator: usize) -> f64 {
