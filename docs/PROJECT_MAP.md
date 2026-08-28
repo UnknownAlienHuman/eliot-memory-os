@@ -98,9 +98,10 @@ create authority by itself.
 - Core/daemon issues #13–#24 use fresh issue-numbered branches and
   `workstreams/core-daemons/AGENTS.md`.
 - Cognitive prototype PR #26 is the sole active nonstandard branch. Merged PR
-  #31 refreshed `cognitive-micromodules-wave-01` from current `main`; mutation is
-  restricted to the prototype-manifest/assignment paths declared in
-  `workstreams/ACTIVE.toml`. It is not a general repair branch.
+  #34 refreshed `cognitive-micromodules-wave-01` from the final
+  repository-cleanup `main`; mutation is restricted to the
+  prototype-manifest/assignment paths declared in `workstreams/ACTIVE.toml`.
+  It is not a general repair branch.
 
 There is no shared long-lived core/daemon branch. Each issue starts a fresh
 branch when an agent is assigned. Every nonstandard branch not listed in
