@@ -1,0 +1,140 @@
+name: Materialize cognitive prototype assignments
+
+on:
+  push:
+    branches:
+      - cognitive-micromodules-wave-01
+    paths:
+      - ".github/workflows/cognitive-prototype-materialize.yml"
+      - ".github/cognitive-prototype-payload/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cognitive-prototype-materialize
+  cancel-in-progress: false
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Materialize and validate prototype files
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import base64
+          import json
+          import lzma
+          import shutil
+          import tomllib
+
+          root = Path(".")
+          payload_dir = root / ".github" / "cognitive-prototype-payload"
+          parts = sorted(payload_dir.glob("part-*"))
+          if not parts:
+              raise SystemExit("prototype payload is missing")
+          encoded = "".join(part.read_text(encoding="utf-8").strip() for part in parts)
+          payload = json.loads(lzma.decompress(base64.b64decode(encoded)).decode("utf-8"))
+
+          for relative, content in payload["files"].items():
+              target = root / relative
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_text(content, encoding="utf-8")
+
+          for relative in payload["delete"]:
+              target = root / relative
+              if target.exists():
+                  target.unlink()
+
+          # Validate every materialized TOML file.
+          parsed = {}
+          for relative, content in payload["files"].items():
+              if relative.endswith(".toml"):
+                  parsed[relative] = tomllib.loads(content)
+
+          assignments = []
+          for relative in (
+              "crates/smart/cognitive-wave-01.toml",
+              "crates/smart/cognitive-wave-02.toml",
+          ):
+              assignments.extend(parsed[relative]["assignment"])
+
+          orders = [entry["order"] for entry in assignments]
+          if orders != list(range(1, 44)):
+              raise SystemExit(f"assignment order mismatch: {orders}")
+
+          module_ids = []
+          for entry in assignments:
+              manifest = entry["manifest"]
+              if manifest not in parsed:
+                  raise SystemExit(f"missing assignment manifest: {manifest}")
+              module = parsed[manifest]
+              module_ids.append(module["module_id"])
+              required = {
+                  "lifecycle_owner",
+                  "state_class",
+                  "owned_mutable_state",
+                  "allowed_effects",
+                  "product_objective",
+                  "causal_property",
+                  "old_failure_or_missing_capability",
+                  "discriminator",
+                  "proof_surface",
+                  "proof_ceiling",
+                  "product_pulse",
+                  "replacement_boundary",
+                  "agent_task",
+              }
+              missing = required.difference(module)
+              if missing:
+                  raise SystemExit(f"{manifest}: missing {sorted(missing)}")
+
+          if len(module_ids) != len(set(module_ids)):
+              raise SystemExit("duplicate functional cell/module IDs")
+
+          if any((root / path).exists() for path in payload["delete"]):
+              raise SystemExit("superseded observation-classifier prototype still exists")
+
+          if "Cargo.toml" in payload["files"]:
+              raise SystemExit("root workspace modification is forbidden")
+
+          # The prototypes intentionally contain no Rust implementation.
+          unexpected_rs = [
+              str(path)
+              for path in root.glob("crates/**/src/lib.rs")
+              if str(path).replace("\\", "/").startswith(
+                  tuple(
+                      f"{entry['manifest'].rsplit('/', 1)[0]}/"
+                      for entry in assignments
+                      if entry["package_action"] == "create_prototype_crate"
+                  )
+              )
+          ]
+          # Existing donor crates have src/lib.rs; new prototype paths must not.
+          if unexpected_rs:
+              raise SystemExit(f"Rust implementation already present in prototype paths: {unexpected_rs}")
+          generated_rs = [relative for relative in payload["files"] if relative.endswith(".rs")]
+          if generated_rs:
+              raise SystemExit(f"Rust implementation unexpectedly generated: {generated_rs}")
+
+          shutil.rmtree(payload_dir)
+          (root / ".github" / "workflows" / "cognitive-prototype-materialize.yml").unlink()
+          print(f"materialized {len(payload['files'])} files; deleted {len(payload['delete'])}")
+          print("validated 43 ordered functional cells and zero generated Rust sources")
+          PY
+
+      - name: Commit materialized prototype contour
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "prototype(cognitive): materialize audited assignment waves"
+          git push
