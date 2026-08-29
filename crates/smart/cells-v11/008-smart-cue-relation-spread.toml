@@ -1,0 +1,44 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.cue.relation_spread"
+agent_order = 8
+physical_package = "eliot-cues"
+execution_class = "OPTIONAL_WARM_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Expand direct seeds through admitted typed edges without weakening direct hits."
+
+[agent]
+objective = "Implement optional bounded relation spread with local degradation."
+write_scope = ["crates/smart/eliot-cues/src/relation_spread.rs", "crates/smart/eliot-cues/tests/relation_spread.rs"]
+integration_owner = "cue projection integration owner"
+forbidden_files = ["crates/smart/eliot-cues/src/lib.rs", "crates/smart/eliot-cues/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn expand_cue_activation(snapshot: &CueSnapshot, request: &ActivationSpreadRequest, direct: &DirectCueMatchSet) -> Result<SpreadActivationSet, ActivationSpreadError>"]
+
+[algorithm]
+steps = [
+  "Return empty spread when disabled or graph is empty.",
+  "Validate depth, fanout, result and visited-node limits.",
+  "Traverse stable adjacency order.",
+  "Retain the best admissible single-path contribution per target rather than popularity sum.",
+  "Never remove, demote or rewrite a direct seed.",
+  "Record every accepted and suppressed path reason."
+]
+
+[limits]
+rules = ["Default maximum depth is 2.", "Use explicit fanout, visited-node and result ceilings.", "Traversal must be cycle-safe."]
+
+[errors]
+variants = ["StaleSnapshot", "FenceMismatch", "InvalidLimits", "UnknownSeed", "TraversalBudgetExhausted"]
+
+[forbidden]
+operations = ["unbounded traversal", "path-count popularity scoring", "direct-hit demotion", "storage call", "model call"]
+
+[tests]
+required = ["graph failure leaves direct results intact", "cycle is bounded and deterministic", "many weak paths do not overpower an exact seed", "disabled spread returns empty set"]
+
+[integration]
+provider = "smart.cue.direct_match"
+consumer = "smart.cue.activation"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if typed edge semantics, fanout or revision fence are absent."
