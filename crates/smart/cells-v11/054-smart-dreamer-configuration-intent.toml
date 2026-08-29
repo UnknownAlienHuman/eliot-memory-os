@@ -1,0 +1,42 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.configuration_intent"
+agent_order = 54
+physical_package = "eliot-dreamer-planning"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Translate a natural-language configuration request into a typed reversible intent without editing configuration."
+
+[agent]
+objective = "Implement typed configuration-change intent construction only."
+write_scope = ["crates/smart/eliot-dreamer-planning/src/configuration_intent.rs", "crates/smart/eliot-dreamer-planning/tests/configuration_intent.rs"]
+integration_owner = "Dreamer planning integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-planning/src/lib.rs", "crates/smart/eliot-dreamer-planning/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_configuration_change_intent(request: &ConfigurationIntentRequest, schema: &ConfigurationSchemaProjection, current: &ConfigurationSnapshot, draft: &AdmittedDreamDraft) -> Result<ConfigurationChangeIntentCandidate, ConfigurationIntentError>"]
+
+[algorithm]
+steps = [
+  "Validate setting schema, current snapshot, owner revision and fence.",
+  "Normalize exact setting deltas and impact classes.",
+  "Reject unknown settings and cost, privacy, remote or authority widening outside policy.",
+  "Require expected benefit, counter-risks, approval, probe or shadow, rollback and review condition."
+]
+
+[limits]
+rules = ["Use explicit setting-delta maxima.", "Perform no file, registry or snapshot mutation."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "UnknownSetting", "InvalidValue", "OwnerMismatch", "CeilingIncreaseDenied", "RollbackMissing"]
+
+[forbidden]
+operations = ["configuration edit", "file/registry mutation", "authority/privacy/cost ceiling widening", "approval grant", "external effect"]
+
+[tests]
+required = ["unknown setting is rejected", "authority widening cannot be inferred", "intent does not edit config", "rollback and review are mandatory"]
+
+[integration]
+provider = "Governor configuration schema and snapshot owner"
+consumer = "external configuration approval/application owner"
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if setting schema, owner revision, approval or rollback contract is absent."
