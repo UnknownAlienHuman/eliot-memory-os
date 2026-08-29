@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.accessibility"
+agent_order = 38
+physical_package = "eliot-dreamer-accessibility"
+execution_class = "BACKGROUND_READ_ONLY_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Propose reversible accessibility changes only from attributed use, outcome and false-activation evidence."
+
+[agent]
+objective = "Implement accessibility-only proposals; leave support, existence and influence unchanged."
+write_scope = ["crates/smart/eliot-dreamer-accessibility/src/accessibility.rs", "crates/smart/eliot-dreamer-accessibility/tests/accessibility.rs"]
+integration_owner = "memory accessibility integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-accessibility/src/lib.rs", "crates/smart/eliot-dreamer-accessibility/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_accessibility_candidate(request: &AccessibilityRequest, evidence: &AccessibilityEvidenceSnapshot) -> Result<AccessibilityCandidate, AccessibilityError>"]
+
+[algorithm]
+steps = [
+  "Validate complete or explicitly partial denominator, target revision and fence.",
+  "Evaluate observed use, attributed outcome, false activation, retrieval cost, retention value and protected role independently.",
+  "Return suppress, demote, archive or reactivate proposal only when policy dimensions justify it.",
+  "Preserve existence, support and influence dimensions unchanged.",
+  "Require restore and review conditions."
+]
+
+[limits]
+rules = ["Use explicit event and window maxima.", "Use no frequency-only heuristic or model call."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "MissingDenominator", "InsufficientOutcomeAttribution", "ProtectedRecord", "WrongOwnerDimension", "RestoreConditionMissing"]
+
+[forbidden]
+operations = ["support change", "existence change", "influence revocation", "frequency-only usefulness judgment", "physical purge", "canonical mutation"]
+
+[tests]
+required = ["low use alone yields no proposal", "false activation can lower accessibility without lowering support", "protected minority record is not demoted", "partial denominator cannot claim exact usefulness"]
+
+[integration]
+provider = "attributed use/outcome/false-activation evidence owner"
+consumer = "smart.dreamer.curation_dispatch and Governor/Human accessibility owner"
+product_pulse = "D3C_CURATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if attributed outcome, false-activation denominator, protected role or restore condition is unavailable."
