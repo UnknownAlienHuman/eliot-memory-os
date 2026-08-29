@@ -1,0 +1,45 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.draft_admission"
+agent_order = 21
+physical_package = "eliot-dreamer-validation"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Admit a grounded draft structurally under job, fence, privacy, budget, schema and transformation policy."
+
+[agent]
+objective = "Implement structural Dreamer draft admission without rewriting semantic content."
+write_scope = ["crates/smart/eliot-dreamer-validation/src/admission.rs", "crates/smart/eliot-dreamer-validation/tests/admission.rs"]
+integration_owner = "Dreamer validation integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-validation/src/lib.rs", "crates/smart/eliot-dreamer-validation/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn admit_grounded_dream_draft(request: &DreamDraftAdmissionRequest, grounded: &GroundedDreamDraft, report: &TransformationValidationReport) -> Result<AdmittedDreamDraft, DreamDraftAdmissionError>"]
+owned_types = ["DreamDraftAdmissionRequest", "DreamDraftAdmissionError"]
+
+[algorithm]
+steps = [
+  "Validate exact job, bundle and State Fence identity.",
+  "Check allowed candidate kinds and required typed subtypes for the job class.",
+  "Enforce privacy, budget, deadline and output schema.",
+  "Enforce forbidden effects and source-derived authority ceiling.",
+  "Apply per-job dimension thresholds including explicitly allowed Inconclusive states.",
+  "Return a typed admitted draft without rewriting model content."
+]
+
+[limits]
+rules = ["Use bounded draft bytes and items.", "Use a closed policy table per job class.", "Provide no semantic repair fallback."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "JobClassMismatch", "CandidateKindDenied", "PrivacyViolation", "BudgetExceeded", "SchemaMismatch", "TransformationRejected", "ForbiddenEffect"]
+
+[forbidden]
+operations = ["claim editing", "subtype inference from prose", "authority promotion", "canonical write", "model retry", "effect execution"]
+
+[tests]
+required = ["admission cannot edit claims", "unknown subtype is rejected", "failed lineage dimension rejects every job", "Orientation cannot emit canonical status"]
+
+[integration]
+provider = "smart.dreamer.transformation_validation"
+consumer = "typed Dreamer semantic handlers"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if job-class candidate-kind policy or required transformation thresholds are undefined."
