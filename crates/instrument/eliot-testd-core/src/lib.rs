@@ -1191,21 +1191,47 @@ impl TestdStore {
             );
         }
         drop(table);
-        jobs.retain(|job| {
-            matches!(job.state, JobState::Queued | JobState::RetryWait)
-                && job.not_before_ms <= now
-                && job.lease.is_none()
-        });
-        let snapshot = jobs.clone();
-        jobs.retain(|job| {
-            !snapshot.iter().any(|other| {
-                other.project_id == job.project_id
-                    && other.project_sequence < job.project_sequence
-                    && !other.state.is_terminal()
+
+        // Project-head blocking must see every durable state. Filtering to
+        // queued/retry candidates first would erase a Running predecessor and
+        // allow a later same-project sequence to start concurrently.
+        let snapshot = jobs;
+        let mut candidates = snapshot
+            .iter()
+            .filter(|job| {
+                matches!(job.state, JobState::Queued | JobState::RetryWait)
+                    && job.not_before_ms <= now
+                    && job.lease.is_none()
             })
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.retain(|job| {
+            !project_head_blocked(
+                &job.project_id,
+                job.project_sequence,
+                snapshot.iter().map(|other| {
+                    (
+                        other.project_id.as_str(),
+                        other.project_sequence,
+                        other.state,
+                    )
+                }),
+            )
         });
-        Ok(jobs)
+        Ok(candidates)
     }
+}
+
+fn project_head_blocked<'a>(
+    project_id: &str,
+    project_sequence: u64,
+    jobs: impl IntoIterator<Item = (&'a str, u64, JobState)>,
+) -> bool {
+    jobs.into_iter().any(|(other_project, other_sequence, other_state)| {
+        other_project == project_id
+            && other_sequence < project_sequence
+            && !other_state.is_terminal()
+    })
 }
 
 fn payload_digest(
@@ -1515,6 +1541,40 @@ mod tests {
             Some(&current),
             "worker-a",
             200,
+        ));
+    }
+
+    #[test]
+    fn project_head_blocking_uses_every_durable_nonterminal_state() {
+        assert!(project_head_blocked(
+            "project-a",
+            2,
+            [("project-a", 1, JobState::Running)]
+        ));
+        assert!(!project_head_blocked(
+            "project-a",
+            2,
+            [("project-a", 1, JobState::Succeeded)]
+        ));
+        assert!(!project_head_blocked(
+            "project-a",
+            2,
+            [("project-b", 1, JobState::Running)]
+        ));
+        assert!(project_head_blocked(
+            "project-a",
+            2,
+            [("project-a", 1, JobState::Queued)]
+        ));
+        assert!(project_head_blocked(
+            "project-a",
+            2,
+            [("project-a", 1, JobState::RetryWait)]
+        ));
+        assert!(!project_head_blocked(
+            "project-a",
+            1,
+            [("project-a", 2, JobState::Running)]
         ));
     }
 
