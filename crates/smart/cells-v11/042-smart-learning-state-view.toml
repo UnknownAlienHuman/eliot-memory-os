@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.learning.state_view"
+agent_order = 42
+physical_package = "eliot-learning"
+execution_class = "ATTEMPT_BOUNDARY_HOT"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Assemble an immutable learning view from exact owner-produced task, attempt, evaluator, context and artifact projections."
+
+[agent]
+objective = "Implement immutable learning-owner projection assembly only."
+write_scope = ["crates/smart/eliot-learning/src/state_view.rs", "crates/smart/eliot-learning/tests/state_view.rs"]
+integration_owner = "learning integration owner"
+forbidden_files = ["crates/smart/eliot-learning/src/lib.rs", "crates/smart/eliot-learning/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_campaign_learning_state_view(request: &LearningStateViewRequest, projections: &LearningOwnerProjections) -> Result<CampaignLearningStateView, LearningStateViewError>"]
+
+[algorithm]
+steps = [
+  "Validate owner identities, revisions and common State Fence.",
+  "Require explicit coverage for Task Controller, attempt lineage, Governor admission, Context Compiler, Evaluator and artifacts.",
+  "Represent Partial, Stale, Blocked and Unavailable separately.",
+  "Never fill missing owner state from transcript or model memory.",
+  "Compute canonical view digest."
+]
+
+[limits]
+rules = ["Use explicit projection and artifact maxima.", "Use O(n log n) stable merge with no owner callback."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "MissingOwnerCoverage", "StaleProjection", "DuplicateProjection", "DigestFailure"]
+
+[forbidden]
+operations = ["transcript inference", "model-memory inference", "owner callback", "mutable campaign aggregate", "storage scan", "blocking I/O"]
+
+[tests]
+required = ["missing Task Controller projection is not inferred from transcript", "Partial view authorizes only explicitly narrower work", "permutation yields identical digest", "mixed-fence projection is rejected"]
+
+[integration]
+provider = "Task Controller, attempt, Governor, Context, Evaluator and artifact owners"
+consumer = "smart.learning.attempt_delta"
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if any required owner cannot provide identity, revision, fence and explicit coverage."
