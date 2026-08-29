@@ -11,9 +11,16 @@ Read, in order:
 1. [`WORKFLOW.md`](WORKFLOW.md);
 2. [`workstreams/ACTIVE.toml`](workstreams/ACTIVE.toml);
 3. the owning open GitHub issue and current PR, when one exists;
-4. [`docs/ARCHITECTURE_CONTRACT.md`](docs/ARCHITECTURE_CONTRACT.md) and only the
+4. the nearest `AGENTS.md` from the repository root down to every mutable path;
+5. [`docs/ARCHITECTURE_CONTRACT.md`](docs/ARCHITECTURE_CONTRACT.md) and only the
    applicable canonical Architecture/Implementation sections;
-5. the exact source, contracts, tests, and one-hop dependencies for the work.
+6. the exact source, contracts, tests, and one-hop dependencies for the work.
+
+A deeper `AGENTS.md` narrows the work allowed in that subtree. It cannot expand
+authority granted by the root instructions, owning issue, Architecture, or
+Implementation. In particular, `crates/eliot-app/AGENTS.md` marks the old
+`eliot-governor` surface as a migration/regression facade rather than a current
+composition root.
 
 ## Mandatory preflight
 

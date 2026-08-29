@@ -72,6 +72,7 @@ jobs:
           pair = tomllib.loads(pathlib.Path('docs/normative-pair.toml').read_text(encoding='utf-8'))
           active = tomllib.loads(pathlib.Path('workstreams/ACTIVE.toml').read_text(encoding='utf-8'))
           inventory = json.loads(pathlib.Path('workstreams/core-daemons/inventory.json').read_text(encoding='utf-8'))
+          legacy_app = tomllib.loads(pathlib.Path('crates/eliot-app/Cargo.toml').read_text(encoding='utf-8'))
 
           assert pair['status'] == 'accepted'
           assert pair['repository_authority_branch'] == 'main'
@@ -84,12 +85,15 @@ jobs:
           assert all(w['status'] == 'active' for w in active['workstream'])
           assert all(w['branch_strategy'] == 'fresh_per_issue_from_current_main' for w in active['workstream'])
           assert inventory['authority']['branch'] == 'main'
+          assert 'legacy' in legacy_app['package']['description'].lower()
+          assert 'migration' in legacy_app['package']['description'].lower()
 
           required = [
               '.github/README.md',
               '.github/workflows/ci.yml',
               '.github/workflows/repository-policy.yml',
               '.github/workflows/source-candidate.yml',
+              'crates/eliot-app/AGENTS.md',
               'crates/smart/cognitive-wave-01.toml',
               'crates/smart/cognitive-wave-02.toml',
               'crates/smart/cognitive-edge-map.toml',
@@ -170,6 +174,7 @@ jobs:
             docs/architecture/README.md
             docs/architecture/INDEX.md
             docs/operations/README.md
+            crates/eliot-app/AGENTS.md
             scripts/README.md
             workstreams/README.md
             workstreams/ACTIVE.toml
