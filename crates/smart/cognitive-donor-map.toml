@@ -1,83 +1,14 @@
-schema_version = 3
-map_id = "cognitive-donor-map-2026-08-28-rev6"
-current_main_commit = "7f075ddf5d168f3d2ad3144807b7f0b9d4f0bb61"
-superseded_prototype_branch_commit = "b35e4a489d45d81f172ef7d5b44bea165438cb1c"
-rule = "Reuse requires one current causal owner, current documentation fit, a pure or reconstructible boundary, exact donor anchors, an independent proof path and an explicit rejected-overgeneralization."
-source_status = "STATIC_REVIEW_ONLY"
-
-[[donor]]
-path = "crates/governor/eliot-observation"
-disposition = "RETAIN_OWNER_AND_HARDEN_IN_PLACE"
-targets = ["governor.observation.classifier"]
-rationale = "Current Governor capture/admission owner already exists. Keep deterministic first-pass classification there; do not create a competing Smart capture owner."
-rejected_overgeneralization = "Any Smart crate that owns capture, status, lifecycle or canonical admission."
-
-[[donor]]
-path = "crates/smart/eliot-context"
-disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
-targets = ["eliot-context-contracts", "eliot-context-candidates", "eliot-context-admission", "eliot-context-assembly"]
-rationale = "Retain pure whole-unit compiler, deterministic ordering and vector quality ideas; separate candidate construction, admission and rendering."
-rejected_overgeneralization = "Nested compilation, mixed ownership and a facade that recomputes child semantics."
-
-[[donor]]
-path = "crates/smart/eliot-understanding"
-disposition = "MERGE_RENDERING_INTO_CONTEXT_ASSEMBLY_THEN_RETIRE"
-targets = ["eliot-context-assembly"]
-rationale = "Retain role-preserving sections, omission manifest and expansion handles; remove the second ContextCompiler invocation and duplicate understanding owner."
-rejected_overgeneralization = "Independent mutable Understanding State or a second admission pass."
-
-[[donor]]
-path = "crates/smart/eliot-cues"
-disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
-targets = ["eliot-cue-contracts", "eliot-cue-normalizer", "eliot-cue-binding", "eliot-cue-index", "eliot-cue-activation"]
-rationale = "Retain deterministic matching, bounded spreading and trace shape; split canonical normalization, binding proposals, admitted projection construction and hot evaluation."
-rejected_overgeneralization = "Destructive canonical-path lowercasing, candidate bindings bypassing Governor admission, session delivery state in the pure evaluator, or graph-edge minimums for exact firing."
-
-[[donor]]
-path = "crates/smart/eliot-dreamer-core"
-disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
-targets = ["eliot-dreamer-contracts", "eliot-dreamer-bundle", "eliot-dreamer-candidate-validation", "eliot-dreamer-orientation", "eliot-dreamer-clarification", "eliot-dreamer-architecture-brief", "eliot-dreamer-implementation-brief", "eliot-dreamer-classification", "eliot-dreamer-relation", "eliot-dreamer-episode", "eliot-dreamer-concept", "eliot-dreamer-procedure", "eliot-dreamer-failure", "eliot-dreamer-structure-repair", "eliot-dreamer-reconsolidation", "eliot-dreamer-accessibility", "eliot-dreamer-memory-repair", "eliot-dreamer-curation", "eliot-dreamer-conflict-analysis", "eliot-dreamer-development-diagnosis", "eliot-dreamer-maintenance-plan", "eliot-dreamer-configuration-plan", "eliot-dreamer-orchestration-plan"]
-rationale = "Retain candidate-only ceiling, bounded draft validation, lineage and preservation concepts; separate top-level job classes from shared sub-handlers and move each transformation, diagnosis or planning function behind an independent boundary."
-rejected_overgeneralization = "One generator that mixes job contracts, bundle construction, validation, self-query authority domains, subtype semantics, scheduling or promotion."
-
-[[donor]]
-path = "crates/smart/eliot-epistemic"
-disposition = "RETAIN_AND_HARDEN_IN_PLACE"
-targets = ["eliot-epistemic"]
-rationale = "Already one coherent stateless resolver. Add assumption, verifier-competence, supersession and discriminative inquiry semantics; classify it as a D3a shared prerequisite."
-rejected_overgeneralization = "Truth declaration, canonical epistemic transition or action blocking inside the resolver."
-
-[[donor]]
-path = "crates/smart/eliot-memory-curation"
-disposition = "PARTIAL_REUSE_THEN_RETIRE_FACADE"
-targets = ["eliot-memory-curation-screen", "eliot-dreamer-structure-repair", "eliot-dreamer-accessibility", "eliot-dreamer-curation"]
-rationale = "Keep bounded read-only screening, protection and stable cursor ideas; use current shared contracts and typed subtype handlers."
-rejected_overgeneralization = "Duplicate domain enums, writer utility as authority, lifecycle/action ownership or generic semantic fallback."
-
-[[donor]]
-path = "crates/smart/eliot-memory"
-disposition = "RETIRE_AS_COGNITIVE_STATE_OWNER_AFTER_EDGE_MIGRATION"
-targets = ["governor.observation.classifier"]
-rationale = "Salvage only pure classification heuristics. Arc/Mutex canonical memory, retrieval, status, lifecycle and influence ownership conflict with the sole Governor/canonical path."
-rejected_overgeneralization = "Any second memory plane, status owner, retrieval reinforcement or direct write surface."
-
-[[donor]]
-path = "crates/smart/eliot-system-experience"
-disposition = "RETIRE_AS_STATE_OWNER_DEFER_READ_PROJECTION_IDEAS"
-targets = []
-rationale = "The canonical self-scope experience bank and SystemObservationJournal already have Governor/Memory OS owners. Later reuse only bounded read/filter/projection mechanics over those records."
-rejected_overgeneralization = "A second self-memory owner, relation store or lifecycle transition path."
-
-[[donor]]
-path = "crates/meta/eliot-improvement"
-disposition = "RETAIN_AND_HARDEN_IN_PLACE"
-targets = ["meta.learning.closure", "meta.improvement.promotion_input"]
-rationale = "The advisory-only candidate and external promotion-input ceiling are useful. Add activation/adherence, retention/transfer, evaluator validity, Product Pulse, rollback and explicit no-change closure semantics through non-overlapping source cells."
-rejected_overgeneralization = "Direct promotion, self-selected evaluator, automatic policy/source rewrite, overlapping agent write scopes or one aggregate learning score."
-
-[[donor]]
-path = "branch:cognitive-crates-prototypes-01"
-disposition = "SUPERSEDE_DO_NOT_ASSIGN"
-targets = []
-rationale = "The branch is stale against current main and contains hundreds of noun-level or empty manifest prototypes. Reuse only individually revalidated boundary hypotheses."
-rejected_overgeneralization = "Effective indexes, old READY labels or empty crates treated as current implementation assignments."
+schema_version = 1
+status = "COMPATIBILITY_POINTER"
+authority = "crates/smart/cognitive-rev11-migration.toml"
+rule = "Reuse deterministic algorithms and proof discriminators only; never inherit duplicate canonical state, lifecycle, authority, delivery, influence or proof ownership."
+primary_donors = [
+  "crates/smart/eliot-epistemic",
+  "crates/smart/eliot-cues",
+  "crates/smart/eliot-context",
+  "crates/smart/eliot-dreamer-core",
+  "crates/smart/eliot-memory-curation",
+  "crates/smart/eliot-understanding",
+]
+state_owner_retirements = ["crates/smart/eliot-memory", "crates/smart/eliot-system-experience"]
+assignment_rule = "Use the exact keep/replace/forbid_transfer disposition in cognitive-rev11-migration.toml."
