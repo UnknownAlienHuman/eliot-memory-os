@@ -1,14 +1,6 @@
 name: Cognitive contracts wave 0
 
 on:
-  push:
-    branches:
-      - work/94-cognitive-contracts-wave0
-    paths:
-      - .github/workflows/cognitive-contracts-wave0.yml
-      - crates/smart/eliot-memory-projection-contracts/**
-      - crates/smart/eliot-context-contracts/**
-      - crates/smart/eliot-learning-contracts/**
   workflow_dispatch:
 
 permissions:
