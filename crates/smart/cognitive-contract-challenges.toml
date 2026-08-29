@@ -1,68 +1,91 @@
 schema_version = 1
-registry_id = "cognitive-contract-challenges-2026-08-28"
-status = "ACTIVE"
-wave = "cognitive-micromodules-wave-01"
-rule = "A cognitive agent must stop at a missing owner-neutral provider contract. It may define only its own output protocol and must not invent another plane's authority, denominator, state or runtime behavior."
+status = "OPEN_EXTERNAL_CONTRACT_CHALLENGES"
+authority = "crates/smart/cognitive-rev11-authority.toml"
+rule = "A Smart or Meta agent must not invent an owner-neutral contract that belongs to Governor, Kernel, Researcher, Security, Task Controller, Evaluator or Agent Coordinator. Block the live edge and implement against fixtures until the owner publishes it."
 
 [[challenge]]
 id = "CC-001"
-status = "OPEN_BLOCKING_ACCESSIBILITY"
-required_owner = "Governor/Meta evaluation contract owner"
-needed_by = ["eliot-dreamer-accessibility", "future use attribution/usefulness evaluation"]
-missing_contract = "Canonical attributed inclusion/influence/use/outcome/cost/regret evidence with complete denominator, fence, scope and no-use semantics."
-forbidden_workaround = "writer utility score, retrieval count, recency or model judgment treated as usefulness proof"
-resolution_evidence = ["versioned owner-neutral contract", "producer fixtures", "complete-denominator and attribution tests", "Governor/Meta ownership acceptance"]
+required_by = ["smart.dreamer.implementation_brief"]
+owner = "current-system evidence/conformance owner"
+missing = "CurrentSystemEvidenceSnapshot with exact Product Identity, proof ceiling, coverage and State Fence"
+fallback = "target-only Implementation brief with current support Unknown"
 
 [[challenge]]
 id = "CC-002"
-status = "OPEN_INTEGRATION_GATE"
-required_owner = "Codex-owned runtime composition"
-needed_by = ["Orientation Product Pulse", "all Dreamer handlers"]
-missing_contract = "Typed model-route adapter boundary from DreamInputBundle to schema-valid ModelDraft, including timeout/cancellation/privacy/cost receipt and no semantic authority."
-forbidden_workaround = "provider SDK or route reservation inside Smart crates"
-resolution_evidence = ["adapter contract fixture", "malformed/partial/timeout model-output fixtures", "cost/privacy receipt", "Product Pulse wiring proof"]
+required_by = ["smart.dreamer.architecture_brief", "smart.dreamer.implementation_brief"]
+owner = "Architecture authority projection owner"
+missing = "runtime-accessible accepted normative document projection preserving exact path, digest, revision, edition and pair key"
+fallback = "fixture-only package proof; live self-query remains blocked"
 
 [[challenge]]
 id = "CC-003"
-status = "OPEN_INTEGRATION_GATE"
-required_owner = "Codex-owned runtime composition"
-needed_by = ["eliot-dreamer-curation"]
-missing_contract = "Open typed handler registry/invocation protocol that produces TypedCurationHandlerResult without making the facade depend on concrete handlers."
-forbidden_workaround = "hard-coded match that imports every concrete handler crate into the curation facade"
-resolution_evidence = ["registry contract", "missing/duplicate handler fixtures", "partial failure and cancellation semantics", "no-concrete-link dependency proof"]
+required_by = ["smart.dreamer.accessibility"]
+owner = "usage/outcome attribution owner"
+missing = "Frozen opportunity/use/outcome/false-activation denominator with exact record and attempt lineage"
+fallback = "Inconclusive; no accessibility demotion proposal"
 
 [[challenge]]
 id = "CC-004"
-status = "OPEN_PROVIDER_CONFORMANCE"
-required_owner = "Governor canonical projection owners"
-needed_by = ["eliot-context-candidates"]
-missing_contract = "Versioned admitted task, continuity, safety/negative-memory and affordance projections compatible with one StateFence and WorkScope."
-forbidden_workaround = "context-candidate mapper retrieving canonical state or inventing missing role prose"
-resolution_evidence = ["projection schemas", "shared-fence fixtures", "omission semantics", "provider/consumer replacement tests"]
+required_by = ["smart.dreamer.influence_repair"]
+owner = "Security influence owner"
+missing = "Owner-neutral InfluenceDependencyClosure with completeness, indirect paths, State Fence and revision"
+fallback = "warning or revalidation proposal only; no revoke-influence proposal"
 
 [[challenge]]
 id = "CC-005"
-status = "DEFERRED_RESEARCH"
-required_owner = "Researcher plane"
-needed_by = ["future Dreamer Research synthesis"]
-missing_contract = "ResearchPack, Evidence Grade, confirmatory/exploratory separation, evidence freeze, citation manifest and coverage denominator."
-forbidden_workaround = "Dreamer source acquisition, self-selected denominator or aggregate URL list treated as grounded research"
-resolution_evidence = ["Researcher contract implementation", "frozen evidence fixtures", "claim-level citation closure", "coverage/omission proof"]
+required_by = ["smart.dreamer.curation"]
+owner = "Governor/module registry owner"
+missing = "Open typed CurationHandlerRegistrySnapshot with handler identity, subtype, schema, generation and State Fence"
+fallback = "fixture-only dispatch proof; live unknown subtype remains Unsupported"
 
 [[challenge]]
 id = "CC-006"
-status = "DEFERRED_SELF_SCOPE"
-required_owner = "Architecture/Implementation accepted-source projection owner"
-needed_by = ["future Dreamer ArchitectureBrief", "future Dreamer ImplementationBrief", "conformance handler"]
-missing_contract = "Exact accepted-source projection with edition identity, section handles, current-source/runtime evidence and conflict precedence."
-forbidden_workaround = "Dreamer reading arbitrary repository prose and declaring architecture conformance"
-resolution_evidence = ["accepted-source manifest", "edition/fence fixtures", "Architecture-over-Implementation conflict tests", "current-system evidence separation"]
+required_by = ["meta.learning.activation_assessment"]
+owner = "Harness activation/delivery owner"
+missing = "HarnessActivationReceipt proving exact candidate, target, revision, delivery boundary and observed activation ceiling"
+fallback = "activation Inconclusive; acknowledgement is insufficient"
 
 [[challenge]]
 id = "CC-007"
-status = "DEFERRED_SELF_LEARNING"
-required_owner = "Governor/Meta outcome and experiment owners"
-needed_by = ["future DreamCycle", "use attribution", "usefulness/harm/cost evaluation", "improvement experiment"]
-missing_contract = "Candidate use attribution, intervention/control identity, outcome window, confounders, cost/harm/regret dimensions, rollback and promotion authority."
-forbidden_workaround = "active-generation self-modification, self-verification, benchmark-only reward or model-rated improvement"
-resolution_evidence = ["versioned attribution/experiment contracts", "counterfactual and confounder fixtures", "dimensioned evaluation", "Governor promotion gate"]
+required_by = ["smart.learning.state_view"]
+owner = "Task Controller and AgentAttempt owners"
+missing = "Complete owner-neutral campaign/attempt lineage projection with task revision and attempt boundaries"
+fallback = "PARTIAL or BLOCKED CampaignLearningStateView"
+
+[[challenge]]
+id = "CC-008"
+required_by = ["meta.learning.closure", "meta.learning.promotion_input"]
+owner = "Evaluator and Product Pulse evidence owners"
+missing = "Outcome attribution, evaluator-validity, retention, transfer and Product Pulse projections over exact Product Identity"
+fallback = "NO_REUSABLE_DELTA or insufficient promotion input"
+
+[[challenge]]
+id = "CC-009"
+required_by = ["smart.dreamer.maintenance_plan", "smart.dreamer.cycle_plan"]
+owner = "Governor maintenance owner"
+missing = "MaintenanceModeProjection, maintenance family registry and trigger snapshot from the single MaintenanceTriggerEvaluator"
+fallback = "no maintenance plan"
+
+[[challenge]]
+id = "CC-010"
+required_by = ["smart.dreamer.orchestration_plan"]
+owner = "Task Controller, Governor and Agent Coordinator"
+missing = "Owner-neutral capability, admission and execution-boundary projections without exposing mutable Ready Queue or SwarmExecutionState"
+fallback = "advisory NoEligibleRoute or HumanReviewRequired"
+
+[[challenge]]
+id = "CC-011"
+required_by = ["smart.context.reactive_delivery_plan"]
+owner = "host integration and session delivery owner"
+missing = "HostContextCapabilitySnapshot and delivery-boundary contract distinguishing event-integrated, tool-only and attention-only hosts"
+fallback = "AttentionOnly plan; no prevention claim"
+
+[[challenge]]
+id = "CC-012"
+required_by = ["smart.cue.normalizer"]
+owner = "WorkScope/resource identity owner"
+missing = "Comparison profile projection for case sensitivity, path separators, repository spelling and error-signature rules"
+fallback = "UnsupportedProfile; never global lowercasing"
+
+[closure_rule]
+requirements = ["owner publishes contract", "exact schema and proof ceiling reviewed", "fixture proof updated", "real provider/consumer Edge Proof passes"]
