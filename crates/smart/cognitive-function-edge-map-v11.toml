@@ -1,0 +1,555 @@
+schema_version = "eliot-cognitive-function-edge-map-v11"
+status = "ACTIVE_WORKING_DRAFT"
+issue = "github:UnknownAlienHuman/eliot-memory-os#94"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+edge_count = 54
+rule = "A function edge carries one typed immutable output across one owner boundary. Logical implementation order is not a Cargo dependency. Every implemented edge requires a real provider-consumer fixture and failure-path proof."
+
+[[edge]]
+id = "E01_CAPTURE_CLASSIFICATION_TO_GOVERNOR_ADMISSION"
+producer = "governor.observation.classifier::classify_observation"
+output = "ObservationClassification"
+consumer = "Governor observation admission owner"
+input_role = "classification proposal accompanying loss-tolerant capture"
+required = true
+failure = "preserve safe cold capture; quarantine ambiguous task binding"
+proof = "ambiguous classification never drops safe material or promotes support"
+
+[[edge]]
+id = "E02_ADMITTED_EVIDENCE_TO_EPISTEMIC_POSITION"
+producer = "Governor canonical read projection owner"
+output = "Vec<EpistemicRecordProjection>"
+consumer = "smart.epistemic.position::resolve_current_epistemic_position"
+input_role = "exact fenced evidence set"
+required = true
+failure = "return typed incomplete or stale position; never infer missing records"
+proof = "mixed-fence, duplicate and stale inputs fail or remain explicit"
+
+[[edge]]
+id = "E03_POSITION_TO_DREAM_BUNDLE"
+producer = "smart.epistemic.position::resolve_current_epistemic_position"
+output = "CurrentEpistemicPosition"
+consumer = "Governor Dream job/bundle request builder"
+input_role = "question-local position handles and safety-floor requirements"
+required = true
+failure = "Dream job remains blocked or incomplete"
+proof = "assumptions, rivals, conflicts and investigations survive bundle selection"
+
+[[edge]]
+id = "E04_REFERENCE_DESCRIPTORS_TO_MANIFEST"
+producer = "Governor admitted-reference projection owner"
+output = "Vec<ReferenceDescriptor>"
+consumer = "smart.dreamer.bundle::build_reference_manifest"
+input_role = "only handles Dreamer may expand or cite"
+required = true
+failure = "unknown or privacy-incompatible descriptor rejected"
+proof = "unadmitted handle cannot enter manifest"
+
+[[edge]]
+id = "E05_MANIFEST_EXPANSIONS_TO_BUNDLE"
+producer = "Governor/Research read-expansion owner"
+output = "Vec<ExpandedReference>"
+consumer = "smart.dreamer.bundle::assemble_dream_input_bundle"
+input_role = "bounded whole-reference payloads"
+required = true
+failure = "required reference retained as exact handle or bundle fails visibly"
+proof = "Safety Floor and downstream headroom are reserved before optional references"
+
+[[edge]]
+id = "E06_BUNDLE_TO_MODEL_ROUTE"
+producer = "smart.dreamer.bundle::assemble_dream_input_bundle"
+output = "DreamInputBundle"
+consumer = "external governed model-route adapter"
+input_role = "bounded disclosure-safe prompt material"
+required = true
+failure = "route failure produces no model draft and no candidate"
+proof = "Dreamer core has no provider SDK or route-selection authority"
+
+[[edge]]
+id = "E07_MODEL_DRAFT_TO_CLAIM_GROUNDING"
+producer = "external governed model-route adapter"
+output = "ModelDraftEnvelope"
+consumer = "smart.dreamer.claim_grounding::ground_draft_claims"
+input_role = "untrusted candidate draft"
+required = true
+failure = "invented citations or missing material claims reject grounding"
+proof = "every material claim maps to exact manifest handles or unsupported residue"
+
+[[edge]]
+id = "E08_GROUNDED_DRAFT_TO_TRANSFORMATION_VALIDATION"
+producer = "smart.dreamer.claim_grounding::ground_draft_claims"
+output = "GroundedDreamDraft"
+consumer = "smart.dreamer.transformation_validation::validate_dream_transformation"
+input_role = "claim-level grounded transformation"
+required = true
+failure = "unprovable dimensions remain Inconclusive"
+proof = "seven dimensions remain independent and no source count becomes coverage"
+
+[[edge]]
+id = "E09_VALIDATION_TO_DRAFT_ADMISSION"
+producer = "smart.dreamer.transformation_validation::validate_dream_transformation"
+output = "TransformationValidationReport"
+consumer = "smart.dreamer.draft_admission::admit_grounded_dream_draft"
+input_role = "dimensioned structural proof ceiling"
+required = true
+failure = "job-specific threshold failure rejects draft without rewriting it"
+proof = "failed lineage/authority dimension cannot be hidden"
+
+[[edge]]
+id = "E10_ADMITTED_DRAFT_TO_RIVAL_MODELS"
+producer = "smart.dreamer.draft_admission::admit_grounded_dream_draft"
+output = "AdmittedDreamDraft"
+consumer = "smart.dreamer.rival_model::build_rival_model_set"
+input_role = "Orientation model candidates"
+required = true
+failure = "return no-model/unknown rather than fabricate rival"
+proof = "dependent repetitions do not erase independent dissent"
+
+[[edge]]
+id = "E11_ADMITTED_DRAFT_TO_RELATION_CORE"
+producer = "smart.dreamer.draft_admission::admit_grounded_dream_draft"
+output = "AdmittedDreamDraft"
+consumer = "smart.dreamer.relation::build_relation_candidates"
+input_role = "typed Orientation or Curation relation request"
+required = true
+failure = "unknown endpoint/kind/falsifier rejects candidate"
+proof = "chronology, similarity and causal hypothesis remain distinct"
+
+[[edge]]
+id = "E12_RIVALS_POSITION_TO_PROBE_PLAN"
+producer = "smart.dreamer.rival_model::build_rival_model_set"
+output = "RivalModelSet"
+consumer = "smart.dreamer.probe_plan::build_discriminative_probe_plan"
+input_role = "rival predictions requiring discrimination"
+required = false
+failure = "empty safe plan is valid when no admissible probe exists"
+proof = "probe planner performs no effect and retains verifier/stop conditions"
+
+[[edge]]
+id = "E13_ORIENTATION_CHILDREN_TO_PACKET"
+producer = "rival/relation/probe child cells"
+output = "RivalModelSet + RelationCandidateSet + DiscriminativeProbePlan"
+consumer = "smart.dreamer.orientation::assemble_orientation_packet"
+input_role = "already typed Orientation sections"
+required = true
+failure = "identity/fence mismatch rejects assembly"
+proof = "packet assembly never reruns semantic reasoning or writes confirmed evidence"
+
+[[edge]]
+id = "E14_POSITION_DRAFT_TO_CLARIFICATION"
+producer = "CurrentEpistemicPosition + AdmittedDreamDraft"
+output = "explicit unknown/conflict set"
+consumer = "smart.dreamer.clarification::build_clarification_candidate"
+input_role = "decision-relevant ambiguity"
+required = false
+failure = "no clarification candidate when answer cannot change admissible decision"
+proof = "every question names expected decision delta and answer schema"
+
+[[edge]]
+id = "E15_RESEARCHER_BUNDLE_TO_RESEARCH_SYNTHESIS"
+producer = "eliot-research-exchange-api / Researcher acquisition owner"
+output = "ResearchEvidenceBundle"
+consumer = "smart.dreamer.research_synthesis::synthesize_research_candidate"
+input_role = "already acquired immutable evidence bundle"
+required = true
+failure = "failed acquisition and incomplete coverage remain visible"
+proof = "Dreamer performs no acquisition and cannot claim no-match on incomplete scope"
+
+[[edge]]
+id = "E16_NORMALIZED_CUE_TO_BINDING_CANDIDATES"
+producer = "smart.cue.normalization::normalize_observed_cues"
+output = "Vec<NormalizedCue>"
+consumer = "smart.cue.binding::build_cue_binding_candidates"
+input_role = "canonical spelling plus explicit comparison key"
+required = true
+failure = "invalid cue retained only in upstream observation evidence, not index"
+proof = "capture and fire use identical normalization profile"
+
+[[edge]]
+id = "E17_BINDING_CANDIDATE_TO_GOVERNOR_ADMISSION"
+producer = "smart.cue.binding::build_cue_binding_candidates"
+output = "CueBindingCandidateSet"
+consumer = "Governor cue-binding admission owner"
+input_role = "candidate-only binding proposals"
+required = true
+failure = "unadmitted binding never reaches published snapshot"
+proof = "Smart cannot self-publish candidate binding"
+
+[[edge]]
+id = "E18_ADMITTED_BINDINGS_TO_SNAPSHOT"
+producer = "Governor cue-binding admission owner"
+output = "Vec<AdmittedCueBinding> + Vec<AdmittedActivationEdge>"
+consumer = "smart.cue.snapshot::build_cue_snapshot"
+input_role = "exact admitted projection inputs"
+required = true
+failure = "candidate/stale/unknown-endpoint input rejects rebuild"
+proof = "zero-edge snapshot remains valid and direct index independent"
+
+[[edge]]
+id = "E19_OBSERVED_CUES_TO_DIRECT_MATCH"
+producer = "event/tool adapter using smart.cue.normalization"
+output = "DirectCueMatchRequest"
+consumer = "smart.cue.direct_match::match_direct_cues"
+input_role = "normalized observed cues on exact snapshot revision"
+required = true
+failure = "stale snapshot fails visibly"
+proof = "exact cue fires when relation edge set is empty"
+
+[[edge]]
+id = "E20_DIRECT_MATCH_TO_RELATION_SPREAD"
+producer = "smart.cue.direct_match::match_direct_cues"
+output = "DirectCueMatchSet"
+consumer = "smart.cue.relation_spread::expand_cue_activation"
+input_role = "protected direct seeds"
+required = false
+failure = "spread returns degraded empty set while direct results survive"
+proof = "optional graph failure cannot remove or demote direct hits"
+
+[[edge]]
+id = "E21_DIRECT_AND_SPREAD_TO_ACTIVATION"
+producer = "direct match and optional relation spread"
+output = "DirectCueMatchSet + SpreadActivationSet"
+consumer = "smart.cue.activation::assemble_cue_activation"
+input_role = "bounded activation components"
+required = true
+failure = "direct overflow fails; optional spread truncates with trace"
+proof = "direct results precede optional spread and retain classification"
+
+[[edge]]
+id = "E22_ACTIVATION_TO_MEMORY_CONTEXT_PROVIDER"
+producer = "smart.cue.activation::assemble_cue_activation"
+output = "CueActivationResult"
+consumer = "canonical memory/context projection owner"
+input_role = "handles and activation traces for owner-produced ContextContribution"
+required = false
+failure = "context compilation continues with provider coverage gap"
+proof = "activation result does not retrieve canonical payload itself"
+
+[[edge]]
+id = "E23_OWNER_CONTRIBUTIONS_TO_CONTEXT_MERGE"
+producer = "task, attention, epistemic, memory, authority and self-model projection owners"
+output = "Vec<ContextContribution>"
+consumer = "smart.context.contribution_merge::merge_context_contributions"
+input_role = "already materialized whole atoms and ProviderCoverage"
+required = true
+failure = "missing/unavailable/not-queried providers remain distinct"
+proof = "merge performs no retrieval, ranking or payload rewrite"
+
+[[edge]]
+id = "E24_MERGED_CANDIDATES_TO_CONTEXT_ADMISSION"
+producer = "smart.context.contribution_merge::merge_context_contributions"
+output = "MergedContextCandidateSet"
+consumer = "smart.context.admission::admit_context_candidates"
+input_role = "whole candidate set with denominators"
+required = true
+failure = "missing Safety Floor/headroom/required representation fails visibly"
+proof = "whole-unit provider-fair admission preserves rivals and unknowns"
+
+[[edge]]
+id = "E25_ADMITTED_CONTEXT_TO_QUALITY"
+producer = "smart.context.admission::admit_context_candidates"
+output = "AdmittedContextSet"
+consumer = "smart.context.quality::assess_context_quality"
+input_role = "frozen membership and omission manifest"
+required = true
+failure = "failed/inconclusive dimensions remain explicit"
+proof = "quality oracle cannot mutate membership or collapse dimensions"
+
+[[edge]]
+id = "E26_ADMITTED_CONTEXT_TO_VIEW"
+producer = "smart.context.admission::admit_context_candidates"
+output = "AdmittedContextSet"
+consumer = "smart.context.view_assembly::assemble_active_understanding_view"
+input_role = "already admitted whole atoms"
+required = true
+failure = "membership/fence mismatch rejects assembly"
+proof = "view has identical membership digest and preserves omission handles"
+
+[[edge]]
+id = "E27_VIEW_TO_DECISION_TAIL"
+producer = "smart.context.view_assembly::assemble_active_understanding_view"
+output = "ActiveUnderstandingView"
+consumer = "smart.context.decision_tail::build_decision_local_tail"
+input_role = "decision-boundary projection"
+required = true
+failure = "missing goal/verifier/stop or unsafe next action fails closed"
+proof = "tail adds no new evidence and changes no view membership"
+
+[[edge]]
+id = "E28_VIEW_TAIL_TO_REACTIVE_PLAN"
+producer = "ActiveUnderstandingView + DecisionLocalTail"
+output = "exact context identities"
+consumer = "smart.context.reactive_plan::plan_reactive_context_injection"
+input_role = "effect-free delivery planning input"
+required = true
+failure = "unsupported host becomes next-boundary or durable-attention degradation"
+proof = "planner neither sends context nor creates receipt/dedup state"
+
+[[edge]]
+id = "E29_REACTIVE_PLAN_TO_DELIVERY_OWNER"
+producer = "smart.context.reactive_plan::plan_reactive_context_injection"
+output = "PendingContextInjectionPlan"
+consumer = "external host/session delivery owner"
+input_role = "advisory bounded delivery plan"
+required = false
+failure = "no delivery claim without external receipt"
+proof = "pre-action prevention only when host proves interception capability"
+
+[[edge]]
+id = "E30_CANONICAL_SNAPSHOT_TO_CURATION_SCREEN"
+producer = "Governor canonical read projection owner"
+output = "CurationSnapshot"
+consumer = "smart.memory_curation.screen::screen_memory_curation"
+input_role = "exact bounded read-only corpus projection"
+required = true
+failure = "partial denominator cannot claim exact totals or usefulness"
+proof = "protected/minority/counterexample records survive screening"
+
+[[edge]]
+id = "E31_CURATION_SCREEN_TO_JOB_BUILDER"
+producer = "smart.memory_curation.screen::screen_memory_curation"
+output = "CurationScreenResult"
+consumer = "Governor/Dream job request builder"
+input_role = "typed review candidates and protected manifest"
+required = false
+failure = "no semantic handler invocation for unsupported finding"
+proof = "screening does not change lifecycle or support"
+
+[[edge]]
+id = "E32_TYPED_CURATION_REQUEST_TO_HANDLER"
+producer = "external governed CurationHandlerRegistry"
+output = "typed curation subtype request"
+consumer = "exact semantic/structure/accessibility/influence handler cell"
+input_role = "pre-resolved closed subtype"
+required = true
+failure = "unknown/ambiguous subtype remains unsupported"
+proof = "no free-text subtype inference or generic fallback"
+
+[[edge]]
+id = "E33_HANDLER_RESULTS_TO_CURATION_ASSEMBLY"
+producer = "typed curation handlers"
+output = "Vec<TypedCurationHandlerResult>"
+consumer = "smart.dreamer.curation_dispatch::assemble_curation_candidate_set"
+input_role = "already interpreted handler results"
+required = true
+failure = "result identity mismatch or duplicate candidate rejected"
+proof = "dispatcher does not rewrite semantics or transition lifecycle"
+
+[[edge]]
+id = "E34_CURATION_SET_TO_GOVERNOR_REVIEW"
+producer = "smart.dreamer.curation_dispatch::assemble_curation_candidate_set"
+output = "CurationCandidateSet"
+consumer = "Governor/Human curation review owner"
+input_role = "reversible candidate-only changes"
+required = false
+failure = "no canonical change without external admission/receipt"
+proof = "existence, support, accessibility and influence remain independently governed"
+
+[[edge]]
+id = "E35_OWNER_PROJECTIONS_TO_LEARNING_VIEW"
+producer = "Task Controller, attempt, Governor, Context, Evaluator and artifact owners"
+output = "LearningOwnerProjections"
+consumer = "smart.learning.state_view::build_campaign_learning_state_view"
+input_role = "exact owner-produced task-local state"
+required = true
+failure = "missing owner coverage remains Partial/Stale/Blocked/Unavailable"
+proof = "transcript or model memory cannot fill owner state"
+
+[[edge]]
+id = "E36_ATTEMPT_EVIDENCE_TO_LEARNING_DELTA"
+producer = "attempt trace/artifact/evaluator owners"
+output = "AttemptOutcomeEvidence"
+consumer = "smart.learning.attempt_delta::derive_attempt_learning_delta"
+input_role = "actual result against predeclared hypothesis/prediction"
+required = true
+failure = "invalid attribution yields Inconclusive or InvalidEvidence"
+proof = "equivalent retry without controlled purpose is rejected"
+
+[[edge]]
+id = "E37_DELTA_TO_OVERLAY_CANDIDATE"
+producer = "smart.learning.attempt_delta::derive_attempt_learning_delta"
+output = "AttemptLearningDelta"
+consumer = "smart.learning.overlay_candidate::build_campaign_overlay_candidate"
+input_role = "admitted task-local change rationale"
+required = false
+failure = "NoJustifiedChange/Inconclusive cannot produce overlay"
+proof = "objective/acceptance/authority/privacy/evaluator surfaces are forbidden"
+
+[[edge]]
+id = "E38_OVERLAY_TO_VALIDATION"
+producer = "smart.learning.overlay_candidate::build_campaign_overlay_candidate"
+output = "CampaignHarnessOverlayCandidate"
+consumer = "smart.learning.overlay_validation::validate_campaign_overlay"
+input_role = "reversible task-local overlay proposal"
+required = true
+failure = "failed dimension blocks Governor-admission request"
+proof = "validation is dimensioned and does not admit overlay"
+
+[[edge]]
+id = "E39_VALIDATED_OVERLAY_TO_GOVERNOR_ADMISSION"
+producer = "smart.learning.overlay_validation::validate_campaign_overlay"
+output = "OverlayValidationReport"
+consumer = "Governor overlay admission owner"
+input_role = "advisory proof dimensions and approval requirements"
+required = true
+failure = "no activation without external admission receipt"
+proof = "Smart cannot widen authority or self-admit"
+
+[[edge]]
+id = "E40_EXTERNAL_ACTIVATION_RECEIPT_TO_ASSESSMENT"
+producer = "external host/Governor activation receipt owner"
+output = "HarnessActivationReceipt"
+consumer = "smart.learning.activation_assessment::assess_harness_activation"
+input_role = "observed delivery/availability/activation evidence"
+required = true
+failure = "unobservable activation remains Inconclusive"
+proof = "assessment consumes and never creates receipt"
+
+[[edge]]
+id = "E41_ACTIVATION_TRACE_TO_ADHERENCE"
+producer = "HarnessActivationAssessment + AttemptTraceProjection"
+output = "activation and decision-point evidence"
+consumer = "smart.learning.adherence_assessment::assess_harness_adherence"
+input_role = "instruction-to-action comparison"
+required = true
+failure = "not-reached/unobservable/contradicted remain distinct"
+proof = "adherence does not imply outcome benefit"
+
+[[edge]]
+id = "E42_CAMPAIGN_EVIDENCE_TO_CLOSURE"
+producer = "delta, activation, adherence and outcome owners"
+output = "complete bounded campaign evidence"
+consumer = "smart.learning.closure::build_campaign_learning_closure"
+input_role = "task-local campaign denominator"
+required = true
+failure = "missing denominator/attribution yields Inconclusive"
+proof = "NoReusableDelta is a valid honest outcome"
+
+[[edge]]
+id = "E43_TRANSFER_EVIDENCE_TO_ASSESSMENT"
+producer = "external task/evaluator evidence owners"
+output = "RetentionTransferEvidenceSet"
+consumer = "smart.learning.retention_transfer::assess_retention_and_transfer"
+input_role = "independent retention/near/far/negative-transfer evidence"
+required = false
+failure = "dependent or invalid-evaluator evidence cannot pass"
+proof = "near transfer cannot stand in for far transfer"
+
+[[edge]]
+id = "E44_CLOSURE_TRANSFER_PRODUCT_TO_PROMOTION_INPUT"
+producer = "learning closure + retention/transfer + Product Pulse + rollback owners"
+output = "dimensioned evidence bundle"
+consumer = "smart.learning.promotion_input::build_promotion_input"
+input_role = "advisory cross-task review input"
+required = false
+failure = "missing/failed dimension remains visible"
+proof = "function returns no Promoted status or scalar score"
+
+[[edge]]
+id = "E45_PROMOTION_INPUT_TO_GOVERNOR_HUMAN"
+producer = "smart.learning.promotion_input::build_promotion_input"
+output = "PromotionInputCandidate"
+consumer = "Governor/Human promotion owner"
+input_role = "advisory evidence dimensions"
+required = false
+failure = "no promotion without external decision and receipt"
+proof = "Smart cannot promote itself"
+
+[[edge]]
+id = "E46_POSITION_TO_CONFLICT_ANALYSIS"
+producer = "smart.epistemic.position::resolve_current_epistemic_position"
+output = "CurrentEpistemicPosition"
+consumer = "smart.dreamer.conflict_analysis::build_conflict_analysis_candidate"
+input_role = "structured conflict set"
+required = false
+failure = "unknown conflict or missing decision owner rejected"
+proof = "observations, interpretations, dependence and residue remain separate"
+
+[[edge]]
+id = "E47_SYSTEM_EVIDENCE_TO_DEVELOPMENT_DIAGNOSIS"
+producer = "Product Objective and CurrentSystemEvidenceSnapshot owners"
+output = "DevelopmentEvidenceSnapshot"
+consumer = "smart.dreamer.development_diagnosis::build_development_diagnosis_candidate"
+input_role = "exact Product Identity, Failure Capsules and discriminators"
+required = true
+failure = "missing Product Identity/evidence/discriminator blocks diagnosis"
+proof = "build success and proxy activity do not prove product outcome"
+
+[[edge]]
+id = "E48_MAINTENANCE_POLICY_TO_PLAN"
+producer = "Governor maintenance-policy/trigger owner"
+output = "MaintenancePolicyProjection"
+consumer = "smart.dreamer.maintenance_plan::build_maintenance_plan_candidate"
+input_role = "exact automation mode and trigger"
+required = true
+failure = "missing projection or denied mode fails closed"
+proof = "plan creates no DurableJob, schedule, reservation or launch"
+
+[[edge]]
+id = "E49_CONFIG_SCHEMA_TO_INTENT"
+producer = "Governor configuration schema/snapshot owner"
+output = "ConfigurationSchemaProjection + ConfigurationSnapshot"
+consumer = "smart.dreamer.configuration_intent::build_configuration_change_intent"
+input_role = "typed current setting surface"
+required = true
+failure = "unknown setting or ceiling increase rejected"
+proof = "intent edits no file, registry or snapshot"
+
+[[edge]]
+id = "E50_OBJECTIVE_EVIDENCE_TO_WORK_DECOMPOSITION"
+producer = "Product Objective and CurrentSystemEvidenceSnapshot owners"
+output = "ProductObjectiveProjection + CurrentSystemEvidenceSnapshot"
+consumer = "smart.dreamer.work_decomposition::build_work_decomposition_candidate"
+input_role = "causal work decomposition input"
+required = true
+failure = "owner ambiguity/overlap/missing discriminator/pulse rejects plan"
+proof = "function count or LOC alone cannot create package boundary"
+
+[[edge]]
+id = "E51_DECOMPOSITION_CAPABILITY_TO_ORCHESTRATION"
+producer = "work decomposition + Agent capability projection owners"
+output = "WorkDecompositionCandidate + AgentCapabilityProjection"
+consumer = "smart.dreamer.orchestration_plan::build_orchestration_plan_candidate"
+input_role = "already defined work units and capabilities"
+required = true
+failure = "cycle, shared-scope conflict or capability gap remains explicit"
+proof = "no WorkItem, SwarmPlanDefinition, queue reservation, lease or launch"
+
+[[edge]]
+id = "E52_OWNER_SNAPSHOT_TO_DREAMCYCLE_SAMPLE"
+producer = "Governor/canonical maintenance snapshot owner"
+output = "DreamCycleSourceSnapshot"
+consumer = "smart.dreamer.cycle_sample::select_dream_cycle_sample"
+input_role = "frozen stratified denominator"
+required = true
+failure = "incomplete denominator remains visible"
+proof = "sampling performs no storage read, acquisition or model call"
+
+[[edge]]
+id = "E53_SAMPLE_REGISTRY_TO_DREAMCYCLE_PLAN"
+producer = "DreamCycleSample + external CurationHandlerRegistry"
+output = "bounded sample and exact handler map"
+consumer = "smart.dreamer.cycle_plan::build_dream_cycle_plan_candidate"
+input_role = "one finite maintenance cycle"
+required = true
+failure = "unknown kind/stale registry/policy denial rejects item"
+proof = "plan cannot schedule itself or launch work"
+
+[[edge]]
+id = "E54_NORMATIVE_AND_CURRENT_EVIDENCE_TO_SELF_MODEL"
+producer = "accepted normative-source and CurrentSystemEvidenceSnapshot owners"
+output = "AcceptedNormativeSourceProjection + CurrentSystemEvidenceSnapshot"
+consumer = "architecture brief, implementation brief and current-system conformance cells"
+input_role = "exact pair-key/digest/anchor and Product Identity evidence"
+required = true
+failure = "stale digest, missing anchor or stale evidence fails closed"
+proof = "target prose and build/test counts cannot establish runtime support"
+
+[edge_proof_gate]
+required_evidence = [
+  "exact producer and consumer package revisions",
+  "fixture serialized by the producer contract and accepted by the consumer",
+  "mixed-fence and stale-revision negative cases",
+  "unknown/partial/unavailable failure propagation",
+  "proof ceiling and Product Identity where applicable"
+]
