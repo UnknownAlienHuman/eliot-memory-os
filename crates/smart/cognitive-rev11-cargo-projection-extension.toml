@@ -1,0 +1,62 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "TARGET_CARGO_EXTENSION_NOT_WORKSPACE_ADMITTED"
+base_cargo_plan = "crates/smart/cognitive-rev11-cargo-plan.toml"
+
+[[package]]
+name = "eliot-memory-projection-contracts"
+path = "crates/smart/eliot-memory-projection-contracts"
+action = "new_prototype_manifest_present"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-contracts", "eliot-evidence", "eliot-receipts", "eliot-cue-contracts", "eliot-context-contracts", "serde", "schemars", "thiserror"]
+forbidden_dependencies = ["eliot-store-api implementation client", "eliot-governor implementation", "provider SDK", "filesystem/database client"]
+
+[[package]]
+name = "eliot-memory-projection"
+path = "crates/smart/eliot-memory-projection"
+action = "new_prototype_manifest_present"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-memory-projection-contracts", "eliot-cue-contracts", "eliot-context-contracts", "eliot-evidence"]
+forbidden_dependencies = ["eliot-store-memory", "eliot-store-surreal-adapter", "eliot-governor implementation", "eliot-memory legacy implementation", "Tokio", "provider SDK"]
+
+[[package]]
+name = "eliot-learning-contracts"
+path = "crates/smart/eliot-learning-contracts"
+action = "extend_existing_target_plan"
+added_cell = "smart.learning.contracts.experience"
+added_target_dependencies = ["eliot-receipts", "eliot-evaluation-contracts"]
+cell_agent_edits_manifest = false
+
+[[package]]
+name = "eliot-experience-projection"
+path = "crates/smart/eliot-experience-projection"
+action = "new_prototype_manifest_present"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-learning-contracts", "eliot-contracts", "eliot-receipts", "eliot-evaluation-contracts"]
+forbidden_dependencies = ["eliot-system-experience legacy implementation", "Task Controller implementation", "Evaluator implementation", "effect executor", "Tokio", "provider SDK"]
+
+[[package]]
+name = "eliot-dreamer-self-query"
+path = "crates/smart/eliot-dreamer-self-query"
+action = "extend_existing_target_plan"
+added_cell = "smart.self_model.context_projection"
+added_target_dependencies = ["eliot-context-contracts"]
+cell_agent_edits_manifest = false
+
+[dependency_direction]
+allowed = [
+  "Governor/read adapter -> eliot-memory-projection-contracts",
+  "eliot-memory-projection -> projection/cue/context contracts",
+  "eliot-experience-projection -> learning/foundation contracts",
+  "eliot-context -> provider-neutral Context contracts",
+]
+forbidden = [
+  "Governor depending on eliot-memory-projection implementation",
+  "Smart projection opening canonical storage",
+  "projection implementation depending on legacy mutable Smart state owners",
+  "Context Compiler depending on provider implementation for logical ordering",
+]
+
+[workspace_admission]
+current = "BLOCKED"
+required = ["all six cells implemented", "package-local tests", "dependency DAG check", "E28-E34 Edge Proof", "two projection Product Pulses"]
