@@ -1,0 +1,17 @@
+[package]
+name = "eliot-dreamer-planning"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[dependencies]
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
+eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts" }
+eliot-runtime-contracts = { path = "../../foundation/eliot-runtime-contracts" }
+
+[package.metadata.eliot]
+status = "prototype-no-rust"
+workspace_admission = "blocked-until-module-edge-and-product-proof"
+cells = "smart.dreamer.maintenance_plan,smart.dreamer.configuration_plan,smart.dreamer.work_decomposition,smart.dreamer.orchestration_plan"
+integration_owner = "Advisory Planning Candidate Owner"
