@@ -47,26 +47,22 @@ jobs:
                   )
               file_path.write_text(text.replace(old, new), encoding="utf-8")
 
-          old_block = '''    let jwt = [
-          ["eyJhbGciOi", "JIUzI1NiJ9"].concat(),
-          ["eyJzdWIiOi", "JlbGlvdCJ9"].concat(),
-          ["signature", "bytes"].concat(),
-      ]
-      .join(".");'''
-          # The previous source edit intentionally avoided workspace-wide formatting;
-          # normalize the exact block and borrow the generated String in assertions.
-          actual_unformatted = '''    let jwt = [
-    ["eyJhbGciOi", "JIUzI1NiJ9"].concat(),
-    ["eyJzdWIiOi", "JlbGlvdCJ9"].concat(),
-    ["signature", "bytes"].concat(),
-]
-.join(".");'''
-          formatted = '''    let jwt = [
-        ["eyJhbGciOi", "JIUzI1NiJ9"].concat(),
-        ["eyJzdWIiOi", "JlbGlvdCJ9"].concat(),
-        ["signature", "bytes"].concat(),
-    ]
-    .join(".");'''
+          actual_unformatted = "\n".join([
+              "    let jwt = [",
+              "    [\"eyJhbGciOi\", \"JIUzI1NiJ9\"].concat(),",
+              "    [\"eyJzdWIiOi\", \"JlbGlvdCJ9\"].concat(),",
+              "    [\"signature\", \"bytes\"].concat(),",
+              "]",
+              ".join(\".\");",
+          ])
+          formatted = "\n".join([
+              "    let jwt = [",
+              "        [\"eyJhbGciOi\", \"JIUzI1NiJ9\"].concat(),",
+              "        [\"eyJzdWIiOi\", \"JlbGlvdCJ9\"].concat(),",
+              "        [\"signature\", \"bytes\"].concat(),",
+              "    ]",
+              "    .join(\".\");",
+          ])
 
           for path in [
               "crates/eliot-app/src/host_runtime/tests.rs",
