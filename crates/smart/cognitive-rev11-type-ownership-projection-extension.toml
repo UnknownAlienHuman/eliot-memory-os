@@ -1,0 +1,39 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "PUBLIC_TYPE_OWNERSHIP_EXTENSION"
+base_registry = "crates/smart/cognitive-rev11-type-ownership.toml"
+
+[[family]]
+owner = "eliot-memory-projection-contracts"
+types = ["CanonicalMemoryReadRequest", "CanonicalMemoryReadSnapshot", "MemoryCandidate", "MemoryCandidateSet", "MemoryContextProjectionRequest", "MemoryProjectionRecord", "MemoryQueryIntent", "MemorySelectionDimension", "MemorySelectionPolicy", "MemorySelectionTrace"]
+producers = ["Governor canonical read adapter", "eliot-memory-projection"]
+consumers = ["eliot-memory-projection", "Context diagnostics", "Governor projection admission adapter"]
+forbidden_duplicates = ["legacy eliot-memory MemoryRecord", "mutable record reference", "local status/lifecycle enum", "retrieval-owned support field"]
+
+[[family]]
+owner = "eliot-learning-contracts::experience"
+types = ["AttemptExperience", "CanonicalExperienceReadSnapshot", "ExperienceCoverage", "FailureObservation", "OutcomeAttribution", "SystemExperienceProjection", "SystemExperienceProjectionRequest"]
+producers = ["Task/attempt/evaluator/effect read adapter", "eliot-experience-projection"]
+consumers = ["eliot-experience-projection", "eliot-learning-loop", "eliot-learning-evaluation", "eliot-dreamer-diagnosis"]
+forbidden_duplicates = ["legacy eliot-system-experience record", "mutable experience aggregate", "string outcome status", "success count as causal attribution"]
+
+[[family]]
+owner = "eliot-context-contracts::candidate"
+types = ["ProviderContribution"]
+added_producers = ["smart.memory.context_projection", "smart.self_model.context_projection"]
+rule = "Projection providers emit Context candidates only. They do not admit, rank across providers or create ActiveUnderstandingView."
+
+[[adapter_boundary]]
+name = "Governor canonical memory read adapter"
+input_owner = "eliot-read / Governor canonical read contract"
+output_owner = "eliot-memory-projection-contracts::CanonicalMemoryReadSnapshot"
+rule = "Adapter authenticates and materializes the owner read. Smart sees no database handle, store client or mutable canonical object."
+
+[[adapter_boundary]]
+name = "Canonical experience read adapter"
+input_owners = ["Task Controller", "AgentAttempt owner", "Evaluator", "effect/receipt owner", "Governor canonical state"]
+output_owner = "eliot-learning-contracts::experience::CanonicalExperienceReadSnapshot"
+rule = "Adapter preserves exact owner coverage and causal bindings; it cannot fabricate OutcomeAttribution."
+
+[worker_rule]
+missing_owner_contract = "Return ContractChallenge. Do not import legacy mutable state schemas as a shortcut."
