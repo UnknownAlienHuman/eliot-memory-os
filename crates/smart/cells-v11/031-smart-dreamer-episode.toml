@@ -1,0 +1,44 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.episode"
+agent_order = 31
+physical_package = "eliot-dreamer-memory-semantics"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Reconstruct an episode while keeping observed chronology separate from causal hypotheses."
+
+[agent]
+objective = "Implement episode reconstruction with strict chronology-versus-causality separation."
+write_scope = ["crates/smart/eliot-dreamer-memory-semantics/src/episode.rs", "crates/smart/eliot-dreamer-memory-semantics/tests/episode.rs"]
+integration_owner = "Dreamer memory semantics integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-memory-semantics/src/lib.rs", "crates/smart/eliot-dreamer-memory-semantics/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_episode_candidate(request: &EpisodeRequest, draft: &AdmittedDreamDraft) -> Result<EpisodeCandidate, EpisodeError>"]
+owned_types = ["EpisodeChronology", "TemporalRelation", "CausalHypothesis", "EpisodeCandidate"]
+
+[algorithm]
+steps = [
+  "Validate immutable event handles, transaction order and fence.",
+  "Build EpisodeChronology only from observed before/after relations and transaction sequence.",
+  "Build each CausalHypothesis separately with mechanism, support, counterevidence, rival explanations and falsifier.",
+  "Retain missing spans and contradictory order evidence.",
+  "Never name chronology as causal predecessor evidence."
+]
+
+[limits]
+rules = ["Use explicit event, temporal-relation and causal-hypothesis maxima.", "Use stable causal and chronology ordering."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "InvalidChronology", "MissingEvent", "MissingMechanism", "MissingFalsifier", "CausalOverclaim"]
+
+[forbidden]
+operations = ["causality from succession", "raw event rewrite", "timestamp as causal authority", "missing-span invention", "canonical write"]
+
+[tests]
+required = ["temporal succession alone yields no causal hypothesis", "contradictory timestamps remain visible", "causal hypothesis requires mechanism and falsifier", "raw event order is unchanged"]
+
+[integration]
+provider = "smart.dreamer.draft_admission"
+consumer = "smart.dreamer.curation_dispatch and Governor/Human review owner"
+product_pulse = "D3C_CURATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if event order, transaction order, mechanism or falsifier cannot be represented separately."
