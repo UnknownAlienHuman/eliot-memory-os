@@ -352,35 +352,43 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    fn reject_daemon_process_readiness(&self, reason: &str) -> KernelServiceError {
+        match self.mark_daemon_failed(reason.to_owned()) {
+            Ok(()) => KernelServiceError::ReadinessNotProven,
+            Err(error) => KernelServiceError::Platform(format!(
+                "eliotd readiness rejection: {reason}; failed to record and fence eliotd failure: {error}"
+            )),
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) async fn validate_daemon_process_readiness(
         &self,
         launch: &EliotdLaunchDescriptor,
         receipt: &ProcessStartReceipt,
     ) -> Result<(), KernelServiceError> {
         let Some(gateway) = self.process_gateway.as_ref() else {
-            let _ = self
-                .mark_daemon_failed("eliotd physical process authority is unavailable".to_owned());
-            return Err(KernelServiceError::ReadinessNotProven);
+            return Err(self.reject_daemon_process_readiness(
+                "eliotd physical process authority is unavailable",
+            ));
         };
         if gateway
             .inspect_exact_running_receipt(receipt)
             .await
             .is_err()
         {
-            let _ = self
-                .mark_daemon_failed("eliotd physical process is not freshly Running".to_owned());
-            return Err(KernelServiceError::ReadinessNotProven);
+            return Err(self.reject_daemon_process_readiness(
+                "eliotd physical process is not freshly Running",
+            ));
         }
 
         let generation = Generation::new(launch.generation.value()).map_err(|_| {
-            let _ = self.mark_daemon_failed("eliotd launch generation is invalid".to_owned());
-            KernelServiceError::ReadinessNotProven
+            self.reject_daemon_process_readiness("eliotd launch generation is invalid")
         })?;
         let kernel_process = observe_named_pipe_peer_process(std::process::id()).map_err(|_| {
-            let _ = self.mark_daemon_failed(
-                "Kernel physical identity is unavailable for eliotd readiness".to_owned(),
-            );
-            KernelServiceError::ReadinessNotProven
+            self.reject_daemon_process_readiness(
+                "Kernel physical identity is unavailable for eliotd readiness",
+            )
         })?;
         let launch_identity = eliotd_launch_attempt_identity(
             launch,
@@ -389,14 +397,13 @@ impl KernelComposition {
             kernel_process.image_path(),
         )
         .map_err(|_| {
-            let _ = self.mark_daemon_failed("eliotd launch attempt identity is invalid".to_owned());
-            KernelServiceError::ReadinessNotProven
+            self.reject_daemon_process_readiness("eliotd launch attempt identity is invalid")
         })?;
         let expected_operation =
             eliotd_operation_id(generation, &launch_identity).map_err(|_| {
-                let _ = self
-                    .mark_daemon_failed("eliotd launch operation identity is invalid".to_owned());
-                KernelServiceError::ReadinessNotProven
+                self.reject_daemon_process_readiness(
+                    "eliotd launch operation identity is invalid",
+                )
             })?;
         let physical = receipt.identity().physical();
         if receipt.operation_id() != &expected_operation
@@ -408,11 +415,9 @@ impl KernelComposition {
                 .image_path()
                 .eq_ignore_ascii_case(launch.executable.as_str())
         {
-            let _ = self.mark_daemon_failed(
-                "eliotd physical process binding does not match the approved launch contour"
-                    .to_owned(),
-            );
-            return Err(KernelServiceError::ReadinessNotProven);
+            return Err(self.reject_daemon_process_readiness(
+                "eliotd physical process binding does not match the approved launch contour",
+            ));
         }
         Ok(())
     }
