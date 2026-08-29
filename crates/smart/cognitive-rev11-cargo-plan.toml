@@ -1,0 +1,198 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "TARGET_CARGO_PLAN_NOT_WORKSPACE_ADMITTED"
+rule = "Cargo manifests are package integration-owner surfaces. Cell agents do not edit them. Dependencies follow contract/lower-layer direction; logical implementation order is never encoded as an implementation-to-implementation dependency."
+
+[[package]]
+name = "eliot-observation"
+path = "crates/governor/eliot-observation"
+action = "retain_and_extend_existing"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-observation-contracts", "eliot-contracts", "eliot-evidence"]
+
+[[package]]
+name = "eliot-epistemic-contracts"
+path = "crates/smart/eliot-epistemic-contracts"
+action = "retain_prototype_reconcile_manifest"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-contracts", "eliot-evidence", "eliot-receipts", "serde", "schemars", "thiserror"]
+
+[[package]]
+name = "eliot-epistemic"
+path = "crates/smart/eliot-epistemic"
+action = "refactor_existing"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-epistemic-contracts", "eliot-evidence", "eliot-contracts"]
+
+[[package]]
+name = "eliot-dreamer-contracts"
+path = "crates/smart/eliot-dreamer-contracts"
+action = "retain_prototype_reconcile_manifest"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-contracts", "eliot-evidence", "eliot-receipts", "eliot-epistemic-contracts", "eliot-research-exchange-api", "serde", "schemars", "thiserror"]
+
+[[package]]
+name = "eliot-dreamer-bundle"
+path = "crates/smart/eliot-dreamer-bundle"
+action = "retain_prototype_reconcile_manifest"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-dreamer-contracts", "eliot-contracts"]
+
+[[package]]
+name = "eliot-dreamer-validation"
+path = "crates/smart/eliot-dreamer-validation"
+action = "new_prototype_manifest_present"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-dreamer-contracts"]
+
+[[package]]
+name = "eliot-dreamer-orientation"
+path = "crates/smart/eliot-dreamer-orientation"
+action = "retain_and_consolidate_prototype_reconcile_manifest"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-dreamer-contracts", "eliot-epistemic-contracts"]
+
+[[package]]
+name = "eliot-dreamer-self-query"
+path = "crates/smart/eliot-dreamer-self-query"
+action = "new_prototype_manifest_present"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-dreamer-contracts", "eliot-contracts"]
+
+[[package]]
+name = "eliot-cue-contracts"
+path = "crates/smart/eliot-cue-contracts"
+action = "retain_prototype_reconcile_manifest"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-contracts", "eliot-evidence", "serde", "schemars", "thiserror"]
+
+[[package]]
+name = "eliot-cues"
+path = "crates/smart/eliot-cues"
+action = "refactor_existing"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-cue-contracts", "eliot-contracts", "eliot-evidence"]
+optional_dependencies = ["eliot-graph-api"]
+optional_dependency_rule = "Graph dependency may implement relation spread only; direct matching and base activation compile and prove without it."
+
+[[package]]
+name = "eliot-context-contracts"
+path = "crates/smart/eliot-context-contracts"
+action = "retain_prototype_reconcile_manifest"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-contracts", "eliot-evidence", "eliot-epistemic-contracts", "eliot-cue-contracts", "serde", "schemars", "thiserror"]
+
+[[package]]
+name = "eliot-context"
+path = "crates/smart/eliot-context"
+action = "refactor_existing"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-context-contracts", "eliot-contracts", "eliot-evidence"]
+
+[[package]]
+name = "eliot-memory-curation-contracts"
+path = "crates/smart/eliot-memory-curation-contracts"
+action = "retain_prototype_reconcile_manifest"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-contracts", "eliot-evidence", "eliot-security-contracts", "serde", "schemars", "thiserror"]
+
+[[package]]
+name = "eliot-memory-curation-screen"
+path = "crates/smart/eliot-memory-curation-screen"
+action = "retain_prototype_reconcile_manifest"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-memory-curation-contracts"]
+
+[[package]]
+name = "eliot-dreamer-memory-models"
+path = "crates/smart/eliot-dreamer-memory-models"
+action = "new_prototype_manifest_present"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-dreamer-contracts", "eliot-memory-curation-contracts"]
+
+[[package]]
+name = "eliot-dreamer-procedural"
+path = "crates/smart/eliot-dreamer-procedural"
+action = "new_prototype_manifest_present"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-dreamer-contracts", "eliot-memory-curation-contracts"]
+
+[[package]]
+name = "eliot-dreamer-memory-revision"
+path = "crates/smart/eliot-dreamer-memory-revision"
+action = "new_prototype_manifest_present"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-dreamer-contracts", "eliot-memory-curation-contracts", "eliot-security-contracts"]
+
+[[package]]
+name = "eliot-dreamer-curation"
+path = "crates/smart/eliot-dreamer-curation"
+action = "retain_thin_dispatch_reconcile_manifest"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-dreamer-contracts", "eliot-memory-curation-contracts"]
+forbidden_dependencies = ["every concrete curation handler implementation crate"]
+
+[[package]]
+name = "eliot-dreamer-research-synthesis"
+path = "crates/smart/eliot-dreamer-research-synthesis"
+action = "new_prototype_manifest_present"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-dreamer-contracts", "eliot-research-exchange-api"]
+forbidden_dependencies = ["provider SDK", "credential store", "network client", "eliot-researcher implementation"]
+
+[[package]]
+name = "eliot-learning-contracts"
+path = "crates/smart/eliot-learning-contracts"
+action = "retain_prototype_reconcile_manifest"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-contracts", "eliot-evaluation-contracts", "eliot-receipts", "serde", "schemars", "thiserror"]
+
+[[package]]
+name = "eliot-learning-loop"
+path = "crates/smart/eliot-learning-loop"
+action = "new_prototype_manifest_present"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-learning-contracts"]
+
+[[package]]
+name = "eliot-learning-evaluation"
+path = "crates/meta/eliot-learning-evaluation"
+action = "new_prototype_manifest_present"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-learning-contracts", "eliot-evaluation-contracts"]
+
+[[package]]
+name = "eliot-dreamer-diagnosis"
+path = "crates/smart/eliot-dreamer-diagnosis"
+action = "new_prototype_manifest_present"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-dreamer-contracts", "eliot-epistemic-contracts", "eliot-evaluation-contracts"]
+
+[[package]]
+name = "eliot-dreamer-planning"
+path = "crates/smart/eliot-dreamer-planning"
+action = "new_prototype_manifest_present"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-dreamer-contracts", "eliot-agent-contracts", "eliot-runtime-contracts"]
+forbidden_dependencies = ["eliot-agent-coordinator implementation", "eliot-swarm execution implementation", "eliot-kernel runtime implementation"]
+
+[[package]]
+name = "eliot-dreamer-cycle"
+path = "crates/smart/eliot-dreamer-cycle"
+action = "new_prototype_manifest_present"
+cell_agent_edits_manifest = false
+target_dependencies = ["eliot-dreamer-contracts", "eliot-memory-curation-contracts"]
+
+[integration_owner_tasks]
+steps = [
+  "compare retained manifest dependencies with this target plan",
+  "remove implementation-to-implementation ordering edges",
+  "add only workspace dependency aliases after package code exists",
+  "create package src/lib.rs and re-export exact cell modules",
+  "run cargo metadata in an isolated candidate workspace",
+  "run package proof before root workspace admission",
+]
+
+[workspace_admission]
+allowed_only_after = ["all source modules exist", "all target dependencies resolve", "package-local tests pass", "affected Edge Proof passes", "named Product Pulse passes"]
+current = "BLOCKED"
