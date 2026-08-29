@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.memory_curation.screen"
+agent_order = 29
+physical_package = "eliot-memory-curation"
+execution_class = "BACKGROUND_READ_ONLY_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Screen one exact canonical projection for review candidates while preserving protected and unresolved records."
+
+[agent]
+objective = "Refactor donor preview logic into dimensioned read-only screening and remove scalar shortcuts."
+write_scope = ["crates/smart/eliot-memory-curation/src/screen.rs", "crates/smart/eliot-memory-curation/tests/screen.rs"]
+integration_owner = "memory curation integration owner"
+forbidden_files = ["crates/smart/eliot-memory-curation/src/lib.rs", "crates/smart/eliot-memory-curation/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn screen_memory_curation(request: &CurationScreenRequest, snapshot: &CurationSnapshot) -> Result<CurationScreenResult, CurationScreenError>"]
+
+[algorithm]
+steps = [
+  "Validate scope, revision, fence, denominator and unique handles.",
+  "Partition protected roles before any candidate rule.",
+  "Evaluate exact duplicate, verified semantic equivalence, wrong scope, unsafe instruction, stale supersession and outcome-linked accessibility evidence separately.",
+  "Return dimensioned findings and review handles only.",
+  "Emit truncated or incomplete denominator explicitly."
+]
+
+[limits]
+rules = ["Use explicit record, reference and page maxima.", "Use stable handle order and cursor identity.", "Perform no embedding or model call."]
+
+[errors]
+variants = ["InvalidFence", "ScopeMismatch", "DuplicateHandle", "MissingDenominator", "UnsupportedRuleset", "ScanLimitExceeded"]
+
+[forbidden]
+operations = ["lifecycle transition", "support change", "archive action", "writer confidence or utility proof", "model call", "storage scan beyond supplied snapshot"]
+
+[tests]
+required = ["low retrieval frequency alone produces no archive proposal", "writer confidence or utility values are ignored", "counterexample and minority records remain protected", "incomplete scan cannot claim exact totals"]
+
+[integration]
+provider = "Governor canonical read projection owner"
+consumer = "Governor/Dream curation job builder"
+product_pulse = "D3C_CURATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if the snapshot lacks exact denominator, protected roles or owner revision."
