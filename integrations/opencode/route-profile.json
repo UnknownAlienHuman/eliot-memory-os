@@ -1,0 +1,154 @@
+{
+  "$schema": "../agent-runtimes/route-profile.schema.json",
+  "schema_version": "eliot.agent-route-profile.v1",
+  "profile_id": "opencode.local.http-sse",
+  "host_family": "opencode",
+  "route_class": "primary-2",
+  "implementation_support": "PARTIAL",
+  "evidence_execution_status": "NOT_EXECUTED",
+  "architecture_anchors": [
+    "ARCH-PORT-01",
+    "ARCH-CTX-03",
+    "ARCH-SKL-01",
+    "ARCH-SWM-01",
+    "ARCH-SWM-02",
+    "ARCH-LONG-01",
+    "ARCH-SEC-04",
+    "ARCH-FIN-01"
+  ],
+  "host_surfaces": [
+    {
+      "surface_id": "opencode.plugin",
+      "kind": "plugin_bundle",
+      "status": "implemented_unverified",
+      "path": "integrations/opencode/plugins/eliot.js",
+      "purpose": ["lifecycle_observation", "pre_effect_gate_candidate", "bounded_event_forwarding"],
+      "authority_ceiling": "pre_effect_gate_candidate"
+    },
+    {
+      "surface_id": "opencode.instruction",
+      "kind": "host_instruction",
+      "status": "implemented_unverified",
+      "path": "integrations/opencode/instructions/eliot.md",
+      "purpose": ["host_specific_recovery_guidance"],
+      "authority_ceiling": "none"
+    },
+    {
+      "surface_id": "opencode.skills",
+      "kind": "skills",
+      "status": "implemented_unverified",
+      "path": "integrations/opencode/skills",
+      "purpose": ["progressive_instruction_disclosure"],
+      "authority_ceiling": "none"
+    },
+    {
+      "surface_id": "opencode.mcp",
+      "kind": "mcp_registration",
+      "status": "implemented_unverified",
+      "path": "integrations/opencode/opencode.json",
+      "purpose": ["eliot_semantic_tools", "resource_expansion"],
+      "authority_ceiling": "none"
+    }
+  ],
+  "execution_routes": [
+    {
+      "route_id": "opencode.server.http-sse",
+      "role": "primary_candidate",
+      "status": "target",
+      "transport": "loopback_http_openapi_and_sse",
+      "execution_identity": "interactive_user",
+      "launch": {
+        "program": "opencode",
+        "argv": ["serve", "--hostname", "127.0.0.1", "--port", "<reserved_loopback_port>"],
+        "argv_construction": "typed_no_shell",
+        "shell": false,
+        "stdin_mode": "none_after_start",
+        "environment_policy": "allowlist",
+        "credential_boundary": "scoped OPENCODE_SERVER_PASSWORD materialized only to the user-owned route process"
+      },
+      "schema_and_health_probe": {
+        "version": "GET /global/health plus executable hash",
+        "schema": "GET /doc and pin the OpenAPI 3.1 digest",
+        "health": "GET /global/health then create, prompt, observe, and abort one disposable session",
+        "negative_capability_challenge": "request one optional session or tool method with a harmless invalid identifier and require a typed non-success"
+      },
+      "model_selection": {
+        "discovery": "GET /config/providers and GET /provider",
+        "selection": "model field on the public session message or prompt_async request",
+        "fixed_model_id": null,
+        "per_attempt_receipt": true
+      },
+      "session_control": {
+        "start": "POST /session then POST /session/:id/message or /prompt_async",
+        "resume": "GET /session/:id then continue through the message surface",
+        "fork": "POST /session/:id/fork",
+        "cancel": "POST /session/:id/abort",
+        "continuation_kind": "native_resume"
+      },
+      "event_contract": {
+        "source": "GET /event or /global/event server-sent event stream plus plugin pre-effect observations",
+        "ordering": "server event identity and cursor wrapped in ELIOT EventEnvelope sequence",
+        "durable_bridge_required": true,
+        "terminal_result_separate": true,
+        "coverage_status": "documented_not_observed"
+      },
+      "child_agents": {
+        "native_surface": "session parentID, child-session listing, and agent selection are documented but not automatically admitted as ELIOT delegation",
+        "admission": "disabled_until_probed",
+        "descendant_closure_required": true
+      },
+      "swarm": {
+        "control_plane": "eliot.coordinate",
+        "durable_mailbox": true,
+        "direct_group_chat": false,
+        "recursive_launch_default": "disabled",
+        "context_policy": "minimum_decision_sufficient_packet"
+      },
+      "proof_ceiling": "The public OpenAPI/SSE surface can host one bounded candidate attempt; OpenCode internal storage and plugin callbacks are not ELIOT task or recovery truth."
+    }
+  ],
+  "skills": {
+    "canonical_source": "integrations/agent-skills",
+    "delivery": "lazy",
+    "index_payload": "name_and_trigger_description",
+    "body_payload": "on_activation",
+    "runtime_payload": "on_reference",
+    "authority_ceiling": "none"
+  },
+  "mcp": {
+    "server_name": "eliot",
+    "status": "implemented_unverified",
+    "transport": "stdio",
+    "semantic_surface": "canonical_eliot_operations",
+    "raw_store_access": false,
+    "tool_visibility": "task_relative_lazy"
+  },
+  "coordination": {
+    "attempt_state_owner": "eliot_agent_coordinator",
+    "message_transport": "durable_mailbox",
+    "meeting_form": "concilium_over_sealed_evidence",
+    "decision_owner": "task_controller_or_human",
+    "transcript_policy": "no_whole_sibling_transcript_by_default",
+    "result_authority": "candidate_only_until_governed_transition"
+  },
+  "probe_requirements": [
+    "pin executable and OpenAPI digest for the exact installed runtime",
+    "prove health, provider/model discovery, session create, prompt, SSE terminal event, fork, and abort",
+    "prove plugin mutating gates fail closed only for attached mutating tasks",
+    "prove passive plugin events use bounded serialized dispatch and cannot exhaust child processes",
+    "prove no environment outside the explicit allowlist reaches the bridge process",
+    "prove child-session closure and cancellation before parent attempt disposition"
+  ],
+  "known_gaps": [
+    "the HTTP/SSE adapter and User Broker launch path are not implemented in this profile change",
+    "the existing plugin still invokes the legacy bridge executable for host events",
+    "current-account provider, model, quota, and auth behavior are unprobed",
+    "OpenCode internal runtime storage remains forensic-only and cannot resume ELIOT authority"
+  ],
+  "source_refs": [
+    "https://opencode.ai/docs/plugins/",
+    "https://opencode.ai/docs/server/",
+    "https://opencode.ai/docs/config/",
+    "https://opencode.ai/docs/mcp-servers/"
+  ]
+}

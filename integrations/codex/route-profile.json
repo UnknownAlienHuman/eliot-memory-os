@@ -1,0 +1,153 @@
+{
+  "$schema": "../agent-runtimes/route-profile.schema.json",
+  "schema_version": "eliot.agent-route-profile.v1",
+  "profile_id": "codex.local.app-server",
+  "host_family": "codex",
+  "route_class": "primary-1",
+  "implementation_support": "TARGET",
+  "evidence_execution_status": "NOT_EXECUTED",
+  "architecture_anchors": [
+    "ARCH-PORT-01",
+    "ARCH-CTX-03",
+    "ARCH-SKL-01",
+    "ARCH-SWM-01",
+    "ARCH-SWM-02",
+    "ARCH-LONG-01",
+    "ARCH-SEC-04",
+    "ARCH-FIN-01"
+  ],
+  "host_surfaces": [
+    {
+      "surface_id": "codex.plugin",
+      "kind": "plugin_bundle",
+      "status": "implemented_unverified",
+      "path": "plugin/eliot-governor/.codex-plugin/plugin.json",
+      "purpose": ["skill_discovery", "mcp_registration", "hook_registration"],
+      "authority_ceiling": "none"
+    },
+    {
+      "surface_id": "codex.hooks",
+      "kind": "hooks",
+      "status": "implemented_unverified",
+      "path": "plugin/eliot-governor/hooks/hooks.json",
+      "purpose": ["session_observation", "pre_effect_gate_candidate", "compaction_boundary", "finish_candidate"],
+      "authority_ceiling": "pre_effect_gate_candidate"
+    },
+    {
+      "surface_id": "codex.skills",
+      "kind": "skills",
+      "status": "implemented_unverified",
+      "path": "plugin/eliot-governor/skills",
+      "purpose": ["progressive_instruction_disclosure"],
+      "authority_ceiling": "none"
+    },
+    {
+      "surface_id": "codex.mcp",
+      "kind": "mcp_registration",
+      "status": "implemented_unverified",
+      "path": "plugin/eliot-governor/.mcp.json",
+      "purpose": ["eliot_semantic_tools", "resource_expansion"],
+      "authority_ceiling": "none"
+    }
+  ],
+  "execution_routes": [
+    {
+      "route_id": "codex.app-server.stdio",
+      "role": "primary_candidate",
+      "status": "target",
+      "transport": "stdio_jsonl",
+      "execution_identity": "interactive_user",
+      "launch": {
+        "program": "codex",
+        "argv": ["app-server", "--listen", "stdio://"],
+        "argv_construction": "typed_no_shell",
+        "shell": false,
+        "stdin_mode": "jsonl_requests_and_notifications",
+        "environment_policy": "allowlist",
+        "credential_boundary": "authorized_user_broker_or_current_user"
+      },
+      "schema_and_health_probe": {
+        "version": "codex --version plus executable hash",
+        "schema": "initialize followed by stable app-server method probe; experimental methods require explicit opt-in",
+        "health": "initialize response plus bounded thread/start and turn lifecycle challenge",
+        "negative_capability_challenge": "invoke one advertised optional method with a harmless invalid request and require the documented typed failure"
+      },
+      "model_selection": {
+        "discovery": "model/list",
+        "selection": "thread/start model and route options recorded per attempt",
+        "fixed_model_id": null,
+        "per_attempt_receipt": true
+      },
+      "session_control": {
+        "start": "thread/start then turn/start",
+        "resume": "thread/resume",
+        "fork": "thread/fork",
+        "cancel": "turn/interrupt",
+        "continuation_kind": "native_resume"
+      },
+      "event_contract": {
+        "source": "app-server thread, turn, item, approval, and terminal notifications",
+        "ordering": "native thread/turn/item identities wrapped in ELIOT EventEnvelope sequence",
+        "durable_bridge_required": true,
+        "terminal_result_separate": true,
+        "coverage_status": "documented_not_observed"
+      },
+      "child_agents": {
+        "native_surface": "experimental collaboration methods are outside the stable production profile",
+        "admission": "disabled_until_probed",
+        "descendant_closure_required": true
+      },
+      "swarm": {
+        "control_plane": "eliot.coordinate",
+        "durable_mailbox": true,
+        "direct_group_chat": false,
+        "recursive_launch_default": "disabled",
+        "context_policy": "minimum_decision_sufficient_packet"
+      },
+      "proof_ceiling": "A stable App Server method can produce one bounded candidate attempt; plugin installation alone proves neither route readiness nor task completion."
+    }
+  ],
+  "skills": {
+    "canonical_source": "integrations/agent-skills",
+    "delivery": "lazy",
+    "index_payload": "name_and_trigger_description",
+    "body_payload": "on_activation",
+    "runtime_payload": "on_reference",
+    "authority_ceiling": "none"
+  },
+  "mcp": {
+    "server_name": "eliot",
+    "status": "implemented_unverified",
+    "transport": "stdio",
+    "semantic_surface": "canonical_eliot_operations",
+    "raw_store_access": false,
+    "tool_visibility": "task_relative_lazy"
+  },
+  "coordination": {
+    "attempt_state_owner": "eliot_agent_coordinator",
+    "message_transport": "durable_mailbox",
+    "meeting_form": "concilium_over_sealed_evidence",
+    "decision_owner": "task_controller_or_human",
+    "transcript_policy": "no_whole_sibling_transcript_by_default",
+    "result_authority": "candidate_only_until_governed_transition"
+  },
+  "probe_requirements": [
+    "pin executable and stable schema fingerprint",
+    "prove initialize, model/list, thread/start, turn/start, terminal event, and turn/interrupt",
+    "prove reconnect or rehydration without reviving stale authority",
+    "prove plugin hooks are present only when their feature gate and exact event coverage are observed",
+    "prove no child or terminal task result is lost before parent reconciliation"
+  ],
+  "known_gaps": [
+    "the App Server adapter process is not implemented in this profile change",
+    "current-account model and quota behavior are unprobed",
+    "experimental collaboration methods are excluded from production admission",
+    "existing hook commands still use the legacy bridge and are not a substitute for App Server execution"
+  ],
+  "source_refs": [
+    "https://developers.openai.com/codex/app-server",
+    "https://developers.openai.com/codex/plugins",
+    "https://developers.openai.com/codex/hooks",
+    "https://developers.openai.com/codex/skills"
+  ]
+}
