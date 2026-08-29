@@ -1,0 +1,86 @@
+schema_version = "eliot-dreamer-job-coverage-v11"
+status = "CLOSED_WORLD_WORKING_DRAFT"
+issue = "github:UnknownAlienHuman/eliot-memory-os#94"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+job_class_count = 8
+unknown_job_class = "REJECT_UNSUPPORTED_JOB_CLASS"
+common_pipeline = ["smart.dreamer.bundle", "smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+
+[[job_class]]
+name = "Orientation"
+request_contract = "OrientationPacketRequest"
+semantic_cells = ["smart.epistemic.position", "smart.dreamer.rival_model", "smart.dreamer.relation", "smart.dreamer.probe_plan", "smart.dreamer.clarification", "smart.dreamer.orientation"]
+output_contract = "DreamPacket"
+authority_ceiling = "CANDIDATE_ONLY"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+
+[[job_class]]
+name = "Curation"
+request_contract = "CurationDispatchRequest"
+semantic_cells = ["smart.memory_curation.screen", "smart.dreamer.classification", "smart.dreamer.relation", "smart.dreamer.episode", "smart.dreamer.concept", "smart.dreamer.procedure", "smart.dreamer.skill", "smart.dreamer.failure_fingerprint", "smart.dreamer.structure_repair", "smart.dreamer.reconsolidation", "smart.dreamer.accessibility", "smart.dreamer.influence_repair", "smart.dreamer.curation_dispatch"]
+output_contract = "CurationCandidateSet"
+authority_ceiling = "REVERSIBLE_CANDIDATE_ONLY"
+product_pulse = "D3C_CURATION_PULSE_01"
+
+[[job_class]]
+name = "Clarification"
+request_contract = "ClarificationRequest"
+semantic_cells = ["smart.epistemic.position", "smart.dreamer.clarification"]
+output_contract = "ClarificationCandidate"
+authority_ceiling = "QUESTION_CANDIDATE_ONLY"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+
+[[job_class]]
+name = "ResearchSynthesis"
+request_contract = "ResearchSynthesisRequest"
+semantic_cells = ["smart.dreamer.research_synthesis"]
+external_input_owner = "Researcher / eliot-research-exchange-api"
+output_contract = "ResearchSynthesisCandidate"
+authority_ceiling = "INTERPRETATION_CANDIDATE_ONLY"
+product_pulse = "D3A_RESEARCH_SYNTHESIS_EDGE_01"
+
+[[job_class]]
+name = "Architecture"
+request_contract = "ArchitectureSelfQueryRequest"
+semantic_cells = ["smart.dreamer.architecture_brief", "smart.dreamer.implementation_brief", "smart.dreamer.current_system_conformance"]
+external_input_owner = "accepted normative-source projection and CurrentSystemEvidenceSnapshot owners"
+output_contract = "ArchitectureSelfQueryCandidate"
+authority_ceiling = "BOUNDED_PROJECTION_AND_CONFORMANCE_CANDIDATE"
+product_pulse = "D5_SELF_QUERY_EDGE_01"
+
+[[job_class]]
+name = "DevelopmentDiagnosis"
+request_contract = "DevelopmentDiagnosisRequest"
+semantic_cells = ["smart.dreamer.conflict_analysis", "smart.dreamer.development_diagnosis"]
+output_contract = "DevelopmentDiagnosisCandidate"
+authority_ceiling = "DIAGNOSIS_CANDIDATE_ONLY"
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+
+[[job_class]]
+name = "Maintenance"
+request_contract = "MaintenanceJobRequest"
+required_subtype = true
+subtypes = ["MaintenancePlan", "ConfigurationIntent", "DreamCycleSample", "DreamCyclePlan"]
+semantic_cells = ["smart.dreamer.maintenance_plan", "smart.dreamer.configuration_intent", "smart.dreamer.cycle_sample", "smart.dreamer.cycle_plan"]
+output_contract = "TypedMaintenanceCandidate"
+authority_ceiling = "MAINTENANCE_CANDIDATE_ONLY"
+product_pulse = "D6_DREAM_CYCLE_PULSE_01"
+
+[[job_class]]
+name = "OrchestrationPlanning"
+request_contract = "OrchestrationPlanningRequest"
+required_subtype = true
+subtypes = ["WorkDecomposition", "OrchestrationPlan"]
+semantic_cells = ["smart.dreamer.work_decomposition", "smart.dreamer.orchestration_plan"]
+output_contract = "TypedOrchestrationCandidate"
+authority_ceiling = "PLAN_CANDIDATE_ONLY"
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+
+[validation]
+rules = [
+  "Every job passes the common bundle, grounding, transformation-validation and structural-admission pipeline unless the request is a pure contract validation fixture.",
+  "Every job resolves to a closed typed semantic handler; free-text subtype inference is forbidden.",
+  "No handler may return canonical, supported, authorized, finished, scheduled, executed or promoted status.",
+  "ResearchSynthesis cannot acquire sources; Maintenance cannot schedule; OrchestrationPlanning cannot create execution state.",
+  "Unknown job class or subtype fails closed without a generic model fallback."
+]
