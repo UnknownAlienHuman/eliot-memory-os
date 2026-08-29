@@ -35,7 +35,108 @@ function Sha256([string] $Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Require-LowerHexDigest(
+    [string] $FieldName,
+    [string] $Value
+) {
+    if ($Value -cnotmatch '^[0-9a-f]{64}$') {
+        Fail "$FieldName must be exactly 64 lowercase hexadecimal characters"
+    }
+}
+
+function Require-PairKeyFormat([string] $Value) {
+    if ($Value -cnotmatch '^sha256:[0-9a-f]{64}$') {
+        Fail 'pair_key must be sha256: followed by exactly 64 lowercase hexadecimal characters'
+    }
+}
+
+function Require-ExactDigest(
+    [string] $Name,
+    [string] $ReceiptValue,
+    [string] $ActualValue
+) {
+    Require-LowerHexDigest "${Name}_sha256" $ReceiptValue
+    if ($ReceiptValue -cne $ActualValue) {
+        Fail "$Name digest mismatch: expected $ReceiptValue, actual $ActualValue"
+    }
+}
+
+function Get-PairKey(
+    [string] $ArchitectureHash,
+    [string] $ImplementationHash
+) {
+    $pairInput =
+        'eliot-normative-pair-v1' + [char]0 +
+        $ArchitectureHash + [char]0 +
+        $ImplementationHash + [char]0
+    $pairBytes = [Text.Encoding]::UTF8.GetBytes($pairInput)
+    $pairDigest = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData($pairBytes)
+    ).ToLowerInvariant()
+    return "sha256:$pairDigest"
+}
+
+function Require-ExactPairKey(
+    [string] $ReceiptValue,
+    [string] $ExpectedValue
+) {
+    Require-PairKeyFormat $ReceiptValue
+    if ($ReceiptValue -cne $ExpectedValue) {
+        Fail "pair key mismatch: expected $ExpectedValue, receipt $ReceiptValue"
+    }
+}
+
+function Assert-SelfTestFailure(
+    [scriptblock] $Action,
+    [string] $ExpectedPattern,
+    [string] $CaseName
+) {
+    $failed = $false
+    try {
+        & $Action | Out-Null
+    }
+    catch {
+        $failed = $true
+        if ($_.Exception.Message -notmatch $ExpectedPattern) {
+            throw
+        }
+    }
+    if (-not $failed) {
+        Fail "normative self-test case did not fail: $CaseName"
+    }
+}
+
+function Invoke-NormativeSelfTest {
+    $validDigest = [string]::new([char]'a', 64)
+    foreach ($invalidLength in @(62, 63, 65)) {
+        $invalidDigest = if ($invalidLength -lt 64) {
+            $validDigest.Substring(0, $invalidLength)
+        }
+        else {
+            $validDigest + 'a'
+        }
+        Assert-SelfTestFailure {
+            Require-LowerHexDigest 'architecture_sha256' $invalidDigest
+        } 'architecture_sha256 must be exactly 64 lowercase hexadecimal characters' "architecture digest length $invalidLength"
+    }
+
+    $differentDigest = [string]::new([char]'b', 64)
+    Assert-SelfTestFailure {
+        Require-ExactDigest 'Architecture' $validDigest $differentDigest
+    } 'Architecture digest mismatch' 'wrong well-formed Architecture digest'
+
+    $receiptPairKey = 'sha256:' + $validDigest
+    $expectedPairKey = 'sha256:' + $differentDigest
+    Assert-SelfTestFailure {
+        Require-ExactPairKey $receiptPairKey $expectedPairKey
+    } 'pair key mismatch' 'wrong well-formed pair key'
+
+    Write-Output 'NORMATIVE_SELF_TEST: PASS cases=5'
+}
+
 try {
+    Invoke-NormativeSelfTest
+
     $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
     $receiptPath = Join-Path $repoRoot 'docs/normative-pair.toml'
     $contractPath = Join-Path $repoRoot 'docs/ARCHITECTURE_CONTRACT.md'
@@ -77,6 +178,10 @@ try {
         Fail 'unsupported pair-key algorithm'
     }
 
+    Require-LowerHexDigest 'architecture_sha256' $receipt['architecture_sha256']
+    Require-LowerHexDigest 'implementation_sha256' $receipt['implementation_sha256']
+    Require-PairKeyFormat $receipt['pair_key']
+
     $expectedArchitecturePath = 'docs/architecture/ELIOT_ARCHITECTURE.md'
     $expectedImplementationPath = 'docs/architecture/ELIOT_IMPLEMENTATION.md'
     if ($receipt['architecture_path'] -ne $expectedArchitecturePath -or
@@ -94,25 +199,11 @@ try {
 
     $architectureHash = Sha256 $architecturePath
     $implementationHash = Sha256 $implementationPath
-    if ($architectureHash -ne $receipt['architecture_sha256'].ToLowerInvariant()) {
-        Fail "Architecture digest mismatch: expected $($receipt['architecture_sha256']), actual $architectureHash"
-    }
-    if ($implementationHash -ne $receipt['implementation_sha256'].ToLowerInvariant()) {
-        Fail "Implementation digest mismatch: expected $($receipt['implementation_sha256']), actual $implementationHash"
-    }
+    Require-ExactDigest 'Architecture' $receipt['architecture_sha256'] $architectureHash
+    Require-ExactDigest 'Implementation' $receipt['implementation_sha256'] $implementationHash
 
-    $pairInput =
-        'eliot-normative-pair-v1' + [char]0 +
-        $architectureHash + [char]0 +
-        $implementationHash + [char]0
-    $pairBytes = [Text.Encoding]::UTF8.GetBytes($pairInput)
-    $pairDigest = [Convert]::ToHexString(
-        [Security.Cryptography.SHA256]::HashData($pairBytes)
-    ).ToLowerInvariant()
-    $expectedPairKey = "sha256:$pairDigest"
-    if ($receipt['pair_key'].ToLowerInvariant() -ne $expectedPairKey) {
-        Fail "pair key mismatch: expected $expectedPairKey, receipt $($receipt['pair_key'])"
-    }
+    $expectedPairKey = Get-PairKey $architectureHash $implementationHash
+    Require-ExactPairKey $receipt['pair_key'] $expectedPairKey
 
     $contractText = Get-Content -Raw -LiteralPath $contractPath
     foreach ($requiredText in @(
