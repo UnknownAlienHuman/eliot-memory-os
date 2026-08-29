@@ -104,7 +104,6 @@ the primary integration issues above.
 | #65 | separate normal admission from protected Control Reserve at every claimed bottleneck |
 | #66 | submit one typed semantic activation result instead of silently re-claiming tickets |
 | #67 | allow bounded concurrent Store transactions for disjoint Ordering Scopes |
-| #72 | keep later testd project jobs blocked while an earlier job is Running |
 | #74 | give User Broker register/heartbeat/launch/fence distinct operation identities |
 | #75 | reject or explicitly rebind WASM limits that exceed the provider ceiling; hidden clamp removed, completion depends on #120 |
 | #76 | preserve typed Store errors and recovery directives on EBP |
@@ -113,10 +112,12 @@ the primary integration issues above.
 | #79 | separate transport connection identity from durable process/session ownership |
 | #120 | persist and independently verify the exact effective WASM epoch/cancellation policy |
 
-Merged local repairs #59, #61, #68, #70 and #73 close only their exact source
-discriminators. In particular, #73 now binds provider/config identity to the
-workspace-pinned Wasmtime 47.0.4 generation; it does not establish #21 runtime
-conformance or Product support.
+Merged local repairs #59, #61, #68, #70, #72 and #73 close only their exact
+source discriminators. #72 now keeps later same-project testd work behind every
+earlier nonterminal durable record, but its focused tests were not executed by
+Actions and #20/#11 still own daemon integration, crash recovery and Product
+Proof. #73 binds provider/config identity to the workspace-pinned Wasmtime
+47.0.4 generation without establishing #21 runtime conformance.
 
 ### Required wave ordering
 
@@ -128,7 +129,7 @@ Do not combine the load-bearing migrations into one broad patch:
 → #63 executable request digest
 → #65 protected capacity classes
 → process-specific identity/activation/error units (#66, #74, #76–#79)
-→ local scheduler/provider units (#67, #72, #75, #120)
+→ local scheduler/provider units (#67, #75, #120)
 → affected real edges
 → #11 Product Pulse.
 ```
