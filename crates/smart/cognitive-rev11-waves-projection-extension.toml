@@ -1,0 +1,32 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "ORDERED_ASSIGNMENT_EXTENSION"
+base_waves = "crates/smart/cognitive-rev11-waves.toml"
+
+[[wave]]
+id = "W8_CANONICAL_PROJECTION_BRIDGES"
+orders = [68, 69, 70, 71, 72, 73]
+requires = ["W0_CONTRACT_EVIDENCE", "W1_D3A_ORIENTATION"]
+product_pulses = ["D3B_CANONICAL_PROJECTION_PULSE_01", "D4_EXPERIENCE_PROJECTION_PULSE_01"]
+implementation_order = [68, 71, 69, 72, 70, 73]
+gate = "Governor-owned canonical memory/experience reads can be transformed into bounded immutable Smart projections without preserving a second state owner or hiding provider coverage."
+
+[parallelism]
+contract_cells = [68, 71]
+independent_implementation_cells = [69, 72, 73]
+requires_memory_candidates = [70]
+integration_owner_only = ["Cargo.toml", "src/lib.rs", "package re-exports", "provider adapter wiring"]
+
+[relationship_to_existing_waves]
+reason_for_append = "These are less-important edge-completion cells discovered after the core handlers; appending preserves stable prior agent order."
+D3B_rule = "W2 compiler cells may be implemented against fixtures, but D3B product acceptance requires the real W8 memory/self-model provider edges."
+D4_rule = "W5 learning cells may be implemented against fixtures, but D4 product acceptance requires the real W8 SystemExperienceProjection edge."
+
+[stop_conditions]
+items = [
+  "Governor read snapshot contract is replaced by a different current owner contract",
+  "projection requires mutable Smart state",
+  "query requires storage I/O or unbounded corpus scan",
+  "experience attribution requires invented causal linkage",
+  "self-model projection would treat target prose as current support",
+]
