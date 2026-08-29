@@ -12,7 +12,8 @@ Canonical navigation:
 - Architecture authority: `docs/ARCHITECTURE_CONTRACT.md`;
 - exact pair identity: `docs/normative-pair.toml`;
 - product/source map: `docs/PROJECT_MAP.md`;
-- active programmes and exceptional branches: `workstreams/ACTIVE.toml`;
+- documentation map: `docs/README.md`;
+- active programmes: `workstreams/ACTIVE.toml`;
 - repository agent rules: `AGENTS.md`.
 
 ## Work lifecycle
@@ -48,18 +49,15 @@ A standard issue-numbered branch is valid only when:
 4. its PR is open when one exists;
 5. the declared mutable path scope has no other writer.
 
-`workstreams/ACTIVE.toml` lists programmes and exceptional nonstandard/long-lived
-branches. It intentionally does **not** duplicate every ephemeral issue branch;
-the issue and PR own that current state. A nonstandard branch absent from the
-exception registry is read-only archaeology.
+`workstreams/ACTIVE.toml` lists programmes, shared routing inputs, and any rare
+explicit exception. It intentionally does not duplicate every ephemeral issue
+branch; the issue and PR own that current state. There are no active long-lived
+or nonstandard implementation branches.
 
 Do not repair a superseded branch in place. Start a fresh branch and carry only
 the reviewed change. A merged, closed, abandoned, or superseded branch is
 retired. Branch content never outranks `main`, even when it contains newer dates
 or more prose.
-
-The temporary legacy branch for PR #26 is preserved as a candidate, but it is
-not mutable until refreshed from current `main` and revalidated.
 
 ## Worktrees and writers
 
@@ -104,6 +102,8 @@ A PR states:
 - migration/rollback/removal consequences;
 - residual unknowns.
 
-A green local test is not product acceptance. Source, build, runtime, store, and
-Product Proof remain separate evidence dimensions. Documentation cleanup never
-promotes runtime support.
+Ordinary PR CI checks current source shape and compilation. The expensive full
+workspace test/Clippy/build gate is a separately invoked source-candidate or
+release operation, not a tax on every local change. A green check is not product
+acceptance: source, build, runtime, store, and Product Proof remain separate
+evidence dimensions.

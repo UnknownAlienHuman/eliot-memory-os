@@ -3,17 +3,18 @@
 This directory routes current implementation programmes. It does not replace
 GitHub issues, pull requests, or the canonical Architecture/Implementation pair.
 
-Rules:
+## Rules
 
-- `main` is the sole authority branch.
-- Ordinary work uses a fresh issue-numbered branch from current `main`.
-- The owning issue/PR is the live record for that ephemeral branch.
-- `ACTIVE.toml` lists programmes and exceptional nonstandard/long-lived
-  branches; it does not duplicate every normal issue branch.
-- A nonstandard branch absent from the exception registry is read-only
-  archaeology.
-- Investigation results live in issues/PRs; only bounded reusable briefs and
-  routing metadata live here.
+- `main` is the sole source and documentation authority.
+- Each implementation unit uses a fresh issue-numbered branch from current
+  `main` and one PR back to `main`.
+- The owning issue/PR is the live record for that branch.
+- `ACTIVE.toml` lists programmes and their reusable routing inputs; it does not
+  create shared implementation branches.
+- A nonstandard branch requires an explicit temporary exception. There are no
+  active exceptions now.
+- Investigation findings remain in issues/PRs or CI artifacts. Only reusable
+  contracts, manifests, inventories, and bounded work briefs remain in Git.
 
 ## Current programmes
 
@@ -22,14 +23,15 @@ Rules:
 Issues #13–#24 cover Host, Kernel, `eliotd`, Watchdog, Doctor, storage,
 testd, WASM/native contours, User Broker, and Researcher provider execution.
 Use [`core-daemons/AGENTS.md`](core-daemons/AGENTS.md). Dreamer is excluded.
-Each issue receives a new issue-numbered branch when an agent actually starts
-that work.
 
 ### Cognitive micro-modules
 
-PR #26 is the sole active nonstandard branch. Its branch must contain current
-`main` as an ancestor before any mutation or integration. Administrative refresh
-merges do not alter the cognitive prototype payload. Mutation is permitted only
-inside the exact prototype-manifest/assignment scope declared in `ACTIVE.toml`;
-the branch is not a place for unrelated fixes, implementation, or general
-Dreamer development. It is retired when PR #26 is merged, closed, or superseded.
+The validated candidate scaffold is now on `main` under `crates/smart/` plus
+its declared Governor/Meta in-place assignment manifests. Issues #38–#45 own
+the current contract, donor-migration, integration, and self-learning gaps.
+
+The wave, edge, donor, decision, and per-cell `module.toml` files are planning
+and assignment metadata. They do not admit a package to the root workspace,
+implement Rust behavior, activate a runtime generation, or establish support.
+Each cell is implemented and proved through its own issue-numbered branch and
+PR; no shared cognitive implementation branch exists.

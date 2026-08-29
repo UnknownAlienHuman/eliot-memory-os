@@ -1,6 +1,6 @@
 schema = "eliot.active-workstreams.v1"
 authority_branch = "main"
-updated_at = "2026-08-28"
+updated_at = "2026-08-29"
 workflow = "WORKFLOW.md"
 agent_rules = "AGENTS.md"
 
@@ -19,48 +19,42 @@ status = "active"
 branch_strategy = "fresh_per_issue_from_current_main"
 issue_refs = [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
 integration_issue_refs = [11]
-brief = "workstreams/core-daemons/AGENTS.md"
-inventory = "workstreams/core-daemons/inventory.json"
+briefs = ["workstreams/core-daemons/AGENTS.md"]
+inventories = ["workstreams/core-daemons/inventory.json"]
 excluded_capabilities = ["dreamer"]
 
 [[workstream]]
 id = "cognitive-micromodules"
-status = "active_draft_pr"
-branch_strategy = "single_declared_exception_branch"
-pr = 26
-scope = "prototype manifests and assignment contour only; no Rust implementation or unrelated repair"
-integration_owner = "PR #26 owner/reviewer"
-
-[[exception_branch]]
-branch = "cognitive-micromodules-wave-01"
-workstream_id = "cognitive-micromodules"
-status = "active_draft_pr"
-pr = 26
-mutation_allowed = true
-current_main_ancestor_required = true
-allowed_path_scope = [
-  "crates/smart/**",
-  "crates/meta/eliot-learning-activation-assessment/**",
-  "crates/meta/eliot-improvement/*.module.toml",
-  "crates/governor/eliot-observation/classifier.module.toml"
+status = "active"
+branch_strategy = "fresh_per_issue_from_current_main"
+issue_refs = [38, 39, 40, 41, 42, 43, 44, 45]
+briefs = [
+  "crates/smart/cognitive-wave-01.toml",
+  "crates/smart/cognitive-wave-02.toml"
 ]
-no_unrelated_repairs = true
-retire_after_pr_disposition = true
-reason = "The candidate must contain current main as an ancestor before mutation or integration; administrative refresh merges do not change the cognitive prototype payload."
+inventories = [
+  "crates/smart/cognitive-contract-challenges.toml",
+  "crates/smart/cognitive-crate-decisions.toml",
+  "crates/smart/cognitive-donor-map.toml",
+  "crates/smart/cognitive-edge-map.toml"
+]
+implementation_rule = "Each cell is implemented in its own issue-numbered branch and PR. Prototype Cargo/module manifests on main create no workspace, runtime, state, authority, or support admission."
 
 [retired_refs]
 status = "non_mutable_aliases_of_main"
 physical_delete_supported = false
-rule = "These refs may remain visible by name because the connected GitHub surface cannot delete refs. Their pointers are forced to current main and they are never valid work branches."
+rule = "Visible legacy refs may remain because the connected GitHub surface cannot delete refs. They are forced to current main and are never valid work branches."
 branches = [
   "audit/core-daemon-conformance-20260828",
   "chore/28-repository-hygiene",
   "chore/32-finalize-branch-state",
   "chore/32-retire-stale-branches",
+  "chore/32-sync-cognitive-authority",
   "claude/codex-swarm-audit-p576l9",
   "claude/eliot-search-architecture-45fdpe",
   "claude/loving-wozniak-tw3r2s",
   "cognitive-crates-prototypes-01",
   "cognitive-materialize-run",
+  "cognitive-micromodules-wave-01",
   "docs/related-repositories"
 ]

@@ -1,15 +1,21 @@
-name: repository-policy
+name: Repository Policy
 
 on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: ['**']
   workflow_dispatch:
 
 permissions:
   contents: read
   issues: read
   pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   branch-and-authority-policy:
@@ -18,6 +24,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Validate branch identity, issue, and current-main ancestry
         shell: bash
@@ -27,26 +34,23 @@ jobs:
         run: |
           set -euo pipefail
           pattern='^(work|fix|docs|chore|refactor|test)/([0-9]+)-[a-z0-9]+(-[a-z0-9]+)*$'
-          legacy='cognitive-micromodules-wave-01'
 
           if [[ "$HEAD_BRANCH" == 'main' ]]; then
             exit 0
           fi
 
-          if [[ "$HEAD_BRANCH" != "$legacy" ]]; then
-            if [[ ! "$HEAD_BRANCH" =~ $pattern ]]; then
-              echo "Branch '$HEAD_BRANCH' is not issue-numbered."
-              echo "Use <work|fix|docs|chore|refactor|test>/<issue>-<slug>."
-              exit 1
-            fi
+          if [[ ! "$HEAD_BRANCH" =~ $pattern ]]; then
+            echo "Branch '$HEAD_BRANCH' is not issue-numbered."
+            echo "Use <work|fix|docs|chore|refactor|test>/<issue>-<slug>."
+            exit 1
+          fi
 
-            issue_number="${BASH_REMATCH[2]}"
-            issue_state="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${issue_number}" --jq '.state')"
-            issue_is_pr="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${issue_number}" --jq 'has("pull_request")')"
-            if [[ "$issue_state" != 'open' || "$issue_is_pr" != 'false' ]]; then
-              echo "Branch issue #${issue_number} is not an open issue."
-              exit 1
-            fi
+          issue_number="${BASH_REMATCH[2]}"
+          issue_state="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${issue_number}" --jq '.state')"
+          issue_is_pr="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${issue_number}" --jq 'has("pull_request")')"
+          if [[ "$issue_state" != 'open' || "$issue_is_pr" != 'false' ]]; then
+            echo "Branch issue #${issue_number} is not an open issue."
+            exit 1
           fi
 
           git fetch --no-tags origin main
@@ -75,11 +79,24 @@ jobs:
           assert active['branch_policy']['standard_branch_requires_open_issue'] is True
           assert active['branch_policy']['requires_current_main_ancestor'] is True
           assert active['branch_policy']['one_issue_one_branch_one_pr'] is True
-          assert active['branch_policy']['nonstandard_branch_requires_explicit_exception'] is True
+          assert active['branch_policy']['unlisted_branch_mutation_allowed'] is False
+          assert active.get('exception_branch', []) == []
+          assert all(w['status'] == 'active' for w in active['workstream'])
+          assert all(w['branch_strategy'] == 'fresh_per_issue_from_current_main' for w in active['workstream'])
           assert inventory['authority']['branch'] == 'main'
+
+          required = [
+              'crates/smart/cognitive-wave-01.toml',
+              'crates/smart/cognitive-wave-02.toml',
+              'crates/smart/cognitive-edge-map.toml',
+              'crates/smart/cognitive-donor-map.toml',
+              'crates/smart/cognitive-crate-decisions.toml',
+          ]
+          for item in required:
+              assert pathlib.Path(item).is_file(), item
           PY
 
-      - name: Reject retired authority surfaces
+      - name: Reject retired authority and campaign surfaces
         shell: bash
         run: |
           set -euo pipefail
@@ -101,6 +118,8 @@ jobs:
             'docs/operations/RUNTIME_LIVE_V3_HANDOFF_2026-08-22.md'
             'COGNITIVE_COMPLETION_RECOVERY_PROGRESS.md'
             'UL_PROGRESS.md'
+            'crates/smart/.audit-probe'
+            '.github/workflows/runtime017-primary.yml'
             'scripts/gen-composition-roots.ps1'
             'scripts/verify-composition-roots.ps1'
             'scripts/gen-conformance.ps1'
@@ -119,7 +138,7 @@ jobs:
 
           for path in "${forbidden[@]}"; do
             if [[ -e "$path" ]]; then
-              echo "Retired authority surface is present: $path"
+              echo "Retired authority/campaign surface is present: $path"
               exit 1
             fi
           done
@@ -136,6 +155,7 @@ jobs:
             README.md
             AGENTS.md
             WORKFLOW.md
+            docs/README.md
             docs/ARCHITECTURE_CONTRACT.md
             docs/PROJECT_MAP.md
             docs/architecture/README.md
@@ -146,7 +166,7 @@ jobs:
             workstreams/core-daemons/AGENTS.md
           )
 
-          if grep -nE 'reports/audit/|docs/normative/|RECOVERY_PROGRAM_v1|ELIOT_(ARCHITECTURE|IMPLEMENTATION)_ENGLISH_FINAL_2026-08-28' "${files[@]}"; then
+          if grep -nE 'reports/audit/|docs/normative/|RECOVERY_PROGRAM_v1|ELIOT_(ARCHITECTURE|IMPLEMENTATION)_ENGLISH_FINAL_2026-08-28|PR #26 is the sole active' "${files[@]}"; then
             echo 'Stale authority/reference detected in a current routing surface.'
             exit 1
           fi

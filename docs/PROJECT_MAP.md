@@ -1,6 +1,6 @@
 # ELIOT Memory OS project map
 
-Status: current routing map for `main`, 2026-08-28. Navigation only; product
+Status: current routing map for `main`, 2026-08-29. Navigation only; product
 status remains `NOT_ACCEPTED / UNVERIFIED`.
 
 ## Authority and work
@@ -9,7 +9,8 @@ status remains `NOT_ACCEPTED / UNVERIFIED`.
 |---|---|
 | Current code and documentation | `main` |
 | Repository workflow | `AGENTS.md`, `WORKFLOW.md` |
-| Active programmes and branch exceptions | `workstreams/ACTIVE.toml` |
+| Active programmes | `workstreams/ACTIVE.toml` |
+| Documentation routing | `docs/README.md` |
 | Architecture authority and pair identity | `docs/ARCHITECTURE_CONTRACT.md`, `docs/normative-pair.toml` |
 | Current implementation change | owning open issue and PR |
 | Live Windows operational-spine proof | issue #11 |
@@ -44,7 +45,7 @@ A crate is a source/build boundary, not a lifecycle or authority owner.
 | `eliotd.exe` | Governor semantic daemon | #18 |
 | `eliot-watchdog.exe` | independent supervision | #16 |
 | `eliot-doctor.exe` | bounded one-shot repair | #17 |
-| store bridge / Surreal generation / BlobStore | closed storage path and single owners | #19, #7–#9 |
+| store bridge / Surreal generation / BlobStore | closed storage path and single owners | #19, #7–#10 |
 | `eliot-testd.exe` | isolated Instrument execution | #20 |
 | `eliot-wasm-host.exe` | capability-limited component host | #21 |
 | native worker | isolated OS-heavy generation | #22 |
@@ -52,7 +53,9 @@ A crate is a source/build boundary, not a lifecycle or authority owner.
 | notify / agent bridge | stateless or near-stateless surfaces | #13 |
 | Researcher provider process | governed acquisition execution | #24 |
 
-Dreamer is excluded from the core/daemon workstream and owned separately.
+Dreamer is excluded from the core/daemon workstream. Its candidate-only
+cognitive capability-cell scaffold is on `main`; issues #38–#45 own the current
+contract, donor-migration, integration, and self-learning gaps.
 
 ## Canonical transition path
 
@@ -89,11 +92,11 @@ cannot grant authority by itself.
 
 - Core/daemon issues #13–#24 use fresh issue-numbered branches and
   `workstreams/core-daemons/AGENTS.md`.
-- Draft cognitive prototype PR #26 is the sole active nonstandard branch. Its
-  branch must contain current `main` as an ancestor before mutation or merge,
-  and mutation is restricted to the paths declared in `workstreams/ACTIVE.toml`.
-  It is not a general repair branch.
+- Cognitive issues #38–#45 use the wave/edge/donor/decision manifests already
+  on `main`; every implementation cell receives a fresh issue-numbered branch.
+- Issue #11 owns current live Windows installation and Product-Pulse evidence.
 
-Every other nonstandard branch is retired/read-only archaeology. Current
+There is no shared long-lived implementation branch. Visible legacy refs are
+non-mutable aliases of `main` until they can be physically deleted. Current
 support still requires exact source/build/runtime/store evidence and the
 applicable Product Pulse; committed prose does not substitute for that proof.
