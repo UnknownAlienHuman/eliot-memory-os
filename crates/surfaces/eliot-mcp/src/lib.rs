@@ -11,14 +11,16 @@
 mod contract;
 mod core;
 mod host;
+mod host_gateway;
 mod schema;
 
 pub use contract::*;
 pub use core::*;
 pub use host::*;
+pub use host_gateway::*;
 pub use schema::*;
 
 /// Stable package contract name.
 pub const CONTRACT_NAME: &str = "eliot.surface.mcp";
 /// Current package contract revision.
-pub const CONTRACT_REVISION: &str = "1.1.0";
+pub const CONTRACT_REVISION: &str = "1.2.0";
