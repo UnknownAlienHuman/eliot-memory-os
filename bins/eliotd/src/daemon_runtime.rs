@@ -14,7 +14,7 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_governor::KernelTransitionPort;
 use eliotd::{
@@ -203,7 +203,7 @@ async fn run_loop(
                     .await
                     .map_err(|error| format!("Kernel activation ticket claim: {error}"))?
                 {
-                    let now = unix_ms();
+                    let now = unix_ms(SystemTime::now())?;
                     if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
                         // Kernel owns the typed expiry outcome.  Do not call
                         // the resolver at or after its exact deadline.
@@ -228,13 +228,14 @@ async fn run_loop(
     }
 }
 
-fn unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+fn unix_ms(now: SystemTime) -> Result<u64, String> {
+    let elapsed = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("daemon activation clock precedes Unix epoch: {error}"))?;
+    elapsed
         .as_millis()
         .try_into()
-        .unwrap_or(u64::MAX)
+        .map_err(|_| "daemon activation clock exceeds u64 milliseconds".to_owned())
 }
 
 fn activation_deadline_expired(now: u64, deadline: u64) -> bool {
@@ -298,6 +299,21 @@ mod tests {
 
         assert!(activation_ticks >= 2);
         assert_eq!(health_ticks, 2);
+    }
+
+    #[test]
+    fn activation_clock_preserves_exact_unix_milliseconds() {
+        let observed = UNIX_EPOCH + Duration::from_millis(42);
+        assert_eq!(unix_ms(observed), Ok(42));
+    }
+
+    #[test]
+    fn activation_clock_rejects_time_before_unix_epoch() {
+        let observed = UNIX_EPOCH
+            .checked_sub(Duration::from_secs(1))
+            .expect("one second before Unix epoch must be representable");
+        let error = unix_ms(observed).expect_err("pre-epoch clock must fail closed");
+        assert!(error.contains("precedes Unix epoch"));
     }
 
     #[test]
