@@ -1,0 +1,118 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "VALIDATION_EXTENSION_NOT_PRODUCT_PROOF"
+base_validation = "crates/smart/cognitive-rev11-validation.toml"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[combined_expected]
+functional_cells = 73
+orders = "1..73"
+physical_crates = 28
+hot_path_cells = 14
+dreamer_job_classes = 8
+candidate_kinds = 17
+curation_subtypes = 11
+typed_edges = 34
+product_pulses = 9
+waves = 9
+external_contract_challenges = 12
+
+[inputs]
+authority = "crates/smart/cognitive-rev11-authority.toml"
+projection_catalog = "crates/smart/cognitive-rev11-projection-bridge.toml"
+projection_index = "crates/smart/cognitive-rev11-projection-index.toml"
+topology_extension = "crates/smart/cognitive-rev11-topology-projection-extension.toml"
+wave_extension = "crates/smart/cognitive-rev11-waves-projection-extension.toml"
+edge_extension = "crates/smart/cognitive-rev11-edge-projection-extension.toml"
+cargo_extension = "crates/smart/cognitive-rev11-cargo-projection-extension.toml"
+type_extension = "crates/smart/cognitive-rev11-type-ownership-projection-extension.toml"
+migration_extension = "crates/smart/cognitive-rev11-migration-projection-extension.toml"
+
+[[assertion]]
+id = "PX01_COMBINED_ORDER_CLOSURE"
+severity = "ERROR"
+rule = "The rev11 core index is exactly 1..67, the projection index is exactly 68..73, their union is exactly 1..73, and ids/orders are globally unique."
+
+[[assertion]]
+id = "PX02_COMBINED_TOPOLOGY"
+severity = "ERROR"
+rule = "The 25-crate core topology plus the three-crate projection extension contains exactly 28 unique physical crates and covers each of 73 cells once."
+
+[[assertion]]
+id = "PX03_EXACT_HOT_SET"
+severity = "ERROR"
+rule = "The 11 core hot cells plus memory candidate query, memory context projection and self-model context projection are the exact 14-cell hot set. Experience contracts/projection remain cold."
+
+[[assertion]]
+id = "PX04_GOVERNOR_READ_BOUNDARY"
+severity = "ERROR"
+rule = "CanonicalMemoryReadSnapshot and CanonicalExperienceReadSnapshot are materialized by external owner adapters. No Smart projection function opens storage, retries a read, owns a store client or mutates canonical state."
+
+[[assertion]]
+id = "PX05_MEMORY_DIMENSIONS"
+severity = "ERROR"
+rule = "MemoryProjectionRecord preserves epistemic status, lifecycle, accessibility and permitted influence as separate owner projections. Query/retrieval cannot modify any dimension."
+
+[[assertion]]
+id = "PX06_RETRIEVAL_NO_REINFORCEMENT"
+severity = "ERROR"
+rule = "Retrieval count, activation score, repeated selection and model agreement cannot raise support, accessibility or influence. Query emits a selection trace only."
+
+[[assertion]]
+id = "PX07_QUERY_BOUNDED_HOT_PATH"
+severity = "ERROR"
+rule = "Memory candidate query works only over a request-bounded materialized snapshot, has O(n log n + c log n) or stronger declared bound, and performs no I/O, model call, unbounded scan or session mutation."
+
+[[assertion]]
+id = "PX08_CONTEXT_PROVIDER_BOUNDARY"
+severity = "ERROR"
+rule = "Memory and self-model projections emit ProviderContribution only. They cannot rank across providers, admit atoms, assemble the view, assess final quality or deliver context."
+
+[[assertion]]
+id = "PX09_DISCLOSURE_AND_ACCESSIBILITY"
+severity = "ERROR"
+rule = "Memory context projection never copies inaccessible or disclosure-denied payload. It uses an exact safe representation, handle-only expansion or explicit omission/block."
+
+[[assertion]]
+id = "PX10_EXPERIENCE_NOT_STATE_OWNER"
+severity = "ERROR"
+rule = "SystemExperienceProjection is immutable and owner-attributed. The projection crate has no mutable store, attempt lifecycle, evaluator, effect executor, canonical writer or learning-delta promotion API."
+
+[[assertion]]
+id = "PX11_CAUSAL_ATTRIBUTION"
+severity = "ERROR"
+rule = "Observed sequence and success/failure remain separate from OutcomeAttribution. Attribution requires exact attempt, trace, artifact, evaluator and effect bindings and exposes confounders and unknown outcomes."
+
+[[assertion]]
+id = "PX12_SELF_MODEL_TRUTH"
+severity = "ERROR"
+rule = "Self-model Context projection preserves Architecture semantic precedence and separates Implementation target from current observed/verified support. Missing or stale conformance yields Unknown/Blocked, never target-as-fact."
+
+[[assertion]]
+id = "PX13_LEGACY_OWNER_CUTOVER"
+severity = "ERROR"
+rule = "eliot-memory and eliot-system-experience are donor/compatibility-only and receive no new cell, type, consumer or feature. Their retirement gates name the real projection edges and Product Pulses."
+
+[[assertion]]
+id = "PX14_TYPE_OWNERSHIP"
+severity = "ERROR"
+rule = "All projection public types have one contract owner. External adapters do not depend on projection implementation crates, and implementations do not publish compatibility copies of legacy record schemas."
+
+[[assertion]]
+id = "PX15_CARGO_DIRECTION"
+severity = "ERROR"
+rule = "Projection manifests depend only on owner-neutral foundation/cue/context/learning contracts. They do not depend on store implementations, Governor implementation, legacy Smart state owners, Tokio or provider SDKs."
+
+[[assertion]]
+id = "PX16_EDGE_AND_PULSE_CLOSURE"
+severity = "ERROR"
+rule = "Edges E28-E34 are each consumed by D3B_CANONICAL_PROJECTION_PULSE_01 or D4_EXPERIENCE_PROJECTION_PULSE_01, and product acceptance of D3B/D4 requires those real edges rather than fixtures."
+
+[[assertion]]
+id = "PX17_REMOTE_DIFF_HYGIENE"
+severity = "ERROR"
+rule = "Projection extension changes contain only TOML design and prototype Cargo manifests under crates/smart. No Rust, Markdown, workflow, archive, base64 chunk, .eliot path, root Cargo.toml or Cargo.lock change is allowed."
+
+[pass_definition]
+required = "All base ERROR assertions and PX01-PX17 pass on the exact remote branch tree and current main merge base."
+not_proven = ["Rust implementation", "Cargo compilation", "Module behavior", "executed Edge Proof", "Product Pulse", "runtime support", "product acceptance"]
