@@ -1,0 +1,159 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "MIGRATION_PLAN_NOT_EXECUTED"
+rule = "Reuse deterministic logic, tests and contract-neutral algorithms only. Do not inherit duplicate state, authority, lifecycle or proof ownership."
+
+[[donor]]
+path = "crates/smart/eliot-epistemic"
+disposition = "REFRACTOR_IN_PLACE"
+keep = ["stateless fenced resolver", "deterministic ordering", "provenance preservation", "freshness checks"]
+replace = ["global conflicted collapse", "implicit assumed state", "unstructured inquiry strings"]
+target = ["smart.epistemic.contracts", "smart.epistemic.position"]
+
+[[donor]]
+path = "crates/smart/eliot-cues"
+disposition = "REFACTOR_IN_PLACE"
+keep = ["immutable snapshot", "exact-first matching", "bounded spread", "activation trace", "deterministic ordering"]
+replace = ["lowercasing canonical path spelling", "combined direct/spread proof", "hidden lifecycle mutation"]
+target = ["smart.cue.normalizer", "smart.cue.binding", "smart.cue.index", "smart.cue.direct_match", "smart.cue.relation_spread", "smart.cue.activation"]
+
+[[donor]]
+path = "crates/smart/eliot-context"
+disposition = "REFACTOR_IN_PLACE"
+keep = ["pure whole-atom compiler", "typed admissions", "deterministic ordering", "inspectable omissions"]
+replace = ["scalar or boolean-only quality shortcuts", "missing provider denominator", "no downstream headroom", "admission-owned quality", "single linear optional allocation"]
+target = ["smart.context.contribution_merge", "smart.context.admission", "smart.context.assembly", "smart.context.quality", "smart.context.decision_tail", "smart.context.reactive_delivery_plan"]
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-core"
+disposition = "DONOR_ONLY_THEN_COMPATIBILITY_RETIREMENT"
+keep = ["candidate-only ceiling", "bounded job input", "forbidden confirmation field", "scope and State Fence checks"]
+replace = ["source count as coverage", "constant authority_unchanged", "constant uncertainty_visible", "self-asserted preservation", "monolithic generator"]
+target = ["smart.dreamer.bundle", "smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+
+[[donor]]
+path = "crates/smart/eliot-memory-curation"
+disposition = "DONOR_ONLY_THEN_COMPATIBILITY_RETIREMENT"
+keep = ["bounded read-only scan", "protected-record checks", "stable pagination", "reversible proposal intent"]
+replace = ["writer utility floats", "scalar confidence", "duplicate lifecycle enum", "archive as an already-owned action"]
+target = ["smart.memory.curation.contracts", "smart.memory.curation.screen"]
+
+[[donor]]
+path = "crates/smart/eliot-understanding"
+disposition = "MERGE_RENDERING_INTO_ELIOT_CONTEXT_THEN_RETIRE"
+keep = ["role-preserving rendering", "omission manifest", "decision-tail formatting"]
+replace = ["second Context Compiler invocation", "duplicate understanding owner"]
+target = ["smart.context.assembly", "smart.context.decision_tail"]
+
+[[donor]]
+path = "crates/smart/eliot-memory"
+disposition = "RETIRE_AS_CANONICAL_STATE_OWNER_AFTER_EDGE_MIGRATION"
+keep = ["bounded exact retrieval discriminators", "negative-memory tests", "append-only intent"]
+forbid_transfer = ["Arc<Mutex<State>> canonical plane", "status owner", "lifecycle owner", "session delivery owner", "influence owner", "duplicate record schema"]
+target_owner = "Governor canonical state plus store-neutral storage"
+
+[[donor]]
+path = "crates/smart/eliot-system-experience"
+disposition = "RETIRE_AS_STATE_OWNER_AFTER_EDGE_MIGRATION"
+keep = ["bounded experience query/projection logic", "outcome-linking discriminators"]
+forbid_transfer = ["second experience store", "second lifecycle owner", "self-authored system truth"]
+target_owner = "Governor canonical evidence and owner-produced projections"
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-candidate-validation"
+reason = "Collapsed incompatible grounding, seven-dimensional transformation validation and structural admission into one owner."
+replacement = "crates/smart/eliot-dreamer-validation"
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-memory-repair"
+reason = "Mixed identity, relation, accessibility, influence, projection and runtime repair."
+replacement = "crates/smart/eliot-dreamer-memory-revision plus Doctor/projection owners"
+
+[[retired_prototype]]
+path = "crates/smart/eliot-cue-normalizer"
+reason = "Function-only package inside one pure hot cue dependency island."
+replacement = "crates/smart/eliot-cues/src/normalizer.rs"
+
+[[retired_prototype]]
+path = "crates/smart/eliot-cue-binding"
+reason = "Function-only package inside one pure hot cue dependency island."
+replacement = "crates/smart/eliot-cues/src/binding.rs"
+
+[[retired_prototype]]
+path = "crates/smart/eliot-cue-index"
+reason = "Function-only package inside one rebuildable cue projection owner."
+replacement = "crates/smart/eliot-cues/src/index.rs"
+
+[[retired_prototype]]
+path = "crates/smart/eliot-cue-activation"
+reason = "Direct matching, optional spread and assembly require separate cells but not separate packages."
+replacement = "crates/smart/eliot-cues/src/{direct_match,relation_spread,activation}.rs"
+
+[[retired_prototype]]
+path = "crates/smart/eliot-context-candidates"
+reason = "Function-only package with no independent dependency or replacement seam."
+replacement = "crates/smart/eliot-context/src/contribution_merge.rs"
+
+[[retired_prototype]]
+path = "crates/smart/eliot-context-admission"
+reason = "Admission is an independently assigned hot cell inside the Context Compiler package."
+replacement = "crates/smart/eliot-context/src/admission.rs"
+
+[[retired_prototype]]
+path = "crates/smart/eliot-context-assembly"
+reason = "Assembly, quality and tail share Context contracts and package proof but retain separate source cells."
+replacement = "crates/smart/eliot-context/src/{assembly,quality,decision_tail,reactive_plan}.rs"
+
+[[retired_family]]
+paths = [
+  "crates/smart/eliot-dreamer-rival-model",
+  "crates/smart/eliot-dreamer-relation",
+  "crates/smart/eliot-dreamer-probe-plan",
+  "crates/smart/eliot-dreamer-clarification",
+]
+replacement = "crates/smart/eliot-dreamer-orientation"
+reason = "One Orientation candidate family with separate causal source modules and one package proof boundary."
+
+[[retired_family]]
+paths = ["crates/smart/eliot-dreamer-architecture-brief", "crates/smart/eliot-dreamer-implementation-brief"]
+replacement = "crates/smart/eliot-dreamer-self-query"
+reason = "Shared accepted-document identity and authority-preservation boundary."
+
+[[retired_family]]
+paths = ["crates/smart/eliot-dreamer-classification", "crates/smart/eliot-dreamer-episode", "crates/smart/eliot-dreamer-concept"]
+replacement = "crates/smart/eliot-dreamer-memory-models"
+reason = "Descriptive semantic reconstruction dependency island; separate files and tests preserve cell independence."
+
+[[retired_family]]
+paths = ["crates/smart/eliot-dreamer-procedure", "crates/smart/eliot-dreamer-skill", "crates/smart/eliot-dreamer-failure"]
+replacement = "crates/smart/eliot-dreamer-procedural"
+reason = "Procedural candidate family shares trigger/precondition/verifier/failure contracts without effect ownership."
+
+[[retired_family]]
+paths = ["crates/smart/eliot-dreamer-structure-repair", "crates/smart/eliot-dreamer-reconsolidation", "crates/smart/eliot-dreamer-accessibility", "crates/smart/eliot-dreamer-influence-repair"]
+replacement = "crates/smart/eliot-dreamer-memory-revision"
+reason = "Forward-only reversible memory revision proposals share lineage and dependency-closure proof."
+
+[[retired_family]]
+paths = ["crates/smart/eliot-learning-state-view", "crates/smart/eliot-learning-delta", "crates/smart/eliot-learning-overlay"]
+replacement = "crates/smart/eliot-learning-loop"
+reason = "One task-local attempt-to-attempt adaptation loop; separate cells remain independently assigned."
+
+[[retired_family]]
+paths = ["crates/meta/eliot-learning-activation-assessment"]
+replacement = "crates/meta/eliot-learning-evaluation"
+reason = "Activation assessment, closure and advisory promotion input require one outcome-linked dimensional evaluation boundary."
+
+[[retired_family]]
+paths = ["crates/smart/eliot-dreamer-conflict-analysis", "crates/smart/eliot-dreamer-development-diagnosis"]
+replacement = "crates/smart/eliot-dreamer-diagnosis"
+reason = "Rival-preserving diagnosis family with one evidence dependency island."
+
+[[retired_family]]
+paths = ["crates/smart/eliot-dreamer-maintenance-plan", "crates/smart/eliot-dreamer-configuration-plan", "crates/smart/eliot-dreamer-work-decomposition", "crates/smart/eliot-dreamer-orchestration-plan"]
+replacement = "crates/smart/eliot-dreamer-planning"
+reason = "Advisory planning family; external owners retain jobs, settings, routes and execution."
+
+[assignment_authority]
+do_not_assign = ["any retired_prototype or retired_family path", "legacy module.toml", "legacy *.api.toml", "cognitive-crate-decisions rev7", "cognitive-wave rev7"]
+assign_only = "Cells listed by cognitive-rev11-cells-*.toml and ordered by cognitive-rev11-waves.toml."
