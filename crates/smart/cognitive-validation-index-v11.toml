@@ -1,0 +1,18 @@
+schema_version = "eliot-cognitive-validation-index-v11"
+status = "REQUIRED_BEFORE_ASSIGNMENT"
+issue = "github:UnknownAlienHuman/eliot-memory-os#94"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+expected_cell_count = 61
+expected_orders = "1..61"
+validators = [
+  "crates/smart/cognitive-design-validation-v11.toml",
+  "crates/smart/cognitive-design-validation-v11-wave2.toml"
+]
+cell_sets = [
+  "crates/smart/cognitive-hot-path-cells-v11.toml",
+  "crates/smart/cognitive-dreamer-core-cells-v11.toml",
+  "crates/smart/cognitive-curation-cells-v11.toml",
+  "crates/smart/cognitive-learning-planning-cells-v11.toml"
+]
+required_result = "PASS_WITH_PROOF_CEILING_STATIC_FUNCTION_DESIGN_ONLY"
+fail_closed_on = ["parse error", "missing order", "duplicate cell id", "overlapping worker scope", "unknown physical package", "forbidden owner expansion", "hot-path hidden I/O", "missing denominator", "generic subtype fallback", "root workspace mutation"]
