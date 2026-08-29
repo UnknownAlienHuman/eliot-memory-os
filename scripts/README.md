@@ -12,11 +12,12 @@ retired rather than preserved as archaeology.
 
 | Script | Purpose | Proof ceiling |
 |---|---|---|
-| `verify.ps1` | Current Windows developer verification: normative identity, architecture-boundary audit, Cargo metadata, formatting, and workspace check | Source/build candidate only |
+| `verify.ps1` | Current Windows developer verification: normative identity, architecture-boundary audit, nearest-path agent guardrails, Cargo metadata, formatting, and workspace check | Source/build candidate only |
 | `verify.sh` | Unix-compatible counterpart for the current bounded source checks | Source/build candidate only |
 | `verify-normative.ps1` | Recompute canonical Architecture/Implementation digests and pair key; reject predecessor copies | Normative artifact identity only |
 | `verify-normative.sh` | Unix-compatible normative-pair verifier | Normative artifact identity only |
 | `audit-architecture-boundaries.py` | Scan declared core/daemon runtime roots for forbidden dependencies, SurrealDB leakage, untracked direct process launch, and production placeholders | Static source/build architecture evidence only |
+| `verify-agent-guardrails.py` | Require bounded nearest-path owner/proof/stop instructions for core and daemon source subtrees | Routing/control-plane evidence only |
 | `verify-lint-policy.ps1` | Verify the current Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
 
 Normal iteration uses `just quick` or `scripts/verify.ps1`. The manual Source
@@ -44,6 +45,24 @@ The policy is `config/architecture-boundaries.toml`. An exception must name one
 exact path/package, issue, reason, and removal condition. Wildcards and unnamed
 legacy allowances are rejected. A clean audit does not prove runtime behavior,
 process containment, store correctness, or Product acceptance.
+
+### Nearest-path agent guardrails
+
+```powershell
+python scripts/verify-agent-guardrails.py --self-test
+python scripts/verify-agent-guardrails.py
+```
+
+The verifier requires the routing files at `bins/AGENTS.md` and the declared
+Governor, Instrument, Kernel, Meta, Module, Research, Storage, Supervision, and
+Surface subtrees. Each file must remain bounded, name current owner issues,
+require current-`main` issue/branch/PR/write-scope discipline, state authority
+and canonical-write limits, and expose a proof plus stop condition.
+
+These files narrow work; they cannot grant authority beyond the root
+instructions, owning issue, or normative pair. A clean result proves only that
+the expected routing surfaces exist and contain the required boundaries. It
+does not prove the implementation follows them.
 
 ## Release and installation
 

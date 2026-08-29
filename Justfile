@@ -11,6 +11,12 @@ architecture-boundaries-self-test:
 architecture-boundaries:
     python scripts/audit-architecture-boundaries.py
 
+agent-guardrails-self-test:
+    python scripts/verify-agent-guardrails.py --self-test
+
+agent-guardrails:
+    python scripts/verify-agent-guardrails.py
+
 metadata:
     cargo metadata --locked --no-deps --format-version 1 | Out-Null
 
@@ -37,7 +43,7 @@ claude-package:
 sync-skills:
     cargo run --quiet -p eliot-app -- host skill-sync
 
-quick: normative architecture-boundaries-self-test architecture-boundaries metadata fmt-check check
+quick: normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails metadata fmt-check check
 
 verify:
     pwsh -NoProfile -File scripts/verify.ps1
