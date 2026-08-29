@@ -34,9 +34,17 @@ A runtime may execute a worker, but it does not own the swarm. ELIOT creates bou
 
 ## Verification
 
+Install the pinned schema-validator dependency before running the verifier outside CI:
+
+```text
+python -m pip install --disable-pip-version-check --no-input -r scripts/requirements-verification.txt
+```
+
+Then run:
+
 ```text
 python scripts/verify-agent-route-bundles.py --self-test
 python scripts/verify-agent-route-bundles.py
 ```
 
-The verifier proves profile shape and selected static safety properties. It does not prove a current account, provider route, hook delivery, sidecar implementation, or end-to-end swarm outcome.
+A missing Draft 2020-12 validator is a hard verifier failure; profiles are never accepted by falling back to partial manual checks. The verifier proves profile shape and selected static safety properties. It does not prove a current account, provider route, hook delivery, sidecar implementation, or end-to-end swarm outcome.
