@@ -1,0 +1,23 @@
+[package]
+name = "eliot-context-view"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Immutable post-admission Active Understanding View, decision-local tail and effect-free reactive delivery planning"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "NOT_IMPLEMENTED"
+workspace_admission = "pending_cell_implementation_edge_proof_and_product_pulse"
+functional_cells = ["smart.context.view_assembly", "smart.context.decision_tail", "smart.context.reactive_plan"]
+runtime_authority = "NONE"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-context-contracts = { path = "../eliot-context-contracts" }
