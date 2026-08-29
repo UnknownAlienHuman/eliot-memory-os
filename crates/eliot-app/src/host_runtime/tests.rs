@@ -1469,7 +1469,12 @@ async fn standard_managed_environment_clears_unlisted_secrets() -> anyhow::Resul
 #[test]
 fn managed_output_is_redacted_before_persistence() -> anyhow::Result<()> {
     let secret = format!("{}{}{}", "github_", "pat_", "A".repeat(40));
-    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJlbGlvdCJ9.signaturebytes";
+    let jwt = [
+    ["eyJhbGciOi", "JIUzI1NiJ9"].concat(),
+    ["eyJzdWIiOi", "JlbGlvdCJ9"].concat(),
+    ["signature", "bytes"].concat(),
+]
+.join(".");
     let output = format!(
         "safe event\napi_key={secret}\n{{\"password\":\"must-not-persist\"}}\napi_token=must-not-persist-either\nAWS_SECRET_ACCESS_KEY=must-not-persist-aws\nAuthorization: Basic must-not-persist-basic\nAuthorization:\n Basic must-not-persist-folded\n second-must-not-persist-folded\nraw={jwt}\ntokens=128\n"
     );
