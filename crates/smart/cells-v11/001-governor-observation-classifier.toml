@@ -1,0 +1,50 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "governor.observation.classifier"
+agent_order = 1
+physical_package = "eliot-observation"
+execution_class = "CAPTURE_SYNC_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Classify one admitted observation without dropping safe material or promoting truth."
+
+[agent]
+objective = "Implement the deterministic first-pass observation classifier and its package-local tests."
+write_scope = ["crates/governor/eliot-observation/src/classifier.rs", "crates/governor/eliot-observation/tests/classifier.rs"]
+integration_owner = "Governor observation owner"
+forbidden_files = ["crates/governor/eliot-observation/src/lib.rs", "crates/governor/eliot-observation/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn classify_observation(input: &ObservationClassificationInput, policy: &ObservationClassificationPolicy) -> Result<ObservationClassification, ObservationClassificationError>"]
+owned_types = ["ObservationClassificationInput", "ObservationClassificationPolicy", "ObservationClassification", "ObservationFamily", "TaskBindingDisposition", "ColdCaptureReason"]
+
+[algorithm]
+steps = [
+  "Validate operation identity, State Fence and source identity.",
+  "Separate content family from task-binding confidence.",
+  "Apply deterministic family rules in declared precedence.",
+  "On ambiguous family return ObservationCandidate/Unknown without loss.",
+  "On contaminated task binding quarantine the binding while preserving cold capture.",
+  "Emit exact rule ids and unresolved dimensions."
+]
+
+[limits]
+rules = ["Use validated policy maxima for payload bytes and affected resources.", "Use one bounded metadata pass plus stable canonical-resource sort."]
+
+[errors]
+variants = ["InvalidFence", "InvalidSource", "OversizedObservation", "DuplicateResource", "UnsupportedHint"]
+
+[forbidden]
+operations = ["storage or filesystem scan", "model/provider/network call", "canonical support promotion", "task finish or authority decision", "panic on admitted input"]
+
+[tests]
+required = [
+  "safe unclassified input is retained cold",
+  "conflicting task hints cannot bind a task",
+  "affected-resource permutation does not change classification",
+  "retrieval or repetition cannot promote status"
+]
+
+[integration]
+provider = "external observation adapter"
+consumer = "Governor observation admission owner"
+product_pulse = "D1_CAPTURE_CLASSIFICATION_EDGE_01"
+stop_condition = "Stop and return ContractChallenge if exact observation-family policy or owner-owned admission contract is absent or contradictory."
