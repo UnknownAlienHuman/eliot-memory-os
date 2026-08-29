@@ -1,0 +1,148 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+range = "60..67"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[cell]]
+order = 60
+id = "smart.dreamer.conflict_analysis"
+stage = "W6_DIAGNOSIS_PLANNING"
+physical_crate = "eliot-dreamer-diagnosis"
+hot_path = false
+responsibility = "Build a rival-preserving conflict analysis candidate with shared lineage, dependence, unresolved residue and discriminative probes."
+public_functions = ["pub fn analyze_epistemic_conflict(request: &ConflictAnalysisRequest, position: &CurrentEpistemicPosition, draft: &AdmittedDreamDraft) -> Result<ConflictAnalysisCandidate, ConflictAnalysisError>"]
+algorithm = ["validate exact conflict identity and participants", "separate observations from interpretations", "identify shared and dependent evidence", "retain strongest objections and unresolved residue", "list temporarily admissible actions and exact decision owner", "attach discriminative probes and revision conditions"]
+invariants = ["vote count is not truth weight", "shared lineage is not independent corroboration", "analysis cannot adjudicate or promote", "minority evidence remains visible"]
+degradation = "Return UnresolvedConflict with safe temporary actions and escalation rather than choose a winner."
+errors = ["ConflictMissing", "ParticipantMismatch", "LineageIncomplete", "DecisionOwnerMissing", "FenceMismatch"]
+tests = ["dependent evidence not double-counted", "minority participant retained", "no winner without discriminator", "temporary action names owner"]
+source_files = ["crates/smart/eliot-dreamer-diagnosis/src/conflict.rs", "crates/smart/eliot-dreamer-diagnosis/tests/conflict.rs"]
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+architecture_refs = ["rival models", "conflict remains explicit"]
+implementation_refs = ["conflict analysis candidate"]
+
+[[cell]]
+order = 61
+id = "smart.dreamer.development_diagnosis"
+stage = "W6_DIAGNOSIS_PLANNING"
+physical_crate = "eliot-dreamer-diagnosis"
+hot_path = false
+responsibility = "Diagnose one development failure class from exact objective, identity, failure capsule, repair sequence and discriminator evidence."
+public_functions = ["pub fn diagnose_development_failure(request: &DevelopmentDiagnosisRequest, evidence: &DevelopmentEvidenceSnapshot, draft: &AdmittedDreamDraft) -> Result<DevelopmentDiagnosisCandidate, DevelopmentDiagnosisError>"]
+algorithm = ["validate Product Objective and exact candidate identities", "group observations by failure class and causal boundary", "compare attempted repairs and discriminators", "identify changed and unchanged mechanism hypotheses", "detect proxy activity and counter-metrics", "propose next discriminator or MechanismReviewCandidate"]
+invariants = ["another broad refactor is not a diagnosis", "materially equivalent retry requires a new experimental purpose", "build/test count is not Product Proof", "diagnosis cannot execute repair"]
+degradation = "Return MechanismReviewCandidate when repeated attempts do not change causal hypothesis or discriminator."
+errors = ["ObjectiveMissing", "IdentityMismatch", "FailureCapsuleInvalid", "NoDiscriminator", "EquivalentRetry", "EvidenceStale"]
+tests = ["equivalent retry triggers mechanism review", "proxy progress not outcome", "failed discriminator retained", "repair execution absent"]
+source_files = ["crates/smart/eliot-dreamer-diagnosis/src/development.rs", "crates/smart/eliot-dreamer-diagnosis/tests/development.rs"]
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+architecture_refs = ["causal diagnosis", "Product Objective and proof"]
+implementation_refs = ["development diagnosis job class"]
+
+[[cell]]
+order = 62
+id = "smart.dreamer.maintenance_plan"
+stage = "W6_DIAGNOSIS_PLANNING"
+physical_crate = "eliot-dreamer-planning"
+hot_path = false
+responsibility = "Propose a bounded maintenance plan from Governor-owned maintenance mode and trigger projections without creating a job or schedule."
+public_functions = ["pub fn build_maintenance_plan(request: &MaintenancePlanRequest, mode: &MaintenanceModeProjection, triggers: &MaintenanceTriggerSnapshot, draft: &AdmittedDreamDraft) -> Result<MaintenancePlanCandidate, MaintenancePlanError>"]
+algorithm = ["validate maintenance mode, family and trigger revisions", "select eligible bounded maintenance objectives", "derive prerequisites, expected observables, verifier, budget request, stop and rollback", "state external job/scheduler owner", "emit candidate only"]
+invariants = ["MaintenanceTriggerEvaluator remains automation-decision owner", "no DurableJob, WakeIntent, lease, schedule, route or model call is created", "disabled mode yields no plan", "candidate cannot self-repeat"]
+degradation = "Return None or BlockedByExternalContract when maintenance mode/trigger projection is absent or stale."
+errors = ["ModeProjectionMissing", "TriggerSnapshotStale", "FamilyUnsupported", "JobCreationAttempt", "BudgetInvalid"]
+tests = ["disabled mode no plan", "stale trigger blocked", "candidate contains no job id", "self-scheduling field absent"]
+source_files = ["crates/smart/eliot-dreamer-planning/src/maintenance.rs", "crates/smart/eliot-dreamer-planning/tests/maintenance.rs"]
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+architecture_refs = ["maintenance is governed", "bounded background work"]
+implementation_refs = ["MaintenanceTriggerEvaluator", "maintenance plan candidate"]
+
+[[cell]]
+order = 63
+id = "smart.dreamer.configuration_plan"
+stage = "W6_DIAGNOSIS_PLANNING"
+physical_crate = "eliot-dreamer-planning"
+hot_path = false
+responsibility = "Translate a configuration request into a typed reversible ConfigurationChangeIntentCandidate without editing settings or widening ceilings."
+public_functions = ["pub fn build_configuration_change_intent(request: &ConfigurationPlanRequest, registry: &ConfigurationRegistrySnapshot, draft: &AdmittedDreamDraft) -> Result<ConfigurationChangeIntentCandidate, ConfigurationPlanError>"]
+algorithm = ["resolve exact setting identities and owners", "compare current and requested values", "classify impact and required approval", "derive probe/shadow, expected benefit, counter-risks, rollback and review condition", "emit normalized deltas"]
+invariants = ["no file or registry mutation", "cost, privacy, remote and authority ceilings cannot widen without external approval", "unknown setting fails closed", "candidate retains current snapshot identity"]
+degradation = "Return UnsupportedSetting or ApprovalRequired with no mutation."
+errors = ["SettingUnknown", "RegistryStale", "OwnerUnknown", "CeilingExpansion", "RollbackMissing"]
+tests = ["unknown setting rejected", "ceiling widening flagged", "rollback required", "registry unchanged"]
+source_files = ["crates/smart/eliot-dreamer-planning/src/configuration.rs", "crates/smart/eliot-dreamer-planning/tests/configuration.rs"]
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+architecture_refs = ["configuration is governed", "reversibility"]
+implementation_refs = ["configuration change intent"]
+
+[[cell]]
+order = 64
+id = "smart.dreamer.work_decomposition"
+stage = "W6_DIAGNOSIS_PLANNING"
+physical_crate = "eliot-dreamer-planning"
+hot_path = false
+responsibility = "Propose causal work units with one property, owner, discriminator, proof ceiling and replacement boundary rather than splitting by files or LOC."
+public_functions = ["pub fn decompose_work(request: &WorkDecompositionRequest, constraints: &WorkBoundarySnapshot, draft: &AdmittedDreamDraft) -> Result<WorkDecompositionCandidate, WorkDecompositionError>"]
+algorithm = ["identify the product-level causal property", "locate contract and evidence prerequisites", "separate independent module cells", "add affected edge integration units", "add final Product Pulse unit", "validate owner and source-scope exclusivity", "order dependency DAG"]
+invariants = ["one work unit has one primary causal property", "LOC and file count are counter-metrics", "cross-owner defect becomes contract, module, edge and pulse units", "candidate does not create work items"]
+degradation = "Return UnsplittableBoundary or ContractChallenge when independent proof/ownership cannot be established."
+errors = ["ObjectiveMissing", "OwnerConflict", "SourceScopeOverlap", "DependencyCycle", "ProofOracleMissing", "WorkItemCreationAttempt"]
+tests = ["file-count split rejected", "cross-owner defect creates edge unit", "source scopes disjoint", "dependency cycle rejected"]
+source_files = ["crates/smart/eliot-dreamer-planning/src/decomposition.rs", "crates/smart/eliot-dreamer-planning/tests/decomposition.rs"]
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+architecture_refs = ["FunctionalCapabilityCell", "micro-modularity follows causality"]
+implementation_refs = ["contract to module to edge to Product Pulse"]
+
+[[cell]]
+order = 65
+id = "smart.dreamer.orchestration_plan"
+stage = "W6_DIAGNOSIS_PLANNING"
+physical_crate = "eliot-dreamer-planning"
+hot_path = false
+responsibility = "Propose route, staffing, ordering and independence constraints over already defined work units without owning execution."
+public_functions = ["pub fn build_orchestration_plan(request: &OrchestrationPlanRequest, work: &WorkDecompositionCandidate, capabilities: &AgentCapabilitySnapshot, draft: &AdmittedDreamDraft) -> Result<OrchestrationPlanCandidate, OrchestrationPlanError>"]
+algorithm = ["validate work-unit DAG and exact capability snapshot", "map required proof and context to eligible agent classes", "identify parallel-independent units and integration barriers", "propose route class, staffing, review and handoff", "attach budget request, stop and fallback", "name external admission and execution owners"]
+invariants = ["Task Controller owns SwarmPlanDefinition", "Governor owns admission", "Agent Coordinator owns execution state", "no WorkItem, AgentAttempt, route reservation, launch or budget allocation is created"]
+degradation = "Return NoEligibleRoute or HumanReviewRequired with exact missing capability."
+errors = ["WorkGraphInvalid", "CapabilitySnapshotStale", "NoEligibleAgent", "IndependenceConflict", "ExecutionOwnershipViolation"]
+tests = ["no WorkItem output", "parallelism requires independence", "stale capability blocked", "external owners named"]
+source_files = ["crates/smart/eliot-dreamer-planning/src/orchestration.rs", "crates/smart/eliot-dreamer-planning/tests/orchestration.rs"]
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+architecture_refs = ["swarm coordination is governed", "owner-sparse runtime"]
+implementation_refs = ["SwarmPlanDefinition and Agent Coordinator ownership"]
+
+[[cell]]
+order = 66
+id = "smart.dreamer.cycle_sample"
+stage = "W7_DREAM_CYCLE"
+physical_crate = "eliot-dreamer-cycle"
+hot_path = false
+responsibility = "Select one deterministic bounded DreamCycle sample with a frozen denominator and explicit omitted strata."
+public_functions = ["pub fn select_dream_cycle_sample(snapshot: &DreamCycleSourceSnapshot, policy: &DreamCycleSamplingPolicy) -> Result<DreamCycleSample, DreamCycleSampleError>"]
+algorithm = ["validate snapshot identity, State Fence and strata denominators", "sample bounded recent/active episodes, unresolved conflicts, failure evidence, minority/counterevidence, utility/false-activation signals and maintenance debt", "apply deterministic per-stratum selection", "record included and omitted handles and coverage", "compute sample digest"]
+invariants = ["no storage read", "no Researcher or model call", "scope cannot expand", "omitted denominator is explicit", "same snapshot and policy produce same sample"]
+degradation = "Partial source coverage yields Partial sample and prevents complete-corpus claims."
+errors = ["SnapshotInvalid", "DenominatorMissing", "PolicyInvalid", "FenceMismatch", "SampleLimitExceeded"]
+tests = ["deterministic sample", "minority stratum retained", "partial denominator visible", "no acquisition fields"]
+source_files = ["crates/smart/eliot-dreamer-cycle/src/sample.rs", "crates/smart/eliot-dreamer-cycle/tests/sample.rs"]
+product_pulse = "D6_BOUNDED_DREAM_CYCLE_PULSE_01"
+architecture_refs = ["DreamCycle is bounded maintenance", "minority and failure evidence"]
+implementation_refs = ["I9.8 DreamCycle sampling"]
+
+[[cell]]
+order = 67
+id = "smart.dreamer.cycle_plan"
+stage = "W7_DREAM_CYCLE"
+physical_crate = "eliot-dreamer-cycle"
+hot_path = false
+responsibility = "Map one frozen DreamCycle sample to a finite candidate-only curation and challenge plan without scheduling or executing it."
+public_functions = ["pub fn build_dream_cycle_plan_candidate(sample: &DreamCycleSample, registry: &DreamCycleHandlerRegistrySnapshot, policy: &DreamCyclePolicy) -> Result<DreamCyclePlanCandidate, DreamCyclePlanError>"]
+algorithm = ["validate sample, registry and policy revisions", "map each sampled problem kind to exact registered handler", "deduplicate target/problem/lineage/proposed-effect identities", "allow at most one automatic experiment per target", "apply privacy, budget, route and user-session constraints", "order a finite one-cycle plan with stop conditions"]
+invariants = ["no model, agent or tool execution", "no DurableJob or schedule", "no self-enqueue or perpetual loop", "unknown problem kind fails closed", "plan horizon is exactly one cycle"]
+degradation = "Unsupported items remain in an unplanned manifest; plan may be empty with reasons."
+errors = ["SampleMismatch", "RegistryStale", "HandlerMissing", "DuplicateExperiment", "BudgetInvalid", "SelfSchedulingAttempt"]
+tests = ["one-cycle finite plan", "unknown handler retained unplanned", "duplicate experiment removed", "no schedule or job fields"]
+source_files = ["crates/smart/eliot-dreamer-cycle/src/plan.rs", "crates/smart/eliot-dreamer-cycle/tests/plan.rs"]
+product_pulse = "D6_BOUNDED_DREAM_CYCLE_PULSE_01"
+architecture_refs = ["DreamCycle candidate-only", "bounded maintenance"]
+implementation_refs = ["I9.8 one maintenance job, no subconscious loop"]
