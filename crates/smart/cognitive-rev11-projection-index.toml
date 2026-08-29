@@ -1,0 +1,46 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "ORDERED_PROJECTION_EXTENSION_INDEX"
+expected_orders = "68..73"
+
+[[cell]]
+order = 68
+id = "smart.memory.projection.contracts"
+crate = "eliot-memory-projection-contracts"
+catalog = "cognitive-rev11-projection-bridge.toml"
+hot_path = false
+
+[[cell]]
+order = 69
+id = "smart.memory.candidate_query"
+crate = "eliot-memory-projection"
+catalog = "cognitive-rev11-projection-bridge.toml"
+hot_path = true
+
+[[cell]]
+order = 70
+id = "smart.memory.context_projection"
+crate = "eliot-memory-projection"
+catalog = "cognitive-rev11-projection-bridge.toml"
+hot_path = true
+
+[[cell]]
+order = 71
+id = "smart.learning.contracts.experience"
+crate = "eliot-learning-contracts"
+catalog = "cognitive-rev11-projection-bridge.toml"
+hot_path = false
+
+[[cell]]
+order = 72
+id = "smart.experience.projection"
+crate = "eliot-experience-projection"
+catalog = "cognitive-rev11-projection-bridge.toml"
+hot_path = false
+
+[[cell]]
+order = 73
+id = "smart.self_model.context_projection"
+crate = "eliot-dreamer-self-query"
+catalog = "cognitive-rev11-projection-bridge.toml"
+hot_path = true
