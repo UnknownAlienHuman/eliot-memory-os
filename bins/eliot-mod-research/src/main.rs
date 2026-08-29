@@ -1,82 +1,38 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 
-use eliot_contracts::StateFence;
-use eliot_mod_research::{cancel, compose_from_environment, submit};
-use eliot_research_exchange_api::ResearchQueryRequest;
-use serde::{Deserialize, Serialize};
-
-/// JSON request envelope; inline submit preserves the established wire layout.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-enum Request {
-    Submit {
-        request: ResearchQueryRequest,
-    },
-    Cancel {
-        job_id: String,
-        state_fence: StateFence,
-    },
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum Response {
-    Accepted {
-        job: eliot_research_exchange::ExchangeJob,
-    },
-    Cancelled {
-        job: eliot_research_exchange::ExchangeJob,
-    },
-    Error {
-        error: String,
-    },
-}
+const SERVICE_NAME: &str = "eliot-mod-research";
+const PROTOCOL_VERSION: &str = "eliot.research.provider.v1";
+const OPERATION: &str = "eliot.research.provider.execute";
+const KERNEL_ADMISSION_REQUIRED: &str = "KERNEL_ADMISSION_REQUIRED";
+const EXIT_KERNEL_ADMISSION_REQUIRED: i32 = 78;
 
 fn main() {
-    let stdin = io::stdin();
-    let mut output = io::BufWriter::new(io::stdout().lock());
-    let mut researcher = compose_from_environment();
-
-    for line in stdin.lock().lines() {
-        let response = match line {
-            Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => handle(&mut researcher, &line),
-            Err(error) => Response::Error {
-                error: format!("input: {error}"),
-            },
-        };
-        if serde_json::to_writer(&mut output, &response).is_err()
-            || output.write_all(b"\n").is_err()
-            || output.flush().is_err()
-        {
-            break;
-        }
-    }
+    // The current repository has no authenticated Kernel-issued Research
+    // provider/process claim. Do not accept stdin as authority, read an
+    // ambient executable path, or spawn a child outside the shared governed
+    // ProcessExecutor contour.
+    let _ = writeln!(io::stderr(), "{}", admission_required_message());
+    std::process::exit(EXIT_KERNEL_ADMISSION_REQUIRED);
 }
 
-fn handle(researcher: &mut eliot_mod_research::ResearchComposition, line: &str) -> Response {
-    let request = match serde_json::from_str::<Request>(line) {
-        Ok(request) => request,
-        Err(error) => {
-            return Response::Error {
-                error: format!("request: {error}"),
-            };
-        }
-    };
-    match request {
-        Request::Submit { request } => submit(researcher, request)
-            .map(|job| Response::Accepted { job })
-            .unwrap_or_else(|error| Response::Error {
-                error: error.to_string(),
-            }),
-        Request::Cancel {
-            job_id,
-            state_fence,
-        } => cancel(researcher, &job_id, state_fence)
-            .map(|job| Response::Cancelled { job })
-            .unwrap_or_else(|error| Response::Error {
-                error: error.to_string(),
-            }),
+fn admission_required_message() -> String {
+    format!(
+        "{KERNEL_ADMISSION_REQUIRED}: service={SERVICE_NAME} protocol={PROTOCOL_VERSION} operation={OPERATION}"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standalone_diagnostic_is_stable_and_never_claims_readiness() {
+        let message = admission_required_message();
+        assert_eq!(
+            message,
+            "KERNEL_ADMISSION_REQUIRED: service=eliot-mod-research protocol=eliot.research.provider.v1 operation=eliot.research.provider.execute"
+        );
+        assert!(!message.to_ascii_lowercase().contains("ready"));
+        assert_ne!(EXIT_KERNEL_ADMISSION_REQUIRED, 0);
     }
 }
