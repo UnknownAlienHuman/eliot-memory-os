@@ -353,12 +353,8 @@ impl KernelComposition {
             Ok(receipt) => receipt,
             Err(error) => return Err(self.daemon_failure_error(error.to_string())),
         };
-        if let Err(error) = self
-            .await_daemon_ready(&launched, self.ipc_limits().operation_timeout)
-            .await
-        {
-            return Err(self.daemon_failure_error(error.to_string()));
-        }
+        self.await_daemon_ready(&launched, self.ipc_limits().operation_timeout)
+            .await?;
         Ok(launched)
     }
 
