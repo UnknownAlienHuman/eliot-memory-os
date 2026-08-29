@@ -1,0 +1,34 @@
+schema_version = "eliot-cognitive-design-validation-v11-extension"
+extends = "crates/smart/cognitive-design-validation-v11.toml"
+status = "REQUIRED_BEFORE_ASSIGNMENT"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+expected_orders = "1..61"
+expected_cell_count = 61
+
+additional_cell_sets = [
+  "crates/smart/cognitive-curation-cells-v11.toml",
+  "crates/smart/cognitive-learning-planning-cells-v11.toml"
+]
+
+required_checks = [
+  "Every curation subtype maps to exactly one typed handler; no generic model fallback.",
+  "Episode chronology and causal hypotheses use distinct types and proof ceilings.",
+  "Curation uses shared lifecycle/evidence vocabularies and no writer-supplied scalar confidence or utility proof.",
+  "Existence, support, accessibility and permitted influence remain independent.",
+  "Influence repair accepts an exact external InfluenceDependencyClosure and cannot discover dependencies by similarity.",
+  "Every learning overlay is task-local, reversible, expiring and forbidden from changing objective, acceptance, authority, privacy, evaluator or holdout.",
+  "Activation assessment consumes but never creates HarnessActivationReceipt.",
+  "Adherence does not imply benefit; outcome attribution remains separate.",
+  "Promotion input is advisory and dimensioned; no scalar promotion score or promotion status exists.",
+  "Maintenance, decomposition and orchestration outputs cannot create DurableJob, WorkItem, SwarmPlanDefinition, Ready Queue reservation, lease or launch.",
+  "DreamCycle is one bounded sample and one finite plan and cannot schedule itself.",
+  "Architecture and Implementation briefs require the exact accepted pair key and source digests.",
+  "Current-system conformance requires exact Product Identity and evidence handles and never treats prose, build success or test count as runtime support."
+]
+
+[closed_world_coverage]
+curation = ["smart.memory_curation.contracts", "smart.memory_curation.screen", "smart.dreamer.classification", "smart.dreamer.relation", "smart.dreamer.episode", "smart.dreamer.concept", "smart.dreamer.procedure", "smart.dreamer.skill", "smart.dreamer.failure_fingerprint", "smart.dreamer.structure_repair", "smart.dreamer.reconsolidation", "smart.dreamer.accessibility", "smart.dreamer.influence_repair", "smart.dreamer.curation_dispatch"]
+learning = ["smart.learning.contracts", "smart.learning.state_view", "smart.learning.attempt_delta", "smart.learning.overlay_candidate", "smart.learning.overlay_validation", "smart.learning.activation_assessment", "smart.learning.adherence_assessment", "smart.learning.closure", "smart.learning.retention_transfer", "smart.learning.promotion_input"]
+planning = ["smart.dreamer.conflict_analysis", "smart.dreamer.development_diagnosis", "smart.dreamer.maintenance_plan", "smart.dreamer.configuration_intent", "smart.dreamer.work_decomposition", "smart.dreamer.orchestration_plan"]
+dream_cycle = ["smart.dreamer.cycle_sample", "smart.dreamer.cycle_plan"]
+self_model = ["smart.dreamer.architecture_brief", "smart.dreamer.implementation_brief", "smart.dreamer.current_system_conformance"]
