@@ -5,7 +5,7 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
   push:
-    branches: ['**']
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -14,7 +14,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
