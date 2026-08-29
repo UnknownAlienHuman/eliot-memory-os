@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
-description = "Thin production entrypoint for the governed ELIOT research exchange"
+description = "Kernel-gated ELIOT Researcher provider process; standalone binary fails closed until admitted"
 
 [lib]
 path = "src/lib.rs"
