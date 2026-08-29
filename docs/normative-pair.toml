@@ -12,7 +12,7 @@ pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca58431
 architecture_path = "docs/architecture/ELIOT_ARCHITECTURE.md"
 architecture_revision = "4.5-draft"
 architecture_edition = "2026-08-28"
-architecture_sha256 = "c6932eaf26935e752eefb4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
 
 implementation_path = "docs/architecture/ELIOT_IMPLEMENTATION.md"
 implementation_revision = "0.29-draft"
