@@ -41,6 +41,9 @@ jobs:
       - name: Install pinned toolchain
         run: rustup show active-toolchain
 
+      - name: Install bounded Python verification dependencies
+        run: python -m pip install --disable-pip-version-check --no-input -r scripts/requirements-verification.txt
+
       - name: Cache Cargo inputs
         uses: actions/cache@v4
         with:

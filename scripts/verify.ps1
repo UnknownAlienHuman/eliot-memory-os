@@ -12,6 +12,7 @@ $architectureAudit = Join-Path $PSScriptRoot 'audit-architecture-boundaries.py'
 $guardrailVerifier = Join-Path $PSScriptRoot 'verify-agent-guardrails.py'
 $runtimeHygieneAudit = Join-Path $PSScriptRoot 'audit-runtime-source-hygiene.py'
 $agentBridgeProtocolVerifier = Join-Path $PSScriptRoot 'verify-agent-bridge-protocol.py'
+$agentRouteBundleVerifier = Join-Path $PSScriptRoot 'verify-agent-route-bundles.py'
 
 $steps = @(
     [pscustomobject]@{
@@ -33,6 +34,14 @@ $steps = @(
     [pscustomobject]@{
         Name = 'agent-guardrails'
         Command = { python $guardrailVerifier --root $repoRoot }
+    },
+    [pscustomobject]@{
+        Name = 'agent-route-bundles-self-test'
+        Command = { python $agentRouteBundleVerifier --self-test }
+    },
+    [pscustomobject]@{
+        Name = 'agent-route-bundles'
+        Command = { python $agentRouteBundleVerifier --root $repoRoot }
     },
     [pscustomobject]@{
         Name = 'runtime-source-hygiene-self-test'
