@@ -13,6 +13,18 @@ Broker, notify, agent bridge, and Researcher provider execution.
 Excluded: Dreamer. Do not change Dreamer code, contracts, prompts, process
 topology, routes, manifests, or tests from this workstream.
 
+## Source routing
+
+Current composition roots are under `bins/eliot`, `bins/eliotd`, the Host/
+Kernel/Store/Watchdog binaries, and their declared first-party crates.
+
+`crates/eliot-app` and its `eliot-governor` binary are a legacy migration and
+regression facade, not another Governor. Read its local `AGENTS.md` before any
+change. Work there is allowed only when the owning issue proves the current path
+still terminates there and the patch is a bounded regression repair,
+compatibility-fixture change, extraction to a current owner, or deletion.
+Adding a new feature or state/effect owner to the facade is prohibited.
+
 ## Start condition
 
 Do not use a shared long-lived core/daemon branch. For the assigned issue:
@@ -20,7 +32,8 @@ Do not use a shared long-lived core/daemon branch. For the assigned issue:
 1. run the root `AGENTS.md` preflight;
 2. create a fresh `<kind>/<issue>-<slug>` branch from exact current `main`;
 3. record the primary paths and integration owner in the issue/PR;
-4. verify that no other writer owns the same path scope.
+4. read every applicable nearest-path `AGENTS.md`;
+5. verify that no other writer owns the same path scope.
 
 A branch or brief bound to a different normative-pair digest or missing current
 `main` as an ancestor is stale and read-only.
@@ -67,7 +80,7 @@ Every candidate returns:
 | #15 | small Kernel, fencing, ORS, Control Reserve, generation routing |
 | #16 | Watchdog deterministic core, protected spool, SCM, containment |
 | #17 | bounded one-shot Doctor repair execution |
-| #18 | `eliotd` semantic admission, `PreparedTransition`, strict finish |
+| #18 | `eliotd` semantic admission, legacy-facade extraction, `PreparedTransition`, strict finish |
 | #19 | store bridge, BlobStore owner, Surreal process generation |
 | #20 | isolated typed Instrument/testd execution |
 | #21 | capability-limited WASM component generations |
@@ -75,8 +88,9 @@ Every candidate returns:
 | #23 | User Broker SID/session/credential/resource boundary |
 | #24 | governed Researcher provider process bridge |
 
-Existing defect issues #7–#9 own their exact storage failures. Issue #11 owns
-live Windows operational-spine/Product-Pulse evidence.
+Regression probes #7–#10 own Claude Desktop completion, attach/context,
+Antigravity terminal reconciliation, and arbitrary JSON payload integrity.
+Issue #11 owns live Windows operational-spine/Product-Pulse evidence.
 
 ## Result schema
 
