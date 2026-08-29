@@ -1,103 +1,222 @@
 schema_version = 1
-map_id = "cognitive-contract-edges-2026-08-28"
-status = "ACTIVE_PROTOTYPE_EDGE_AUTHORITY"
-wave = "cognitive-micromodules-wave-01"
-rule = "Execution order and compile-time linkage are different. Functional cells exchange only owner-neutral versioned contracts; a consumer must not link the concrete algorithm that produced an already validated value."
-composition_owner = "runtime composition root outside Smart; Codex-owned daemon/runtime code wires concrete implementations"
-fixture_rule = "Every edge has producer, consumer, version/fence, omission/failure and replacement fixtures before workspace admission."
+status = "REV11_TYPED_EDGE_PLAN"
+authority = "crates/smart/cognitive-rev11-authority.toml"
+proof_ceiling = "DESIGN_ONLY_NOT_EXECUTED"
+rule = "Every edge passes only the declared owner-neutral contract, one compatible State Fence and typed failure. Logical implementation order is not a Cargo dependency on another implementation crate."
 
 [[edge]]
-producer = "eliot-cue-normalizer"
-contract = "eliot-cue-contracts::NormalizedCueSet"
-consumer = "eliot-cue-index, eliot-cue-activation"
-compile_link = "contract_only"
+id = "E01_OBSERVATION_TO_EPISTEMIC"
+producer = "governor.observation.classifier::classify_observation"
+contract = "AdmittedEpistemicRecord"
+consumer = "smart.epistemic.position::resolve_current_epistemic_position"
+failure = "invalid or quarantined classification remains cold evidence and cannot influence the position"
 
 [[edge]]
-producer = "eliot-epistemic"
-contract = "eliot-epistemic-contracts::CurrentEpistemicPosition"
-consumer = "eliot-context-candidates, Dreamer handlers"
-compile_link = "contract_only"
+id = "E02_POSITION_TO_DREAM_BUNDLE"
+producer = "smart.epistemic.position::resolve_current_epistemic_position"
+contract = "CurrentEpistemicPosition"
+consumer = "smart.dreamer.bundle::assemble_dream_input_bundle"
+failure = "partial position remains explicit; missing required handle blocks bundle"
 
 [[edge]]
-producer = "eliot-context-candidates"
-contract = "eliot-context-contracts::ContextCandidateSet"
-consumer = "eliot-context-admission"
-compile_link = "contract_only"
+id = "E03_BUNDLE_TO_GROUNDING"
+producer = "smart.dreamer.bundle::assemble_dream_input_bundle"
+contract = "DreamInputBundle plus ReferenceManifest"
+consumer = "smart.dreamer.claim_grounding::ground_dream_claims"
+failure = "unknown handle fails closed"
 
 [[edge]]
-producer = "eliot-context-admission"
-contract = "eliot-context-contracts::AdmittedContextSet"
-consumer = "eliot-context-assembly"
-compile_link = "contract_only"
+id = "E04_GROUNDING_TO_TRANSFORMATION"
+producer = "smart.dreamer.claim_grounding::ground_dream_claims"
+contract = "GroundedDreamDraft"
+consumer = "smart.dreamer.transformation_validation::validate_dream_transformation"
+failure = "unsupported residue remains visible"
 
 [[edge]]
-producer = "eliot-context-assembly"
-contract = "eliot-context-contracts::ActiveUnderstandingView"
-consumer = "eliot-dreamer-bundle, Governor decision path"
-compile_link = "contract_only"
+id = "E05_TRANSFORMATION_TO_ADMISSION"
+producer = "smart.dreamer.transformation_validation::validate_dream_transformation"
+contract = "TransformationValidationReport"
+consumer = "smart.dreamer.draft_admission::admit_grounded_dream_draft"
+failure = "Fail or Inconclusive dimension follows per-kind policy; never scalar override"
 
 [[edge]]
-producer = "eliot-dreamer-bundle"
-contract = "eliot-dreamer-contracts::DreamInputBundle"
-consumer = "model-route adapter, eliot-dreamer-claim-grounding"
-compile_link = "contract_only"
+id = "E06_ADMISSION_TO_ORIENTATION"
+producer = "smart.dreamer.draft_admission::admit_grounded_dream_draft"
+contract = "AdmittedDreamDraft"
+consumer = "smart.dreamer.orientation::assemble_orientation_packet"
+failure = "required rejected claim blocks packet; optional rejection stays in manifest"
 
 [[edge]]
-producer = "eliot-dreamer-claim-grounding"
-contract = "eliot-dreamer-contracts::GroundedDreamDraft"
-consumer = "eliot-dreamer-candidate-validation"
-compile_link = "contract_only"
+id = "E07_RESEARCH_BUNDLE_TO_SYNTHESIS"
+producer = "Researcher"
+contract = "ResearchEvidenceBundle plus AllowedReferenceManifest"
+consumer = "smart.dreamer.research_synthesis::synthesize_research_candidates"
+failure = "incomplete acquisition remains incomplete coverage; no source expansion"
 
 [[edge]]
-producer = "eliot-dreamer-candidate-validation"
-contract = "eliot-dreamer-contracts::ValidatedDreamDraft"
-consumer = "all Dreamer semantic handlers"
-compile_link = "contract_only"
+id = "E08_NORMALIZATION_TO_BINDING"
+producer = "smart.cue.normalizer::normalize_observed_cues"
+contract = "NormalizedCue"
+consumer = "smart.cue.binding::build_cue_binding_candidates"
+failure = "invalid optional cue omitted with reason; canonical spelling remains intact"
 
 [[edge]]
-producer = "eliot-dreamer-rival-model, eliot-dreamer-probe-plan"
-contract = "eliot-dreamer-contracts::RivalModelSet, ProbePlan"
-consumer = "eliot-dreamer-orientation"
-compile_link = "contract_only"
+id = "E09_GOVERNOR_TO_CUE_INDEX"
+producer = "Governor cue-binding admission"
+contract = "AdmittedCueBinding"
+consumer = "smart.cue.index::build_cue_snapshot"
+failure = "unadmitted candidate cannot enter projection"
 
 [[edge]]
-producer = "eliot-memory-curation-screen"
-contract = "eliot-memory-curation-contracts::CurationScreenResult"
-consumer = "eliot-dreamer-curation"
-compile_link = "contract_only"
+id = "E10_CUE_INDEX_TO_DIRECT_MATCH"
+producer = "smart.cue.index::build_cue_snapshot"
+contract = "CueSnapshot"
+consumer = "smart.cue.direct_match::match_direct_cues"
+failure = "stale snapshot requires revalidation"
 
 [[edge]]
-producer = "all typed curation handlers"
-contract = "eliot-dreamer-contracts::TypedCurationHandlerResult"
-consumer = "eliot-dreamer-curation"
-compile_link = "contract_only"
+id = "E11_DIRECT_TO_OPTIONAL_SPREAD"
+producer = "smart.cue.direct_match::match_direct_cues"
+contract = "DirectCueMatchResult"
+consumer = "smart.cue.relation_spread::expand_cue_activation"
+failure = "spread failure leaves direct result usable"
 
-[[forbidden_compile_edge]]
-from = "eliot-cue-index"
-to = "eliot-cue-normalizer"
-reason = "index consumes NormalizedCueSet, not the normalization algorithm"
+[[edge]]
+id = "E12_CUE_TO_CONTEXT_CONTRIBUTION"
+producer = "smart.cue.activation::assemble_cue_activation"
+contract = "CueActivationResult handles and trace"
+consumer = "context projection providers"
+failure = "activation score cannot become support"
 
-[[forbidden_compile_edge]]
-from = "eliot-context-assembly"
-to = "eliot-context-admission"
-reason = "assembly consumes AdmittedContextSet, not the ranking algorithm"
+[[edge]]
+id = "E13_CONTRIBUTIONS_TO_ADMISSION"
+producer = "smart.context.contribution_merge::merge_context_contributions"
+contract = "ContextCandidateSet"
+consumer = "smart.context.admission::admit_context_candidates"
+failure = "missing provider remains coverage gap"
 
-[[forbidden_compile_edge]]
-from = "eliot-context-candidates"
-to = "eliot-epistemic"
-reason = "candidate projection consumes CurrentEpistemicPosition from the contract crate"
+[[edge]]
+id = "E14_ADMISSION_TO_ASSEMBLY"
+producer = "smart.context.admission::admit_context_candidates"
+contract = "AdmittedContextSet"
+consumer = "smart.context.assembly::assemble_active_understanding_view"
+failure = "assembly cannot rerank or change membership"
 
-[[forbidden_compile_edge]]
-from = "Dreamer semantic handler"
-to = "eliot-dreamer-candidate-validation or eliot-dreamer-claim-grounding"
-reason = "handler consumes a grounded and validated draft; orchestration owns sequencing"
+[[edge]]
+id = "E15_VIEW_TO_QUALITY"
+producer = "smart.context.assembly::assemble_active_understanding_view"
+contract = "ActiveUnderstandingView"
+consumer = "smart.context.quality::assess_context_quality"
+failure = "quality cannot mutate view"
 
-[[forbidden_compile_edge]]
-from = "eliot-dreamer-curation"
-to = "concrete curation handler crates"
-reason = "runtime composition supplies typed outcomes/registry; facade must remain open to replacement and extension"
+[[edge]]
+id = "E16_VIEW_TO_DECISION_TAIL"
+producer = "smart.context.assembly::assemble_active_understanding_view"
+contract = "ActiveUnderstandingView"
+consumer = "smart.context.decision_tail::build_decision_local_tail"
+failure = "missing admitted action yields DecisionBlocked"
 
-[[forbidden_compile_edge]]
-from = "any Smart cognitive crate"
-to = "storage adapter, kernel/daemon implementation, provider SDK, scheduler or effect executor"
-reason = "Smart handlers are deterministic/stateless or rebuildable projections and have no operational authority"
+[[edge]]
+id = "E17_TAIL_TO_DELIVERY_PLAN"
+producer = "smart.context.decision_tail::build_decision_local_tail"
+contract = "DecisionLocalTail"
+consumer = "smart.context.reactive_delivery_plan::plan_reactive_context_injection"
+failure = "unsupported host yields attention-only plan, not false prevention claim"
+
+[[edge]]
+id = "E18_SCREEN_TO_TYPED_CURATION"
+producer = "smart.memory.curation.screen::screen_curation_snapshot"
+contract = "CurationScreenResult"
+consumer = "smart.dreamer.curation::dispatch_curation_item"
+failure = "unsupported subtype stays unplanned"
+
+[[edge]]
+id = "E19_RELATION_SHARED_CORE"
+producer = "smart.dreamer.relation_candidate::build_relation_candidate_set"
+contract = "RelationCandidateSet"
+consumer = "Orientation or Curation assembler"
+failure = "one semantics owner; use case remains typed"
+
+[[edge]]
+id = "E20_STATE_VIEW_TO_DELTA"
+producer = "smart.learning.state_view::assemble_campaign_learning_state_view"
+contract = "CampaignLearningStateView"
+consumer = "smart.learning.delta::derive_attempt_learning_delta"
+failure = "STALE or BLOCKED state stops adaptation"
+
+[[edge]]
+id = "E21_DELTA_TO_OVERLAY"
+producer = "smart.learning.delta::derive_attempt_learning_delta"
+contract = "AttemptLearningDelta"
+consumer = "smart.learning.overlay::build_campaign_harness_overlay"
+failure = "no justified change yields no overlay"
+
+[[edge]]
+id = "E22_OVERLAY_TO_EXTERNAL_ADMISSION"
+producer = "smart.learning.overlay_validation::validate_campaign_overlay"
+contract = "CampaignHarnessOverlayCandidate plus OverlayValidationReport"
+consumer = "Governor overlay admission"
+failure = "validator cannot admit or activate"
+
+[[edge]]
+id = "E23_EXTERNAL_RECEIPT_TO_ASSESSMENT"
+producer = "external Harness activation owner"
+contract = "HarnessActivationReceiptRef"
+consumer = "meta.learning.activation_assessment::assess_harness_activation"
+failure = "missing receipt yields Inconclusive, never inferred activation"
+
+[[edge]]
+id = "E24_ASSESSMENT_TO_CLOSURE"
+producer = "meta.learning.activation_assessment::assess_harness_activation"
+contract = "HarnessActivationAssessment"
+consumer = "meta.learning.closure::build_campaign_learning_closure"
+failure = "unknown activation blocks causal outcome attribution"
+
+[[edge]]
+id = "E25_CLOSURE_TO_PROMOTION_INPUT"
+producer = "meta.learning.closure::build_campaign_learning_closure"
+contract = "CampaignLearningClosureCandidate"
+consumer = "meta.learning.promotion_input::build_promotion_input"
+failure = "NO_REUSABLE_DELTA yields no promotion input"
+
+[[edge]]
+id = "E26_DECOMPOSITION_TO_ORCHESTRATION"
+producer = "smart.dreamer.work_decomposition::decompose_work"
+contract = "WorkDecompositionCandidate"
+consumer = "smart.dreamer.orchestration_plan::build_orchestration_plan"
+failure = "invalid DAG or overlapping source scope blocks orchestration"
+
+[[edge]]
+id = "E27_DREAM_SAMPLE_TO_PLAN"
+producer = "smart.dreamer.cycle_sample::select_dream_cycle_sample"
+contract = "DreamCycleSample"
+consumer = "smart.dreamer.cycle_plan::build_dream_cycle_plan_candidate"
+failure = "partial denominator forbids complete-cycle claims"
+
+[[pulse]]
+id = "D3A_ORIENTATION_PULSE_01"
+required_edges = ["E01_OBSERVATION_TO_EPISTEMIC", "E02_POSITION_TO_DREAM_BUNDLE", "E03_BUNDLE_TO_GROUNDING", "E04_GROUNDING_TO_TRANSFORMATION", "E05_TRANSFORMATION_TO_ADMISSION", "E06_ADMISSION_TO_ORIENTATION"]
+
+[[pulse]]
+id = "D3B_REACTIVE_CONTEXT_PULSE_01"
+required_edges = ["E08_NORMALIZATION_TO_BINDING", "E09_GOVERNOR_TO_CUE_INDEX", "E10_CUE_INDEX_TO_DIRECT_MATCH", "E11_DIRECT_TO_OPTIONAL_SPREAD", "E12_CUE_TO_CONTEXT_CONTRIBUTION", "E13_CONTRIBUTIONS_TO_ADMISSION", "E14_ADMISSION_TO_ASSEMBLY", "E15_VIEW_TO_QUALITY", "E16_VIEW_TO_DECISION_TAIL", "E17_TAIL_TO_DELIVERY_PLAN"]
+
+[[pulse]]
+id = "D3A_CURATION_PULSE_01"
+required_edges = ["E18_SCREEN_TO_TYPED_CURATION", "E19_RELATION_SHARED_CORE"]
+
+[[pulse]]
+id = "D3A_RESEARCH_SYNTHESIS_PULSE_01"
+required_edges = ["E07_RESEARCH_BUNDLE_TO_SYNTHESIS", "E03_BUNDLE_TO_GROUNDING", "E04_GROUNDING_TO_TRANSFORMATION", "E05_TRANSFORMATION_TO_ADMISSION"]
+
+[[pulse]]
+id = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+required_edges = ["E20_STATE_VIEW_TO_DELTA", "E21_DELTA_TO_OVERLAY", "E22_OVERLAY_TO_EXTERNAL_ADMISSION", "E23_EXTERNAL_RECEIPT_TO_ASSESSMENT", "E24_ASSESSMENT_TO_CLOSURE", "E25_CLOSURE_TO_PROMOTION_INPUT"]
+
+[[pulse]]
+id = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+required_edges = ["E26_DECOMPOSITION_TO_ORCHESTRATION"]
+
+[[pulse]]
+id = "D6_BOUNDED_DREAM_CYCLE_PULSE_01"
+required_edges = ["E27_DREAM_SAMPLE_TO_PLAN"]
