@@ -1,0 +1,44 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.claim_grounding"
+agent_order = 19
+physical_package = "eliot-dreamer-validation"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Ground every material model claim to exact manifest handles without interpreting support."
+
+[agent]
+objective = "Implement exact claim-to-handle grounding and unsupported-residue preservation only."
+write_scope = ["crates/smart/eliot-dreamer-validation/src/claim_grounding.rs", "crates/smart/eliot-dreamer-validation/tests/claim_grounding.rs"]
+integration_owner = "Dreamer validation integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-validation/src/lib.rs", "crates/smart/eliot-dreamer-validation/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn ground_draft_claims(bundle: &DreamInputBundle, draft: &ModelDraftEnvelope) -> Result<GroundedDreamDraft, ClaimGroundingError>"]
+
+[algorithm]
+steps = [
+  "Validate bundle and draft job or fence identity.",
+  "Enumerate every material claim, including implied action predicates.",
+  "Require each citation and counterevidence handle to exist in ReferenceManifest.",
+  "Separate cited material from unsupported residue.",
+  "Derive source-authority ceiling from descriptors, never model wording.",
+  "Stable-sort claims and handles."
+]
+
+[limits]
+rules = ["Use DreamBudget maxima for claims and handles.", "Use linear manifest lookup plus stable sort."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "UnknownHandle", "MissingMaterialClaim", "DuplicateClaim", "AuthorityCeilingUnknown"]
+
+[forbidden]
+operations = ["support adjudication", "citation invention", "model self-verification", "storage read", "provider call", "canonical write"]
+
+[tests]
+required = ["invented citation is rejected", "unsupported residue remains visible", "counterevidence cannot be dropped", "model assertion cannot raise source authority"]
+
+[integration]
+provider = "external governed model route"
+consumer = "smart.dreamer.transformation_validation"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if material-claim or source-authority classification is not closed and typed."
