@@ -1,0 +1,95 @@
+schema_version = "eliot-cognitive-authority-v11-final"
+status = "ACTIVE_WORKING_DRAFT"
+issue = "github:UnknownAlienHuman/eliot-memory-os#94"
+branch = "work/94-cognitive-function-design-audit"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+rust_implementation = "ABSENT"
+root_workspace_admission = false
+total_functional_cells = 61
+physical_packages = 26
+assignment_entrypoint = "crates/smart/00-cognitive-assignment-index-v11.toml"
+assignment_index = "crates/smart/cognitive-assignment-index-v11.toml"
+validation_index = "crates/smart/cognitive-validation-index-v11.toml"
+closed_world_index = "crates/smart/cognitive-closed-world-index-v11.toml"
+authority_rule = "This lexically first file and its referenced v11 cell sets are the sole cognitive swarm-assignment authority. Earlier cognitive authority, wave, module and API records are donor evidence only."
+
+[normative_pair]
+architecture_path = "docs/architecture/ELIOT_ARCHITECTURE.md"
+architecture_revision = "4.5-draft"
+architecture_edition = "2026-08-28"
+architecture_sha256 = "c6932eaf26935e752eefb4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+implementation_path = "docs/architecture/ELIOT_IMPLEMENTATION.md"
+implementation_revision = "0.29-draft"
+implementation_edition = "2026-08-28"
+implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+precedence = "Architecture semantic intent and Hard Boundaries prevail; Implementation owns target contracts, owners, defaults and failure behavior where consistent."
+
+[cell_sets]
+files = [
+  "crates/smart/cognitive-hot-path-cells-v11.toml",
+  "crates/smart/cognitive-dreamer-core-cells-v11.toml",
+  "crates/smart/cognitive-curation-cells-v11.toml",
+  "crates/smart/cognitive-learning-planning-cells-v11.toml"
+]
+orders = "1..61"
+
+[topology]
+files = [
+  "crates/smart/cognitive-physical-topology-v11.toml",
+  "crates/smart/cognitive-physical-topology-v11-wave2.toml"
+]
+rule = "One FunctionalCapabilityCell is one agent assignment; package count follows contract, dependency, security, proof, deployment and replacement seams rather than function count or LOC."
+
+[closed_world]
+files = [
+  "crates/smart/cognitive-dreamer-job-coverage-v11.toml",
+  "crates/smart/cognitive-dreamer-candidate-kind-coverage-v11.toml",
+  "crates/smart/cognitive-curation-subtype-coverage-v11.toml",
+  "crates/smart/cognitive-function-edge-map-v11.toml",
+  "crates/smart/cognitive-product-pulses-v11.toml"
+]
+counts = { dreamer_job_classes = 8, candidate_kinds = 17, curation_subtypes = 11, function_edges = 54, product_pulses = 9 }
+
+[invariants]
+items = [
+  "No cognitive cell owns canonical truth, support, authority, task completion, scheduler state, provider acquisition, external effects or production promotion.",
+  "Every decision-boundary hot cell is bounded, deterministic, model-free, storage-scan-free, network-free, lock-free and blocking-I/O-free.",
+  "Every model output remains candidate-only with exact lineage, visible uncertainty, invalidation and a source-derived authority ceiling.",
+  "Existence, epistemic support, accessibility and permitted influence are independent dimensions.",
+  "Observed chronology is not causality; causality requires mechanism, evidence, rivals and falsifier.",
+  "Online learning may change only reversible expiring task-local overlays; global promotion is external and proof-gated.",
+  "Planning cannot create DurableJob, WorkItem, SwarmPlanDefinition, execution state, lease, queue reservation or launch.",
+  "DreamCycle is one bounded sample and one finite plan and cannot schedule itself."
+]
+
+[agent_contract]
+rules = [
+  "Read this file, the two topology files, exactly one cell record and the cell's named normative anchors.",
+  "Edit only the declared worker source and test files; Cargo.toml, src/lib.rs and package re-exports belong to the integration owner.",
+  "Do not invent a missing external owner contract inside Smart; return a ContractChallenge.",
+  "Unknown job, kind, subtype, missing denominator, stale fence, absent owner projection or unavailable authority path fails closed.",
+  "A package-local green result does not establish Edge, Product Pulse, runtime or product support."
+]
+
+[supersedes_for_assignment]
+paths = [
+  "crates/smart/000-cognitive-authority-v11.toml",
+  "crates/smart/cognitive-design-authority-v11.toml",
+  "crates/smart/cognitive-crate-decisions.toml",
+  "historical cognitive wave files",
+  "historical standalone module.toml/api.toml pairs",
+  "crates/smart/eliot-dreamer-candidate-validation",
+  "crates/smart/eliot-dreamer-memory-repair"
+]
+
+[admission_gate]
+required = [
+  "all 61 cell records pass static closed-world validation",
+  "physical package seams are approved by integration owners",
+  "worker write scopes are non-overlapping",
+  "root Cargo.toml and Cargo.lock remain unchanged until implementation admission",
+  "implemented package obtains package proof",
+  "every affected edge obtains provider-consumer Edge Proof",
+  "the named Product Pulse passes on exact Product Identity"
+]
