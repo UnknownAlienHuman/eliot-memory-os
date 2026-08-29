@@ -1,20 +1,24 @@
 //! Stateless MCP contract and core bridge for ELIOT.
 //!
 //! This crate owns no transport, process, database, session, task, admission,
-//! authority, verification, or finish state. Every call carries an explicit
-//! application binding and is forwarded to an injected Kernel/Governor port.
+//! authority, verification, or finish state. The host-facing request contract
+//! carries only inert operation intent and correlation. Existing bound request
+//! types remain Kernel/Governor-facing compatibility surfaces until the bridge
+//! adapter and Kernel identity-binding units migrate under issue #77.
 
 #![forbid(unsafe_code)]
 
 mod contract;
 mod core;
+mod host;
 mod schema;
 
 pub use contract::*;
 pub use core::*;
+pub use host::*;
 pub use schema::*;
 
 /// Stable package contract name.
 pub const CONTRACT_NAME: &str = "eliot.surface.mcp";
 /// Current package contract revision.
-pub const CONTRACT_REVISION: &str = "1.0.0";
+pub const CONTRACT_REVISION: &str = "1.1.0";
