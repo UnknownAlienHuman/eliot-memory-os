@@ -10,6 +10,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $architectureAudit = Join-Path $PSScriptRoot 'audit-architecture-boundaries.py'
 $guardrailVerifier = Join-Path $PSScriptRoot 'verify-agent-guardrails.py'
+$runtimeHygieneAudit = Join-Path $PSScriptRoot 'audit-runtime-source-hygiene.py'
 
 $steps = @(
     [pscustomobject]@{
@@ -31,6 +32,14 @@ $steps = @(
     [pscustomobject]@{
         Name = 'agent-guardrails'
         Command = { python $guardrailVerifier --root $repoRoot }
+    },
+    [pscustomobject]@{
+        Name = 'runtime-source-hygiene-self-test'
+        Command = { python $runtimeHygieneAudit --self-test }
+    },
+    [pscustomobject]@{
+        Name = 'runtime-source-hygiene'
+        Command = { python $runtimeHygieneAudit --root $repoRoot }
     },
     [pscustomobject]@{
         Name = 'cargo-metadata'
