@@ -1,0 +1,62 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "ROUTING_PROJECTION_NOT_API_AUTHORITY"
+current = "crates/smart/cognitive-current.toml"
+rule = "A swarm dispatcher resolves one order through the indices and sends only the exact authoritative [[cell]] record plus the shared owner/type/edge prerequisites. This routing file never duplicates signatures or algorithms."
+
+[resolution]
+steps = [
+  "read cognitive-current.toml",
+  "resolve order 1..67 through cognitive-rev11-cell-index.toml",
+  "resolve order 68..73 through cognitive-rev11-projection-index.toml",
+  "resolve order 74..75 through cognitive-rev11-context-provider-index.toml",
+  "open the named catalog and extract exactly one [[cell]] whose order and id match the index",
+  "attach only the type-owner families used by the public signature",
+  "attach only prerequisite edge contracts and open ContractChallenges",
+  "attach the physical-crate topology and Cargo-plan entry",
+  "attach the exact donor disposition when present",
+]
+
+[dispatcher_output]
+required = [
+  "cell identity and order",
+  "one causal responsibility",
+  "public signatures",
+  "type owners",
+  "ordered algorithm",
+  "invariants and degradation",
+  "typed errors",
+  "minimum tests",
+  "exact source/test write scope",
+  "prerequisites and Product Pulse",
+  "proof ceiling and stop conditions",
+]
+forbidden = [
+  "another cell record",
+  "whole Architecture or Implementation books",
+  "retired module.toml or *.api.toml",
+  "full repository inventory",
+  "unrelated donor code",
+  "mutable owner state",
+]
+
+[one_cell_artifact]
+format = "ephemeral dispatcher packet or generated ignored file"
+checked_in_duplicate = false
+reason = "Checking 75 copied assignments into Git would recreate the module/API divergence that rev11 removed. The one-cell packet must be extracted from the authoritative record at dispatch time."
+identity = "sha256(canonical authoritative cell record + current authority id + normative pair key)"
+
+[agent_prompt]
+opening = "Implement exactly this FunctionalCapabilityCell in Rust 2024. Do not redesign neighboring cells, public owners, package topology, authority or runtime behavior."
+required_directive = "Use the supplied public signatures as an allowlist, keep helpers private, write only the declared files, run the declared tests, and return a typed ContractChallenge instead of inventing a missing owner contract."
+completion = "Return changed files, tests, commands/results, external challenges, inconclusive dimensions and honest proof ceiling."
+
+[validation]
+assertions = [
+  "every order 1..75 resolves through exactly one index",
+  "every index entry resolves to exactly one authoritative cell",
+  "routing output contains exactly one cell",
+  "routing output signature and source_files are copied byte-for-byte from authority",
+  "routing output contains no neighboring cell or retired assignment",
+  "routing packet identity changes when authority or normative pair changes",
+]
