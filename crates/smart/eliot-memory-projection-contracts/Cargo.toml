@@ -1,0 +1,26 @@
+[package]
+name = "eliot-memory-projection-contracts"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Provider-neutral immutable canonical-memory read and candidate projection contracts."
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "NOT_IMPLEMENTED"
+workspace_admission = "pending_agent_implementation_module_edge_and_product_proof"
+source_layer = "C0"
+runtime_layer = "R5"
+runtime_bundle = "eliotd"
+functional_cell_refs = ["smart.memory.projection_contracts"]
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+issue = 152
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }

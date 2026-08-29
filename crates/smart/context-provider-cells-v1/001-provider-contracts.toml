@@ -1,0 +1,133 @@
+schema_version = 1
+authority = "eliot-cognitive-context-provider-cells-v1"
+status = "STATIC_FUNCTION_DESIGN_ONLY"
+issue = 152
+branch = "work/152-context-provider-projections"
+base_main_commit = "e7c0cdbfd9b2a95305b63e63e3a69aa6242f846a"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+assignment_rule = "This file is the complete assignment and Rust-oriented API for exactly one FunctionalCapabilityCell."
+shared_hot_path_contract = [
+  "immutable bounded inputs only",
+  "no model call",
+  "no storage read or scan",
+  "no network or process startup",
+  "no blocking I/O",
+  "deterministic ordering and stable tie-break",
+  "visible local degradation",
+]
+
+[cell]
+order = 1
+id = "smart.context.provider_contracts"
+stage = "W0_CONTEXT_PROVIDER_CONTRACT"
+physical_crate = "eliot-context-contracts"
+runtime_layer = "R5"
+hot_path = false
+stateless = true
+responsibility = "Own the provider-neutral closed algebra for expected Context providers, per-provider projection requests/results, whole Context atoms, coverage and role declarations."
+public_functions = [
+  "pub fn validate_context_provider_registry(registry: &ContextProviderRegistrySnapshot) -> Result<(), ContextProviderContractError>",
+  "pub fn validate_expected_context_provider_set(set: &ExpectedContextProviderSet) -> Result<(), ContextProviderContractError>",
+  "pub fn validate_provider_projection_request(request: &ContextProviderProjectionRequest) -> Result<(), ContextProviderContractError>",
+  "pub fn validate_provider_contribution_result(result: &ProviderContributionResult) -> Result<(), ContextProviderContractError>",
+  "pub fn context_provider_result_digest(result: &ProviderContributionResult) -> Result<String, ContextProviderContractError>",
+]
+public_types = [
+  "ContextProviderClass",
+  "ContextSemanticRole",
+  "ContextProviderRequirement",
+  "ContextProviderDescriptor",
+  "ContextProviderRegistrySnapshot",
+  "ExpectedContextProvider",
+  "ExpectedContextProviderSet",
+  "ContextProviderProjectionRequest",
+  "ProviderContributionResult",
+  "ProviderContribution",
+  "ProviderContributionDisposition",
+  "ProviderCoverage",
+  "ContextAtom",
+  "ContextAtomRepresentation",
+  "ContextAtomPolicyRef",
+  "ProviderOmission",
+  "ProviderLimit",
+]
+type_shapes = [
+  "pub enum ContextProviderClass { TaskContinuity, CriticalAttention, EpistemicPosition, MemoryRecall, AuthorityAffordance, SelfModel }",
+  "pub enum ContextSemanticRole { Goal, Acceptance, Attention, EpistemicPosition, SemanticModel, CausalModel, Continuity, Invariant, NegativeMemory, Evidence, Unknown, Affordance, Verifier, NextBoundary, SelfModel }",
+  "pub enum ContextProviderRequirement { Mandatory, Optional, Conditional }",
+  "pub enum ProviderContributionDisposition { Complete, EmptyComplete, Partial, Unavailable, Stale, Blocked, NotApplicable }",
+  "pub struct ContextProviderProjectionRequest { pub request_id: String, pub compilation_id: String, pub provider_id: String, pub provider_class: ContextProviderClass, pub expected_provider_set_digest: String, pub registry_revision: u64, pub recipe_revision: String, pub scope_id: String, pub task_id: Option<String>, pub state_fence: StateFence, pub required_roles: Vec<ContextSemanticRole>, pub maximum_atoms: u32, pub maximum_inline_bytes: u32, pub policy_snapshot_ref: String, pub disclosure_decision_ref: Option<String> }",
+]
+input_owners = ["eliot-contracts::StateFence", "eliot-context-contracts owns every type declared by this cell"]
+output_owners = ["eliot-context-contracts owns the closed provider/result wire algebra"]
+preconditions = [
+  "all identifiers are nonblank, bounded and canonicalizable",
+  "all entries in one registry/set/request/result share one compatible StateFence",
+  "provider class is one of the six closed classes and DecisionLocalTail is not a provider class",
+  "every expected provider names supported roles and one requirement class",
+]
+algorithm = [
+  "validate bounded identities, revisions and collections",
+  "reject duplicate provider identities or duplicate classes where the recipe requires a single owner",
+  "validate that supported roles cover every requested/expected role without overclaim",
+  "validate result identity against exact request and expected-set digest",
+  "require contribution presence only for Complete/Partial; require no payload for Unavailable/Stale/Blocked/NotApplicable; allow EmptyComplete only with a complete denominator",
+  "canonicalize maps and vectors by stable identity and compute canonical digest",
+]
+complexity = "O(p log p + a log a) time and O(p + a) memory within explicit registry/provider/atom limits; no I/O."
+invariants = [
+  "the contract crate owns no provider implementation, registry lifecycle or Context admission",
+  "one expected provider produces exactly one typed result or one typed collector failure",
+  "EmptyComplete is not Unavailable, Partial, Stale, Blocked or NotApplicable",
+  "a provider cannot claim another provider class or semantic role",
+  "ContextAtom is a whole addressable unit and cannot be silently sliced",
+  "Decision-local tail is assembled after admission and never appears in the provider denominator",
+]
+degradation = "Unknown class, unsupported role, stale registry/fence or missing mandatory provider fails typed validation; optional unavailable providers remain explicit results."
+errors = [
+  "InvalidIdentity",
+  "InvalidFence",
+  "UnknownProviderClass",
+  "DuplicateProvider",
+  "RoleUnsupported",
+  "RoleOverclaim",
+  "RegistryRevisionMismatch",
+  "ExpectedSetDigestMismatch",
+  "DispositionPayloadMismatch",
+  "IncompleteDenominator",
+]
+tests = [
+  "all six provider classes round-trip and no seventh class decodes",
+  "DecisionLocalTail cannot decode as ContextProviderClass",
+  "EmptyComplete requires complete denominator and zero atoms",
+  "Unavailable with contribution payload is rejected",
+  "mandatory provider omission is rejected",
+  "optional unavailable result remains valid and explicit",
+  "provider result for another expected-set digest is rejected",
+]
+source_files = [
+  "crates/smart/eliot-context-contracts/src/provider.rs",
+  "crates/smart/eliot-context-contracts/tests/provider.rs",
+]
+proof_entrypoint = "cargo test -p eliot-context-contracts --test provider"
+replacement_boundary = "Replace provider wire implementation only with byte/semantic compatibility for all six classes and existing consumer fixtures."
+forbidden = [
+  "provider execution",
+  "Context admission/ranking",
+  "canonical read/write",
+  "delivery or use receipt",
+  "authority decision",
+  "model/vendor type",
+]
+architecture_refs = [
+  "ARCH-MOD-03",
+  "ARCH-CTX-01",
+  "ARCH-CTX-04",
+  "ARCH-UND-01",
+]
+implementation_refs = [
+  "I2.20 FunctionalCapabilityCell",
+  "I7.11 Context payload profiles",
+  "I12.13 Context Compiler",
+  "I5.20 stable-scope reads",
+]

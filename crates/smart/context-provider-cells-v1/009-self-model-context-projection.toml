@@ -1,0 +1,96 @@
+schema_version = 1
+authority = "eliot-cognitive-context-provider-cells-v1"
+status = "STATIC_FUNCTION_DESIGN_ONLY"
+issue = 152
+branch = "work/152-context-provider-projections"
+base_main_commit = "e7c0cdbfd9b2a95305b63e63e3a69aa6242f846a"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+assignment_rule = "This file is the complete assignment and Rust-oriented API for exactly one FunctionalCapabilityCell."
+shared_hot_path_contract = [
+  "immutable bounded inputs only",
+  "no model call",
+  "no storage read or scan",
+  "no network or process startup",
+  "no blocking I/O",
+  "deterministic ordering and stable tie-break",
+  "visible local degradation",
+]
+
+[cell]
+order = 9
+id = "smart.self_model.context_projection"
+stage = "W2_SELF_MODEL_CONTEXT_PROJECTION"
+physical_crate = "eliot-self-model-projection"
+runtime_layer = "R5"
+hot_path = true
+stateless = true
+responsibility = "Project a SystemSelfModelSnapshot into decision-relevant whole Context atoms for an ELIOT-system task without upgrading targets, evidence or uncertainty."
+public_functions = [
+  "pub fn project_self_model_context(request: &ContextProviderProjectionRequest, snapshot: &SystemSelfModelSnapshot) -> Result<ProviderContributionResult, SelfModelContextProjectionError>",
+]
+preconditions = [
+  "request provider class is SelfModel",
+  "snapshot digest, normative-pair identity, scope and StateFence match request",
+  "request names exact Architecture/Implementation/current-conformance roles required by the decision",
+]
+algorithm = [
+  "validate request and snapshot identities",
+  "select Constitutional anchors and rationale applicable to the changed capability/effect",
+  "select Implemented target/current distinctions, Operational degradation, relevant Experience and Epistemic conflicts/unknowns",
+  "preserve item status and source handles; do not rewrite Target/Unknown into current support",
+  "place load-bearing invariants, gaps, failures and unknowns in whole atoms under DecisionSafetyFloor policies",
+  "bound optional items by handle/omission while preserving expansion path",
+  "derive contribution disposition from exact snapshot coverage and compute digest",
+]
+complexity = "O(n log n + rendered_bytes) over bounded snapshot; no source read, model call, Context admission, network or blocking I/O."
+invariants = [
+  "Constitutional, Implemented, Operational, Experiential and Epistemic items remain distinguishable",
+  "Architecture precedence remains visible",
+  "current support requires current evidence",
+  "Dreamer candidate brief cannot become a current self-model fact",
+  "projection cannot change conformance, policy or Architecture",
+  "omission never hides a load-bearing gap without a handle/reason",
+]
+degradation = "Stale/missing current evidence emits target-only plus explicit Unknown/Blocked atoms; mismatched normative pair or fence fails closed."
+errors = [
+  "WrongProviderClass",
+  "SnapshotDigestMismatch",
+  "NormativePairMismatch",
+  "FenceMismatch",
+  "CurrentSupportOverclaim",
+  "RequiredInvariantMissing",
+  "RequiredGapOmitted",
+  "ProjectionLimitExceeded",
+]
+tests = [
+  "target/current remain separate in atoms",
+  "wrong pair rejected",
+  "operational degradation remains visible",
+  "experience item does not become Architecture invariant",
+  "missing current evidence becomes Unknown",
+  "load-bearing conformance gap cannot be silently omitted",
+  "projection has no admission/self-certification field",
+]
+source_files = [
+  "crates/smart/eliot-self-model-projection/src/context_projection.rs",
+  "crates/smart/eliot-self-model-projection/tests/context_projection.rs",
+]
+proof_entrypoint = "cargo test -p eliot-self-model-projection --test context_projection"
+replacement_boundary = "Renderer may change only with status, source, omission and normative-precedence equivalence."
+forbidden = [
+  "self-model assembly/source read",
+  "storage read or scan",
+  "network call",
+  "Context admission",
+  "support/conformance promotion",
+  "Architecture change",
+  "model call",
+  "current-state inference from prose",
+]
+architecture_refs = [
+  "ARCH-SELF-01",
+  "ARCH-CTX-01",
+  "ARCH-UND-01",
+  "ARCH-MOD-03",
+]
+implementation_refs = ["I12.13 Context Compiler", "I12.23 Architecture/Implementation Knowledge", "I7.11 Decision Safety Floor"]

@@ -1,0 +1,103 @@
+schema_version = 1
+authority = "eliot-cognitive-context-provider-cells-v1"
+status = "STATIC_FUNCTION_DESIGN_ONLY"
+issue = 152
+branch = "work/152-context-provider-projections"
+base_main_commit = "e7c0cdbfd9b2a95305b63e63e3a69aa6242f846a"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+assignment_rule = "This file is the complete assignment and Rust-oriented API for exactly one FunctionalCapabilityCell."
+shared_hot_path_contract = [
+  "immutable bounded inputs only",
+  "no model call",
+  "no storage read or scan",
+  "no network or process startup",
+  "no blocking I/O",
+  "deterministic ordering and stable tie-break",
+  "visible local degradation",
+]
+
+[cell]
+order = 5
+id = "smart.memory.context_projection"
+stage = "W2_MEMORY_CONTEXT_PROJECTION"
+physical_crate = "eliot-memory-projection"
+runtime_layer = "R5"
+hot_path = true
+stateless = true
+responsibility = "Project one MemoryCandidateSet into an owner-attributed ProviderContributionResult made of whole Context atoms, preserving support, accessibility, permitted influence, provenance and reversible omission."
+public_functions = [
+  "pub fn project_memory_context(request: &ContextProviderProjectionRequest, candidates: &MemoryCandidateSet) -> Result<ProviderContributionResult, MemoryContextProjectionError>",
+]
+preconditions = [
+  "request provider class is MemoryRecall and request/result contracts are valid",
+  "candidate-set digest, expected-set digest, scope/task and StateFence match the request",
+  "candidate records contain owner-projected accessibility, disclosure and influence dispositions",
+]
+algorithm = [
+  "validate request and candidate-set identity",
+  "for each candidate choose InlineExact, Extractive or HandleOnly representation only as permitted by accessibility/disclosure",
+  "reject any candidate whose influence was suppressed/quarantined/revoked from payload admission; preserve only non-influential omission/suppression metadata allowed by the contract",
+  "map each candidate to one or more whole atoms only when semantic roles are explicitly declared; never split a logical object, citation, evidence edge or tool/result pair",
+  "preserve source/evidence/counterevidence, epistemic status, negative-memory role, applicability and StateFence",
+  "derive Complete, EmptyComplete, Partial, Stale, Unavailable or Blocked from the exact candidate coverage; never infer NotApplicable for a requested provider",
+  "bound atom count/bytes and emit exact omissions/expansion handles",
+  "compute result digest",
+]
+complexity = "O(n log n + rendered_bytes) within request limits; no storage read, model call, network, blocking I/O or Context admission."
+invariants = [
+  "projection cannot admit or rank itself against other providers",
+  "inaccessible payload is never copied",
+  "handle-only representation keeps exact expansion identity",
+  "record support and permitted-influence ceiling are unchanged",
+  "one memory item remains addressable and its provenance is not laundered",
+  "EmptyComplete is possible only for a complete searched denominator with zero admissible candidates",
+]
+degradation = "Optional unrenderable items become handle-only or explicit omissions; a required protected item without a safe representation returns RequiredRepresentationMissing and blocks only the dependent provider result."
+errors = [
+  "WrongProviderClass",
+  "RequestCandidateMismatch",
+  "ExpectedSetDigestMismatch",
+  "FenceMismatch",
+  "DisclosureDenied",
+  "AccessibilityUnknown",
+  "InfluenceDenied",
+  "RequiredRepresentationMissing",
+  "AtomBoundaryLoss",
+  "ProjectionLimitExceeded",
+]
+tests = [
+  "inaccessible payload is not leaked",
+  "handle-only output preserves exact record/source handles",
+  "support/influence/status survive byte-for-byte semantics",
+  "complete empty becomes EmptyComplete",
+  "partial snapshot cannot become EmptyComplete",
+  "revoked candidate cannot become an atom",
+  "protected unrenderable candidate fails rather than disappears",
+]
+source_files = [
+  "crates/smart/eliot-memory-projection/src/context_projection.rs",
+  "crates/smart/eliot-memory-projection/tests/context_projection.rs",
+]
+proof_entrypoint = "cargo test -p eliot-memory-projection --test context_projection"
+replacement_boundary = "Representation renderer may change only with semantic-equivalence, no-leak, whole-unit and reversible-omission fixtures."
+forbidden = [
+  "Context admission",
+  "provider registry mutation",
+  "canonical read/write",
+  "delivery/use receipt",
+  "support/lifecycle change",
+  "generative paraphrase as evidence",
+]
+architecture_refs = [
+  "ARCH-MEM-03",
+  "ARCH-MEM-04",
+  "ARCH-CTX-01",
+  "ARCH-CTX-04",
+  "ARCH-SEC-03",
+]
+implementation_refs = [
+  "I7.11 payload profiles",
+  "I7.26 omission handles",
+  "I12.13 Context Compiler",
+  "I12.20 influence revocation",
+]

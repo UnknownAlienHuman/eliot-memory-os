@@ -1,0 +1,117 @@
+schema_version = 1
+authority = "eliot-cognitive-context-provider-cells-v1"
+status = "VALIDATION_CONTRACT_NOT_IMPLEMENTATION_OR_PRODUCT_PROOF"
+issue = 152
+branch = "work/152-context-provider-projections"
+expected_base_main = "e7c0cdbfd9b2a95305b63e63e3a69aa6242f846a"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[expected]
+files = 18
+toml_files = 18
+functional_cells = 9
+orders = "1..9"
+physical_crates_touched = 7
+new_physical_crates = 4
+existing_physical_crates_extended = 3
+hot_path_cells = 5
+provider_classes = 6
+typed_edges = 10
+external_contract_challenges = 5
+product_pulses = 3
+normative_architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
+normative_implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+
+[inputs]
+required_files = [
+  "crates/smart/cognitive-wave-03-context-providers.toml",
+  "crates/smart/context-provider-cells-v1/index.toml",
+  "crates/smart/context-provider-cells-v1/001-provider-contracts.toml",
+  "crates/smart/context-provider-cells-v1/002-expected-provider-set.toml",
+  "crates/smart/context-provider-cells-v1/003-memory-projection-contracts.toml",
+  "crates/smart/context-provider-cells-v1/004-memory-candidate-query.toml",
+  "crates/smart/context-provider-cells-v1/005-memory-context-projection.toml",
+  "crates/smart/context-provider-cells-v1/006-experience-projection.toml",
+  "crates/smart/context-provider-cells-v1/007-epistemic-context-projection.toml",
+  "crates/smart/context-provider-cells-v1/008-self-model-snapshot.toml",
+  "crates/smart/context-provider-cells-v1/009-self-model-context-projection.toml",
+  "crates/smart/cognitive-context-provider-edges-v1.toml",
+  "crates/smart/cognitive-context-provider-contract-challenges-v1.toml",
+  "crates/smart/cognitive-context-provider-validation-v1.toml",
+  "crates/smart/eliot-memory-projection-contracts/Cargo.toml",
+  "crates/smart/eliot-memory-projection/Cargo.toml",
+  "crates/smart/eliot-experience-projection/Cargo.toml",
+  "crates/smart/eliot-self-model-projection/Cargo.toml",
+]
+
+[hot_path]
+exact_cells = [
+  "smart.context.expected_provider_set",
+  "smart.memory.candidate_query",
+  "smart.memory.context_projection",
+  "smart.epistemic.context_projection",
+  "smart.self_model.context_projection",
+]
+requirements = [
+  "immutable bounded inputs",
+  "deterministic ordering/tie-breaks",
+  "no model call",
+  "no storage read or scan",
+  "no network/process startup/blocking I/O",
+  "visible local degradation",
+]
+
+[assertions]
+structural = [
+  "all eighteen files parse as TOML",
+  "orders are exactly unique 1..9",
+  "each cell has one responsibility, one physical crate, explicit statelessness, public functions/types, preconditions, deterministic algorithm, complexity or boundedness, invariants, degradation, typed errors, at least six tests, exact source scope, proof entrypoint, proof ceiling and replacement boundary",
+  "cell source/test write scopes do not overlap",
+  "every public type family has one declared owner",
+  "Cargo dependency direction is acyclic",
+  "all four new manifests remain outside root workspace",
+  "branch parent is exact current main and current main remains an ancestor before mutation/PR update",
+]
+semantic = [
+  "provider classes are exactly TaskContinuity, CriticalAttention, EpistemicPosition, MemoryRecall, AuthorityAffordance and SelfModel",
+  "DecisionLocalTail is not a provider class and is assembled only after Context admission",
+  "Complete, EmptyComplete, Partial, Unavailable, Stale, Blocked and NotApplicable remain distinct",
+  "expected provider set is frozen before results and forms a recheckable denominator",
+  "one result or typed failure exists for every expected provider",
+  "ContextProviderProjectionRequest and ProviderContributionResult have exactly one owner in eliot-context-contracts",
+  "all provider outputs are candidate contributions and contain no Context admission, authority, delivery/use or finish decision",
+  "Memory existence, epistemic support, accessibility and permitted influence remain independent",
+  "retrieval/citation/repetition/model agreement never strengthen support",
+  "exact cue matching works with zero relation-spread edges",
+  "Current Epistemic Position projection preserves assumptions, rivals, conflicts, stale/superseded records, unknowns and inquiry requirements",
+  "experience projection separates sequence, observed association, supported contribution and intervention-supported causality",
+  "self-model preserves Constitutional, Implemented, Operational, Experiential and Epistemic dimensions",
+  "Implementation target or Dreamer/audit prose cannot become current support",
+  "all five hot cells are bounded deterministic and perform no model call, storage read/scan, network, process startup or blocking I/O",
+]
+payload = [
+  "diff contains only the eighteen declared TOML paths",
+  "no .rs or .md file changes",
+  "no .github/workflows change",
+  "no archive, base64 part, probe, .eliot or generated report payload",
+  "root Cargo.toml and Cargo.lock are unchanged",
+  "no runtime/workspace/current-support/Product Proof promotion",
+]
+
+[proof_honesty]
+proven = [
+  "static contract shape",
+  "type ownership plan",
+  "source write isolation",
+  "dependency direction",
+  "bounded/failure semantics",
+]
+not_proven = [
+  "Rust compilation",
+  "package behavior",
+  "real provider/consumer Edge Proof",
+  "Product Pulse",
+  "runtime support",
+  "product acceptance",
+]

@@ -1,0 +1,28 @@
+[package]
+name = "eliot-self-model-projection"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Deterministic five-dimensional ELIOT self-model snapshot and Context projection."
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "NOT_IMPLEMENTED"
+workspace_admission = "pending_agent_implementation_module_edge_and_product_proof"
+source_layer = "C1"
+runtime_layer = "R5"
+runtime_bundle = "eliotd"
+functional_cell_refs = ["smart.self_model.snapshot", "smart.self_model.context_projection"]
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+issue = 152
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }
+eliot-context-contracts = { path = "../eliot-context-contracts" }
+eliot-experience-projection = { path = "../eliot-experience-projection" }

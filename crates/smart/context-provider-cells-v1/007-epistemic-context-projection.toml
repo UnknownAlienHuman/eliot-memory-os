@@ -1,0 +1,102 @@
+schema_version = 1
+authority = "eliot-cognitive-context-provider-cells-v1"
+status = "STATIC_FUNCTION_DESIGN_ONLY"
+issue = 152
+branch = "work/152-context-provider-projections"
+base_main_commit = "e7c0cdbfd9b2a95305b63e63e3a69aa6242f846a"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+assignment_rule = "This file is the complete assignment and Rust-oriented API for exactly one FunctionalCapabilityCell."
+shared_hot_path_contract = [
+  "immutable bounded inputs only",
+  "no model call",
+  "no storage read or scan",
+  "no network or process startup",
+  "no blocking I/O",
+  "deterministic ordering and stable tie-break",
+  "visible local degradation",
+]
+
+[cell]
+order = 7
+id = "smart.epistemic.context_projection"
+stage = "W2_EPISTEMIC_CONTEXT_PROJECTION"
+physical_crate = "eliot-epistemic"
+runtime_layer = "R5"
+hot_path = true
+stateless = true
+responsibility = "Translate one Current Epistemic Position into a whole-atom ProviderContributionResult without flattening assumptions, rivals, conflicts, stale/superseded records, unknowns or inquiry requirements."
+public_functions = [
+  "pub fn project_epistemic_context(request: &ContextProviderProjectionRequest, position: &CurrentEpistemicPosition) -> Result<ProviderContributionResult, EpistemicContextProjectionError>",
+]
+external_types = [
+  "eliot-context-contracts::ContextProviderProjectionRequest",
+  "eliot-context-contracts::ProviderContributionResult",
+  "eliot-epistemic::CurrentEpistemicPosition",
+]
+preconditions = [
+  "request provider class is EpistemicPosition",
+  "position digest/scope/question/time and StateFence match the request",
+  "position already resolved support, assumptions, conflicts, staleness and inquiry requirements",
+]
+algorithm = [
+  "validate request and position identities",
+  "map direct observations to Evidence/EpistemicPosition atoms",
+  "map supported and rival models to distinct SemanticModel/CausalModel atoms with evidence dependence preserved",
+  "map ExplicitAssumption records as assumption-labelled atoms; never convert to supported",
+  "map each ConflictSet with participants, common/dependent lineage, residue and discriminator as a whole structured atom family",
+  "map stale/superseded positions, unknowns and InvestigationRequirements without suppressing minority/counterevidence",
+  "protect load-bearing conflict/unknown/counterevidence under request roles and ContextAtomPolicy",
+  "bound representations by whole unit and emit coverage/omissions/digest",
+]
+complexity = "O(n log n + rendered_bytes) over bounded CurrentEpistemicPosition; no canonical read, model call, Context admission or I/O."
+invariants = [
+  "Assumed never becomes Supported",
+  "one local conflict does not collapse unrelated propositions",
+  "conflict is not flattened into a warning string",
+  "minority/counterevidence remains addressable",
+  "projection cannot rank against other providers or admit itself",
+  "partial position coverage remains partial",
+]
+degradation = "Partial position coverage produces Partial contribution with exact missing owners/unknowns; stale or mismatched fence returns typed failure rather than a current packet."
+errors = [
+  "WrongProviderClass",
+  "PositionDigestMismatch",
+  "ScopeQuestionMismatch",
+  "FenceMismatch",
+  "RequiredRoleUnrepresentable",
+  "ConflictBoundaryLoss",
+  "ProjectionLimitExceeded",
+]
+tests = [
+  "explicit assumption remains assumption",
+  "rivals and counterevidence remain separate",
+  "dependent evidence is marked dependent",
+  "local conflict remains local and structured",
+  "stale/superseded records remain visible",
+  "partial owner coverage yields Partial",
+  "projection contains no admission or truth-promotion field",
+]
+source_files = [
+  "crates/smart/eliot-epistemic/src/context_projection.rs",
+  "crates/smart/eliot-epistemic/tests/context_projection.rs",
+]
+proof_entrypoint = "cargo test -p eliot-epistemic --test context_projection"
+replacement_boundary = "Renderer may change only behind role-preservation and whole-conflict differential fixtures."
+forbidden = [
+  "epistemic resolution or promotion",
+  "canonical read/write",
+  "storage read or scan",
+  "network call",
+  "Context admission",
+  "model call",
+  "conflict smoothing",
+  "aggregate confidence score",
+]
+architecture_refs = [
+  "ARCH-EPI-01",
+  "ARCH-CONCIL-01",
+  "ARCH-CTX-01",
+  "ARCH-UND-01",
+  "ARCH-MOD-03",
+]
+implementation_refs = ["I12.12 Current Epistemic Position Resolver", "I12.13 Context Compiler", "I7.11 Decision Safety Floor"]

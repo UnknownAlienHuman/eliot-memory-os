@@ -1,0 +1,131 @@
+schema_version = 1
+authority = "eliot-cognitive-context-provider-cells-v1"
+status = "STATIC_FUNCTION_DESIGN_ONLY"
+issue = 152
+branch = "work/152-context-provider-projections"
+base_main_commit = "e7c0cdbfd9b2a95305b63e63e3a69aa6242f846a"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+assignment_rule = "This file is the complete assignment and Rust-oriented API for exactly one FunctionalCapabilityCell."
+shared_hot_path_contract = [
+  "immutable bounded inputs only",
+  "no model call",
+  "no storage read or scan",
+  "no network or process startup",
+  "no blocking I/O",
+  "deterministic ordering and stable tie-break",
+  "visible local degradation",
+]
+
+[cell]
+order = 3
+id = "smart.memory.projection_contracts"
+stage = "W0_MEMORY_PROJECTION_CONTRACT"
+physical_crate = "eliot-memory-projection-contracts"
+runtime_layer = "R5"
+hot_path = false
+stateless = true
+responsibility = "Own store-neutral immutable Governor-read memory projection, candidate-selection and context-projection contracts while keeping existence, support, accessibility and permitted influence independent."
+public_functions = [
+  "pub fn validate_canonical_memory_read_snapshot(snapshot: &CanonicalMemoryReadSnapshot) -> Result<(), MemoryProjectionContractError>",
+  "pub fn validate_memory_candidate_set(set: &MemoryCandidateSet) -> Result<(), MemoryProjectionContractError>",
+  "pub fn memory_candidate_set_digest(set: &MemoryCandidateSet) -> Result<String, MemoryProjectionContractError>",
+]
+public_types = [
+  "CanonicalMemoryReadSnapshot",
+  "MemoryProjectionRecord",
+  "MemoryReadCoverage",
+  "MemoryDenominator",
+  "MemoryQueryIntent",
+  "MemorySelectionPolicy",
+  "MemorySelectionDimension",
+  "MemoryDimensionResult",
+  "MemoryCandidate",
+  "MemoryCandidateSet",
+  "MemorySelectionTrace",
+  "MemorySuppressionTrace",
+  "MemoryRecordExistence",
+  "MemorySupportProjection",
+  "MemoryAccessibilityProjection",
+  "MemoryInfluenceProjection",
+  "MemoryRepresentationRef",
+  "MemoryNegativeRole",
+  "MemoryProjectionContractError",
+]
+type_shapes = [
+  "pub enum MemoryReadCoverage { Complete, Partial, Unavailable, Stale, Blocked }",
+  "pub enum MemoryRecordExistence { Present, Tombstoned, ErasedReferenceOnly }",
+  "pub enum MemoryAccessibilityProjection { InlineExact, Extractive, HandleOnly, Unavailable }",
+  "pub enum MemoryInfluenceProjection { Allowed, WarningOnly, RequiresRevalidation, Suppressed, Quarantined, Revoked }",
+  "pub enum MemorySelectionDimension { ExactBinding, ScopeFit, Applicability, Freshness, EpistemicSupport, SourceAssurance, DecisionDelta, NegativeMemoryValue, UnknownProbeValue, RouteAccessibility, RepresentationCost, DistractionRisk }",
+]
+preconditions = [
+  "snapshot comes from one authenticated Governor named read or exact immutable fixture",
+  "records carry only immutable handles/representations and owner projections",
+  "one snapshot/candidate set has one compatible StateFence and canonical revision",
+  "denominator identifies searched scope/revision/method and distinguishes complete-empty from unavailable",
+]
+algorithm = [
+  "validate read identity, canonical revision, denominator and coverage",
+  "validate each record's independent existence/support/accessibility/influence projections",
+  "reject storage clients, mutable references or delivery/use counters as state-changing inputs",
+  "canonicalize records, traces and dimensions by stable identity",
+  "validate candidate references against the exact snapshot",
+  "compute canonical candidate-set digest",
+]
+complexity = "O(n log n) time and O(n) memory within declared snapshot/candidate limits; no I/O."
+invariants = [
+  "retrieval, citation, repetition and model agreement never change support",
+  "accessibility does not imply permitted influence",
+  "existence/tombstone/erasure does not derive support",
+  "unavailable or stale snapshot is not an empty complete corpus",
+  "candidate set owns no lifecycle, delivery, use or causal-benefit state",
+]
+degradation = "Partial, stale, unavailable and blocked snapshots remain representable and cannot be upgraded by the consumer."
+errors = [
+  "ReadIdentityInvalid",
+  "CanonicalRevisionMissing",
+  "FenceMismatch",
+  "DenominatorMissing",
+  "CoverageContradiction",
+  "DuplicateRecord",
+  "ProjectionDimensionCollapsed",
+  "RecordReferenceInvalid",
+  "CandidateOutsideSnapshot",
+  "LimitExceeded",
+]
+tests = [
+  "complete empty differs from unavailable",
+  "support/accessibility/influence remain independent after round-trip",
+  "retrieval metadata cannot mutate support",
+  "revoked influence cannot decode as allowed",
+  "candidate outside snapshot is rejected",
+  "duplicate record handle is rejected",
+  "partial denominator remains partial",
+]
+source_files = [
+  "crates/smart/eliot-memory-projection-contracts/src/lib.rs",
+  "crates/smart/eliot-memory-projection-contracts/tests/contracts.rs",
+]
+proof_entrypoint = "cargo test -p eliot-memory-projection-contracts"
+replacement_boundary = "Replaceable with any store-neutral implementation preserving independent dimensions, exact denominator and canonical fixtures."
+forbidden = [
+  "store client or query",
+  "mutable memory state",
+  "lifecycle transition",
+  "support promotion",
+  "delivery/use receipt",
+  "aggregate confidence/utility scalar",
+]
+architecture_refs = [
+  "ARCH-MEM-02",
+  "ARCH-MEM-03",
+  "ARCH-MEM-04",
+  "ARCH-CTX-04",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I5.20 read model",
+  "I12.1 state model",
+  "I12.13 Context Compiler",
+  "I12.26 retrieval and admission",
+]

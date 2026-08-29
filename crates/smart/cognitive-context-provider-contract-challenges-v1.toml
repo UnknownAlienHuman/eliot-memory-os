@@ -1,0 +1,56 @@
+schema_version = 1
+authority = "eliot-cognitive-context-provider-cells-v1"
+status = "OPEN_EXTERNAL_CONTRACTS_REQUIRED_BEFORE_EDGE_ADMISSION"
+issue = 152
+challenge_count = 5
+rule = "A challenge records a missing external owner-neutral contract. Workers may implement pure cells against fixtures but must not invent Governor/store/runtime authority or duplicate public types."
+
+[[challenge]]
+id = "CTX-P-001"
+name = "Governor canonical memory read snapshot port"
+required_owner = "Governor read/Canonical Memory owner"
+consumer = "eliot-memory-projection"
+required_contract = "A named bounded read returns CanonicalMemoryReadSnapshot with read operation identity, canonical revision, StateFence, searched denominator, coverage and independent existence/support/accessibility/influence projections."
+forbidden_resolution = "Memory projection opens store credentials, raw query, direct database handle or mutable memory service."
+degradation = "Partial/stale/unavailable read is returned explicitly and only dependent Context compilation is narrowed/blocked."
+edge_gate = "CTXE-003"
+
+[[challenge]]
+id = "CTX-P-002"
+name = "Governor TaskContinuity and CriticalAttention provider ports"
+required_owner = "Governor Task Controller/read-model and Problem/Critical Attention owners"
+consumer = "Context provider collector"
+required_contract = "Each owner accepts ContextProviderProjectionRequest and returns one ProviderContributionResult preserving exact task/attention revisions, obligations, resolution state and StateFence."
+forbidden_resolution = "Smart infers task goal, acceptance, attention resolution or continuity from memory/prose."
+degradation = "Missing TaskContinuity blocks compilation; unavailable CriticalAttention blocks only recipes/impacts where it is mandatory."
+edge_gate = "CTXE-010"
+
+[[challenge]]
+id = "CTX-P-003"
+name = "Governor AuthorityAffordance provider port"
+required_owner = "Governor authority, capability-introduction, tool-surface and verifier owners"
+consumer = "Context provider collector"
+required_contract = "Return only currently introduced/allowed affordances and applicable verifier handles under exact authority epoch, policy, capability evidence and StateFence."
+forbidden_resolution = "Context provider creates token, lease, approval, tool introduction, route or effect authority."
+degradation = "Unavailable/stale authority provider permits read-only/narrowed work only as declared; Material effect-facing view cannot be complete."
+edge_gate = "CTXE-010"
+
+[[challenge]]
+id = "CTX-P-004"
+name = "Self-model source snapshot ports"
+required_owner = "Accepted Architecture/Implementation index owners, CurrentSystemEvidence/conformance owners and system-experience owners"
+consumer = "eliot-self-model-projection"
+required_contract = "Immutable exact source projections identify accepted pair, current source/runtime/store/integration evidence, gaps, invalidation and coverage without letting report prose set support."
+forbidden_resolution = "Self-model or Dreamer reads arbitrary files/runtime/store, hand-edits support, or treats Implementation target as current state."
+degradation = "Missing current evidence yields target-only/Unknown/Blocked self-model dimensions."
+edge_gate = "CTXE-007"
+
+[[challenge]]
+id = "CTX-P-005"
+name = "Expected-provider collector completeness contract"
+required_owner = "Context Compiler integration owner"
+consumer = "Context contribution merge/admission"
+required_contract = "Collect one typed result or one typed failure for every expected provider; verify request/result/expected-set digest and common StateFence before merge."
+forbidden_resolution = "Merge discovers providers opportunistically, drops timeouts, converts unavailable to empty, or permits provider self-admission."
+degradation = "Missing mandatory result prevents complete packet; optional result remains explicit coverage gap."
+edge_gate = "CTXE-010"

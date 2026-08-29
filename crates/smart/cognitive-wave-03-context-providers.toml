@@ -1,0 +1,187 @@
+schema_version = 1
+wave_id = "cognitive-context-provider-projections-v1"
+status = "STATIC_FUNCTION_DESIGN_ONLY"
+issue = 152
+branch = "work/152-context-provider-projections"
+base_main_commit = "e7c0cdbfd9b2a95305b63e63e3a69aa6242f846a"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+purpose = "Define the immutable owner-attributed projection boundary between canonical/current-system owners and Context Compiler without adding a second memory, experience, task, authority or self-model state owner."
+functional_cells = 9
+physical_crates_touched = 7
+new_physical_crates = 4
+existing_physical_crates_extended = 3
+hot_path_cells = 5
+provider_class_count = 6
+typed_edges = 10
+external_contract_challenges = 5
+product_pulses = 3
+
+[normative_pair]
+architecture_revision = "4.5-draft"
+architecture_edition = "2026-08-28"
+architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
+implementation_revision = "0.29-draft"
+implementation_edition = "2026-08-28"
+implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+precedence = "Architecture defines intent and Hard Boundaries; Implementation defines current target owners, contracts, defaults and failure behavior."
+
+[rules]
+agent_unit = "One agent receives one FunctionalCapabilityCell, its exact source/test scope, frozen public signatures, one-hop edges, discriminator, proof ceiling and stop condition."
+packaging = "A physical crate exists only for a real contract, dependency, proof, replacement or failure-containment seam; a different function or agent is insufficient."
+workspace = "Prototype manifests remain outside the root workspace until Rust implementation, package proof, affected Edge Proof and integration review."
+authority = "Projection cells are stateless and read-only; they create no canonical state, admission, authority, delivery, use, causal credit, finish or external effect."
+hot_path = "Hot cells use only immutable bounded inputs and deterministic local computation; model calls, storage reads/scans, network, process startup and blocking I/O are forbidden."
+assignment_authority = "This wave plus context-provider-cells-v1/index.toml and its nine referenced cell manifests are the only assignment/API authority for issue 152; legacy module.toml and old branch projections are not assignment sources."
+
+[[assignment]]
+order = 1
+cell_id = "smart.context.provider_contracts"
+physical_crate = "eliot-context-contracts"
+package_action = "extend_existing_contract_crate"
+source_scope = [
+  "crates/smart/eliot-context-contracts/src/provider.rs",
+  "crates/smart/eliot-context-contracts/tests/provider.rs",
+]
+depends_on = []
+product_pulse = "D3B_CONTEXT_PROVIDER_DENOMINATOR_PULSE_01"
+cell_manifest = "crates/smart/context-provider-cells-v1/001-provider-contracts.toml"
+
+[[assignment]]
+order = 2
+cell_id = "smart.context.expected_provider_set"
+physical_crate = "eliot-context"
+package_action = "extend_existing_crate"
+source_scope = ["crates/smart/eliot-context/src/providers.rs", "crates/smart/eliot-context/tests/providers.rs"]
+depends_on = ["smart.context.provider_contracts"]
+product_pulse = "D3B_CONTEXT_PROVIDER_DENOMINATOR_PULSE_01"
+cell_manifest = "crates/smart/context-provider-cells-v1/002-expected-provider-set.toml"
+
+[[assignment]]
+order = 3
+cell_id = "smart.memory.projection_contracts"
+physical_crate = "eliot-memory-projection-contracts"
+package_action = "create_prototype_contract_crate"
+source_scope = [
+  "crates/smart/eliot-memory-projection-contracts/src/lib.rs",
+  "crates/smart/eliot-memory-projection-contracts/tests/contracts.rs",
+]
+depends_on = []
+product_pulse = "D3B_CONTEXT_PROVIDER_DENOMINATOR_PULSE_01"
+cell_manifest = "crates/smart/context-provider-cells-v1/003-memory-projection-contracts.toml"
+
+[[assignment]]
+order = 4
+cell_id = "smart.memory.candidate_query"
+physical_crate = "eliot-memory-projection"
+package_action = "create_prototype_crate"
+source_scope = [
+  "crates/smart/eliot-memory-projection/src/candidate_query.rs",
+  "crates/smart/eliot-memory-projection/tests/candidate_query.rs",
+]
+depends_on = ["smart.memory.projection_contracts", "smart.context.provider_contracts"]
+product_pulse = "D3B_CONTEXT_PROVIDER_DENOMINATOR_PULSE_01"
+cell_manifest = "crates/smart/context-provider-cells-v1/004-memory-candidate-query.toml"
+
+[[assignment]]
+order = 5
+cell_id = "smart.memory.context_projection"
+physical_crate = "eliot-memory-projection"
+package_action = "implement_second_cell_in_shared_crate"
+source_scope = [
+  "crates/smart/eliot-memory-projection/src/context_projection.rs",
+  "crates/smart/eliot-memory-projection/tests/context_projection.rs",
+]
+depends_on = ["smart.memory.candidate_query", "smart.context.provider_contracts"]
+product_pulse = "D3B_CONTEXT_PROVIDER_DENOMINATOR_PULSE_01"
+cell_manifest = "crates/smart/context-provider-cells-v1/005-memory-context-projection.toml"
+
+[[assignment]]
+order = 6
+cell_id = "smart.experience.projection"
+physical_crate = "eliot-experience-projection"
+package_action = "create_prototype_crate"
+source_scope = [
+  "crates/smart/eliot-experience-projection/src/lib.rs",
+  "crates/smart/eliot-experience-projection/tests/projection.rs",
+]
+depends_on = []
+product_pulse = "D4_EXPERIENCE_PROJECTION_EDGE_01"
+cell_manifest = "crates/smart/context-provider-cells-v1/006-experience-projection.toml"
+
+[[assignment]]
+order = 7
+cell_id = "smart.epistemic.context_projection"
+physical_crate = "eliot-epistemic"
+package_action = "extend_existing_crate"
+source_scope = [
+  "crates/smart/eliot-epistemic/src/context_projection.rs",
+  "crates/smart/eliot-epistemic/tests/context_projection.rs",
+]
+depends_on = ["smart.context.provider_contracts"]
+product_pulse = "D3B_CONTEXT_PROVIDER_DENOMINATOR_PULSE_01"
+cell_manifest = "crates/smart/context-provider-cells-v1/007-epistemic-context-projection.toml"
+
+[[assignment]]
+order = 8
+cell_id = "smart.self_model.snapshot"
+physical_crate = "eliot-self-model-projection"
+package_action = "create_prototype_crate"
+source_scope = [
+  "crates/smart/eliot-self-model-projection/src/snapshot.rs",
+  "crates/smart/eliot-self-model-projection/tests/snapshot.rs",
+]
+depends_on = ["smart.experience.projection"]
+product_pulse = "D3B_SELF_MODEL_CONTEXT_EDGE_01"
+cell_manifest = "crates/smart/context-provider-cells-v1/008-self-model-snapshot.toml"
+
+[[assignment]]
+order = 9
+cell_id = "smart.self_model.context_projection"
+physical_crate = "eliot-self-model-projection"
+package_action = "implement_second_cell_in_shared_crate"
+source_scope = [
+  "crates/smart/eliot-self-model-projection/src/context_projection.rs",
+  "crates/smart/eliot-self-model-projection/tests/context_projection.rs",
+]
+depends_on = ["smart.self_model.snapshot", "smart.context.provider_contracts"]
+product_pulse = "D3B_SELF_MODEL_CONTEXT_EDGE_01"
+cell_manifest = "crates/smart/context-provider-cells-v1/009-self-model-context-projection.toml"
+
+[[product_pulse]]
+id = "D3B_CONTEXT_PROVIDER_DENOMINATOR_PULSE_01"
+scenario = "A Material task compiles an exact six-class provider denominator; one optional provider is unavailable, one mandatory provider is empty-complete and exact memory/epistemic projections remain whole, fenced and read-only before Context admission."
+required_observables = [
+  "expected provider-set digest",
+  "one typed result per expected provider",
+  "unavailable differs from empty-complete",
+  "no admission or delivery field in provider output",
+  "zero storage/model/network calls in hot provider cells",
+]
+status = "NOT_EXECUTED"
+proof_ceiling = "Product Pulse target only; this prototype does not execute it."
+
+[[product_pulse]]
+id = "D4_EXPERIENCE_PROJECTION_EDGE_01"
+scenario = "Exact task, attempt, trace, artifact, evaluator and effect owner snapshots produce one immutable experience projection that separates sequence, observed association and causal support."
+required_observables = [
+  "all owner revisions preserved",
+  "unknown effect remains unknown",
+  "success does not imply mechanism",
+  "no mutable experience store API",
+]
+status = "NOT_EXECUTED"
+proof_ceiling = "Edge Proof target only; this prototype does not execute it."
+
+[[product_pulse]]
+id = "D3B_SELF_MODEL_CONTEXT_EDGE_01"
+scenario = "An ELIOT-system task receives Constitutional, Implemented, Operational, Experiential and Epistemic self-model atoms while an Implementation target with no current evidence remains TARGET/UNKNOWN rather than current support."
+required_observables = [
+  "accepted normative-pair identity",
+  "five dimensions preserved",
+  "current evidence and target separated",
+  "Dreamer brief cannot self-certify support",
+  "omitted items remain expandable",
+]
+status = "NOT_EXECUTED"
+proof_ceiling = "Edge Proof target only; this prototype does not execute it."

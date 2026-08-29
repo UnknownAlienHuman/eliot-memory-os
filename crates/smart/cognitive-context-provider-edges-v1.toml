@@ -1,0 +1,232 @@
+schema_version = 1
+authority = "eliot-cognitive-context-provider-cells-v1"
+status = "STATIC_EDGE_DESIGN_ONLY"
+issue = 152
+branch = "work/152-context-provider-projections"
+base_main_commit = "e7c0cdbfd9b2a95305b63e63e3a69aa6242f846a"
+provider_class_count = 6
+typed_edge_count = 10
+new_crates = 4
+existing_crates_extended = 3
+
+[[provider_class]]
+class = "TaskContinuity"
+semantic_owner = "Governor Task Controller/read-model owner"
+implementation_location = "outside issue 152"
+requirement_default = "Mandatory"
+roles = [
+  "Goal",
+  "Acceptance",
+  "Continuity",
+  "NextBoundary",
+]
+smart_implementation = false
+
+[[provider_class]]
+class = "CriticalAttention"
+semantic_owner = "Governor Problem/Critical Attention owner"
+implementation_location = "outside issue 152"
+requirement_default = "Conditional"
+roles = [
+  "Attention",
+  "Invariant",
+  "NegativeMemory",
+  "Unknown",
+]
+smart_implementation = false
+
+[[provider_class]]
+class = "EpistemicPosition"
+semantic_owner = "eliot-epistemic"
+implementation_location = "crates/smart/eliot-epistemic/src/context_projection.rs"
+requirement_default = "Conditional"
+roles = [
+  "EpistemicPosition",
+  "SemanticModel",
+  "CausalModel",
+  "Evidence",
+  "Unknown",
+]
+smart_implementation = true
+
+[[provider_class]]
+class = "MemoryRecall"
+semantic_owner = "Governor canonical memory read owner plus stateless eliot-memory-projection"
+implementation_location = "crates/smart/eliot-memory-projection/src/context_projection.rs"
+requirement_default = "Conditional"
+roles = [
+  "Evidence",
+  "Continuity",
+  "Invariant",
+  "NegativeMemory",
+  "Unknown",
+]
+smart_implementation = true
+
+[[provider_class]]
+class = "AuthorityAffordance"
+semantic_owner = "Governor authority/capability/tool/verifier owners"
+implementation_location = "outside issue 152"
+requirement_default = "Conditional"
+roles = ["Affordance", "Verifier", "Invariant"]
+smart_implementation = false
+
+[[provider_class]]
+class = "SelfModel"
+semantic_owner = "accepted normative/current-evidence owners plus stateless eliot-self-model-projection"
+implementation_location = "crates/smart/eliot-self-model-projection/src/context_projection.rs"
+requirement_default = "Conditional"
+roles = [
+  "SelfModel",
+  "Invariant",
+  "Evidence",
+  "Unknown",
+]
+smart_implementation = true
+
+[[edge]]
+id = "CTXE-001"
+producer = "ContextProviderRegistrySnapshot and ContextRecipe owners"
+contract = "ContextProviderRegistrySnapshot + ContextCompilationRequest + ContextRecipe"
+consumer = "smart.context.expected_provider_set::resolve_expected_context_provider_set"
+failure = "stale registry/recipe or missing mandatory class returns typed blocked/partial resolution; no provider discovery occurs"
+
+[[edge]]
+id = "CTXE-002"
+producer = "smart.context.expected_provider_set"
+contract = "ExpectedContextProviderSet"
+consumer = "smart.context.expected_provider_set::build_context_provider_projection_requests"
+failure = "unrepresentable role/budget/headroom fails before provider calls"
+
+[[edge]]
+id = "CTXE-003"
+producer = "Governor canonical memory named-read owner"
+contract = "CanonicalMemoryReadSnapshot"
+consumer = "smart.memory.candidate_query::query_memory_candidates"
+failure = "partial/stale/unavailable read remains explicit; no convenient store fallback"
+
+[[edge]]
+id = "CTXE-004"
+producer = "eliot-cues exact/bounded activation owner"
+contract = "CueActivationResult"
+consumer = "smart.memory.candidate_query::query_memory_candidates"
+failure = "zero relation edges still allow exact bindings; stale fence fails closed"
+
+[[edge]]
+id = "CTXE-005"
+producer = "smart.memory.candidate_query"
+contract = "MemoryCandidateSet"
+consumer = "smart.memory.context_projection::project_memory_context"
+failure = "suppressed/revoked/inaccessible candidates cannot become payload atoms"
+
+[[edge]]
+id = "CTXE-006"
+producer = "smart.epistemic.position resolver"
+contract = "CurrentEpistemicPosition"
+consumer = "smart.epistemic.context_projection::project_epistemic_context"
+failure = "partial coverage stays partial; assumptions/conflicts cannot flatten"
+
+[[edge]]
+id = "CTXE-007"
+producer = "ArchitectureIndex + ImplementationIndex + CurrentSystemEvidence/conformance + experience owners"
+contract = "SelfModelInputBundle of immutable exact refs"
+consumer = "smart.self_model.snapshot::assemble_system_self_model"
+failure = "missing current evidence yields target-only/Unknown; wrong normative pair fails closed"
+
+[[edge]]
+id = "CTXE-008"
+producer = "smart.self_model.snapshot"
+contract = "SystemSelfModelSnapshot"
+consumer = "smart.self_model.context_projection::project_self_model_context"
+failure = "target/current and five dimensions remain separate"
+
+[[edge]]
+id = "CTXE-009"
+producer = "Task/Attempt/Trace/Artifact/Evaluator/Effect owners"
+contract = "SystemExperienceProjectionInputs"
+consumer = "smart.experience.projection::project_system_experience"
+failure = "missing/stale owner caps attribution and remains explicit"
+
+[[edge]]
+id = "CTXE-010"
+producer = "provider collector over exact expected set"
+contract = "ExpectedContextProviderSet + Vec<ProviderContributionResult>"
+consumer = "Context contribution merge/admission owner"
+failure = "one missing mandatory result or digest mismatch prevents complete compilation; provider output never self-admits"
+
+[[type_owner]]
+type_family = "ContextProviderClass, roles, registry, expected set, projection request/result, ProviderContribution, ContextAtom"
+sole_owner = "eliot-context-contracts::provider"
+consumers = [
+  "eliot-context",
+  "eliot-memory-projection",
+  "eliot-epistemic",
+  "eliot-self-model-projection",
+]
+forbidden_duplicate = "all provider implementations and old branch projections"
+
+[[type_owner]]
+type_family = "CanonicalMemoryReadSnapshot, MemoryProjectionRecord, query/policy/candidate/dimensional trace"
+sole_owner = "eliot-memory-projection-contracts"
+consumers = ["Governor read adapter", "eliot-memory-projection"]
+forbidden_duplicate = "eliot-memory and Context Compiler"
+
+[[type_owner]]
+type_family = "SystemExperienceProjectionRequest/Inputs/Projection and attribution/coverage"
+sole_owner = "eliot-experience-projection"
+consumers = ["learning", "diagnosis", "self-model projection"]
+forbidden_duplicate = "eliot-system-experience mutable store"
+
+[[type_owner]]
+type_family = "SelfModelAssemblyRequest/InputBundle/Snapshot/five dimensions"
+sole_owner = "eliot-self-model-projection"
+consumers = ["Context self-model provider", "Dreamer self-query navigation adapters"]
+forbidden_duplicate = "Dreamer brief or conformance report as state owner"
+
+[[cargo_direction]]
+crate = "eliot-memory-projection-contracts"
+depends_on = ["eliot-contracts", "eliot-evidence"]
+must_not_depend_on = ["eliot-context", "eliot-memory-projection", "store/provider/vendor SDK"]
+
+[[cargo_direction]]
+crate = "eliot-memory-projection"
+depends_on = [
+  "eliot-contracts",
+  "eliot-evidence",
+  "eliot-context-contracts",
+  "eliot-cue-contracts",
+  "eliot-memory-projection-contracts",
+]
+must_not_depend_on = ["eliot-context", "Governor implementation", "store/provider/vendor SDK"]
+
+[[cargo_direction]]
+crate = "eliot-experience-projection"
+depends_on = ["eliot-contracts", "eliot-evidence", "eliot-evaluation-contracts"]
+must_not_depend_on = ["eliot-learning-loop", "eliot-self-model-projection", "Task/AgentCoordinator implementation"]
+
+[[cargo_direction]]
+crate = "eliot-self-model-projection"
+depends_on = [
+  "eliot-contracts",
+  "eliot-evidence",
+  "eliot-context-contracts",
+  "eliot-experience-projection",
+]
+must_not_depend_on = ["Dreamer model/provider", "bootstrap implementation internals", "runtime/store adapters"]
+
+[[cargo_direction]]
+crate = "eliot-epistemic"
+planned_dependency_addition = ["eliot-context-contracts"]
+must_not_depend_on = ["eliot-context", "Governor implementation"]
+
+[[cargo_direction]]
+crate = "eliot-context"
+planned_dependency_addition = ["eliot-context-contracts"]
+must_not_depend_on = ["memory/epistemic/self-model implementation crates"]
+
+[global_dependency_rules]
+direction = "contracts -> stateless provider projections -> Context collector/merge/admission; no reverse dependency from provider to Context implementation"
+acyclic = true
+root_workspace_change = false
+provider_result_rule = "Every ExpectedContextProvider has exactly one ProviderContributionResult or one collector failure bound to the same expected-set digest."
+decision_tail_rule = "Decision-local tail consumes admitted Context; it is not a provider and creates no provider-cycle."

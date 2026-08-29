@@ -1,0 +1,122 @@
+schema_version = 1
+authority = "eliot-cognitive-context-provider-cells-v1"
+status = "STATIC_FUNCTION_DESIGN_ONLY"
+issue = 152
+branch = "work/152-context-provider-projections"
+base_main_commit = "e7c0cdbfd9b2a95305b63e63e3a69aa6242f846a"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+assignment_rule = "This file is the complete assignment and Rust-oriented API for exactly one FunctionalCapabilityCell."
+shared_hot_path_contract = [
+  "immutable bounded inputs only",
+  "no model call",
+  "no storage read or scan",
+  "no network or process startup",
+  "no blocking I/O",
+  "deterministic ordering and stable tie-break",
+  "visible local degradation",
+]
+
+[cell]
+order = 6
+id = "smart.experience.projection"
+stage = "W3_EXPERIENCE_PROJECTION"
+physical_crate = "eliot-experience-projection"
+runtime_layer = "R7"
+hot_path = false
+stateless = true
+responsibility = "Join immutable task, attempt, trace, artifact, evaluator and effect-owner projections into one bounded SystemExperienceProjection without creating an experience store or causal claim beyond evidence."
+public_functions = [
+  "pub fn project_system_experience(request: &SystemExperienceProjectionRequest, inputs: &SystemExperienceProjectionInputs) -> Result<SystemExperienceProjection, ExperienceProjectionError>",
+]
+public_types = [
+  "SystemExperienceProjectionRequest",
+  "SystemExperienceProjectionInputs",
+  "OwnerProjectionRef",
+  "AttemptExperience",
+  "AttemptSequenceObservation",
+  "FailureObservation",
+  "OutcomeObservation",
+  "OutcomeAttribution",
+  "ConfounderRecord",
+  "ExperienceCoverage",
+  "SystemExperienceProjection",
+]
+type_shapes = [
+  "pub enum OutcomeAttribution { ObservedAssociation, SupportedContribution, ObservedUnderIntervention, CompositeBenefit, Contradicted, Unknown }",
+  "pub enum ExperienceCoverage { CompleteForRequest, Partial, Stale, Blocked }",
+  "pub struct SystemExperienceProjectionInputs { pub task_projection: OwnerProjectionRef, pub attempt_lineage_projection: OwnerProjectionRef, pub trace_projection: OwnerProjectionRef, pub artifact_projection: OwnerProjectionRef, pub evaluator_projection: OwnerProjectionRef, pub effect_projection: OwnerProjectionRef, pub preserved_success_projection: Option<OwnerProjectionRef> }",
+  "pub struct SystemExperienceProjection { pub projection_id: String, pub task_id: String, pub state_fence: StateFence, pub source_owner_revisions: Vec<OwnerProjectionRef>, pub attempts: Vec<AttemptExperience>, pub sequences: Vec<AttemptSequenceObservation>, pub failures: Vec<FailureObservation>, pub outcomes: Vec<OutcomeObservation>, pub confounders: Vec<ConfounderRecord>, pub coverage: ExperienceCoverage, pub missing_or_stale_owner_refs: Vec<String>, pub digest: String }",
+]
+preconditions = [
+  "all owner projections are immutable, bounded and tied to exact task/attempt identities",
+  "all load-bearing projections share one compatible StateFence",
+  "request names the exact attempt/task range and required owners",
+  "effect and evaluator outcomes distinguish executed, unknown, stale and not executed",
+]
+algorithm = [
+  "validate request and expected owner set",
+  "join attempts, traces, artifacts, evaluator observations and effect receipts only by exact stable identities",
+  "record observed sequence separately from mechanism or causal attribution",
+  "compare predeclared hypothesis/prediction with actual observable only when both exist",
+  "classify attribution with the strongest justified enum value and retain contrary evidence/confounders",
+  "retain failed, partial, cancelled and unknown-outcome attempts",
+  "mark missing/stale owner coverage explicitly",
+  "canonicalize by attempt lineage and event order, then compute digest",
+]
+complexity = "O(n log n) over bounded owner projections; no owner query, mutable journal, model call or I/O."
+invariants = [
+  "success or failure count is not causal attribution",
+  "temporal sequence is not a causal edge",
+  "unknown external effect remains Unknown",
+  "projection does not create AttemptLearningDelta, procedure, Skill or promotion input",
+  "eliot-system-experience remains donor-only and cannot be a second mutable state owner",
+]
+degradation = "Missing/stale load-bearing owner produces Partial/Stale/Blocked coverage and caps attribution at Unknown or ObservedAssociation while retaining exact handles."
+errors = [
+  "RequestInvalid",
+  "OwnerProjectionMissing",
+  "OwnerRevisionMismatch",
+  "AttemptLineageMismatch",
+  "FenceMismatch",
+  "ArtifactBindingMismatch",
+  "EvaluatorBindingMismatch",
+  "EffectReceiptMismatch",
+  "AttributionUnsupported",
+  "LimitExceeded",
+]
+tests = [
+  "unattributed success remains ObservedAssociation or Unknown",
+  "sequence does not become causality",
+  "intervention-supported attribution requires intervention and verifier evidence",
+  "unknown effect remains unknown",
+  "failed attempt and contrary outcome remain visible",
+  "missing evaluator caps attribution",
+  "projection has no mutation/store API",
+]
+source_files = [
+  "crates/smart/eliot-experience-projection/src/lib.rs",
+  "crates/smart/eliot-experience-projection/tests/projection.rs",
+]
+proof_entrypoint = "cargo test -p eliot-experience-projection"
+replacement_boundary = "Join/attribution implementation may change only behind identical owner, causality and coverage fixtures."
+forbidden = [
+  "mutable campaign/experience state",
+  "attempt journal",
+  "scheduler",
+  "procedure/promotion decision",
+  "self-reported success as proof",
+  "model inference",
+]
+architecture_refs = [
+  "ARCH-CORE-00",
+  "ARCH-UND-02",
+  "ARCH-LEARN-01",
+  "ARCH-LEARN-02",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I7.27 evidence status",
+  "I12.18 prediction/calibration",
+  "I12.24 CampaignLearningStateView",
+  "I20.8 distinct adaptation contracts",
+]

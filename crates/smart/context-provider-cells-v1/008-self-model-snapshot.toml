@@ -1,0 +1,119 @@
+schema_version = 1
+authority = "eliot-cognitive-context-provider-cells-v1"
+status = "STATIC_FUNCTION_DESIGN_ONLY"
+issue = 152
+branch = "work/152-context-provider-projections"
+base_main_commit = "e7c0cdbfd9b2a95305b63e63e3a69aa6242f846a"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+assignment_rule = "This file is the complete assignment and Rust-oriented API for exactly one FunctionalCapabilityCell."
+shared_hot_path_contract = [
+  "immutable bounded inputs only",
+  "no model call",
+  "no storage read or scan",
+  "no network or process startup",
+  "no blocking I/O",
+  "deterministic ordering and stable tie-break",
+  "visible local degradation",
+]
+
+[cell]
+order = 8
+id = "smart.self_model.snapshot"
+stage = "W3_SELF_MODEL_SNAPSHOT"
+physical_crate = "eliot-self-model-projection"
+runtime_layer = "R7"
+hot_path = false
+stateless = true
+responsibility = "Assemble a bounded five-dimensional System Self-Model snapshot from exact accepted Architecture/Implementation identities, current evidence/conformance and system experience without self-certification."
+public_functions = [
+  "pub fn assemble_system_self_model(request: &SelfModelAssemblyRequest, inputs: &SelfModelInputBundle) -> Result<SystemSelfModelSnapshot, SelfModelProjectionError>",
+]
+public_types = [
+  "SelfModelAssemblyRequest",
+  "SelfModelInputBundle",
+  "SelfModelSourceRef",
+  "SelfModelDimension",
+  "SelfModelItem",
+  "SelfModelItemStatus",
+  "SelfModelCoverage",
+  "SystemSelfModelSnapshot",
+]
+type_shapes = [
+  "pub enum SelfModelDimension { Constitutional, Implemented, Operational, Experiential, Epistemic }",
+  "pub enum SelfModelItemStatus { AcceptedNormative, Target, CurrentVerified, CurrentUnverified, Partial, Blocked, Degraded, Stale, Contested, Unknown, NotApplicable }",
+  "pub enum SelfModelCoverage { CompleteForRequest, Partial, Stale, Blocked }",
+  "pub struct SelfModelInputBundle { pub normative_pair_ref: String, pub architecture_index_ref: SelfModelSourceRef, pub implementation_index_ref: SelfModelSourceRef, pub current_system_evidence_ref: Option<SelfModelSourceRef>, pub conformance_map_ref: Option<SelfModelSourceRef>, pub system_experience_refs: Vec<SelfModelSourceRef>, pub problem_improvement_refs: Vec<SelfModelSourceRef> }",
+  "pub struct SystemSelfModelSnapshot { pub snapshot_id: String, pub normative_pair_ref: String, pub state_fence: StateFence, pub constitutional: Vec<SelfModelItem>, pub implemented: Vec<SelfModelItem>, pub operational: Vec<SelfModelItem>, pub experiential: Vec<SelfModelItem>, pub epistemic: Vec<SelfModelItem>, pub coverage: SelfModelCoverage, pub omissions: Vec<String>, pub digest: String }",
+]
+preconditions = [
+  "Architecture and Implementation inputs identify the accepted normative-pair receipt",
+  "current source/runtime/store/integration support comes only from exact current evidence/conformance owner projections",
+  "experience/problem inputs are immutable and source-linked",
+  "request declares scope, decision purpose, selected anchors and bounded output limits",
+]
+algorithm = [
+  "validate normative-pair identity and source digests",
+  "build Constitutional items only from accepted Architecture anchors/rationale",
+  "build Implemented items from Implementation target contracts plus exact current source evidence; label target and current support independently",
+  "build Operational items only from current runtime/store/integration observations and visible degradation",
+  "build Experiential items from admitted incidents, repairs, outcomes and SystemExperienceProjection references",
+  "build Epistemic items from current support evidence, conflicts, unknowns, coverage gaps and invalidation conditions",
+  "reject any attempt to promote target/prose/Dreamer brief into current verified support",
+  "preserve exact source handles, coverage and StateFence; canonicalize and compute digest",
+]
+complexity = "O(n log n) over bounded pre-materialized source projections; no document/repository/runtime/store read, model call, probe or network I/O."
+invariants = [
+  "Architecture semantic precedence remains explicit",
+  "Implementation TARGET is not Implemented/Operational current support",
+  "Dreamer brief, audit prose and code shape are projections/evidence, never constitutional or support authority",
+  "five dimensions remain distinct",
+  "self-model cannot certify its own correctness or change Architecture",
+  "missing current evidence becomes Unknown/Blocked, not assumed current",
+]
+degradation = "Missing/stale current-system evidence yields a valid target-only/constitutional snapshot with Partial/Stale coverage and explicit Unknown/Blocked items."
+errors = [
+  "RequestInvalid",
+  "NormativePairMismatch",
+  "ArchitectureIdentityMismatch",
+  "ImplementationIdentityMismatch",
+  "SourceDigestMismatch",
+  "FenceMismatch",
+  "CurrentSupportOverclaim",
+  "DimensionCollapsed",
+  "CoverageInvalid",
+  "LimitExceeded",
+]
+tests = [
+  "accepted Architecture anchor becomes Constitutional only",
+  "Implementation target without source evidence remains Target/Unknown",
+  "prose-only current support is rejected",
+  "operational degradation remains separate from implemented source",
+  "system experience does not become constitutional rule",
+  "all five dimensions survive round-trip",
+  "wrong normative pair fails closed",
+]
+source_files = [
+  "crates/smart/eliot-self-model-projection/src/snapshot.rs",
+  "crates/smart/eliot-self-model-projection/tests/snapshot.rs",
+]
+proof_entrypoint = "cargo test -p eliot-self-model-projection --test snapshot"
+replacement_boundary = "Assembler may change only with five-dimension, normative-precedence and no-overclaim differential fixtures."
+forbidden = [
+  "document/repository/runtime probing",
+  "Architecture change",
+  "support promotion",
+  "Dreamer self-certification",
+  "canonical write",
+  "mutable self-model store",
+]
+architecture_refs = [
+  "ARCH-SELF-01",
+  "ARCH-UND-01",
+  "ARCH-GROUND-01",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I0.5 CurrentSystemEvidenceSnapshot",
+  "I12.23 Architecture and Implementation Knowledge pipeline",
+  "I4.8 eliot_system self-scope",
+]

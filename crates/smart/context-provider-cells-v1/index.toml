@@ -1,0 +1,127 @@
+schema_version = 1
+authority_id = "eliot-cognitive-context-provider-cells-v1"
+status = "STATIC_FUNCTION_DESIGN_ONLY"
+issue = 152
+branch = "work/152-context-provider-projections"
+base_main_commit = "e7c0cdbfd9b2a95305b63e63e3a69aa6242f846a"
+functional_cells = 9
+orders = "1..9"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+catalogue_rule = "One file owns one cell assignment/API. The index is navigation only; it cannot override a cell file."
+forbidden_sources = [
+  "legacy module.toml",
+  "legacy *.api.toml",
+  "old cognitive branches",
+  "superseded monolithic rev11 projections",
+]
+shared_cell_contract = [
+  "one causal responsibility and explicit statelessness",
+  "one public contract surface and one owner for every public type",
+  "bounded deterministic algorithm, typed degradation/errors and exact source/test scope",
+  "independent Module proof entrypoint, named replacement boundary and one-hop Edge obligations",
+]
+
+[[entry]]
+order = 1
+cell_id = "smart.context.provider_contracts"
+manifest = "crates/smart/context-provider-cells-v1/001-provider-contracts.toml"
+physical_crate = "eliot-context-contracts"
+hot_path = false
+source_files = [
+  "crates/smart/eliot-context-contracts/src/provider.rs",
+  "crates/smart/eliot-context-contracts/tests/provider.rs",
+]
+proof_entrypoint = "cargo test -p eliot-context-contracts --test provider"
+
+[[entry]]
+order = 2
+cell_id = "smart.context.expected_provider_set"
+manifest = "crates/smart/context-provider-cells-v1/002-expected-provider-set.toml"
+physical_crate = "eliot-context"
+hot_path = true
+source_files = ["crates/smart/eliot-context/src/providers.rs", "crates/smart/eliot-context/tests/providers.rs"]
+proof_entrypoint = "cargo test -p eliot-context --test providers"
+
+[[entry]]
+order = 3
+cell_id = "smart.memory.projection_contracts"
+manifest = "crates/smart/context-provider-cells-v1/003-memory-projection-contracts.toml"
+physical_crate = "eliot-memory-projection-contracts"
+hot_path = false
+source_files = [
+  "crates/smart/eliot-memory-projection-contracts/src/lib.rs",
+  "crates/smart/eliot-memory-projection-contracts/tests/contracts.rs",
+]
+proof_entrypoint = "cargo test -p eliot-memory-projection-contracts"
+
+[[entry]]
+order = 4
+cell_id = "smart.memory.candidate_query"
+manifest = "crates/smart/context-provider-cells-v1/004-memory-candidate-query.toml"
+physical_crate = "eliot-memory-projection"
+hot_path = true
+source_files = [
+  "crates/smart/eliot-memory-projection/src/candidate_query.rs",
+  "crates/smart/eliot-memory-projection/tests/candidate_query.rs",
+]
+proof_entrypoint = "cargo test -p eliot-memory-projection --test candidate_query"
+
+[[entry]]
+order = 5
+cell_id = "smart.memory.context_projection"
+manifest = "crates/smart/context-provider-cells-v1/005-memory-context-projection.toml"
+physical_crate = "eliot-memory-projection"
+hot_path = true
+source_files = [
+  "crates/smart/eliot-memory-projection/src/context_projection.rs",
+  "crates/smart/eliot-memory-projection/tests/context_projection.rs",
+]
+proof_entrypoint = "cargo test -p eliot-memory-projection --test context_projection"
+
+[[entry]]
+order = 6
+cell_id = "smart.experience.projection"
+manifest = "crates/smart/context-provider-cells-v1/006-experience-projection.toml"
+physical_crate = "eliot-experience-projection"
+hot_path = false
+source_files = [
+  "crates/smart/eliot-experience-projection/src/lib.rs",
+  "crates/smart/eliot-experience-projection/tests/projection.rs",
+]
+proof_entrypoint = "cargo test -p eliot-experience-projection"
+
+[[entry]]
+order = 7
+cell_id = "smart.epistemic.context_projection"
+manifest = "crates/smart/context-provider-cells-v1/007-epistemic-context-projection.toml"
+physical_crate = "eliot-epistemic"
+hot_path = true
+source_files = [
+  "crates/smart/eliot-epistemic/src/context_projection.rs",
+  "crates/smart/eliot-epistemic/tests/context_projection.rs",
+]
+proof_entrypoint = "cargo test -p eliot-epistemic --test context_projection"
+
+[[entry]]
+order = 8
+cell_id = "smart.self_model.snapshot"
+manifest = "crates/smart/context-provider-cells-v1/008-self-model-snapshot.toml"
+physical_crate = "eliot-self-model-projection"
+hot_path = false
+source_files = [
+  "crates/smart/eliot-self-model-projection/src/snapshot.rs",
+  "crates/smart/eliot-self-model-projection/tests/snapshot.rs",
+]
+proof_entrypoint = "cargo test -p eliot-self-model-projection --test snapshot"
+
+[[entry]]
+order = 9
+cell_id = "smart.self_model.context_projection"
+manifest = "crates/smart/context-provider-cells-v1/009-self-model-context-projection.toml"
+physical_crate = "eliot-self-model-projection"
+hot_path = true
+source_files = [
+  "crates/smart/eliot-self-model-projection/src/context_projection.rs",
+  "crates/smart/eliot-self-model-projection/tests/context_projection.rs",
+]
+proof_entrypoint = "cargo test -p eliot-self-model-projection --test context_projection"

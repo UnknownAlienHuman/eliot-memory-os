@@ -1,0 +1,108 @@
+schema_version = 1
+authority = "eliot-cognitive-context-provider-cells-v1"
+status = "STATIC_FUNCTION_DESIGN_ONLY"
+issue = 152
+branch = "work/152-context-provider-projections"
+base_main_commit = "e7c0cdbfd9b2a95305b63e63e3a69aa6242f846a"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+assignment_rule = "This file is the complete assignment and Rust-oriented API for exactly one FunctionalCapabilityCell."
+shared_hot_path_contract = [
+  "immutable bounded inputs only",
+  "no model call",
+  "no storage read or scan",
+  "no network or process startup",
+  "no blocking I/O",
+  "deterministic ordering and stable tie-break",
+  "visible local degradation",
+]
+
+[cell]
+order = 2
+id = "smart.context.expected_provider_set"
+stage = "W1_CONTEXT_PROVIDER_RESOLUTION"
+physical_crate = "eliot-context"
+runtime_layer = "R5"
+hot_path = true
+stateless = true
+responsibility = "Resolve the exact provider denominator for one Context compilation and build bounded provider requests without calling providers or admitting their results."
+public_functions = [
+  "pub fn resolve_expected_context_provider_set(request: &ContextCompilationRequest, recipe: &ContextRecipe, registry: &ContextProviderRegistrySnapshot) -> Result<ExpectedContextProviderSet, ContextProviderResolutionError>",
+  "pub fn build_context_provider_projection_requests(request: &ContextCompilationRequest, recipe: &ContextRecipe, expected: &ExpectedContextProviderSet) -> Result<Vec<ContextProviderProjectionRequest>, ContextProviderResolutionError>",
+]
+public_types = ["ContextProviderResolutionError"]
+external_types = [
+  "eliot-context::ContextCompilationRequest",
+  "eliot-context::ContextRecipe",
+  "eliot-context-contracts::ContextProviderRegistrySnapshot",
+  "eliot-context-contracts::ExpectedContextProviderSet",
+  "eliot-context-contracts::ContextProviderProjectionRequest",
+]
+preconditions = [
+  "request, recipe and registry revisions are exact and share one compatible StateFence",
+  "recipe declares provider requirements by task family, route, impact and governance profile",
+  "registry contains at most one active descriptor for each single-owner provider class",
+  "required DecisionSafetyFloor and downstream headroom constraints are already materialized in the request",
+]
+algorithm = [
+  "validate request, recipe and registry identities",
+  "evaluate recipe conditions against task family, WorkScope kind, impact class, active attention, requested semantic roles and governance profile",
+  "select applicable Mandatory, Optional and Conditional descriptors; do not add a class absent from the recipe",
+  "require TaskContinuity for every nonempty compilation",
+  "require CriticalAttention when active obligations or recipe safety roles apply",
+  "require EpistemicPosition for Material/Critical decisions or an explicit epistemic role",
+  "require AuthorityAffordance before any Material/Critical effect-facing view",
+  "require SelfModel only for eliot_system work or a Material change to ELIOT",
+]
+complexity = "O(p log p + r) over bounded registry providers and recipe rules; no provider call, model call, storage read, network or blocking I/O."
+invariants = [
+  "expected set is a frozen denominator, not a discovered-after-results list",
+  "missing mandatory provider is visible before merge",
+  "optional provider absence cannot be reclassified as EmptyComplete",
+  "provider request budget cannot consume reserved decision-local tail or response/verifier headroom",
+  "resolver owns no provider result, admission, packet or delivery state",
+]
+degradation = "Return a typed blocked/partial resolution error naming missing mandatory classes or unsupported roles; independent optional providers remain requestable/omittable as declared by the recipe."
+errors = [
+  "RequestInvalid",
+  "RecipeMismatch",
+  "RegistryStale",
+  "FenceMismatch",
+  "ProviderAmbiguous",
+  "MandatoryProviderMissing",
+  "RoleCoverageIncomplete",
+  "BudgetPartitionImpossible",
+  "DecisionSafetyFloorUnrepresentable",
+  "HeadroomConflict",
+]
+tests = [
+  "TaskContinuity is mandatory for a normal task",
+  "SelfModel is required for Material eliot_system work but not ordinary project work",
+  "DecisionLocalTail never appears in expected providers",
+  "optional MemoryRecall unavailability does not remove it from the expected denominator",
+  "missing mandatory EpistemicPosition blocks only the dependent compilation",
+  "provider budget cannot consume protected headroom",
+  "same inputs in any order produce identical expected-set digest",
+]
+source_files = ["crates/smart/eliot-context/src/providers.rs", "crates/smart/eliot-context/tests/providers.rs"]
+proof_entrypoint = "cargo test -p eliot-context --test providers"
+replacement_boundary = "Provider-set resolver may change only behind the same recipe/registry/result semantics and differential fixtures."
+forbidden = [
+  "provider invocation",
+  "contribution merge",
+  "Context admission",
+  "decision-tail assembly",
+  "storage/model/network I/O",
+  "registry mutation",
+]
+architecture_refs = [
+  "ARCH-CTX-01",
+  "ARCH-CTX-04",
+  "ARCH-MOD-03",
+  "ARCH-RES-04",
+]
+implementation_refs = [
+  "I7.11 Decision Safety Floor",
+  "I12.13 Context Compiler",
+  "I14.29 downstream headroom",
+  "I2.15 hot-path modularity",
+]

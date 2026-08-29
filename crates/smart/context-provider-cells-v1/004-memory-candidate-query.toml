@@ -1,0 +1,102 @@
+schema_version = 1
+authority = "eliot-cognitive-context-provider-cells-v1"
+status = "STATIC_FUNCTION_DESIGN_ONLY"
+issue = 152
+branch = "work/152-context-provider-projections"
+base_main_commit = "e7c0cdbfd9b2a95305b63e63e3a69aa6242f846a"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+assignment_rule = "This file is the complete assignment and Rust-oriented API for exactly one FunctionalCapabilityCell."
+shared_hot_path_contract = [
+  "immutable bounded inputs only",
+  "no model call",
+  "no storage read or scan",
+  "no network or process startup",
+  "no blocking I/O",
+  "deterministic ordering and stable tie-break",
+  "visible local degradation",
+]
+
+[cell]
+order = 4
+id = "smart.memory.candidate_query"
+stage = "W2_MEMORY_CANDIDATE_SELECTION"
+physical_crate = "eliot-memory-projection"
+runtime_layer = "R5"
+hot_path = true
+stateless = true
+responsibility = "Select a bounded deterministic candidate set from one already materialized canonical-memory snapshot using exact intent/cues before broader routes, without changing memory state or epistemic support."
+public_functions = [
+  "pub fn query_memory_candidates(snapshot: &CanonicalMemoryReadSnapshot, intent: &MemoryQueryIntent, cues: &CueActivationResult, policy: &MemorySelectionPolicy) -> Result<MemoryCandidateSet, MemoryCandidateQueryError>",
+]
+external_types = ["eliot-memory-projection-contracts::*", "eliot-cue-contracts::CueActivationResult"]
+preconditions = [
+  "snapshot, intent and cue activation identify one scope/task and compatible StateFence",
+  "snapshot is bounded and already materialized; this function cannot perform a named read",
+  "policy fixes collection limits, protected roles and deterministic comparison/tie-break rules",
+  "cue activation may contain zero relation-spread edges",
+]
+algorithm = [
+  "validate snapshot, intent, cues and policy identities",
+  "retain a suppression trace for records whose permitted influence is Suppressed, Quarantined or Revoked",
+  "construct tier 0 from explicit record handles and exact cue bindings",
+  "construct later allowed tiers from typed scope, record-kind, lexical/semantic or precomputed relation selectors already present in inputs",
+  "evaluate each candidate independently across all MemorySelectionDimension values without reducing them to one confidence/utility score",
+  "protect applicable negative memory, invariants, rivals, counterevidence and material unknown/probe records from popularity displacement",
+  "order by tier, protected-role precedence, dimension disposition vector, owner-provided freshness and stable record_ref tie-break",
+  "deduplicate by record identity while preserving all selection reasons and evidence lineage",
+]
+complexity = "O((n + c) log n) time and O(n) memory for bounded materialized records/cues; no storage I/O, model call, unbounded graph traversal, network or blocking wait."
+invariants = [
+  "exact cue firing works when relation-spread edge count is zero",
+  "query never marks a record delivered, acknowledged, used or helpful",
+  "retrieval frequency and activation score never change support",
+  "unknown applicability or decision delta is visible and not equivalent to rejection",
+  "one verbose/popular source cannot displace protected rivals, unknowns or negative memory before policy floors are met",
+]
+degradation = "Partial/stale snapshot yields a partial/stale candidate set with exact missing denominator/revalidation requirements; mixed fence fails closed."
+errors = [
+  "SnapshotInvalid",
+  "IntentInvalid",
+  "FenceMismatch",
+  "CueSnapshotMismatch",
+  "PolicyInvalid",
+  "InfluenceProjectionMissing",
+  "RepresentationLimitInvalid",
+  "CandidateLimitExceeded",
+]
+tests = [
+  "exact handle precedes every broad candidate",
+  "zero relation edges still fire exact cue candidates",
+  "retrieval leaves input bytes unchanged",
+  "revoked influence is suppressed with trace",
+  "negative memory and counterevidence survive popularity pressure",
+  "unknown decision delta is not converted to failed",
+  "partial denominator remains visible",
+]
+source_files = [
+  "crates/smart/eliot-memory-projection/src/candidate_query.rs",
+  "crates/smart/eliot-memory-projection/tests/candidate_query.rs",
+]
+proof_entrypoint = "cargo test -p eliot-memory-projection --test candidate_query"
+replacement_boundary = "Candidate algorithm may be replaced behind identical dimensional traces, protected floors and differential corpus."
+forbidden = [
+  "canonical read/store access",
+  "Context admission",
+  "support/lifecycle mutation",
+  "delivery/use attribution",
+  "model/network/process call",
+  "single aggregate ranking score",
+]
+architecture_refs = [
+  "ARCH-CTX-02",
+  "ARCH-CTX-04",
+  "ARCH-MEM-04",
+  "ARCH-EPI-01",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I7.19 reactive context sequence",
+  "I12.13 Context Compiler",
+  "I12.19 negative memory",
+  "I12.26 retrieval plan and admission",
+]
