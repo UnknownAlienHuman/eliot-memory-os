@@ -1,0 +1,42 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.maintenance_plan"
+agent_order = 53
+physical_package = "eliot-dreamer-planning"
+execution_class = "BACKGROUND_ADVISORY_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Propose one maintenance plan over an externally owned maintenance-mode and trigger projection."
+
+[agent]
+objective = "Implement advisory maintenance planning only."
+write_scope = ["crates/smart/eliot-dreamer-planning/src/maintenance_plan.rs", "crates/smart/eliot-dreamer-planning/tests/maintenance_plan.rs"]
+integration_owner = "Dreamer planning integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-planning/src/lib.rs", "crates/smart/eliot-dreamer-planning/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_maintenance_plan_candidate(request: &MaintenancePlanRequest, projection: &MaintenancePolicyProjection, draft: &AdmittedDreamDraft) -> Result<MaintenancePlanCandidate, MaintenancePlanError>"]
+
+[algorithm]
+steps = [
+  "Validate maintenance family, mode, trigger, budget, fence and owner revision.",
+  "Map observed debt or failure to bounded candidate work.",
+  "Name prerequisites, route class, verification, rollback and user-session requirement.",
+  "Respect disabled, advisory, shadow and automatic modes without changing them."
+]
+
+[limits]
+rules = ["Use explicit work-item and cost maxima.", "Create no DurableJob, WakeIntent, schedule, route reservation or launch."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "PolicyProjectionMissing", "ModeDenied", "TriggerMismatch", "BudgetExceeded", "MissingVerifier"]
+
+[forbidden]
+operations = ["DurableJob creation", "schedule mutation", "route reservation", "agent/model launch", "automation-mode change", "external effect"]
+
+[tests]
+required = ["disabled mode produces no automatic plan", "plan does not create DurableJob", "missing policy projection fails closed", "user-session requirement remains explicit"]
+
+[integration]
+provider = "Governor maintenance-policy and trigger owner"
+consumer = "external maintenance/Governor/Agent Coordinator owner"
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if maintenance mode, family, trigger, budget or verifier projection is unavailable."
