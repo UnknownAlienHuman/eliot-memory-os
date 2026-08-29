@@ -1,0 +1,45 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.transformation_validation"
+agent_order = 20
+physical_package = "eliot-dreamer-validation"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Assess seven transformation dimensions independently without scalar confidence or same-model proof."
+
+[agent]
+objective = "Implement the seven-dimensional deterministic transformation validator."
+write_scope = ["crates/smart/eliot-dreamer-validation/src/transformation.rs", "crates/smart/eliot-dreamer-validation/tests/transformation.rs"]
+integration_owner = "Dreamer validation integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-validation/src/lib.rs", "crates/smart/eliot-dreamer-validation/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn validate_dream_transformation(bundle: &DreamInputBundle, grounded: &GroundedDreamDraft, policy: &TransformationPolicy) -> Result<TransformationValidationReport, TransformationValidationError>"]
+owned_types = ["TransformationPolicy", "TransformationValidationError"]
+
+[algorithm]
+steps = [
+  "Validate exact bundle and draft identity.",
+  "Evaluate Coverage, Preservation, Faithfulness, Lineage, Reversibility, SourceAuthority and DependencyClosure separately.",
+  "Return Pass, Fail, Inconclusive or NotApplicable per dimension.",
+  "Use deterministic evidence only for Pass.",
+  "Retain exact failures, unknowns and required external verifiers.",
+  "Compute no aggregate score."
+]
+
+[limits]
+rules = ["Use bounded claims and references.", "Evaluate exactly seven named dimensions.", "Perform no model or provider call."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "InvalidPolicy", "MissingDimension", "InvalidDeterministicEvidence"]
+
+[forbidden]
+operations = ["aggregate confidence", "same-model self-proof", "source count as coverage", "constant authority_unchanged", "storage or provider call", "canonical write"]
+
+[tests]
+required = ["source count is not coverage", "uncertainty text is not preservation proof", "same-model self-check cannot pass faithfulness", "a failed dimension cannot be hidden by other passes"]
+
+[integration]
+provider = "smart.dreamer.claim_grounding"
+consumer = "smart.dreamer.draft_admission"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if any dimension lacks a deterministic oracle and cannot be represented as Inconclusive."
