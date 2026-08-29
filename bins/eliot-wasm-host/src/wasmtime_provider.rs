@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use eliot_wasm_runtime::{
     ComponentEnginePort, EngineBinding, EngineInvocation, EngineReport, EngineTermination,
-    EngineUsage, InvocationLimits, PortError, Sha256Digest, TrapClass,
+    EngineUsage, InvocationLimits, MAX_EPOCH_DEADLINE_TICKS, PortError, Sha256Digest, TrapClass,
 };
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
@@ -16,7 +16,6 @@ const WASMTIME_VERSION: &str = "40.0.0";
 const WIT_VERSION: &str = "1.0.0";
 const WIT_WORLD: &str = "eliot:wasm/guest";
 const RUN_EXPORT: &str = "run";
-const MAX_EFFECTIVE_EPOCH_DEADLINE: u64 = 1024;
 const PROVIDER_STACK_SIZE: usize = 8 * 1024;
 #[cfg(test)]
 const COMPONENT_CONFIGURATION: &[u8] =
@@ -174,7 +173,8 @@ impl WasmtimeComponentEngine {
         limits: &InvocationLimits,
         input: &[u8],
         post_commit_known: bool,
-    ) -> EngineReport {
+    ) -> Result<EngineReport, PortError> {
+        validate_epoch_policy(limits)?;
         let (invocation_engine, component) = match limits.epoch.cancellation {
             eliot_wasm_runtime::CancellationPolicy::EpochInterruption => {
                 (&self.epoch_engine, &self.epoch_component)
@@ -206,10 +206,10 @@ impl WasmtimeComponentEngine {
             eliot_wasm_runtime::CancellationPolicy::EpochAndFuel
         ) && store.set_fuel(limits.max_fuel).is_ok();
         let wall_ticks = limits.wall_deadline_ms;
-        let effective_epoch_deadline = limits
-            .epoch
-            .deadline_ticks
-            .min(MAX_EFFECTIVE_EPOCH_DEADLINE);
+        // The provider has no negotiation path. After the explicit ceiling
+        // check above, the exact admitted policy is the effective policy: it
+        // is neither clamped nor otherwise rewritten before Store execution.
+        let effective_epoch_deadline = limits.epoch.deadline_ticks;
         store.set_epoch_deadline(effective_epoch_deadline);
         let stop_epoch = Arc::new(AtomicBool::new(false));
         let epoch_stop = Arc::clone(&stop_epoch);
@@ -224,7 +224,9 @@ impl WasmtimeComponentEngine {
                 thread::sleep(Duration::from_millis(1));
                 if Instant::now() >= wall_deadline {
                     wall_interrupted_thread.store(true, Ordering::Release);
-                    for _ in 0..=MAX_EFFECTIVE_EPOCH_DEADLINE {
+                    let emitted = observed_epoch_ticks.load(Ordering::Acquire);
+                    let remaining = effective_epoch_deadline.saturating_sub(emitted);
+                    for _ in 0..remaining {
                         epoch_engine.increment_epoch();
                         observed_epoch_ticks.fetch_add(1, Ordering::AcqRel);
                     }
@@ -295,7 +297,7 @@ impl WasmtimeComponentEngine {
             }
             other => other,
         };
-        EngineReport {
+        Ok(EngineReport {
             request_digest: request_digest.clone(),
             termination,
             usage: EngineUsage {
@@ -324,7 +326,7 @@ impl WasmtimeComponentEngine {
                     termination,
                     EngineTermination::Partial | EngineTermination::PostCommitUnknown
                 ),
-        }
+        })
     }
 }
 
@@ -356,16 +358,26 @@ impl ComponentEnginePort for WasmtimeComponentEngine {
         {
             return Err(PortError::Denied);
         }
-        Ok(self.invoke_component(
+        self.invoke_component(
             &invocation.request_digest,
             &invocation.limits,
             &invocation.input,
             invocation.manifest.imports.is_empty(),
-        ))
+        )
     }
 
     fn reconcile(&mut self, _invocation: &EngineInvocation) -> Result<EngineReport, PortError> {
         Err(PortError::UnknownOutcome)
+    }
+}
+
+fn validate_epoch_policy(limits: &InvocationLimits) -> Result<(), PortError> {
+    if limits.epoch.deadline_ticks == 0
+        || limits.epoch.deadline_ticks > MAX_EPOCH_DEADLINE_TICKS
+    {
+        Err(PortError::Denied)
+    } else {
+        Ok(())
     }
 }
 
@@ -391,7 +403,7 @@ fn configuration_digest() -> Sha256Digest {
 }
 
 fn canonical_configuration_descriptor() -> &'static [u8] {
-    b"wasmtime=40.0.0;component_model=true;typed_abi=guest.run;max_wasm_stack=8192;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true"
+    b"wasmtime=40.0.0;component_model=true;typed_abi=guest.run;max_wasm_stack=8192;max_epoch_deadline_ticks=1024;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true"
 }
 
 fn configured_engine(consume_fuel: bool) -> Result<Engine, WasmtimeBuildError> {
@@ -470,12 +482,14 @@ mod tests {
                 max_bytes: 65_536,
             },
         };
-        let report = engine.invoke_component(
-            &Sha256Digest::of_bytes(b"request"),
-            &limits,
-            b"typed guest input",
-            true,
-        );
+        let report = engine
+            .invoke_component(
+                &Sha256Digest::of_bytes(b"request"),
+                &limits,
+                b"typed guest input",
+                true,
+            )
+            .map_err(|error| error.to_string())?;
         assert_eq!(report.termination, EngineTermination::Completed);
         assert_eq!(report.output, b"typed guest input");
         assert_eq!(report.usage.enforced_stack_limit_bytes, Some(8 * 1024));
@@ -497,12 +511,14 @@ mod tests {
         .map_err(|error| error.to_string())?;
         let mut limits = test_limits(digest);
         limits.max_output_bytes = 3;
-        let output_limited = engine.invoke_component(
-            &Sha256Digest::of_bytes(b"output-limit"),
-            &limits,
-            b"typed guest input",
-            true,
-        );
+        let output_limited = engine
+            .invoke_component(
+                &Sha256Digest::of_bytes(b"output-limit"),
+                &limits,
+                b"typed guest input",
+                true,
+            )
+            .map_err(|error| error.to_string())?;
         assert_eq!(output_limited.termination, EngineTermination::OutputLimit);
         assert_eq!(output_limited.output, Vec::<u8>::new());
         assert_eq!(output_limited.usage.output_bytes, 0);
@@ -511,13 +527,52 @@ mod tests {
 
         limits.max_output_bytes = 64;
         limits.max_fuel = 1;
-        let fuel_limited = engine.invoke_component(
-            &Sha256Digest::of_bytes(b"fuel-limit"),
-            &limits,
-            b"typed guest input",
-            true,
-        );
+        let fuel_limited = engine
+            .invoke_component(
+                &Sha256Digest::of_bytes(b"fuel-limit"),
+                &limits,
+                b"typed guest input",
+                true,
+            )
+            .map_err(|error| error.to_string())?;
         assert_eq!(fuel_limited.termination, EngineTermination::FuelExhausted);
+        Ok(())
+    }
+
+    #[test]
+    fn epoch_deadline_ceiling_is_exact_and_fail_closed() -> Result<(), String> {
+        let artifact =
+            wat::parse_file("tests/fixtures/guest.wat").map_err(|error| error.to_string())?;
+        let digest = Sha256Digest::of_bytes(&artifact);
+        let engine = WasmtimeComponentEngine::new(
+            binding(),
+            digest.clone(),
+            &artifact,
+            COMPONENT_CONFIGURATION,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut limits = test_limits(digest);
+        limits.epoch.deadline_ticks = MAX_EPOCH_DEADLINE_TICKS;
+        let accepted = engine
+            .invoke_component(
+                &Sha256Digest::of_bytes(b"epoch-boundary-accepted"),
+                &limits,
+                b"typed guest input",
+                true,
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(accepted.termination, EngineTermination::Completed);
+
+        limits.epoch.deadline_ticks = MAX_EPOCH_DEADLINE_TICKS + 1;
+        assert!(matches!(
+            engine.invoke_component(
+                &Sha256Digest::of_bytes(b"epoch-boundary-rejected"),
+                &limits,
+                b"typed guest input",
+                true,
+            ),
+            Err(PortError::Denied)
+        ));
         Ok(())
     }
 
@@ -536,12 +591,15 @@ mod tests {
         .map_err(|error| error.to_string())?;
         let mut limits = test_limits(digest);
         limits.wall_deadline_ms = 10;
-        limits.epoch.deadline_ticks = u64::MAX;
+        limits.epoch.deadline_ticks = MAX_EPOCH_DEADLINE_TICKS;
         limits.max_fuel = u64::MAX;
-        let report =
-            engine.invoke_component(&Sha256Digest::of_bytes(b"deadline"), &limits, b"", true);
+        let report = engine
+            .invoke_component(&Sha256Digest::of_bytes(b"deadline"), &limits, b"", true)
+            .map_err(|error| error.to_string())?;
         assert_eq!(report.termination, EngineTermination::Deadline);
-        assert!(report.usage.epoch_ticks.unwrap_or(0) > 0);
+        let epoch_ticks = report.usage.epoch_ticks.unwrap_or(0);
+        assert!(epoch_ticks > 0);
+        assert!(epoch_ticks <= limits.epoch.deadline_ticks);
         assert!(started.elapsed() < Duration::from_secs(2));
         Ok(())
     }
@@ -562,8 +620,9 @@ mod tests {
         limits.wall_deadline_ms = 10;
         limits.max_fuel = 1;
         limits.epoch.cancellation = eliot_wasm_runtime::CancellationPolicy::EpochInterruption;
-        let report =
-            engine.invoke_component(&Sha256Digest::of_bytes(b"epoch-only"), &limits, b"", true);
+        let report = engine
+            .invoke_component(&Sha256Digest::of_bytes(b"epoch-only"), &limits, b"", true)
+            .map_err(|error| error.to_string())?;
         assert!(matches!(
             report.termination,
             EngineTermination::Deadline | EngineTermination::EpochDeadline
@@ -585,8 +644,9 @@ mod tests {
         .map_err(|error| error.to_string())?;
         let mut limits = test_limits(digest);
         limits.max_instances = 1;
-        let report =
-            engine.invoke_component(&Sha256Digest::of_bytes(b"instances"), &limits, b"", true);
+        let report = engine
+            .invoke_component(&Sha256Digest::of_bytes(b"instances"), &limits, b"", true)
+            .map_err(|error| error.to_string())?;
         assert_eq!(report.termination, EngineTermination::InstanceLimit);
         Ok(())
     }
