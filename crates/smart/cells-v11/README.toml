@@ -1,0 +1,6 @@
+schema_version = "eliot-cognitive-cell-directory-v11"
+status = "ACTIVE_WORKING_DRAFT"
+authority = "crates/smart/0000-cognitive-authority-v11.toml"
+rule = "Each numbered file is one self-contained agent assignment. The agent reads only the authority/router, the physical-package cells-v11 manifest and its numbered cell file."
+expected_cells = 61
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
