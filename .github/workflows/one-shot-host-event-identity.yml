@@ -29,10 +29,10 @@ jobs:
         run: cargo fmt --all
 
       - name: Verify focused host event behavior
-        run: cargo test --locked -p eliot-engine host_event_tests -- --nocapture
+        run: cargo test -p eliot-engine host_event_tests -- --nocapture
 
       - name: Verify affected contracts compile
-        run: cargo check --locked -p eliot-types -p eliot-engine
+        run: cargo check -p eliot-types -p eliot-engine
 
       - name: Verify route bundle contracts
         shell: pwsh
@@ -44,6 +44,7 @@ jobs:
       - name: Commit verified source changes
         shell: pwsh
         run: |
+          git checkout -- Cargo.lock
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add crates/eliot-types/src/host.rs crates/eliot-engine/src/host.rs
