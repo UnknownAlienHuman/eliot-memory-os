@@ -1,0 +1,42 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.learning.retention_transfer"
+agent_order = 49
+physical_package = "eliot-learning"
+execution_class = "BACKGROUND_EVALUATION_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Assess retention and transfer evidence independently for a reusable learning candidate."
+
+[agent]
+objective = "Implement dimensioned retention and transfer assessment only."
+write_scope = ["crates/smart/eliot-learning/src/retention_transfer.rs", "crates/smart/eliot-learning/tests/retention_transfer.rs"]
+integration_owner = "learning integration owner"
+forbidden_files = ["crates/smart/eliot-learning/src/lib.rs", "crates/smart/eliot-learning/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn assess_retention_and_transfer(request: &RetentionTransferRequest, evidence: &RetentionTransferEvidenceSet) -> Result<RetentionTransferAssessment, RetentionTransferError>"]
+
+[algorithm]
+steps = [
+  "Validate candidate identity, task-family boundaries, evaluator and fence.",
+  "Separate same-task retention, near transfer, far transfer and negative transfer.",
+  "Require independent task instances and current evaluator validity.",
+  "Return dimensioned results with denominators and counterexamples."
+]
+
+[limits]
+rules = ["Use explicit task-instance and evidence maxima.", "Perform no benchmark generation or evaluator mutation."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "MissingDenominator", "DependentInstances", "EvaluatorInvalid", "ScopeLeak"]
+
+[forbidden]
+operations = ["same-trace reuse as transfer", "near-to-far inference", "negative-transfer suppression", "evaluator mutation", "promotion decision"]
+
+[tests]
+required = ["repeated same trace is not transfer", "negative transfer remains visible", "invalid evaluator prevents Pass", "far transfer cannot be inferred from near transfer"]
+
+[integration]
+provider = "external task and evaluator evidence owners"
+consumer = "smart.learning.promotion_input"
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if independent task instances, evaluator validity or denominators are unavailable."
