@@ -1,0 +1,114 @@
+name: rev9 cognitive function-design bootstrap
+
+on:
+  push:
+    branches: [cognitive-micromodules-wave-01]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rev9-cognitive-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: github.repository == 'UnknownAlienHuman/eliot-memory-os'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: Apply validated rev9 overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECTED_BASE=d5f37f288f8de281b3451019403f37d7e17e6886
+          EXPECTED_SHA=a4578c01955410f0e58a5d54f8617654b7b25d75437200e5113777649ebe772d
+          FINAL_MESSAGE='prototype(smart): specify cognitive function contracts'
+          test "$GITHUB_REF_NAME" = 'cognitive-micromodules-wave-01'
+          git merge-base --is-ancestor "$EXPECTED_BASE" HEAD
+          if git log -10 --pretty=%s | grep -Fxq "$FINAL_MESSAGE"; then
+            rm -rf .eliot/rev9-bootstrap
+            rm -f .eliot/probe.txt .github/workflows/rev9-bootstrap.yml
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add -A
+            if ! git diff --cached --quiet; then
+              git diff --cached --check
+              git commit -m 'chore(smart): remove rev9 bootstrap residue'
+              git push origin HEAD:cognitive-micromodules-wave-01
+            fi
+            exit 0
+          fi
+          unexpected="$(git diff --name-only "$EXPECTED_BASE"...HEAD | grep -Ev '^(\.eliot/rev9-bootstrap/|\.github/workflows/rev9-bootstrap\.yml$|\.eliot/probe\.txt$)' || true)"
+          test -z "$unexpected" || { printf 'Unexpected staging changes:\n%s\n' "$unexpected"; exit 1; }
+          rm -f /tmp/rev9.tar.xz /tmp/rev9.decoded
+          found=0
+          for candidate in .eliot/rev9-bootstrap/*; do
+            test -f "$candidate" || continue
+            got="$(sha256sum "$candidate" | awk '{print $1}')"
+            if test "$got" = "$EXPECTED_SHA"; then
+              cp "$candidate" /tmp/rev9.tar.xz
+              found=1
+              break
+            fi
+            if base64 -d "$candidate" > /tmp/rev9.decoded 2>/dev/null; then
+              got="$(sha256sum /tmp/rev9.decoded | awk '{print $1}')"
+              if test "$got" = "$EXPECTED_SHA"; then
+                mv /tmp/rev9.decoded /tmp/rev9.tar.xz
+                found=1
+                break
+              fi
+            fi
+          done
+          test "$found" = 1 || { echo 'No bootstrap candidate matched the required archive SHA-256'; exit 1; }
+          rm -rf /tmp/rev9-extract
+          mkdir -p /tmp/rev9-extract
+          tar -xJf /tmp/rev9.tar.xz -C /tmp/rev9-extract
+          python3 - <<'PY'
+          import hashlib, json, pathlib, tomllib
+          root = pathlib.Path('/tmp/rev9-extract/repo')
+          val = json.loads(pathlib.Path('/tmp/rev9-extract/overlay/validation.json').read_text())
+          assert val['status'] == 'PASS'
+          assert val['expected_branch_head'] == 'd5f37f288f8de281b3451019403f37d7e17e6886'
+          assert val['current_main_seen'] == 'd5f37f288f8de281b3451019403f37d7e17e6886'
+          expected = val['payload_sha256']
+          files = sorted(p for p in root.rglob('*') if p.is_file())
+          rels = {p.relative_to(root).as_posix() for p in files}
+          assert len(files) == 161, len(files)
+          assert rels == set(expected), (rels - set(expected), set(expected) - rels)
+          for p in files:
+              rel = p.relative_to(root).as_posix()
+              assert p.suffix == '.toml', rel
+              tomllib.loads(p.read_text())
+              assert hashlib.sha256(p.read_bytes()).hexdigest() == expected[rel], rel
+          assert 'Cargo.toml' not in expected and 'Cargo.lock' not in expected
+          PY
+          cp -a /tmp/rev9-extract/repo/. .
+          rm -f crates/smart/.audit-probe
+          rm -rf crates/smart/eliot-dreamer-candidate-validation
+          rm -rf crates/smart/eliot-dreamer-memory-repair
+          rm -f crates/smart/eliot-dreamer-contracts/module.toml
+          rm -f crates/smart/eliot-context-contracts/module.toml
+          rm -f crates/smart/eliot-learning-contracts/module.toml
+          rm -rf .eliot/rev9-bootstrap
+          rm -f .eliot/probe.txt .github/workflows/rev9-bootstrap.yml
+          python3 - <<'PY'
+          import hashlib, json, pathlib, tomllib
+          root = pathlib.Path('.')
+          val = json.loads(pathlib.Path('/tmp/rev9-extract/overlay/validation.json').read_text())
+          for rel, want in val['payload_sha256'].items():
+              p = root / rel
+              assert p.is_file(), rel
+              tomllib.loads(p.read_text())
+              assert hashlib.sha256(p.read_bytes()).hexdigest() == want, rel
+          PY
+          git diff --exit-code -- Cargo.toml Cargo.lock
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          bad="$(git diff --cached --name-only | grep -E '\.(rs|md)$' || true)"
+          test -z "$bad" || { printf 'Forbidden staged files:\n%s\n' "$bad"; exit 1; }
+          git diff --cached --check
+          git commit -m "$FINAL_MESSAGE"
+          git push origin HEAD:cognitive-micromodules-wave-01
