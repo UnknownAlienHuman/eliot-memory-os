@@ -5,6 +5,12 @@ default: quick
 normative:
     pwsh -NoProfile -File scripts/verify-normative.ps1
 
+architecture-boundaries-self-test:
+    python scripts/audit-architecture-boundaries.py --self-test
+
+architecture-boundaries:
+    python scripts/audit-architecture-boundaries.py
+
 metadata:
     cargo metadata --locked --no-deps --format-version 1 | Out-Null
 
@@ -31,7 +37,7 @@ claude-package:
 sync-skills:
     cargo run --quiet -p eliot-app -- host skill-sync
 
-quick: normative metadata fmt-check check
+quick: normative architecture-boundaries-self-test architecture-boundaries metadata fmt-check check
 
 verify:
     pwsh -NoProfile -File scripts/verify.ps1

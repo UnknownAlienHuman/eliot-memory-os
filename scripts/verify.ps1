@@ -8,11 +8,20 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$architectureAudit = Join-Path $PSScriptRoot 'audit-architecture-boundaries.py'
 
 $steps = @(
     [pscustomobject]@{
         Name = 'normative-pair'
         Command = { pwsh -NoProfile -File (Join-Path $PSScriptRoot 'verify-normative.ps1') }
+    },
+    [pscustomobject]@{
+        Name = 'architecture-boundaries-self-test'
+        Command = { python $architectureAudit --self-test }
+    },
+    [pscustomobject]@{
+        Name = 'architecture-boundaries'
+        Command = { python $architectureAudit --root $repoRoot }
     },
     [pscustomobject]@{
         Name = 'cargo-metadata'
