@@ -22,24 +22,42 @@ present in the active checkout.
 
 ## Repository planes
 
-| Plane | Paths | Responsibility |
+| Plane | Current source paths | Responsibility |
 |---|---|---|
 | Foundation | `crates/foundation/*` | contracts, protocols, evidence, receipts, security/runtime types |
-| Governor | `crates/governor/*`, `crates/eliot-app`, `crates/eliot-engine` | semantic admission, tasks, WorkScopes, coordination, finish |
-| Kernel/Host | `crates/kernel/*` | installation, Host journal, IPC, ORS, authority/fencing, process lifecycle |
-| Storage | `crates/storage/*`, `crates/eliot-store` | store API, Surreal bridge, BlobStore, export/backup |
+| Governor | `crates/governor/*`, `bins/eliotd` | semantic admission, tasks, WorkScopes, coordination, finish |
+| Kernel/Host | `crates/kernel/*`, `bins/eliot-host`, `bins/eliot-kernel` | installation, Host journal, IPC, ORS, authority/fencing, process lifecycle |
+| Storage | `crates/storage/*`, `bins/eliot-store-surreal` | store API, Surreal bridge, BlobStore, export/backup |
 | Agent fabric | `crates/agent/*` | agent routes and coordination contracts/adapters |
 | Smart/research/security | `crates/smart/*`, `crates/research/*`, `crates/security/*` | context, memory, understanding, Dreamer/Researcher candidates, privacy/influence |
 | Instrument/meta/supervision | `crates/instrument/*`, `crates/meta/*`, `crates/supervision/*` | instruments, verification, runtime status, Watchdog/Doctor cores |
-| Surfaces/modules | `crates/surfaces/*`, `crates/modules/*` | CLI/MCP/skills, User Broker, native/WASM boundaries |
+| Surfaces/modules | `crates/surfaces/*`, `crates/modules/*`, applicable `bins/*` | CLI/MCP/skills, User Broker, native/WASM boundaries |
 | Composition roots | `bins/*`, `workspace/tools/*` | runtime executables and bounded tools |
 
 A crate is a source/build boundary, not a lifecycle or authority owner.
+
+## Legacy migration facades
+
+The earlier broad source owners remain in the workspace for compatibility,
+regression reproduction, extraction, and deletion. Their names and code volume
+do not make them current runtime or semantic owners.
+
+| Facade | Current disposition |
+|---|---|
+| `crates/eliot-app` / `eliot-governor` | Legacy migration/regression facade. Not a production composition root or root default member. Read its local `AGENTS.md`; no new feature or state/effect owner is allowed. Extraction/disposition is owned by #18 and registry binding by #13. |
+| `crates/eliot-engine` | Migration facade for historical application/domain logic. New capabilities belong in the declared current owner; edits require a proven current consumer or extraction path. |
+| `crates/eliot-store` | Migration facade around historical store-facing behavior. It cannot bypass the current store API/bridge or become a second storage owner. |
+| `crates/eliot-types` | Migration contract/type facade. It must not become an unbounded common-type owner; stable current contracts live in the declared foundation/domain contract crates. |
+| `crates/eliot-windows-ipc` | Compatibility facade for historical Windows IPC behavior; current process/IPC ownership remains in the declared Kernel/platform/surface contracts. |
+
+A regression may still terminate in a facade. That permits a scoped repair or
+migration under the owning issue, not general development there.
 
 ## Runtime owners and work items
 
 | Capability | Intended role | Work item |
 |---|---|---|
+| `eliot.exe` | canonical one-shot operator/agent CLI | current surface/installation issue |
 | `eliot-host.exe` | external lifecycle/recovery boundary | #14 |
 | `eliot-kernel.exe` | identity, fencing, ORS, reserve, generation routing | #15 |
 | `eliotd.exe` | Governor semantic daemon | #18 |
@@ -68,8 +86,8 @@ proposal or observation
 → reconciliation and projection publication
 ```
 
-No report, branch, Module, Doctor, Watchdog, Dreamer, provider, or recovery
-spool creates another semantic write path.
+No report, branch, facade, Module, Doctor, Watchdog, Dreamer, provider, or
+recovery spool creates another semantic write path.
 
 ## Mutable-state ownership
 
