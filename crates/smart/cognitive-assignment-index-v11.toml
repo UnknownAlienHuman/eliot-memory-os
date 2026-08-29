@@ -1,0 +1,57 @@
+schema_version = "eliot-cognitive-assignment-index-v11"
+status = "ACTIVE_WORKING_DRAFT"
+issue = "github:UnknownAlienHuman/eliot-memory-os#94"
+branch = "work/94-cognitive-function-design-audit"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+total_functional_cells = 61
+physical_packages = 26
+root_workspace_admission = false
+supersedes_assignment_routing = "crates/smart/cognitive-crate-decisions.toml"
+
+[authority]
+base = "crates/smart/cognitive-design-authority-v11.toml"
+physical_topology = ["crates/smart/cognitive-physical-topology-v11.toml", "crates/smart/cognitive-physical-topology-v11-wave2.toml"]
+cell_sets = [
+  "crates/smart/cognitive-hot-path-cells-v11.toml",
+  "crates/smart/cognitive-dreamer-core-cells-v11.toml",
+  "crates/smart/cognitive-curation-cells-v11.toml",
+  "crates/smart/cognitive-learning-planning-cells-v11.toml"
+]
+validation = "crates/smart/cognitive-design-validation-v11.toml"
+
+[order_ranges]
+foundation_and_hot_path = "1..16"
+dreamer_common_orientation_research = "17..27"
+curation_and_memory_rehabilitation = "28..40"
+task_local_learning = "41..50"
+diagnosis_planning_cycle_self_model = "51..61"
+
+[assignment]
+rules = [
+  "One agent receives one cell id, one causal property and one worker write scope.",
+  "Multiple cells may share one physical package when they share a real dependency and proof boundary.",
+  "No worker edits Cargo.toml, src/lib.rs, package re-exports or another cell file.",
+  "Unknown subtype, missing denominator, stale fence, unavailable owner projection or absent authority path fails closed.",
+  "A local module pass never promotes package, edge, Product Pulse, runtime or product support."
+]
+
+[integration_sequence]
+steps = [
+  "freeze contract and evidence inputs",
+  "implement independent cell source and tests",
+  "integrate package exports by integration owner",
+  "run package proof",
+  "run every affected provider-consumer Edge Proof",
+  "run the named Product Pulse on exact Product Identity",
+  "only then consider workspace or runtime admission"
+]
+
+[legacy_disposition]
+do_not_assign = [
+  "historical cognitive-wave-01.toml and cognitive-wave-02.toml",
+  "standalone pre-v11 module.toml/api.toml pairs",
+  "eliot-dreamer-candidate-validation",
+  "eliot-dreamer-memory-repair"
+]
+donor_only = ["eliot-cues", "eliot-context", "eliot-epistemic", "eliot-dreamer-core", "eliot-memory-curation", "eliot-understanding"]
+retire_after_edge_migration = ["eliot-memory", "eliot-system-experience", "eliot-understanding"]
