@@ -1,0 +1,203 @@
+schema_version = "eliot-cognitive-physical-topology-v11"
+status = "ACTIVE_WORKING_DRAFT"
+issue = "github:UnknownAlienHuman/eliot-memory-os#94"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+rule = "FunctionalCapabilityCell assignment is independent from Cargo package count. A physical package requires a real contract, dependency, security, proof, deployment or replacement seam."
+
+[[package]]
+name = "eliot-observation"
+action = "extend_existing"
+layer = "Governor"
+cells = ["governor.observation.classifier"]
+seam = "Governor-owned observation admission and safe first-pass classification"
+integration_owner = "Governor observation owner"
+
+[[package]]
+name = "eliot-epistemic"
+action = "extend_existing"
+layer = "Smart"
+cells = ["smart.epistemic.position"]
+seam = "stateless epistemic-resolution replacement and proof boundary"
+integration_owner = "epistemic integration owner"
+
+[[package]]
+name = "eliot-dreamer-contracts"
+action = "retain_prototype_contract_crate"
+layer = "Smart"
+cells = ["smart.dreamer.contracts"]
+seam = "provider-neutral wire contracts shared by all Dreamer jobs"
+integration_owner = "Dreamer contract integration owner"
+
+[[package]]
+name = "eliot-dreamer-bundle"
+action = "retain_prototype"
+layer = "Smart"
+cells = ["smart.dreamer.bundle"]
+seam = "bounded disclosure and context-expansion boundary before model routing"
+integration_owner = "Dreamer input integration owner"
+
+[[package]]
+name = "eliot-dreamer-validation"
+action = "create_consolidated_prototype"
+layer = "Smart"
+cells = ["smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+seam = "common deterministic validation dependency island used by every Dreamer job"
+integration_owner = "Dreamer validation integration owner"
+
+[[package]]
+name = "eliot-dreamer-relation"
+action = "retain_and_generalize"
+layer = "Smart"
+cells = ["smart.dreamer.relation"]
+seam = "shared typed relation semantics reused by Orientation and Curation"
+integration_owner = "Dreamer relation integration owner"
+
+[[package]]
+name = "eliot-dreamer-orientation"
+action = "consolidate_orientation_cells"
+layer = "Smart"
+cells = ["smart.dreamer.rival_model", "smart.dreamer.probe_plan", "smart.dreamer.orientation"]
+seam = "problem-orientation semantic handler and packet assembly"
+integration_owner = "Dreamer Orientation integration owner"
+
+[[package]]
+name = "eliot-dreamer-research"
+action = "create_consolidated_prototype"
+layer = "Smart"
+cells = ["smart.dreamer.research_synthesis"]
+seam = "interpret already-acquired ResearchEvidenceBundle without acquisition ownership"
+integration_owner = "Dreamer Research integration owner"
+
+[[package]]
+name = "eliot-cue-contracts"
+action = "retain_prototype_contract_crate"
+layer = "Smart"
+cells = ["smart.cue.contracts"]
+seam = "stable cue wire types and comparison-profile contracts"
+integration_owner = "cue contract integration owner"
+
+[[package]]
+name = "eliot-cues"
+action = "consolidate_into_existing"
+layer = "Smart"
+cells = ["smart.cue.normalization", "smart.cue.binding", "smart.cue.snapshot", "smart.cue.direct_match", "smart.cue.relation_spread", "smart.cue.activation"]
+seam = "one rebuildable derived cue projection and bounded activation dependency island"
+integration_owner = "cue projection integration owner"
+
+[[package]]
+name = "eliot-context-contracts"
+action = "retain_prototype_contract_crate"
+layer = "Smart"
+cells = ["smart.context.contracts"]
+seam = "stable whole-unit context candidate, admission, view and quality contracts"
+integration_owner = "Context contract integration owner"
+
+[[package]]
+name = "eliot-context"
+action = "consolidate_compiler_cells_into_existing"
+layer = "Smart"
+cells = ["smart.context.contribution_merge", "smart.context.admission", "smart.context.quality"]
+seam = "pure bounded Context Compiler and independent quality oracle"
+integration_owner = "Context Compiler integration owner"
+
+[[package]]
+name = "eliot-context-view"
+action = "create_consolidated_prototype"
+layer = "Smart"
+cells = ["smart.context.view_assembly", "smart.context.decision_tail", "smart.context.reactive_plan"]
+seam = "immutable presentation and replacement boundary after membership is frozen"
+integration_owner = "Context view integration owner"
+
+[[fold]]
+from = "eliot-cue-normalizer"
+into = "eliot-cues"
+reason = "same pure dependency island; function boundary remains an independently assigned cell"
+
+[[fold]]
+from = "eliot-cue-binding"
+into = "eliot-cues"
+reason = "same projection owner; Governor admission remains an external edge"
+
+[[fold]]
+from = "eliot-cue-index"
+into = "eliot-cues"
+reason = "snapshot construction is not an independent lifecycle owner"
+
+[[fold]]
+from = "eliot-cue-activation"
+into = "eliot-cues"
+reason = "direct matching and bounded spread require one immutable snapshot contract"
+
+[[fold]]
+from = "eliot-context-candidates"
+into = "eliot-context"
+reason = "provider contribution merge belongs to the compiler dependency island"
+
+[[fold]]
+from = "eliot-context-admission"
+into = "eliot-context"
+reason = "whole-unit admission and quality share one pure proof boundary"
+
+[[fold]]
+from = "eliot-context-assembly"
+into = "eliot-context-view"
+reason = "assembly belongs after frozen membership"
+
+[[fold]]
+from = "eliot-reactive-context-plan"
+into = "eliot-context-view"
+reason = "delivery planning is a view-adjacent effect-free plan"
+
+[[fold]]
+from = "eliot-dreamer-claim-grounding"
+into = "eliot-dreamer-validation"
+reason = "common deterministic validation dependency island"
+
+[[fold]]
+from = "eliot-dreamer-transformation-validation"
+into = "eliot-dreamer-validation"
+reason = "common deterministic validation dependency island"
+
+[[fold]]
+from = "eliot-dreamer-draft-admission"
+into = "eliot-dreamer-validation"
+reason = "common deterministic validation dependency island"
+
+[[fold]]
+from = "eliot-dreamer-rival-model"
+into = "eliot-dreamer-orientation"
+reason = "job-specific Orientation semantics"
+
+[[fold]]
+from = "eliot-dreamer-probe-plan"
+into = "eliot-dreamer-orientation"
+reason = "job-specific Orientation semantics"
+
+[[retire_after_edge_migration]]
+package = "eliot-dreamer-candidate-validation"
+reason = "mixes grounding, transformation proof and structural admission"
+
+[[retire_after_edge_migration]]
+package = "eliot-dreamer-memory-repair"
+reason = "mixes identity, relation, accessibility, influence and infrastructure repair"
+
+[[retire_after_edge_migration]]
+package = "eliot-memory"
+reason = "second mutable canonical-memory owner"
+
+[[retire_after_edge_migration]]
+package = "eliot-system-experience"
+reason = "second mutable self-memory owner"
+
+[[retire_after_edge_migration]]
+package = "eliot-understanding"
+reason = "duplicate Context Compiler; salvage rendering only into eliot-context-view"
+
+[admission]
+rules = [
+  "Do not add prototype packages to the root workspace.",
+  "A worker edits only its declared src/<cell>.rs and tests/<cell>.rs.",
+  "Package src/lib.rs, Cargo.toml and re-export integration belong to the package integration owner.",
+  "Fold decisions execute only after target-package cell tests and affected Edge Proof exist.",
+  "A size threshold is a review trigger, not a constitutional package boundary."
+]
