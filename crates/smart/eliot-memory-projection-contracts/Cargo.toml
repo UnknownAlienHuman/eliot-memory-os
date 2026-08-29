@@ -1,10 +1,11 @@
 [package]
 name = "eliot-memory-projection-contracts"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
 publish = false
+description = "Store-neutral canonical-memory read, candidate-selection, and context-projection contracts for ELIOT."
 
 [lib]
 path = "src/lib.rs"
@@ -14,7 +15,17 @@ layer = "C0"
 purpose = "store-neutral memory projection contracts"
 source_maintenance_owner = "cognitive-integration-owner"
 functional_cell_refs = ["smart.memory.projection.contracts"]
-independent_proof_profile = "prototype-not-workspace-admitted"
+independent_proof_profile = "cargo test --manifest-path crates/smart/eliot-memory-projection-contracts/Cargo.toml"
 contract_refs = ["crates/smart/cognitive-current.toml"]
-implementation_support = "TARGET"
+implementation_support = "PACKAGE_CANDIDATE"
 evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "pending package proof, edge proof, and integration-owner review"
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }
+schemars = "1.2.1"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+
+[workspace]

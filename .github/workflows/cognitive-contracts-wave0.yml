@@ -1,0 +1,47 @@
+name: Cognitive contracts wave 0
+
+on:
+  push:
+    branches:
+      - work/94-cognitive-contracts-wave0
+    paths:
+      - .github/workflows/cognitive-contracts-wave0.yml
+      - crates/smart/eliot-memory-projection-contracts/**
+      - crates/smart/eliot-context-contracts/**
+      - crates/smart/eliot-learning-contracts/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cognitive-contracts-wave0-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-proof:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: 1.94.0
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          components: rustfmt, clippy
+      - name: Verify isolated contract packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifests=(
+            crates/smart/eliot-memory-projection-contracts/Cargo.toml
+            crates/smart/eliot-context-contracts/Cargo.toml
+            crates/smart/eliot-learning-contracts/Cargo.toml
+          )
+          for manifest in "${manifests[@]}"; do
+            cargo metadata --manifest-path "$manifest" --format-version 1 --no-deps >/dev/null
+            cargo fmt --manifest-path "$manifest" -- --check
+            cargo test --manifest-path "$manifest" --all-targets
+            cargo clippy --manifest-path "$manifest" --all-targets -- -D warnings
+          done

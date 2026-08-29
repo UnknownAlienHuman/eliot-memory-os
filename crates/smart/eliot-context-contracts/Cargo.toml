@@ -5,21 +5,26 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Own minimal public context atom, recipe, candidate, admission, omission, selection-integrity and view schemas."
+description = "Closed Context provider-registry contracts for ELIOT."
 
 [lib]
 path = "src/lib.rs"
 
 [package.metadata.eliot]
-prototype = true
-source_status = "NOT_IMPLEMENTED"
-workspace_admission = "pending_agent_implementation_and_proof"
-functional_cell = "smart.context.contracts"
-source_layer = "C0"
-runtime_layer = "R5"
-runtime_bundle = "eliotd"
-agent_order = 15
+layer = "C0"
+purpose = "closed Context provider denominator and generic provider request"
+source_maintenance_owner = "cognitive-integration-owner"
+functional_cell_refs = ["smart.context.provider_registry_contracts"]
+independent_proof_profile = "cargo test --manifest-path crates/smart/eliot-context-contracts/Cargo.toml"
+contract_refs = ["crates/smart/cognitive-current.toml"]
+implementation_support = "PACKAGE_CANDIDATE"
+evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "pending package proof, edge proof, and integration-owner review"
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
-eliot-evidence = { path = "../../foundation/eliot-evidence" }
+schemars = "1.2.1"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+
+[workspace]
