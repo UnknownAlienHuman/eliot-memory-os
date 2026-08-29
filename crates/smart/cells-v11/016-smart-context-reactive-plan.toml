@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.context.reactive_plan"
+agent_order = 16
+physical_package = "eliot-context-view"
+execution_class = "DECISION_BOUNDARY_HOT"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Plan bounded context delivery without claiming delivery, interception or dedup state."
+
+[agent]
+objective = "Implement effect-free reactive delivery planning only."
+write_scope = ["crates/smart/eliot-context-view/src/reactive_plan.rs", "crates/smart/eliot-context-view/tests/reactive_plan.rs"]
+integration_owner = "Context view integration owner"
+forbidden_files = ["crates/smart/eliot-context-view/src/lib.rs", "crates/smart/eliot-context-view/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn plan_reactive_context_injection(request: &ReactiveContextPlanRequest, view: &ActiveUnderstandingView, tail: &DecisionLocalTail) -> Result<PendingContextInjectionPlan, ReactiveContextPlanError>"]
+
+[algorithm]
+steps = [
+  "Validate host capability profile and exact context identities.",
+  "Choose pre-action delivery only when the host contract proves interception capability.",
+  "Otherwise choose next-boundary delivery or a durable attention obligation.",
+  "Name the expected receipt owner and dedup key without mutating either.",
+  "Emit visible degradation when the host cannot deliver safely."
+]
+
+[limits]
+rules = ["Emit one plan per request.", "Use a bounded capability table.", "Do not mutate session state."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "UnsupportedHostCapability", "NoSafeDeliveryBoundary", "InvalidDedupKey"]
+
+[forbidden]
+operations = ["sending context", "creating DeliveryReceipt", "session dedup mutation", "claiming prevention without interception", "storage call", "model call", "blocking I/O"]
+
+[tests]
+required = ["tool-only host never claims pre-action prevention", "plan does not create a receipt", "dedup key remains advisory to external owner", "unsupported host degrades visibly"]
+
+[integration]
+provider = "smart.context.view_assembly and smart.context.decision_tail"
+consumer = "external host/session delivery owner"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if host interception, delivery receipt or dedup ownership is not explicitly defined."
