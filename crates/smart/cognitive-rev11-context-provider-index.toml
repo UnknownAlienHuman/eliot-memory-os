@@ -1,0 +1,18 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "ORDERED_CONTEXT_PROVIDER_INDEX"
+expected_orders = "74..75"
+
+[[cell]]
+order = 74
+id = "smart.context.provider_registry_contracts"
+crate = "eliot-context-contracts"
+catalog = "cognitive-rev11-context-provider-completion.toml"
+hot_path = false
+
+[[cell]]
+order = 75
+id = "smart.epistemic.context_projection"
+crate = "eliot-epistemic"
+catalog = "cognitive-rev11-context-provider-completion.toml"
+hot_path = true
