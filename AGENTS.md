@@ -62,6 +62,27 @@ branch from current `main`.
 - Core/daemon work follows [`workstreams/core-daemons/AGENTS.md`](workstreams/core-daemons/AGENTS.md).
 - Dreamer is not part of the core/daemon workstream.
 
+## GitHub Actions policy
+
+Automatic GitHub Actions runs are disabled by repository policy.
+
+- Every workflow may use only `on: workflow_dispatch`.
+- Never create, restore, enable, or retain `push`, `pull_request`,
+  `pull_request_target`, `merge_group`, `schedule`, `workflow_run`,
+  `repository_dispatch`, `workflow_call`, release, issue, discussion, branch,
+  tag, package, page-build, status, watch, or any other automatic trigger.
+- Never add a branch-local, PR-only, temporary, audit, export, validation,
+  packaging, merge, or release workflow with an automatic trigger.
+- Do not change `.github/workflows/**` unless the current user request explicitly
+  requires that exact workflow change. Even then, the trigger remains
+  `workflow_dispatch` only.
+- Run ordinary verification locally. A GitHub-hosted workflow runs only after a
+  person starts it manually from the Actions UI or an equivalent explicit
+  manual dispatch.
+
+A CI result is never required merely to open or update a PR. Creating an
+automatic workflow to obtain proof is a policy violation, not a workaround.
+
 ## Repository hygiene
 
 Do not commit:
