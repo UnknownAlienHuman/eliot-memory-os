@@ -1,0 +1,74 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "ORDERED_ASSIGNMENT_PLAN"
+orders = "1..67"
+assignment_rule = "One agent receives one cell record, its exact source/test files, prerequisites, discriminator and proof ceiling. Shared crate integration is a later owner-only task."
+
+[[wave]]
+id = "W0_CONTRACT_EVIDENCE"
+orders = [1, 2, 4, 5, 6, 7, 19, 26, 27, 28, 35, 49, 50, 51, 52]
+gate = "All provider-neutral wire types, owners, State Fence fields, ceilings and closed enums are frozen before implementation cells consume them."
+parallelism = "Disjoint contract modules may proceed in parallel; src/lib.rs remains integration-owner-only."
+
+[[wave]]
+id = "W1_D3A_ORIENTATION"
+orders = [3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+requires = ["W0_CONTRACT_EVIDENCE"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+gate = "Admitted evidence can produce a candidate-only DreamPacket preserving rivals, unknowns, lineage, authority ceiling and discriminative probes."
+
+[[wave]]
+id = "W2_D3B_REACTIVE_CONTEXT"
+orders = [20, 21, 22, 23, 24, 25, 29, 30, 31, 32, 33, 34]
+requires = ["W0_CONTRACT_EVIDENCE", "W1_D3A_ORIENTATION"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+gate = "An exact cue fires with zero graph edges and produces a bounded, Safety-Floor-preserving decision-local context plan without I/O."
+
+[[wave]]
+id = "W3_CURATED_MEMORY"
+orders = [36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
+requires = ["W0_CONTRACT_EVIDENCE", "W1_D3A_ORIENTATION"]
+product_pulse = "D3A_CURATION_PULSE_01"
+gate = "Every supported curation subtype reaches one typed handler; existence, support, accessibility and influence remain independent and all outputs are proposals."
+
+[[wave]]
+id = "W4_RESEARCH_SYNTHESIS"
+orders = [48]
+requires = ["W0_CONTRACT_EVIDENCE", "W1_D3A_ORIENTATION"]
+product_pulse = "D3A_RESEARCH_SYNTHESIS_PULSE_01"
+gate = "One frozen ResearchEvidenceBundle is interpreted with exact citations, counterclaims, failed acquisition and coverage denominator; no acquisition or promotion occurs."
+
+[[wave]]
+id = "W5_TASK_LOCAL_LEARNING"
+orders = [53, 54, 55, 56, 57, 58, 59]
+requires = ["W0_CONTRACT_EVIDENCE", "W2_D3B_REACTIVE_CONTEXT"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+gate = "A reversible task-local overlay is derived from an attributed attempt delta, externally activated, dimensionally assessed and closed without global promotion."
+
+[[wave]]
+id = "W6_DIAGNOSIS_PLANNING"
+orders = [60, 61, 62, 63, 64, 65]
+requires = ["W1_D3A_ORIENTATION", "W5_TASK_LOCAL_LEARNING"]
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+gate = "Diagnosis and planning remain advisory; no job, route, schedule, lease, setting mutation, agent launch or effect is created."
+
+[[wave]]
+id = "W7_DREAM_CYCLE"
+orders = [66, 67]
+requires = ["W3_CURATED_MEMORY", "W5_TASK_LOCAL_LEARNING", "W6_DIAGNOSIS_PLANNING"]
+product_pulse = "D6_BOUNDED_DREAM_CYCLE_PULSE_01"
+gate = "One finite frozen sample yields one candidate plan with explicit denominator and no self-scheduling or unbounded model loop."
+
+[integration_order]
+steps = [
+  "implement and prove individual cells in isolated candidate workspaces",
+  "integration owner wires shared crate modules and public re-exports",
+  "run package proof for each physical crate",
+  "run affected typed Edge Proofs",
+  "run the named Product Pulse",
+  "only then consider root workspace admission",
+]
+
+[stop_conditions]
+cell = ["owner contradiction", "missing external contract", "proof oracle unavailable", "source scope overlaps another agent", "required behavior would exceed declared effect ceiling"]
+wave = ["prior Product Pulse failed", "current main changed a load-bearing owner contract", "normative pair changed", "candidate topology created a second state or authority owner"]
