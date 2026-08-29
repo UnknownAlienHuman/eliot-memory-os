@@ -1,118 +1,38 @@
-use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::io::{self, Write};
 
-use eliot_testd::{
-    PROTOCOL_VERSION, SERVICE_NAME, TestReceipt, TestdComposition, TestdJobRequest,
-    UnavailableProcessIssuer,
-};
-use eliot_testd_core::Lease;
-use serde::{Deserialize, Serialize};
+use eliot_testd::{PROTOCOL_VERSION, SERVICE_NAME};
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-enum Request {
-    Submit {
-        request: Box<TestdJobRequest>,
-    },
-    Status {
-        job_id: String,
-    },
-    Cancel {
-        job_id: String,
-        #[serde(default)]
-        lease: Option<Lease>,
-        #[serde(default = "default_actor")]
-        actor: String,
-    },
-}
-
-fn default_actor() -> String {
-    SERVICE_NAME.to_owned()
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum Response {
-    Ready {
-        service: &'static str,
-        protocol: &'static str,
-    },
-    Receipt {
-        receipt: TestReceipt,
-    },
-    Error {
-        error: String,
-    },
-}
+const EXIT_KERNEL_ADMISSION_REQUIRED: i32 = 78;
+const KERNEL_ADMISSION_REQUIRED: &str = "KERNEL_ADMISSION_REQUIRED";
+const OPERATION: &str = "eliot.instrument.test.execute";
 
 fn main() {
-    let state_path = std::env::var_os("ELIOT_TESTD_STATE")
-        .map_or_else(|| PathBuf::from(".eliot-testd.redb"), PathBuf::from);
-    let mut output = io::BufWriter::new(io::stdout().lock());
-    let daemon = match TestdComposition::open(state_path, Arc::new(UnavailableProcessIssuer)) {
-        Ok(daemon) => daemon,
-        Err(error) => {
-            let _ = write_response(
-                &mut output,
-                &Response::Error {
-                    error: error.to_string(),
-                },
-            );
-            return;
-        }
-    };
-    if !write_response(
-        &mut output,
-        &Response::Ready {
-            service: SERVICE_NAME,
-            protocol: PROTOCOL_VERSION,
-        },
-    ) {
-        return;
-    }
-    for line in io::stdin().lock().lines() {
-        let response = match line {
-            Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => dispatch(&daemon, &line),
-            Err(error) => Response::Error {
-                error: format!("input: {error}"),
-            },
-        };
-        if !write_response(&mut output, &response) {
-            break;
-        }
-    }
+    // The current Kernel does not advertise the Testd execution operation.
+    // Do not open an ambient cwd/env-selected state file, accept stdin as an
+    // authority surface, or advertise readiness before an authenticated
+    // Kernel handshake and one-shot ProcessRequest provider exist.
+    let _ = writeln!(io::stderr(), "{}", admission_required_message());
+    std::process::exit(EXIT_KERNEL_ADMISSION_REQUIRED);
 }
 
-fn dispatch(daemon: &TestdComposition, line: &str) -> Response {
-    let request = match serde_json::from_str::<Request>(line) {
-        Ok(request) => request,
-        Err(error) => {
-            return Response::Error {
-                error: format!("request: {error}"),
-            };
-        }
-    };
-    let result = match request {
-        Request::Submit { request } => daemon.submit(*request),
-        Request::Status { job_id } => daemon.status(&job_id),
-        Request::Cancel {
-            job_id,
-            lease,
-            actor,
-        } => daemon.cancel_with_lease(&job_id, lease.as_ref(), &actor),
-    };
-    result.map_or_else(
-        |error| Response::Error {
-            error: error.to_string(),
-        },
-        |receipt| Response::Receipt { receipt },
+fn admission_required_message() -> String {
+    format!(
+        "{KERNEL_ADMISSION_REQUIRED}: service={SERVICE_NAME} protocol={PROTOCOL_VERSION} operation={OPERATION}"
     )
 }
 
-fn write_response(output: &mut impl Write, response: &Response) -> bool {
-    serde_json::to_writer(&mut *output, response).is_ok()
-        && output.write_all(b"\n").is_ok()
-        && output.flush().is_ok()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standalone_diagnostic_is_stable_and_never_claims_ready() {
+        let message = admission_required_message();
+        assert_eq!(
+            message,
+            "KERNEL_ADMISSION_REQUIRED: service=eliot-testd protocol=eliot.testd.v2 operation=eliot.instrument.test.execute"
+        );
+        assert!(!message.to_ascii_lowercase().contains("ready"));
+        assert_ne!(EXIT_KERNEL_ADMISSION_REQUIRED, 0);
+    }
 }
