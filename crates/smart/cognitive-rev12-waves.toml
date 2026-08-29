@@ -1,0 +1,42 @@
+schema_version = 2
+authority = "eliot-cognitive-function-design-rev12"
+status = "ORDERED_AGENT_WAVES_NOT_EXECUTED"
+wave_count = 9
+
+[[wave]]
+id = "W0_CONTRACT_EVIDENCE"
+orders = [1, 2, 4, 5, 6, 7, 19, 26, 27, 28, 35, 49, 50, 51, 52, 68, 71, 74]
+rule = "Freeze public types, owner boundaries and negative fixtures before semantic workers."
+
+[[wave]]
+id = "W1_D3A_ORIENTATION"
+orders = [3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+
+[[wave]]
+id = "W2_D3B_REACTIVE_CONTEXT"
+orders = [20, 21, 22, 23, 24, 25, 29, 30, 31, 32, 33, 34]
+
+[[wave]]
+id = "W3_CURATION_MODELS"
+orders = [36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
+
+[[wave]]
+id = "W4_RESEARCH"
+orders = [48]
+
+[[wave]]
+id = "W5_TASK_LOCAL_LEARNING"
+orders = [53, 54, 55, 56, 57, 58, 59]
+
+[[wave]]
+id = "W6_DIAGNOSIS_PLANNING"
+orders = [60, 61, 62, 63, 64, 65]
+
+[[wave]]
+id = "W7_DREAM_CYCLE"
+orders = [66, 67]
+
+[[wave]]
+id = "W8_PROJECTIONS_AND_META_QUALITY"
+orders = [69, 70, 72, 73, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86]
+rule = "Projection cells integrate only after owner contracts are frozen; Meta cells consume immutable evidence and remain candidate/advisory."

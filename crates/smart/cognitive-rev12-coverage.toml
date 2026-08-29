@@ -1,0 +1,36 @@
+schema_version = 2
+authority = "eliot-cognitive-function-design-rev12"
+status = "CLOSED_WORLD_STATIC_COVERAGE"
+dispatch_coverage = "crates/smart/cognitive-rev11-coverage.toml"
+unknown_rule = "Unknown job class, candidate kind, curation subtype, provider class or assessment kind returns a typed unsupported result. No generic LLM fallback or prose inference is allowed."
+
+[counts]
+functional_cells = 86
+physical_crates = 31
+hot_path_cells = 15
+dreamer_job_classes = 8
+candidate_kinds = 17
+curation_subtypes = 11
+context_provider_classes = 7
+meta_quality_cells = 11
+base_typed_edges = 54
+extension_typed_edges = 14
+base_product_pulses = 9
+extension_product_pulses = 3
+
+[closed_sets]
+dreamer_job_classes = ["Orientation", "Curation", "Clarification", "ResearchSynthesis", "Architecture", "DevelopmentDiagnosis", "Maintenance", "OrchestrationPlanning"]
+curation_subtypes = ["Classification", "Relation", "Episode", "Concept", "Procedure", "Skill", "FailureFingerprint", "MergeSplit", "Reconsolidation", "Accessibility", "InfluenceRepair"]
+context_provider_classes = ["GoalTask", "CriticalAttention", "EpistemicPosition", "MemoryRecall", "AuthorityAffordance", "SelfModel", "DecisionTail"]
+understanding_statuses = ["NOT_ONBOARDED", "UNTESTED", "LOCALLY_ADEQUATE", "REFUTED", "INCONCLUSIVE", "STALE"]
+
+[assertions]
+orders_are_exactly_1_through_86 = true
+all_cells_have_one_catalog_record = true
+all_cells_have_owned_mutable_state_or_explicit_none = true
+all_public_functions_are_typed = true
+all_hot_cells_are_bounded_no_io_no_model = true
+all_unknowns_fail_closed_or_degrade_explicitly = true
+all_assessments_are_dimensioned_not_scalar = true
+all_meta_outputs_are_views_assessments_or_candidates = true
+no_cell_owns_canonical_state_authority_effect_scheduler_or_finish = true

@@ -1,0 +1,48 @@
+schema_version = 2
+status = "CURRENT_COGNITIVE_DESIGN_AUTHORITY"
+authority = "crates/smart/cognitive-rev12-authority.toml"
+issue = 94
+branch = "work/94-cognitive-function-design-rev11"
+base_main_commit = "d041d106a111572fab923c4b76d03e4c990ad46a"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+functional_cells = 86
+physical_crates = 31
+hot_path_cells = 15
+orders = "1..86"
+
+[normative_pair]
+pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
+implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+
+[assignment]
+index = "crates/smart/cognitive-rev12-cell-index.toml"
+base_catalogs = [
+  "crates/smart/cognitive-rev11-cells-foundation.toml",
+  "crates/smart/cognitive-rev11-cells-cues-context.toml",
+  "crates/smart/cognitive-rev11-cells-curation-research.toml",
+  "crates/smart/cognitive-rev11-cells-learning.toml",
+  "crates/smart/cognitive-rev11-cells-diagnosis-planning.toml",
+]
+extension_catalogs = [
+  "crates/smart/cognitive-rev12-cells-projections.toml",
+  "crates/smart/cognitive-rev12-cells-meta-quality.toml",
+]
+new_agent_units = "crates/smart/cells-v12/README.toml"
+
+[control]
+topology = "crates/smart/cognitive-rev12-topology.toml"
+coverage = "crates/smart/cognitive-rev12-coverage.toml"
+dispatch_coverage = "crates/smart/cognitive-rev11-coverage.toml"
+type_ownership = "crates/smart/cognitive-rev12-type-ownership.toml"
+base_edges = "crates/smart/cognitive-function-edge-map-v11.toml"
+extension_edges = "crates/smart/cognitive-rev12-edge-extension.toml"
+base_product_pulses = "crates/smart/cognitive-product-pulses-v11.toml"
+extension_product_pulses = "crates/smart/cognitive-rev12-product-pulse-extension.toml"
+waves = "crates/smart/cognitive-rev12-waves.toml"
+agent_handoff = "crates/smart/cognitive-rev12-agent-handoff.toml"
+migration = "crates/smart/cognitive-rev12-migration.toml"
+validation = "crates/smart/cognitive-rev12-validation.toml"
+
+[forbidden_assignment_sources]
+paths = ["legacy module.toml", "legacy *.api.toml", "cognitive-crate-decisions rev7", "old cognitive branches", "retired function-only crates"]

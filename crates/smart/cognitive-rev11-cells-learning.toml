@@ -1,0 +1,206 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+range = "49..59"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[cell]]
+order = 49
+id = "smart.learning.contracts.common"
+stage = "W0_CONTRACT_EVIDENCE"
+physical_crate = "eliot-learning-contracts"
+hot_path = false
+responsibility = "Own common campaign, attempt, hypothesis, evidence and task-local learning identities without owning Task or AgentAttempt lifecycle."
+public_functions = ["pub fn validate_learning_identity(identity: &LearningIdentity) -> Result<(), LearningContractError>", "pub fn learning_contract_identity() -> Result<ContractIdentity, LearningContractError>"]
+public_types = ["CampaignId", "AttemptId", "LearningIdentity", "LearningScope", "LearningEvidenceHandle", "LearningDisposition", "MechanismHypothesis", "Prediction", "ObservedOutcome", "LearningLimits"]
+algorithm = ["validate stable identities and exact task/attempt bindings", "require one compatible State Fence", "bound hypotheses, predictions and evidence handles", "canonicalize collections", "compute contract identity"]
+invariants = ["Task Controller owns task and attempt lifecycle", "learning record is not a retry scheduler", "model statement is not outcome evidence", "all reuse remains scope-qualified"]
+degradation = "Unknown or missing attempt identity fails closed; partial evidence remains representable."
+errors = ["InvalidIdentity", "FenceMismatch", "DuplicateEvidence", "ScopeInvalid", "LimitExceeded"]
+tests = ["attempt identity required", "cross-task binding rejected", "canonical order stable", "no scheduler fields in schema"]
+source_files = ["crates/smart/eliot-learning-contracts/src/common.rs", "crates/smart/eliot-learning-contracts/tests/common.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+architecture_refs = ["online learning during work", "owner-sparse state"]
+implementation_refs = ["ARCH-LEARN-02", "task-local learning loop"]
+
+[[cell]]
+order = 50
+id = "smart.learning.contracts.state_view"
+stage = "W0_CONTRACT_EVIDENCE"
+physical_crate = "eliot-learning-contracts"
+hot_path = false
+responsibility = "Own immutable CampaignLearningStateView and exact owner coverage records."
+public_functions = ["pub fn validate_campaign_learning_state_view(view: &CampaignLearningStateView) -> Result<(), LearningContractError>"]
+public_types = ["CampaignLearningStateView", "OwnerProjectionRef", "OwnerCoverageState", "AttemptLineageView", "TaskGoalView", "AuthorityView", "ContextRecipeView", "EvaluatorView", "ArtifactOutcomeView"]
+algorithm = ["validate exact revisions from Task Controller, attempt lineage, Governor, Context Compiler, Evaluator and artifact owners", "require provider coverage state", "bind all views to one campaign/task/fence", "canonicalize owner projections"]
+invariants = ["view is immutable projection", "view is not attempt journal", "STALE and BLOCKED cannot be filled from transcript", "owner coverage distinguishes not queried, unavailable, partial and complete"]
+degradation = "PARTIAL permits only an explicitly narrower safe next attempt; STALE or BLOCKED stops adaptation."
+errors = ["OwnerProjectionMissing", "OwnerRevisionMismatch", "FenceMismatch", "TaskBindingMismatch", "CoverageInvalid"]
+tests = ["stale owner blocks adaptation", "transcript cannot fill missing projection", "partial owner visible", "view order deterministic"]
+source_files = ["crates/smart/eliot-learning-contracts/src/state_view.rs", "crates/smart/eliot-learning-contracts/tests/state_view.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+architecture_refs = ["online learning uses governed state", "current-system evidence"]
+implementation_refs = ["CampaignLearningStateView"]
+
+[[cell]]
+order = 51
+id = "smart.learning.contracts.adaptation"
+stage = "W0_CONTRACT_EVIDENCE"
+physical_crate = "eliot-learning-contracts"
+hot_path = false
+responsibility = "Own AttemptLearningDelta, reversible CampaignHarnessOverlayCandidate and dimensional validation contracts."
+public_functions = ["pub fn validate_attempt_learning_delta(delta: &AttemptLearningDelta) -> Result<(), LearningContractError>", "pub fn validate_overlay_candidate(candidate: &CampaignHarnessOverlayCandidate) -> Result<(), LearningContractError>"]
+public_types = ["AttemptLearningDelta", "LearningDeltaDimension", "DeltaEvidence", "CampaignHarnessOverlayCandidate", "OverlayChange", "OverlaySurface", "OverlayValidationReport", "AdaptationDimension"]
+algorithm = ["validate predeclared hypothesis, strategy and prediction", "bind actual trace, artifact and evaluator evidence", "require reversible task-local overlay surfaces", "validate dimensional safety without aggregate score"]
+invariants = ["overlay cannot change objective, acceptance, finish, authority, privacy, cost ceiling, evaluator, holdout or canonical write semantics", "equivalent retry needs an explicit experimental purpose", "global promotion is not represented here"]
+degradation = "No justified change and Inconclusive are valid dispositions."
+errors = ["HypothesisMissing", "OutcomeUnattributed", "ForbiddenOverlaySurface", "IrreversibleOverlay", "ScalarScoreForbidden"]
+tests = ["objective mutation rejected", "equivalent retry without experiment rejected", "task-local recipe change allowed", "no-justified-change roundtrip"]
+source_files = ["crates/smart/eliot-learning-contracts/src/adaptation.rs", "crates/smart/eliot-learning-contracts/tests/adaptation.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+architecture_refs = ["learn online", "task-local reversible adaptation"]
+implementation_refs = ["ARCH-LEARN-02", "CampaignHarnessOverlay"]
+
+[[cell]]
+order = 52
+id = "smart.learning.contracts.evaluation"
+stage = "W0_CONTRACT_EVIDENCE"
+physical_crate = "eliot-learning-contracts"
+hot_path = false
+responsibility = "Own activation, adherence, closure and promotion-input dimension contracts without creating receipts or decisions."
+public_functions = ["pub fn validate_activation_assessment(value: &HarnessActivationAssessment) -> Result<(), LearningContractError>", "pub fn validate_learning_closure(value: &CampaignLearningClosureCandidate) -> Result<(), LearningContractError>", "pub fn validate_promotion_input(value: &PromotionInputCandidate) -> Result<(), LearningContractError>"]
+public_types = ["HarnessActivationAssessment", "HarnessActivationReceiptRef", "AdherenceAssessment", "DecisionDeltaAssessment", "CampaignLearningClosureCandidate", "PromotionInputCandidate", "PromotionEvidenceDimension", "RetentionAssessment", "TransferAssessment", "RollbackAssessment"]
+algorithm = ["require external activation receipt reference for claims of activation", "separate activation, adherence, decision delta and outcome", "represent retention, transfer, evaluator validity, Product Pulse, rollback, economics and authority independently", "validate advisory-only ceiling"]
+invariants = ["assessment cannot create HarnessActivationReceipt", "acknowledgement is not activation proof", "outcome is not automatically causal", "promotion decision belongs to Governor/Human"]
+degradation = "Missing activation or outcome attribution yields Inconclusive or NO_REUSABLE_DELTA."
+errors = ["ReceiptMissing", "AttributionInvalid", "DimensionMissing", "PromotionDecisionAttempt", "AggregateScoreForbidden"]
+tests = ["self-created receipt rejected", "acknowledgement not activation", "no reusable delta valid", "failed transfer dimension remains visible"]
+source_files = ["crates/smart/eliot-learning-contracts/src/evaluation.rs", "crates/smart/eliot-learning-contracts/tests/evaluation.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+architecture_refs = ["promote globally only under proof", "retention and transfer"]
+implementation_refs = ["ARCH-LEARN-02", "learning closure and promotion input"]
+
+[[cell]]
+order = 53
+id = "smart.learning.state_view"
+stage = "W5_TASK_LOCAL_LEARNING"
+physical_crate = "eliot-learning-loop"
+hot_path = false
+responsibility = "Assemble one immutable CampaignLearningStateView from exact owner-produced projections."
+public_functions = ["pub fn assemble_campaign_learning_state_view(request: &LearningStateViewRequest, projections: &[OwnerProjectionRef]) -> Result<CampaignLearningStateView, LearningStateViewError>"]
+algorithm = ["validate request and expected owner set", "join projections by exact owner identity and revision", "check common task, campaign and State Fence", "record coverage state for every expected owner", "sort and digest view"]
+invariants = ["no owner is queried by this function", "no transcript substitution", "view owns no mutable state", "missing projection remains explicit"]
+degradation = "Return PARTIAL, STALE or BLOCKED according to exact owner coverage; do not synthesize missing data."
+errors = ["RequestInvalid", "OwnerDuplicate", "OwnerUnexpected", "RevisionMismatch", "FenceMismatch"]
+tests = ["missing owner partial", "stale owner blocks", "unexpected owner rejected", "permutation deterministic"]
+source_files = ["crates/smart/eliot-learning-loop/src/state_view.rs", "crates/smart/eliot-learning-loop/tests/state_view.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+architecture_refs = ["governed self-learning", "single state owner"]
+implementation_refs = ["CampaignLearningStateView assembly"]
+
+[[cell]]
+order = 54
+id = "smart.learning.delta"
+stage = "W5_TASK_LOCAL_LEARNING"
+physical_crate = "eliot-learning-loop"
+hot_path = false
+responsibility = "Derive one AttemptLearningDelta by comparing a predeclared mechanism hypothesis and prediction with attributed actual evidence."
+public_functions = ["pub fn derive_attempt_learning_delta(view: &CampaignLearningStateView, request: &LearningDeltaRequest) -> Result<AttemptLearningDelta, LearningDeltaError>"]
+algorithm = ["validate attempt and baseline identity", "load only handles already present in the state view", "compare hypothesis, strategy and prediction with actual trace, artifact, evaluator and effect observations", "classify mechanism-supporting, mechanism-refuting, noise, invalid or inconclusive dimensions", "select one explicit disposition"]
+invariants = ["post-hoc story without predeclared hypothesis is invalid", "same retry is useful only for replication, noise estimation, controlled comparison, exact reproduction, recovery proof or verifier calibration", "outcome without attribution is not learning"]
+degradation = "Return NO_JUSTIFIED_CHANGE, INCONCLUSIVE or INVALID_EVIDENCE rather than force adaptation."
+errors = ["AttemptMissing", "BaselineMissing", "HypothesisMissing", "EvidenceOutsideView", "AttributionInvalid", "EquivalentRetryUnjustified"]
+tests = ["post-hoc hypothesis rejected", "equivalent retry purpose required", "unattributed outcome invalid", "refuting evidence retained"]
+source_files = ["crates/smart/eliot-learning-loop/src/delta.rs", "crates/smart/eliot-learning-loop/tests/delta.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+architecture_refs = ["causal self-learning", "hypothesis and observable"]
+implementation_refs = ["AttemptLearningDelta"]
+
+[[cell]]
+order = 55
+id = "smart.learning.overlay"
+stage = "W5_TASK_LOCAL_LEARNING"
+physical_crate = "eliot-learning-loop"
+hot_path = false
+responsibility = "Propose a bounded reversible task-local CampaignHarnessOverlayCandidate from an admitted learning delta."
+public_functions = ["pub fn build_campaign_harness_overlay(view: &CampaignLearningStateView, delta: &AttemptLearningDelta, policy: &OverlayPolicy) -> Result<Option<CampaignHarnessOverlayCandidate>, LearningOverlayError>"]
+algorithm = ["accept only justified local-update or next-probe dispositions", "map mechanism delta to allowed local surfaces", "bound number and scope of changes", "attach expected observable, verifier, stop, expiry and rollback", "return None when no safe local adaptation exists"]
+invariants = ["objective and acceptance immutable", "authority, privacy and cost ceilings immutable", "evaluator and sealed holdout immutable", "overlay expires with task/campaign scope"]
+degradation = "Return None or EscalationRequired when change needs a forbidden/global surface."
+errors = ["DeltaDispositionInvalid", "ForbiddenSurface", "ScopeExpansion", "RollbackMissing", "VerifierMissing"]
+tests = ["goal change rejected", "local context recipe allowed", "expiry required", "global promotion absent"]
+source_files = ["crates/smart/eliot-learning-loop/src/overlay.rs", "crates/smart/eliot-learning-loop/tests/overlay.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+architecture_refs = ["task-local overlay", "reversible adaptation"]
+implementation_refs = ["CampaignHarnessOverlayCandidate"]
+
+[[cell]]
+order = 56
+id = "smart.learning.overlay_validation"
+stage = "W5_TASK_LOCAL_LEARNING"
+physical_crate = "eliot-learning-loop"
+hot_path = false
+responsibility = "Validate overlay applicability, safety, causality, reversibility, authority and expected proof dimensions independently."
+public_functions = ["pub fn validate_campaign_overlay(view: &CampaignLearningStateView, delta: &AttemptLearningDelta, candidate: &CampaignHarnessOverlayCandidate, policy: &OverlayAdmissionPolicy) -> Result<OverlayValidationReport, OverlayValidationError>"]
+algorithm = ["validate identities and scope", "evaluate applicability", "evaluate evidence attribution", "evaluate authority/privacy/cost ceilings", "evaluate reversibility and rollback", "evaluate verifier and expected observable", "return dimension vector without admission decision"]
+invariants = ["no aggregate score", "validation is not Governor admission", "one failed load-bearing dimension remains visible", "candidate content is not rewritten"]
+degradation = "Return Inconclusive dimensions when evidence cannot establish a claim; caller decides whether to block."
+errors = ["IdentityMismatch", "ScopeMismatch", "ForbiddenSurface", "RollbackInvalid", "DimensionInputMissing"]
+tests = ["authority failure visible", "missing rollback fails dimension", "inconclusive not pass", "validator does not mutate candidate"]
+source_files = ["crates/smart/eliot-learning-loop/src/overlay_validation.rs", "crates/smart/eliot-learning-loop/tests/overlay_validation.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+architecture_refs = ["dimensional validation", "authority ceiling"]
+implementation_refs = ["task-local overlay admission boundary"]
+
+[[cell]]
+order = 57
+id = "meta.learning.activation_assessment"
+stage = "W5_TASK_LOCAL_LEARNING"
+physical_crate = "eliot-learning-evaluation"
+hot_path = false
+responsibility = "Assess whether an externally admitted overlay was delivered and activated, using an external receipt and attempt trace, without creating that receipt."
+public_functions = ["pub fn assess_harness_activation(candidate: &CampaignHarnessOverlayCandidate, receipt: &HarnessActivationReceiptRef, trace: &AttemptTraceProjection) -> Result<HarnessActivationAssessment, ActivationAssessmentError>"]
+algorithm = ["validate candidate, receipt and trace identities", "check delivery target, revision and timing", "distinguish delivered, parsed, available, invoked and actually used", "record contrary evidence and coverage", "return dimensioned assessment"]
+invariants = ["function cannot create receipt", "acknowledgement is not use", "hidden activation cannot be inferred", "assessment is not outcome evaluation"]
+degradation = "Missing or partial trace yields Inconclusive dimensions, not assumed activation."
+errors = ["ReceiptMismatch", "TraceMismatch", "ReceiptMissing", "CoverageInsufficient", "SelfIssuedReceipt"]
+tests = ["acknowledgement not activation", "receipt target mismatch rejected", "partial trace inconclusive", "no receipt construction API"]
+source_files = ["crates/meta/eliot-learning-evaluation/src/activation.rs", "crates/meta/eliot-learning-evaluation/tests/activation.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+architecture_refs = ["actual use must be observed", "receipts bind effects"]
+implementation_refs = ["HarnessActivationReceipt owner separation"]
+
+[[cell]]
+order = 58
+id = "meta.learning.closure"
+stage = "W5_TASK_LOCAL_LEARNING"
+physical_crate = "eliot-learning-evaluation"
+hot_path = false
+responsibility = "Close one campaign learning episode dimensionally and identify reusable candidate residue without forcing a reusable delta."
+public_functions = ["pub fn build_campaign_learning_closure(view: &CampaignLearningStateView, delta: &AttemptLearningDelta, activation: &HarnessActivationAssessment, adherence: &AdherenceAssessment, outcome: &OutcomeAssessment) -> Result<CampaignLearningClosureCandidate, LearningClosureError>"]
+algorithm = ["validate common campaign and attempt lineage", "separate activation, adherence, decision delta and outcome", "assess mechanism attribution and confounders", "classify reusable scope and evidence gaps", "emit reusable candidate, local-only residue or NO_REUSABLE_DELTA"]
+invariants = ["success does not force reusable learning", "one-off external event may yield no delta", "closure cannot promote globally", "contrary outcomes remain visible"]
+degradation = "Return NO_REUSABLE_DELTA or INCONCLUSIVE when mechanism, activation or outcome attribution is weak."
+errors = ["LineageMismatch", "ActivationUnknown", "OutcomeUnattributed", "MechanismUnidentified", "PromotionAttempt"]
+tests = ["one-off event no reusable delta", "success without activation no attribution", "contrary outcome retained", "closure advisory only"]
+source_files = ["crates/meta/eliot-learning-evaluation/src/closure.rs", "crates/meta/eliot-learning-evaluation/tests/closure.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+architecture_refs = ["self-learning closure", "causal attribution"]
+implementation_refs = ["CampaignLearningClosureCandidate"]
+
+[[cell]]
+order = 59
+id = "meta.learning.promotion_input"
+stage = "W5_TASK_LOCAL_LEARNING"
+physical_crate = "eliot-learning-evaluation"
+hot_path = false
+responsibility = "Prepare an advisory PromotionInputCandidate with separate retention, transfer, evaluator, Product Pulse, rollback, economics and authority dimensions."
+public_functions = ["pub fn build_promotion_input(closure: &CampaignLearningClosureCandidate, evidence: &PromotionEvidenceSnapshot) -> Result<Option<PromotionInputCandidate>, PromotionInputError>"]
+algorithm = ["require reusable closure disposition", "bind retention and transfer observations to exact revisions", "assess evaluator validity, Product Pulse and rollback evidence", "assess economics and authority separately", "emit advisory input or None"]
+invariants = ["no scalar promotion score", "cross-task/global change requires external Governor/Human decision", "missing Product Pulse remains visible", "candidate cannot modify active generation"]
+degradation = "Return None or advisory InsufficientEvidence with missing dimensions."
+errors = ["ClosureNotReusable", "EvidenceMismatch", "TransferUnknown", "EvaluatorInvalid", "PromotionDecisionAttempt"]
+tests = ["missing transfer no promotion-ready claim", "failed Product Pulse visible", "rollback missing visible", "no decision field in output"]
+source_files = ["crates/meta/eliot-learning-evaluation/src/promotion_input.rs", "crates/meta/eliot-learning-evaluation/tests/promotion_input.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+architecture_refs = ["promote globally only under proof", "retention and transfer"]
+implementation_refs = ["ARCH-LEARN-02 promotion gate"]

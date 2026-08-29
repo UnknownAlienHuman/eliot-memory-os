@@ -1,0 +1,39 @@
+schema_version = 2
+authority = "eliot-cognitive-function-design-rev12"
+status = "PUBLIC_TYPE_OWNERSHIP_ALLOWLIST"
+rule = "Every public wire type has one owner. Consumers import it; adapters and workers do not redefine it."
+
+[[family]]
+owner = "eliot-context-contracts"
+types = ["ContextProviderClass", "ContextProviderDescriptor", "ContextProviderRegistrySnapshot", "ExpectedContextProvider", "ExpectedContextProviderSet", "ContextProviderProjectionRequest", "ProviderRoleRequirement", "ProviderAvailabilityClass", "ProviderContribution"]
+resolution = "The prior unresolved EpistemicContextProjectionRequest is removed. smart.epistemic.context_projection consumes ContextProviderProjectionRequest."
+
+[[family]]
+owner = "eliot-memory-projection-contracts"
+types = ["CanonicalMemoryReadRequest", "CanonicalMemoryReadSnapshot", "MemoryProjectionRecord", "MemoryQueryIntent", "MemorySelectionPolicy", "MemoryCandidate", "MemoryCandidateSet", "MemorySelectionDimension", "MemorySelectionTrace", "MemoryContextProjectionRequest"]
+
+[[family]]
+owner = "eliot-learning-contracts"
+types = ["SystemExperienceProjectionRequest", "CanonicalExperienceReadSnapshot", "AttemptExperience", "OutcomeAttribution", "FailureObservation", "ExperienceCoverage", "SystemExperienceProjection"]
+
+[[family]]
+owner = "eliot-memory-quality"
+types = ["MemoryEcologyAssessmentRequest", "MemoryEcologyEvidence", "MemoryEcologyAssessment", "MemoryEcologyDimension", "InfluenceStageEvidence", "MemoryOutcomeClass", "MemoryCohortCoverage", "MemoryEcologyActionCandidate", "MemoryGravityAssessmentRequest", "MemoryContextExposure", "MemoryGravityAssessment", "MemoryGravityDimension", "GravityInterventionCandidate"]
+
+[[family]]
+owner = "eliot-dreamer-memory-revision"
+types = ["NegativeMemoryExtinctionRequest", "SafeReexposureEvidence", "NegativeMemoryExtinctionCandidate", "ExtinctionDisposition", "TriggerBoundaryRevision"]
+
+[[family]]
+owner = "eliot-cognitive-quality"
+types = ["SkillLifecycleAssessmentRequest", "SkillLifecycleEvidence", "SkillLifecycleAssessment", "ToolSurfaceAssessmentRequest", "ToolExposureReceiptView", "ToolSurfaceAssessment", "DreamerJobEconomicsRequest", "DreamerJobOutcomeEvidence", "DreamerJobEconomicsAssessment", "EliotSelfQualityViewRequest", "SelfQualityOwnerProjection", "EliotSelfQualityView", "LearningBottleneckEvidence", "LearningBottleneckAssessment", "SelfQualityInterventionCandidate"]
+
+[[family]]
+owner = "eliot-understanding-assessment"
+types = ["CommonGroundAssessmentRequest", "PublicInheritanceSnapshot", "ReconstructedInheritanceSnapshot", "CommonGroundAssessment", "ScopedUnderstandingAssessmentRequest", "ScopedUnderstandingEvidence", "ScopedUnderstandingAssessment", "ScopedUnderstandingStatus"]
+
+[forbidden]
+duplicate_provider_request_type = true
+provider_sdk_type_in_public_contract = true
+stringly_typed_any_json_public_surface = true
+aggregate_confidence_or_intelligence_score = true

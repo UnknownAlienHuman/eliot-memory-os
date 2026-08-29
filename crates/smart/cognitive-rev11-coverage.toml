@@ -1,0 +1,210 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "CLOSED_WORLD_STATIC_COVERAGE"
+unknown_rule = "An unknown job class, candidate kind or curation subtype returns a typed unsupported result. No generic LLM fallback, text inference or catch-all handler is allowed."
+
+[[dreamer_job_class]]
+name = "Orientation"
+common_pipeline = ["smart.dreamer.bundle", "smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+handler = "smart.dreamer.orientation"
+
+[[dreamer_job_class]]
+name = "Curation"
+common_pipeline = ["smart.dreamer.bundle", "smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+handler = "smart.dreamer.curation"
+
+[[dreamer_job_class]]
+name = "Clarification"
+common_pipeline = ["smart.dreamer.bundle", "smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+handler = "smart.dreamer.clarification"
+
+[[dreamer_job_class]]
+name = "ResearchSynthesis"
+common_pipeline = ["smart.dreamer.bundle", "smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+handler = "smart.dreamer.research_synthesis"
+
+[[dreamer_job_class]]
+name = "Architecture"
+common_pipeline = ["smart.dreamer.bundle", "smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+handler = "smart.dreamer.architecture_brief"
+secondary_handler = "smart.dreamer.implementation_brief"
+
+[[dreamer_job_class]]
+name = "DevelopmentDiagnosis"
+common_pipeline = ["smart.dreamer.bundle", "smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+handler = "smart.dreamer.development_diagnosis"
+
+[[dreamer_job_class]]
+name = "Maintenance"
+common_pipeline = ["smart.dreamer.bundle", "smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+handler = "smart.dreamer.maintenance_plan"
+secondary_handler = "smart.dreamer.cycle_plan"
+
+[[dreamer_job_class]]
+name = "OrchestrationPlanning"
+common_pipeline = ["smart.dreamer.bundle", "smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+handler = "smart.dreamer.orchestration_plan"
+secondary_handler = "smart.dreamer.work_decomposition"
+
+[[candidate_kind]]
+name = "Interpretation"
+subtype_required = true
+handlers = ["smart.dreamer.orientation", "smart.dreamer.research_synthesis", "smart.dreamer.conflict_analysis"]
+
+[[candidate_kind]]
+name = "RivalModel"
+subtype_required = false
+handlers = ["smart.dreamer.rival_model"]
+
+[[candidate_kind]]
+name = "Relation"
+subtype_required = false
+handlers = ["smart.dreamer.relation_candidate"]
+
+[[candidate_kind]]
+name = "Classification"
+subtype_required = false
+handlers = ["smart.dreamer.classification"]
+
+[[candidate_kind]]
+name = "Episode"
+subtype_required = false
+handlers = ["smart.dreamer.episode"]
+
+[[candidate_kind]]
+name = "Concept"
+subtype_required = false
+handlers = ["smart.dreamer.concept"]
+
+[[candidate_kind]]
+name = "Procedure"
+subtype_required = true
+handlers = ["smart.dreamer.procedure", "smart.dreamer.skill"]
+
+[[candidate_kind]]
+name = "Failure"
+subtype_required = false
+handlers = ["smart.dreamer.failure"]
+
+[[candidate_kind]]
+name = "Merge"
+subtype_required = false
+handlers = ["smart.dreamer.structure_repair"]
+
+[[candidate_kind]]
+name = "Split"
+subtype_required = false
+handlers = ["smart.dreamer.structure_repair"]
+
+[[candidate_kind]]
+name = "Reconsolidation"
+subtype_required = false
+handlers = ["smart.dreamer.reconsolidation"]
+
+[[candidate_kind]]
+name = "Accessibility"
+subtype_required = false
+handlers = ["smart.dreamer.accessibility"]
+
+[[candidate_kind]]
+name = "Repair"
+subtype_required = true
+handlers = ["smart.dreamer.structure_repair", "smart.dreamer.influence_repair"]
+forbidden_fallbacks = ["runtime repair", "projection rebuild", "Doctor repair", "generic memory repair"]
+
+[[candidate_kind]]
+name = "Clarification"
+subtype_required = false
+handlers = ["smart.dreamer.clarification"]
+
+[[candidate_kind]]
+name = "Probe"
+subtype_required = false
+handlers = ["smart.dreamer.probe_plan"]
+
+[[candidate_kind]]
+name = "Maintenance"
+subtype_required = true
+handlers = ["smart.dreamer.maintenance_plan", "smart.dreamer.cycle_plan"]
+
+[[candidate_kind]]
+name = "WorkPlan"
+subtype_required = true
+handlers = ["smart.dreamer.work_decomposition", "smart.dreamer.orchestration_plan"]
+
+[[curation_subtype]]
+name = "Classification"
+handler = "smart.dreamer.classification"
+output = "ClassificationCandidate"
+
+[[curation_subtype]]
+name = "Relation"
+handler = "smart.dreamer.relation_candidate"
+entrypoint = "build_curation_relation_candidates"
+output = "RelationCandidateSet"
+
+[[curation_subtype]]
+name = "Episode"
+handler = "smart.dreamer.episode"
+output = "EpisodeCandidateSet"
+
+[[curation_subtype]]
+name = "Concept"
+handler = "smart.dreamer.concept"
+output = "ConceptCandidateSet"
+
+[[curation_subtype]]
+name = "Procedure"
+handler = "smart.dreamer.procedure"
+output = "ProcedureCandidateSet"
+
+[[curation_subtype]]
+name = "Skill"
+handler = "smart.dreamer.skill"
+output = "SkillCandidateSet"
+
+[[curation_subtype]]
+name = "FailureFingerprint"
+handler = "smart.dreamer.failure"
+output = "FailureFingerprintCandidateSet"
+
+[[curation_subtype]]
+name = "MergeSplit"
+handler = "smart.dreamer.structure_repair"
+output = "StructureRepairCandidateSet"
+
+[[curation_subtype]]
+name = "Reconsolidation"
+handler = "smart.dreamer.reconsolidation"
+output = "ReconsolidationCandidateSet"
+
+[[curation_subtype]]
+name = "Accessibility"
+handler = "smart.dreamer.accessibility"
+output = "AccessibilityCandidateSet"
+
+[[curation_subtype]]
+name = "InfluenceRepair"
+handler = "smart.dreamer.influence_repair"
+output = "InfluenceRepairCandidateSet"
+
+[relation_semantics]
+owner = "smart.dreamer.relation_candidate"
+shared_core = "build_relation_candidate_set"
+orientation_entrypoint = "build_orientation_relation_candidates"
+curation_entrypoint = "build_curation_relation_candidates"
+rule = "Both entrypoints call the same typed relation semantics. Orientation and Curation cannot fork relation meaning."
+
+[research_boundary]
+acquisition_owner = "Researcher"
+interpretation_owner = "smart.dreamer.research_synthesis"
+admission_and_support_owner = "Governor"
+required_inputs = ["ResearchEvidenceBundle", "AllowedReferenceManifest", "frozen coverage denominator", "exact citations", "counterclaims", "failed acquisition", "State Fence"]
+forbidden = ["provider discovery", "credential use", "network acquisition", "new source expansion", "citation invention", "epistemic promotion"]
+
+[coverage_assertions]
+dreamer_job_classes = 8
+candidate_kinds = 17
+curation_subtypes = 11
+all_handlers_are_cells = true
+all_unknowns_fail_closed = true

@@ -1,0 +1,305 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+range = "19..34"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[cell]]
+order = 19
+id = "smart.cue.contracts"
+stage = "W0_CONTRACT_EVIDENCE"
+physical_crate = "eliot-cue-contracts"
+hot_path = false
+responsibility = "Own provider-neutral cue observation, normalization, binding, immutable index, match, spread and activation contracts."
+public_functions = ["pub fn validate_observed_cue(cue: &ObservedCue) -> Result<(), CueContractError>", "pub fn validate_cue_snapshot(snapshot: &CueSnapshot) -> Result<(), CueContractError>", "pub fn cue_snapshot_digest(snapshot: &CueSnapshot) -> Result<String, CueContractError>"]
+public_types = ["CueKind", "MatchMode", "ComparisonProfileId", "ObservedCue", "NormalizedCue", "CueKey", "CueBindingCandidate", "AdmittedCueBinding", "CueSnapshot", "DirectCueHit", "RelationSpreadHit", "ActivationTrace", "CueActivationResult", "CueLimits"]
+algorithm = ["validate bounded text and collections", "require canonical_value and comparison_key separation", "require exact target and source revision", "bind snapshot to one State Fence and projection revision", "canonicalize output ordering"]
+invariants = ["canonical spelling is never derived from comparison key", "snapshot is a rebuildable projection, not memory state", "direct and spread hits remain distinguishable", "all limits are explicit in the request or policy"]
+degradation = "Represent disabled or unavailable relation spread explicitly while retaining valid direct-hit contracts."
+errors = ["InvalidCue", "InvalidComparisonProfile", "MissingTarget", "FenceMismatch", "StaleProjection", "LimitInvalid"]
+tests = ["path spelling survives roundtrip", "comparison key cannot overwrite canonical value", "snapshot digest ignores input order", "direct and spread traces remain distinct"]
+source_files = ["crates/smart/eliot-cue-contracts/src/contracts.rs", "crates/smart/eliot-cue-contracts/tests/contracts.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+architecture_refs = ["proactive memory cues", "rebuildable derived projections"]
+implementation_refs = ["D3b cue contracts", "zero-edge exact firing"]
+
+[[cell]]
+order = 20
+id = "smart.cue.normalizer"
+stage = "W2_D3B_REACTIVE_CONTEXT"
+physical_crate = "eliot-cues"
+hot_path = true
+responsibility = "Normalize one observed cue into preserved canonical spelling plus a profile-scoped comparison key."
+public_functions = ["pub fn normalize_observed_cue(cue: &ObservedCue, profile: &CueComparisonProfile) -> Result<NormalizedCue, CueNormalizationError>", "pub fn normalize_observed_cues(cues: &[ObservedCue], profile: &CueComparisonProfile, limits: CueLimits) -> Result<Vec<NormalizedCue>, CueNormalizationError>"]
+algorithm = ["validate scope, kind and bounded value", "preserve source canonical_value after separator normalization allowed by kind", "reject dot-dot traversal and invalid signature forms", "derive comparison_key using explicit WorkScope/platform profile", "sort and deduplicate by CueKey while retaining canonical variants"]
+complexity = "O(n log n + total_input_bytes); no filesystem lookup, canonicalize syscall, symlink resolution, I/O or model call."
+invariants = ["Windows case folding is profile-specific", "Git/source spelling remains available", "path comparison cannot grant resource identity", "capture and fire use the same function"]
+degradation = "Return typed UnsupportedProfile or InvalidCue; never silently fall back to global lowercasing."
+errors = ["InvalidText", "TraversalSegment", "InvalidSignature", "UnsupportedProfile", "LimitExceeded"]
+tests = ["mixed-case path preserves canonical spelling", "Windows comparison key matches profile", "case-sensitive profile keeps distinction", "dot-dot path rejected"]
+source_files = ["crates/smart/eliot-cues/src/normalizer.rs", "crates/smart/eliot-cues/tests/normalizer.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+architecture_refs = ["resource identity is governed", "exact cues"]
+implementation_refs = ["D3b cue normalization", "WorkScope comparison profile"]
+
+[[cell]]
+order = 21
+id = "smart.cue.binding"
+stage = "W2_D3B_REACTIVE_CONTEXT"
+physical_crate = "eliot-cues"
+hot_path = false
+responsibility = "Construct bounded cue-binding candidates from owner-produced canonical target projections without publishing the index."
+public_functions = ["pub fn build_cue_binding_candidates(source: &CueBindingSourceProjection, cues: &[NormalizedCue], policy: &CueBindingPolicy) -> Result<CueBindingCandidateSet, CueBindingError>"]
+algorithm = ["validate source owner, target handle, revision and State Fence", "map eligible explicit cues and deterministic derived cues", "attach target kind, strength, freshness, negative-memory flag and lineage", "deduplicate exact binding identity", "return proposals for Governor admission"]
+invariants = ["binding is a candidate, not an admitted projection row", "no target payload is copied into the cue index", "negative-memory marker does not itself grant influence", "derived cue rules are closed and versioned"]
+degradation = "Omit only invalid optional derived cues with typed reasons; invalid target identity fails the set."
+errors = ["SourceProjectionInvalid", "TargetMissing", "RuleVersionUnknown", "FenceMismatch", "TooManyBindings"]
+tests = ["candidate cannot bypass Governor admission", "touched-file derivation deterministic", "unknown target rejected", "negative memory keeps lineage"]
+source_files = ["crates/smart/eliot-cues/src/binding.rs", "crates/smart/eliot-cues/tests/binding.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+architecture_refs = ["derived projection", "Governor admission"]
+implementation_refs = ["D3b cue binding"]
+
+[[cell]]
+order = 22
+id = "smart.cue.index"
+stage = "W2_D3B_REACTIVE_CONTEXT"
+physical_crate = "eliot-cues"
+hot_path = false
+responsibility = "Build an immutable deterministic cue snapshot from admitted bindings and typed optional relation edges."
+public_functions = ["pub fn build_cue_snapshot(revision: CueProjectionRevision, fence: &StateFence, bindings: &[AdmittedCueBinding], edges: &[AdmittedActivationEdge], limits: CueLimits) -> Result<CueSnapshot, CueIndexError>"]
+algorithm = ["validate one compatible fence and non-future source revisions", "index exact and allowed-prefix keys separately", "validate typed relation edges and bounded fan-out", "sort rows and adjacency lists by canonical identities", "compute content digest"]
+invariants = ["only admitted bindings enter the snapshot", "snapshot owns no canonical payload or lifecycle", "rebuild from same inputs is byte-identical", "edge absence is valid"]
+degradation = "Drop an optional invalid edge only when policy marks it isolated and report it; invalid binding or mixed fence fails closed."
+errors = ["UnadmittedBinding", "FenceMismatch", "FutureRevision", "DuplicateBinding", "EdgeInvalid", "FanoutExceeded"]
+tests = ["candidate binding rejected", "zero-edge snapshot valid", "rebuild deterministic", "mixed fence rejected"]
+source_files = ["crates/smart/eliot-cues/src/index.rs", "crates/smart/eliot-cues/tests/index.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+architecture_refs = ["rebuildable index", "single canonical memory owner"]
+implementation_refs = ["D3b immutable Cue Index"]
+
+[[cell]]
+order = 23
+id = "smart.cue.direct_match"
+stage = "W2_D3B_REACTIVE_CONTEXT"
+physical_crate = "eliot-cues"
+hot_path = true
+responsibility = "Match normalized observed cues against exact, allowed-prefix and canonical-signature rows without graph dependency."
+public_functions = ["pub fn match_direct_cues(snapshot: &CueSnapshot, observed: &[NormalizedCue], request: &CueMatchRequest) -> Result<DirectCueMatchResult, CueMatchError>"]
+algorithm = ["validate snapshot revision and compatible State Fence", "perform exact-key lookup", "perform kind-authorized prefix lookup", "perform canonical signature lookup", "filter inactive, stale or non-influential projection rows", "sort direct hits by negative-memory priority, match strength and target identity"]
+complexity = "O(k log n + h log h) with request-bounded cues and hits; no edge traversal, I/O, allocation proportional to full corpus or model call."
+invariants = ["exact cue firing works with zero edges", "direct hit score is not reduced by graph state", "negative-memory exact hits remain visible", "session delivery dedup is not owned here"]
+degradation = "If relation graph is unavailable nothing changes; stale snapshot returns typed revalidation requirement."
+errors = ["SnapshotStale", "FenceMismatch", "ObservedCueLimit", "HitLimit", "InvalidMatchMode"]
+tests = ["zero-edge exact firing", "prefix only for authorized kinds", "stale row suppressed with trace", "negative exact ordered first"]
+source_files = ["crates/smart/eliot-cues/src/direct_match.rs", "crates/smart/eliot-cues/tests/direct_match.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+architecture_refs = ["proactive exact cues", "negative memory"]
+implementation_refs = ["D3b zero-edge exact firing"]
+
+[[cell]]
+order = 24
+id = "smart.cue.relation_spread"
+stage = "W2_D3B_REACTIVE_CONTEXT"
+physical_crate = "eliot-cues"
+hot_path = true
+responsibility = "Optionally expand direct cue hits over a bounded typed relation graph without altering direct results."
+public_functions = ["pub fn expand_cue_activation(snapshot: &CueSnapshot, direct: &DirectCueMatchResult, policy: &RelationSpreadPolicy) -> Result<RelationSpreadResult, RelationSpreadError>"]
+algorithm = ["return Disabled when policy disables spread", "seed only from direct target handles", "traverse allowed relation types to max depth and max fan-out", "use best admissible single-path contribution rather than popularity sum", "stop at max expanded hits", "retain complete path and suppression trace"]
+complexity = "O(min(reachable, max_nodes + max_edges) log max_hits); all limits are positive and request-bound."
+invariants = ["direct hits are immutable inputs", "multiple paths cannot manufacture popularity authority", "cycles terminate", "edge type and direction are explicit"]
+degradation = "Unavailable or invalid graph yields SpreadUnavailable plus unchanged direct results."
+errors = ["SnapshotMismatch", "PolicyInvalid", "EdgeTypeDenied", "TraversalLimit", "CycleInvariant"]
+tests = ["disabled spread preserves direct hits", "cycle terminates", "best path wins without score summation", "graph failure is local degradation"]
+source_files = ["crates/smart/eliot-cues/src/relation_spread.rs", "crates/smart/eliot-cues/tests/relation_spread.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+architecture_refs = ["bounded spreading activation", "no popularity truth"]
+implementation_refs = ["D3b optional relation spread"]
+
+[[cell]]
+order = 25
+id = "smart.cue.activation"
+stage = "W2_D3B_REACTIVE_CONTEXT"
+physical_crate = "eliot-cues"
+hot_path = true
+responsibility = "Assemble direct and optional spread results into one bounded activation result and trace without fetching memory payloads."
+public_functions = ["pub fn assemble_cue_activation(direct: DirectCueMatchResult, spread: RelationSpreadResult, limits: CueLimits) -> Result<CueActivationResult, CueActivationError>"]
+algorithm = ["validate shared snapshot identity", "retain all direct hits before expanded hits", "deduplicate target handles while preserving direct provenance", "apply final hit bound with explicit overflow", "emit direct/spread/suppression trace"]
+invariants = ["direct hit can never be removed by spread", "activation result contains handles only", "score does not become epistemic support", "no context or storage read"]
+degradation = "Assemble direct-only result when spread is Disabled or Unavailable."
+errors = ["SnapshotMismatch", "DirectHitLost", "LimitInvalid", "TraceInvalid"]
+tests = ["direct-only success", "duplicate spread target retains direct trace", "overflow explicit", "score cannot alter source status"]
+source_files = ["crates/smart/eliot-cues/src/activation.rs", "crates/smart/eliot-cues/tests/activation.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+architecture_refs = ["cue activation yields candidates", "epistemic separation"]
+implementation_refs = ["D3b activation result"]
+
+[[cell]]
+order = 26
+id = "smart.context.contracts.candidate"
+stage = "W0_CONTRACT_EVIDENCE"
+physical_crate = "eliot-context-contracts"
+hot_path = false
+responsibility = "Own whole context atoms, provider contributions, expected-decision-delta algebra and coverage denominators."
+public_functions = ["pub fn validate_context_candidate_set(set: &ContextCandidateSet) -> Result<(), ContextContractError>"]
+public_types = ["ContextRole", "ContextAtom", "ContextRepresentation", "DecisionDeltaEstimate", "ProviderId", "ProviderCoverage", "ProviderContribution", "ContextCandidateSet", "DecisionSafetyFloor"]
+algorithm = ["validate whole addressable atom and exact source handles", "require owner-provided coverage state and denominator", "represent decision delta as Known, BoundedRange or Unknown", "validate one compatible State Fence", "canonicalize provider and atom ordering"]
+invariants = ["atom is never cut mid-unit", "Unknown decision delta is not zero", "missing provider is distinguishable from empty complete result", "candidate payload grants no authority"]
+degradation = "Partial or unavailable provider coverage remains an explicit contribution state."
+errors = ["AtomInvalid", "MissingLineage", "FenceMismatch", "ProviderCoverageMissing", "DuplicateAtom", "UnboundedSet"]
+tests = ["unknown delta survives roundtrip", "missing provider differs from empty provider", "whole-unit identity stable", "mixed fence rejected"]
+source_files = ["crates/smart/eliot-context-contracts/src/candidate.rs", "crates/smart/eliot-context-contracts/tests/candidate.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+architecture_refs = ["whole-unit context", "provider coverage", "Decision Safety Floor"]
+implementation_refs = ["Context Compiler candidate set"]
+
+[[cell]]
+order = 27
+id = "smart.context.contracts.admission"
+stage = "W0_CONTRACT_EVIDENCE"
+physical_crate = "eliot-context-contracts"
+hot_path = false
+responsibility = "Own admission recipe, headroom, dispositions, omission reasons and admitted set contracts."
+public_functions = ["pub fn validate_context_recipe(recipe: &ContextRecipe) -> Result<(), ContextContractError>", "pub fn validate_admitted_context_set(set: &AdmittedContextSet) -> Result<(), ContextContractError>"]
+public_types = ["ContextRecipe", "RouteBudget", "DownstreamHeadroom", "AdmissionDisposition", "AdmissionDecision", "OmissionReason", "ExpansionHandle", "AdmittedContextSet", "SelectionIntegrityRecord"]
+algorithm = ["validate positive route budget and reserved headroom", "require all Safety Floor roles and fallback representations", "require one disposition for every input atom", "validate reversible omissions and exact expansion handles", "bind selection to candidate-set digest"]
+invariants = ["required atom is payload, handle, warned or compilation fails", "headroom is reserved before optional allocation", "quarantine differs from suppression", "selection record does not claim runtime delivery"]
+degradation = "A bounded handle representation is permitted only when the contract says the decision role remains intelligible."
+errors = ["BudgetInvalid", "HeadroomInvalid", "SafetyFloorIncomplete", "CandidateDigestMismatch", "MissingDisposition", "IrreversibleOmission"]
+tests = ["missing Safety Floor role rejected", "zero headroom rejected", "every candidate receives disposition", "omission without expansion handle rejected"]
+source_files = ["crates/smart/eliot-context-contracts/src/admission.rs", "crates/smart/eliot-context-contracts/tests/admission.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+architecture_refs = ["Decision Safety Floor", "reversible omission"]
+implementation_refs = ["whole-unit budgeting", "downstream headroom"]
+
+[[cell]]
+order = 28
+id = "smart.context.contracts.view_quality"
+stage = "W0_CONTRACT_EVIDENCE"
+physical_crate = "eliot-context-contracts"
+hot_path = false
+responsibility = "Own immutable Active Understanding View, decision-local tail, pending injection plan and dimensioned quality contracts."
+public_functions = ["pub fn validate_active_understanding_view(view: &ActiveUnderstandingView) -> Result<(), ContextContractError>", "pub fn validate_packet_quality(scorecard: &PacketQualityScorecard) -> Result<(), ContextContractError>"]
+public_types = ["ContextSection", "ActiveUnderstandingView", "OmissionManifest", "PacketQualityDimension", "QualityResult", "PacketQualityScorecard", "DecisionLocalTail", "PendingContextInjectionPlan", "DeliveryCapabilityClass"]
+algorithm = ["validate section role order and admitted-set identity", "retain omission and expansion manifests", "validate each quality dimension independently", "bind decision tail and delivery plan to exact view digest"]
+invariants = ["no scalar quality score", "quality assessor cannot change membership", "delivery plan is not a DeliveryReceipt", "route/token measurement may be Inconclusive"]
+degradation = "Unknown tokenizer, host hook or provider coverage produces explicit Inconclusive dimensions and a narrower delivery plan."
+errors = ["ViewDigestMismatch", "SectionOrderInvalid", "QualityDimensionMissing", "TailMismatch", "DeliveryCapabilityInvalid"]
+tests = ["single failed dimension remains visible", "view membership immutable", "unknown tokenizer not Pass", "plan cannot claim delivery"]
+source_files = ["crates/smart/eliot-context-contracts/src/view_quality.rs", "crates/smart/eliot-context-contracts/tests/view_quality.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+architecture_refs = ["Active Understanding View", "dimensioned PacketQualityScorecard"]
+implementation_refs = ["Context Compiler output", "Decision-Local Tail"]
+
+[[cell]]
+order = 29
+id = "smart.context.contribution_merge"
+stage = "W2_D3B_REACTIVE_CONTEXT"
+physical_crate = "eliot-context"
+hot_path = true
+responsibility = "Merge bounded owner-produced context contributions into one candidate set without storage retrieval, ranking or membership decisions."
+public_functions = ["pub fn merge_context_contributions(request: &ContextCompilationRequest, contributions: &[ProviderContribution], limits: ContextLimits) -> Result<ContextCandidateSet, ContextMergeError>"]
+algorithm = ["validate request, provider identities and compatible fences", "require expected provider coverage records", "deduplicate atoms only by stable atom identity and identical digest", "retain conflicting payloads as conflict candidates", "sort providers and atoms canonically", "compute candidate-set digest"]
+complexity = "O(p + n log n) for bounded providers and atoms; no storage, graph, model or provider calls."
+invariants = ["merge does not fetch missing providers", "merge does not rank or admit", "conflicting same-id payloads cannot overwrite", "provider denominator is preserved"]
+degradation = "Unavailable providers remain explicit coverage entries; conflicting identities fail affected atoms without erasing other providers."
+errors = ["RequestInvalid", "ProviderDuplicate", "FenceMismatch", "AtomIdentityConflict", "ProviderCoverageMissing", "LimitExceeded"]
+tests = ["missing provider visible", "conflicting atom not last-write-wins", "input permutation invariant", "no membership decision emitted"]
+source_files = ["crates/smart/eliot-context/src/contribution_merge.rs", "crates/smart/eliot-context/tests/contribution_merge.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+architecture_refs = ["owner-produced projections", "single state owner"]
+implementation_refs = ["Context Compiler contribution merge"]
+
+[[cell]]
+order = 30
+id = "smart.context.admission"
+stage = "W2_D3B_REACTIVE_CONTEXT"
+physical_crate = "eliot-context"
+hot_path = true
+responsibility = "Select whole context units under Safety Floor, headroom, provider fairness, uncertainty and influence constraints."
+public_functions = ["pub fn admit_context_candidates(candidates: &ContextCandidateSet, recipe: &ContextRecipe) -> Result<AdmittedContextSet, ContextAdmissionError>"]
+algorithm = ["validate candidate digest, recipe and fence", "reserve downstream headroom", "quarantine denied influence and mark stale material for revalidation", "admit mandatory Safety Floor atoms or exact intelligible handles first", "allocate optional budget in deterministic provider-fair rounds", "retain rivals, unknowns and negative memory against ordinary shedding", "emit one disposition and reason per candidate"]
+complexity = "O(n log n + n * bounded_provider_rounds); no I/O or model call."
+invariants = ["whole atoms only", "unknown decision delta is never treated as zero", "one verbose provider cannot consume all optional budget", "required role cannot silently disappear", "headroom remains reserved"]
+degradation = "If mandatory material cannot fit as payload or valid handle, return SafetyFloorUnrepresentable rather than a misleading view."
+errors = ["CandidateDigestMismatch", "FenceMismatch", "SafetyFloorUnrepresentable", "HeadroomExhausted", "InfluenceDenied", "RecipeInvalid"]
+tests = ["permutation invariance", "provider fairness", "required atom handle fallback", "unknown delta not dropped as zero", "headroom preserved"]
+source_files = ["crates/smart/eliot-context/src/admission.rs", "crates/smart/eliot-context/tests/admission.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+architecture_refs = ["Decision Safety Floor", "whole-unit budgeting", "uncertainty visibility"]
+implementation_refs = ["Context admission", "Packet Selection Integrity"]
+
+[[cell]]
+order = 31
+id = "smart.context.assembly"
+stage = "W2_D3B_REACTIVE_CONTEXT"
+physical_crate = "eliot-context"
+hot_path = true
+responsibility = "Render an immutable role-preserving Active Understanding View from an already admitted set without changing membership."
+public_functions = ["pub fn assemble_active_understanding_view(admitted: &AdmittedContextSet, layout: &ContextLayout) -> Result<ActiveUnderstandingView, ContextAssemblyError>"]
+algorithm = ["validate admitted-set and layout identities", "render sections in fixed role order", "render warnings and revalidation markers without rewriting payload semantics", "emit exact handle-only and omission manifests", "compute view digest"]
+complexity = "O(n log n + total_rendered_bytes); no ranking, admission, I/O or model call."
+invariants = ["membership and dispositions are immutable", "assembly never reruns Context Compiler admission", "role labels preserve epistemic meaning", "omitted items remain expandable"]
+degradation = "A rendering failure for optional payload may use its admitted handle representation; required unrenderable material fails closed."
+errors = ["AdmittedSetInvalid", "LayoutInvalid", "MembershipMutation", "RequiredRenderFailure", "ViewTooLarge"]
+tests = ["role order stable", "membership unchanged", "omission manifest exact", "required render failure stops assembly"]
+source_files = ["crates/smart/eliot-context/src/assembly.rs", "crates/smart/eliot-context/tests/assembly.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+architecture_refs = ["Active Understanding View", "role-preserving context"]
+implementation_refs = ["Context assembly"]
+
+[[cell]]
+order = 32
+id = "smart.context.quality"
+stage = "W2_D3B_REACTIVE_CONTEXT"
+physical_crate = "eliot-context"
+hot_path = true
+responsibility = "Independently assess dimensioned packet quality over the immutable candidate, admission and view records."
+public_functions = ["pub fn assess_context_quality(candidates: &ContextCandidateSet, admitted: &AdmittedContextSet, view: &ActiveUnderstandingView, measurements: &ContextMeasurements) -> Result<PacketQualityScorecard, ContextQualityError>"]
+algorithm = ["verify immutable identities across inputs", "assess goal, epistemic, provenance, fence, uncertainty and Safety Floor coverage", "assess decision readiness, whole-unit integrity, provider denominator, headroom and reversible omission", "assess route/token measurement validity separately", "return Pass, Fail, Inconclusive or NotApplicable per dimension"]
+complexity = "O(n log n); no mutation, I/O, tokenizer call or model call."
+invariants = ["quality cannot alter membership", "no aggregate score", "unknown measurement is Inconclusive", "provider coverage uses declared denominator"]
+degradation = "Return partial scorecard with Inconclusive dimensions when external measurements are absent."
+errors = ["IdentityMismatch", "MissingDimensionInput", "ViewMutationDetected", "MeasurementInvalid"]
+tests = ["failed Safety Floor visible despite other passes", "missing tokenizer Inconclusive", "provider denominator checked", "assessor output cannot modify view"]
+source_files = ["crates/smart/eliot-context/src/quality.rs", "crates/smart/eliot-context/tests/quality.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+architecture_refs = ["dimensioned quality", "Decision Safety Floor"]
+implementation_refs = ["PacketQualityScorecard"]
+
+[[cell]]
+order = 33
+id = "smart.context.decision_tail"
+stage = "W2_D3B_REACTIVE_CONTEXT"
+physical_crate = "eliot-context"
+hot_path = true
+responsibility = "Build the final bounded decision-local projection naming goal, scope, load-bearing evidence, next action, observable, verifier and stop condition."
+public_functions = ["pub fn build_decision_local_tail(view: &ActiveUnderstandingView, boundary: &DecisionBoundary, limits: ContextLimits) -> Result<DecisionLocalTail, DecisionTailError>"]
+algorithm = ["validate exact view and boundary identity", "select current goal and acceptance", "select exact load-bearing atoms and do-not-use/revalidate items", "render next action, expected observable, verifier and stop/revision condition", "retain active conflict, recovery or security directive", "attach expansion handles"]
+complexity = "O(n log n) over bounded view units; no new retrieval, admission or model call."
+invariants = ["tail does not invent next action authority", "verifier is explicit", "security and recovery directive cannot be shed", "tail points back to view digest"]
+degradation = "If next action is not admitted, emit DecisionBlocked with the exact missing dependency rather than fabricate one."
+errors = ["ViewMismatch", "BoundaryInvalid", "GoalMissing", "VerifierMissing", "DecisionBlocked", "TailTooLarge"]
+tests = ["verifier required", "security directive retained", "blocked action explicit", "tail digest binds view"]
+source_files = ["crates/smart/eliot-context/src/decision_tail.rs", "crates/smart/eliot-context/tests/decision_tail.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+architecture_refs = ["Decision-Local Tail", "next action and verifier"]
+implementation_refs = ["R5 decision boundary"]
+
+[[cell]]
+order = 34
+id = "smart.context.reactive_delivery_plan"
+stage = "W2_D3B_REACTIVE_CONTEXT"
+physical_crate = "eliot-context"
+hot_path = true
+responsibility = "Plan bounded context delivery for the actual host capability class without sending, deduplicating or claiming prevention."
+public_functions = ["pub fn plan_reactive_context_injection(view: &ActiveUnderstandingView, tail: &DecisionLocalTail, host: &HostContextCapabilitySnapshot, policy: &ReactiveContextPolicy) -> Result<PendingContextInjectionPlan, ReactivePlanError>"]
+algorithm = ["validate exact view/tail and host capability revision", "choose pre-action delivery only for event-integrated host", "choose next-boundary delivery for tool-only host", "otherwise propose durable attention obligation", "attach payload/handle selection, deadline, dedup key suggestion and receipt requirement"]
+complexity = "O(1) plus bounded handle sorting; no host call, session mutation, delivery or receipt creation."
+invariants = ["plan is not DeliveryReceipt", "session dedup owner remains external", "tool-only host cannot claim pre-action prevention", "host capability is exact and revisioned"]
+degradation = "Return AttentionOnly or UnsupportedHostCapability with explicit limitation."
+errors = ["ViewTailMismatch", "HostCapabilityStale", "PolicyInvalid", "DeliveryModeUnsupported"]
+tests = ["event host may plan pre-action", "tool-only host uses next boundary", "no hook cannot claim prevention", "plan contains receipt requirement but no receipt"]
+source_files = ["crates/smart/eliot-context/src/reactive_plan.rs", "crates/smart/eliot-context/tests/reactive_plan.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+architecture_refs = ["proactive context", "honest host capability"]
+implementation_refs = ["reactive context delivery plan"]
