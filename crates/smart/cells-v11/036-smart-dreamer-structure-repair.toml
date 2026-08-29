@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.structure_repair"
+agent_order = 36
+physical_package = "eliot-dreamer-memory-structure"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Propose merge or split identity repair while retaining old identities, lineage and rollback."
+
+[agent]
+objective = "Implement identity merge/split proposals only; never rewrite or delete canonical history."
+write_scope = ["crates/smart/eliot-dreamer-memory-structure/src/structure_repair.rs", "crates/smart/eliot-dreamer-memory-structure/tests/structure_repair.rs"]
+integration_owner = "Dreamer memory structure integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-memory-structure/src/lib.rs", "crates/smart/eliot-dreamer-memory-structure/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_structure_repair_candidate(request: &StructureRepairRequest, draft: &AdmittedDreamDraft) -> Result<StructureRepairCandidate, StructureRepairError>"]
+
+[algorithm]
+steps = [
+  "Validate all identities, revisions, references and fence.",
+  "For merge require semantic equivalence, scope compatibility and counterexample review.",
+  "For split require distinct applicability or contradiction boundaries.",
+  "Retain previous identities as addressable lineage.",
+  "Emit forward migration, dependent-reference plan, rollback and invalidation."
+]
+
+[limits]
+rules = ["Use explicit identity and dependency maxima.", "Perform no canonical rewrite or delete."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "EquivalenceNotEstablished", "SplitBoundaryMissing", "DependencyClosureMissing", "RollbackMissing"]
+
+[forbidden]
+operations = ["merge by similarity", "identity deletion", "raw history rewrite", "dependency inference by convenience", "canonical mutation"]
+
+[tests]
+required = ["similarity alone cannot justify merge", "split retains original lineage", "dependent references must be enumerated", "rollback is mandatory"]
+
+[integration]
+provider = "smart.dreamer.draft_admission and exact dependency projection owner"
+consumer = "smart.dreamer.curation_dispatch and Governor/Human review owner"
+product_pulse = "D3C_CURATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if equivalence/split boundary or exact dependency closure cannot be established."
