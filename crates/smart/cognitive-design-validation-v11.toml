@@ -1,0 +1,97 @@
+schema_version = "eliot-cognitive-design-validation-v11"
+status = "REQUIRED_BEFORE_ASSIGNMENT"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+issue = "github:UnknownAlienHuman/eliot-memory-os#94"
+
+authoritative_cell_sets = [
+  "crates/smart/cognitive-hot-path-cells-v11.toml",
+  "crates/smart/cognitive-dreamer-core-cells-v11.toml"
+]
+
+required_checks = [
+  "All TOML parses.",
+  "Cell ids and orders are unique and cover exactly 1 through 27.",
+  "Each cell has exactly one physical package and one causal property.",
+  "Each cell has at least one exact public Rust signature.",
+  "Each cell has typed errors, explicit bounds, forbidden effects and at least three discriminating tests.",
+  "Worker write scopes never overlap and never contain src/lib.rs or Cargo.toml.",
+  "Decision-boundary hot cells contain no async, provider, model, storage, filesystem, network, lock or unbounded traversal contract.",
+  "Every model cell is candidate-only and cannot create canonical, support, authority, finish or effect outcomes.",
+  "Every package exists for a declared contract, dependency, proof, deployment or replacement seam.",
+  "Every fold or retire decision names an integration owner and migration gate.",
+  "Architecture and Implementation anchors resolve in the accepted normative pair.",
+  "Root Cargo.toml and Cargo.lock remain unchanged.",
+  "No Rust, Markdown, archive, bootstrap workflow or probe payload is introduced by this design wave."
+]
+
+[closed_world_coverage]
+hot_path = [
+  "governor.observation.classifier",
+  "smart.epistemic.position",
+  "smart.cue.normalization",
+  "smart.cue.direct_match",
+  "smart.cue.activation",
+  "smart.context.contribution_merge",
+  "smart.context.admission",
+  "smart.context.quality",
+  "smart.context.view_assembly",
+  "smart.context.decision_tail",
+  "smart.context.reactive_plan"
+]
+
+dreamer_common_pipeline = [
+  "smart.dreamer.bundle",
+  "smart.dreamer.claim_grounding",
+  "smart.dreamer.transformation_validation",
+  "smart.dreamer.draft_admission"
+]
+
+orientation_pipeline = [
+  "smart.epistemic.position",
+  "smart.dreamer.rival_model",
+  "smart.dreamer.relation",
+  "smart.dreamer.probe_plan",
+  "smart.dreamer.clarification",
+  "smart.dreamer.orientation"
+]
+
+reactive_context_pipeline = [
+  "smart.cue.normalization",
+  "smart.cue.direct_match",
+  "smart.cue.relation_spread",
+  "smart.cue.activation",
+  "smart.context.contribution_merge",
+  "smart.context.admission",
+  "smart.context.quality",
+  "smart.context.view_assembly",
+  "smart.context.decision_tail",
+  "smart.context.reactive_plan"
+]
+
+research_pipeline = [
+  "smart.dreamer.bundle",
+  "smart.dreamer.claim_grounding",
+  "smart.dreamer.transformation_validation",
+  "smart.dreamer.draft_admission",
+  "smart.dreamer.research_synthesis"
+]
+
+[assignment_gate]
+required = [
+  "Issue #94 remains open and owns the wave.",
+  "The branch contains direct TOML artifacts, not an archive or bootstrap workflow.",
+  "The branch is based on or rebased onto current main before assignment.",
+  "The package integration owner approves physical fold and retirement decisions.",
+  "An agent receives exactly one cell id and its worker write scope.",
+  "Package proof, affected Edge Proof and the named Product Pulse remain mandatory after Rust implementation."
+]
+
+[fail_closed]
+conditions = [
+  "Missing cell record blocks assignment.",
+  "Module/API disagreement blocks assignment; the v11 cell record is the only authority.",
+  "Unknown subtype blocks dispatch instead of invoking a generic LLM fallback.",
+  "Missing denominator yields INCONCLUSIVE, never PASS.",
+  "Missing host interception capability forbids a pre-action prevention claim.",
+  "Missing Research coverage forbids a no-match conclusion."
+]
