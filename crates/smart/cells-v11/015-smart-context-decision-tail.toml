@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.context.decision_tail"
+agent_order = 15
+physical_package = "eliot-context-view"
+execution_class = "DECISION_BOUNDARY_HOT"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Derive the final decision-local projection with next action, observable, verifier and stop or revision condition."
+
+[agent]
+objective = "Implement one decision boundary only; do not execute or perform long-horizon replanning."
+write_scope = ["crates/smart/eliot-context-view/src/decision_tail.rs", "crates/smart/eliot-context-view/tests/decision_tail.rs"]
+integration_owner = "Context view integration owner"
+forbidden_files = ["crates/smart/eliot-context-view/src/lib.rs", "crates/smart/eliot-context-view/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_decision_local_tail(request: &DecisionTailRequest, view: &ActiveUnderstandingView) -> Result<DecisionLocalTail, DecisionTailError>"]
+
+[algorithm]
+steps = [
+  "Validate view identity and task/fence binding.",
+  "Select only already represented load-bearing atoms and handles.",
+  "Require goal and acceptance, next action, expected observable, verifier and stop or revision condition.",
+  "Include active conflicts, do-not-use or revalidate items and expansion handles.",
+  "Fail visibly when no safe next action can be represented."
+]
+
+[limits]
+rules = ["Use bounded view sections.", "Plan only the declared next boundary."]
+
+[errors]
+variants = ["ViewMismatch", "FenceMismatch", "MissingGoal", "MissingVerifier", "MissingStopCondition", "UnsafeNextAction"]
+
+[forbidden]
+operations = ["effect execution", "new evidence retrieval", "long-horizon replanning", "finish decision", "storage call", "model call", "blocking I/O"]
+
+[tests]
+required = ["tail without verifier is rejected", "active conflict remains visible", "unsafe next action returns typed failure", "view membership remains unchanged"]
+
+[integration]
+provider = "smart.context.view_assembly"
+consumer = "smart.context.reactive_plan and external agent decision owner"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if goal, acceptance, verifier or stop/revision contract is absent."
