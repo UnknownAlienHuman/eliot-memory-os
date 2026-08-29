@@ -1,0 +1,15 @@
+[package]
+name = "eliot-dreamer-validation"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[dependencies]
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
+
+[package.metadata.eliot]
+status = "prototype-no-rust"
+workspace_admission = "blocked-until-module-edge-and-product-proof"
+cells = "smart.dreamer.claim_grounding,smart.dreamer.transformation_validation,smart.dreamer.draft_admission"
+integration_owner = "Dream Transformation Validation Owner"
