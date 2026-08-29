@@ -14,7 +14,7 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_governor::KernelTransitionPort;
 use eliotd::{
@@ -76,7 +76,7 @@ pub(super) fn run() -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     kernel.report_ready().map_err(|error| error.to_string())?;
     let status = composition.status();
-    write_json(&ready_message(&status));
+    write_json(&ready_message(&status))?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -86,39 +86,45 @@ pub(super) fn run() -> Result<(), String> {
     let shutdown_result = composition.shutdown().map_err(|error| error.to_string());
     match (loop_result, shutdown_result) {
         (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => {
-            let _ = kernel.report_degraded(error.clone());
-            write_json(&ReadyMessage::Degraded {
-                service: SERVICE_NAME,
-                protocol: PROTOCOL_VERSION,
-                reason: error.clone(),
-            });
-            let _ = kernel.report_fatal(error.clone());
-            write_json(&ReadyMessage::Fatal {
-                service: SERVICE_NAME,
-                protocol: PROTOCOL_VERSION,
-                reason: error.clone(),
-            });
-            Err(error)
-        }
-        (Ok(()), Err(error)) => Err(error),
-        (Err(error), Err(shutdown_error)) => {
-            let combined = format!("{error}; shutdown: {shutdown_error}");
-            let _ = kernel.report_degraded(combined.clone());
-            write_json(&ReadyMessage::Degraded {
-                service: SERVICE_NAME,
-                protocol: PROTOCOL_VERSION,
-                reason: combined.clone(),
-            });
-            let _ = kernel.report_fatal(combined.clone());
-            write_json(&ReadyMessage::Fatal {
-                service: SERVICE_NAME,
-                protocol: PROTOCOL_VERSION,
-                reason: combined.clone(),
-            });
-            Err(combined)
-        }
+        (Err(error), Ok(())) => Err(report_terminal_failure(&kernel, error)),
+        (Ok(()), Err(error)) => Err(report_terminal_failure(&kernel, error)),
+        (Err(error), Err(shutdown_error)) => Err(report_terminal_failure(
+            &kernel,
+            format!("{error}; shutdown: {shutdown_error}"),
+        )),
     }
+}
+
+fn report_terminal_failure(kernel: &DaemonKernelClient, reason: String) -> String {
+    let mut terminal = reason.clone();
+    if let Err(error) = kernel.report_degraded(reason.clone()) {
+        append_failure(&mut terminal, "Kernel degraded report", error);
+    }
+    if let Err(error) = write_json(&ReadyMessage::Degraded {
+        service: SERVICE_NAME,
+        protocol: PROTOCOL_VERSION,
+        reason: reason.clone(),
+    }) {
+        append_failure(&mut terminal, "degraded status output", error);
+    }
+    if let Err(error) = kernel.report_fatal(reason.clone()) {
+        append_failure(&mut terminal, "Kernel fatal report", error);
+    }
+    if let Err(error) = write_json(&ReadyMessage::Fatal {
+        service: SERVICE_NAME,
+        protocol: PROTOCOL_VERSION,
+        reason,
+    }) {
+        append_failure(&mut terminal, "fatal status output", error);
+    }
+    terminal
+}
+
+fn append_failure(target: &mut String, context: &str, error: impl std::fmt::Display) {
+    target.push_str("; ");
+    target.push_str(context);
+    target.push_str(": ");
+    target.push_str(&error.to_string());
 }
 
 struct LaunchArgs {
@@ -197,7 +203,7 @@ async fn run_loop(
                     .await
                     .map_err(|error| format!("Kernel activation ticket claim: {error}"))?
                 {
-                    let now = unix_ms();
+                    let now = unix_ms(SystemTime::now())?;
                     if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
                         // Kernel owns the typed expiry outcome.  Do not call
                         // the resolver at or after its exact deadline.
@@ -222,13 +228,14 @@ async fn run_loop(
     }
 }
 
-fn unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+fn unix_ms(now: SystemTime) -> Result<u64, String> {
+    let elapsed = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("daemon activation clock precedes Unix epoch: {error}"))?;
+    elapsed
         .as_millis()
         .try_into()
-        .unwrap_or(u64::MAX)
+        .map_err(|_| "daemon activation clock exceeds u64 milliseconds".to_owned())
 }
 
 fn activation_deadline_expired(now: u64, deadline: u64) -> bool {
@@ -246,12 +253,22 @@ fn ready_message(status: &DaemonStatus) -> ReadyMessage {
     }
 }
 
-pub(super) fn write_json(message: &ReadyMessage) {
+pub(super) fn write_json(message: &ReadyMessage) -> Result<(), String> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    let _ = serde_json::to_writer(&mut output, message);
-    let _ = output.write_all(b"\n");
-    let _ = output.flush();
+    write_json_to(&mut output, message)
+}
+
+fn write_json_to(output: &mut impl Write, message: &ReadyMessage) -> Result<(), String> {
+    serde_json::to_writer(&mut *output, message)
+        .map_err(|error| format!("daemon status encode/write: {error}"))?;
+    output
+        .write_all(b"\n")
+        .map_err(|error| format!("daemon status delimiter write: {error}"))?;
+    output
+        .flush()
+        .map_err(|error| format!("daemon status flush: {error}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -282,5 +299,71 @@ mod tests {
 
         assert!(activation_ticks >= 2);
         assert_eq!(health_ticks, 2);
+    }
+
+    #[test]
+    fn activation_clock_preserves_exact_unix_milliseconds() {
+        let observed = UNIX_EPOCH + Duration::from_millis(42);
+        assert_eq!(unix_ms(observed), Ok(42));
+    }
+
+    #[test]
+    fn activation_clock_rejects_time_before_unix_epoch() {
+        let observed = UNIX_EPOCH
+            .checked_sub(Duration::from_secs(1))
+            .expect("one second before Unix epoch must be representable");
+        let error = unix_ms(observed).expect_err("pre-epoch clock must fail closed");
+        assert!(error.contains("precedes Unix epoch"));
+    }
+
+    #[test]
+    fn status_writer_emits_one_newline_delimited_json_record() {
+        let mut output = Vec::new();
+        write_json_to(
+            &mut output,
+            &ReadyMessage::Degraded {
+                service: SERVICE_NAME,
+                protocol: PROTOCOL_VERSION,
+                reason: "injected degradation".to_owned(),
+            },
+        )
+        .expect("status record must be written");
+
+        assert_eq!(output.last(), Some(&b'\n'));
+        let value: serde_json::Value =
+            serde_json::from_slice(&output[..output.len() - 1]).expect("valid JSON record");
+        assert_eq!(value["status"], "degraded");
+        assert_eq!(value["reason"], "injected degradation");
+    }
+
+    struct RejectingWriter;
+
+    impl Write for RejectingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected status output failure",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn status_writer_surfaces_write_failure() {
+        let error = write_json_to(
+            &mut RejectingWriter,
+            &ReadyMessage::Error {
+                service: SERVICE_NAME,
+                protocol: PROTOCOL_VERSION,
+                error: "primary failure".to_owned(),
+            },
+        )
+        .expect_err("writer failure must not be ignored");
+
+        assert!(error.contains("daemon status encode/write"));
+        assert!(error.contains("injected status output failure"));
     }
 }
