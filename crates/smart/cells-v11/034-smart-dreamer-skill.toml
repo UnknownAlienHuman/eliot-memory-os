@@ -1,0 +1,42 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.skill"
+agent_order = 34
+physical_package = "eliot-dreamer-memory-semantics"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Render a compact Skill candidate from an admitted procedure without installing capability."
+
+[agent]
+objective = "Implement compact Skill-candidate rendering only."
+write_scope = ["crates/smart/eliot-dreamer-memory-semantics/src/skill.rs", "crates/smart/eliot-dreamer-memory-semantics/tests/skill.rs"]
+integration_owner = "Dreamer memory semantics integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-memory-semantics/src/lib.rs", "crates/smart/eliot-dreamer-memory-semantics/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_skill_candidate(request: &SkillRequest, procedure: &ProcedureCandidate) -> Result<SkillCandidate, SkillError>"]
+
+[algorithm]
+steps = [
+  "Validate procedure identity, transfer evidence and fence.",
+  "Extract trigger, intent, immediate action, tool constraints, where-not-to-apply and stop or escalation.",
+  "Require exact dependency and authority requirements.",
+  "Preserve procedure handle and invalidation conditions."
+]
+
+[limits]
+rules = ["Use explicit trigger and action byte maxima.", "Perform no package creation, installation or registry mutation."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "ProcedureNotTransferable", "MissingTrigger", "MissingStopCondition", "AuthorityRequirementMissing"]
+
+[forbidden]
+operations = ["Skill installation", "package creation", "registry mutation", "capability grant", "tool execution"]
+
+[tests]
+required = ["Skill cannot omit where-not-to-apply", "installation is never performed", "unproven transfer returns Inconclusive", "authority requirements cannot be inferred"]
+
+[integration]
+provider = "smart.dreamer.procedure"
+consumer = "smart.dreamer.curation_dispatch and external Skill review owner"
+product_pulse = "D3C_CURATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if procedure transfer evidence or exact authority/tool requirements are unavailable."
