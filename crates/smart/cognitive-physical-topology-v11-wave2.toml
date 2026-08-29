@@ -1,0 +1,166 @@
+schema_version = "eliot-cognitive-physical-topology-v11-extension"
+extends = "crates/smart/cognitive-physical-topology-v11.toml"
+status = "ACTIVE_WORKING_DRAFT"
+issue = "github:UnknownAlienHuman/eliot-memory-os#94"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[package]]
+name = "eliot-memory-curation-contracts"
+action = "retain_contract_crate"
+cells = ["smart.memory_curation.contracts"]
+seam = "stable curation snapshot, protection, dimension and proposal contracts"
+integration_owner = "memory curation contract owner"
+
+[[package]]
+name = "eliot-memory-curation"
+action = "refactor_existing"
+cells = ["smart.memory_curation.screen"]
+seam = "bounded read-only screening of one exact canonical projection"
+integration_owner = "memory curation integration owner"
+
+[[package]]
+name = "eliot-dreamer-memory-semantics"
+action = "create_consolidated_prototype"
+cells = ["smart.dreamer.classification", "smart.dreamer.episode", "smart.dreamer.concept", "smart.dreamer.procedure", "smart.dreamer.skill", "smart.dreamer.failure_fingerprint"]
+seam = "candidate-only semantic memory formation dependency island"
+integration_owner = "Dreamer memory semantics integration owner"
+
+[[package]]
+name = "eliot-dreamer-memory-structure"
+action = "create_consolidated_prototype"
+cells = ["smart.dreamer.structure_repair", "smart.dreamer.reconsolidation"]
+seam = "forward identity and interpretation revision with lineage and rollback"
+integration_owner = "Dreamer memory structure integration owner"
+
+[[package]]
+name = "eliot-dreamer-accessibility"
+action = "retain_and_narrow"
+cells = ["smart.dreamer.accessibility"]
+seam = "outcome-linked accessibility evidence and reversible proposal boundary"
+integration_owner = "memory accessibility integration owner"
+
+[[package]]
+name = "eliot-dreamer-influence"
+action = "create_security_dependency_prototype"
+cells = ["smart.dreamer.influence_repair"]
+seam = "exact InfluenceDependencyClosure dependency and security proof boundary"
+integration_owner = "influence repair integration owner"
+
+[[package]]
+name = "eliot-dreamer-curation"
+action = "retain_as_thin_dispatcher"
+cells = ["smart.dreamer.curation_dispatch"]
+seam = "open typed handler registry and stable candidate-set assembly"
+integration_owner = "Dreamer curation integration owner"
+
+[[package]]
+name = "eliot-learning-contracts"
+action = "retain_contract_crate"
+cells = ["smart.learning.contracts"]
+seam = "task-local learning and promotion-input wire contracts"
+integration_owner = "learning contract integration owner"
+
+[[package]]
+name = "eliot-learning"
+action = "create_consolidated_prototype"
+cells = ["smart.learning.state_view", "smart.learning.attempt_delta", "smart.learning.overlay_candidate", "smart.learning.overlay_validation", "smart.learning.activation_assessment", "smart.learning.adherence_assessment", "smart.learning.closure", "smart.learning.retention_transfer", "smart.learning.promotion_input"]
+seam = "pure task-local adaptation and evidence-assessment dependency island"
+integration_owner = "learning integration owner"
+
+[[package]]
+name = "eliot-dreamer-diagnosis"
+action = "create_consolidated_prototype"
+cells = ["smart.dreamer.conflict_analysis", "smart.dreamer.development_diagnosis"]
+seam = "evidence-bound conflict and development failure diagnosis"
+integration_owner = "Dreamer diagnosis integration owner"
+
+[[package]]
+name = "eliot-dreamer-planning"
+action = "create_consolidated_prototype"
+cells = ["smart.dreamer.maintenance_plan", "smart.dreamer.configuration_intent", "smart.dreamer.work_decomposition", "smart.dreamer.orchestration_plan"]
+seam = "advisory work and configuration planning without execution-state ownership"
+integration_owner = "Dreamer planning integration owner"
+
+[[package]]
+name = "eliot-dreamer-cycle"
+action = "create_consolidated_prototype"
+cells = ["smart.dreamer.cycle_sample", "smart.dreamer.cycle_plan"]
+seam = "one bounded maintenance-cycle sample and candidate-plan boundary"
+integration_owner = "DreamCycle integration owner"
+
+[[package]]
+name = "eliot-dreamer-self-model"
+action = "create_consolidated_prototype"
+cells = ["smart.dreamer.architecture_brief", "smart.dreamer.implementation_brief", "smart.dreamer.current_system_conformance"]
+seam = "accepted normative-source projection and exact current-system evidence comparison"
+integration_owner = "Dreamer self-model integration owner"
+
+[[fold]]
+from = "eliot-dreamer-classification"
+into = "eliot-dreamer-memory-semantics"
+reason = "same candidate-only semantic formation dependency island"
+
+[[fold]]
+from = "eliot-dreamer-episode"
+into = "eliot-dreamer-memory-semantics"
+reason = "same candidate-only semantic formation dependency island"
+
+[[fold]]
+from = "eliot-dreamer-concept"
+into = "eliot-dreamer-memory-semantics"
+reason = "same candidate-only semantic formation dependency island"
+
+[[fold]]
+from = "eliot-dreamer-procedure"
+into = "eliot-dreamer-memory-semantics"
+reason = "same candidate-only semantic formation dependency island"
+
+[[fold]]
+from = "eliot-dreamer-skill"
+into = "eliot-dreamer-memory-semantics"
+reason = "Skill remains a candidate renderer, not installation owner"
+
+[[fold]]
+from = "eliot-dreamer-failure"
+into = "eliot-dreamer-memory-semantics"
+reason = "FailureFingerprint is one semantic candidate cell"
+
+[[fold]]
+from = "eliot-dreamer-structure-repair"
+into = "eliot-dreamer-memory-structure"
+reason = "shared identity, lineage and rollback dependency island"
+
+[[fold]]
+from = "eliot-dreamer-reconsolidation"
+into = "eliot-dreamer-memory-structure"
+reason = "shared forward-revision and lineage dependency island"
+
+[[fold]]
+from = "eliot-learning-state-view"
+into = "eliot-learning"
+reason = "same task-local adaptation proof boundary"
+
+[[fold]]
+from = "eliot-learning-delta"
+into = "eliot-learning"
+reason = "same task-local adaptation proof boundary"
+
+[[fold]]
+from = "eliot-learning-overlay"
+into = "eliot-learning"
+reason = "same task-local adaptation proof boundary"
+
+[[fold]]
+from = "eliot-learning-closure"
+into = "eliot-learning"
+reason = "same task-local evidence-assessment dependency island"
+
+[admission]
+rules = [
+  "Worker cells retain separate src and tests files inside consolidated packages.",
+  "Package Cargo.toml and src/lib.rs remain integration-owner-only.",
+  "No new prototype package enters the root workspace before Rust implementation and package proof.",
+  "Security-dependent influence repair cannot implement its own dependency-closure discovery.",
+  "Learning cannot create activation receipts or promotion decisions.",
+  "Planning cannot create DurableJob, WorkItem, SwarmExecutionState or scheduler state."
+]
