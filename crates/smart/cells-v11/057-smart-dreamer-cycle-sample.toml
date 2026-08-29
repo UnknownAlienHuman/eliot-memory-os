@@ -1,0 +1,42 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.cycle_sample"
+agent_order = 57
+physical_package = "eliot-dreamer-cycle"
+execution_class = "BACKGROUND_MAINTENANCE_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Select a deterministic bounded DreamCycle sample from an externally materialized owner snapshot."
+
+[agent]
+objective = "Implement bounded deterministic DreamCycle sampling only."
+write_scope = ["crates/smart/eliot-dreamer-cycle/src/sample.rs", "crates/smart/eliot-dreamer-cycle/tests/sample.rs"]
+integration_owner = "DreamCycle integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-cycle/src/lib.rs", "crates/smart/eliot-dreamer-cycle/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn select_dream_cycle_sample(request: &DreamCycleSampleRequest, snapshot: &DreamCycleSourceSnapshot) -> Result<DreamCycleSample, DreamCycleSampleError>"]
+
+[algorithm]
+steps = [
+  "Validate snapshot revision, denominator, policy and fence.",
+  "Stratify recent or active episodes, unresolved conflicts, failure evidence, minority evidence, utility or false-activation signals and maintenance debt.",
+  "Select a deterministic bounded sample with exact handles.",
+  "Emit included and omitted strata, denominator and coverage."
+]
+
+[limits]
+rules = ["Use explicit per-stratum and total sample maxima.", "Perform no storage read, Researcher call, model call or scope expansion."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "MissingDenominator", "UnknownStratum", "SampleBudgetExceeded", "SnapshotIncomplete"]
+
+[forbidden]
+operations = ["storage read", "source acquisition", "Researcher/model call", "frequency-only sampling", "scope expansion"]
+
+[tests]
+required = ["minority stratum is not erased by frequency", "incomplete denominator is visible", "same snapshot and policy yield same sample", "sampling performs no acquisition"]
+
+[integration]
+provider = "Governor/canonical maintenance snapshot owner"
+consumer = "smart.dreamer.cycle_plan"
+product_pulse = "D6_DREAM_CYCLE_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if snapshot denominator, strata, policy revision or exact handles are unavailable."
