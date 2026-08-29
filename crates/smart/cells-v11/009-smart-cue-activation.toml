@@ -1,0 +1,44 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.cue.activation"
+agent_order = 9
+physical_package = "eliot-cues"
+execution_class = "DECISION_BOUNDARY_HOT"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Assemble direct and optional spread results into one bounded traceable activation result."
+
+[agent]
+objective = "Implement deterministic activation-result assembly without another lookup."
+write_scope = ["crates/smart/eliot-cues/src/activation.rs", "crates/smart/eliot-cues/tests/activation.rs"]
+integration_owner = "cue projection integration owner"
+forbidden_files = ["crates/smart/eliot-cues/src/lib.rs", "crates/smart/eliot-cues/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn assemble_cue_activation(direct: DirectCueMatchSet, spread: SpreadActivationSet, limits: &CueLimits) -> Result<CueActivationResult, CueActivationError>"]
+
+[algorithm]
+steps = [
+  "Require compatible snapshot identity and fence.",
+  "Copy all direct hits before spread hits.",
+  "Merge duplicate targets without changing direct classification.",
+  "Sort by directness, protected role, score, depth and canonical id.",
+  "Truncate only optional spread before direct hits.",
+  "Emit overflow and degradation metadata."
+]
+
+[limits]
+rules = ["All direct hits must fit the configured hard ceiling or fail visibly.", "Optional spread truncation must retain trace handles."]
+
+[errors]
+variants = ["FenceMismatch", "SnapshotMismatch", "InvalidLimits", "DirectOverflow"]
+
+[forbidden]
+operations = ["silent direct-hit truncation", "second snapshot lookup", "storage call", "model call", "blocking I/O", "lock acquisition"]
+
+[tests]
+required = ["spread outage preserves direct output", "direct hit cannot be truncated by optional result", "duplicate merge retains both traces", "identity mismatch fails closed"]
+
+[integration]
+provider = "smart.cue.direct_match and optional smart.cue.relation_spread"
+consumer = "canonical memory/context projection owner"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if direct-hit ceiling cannot preserve every required direct result."
