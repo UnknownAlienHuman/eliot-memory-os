@@ -1,6 +1,7 @@
+use std::io;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,6 +18,7 @@ const WIT_VERSION: &str = "1.0.0";
 const WIT_WORLD: &str = "eliot:wasm/guest";
 const RUN_EXPORT: &str = "run";
 const PROVIDER_STACK_SIZE: usize = 8 * 1024;
+const EPOCH_DRIVER_THREAD_PREFIX: &str = "eliot-wasm-epoch";
 #[cfg(test)]
 const COMPONENT_CONFIGURATION: &[u8] =
     b"component=guest;world=eliot:wasm/guest;export=run;imports=closed";
@@ -79,6 +81,79 @@ impl ResourceLimiter for StoreState {
     fn instances(&self) -> usize {
         self.limits.instances()
     }
+}
+
+struct EpochDriverTask {
+    stop: Arc<AtomicBool>,
+    wall_interrupted: Arc<AtomicBool>,
+    epoch_ticks: Arc<AtomicU64>,
+    engine: Engine,
+    wall_deadline_ms: u64,
+    effective_epoch_deadline: u64,
+}
+
+impl EpochDriverTask {
+    fn run(self) {
+        let wall_deadline = Instant::now() + Duration::from_millis(self.wall_deadline_ms);
+        while !self.stop.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(1));
+            if Instant::now() >= wall_deadline {
+                self.wall_interrupted.store(true, Ordering::Release);
+                let emitted = self.epoch_ticks.load(Ordering::Acquire);
+                let remaining = self.effective_epoch_deadline.saturating_sub(emitted);
+                for _ in 0..remaining {
+                    self.engine.increment_epoch();
+                    self.epoch_ticks.fetch_add(1, Ordering::AcqRel);
+                }
+                break;
+            }
+            self.engine.increment_epoch();
+            self.epoch_ticks.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+struct EpochDriverOwner {
+    identity: String,
+    stop: Arc<AtomicBool>,
+    wall_interrupted: Arc<AtomicBool>,
+    epoch_ticks: Arc<AtomicU64>,
+    join_handle: thread::JoinHandle<()>,
+}
+
+struct EpochDriverObservation {
+    identity: String,
+    joined: bool,
+    wall_interrupted: bool,
+    epoch_ticks: u64,
+}
+
+impl EpochDriverOwner {
+    fn finish(self) -> EpochDriverObservation {
+        self.stop.store(true, Ordering::Release);
+        let joined = self.join_handle.join().is_ok();
+        EpochDriverObservation {
+            identity: self.identity,
+            joined,
+            wall_interrupted: self.wall_interrupted.load(Ordering::Acquire),
+            epoch_ticks: self.epoch_ticks.load(Ordering::Acquire),
+        }
+    }
+}
+
+fn epoch_driver_identity(request_digest: &Sha256Digest) -> String {
+    let digest = request_digest.as_str();
+    let suffix = digest.get(..12).unwrap_or(digest);
+    format!("{EPOCH_DRIVER_THREAD_PREFIX}-{suffix}")
+}
+
+fn spawn_epoch_driver(
+    identity: &str,
+    task: EpochDriverTask,
+) -> io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name(identity.to_owned())
+        .spawn(move || task.run())
 }
 
 /// Concrete typed Wasmtime Component Model provider for one admitted artifact.
@@ -166,7 +241,6 @@ impl WasmtimeComponentEngine {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     fn invoke_component(
         &self,
         request_digest: &Sha256Digest,
@@ -174,6 +248,27 @@ impl WasmtimeComponentEngine {
         input: &[u8],
         post_commit_known: bool,
     ) -> Result<EngineReport, PortError> {
+        self.invoke_component_with_epoch_driver(
+            request_digest,
+            limits,
+            input,
+            post_commit_known,
+            spawn_epoch_driver,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn invoke_component_with_epoch_driver<F>(
+        &self,
+        request_digest: &Sha256Digest,
+        limits: &InvocationLimits,
+        input: &[u8],
+        post_commit_known: bool,
+        spawn_driver: F,
+    ) -> Result<EngineReport, PortError>
+    where
+        F: FnOnce(&str, EpochDriverTask) -> io::Result<thread::JoinHandle<()>>,
+    {
         validate_epoch_policy(limits)?;
         let (invocation_engine, component) = match limits.epoch.cancellation {
             eliot_wasm_runtime::CancellationPolicy::EpochInterruption => {
@@ -205,37 +300,40 @@ impl WasmtimeComponentEngine {
             limits.epoch.cancellation,
             eliot_wasm_runtime::CancellationPolicy::EpochAndFuel
         ) && store.set_fuel(limits.max_fuel).is_ok();
-        let wall_ticks = limits.wall_deadline_ms;
         // The provider has no negotiation path. After the explicit ceiling
         // check above, the exact admitted policy is the effective policy: it
         // is neither clamped nor otherwise rewritten before Store execution.
         let effective_epoch_deadline = limits.epoch.deadline_ticks;
         store.set_epoch_deadline(effective_epoch_deadline);
+
         let stop_epoch = Arc::new(AtomicBool::new(false));
-        let epoch_stop = Arc::clone(&stop_epoch);
         let wall_interrupted = Arc::new(AtomicBool::new(false));
-        let wall_interrupted_thread = Arc::clone(&wall_interrupted);
-        let epoch_ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let observed_epoch_ticks = Arc::clone(&epoch_ticks);
-        let epoch_engine = invocation_engine.clone();
-        let epoch_thread = thread::spawn(move || {
-            let wall_deadline = Instant::now() + Duration::from_millis(wall_ticks);
-            while !epoch_stop.load(Ordering::Acquire) {
-                thread::sleep(Duration::from_millis(1));
-                if Instant::now() >= wall_deadline {
-                    wall_interrupted_thread.store(true, Ordering::Release);
-                    let emitted = observed_epoch_ticks.load(Ordering::Acquire);
-                    let remaining = effective_epoch_deadline.saturating_sub(emitted);
-                    for _ in 0..remaining {
-                        epoch_engine.increment_epoch();
-                        observed_epoch_ticks.fetch_add(1, Ordering::AcqRel);
-                    }
-                    break;
-                }
-                epoch_engine.increment_epoch();
-                observed_epoch_ticks.fetch_add(1, Ordering::AcqRel);
+        let epoch_ticks = Arc::new(AtomicU64::new(0));
+        let epoch_driver_identity = epoch_driver_identity(request_digest);
+        let epoch_driver_task = EpochDriverTask {
+            stop: Arc::clone(&stop_epoch),
+            wall_interrupted: Arc::clone(&wall_interrupted),
+            epoch_ticks: Arc::clone(&epoch_ticks),
+            engine: invocation_engine.clone(),
+            wall_deadline_ms: limits.wall_deadline_ms,
+            effective_epoch_deadline,
+        };
+        let epoch_driver = match spawn_driver(&epoch_driver_identity, epoch_driver_task) {
+            Ok(join_handle) => EpochDriverOwner {
+                identity: epoch_driver_identity,
+                stop: stop_epoch,
+                wall_interrupted,
+                epoch_ticks,
+                join_handle,
+            },
+            Err(_) => {
+                return Ok(epoch_driver_spawn_failure_report(
+                    request_digest,
+                    limits,
+                    start,
+                ));
             }
-        });
+        };
 
         let (termination, output, attempted_output_bytes) = if fuel_set
             || matches!(
@@ -275,9 +373,12 @@ impl WasmtimeComponentEngine {
                 0,
             )
         };
-        stop_epoch.store(true, Ordering::Release);
-        let epoch_joined = epoch_thread.join().is_ok();
-        let epoch_ticks = epoch_ticks.load(Ordering::Acquire);
+        let epoch_observation = epoch_driver.finish();
+        debug_assert!(
+            epoch_observation
+                .identity
+                .starts_with(EPOCH_DRIVER_THREAD_PREFIX)
+        );
         let remaining_fuel = store.get_fuel().unwrap_or(0);
         let peak_memory_bytes = store.data().peak_memory_bytes;
         let table_elements = store.data().table_elements;
@@ -292,7 +393,7 @@ impl WasmtimeComponentEngine {
             0
         };
         let termination = match termination {
-            EngineTermination::EpochDeadline if wall_interrupted.load(Ordering::Acquire) => {
+            EngineTermination::EpochDeadline if epoch_observation.wall_interrupted => {
                 EngineTermination::Deadline
             }
             other => other,
@@ -312,7 +413,7 @@ impl WasmtimeComponentEngine {
                 enforced_stack_limit_bytes: Some(limits.max_stack_bytes),
                 elapsed_ms,
                 effective_epoch_policy: limits.epoch,
-                epoch_ticks: Some(epoch_ticks),
+                epoch_ticks: Some(epoch_observation.epoch_ticks),
                 artifact_reads: 1,
                 artifact_bytes: self.artifact_bytes,
                 accessed_artifact_digests: vec![self.artifact_digest.clone()],
@@ -321,13 +422,46 @@ impl WasmtimeComponentEngine {
             host_calls: Vec::new(),
             proposed_effects: Vec::new(),
             observed_state_delta: Vec::new(),
-            post_commit_known: epoch_joined
+            post_commit_known: epoch_observation.joined
                 && post_commit_known
                 && !matches!(
                     termination,
                     EngineTermination::Partial | EngineTermination::PostCommitUnknown
                 ),
         })
+    }
+}
+
+fn epoch_driver_spawn_failure_report(
+    request_digest: &Sha256Digest,
+    limits: &InvocationLimits,
+    start: Instant,
+) -> EngineReport {
+    EngineReport {
+        request_digest: request_digest.clone(),
+        termination: EngineTermination::Trap(TrapClass::HostContractViolation),
+        usage: EngineUsage {
+            attempted_output_bytes: 0,
+            output_bytes: 0,
+            host_calls: 0,
+            fuel_consumed: 0,
+            peak_memory_bytes: Some(0),
+            table_elements: Some(0),
+            instances: 0,
+            stack_bytes: None,
+            enforced_stack_limit_bytes: Some(limits.max_stack_bytes),
+            elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            effective_epoch_policy: limits.epoch,
+            epoch_ticks: Some(0),
+            artifact_reads: 0,
+            artifact_bytes: 0,
+            accessed_artifact_digests: Vec::new(),
+        },
+        output: Vec::new(),
+        host_calls: Vec::new(),
+        proposed_effects: Vec::new(),
+        observed_state_delta: Vec::new(),
+        post_commit_known: true,
     }
 }
 
@@ -590,6 +724,58 @@ mod tests {
     }
 
     #[test]
+    fn epoch_driver_spawn_failure_is_fail_closed_before_guest_execution() -> Result<(), String> {
+        let artifact =
+            wat::parse_file("tests/fixtures/guest.wat").map_err(|error| error.to_string())?;
+        let digest = Sha256Digest::of_bytes(&artifact);
+        let engine = WasmtimeComponentEngine::new(
+            binding(),
+            digest.clone(),
+            &artifact,
+            COMPONENT_CONFIGURATION,
+        )
+        .map_err(|error| error.to_string())?;
+        let limits = test_limits(digest);
+        let request_digest = Sha256Digest::of_bytes(b"epoch-driver-spawn-failure");
+        let expected_identity = epoch_driver_identity(&request_digest);
+        let mut observed_identity = None;
+
+        let report = engine
+            .invoke_component_with_epoch_driver(
+                &request_digest,
+                &limits,
+                b"typed guest input",
+                true,
+                |identity, _task| {
+                    observed_identity = Some(identity.to_owned());
+                    Err(io::Error::other("injected epoch driver spawn failure"))
+                },
+            )
+            .map_err(|error| error.to_string())?;
+
+        assert_eq!(observed_identity.as_deref(), Some(expected_identity.as_str()));
+        assert_eq!(
+            report.termination,
+            EngineTermination::Trap(TrapClass::HostContractViolation)
+        );
+        assert_eq!(report.usage.instances, 0);
+        assert_eq!(report.usage.host_calls, 0);
+        assert_eq!(report.usage.output_bytes, 0);
+        assert_eq!(report.usage.attempted_output_bytes, 0);
+        assert_eq!(report.usage.fuel_consumed, 0);
+        assert_eq!(report.usage.epoch_ticks, Some(0));
+        assert_eq!(report.usage.effective_epoch_policy, limits.epoch);
+        assert_eq!(report.usage.artifact_reads, 0);
+        assert!(report.usage.accessed_artifact_digests.is_empty());
+        assert!(report.output.is_empty());
+        assert!(report.host_calls.is_empty());
+        assert!(report.proposed_effects.is_empty());
+        assert!(report.observed_state_delta.is_empty());
+        assert!(report.post_commit_known);
+        Ok(())
+    }
+
+    #[test]
     fn wall_deadline_interrupts_a_looping_guest() -> Result<(), String> {
         let started = Instant::now();
         let artifact =
@@ -658,7 +844,8 @@ mod tests {
         let mut limits = test_limits(digest);
         limits.max_instances = 1;
         let report = engine
-            .invoke_component(&Sha256Digest::of_bytes(b"instances"),
+            .invoke_component(
+                &Sha256Digest::of_bytes(b"instances"),
                 &limits,
                 b"",
                 true,
