@@ -22,6 +22,7 @@ eliot-profile-full-composition = []
 eliot-agent-bridge-core.workspace = true
 eliot-contracts.workspace = true
 eliot-ipc.workspace = true
+eliot-mcp.workspace = true
 eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true
 eliot-receipts.workspace = true
