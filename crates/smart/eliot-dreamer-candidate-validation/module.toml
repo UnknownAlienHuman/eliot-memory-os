@@ -1,0 +1,59 @@
+schema_version = 4
+module_id = "smart.dreamer.candidate_validation"
+crate = "eliot-dreamer-candidate-validation"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 5
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.candidate_validation"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Every specialized Dreamer handler receives one validated draft with explicit lineage, preservation, fence and authority ceiling."
+causal_property = "common Dreamer candidate validation"
+old_failure_or_missing_capability = "The legacy generator repeats or bypasses validation inside subtype semantics."
+discriminator = "The same invalid draft is rejected identically for every handler before subtype-specific synthesis."
+primary_responsibility = "Validate one structured model draft against its job and bundle before a specialized handler may emit candidate artifacts."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["DreamJobInput", "DreamInputBundle", "structured ModelDraft"]
+outputs = ["ValidatedDreamDraft", "CandidateRejectionReport", "PreservationReport"]
+depends_on = ["eliot-dreamer-contracts"]
+providers = ["Dreamer contract hub", "Governor-admitted bundle"]
+consumers = ["all specialized Dreamer handlers"]
+non_goals = ["model invocation", "handler-specific synthesis", "canonical promotion", "verifier or evaluator execution"]
+invariants = ["every material statement cites an admitted handle", "model output cannot declare confirmation or Current Epistemic Position", "transformations preserve counterevidence, uncertainty and rollback", "output and source budgets are enforced"]
+failure_behavior = "Reject the candidate draft with exact violations while leaving all source state unchanged."
+proof_surface = ["invented handle", "unsupported confirmation or promotion", "false merge with lost minority evidence", "budget exhaustion", "scope or fence mismatch"]
+proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-core/src/lib.rs"
+disposition = "extract and harden DraftItem/ModelDraft validation"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I9.7"
+disposition = "authoritative transformation-validation contract"
+
+[agent_task]
+objective = "Centralize candidate safety checks once so specialized handlers remain small and cannot invent promotion semantics."
+write_scope = ["crates/smart/eliot-dreamer-candidate-validation/**"]
+deliverables = ["common validator", "structured rejection report", "preservation and authority-ceiling tests"]
+acceptance = ["all handlers use the common validator", "source state is never mutated", "rejected drafts remain non-influential"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop if validation requires deciding task truth; preserve uncertainty and route to the applicable verifier or owner."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"

@@ -1,0 +1,333 @@
+schema_version = 6
+wave_id = "cognitive-micromodules-wave-01"
+status = "PROTOTYPE_ASSIGNMENT_READY_AFTER_STATIC_REVIEW"
+base_commit = "7f075ddf5d168f3d2ad3144807b7f0b9d4f0bb61"
+normative_pair = "ELIOT Architecture 4.5-draft + Implementation 0.29-draft; English edition 2026-08-28"
+purpose = "Keep D1 capture ownership in Governor, close a minimal D3a Orientation pulse, add independent Clarification/self-query handlers, then D3b reactive context and bounded candidate-only curation."
+integration_owner = "cognitive-wave-integrator"
+agent_rule = "One agent receives one active module manifest, frozen one-hop contracts, old failure, discriminator, exact write scope, proof ceiling and named Product Pulse or Edge proof."
+workspace_rule = "Prototype packages stay outside the root workspace until implementation, package proof, affected Edge proof, current-main ancestry and integration review."
+size_rule = "10000 LOC is a review signal only; causal cohesion, state ownership, proof, change closure and replacement boundary decide topology."
+authority_rule = "No prototype owns canonical state, runtime scheduling, evaluator state, policy, authority, finish or external effects."
+dependency_rule = "Assignment depends_on lists logical implementation prerequisites; Cargo dependencies are narrower and exist only for public types actually imported."
+supersession_rule = "The stale cognitive-crates-prototypes-01 branch is not an assignment source."
+
+[[stage]]
+id = "D1_CAPTURE_OWNER_REPAIR"
+orders = [1, 1]
+gate = "Keep first-pass classification inside the existing Governor observation owner."
+
+[[stage]]
+id = "D3A_ORIENTATION_FIRST_VALUE"
+orders = [2, 6]
+gate = "Current Epistemic Position, bounded bundle, common validation and candidate-only Orientation close the first useful D3a pulse."
+
+[[stage]]
+id = "D3A_COMPANION_JOB_HANDLERS"
+orders = [7, 9]
+gate = "Clarification and Architecture/self query remain independent job handlers and do not become prerequisites of basic Orientation or D3b."
+
+[[stage]]
+id = "D3B_REACTIVE_CONTEXT_NEXT_VALUE"
+orders = [10, 19]
+gate = "Cue binding/index/activation, context admission/assembly and pure delivery planning; may start once order 6 passes."
+
+[[stage]]
+id = "D3A_BOUNDED_CURATION_EXPANSION"
+orders = [20, 31]
+gate = "Assign only after the Orientation Product Pulse shows useful value."
+
+[[product_pulse]]
+id = "D1_CAPTURE_CLASSIFICATION_EDGE_01"
+scenario = "A misleading or ambiguous hint is preserved once by Governor as a deterministic family or cold ObservationCandidate."
+status = "NOT_EXECUTED"
+proof_ceiling = "Exact-scenario Edge proof only"
+
+[[product_pulse]]
+id = "D3A_ORIENTATION_PULSE_01"
+scenario = "One current goal yields a source-linked DreamPacket with Current Epistemic Position handles, rivals, unknowns, hidden relation candidates and probes; no self-query brief is required."
+status = "NOT_EXECUTED"
+proof_ceiling = "Exact-scenario Product proof only"
+
+[[product_pulse]]
+id = "D3A_CLARIFICATION_EDGE_01"
+scenario = "One material ambiguity yields exactly one discriminative question, why it matters and a safe unanswered fallback; no delivery effect occurs in the handler."
+status = "NOT_EXECUTED"
+proof_ceiling = "Exact-scenario Edge proof only"
+
+[[product_pulse]]
+id = "D3A_SELF_QUERY_EDGE_01"
+scenario = "An ELIOT self-query yields separate ArchitectureBrief and ImplementationBrief candidates bound to exact accepted source digests and current conformance evidence; Architecture precedence remains visible."
+status = "NOT_EXECUTED"
+proof_ceiling = "Exact-scenario Edge proof only"
+
+[[product_pulse]]
+id = "D3B_REACTIVE_CONTEXT_PULSE_01"
+scenario = "An exact cue fires with zero relation edges, preserves the Decision Safety Floor and yields a delivery plan without model work on the hot path."
+status = "NOT_EXECUTED"
+proof_ceiling = "Exact-scenario Product proof only"
+
+[[product_pulse]]
+id = "D3A_CURATION_PULSE_01"
+scenario = "A bounded batch routes each item to one typed handler or explicit unsupported disposition; original memory remains unchanged."
+status = "NOT_EXECUTED"
+proof_ceiling = "Exact-scenario Product proof only"
+
+[[assignment]]
+order = 1
+crate = "eliot-observation"
+manifest = "crates/governor/eliot-observation/classifier.module.toml"
+depends_on = []
+product_pulse = "D1_CAPTURE_CLASSIFICATION_EDGE_01"
+package_action = "implement_cell_in_existing_crate"
+
+[[assignment]]
+order = 2
+crate = "eliot-epistemic"
+manifest = "crates/smart/eliot-epistemic/module.toml"
+depends_on = []
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+package_action = "implement_cell_in_existing_crate"
+
+[[assignment]]
+order = 3
+crate = "eliot-dreamer-contracts"
+manifest = "crates/smart/eliot-dreamer-contracts/module.toml"
+depends_on = []
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 4
+crate = "eliot-dreamer-bundle"
+manifest = "crates/smart/eliot-dreamer-bundle/module.toml"
+depends_on = ["eliot-dreamer-contracts"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 5
+crate = "eliot-dreamer-candidate-validation"
+manifest = "crates/smart/eliot-dreamer-candidate-validation/module.toml"
+depends_on = ["eliot-dreamer-contracts"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 6
+crate = "eliot-dreamer-orientation"
+manifest = "crates/smart/eliot-dreamer-orientation/module.toml"
+depends_on = ["eliot-epistemic", "eliot-dreamer-contracts", "eliot-dreamer-bundle", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 7
+crate = "eliot-dreamer-clarification"
+manifest = "crates/smart/eliot-dreamer-clarification/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CLARIFICATION_EDGE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 8
+crate = "eliot-dreamer-architecture-brief"
+manifest = "crates/smart/eliot-dreamer-architecture-brief/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_SELF_QUERY_EDGE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 9
+crate = "eliot-dreamer-implementation-brief"
+manifest = "crates/smart/eliot-dreamer-implementation-brief/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_SELF_QUERY_EDGE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 10
+crate = "eliot-cue-contracts"
+manifest = "crates/smart/eliot-cue-contracts/module.toml"
+depends_on = []
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 11
+crate = "eliot-cue-normalizer"
+manifest = "crates/smart/eliot-cue-normalizer/module.toml"
+depends_on = ["eliot-cue-contracts"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 12
+crate = "eliot-cue-binding"
+manifest = "crates/smart/eliot-cue-binding/module.toml"
+depends_on = ["eliot-cue-contracts", "eliot-cue-normalizer"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 13
+crate = "eliot-cue-index"
+manifest = "crates/smart/eliot-cue-index/module.toml"
+depends_on = ["eliot-cue-contracts", "eliot-cue-normalizer", "eliot-cue-binding"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 14
+crate = "eliot-cue-activation"
+manifest = "crates/smart/eliot-cue-activation/module.toml"
+depends_on = ["eliot-cue-contracts", "eliot-cue-normalizer", "eliot-cue-index"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 15
+crate = "eliot-context-contracts"
+manifest = "crates/smart/eliot-context-contracts/module.toml"
+depends_on = []
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 16
+crate = "eliot-context-candidates"
+manifest = "crates/smart/eliot-context-candidates/module.toml"
+depends_on = ["eliot-cue-contracts", "eliot-cue-activation", "eliot-epistemic", "eliot-context-contracts"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 17
+crate = "eliot-context-admission"
+manifest = "crates/smart/eliot-context-admission/module.toml"
+depends_on = ["eliot-context-contracts"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 18
+crate = "eliot-context-assembly"
+manifest = "crates/smart/eliot-context-assembly/module.toml"
+depends_on = ["eliot-context-contracts", "eliot-context-admission"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 19
+crate = "eliot-reactive-context-plan"
+manifest = "crates/smart/eliot-reactive-context-plan/module.toml"
+depends_on = ["eliot-context-contracts", "eliot-cue-contracts", "eliot-cue-activation", "eliot-context-assembly"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 20
+crate = "eliot-memory-curation-screen"
+manifest = "crates/smart/eliot-memory-curation-screen/module.toml"
+depends_on = []
+product_pulse = "D3A_CURATION_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 21
+crate = "eliot-dreamer-classification"
+manifest = "crates/smart/eliot-dreamer-classification/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 22
+crate = "eliot-dreamer-relation"
+manifest = "crates/smart/eliot-dreamer-relation/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 23
+crate = "eliot-dreamer-episode"
+manifest = "crates/smart/eliot-dreamer-episode/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 24
+crate = "eliot-dreamer-concept"
+manifest = "crates/smart/eliot-dreamer-concept/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 25
+crate = "eliot-dreamer-procedure"
+manifest = "crates/smart/eliot-dreamer-procedure/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 26
+crate = "eliot-dreamer-failure"
+manifest = "crates/smart/eliot-dreamer-failure/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 27
+crate = "eliot-dreamer-structure-repair"
+manifest = "crates/smart/eliot-dreamer-structure-repair/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 28
+crate = "eliot-dreamer-reconsolidation"
+manifest = "crates/smart/eliot-dreamer-reconsolidation/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 29
+crate = "eliot-dreamer-accessibility"
+manifest = "crates/smart/eliot-dreamer-accessibility/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 30
+crate = "eliot-dreamer-memory-repair"
+manifest = "crates/smart/eliot-dreamer-memory-repair/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse = "D3A_CURATION_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 31
+crate = "eliot-dreamer-curation"
+manifest = "crates/smart/eliot-dreamer-curation/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation", "eliot-memory-curation-screen", "eliot-dreamer-classification", "eliot-dreamer-relation", "eliot-dreamer-episode", "eliot-dreamer-concept", "eliot-dreamer-procedure", "eliot-dreamer-failure", "eliot-dreamer-structure-repair", "eliot-dreamer-reconsolidation", "eliot-dreamer-accessibility", "eliot-dreamer-memory-repair"]
+product_pulse = "D3A_CURATION_PULSE_01"
+package_action = "create_prototype_crate"
+
+[assignment_output]
+required = ["implementation in declared scope", "package/module proof", "affected Edge proof", "named Product Pulse when applicable", "donor trace", "ContractChallenges", "merge/remove recommendation"]
+
+[[deferred]]
+capability = "Dreamer Research synthesis and Concilium planning"
+activation = "Researcher-owned ResearchPack, Evidence Grade, evidence freeze, provider independence and coverage denominator"
+
+[[deferred]]
+capability = "D3c structural/causal depth"
+activation = "accepted exact code, behavioral and causal projections plus demonstrated Product Pulse value"

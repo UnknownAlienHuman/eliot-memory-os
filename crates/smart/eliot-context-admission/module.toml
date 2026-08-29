@@ -1,0 +1,59 @@
+schema_version = 3
+module_id = "smart.context.admission"
+crate = "eliot-context-admission"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 17
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "smart.context.admission"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "The Active View preserves every distinction that can change the decision, risk, verifier or unknown."
+causal_property = "bounded context admission and selection integrity"
+old_failure_or_missing_capability = "legacy compiler combines ranking with contracts/rendering and can hide why membership changed"
+discriminator = "permutation/starvation adversarial fixtures preserve the Decision Safety Floor and immutable decision chain"
+primary_responsibility = "Apply one immutable ContextRecipe and decide include, handle-only, revalidate, suppress or quarantine for each candidate."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["ContextCandidateSet", "ContextRecipe", "route/headroom profile"]
+outputs = ["AdmittedContextSet", "AdmissionDecision list", "SelectionIntegrity stage", "pre-assembly gaps"]
+depends_on = ["eliot-context-contracts"]
+providers = ["context candidates"]
+consumers = ["context assembly"]
+non_goals = ["candidate construction", "rendering", "recipe optimization", "support changes"]
+invariants = ["safety floor never silently dropped", "unknown delta is not negative evidence", "one verbose source cannot starve rivals"]
+failure_behavior = "Return DECISION_CONTEXT_INCOMPLETE, handle-only set or route/decomposition requirement; never fluent incomplete success."
+proof_surface = ["permutation invariance", "role starvation", "stale/quarantine", "non-droppable/headroom"]
+proof_ceiling = "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-context/src/lib.rs"
+disposition = "extract/harden compiler"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.13"
+disposition = "authoritative contract"
+
+[agent_task]
+objective = "Split deterministic admission from collection and rendering."
+write_scope = ["crates/smart/eliot-context-admission/**"]
+deliverables = ["public contract/core implementation", "property/adversarial fixtures", "affected edge fixtures"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, unbounded traversal, model call or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"

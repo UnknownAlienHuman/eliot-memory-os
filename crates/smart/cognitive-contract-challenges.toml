@@ -1,0 +1,68 @@
+schema_version = 1
+registry_id = "cognitive-contract-challenges-2026-08-28"
+status = "ACTIVE"
+wave = "cognitive-micromodules-wave-01"
+rule = "A cognitive agent must stop at a missing owner-neutral provider contract. It may define only its own output protocol and must not invent another plane's authority, denominator, state or runtime behavior."
+
+[[challenge]]
+id = "CC-001"
+status = "OPEN_BLOCKING_ACCESSIBILITY"
+required_owner = "Governor/Meta evaluation contract owner"
+needed_by = ["eliot-dreamer-accessibility", "future use attribution/usefulness evaluation"]
+missing_contract = "Canonical attributed inclusion/influence/use/outcome/cost/regret evidence with complete denominator, fence, scope and no-use semantics."
+forbidden_workaround = "writer utility score, retrieval count, recency or model judgment treated as usefulness proof"
+resolution_evidence = ["versioned owner-neutral contract", "producer fixtures", "complete-denominator and attribution tests", "Governor/Meta ownership acceptance"]
+
+[[challenge]]
+id = "CC-002"
+status = "OPEN_INTEGRATION_GATE"
+required_owner = "Codex-owned runtime composition"
+needed_by = ["Orientation Product Pulse", "all Dreamer handlers"]
+missing_contract = "Typed model-route adapter boundary from DreamInputBundle to schema-valid ModelDraft, including timeout/cancellation/privacy/cost receipt and no semantic authority."
+forbidden_workaround = "provider SDK or route reservation inside Smart crates"
+resolution_evidence = ["adapter contract fixture", "malformed/partial/timeout model-output fixtures", "cost/privacy receipt", "Product Pulse wiring proof"]
+
+[[challenge]]
+id = "CC-003"
+status = "OPEN_INTEGRATION_GATE"
+required_owner = "Codex-owned runtime composition"
+needed_by = ["eliot-dreamer-curation"]
+missing_contract = "Open typed handler registry/invocation protocol that produces TypedCurationHandlerResult without making the facade depend on concrete handlers."
+forbidden_workaround = "hard-coded match that imports every concrete handler crate into the curation facade"
+resolution_evidence = ["registry contract", "missing/duplicate handler fixtures", "partial failure and cancellation semantics", "no-concrete-link dependency proof"]
+
+[[challenge]]
+id = "CC-004"
+status = "OPEN_PROVIDER_CONFORMANCE"
+required_owner = "Governor canonical projection owners"
+needed_by = ["eliot-context-candidates"]
+missing_contract = "Versioned admitted task, continuity, safety/negative-memory and affordance projections compatible with one StateFence and WorkScope."
+forbidden_workaround = "context-candidate mapper retrieving canonical state or inventing missing role prose"
+resolution_evidence = ["projection schemas", "shared-fence fixtures", "omission semantics", "provider/consumer replacement tests"]
+
+[[challenge]]
+id = "CC-005"
+status = "DEFERRED_RESEARCH"
+required_owner = "Researcher plane"
+needed_by = ["future Dreamer Research synthesis"]
+missing_contract = "ResearchPack, Evidence Grade, confirmatory/exploratory separation, evidence freeze, citation manifest and coverage denominator."
+forbidden_workaround = "Dreamer source acquisition, self-selected denominator or aggregate URL list treated as grounded research"
+resolution_evidence = ["Researcher contract implementation", "frozen evidence fixtures", "claim-level citation closure", "coverage/omission proof"]
+
+[[challenge]]
+id = "CC-006"
+status = "DEFERRED_SELF_SCOPE"
+required_owner = "Architecture/Implementation accepted-source projection owner"
+needed_by = ["future Dreamer ArchitectureBrief", "future Dreamer ImplementationBrief", "conformance handler"]
+missing_contract = "Exact accepted-source projection with edition identity, section handles, current-source/runtime evidence and conflict precedence."
+forbidden_workaround = "Dreamer reading arbitrary repository prose and declaring architecture conformance"
+resolution_evidence = ["accepted-source manifest", "edition/fence fixtures", "Architecture-over-Implementation conflict tests", "current-system evidence separation"]
+
+[[challenge]]
+id = "CC-007"
+status = "DEFERRED_SELF_LEARNING"
+required_owner = "Governor/Meta outcome and experiment owners"
+needed_by = ["future DreamCycle", "use attribution", "usefulness/harm/cost evaluation", "improvement experiment"]
+missing_contract = "Candidate use attribution, intervention/control identity, outcome window, confounders, cost/harm/regret dimensions, rollback and promotion authority."
+forbidden_workaround = "active-generation self-modification, self-verification, benchmark-only reward or model-rated improvement"
+resolution_evidence = ["versioned attribution/experiment contracts", "counterfactual and confounder fixtures", "dimensioned evaluation", "Governor promotion gate"]

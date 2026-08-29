@@ -1,0 +1,59 @@
+schema_version = 4
+module_id = "smart.cue.activation"
+crate = "eliot-cue-activation"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 14
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "smart.cue.activation"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "An exact file, error or task cue yields relevant candidates before the next Material action without a model call."
+causal_property = "bounded cue matching and spreading activation"
+old_failure_or_missing_capability = "Legacy evaluation is coupled to snapshot state and the first prototype incorrectly included session delivery dedup."
+discriminator = "Zero-edge exact firing and bounded adversarial graph fixtures pass; no session state is read or mutated."
+primary_responsibility = "Evaluate normalized observed cues against one immutable CueSnapshot and return bounded direct and relation-derived activation with a complete trace."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["CueSnapshot", "NormalizedCue set", "revision and time", "activation profile"]
+outputs = ["CueActivationResult", "ActivationTrace", "overflow or expansion request"]
+depends_on = ["eliot-cue-contracts", "eliot-cue-normalizer", "eliot-cue-index"]
+providers = ["cue normalizer", "cue index snapshot"]
+consumers = ["context candidates", "reactive context plan"]
+non_goals = ["snapshot mutation", "session delivery dedup", "canonical retrieval", "hard block from similarity"]
+invariants = ["exact matches precede broader matching", "exact firing requires zero relation edges", "depth, fanout and result count are bounded", "path score uses bounded max accumulation rather than popularity sum"]
+failure_behavior = "Return direct matches plus explicit partial, overflow or STALE_PROJECTION; never silently widen traversal."
+proof_surface = ["zero-edge exact firing", "bounded fanout and depth", "diamond max accumulation", "stale snapshot"]
+proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-cues/src/lib.rs"
+disposition = "extract pure evaluator"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.7 and I12.15"
+disposition = "authoritative firing and bounded-activation contract"
+
+[agent_task]
+objective = "Extract the pure hot evaluator; snapshot publication and delivery state remain downstream or upstream."
+write_scope = ["crates/smart/eliot-cue-activation/**"]
+deliverables = ["pure activation evaluator", "zero-edge and graph-bound fixtures", "index-consumer Edge fixtures"]
+acceptance = ["one declared responsibility", "bounded deterministic behavior", "no session or delivery state"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop if activation needs snapshot mutation, session state, unbounded traversal, a model call or canonical retrieval."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"

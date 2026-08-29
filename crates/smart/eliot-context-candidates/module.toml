@@ -1,0 +1,59 @@
+schema_version = 4
+module_id = "smart.context.candidates"
+crate = "eliot-context-candidates"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 16
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "smart.context.candidates"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Context admission sees complete typed proposals and explicit provider gaps instead of querying arbitrary stores."
+causal_property = "context candidate construction"
+old_failure_or_missing_capability = "The legacy compiler accepts a preassembled mixed input with no explicit cue-activation provider or coverage boundary."
+discriminator = "Missing provider or fence cases return incomplete candidate sets rather than filler atoms."
+primary_responsibility = "Map immutable task, attention, epistemic, cue-activation, negative-memory, evidence and affordance projections into whole context candidates with lineage."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["TaskFrame projection", "CriticalAttention and Conflict handles", "CurrentEpistemicPosition", "CueActivationResult", "negative-memory and affordance projections"]
+outputs = ["ContextCandidateSet", "coverage manifest", "missing-input and unknown list"]
+depends_on = ["eliot-cue-contracts", "eliot-cue-activation", "eliot-epistemic", "eliot-context-contracts"]
+providers = ["Governor read projections", "cue activation"]
+consumers = ["context admission"]
+non_goals = ["store queries", "ranking", "rendering", "semantic synthesis"]
+invariants = ["every material candidate has lineage", "one compatible fence governs the set", "CueActivationResult is an explicit input rather than an implicit lookup", "retrieval and activation only propose influence"]
+failure_behavior = "Return an incomplete set with exact missing providers; never cross scope silently or fabricate atoms."
+proof_surface = ["missing cue-activation provider", "duplicate or conflicting identity", "cross-fence rejection", "role and lineage completeness"]
+proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-context/src/lib.rs"
+disposition = "extract explicit pre-admission candidate boundary"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.13"
+disposition = "authoritative Context Compiler input contract"
+
+[agent_task]
+objective = "Create the explicit projection-to-compiler candidate boundary."
+write_scope = ["crates/smart/eliot-context-candidates/**"]
+deliverables = ["candidate builder", "provider/coverage/fence fixtures", "activation-to-candidate Edge fixtures"]
+acceptance = ["whole candidates only", "bounded deterministic behavior", "missing providers visible"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop if candidate construction needs store access, ranking, rendering, model work or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"

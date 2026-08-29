@@ -1,0 +1,59 @@
+schema_version = 3
+module_id = "smart.cue.normalizer"
+crate = "eliot-cue-normalizer"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 11
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "smart.cue.normalizer"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Capture and firing cannot miss each other because of asymmetric or destructive normalization."
+causal_property = "shared cue normalization"
+old_failure_or_missing_capability = "legacy normalization lowercases canonical paths and couples comparison semantics to stored identity"
+discriminator = "capture/fire symmetry holds while canonical Git/path spelling remains unchanged"
+primary_responsibility = "Normalize observed cue material into canonical identity plus policy-correct comparison keys used identically by writers and readers."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["ObservedCue", "WorkScope path/case policy", "adapter normalization profile"]
+outputs = ["NormalizedCue", "normalization evidence", "unsupported/ambiguous result"]
+depends_on = ["eliot-cue-contracts"]
+providers = ["cue contracts"]
+consumers = ["cue binding", "cue index", "cue activation"]
+non_goals = ["store writes", "activation", "semantic similarity"]
+invariants = ["one implementation serves write/read", "canonical path preserves case", "noise removal is versioned"]
+failure_behavior = "Return unsupported/ambiguous normalization with original handle; never guess a reusable key."
+proof_surface = ["capture/fire symmetry", "Windows case policy", "Git spelling preservation", "signature fuzzing"]
+proof_ceiling = "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-cues/src/lib.rs"
+disposition = "rewrite not copy"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.6"
+disposition = "authoritative contract"
+
+[agent_task]
+objective = "Implement the shared normalization path and correct destructive lowercasing."
+write_scope = ["crates/smart/eliot-cue-normalizer/**"]
+deliverables = ["public contract/core implementation", "property/adversarial fixtures", "affected edge fixtures"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, unbounded traversal, model call or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"

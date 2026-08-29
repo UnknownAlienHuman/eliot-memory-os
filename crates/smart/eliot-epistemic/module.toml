@@ -1,0 +1,59 @@
+schema_version = 3
+module_id = "smart.epistemic.position"
+crate = "eliot-epistemic"
+status = "RETAIN_AND_HARDEN"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 2
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "smart.epistemic.position"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "A Human or agent sees a scoped, defeasible current position with rivals, assumptions, stale material and the cheapest useful inquiry."
+causal_property = "resolve one explicit question over one admitted fenced evidence set"
+old_failure_or_missing_capability = "the existing resolver omits complete assumption, verifier-competence and Investigation semantics"
+discriminator = "fresh outlier, stale verifier and conflicting evidence produce different typed positions and inquiries without source mutation"
+primary_responsibility = "Resolve one explicit question into observed, supported, assumed, conflicted, stale or unknown position while preserving provenance and required inquiry."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["PositionRequest", "admitted evidence records", "verifier competence/freshness projection"]
+outputs = ["CurrentEpistemicPosition", "ProvenanceView", "InvestigationDirective candidate"]
+depends_on = []
+providers = ["canonical evidence projection", "eliot-evidence"]
+consumers = ["Dreamer bundle", "context candidate builder", "ActionFrame compiler"]
+non_goals = ["truth declaration", "record mutation", "model voting", "action authority"]
+invariants = ["rivals and superseded lineage remain visible", "missing data is a valid position", "scope/fence mismatch fails locally"]
+failure_behavior = "Return conflicted, stale or unknown with an explicit discriminative inquiry; only the dependent effect may be narrowed by its caller."
+proof_surface = ["fresh-outlier conflict", "assumption withdrawal", "stale verifier", "mixed-provenance ceiling", "empty-current inquiry"]
+proof_ceiling = "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-epistemic/src/lib.rs"
+disposition = "retain and harden"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.12"
+disposition = "authoritative contract"
+
+[agent_task]
+objective = "Harden the existing stateless resolver in place."
+write_scope = ["crates/smart/eliot-epistemic/**"]
+deliverables = ["revised position algebra", "deterministic inquiry selection", "property/adversarial tests"]
+acceptance = ["one coherent resolver remains", "no new state owner", "rivals and unknowns survive every result"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop if a requested change belongs to Governor transition state, policy or action authority."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"

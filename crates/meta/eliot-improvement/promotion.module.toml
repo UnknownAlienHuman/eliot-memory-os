@@ -1,0 +1,62 @@
+schema_version = 4
+module_id = "meta.improvement.promotion_input"
+crate = "eliot-improvement"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-02"
+agent_order = 38
+plane = "Meta"
+runtime_layer = "R7"
+delivery_depth = "D4"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "meta.improvement.promotion_input"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Only local learning with exact activation, adherence, outcome, retention, transfer, evaluator-validity, Product Pulse and rollback evidence becomes an advisory promotion input."
+causal_property = "outer-loop promotion-input preparation"
+old_failure_or_missing_capability = "Legacy improvement logic can treat a passing verifier and replay plan as sufficient without binding activation, adherence, retention, transfer or exact product identity."
+discriminator = "Promotion input is impossible without exact current gates and always remains advisory to the named Governor or Human promotion owner."
+primary_responsibility = "Harden the advisory ImprovementCandidate and PromotionInput core against updated activation, retention, transfer, Product Pulse and rollback gates."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["CampaignLearningClosure", "ImprovementCandidate", "replay, holdout, transfer, retention, Product Pulse and evaluator evidence"]
+outputs = ["PromotionInput candidate", "gate and missingness report", "rejection or narrowing recommendation"]
+depends_on = ["eliot-learning-contracts"]
+providers = ["Meta closure", "evaluation and Product Pulse evidence"]
+consumers = ["Governor or Human promotion owner"]
+non_goals = ["promotion execution", "active generation rewrite", "policy or Architecture change", "evaluator ownership", "shared crate export wiring"]
+invariants = ["direct_promotion is always false", "candidate validity scope and product identity are exact", "stale stack or evaluator invalidates reuse", "this agent has no shared write surface with learning-closure implementation"]
+failure_behavior = "Return rejected, narrowed or incomplete PromotionInput with exact missing gates; never infer promotion readiness from one score."
+proof_surface = ["missing activation", "transfer without retention", "stale evaluator", "Product Pulse regression", "direct promotion", "non-overlapping source paths"]
+proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/meta/eliot-improvement/src/lib.rs"
+disposition = "retain and harden advisory boundary; integration owner wires the new module"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.24 and ELIOT_ARCHITECTURE A14.5"
+disposition = "authoritative promotion-ceiling contract"
+
+[agent_task]
+objective = "Harden the existing crate in place without creating another promotion owner or sharing a writable file with the closure agent."
+write_scope = ["crates/meta/eliot-improvement/src/promotion_input.rs", "crates/meta/eliot-improvement/tests/promotion_input.rs"]
+deliverables = ["PromotionInput core", "gate/missingness/narrowing fixtures", "integration-owner export request"]
+acceptance = ["advisory candidate only", "all required gates dimensioned", "no edit to shared lib.rs"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification", "direct edits to crates/meta/eliot-improvement/src/lib.rs by this agent", "writes outside promotion_input.rs and its dedicated tests"]
+stop_condition = "Stop if work requires promotion execution, evaluator selection, active-generation rewrite, policy change or shared-file editing."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"
+shared_integration_surface = "crates/meta/eliot-improvement/src/lib.rs"
+shared_integration_owner = "cognitive-wave-integrator"
+integration_rule = "The integration owner alone wires module exports after both existing-crate cells return non-overlapping implementations."

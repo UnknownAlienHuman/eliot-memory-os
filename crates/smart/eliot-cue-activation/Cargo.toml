@@ -1,0 +1,26 @@
+[package]
+name = "eliot-cue-activation"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Evaluate normalized cues against one immutable snapshot and return bounded direct and relation-derived activation with a complete trace."
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "NOT_IMPLEMENTED"
+workspace_admission = "pending_agent_implementation_and_proof"
+functional_cell = "smart.cue.activation"
+source_layer = "C1"
+runtime_layer = "R5"
+runtime_bundle = "eliotd"
+agent_order = 14
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }
+eliot-cue-contracts = { path = "../eliot-cue-contracts" }

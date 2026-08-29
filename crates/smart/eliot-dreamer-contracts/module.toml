@@ -1,0 +1,59 @@
+schema_version = 4
+module_id = "smart.dreamer.contracts"
+crate = "eliot-dreamer-contracts"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 3
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C0"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.contracts"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "All Dreamer jobs share provider-neutral candidate-only schemas while distinct job classes and authority domains remain explicit."
+causal_property = "Dreamer contract representation"
+old_failure_or_missing_capability = "The legacy eliot-dreamer-core combines shared schemas with bundle construction, validation and handler semantics."
+discriminator = "Schema tests keep Orientation, Clarification, ArchitectureSelfQuery, Curation, ResearchSynthesis, DevelopmentDiagnosis, Maintenance, OrchestrationPlanning and ConfigurationAssistance distinct."
+primary_responsibility = "Own provider-neutral job, bundle, draft, candidate, preservation and result schemas shared by all Dreamer handlers."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["foundation identities, fences, evidence, privacy and budget handles"]
+outputs = ["DreamJobInput and separate JobClass variants", "DreamInputBundle shapes", "ModelDraft and candidate/result contracts"]
+depends_on = []
+providers = ["foundation identities and evidence contracts"]
+consumers = ["all Dreamer handlers", "Dreamer runtime adapter"]
+non_goals = ["handler logic", "job admission", "route selection", "provider SDK"]
+invariants = ["every result is candidate-only", "evidence and synthesis fields cannot be conflated", "scope, fence, privacy, budget and forbidden effects are explicit", "Orientation never embeds Clarification or ArchitectureSelfQuery as required sections", "ArchitectureBrief and ImplementationBrief remain authority-separated outputs of one self-query job"]
+failure_behavior = "Reject incompatible or unknown schema variants with exact version gaps; never coerce one job class into another."
+proof_surface = ["schema roundtrip", "job-class separation", "unknown job/result compatibility", "model text cannot populate resolved evidence fields"]
+proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-core/src/lib.rs"
+disposition = "extract contract shapes"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I9.3-I9.7"
+disposition = "authoritative contract"
+
+[agent_task]
+objective = "Create the stable Dreamer contract hub before any handler implementation."
+write_scope = ["crates/smart/eliot-dreamer-contracts/**"]
+deliverables = ["typed contract hub", "schema/version fixtures", "job-class separation tests"]
+acceptance = ["candidate-only schemas", "separate job classes and authority domains", "no state mutation or external effect"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop if a shared schema starts carrying handler behavior, provider SDKs, admission or authority."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"

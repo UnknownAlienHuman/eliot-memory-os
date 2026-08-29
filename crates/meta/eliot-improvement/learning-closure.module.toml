@@ -1,0 +1,62 @@
+schema_version = 4
+module_id = "meta.learning.closure"
+crate = "eliot-improvement"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-02"
+agent_order = 37
+plane = "Meta"
+runtime_layer = "R7"
+delivery_depth = "D4"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "meta.learning.closure"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Every consequential campaign closes with an evidence-backed reusable delta, no-change, exhaustion, rollback or explicit open learning debt."
+causal_property = "campaign learning closure candidate"
+old_failure_or_missing_capability = "Consequential work can finish while its learning debt disappears without a terminal or checkpoint disposition."
+discriminator = "Every terminal or checkpoint campaign produces a valid closure or explicit delayed or inconclusive debt; closure never performs promotion."
+primary_responsibility = "Assemble one CampaignLearningClosure candidate from exact outcome, delta, activation, adherence and retained or rejected update evidence."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["campaign outcome and economics evidence", "AttemptLearningDelta refs", "HarnessActivationReceipt refs", "reusable candidate refs"]
+outputs = ["CampaignLearningClosure candidate", "inheritance action candidates", "open learning debt"]
+depends_on = ["eliot-learning-contracts"]
+providers = ["learning, evaluator and attempt projections"]
+consumers = ["improvement promotion-input cell", "Governor or Memory OS disposition"]
+non_goals = ["task finish", "promotion execution", "cross-task admission", "scheduler", "shared crate export wiring"]
+invariants = ["NO_REUSABLE_DELTA is valid", "closure may be asynchronous but has one owner", "promotion is separately referenced and externally owned", "this agent has no shared write surface with promotion-input implementation"]
+failure_behavior = "Return inconclusive closure or explicit open learning debt with exact missing outcome, activation or adherence evidence."
+proof_surface = ["no reusable delta", "deferred outcome", "rollback", "missing closure owner", "non-overlapping source paths"]
+proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/meta/eliot-improvement/src/lib.rs"
+disposition = "retain advisory candidate boundary; integration owner wires the new module"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.24 CampaignLearningClosure"
+disposition = "authoritative closure contract"
+
+[agent_task]
+objective = "Implement the closure cell inside the existing crate without sharing a writable file with the promotion-input agent."
+write_scope = ["crates/meta/eliot-improvement/src/learning_closure.rs", "crates/meta/eliot-improvement/tests/learning_closure.rs"]
+deliverables = ["CampaignLearningClosure core", "no-change/debt/rollback fixtures", "integration-owner export request"]
+acceptance = ["explicit terminal or debt disposition", "no promotion execution", "no edit to shared lib.rs"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification", "direct edits to crates/meta/eliot-improvement/src/lib.rs by this agent", "writes outside learning_closure.rs and its dedicated tests"]
+stop_condition = "Stop if closure requires task finish, promotion, evaluator replacement, shared-file editing or hidden campaign state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"
+shared_integration_surface = "crates/meta/eliot-improvement/src/lib.rs"
+shared_integration_owner = "cognitive-wave-integrator"
+integration_rule = "The integration owner alone wires module exports after both existing-crate cells return non-overlapping implementations."

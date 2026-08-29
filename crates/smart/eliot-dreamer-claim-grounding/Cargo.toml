@@ -1,0 +1,26 @@
+[package]
+name = "eliot-dreamer-claim-grounding"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Claim-level grounding of bounded Dreamer drafts against authorized references"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
+
+[package.metadata.eliot]
+prototype = true
+workspace_admission = "pending_agent_implementation"
+functional_cell = "smart.dreamer.claim_grounding"
+source_layer = "C1"
+runtime_layer = "R6"
+runtime_bundle = "eliot-dreamer"
+agent_order = 14
+
+[lints]
+workspace = true

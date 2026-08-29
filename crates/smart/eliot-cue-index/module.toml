@@ -1,0 +1,59 @@
+schema_version = 4
+module_id = "smart.cue.index"
+crate = "eliot-cue-index"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 13
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "smart.cue.index"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Reactive cue evaluation reads one current immutable projection built only from Governor-admitted bindings."
+causal_property = "cue projection construction"
+old_failure_or_missing_capability = "Legacy CueRuntime combines snapshot construction and evaluation, while the first prototype did not make the cue-binding admission edge explicit."
+discriminator = "The same admitted bindings and profile rebuild the same snapshot; raw CueBindingCandidate values cannot enter the index."
+primary_responsibility = "Build and validate one immutable rebuildable CueSnapshot from Governor-admitted binding projections and typed activation edges."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["admitted cue-binding projection", "typed activation edges", "projection revision and fence"]
+outputs = ["CueSnapshot", "publication manifest", "rejected row and edge report"]
+depends_on = ["eliot-cue-contracts", "eliot-cue-normalizer", "eliot-cue-binding"]
+providers = ["Governor/store named-read projection over admitted cue bindings"]
+consumers = ["cue activation"]
+non_goals = ["canonical binding mutation", "CueBindingCandidate admission", "hot evaluation", "semantic graph mining"]
+invariants = ["CueBindingCandidate output never bypasses Governor admission", "snapshot has one source fence", "rows contain handles rather than payload authority", "invalid rows or edges fail locally"]
+failure_behavior = "Return partial or failed publication with exact rejected rows; the previous current snapshot remains visible."
+proof_surface = ["deterministic rebuild", "candidate-bypass rejection", "duplicate row", "stale generation", "invalid endpoint", "zero-edge snapshot"]
+proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-cues/src/lib.rs"
+disposition = "extract snapshot model"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.6-I12.7"
+disposition = "authoritative binding-admission and Cue Index contract"
+
+[agent_task]
+objective = "Separate rebuildable projection construction from hot activation and make the Governor admission edge explicit."
+write_scope = ["crates/smart/eliot-cue-index/**"]
+deliverables = ["CueSnapshot builder", "admission/fence/rebuild fixtures", "publisher-consumer Edge fixtures"]
+acceptance = ["only admitted bindings enter", "bounded deterministic rebuild", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop if index construction needs canonical mutation, candidate admission, unbounded graph mining, model work or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"

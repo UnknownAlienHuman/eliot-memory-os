@@ -1,0 +1,55 @@
+schema_version = 4
+module_id = "smart.dreamer.configuration_plan"
+crate = "eliot-dreamer-configuration-plan"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-02"
+agent_order = 42
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.configuration_plan"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Natural-language configuration requests become typed reviewable ConfigurationChangeIntent candidates and never direct edits."
+causal_property = "ConfigurationChangeIntent synthesis"
+old_failure_or_missing_capability = "Configuration assistance can blur explanation, candidate construction and active snapshot mutation."
+discriminator = "The handler emits one typed delta candidate with current and candidate snapshots, impact, owner, probe and rollback; active configuration is unchanged."
+primary_responsibility = "Translate a Human request or diagnosed problem into one typed ConfigurationChangeIntent candidate."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["DreamJobInput class=ConfigurationAssistance", "current configuration snapshots", "natural-language request or diagnosed Problem evidence"]
+outputs = ["ConfigurationChangeIntent candidate", "impact and owner matrix", "probe and rollback plan"]
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+providers = ["Governor-admitted Dreamer bundle", "current configuration projections"]
+consumers = ["Dreamer configuration surface", "owning configuration transition path"]
+non_goals = ["file edit", "snapshot publication", "cost, privacy, remote access, authority or automatic-launch widening"]
+invariants = ["current and candidate snapshots are exact", "Human-owned boundaries are explicit", "previous snapshot is the rollback anchor", "forbidden ceiling widening is rejected rather than merely warned"]
+failure_behavior = "Return unsupported or inconclusive ConfigurationChangeIntent with exact missing snapshot, owner or impact evidence; never mutate configuration."
+proof_surface = ["presentation-only change", "model-cost route", "privacy widening", "stale capability", "missing rollback"]
+proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+product_pulse = "D3A_ADVISORY_DIAGNOSIS_PLANNING_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I9.3 Configuration assistance and I3.10"
+disposition = "authoritative intent and owner boundary"
+
+[agent_task]
+objective = "Implement one candidate-only ConfigurationChangeIntent handler; publication remains with the owning transition path."
+write_scope = ["crates/smart/eliot-dreamer-configuration-plan/**"]
+deliverables = ["ConfigurationChangeIntent core", "ceiling/impact/rollback fixtures", "configuration-owner Edge fixtures"]
+acceptance = ["typed candidate only", "active snapshot unchanged", "forbidden widening rejected"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop if assistance requires editing files, publishing a snapshot or widening Human-owned ceilings."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"

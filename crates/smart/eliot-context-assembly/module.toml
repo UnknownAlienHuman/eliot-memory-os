@@ -1,0 +1,63 @@
+schema_version = 3
+module_id = "smart.context.assembly"
+crate = "eliot-context-assembly"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 18
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "smart.context.assembly"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "A route receives a bounded reconstructible Active Understanding View with exact expansion paths."
+causal_property = "context assembly and decision-local rendering"
+old_failure_or_missing_capability = "legacy eliot-understanding invokes ContextCompiler again and creates a second synthesis owner"
+discriminator = "assembly consumes exactly one admission result and preserves identical membership/ceilings"
+primary_responsibility = "Render one admitted set into semantic sections, reversible omission manifest and decision-local tail without re-running admission."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["AdmittedContextSet", "ContextRecipe layout policy", "renderer profile"]
+outputs = ["ActiveUnderstandingView", "DecisionLocalTail", "BoundaryMetadataEnvelope", "final quality scorecard"]
+depends_on = ["eliot-context-contracts", "eliot-context-admission"]
+providers = ["context admission"]
+consumers = ["reactive context plan", "agent packet surface", "Dreamer bundle"]
+non_goals = ["candidate ranking", "retrieval", "model synthesis", "canonical persistence"]
+invariants = ["semantic units not cut falsely", "handles remain expandable", "rendering cannot strengthen support/authority"]
+failure_behavior = "Return typed incomplete view with exact handles or no view; never hide truncation or recompute admission."
+proof_surface = ["role order", "reversible omission", "no double compilation", "stable digest/quality"]
+proof_ceiling = "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-understanding/src/lib.rs"
+disposition = "merge rendering only"
+
+[[donor]]
+path = "crates/smart/eliot-context/src/lib.rs"
+disposition = "extract result semantics"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I7.11/I12.13/I12.17"
+disposition = "authoritative contract"
+
+[agent_task]
+objective = "Replace the duplicated understanding compiler with one thin assembler."
+write_scope = ["crates/smart/eliot-context-assembly/**"]
+deliverables = ["public contract/core implementation", "property/adversarial fixtures", "affected edge fixtures"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, unbounded traversal, model call or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"

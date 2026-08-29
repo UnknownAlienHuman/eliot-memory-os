@@ -1,0 +1,27 @@
+[package]
+name = "eliot-dreamer-maintenance-plan"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Translate bounded self-scope quality/problem evidence into one maintenance plan candidate with expected delta, cost, rollback and Human boundary."
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "NOT_IMPLEMENTED"
+workspace_admission = "pending_agent_implementation_and_proof"
+functional_cell = "smart.dreamer.maintenance_plan"
+source_layer = "C1"
+runtime_layer = "R6"
+runtime_bundle = "eliot-dreamer"
+agent_order = 41
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
+eliot-dreamer-candidate-validation = { path = "../eliot-dreamer-candidate-validation" }

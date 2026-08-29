@@ -1,0 +1,57 @@
+schema_version = 2
+module_id = "smart.dreamer.probe_plan"
+crate = "eliot-dreamer-probe-plan"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 17
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.probe_plan"
+loc_soft_ceiling = 10000
+primary_responsibility = "Convert explicit unknowns and rival disagreements into a bounded ordered set of candidate discriminative probes with visible cost, risk, authority and expected discrimination dimensions."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["DreamInputBundle", "ValidatedDreamDraft", "RivalModelSet", "available inquiry affordance descriptors"]
+outputs = ["ProbePlan", "unprobeable unknowns", "budget/authority omissions"]
+depends_on = ["eliot-dreamer-contracts"]
+execution_after = ["eliot-dreamer-rival-model"]
+consumers = ["eliot-dreamer-orientation", "eliot-dreamer-clarification", "Governor/Researcher planning boundary"]
+non_goals = ["execute tools or research", "reserve routes/budget", "decide policy/authority", "grade resulting evidence"]
+invariants = ["probe proposals target a named disagreement or unknown", "ranking is vector-preserving and bounded", "unauthorized probes remain proposals only", "no scalar hides cost/risk/authority failure"]
+failure_behavior = "Return unprobeable/over-budget/authority-blocked gaps explicitly; never launch a fallback action."
+proof_surface = ["discrimination-target coverage", "budget/risk/authority vectors", "duplicate probe collapse", "deterministic ordering"]
+replacement_boundary = "pure probe planning algorithm behind ProbePlan"
+split_trigger = "tool execution, scheduling, route reservation or evidence ingestion appears"
+rust_contract_dependencies = ["eliot-dreamer-contracts"]
+
+[[donor]]
+path = "crates/smart/eliot-epistemic/src/lib.rs"
+disposition = "reuse_intent_only"
+scope = "required_inquiry and cheapest discriminative inquiry intent; replace prose with typed bounded probes"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-core/src/lib.rs"
+disposition = "partial_reuse"
+scope = "recommended_probes and budget fields; harden into typed vector-scored proposals"
+
+[[donor]]
+path = "ELIOT Architecture/Implementation English edition 2026-08-28"
+disposition = "authoritative_contract"
+scope = "Investigation, discriminative inquiry, authority and Researcher separation"
+
+[agent_task]
+objective = "Implement candidate-only probe planning; leave all execution to Governor/Researcher/runtime owners."
+write_scope = ["crates/smart/eliot-dreamer-probe-plan/**"]
+deliverables = ["probe proposal builder", "dimensioned ordering", "blocked/unprobeable gap tests"]
+acceptance = ["every probe names the uncertainty it discriminates", "no effects or reservation", "dimension failures remain visible"]
+forbidden = ["canonical writes", "tool/model/provider calls", "Researcher source acquisition", "job scheduling", "authority or budget reservation"]
+stop_condition = "Stop if a probe cannot be proposed without executing it or knowing provider capacity; emit the missing affordance/authority requirement."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package proof", "rival/orientation edge fixtures", "Orientation Product Pulse"]
+workspace_admission = "forbidden until src/lib.rs, package proof and Orientation Product Pulse pass"

@@ -1,0 +1,26 @@
+[package]
+name = "eliot-dreamer-bundle"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Bounded Dreamer input-bundle assembly from Governor-provided handles"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "NOT_IMPLEMENTED"
+workspace_admission = "pending_agent_implementation_and_proof"
+functional_cell = "smart.dreamer.bundle"
+source_layer = "C1"
+runtime_layer = "R6"
+runtime_bundle = "eliot-dreamer"
+agent_order = 4
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-context-contracts = { path = "../eliot-context-contracts" }
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
