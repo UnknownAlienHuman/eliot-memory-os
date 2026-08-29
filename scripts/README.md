@@ -12,13 +12,14 @@ retired rather than preserved as archaeology.
 
 | Script | Purpose | Proof ceiling |
 |---|---|---|
-| `verify.ps1` | Current Windows developer verification: normative identity, architecture-boundary audit, nearest-path agent guardrails, runtime-source hygiene, Cargo metadata, formatting, and workspace check | Source/build candidate only |
+| `verify.ps1` | Current Windows developer verification: normative identity, architecture-boundary audit, nearest-path agent guardrails, runtime-source hygiene, agent-bridge public protocol policy, Cargo metadata, formatting, and workspace check | Source/build candidate only |
 | `verify.sh` | Unix-compatible counterpart for the current bounded source checks | Source/build candidate only |
 | `verify-normative.ps1` | Recompute canonical Architecture/Implementation digests and pair key; reject predecessor copies | Normative artifact identity only |
 | `verify-normative.sh` | Unix-compatible normative-pair verifier | Normative artifact identity only |
 | `audit-architecture-boundaries.py` | Scan declared core/daemon runtime roots for forbidden dependencies, SurrealDB leakage, untracked direct process launch, and production placeholders | Static source/build architecture evidence only |
 | `verify-agent-guardrails.py` | Require bounded nearest-path owner/proof/stop instructions for core and daemon source subtrees | Routing/control-plane evidence only |
 | `audit-runtime-source-hygiene.py` | Expose unsafe, panic/unwrap/expect, ambient configuration, unbounded-output, blocking-sleep, and source-concentration risks in runtime roots | Static source-quality signals only |
+| `verify-agent-bridge-protocol.py` | Reject raw canonical Frame ingress, host-minted authority fields, validation bypass, correlation loss, and mandatory cancellation prose | Static protocol/source-policy evidence only |
 | `verify-lint-policy.ps1` | Verify the current Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
 
 Normal iteration uses `just quick` or `scripts/verify.ps1`. The manual Source
@@ -84,6 +85,30 @@ volume. Review the exact path, owner, effect, failure behavior, and replacement
 boundary. JSON output is permitted only as a current issue/PR or CI artifact;
 it is not committed as a support report. A clean scan is not runtime, process,
 store, security, or Product proof.
+
+### Agent-bridge public protocol policy
+
+```powershell
+python scripts/verify-agent-bridge-protocol.py --self-test
+python scripts/verify-agent-bridge-protocol.py
+```
+
+The verifier is bound to the public `eliot-agent-bridge` stdin request enum, the
+inert host request/cancellation contracts, and the stateless host gateway. It
+requires typed `invoke`/`cancel`, strict unknown-field rejection, validation
+before the trusted port call, exact host correlation and cancellation-target
+preservation, optional cancellation prose, and a typed fail-closed Kernel gap.
+
+It rejects public raw canonical `Frame` forwarding and host fields that would
+mint or carry Kernel/Governor-owned principal, Session/task/WorkScope,
+`RequestIdentity`, State Fence, Authority Epoch, idempotency/cancellation
+identity, absolute deadline, or effect ceiling. Its self-test covers both the
+accepted contract and the named regression classes.
+
+A clean result proves only the current public source boundary. It does not
+establish a live Kernel host-request endpoint, RequestIdentity issuance,
+Governor dispatch, external effects, reconnect behavior, Edge Proof, or Product
+support. The complete integration remains owned by issue #77.
 
 ## Release and installation
 
