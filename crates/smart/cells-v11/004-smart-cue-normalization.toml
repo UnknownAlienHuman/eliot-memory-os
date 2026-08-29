@@ -1,0 +1,51 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.cue.normalization"
+agent_order = 4
+physical_package = "eliot-cues"
+execution_class = "DECISION_BOUNDARY_HOT"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Normalize observed cues while preserving source spelling and applying one explicit WorkScope/platform comparison profile."
+
+[agent]
+objective = "Replace donor lowercasing with canonical_value plus profile-derived comparison_key."
+write_scope = ["crates/smart/eliot-cues/src/normalization.rs", "crates/smart/eliot-cues/tests/normalization.rs"]
+integration_owner = "cue projection integration owner"
+forbidden_files = ["crates/smart/eliot-cues/src/lib.rs", "crates/smart/eliot-cues/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = [
+  "pub fn normalize_observed_cue(cue: &ObservedCue, profile: &CueComparisonProfile) -> Result<NormalizedCue, CueNormalizationError>",
+  "pub fn normalize_observed_cues(cues: &[ObservedCue], profile: &CueComparisonProfile, limits: &CueLimits) -> Result<Vec<NormalizedCue>, CueNormalizationError>"
+]
+
+[algorithm]
+steps = [
+  "Validate kind, scope and bounded UTF-8.",
+  "Preserve trimmed source spelling in canonical_value.",
+  "Build comparison_key only through the supplied comparison profile.",
+  "Reject parent traversal and malformed signatures.",
+  "Stable-sort and deduplicate by kind, profile and comparison_key while retaining spelling provenance."
+]
+
+[limits]
+rules = ["Use explicit cue-count and byte maxima.", "Use one bounded pass plus stable sort.", "Do not call OS canonicalize or resolve symlinks/reparse points."]
+
+[errors]
+variants = ["InvalidText", "UnsupportedKind", "InvalidPathTraversal", "InvalidSignature", "ProfileMismatch", "TooManyCues"]
+
+[forbidden]
+operations = ["lowercasing canonical path spelling", "filesystem access", "ambient platform inference", "model call", "blocking I/O", "lock acquisition"]
+
+[tests]
+required = [
+  "case-insensitive profile matches variants without changing canonical spelling",
+  "case-sensitive profile keeps distinct keys",
+  "parent traversal is rejected",
+  "capture and fire normalization are identical"
+]
+
+[integration]
+provider = "ObservedCue adapter"
+consumer = "smart.cue.binding and smart.cue.direct_match"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if WorkScope comparison profile cannot be supplied explicitly."
