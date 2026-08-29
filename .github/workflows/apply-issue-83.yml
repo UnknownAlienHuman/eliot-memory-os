@@ -1,0 +1,58 @@
+name: Apply issue 83 deadline watcher patch
+
+on:
+  push:
+    branches: ["fix/83-deadline-watcher"]
+    paths:
+      - ".github/workflows/apply-issue-83.yml"
+      - "scripts/apply-issue-83.py"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: issue-83-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apply-and-verify:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Configure isolated Cargo target
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'eliot-issue-83-target'
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$target"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'CARGO_INCREMENTAL=0'
+
+      - name: Apply exact source transformation
+        shell: pwsh
+        run: python scripts/apply-issue-83.py .
+
+      - name: Verify focused package
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          cargo check --locked -p eliot-process-executor --all-targets
+          cargo test --locked -p eliot-process-executor
+          cargo clippy --locked -p eliot-process-executor --all-targets -- -D warnings
+          git diff --check
+
+      - name: Commit verified source and remove one-shot machinery
+        shell: pwsh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm scripts/apply-issue-83.py .github/workflows/apply-issue-83.yml
+          git add crates/instrument/eliot-process-executor/src/lib.rs
+          git add crates/instrument/eliot-process-executor/src/tests.rs
+          git add crates/instrument/eliot-process-executor/Cargo.toml
+          git commit -m 'fix(process): own deadline watcher before start receipt [skip ci]'
+          git push origin "HEAD:$($env:GITHUB_REF_NAME)"
