@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.current_system_conformance"
+agent_order = 61
+physical_package = "eliot-dreamer-self-model"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Compare accepted target contracts with an exact CurrentSystemEvidenceSnapshot without promoting prose, build success or test count to support."
+
+[agent]
+objective = "Implement exact target-versus-current conformance analysis only."
+write_scope = ["crates/smart/eliot-dreamer-self-model/src/current_system_conformance.rs", "crates/smart/eliot-dreamer-self-model/tests/current_system_conformance.rs"]
+integration_owner = "Dreamer self-model integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-self-model/src/lib.rs", "crates/smart/eliot-dreamer-self-model/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_current_system_conformance_candidate(request: &CurrentSystemConformanceRequest, target: &ImplementationBriefCandidate, current: &CurrentSystemEvidenceSnapshot) -> Result<CurrentSystemConformanceCandidate, CurrentSystemConformanceError>"]
+
+[algorithm]
+steps = [
+  "Validate Product Identity, evidence freshness, target identity and fence.",
+  "Compare owner, contract, source, Cargo, generated metadata, diagnostic, test, artifact and runtime dimensions separately.",
+  "Classify each target as ConfirmedSourceSupport, Partial, Absent, Contradicted, Stale or Unverified.",
+  "Require exact evidence handles and proof ceiling.",
+  "Never infer runtime health from source or build evidence."
+]
+
+[limits]
+rules = ["Use explicit target and evidence maxima.", "Perform no repository, build, test or runtime execution."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "ProductIdentityMissing", "EvidenceStale", "TargetMismatch", "MissingEvidenceHandle", "ProofOverclaim"]
+
+[forbidden]
+operations = ["repository/build/test/runtime execution", "prose as implementation evidence", "build success as runtime proof", "test count as product proof", "support promotion"]
+
+[tests]
+required = ["successful build does not prove runtime support", "prose does not prove current implementation", "stale evidence is labelled stale", "each conclusion names exact handles and proof ceiling"]
+
+[integration]
+provider = "accepted normative-source and CurrentSystemEvidenceSnapshot owners"
+consumer = "external self-query, audit and planning owners"
+product_pulse = "D5_SELF_QUERY_EDGE_01"
+stop_condition = "Stop and return ContractChallenge if exact Product Identity, current evidence handles, freshness or proof ceiling is unavailable."
