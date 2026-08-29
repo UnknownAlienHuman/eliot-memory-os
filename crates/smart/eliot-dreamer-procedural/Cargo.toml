@@ -1,0 +1,16 @@
+[package]
+name = "eliot-dreamer-procedural"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[dependencies]
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
+eliot-memory-curation-contracts = { path = "../eliot-memory-curation-contracts" }
+
+[package.metadata.eliot]
+status = "prototype-no-rust"
+workspace_admission = "blocked-until-module-edge-and-product-proof"
+cells = "smart.dreamer.procedure,smart.dreamer.skill,smart.dreamer.failure"
+integration_owner = "Procedural Candidate Owner"
