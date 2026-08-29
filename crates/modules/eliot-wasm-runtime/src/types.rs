@@ -130,8 +130,7 @@ impl Revision {
 
 impl<'de> Deserialize<'de> for Revision {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
+    where D: Deserializer<'de>,
     {
         Self::new(u64::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
@@ -572,6 +571,9 @@ pub struct EngineUsage {
     /// Wasmtime cannot expose observed stack usage.
     pub enforced_stack_limit_bytes: Option<u64>,
     pub elapsed_ms: u64,
+    /// Exact epoch deadline and cancellation mechanism reported as installed
+    /// by the engine adapter. This is execution evidence, not caller intent.
+    pub effective_epoch_policy: EpochPolicy,
     pub epoch_ticks: Option<u64>,
     pub artifact_reads: u32,
     pub artifact_bytes: u64,

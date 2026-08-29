@@ -311,6 +311,7 @@ impl WasmtimeComponentEngine {
                 stack_bytes: None,
                 enforced_stack_limit_bytes: Some(limits.max_stack_bytes),
                 elapsed_ms,
+                effective_epoch_policy: limits.epoch,
                 epoch_ticks: Some(epoch_ticks),
                 artifact_reads: 1,
                 artifact_bytes: self.artifact_bytes,
@@ -504,6 +505,7 @@ mod tests {
         assert_eq!(report.termination, EngineTermination::Completed);
         assert_eq!(report.output, b"typed guest input");
         assert_eq!(report.usage.enforced_stack_limit_bytes, Some(8 * 1024));
+        assert_eq!(report.usage.effective_epoch_policy, limits.epoch);
         assert!(report.usage.stack_bytes.is_none());
         Ok(())
     }
@@ -656,7 +658,11 @@ mod tests {
         let mut limits = test_limits(digest);
         limits.max_instances = 1;
         let report = engine
-            .invoke_component(&Sha256Digest::of_bytes(b"instances"), &limits, b"", true)
+            .invoke_component(&Sha256Digest::of_bytes(b"instances"),
+                &limits,
+                b"",
+                true,
+            )
             .map_err(|error| error.to_string())?;
         assert_eq!(report.termination, EngineTermination::InstanceLimit);
         Ok(())
