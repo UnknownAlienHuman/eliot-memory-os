@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.context.view_assembly"
+agent_order = 14
+physical_package = "eliot-context-view"
+execution_class = "DECISION_BOUNDARY_HOT"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Render immutable Active Understanding View sections from an already admitted set without re-admission."
+
+[agent]
+objective = "Implement post-admission section assembly and omission rendering only."
+write_scope = ["crates/smart/eliot-context-view/src/assembly.rs", "crates/smart/eliot-context-view/tests/assembly.rs"]
+integration_owner = "Context view integration owner"
+forbidden_files = ["crates/smart/eliot-context-view/src/lib.rs", "crates/smart/eliot-context-view/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn assemble_active_understanding_view(request: &ContextViewRequest, admitted: &AdmittedContextSet) -> Result<ActiveUnderstandingView, ContextViewError>"]
+
+[algorithm]
+steps = [
+  "Validate admitted membership digest and common fence.",
+  "Render fixed semantic section order.",
+  "Copy payload, handle and warning dispositions without changing membership.",
+  "Retain rivals, unknowns, negative memory and omission manifest.",
+  "Compute canonical view digest."
+]
+
+[limits]
+rules = ["Use bounded admitted atoms.", "Use linear rendering plus stable canonical serialization."]
+
+[errors]
+variants = ["FenceMismatch", "MembershipMismatch", "MissingSectionRepresentation", "InvalidOmission", "DigestFailure"]
+
+[forbidden]
+operations = ["re-ranking", "re-admission", "retrieval", "model call", "storage call", "blocking I/O", "lock acquisition"]
+
+[tests]
+required = ["assembly cannot add or remove atoms", "rival remains distinct from supported model", "omitted item retains expansion handle", "same admitted set yields same digest"]
+
+[integration]
+provider = "smart.context.admission"
+consumer = "smart.context.decision_tail and external context presentation surfaces"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if admitted membership or omission identity is not frozen before assembly."
