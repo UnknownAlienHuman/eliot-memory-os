@@ -1,0 +1,16 @@
+[package]
+name = "eliot-learning-evaluation"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[dependencies]
+eliot-learning-contracts = { path = "../../smart/eliot-learning-contracts" }
+eliot-evaluation-contracts = { path = "../../foundation/eliot-evaluation-contracts" }
+
+[package.metadata.eliot]
+status = "prototype-no-rust"
+workspace_admission = "blocked-until-module-edge-and-product-proof"
+cells = "meta.learning.activation_assessment,meta.learning.closure,meta.learning.promotion_input"
+integration_owner = "Learning Evaluation Projection Owner"
