@@ -6,12 +6,17 @@ on:
     paths:
       - ".github/workflows/apply-issue-83.yml"
       - "scripts/apply-issue-83.py"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/apply-issue-83.yml"
+      - "scripts/apply-issue-83.py"
 
 permissions:
   contents: write
 
 concurrency:
-  group: issue-83-${{ github.ref }}
+  group: issue-83-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -22,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ github.event.pull_request.head.ref || github.ref_name }}
           fetch-depth: 0
 
       - name: Configure isolated Cargo target
@@ -55,4 +60,4 @@ jobs:
           git add crates/instrument/eliot-process-executor/src/tests.rs
           git add crates/instrument/eliot-process-executor/Cargo.toml
           git commit -m 'fix(process): own deadline watcher before start receipt [skip ci]'
-          git push origin "HEAD:$($env:GITHUB_REF_NAME)"
+          git push origin "HEAD:${{ github.event.pull_request.head.ref || github.ref_name }}"
