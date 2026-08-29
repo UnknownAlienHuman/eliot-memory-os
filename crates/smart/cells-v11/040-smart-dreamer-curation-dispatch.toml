@@ -1,0 +1,46 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.curation_dispatch"
+agent_order = 40
+physical_package = "eliot-dreamer-curation"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Dispatch an already typed curation item to one registered handler and assemble typed results without semantic fallback."
+
+[agent]
+objective = "Implement typed dispatch and candidate-set assembly only."
+write_scope = ["crates/smart/eliot-dreamer-curation/src/dispatch.rs", "crates/smart/eliot-dreamer-curation/tests/dispatch.rs"]
+integration_owner = "Dreamer curation integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-curation/src/lib.rs", "crates/smart/eliot-dreamer-curation/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = [
+  "pub fn dispatch_curation_item(request: &CurationDispatchRequest, registry: &CurationHandlerRegistry) -> Result<TypedCurationHandlerResult, CurationDispatchError>",
+  "pub fn assemble_curation_candidate_set(request: &CurationAssemblyRequest, results: &[TypedCurationHandlerResult]) -> Result<CurationCandidateSet, CurationAssemblyError>"
+]
+
+[algorithm]
+steps = [
+  "Validate item subtype, registry revision and fence.",
+  "Resolve exactly one registered handler for the typed subtype.",
+  "Reject unknown or ambiguous subtype.",
+  "Preserve handler result and lineage without reinterpretation.",
+  "Assemble stable candidate set and unsupported-item manifest."
+]
+
+[limits]
+rules = ["Use explicit item and result maxima.", "Use no generic LLM fallback.", "Do not maintain a closed semantic match table when the governed registry is unavailable."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "RegistryStale", "UnsupportedSubtype", "AmbiguousHandler", "HandlerResultMismatch", "DuplicateCandidate"]
+
+[forbidden]
+operations = ["subtype inference from prose", "semantic fallback", "handler-output rewrite", "lifecycle transition", "canonical write"]
+
+[tests]
+required = ["unknown subtype remains unsupported", "handler output is not semantically rewritten", "two handlers for one subtype fail closed", "candidate ordering is deterministic"]
+
+[integration]
+provider = "external governed CurationHandlerRegistry and typed curation handlers"
+consumer = "Governor/Human curation review owner"
+product_pulse = "D3C_CURATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if open typed handler registry, subtype identity or handler-result contract is unavailable."
