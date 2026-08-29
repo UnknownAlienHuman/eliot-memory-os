@@ -25,11 +25,11 @@ def main() -> None:
         """pub struct HostEventEnvelope {
     pub host_id: AgentHostId,
     pub host_session_id: Option<String>,
-    #[serde(default, skip_serializing_if = \"Option::is_none\")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_event_id: Option<String>,
-    #[serde(default, skip_serializing_if = \"Option::is_none\")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_sequence: Option<u64>,
-    #[serde(default, skip_serializing_if = \"Option::is_none\")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_emitted_at: Option<String>,
     pub eliot_session_id: Option<AgentSessionId>,
 """,
@@ -38,24 +38,24 @@ def main() -> None:
     engine = Path("crates/eliot-engine/src/host.rs")
     replace_once(
         engine,
-        """        let tool_or_command = string_field(&value, &[\"tool\", \"tool_name\", \"command\"]);
-        let changed_path_refs = [\"changed_path\", \"file_path\", \"path\"]
+        """        let tool_or_command = string_field(&value, &["tool", "tool_name", "command"]);
+        let changed_path_refs = ["changed_path", "file_path", "path"]
 """,
-        """        let tool_or_command = string_field(&value, &[\"tool\", \"tool_name\", \"command\"]);
-        let source_event_id = string_field(&value, &[\"event_id\", \"eventId\"]);
-        let source_sequence = value.get(\"sequence\").and_then(Value::as_u64);
-        let source_emitted_at = string_field(&value, &[\"emitted_at\", \"emittedAt\"]);
-        let changed_path_refs = [\"changed_path\", \"file_path\", \"path\"]
+        """        let tool_or_command = string_field(&value, &["tool", "tool_name", "command"]);
+        let source_event_id = string_field(&value, &["event_id", "eventId"]);
+        let source_sequence = value.get("sequence").and_then(Value::as_u64);
+        let source_emitted_at = string_field(&value, &["emitted_at", "emittedAt"]);
+        let changed_path_refs = ["changed_path", "file_path", "path"]
 """,
     )
     replace_once(
         engine,
         """            host_id,
-            host_session_id: string_field(&value, &[\"host_session_id\", \"session_id\"]),
+            host_session_id: string_field(&value, &["host_session_id", "session_id"]),
             eliot_session_id: None,
 """,
         """            host_id,
-            host_session_id: string_field(&value, &[\"host_session_id\", \"session_id\"]),
+            host_session_id: string_field(&value, &["host_session_id", "session_id"]),
             source_event_id,
             source_sequence,
             source_emitted_at,
@@ -69,7 +69,7 @@ def main() -> None:
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HostBrokerService;
 """,
-        """}
+        '''}
 
 #[cfg(test)]
 mod host_event_tests {
@@ -78,27 +78,27 @@ mod host_event_tests {
 
     #[test]
     fn opencode_source_identity_survives_normalization() {
-        let raw = br#\"{
-            \\"event_id\\": \\"opencode:tool.execute.after:native-42\\",
-            \\"sequence\\": 17,
-            \\"emitted_at\\": \\"2026-08-29T18:40:00.123Z\\",
-            \\"event_kind\\": \\"tool.execute.after\\",
-            \\"host_session_id\\": \\"session-7\\"
-        }\"#;
+        let raw = br#"{
+            "event_id": "opencode:tool.execute.after:native-42",
+            "sequence": 17,
+            "emitted_at": "2026-08-29T18:40:00.123Z",
+            "event_kind": "tool.execute.after",
+            "host_session_id": "session-7"
+        }"#;
         let event = HostEventService
-            .normalize(AgentHostId::OpenCode, \"tool.execute.after\", raw)
-            .expect(\"OpenCode event must normalize\");
+            .normalize(AgentHostId::OpenCode, "tool.execute.after", raw)
+            .expect("OpenCode event must normalize");
 
         assert_eq!(
             event.source_event_id.as_deref(),
-            Some(\"opencode:tool.execute.after:native-42\")
+            Some("opencode:tool.execute.after:native-42")
         );
         assert_eq!(event.source_sequence, Some(17));
         assert_eq!(
             event.source_emitted_at.as_deref(),
-            Some(\"2026-08-29T18:40:00.123Z\")
+            Some("2026-08-29T18:40:00.123Z")
         );
-        assert_eq!(event.host_session_id.as_deref(), Some(\"session-7\"));
+        assert_eq!(event.host_session_id.as_deref(), Some("session-7"));
     }
 
     #[test]
@@ -106,10 +106,10 @@ mod host_event_tests {
         let event = HostEventService
             .normalize(
                 AgentHostId::Claude,
-                \"session.created\",
-                br#\"{\\"event_kind\\":\\"session.created\\"}\"#,
+                "session.created",
+                br#"{"event_kind":"session.created"}"#,
             )
-            .expect(\"legacy event must normalize\");
+            .expect("legacy event must normalize");
 
         assert!(event.source_event_id.is_none());
         assert!(event.source_sequence.is_none());
@@ -119,7 +119,7 @@ mod host_event_tests {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HostBrokerService;
-""",
+''',
     )
 
 
