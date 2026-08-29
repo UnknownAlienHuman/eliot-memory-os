@@ -1,8 +1,8 @@
 # Core and daemon work units
 
-This brief routes issues #13–#24. It is not normative. Current meaning comes
-from the canonical pair in `docs/architecture/`, and the exact issue body is the
-work-unit contract.
+This brief routes issues #13–#24 and their confirmed bounded defect units. It is
+not normative. Current meaning comes from the canonical pair in
+`docs/architecture/`, and the exact issue body is the work-unit contract.
 
 ## Scope
 
@@ -71,7 +71,7 @@ Every candidate returns:
    regression;
 6. promotion, narrowing, rollback, rejection, or blocked disposition.
 
-## Issue routing
+## Primary issue routing
 
 | Issue | Primary boundary |
 |---|---|
@@ -91,6 +91,48 @@ Every candidate returns:
 Regression probes #7–#10 own Claude Desktop completion, attach/context,
 Antigravity terminal reconciliation, and arbitrary JSON payload integrity.
 Issue #11 owns live Windows operational-spine/Product-Pulse evidence.
+
+## Confirmed bounded defect units
+
+These issues own one causal contract or local source repair. They do not replace
+the primary integration issues above.
+
+| Issue | Causal property |
+|---|---|
+| #63 | recompute one canonical executable request hash across Governor, Kernel and Store |
+| #64 | replace scalar authority epochs with one lineage-aware identity and migration |
+| #65 | separate normal admission from protected Control Reserve at every claimed bottleneck |
+| #66 | submit one typed semantic activation result instead of silently re-claiming tickets |
+| #67 | allow bounded concurrent Store transactions for disjoint Ordering Scopes |
+| #72 | keep later testd project jobs blocked while an earlier job is Running |
+| #73 | bind the WASM provider to the actual pinned Wasmtime generation |
+| #74 | give User Broker register/heartbeat/launch/fence distinct operation identities |
+| #75 | reject or explicitly rebind WASM limits that exceed the provider ceiling |
+| #76 | preserve typed Store errors and recovery directives on EBP |
+| #77 | translate host requests before Kernel RequestIdentity binding; no raw Frame passthrough |
+| #78 | give notification verification/delivery/ledger steps distinct child operation identities |
+| #79 | separate transport connection identity from durable process/session ownership |
+
+Merged local repairs #59, #61, #68 and #70 close only their exact source
+discriminators. They do not establish build, runtime or Product support.
+
+### Required wave ordering
+
+Do not combine the load-bearing migrations into one broad patch:
+
+```text
+#13 capability/proof ownership projection
+→ #64 lineaged epoch contract
+→ #63 executable request digest
+→ #65 protected capacity classes
+→ process-specific identity/activation/error units (#66, #74, #76–#79)
+→ local scheduler/provider units (#67, #72, #73, #75)
+→ affected real edges
+→ #11 Product Pulse.
+```
+
+A different order requires an explicit Contract Challenge showing why the
+consumer can migrate safely without a temporary second owner or lossy adapter.
 
 ## Result schema
 

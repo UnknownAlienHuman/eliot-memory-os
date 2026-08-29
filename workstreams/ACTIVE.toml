@@ -26,9 +26,12 @@ status = "active"
 branch_strategy = "fresh_per_issue_from_current_main"
 issue_refs = [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
 integration_issue_refs = [11]
+confirmed_open_defect_refs = [63, 64, 65, 66, 67, 72, 73, 74, 75, 76, 77, 78, 79]
+merged_source_fix_refs = [59, 61, 68, 70]
 briefs = ["workstreams/core-daemons/AGENTS.md"]
 inventories = ["workstreams/core-daemons/inventory.json"]
 excluded_capabilities = ["dreamer"]
+implementation_rule = "Primary issues own integration. Confirmed defect issues own one causal contract or local repair. Every defect uses its own current-main branch/PR; no worker combines the epoch, request-digest, Control-Reserve, process-session and runtime-contour migrations into one patch."
 
 [[workstream]]
 id = "cognitive-micromodules"
