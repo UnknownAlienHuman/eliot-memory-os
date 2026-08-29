@@ -1,0 +1,46 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.context.admission"
+agent_order = 12
+physical_package = "eliot-context"
+execution_class = "DECISION_BOUNDARY_HOT"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Admit whole atoms under Decision Safety Floor, downstream headroom, provider fairness and epistemic safety."
+
+[agent]
+objective = "Implement deterministic whole-unit admission without presentation assembly."
+write_scope = ["crates/smart/eliot-context/src/admission.rs", "crates/smart/eliot-context/tests/admission.rs"]
+integration_owner = "Context Compiler integration owner"
+forbidden_files = ["crates/smart/eliot-context/src/lib.rs", "crates/smart/eliot-context/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn admit_context_candidates(request: &ContextAdmissionRequest, candidates: &MergedContextCandidateSet) -> Result<AdmittedContextSet, ContextAdmissionError>"]
+
+[algorithm]
+steps = [
+  "Validate budget, route estimate, Safety Floor and headroom.",
+  "Quarantine unsafe or forbidden-influence atoms before ranking.",
+  "Reserve Safety Floor atoms or exact handles.",
+  "Reserve output and review headroom before optional filling.",
+  "Allocate optional budget provider-fair round-robin within semantic roles.",
+  "Treat Unknown decision delta as unresolved rather than zero.",
+  "Emit one typed disposition and omission record for every atom.",
+  "Produce stable order independent of input order."
+]
+
+[limits]
+rules = ["Use explicit atom, provider and role maxima.", "Admit whole units only.", "Use bounded round-robin passes.", "Do not use generative compression."]
+
+[errors]
+variants = ["InvalidFence", "InvalidBudget", "MissingSafetyFloor", "UnrepresentableRequiredAtom", "ProviderCoverageGap", "HeadroomViolation", "TooManyAtoms"]
+
+[forbidden]
+operations = ["partial atom slicing", "scalar score as sole decision", "generative summarization", "storage call", "model call", "blocking I/O", "lock acquisition"]
+
+[tests]
+required = ["required atom never silently disappears", "verbose provider cannot consume all optional budget", "Unknown delta is not treated as zero", "permutation is invariant", "headroom is reserved first"]
+
+[integration]
+provider = "smart.context.contribution_merge"
+consumer = "smart.context.quality and smart.context.view_assembly"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if a required Safety Floor atom has neither safe payload nor exact handle representation."
