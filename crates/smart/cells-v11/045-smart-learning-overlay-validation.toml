@@ -1,0 +1,42 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.learning.overlay_validation"
+agent_order = 45
+physical_package = "eliot-learning"
+execution_class = "ATTEMPT_BOUNDARY_HOT"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Validate an overlay candidate dimension-by-dimension before external Governor admission."
+
+[agent]
+objective = "Implement pure dimensioned overlay validation only."
+write_scope = ["crates/smart/eliot-learning/src/overlay_validation.rs", "crates/smart/eliot-learning/tests/overlay_validation.rs"]
+integration_owner = "learning integration owner"
+forbidden_files = ["crates/smart/eliot-learning/src/lib.rs", "crates/smart/eliot-learning/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn validate_campaign_overlay(request: &OverlayValidationRequest, candidate: &CampaignHarnessOverlayCandidate) -> Result<OverlayValidationReport, OverlayValidationError>"]
+
+[algorithm]
+steps = [
+  "Validate task, policy, authority epoch and State Fence.",
+  "Evaluate scope, reversibility, objective preservation, acceptance preservation, authority ceiling, privacy ceiling, evaluator integrity, holdout integrity, cost ceiling and rollback separately.",
+  "Return Pass, Fail, Inconclusive or NotApplicable per dimension.",
+  "Emit required external approval handles without granting approval."
+]
+
+[limits]
+rules = ["Use a fixed closed validation-dimension set.", "Compute no aggregate score and perform no mutation."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "PolicyMismatch", "MissingDimension", "ForbiddenSurface", "InvalidApprovalReference"]
+
+[forbidden]
+operations = ["Governor admission", "approval grant", "aggregate score", "candidate rewrite", "authority inference", "blocking I/O"]
+
+[tests]
+required = ["failed holdout-integrity dimension cannot be hidden", "unknown authority path is Inconclusive", "validator does not admit overlay", "objective preservation is independently checked"]
+
+[integration]
+provider = "smart.learning.overlay_candidate"
+consumer = "external Governor overlay admission owner"
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if policy, authority path or any required validation dimension is unavailable."
