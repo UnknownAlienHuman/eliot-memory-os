@@ -56,6 +56,9 @@ pub enum TestdError {
     /// A contract supplied by an instrument or process adapter is invalid.
     #[error("contract validation failed: {0}")]
     Contract(String),
+    /// The execution-contour grant tuple could not be serialized exactly.
+    #[error("execution contour grant digest serialization failed")]
+    GrantDigestSerialization,
     /// The durable plane only admits test profiles.
     #[error("testd accepts only TEST instrument invocations")]
     WrongInstrumentKind,
@@ -301,7 +304,7 @@ impl ExecutionContourGrant {
         ] {
             validate_text(value, field)?;
         }
-        self.grant_digest = contour_grant_digest(&self);
+        self.grant_digest = contour_grant_digest(&self)?;
         Ok(self)
     }
 
@@ -340,7 +343,7 @@ impl ExecutionContourGrant {
         ] {
             validate_text(value, field)?;
         }
-        if self.grant_digest != contour_grant_digest(self) {
+        if self.grant_digest != contour_grant_digest(self)? {
             return Err(TestdError::InvalidBinding);
         }
         Ok(())
@@ -386,7 +389,7 @@ impl ProcessAdmissionPermit {
     }
 }
 
-fn contour_grant_digest(grant: &ExecutionContourGrant) -> String {
+fn contour_grant_digest(grant: &ExecutionContourGrant) -> Result<String, TestdError> {
     let bytes = serde_json::to_vec(&(
         &grant.contour_root,
         &grant.job_id,
@@ -397,8 +400,8 @@ fn contour_grant_digest(grant: &ExecutionContourGrant) -> String {
         grant.resource_generation,
         &grant.grant_id,
     ))
-    .unwrap_or_default();
-    blake3::hash(&bytes).to_hex().to_string()
+    .map_err(|_| TestdError::GrantDigestSerialization)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
 /// Canonical roots bound to one isolated execution job.
@@ -1518,6 +1521,20 @@ mod tests {
         }
     }
 
+    fn contour_grant_fixture() -> ExecutionContourGrant {
+        ExecutionContourGrant {
+            contour_root: "C:\\approved-contour".to_owned(),
+            job_id: "job".to_owned(),
+            invocation_id: "invocation".to_owned(),
+            operation_id: "operation".to_owned(),
+            process_tree_id: "tree".to_owned(),
+            authority_epoch: 7,
+            resource_generation: 3,
+            grant_id: "grant-1".to_owned(),
+            grant_digest: String::new(),
+        }
+    }
+
     #[test]
     fn running_cancel_without_exact_fence_is_rejected() {
         let current = lease();
@@ -1598,19 +1615,25 @@ mod tests {
     }
 
     #[test]
+    fn contour_grant_digest_is_stable_for_identical_input() {
+        let first = contour_grant_digest(&contour_grant_fixture()).expect("serialize grant");
+        let second = contour_grant_digest(&contour_grant_fixture()).expect("serialize grant");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn contour_grant_issue_and_integrity_validation_round_trip() {
+        let grant = contour_grant_fixture()
+            .with_digest()
+            .expect("issue contour grant");
+        assert!(grant.validate_integrity().is_ok());
+    }
+
+    #[test]
     fn forged_contour_cannot_widen_issuer_grant() {
-        let mut grant = ExecutionContourGrant {
-            contour_root: "C:\\approved-contour".to_owned(),
-            job_id: "job".to_owned(),
-            invocation_id: "invocation".to_owned(),
-            operation_id: "operation".to_owned(),
-            process_tree_id: "tree".to_owned(),
-            authority_epoch: 7,
-            resource_generation: 3,
-            grant_id: "grant-1".to_owned(),
-            grant_digest: String::new(),
-        };
-        grant.grant_digest = contour_grant_digest(&grant);
+        let mut grant = contour_grant_fixture()
+            .with_digest()
+            .expect("issue contour grant");
         grant.contour_root = "C:\\caller-widened-contour".to_owned();
         assert!(grant.validate_integrity().is_err());
     }
