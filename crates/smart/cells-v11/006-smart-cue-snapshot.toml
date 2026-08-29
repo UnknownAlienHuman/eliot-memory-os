@@ -1,0 +1,44 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.cue.snapshot"
+agent_order = 6
+physical_package = "eliot-cues"
+execution_class = "BACKGROUND_REBUILD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Build one immutable rebuildable snapshot only from admitted bindings and typed relation edges."
+
+[agent]
+objective = "Implement deterministic immutable cue snapshot rebuilding only."
+write_scope = ["crates/smart/eliot-cues/src/snapshot.rs", "crates/smart/eliot-cues/tests/snapshot.rs"]
+integration_owner = "cue projection integration owner"
+forbidden_files = ["crates/smart/eliot-cues/src/lib.rs", "crates/smart/eliot-cues/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_cue_snapshot(request: &CueSnapshotBuildRequest, bindings: &[AdmittedCueBinding], edges: &[AdmittedActivationEdge]) -> Result<CueSnapshot, CueSnapshotError>"]
+
+[algorithm]
+steps = [
+  "Validate exact revision and common State Fence.",
+  "Reject candidate-only or stale binding inputs.",
+  "Index direct keys independently from relation edges.",
+  "Validate bounded edge endpoints and weights without inferring semantics.",
+  "Stable-sort rows and adjacency lists.",
+  "Compute canonical snapshot digest."
+]
+
+[limits]
+rules = ["Use explicit maximum rows, edges and fanout.", "Use O((rows + edges) log n) rebuild."]
+
+[errors]
+variants = ["InvalidFence", "StaleBinding", "CandidateBinding", "DuplicateBinding", "UnknownEdgeEndpoint", "TooManyRows", "DigestFailure"]
+
+[forbidden]
+operations = ["canonical-state ownership", "incremental hidden mutation", "unbounded graph", "model call", "storage scan"]
+
+[tests]
+required = ["zero-edge snapshot is valid", "permutation yields identical digest", "candidate-only binding is rejected", "unknown edge endpoint is rejected"]
+
+[integration]
+provider = "Governor cue-binding and activation-edge admission owners"
+consumer = "smart.cue.direct_match and smart.cue.relation_spread"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if admitted binding or edge contracts are not exact and revision-fenced."
