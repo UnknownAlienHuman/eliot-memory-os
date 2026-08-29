@@ -1,0 +1,44 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.contracts"
+agent_order = 17
+physical_package = "eliot-dreamer-contracts"
+execution_class = "CONTRACT_ONLY"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Define provider-neutral Dreamer job, bundle, draft, grounding, validation and packet contracts."
+
+[agent]
+objective = "Implement provider-neutral Dreamer contracts only; no model route, scheduling or semantic handler logic."
+write_scope = ["crates/smart/eliot-dreamer-contracts/src/contracts.rs", "crates/smart/eliot-dreamer-contracts/tests/contracts.rs"]
+integration_owner = "Dreamer contract integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-contracts/src/lib.rs", "crates/smart/eliot-dreamer-contracts/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn validate_dream_contract(value: &DreamContractEnvelope) -> Result<(), DreamContractError>"]
+owned_types = ["DreamJobClass", "DreamJobEnvelope", "DreamBudget", "DreamPrivacyProfile", "ForbiddenEffectSet", "ReferenceDescriptor", "ReferenceManifest", "ExpandedReference", "DreamInputBundle", "ModelDraftEnvelope", "DraftClaim", "GroundedClaim", "GroundedDreamDraft", "TransformationDimension", "TransformationDimensionResult", "TransformationValidationReport", "AdmittedDreamDraft", "DreamPacket"]
+
+[algorithm]
+steps = [
+  "Validate stable job class, exact question, scope and State Fence.",
+  "Require an exact Allowed Reference Manifest.",
+  "Require explicit privacy, route, budget, deadline, output schema and forbidden effects.",
+  "Require every candidate output to declare lineage, uncertainty, authority ceiling and invalidation.",
+  "Deny unknown wire fields and preserve deterministic enum spelling."
+]
+
+[limits]
+rules = ["Wire collection and byte maxima are explicit validated fields.", "Contracts perform no hidden I/O or owner resolution."]
+
+[errors]
+variants = ["InvalidText", "InvalidFence", "InvalidJobClass", "MissingManifest", "MissingForbiddenEffects", "InvalidBudget", "InvalidSchema"]
+
+[forbidden]
+operations = ["model/provider call", "route selection", "job scheduling", "canonical write", "authority or finish decision"]
+
+[tests]
+required = ["every declared job class round-trips", "candidate without authority ceiling is rejected", "ForbiddenEffectSet cannot be absent", "mixed-fence packet is rejected"]
+
+[integration]
+provider = "Governor Dream job builder and governed model-route adapter"
+consumer = "all Dreamer bundle, validation and semantic cells"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if a public wire type requires importing provider SDK, storage implementation or runtime scheduler types."
