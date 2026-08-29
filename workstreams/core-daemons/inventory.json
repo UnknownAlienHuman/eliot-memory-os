@@ -1,334 +1,284 @@
 {
-  "schema": "eliot.core-daemon-workstream.v3",
+  "schema": "eliot.core-daemon-workstream.v4",
   "updated_at": "2026-08-29",
   "authority": {
     "branch": "main",
-    "source_audit_base": "89281ebd9828dbf886d105abedfe690183a18562",
-    "normative_pair_receipt": "docs/normative-pair.toml",
-    "architecture_sha256": "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a",
-    "implementation_sha256": "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063",
-    "product_status": "NOT_ACCEPTED_UNVERIFIED"
+    "normative_pair": "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b",
+    "product_status": "NOT_ACCEPTED_UNVERIFIED",
+    "source_identity_rule": "Resolve exact current main at work start and record base/candidate SHAs in issue/PR evidence; this inventory never freezes a source head.",
+    "role": "Non-authoritative routing projection; source presence does not create lifecycle, state, semantic, runtime, or support authority."
   },
   "scope": {
-    "included": [
-      "host",
-      "kernel",
-      "governor_daemon",
-      "watchdog",
-      "doctor",
-      "store_bridge",
-      "surreal_dependency",
-      "blob_store",
-      "testd",
-      "wasm_host",
-      "native_worker",
-      "user_broker",
-      "notify",
-      "agent_bridge",
-      "research_provider_process"
-    ],
-    "excluded": ["dreamer"]
+    "programme": "core-daemons",
+    "integration_issue": 11,
+    "registry_issue": 13,
+    "excluded_capabilities": ["dreamer", "cognitive_micromodule_implementation"],
+    "work_rule": "One issue, one causal change, one current-main branch, one PR, one mutable-path writer."
   },
-  "branch_policy": {
-    "shared_workstream_branch": false,
-    "fresh_issue_branch_from_current_main": true,
-    "one_issue_one_branch_one_pr": true
+  "proof_ceiling": {
+    "architecture_boundary_lint": "STATIC_SOURCE_BUILD_POLICY_ONLY",
+    "nearest_path_guardrails": "ROUTING_CONTROL_PLANE_ONLY",
+    "runtime_source_hygiene": "STATIC_SOURCE_QUALITY_SIGNALS_ONLY",
+    "agent_bridge_protocol_policy": "STATIC_PROTOCOL_SOURCE_POLICY_ONLY",
+    "package_build": "CURRENT_UNVERIFIED_UNLESS_EXECUTED_ON_EXACT_CANDIDATE",
+    "edge": "NOT_EXECUTED",
+    "windows_runtime": "NOT_EXECUTED",
+    "store_runtime": "NOT_EXECUTED",
+    "product_pulse": "NOT_EXECUTED",
+    "support": "NOT_ACCEPTED"
   },
-  "cross_cutting": [
-    {
-      "issue": 13,
-      "priority": "P0",
-      "property": "current-pair capability-cell ownership, runtime bundle and proof registry"
-    },
-    {
-      "issue": 11,
-      "priority": "P0",
-      "property": "live Windows operational spine and Product Pulse"
-    },
-    {
-      "issue": 64,
-      "priority": "P0",
-      "property": "one lineage-aware authority epoch identity across Host, Kernel, ORS, daemon, store and process contours"
-    },
-    {
-      "issue": 63,
-      "priority": "P0",
-      "property": "one canonical executable request hash recomputed across Governor, Kernel and store"
-    },
-    {
-      "issue": 65,
-      "priority": "P0",
-      "property": "normal workload admission separated from protected Control Reserve at every claimed bottleneck"
-    },
-    {
-      "issue": 79,
-      "priority": "P0",
-      "property": "transport connection identity separated from durable process/session ownership"
-    }
+  "merged_control_plane_repairs": [
+    {"issue": 90, "result": "Architecture-boundary scanner and tracked-debt policy are on main.", "ceiling": "STATIC_SOURCE_BUILD_POLICY_ONLY"},
+    {"issue": 92, "result": "Nearest-path owner/authority/proof/stop guardrails are on main.", "ceiling": "ROUTING_CONTROL_PLANE_ONLY"},
+    {"issue": 96, "result": "Runtime source-hygiene signals and fixtures are on main.", "ceiling": "STATIC_SOURCE_QUALITY_SIGNALS_ONLY"},
+    {"issue": 102, "result": "Normative-pair receipt binds the exact frozen books.", "ceiling": "NORMATIVE_ARTIFACT_IDENTITY_ONLY"},
+    {"issue": 121, "result": "Agent-bridge typed public ingress is guarded against raw Frame and host-authority regressions.", "ceiling": "STATIC_PROTOCOL_SOURCE_POLICY_ONLY"}
   ],
-  "merged_source_repairs": [
-    {
-      "issue": 59,
-      "property": "RouteFence rejects unactivated future epochs at the public boundary",
-      "proof_ceiling": "focused source test; build/runtime not executed"
-    },
-    {
-      "issue": 61,
-      "property": "eliotd health cadence is no longer starved by the faster activation poll",
-      "proof_ceiling": "focused async source test; live heartbeat not executed"
-    },
-    {
-      "issue": 68,
-      "property": "Watchdog readiness publishes one coherent admitted epoch pair and clears it on gaps",
-      "proof_ceiling": "focused deterministic source tests; live supervision not executed"
-    },
-    {
-      "issue": 70,
-      "property": "standalone testd no longer creates ambient state or advertises false readiness without Kernel admission",
-      "proof_ceiling": "focused deterministic source test; testd runtime remains blocked"
-    }
+  "cross_cutting_contract_waves": [
+    {"issue": 64, "status": "OPEN_LOAD_BEARING_MIGRATION", "property": "One lineage-aware Authority Epoch across Host, Kernel, ORS, protocol, daemon, store and runtime receipts."},
+    {"issue": 63, "status": "OPEN_LOAD_BEARING_MIGRATION", "property": "One canonical executable request digest recomputed by Governor, Kernel and store."},
+    {"issue": 65, "status": "OPEN_LOAD_BEARING_MIGRATION", "property": "Protected control/recovery capacity unavailable to normal workload at every claimed bottleneck."},
+    {"issue": 100, "status": "OPEN_INTEGRATION_OWNER", "property": "One admitted native ProcessExecutor identity/stream/deadline/cancel/no-orphan contract.", "subissues": [82, 83, 84, 85]},
+    {"issue": 79, "status": "OPEN_CONTRACT_MIGRATION", "property": "Transport connection identity remains distinct from durable process/WorkScope/UserBroker Session identity."}
   ],
   "units": [
     {
       "id": "host",
-      "primary_issue": 14,
-      "source": "present",
-      "core_support": "PARTIAL",
-      "process_support": "CURRENT_UNVERIFIED",
-      "disposition": "REWORK_COMPOSITION",
-      "confirmed_strengths": [
-        "lineage-aware Host epochs",
-        "one-time launch nonce",
-        "durable PID/start/image/file/Job identity",
-        "fail-closed HostStateJournal"
-      ],
-      "next_issues": [13, 64, 65, 11]
+      "process": "eliot-host.exe",
+      "paths": ["bins/eliot-host", "crates/kernel/eliot-host-state", "crates/kernel/eliot-host-service", "crates/kernel/eliot-installation", "crates/kernel/eliot-platform-windows"],
+      "source_shape": "Host journal, activation, installation and Windows lifecycle components exist; the composition root remains broad.",
+      "reusable_parts": ["HostStateJournal lineage", "activation/drain state machines", "installation contracts", "Windows service and Job Object mechanics"],
+      "implementation_support": "CURRENT_PARTIAL",
+      "runtime_support": "CURRENT_UNVERIFIED",
+      "strategy": "TARGETED_EXTRACTION_AND_HARDENING",
+      "main_nonconformant_boundary": "Binary is not yet composition-only and shared process/control-reserve semantics are neither closed nor live-proved.",
+      "owner_issues": [14, 64, 65, 100],
+      "next_causal_action": "Close one-writer Host cells and prove journal corruption, lineage replacement, no-orphan lifecycle and independent managed-dependency restart.",
+      "proof_required": ["journal corruption Module Proof", "real Windows service/Job Edge Proof", "D0/D1 install/restart/rollback pulse"]
     },
     {
       "id": "kernel",
-      "primary_issue": 15,
-      "source": "present",
-      "core_support": "PARTIAL",
-      "process_support": "PARTIAL",
-      "disposition": "REWORK_CONTRACT_EDGES",
-      "confirmed_strengths": [
-        "small dependency-light pure decision core",
-        "MAC-bound authority tokens",
-        "explicit generation routes and route fences",
-        "separate ORS and store gateway"
-      ],
-      "fixed_issues": [59],
-      "open_issues": [13, 63, 64, 65, 66, 79],
-      "next_product_proof": 11
+      "process": "eliot-kernel.exe",
+      "paths": ["bins/eliot-kernel", "crates/kernel/eliot-kernel-core", "crates/kernel/eliot-kernel-service", "crates/kernel/eliot-ors", "crates/kernel/eliot-ipc", "crates/kernel/eliot-process", "crates/kernel/eliot-runtime"],
+      "source_shape": "Substantial fencing, ORS, IPC and route/process-authority code exists; the binary still composes broad runtime and test behavior.",
+      "reusable_parts": ["decision/state-machine cores", "ORS recovery records", "authenticated IPC", "route/generation fencing"],
+      "implementation_support": "CURRENT_PARTIAL",
+      "runtime_support": "CURRENT_UNVERIFIED",
+      "strategy": "TARGETED_EXTRACTION_AND_HARDENING",
+      "main_nonconformant_boundary": "Scalar epochs, ordinary-workload reserve use, process Session conflation and broad composition violate the small failure-surviving Kernel target.",
+      "owner_issues": [15, 63, 64, 65, 66, 79, 88, 100],
+      "merged_local_repairs": [59],
+      "next_causal_action": "Complete lineaged authority and exact request/operation identity contracts before closing front-door, ORS, reserve, process and supervision cells.",
+      "proof_required": ["daemon-loss fencing", "unknown-commit reconciliation", "reserve saturation", "stale generation/session rejection", "D0/D1 pulse"]
     },
     {
       "id": "governor_daemon",
-      "primary_issue": 18,
-      "source": "present",
-      "core_support": "PARTIAL",
-      "process_support": "PARTIAL",
-      "disposition": "REWORK_SEMANTIC_EDGE_AND_LEGACY_EXTRACTION",
-      "fixed_issues": [61],
-      "open_issues": [13, 63, 64, 66],
-      "legacy_facade": "crates/eliot-app",
-      "next_product_proof": 11
+      "process": "eliotd.exe",
+      "paths": ["bins/eliotd", "crates/governor"],
+      "source_shape": "Governor domain crates and a semantic daemon exist; Kernel ports are isolated but request, lease and strict-finish integration remains incomplete.",
+      "reusable_parts": ["WorkScope/task/session contracts", "semantic admission", "coordination/problem/finish domains", "daemon Kernel-port adapters"],
+      "implementation_support": "CURRENT_PARTIAL",
+      "runtime_support": "CURRENT_UNVERIFIED",
+      "strategy": "KEEP_AND_BIND_THEN_MIGRATE_LEGACY_CONSUMERS",
+      "main_nonconformant_boundary": "PreparedTransition identity is not end-to-end recomputed, activation errors lose typed disposition, sustained lease renewal is absent and legacy consumers remain.",
+      "owner_issues": [18, 63, 64, 66, 88],
+      "merged_local_repairs": [61],
+      "next_causal_action": "Close exact admission/finish/lease contracts and inventory each real legacy-facade consumer.",
+      "proof_required": ["Governor/Kernel/store digest fixtures", "typed task-selection edge", "daemon restart without authority revival", "strict-finish negatives"]
     },
     {
       "id": "watchdog",
-      "primary_issue": 16,
-      "source": "present",
-      "core_support": "PARTIAL",
-      "process_support": "PARTIAL",
-      "disposition": "WIRE_DETERMINISTIC_ACTION_CORE",
-      "confirmed_strengths": [
-        "independent SCM sibling",
-        "signed admission lease reload",
-        "Host identity observation during authority gaps",
-        "protected non-semantic spool"
-      ],
-      "fixed_issues": [68],
-      "open_issues": [13, 64, 65],
-      "known_gap": "deterministic observe/tick/restart/reap decisions are not connected to production Kernel/Host action receipts",
-      "next_product_proof": 11
+      "process": "eliot-watchdog.exe",
+      "paths": ["bins/eliot-watchdog", "crates/supervision/eliot-watchdog-core"],
+      "source_shape": "A useful deterministic core exists; spool, SCM, sensors, containment, publication and reconciliation remain broad in process composition.",
+      "reusable_parts": ["deterministic decision core", "supervision/coverage contracts", "host identity/status cells"],
+      "implementation_support": "PURE_CORE_CURRENT_PARTIAL_PROCESS",
+      "runtime_support": "CURRENT_UNVERIFIED",
+      "strategy": "KEEP_CORE_AND_EXTRACT_PROCESS_CELLS",
+      "main_nonconformant_boundary": "Independent spool ownership, sustained lease observation, protected containment and live SCM coverage are not closed end to end.",
+      "owner_issues": [16, 64, 65, 88, 100],
+      "merged_local_repairs": [68],
+      "next_causal_action": "Separate deterministic core, protected spool, sensors/SCM, containment request and Governor reconciliation.",
+      "proof_required": ["spool gap/pressure tests", "forged identity rejection", "independent failure-domain Edge Proof", "supervision Product Pulse"]
     },
     {
       "id": "doctor",
-      "primary_issue": 17,
-      "source": "present",
-      "core_support": "CURRENT_UNVERIFIED",
-      "process_support": "BLOCKED",
-      "disposition": "IMPLEMENT_KERNEL_GATED_REPAIR_EDGE",
-      "confirmed_strengths": [
-        "one-shot fail-closed binary",
-        "candidate-only repair core",
-        "unknown effect preserved",
-        "no direct canonical write"
-      ],
-      "open_issues": [13, 64, 65],
-      "known_gaps": [
-        "no production Kernel Doctor operation",
-        "attempt budget and cooldown are not durable across invocations",
-        "success depends on caller-provided verified boolean rather than an executed VerificationReceipt"
-      ],
-      "next_product_proof": 11
+      "process": "eliot-doctor.exe",
+      "paths": ["bins/eliot-doctor", "crates/meta/eliot-doctor-core"],
+      "source_shape": "The executable is comparatively thin and the repair model is reusable; durable recipe/attempt identity and governed effect execution remain incomplete.",
+      "reusable_parts": ["pure repair model", "recipe classes", "diagnostic/evidence contracts"],
+      "implementation_support": "PURE_CORE_CURRENT_PARTIAL_PROCESS",
+      "runtime_support": "CURRENT_UNVERIFIED",
+      "strategy": "KEEP_AND_HARDEN",
+      "main_nonconformant_boundary": "Canonical identities, shared process/effect execution, unknown-outcome reconciliation and independent verifier-backed terminal state are not fully bound.",
+      "owner_issues": [17, 64, 65, 100],
+      "next_causal_action": "Bind exact recipe identity, RecoveryLease/effect ceilings and one-shot verifier-backed disposition.",
+      "proof_required": ["identity golden vectors", "diagnose-only/effect negatives", "crash/unknown-outcome reconciliation", "budget exhaustion"]
     },
     {
       "id": "store_bridge",
-      "primary_issue": 19,
-      "source": "present",
-      "core_support": "PARTIAL",
-      "process_support": "PARTIAL",
-      "disposition": "REWORK_DIGEST_ERROR_CONCURRENCY_AND_LIFECYCLE_EDGES",
-      "confirmed_strengths": [
-        "provider-neutral closed store API",
-        "protected config and credential boundary",
-        "named-operation manifest",
-        "optimistic RevisionHead and OrderingHead checks",
-        "atomic event/projection/relation/receipt/outbox transaction"
-      ],
-      "open_issues": [10, 13, 63, 64, 67, 76],
-      "next_product_proof": 11
+      "process": "eliot-store-surreal.exe",
+      "paths": ["bins/eliot-store-surreal", "crates/storage/eliot-store-api", "crates/storage/eliot-store-surreal-adapter", "crates/storage/eliot-store-memory"],
+      "source_shape": "Provider-neutral API, memory reference adapter, Surreal adapter and transaction writer exist; protocol, concurrency, payload and generation boundaries remain open.",
+      "reusable_parts": ["closed named-operation direction", "atomic transaction writer", "receipt/idempotency models", "reference conformance surface"],
+      "implementation_support": "CURRENT_PARTIAL",
+      "runtime_support": "CURRENT_UNVERIFIED",
+      "strategy": "TARGETED_CONTRACT_AND_ADAPTER_HARDENING",
+      "main_nonconformant_boundary": "Request digest is not recomputed at all layers, StoreError loses typed wire semantics, writes are globally serialized and arbitrary JSON bytes are unproved.",
+      "owner_issues": [10, 19, 63, 64, 67, 76],
+      "next_causal_action": "Close canonical request encoding, typed StoreFailure and OrderingScope-aware bounded scheduling before real Surreal crash/recovery proof.",
+      "proof_required": ["provider-independent corpus", "real Surreal payload round trip", "transaction/unknown-commit edge", "independent-scope concurrency", "D1 store pulse"]
     },
     {
       "id": "surreal_dependency",
-      "primary_issue": 19,
-      "source": "external_declared",
-      "core_support": "NOT_APPLICABLE",
-      "process_support": "TARGET",
-      "disposition": "VERIFY_HOST_MANAGED_GENERATION",
-      "open_issues": [10, 11, 19, 64],
-      "known_gap": "installed artifact, exclusive data-root ownership, crash, restore and update have not been observed"
+      "process": "surreal.exe",
+      "paths": ["crates/kernel/eliot-host-service", "crates/storage/eliot-store-surreal-adapter"],
+      "source_shape": "Managed-dependency lifecycle and readiness concepts exist; immutable generation ownership, exclusive data-root cutover and compatible rollback are not live-proved.",
+      "reusable_parts": ["managed-dependency lineage", "health/readiness contracts", "migration rehearsal components"],
+      "implementation_support": "TARGET_PARTIAL",
+      "runtime_support": "NOT_EXECUTED",
+      "strategy": "LIVE_EDGE_AND_GENERATION_HARDENING",
+      "main_nonconformant_boundary": "No current proof establishes one owned process generation and exclusive DB root through update, failure and recovery.",
+      "owner_issues": [11, 19, 64, 100],
+      "next_causal_action": "Bind exact artifact/config/credential/data-root identity and execute rehearsal, quiesce, replacement and rollback/forward repair.",
+      "proof_required": ["foreign process rejection", "exclusive root", "bridge/server restart", "migration/rollback Product Proof"]
     },
     {
       "id": "blob_store",
-      "primary_issue": 19,
-      "source": "present",
-      "core_support": "CURRENT_UNVERIFIED",
-      "process_support": "TARGET",
-      "disposition": "CLOSE_STAGE_REACHABILITY_GC_RESIDENCY_AND_CUTOVER",
-      "open_issues": [13, 19, 64],
-      "next_product_proof": 11
+      "process": "embedded or isolated BlobStore owner",
+      "paths": ["crates/storage/eliot-blob-api", "crates/storage/eliot-blob"],
+      "source_shape": "Blob contracts and implementation exist; root ownership, process-evidence integration, retention/privacy domains and recovery are not product-proved.",
+      "reusable_parts": ["blob API", "immutable locators", "reachability/GC foundations"],
+      "implementation_support": "CURRENT_PARTIAL",
+      "runtime_support": "CURRENT_UNVERIFIED",
+      "strategy": "KEEP_AND_HARDEN",
+      "main_nonconformant_boundary": "One active root owner and durable process-stream expansion handles are not integrated across crash, purge and consumer reconstruction.",
+      "owner_issues": [19, 85],
+      "next_causal_action": "Close root ownership, privacy-retention identity, staged-orphan GC and exact expansion handles.",
+      "proof_required": ["single-root writer negative", "purge/retention tests", "stream expansion after cleanup", "D1 recovery edge"]
     },
     {
       "id": "testd",
-      "primary_issue": 20,
-      "source": "present",
-      "core_support": "PARTIAL",
-      "process_support": "BLOCKED",
-      "disposition": "IMPLEMENT_KERNEL_GATED_EXECUTION_LOOP",
-      "confirmed_strengths": [
-        "durable redb job and event store",
-        "non-serializable consuming ProcessRequest permit",
-        "strict source/build/cache root validation",
-        "exact raw evidence digest and normalized evidence binding"
-      ],
-      "fixed_issues": [70],
-      "open_issues": [13, 64, 65, 72, 79],
-      "known_gap": "no authenticated Kernel/EBP worker loop or real ProcessExecutor evidence publication",
-      "next_product_proof": 11
+      "process": "eliot-testd.exe",
+      "paths": ["bins/eliot-testd", "crates/instrument/eliot-testd-core", "crates/instrument"],
+      "source_shape": "Instrument APIs, runners and a substantial core exist; the standalone binary is intentionally fail-closed until Kernel admission exists.",
+      "reusable_parts": ["typed Instrument profiles", "job/state models", "build/test adapters", "artifact/evidence foundations"],
+      "implementation_support": "CORE_CURRENT_BINARY_BLOCKED_FAIL_CLOSED",
+      "runtime_support": "BLOCKED",
+      "strategy": "KEEP_CORE_AND_REBUILD_AUTHENTICATED_COMPOSITION",
+      "main_nonconformant_boundary": "No authenticated Kernel job path exists; FIFO ordering, shared ProcessExecutor health/evidence and immutable raw-output closure remain open.",
+      "owner_issues": [20, 72, 79, 82, 83, 84, 85, 100],
+      "merged_local_repairs": [70],
+      "next_causal_action": "Fix project ordering and shared process/evidence contracts, then compose admitted typed jobs behind Kernel identity/cancellation.",
+      "proof_required": ["FIFO/reconciliation Module Proof", "Windows process-tree Edge Proof", "durable raw output", "Instrument-to-Verification Product path"]
     },
     {
       "id": "wasm_host",
-      "primary_issue": 21,
-      "source": "present",
-      "core_support": "PARTIAL",
-      "process_support": "BLOCKED",
-      "disposition": "FIX_PROVIDER_IDENTITY_LIMITS_AND_IMPLEMENT_KERNEL_GENERATION_CONTOUR",
-      "confirmed_strengths": [
-        "candidate-only pure runtime",
-        "typed Component Model provider",
-        "empty linker with no WASI/imports",
-        "bounded memory/table/instance/output/fuel/stack limits",
-        "standalone fail-closed binary"
-      ],
-      "open_issues": [13, 64, 73, 75],
-      "next_product_proof": 11
+      "process": "eliot-wasm-host.exe",
+      "paths": ["bins/eliot-wasm-host", "crates/modules/eliot-wasm-runtime"],
+      "source_shape": "A substantial Wasmtime component host exists. Provider version identity and hidden epoch-deadline clamping were repaired; broad composition and persisted effective-policy evidence remain open.",
+      "reusable_parts": ["component validation/runtime", "fuel/memory/deadline controls", "trap/cancel foundations", "cache/pool mechanics"],
+      "implementation_support": "CURRENT_PARTIAL_SOURCE_IDENTITY_REPAIRED",
+      "runtime_support": "CURRENT_UNVERIFIED",
+      "strategy": "TARGETED_CELL_EXTRACTION_AND_CONFORMANCE",
+      "main_nonconformant_boundary": "Capability introduction, ambient-resource negatives, immutable generation/cutover and persisted effective policy are not closed or live-proved.",
+      "owner_issues": [21, 64, 75, 120],
+      "merged_local_repairs": [73, 75],
+      "next_causal_action": "Persist exact admitted/effective policy identity, then split only real seams and run differential contour proof.",
+      "proof_required": ["ambient-resource denial", "artifact/generation mismatch", "trap/resource cleanup", "core/WASM differential corpus", "canary rollback"]
     },
     {
       "id": "native_worker",
-      "primary_issue": 22,
-      "source": "present",
-      "core_support": "PARTIAL",
-      "process_support": "BLOCKED",
-      "disposition": "ADOPT_SHARED_EBP_AND_TYPED_KERNEL_CLAIM",
-      "confirmed_strengths": [
-        "standalone fail-closed binary",
-        "injected ProcessExecutor and capability ports",
-        "candidate-only effect model",
-        "explicit replay/checkpoint/cancel states"
-      ],
-      "open_issues": [13, 64, 65, 79],
-      "known_gap": "worker protocol duplicates EBP identity/fence/ack contracts and Kernel claim is not consumable",
-      "next_product_proof": 11
+      "process": "eliot-native-worker.exe",
+      "paths": ["bins/eliot-native-worker", "crates/modules/eliot-native-worker-core"],
+      "source_shape": "A narrow core and executable exist; execution manifest, resource/credential introduction and shared process evidence remain incomplete.",
+      "reusable_parts": ["native worker core", "module/facet direction", "resource lease foundations"],
+      "implementation_support": "CURRENT_PARTIAL",
+      "runtime_support": "CURRENT_UNVERIFIED",
+      "strategy": "KEEP_CORE_AND_HARDEN_PROCESS_BOUNDARY",
+      "main_nonconformant_boundary": "Artifact/protocol/facet identity, lineaged epoch, credentials/resources, containment and unknown-effect reconciliation are incomplete.",
+      "owner_issues": [22, 64, 79, 82, 83, 84, 85, 100],
+      "next_causal_action": "Bind one immutable execution manifest to shared ProcessExecutor and explicit resource introductions without worker policy ownership.",
+      "proof_required": ["identity mismatch negatives", "stale generation rejection", "credential/resource replay", "Job cleanup/differential proof"]
     },
     {
       "id": "user_broker",
-      "primary_issue": 23,
-      "source": "present",
-      "core_support": "PARTIAL",
-      "process_support": "PARTIAL",
-      "disposition": "REWORK_OPERATION_IDENTITY_READINESS_CLOCK_AND_LOGOFF_EDGE",
-      "confirmed_strengths": [
-        "protected launch declaration",
-        "PID/SID/session/artifact validation",
-        "Kernel re-authorization for each launch",
-        "shared ProcessExecutor and one-shot dispatch permit",
-        "heartbeat loss terminates the process contour"
-      ],
-      "open_issues": [13, 64, 65, 74, 79],
-      "next_product_proof": 11
+      "process": "eliot-user-broker.exe",
+      "paths": ["bins/eliot-user-broker", "crates/surfaces/eliot-user-broker-core"],
+      "source_shape": "Broker contracts and composition exist; per-operation identity, registration/epoch and exact user-session resource execution remain incomplete.",
+      "reusable_parts": ["SID/session registration", "resource lease models", "launch authorization core"],
+      "implementation_support": "CURRENT_PARTIAL",
+      "runtime_support": "CURRENT_UNVERIFIED",
+      "strategy": "TARGETED_IDENTITY_AND_PROCESS_HARDENING",
+      "main_nonconformant_boundary": "One durable launch RequestIdentity is reused across operations; logoff/lease/resource/credential and no-orphan behavior are unproved.",
+      "owner_issues": [23, 64, 74, 79, 82, 83, 84, 85, 100],
+      "next_causal_action": "Separate stable launch binding from fresh operation identities, then bind SID/session/epoch/process/resource lifecycle.",
+      "proof_required": ["registration/stale epoch", "operation replay", "credential non-disclosure", "logoff/resource substitution", "User Broker pulse"]
     },
     {
-      "id": "notify",
-      "primary_issue": 13,
-      "source": "present",
-      "core_support": "PARTIAL",
-      "process_support": "PARTIAL",
-      "disposition": "SPLIT_AND_BIND_EFFECT_AND_LEDGER_CELLS",
-      "confirmed_strengths": [
-        "one-shot process",
-        "protected root",
-        "Kernel-backed normal verification",
-        "signed Watchdog fallback",
-        "one-shot ledger"
-      ],
-      "open_issues": [13, 64, 78],
-      "next_product_proof": 11
+      "id": "notify_surface",
+      "process": "eliot-notify.exe",
+      "paths": ["bins/eliot-notify", "crates/surfaces/eliot-notify-core"],
+      "source_shape": "Near-stateless notification and ledger/verification adapters exist; distinct suboperation identity and real delivery reconciliation remain open.",
+      "reusable_parts": ["notification contracts", "delivery/ledger concepts", "Watchdog fallback direction"],
+      "implementation_support": "CURRENT_PARTIAL",
+      "runtime_support": "CURRENT_UNVERIFIED",
+      "strategy": "KEEP_AND_REPAIR_OPERATION_LINEAGE",
+      "main_nonconformant_boundary": "Verify, admit, reserve, delivery verification and commit reuse one RequestIdentity despite distinct effects.",
+      "owner_issues": [13, 64, 78],
+      "next_causal_action": "Introduce parent/child operation lineage and prove reserve/delivery/commit reconciliation without duplicates.",
+      "proof_required": ["identity conflicts", "crash reconciliation", "signed fallback", "real notification edge"]
     },
     {
-      "id": "agent_bridge",
-      "primary_issue": 13,
-      "source": "present",
-      "core_support": "PARTIAL",
-      "process_support": "PARTIAL",
-      "disposition": "SPLIT_ACTIVATION_EVENT_AND_REQUEST_TRANSLATION_CELLS",
-      "confirmed_strengths": [
-        "protected client declaration and peer challenge",
-        "one-shot Kernel activation exchange",
-        "durable event replay/ack pure core",
-        "restart-empty process state"
-      ],
-      "open_issues": [7, 8, 9, 13, 64, 66, 77, 79],
-      "known_gap": "normal Request/Cancel raw Frame passthrough is contractually impossible and production forwarding remains a stub",
-      "next_product_proof": 11
+      "id": "agent_bridge_surface",
+      "process": "eliot-agent-bridge.exe",
+      "paths": ["bins/eliot-agent-bridge", "crates/surfaces/eliot-agent-bridge-core", "crates/surfaces/eliot-mcp"],
+      "source_shape": "Typed inert invoke/cancel contracts, correlated gateway and public typed stdin ingress are on main. Activation exists; no post-activation Kernel host-request endpoint or real dispatch port exists.",
+      "reusable_parts": ["strict host contracts", "correlated gateway", "authenticated activation client", "durable observation contracts", "protocol regression policy"],
+      "implementation_support": "CONTRACT_AND_PUBLIC_INGRESS_CURRENT_RUNTIME_BLOCKED",
+      "runtime_support": "BLOCKED",
+      "strategy": "IMPLEMENT_KERNEL_BIND_DISPATCH_ADAPTER_THEN_RETIRE_INTERNAL_COMPATIBILITY",
+      "main_nonconformant_boundary": "The binary intentionally returns typed PlanGap because Kernel cannot bind principal/Session/task/fence and issue RequestIdentity; internal raw-frame compatibility remains non-public.",
+      "owner_issues": [7, 8, 9, 13, 64, 66, 77, 79],
+      "merged_local_repairs": [104, 112, 118, 121],
+      "next_causal_action": "After Kernel exposes authenticated bind/dispatch/cancel, implement the real port, correlate terminal state, remove internal Frame compatibility and run one MCP edge.",
+      "proof_required": ["Kernel-issued identity/task fixtures", "invoke/cancel replay and fence negatives", "reconnect/delayed response edge", "host-to-receipt Product path"]
     },
     {
-      "id": "research_provider_process",
-      "primary_issue": 24,
-      "source": "present",
-      "core_support": "PARTIAL",
-      "process_support": "PARTIAL",
-      "disposition": "MOVE_TO_GOVERNED_PROCESS_CONTOUR",
-      "open_issues": [13, 24, 64, 65, 79],
-      "known_gap": "ambient environment-selected direct process launch bypasses the governed process contour"
+      "id": "research_provider",
+      "process": "eliot-mod-research.exe",
+      "paths": ["bins/eliot-mod-research", "crates/research/eliot-researcher", "crates/research/eliot-research-exchange", "crates/research/eliot-research-exchange-api"],
+      "source_shape": "Research libraries remain; the standalone binary is intentionally fail-closed and no longer accepts unauthenticated stdin or ambient executable selection.",
+      "reusable_parts": ["candidate-only exchange contracts", "inquiry/source coverage models", "acquisition library logic"],
+      "implementation_support": "LIBRARY_CURRENT_BINARY_BLOCKED_FAIL_CLOSED",
+      "runtime_support": "BLOCKED",
+      "strategy": "KEEP_LIBRARY_AND_BUILD_GOVERNED_PROVIDER_CONTOUR",
+      "main_nonconformant_boundary": "No admitted provider artifact/process generation, typed adapter, durable Governor job or shared process/evidence path exists.",
+      "owner_issues": [24, 64, 65, 79, 82, 83, 84, 85, 100],
+      "merged_local_repairs": [86],
+      "next_causal_action": "Implement Kernel-gated immutable provider execution through shared ProcessExecutor and admit only candidate material through Governor.",
+      "proof_required": ["path injection negatives", "timeout/cancel/crash cleanup", "privacy/budget/fence mismatch", "provider reconciliation", "real/unavailable provider edge"]
+    },
+    {
+      "id": "runtime_status_and_live_installation",
+      "process": "eliot.exe and installed SystemService topology",
+      "paths": ["bins/eliot", "crates/meta/eliot-runtime-status", "crates/kernel/eliot-installation", "docs/release/WINDOWS_X64_RELEASE.md"],
+      "source_shape": "Release, installation and runtime-status components exist; no exact current Product Identity completed independent installed-state readback and D0/D1 pulses.",
+      "reusable_parts": ["release/signing pipeline", "installation transaction", "runtime status", "operator CLI"],
+      "implementation_support": "SOURCE_CURRENT_LIVE_UNVERIFIED",
+      "runtime_support": "NOT_EXECUTED",
+      "strategy": "LIVE_VERIFICATION_AFTER_LOAD_BEARING_CONTRACTS",
+      "main_nonconformant_boundary": "Static source/build/signing evidence is not an installed runtime; SCM, ACL, credentials, process lineage, store ownership and failure recovery remain unobserved.",
+      "owner_issues": [11, 13, 14, 15, 16, 18, 19],
+      "next_causal_action": "After load-bearing contract waves, materialize a fresh SystemService transaction and execute independent readback plus declared failure scenarios.",
+      "proof_required": ["ACTIVE_VERIFIED installation", "SCM/ACL/credential/Job/store readback", "first activation/repeat", "failure recovery", "live-canary decision"]
     }
   ],
-  "evidence_ceiling": {
-    "source_inventory": "OBSERVED",
-    "source_code_review": "OBSERVED_PARTIAL",
-    "build": "NOT_EXECUTED",
-    "runtime": "NOT_EXECUTED",
-    "store": "NOT_EXECUTED",
-    "product_pulse": "NOT_EXECUTED"
-  }
+  "retired_or_migration_facades": [
+    {"path": "crates/eliot-app", "status": "LEGACY_MIGRATION_REGRESSION_FACADE", "owner_issue": 18, "rule": "No new semantic/state/effect owner; every consumer is migrated, bounded as fixture, or deleted."},
+    {"path": "crates/eliot-engine", "status": "LEGACY_DOMAIN_DONOR_FACADE", "owner_issue": 18, "rule": "Extract only a proven current causal cell; never extend as a second Governor."},
+    {"path": "crates/eliot-store", "status": "LEGACY_STORE_FACADE", "owner_issue": 19, "rule": "Cannot bypass current store API/bridge or become a second storage owner."},
+    {"path": "crates/eliot-types", "status": "LEGACY_TYPE_FACADE", "owner_issue": 13, "rule": "Do not grow an unbounded common-type owner."},
+    {"path": "crates/eliot-windows-ipc", "status": "LEGACY_IPC_COMPATIBILITY_FACADE", "owner_issue": 15, "rule": "Current IPC/process ownership remains in declared Kernel/platform/surface contracts."}
+  ]
 }
