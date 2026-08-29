@@ -1,0 +1,20 @@
+schema_version = "eliot-cognitive-closed-world-index-v11"
+status = "ACTIVE_WORKING_DRAFT"
+issue = "github:UnknownAlienHuman/eliot-memory-os#94"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+ledgers = [
+  "crates/smart/cognitive-dreamer-job-coverage-v11.toml",
+  "crates/smart/cognitive-dreamer-candidate-kind-coverage-v11.toml",
+  "crates/smart/cognitive-curation-subtype-coverage-v11.toml",
+  "crates/smart/cognitive-function-edge-map-v11.toml",
+  "crates/smart/cognitive-product-pulses-v11.toml"
+]
+required_counts = { dreamer_job_classes = 8, candidate_kinds = 17, curation_subtypes = 11, function_edges = 54, product_pulses = 9 }
+fail_closed = [
+  "unknown job class",
+  "unknown or ambiguous candidate subtype",
+  "unknown or ambiguous curation handler",
+  "missing provider-consumer edge",
+  "missing required Product Pulse",
+  "missing denominator, exact fence, owner revision or Product Identity"
+]
