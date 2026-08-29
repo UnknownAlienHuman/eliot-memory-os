@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Contract-validating ELIOT production test daemon"
+description = "Kernel-gated ELIOT test execution plane; standalone binary fails closed until admitted"
 
 [lib]
 path = "src/lib.rs"
