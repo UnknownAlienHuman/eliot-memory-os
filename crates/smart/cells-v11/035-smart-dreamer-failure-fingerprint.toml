@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.failure_fingerprint"
+agent_order = 35
+physical_package = "eliot-dreamer-memory-semantics"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Construct a FailureFingerprint that distinguishes exact deterministic triggers from semantic similarity."
+
+[agent]
+objective = "Implement FailureFingerprint candidate construction with an exact-trigger hard-block ceiling."
+write_scope = ["crates/smart/eliot-dreamer-memory-semantics/src/failure_fingerprint.rs", "crates/smart/eliot-dreamer-memory-semantics/tests/failure_fingerprint.rs"]
+integration_owner = "Dreamer memory semantics integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-memory-semantics/src/lib.rs", "crates/smart/eliot-dreamer-memory-semantics/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_failure_fingerprint(request: &FailureFingerprintRequest, draft: &AdmittedDreamDraft) -> Result<FailureFingerprintCandidate, FailureFingerprintError>"]
+
+[algorithm]
+steps = [
+  "Validate failure, attempted action, observable, verifier and fence.",
+  "Separate exact signature, exact preconditions and causal mechanism from semantic neighbours.",
+  "Permit hard-block recommendation only for a deterministic exact trigger with current evidence.",
+  "Map semantic similarity to warning or probe requirement.",
+  "Require recovery, stop and invalidation conditions."
+]
+
+[limits]
+rules = ["Use explicit signature, neighbour and evidence maxima.", "Perform no broad similarity scan."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "MissingObservable", "MissingVerifier", "MissingMechanism", "HardBlockNotJustified", "MissingRecovery"]
+
+[forbidden]
+operations = ["hard block from semantic similarity", "stale trigger treated current", "broad embedding search", "effect execution", "canonical write"]
+
+[tests]
+required = ["semantic similarity alone cannot create hard block", "exact stale trigger requires revalidation", "fingerprint retains successful counterexample", "recovery condition is mandatory"]
+
+[integration]
+provider = "smart.dreamer.draft_admission"
+consumer = "smart.dreamer.curation_dispatch and context negative-memory projection owner"
+product_pulse = "D3C_CURATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if deterministic trigger, observable, verifier or recovery contract is missing."
