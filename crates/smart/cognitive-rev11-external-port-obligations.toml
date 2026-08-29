@@ -1,0 +1,132 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "EXTERNAL_OWNER_CONTRACT_OBLIGATIONS"
+proof_ceiling = "STATIC_CROSS_OWNER_DESIGN_ONLY"
+counted_as_cognitive_cells = false
+rule = "These functions belong to Governor, Task Controller, Evaluator, Security, Host integration or Agent Coordinator. Cognitive agents may consume their owner-neutral contracts but must not implement, mock as production, or absorb their ownership."
+
+[[obligation]]
+id = "XP01_CANONICAL_MEMORY_READ"
+owner = "Governor Read / canonical state owner"
+required_by = ["smart.memory.candidate_query"]
+public_function = "pub async fn read_canonical_memory_snapshot(request: &CanonicalMemoryReadRequest) -> Result<CanonicalMemoryReadSnapshot, CanonicalMemoryReadPortError>"
+input_owner = "eliot-memory-projection-contracts"
+output_owner = "eliot-memory-projection-contracts"
+requirements = ["authenticate request metadata and WorkScope", "enforce exact State Fence and canonical revision", "materialize a bounded frozen denominator", "project status, lifecycle, accessibility and permitted influence separately", "emit one read receipt or typed unknown outcome according to Governor/Store contracts"]
+forbidden = ["depend on eliot-memory-projection implementation", "perform Smart ranking", "mark records used/delivered", "promote support", "return database handles"]
+failure = ["StaleFence", "StaleCanonicalRevision", "CoveragePartial", "Unavailable", "UnknownReadOutcome"]
+edge = "E28_GOVERNOR_READ_TO_MEMORY_SNAPSHOT"
+
+[[obligation]]
+id = "XP02_CONTEXT_PROVIDER_REGISTRY"
+owner = "Governor composition / module registry owner"
+required_by = ["smart.context.contribution_merge", "all Context projection providers"]
+public_function = "pub fn current_context_provider_registry(state: &GovernorCompositionSnapshot) -> Result<ContextProviderRegistrySnapshot, ContextProviderRegistryPortError>"
+input_owner = "Governor composition contract"
+output_owner = "eliot-context-contracts::provider_registry"
+requirements = ["publish exact provider identities and generations", "publish supported roles and mandatory/optional class", "bind registry revision and State Fence", "include provider contract identities", "derive ExpectedContextProviderSet for one task boundary"]
+forbidden = ["call provider implementations", "perform Context merge", "infer availability from package presence", "treat unregistered provider as optional"]
+failure = ["RegistryUnavailable", "ProviderGenerationUnknown", "ContractIdentityMismatch", "FenceMismatch"]
+edge = "E35_PROVIDER_REGISTRY_TO_CONTEXT_MERGE"
+
+[[obligation]]
+id = "XP03_GOAL_TASK_CONTEXT_PROVIDER"
+owner = "Governor Task / Problem owner"
+required_by = ["D3B_CANONICAL_PROJECTION_PULSE_01"]
+public_function = "pub fn project_goal_task_context(request: &ContextProviderProjectionRequest, task: &TaskProblemProjection) -> Result<ProviderContribution, GoalTaskProjectionError>"
+input_owner = "eliot-context-contracts::provider_registry plus Governor Task/Problem contracts"
+output_owner = "eliot-context-contracts::candidate"
+requirements = ["emit Goal and Continuity whole atoms", "preserve objective, acceptance, plan revision and unresolved commitments", "bind exact task and State Fence", "publish complete/partial coverage"]
+forbidden = ["modify task", "decide finish", "rank other providers", "invoke Context admission"]
+failure = ["TaskRevisionMismatch", "ObjectiveMissing", "AcceptanceMissing", "FenceMismatch", "CoveragePartial"]
+provider_class = "GoalTask"
+
+[[obligation]]
+id = "XP04_CRITICAL_ATTENTION_CONTEXT_PROVIDER"
+owner = "Governor Problem / Critical Attention owner"
+required_by = ["D3B_CANONICAL_PROJECTION_PULSE_01"]
+public_function = "pub fn project_critical_attention_context(request: &ContextProviderProjectionRequest, attention: &CriticalAttentionProjection) -> Result<ProviderContribution, CriticalAttentionProjectionError>"
+input_owner = "eliot-context-contracts::provider_registry plus Governor Problem contracts"
+output_owner = "eliot-context-contracts::candidate"
+requirements = ["emit Attention and Safety whole atoms", "retain active conflict, hold, recovery and security directives", "mark mandatory Decision Safety Floor atoms", "bind exact problem/attention revision and State Fence"]
+forbidden = ["close attention", "resolve conflict", "suppress security directive for budget", "invoke Context admission"]
+failure = ["AttentionRevisionMismatch", "RequiredDirectiveMissing", "FenceMismatch", "CoveragePartial"]
+provider_class = "CriticalAttention"
+
+[[obligation]]
+id = "XP05_AUTHORITY_AFFORDANCE_CONTEXT_PROVIDER"
+owner = "Governor Authority / Skill / Tool owners"
+required_by = ["D3B_CANONICAL_PROJECTION_PULSE_01"]
+public_function = "pub fn project_authority_affordance_context(request: &ContextProviderProjectionRequest, capabilities: &EffectiveCapabilitySnapshot, tools: &ToolAffordanceSnapshot) -> Result<ProviderContribution, AuthorityAffordanceProjectionError>"
+input_owner = "eliot-context-contracts::provider_registry plus Governor Authority/Skill/Tool contracts"
+output_owner = "eliot-context-contracts::candidate"
+requirements = ["emit Affordance and Safety atoms", "publish exact effective capability paths and ceilings", "publish tool availability without credentials", "retain revoked/expired/unavailable distinctions", "bind authority epoch, resource generation and State Fence"]
+forbidden = ["grant or activate capability", "expose credential", "reserve route", "execute tool", "infer capability from installed package"]
+failure = ["AuthorityEpochMismatch", "CapabilityPathMissing", "ToolSnapshotStale", "FenceMismatch", "CoveragePartial"]
+provider_class = "AuthorityAffordance"
+
+[[obligation]]
+id = "XP06_CANONICAL_EXPERIENCE_READ"
+owner = "Task Controller + AgentAttempt + Evaluator + effect/receipt + Governor canonical owners"
+required_by = ["smart.experience.projection"]
+public_function = "pub async fn read_canonical_experience_snapshot(request: &SystemExperienceProjectionRequest) -> Result<CanonicalExperienceReadSnapshot, CanonicalExperienceReadPortError>"
+input_owner = "eliot-learning-contracts::experience"
+output_owner = "eliot-learning-contracts::experience"
+requirements = ["materialize exact task and attempt lineage", "include predeclared hypothesis, strategy and prediction handles", "include trace, artifact, evaluator and effect receipt handles", "publish expected owner denominator and coverage", "bind one State Fence and canonical revision"]
+forbidden = ["compute OutcomeAttribution", "drop failed attempts", "rewrite traces", "depend on eliot-experience-projection implementation"]
+failure = ["AttemptLineageMismatch", "OwnerUnavailable", "ReceiptUnknown", "FenceMismatch", "CoveragePartial"]
+edge = "E32_CANONICAL_EXPERIENCE_TO_PROJECTION"
+
+[[obligation]]
+id = "XP07_HARNESS_ACTIVATION_RECEIPT"
+owner = "Harness delivery / activation owner"
+required_by = ["meta.learning.activation_assessment"]
+public_function = "pub fn record_harness_activation(observation: &HarnessActivationObservation) -> Result<HarnessActivationReceipt, HarnessActivationReceiptError>"
+input_owner = "Harness runtime contract"
+output_owner = "Harness activation receipt contract"
+requirements = ["bind exact overlay candidate, target attempt, revision and State Fence", "distinguish delivered, parsed, available, invoked and used", "set proof ceiling from actual observation", "append immutable causal receipt"]
+forbidden = ["infer use from acknowledgement", "self-issue receipt in Meta", "claim outcome benefit", "promote overlay"]
+failure = ["TargetMismatch", "RevisionMismatch", "ObservationInsufficient", "FenceMismatch"]
+edge = "E23_EXTERNAL_RECEIPT_TO_ASSESSMENT"
+contract_challenge = "CC-006"
+
+[[obligation]]
+id = "XP08_CURATION_HANDLER_REGISTRY"
+owner = "Governor module registry owner"
+required_by = ["smart.dreamer.curation"]
+public_function = "pub fn current_curation_handler_registry(state: &ModuleRegistrySnapshot) -> Result<CurationHandlerRegistrySnapshot, CurationRegistryPortError>"
+input_owner = "Governor module registry contract"
+output_owner = "eliot-dreamer-contracts::curation"
+requirements = ["publish subtype, handler identity, schema, generation and State Fence", "enforce one semantic owner per subtype", "exclude unavailable or revoked handlers", "preserve open typed registration"]
+forbidden = ["execute handler", "infer subtype from free text", "generic fallback", "register two owners for one subtype"]
+failure = ["RegistryUnavailable", "DuplicateSubtypeOwner", "SchemaMissing", "GenerationStale", "FenceMismatch"]
+contract_challenge = "CC-005"
+
+[[obligation]]
+id = "XP09_MAINTENANCE_MODE_TRIGGER"
+owner = "Governor maintenance owner / MaintenanceTriggerEvaluator"
+required_by = ["smart.dreamer.maintenance_plan", "smart.dreamer.cycle_plan"]
+public_function = "pub fn evaluate_maintenance_projection(state: &MaintenanceEvaluationInput) -> Result<MaintenanceModeProjection, MaintenanceProjectionError>"
+input_owner = "Governor maintenance contracts"
+output_owner = "Governor maintenance projection contract"
+requirements = ["publish exact mode, family, trigger revision and State Fence", "distinguish disabled, manual, suggested and admitted automation", "publish bounded trigger evidence and budget ceiling"]
+forbidden = ["create Dreamer plan", "create DurableJob", "schedule work", "call model"]
+failure = ["TriggerCoveragePartial", "PolicyRevisionMismatch", "FenceMismatch", "Disabled"]
+contract_challenge = "CC-009"
+
+[[obligation]]
+id = "XP10_HOST_CONTEXT_CAPABILITY"
+owner = "Host integration and session delivery owner"
+required_by = ["smart.context.reactive_delivery_plan"]
+public_function = "pub fn current_host_context_capability(host: &HostIdentity) -> Result<HostContextCapabilitySnapshot, HostContextCapabilityError>"
+input_owner = "Host integration contract"
+output_owner = "Host context capability contract"
+requirements = ["distinguish event-integrated, tool-only and attention-only host", "publish exact generation and delivery boundaries", "publish receipt and session-dedup capability", "bind State Fence where task/session-bound"]
+forbidden = ["deliver context", "claim prevention", "create PendingContextInjectionPlan"]
+failure = ["HostUnknown", "GenerationStale", "CapabilityPartial", "FenceMismatch"]
+contract_challenge = "CC-011"
+
+[integration_rule]
+consumer_dependency = "Cognitive implementation depends only on the owner-neutral output contract, never on the external implementation crate."
+provider_dependency = "External owner implementation depends on foundation/owner-neutral projection contracts, never on Smart semantic implementation."
+proof = "Each obligation requires a real typed Edge Proof before the dependent Product Pulse may pass."
