@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.conflict_analysis"
+agent_order = 51
+physical_package = "eliot-dreamer-diagnosis"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Analyze one conflict while preserving observations, rival interpretations, evidence dependence and unresolved residue."
+
+[agent]
+objective = "Implement conflict-analysis candidate construction only."
+write_scope = ["crates/smart/eliot-dreamer-diagnosis/src/conflict_analysis.rs", "crates/smart/eliot-dreamer-diagnosis/tests/conflict_analysis.rs"]
+integration_owner = "Dreamer diagnosis integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-diagnosis/src/lib.rs", "crates/smart/eliot-dreamer-diagnosis/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_conflict_analysis_candidate(request: &ConflictAnalysisRequest, position: &CurrentEpistemicPosition, draft: &AdmittedDreamDraft) -> Result<ConflictAnalysisCandidate, ConflictAnalysisError>"]
+
+[algorithm]
+steps = [
+  "Validate conflict identity, participants, position and fence.",
+  "Separate observations from interpretations.",
+  "Mark shared and dependent lineage.",
+  "Retain strong objections and unresolved residue.",
+  "Name temporarily admissible actions, decision owner and discriminative probes without executing them."
+]
+
+[limits]
+rules = ["Use explicit participant, evidence and probe maxima.", "Use no vote-count truth weighting."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "UnknownConflict", "MissingParticipant", "MissingLineage", "NoDecisionOwner"]
+
+[forbidden]
+operations = ["truth adjudication", "vote-count weighting", "observation/interpretation collapse", "probe execution", "canonical write"]
+
+[tests]
+required = ["majority does not erase independent dissent", "shared lineage is not independent evidence", "unresolved residue remains explicit", "no decision owner fails closed"]
+
+[integration]
+provider = "smart.epistemic.position and smart.dreamer.draft_admission"
+consumer = "smart.dreamer.development_diagnosis and external decision owner"
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if conflict identity, lineage dependence, decision owner or discriminative probe target is missing."
