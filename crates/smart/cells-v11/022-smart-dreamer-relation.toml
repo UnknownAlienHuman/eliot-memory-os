@@ -1,0 +1,49 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.relation"
+agent_order = 22
+physical_package = "eliot-dreamer-relation"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Propose typed relations through one semantic core with explicit Orientation or Curation use case."
+
+[agent]
+objective = "Generalize relation semantics to two typed use cases without duplicate logic."
+write_scope = ["crates/smart/eliot-dreamer-relation/src/relation.rs", "crates/smart/eliot-dreamer-relation/tests/relation.rs"]
+integration_owner = "Dreamer relation integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-relation/src/lib.rs", "crates/smart/eliot-dreamer-relation/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = [
+  "pub fn build_relation_candidates(request: &RelationCandidateRequest, draft: &AdmittedDreamDraft) -> Result<RelationCandidateSet, RelationCandidateError>",
+  "pub fn build_orientation_relation_candidates(request: &OrientationRelationRequest, draft: &AdmittedDreamDraft) -> Result<RelationCandidateSet, RelationCandidateError>",
+  "pub fn build_curation_relation_candidates(request: &CurationRelationRequest, draft: &AdmittedDreamDraft) -> Result<RelationCandidateSet, RelationCandidateError>"
+]
+owned_types = ["RelationUseCase", "RelationCandidateRequest", "OrientationRelationRequest", "CurationRelationRequest", "RelationCandidate", "RelationCandidateSet", "RelationCandidateError"]
+
+[algorithm]
+steps = [
+  "Validate use case, endpoints, scope and fence.",
+  "Require exact source and counterevidence handles for every relation.",
+  "Separate observed chronology, co-change and similarity from causal hypotheses.",
+  "Require direction, relation kind, applicability, falsifier and status ceiling.",
+  "Apply a use-case-specific output envelope without duplicating relation semantics.",
+  "Stable-deduplicate exact relation identity."
+]
+
+[limits]
+rules = ["Use explicit endpoint and candidate maxima.", "Perform no graph acquisition or ambient traversal."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "UnknownEndpoint", "UnsupportedRelationKind", "MissingEvidence", "MissingFalsifier", "UseCaseMismatch"]
+
+[forbidden]
+operations = ["causality from sequence or similarity", "graph acquisition", "canonical relation write", "model self-proof", "generic fallback"]
+
+[tests]
+required = ["Orientation and Curation entrypoints share core semantics", "similarity never becomes a causal relation", "unknown endpoint is rejected", "counterevidence remains attached"]
+
+[integration]
+provider = "smart.dreamer.draft_admission"
+consumer = "smart.dreamer.orientation and smart.dreamer.curation_dispatch"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if relation kind, endpoint ownership, status ceiling or falsifier contract is missing."
