@@ -1,0 +1,42 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.learning.attempt_delta"
+agent_order = 43
+physical_package = "eliot-learning"
+execution_class = "POST_ATTEMPT_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Derive one evidence-backed learning delta by comparing a predeclared hypothesis and prediction with actual trace, artifact and evaluator evidence."
+
+[agent]
+objective = "Implement post-attempt learning-delta derivation only."
+write_scope = ["crates/smart/eliot-learning/src/attempt_delta.rs", "crates/smart/eliot-learning/tests/attempt_delta.rs"]
+integration_owner = "learning integration owner"
+forbidden_files = ["crates/smart/eliot-learning/src/lib.rs", "crates/smart/eliot-learning/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn derive_attempt_learning_delta(request: &AttemptDeltaRequest, state: &CampaignLearningStateView, evidence: &AttemptOutcomeEvidence) -> Result<AttemptLearningDelta, AttemptDeltaError>"]
+
+[algorithm]
+steps = [
+  "Validate attempt lineage, predeclared hypothesis, prediction, evidence and evaluator identity.",
+  "Classify result as LocalUpdateAdmitted, NextProbeChanged, ReusableCandidateOpened, NoJustifiedChange, Inconclusive or InvalidEvidence.",
+  "Reject a materially equivalent retry unless purpose is replication, noise estimation, controlled comparison, exact reproduction, recovery proof or verifier calibration.",
+  "Retain failed prediction, counterevidence and causal uncertainty."
+]
+
+[limits]
+rules = ["Process one attempt and bounded evidence set per call.", "Perform no model, tool or provider launch."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "MissingHypothesis", "MissingPrediction", "InvalidEvidence", "EquivalentRetryWithoutPurpose", "EvaluatorMismatch"]
+
+[forbidden]
+operations = ["post-hoc hypothesis invention", "equivalent retry without controlled purpose", "evaluator mutation", "outcome fabrication", "model/tool launch"]
+
+[tests]
+required = ["equivalent retry without new purpose is rejected", "outcome without attribution yields Inconclusive", "failed prediction remains in delta", "NoJustifiedChange is valid and explicit"]
+
+[integration]
+provider = "smart.learning.state_view plus attempt trace/artifact/evaluator owners"
+consumer = "smart.learning.overlay_candidate and smart.learning.closure"
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if predeclared hypothesis/prediction or evaluator-bound outcome evidence is absent."
