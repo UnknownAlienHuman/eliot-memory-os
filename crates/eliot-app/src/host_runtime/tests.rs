@@ -1483,7 +1483,7 @@ fn managed_output_is_redacted_before_persistence() -> anyhow::Result<()> {
     assert!(sanitized.receipt.redacted);
     assert!(!text.contains(&secret));
     assert!(!text.contains("must-not-persist"));
-    assert!(!text.contains(&jwt));
+    assert!(!text.contains(jwt.as_str()));
     assert!(text.contains("safe event"));
     assert!(text.contains("tokens=128"));
     assert!(
