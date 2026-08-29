@@ -1,0 +1,150 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "STATIC_FUNCTION_DESIGN_EXTENSION"
+orders = "74..75"
+additional_cells = 2
+additional_physical_crates = 0
+reason = "Make the expected Context provider denominator and the Epistemic provider function explicit instead of hiding them inside merge or ad-hoc adapters."
+
+[[cell]]
+order = 74
+id = "smart.context.provider_registry_contracts"
+stage = "W8_CANONICAL_PROJECTION_BRIDGES"
+physical_crate = "eliot-context-contracts"
+hot_path = false
+responsibility = "Own the closed provider-class, expected-provider-set, role-coverage and provider-request contracts used to construct a complete Context denominator."
+public_functions = ["pub fn validate_context_provider_registry(registry: &ContextProviderRegistrySnapshot) -> Result<(), ContextContractError>", "pub fn validate_expected_provider_set(expected: &ExpectedContextProviderSet) -> Result<(), ContextContractError>"]
+public_types = ["ContextProviderClass", "ContextProviderDescriptor", "ContextProviderRegistrySnapshot", "ExpectedContextProvider", "ExpectedContextProviderSet", "ContextProviderProjectionRequest", "ProviderRoleRequirement", "ProviderAvailabilityClass"]
+algorithm = ["validate closed provider class and stable provider identity", "bind provider generation, contract identity and supported Context roles", "require one compatible State Fence and registry revision", "validate mandatory/optional provider classes and role coverage", "canonicalize providers and compute expected-set digest"]
+invariants = ["provider registry owns no provider implementation", "missing mandatory provider is not an empty complete result", "one provider cannot silently claim another role", "Context merge receives an exact expected denominator"]
+degradation = "Unavailable optional provider remains an explicit availability state; missing mandatory provider yields partial/blocked compilation according to recipe."
+errors = ["UnknownProviderClass", "ProviderDuplicate", "RoleUnsupported", "RegistryStale", "FenceMismatch", "MandatoryProviderMissing"]
+tests = ["duplicate provider rejected", "missing mandatory provider visible", "role overclaim rejected", "provider order does not affect expected-set digest"]
+source_files = ["crates/smart/eliot-context-contracts/src/provider_registry.rs", "crates/smart/eliot-context-contracts/tests/provider_registry.rs"]
+product_pulse = "D3B_CANONICAL_PROJECTION_PULSE_01"
+architecture_refs = ["Context Compiler consumes owner projections", "provider coverage denominator", "owner-sparse architecture"]
+implementation_refs = ["Context contribution merge", "Packet Selection Integrity"]
+
+[[cell]]
+order = 75
+id = "smart.epistemic.context_projection"
+stage = "W8_CANONICAL_PROJECTION_BRIDGES"
+physical_crate = "eliot-epistemic"
+hot_path = true
+responsibility = "Translate one CurrentEpistemicPosition into an owner-attributed ProviderContribution while preserving observations, assumptions, rivals, conflicts, stale/superseded records, unknowns and investigation requirements."
+public_functions = ["pub fn project_epistemic_context(request: &EpistemicContextProjectionRequest, position: &CurrentEpistemicPosition) -> Result<ProviderContribution, EpistemicContextProjectionError>"]
+public_types = ["EpistemicContextProjectionRequest"]
+algorithm = ["validate exact position digest, expected provider identity and one State Fence", "map position roles to whole ContextAtoms without merging their epistemic states", "retain explicit assumptions, rival models, conflict participants, stale/superseded handles, unknowns and InvestigationRequirements", "protect load-bearing conflict, unknown and counterevidence atoms according to Decision Safety Floor policy", "emit provider coverage and exact denominator"]
+complexity = "O(n log n + selected_representation_bytes) over a bounded CurrentEpistemicPosition; no canonical read, model call, Context admission or I/O."
+invariants = ["Assumed never becomes Supported", "conflict is not flattened into one warning string", "minority and counterevidence remain addressable", "projection cannot rank against other providers or admit itself", "source handles and State Fence are preserved"]
+degradation = "Partial position coverage produces a partial ProviderContribution with explicit missing owners and unknowns; invalid fence fails closed."
+errors = ["PositionDigestMismatch", "FenceMismatch", "ProviderIdentityMismatch", "RequiredRoleUnrepresentable", "ProjectionLimitExceeded"]
+tests = ["assumption remains assumption", "rival/counterevidence retained", "local conflict remains structured", "partial owner coverage visible", "projection contains no admission disposition"]
+source_files = ["crates/smart/eliot-epistemic/src/context_projection.rs", "crates/smart/eliot-epistemic/tests/context_projection.rs"]
+product_pulse = "D3B_CANONICAL_PROJECTION_PULSE_01"
+architecture_refs = ["Current Epistemic Position", "Active Understanding View", "uncertainty visibility"]
+implementation_refs = ["Context Compiler epistemic provider", "Decision Safety Floor"]
+
+[[provider]]
+class = "GoalTask"
+owner = "Governor Task/Problem owner"
+required_roles = ["Goal", "Continuity"]
+adapter_contract = "ContextProviderProjectionRequest -> ProviderContribution"
+cognitive_implementation = false
+
+[[provider]]
+class = "CriticalAttention"
+owner = "Governor Problem/Critical Attention owner"
+required_roles = ["Attention", "Safety"]
+adapter_contract = "ContextProviderProjectionRequest -> ProviderContribution"
+cognitive_implementation = false
+
+[[provider]]
+class = "EpistemicPosition"
+owner = "eliot-epistemic"
+required_roles = ["Evidence", "Model", "Unknown"]
+adapter_function = "project_epistemic_context"
+cognitive_implementation = true
+
+[[provider]]
+class = "MemoryRecall"
+owner = "eliot-memory-projection"
+required_roles = ["Evidence", "Continuity", "Safety", "Unknown"]
+adapter_function = "project_memory_context"
+cognitive_implementation = true
+
+[[provider]]
+class = "AuthorityAffordance"
+owner = "Governor Authority/Skill/Tool owners"
+required_roles = ["Affordance", "Safety"]
+adapter_contract = "ContextProviderProjectionRequest -> ProviderContribution"
+cognitive_implementation = false
+
+[[provider]]
+class = "SelfModel"
+owner = "eliot-dreamer-self-query"
+required_roles = ["Model", "Safety", "Unknown"]
+adapter_function = "project_self_model_context"
+cognitive_implementation = true
+
+[[provider]]
+class = "DecisionTail"
+owner = "eliot-context"
+required_roles = ["DecisionTail"]
+adapter_function = "build_decision_local_tail"
+cognitive_implementation = true
+provider_phase = "post_admission_view"
+
+[[edge]]
+id = "E35_PROVIDER_REGISTRY_TO_CONTEXT_MERGE"
+producer = "Context provider registry owner"
+contract = "ContextProviderRegistrySnapshot plus ExpectedContextProviderSet"
+consumer = "smart.context.contribution_merge::merge_context_contributions"
+failure = "missing mandatory provider remains partial/blocked coverage, never empty complete input"
+
+[[edge]]
+id = "E36_EPISTEMIC_POSITION_TO_CONTEXT_PROJECTION"
+producer = "smart.epistemic.position::resolve_current_epistemic_position"
+contract = "CurrentEpistemicPosition"
+consumer = "smart.epistemic.context_projection::project_epistemic_context"
+failure = "partial position remains partial; assumptions and conflicts cannot be flattened"
+
+[[edge]]
+id = "E37_EPISTEMIC_PROJECTION_TO_CONTEXT_MERGE"
+producer = "smart.epistemic.context_projection::project_epistemic_context"
+contract = "ProviderContribution"
+consumer = "smart.context.contribution_merge::merge_context_contributions"
+failure = "missing epistemic provider is a mandatory coverage gap"
+
+[topology_extension]
+added_crates = 0
+added_cells = 2
+existing_crate_extensions = [
+  "eliot-context-contracts: src/provider_registry.rs + tests/provider_registry.rs",
+  "eliot-epistemic: src/context_projection.rs + tests/context_projection.rs",
+]
+
+[cargo_extension]
+eliot_context_contracts_added_types = ["provider registry and request contracts"]
+eliot_epistemic_added_dependencies = ["eliot-context-contracts"]
+forbidden = ["Context merge depending on Governor implementation", "epistemic projection owning provider registry", "provider adapter hidden inside merge"]
+
+[type_ownership_extension]
+context_provider_types_owner = "eliot-context-contracts::provider_registry"
+epistemic_projection_request_owner = "eliot-epistemic-contracts or eliot-context-contracts integration-owner decision before implementation"
+contract_challenge_if_unresolved = "The integration owner must choose exactly one owner before cell 75 implementation; the worker cannot define a duplicate public request type."
+
+[validation]
+combined_cells = 75
+combined_physical_crates = 28
+combined_hot_path_cells = 15
+combined_typed_edges = 37
+combined_product_pulses = 9
+assertions = [
+  "orders 74 and 75 are globally unique",
+  "registry denominator is required by context merge",
+  "all six provider classes have one owner and role set",
+  "epistemic projection is in the exact hot set",
+  "epistemic projection preserves every epistemic role",
+  "external Governor provider adapters are not implemented inside Smart",
+]
