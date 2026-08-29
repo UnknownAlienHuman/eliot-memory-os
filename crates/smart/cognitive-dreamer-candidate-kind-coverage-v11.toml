@@ -1,0 +1,100 @@
+schema_version = "eliot-dreamer-candidate-kind-coverage-v11"
+status = "CLOSED_WORLD_WORKING_DRAFT"
+issue = "github:UnknownAlienHuman/eliot-memory-os#94"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+unknown_candidate_kind = "REJECT_UNSUPPORTED_CANDIDATE_KIND"
+rule = "Broad CandidateKind values require a closed typed subtype before semantic dispatch. No free-text subtype inference or generic LLM fallback."
+
+[[candidate_kind]]
+name = "Interpretation"
+required_subtypes = ["OrientationSynthesis", "ResearchSynthesis", "ArchitectureBrief", "ImplementationBrief", "CurrentSystemConformance", "ConflictAnalysis", "DevelopmentDiagnosis"]
+handlers = ["smart.dreamer.orientation", "smart.dreamer.research_synthesis", "smart.dreamer.architecture_brief", "smart.dreamer.implementation_brief", "smart.dreamer.current_system_conformance", "smart.dreamer.conflict_analysis", "smart.dreamer.development_diagnosis"]
+
+[[candidate_kind]]
+name = "RivalModel"
+required_subtypes = []
+handlers = ["smart.dreamer.rival_model"]
+
+[[candidate_kind]]
+name = "Relation"
+required_subtypes = ["OrientationRelation", "CurationRelation"]
+handlers = ["smart.dreamer.relation"]
+
+[[candidate_kind]]
+name = "Classification"
+required_subtypes = []
+handlers = ["smart.dreamer.classification"]
+
+[[candidate_kind]]
+name = "Episode"
+required_subtypes = []
+handlers = ["smart.dreamer.episode"]
+
+[[candidate_kind]]
+name = "Concept"
+required_subtypes = []
+handlers = ["smart.dreamer.concept"]
+
+[[candidate_kind]]
+name = "Procedure"
+required_subtypes = ["ProcedureCandidate", "SkillCandidate"]
+handlers = ["smart.dreamer.procedure", "smart.dreamer.skill"]
+
+[[candidate_kind]]
+name = "Failure"
+required_subtypes = ["FailureFingerprint"]
+handlers = ["smart.dreamer.failure_fingerprint"]
+
+[[candidate_kind]]
+name = "Merge"
+required_subtypes = ["StructureMerge"]
+handlers = ["smart.dreamer.structure_repair"]
+
+[[candidate_kind]]
+name = "Split"
+required_subtypes = ["StructureSplit"]
+handlers = ["smart.dreamer.structure_repair"]
+
+[[candidate_kind]]
+name = "Reconsolidation"
+required_subtypes = []
+handlers = ["smart.dreamer.reconsolidation"]
+
+[[candidate_kind]]
+name = "Accessibility"
+required_subtypes = ["Suppress", "Demote", "Archive", "Reactivate"]
+handlers = ["smart.dreamer.accessibility"]
+
+[[candidate_kind]]
+name = "Repair"
+required_subtypes = ["StructureRepair", "InfluenceRepair"]
+handlers = ["smart.dreamer.structure_repair", "smart.dreamer.influence_repair"]
+
+[[candidate_kind]]
+name = "Clarification"
+required_subtypes = []
+handlers = ["smart.dreamer.clarification"]
+
+[[candidate_kind]]
+name = "Probe"
+required_subtypes = ["DiscriminativeProbe"]
+handlers = ["smart.dreamer.probe_plan"]
+
+[[candidate_kind]]
+name = "Maintenance"
+required_subtypes = ["MaintenancePlan", "ConfigurationIntent", "DreamCycleSample", "DreamCyclePlan"]
+handlers = ["smart.dreamer.maintenance_plan", "smart.dreamer.configuration_intent", "smart.dreamer.cycle_sample", "smart.dreamer.cycle_plan"]
+
+[[candidate_kind]]
+name = "WorkPlan"
+required_subtypes = ["WorkDecomposition", "OrchestrationPlan"]
+handlers = ["smart.dreamer.work_decomposition", "smart.dreamer.orchestration_plan"]
+
+[validation]
+rules = [
+  "Every candidate kind resolves to one exact handler after subtype resolution.",
+  "Two handlers may share one kind only when a required subtype disambiguates them before dispatch.",
+  "Accessibility cannot change support or existence; Repair cannot become infrastructure repair; Maintenance cannot create scheduler state; WorkPlan cannot create execution state.",
+  "Skill remains a Procedure subtype until the normative contract introduces a distinct CandidateKind.",
+  "Unknown kind or subtype is retained as unsupported and cannot be interpreted by a generic fallback."
+]
