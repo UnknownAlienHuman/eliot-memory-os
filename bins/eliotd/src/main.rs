@@ -10,11 +10,16 @@ use eliotd::{PROTOCOL_VERSION, SERVICE_NAME};
 
 fn main() {
     if let Err(error) = daemon_runtime::run() {
-        daemon_runtime::write_json(&daemon_runtime::ReadyMessage::Error {
+        let message = daemon_runtime::ReadyMessage::Error {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
-            error,
-        });
+            error: error.clone(),
+        };
+        if let Err(output_error) = daemon_runtime::write_json(&message) {
+            eprintln!(
+                "eliotd structured error output failed: {output_error}; original failure: {error}"
+            );
+        }
         std::process::exit(1);
     }
 }
