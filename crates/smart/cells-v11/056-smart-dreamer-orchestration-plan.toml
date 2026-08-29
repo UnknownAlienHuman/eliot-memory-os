@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.orchestration_plan"
+agent_order = 56
+physical_package = "eliot-dreamer-planning"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Propose route, staffing and ordering over already defined work units without creating execution state."
+
+[agent]
+objective = "Implement advisory orchestration planning only."
+write_scope = ["crates/smart/eliot-dreamer-planning/src/orchestration_plan.rs", "crates/smart/eliot-dreamer-planning/tests/orchestration_plan.rs"]
+integration_owner = "Dreamer planning integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-planning/src/lib.rs", "crates/smart/eliot-dreamer-planning/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_orchestration_plan_candidate(request: &OrchestrationPlanRequest, decomposition: &WorkDecompositionCandidate, capabilities: &AgentCapabilityProjection, draft: &AdmittedDreamDraft) -> Result<OrchestrationPlanCandidate, OrchestrationPlanError>"]
+
+[algorithm]
+steps = [
+  "Validate work-unit identities, dependencies, capability projection, budget and fence.",
+  "Respect declared independent and integration units.",
+  "Propose route classes, staffing constraints, ordering and review points.",
+  "Name conflicts, shared files and required integration owner.",
+  "Return candidate only to Task Controller, Governor and Agent Coordinator owners."
+]
+
+[limits]
+rules = ["Use explicit work-unit and agent-role maxima.", "Create no SwarmPlanDefinition, WorkItem, Ready Queue reservation, lease or launch."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "UnknownWorkUnit", "CapabilityGap", "DependencyCycle", "SharedScopeConflict", "BudgetExceeded"]
+
+[forbidden]
+operations = ["SwarmPlanDefinition creation", "WorkItem creation", "queue reservation", "lease acquisition", "agent launch", "execution-state mutation"]
+
+[tests]
+required = ["dependency cycle is rejected", "shared source file requires integration owner", "plan cannot create execution state", "unavailable capability remains a gap"]
+
+[integration]
+provider = "smart.dreamer.work_decomposition and Agent capability projection owner"
+consumer = "Task Controller, Governor and Agent Coordinator owners"
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if work-unit dependency, capability, shared-scope or integration-owner data is incomplete."
