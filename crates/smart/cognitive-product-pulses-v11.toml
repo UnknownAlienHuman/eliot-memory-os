@@ -1,0 +1,81 @@
+schema_version = "eliot-cognitive-product-pulses-v11"
+status = "NOT_EXECUTED_DESIGN_CONTRACTS"
+issue = "github:UnknownAlienHuman/eliot-memory-os#94"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+pulse_count = 9
+rule = "A Product Pulse is executed evidence on an exact Product Identity. These records define the required path and oracles; they do not constitute proof."
+
+[[pulse]]
+id = "D1_CAPTURE_CLASSIFICATION_EDGE_01"
+purpose = "Prove capture-first observation handling without task contamination or epistemic promotion."
+path = ["external observation adapter", "governor.observation.classifier::classify_observation", "Governor observation admission owner", "canonical write receipt owner"]
+required_oracles = ["safe material retained", "ambiguous task binding quarantined", "classification status no stronger than observation evidence", "same operation/fence identity preserved", "typed receipt from external owner"]
+negative_cases = ["conflicting task hints", "unsupported hint", "oversized content", "stale fence", "writer support claim"]
+forbidden_claims = ["capture proves support", "classifier owns canonical storage", "cold capture is failure"]
+
+[[pulse]]
+id = "D3A_ORIENTATION_PULSE_01"
+purpose = "Prove candidate-only problem orientation from a current epistemic position through common Dreamer validation."
+path = ["CurrentEpistemicPosition", "build_reference_manifest", "assemble_dream_input_bundle", "external governed model route", "ground_draft_claims", "validate_dream_transformation", "admit_grounded_dream_draft", "build_rival_model_set", "build_orientation_relation_candidates", "build_discriminative_probe_plan", "assemble_orientation_packet"]
+required_oracles = ["all material claims grounded or unsupported residue visible", "seven validation dimensions retained", "rivals and objections retained", "relations remain candidates", "probes have verifier/stop/revision", "model text cannot populate confirmed evidence", "no canonical write/effect"]
+negative_cases = ["invented citation", "mixed State Fence", "same-model faithfulness self-check", "source-count-as-coverage", "unsafe probe", "over-budget packet"]
+forbidden_claims = ["DreamPacket is truth", "Orientation completes task", "model route grants authority"]
+
+[[pulse]]
+id = "D3A_RESEARCH_SYNTHESIS_EDGE_01"
+purpose = "Prove Researcher acquisition and Dreamer interpretation remain separate and coverage-safe."
+path = ["ResearchQueryRequest owner", "Researcher acquisition", "ResearchEvidenceBundle", "common Dreamer validation", "synthesize_research_candidate", "Governor/Human review owner"]
+required_oracles = ["exact bundle digest and allowed manifest", "citation precision within manifest", "counterclaims retained", "failed acquisition retained", "frozen denominator retained", "no-match only with complete declared scope", "Dreamer performs no acquisition"]
+negative_cases = ["invented source handle", "unsupported citation precision", "incomplete scope no-match", "disclosure mismatch", "stale bundle fence"]
+forbidden_claims = ["Researcher synthesis is canonical support", "Dreamer searched the web", "source count equals coverage"]
+
+[[pulse]]
+id = "D3B_REACTIVE_CONTEXT_PULSE_01"
+purpose = "Prove exact proactive memory activation and bounded decision-local context compilation."
+path = ["ObservedCue", "normalize_observed_cues", "match_direct_cues", "optional expand_cue_activation", "assemble_cue_activation", "owner-produced ContextContribution values", "merge_context_contributions", "admit_context_candidates", "assess_context_quality", "assemble_active_understanding_view", "build_decision_local_tail", "plan_reactive_context_injection"]
+required_oracles = ["exact cue fires with zero relation edges", "canonical spelling preserved", "direct hits survive spread failure", "provider denominator visible", "Decision Safety Floor reserved", "downstream headroom reserved", "whole atoms only", "rivals/unknowns/negative memory visible", "quality dimensions independent", "delivery plan emits no receipt"]
+negative_cases = ["case-sensitive path collision", "cyclic spread", "verbose provider budget capture", "unknown decision delta", "missing Safety Floor", "tool-only host pre-action claim"]
+forbidden_claims = ["graph is required for exact cue", "quality score repairs membership", "plan proves delivery"]
+
+[[pulse]]
+id = "D3C_CURATION_PULSE_01"
+purpose = "Prove bounded memory rehabilitation without conflating existence, support, accessibility, influence or identity."
+path = ["CurationSnapshot", "screen_memory_curation", "typed CurationHandlerRegistry", "common Dreamer validation", "exact curation handler", "assemble_curation_candidate_set", "Governor/Human review owner"]
+required_oracles = ["protected/minority/counterexample records retained", "dimensioned findings", "chronology separate from causality", "raw evidence unchanged", "old identities and rollback retained", "accessibility leaves support/existence/influence unchanged", "influence repair consumes exact external closure", "unknown subtype unsupported"]
+negative_cases = ["low retrieval frequency only", "writer utility/confidence scalar", "semantic similarity hard block", "merge by similarity", "raw rewrite", "inferred influence closure", "generic fallback"]
+forbidden_claims = ["candidate changed lifecycle", "retrieval strengthened support", "curation purged raw evidence"]
+
+[[pulse]]
+id = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+purpose = "Prove evidence-backed task-local adaptation without self-promotion or hidden objective/authority change."
+path = ["LearningOwnerProjections", "build_campaign_learning_state_view", "derive_attempt_learning_delta", "build_campaign_overlay_candidate", "validate_campaign_overlay", "external Governor admission and HarnessActivationReceipt", "assess_harness_activation", "assess_harness_adherence", "build_campaign_learning_closure", "assess_retention_and_transfer", "build_promotion_input"]
+required_oracles = ["owner coverage denominator", "predeclared hypothesis/prediction", "equivalent retry rejected unless controlled purpose", "overlay task-local/reversible/expiring", "objective/acceptance/authority/privacy/evaluator/holdout unchanged", "activation receipt externally owned", "activation/adherence/outcome distinct", "NoReusableDelta valid", "promotion input dimensioned and advisory"]
+negative_cases = ["transcript fills owner state", "objective mutation", "acknowledgement proves activation", "adherence proves benefit", "same trace counts as transfer", "scalar promotion score"]
+forbidden_claims = ["overlay promoted globally", "Smart created activation receipt", "learning changed evaluator"]
+
+[[pulse]]
+id = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+purpose = "Prove evidence-bound diagnosis and advisory planning without execution-state ownership."
+path = ["ProductObjectiveProjection and CurrentSystemEvidenceSnapshot", "build_development_diagnosis_candidate", "build_work_decomposition_candidate", "build_orchestration_plan_candidate", "external Task Controller/Governor/Agent Coordinator review"]
+required_oracles = ["exact Product Identity", "Failure Capsules and discriminators", "causal mechanism grouping", "equivalent retry control", "one causal property/owner/discriminator per work unit", "edge integration unit", "Product Pulse unit", "capability gaps/shared files visible", "no WorkItem/job/lease/queue/launch"]
+negative_cases = ["build success closes product failure", "file count defines cell", "overlapping worker scopes", "dependency cycle", "unavailable capability silently substituted"]
+forbidden_claims = ["plan executed", "Dreamer created swarm state", "module green proves product"]
+
+[[pulse]]
+id = "D5_SELF_QUERY_EDGE_01"
+purpose = "Prove bounded self-query distinguishes accepted target contracts from current-system support."
+path = ["AcceptedNormativeSourceProjection", "build_architecture_brief", "build_implementation_brief", "CurrentSystemEvidenceSnapshot", "build_current_system_conformance_candidate"]
+required_oracles = ["exact pair key and document digests", "exact source anchors", "Hard Boundaries retained", "target/current distinction", "exact Product Identity", "dimensioned source/build/test/artifact/runtime evidence", "proof ceiling per conclusion"]
+negative_cases = ["stale normative digest", "missing anchor", "prose treated as implementation", "build/test count treated as runtime support", "stale current evidence"]
+forbidden_claims = ["brief is a third normative source", "target mechanism is CURRENT_VERIFIED", "source proof is runtime proof"]
+
+[[pulse]]
+id = "D6_DREAM_CYCLE_PULSE_01"
+purpose = "Prove one bounded maintenance sampling/planning cycle without autonomous self-scheduling."
+path = ["DreamCycleSourceSnapshot", "select_dream_cycle_sample", "external CurationHandlerRegistry", "build_dream_cycle_plan_candidate", "external maintenance/Governor/Agent Coordinator owner"]
+required_oracles = ["frozen denominator and strata", "minority/conflict/failure evidence retained", "deterministic bounded sample", "exact handler mapping", "one automatic experiment per target", "automation/privacy/budget/user-session constraints", "finite one-cycle horizon", "no scheduler/job/model/agent launch"]
+negative_cases = ["incomplete denominator hidden", "frequency erases minority", "unknown sample kind fallback", "duplicate target experiment", "plan schedules itself"]
+forbidden_claims = ["DreamCycle is continuous subconscious process", "plan created DurableJob", "sample acquired new sources"]
+
+[execution_gate]
+required_for_pass = ["exact Product Identity", "exact source and contract revisions", "actual provider-consumer edge fixtures", "negative-case execution", "typed receipts from external owners where effects or delivery are involved", "no unresolved load-bearing failed dimension"]
