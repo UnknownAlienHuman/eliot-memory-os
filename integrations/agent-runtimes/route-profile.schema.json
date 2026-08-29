@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eliot.local/schemas/agent-route-profile-v1.json",
+  "title": "ELIOT agent runtime route profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile_id",
+    "host_family",
+    "route_class",
+    "implementation_support",
+    "evidence_execution_status",
+    "architecture_anchors",
+    "host_surfaces",
+    "execution_routes",
+    "skills",
+    "mcp",
+    "coordination",
+    "probe_requirements",
+    "known_gaps",
+    "source_refs"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schema_version": { "const": "eliot.agent-route-profile.v1" },
+    "profile_id": { "type": "string", "minLength": 3 },
+    "host_family": {
+      "enum": ["codex", "opencode", "claude", "antigravity"]
+    },
+    "route_class": {
+      "enum": ["primary-1", "primary-2", "later-local-sidecar"]
+    },
+    "implementation_support": {
+      "enum": ["TARGET", "CURRENT_UNVERIFIED", "PARTIAL", "DEFERRED", "EXPERIMENTAL", "DEGRADED", "STALE"]
+    },
+    "evidence_execution_status": {
+      "enum": ["NOT_EXECUTED", "SIMULATED", "EXECUTED", "UNKNOWN_OUTCOME"]
+    },
+    "architecture_anchors": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "pattern": "^ARCH-" },
+      "uniqueItems": true
+    },
+    "host_surfaces": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/host_surface" }
+    },
+    "execution_routes": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/execution_route" }
+    },
+    "skills": { "$ref": "#/$defs/skills" },
+    "mcp": { "$ref": "#/$defs/mcp" },
+    "coordination": { "$ref": "#/$defs/coordination" },
+    "probe_requirements": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 3 }
+    },
+    "known_gaps": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 3 }
+    },
+    "source_refs": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "format": "uri" }
+    }
+  },
+  "$defs": {
+    "host_surface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["surface_id", "kind", "status", "path", "purpose", "authority_ceiling"],
+      "properties": {
+        "surface_id": { "type": "string" },
+        "kind": {
+          "enum": ["plugin_bundle", "hooks", "skills", "mcp_registration", "host_instruction", "desktop_extension"]
+        },
+        "status": {
+          "enum": ["implemented_unverified", "target", "experimental", "deferred", "unavailable"]
+        },
+        "path": { "type": ["string", "null"] },
+        "purpose": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "authority_ceiling": {
+          "enum": ["none", "observation_candidate", "pre_effect_gate_candidate"]
+        }
+      }
+    },
+    "execution_route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "route_id",
+        "role",
+        "status",
+        "transport",
+        "execution_identity",
+        "launch",
+        "schema_and_health_probe",
+        "model_selection",
+        "session_control",
+        "event_contract",
+        "child_agents",
+        "swarm",
+        "proof_ceiling"
+      ],
+      "properties": {
+        "route_id": { "type": "string" },
+        "role": {
+          "enum": ["primary_candidate", "fallback", "alternative_candidate", "remote_deferred"]
+        },
+        "status": {
+          "enum": ["target", "implemented_unverified", "experimental", "deferred", "degraded", "stale"]
+        },
+        "transport": { "type": "string" },
+        "execution_identity": {
+          "enum": ["interactive_user", "service_safe", "remote"]
+        },
+        "launch": { "$ref": "#/$defs/launch" },
+        "schema_and_health_probe": { "$ref": "#/$defs/probe" },
+        "model_selection": { "$ref": "#/$defs/model_selection" },
+        "session_control": { "$ref": "#/$defs/session_control" },
+        "event_contract": { "$ref": "#/$defs/event_contract" },
+        "child_agents": { "$ref": "#/$defs/child_agents" },
+        "swarm": { "$ref": "#/$defs/swarm" },
+        "proof_ceiling": { "type": "string", "minLength": 8 }
+      }
+    },
+    "launch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["program", "argv", "argv_construction", "shell", "stdin_mode", "environment_policy", "credential_boundary"],
+      "properties": {
+        "program": { "type": "string" },
+        "argv": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "argv_construction": { "const": "typed_no_shell" },
+        "shell": { "const": false },
+        "stdin_mode": { "type": "string" },
+        "environment_policy": { "const": "allowlist" },
+        "credential_boundary": { "type": "string" }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "schema", "health", "negative_capability_challenge"],
+      "properties": {
+        "version": { "type": "string" },
+        "schema": { "type": "string" },
+        "health": { "type": "string" },
+        "negative_capability_challenge": { "type": "string" }
+      }
+    },
+    "model_selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["discovery", "selection", "fixed_model_id", "per_attempt_receipt"],
+      "properties": {
+        "discovery": { "type": "string" },
+        "selection": { "type": "string" },
+        "fixed_model_id": { "type": "null" },
+        "per_attempt_receipt": { "const": true }
+      }
+    },
+    "session_control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "resume", "fork", "cancel", "continuation_kind"],
+      "properties": {
+        "start": { "type": "string" },
+        "resume": { "type": ["string", "null"] },
+        "fork": { "type": ["string", "null"] },
+        "cancel": { "type": "string" },
+        "continuation_kind": {
+          "enum": ["native_resume", "native_fork", "rehydrated", "fresh_only"]
+        }
+      }
+    },
+    "event_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "ordering", "durable_bridge_required", "terminal_result_separate", "coverage_status"],
+      "properties": {
+        "source": { "type": "string" },
+        "ordering": { "type": "string" },
+        "durable_bridge_required": { "const": true },
+        "terminal_result_separate": { "const": true },
+        "coverage_status": {
+          "enum": ["unprobed", "partial", "documented_not_observed", "observed"]
+        }
+      }
+    },
+    "child_agents": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["native_surface", "admission", "descendant_closure_required"],
+      "properties": {
+        "native_surface": { "type": "string" },
+        "admission": {
+          "enum": ["disabled_until_probed", "explicit_work_item_only", "unavailable"]
+        },
+        "descendant_closure_required": { "const": true }
+      }
+    },
+    "swarm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["control_plane", "durable_mailbox", "direct_group_chat", "recursive_launch_default", "context_policy"],
+      "properties": {
+        "control_plane": { "const": "eliot.coordinate" },
+        "durable_mailbox": { "const": true },
+        "direct_group_chat": { "const": false },
+        "recursive_launch_default": { "const": "disabled" },
+        "context_policy": { "const": "minimum_decision_sufficient_packet" }
+      }
+    },
+    "skills": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["canonical_source", "delivery", "index_payload", "body_payload", "runtime_payload", "authority_ceiling"],
+      "properties": {
+        "canonical_source": { "const": "integrations/agent-skills" },
+        "delivery": { "const": "lazy" },
+        "index_payload": { "const": "name_and_trigger_description" },
+        "body_payload": { "const": "on_activation" },
+        "runtime_payload": { "const": "on_reference" },
+        "authority_ceiling": { "const": "none" }
+      }
+    },
+    "mcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["server_name", "status", "transport", "semantic_surface", "raw_store_access", "tool_visibility"],
+      "properties": {
+        "server_name": { "const": "eliot" },
+        "status": {
+          "enum": ["implemented_unverified", "target", "deferred", "unavailable"]
+        },
+        "transport": { "enum": ["stdio", "host_native", "unavailable"] },
+        "semantic_surface": { "const": "canonical_eliot_operations" },
+        "raw_store_access": { "const": false },
+        "tool_visibility": { "const": "task_relative_lazy" }
+      }
+    },
+    "coordination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempt_state_owner", "message_transport", "meeting_form", "decision_owner", "transcript_policy", "result_authority"],
+      "properties": {
+        "attempt_state_owner": { "const": "eliot_agent_coordinator" },
+        "message_transport": { "const": "durable_mailbox" },
+        "meeting_form": { "const": "concilium_over_sealed_evidence" },
+        "decision_owner": { "const": "task_controller_or_human" },
+        "transcript_policy": { "const": "no_whole_sibling_transcript_by_default" },
+        "result_authority": { "const": "candidate_only_until_governed_transition" }
+      }
+    }
+  }
+}

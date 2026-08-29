@@ -1,0 +1,217 @@
+{
+  "$schema": "../agent-runtimes/route-profile.schema.json",
+  "schema_version": "eliot.agent-route-profile.v1",
+  "profile_id": "claude.local.agent-sdk-sidecar",
+  "host_family": "claude",
+  "route_class": "later-local-sidecar",
+  "implementation_support": "PARTIAL",
+  "evidence_execution_status": "NOT_EXECUTED",
+  "architecture_anchors": [
+    "ARCH-PORT-01",
+    "ARCH-CTX-03",
+    "ARCH-SKL-01",
+    "ARCH-SWM-01",
+    "ARCH-SWM-02",
+    "ARCH-LONG-01",
+    "ARCH-SEC-04",
+    "ARCH-FIN-01"
+  ],
+  "host_surfaces": [
+    {
+      "surface_id": "claude.code.plugin",
+      "kind": "plugin_bundle",
+      "status": "implemented_unverified",
+      "path": "integrations/claude/eliot/.claude-plugin/plugin.json",
+      "purpose": ["hook_registration", "mcp_registration", "skill_discovery"],
+      "authority_ceiling": "none"
+    },
+    {
+      "surface_id": "claude.code.hooks",
+      "kind": "hooks",
+      "status": "implemented_unverified",
+      "path": "integrations/claude/eliot/hooks/hooks.json",
+      "purpose": ["session_observation", "pre_effect_gate_candidate", "subagent_observation", "compaction_boundary", "finish_candidate"],
+      "authority_ceiling": "pre_effect_gate_candidate"
+    },
+    {
+      "surface_id": "claude.code.skills",
+      "kind": "skills",
+      "status": "implemented_unverified",
+      "path": "integrations/claude/eliot/skills",
+      "purpose": ["progressive_instruction_disclosure"],
+      "authority_ceiling": "none"
+    },
+    {
+      "surface_id": "claude.code.mcp",
+      "kind": "mcp_registration",
+      "status": "implemented_unverified",
+      "path": "integrations/claude/eliot/.mcp.json",
+      "purpose": ["eliot_semantic_tools", "resource_expansion"],
+      "authority_ceiling": "none"
+    },
+    {
+      "surface_id": "claude.desktop.extension",
+      "kind": "desktop_extension",
+      "status": "implemented_unverified",
+      "path": "integrations/claude/claude-desktop",
+      "purpose": ["human_semantic_surface", "mcp_registration"],
+      "authority_ceiling": "none"
+    }
+  ],
+  "execution_routes": [
+    {
+      "route_id": "claude.agent-sdk.local-sidecar",
+      "role": "primary_candidate",
+      "status": "target",
+      "transport": "stdio_ndjson_sdk_sidecar",
+      "execution_identity": "interactive_user",
+      "launch": {
+        "program": "eliot-claude-sidecar",
+        "argv": ["--stdio"],
+        "argv_construction": "typed_no_shell",
+        "shell": false,
+        "stdin_mode": "versioned_request_event_stream",
+        "environment_policy": "allowlist",
+        "credential_boundary": "authorized user-owned Agent SDK runtime; no service-account impersonation"
+      },
+      "schema_and_health_probe": {
+        "version": "sidecar artifact hash plus Claude Code and Agent SDK package versions",
+        "schema": "sidecar contract digest plus SDK options/message compatibility probe",
+        "health": "start one read-only disposable query and observe init, message, result, and cleanup",
+        "negative_capability_challenge": "request one optional hook, subagent, or resume property outside the admitted profile and require a typed non-success"
+      },
+      "model_selection": {
+        "discovery": "current runtime/account capability probe; unknown when the SDK does not expose an authoritative list",
+        "selection": "ClaudeAgentOptions.model or equivalent sidecar request field, recorded per attempt",
+        "fixed_model_id": null,
+        "per_attempt_receipt": true
+      },
+      "session_control": {
+        "start": "query or ClaudeSDKClient connect with a new ELIOT attempt",
+        "resume": "SDK resume/session identifier through the sidecar",
+        "fork": "SDK fork-session option when the exact runtime probe admits it",
+        "cancel": "sidecar cancellation mapped to SDK interruption/close and process-tree reconciliation",
+        "continuation_kind": "native_resume"
+      },
+      "event_contract": {
+        "source": "Agent SDK init, assistant, tool, hook, subagent, result, error, and cleanup events",
+        "ordering": "sidecar stream sequence plus SDK session/message identities wrapped in ELIOT EventEnvelope",
+        "durable_bridge_required": true,
+        "terminal_result_separate": true,
+        "coverage_status": "documented_not_observed"
+      },
+      "child_agents": {
+        "native_surface": "Agent SDK subagents declared in the exact attempt options",
+        "admission": "explicit_work_item_only",
+        "descendant_closure_required": true
+      },
+      "swarm": {
+        "control_plane": "eliot.coordinate",
+        "durable_mailbox": true,
+        "direct_group_chat": false,
+        "recursive_launch_default": "disabled",
+        "context_policy": "minimum_decision_sufficient_packet"
+      },
+      "proof_ceiling": "The local sidecar may execute one bounded candidate attempt. Claude Code plugin hooks observe or gate a host session but do not own SDK attempt state, finish, or recovery."
+    },
+    {
+      "route_id": "claude.managed-agents.remote",
+      "role": "remote_deferred",
+      "status": "deferred",
+      "transport": "remote_managed_agents_api",
+      "execution_identity": "remote",
+      "launch": {
+        "program": "<eliot-claude-managed-adapter>",
+        "argv": [],
+        "argv_construction": "typed_no_shell",
+        "shell": false,
+        "stdin_mode": "versioned_remote_job_request",
+        "environment_policy": "allowlist",
+        "credential_boundary": "separate explicit remote credential, billing, retention, and privacy profile"
+      },
+      "schema_and_health_probe": {
+        "version": "remote API version and adapter hash",
+        "schema": "remote request/event contract digest",
+        "health": "account-scoped harmless job probe",
+        "negative_capability_challenge": "unsupported beta operation must fail without fallback to the local route"
+      },
+      "model_selection": {
+        "discovery": "remote account capability response",
+        "selection": "remote job route field recorded per attempt",
+        "fixed_model_id": null,
+        "per_attempt_receipt": true
+      },
+      "session_control": {
+        "start": "create remote managed job",
+        "resume": null,
+        "fork": null,
+        "cancel": "remote job cancellation plus outcome reconciliation",
+        "continuation_kind": "rehydrated"
+      },
+      "event_contract": {
+        "source": "remote job events and terminal readback",
+        "ordering": "provider job sequence wrapped in ELIOT EventEnvelope",
+        "durable_bridge_required": true,
+        "terminal_result_separate": true,
+        "coverage_status": "unprobed"
+      },
+      "child_agents": {
+        "native_surface": "remote beta behavior is not admitted",
+        "admission": "unavailable",
+        "descendant_closure_required": true
+      },
+      "swarm": {
+        "control_plane": "eliot.coordinate",
+        "durable_mailbox": true,
+        "direct_group_chat": false,
+        "recursive_launch_default": "disabled",
+        "context_policy": "minimum_decision_sufficient_packet"
+      },
+      "proof_ceiling": "Deferred remote capacity is a separate route and may not inherit local subscription, privacy, event, or continuation claims."
+    }
+  ],
+  "skills": {
+    "canonical_source": "integrations/agent-skills",
+    "delivery": "lazy",
+    "index_payload": "name_and_trigger_description",
+    "body_payload": "on_activation",
+    "runtime_payload": "on_reference",
+    "authority_ceiling": "none"
+  },
+  "mcp": {
+    "server_name": "eliot",
+    "status": "implemented_unverified",
+    "transport": "stdio",
+    "semantic_surface": "canonical_eliot_operations",
+    "raw_store_access": false,
+    "tool_visibility": "task_relative_lazy"
+  },
+  "coordination": {
+    "attempt_state_owner": "eliot_agent_coordinator",
+    "message_transport": "durable_mailbox",
+    "meeting_form": "concilium_over_sealed_evidence",
+    "decision_owner": "task_controller_or_human",
+    "transcript_policy": "no_whole_sibling_transcript_by_default",
+    "result_authority": "candidate_only_until_governed_transition"
+  },
+  "probe_requirements": [
+    "pin Claude Code executable, Agent SDK package, sidecar artifact, account, and behavior-affecting options",
+    "prove read-only start, streamed events, result, cancellation, cleanup, resume, and optional fork independently",
+    "prove hook output and SDK event output are not merged into one terminal status",
+    "prove every admitted subagent has a WorkItem and descendant closure before parent disposition",
+    "prove local and remote routes have separate credentials, billing, retention, and ActualRouteReceipt"
+  ],
+  "known_gaps": [
+    "the local Agent SDK sidecar is not implemented in this profile change",
+    "the existing Claude Code plugin invokes the legacy bridge per hook and is not the SDK route",
+    "current-account model discovery, quota, resume, and fork behavior are unprobed",
+    "remote Managed Agents remain a separate deferred beta route"
+  ],
+  "source_refs": [
+    "https://platform.claude.com/docs/en/agent-sdk/overview",
+    "https://platform.claude.com/docs/en/agent-sdk/python",
+    "https://docs.anthropic.com/en/docs/claude-code/hooks",
+    "https://docs.anthropic.com/en/docs/claude-code/plugins",
+    "https://docs.anthropic.com/en/docs/claude-code/skills"
+  ]
+}
