@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.development_diagnosis"
+agent_order = 52
+physical_package = "eliot-dreamer-diagnosis"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Diagnose a development failure from exact objective, Product Identity, Failure Capsules, discriminators and conformance gaps."
+
+[agent]
+objective = "Implement evidence-bound development diagnosis only; do not edit code or run tests."
+write_scope = ["crates/smart/eliot-dreamer-diagnosis/src/development_diagnosis.rs", "crates/smart/eliot-dreamer-diagnosis/tests/development_diagnosis.rs"]
+integration_owner = "Dreamer diagnosis integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-diagnosis/src/lib.rs", "crates/smart/eliot-dreamer-diagnosis/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_development_diagnosis_candidate(request: &DevelopmentDiagnosisRequest, evidence: &DevelopmentEvidenceSnapshot, draft: &AdmittedDreamDraft) -> Result<DevelopmentDiagnosisCandidate, DevelopmentDiagnosisError>"]
+
+[algorithm]
+steps = [
+  "Validate Product Identity, objective, acceptance, Failure Capsules, verifier and fence.",
+  "Group failures by causal mechanism rather than file or symptom count.",
+  "Compare prior repair hypotheses and discriminators.",
+  "Reject a materially equivalent retry unless it changes hypothesis, discriminator or controlled purpose.",
+  "Return a bounded repair sequence or MechanismReviewCandidate."
+]
+
+[limits]
+rules = ["Use explicit failure, hypothesis and repair-step maxima.", "Perform no code edit, build, test or runtime execution."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "MissingProductIdentity", "MissingFailureCapsule", "MissingDiscriminator", "EquivalentRetry", "ConformanceSnapshotMissing"]
+
+[forbidden]
+operations = ["code edit", "test/build execution", "proxy metric as product outcome", "equivalent retry", "finish decision"]
+
+[tests]
+required = ["same patch strategy without new hypothesis is rejected", "build success alone does not close product failure", "proxy activity remains separate from outcome", "MechanismReviewCandidate is a valid output"]
+
+[integration]
+provider = "Product Objective, CurrentSystemEvidenceSnapshot, Failure Capsule and evaluator owners"
+consumer = "smart.dreamer.work_decomposition and external development owner"
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if exact Product Identity, failure capsule, discriminator or current conformance evidence is absent."
