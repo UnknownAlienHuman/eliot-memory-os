@@ -1,0 +1,206 @@
+schema_version = 2
+authority = "eliot-cognitive-function-design-rev12"
+status = "MIGRATION_PLAN_PARTIALLY_APPLIED"
+rule = "Reuse deterministic logic and tests only. Do not inherit duplicate state, authority, lifecycle or proof ownership."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-cue-normalizer"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-cue-binding"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-cue-index"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-cue-activation"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-context-candidates"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-context-admission"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-context-assembly"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-reactive-context-plan"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-candidate-validation"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-memory-repair"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-rival-model"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-relation"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-probe-plan"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-clarification"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-architecture-brief"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-implementation-brief"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-classification"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-episode"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-concept"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-procedure"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-failure"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-structure-repair"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-reconsolidation"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-accessibility"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-conflict-analysis"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-development-diagnosis"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-maintenance-plan"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-configuration-plan"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-dreamer-orchestration-plan"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-learning-state-view"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-learning-delta"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retired_prototype]]
+path = "crates/smart/eliot-learning-overlay"
+disposition = "REMOVE_FUNCTION_ONLY_OR_BROAD_ASSIGNMENT_SURFACE"
+replacement = "Use cognitive-rev12-topology.toml and the indexed cell catalog; implementation remains pending."
+
+[[retained_donor]]
+path = "crates/smart/eliot-epistemic"
+disposition = "REFACTOR_IN_PLACE"
+keep = ["stateless fenced resolver", "deterministic ordering", "provenance preservation"]
+replace = ["global conflict collapse", "implicit assumed state", "unstructured inquiry"]
+
+[[retained_donor]]
+path = "crates/smart/eliot-cues"
+disposition = "REFACTOR_IN_PLACE"
+keep = ["immutable snapshot", "exact-first matching", "bounded spread", "activation trace"]
+replace = ["lowercasing canonical path", "combined exact/spread proof", "hidden lifecycle mutation"]
+
+[[retained_donor]]
+path = "crates/smart/eliot-context"
+disposition = "REFACTOR_IN_PLACE"
+keep = ["pure whole-unit compiler", "deterministic ordering", "inspectable omissions"]
+replace = ["scalar quality", "missing provider denominator", "missing headroom", "admission-owned quality"]
+
+[[retained_donor]]
+path = "crates/smart/eliot-dreamer-core"
+disposition = "RETAIN_CANDIDATE_BOUNDARY_REWRITE_VALIDATION"
+keep = ["pure bounded candidate-only boundary", "no store/model/process ownership"]
+replace = ["constant proof booleans", "source-count coverage", "self-certified faithfulness"]
+
+[[retained_donor]]
+path = "crates/smart/eliot-memory-curation"
+disposition = "RETAIN_SCREENING_ONLY"
+keep = ["bounded read-only screening mechanics"]
+replace = ["scalar utility/confidence", "duplicate lifecycle state", "direct archive action"]
+
+[[state_owner_retirement]]
+path = "crates/smart/eliot-memory"
+disposition = "RETIRE_AS_CANONICAL_STATE_OWNER_AFTER_EDGE_MIGRATION"
+
+[[state_owner_retirement]]
+path = "crates/smart/eliot-system-experience"
+disposition = "RETIRE_AS_STATE_OWNER_KEEP_PROJECTION_DONOR_ONLY"
+
+[[state_owner_retirement]]
+path = "crates/smart/eliot-understanding"
+disposition = "MERGE_RENDERING_INTO_CONTEXT_OWNER_AFTER_EDGE_MIGRATION"

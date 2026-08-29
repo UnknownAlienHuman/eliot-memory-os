@@ -1,0 +1,99 @@
+schema_version = 2
+authority = "eliot-cognitive-function-design-rev12"
+orders = "68..86"
+rule = "Give one file to one worker. The worker also receives exact public contract owners and source anchors named by that file, not the whole repository."
+
+[[assignment]]
+order = 68
+cell = "smart.memory.projection.contracts"
+path = "crates/smart/cells-v12/068-smart-memory-projection-contracts.toml"
+
+[[assignment]]
+order = 69
+cell = "smart.memory.candidate_query"
+path = "crates/smart/cells-v12/069-smart-memory-candidate_query.toml"
+
+[[assignment]]
+order = 70
+cell = "smart.memory.context_projection"
+path = "crates/smart/cells-v12/070-smart-memory-context_projection.toml"
+
+[[assignment]]
+order = 71
+cell = "smart.learning.contracts.experience"
+path = "crates/smart/cells-v12/071-smart-learning-contracts-experience.toml"
+
+[[assignment]]
+order = 72
+cell = "smart.experience.projection"
+path = "crates/smart/cells-v12/072-smart-experience-projection.toml"
+
+[[assignment]]
+order = 73
+cell = "smart.self_model.context_projection"
+path = "crates/smart/cells-v12/073-smart-self_model-context_projection.toml"
+
+[[assignment]]
+order = 74
+cell = "smart.context.provider_registry_contracts"
+path = "crates/smart/cells-v12/074-smart-context-provider_registry_contracts.toml"
+
+[[assignment]]
+order = 75
+cell = "smart.epistemic.context_projection"
+path = "crates/smart/cells-v12/075-smart-epistemic-context_projection.toml"
+
+[[assignment]]
+order = 76
+cell = "meta.memory.ecology_assessment"
+path = "crates/smart/cells-v12/076-meta-memory-ecology_assessment.toml"
+
+[[assignment]]
+order = 77
+cell = "meta.memory.gravity_assessment"
+path = "crates/smart/cells-v12/077-meta-memory-gravity_assessment.toml"
+
+[[assignment]]
+order = 78
+cell = "smart.dreamer.negative_memory_extinction"
+path = "crates/smart/cells-v12/078-smart-dreamer-negative_memory_extinction.toml"
+
+[[assignment]]
+order = 79
+cell = "meta.skill.lifecycle_assessment"
+path = "crates/smart/cells-v12/079-meta-skill-lifecycle_assessment.toml"
+
+[[assignment]]
+order = 80
+cell = "meta.tool.surface_assessment"
+path = "crates/smart/cells-v12/080-meta-tool-surface_assessment.toml"
+
+[[assignment]]
+order = 81
+cell = "meta.dreamer.job_economics"
+path = "crates/smart/cells-v12/081-meta-dreamer-job_economics.toml"
+
+[[assignment]]
+order = 82
+cell = "governor.self_quality.view"
+path = "crates/smart/cells-v12/082-governor-self_quality-view.toml"
+
+[[assignment]]
+order = 83
+cell = "meta.self_quality.learning_bottleneck"
+path = "crates/smart/cells-v12/083-meta-self_quality-learning_bottleneck.toml"
+
+[[assignment]]
+order = 84
+cell = "meta.self_quality.intervention_candidate"
+path = "crates/smart/cells-v12/084-meta-self_quality-intervention_candidate.toml"
+
+[[assignment]]
+order = 85
+cell = "meta.common_ground.assessment"
+path = "crates/smart/cells-v12/085-meta-common_ground-assessment.toml"
+
+[[assignment]]
+order = 86
+cell = "meta.understanding.scoped_assessment"
+path = "crates/smart/cells-v12/086-meta-understanding-scoped_assessment.toml"

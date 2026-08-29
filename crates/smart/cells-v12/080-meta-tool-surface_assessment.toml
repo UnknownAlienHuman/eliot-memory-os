@@ -1,0 +1,15 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+order = 80
+cell = "meta.tool.surface_assessment"
+physical_crate = "eliot-cognitive-quality"
+primary_property = "Assess the actually advertised tool surface and result-use chain without treating tool count, registration or transport completion as utility."
+public_functions = ["pub fn assess_tool_surface(request: &ToolSurfaceAssessmentRequest, exposures: &[ToolExposureReceiptView]) -> Result<ToolSurfaceAssessment, ToolSurfaceAssessmentError>"]
+write_scope = ["crates/meta/eliot-cognitive-quality/src/tool_surface.rs", "crates/meta/eliot-cognitive-quality/tests/tool_surface.rs"]
+minimum_tests = ["advertised but ineligible distinct", "transport complete with truncated result", "rare load-bearing tool retained", "loop risk detected", "no tool registration"]
+non_goals = ["canonical write or lifecycle transition", "policy, authority, scheduling, effect or finish ownership", "public type redefinition", "Cargo/lib/re-export integration", "proof above package-local design/implementation evidence"]
+architecture_refs = ["ARCH-HELP-01", "ARCH-CTX-01", "ARCH-META-01"]
+implementation_refs = ["I7.24 ToolSurfaceDecision", "I7.24 ToolExposureReceipt"]
+product_pulse = "D4_COGNITIVE_QUALITY_PULSE_01"
+stop_condition = "Return a ContractChallenge if the declared API requires another owner, hidden I/O/model work, an oracle change, or a wider mutable scope."
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY until Rust implementation and package proof exist"

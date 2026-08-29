@@ -1,0 +1,20 @@
+[package]
+name = "eliot-dreamer-validation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+layer = "C1"
+purpose = "post-model grounding, dimensional validation and structural admission"
+source_maintenance_owner = "cognitive-integration-owner"
+functional_cell_refs = ["smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+independent_proof_profile = "prototype-not-workspace-admitted"
+contract_refs = ["crates/smart/cognitive-current.toml"]
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"

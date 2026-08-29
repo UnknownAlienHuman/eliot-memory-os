@@ -1,0 +1,15 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+order = 82
+cell = "governor.self_quality.view"
+physical_crate = "eliot-cognitive-quality"
+primary_property = "Compile the Governor-owned problem-oriented EliotSelfQualityView from exact owner projections without creating a second state owner or global intelligence score."
+public_functions = ["pub fn compile_eliot_self_quality_view(request: &EliotSelfQualityViewRequest, projections: &[SelfQualityOwnerProjection]) -> Result<EliotSelfQualityView, EliotSelfQualityViewError>"]
+write_scope = ["crates/meta/eliot-cognitive-quality/src/self_quality_view.rs", "crates/meta/eliot-cognitive-quality/tests/self_quality_view.rs"]
+minimum_tests = ["missing owner visible", "activity without delta exposed", "no global score field", "order-independent digest", "no mutable state API"]
+non_goals = ["canonical write or lifecycle transition", "policy, authority, scheduling, effect or finish ownership", "public type redefinition", "Cargo/lib/re-export integration", "proof above package-local design/implementation evidence"]
+architecture_refs = ["ARCH-SELF-01", "ARCH-META-01", "ARCH-CORE-00"]
+implementation_refs = ["I16.23 EliotSelfQualityView", "I4.8 system experience bank"]
+product_pulse = "D4_SELF_QUALITY_PULSE_01"
+stop_condition = "Return a ContractChallenge if the declared API requires another owner, hidden I/O/model work, an oracle change, or a wider mutable scope."
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY until Rust implementation and package proof exist"

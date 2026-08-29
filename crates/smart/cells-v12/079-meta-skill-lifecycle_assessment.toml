@@ -1,0 +1,15 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+order = 79
+cell = "meta.skill.lifecycle_assessment"
+physical_crate = "eliot-cognitive-quality"
+primary_property = "Assess one Skill revision across eligibility, activation, adherence, decision/verifier delta, outcomes, false activation, transfer and dependency freshness without changing the Skill."
+public_functions = ["pub fn assess_skill_lifecycle(request: &SkillLifecycleAssessmentRequest, evidence: &[SkillLifecycleEvidence]) -> Result<SkillLifecycleAssessment, SkillLifecycleAssessmentError>"]
+write_scope = ["crates/meta/eliot-cognitive-quality/src/skill_lifecycle.rs", "crates/meta/eliot-cognitive-quality/tests/skill_lifecycle.rs"]
+minimum_tests = ["installed-only no utility credit", "delivery without activation", "early adherence abandoned later", "false activation retained", "no Skill mutation"]
+non_goals = ["canonical write or lifecycle transition", "policy, authority, scheduling, effect or finish ownership", "public type redefinition", "Cargo/lib/re-export integration", "proof above package-local design/implementation evidence"]
+architecture_refs = ["ARCH-SKL-01", "ARCH-LEARN-01", "ARCH-META-01"]
+implementation_refs = ["I7.25 SkillLifecycleView", "I12.24 HarnessActivationReceipt"]
+product_pulse = "D4_COGNITIVE_QUALITY_PULSE_01"
+stop_condition = "Return a ContractChallenge if the declared API requires another owner, hidden I/O/model work, an oracle change, or a wider mutable scope."
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY until Rust implementation and package proof exist"

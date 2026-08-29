@@ -1,0 +1,15 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+order = 74
+cell = "smart.context.provider_registry_contracts"
+physical_crate = "eliot-context-contracts"
+primary_property = "Own the closed Context provider registry, expected-provider denominator, role coverage and generic provider-projection request contracts."
+public_functions = ["pub fn validate_context_provider_registry(registry: &ContextProviderRegistrySnapshot) -> Result<(), ContextContractError>", "pub fn validate_expected_provider_set(expected: &ExpectedContextProviderSet) -> Result<(), ContextContractError>", "pub fn validate_context_provider_request(request: &ContextProviderProjectionRequest) -> Result<(), ContextContractError>"]
+write_scope = ["crates/smart/eliot-context-contracts/src/provider_registry.rs", "crates/smart/eliot-context-contracts/tests/provider_registry.rs"]
+minimum_tests = ["duplicate rejected", "missing mandatory visible", "role overclaim rejected", "order-independent digest", "single request type used by all providers"]
+non_goals = ["canonical write or lifecycle transition", "policy, authority, scheduling, effect or finish ownership", "public type redefinition", "Cargo/lib/re-export integration", "proof above package-local design/implementation evidence"]
+architecture_refs = ["ARCH-MOD-03", "ARCH-CTX-01", "ARCH-CTX-04"]
+implementation_refs = ["I12 Context Compiler", "I7.11 provider coverage"]
+product_pulse = "D3B_CANONICAL_PROJECTION_PULSE_01"
+stop_condition = "Return a ContractChallenge if the declared API requires another owner, hidden I/O/model work, an oracle change, or a wider mutable scope."
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY until Rust implementation and package proof exist"

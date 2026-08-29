@@ -1,0 +1,15 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+order = 78
+cell = "smart.dreamer.negative_memory_extinction"
+physical_crate = "eliot-dreamer-memory-revision"
+primary_property = "Propose narrowing, reopening or extinction of a negative-memory activation after safe re-exposure while preserving the original failure episode and support history."
+public_functions = ["pub fn build_negative_memory_extinction_candidate(request: &NegativeMemoryExtinctionRequest, fingerprint: &FailureFingerprint, evidence: &[SafeReexposureEvidence]) -> Result<NegativeMemoryExtinctionCandidate, NegativeMemoryExtinctionError>"]
+write_scope = ["crates/smart/eliot-dreamer-memory-revision/src/negative_memory_extinction.rs", "crates/smart/eliot-dreamer-memory-revision/tests/negative_memory_extinction.rs"]
+minimum_tests = ["near-match cannot hard-block", "single success insufficient for broad extinction", "environment change enables scoped reopen", "history preserved", "no lifecycle receipt"]
+non_goals = ["canonical write or lifecycle transition", "policy, authority, scheduling, effect or finish ownership", "public type redefinition", "Cargo/lib/re-export integration", "proof above package-local design/implementation evidence"]
+architecture_refs = ["ARCH-MEM-02", "ARCH-MEM-04", "ARCH-RES-05"]
+implementation_refs = ["I12.19 Negative memory", "I12.21 lifecycle evaluation"]
+product_pulse = "D4_MEMORY_ECOLOGY_PULSE_01"
+stop_condition = "Return a ContractChallenge if the declared API requires another owner, hidden I/O/model work, an oracle change, or a wider mutable scope."
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY until Rust implementation and package proof exist"

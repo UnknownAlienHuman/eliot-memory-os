@@ -1,0 +1,15 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+order = 81
+cell = "meta.dreamer.job_economics"
+physical_crate = "eliot-cognitive-quality"
+primary_property = "Assess Dreamer job utility against full compute, storage, context and Human cost using downstream adoption and outcome evidence."
+public_functions = ["pub fn assess_dreamer_job_economics(request: &DreamerJobEconomicsRequest, jobs: &[DreamerJobOutcomeEvidence]) -> Result<DreamerJobEconomicsAssessment, DreamerJobEconomicsError>"]
+write_scope = ["crates/meta/eliot-cognitive-quality/src/dreamer_economics.rs", "crates/meta/eliot-cognitive-quality/tests/dreamer_economics.rs"]
+minimum_tests = ["unused synthesis no utility credit", "completed job with no improvement", "Human burden counted", "one-off success scoped", "no schedule mutation"]
+non_goals = ["canonical write or lifecycle transition", "policy, authority, scheduling, effect or finish ownership", "public type redefinition", "Cargo/lib/re-export integration", "proof above package-local design/implementation evidence"]
+architecture_refs = ["ARCH-DRM-03", "ARCH-ECON-01", "ARCH-META-01"]
+implementation_refs = ["I9.16 DreamerJobEconomics", "I9.17 maintenance agent"]
+product_pulse = "D4_COGNITIVE_QUALITY_PULSE_01"
+stop_condition = "Return a ContractChallenge if the declared API requires another owner, hidden I/O/model work, an oracle change, or a wider mutable scope."
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY until Rust implementation and package proof exist"

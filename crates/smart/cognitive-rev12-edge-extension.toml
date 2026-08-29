@@ -1,0 +1,119 @@
+schema_version = 2
+authority = "eliot-cognitive-function-design-rev12"
+status = "STATIC_EDGE_EXTENSION_NOT_EXECUTED"
+base_edge_map = "crates/smart/cognitive-function-edge-map-v11.toml"
+base_edge_count = 54
+extension_edge_count = 14
+combined_edge_count = 68
+
+[[edge]]
+id = "E55_MEMORY_READ_TO_CANDIDATE_QUERY"
+producer = "Governor named canonical read owner"
+contract = "CanonicalMemoryReadSnapshot"
+consumer = "smart.memory.candidate_query::query_memory_candidates"
+failure = "partial denominator remains partial; no direct store read"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[edge]]
+id = "E56_CUE_ACTIVATION_TO_MEMORY_QUERY"
+producer = "smart.cue.activation::assemble_cue_activation"
+contract = "CueActivationResult"
+consumer = "smart.memory.candidate_query::query_memory_candidates"
+failure = "exact firing remains usable without graph spread"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[edge]]
+id = "E57_MEMORY_CANDIDATES_TO_CONTEXT_PROJECTION"
+producer = "smart.memory.candidate_query::query_memory_candidates"
+contract = "MemoryCandidateSet"
+consumer = "smart.memory.context_projection::project_memory_context"
+failure = "status/accessibility/influence remain separate"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[edge]]
+id = "E58_MEMORY_CONTEXT_TO_CONTEXT_MERGE"
+producer = "smart.memory.context_projection::project_memory_context"
+contract = "ProviderContribution"
+consumer = "smart.context.contribution_merge::merge_context_contributions"
+failure = "missing mandatory memory provider remains a coverage gap"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[edge]]
+id = "E59_OWNER_EXPERIENCE_TO_PROJECTION"
+producer = "Governor task/attempt/evaluator/effect read owners"
+contract = "CanonicalExperienceReadSnapshot"
+consumer = "smart.experience.projection::project_system_experience"
+failure = "missing owner blocks causal attribution"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[edge]]
+id = "E60_EXPERIENCE_TO_LEARNING_STATE"
+producer = "smart.experience.projection::project_system_experience"
+contract = "SystemExperienceProjection"
+consumer = "smart.learning.state_view::assemble_campaign_learning_state_view"
+failure = "projection is evidence, not a second attempt journal"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[edge]]
+id = "E61_SELF_MODEL_TO_CONTEXT_MERGE"
+producer = "smart.self_model.context_projection::project_self_model_context"
+contract = "ProviderContribution"
+consumer = "smart.context.contribution_merge::merge_context_contributions"
+failure = "target contracts cannot become current support"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[edge]]
+id = "E62_PROVIDER_REGISTRY_TO_CONTEXT_MERGE"
+producer = "smart.context.provider_registry_contracts"
+contract = "ExpectedContextProviderSet"
+consumer = "smart.context.contribution_merge::merge_context_contributions"
+failure = "missing mandatory provider never becomes empty complete"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[edge]]
+id = "E63_EPISTEMIC_POSITION_TO_CONTEXT"
+producer = "smart.epistemic.position::resolve_current_epistemic_position"
+contract = "CurrentEpistemicPosition"
+consumer = "smart.epistemic.context_projection::project_epistemic_context"
+failure = "assumptions, rivals and conflicts remain structured"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[edge]]
+id = "E64_MEMORY_ECOLOGY_TO_CURATION_PLAN"
+producer = "meta.memory.ecology_assessment::assess_memory_ecology"
+contract = "MemoryEcologyAssessment"
+consumer = "smart.dreamer.maintenance_plan::build_maintenance_plan_candidate"
+failure = "assessment stays advisory and dimensioned"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[edge]]
+id = "E65_GRAVITY_TO_CONTEXT_IMPROVEMENT"
+producer = "meta.memory.gravity_assessment::assess_memory_gravity"
+contract = "MemoryGravityAssessment"
+consumer = "meta.self_quality.intervention_candidate::build_self_quality_intervention_candidate"
+failure = "no support change or deletion"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[edge]]
+id = "E66_SKILL_TOOL_DREAMER_TO_SELF_QUALITY"
+producer = "meta skill/tool/Dreamer assessments"
+contract = "CognitiveQualityAssessmentSet"
+consumer = "governor.self_quality.view::compile_eliot_self_quality_view"
+failure = "missing assessment remains explicit, not zero"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[edge]]
+id = "E67_SELF_QUALITY_TO_INTERVENTION"
+producer = "governor.self_quality.view::compile_eliot_self_quality_view"
+contract = "EliotSelfQualityView"
+consumer = "meta.self_quality.intervention_candidate::build_self_quality_intervention_candidate"
+failure = "candidate cannot execute or self-promote"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[edge]]
+id = "E68_HANDOFF_TO_UNDERSTANDING_ASSESSMENT"
+producer = "HandoffCausalLink and public inheritance owners"
+contract = "PublicInheritanceSnapshot + ReconstructedInheritanceSnapshot"
+consumer = "meta.common_ground.assessment::assess_common_ground"
+failure = "lost invariants/rivals/unknowns block compatible handoff"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"

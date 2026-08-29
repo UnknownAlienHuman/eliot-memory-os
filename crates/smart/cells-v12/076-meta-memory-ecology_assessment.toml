@@ -1,0 +1,15 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+order = 76
+cell = "meta.memory.ecology_assessment"
+physical_crate = "eliot-memory-quality"
+primary_property = "Evaluate memory utility, harm, transfer, accessibility and influence evidence per item or cluster without collapsing dimensions or changing lifecycle state."
+public_functions = ["pub fn assess_memory_ecology(request: &MemoryEcologyAssessmentRequest, evidence: &[MemoryEcologyEvidence]) -> Result<MemoryEcologyAssessment, MemoryEcologyAssessmentError>"]
+write_scope = ["crates/meta/eliot-memory-quality/src/ecology.rs", "crates/meta/eliot-memory-quality/tests/ecology.rs"]
+minimum_tests = ["unused supported fact not demoted epistemically", "delivery without use gives no utility credit", "false activation preserved", "minority evidence protected", "no transition receipt returned"]
+non_goals = ["canonical write or lifecycle transition", "policy, authority, scheduling, effect or finish ownership", "public type redefinition", "Cargo/lib/re-export integration", "proof above package-local design/implementation evidence"]
+architecture_refs = ["ARCH-MEM-04", "ARCH-LEARN-01", "ARCH-META-01"]
+implementation_refs = ["I12.21 MemoryEcologyAssessment", "I12.34 memory evaluation"]
+product_pulse = "D4_MEMORY_ECOLOGY_PULSE_01"
+stop_condition = "Return a ContractChallenge if the declared API requires another owner, hidden I/O/model work, an oracle change, or a wider mutable scope."
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY until Rust implementation and package proof exist"

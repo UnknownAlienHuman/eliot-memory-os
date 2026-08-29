@@ -1,0 +1,15 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+order = 85
+cell = "meta.common_ground.assessment"
+physical_crate = "eliot-understanding-assessment"
+primary_property = "Assess Common Ground across a route/model/harness replacement by checking public goals, decisions, invariants, rivals, unknowns, commitments and action consequences—not summary similarity."
+public_functions = ["pub fn assess_common_ground(request: &CommonGroundAssessmentRequest, source: &PublicInheritanceSnapshot, target: &ReconstructedInheritanceSnapshot) -> Result<CommonGroundAssessment, CommonGroundAssessmentError>"]
+write_scope = ["crates/meta/eliot-understanding-assessment/src/common_ground.rs", "crates/meta/eliot-understanding-assessment/tests/common_ground.rs"]
+minimum_tests = ["matching summary with lost invariant fails", "lost rival visible", "commitment consequence mismatch detected", "native state ignored", "no authority transfer"]
+non_goals = ["canonical write or lifecycle transition", "policy, authority, scheduling, effect or finish ownership", "public type redefinition", "Cargo/lib/re-export integration", "proof above package-local design/implementation evidence"]
+architecture_refs = ["ARCH-PORT-01", "ARCH-SELF-01", "ARCH-UND-01"]
+implementation_refs = ["I7.15 handoff causal link", "I12.23 self-knowledge"]
+product_pulse = "D4_UNDERSTANDING_TRANSFER_PULSE_01"
+stop_condition = "Return a ContractChallenge if the declared API requires another owner, hidden I/O/model work, an oracle change, or a wider mutable scope."
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY until Rust implementation and package proof exist"

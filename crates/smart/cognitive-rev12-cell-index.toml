@@ -1,0 +1,779 @@
+schema_version = 2
+authority = "eliot-cognitive-function-design-rev12"
+status = "COMPLETE_ORDERED_INDEX"
+expected_orders = "1..86"
+functional_cells = 86
+
+[[cell]]
+order = 1
+id = "governor.observation.classifier"
+physical_crate = "eliot-observation"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 2
+id = "smart.epistemic.contracts"
+physical_crate = "eliot-epistemic-contracts"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 3
+id = "smart.epistemic.position"
+physical_crate = "eliot-epistemic"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = true
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 4
+id = "smart.dreamer.contracts.common"
+physical_crate = "eliot-dreamer-contracts"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 5
+id = "smart.dreamer.contracts.orientation"
+physical_crate = "eliot-dreamer-contracts"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 6
+id = "smart.dreamer.contracts.research"
+physical_crate = "eliot-dreamer-contracts"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 7
+id = "smart.dreamer.contracts.curation"
+physical_crate = "eliot-dreamer-contracts"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 8
+id = "smart.dreamer.bundle"
+physical_crate = "eliot-dreamer-bundle"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 9
+id = "smart.dreamer.claim_grounding"
+physical_crate = "eliot-dreamer-validation"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 10
+id = "smart.dreamer.transformation_validation"
+physical_crate = "eliot-dreamer-validation"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 11
+id = "smart.dreamer.draft_admission"
+physical_crate = "eliot-dreamer-validation"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 12
+id = "smart.dreamer.rival_model"
+physical_crate = "eliot-dreamer-orientation"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 13
+id = "smart.dreamer.relation_candidate"
+physical_crate = "eliot-dreamer-orientation"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 14
+id = "smart.dreamer.probe_plan"
+physical_crate = "eliot-dreamer-orientation"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 15
+id = "smart.dreamer.orientation"
+physical_crate = "eliot-dreamer-orientation"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 16
+id = "smart.dreamer.clarification"
+physical_crate = "eliot-dreamer-orientation"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 17
+id = "smart.dreamer.architecture_brief"
+physical_crate = "eliot-dreamer-self-query"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 18
+id = "smart.dreamer.implementation_brief"
+physical_crate = "eliot-dreamer-self-query"
+catalog = "cognitive-rev11-cells-foundation.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 19
+id = "smart.cue.contracts"
+physical_crate = "eliot-cue-contracts"
+catalog = "cognitive-rev11-cells-cues-context.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 20
+id = "smart.cue.normalizer"
+physical_crate = "eliot-cues"
+catalog = "cognitive-rev11-cells-cues-context.toml"
+hot_path = true
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 21
+id = "smart.cue.binding"
+physical_crate = "eliot-cues"
+catalog = "cognitive-rev11-cells-cues-context.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 22
+id = "smart.cue.index"
+physical_crate = "eliot-cues"
+catalog = "cognitive-rev11-cells-cues-context.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 23
+id = "smart.cue.direct_match"
+physical_crate = "eliot-cues"
+catalog = "cognitive-rev11-cells-cues-context.toml"
+hot_path = true
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 24
+id = "smart.cue.relation_spread"
+physical_crate = "eliot-cues"
+catalog = "cognitive-rev11-cells-cues-context.toml"
+hot_path = true
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 25
+id = "smart.cue.activation"
+physical_crate = "eliot-cues"
+catalog = "cognitive-rev11-cells-cues-context.toml"
+hot_path = true
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 26
+id = "smart.context.contracts.candidate"
+physical_crate = "eliot-context-contracts"
+catalog = "cognitive-rev11-cells-cues-context.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 27
+id = "smart.context.contracts.admission"
+physical_crate = "eliot-context-contracts"
+catalog = "cognitive-rev11-cells-cues-context.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 28
+id = "smart.context.contracts.view_quality"
+physical_crate = "eliot-context-contracts"
+catalog = "cognitive-rev11-cells-cues-context.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 29
+id = "smart.context.contribution_merge"
+physical_crate = "eliot-context"
+catalog = "cognitive-rev11-cells-cues-context.toml"
+hot_path = true
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 30
+id = "smart.context.admission"
+physical_crate = "eliot-context"
+catalog = "cognitive-rev11-cells-cues-context.toml"
+hot_path = true
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 31
+id = "smart.context.assembly"
+physical_crate = "eliot-context"
+catalog = "cognitive-rev11-cells-cues-context.toml"
+hot_path = true
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 32
+id = "smart.context.quality"
+physical_crate = "eliot-context"
+catalog = "cognitive-rev11-cells-cues-context.toml"
+hot_path = true
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 33
+id = "smart.context.decision_tail"
+physical_crate = "eliot-context"
+catalog = "cognitive-rev11-cells-cues-context.toml"
+hot_path = true
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 34
+id = "smart.context.reactive_delivery_plan"
+physical_crate = "eliot-context"
+catalog = "cognitive-rev11-cells-cues-context.toml"
+hot_path = true
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 35
+id = "smart.memory.curation.contracts"
+physical_crate = "eliot-memory-curation-contracts"
+catalog = "cognitive-rev11-cells-curation-research.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 36
+id = "smart.memory.curation.screen"
+physical_crate = "eliot-memory-curation-screen"
+catalog = "cognitive-rev11-cells-curation-research.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 37
+id = "smart.dreamer.classification"
+physical_crate = "eliot-dreamer-memory-models"
+catalog = "cognitive-rev11-cells-curation-research.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 38
+id = "smart.dreamer.episode"
+physical_crate = "eliot-dreamer-memory-models"
+catalog = "cognitive-rev11-cells-curation-research.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 39
+id = "smart.dreamer.concept"
+physical_crate = "eliot-dreamer-memory-models"
+catalog = "cognitive-rev11-cells-curation-research.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 40
+id = "smart.dreamer.procedure"
+physical_crate = "eliot-dreamer-procedural"
+catalog = "cognitive-rev11-cells-curation-research.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 41
+id = "smart.dreamer.skill"
+physical_crate = "eliot-dreamer-procedural"
+catalog = "cognitive-rev11-cells-curation-research.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 42
+id = "smart.dreamer.failure"
+physical_crate = "eliot-dreamer-procedural"
+catalog = "cognitive-rev11-cells-curation-research.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 43
+id = "smart.dreamer.structure_repair"
+physical_crate = "eliot-dreamer-memory-revision"
+catalog = "cognitive-rev11-cells-curation-research.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 44
+id = "smart.dreamer.reconsolidation"
+physical_crate = "eliot-dreamer-memory-revision"
+catalog = "cognitive-rev11-cells-curation-research.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 45
+id = "smart.dreamer.accessibility"
+physical_crate = "eliot-dreamer-memory-revision"
+catalog = "cognitive-rev11-cells-curation-research.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 46
+id = "smart.dreamer.influence_repair"
+physical_crate = "eliot-dreamer-memory-revision"
+catalog = "cognitive-rev11-cells-curation-research.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 47
+id = "smart.dreamer.curation"
+physical_crate = "eliot-dreamer-curation"
+catalog = "cognitive-rev11-cells-curation-research.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 48
+id = "smart.dreamer.research_synthesis"
+physical_crate = "eliot-dreamer-research-synthesis"
+catalog = "cognitive-rev11-cells-curation-research.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 49
+id = "smart.learning.contracts.common"
+physical_crate = "eliot-learning-contracts"
+catalog = "cognitive-rev11-cells-learning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 50
+id = "smart.learning.contracts.state_view"
+physical_crate = "eliot-learning-contracts"
+catalog = "cognitive-rev11-cells-learning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 51
+id = "smart.learning.contracts.adaptation"
+physical_crate = "eliot-learning-contracts"
+catalog = "cognitive-rev11-cells-learning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 52
+id = "smart.learning.contracts.evaluation"
+physical_crate = "eliot-learning-contracts"
+catalog = "cognitive-rev11-cells-learning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 53
+id = "smart.learning.state_view"
+physical_crate = "eliot-learning-loop"
+catalog = "cognitive-rev11-cells-learning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 54
+id = "smart.learning.delta"
+physical_crate = "eliot-learning-loop"
+catalog = "cognitive-rev11-cells-learning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 55
+id = "smart.learning.overlay"
+physical_crate = "eliot-learning-loop"
+catalog = "cognitive-rev11-cells-learning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 56
+id = "smart.learning.overlay_validation"
+physical_crate = "eliot-learning-loop"
+catalog = "cognitive-rev11-cells-learning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 57
+id = "meta.learning.activation_assessment"
+physical_crate = "eliot-learning-evaluation"
+catalog = "cognitive-rev11-cells-learning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 58
+id = "meta.learning.closure"
+physical_crate = "eliot-learning-evaluation"
+catalog = "cognitive-rev11-cells-learning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 59
+id = "meta.learning.promotion_input"
+physical_crate = "eliot-learning-evaluation"
+catalog = "cognitive-rev11-cells-learning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 60
+id = "smart.dreamer.conflict_analysis"
+physical_crate = "eliot-dreamer-diagnosis"
+catalog = "cognitive-rev11-cells-diagnosis-planning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 61
+id = "smart.dreamer.development_diagnosis"
+physical_crate = "eliot-dreamer-diagnosis"
+catalog = "cognitive-rev11-cells-diagnosis-planning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 62
+id = "smart.dreamer.maintenance_plan"
+physical_crate = "eliot-dreamer-planning"
+catalog = "cognitive-rev11-cells-diagnosis-planning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 63
+id = "smart.dreamer.configuration_plan"
+physical_crate = "eliot-dreamer-planning"
+catalog = "cognitive-rev11-cells-diagnosis-planning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 64
+id = "smart.dreamer.work_decomposition"
+physical_crate = "eliot-dreamer-planning"
+catalog = "cognitive-rev11-cells-diagnosis-planning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 65
+id = "smart.dreamer.orchestration_plan"
+physical_crate = "eliot-dreamer-planning"
+catalog = "cognitive-rev11-cells-diagnosis-planning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 66
+id = "smart.dreamer.cycle_sample"
+physical_crate = "eliot-dreamer-cycle"
+catalog = "cognitive-rev11-cells-diagnosis-planning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 67
+id = "smart.dreamer.cycle_plan"
+physical_crate = "eliot-dreamer-cycle"
+catalog = "cognitive-rev11-cells-diagnosis-planning.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 68
+id = "smart.memory.projection.contracts"
+physical_crate = "eliot-memory-projection-contracts"
+catalog = "cognitive-rev12-cells-projections.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 69
+id = "smart.memory.candidate_query"
+physical_crate = "eliot-memory-projection"
+catalog = "cognitive-rev12-cells-projections.toml"
+hot_path = true
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 70
+id = "smart.memory.context_projection"
+physical_crate = "eliot-memory-projection"
+catalog = "cognitive-rev12-cells-projections.toml"
+hot_path = true
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 71
+id = "smart.learning.contracts.experience"
+physical_crate = "eliot-learning-contracts"
+catalog = "cognitive-rev12-cells-projections.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 72
+id = "smart.experience.projection"
+physical_crate = "eliot-experience-projection"
+catalog = "cognitive-rev12-cells-projections.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 73
+id = "smart.self_model.context_projection"
+physical_crate = "eliot-dreamer-self-query"
+catalog = "cognitive-rev12-cells-projections.toml"
+hot_path = true
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 74
+id = "smart.context.provider_registry_contracts"
+physical_crate = "eliot-context-contracts"
+catalog = "cognitive-rev12-cells-projections.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 75
+id = "smart.epistemic.context_projection"
+physical_crate = "eliot-epistemic"
+catalog = "cognitive-rev12-cells-projections.toml"
+hot_path = true
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 76
+id = "meta.memory.ecology_assessment"
+physical_crate = "eliot-memory-quality"
+catalog = "cognitive-rev12-cells-meta-quality.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 77
+id = "meta.memory.gravity_assessment"
+physical_crate = "eliot-memory-quality"
+catalog = "cognitive-rev12-cells-meta-quality.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 78
+id = "smart.dreamer.negative_memory_extinction"
+physical_crate = "eliot-dreamer-memory-revision"
+catalog = "cognitive-rev12-cells-meta-quality.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 79
+id = "meta.skill.lifecycle_assessment"
+physical_crate = "eliot-cognitive-quality"
+catalog = "cognitive-rev12-cells-meta-quality.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 80
+id = "meta.tool.surface_assessment"
+physical_crate = "eliot-cognitive-quality"
+catalog = "cognitive-rev12-cells-meta-quality.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 81
+id = "meta.dreamer.job_economics"
+physical_crate = "eliot-cognitive-quality"
+catalog = "cognitive-rev12-cells-meta-quality.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 82
+id = "governor.self_quality.view"
+physical_crate = "eliot-cognitive-quality"
+catalog = "cognitive-rev12-cells-meta-quality.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 83
+id = "meta.self_quality.learning_bottleneck"
+physical_crate = "eliot-cognitive-quality"
+catalog = "cognitive-rev12-cells-meta-quality.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 84
+id = "meta.self_quality.intervention_candidate"
+physical_crate = "eliot-cognitive-quality"
+catalog = "cognitive-rev12-cells-meta-quality.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 85
+id = "meta.common_ground.assessment"
+physical_crate = "eliot-understanding-assessment"
+catalog = "cognitive-rev12-cells-meta-quality.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []
+
+[[cell]]
+order = 86
+id = "meta.understanding.scoped_assessment"
+physical_crate = "eliot-understanding-assessment"
+catalog = "cognitive-rev12-cells-meta-quality.toml"
+hot_path = false
+owned_mutable_state = "NONE"
+allowed_effects = []

@@ -1,0 +1,15 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+order = 83
+cell = "meta.self_quality.learning_bottleneck"
+physical_crate = "eliot-cognitive-quality"
+primary_property = "Diagnose the bottleneck in task-local learning by preserving update quality, activation, adherence, decision delta, outcome and retention as separate dimensions."
+public_functions = ["pub fn diagnose_learning_bottleneck(view: &EliotSelfQualityView, evidence: &LearningBottleneckEvidence) -> Result<LearningBottleneckAssessment, LearningBottleneckError>"]
+write_scope = ["crates/meta/eliot-cognitive-quality/src/learning_bottleneck.rs", "crates/meta/eliot-cognitive-quality/tests/learning_bottleneck.rs"]
+minimum_tests = ["high quality low activation maps to delivery bottleneck", "activation high adherence low maps route/instruction", "decision delta worse outcome retained", "immediate gain retention loss overfitting", "ambiguous rivals preserved"]
+non_goals = ["canonical write or lifecycle transition", "policy, authority, scheduling, effect or finish ownership", "public type redefinition", "Cargo/lib/re-export integration", "proof above package-local design/implementation evidence"]
+architecture_refs = ["ARCH-LEARN-02", "ARCH-META-01", "ARCH-UND-02"]
+implementation_refs = ["I16.23 learning bottleneck diagnosis", "I12.24 activation/adherence"]
+product_pulse = "D4_SELF_QUALITY_PULSE_01"
+stop_condition = "Return a ContractChallenge if the declared API requires another owner, hidden I/O/model work, an oracle change, or a wider mutable scope."
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY until Rust implementation and package proof exist"

@@ -1,0 +1,20 @@
+[package]
+name = "eliot-dreamer-planning"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+layer = "C1"
+purpose = "maintenance, configuration, decomposition and orchestration candidates"
+source_maintenance_owner = "cognitive-integration-owner"
+functional_cell_refs = ["smart.dreamer.maintenance_plan", "smart.dreamer.configuration_plan", "smart.dreamer.work_decomposition", "smart.dreamer.orchestration_plan"]
+independent_proof_profile = "prototype-not-workspace-admitted"
+contract_refs = ["crates/smart/cognitive-current.toml"]
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"

@@ -1,0 +1,27 @@
+schema_version = 2
+authority = "eliot-cognitive-function-design-rev12"
+status = "NOT_EXECUTED_DESIGN_CONTRACTS"
+base = "crates/smart/cognitive-product-pulses-v11.toml"
+extension_count = 3
+combined_count = 12
+
+[[pulse]]
+id = "D4_MEMORY_ECOLOGY_PULSE_01"
+purpose = "Detect stale/false/overdominant memory and produce a reversible candidate without changing support, history or lifecycle authority."
+path = ["Governor memory/usage/outcome projections", "meta.memory.ecology_assessment", "meta.memory.gravity_assessment", "smart.dreamer.negative_memory_extinction", "Governor candidate disposition"]
+required_oracles = ["low use does not reduce support", "retrieval does not reinforce", "minority evidence remains addressable", "extinction is scoped and reversible", "original failure episode survives"]
+negative_cases = ["popular false memory", "rare invariant", "single successful re-exposure", "missing denominator", "semantic near-match"]
+
+[[pulse]]
+id = "D4_COGNITIVE_QUALITY_PULSE_01"
+purpose = "Measure whether Skills, tools and Dreamer jobs are activated, used and outcome-helpful without converting exposure or activity into utility."
+path = ["Skill/Tool/Dreamer owner receipts", "meta.skill.lifecycle_assessment", "meta.tool.surface_assessment", "meta.dreamer.job_economics", "governor.self_quality.view"]
+required_oracles = ["installed differs from delivered and useful", "transport completion differs from result delivery", "job completion differs from improvement", "cost and Human burden visible", "no global intelligence score"]
+negative_cases = ["unused injected Skill", "advertised but ineligible tool", "truncated result", "expensive unused synthesis", "partial host coverage"]
+
+[[pulse]]
+id = "D4_UNDERSTANDING_TRANSFER_PULSE_01"
+purpose = "Show that a model/harness replacement preserves public cognitive inheritance and locally adequate task understanding without inheriting tacit competence or authority."
+path = ["source public inheritance + HandoffCausalLink", "meta.common_ground.assessment", "meta.understanding.scoped_assessment", "target route decision-local view"]
+required_oracles = ["goals/decisions/invariants/rivals/unknowns/commitments/action consequences preserved", "prediction fixed before observation", "discriminative outcome bound", "missing transfer evidence remains untested", "no authority or completion transfer"]
+negative_cases = ["matching summary with lost invariant", "lost rival", "post-hoc prediction", "stale target fence", "native continuation state only"]

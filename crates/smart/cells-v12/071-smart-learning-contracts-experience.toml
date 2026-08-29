@@ -1,0 +1,15 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+order = 71
+cell = "smart.learning.contracts.experience"
+physical_crate = "eliot-learning-contracts"
+primary_property = "Own immutable attempt, trace, artifact, evaluator, effect and experience-projection contracts shared by learning and diagnosis."
+public_functions = ["pub fn validate_experience_projection_request(request: &SystemExperienceProjectionRequest) -> Result<(), LearningContractError>", "pub fn validate_system_experience_projection(projection: &SystemExperienceProjection) -> Result<(), LearningContractError>"]
+write_scope = ["crates/smart/eliot-learning-contracts/src/experience.rs", "crates/smart/eliot-learning-contracts/tests/experience.rs"]
+minimum_tests = ["unattributed success remains observation", "unknown effect retained", "partial owner coverage visible", "order-independent digest"]
+non_goals = ["canonical write or lifecycle transition", "policy, authority, scheduling, effect or finish ownership", "public type redefinition", "Cargo/lib/re-export integration", "proof above package-local design/implementation evidence"]
+architecture_refs = ["ARCH-LEARN-01", "ARCH-LEARN-02", "ARCH-UND-02"]
+implementation_refs = ["I12.24 task-local learning", "I16.23 self-quality evidence"]
+product_pulse = "D4_EXPERIENCE_PROJECTION_PULSE_01"
+stop_condition = "Return a ContractChallenge if the declared API requires another owner, hidden I/O/model work, an oracle change, or a wider mutable scope."
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY until Rust implementation and package proof exist"

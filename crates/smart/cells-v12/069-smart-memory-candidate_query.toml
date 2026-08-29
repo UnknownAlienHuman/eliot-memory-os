@@ -1,0 +1,15 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+order = 69
+cell = "smart.memory.candidate_query"
+physical_crate = "eliot-memory-projection"
+primary_property = "Select a bounded deterministic memory candidate set from one already materialized Governor read snapshot and current cue/query intent."
+public_functions = ["pub fn query_memory_candidates(snapshot: &CanonicalMemoryReadSnapshot, intent: &MemoryQueryIntent, cues: &CueActivationResult, policy: &MemorySelectionPolicy) -> Result<MemoryCandidateSet, MemoryCandidateQueryError>"]
+write_scope = ["crates/smart/eliot-memory-projection/src/candidate_query.rs", "crates/smart/eliot-memory-projection/tests/candidate_query.rs"]
+minimum_tests = ["exact cue precedes broad candidate", "query is side-effect free", "negative memory retained", "partial denominator visible", "permutation deterministic"]
+non_goals = ["canonical write or lifecycle transition", "policy, authority, scheduling, effect or finish ownership", "public type redefinition", "Cargo/lib/re-export integration", "proof above package-local design/implementation evidence"]
+architecture_refs = ["ARCH-CTX-02", "ARCH-CTX-04", "ARCH-MEM-04"]
+implementation_refs = ["I5.20 read model", "I12.14 retrieval", "I7.19 reactive sequence"]
+product_pulse = "D3B_CANONICAL_PROJECTION_PULSE_01"
+stop_condition = "Return a ContractChallenge if the declared API requires another owner, hidden I/O/model work, an oracle change, or a wider mutable scope."
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY until Rust implementation and package proof exist"

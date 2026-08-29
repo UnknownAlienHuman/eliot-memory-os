@@ -1,0 +1,20 @@
+[package]
+name = "eliot-understanding-assessment"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+layer = "C1"
+purpose = "Common Ground and scoped understanding assessment"
+source_maintenance_owner = "cognitive-integration-owner"
+functional_cell_refs = ["meta.common_ground.assessment", "meta.understanding.scoped_assessment"]
+independent_proof_profile = "prototype-not-workspace-admitted"
+contract_refs = ["crates/smart/cognitive-current.toml"]
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"

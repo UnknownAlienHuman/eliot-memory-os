@@ -1,0 +1,20 @@
+[package]
+name = "eliot-learning-loop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+layer = "C1"
+purpose = "task-local reversible learning candidate loop"
+source_maintenance_owner = "cognitive-integration-owner"
+functional_cell_refs = ["smart.learning.state_view", "smart.learning.delta", "smart.learning.overlay", "smart.learning.overlay_validation"]
+independent_proof_profile = "prototype-not-workspace-admitted"
+contract_refs = ["crates/smart/cognitive-current.toml"]
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"

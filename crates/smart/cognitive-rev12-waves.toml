@@ -1,7 +1,7 @@
 schema_version = 2
 authority = "eliot-cognitive-function-design-rev12"
 status = "ORDERED_AGENT_WAVES_NOT_EXECUTED"
-wave_count = 9
+wave_count = 10
 
 [[wave]]
 id = "W0_CONTRACT_EVIDENCE"
@@ -37,6 +37,11 @@ id = "W7_DREAM_CYCLE"
 orders = [66, 67]
 
 [[wave]]
-id = "W8_PROJECTIONS_AND_META_QUALITY"
-orders = [69, 70, 72, 73, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86]
-rule = "Projection cells integrate only after owner contracts are frozen; Meta cells consume immutable evidence and remain candidate/advisory."
+id = "W8_CANONICAL_PROJECTION_BRIDGES"
+orders = [69, 70, 72, 73, 75]
+rule = "Projection cells integrate only after their contract cells 68, 71 and 74 are frozen."
+
+[[wave]]
+id = "W9_META_COGNITIVE_QUALITY"
+orders = [76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86]
+rule = "Meta cells consume immutable owner evidence and remain assessment/candidate-only."

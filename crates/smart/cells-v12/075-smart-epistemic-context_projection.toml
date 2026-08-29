@@ -1,0 +1,15 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+order = 75
+cell = "smart.epistemic.context_projection"
+physical_crate = "eliot-epistemic"
+primary_property = "Translate CurrentEpistemicPosition into an owner-attributed ProviderContribution while preserving every epistemic role."
+public_functions = ["pub fn project_epistemic_context(request: &ContextProviderProjectionRequest, position: &CurrentEpistemicPosition) -> Result<ProviderContribution, EpistemicContextProjectionError>"]
+write_scope = ["crates/smart/eliot-epistemic/src/context_projection.rs", "crates/smart/eliot-epistemic/tests/context_projection.rs"]
+minimum_tests = ["assumption remains assumption", "rival/counterevidence retained", "local conflict structured", "partial coverage visible", "no admission disposition"]
+non_goals = ["canonical write or lifecycle transition", "policy, authority, scheduling, effect or finish ownership", "public type redefinition", "Cargo/lib/re-export integration", "proof above package-local design/implementation evidence"]
+architecture_refs = ["ARCH-EPI-01", "ARCH-CTX-01", "ARCH-UND-01"]
+implementation_refs = ["I12 Current Epistemic Position", "I7.11 Decision Safety Floor"]
+product_pulse = "D3B_CANONICAL_PROJECTION_PULSE_01"
+stop_condition = "Return a ContractChallenge if the declared API requires another owner, hidden I/O/model work, an oracle change, or a wider mutable scope."
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY until Rust implementation and package proof exist"

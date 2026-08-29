@@ -1,5 +1,5 @@
-schema_version = 4
+schema_version = 2
 status = "CURRENT_POINTER"
 authority = "crates/smart/cognitive-current.toml"
 waves = "crates/smart/cognitive-rev12-waves.toml"
-covered = ["W0_CONTRACT_EVIDENCE", "W1_D3A_ORIENTATION", "W2_D3B_REACTIVE_CONTEXT"]
+covered = ["W8_CANONICAL_PROJECTION_BRIDGES", "W9_META_COGNITIVE_QUALITY"]

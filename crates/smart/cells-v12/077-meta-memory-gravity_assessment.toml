@@ -1,0 +1,15 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+order = 77
+cell = "meta.memory.gravity_assessment"
+physical_crate = "eliot-memory-quality"
+primary_property = "Detect memory gravity—context dominance disproportionate to evidence and outcome utility—and propose reversible exposure changes only."
+public_functions = ["pub fn assess_memory_gravity(request: &MemoryGravityAssessmentRequest, exposures: &[MemoryContextExposure]) -> Result<MemoryGravityAssessment, MemoryGravityAssessmentError>"]
+write_scope = ["crates/meta/eliot-memory-quality/src/gravity.rs", "crates/meta/eliot-memory-quality/tests/gravity.rs"]
+minimum_tests = ["repeated popular record can be gravity candidate", "high-utility invariant retained", "minority displacement detected", "no deletion candidate", "inconclusive denominator"]
+non_goals = ["canonical write or lifecycle transition", "policy, authority, scheduling, effect or finish ownership", "public type redefinition", "Cargo/lib/re-export integration", "proof above package-local design/implementation evidence"]
+architecture_refs = ["ARCH-CTX-01", "ARCH-MEM-04", "ARCH-META-01"]
+implementation_refs = ["I12.21 context dominance", "I7.11 Decision Safety Floor"]
+product_pulse = "D4_MEMORY_ECOLOGY_PULSE_01"
+stop_condition = "Return a ContractChallenge if the declared API requires another owner, hidden I/O/model work, an oracle change, or a wider mutable scope."
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY until Rust implementation and package proof exist"

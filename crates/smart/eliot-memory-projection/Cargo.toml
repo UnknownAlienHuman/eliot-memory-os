@@ -1,0 +1,20 @@
+[package]
+name = "eliot-memory-projection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+layer = "C1"
+purpose = "bounded memory candidate and Context projection"
+source_maintenance_owner = "cognitive-integration-owner"
+functional_cell_refs = ["smart.memory.candidate_query", "smart.memory.context_projection"]
+independent_proof_profile = "prototype-not-workspace-admitted"
+contract_refs = ["crates/smart/cognitive-current.toml"]
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"

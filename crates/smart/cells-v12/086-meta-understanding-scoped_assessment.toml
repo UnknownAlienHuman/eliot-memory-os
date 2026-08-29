@@ -1,0 +1,15 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+order = 86
+cell = "meta.understanding.scoped_assessment"
+physical_crate = "eliot-understanding-assessment"
+primary_property = "Produce a scoped, evidence-bound understanding assessment for one question/task family and State Fence without a global understands flag or scalar score."
+public_functions = ["pub fn assess_scoped_understanding(request: &ScopedUnderstandingAssessmentRequest, evidence: &ScopedUnderstandingEvidence) -> Result<ScopedUnderstandingAssessment, ScopedUnderstandingAssessmentError>"]
+write_scope = ["crates/meta/eliot-understanding-assessment/src/scoped.rs", "crates/meta/eliot-understanding-assessment/tests/scoped.rs"]
+minimum_tests = ["fluent prose cannot pass", "graph size cannot pass", "prediction after observation rejected", "miss without revision refutes or inconclusive", "held-out transfer required for product claim"]
+non_goals = ["canonical write or lifecycle transition", "policy, authority, scheduling, effect or finish ownership", "public type redefinition", "Cargo/lib/re-export integration", "proof above package-local design/implementation evidence"]
+architecture_refs = ["ARCH-UND-01", "ARCH-UND-02", "ARCH-EPI-03"]
+implementation_refs = ["I6.16 ScopedUnderstandingAssessment", "I12.18 prediction/calibration"]
+product_pulse = "D4_UNDERSTANDING_TRANSFER_PULSE_01"
+stop_condition = "Return a ContractChallenge if the declared API requires another owner, hidden I/O/model work, an oracle change, or a wider mutable scope."
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY until Rust implementation and package proof exist"
