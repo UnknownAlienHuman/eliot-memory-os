@@ -81,56 +81,196 @@ reason = "Windows process, Job Object, service, resource, and ownership mechanic
 
 [[tracked_debt]]
 kind = "direct_process_launch"
-path = "bins/eliot-host/src/main.rs"
-issue = 14
-reason = "Composition-root process lifecycle must move behind the admitted Host/platform cells."
-remove_when = "Host composition uses only the typed lifecycle/process contracts and independent proof surfaces."
-
-[[tracked_debt]]
-kind = "direct_process_launch"
-path = "bins/eliot-kernel/src/main.rs"
+path = "bins/eliot-kernel/src/r13_os_harness.rs"
 issue = 15
-reason = "Kernel composition must delegate native execution to the admitted process-generation adapter."
-remove_when = "Kernel main is composition-only and direct process mechanics are absent."
+reason = "Kernel's legacy R13 OS harness still launches native helpers directly instead of using the admitted process-generation adapter."
+remove_when = "The R13 harness is moved to the Instrument/conformance boundary or uses the shared ProcessExecutor contract with an independent edge proof."
 
 [[tracked_debt]]
 kind = "direct_process_launch"
-path = "bins/eliot-watchdog/src/main.rs"
-issue = 16
-reason = "Watchdog sensor/containment process mechanics require explicit typed adapters."
-remove_when = "Watchdog composition contains no ambient process launch."
+path = "bins/eliot-kernel/src/tests.rs"
+issue = 15
+reason = "Kernel composition tests still create native processes outside the declared process owner."
+remove_when = "Kernel process fixtures execute through the shared ProcessExecutor test seam and retain equivalent no-orphan/fencing coverage."
 
 [[tracked_debt]]
 kind = "direct_process_launch"
-path = "bins/eliot-doctor/src/main.rs"
-issue = 17
-reason = "Doctor must execute only registered bounded repair effects through admitted adapters."
-remove_when = "Doctor composition contains no ambient process launch."
+path = "bins/eliot-mod-research/src/lib.rs"
+issue = 24
+reason = "The Research provider bridge still discovers and launches an ambient executable directly."
+remove_when = "Research provider execution uses an admitted immutable bridge manifest and shared governed ProcessExecutor semantics."
 
 [[tracked_debt]]
 kind = "direct_process_launch"
-path = "bins/eliot-testd/src/main.rs"
-issue = 20
-reason = "Instrument execution must use the shared governed ProcessExecutor semantics."
-remove_when = "testd delegates every process tree to the admitted executor adapter."
+path = "crates/eliot-app/src/action_plan.rs"
+issue = 18
+reason = "The legacy Governor facade still owns direct tool/process execution in action-plan compatibility code."
+remove_when = "The current consumer is migrated to its typed Instrument/process owner or the obsolete facade path is deleted."
 
 [[tracked_debt]]
 kind = "direct_process_launch"
-path = "bins/eliot-wasm-host/src/main.rs"
-issue = 21
-reason = "WASM host must not gain ambient native process capability."
-remove_when = "No direct native process launch remains in the WASM host."
+path = "crates/eliot-app/src/calibration_runtime.rs"
+issue = 18
+reason = "The legacy Governor facade still launches calibration processes directly."
+remove_when = "Calibration execution is migrated behind the admitted process and Instrument contracts or the compatibility path is retired."
 
 [[tracked_debt]]
 kind = "direct_process_launch"
-path = "bins/eliot-native-worker/src/main.rs"
-issue = 22
-reason = "Native worker process effects require exact execution manifests and shared process semantics."
-remove_when = "Worker uses only typed introduced process/resource capabilities."
+path = "crates/eliot-app/src/cognitive_field_runner.rs"
+issue = 18
+reason = "The legacy Governor facade still contains a direct cognitive-field runner process path."
+remove_when = "The current consumer is moved to its declared replaceable execution contour or the runner is removed."
 
 [[tracked_debt]]
 kind = "direct_process_launch"
-path = "bins/eliot-user-broker/src/main.rs"
-issue = 23
-reason = "User-session launch must remain SID/session/epoch/lease bound."
-remove_when = "Broker launches only through the typed user execution/process adapter."
+path = "crates/eliot-app/src/dogfood.rs"
+issue = 18
+reason = "Legacy dogfood orchestration still launches native commands inside the Governor migration facade."
+remove_when = "Dogfood execution is expressed through current typed instruments/process contracts or the legacy path is deleted."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-app/src/host_runtime/external_agent.rs"
+issue = 18
+reason = "Legacy external-agent execution still launches host runtimes directly from the Governor facade."
+remove_when = "Every current route uses its supervised adapter/process owner and the legacy launch implementation is removed."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-app/src/host_runtime/path_and_package_support.rs"
+issue = 18
+reason = "Legacy host path/package probes still execute native commands directly."
+remove_when = "Discovery/probing uses an admitted bounded Instrument/process adapter or the obsolete probe is removed."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-app/src/host_runtime/tests.rs"
+issue = 18
+reason = "Legacy host-runtime tests still bypass the shared process fixture owner."
+remove_when = "The tests use the shared ProcessExecutor fake/real fixture seam or are retired with the facade consumer."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-app/src/mcp_stdio/finalization.rs"
+issue = 18
+reason = "Legacy MCP finalization still starts native commands inside the migration facade."
+remove_when = "Finalization uses the current bridge/process contract and no direct launch remains in the facade."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-app/src/mcp_stdio/protocol_tests.rs"
+issue = 18
+reason = "Legacy MCP protocol tests still launch process fixtures directly."
+remove_when = "Protocol fixtures use the admitted bridge/process test owner or the compatibility suite is retired."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-app/src/mcp_stdio/provider_handlers.rs"
+issue = 18
+reason = "Legacy MCP provider handlers still own direct provider process launch mechanics."
+remove_when = "Provider execution is migrated to the declared adapter/process generation and the facade implementation is removed."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-app/src/mcp_stdio/runtime_handlers.rs"
+issue = 18
+reason = "Legacy MCP runtime handlers still launch native runtimes directly."
+remove_when = "Runtime handlers delegate to the current supervised route/process owner and direct launch code is deleted."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-app/src/mcp_stdio/verification.rs"
+issue = 18
+reason = "Legacy verification logic still starts verifier processes inside the Governor facade."
+remove_when = "Verification executes through typed Instrument profiles and the legacy direct-launch path is removed."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-app/src/mcp_stdio/work_support.rs"
+issue = 18
+reason = "Legacy work-support behavior still launches native commands directly."
+remove_when = "Work support is migrated to current task/Instrument/process owners or the compatibility code is retired."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-app/src/provider_budget_runtime.rs"
+issue = 18
+reason = "Legacy provider-budget runtime code still starts provider commands directly."
+remove_when = "Provider execution and usage collection use the admitted route adapter/process contract."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-app/src/provider_runtime_contract.rs"
+issue = 18
+reason = "Legacy provider contract probes still contain direct process launch mechanics."
+remove_when = "Capability probes execute through a typed bounded adapter and the legacy launch code is removed."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-app/src/runtime_bootstrap.rs"
+issue = 18
+reason = "Legacy runtime bootstrap still owns direct native process startup."
+remove_when = "Bootstrap delegates to Host/Kernel/User Broker or the exact supervised adapter owner and the facade launch is deleted."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-app/src/ul_cross_agent_runner.rs"
+issue = 18
+reason = "Legacy cross-agent runner still launches native processes inside the Governor facade."
+remove_when = "Agent attempts run through the current Agent Coordinator/route process boundary or the runner is retired."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-engine/src/patch.rs"
+issue = 18
+reason = "Legacy engine patch execution still owns direct process mechanics outside the admitted Instrument/process owner."
+remove_when = "Patch execution is migrated to a typed current owner or the unused legacy path is deleted."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-engine/src/safety.rs"
+issue = 18
+reason = "Legacy engine safety probes still execute native commands directly."
+remove_when = "Safety probes use admitted typed Instruments/process fixtures and the legacy launch code is removed."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-engine/src/worktree.rs"
+issue = 18
+reason = "Legacy worktree helpers still launch Git/native commands directly."
+remove_when = "Worktree operations use the governed tool/process adapter and no direct launch remains in the legacy facade."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-store/src/canonical_store/fts_live_tests.rs"
+issue = 19
+reason = "Legacy live-store tests still start a Surreal process directly outside the Host-managed dependency contour."
+remove_when = "The fixture uses the shared store-generation/process test owner with exclusive root and no-orphan proof."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-store/src/surreal_server.rs"
+issue = 19
+reason = "The legacy store facade still owns direct Surreal server process lifecycle mechanics."
+remove_when = "Surreal process lifecycle is exclusively Host-managed through the immutable dependency/process contract."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "crates/eliot-windows-ipc/src/bin/eliot-process-guardian.rs"
+issue = 100
+reason = "The legacy IPC process guardian implements native launch mechanics outside the single admitted ProcessExecutor owner."
+remove_when = "Guardian consumers migrate to the shared Windows ProcessExecutor/Job Object contract or the binary is retired."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "workspace/tools/eliot-campaign-executor/src/lib.rs"
+issue = 100
+reason = "The development campaign executor uses a private native-process implementation instead of the shared process contract."
+remove_when = "Campaign execution uses the admitted ProcessExecutor client contract or receives a separately justified development-only owner and proof."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "workspace/tools/eliot-runtime-compiler/src/lib.rs"
+issue = 100
+reason = "The development runtime compiler uses a private native-process implementation instead of the shared process contract."
+remove_when = "Runtime compilation uses the admitted ProcessExecutor client contract or receives a separately justified development-only owner and proof."
