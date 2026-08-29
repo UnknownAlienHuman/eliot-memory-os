@@ -45,7 +45,7 @@ A crate is a source/build boundary, not a lifecycle or authority owner.
 | `eliotd.exe` | Governor semantic daemon | #18 |
 | `eliot-watchdog.exe` | independent supervision | #16 |
 | `eliot-doctor.exe` | bounded one-shot repair | #17 |
-| store bridge / Surreal generation / BlobStore | closed storage path and single owners | #19, #7–#10 |
+| store bridge / Surreal generation / BlobStore | closed storage path and single owners | #19; payload regression #10 |
 | `eliot-testd.exe` | isolated Instrument execution | #20 |
 | `eliot-wasm-host.exe` | capability-limited component host | #21 |
 | native worker | isolated OS-heavy generation | #22 |
@@ -90,6 +90,9 @@ cannot grant authority by itself.
 
 ## Active programmes
 
+- Regression issues #7–#10 first reproduce or refute their historical failure
+  class on exact current identities; implementation then changes only the proven
+  current owner/path.
 - Core/daemon issues #13–#24 use fresh issue-numbered branches and
   `workstreams/core-daemons/AGENTS.md`.
 - Cognitive issues #38–#45 use the wave/edge/donor/decision manifests already
