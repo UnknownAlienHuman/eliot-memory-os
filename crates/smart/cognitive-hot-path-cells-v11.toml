@@ -1,0 +1,271 @@
+schema_version = "eliot-cognitive-cell-set-v11"
+set_id = "COGNITIVE_V11_HOT_PATH"
+status = "ACTIVE_WORKING_DRAFT"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+cell_count = 16
+
+[normative_pair]
+architecture_revision = "4.5-draft"
+architecture_sha256 = "c6932eaf26935e752eefb4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+implementation_revision = "0.29-draft"
+implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+
+[[cell]]
+order = 1
+id = "governor.observation.classifier"
+package = "eliot-observation"
+execution_class = "CAPTURE_SYNC_BOUNDED"
+causal_property = "Classify one admitted observation without dropping safe material or promoting truth."
+public_functions = ["pub fn classify_observation(input: &ObservationClassificationInput, policy: &ObservationClassificationPolicy) -> Result<ObservationClassification, ObservationClassificationError>"]
+owned_types = ["ObservationClassificationInput", "ObservationClassificationPolicy", "ObservationClassification", "ObservationFamily", "TaskBindingDisposition", "ColdCaptureReason"]
+algorithm = ["Validate operation, State Fence and source identity.", "Separate content family from task-binding confidence.", "Apply deterministic family rules in declared precedence.", "On ambiguous family return ObservationCandidate/Unknown without loss.", "On contaminated task binding quarantine the binding while preserving cold capture.", "Emit exact rule ids and unresolved dimensions."]
+errors = ["InvalidFence", "InvalidSource", "OversizedObservation", "DuplicateResource", "UnsupportedHint"]
+bounds = ["Maximum payload bytes and affected-resource count come from validated policy.", "Single bounded metadata pass plus stable canonical-resource sort."]
+forbidden = ["Storage or filesystem scan", "Model/provider/network call", "Canonical support promotion", "Task finish or authority decision", "Panic on admitted input"]
+minimum_tests = ["Safe unclassified input is retained cold.", "Conflicting task hints cannot bind a task.", "Affected-resource permutation does not change classification.", "Retrieval or repetition cannot promote status."]
+worker_write_scope = ["crates/governor/eliot-observation/src/classifier.rs", "crates/governor/eliot-observation/tests/classifier.rs"]
+product_pulse = "D1_CAPTURE_CLASSIFICATION_EDGE_01"
+agent_task = "Implement only the classifier cell and its tests; do not edit package integration files."
+
+[[cell]]
+order = 2
+id = "smart.epistemic.position"
+package = "eliot-epistemic"
+execution_class = "DECISION_BOUNDARY_HOT"
+causal_property = "Resolve one explicit question over one admitted fenced evidence set while preserving assumptions, rivals, conflicts and inquiry."
+public_functions = ["pub fn resolve_current_epistemic_position(request: &PositionRequest, records: &[EpistemicRecordProjection]) -> Result<CurrentEpistemicPosition, EpistemicResolutionError>", "pub fn current_position_digest(position: &CurrentEpistemicPosition) -> Result<String, EpistemicResolutionError>"]
+owned_types = ["PositionRequest", "EpistemicRecordProjection", "ExplicitAssumption", "ConflictSet", "ConflictParticipant", "EvidenceDependence", "InvestigationRequirement", "CurrentEpistemicPosition"]
+algorithm = ["Validate question, scope, State Fence and unique handles.", "Partition observed, supported, assumed, contested, stale, superseded, rejected and unknown without scalar collapse.", "Admit Assumed only from an explicit assumption input.", "Group conflicts by proposition and shared lineage.", "Separate independent support from dependent repetition.", "Derive minimum discriminative investigations without executing them.", "Retain exact provenance closure and revision conditions.", "Canonicalize and digest the stable output."]
+errors = ["EmptyInput", "InvalidFence", "FenceMismatch", "ScopeMismatch", "DuplicateHandle", "InvalidAssumption", "InvalidConflict", "InvalidInquiry"]
+bounds = ["Record, conflict-participant and investigation maxima are explicit request policy.", "O(n log n) stable grouping; no graph traversal or hidden reads."]
+forbidden = ["Storage or filesystem scan", "Model call", "Truth/support promotion", "Vote-count epistemology", "Wall-clock order as causal order"]
+minimum_tests = ["Fresh outlier remains visible beside majority evidence.", "Shared-source repetitions are not independent support.", "Implicit assumption is rejected.", "Stale verified evidence cannot remain current verified.", "Record order does not change digest."]
+worker_write_scope = ["crates/smart/eliot-epistemic/src/position.rs", "crates/smart/eliot-epistemic/tests/position.rs"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+agent_task = "Extend the existing stateless resolver with explicit assumptions, structured conflicts and InvestigationRequirements."
+
+[[cell]]
+order = 3
+id = "smart.cue.contracts"
+package = "eliot-cue-contracts"
+execution_class = "CONTRACT_ONLY"
+causal_property = "Define stable cue, comparison-profile, binding, snapshot and activation contracts without owning projection state."
+public_functions = ["pub fn validate_cue_contract(value: &CueContractEnvelope) -> Result<(), CueContractError>"]
+owned_types = ["CueKind", "CueMatchMode", "CueComparisonProfileId", "CueComparisonProfile", "ObservedCue", "NormalizedCue", "CueBindingCandidate", "AdmittedCueBinding", "CueSnapshot", "DirectCueMatchSet", "SpreadActivationSet", "CueActivationResult", "CueActivationTrace"]
+algorithm = ["Validate bounded ids, text, modes and comparison-profile compatibility.", "Require canonical_value and comparison_key as separate fields.", "Require every snapshot row to reference an admitted canonical handle.", "Require compatible State Fence identity across every envelope."]
+errors = ["InvalidText", "InvalidKindMode", "InvalidProfile", "MissingHandle", "FenceMismatch", "TooManyItems"]
+bounds = ["Wire collection maxima are policy fields.", "Public wire structs deny unknown fields and use stable enum spelling."]
+forbidden = ["Projection ownership", "Filesystem canonicalization", "Model call", "Canonical write"]
+minimum_tests = ["Path spelling round-trips unchanged.", "Invalid prefix mode is rejected for unsupported kind.", "Snapshot row without admitted handle is rejected."]
+worker_write_scope = ["crates/smart/eliot-cue-contracts/src/contracts.rs", "crates/smart/eliot-cue-contracts/tests/contracts.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+agent_task = "Implement only provider-neutral cue contracts; no lookup or projection logic."
+
+[[cell]]
+order = 4
+id = "smart.cue.normalization"
+package = "eliot-cues"
+execution_class = "DECISION_BOUNDARY_HOT"
+causal_property = "Normalize observed cues while preserving source spelling and applying one explicit WorkScope/platform comparison profile."
+public_functions = ["pub fn normalize_observed_cue(cue: &ObservedCue, profile: &CueComparisonProfile) -> Result<NormalizedCue, CueNormalizationError>", "pub fn normalize_observed_cues(cues: &[ObservedCue], profile: &CueComparisonProfile, limits: &CueLimits) -> Result<Vec<NormalizedCue>, CueNormalizationError>"]
+algorithm = ["Validate kind, scope and bounded UTF-8.", "Preserve trimmed source spelling in canonical_value.", "Build comparison_key only through the supplied comparison profile.", "Reject parent traversal and malformed signatures.", "Stable-sort and deduplicate by kind, profile and comparison_key while retaining spelling provenance."]
+errors = ["InvalidText", "UnsupportedKind", "InvalidPathTraversal", "InvalidSignature", "ProfileMismatch", "TooManyCues"]
+bounds = ["Explicit cue-count and byte maxima.", "Single pass plus stable sort.", "No OS canonicalize, symlink resolution or filesystem access."]
+forbidden = ["Lowercasing canonical path spelling", "Filesystem access", "Ambient platform inference", "Model call"]
+minimum_tests = ["Case-insensitive profile matches variants without changing canonical spelling.", "Case-sensitive profile keeps distinct keys.", "Parent traversal is rejected.", "Capture and fire normalization are identical."]
+worker_write_scope = ["crates/smart/eliot-cues/src/normalization.rs", "crates/smart/eliot-cues/tests/normalization.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+agent_task = "Replace the donor lowercasing behavior with canonical_value plus comparison_key."
+
+[[cell]]
+order = 5
+id = "smart.cue.binding"
+package = "eliot-cues"
+execution_class = "CAPTURE_SYNC_BOUNDED"
+causal_property = "Derive cue-binding candidates from admitted observation/evidence projections without publishing an index."
+public_functions = ["pub fn build_cue_binding_candidates(request: &CueBindingRequest, normalized: &[NormalizedCue]) -> Result<CueBindingCandidateSet, CueBindingError>"]
+algorithm = ["Validate source revision, targets, fence and comparison profile.", "Derive only rule-declared exact, prefix or signature candidates.", "Attach lineage, strength, freshness and negative-memory role.", "Stable-sort and deduplicate exact candidate identity.", "Return proposals for external Governor admission."]
+errors = ["InvalidFence", "UnknownTarget", "ProfileMismatch", "UnsupportedDerivation", "TooManyBindings"]
+bounds = ["Bounded normalized cues and declared targets.", "No transitive graph expansion."]
+forbidden = ["Publishing CueSnapshot", "Governor admission", "Canonical write", "Storage scan"]
+minimum_tests = ["Candidate cannot bypass Governor admission.", "Negative-memory role is retained.", "Touched-file derivation is deterministic."]
+worker_write_scope = ["crates/smart/eliot-cues/src/binding.rs", "crates/smart/eliot-cues/tests/binding.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+agent_task = "Implement proposal construction only; admission and publication remain external."
+
+[[cell]]
+order = 6
+id = "smart.cue.snapshot"
+package = "eliot-cues"
+execution_class = "BACKGROUND_REBUILD_BOUNDED"
+causal_property = "Build one immutable rebuildable snapshot only from admitted bindings and typed relation edges."
+public_functions = ["pub fn build_cue_snapshot(request: &CueSnapshotBuildRequest, bindings: &[AdmittedCueBinding], edges: &[AdmittedActivationEdge]) -> Result<CueSnapshot, CueSnapshotError>"]
+algorithm = ["Validate exact revision and common State Fence.", "Reject candidate-only or stale binding inputs.", "Index direct keys independently from relation edges.", "Validate bounded edge endpoints and weights without inferring semantics.", "Stable-sort rows and adjacency lists.", "Compute canonical snapshot digest."]
+errors = ["InvalidFence", "StaleBinding", "CandidateBinding", "DuplicateBinding", "UnknownEdgeEndpoint", "TooManyRows", "DigestFailure"]
+bounds = ["Explicit maximum rows, edges and fanout.", "O((rows + edges) log n) rebuild."]
+forbidden = ["Canonical-state ownership", "Incremental hidden mutation", "Unbounded graph", "Model call"]
+minimum_tests = ["Zero-edge snapshot is valid.", "Permutation yields identical digest.", "Candidate-only binding is rejected.", "Unknown edge endpoint is rejected."]
+worker_write_scope = ["crates/smart/eliot-cues/src/snapshot.rs", "crates/smart/eliot-cues/tests/snapshot.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+agent_task = "Implement immutable rebuild only; no mutable runtime store."
+
+[[cell]]
+order = 7
+id = "smart.cue.direct_match"
+package = "eliot-cues"
+execution_class = "DECISION_BOUNDARY_HOT"
+causal_property = "Perform exact-first matching that remains useful when the relation graph has zero edges."
+public_functions = ["pub fn match_direct_cues(snapshot: &CueSnapshot, request: &DirectCueMatchRequest) -> Result<DirectCueMatchSet, CueMatchError>"]
+algorithm = ["Validate snapshot revision, fence and profile.", "Lookup exact keys first.", "Apply only explicitly allowed prefix or signature modes.", "Exclude lifecycle-ineligible or stale rows.", "Rank by match class, negative-memory protection, strength and canonical target id.", "Truncate with explicit overflow metadata."]
+errors = ["StaleSnapshot", "FenceMismatch", "ProfileMismatch", "TooManyObservedCues", "InvalidMode"]
+bounds = ["Explicit observed-cue and direct-hit maxima.", "No graph traversal.", "Lookup bounded by immutable snapshot index."]
+forbidden = ["Embedding similarity", "Relation spreading", "Storage read", "Model call"]
+minimum_tests = ["Exact cue fires with zero edges.", "Negative exact hit precedes positive broader match.", "Stale row is excluded with trace reason.", "Input permutation is invariant."]
+worker_write_scope = ["crates/smart/eliot-cues/src/direct_match.rs", "crates/smart/eliot-cues/tests/direct_match.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+agent_task = "Implement the zero-edge discriminator first; graph logic is outside this cell."
+
+[[cell]]
+order = 8
+id = "smart.cue.relation_spread"
+package = "eliot-cues"
+execution_class = "OPTIONAL_WARM_BOUNDED"
+causal_property = "Expand direct seeds through admitted typed edges without weakening direct hits."
+public_functions = ["pub fn expand_cue_activation(snapshot: &CueSnapshot, request: &ActivationSpreadRequest, direct: &DirectCueMatchSet) -> Result<SpreadActivationSet, ActivationSpreadError>"]
+algorithm = ["Return empty spread when disabled or graph is empty.", "Validate depth, fanout, result and visited-node limits.", "Traverse stable adjacency order.", "Retain the best admissible single-path contribution per target rather than popularity sum.", "Never remove, demote or rewrite a direct seed.", "Record every accepted and suppressed path reason."]
+errors = ["StaleSnapshot", "FenceMismatch", "InvalidLimits", "UnknownSeed", "TraversalBudgetExhausted"]
+bounds = ["Default maximum depth 2.", "Explicit fanout, visited-node and result ceilings.", "Cycle-safe traversal."]
+forbidden = ["Unbounded traversal", "Path-count popularity scoring", "Direct-hit demotion", "Storage or model call"]
+minimum_tests = ["Graph failure leaves direct results intact.", "Cycle is bounded and deterministic.", "Many weak paths do not overpower an exact seed.", "Disabled spread returns empty set."]
+worker_write_scope = ["crates/smart/eliot-cues/src/relation_spread.rs", "crates/smart/eliot-cues/tests/relation_spread.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+agent_task = "Implement optional bounded spread with local degradation; never alter direct semantics."
+
+[[cell]]
+order = 9
+id = "smart.cue.activation"
+package = "eliot-cues"
+execution_class = "DECISION_BOUNDARY_HOT"
+causal_property = "Assemble direct and optional spread results into one bounded traceable activation result."
+public_functions = ["pub fn assemble_cue_activation(direct: DirectCueMatchSet, spread: SpreadActivationSet, limits: &CueLimits) -> Result<CueActivationResult, CueActivationError>"]
+algorithm = ["Require compatible snapshot identity and fence.", "Copy all direct hits before spread hits.", "Merge duplicate targets without changing direct classification.", "Sort by directness, protected role, score, depth and canonical id.", "Truncate only optional spread before direct hits.", "Emit overflow and degradation metadata."]
+errors = ["FenceMismatch", "SnapshotMismatch", "InvalidLimits", "DirectOverflow"]
+bounds = ["All direct hits must fit the configured hard ceiling or fail visibly.", "Optional spread truncation retains trace handles."]
+forbidden = ["Silent direct-hit truncation", "Second snapshot lookup", "Storage or model call"]
+minimum_tests = ["Spread outage preserves direct output.", "Direct hit cannot be truncated by an optional result.", "Duplicate merge retains both traces."]
+worker_write_scope = ["crates/smart/eliot-cues/src/activation.rs", "crates/smart/eliot-cues/tests/activation.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+agent_task = "Implement deterministic result assembly only."
+
+[[cell]]
+order = 10
+id = "smart.context.contracts"
+package = "eliot-context-contracts"
+execution_class = "CONTRACT_ONLY"
+causal_property = "Define whole-unit contribution, admission, view, omission and dimensioned-quality contracts."
+public_functions = ["pub fn validate_context_contract(value: &ContextContractEnvelope) -> Result<(), ContextContractError>"]
+owned_types = ["ContextProviderId", "ContextAtom", "ContextContribution", "ProviderCoverage", "DecisionSafetyFloor", "ContextBudget", "DecisionDeltaEstimate", "AdmissionDisposition", "AdmittedContextSet", "OmissionRecord", "ActiveUnderstandingView", "PacketQualityVector", "DecisionLocalTail", "PendingContextInjectionPlan"]
+algorithm = ["Validate exact owner identity and common fence.", "Require whole atoms with exact expansion handles.", "Represent decision delta as Known or Unknown rather than implicit zero.", "Require provider coverage denominator.", "Require every omission to be typed and reversible.", "Keep quality dimensions separate."]
+errors = ["InvalidText", "InvalidFence", "MissingLineage", "MissingExpansionHandle", "MissingProviderCoverage", "InvalidBudget", "DuplicateAtom"]
+bounds = ["Wire maxima are validated policy fields.", "Unknown fields are denied."]
+forbidden = ["Ranking", "Retrieval", "Scalar quality score", "Canonical ownership"]
+minimum_tests = ["Unknown decision delta survives roundtrip.", "Omission without expansion handle is rejected.", "Mixed fence is rejected."]
+worker_write_scope = ["crates/smart/eliot-context-contracts/src/contracts.rs", "crates/smart/eliot-context-contracts/tests/contracts.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+agent_task = "Implement stable owner-neutral contracts only."
+
+[[cell]]
+order = 11
+id = "smart.context.contribution_merge"
+package = "eliot-context"
+execution_class = "DECISION_BOUNDARY_HOT"
+causal_property = "Merge owner-produced projections without retrieving, ranking or rewriting them."
+public_functions = ["pub fn merge_context_contributions(request: &ContextMergeRequest, contributions: &[ContextContribution]) -> Result<MergedContextCandidateSet, ContextMergeError>"]
+algorithm = ["Validate request and every provider fence and revision.", "Require one ProviderCoverage record for every expected provider.", "Reject duplicate atom identity with non-identical bytes.", "Retain provider identity and source handles.", "Stable-sort by provider and atom identity.", "Represent unavailable, partial and not-queried coverage distinctly."]
+errors = ["InvalidFence", "ProviderMismatch", "MissingCoverage", "DuplicateConflict", "TooManyAtoms"]
+bounds = ["Explicit provider and atom maxima.", "O(n log n) stable merge.", "No callback or lazy retrieval."]
+forbidden = ["Storage lookup", "Ranking", "Payload rewriting", "Provider callback"]
+minimum_tests = ["Missing provider differs from an empty result.", "Identical duplicate deduplicates.", "Conflicting duplicate fails.", "Permutation is invariant."]
+worker_write_scope = ["crates/smart/eliot-context/src/contribution_merge.rs", "crates/smart/eliot-context/tests/contribution_merge.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+agent_task = "Implement merge and coverage accounting only."
+
+[[cell]]
+order = 12
+id = "smart.context.admission"
+package = "eliot-context"
+execution_class = "DECISION_BOUNDARY_HOT"
+causal_property = "Admit whole atoms under Decision Safety Floor, downstream headroom, provider fairness and epistemic safety."
+public_functions = ["pub fn admit_context_candidates(request: &ContextAdmissionRequest, candidates: &MergedContextCandidateSet) -> Result<AdmittedContextSet, ContextAdmissionError>"]
+algorithm = ["Validate budget, route estimate, Safety Floor and headroom.", "Quarantine unsafe or forbidden-influence atoms before ranking.", "Reserve Safety Floor atoms or exact handles.", "Reserve output and review headroom before optional filling.", "Allocate optional budget provider-fair round-robin within semantic roles.", "Treat Unknown decision delta as unresolved rather than zero.", "Emit one typed disposition and omission record for every atom.", "Produce stable order independent of input order."]
+errors = ["InvalidFence", "InvalidBudget", "MissingSafetyFloor", "UnrepresentableRequiredAtom", "ProviderCoverageGap", "HeadroomViolation", "TooManyAtoms"]
+bounds = ["Explicit atom, provider and role maxima.", "Whole-unit only.", "Bounded round-robin passes.", "No generative compression."]
+forbidden = ["Partial atom slicing", "Scalar score as sole decision", "Generative summarization", "Storage or model call"]
+minimum_tests = ["Required atom never silently disappears.", "Verbose provider cannot consume all optional budget.", "Unknown delta is not treated as zero.", "Permutation is invariant.", "Headroom is reserved first."]
+worker_write_scope = ["crates/smart/eliot-context/src/admission.rs", "crates/smart/eliot-context/tests/admission.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+agent_task = "Implement whole-unit deterministic admission; do not assemble presentation."
+
+[[cell]]
+order = 13
+id = "smart.context.quality"
+package = "eliot-context"
+execution_class = "DECISION_BOUNDARY_HOT"
+causal_property = "Independently assess the exact admitted packet without changing membership or collapsing dimensions."
+public_functions = ["pub fn assess_context_quality(request: &ContextQualityRequest, admitted: &AdmittedContextSet) -> Result<PacketQualityVector, ContextQualityError>"]
+algorithm = ["Validate identity and frozen membership digest.", "Evaluate goal, epistemic, provenance, fence, uncertainty, Safety Floor, decision readiness, whole-unit integrity, provider coverage, headroom and reversible omission separately.", "Return Pass, Fail, Inconclusive or NotApplicable per dimension.", "Use actual tokenizer evidence when supplied; otherwise mark token fit Inconclusive.", "Retain exact failing handles and reason codes."]
+errors = ["IdentityMismatch", "FenceMismatch", "MembershipChanged", "InvalidMeasurement", "MissingDenominator"]
+bounds = ["Linear in admitted atoms and omissions.", "No membership mutation.", "No aggregate scalar score."]
+forbidden = ["Membership change", "Self-healing admission", "Scalar quality collapse", "Fake tokenizer pass"]
+minimum_tests = ["Failed safety dimension cannot be hidden.", "Missing tokenizer is Inconclusive.", "Membership digest mismatch is rejected."]
+worker_write_scope = ["crates/smart/eliot-context/src/quality.rs", "crates/smart/eliot-context/tests/quality.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+agent_task = "Implement an independent dimensioned quality oracle."
+
+[[cell]]
+order = 14
+id = "smart.context.view_assembly"
+package = "eliot-context-view"
+execution_class = "DECISION_BOUNDARY_HOT"
+causal_property = "Render immutable Active Understanding View sections from an already admitted set without re-admission."
+public_functions = ["pub fn assemble_active_understanding_view(request: &ContextViewRequest, admitted: &AdmittedContextSet) -> Result<ActiveUnderstandingView, ContextViewError>"]
+algorithm = ["Validate admitted membership digest and common fence.", "Render fixed semantic section order.", "Copy payload, handle and warning dispositions without changing membership.", "Retain rivals, unknowns, negative memory and omission manifest.", "Compute canonical view digest."]
+errors = ["FenceMismatch", "MembershipMismatch", "MissingSectionRepresentation", "InvalidOmission", "DigestFailure"]
+bounds = ["Bounded admitted atoms.", "Linear rendering plus stable serialization."]
+forbidden = ["Re-ranking", "Re-admission", "Retrieval", "Model call"]
+minimum_tests = ["Assembly cannot add or remove atoms.", "Rival remains distinct from supported model.", "Omitted item retains expansion handle.", "Same admitted set yields same digest."]
+worker_write_scope = ["crates/smart/eliot-context-view/src/assembly.rs", "crates/smart/eliot-context-view/tests/assembly.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+agent_task = "Implement post-admission rendering only."
+
+[[cell]]
+order = 15
+id = "smart.context.decision_tail"
+package = "eliot-context-view"
+execution_class = "DECISION_BOUNDARY_HOT"
+causal_property = "Derive the final decision-local projection with next action, observable, verifier and stop or revision condition."
+public_functions = ["pub fn build_decision_local_tail(request: &DecisionTailRequest, view: &ActiveUnderstandingView) -> Result<DecisionLocalTail, DecisionTailError>"]
+algorithm = ["Validate view identity and task/fence binding.", "Select only already represented load-bearing atoms and handles.", "Require goal and acceptance, next action, expected observable, verifier and stop or revision condition.", "Include active conflicts, do-not-use or revalidate items and expansion handles.", "Fail visibly when no safe next action can be represented."]
+errors = ["ViewMismatch", "FenceMismatch", "MissingGoal", "MissingVerifier", "MissingStopCondition", "UnsafeNextAction"]
+bounds = ["Bounded view sections.", "No planning beyond the declared next boundary."]
+forbidden = ["Effect execution", "New evidence retrieval", "Long-horizon replanning", "Finish decision"]
+minimum_tests = ["Tail without verifier is rejected.", "Active conflict remains visible.", "Unsafe next action returns typed failure.", "View membership remains unchanged."]
+worker_write_scope = ["crates/smart/eliot-context-view/src/decision_tail.rs", "crates/smart/eliot-context-view/tests/decision_tail.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+agent_task = "Implement one decision boundary only; no execution."
+
+[[cell]]
+order = 16
+id = "smart.context.reactive_plan"
+package = "eliot-context-view"
+execution_class = "DECISION_BOUNDARY_HOT"
+causal_property = "Plan bounded delivery without claiming delivery, interception or dedup state."
+public_functions = ["pub fn plan_reactive_context_injection(request: &ReactiveContextPlanRequest, view: &ActiveUnderstandingView, tail: &DecisionLocalTail) -> Result<PendingContextInjectionPlan, ReactiveContextPlanError>"]
+algorithm = ["Validate host capability profile and exact context identities.", "Choose pre-action delivery only when the host contract proves interception capability.", "Otherwise choose next-boundary delivery or durable attention obligation.", "Name the expected receipt owner and dedup key without mutating either.", "Emit visible degradation when the host cannot deliver safely."]
+errors = ["IdentityMismatch", "FenceMismatch", "UnsupportedHostCapability", "NoSafeDeliveryBoundary", "InvalidDedupKey"]
+bounds = ["One plan per request.", "Bounded capability table.", "No session-state mutation."]
+forbidden = ["Sending context", "Creating DeliveryReceipt", "Session dedup mutation", "Claiming prevention without interception"]
+minimum_tests = ["Tool-only host never claims pre-action prevention.", "Plan does not create a receipt.", "Dedup key remains advisory to the external owner."]
+worker_write_scope = ["crates/smart/eliot-context-view/src/reactive_plan.rs", "crates/smart/eliot-context-view/tests/reactive_plan.rs"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+agent_task = "Implement effect-free delivery planning only."
