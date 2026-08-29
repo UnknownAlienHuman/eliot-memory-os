@@ -12,16 +12,38 @@ retired rather than preserved as archaeology.
 
 | Script | Purpose | Proof ceiling |
 |---|---|---|
-| `verify.ps1` | Current Windows developer verification: normative identity, Cargo metadata, formatting, and workspace check | Source/build candidate only |
+| `verify.ps1` | Current Windows developer verification: normative identity, architecture-boundary audit, Cargo metadata, formatting, and workspace check | Source/build candidate only |
 | `verify.sh` | Unix-compatible counterpart for the current bounded source checks | Source/build candidate only |
 | `verify-normative.ps1` | Recompute canonical Architecture/Implementation digests and pair key; reject predecessor copies | Normative artifact identity only |
 | `verify-normative.sh` | Unix-compatible normative-pair verifier | Normative artifact identity only |
+| `audit-architecture-boundaries.py` | Scan declared core/daemon runtime roots for forbidden dependencies, SurrealDB leakage, untracked direct process launch, and production placeholders | Static source/build architecture evidence only |
 | `verify-lint-policy.ps1` | Verify the current Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
 
 Normal iteration uses `just quick` or `scripts/verify.ps1`. The manual Source
 Candidate Gate in `.github/workflows/source-candidate.yml` owns the expensive
 workspace check/Clippy/test/build breadth. Neither path proves an installed or
 healthy runtime.
+
+### Architecture-boundary audit
+
+Run the deterministic negative fixtures and then the current-tree scan:
+
+```powershell
+python scripts/audit-architecture-boundaries.py --self-test
+python scripts/audit-architecture-boundaries.py
+```
+
+Use `--json-out <path>` only for a current issue/PR or CI artifact. Generated
+audits are not committed as authority. Findings have three distinct meanings:
+
+- `HARD_VIOLATION` — an untracked contradiction; verification fails;
+- `TRACKED_DEBT` — an exact current path with owning issue and removal condition;
+- `AUDIT_SIGNAL` — review evidence such as a large composition root or stale debt entry; it is not conformance or authority.
+
+The policy is `config/architecture-boundaries.toml`. An exception must name one
+exact path/package, issue, reason, and removal condition. Wildcards and unnamed
+legacy allowances are rejected. A clean audit does not prove runtime behavior,
+process containment, store correctness, or Product acceptance.
 
 ## Release and installation
 

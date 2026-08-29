@@ -1,0 +1,136 @@
+schema = "eliot.architecture-boundaries.v1"
+
+[store_vendor]
+allowed_packages = ["eliot-store-surreal-adapter", "eliot-store-surreal"]
+
+[[runtime_root]]
+package = "eliot-host"
+issue = 14
+forbidden_exact = ["eliot-app", "eliot-engine", "eliot-store-surreal-adapter", "surrealdb"]
+forbidden_prefix = ["eliot-dreamer", "eliot-research", "eliot-researcher", "eliot-agent-", "eliot-model"]
+
+[[runtime_root]]
+package = "eliot-kernel"
+issue = 15
+forbidden_exact = ["eliot-app", "eliot-engine", "eliot-store-surreal-adapter", "surrealdb"]
+forbidden_prefix = ["eliot-dreamer", "eliot-research", "eliot-researcher", "eliot-agent-", "eliot-model"]
+
+[[runtime_root]]
+package = "eliot-watchdog"
+issue = 16
+forbidden_exact = ["eliot-app", "eliot-engine", "eliot-store-surreal-adapter", "surrealdb"]
+forbidden_prefix = ["eliot-dreamer", "eliot-research", "eliot-researcher", "eliot-agent-", "eliot-model"]
+
+[[runtime_root]]
+package = "eliot-doctor"
+issue = 17
+forbidden_exact = ["eliot-app", "eliot-engine", "eliot-store-surreal-adapter", "surrealdb"]
+forbidden_prefix = ["eliot-dreamer", "eliot-research", "eliot-researcher", "eliot-agent-", "eliot-model"]
+
+[[runtime_root]]
+package = "eliotd"
+issue = 18
+forbidden_exact = ["eliot-app", "eliot-engine", "eliot-store-surreal-adapter", "surrealdb"]
+forbidden_prefix = ["eliot-dreamer", "eliot-research", "eliot-researcher", "eliot-model"]
+
+[[runtime_root]]
+package = "eliot-store-surreal"
+issue = 19
+forbidden_exact = ["eliot-app", "eliot-engine"]
+forbidden_prefix = ["eliot-dreamer", "eliot-research", "eliot-researcher", "eliot-agent-", "eliot-model"]
+
+[[runtime_root]]
+package = "eliot-testd"
+issue = 20
+forbidden_exact = ["eliot-app", "eliot-engine", "eliot-store-surreal-adapter", "surrealdb"]
+forbidden_prefix = ["eliot-dreamer", "eliot-research", "eliot-researcher", "eliot-model"]
+
+[[runtime_root]]
+package = "eliot-wasm-host"
+issue = 21
+forbidden_exact = ["eliot-app", "eliot-engine", "eliot-store-surreal-adapter", "surrealdb"]
+forbidden_prefix = ["eliot-dreamer", "eliot-research", "eliot-researcher", "eliot-agent-", "eliot-model"]
+
+[[runtime_root]]
+package = "eliot-native-worker"
+issue = 22
+forbidden_exact = ["eliot-app", "eliot-engine", "eliot-store-surreal-adapter", "surrealdb"]
+forbidden_prefix = ["eliot-dreamer", "eliot-research", "eliot-researcher", "eliot-agent-", "eliot-model"]
+
+[[runtime_root]]
+package = "eliot-user-broker"
+issue = 23
+forbidden_exact = ["eliot-app", "eliot-engine", "eliot-store-surreal-adapter", "surrealdb"]
+forbidden_prefix = ["eliot-dreamer", "eliot-research", "eliot-researcher", "eliot-agent-", "eliot-model"]
+
+[[runtime_root]]
+package = "eliot-mod-research"
+issue = 24
+forbidden_exact = ["eliot-app", "eliot-engine", "eliot-store-surreal-adapter", "surrealdb"]
+forbidden_prefix = ["eliot-dreamer", "eliot-agent-", "eliot-model"]
+
+[[process_owner]]
+path = "crates/instrument/eliot-process-executor"
+issue = 100
+reason = "Shared governed native process execution contract and mechanics integration owner."
+
+[[process_owner]]
+path = "crates/kernel/eliot-platform-windows"
+issue = 100
+reason = "Windows process, Job Object, service, resource, and ownership mechanics."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "bins/eliot-host/src/main.rs"
+issue = 14
+reason = "Composition-root process lifecycle must move behind the admitted Host/platform cells."
+remove_when = "Host composition uses only the typed lifecycle/process contracts and independent proof surfaces."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "bins/eliot-kernel/src/main.rs"
+issue = 15
+reason = "Kernel composition must delegate native execution to the admitted process-generation adapter."
+remove_when = "Kernel main is composition-only and direct process mechanics are absent."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "bins/eliot-watchdog/src/main.rs"
+issue = 16
+reason = "Watchdog sensor/containment process mechanics require explicit typed adapters."
+remove_when = "Watchdog composition contains no ambient process launch."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "bins/eliot-doctor/src/main.rs"
+issue = 17
+reason = "Doctor must execute only registered bounded repair effects through admitted adapters."
+remove_when = "Doctor composition contains no ambient process launch."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "bins/eliot-testd/src/main.rs"
+issue = 20
+reason = "Instrument execution must use the shared governed ProcessExecutor semantics."
+remove_when = "testd delegates every process tree to the admitted executor adapter."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "bins/eliot-wasm-host/src/main.rs"
+issue = 21
+reason = "WASM host must not gain ambient native process capability."
+remove_when = "No direct native process launch remains in the WASM host."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "bins/eliot-native-worker/src/main.rs"
+issue = 22
+reason = "Native worker process effects require exact execution manifests and shared process semantics."
+remove_when = "Worker uses only typed introduced process/resource capabilities."
+
+[[tracked_debt]]
+kind = "direct_process_launch"
+path = "bins/eliot-user-broker/src/main.rs"
+issue = 23
+reason = "User-session launch must remain SID/session/epoch/lease bound."
+remove_when = "Broker launches only through the typed user execution/process adapter."
