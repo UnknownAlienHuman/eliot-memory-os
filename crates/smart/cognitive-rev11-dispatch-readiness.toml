@@ -1,0 +1,147 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "SWARM_DISPATCH_READINESS"
+current = "crates/smart/cognitive-current.toml"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[readiness_classes]
+READY_CONTRACT = "May be implemented immediately in its isolated package/cell scope."
+READY_FIXTURE = "May be implemented and package-proved against exact owner-neutral fixtures; real live edge remains blocked."
+WAIT_PRIOR_PULSE = "Do not dispatch until the named prior Product Pulse or wave gate has executed successfully."
+BLOCKED_CONTRACT = "Do not invent the missing external contract. Only contract tests/fixtures may proceed if the existing cell explicitly permits it."
+INTEGRATION_OWNER_ONLY = "Worker agents must not edit this surface."
+
+[[stage]]
+id = "W0_CONTRACT_EVIDENCE"
+orders = [1, 2, 4, 5, 6, 7, 19, 26, 27, 28, 35, 49, 50, 51, 52, 68, 71, 74]
+readiness = "READY_CONTRACT"
+parallel = true
+completion_gate = "All public types have one owner, schemas roundtrip, bounds/fences validate, and package contract tests pass."
+
+[[stage]]
+id = "W1_D3A_ORIENTATION"
+orders = [3, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+readiness = "WAIT_PRIOR_PULSE"
+requires = ["W0_CONTRACT_EVIDENCE package proofs"]
+parallel_groups = [[3], [8], [9, 10, 11], [12, 13, 14, 16], [15]]
+completion_gate = "D3A_ORIENTATION_PULSE_01"
+
+[[stage]]
+id = "W1_SELF_QUERY"
+orders = [17, 18]
+readiness = "READY_FIXTURE"
+requires = ["W0_CONTRACT_EVIDENCE package proofs"]
+blocked_live_edges = ["CC-001", "CC-002"]
+completion_gate = "D3A_SELF_QUERY_EDGE_01 on exact accepted normative pair and current conformance snapshot"
+
+[[stage]]
+id = "W2_D3B_REACTIVE_CONTEXT_CORE"
+orders = [20, 21, 22, 23, 24, 25, 29, 30, 31, 32, 33, 34]
+readiness = "WAIT_PRIOR_PULSE"
+requires = ["D3A_ORIENTATION_PULSE_01"]
+parallel_groups = [[20, 21, 22], [23, 24, 25], [29], [30], [31, 32], [33, 34]]
+blocked_live_edges = ["CC-011", "CC-012"]
+completion_gate = "D3B_REACTIVE_CONTEXT_PULSE_01 requires real W8 providers, not fixtures"
+
+[[stage]]
+id = "W3_CURATED_MEMORY"
+orders = [36, 37, 38, 39, 40, 41, 42, 43, 44]
+readiness = "WAIT_PRIOR_PULSE"
+requires = ["D3A_ORIENTATION_PULSE_01"]
+parallel_groups = [[36], [37, 38, 39], [40, 41, 42], [43, 44]]
+completion_gate = "D3A_CURATION_PULSE_01"
+
+[[stage]]
+id = "W3_CURATED_MEMORY_BLOCKED_LIVE"
+orders = [45, 46, 47]
+readiness = "READY_FIXTURE"
+requires = ["W0 contracts", "typed curation fixtures"]
+blocked_live_edges = ["CC-003", "CC-004", "CC-005"]
+completion_gate = "Live curation pulse cannot pass until denominators, InfluenceDependencyClosure and handler registry are owner-produced."
+
+[[stage]]
+id = "W4_RESEARCH_SYNTHESIS"
+orders = [48]
+readiness = "WAIT_PRIOR_PULSE"
+requires = ["D3A_ORIENTATION_PULSE_01", "ResearchEvidenceBundle fixture or real Researcher edge"]
+completion_gate = "D3A_RESEARCH_SYNTHESIS_PULSE_01"
+
+[[stage]]
+id = "W5_TASK_LOCAL_LEARNING_CORE"
+orders = [53, 54, 55, 56]
+readiness = "WAIT_PRIOR_PULSE"
+requires = ["D3B canonical projection/core context pulses", "W0 learning contracts"]
+parallel_groups = [[53], [54], [55, 56]]
+blocked_live_edges = ["CC-007"]
+completion_gate = "Governor overlay admission edge plus exact attempt lineage"
+
+[[stage]]
+id = "W5_TASK_LOCAL_LEARNING_EVALUATION"
+orders = [57, 58, 59]
+readiness = "READY_FIXTURE"
+requires = ["cells 53..56 package proofs"]
+blocked_live_edges = ["CC-006", "CC-008"]
+completion_gate = "D4_TASK_LOCAL_LEARNING_PULSE_01 with external activation receipt and attributed outcomes"
+
+[[stage]]
+id = "W6_DIAGNOSIS"
+orders = [60, 61]
+readiness = "WAIT_PRIOR_PULSE"
+requires = ["D4_EXPERIENCE_PROJECTION_PULSE_01 or exact fixture equivalent for package proof"]
+completion_gate = "D5_DIAGNOSIS_PLANNING_PULSE_01 diagnosis side"
+
+[[stage]]
+id = "W6_PLANNING"
+orders = [62, 63, 64, 65]
+readiness = "READY_FIXTURE"
+requires = ["D3A Orientation package/pulse evidence"]
+blocked_live_edges = ["CC-009", "CC-010"]
+completion_gate = "D5_DIAGNOSIS_PLANNING_PULSE_01 with external Governor/Task/AgentCoordinator contracts"
+
+[[stage]]
+id = "W7_DREAM_CYCLE"
+orders = [66, 67]
+readiness = "WAIT_PRIOR_PULSE"
+requires = ["D3A_CURATION_PULSE_01", "D4_TASK_LOCAL_LEARNING_PULSE_01", "D5_DIAGNOSIS_PLANNING_PULSE_01"]
+blocked_live_edges = ["CC-009"]
+completion_gate = "D6_BOUNDED_DREAM_CYCLE_PULSE_01"
+
+[[stage]]
+id = "W8_CANONICAL_PROJECTION_CONTRACTS"
+orders = [68, 71, 74]
+readiness = "READY_CONTRACT"
+parallel = true
+completion_gate = "Contract packages and external adapter fixture schemas pass."
+
+[[stage]]
+id = "W8_CANONICAL_PROJECTION_IMPLEMENTATIONS"
+orders = [69, 70, 72, 73, 75]
+readiness = "WAIT_PRIOR_PULSE"
+requires = ["orders 68, 71, 74 package proofs", "relevant core contract package proofs"]
+parallel_groups = [[69, 72, 73, 75], [70]]
+completion_gate = "D3B_CANONICAL_PROJECTION_PULSE_01 and D4_EXPERIENCE_PROJECTION_PULSE_01"
+
+[integration_owner_only]
+surfaces = [
+  "all Cargo.toml edits after worker implementation",
+  "src/lib.rs and public re-exports",
+  "workspace dependency aliases",
+  "root workspace membership",
+  "real Governor/Task/Evaluator/Host adapters",
+  "provider registry composition",
+  "Product Pulse harness wiring",
+]
+readiness = "INTEGRATION_OWNER_ONLY"
+
+[dispatch_algorithm]
+steps = [
+  "resolve requested order through cognitive-current.toml",
+  "check this readiness manifest and all requires gates",
+  "extract one authoritative cell through cognitive-rev11-assignment-routing.toml",
+  "attach only referenced type owners, edge contracts and ContractChallenges",
+  "reject dispatch when write scope overlaps an active agent",
+  "record assigned branch, cell id, source scope and expected proof ceiling",
+]
+
+[honesty]
+rule = "READY_CONTRACT or READY_FIXTURE is not runtime readiness. WAIT_PRIOR_PULSE is a causal gate, not a scheduling suggestion."
