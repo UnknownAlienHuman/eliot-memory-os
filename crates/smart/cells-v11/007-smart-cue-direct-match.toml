@@ -1,0 +1,44 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.cue.direct_match"
+agent_order = 7
+physical_package = "eliot-cues"
+execution_class = "DECISION_BOUNDARY_HOT"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Perform exact-first matching that remains useful when the relation graph has zero edges."
+
+[agent]
+objective = "Implement the zero-edge exact-match discriminator before any graph logic."
+write_scope = ["crates/smart/eliot-cues/src/direct_match.rs", "crates/smart/eliot-cues/tests/direct_match.rs"]
+integration_owner = "cue projection integration owner"
+forbidden_files = ["crates/smart/eliot-cues/src/lib.rs", "crates/smart/eliot-cues/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn match_direct_cues(snapshot: &CueSnapshot, request: &DirectCueMatchRequest) -> Result<DirectCueMatchSet, CueMatchError>"]
+
+[algorithm]
+steps = [
+  "Validate snapshot revision, fence and comparison profile.",
+  "Lookup exact keys first.",
+  "Apply only explicitly allowed prefix or signature modes.",
+  "Exclude lifecycle-ineligible or stale rows.",
+  "Rank by match class, negative-memory protection, strength and canonical target id.",
+  "Truncate with explicit overflow metadata."
+]
+
+[limits]
+rules = ["Use explicit observed-cue and direct-hit maxima.", "Perform no graph traversal.", "Use only immutable snapshot indices."]
+
+[errors]
+variants = ["StaleSnapshot", "FenceMismatch", "ProfileMismatch", "TooManyObservedCues", "InvalidMode"]
+
+[forbidden]
+operations = ["embedding similarity", "relation spreading", "storage read", "model call", "blocking I/O", "lock acquisition"]
+
+[tests]
+required = ["exact cue fires with zero edges", "negative exact hit precedes positive broader match", "stale row is excluded with trace reason", "input permutation is invariant"]
+
+[integration]
+provider = "smart.cue.snapshot plus normalized observed cues"
+consumer = "smart.cue.activation and optional smart.cue.relation_spread"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if snapshot or comparison-profile identity is not exact."
