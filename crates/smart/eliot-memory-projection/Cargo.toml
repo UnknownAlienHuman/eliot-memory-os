@@ -1,0 +1,18 @@
+[package]
+name = "eliot-memory-projection"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[dependencies]
+eliot-memory-projection-contracts = { path = "../eliot-memory-projection-contracts" }
+eliot-cue-contracts = { path = "../eliot-cue-contracts" }
+eliot-context-contracts = { path = "../eliot-context-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }
+
+[package.metadata.eliot]
+status = "prototype-no-rust"
+workspace_admission = "blocked-until-module-edge-and-product-proof"
+cells = "smart.memory.candidate_query,smart.memory.context_projection"
+integration_owner = "Memory Selection and Context Projection Owner"
