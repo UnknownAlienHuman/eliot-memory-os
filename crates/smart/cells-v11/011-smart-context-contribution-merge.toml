@@ -1,0 +1,44 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.context.contribution_merge"
+agent_order = 11
+physical_package = "eliot-context"
+execution_class = "DECISION_BOUNDARY_HOT"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Merge owner-produced projections without retrieving, ranking or rewriting them."
+
+[agent]
+objective = "Implement deterministic contribution merge and provider-coverage accounting only."
+write_scope = ["crates/smart/eliot-context/src/contribution_merge.rs", "crates/smart/eliot-context/tests/contribution_merge.rs"]
+integration_owner = "Context Compiler integration owner"
+forbidden_files = ["crates/smart/eliot-context/src/lib.rs", "crates/smart/eliot-context/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn merge_context_contributions(request: &ContextMergeRequest, contributions: &[ContextContribution]) -> Result<MergedContextCandidateSet, ContextMergeError>"]
+
+[algorithm]
+steps = [
+  "Validate request and every provider fence and revision.",
+  "Require one ProviderCoverage record for every expected provider.",
+  "Reject duplicate atom identity with non-identical bytes.",
+  "Retain provider identity and source handles.",
+  "Stable-sort by provider and atom identity.",
+  "Represent unavailable, partial and not-queried coverage distinctly."
+]
+
+[limits]
+rules = ["Use explicit provider and atom maxima.", "Use O(n log n) stable merge.", "Do not use callbacks or lazy retrieval."]
+
+[errors]
+variants = ["InvalidFence", "ProviderMismatch", "MissingCoverage", "DuplicateConflict", "TooManyAtoms"]
+
+[forbidden]
+operations = ["storage lookup", "ranking", "payload rewriting", "provider callback", "model call", "blocking I/O", "lock acquisition"]
+
+[tests]
+required = ["missing provider differs from empty result", "identical duplicate deduplicates", "conflicting duplicate fails", "permutation is invariant"]
+
+[integration]
+provider = "task, attention, epistemic, memory, authority and self-model projection owners"
+consumer = "smart.context.admission"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if an expected provider cannot supply explicit coverage status."
