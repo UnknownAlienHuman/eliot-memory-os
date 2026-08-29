@@ -1,0 +1,7 @@
+schema_version = 1
+status = "COMPATIBILITY_POINTER"
+authority = "crates/smart/cognitive-rev11-waves-projection-extension.toml"
+orders = "68..73"
+contains = ["W8_CANONICAL_PROJECTION_BRIDGES"]
+assignment_rule = "Read the exact cell from cognitive-rev11-projection-bridge.toml through cognitive-current.toml. Legacy module.toml is not assignment authority."
+required_pulses = ["D3B_CANONICAL_PROJECTION_PULSE_01", "D4_EXPERIENCE_PROJECTION_PULSE_01"]
