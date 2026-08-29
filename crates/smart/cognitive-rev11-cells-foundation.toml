@@ -1,0 +1,339 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+range = "1..18"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[cell]]
+order = 1
+id = "governor.observation.classifier"
+stage = "W0_CONTRACT_EVIDENCE"
+physical_crate = "eliot-observation"
+hot_path = false
+responsibility = "Deterministic first-pass classification of one immutable observation without promotion or task invention."
+public_functions = ["pub fn classify_observation(input: &ObservationEnvelope, policy: &ObservationClassificationPolicy) -> Result<ObservationClassification, ObservationClassificationError>"]
+input_owners = ["eliot-observation-contracts::ObservationEnvelope", "eliot-observation::ObservationClassificationPolicy"]
+output_owners = ["eliot-observation::ObservationClassification"]
+algorithm = ["validate exact observation identity and State Fence", "apply closed family rules before heuristics", "preserve cold capture when task binding or reuse class is unknown", "quarantine contradictory task binding", "return Unknown rather than infer unsupported semantics"]
+invariants = ["classification cannot raise EpistemicStatus", "classifier never writes canonical state", "structured conflict is preserved", "same input and policy produce byte-identical output"]
+degradation = "Return an explicit Unknown/Cold disposition with reasons; never discard a safe observation."
+errors = ["InvalidObservation", "FenceMismatch", "DuplicateIdentity", "PolicyRevisionMismatch"]
+tests = ["cold observation remains capturable", "conflicting task hints are quarantined", "repetition cannot promote status", "input permutation does not change classification"]
+source_files = ["crates/governor/eliot-observation/src/classifier.rs", "crates/governor/eliot-observation/tests/classifier.rs"]
+product_pulse = "D1_CAPTURE_CLASSIFICATION_EDGE_01"
+architecture_refs = ["capture first", "epistemic status is governed", "single canonical state owner"]
+implementation_refs = ["D1 capture classification", "Governor observation admission"]
+
+[[cell]]
+order = 2
+id = "smart.epistemic.contracts"
+stage = "W0_CONTRACT_EVIDENCE"
+physical_crate = "eliot-epistemic-contracts"
+hot_path = false
+responsibility = "Own the provider-neutral Current Epistemic Position, explicit assumption, structured conflict and investigation wire algebra."
+public_functions = ["pub fn validate_position_request(request: &CurrentPositionRequest) -> Result<(), EpistemicContractError>", "pub fn validate_current_epistemic_position(position: &CurrentEpistemicPosition) -> Result<(), EpistemicContractError>", "pub fn current_position_digest(position: &CurrentEpistemicPosition) -> Result<String, EpistemicContractError>"]
+public_types = ["CurrentPositionRequest", "CurrentEpistemicPosition", "PositionRecord", "ExplicitAssumption", "RivalModel", "ConflictSet", "ConflictParticipant", "EvidenceDependence", "InvestigationRequirement", "DiscriminativeInquiry", "RevisionCondition", "PositionCoverage"]
+algorithm = ["validate bounded collections and exact handles", "require one common compatible State Fence", "require explicit source lineage for every decision-bearing item", "canonicalize ordered collections", "compute digest from canonical JSON"]
+invariants = ["Observed, Supported, Assumed, Conflicted, Stale, Superseded and Unknown remain distinct", "Assumed requires ExplicitAssumption input", "conflict participants retain independent/dependent evidence", "investigation requirements name expected discriminator and revision condition"]
+degradation = "Represent incomplete owner coverage as PositionCoverage::Partial or Unknown; never fill gaps from model prose."
+errors = ["InvalidText", "InvalidFence", "DuplicateHandle", "MissingLineage", "ImplicitAssumption", "InvalidConflict", "UnboundedInput"]
+tests = ["implicit assumption rejected", "dependent duplicate evidence does not become two supports", "conflict survives roundtrip", "canonical digest ignores input order"]
+source_files = ["crates/smart/eliot-epistemic-contracts/src/position.rs", "crates/smart/eliot-epistemic-contracts/tests/position.rs"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+architecture_refs = ["Current Epistemic Position", "rival models and unknowns", "provenance closure"]
+implementation_refs = ["D3a Orientation inputs", "Context Compiler epistemic contribution"]
+
+[[cell]]
+order = 3
+id = "smart.epistemic.position"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-epistemic"
+hot_path = true
+responsibility = "Resolve one question over one admitted bounded evidence set into a structured Current Epistemic Position."
+public_functions = ["pub fn resolve_current_epistemic_position(request: &CurrentPositionRequest, records: &[AdmittedEpistemicRecord]) -> Result<CurrentEpistemicPosition, EpistemicResolutionError>"]
+input_owners = ["eliot-epistemic-contracts::CurrentPositionRequest", "eliot-epistemic-contracts::AdmittedEpistemicRecord"]
+output_owners = ["eliot-epistemic-contracts::CurrentEpistemicPosition"]
+algorithm = ["validate request and bounded record set", "partition direct observations, supported claims, explicit assumptions, rivals, stale and superseded records", "group actual contradictions by proposition and scope", "mark evidence dependence before weighting support", "derive typed InvestigationRequirements only from unresolved decision dependencies", "sort by status role then canonical handle"]
+complexity = "O(n log n) time and O(n) memory for at most policy.max_records; no I/O or model call."
+invariants = ["absence of counterevidence is not support", "record count is not epistemic weight", "fresh minority evidence cannot be silently suppressed", "one contested record does not collapse unrelated propositions into global conflict"]
+degradation = "On partial provider coverage, emit a valid partial position with explicit missing-owner entries; on fence mismatch fail closed."
+errors = ["InvalidRequest", "EmptyInput", "FenceMismatch", "ScopeMismatch", "DuplicateHandle", "InvalidEvidence", "LimitExceeded"]
+tests = ["fresh outlier remains visible", "explicit assumption is preserved but not supported", "unrelated conflict remains local", "same records in random order produce identical position"]
+source_files = ["crates/smart/eliot-epistemic/src/resolver.rs", "crates/smart/eliot-epistemic/tests/resolver.rs"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+architecture_refs = ["Current Epistemic Position", "minority evidence", "uncertainty visibility"]
+implementation_refs = ["D3a Orientation", "R5 decision boundary"]
+
+[[cell]]
+order = 4
+id = "smart.dreamer.contracts.common"
+stage = "W0_CONTRACT_EVIDENCE"
+physical_crate = "eliot-dreamer-contracts"
+hot_path = false
+responsibility = "Own common provider-neutral Dreamer job, budget, reference, draft, grounding, validation and admission contracts."
+public_functions = ["pub fn validate_dream_job_envelope(job: &DreamJobEnvelope) -> Result<(), DreamContractError>", "pub fn validate_reference_manifest(manifest: &ReferenceManifest) -> Result<(), DreamContractError>"]
+public_types = ["DreamJobEnvelope", "DreamJobClass", "DreamRequester", "DreamBudget", "DreamPrivacyProfile", "ForbiddenEffectSet", "ReferenceDescriptor", "ReferenceManifest", "ExpandedReference", "DreamInputBundle", "ModelDraftEnvelope", "DraftClaim", "GroundedClaim", "GroundedDreamDraft", "TransformationDimension", "DimensionResult", "TransformationValidationReport", "AdmittedDreamDraft"]
+algorithm = ["validate closed job class and candidate kinds", "bind exact scope, task, State Fence, budget, deadline and output schema", "validate allowed tools/routes as selectors only", "require explicit forbidden effects", "canonicalize manifests and identifiers"]
+invariants = ["no provider SDK type crosses the contract", "job input is handle-oriented and bounded", "candidate ceiling is explicit", "model draft cannot declare confirmed canonical state"]
+degradation = "Unsupported job classes and candidate kinds return typed errors; no fallback schema."
+errors = ["InvalidIdentity", "InvalidFence", "UnknownJobClass", "UnknownCandidateKind", "BudgetInvalid", "DeadlineInvalid", "ForbiddenEffectMissing", "DuplicateReference"]
+tests = ["unknown job class rejected", "invented candidate kind rejected", "provider-specific type absent from schema", "manifest order does not affect identity"]
+source_files = ["crates/smart/eliot-dreamer-contracts/src/common.rs", "crates/smart/eliot-dreamer-contracts/tests/common.rs"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+architecture_refs = ["Dreamer is candidate-only", "authority ceiling", "bounded context"]
+implementation_refs = ["I9.3 Dreamer job classes", "I9.4 Dreamer input bundle"]
+
+[[cell]]
+order = 5
+id = "smart.dreamer.contracts.orientation"
+stage = "W0_CONTRACT_EVIDENCE"
+physical_crate = "eliot-dreamer-contracts"
+hot_path = false
+responsibility = "Own Orientation, rival-model, relation-candidate, probe and clarification contracts."
+public_functions = ["pub fn validate_orientation_request(request: &OrientationRequest) -> Result<(), DreamContractError>", "pub fn validate_dream_packet(packet: &DreamPacket) -> Result<(), DreamContractError>"]
+public_types = ["OrientationRequest", "RivalModelCandidate", "RivalModelSet", "RelationUseCase", "RelationCandidateRequest", "RelationCandidate", "RelationCandidateSet", "ProbeCandidate", "DiscriminativeProbePlan", "ClarificationCandidate", "DreamPacket"]
+algorithm = ["require Current Epistemic Position handle and exact manifest", "separate resolved evidence from model synthesis", "require unknown, rival and invalidation sections", "validate candidate-only status ceiling"]
+invariants = ["model text cannot populate confirmed evidence sections", "relations are hypotheses unless source evidence already establishes the relation", "probe plan has no execution receipt", "clarification cardinality is bounded"]
+degradation = "Missing rivals or coverage become explicit gaps, not an empty-success packet."
+errors = ["MissingPosition", "MissingGrounding", "AuthorityCeilingExceeded", "InvalidRelationUseCase", "UnboundedProbeSet"]
+tests = ["model-authored confirmation rejected", "orientation and curation relation requests roundtrip separately", "empty rival denominator visible", "probe plan cannot claim execution"]
+source_files = ["crates/smart/eliot-dreamer-contracts/src/orientation.rs", "crates/smart/eliot-dreamer-contracts/tests/orientation.rs"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+architecture_refs = ["rival models", "hidden relations as candidates", "discriminative inquiry"]
+implementation_refs = ["D3a Orientation", "Dream Packet contract"]
+
+[[cell]]
+order = 6
+id = "smart.dreamer.contracts.research"
+stage = "W0_CONTRACT_EVIDENCE"
+physical_crate = "eliot-dreamer-contracts"
+hot_path = false
+responsibility = "Own the Dreamer-side Research Synthesis request and candidate packet without duplicating Research acquisition contracts."
+public_functions = ["pub fn validate_research_synthesis_request(request: &ResearchSynthesisRequest) -> Result<(), DreamContractError>", "pub fn validate_research_synthesis_packet(packet: &ResearchSynthesisPacket) -> Result<(), DreamContractError>"]
+public_types = ["ResearchSynthesisRequest", "ResearchInterpretationCandidate", "ResearchCounterclaim", "ResearchCoverageAssessment", "ResearchSynthesisPacket"]
+external_contracts = ["eliot-research-exchange-api::ResearchEvidenceBundle", "eliot-research-exchange-api::AllowedReferenceManifest", "eliot-research-exchange-api::ExactCitation"]
+algorithm = ["bind one immutable ResearchEvidenceBundle digest", "retain exact allowed-reference manifest and frozen denominator", "represent failed acquisition and coverage unknowns", "separate cited claims, counterclaims and candidate synthesis"]
+invariants = ["Researcher owns acquisition", "Dreamer owns interpretation only", "Governor owns admission and support", "citation precision cannot exceed source anchor"]
+degradation = "Incomplete coverage yields Inconclusive or Partial candidate output; no source expansion."
+errors = ["BundleMismatch", "CitationOutsideManifest", "PrecisionExceeded", "CoverageDenominatorMissing", "AcquisitionOwnershipViolation"]
+tests = ["invented citation rejected", "failed acquisition retained", "partial denominator cannot become complete", "provider route absent from public types"]
+source_files = ["crates/smart/eliot-dreamer-contracts/src/research.rs", "crates/smart/eliot-dreamer-contracts/tests/research.rs"]
+product_pulse = "D3A_RESEARCH_SYNTHESIS_PULSE_01"
+architecture_refs = ["Researcher acquires; Dreamer interprets; Governor governs", "source authority ceiling"]
+implementation_refs = ["I9.3 Research synthesis", "Research Evidence Bundle"]
+
+[[cell]]
+order = 7
+id = "smart.dreamer.contracts.curation"
+stage = "W0_CONTRACT_EVIDENCE"
+physical_crate = "eliot-dreamer-contracts"
+hot_path = false
+responsibility = "Own typed curation dispatch requests and candidate-set envelopes without handler semantics."
+public_functions = ["pub fn validate_curation_request(request: &CurationRequest) -> Result<(), DreamContractError>", "pub fn validate_curation_candidate_set(set: &CurationCandidateSet) -> Result<(), DreamContractError>"]
+public_types = ["CurationSubtype", "CurationRequest", "TypedCurationInput", "TypedCurationHandlerResult", "CurationCandidateSet", "CurationHandlerDescriptor", "CurationHandlerRegistrySnapshot"]
+algorithm = ["validate closed curation subtype", "require exact registered handler identity and schema", "bind all outputs to one job and State Fence", "retain unsupported subtype as typed result"]
+invariants = ["dispatcher does not infer subtype from prose", "one subtype has one semantic owner", "unknown subtype has no generic model fallback", "candidate set contains no lifecycle action receipt"]
+degradation = "Return UnsupportedSubtype with required contract information."
+errors = ["UnknownSubtype", "HandlerNotRegistered", "SchemaMismatch", "FenceMismatch", "MixedJobIdentity"]
+tests = ["all eleven subtypes map once", "unknown subtype fails closed", "handler cannot return another subtype", "registry order does not affect lookup"]
+source_files = ["crates/smart/eliot-dreamer-contracts/src/curation.rs", "crates/smart/eliot-dreamer-contracts/tests/curation.rs"]
+product_pulse = "D3A_CURATION_PULSE_01"
+architecture_refs = ["memory transformation is candidate-only", "single lifecycle owner"]
+implementation_refs = ["I9.7 transformation validation", "typed curation handlers"]
+
+[[cell]]
+order = 8
+id = "smart.dreamer.bundle"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-bundle"
+hot_path = false
+responsibility = "Assemble one bounded disclosure-safe DreamInputBundle from Governor-admitted descriptors."
+public_functions = ["pub fn build_reference_manifest(job: &DreamJobEnvelope, descriptors: &[ReferenceDescriptor]) -> Result<ReferenceManifest, DreamBundleError>", "pub fn assemble_dream_input_bundle(job: &DreamJobEnvelope, manifest: &ReferenceManifest, references: &[ExpandedReference]) -> Result<DreamInputBundle, DreamBundleError>"]
+algorithm = ["validate job, fence and admitted descriptor set", "reserve output, review and verifier headroom", "admit Decision Safety Floor references first", "expand optional references deterministically within disclosure and budget", "retain omitted material as exact handles with reasons"]
+invariants = ["no storage read", "no model call", "no provider route selection", "no generative summary replaces material evidence", "all expanded references belong to manifest"]
+degradation = "Emit a valid bounded bundle with omission and coverage manifests; fail only when required material cannot be represented by payload or handle."
+errors = ["ManifestMismatch", "UnknownReference", "DisclosureDenied", "FenceMismatch", "RequiredReferenceUnrepresentable", "HeadroomExhausted"]
+tests = ["invented handle rejected", "required references precede optional", "omission remains reversible", "permutation yields identical manifest"]
+source_files = ["crates/smart/eliot-dreamer-bundle/src/bundle.rs", "crates/smart/eliot-dreamer-bundle/tests/bundle.rs"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+architecture_refs = ["Decision Safety Floor", "bounded context", "reversible omission"]
+implementation_refs = ["I9.4 Dreamer input bundle"]
+
+[[cell]]
+order = 9
+id = "smart.dreamer.claim_grounding"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-validation"
+hot_path = false
+responsibility = "Ground every material model claim to exact admitted handles and counterevidence without judging truth."
+public_functions = ["pub fn ground_dream_claims(draft: &ModelDraftEnvelope, manifest: &ReferenceManifest) -> Result<GroundedDreamDraft, ClaimGroundingError>"]
+algorithm = ["enumerate every material claim", "resolve every cited and counterevidence handle against exact manifest", "compute source-authority ceiling per claim", "retain unsupported residue explicitly", "sort claims by stable claim identity"]
+invariants = ["similar or guessed handles are rejected", "unsupported residue is never silently dropped", "grounding does not promote status", "counterevidence remains attached to the claim"]
+degradation = "Return a grounded draft containing Unsupported claims when policy permits candidate inspection; structural violations fail closed."
+errors = ["UnknownHandle", "DuplicateClaim", "MissingMaterialClaim", "ManifestDigestMismatch", "AuthorityCeilingUnknown"]
+tests = ["invented handle rejected", "unsupported residue retained", "counterevidence preserved", "claim order deterministic"]
+source_files = ["crates/smart/eliot-dreamer-validation/src/claim_grounding.rs", "crates/smart/eliot-dreamer-validation/tests/claim_grounding.rs"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+architecture_refs = ["provenance closure", "source authority ceiling"]
+implementation_refs = ["I9.7 lineage and authority validation"]
+
+[[cell]]
+order = 10
+id = "smart.dreamer.transformation_validation"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-validation"
+hot_path = false
+responsibility = "Evaluate seven independent transformation dimensions without a scalar confidence shortcut."
+public_functions = ["pub fn validate_dream_transformation(input: &DreamInputBundle, grounded: &GroundedDreamDraft, policy: &TransformationPolicy) -> Result<TransformationValidationReport, TransformationValidationError>"]
+algorithm = ["evaluate Coverage", "evaluate Preservation", "evaluate Faithfulness", "evaluate Lineage", "evaluate Reversibility", "evaluate SourceAuthority", "evaluate DependencyClosure", "return Pass, Fail, Inconclusive or NotApplicable per dimension"]
+invariants = ["no aggregate score", "same model cannot self-certify faithfulness", "Inconclusive is not Pass", "one failed load-bearing dimension remains visible"]
+degradation = "Return a complete dimension vector with Inconclusive where deterministic proof is unavailable."
+errors = ["InputIdentityMismatch", "MissingGrounding", "PolicyInvalid", "DependencyClosureMalformed"]
+tests = ["constant authority-unchanged claim cannot pass", "source count is not coverage", "missing rival becomes preservation failure or inconclusive", "one failed dimension not hidden by others"]
+source_files = ["crates/smart/eliot-dreamer-validation/src/transformation.rs", "crates/smart/eliot-dreamer-validation/tests/transformation.rs"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+architecture_refs = ["coverage, alternatives, faithfulness, lineage, reversibility, authority and dependency closure"]
+implementation_refs = ["I9.7 transformation validation"]
+
+[[cell]]
+order = 11
+id = "smart.dreamer.draft_admission"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-validation"
+hot_path = false
+responsibility = "Apply structural job, schema, fence, privacy, budget and candidate-kind admission after grounding and dimensional validation."
+public_functions = ["pub fn admit_grounded_dream_draft(job: &DreamJobEnvelope, bundle: &DreamInputBundle, grounded: &GroundedDreamDraft, validation: &TransformationValidationReport, policy: &DraftAdmissionPolicy) -> Result<AdmittedDreamDraft, DraftAdmissionError>"]
+algorithm = ["validate shared identities and State Fence", "check closed job-class to candidate-kind policy", "enforce privacy, disclosure, budget and output schema", "apply per-kind minimum dimension requirements", "emit admitted or typed rejected disposition"]
+invariants = ["admission never rewrites model text", "admission never adds sources", "admission never upgrades epistemic status", "candidate is not canonical state"]
+degradation = "Reject only affected candidates when policy permits partial packet; required packet sections fail closed."
+errors = ["JobClassMismatch", "CandidateKindDenied", "FenceMismatch", "PrivacyViolation", "BudgetExceeded", "SchemaMismatch", "ValidationThresholdNotMet"]
+tests = ["model confirmation attempt rejected", "privacy widening rejected", "unknown kind rejected", "partial candidate rejection preserves accepted siblings"]
+source_files = ["crates/smart/eliot-dreamer-validation/src/admission.rs", "crates/smart/eliot-dreamer-validation/tests/admission.rs"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+architecture_refs = ["candidate-only Dreamer", "privacy and authority ceilings"]
+implementation_refs = ["I9.3 job classes", "I9.7 admission after validation"]
+
+[[cell]]
+order = 12
+id = "smart.dreamer.rival_model"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-orientation"
+hot_path = false
+responsibility = "Construct a bounded set of genuinely competing interpretations with objections, predictions and invalidation conditions."
+public_functions = ["pub fn build_rival_model_set(request: &OrientationRequest, draft: &AdmittedDreamDraft) -> Result<RivalModelSet, RivalModelError>"]
+algorithm = ["extract distinct explanatory claims", "collapse paraphrases sharing mechanism and predictions", "retain shared and independent evidence separately", "attach strongest objections and discriminating predictions", "sort by stable model identity"]
+invariants = ["model count is not truth weight", "minority model is retained when it has distinct evidence or prediction", "rivals require incompatible predictions or explanations", "no winner is promoted"]
+degradation = "Return an explicit SingleModelWithMissingRivalSearch disposition when the bundle cannot support rivals."
+errors = ["MissingGroundedClaim", "DuplicateMechanism", "UnboundedRivals", "NoDiscriminator"]
+tests = ["paraphrases deduplicate", "minority evidence retained", "vote count ignored", "single-model result exposes missing rival search"]
+source_files = ["crates/smart/eliot-dreamer-orientation/src/rival_model.rs", "crates/smart/eliot-dreamer-orientation/tests/rival_model.rs"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+architecture_refs = ["rival models", "minority evidence"]
+implementation_refs = ["D3a Orientation rivals"]
+
+[[cell]]
+order = 13
+id = "smart.dreamer.relation_candidate"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-orientation"
+hot_path = false
+responsibility = "Own one typed relation-candidate semantics used by both Orientation and Curation without converting proximity into causality."
+public_functions = ["pub fn build_relation_candidate_set(request: &RelationCandidateRequest, draft: &AdmittedDreamDraft) -> Result<RelationCandidateSet, RelationCandidateError>", "pub fn build_orientation_relation_candidates(request: &OrientationRequest, draft: &AdmittedDreamDraft) -> Result<RelationCandidateSet, RelationCandidateError>", "pub fn build_curation_relation_candidates(request: &CurationRequest, draft: &AdmittedDreamDraft) -> Result<RelationCandidateSet, RelationCandidateError>"]
+algorithm = ["resolve typed endpoints", "classify proposed relation and direction", "attach exact supporting and counterevidence handles", "separate observed association, temporal ordering and causal hypothesis", "require falsifier and status ceiling", "deduplicate identical endpoint/type/scope proposals"]
+invariants = ["graph distance is not causality", "co-change is not causality", "unknown endpoint fails closed", "Orientation and Curation call the same core semantics"]
+degradation = "Return UnsupportedRelationKind or MissingEndpoint candidates only as typed diagnostic results, never generic relations."
+errors = ["UnknownEndpoint", "UnsupportedRelationKind", "DirectionInvalid", "MissingFalsifier", "FenceMismatch"]
+tests = ["unknown endpoint rejected", "temporal relation not labeled causal", "orientation and curation outputs share schema", "similarity alone cannot create Supports relation"]
+source_files = ["crates/smart/eliot-dreamer-orientation/src/relation.rs", "crates/smart/eliot-dreamer-orientation/tests/relation.rs"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+architecture_refs = ["causal semantics", "relation candidates", "uncertainty"]
+implementation_refs = ["D3a hidden relations", "typed curation relation handler"]
+
+[[cell]]
+order = 14
+id = "smart.dreamer.probe_plan"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-orientation"
+hot_path = false
+responsibility = "Rank a bounded Pareto set of safe discriminative probes without executing tools or creating jobs."
+public_functions = ["pub fn build_discriminative_probe_plan(position: &CurrentEpistemicPosition, rivals: &RivalModelSet, capabilities: &ProbeCapabilitySnapshot, policy: &ProbePolicy) -> Result<DiscriminativeProbePlan, ProbePlanError>"]
+algorithm = ["derive unresolved decision dependencies", "enumerate admitted probe templates", "reject unavailable, unsafe or authority-exceeding probes", "score dimensions separately: discriminative power, risk, reversibility, cost and latency", "retain bounded nondominated set", "attach stop, falsification and revision conditions"]
+invariants = ["no tool invocation", "no DurableJob", "no aggregate score hides a safety failure", "every probe names expected observable and affected rivals"]
+degradation = "Return NoAdmissibleProbe with blocking dimensions and escalation requirement."
+errors = ["CapabilitySnapshotStale", "NoDecisionDependency", "ProbeUnsafe", "UnboundedProbeSet", "MissingObservable"]
+tests = ["unsafe high-power probe rejected", "dominated probe removed", "no capability returns explicit no-probe", "plan contains no execution receipt"]
+source_files = ["crates/smart/eliot-dreamer-orientation/src/probe_plan.rs", "crates/smart/eliot-dreamer-orientation/tests/probe_plan.rs"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+architecture_refs = ["discriminative inquiry", "reversibility", "authority"]
+implementation_refs = ["D3a probe recommendations"]
+
+[[cell]]
+order = 15
+id = "smart.dreamer.orientation"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-orientation"
+hot_path = false
+responsibility = "Assemble the candidate-only Orientation DreamPacket from already validated typed child outputs."
+public_functions = ["pub fn assemble_orientation_packet(request: &OrientationRequest, draft: &AdmittedDreamDraft, rivals: RivalModelSet, relations: RelationCandidateSet, probes: DiscriminativeProbePlan) -> Result<DreamPacket, OrientationError>"]
+algorithm = ["validate all child identities and shared fence", "place Governor-resolved position and anchored evidence in non-model sections", "place model synthesis in candidate sections", "attach rivals, relations, unknowns, probes, coverage, cost and invalidation", "compute canonical packet identity"]
+invariants = ["assembly does not rerun semantic handlers", "model synthesis cannot populate resolved evidence", "all omissions and unknowns remain visible", "packet remains candidate-only"]
+degradation = "Emit a partial packet only when required position, lineage and invalidation sections remain valid; otherwise fail closed."
+errors = ["ChildIdentityMismatch", "FenceMismatch", "RequiredSectionMissing", "AuthorityCeilingExceeded", "PacketTooLarge"]
+tests = ["model-authored confirmed section rejected", "rivals retained under size pressure", "child permutation yields same packet", "missing position fails closed"]
+source_files = ["crates/smart/eliot-dreamer-orientation/src/orientation.rs", "crates/smart/eliot-dreamer-orientation/tests/orientation.rs"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+architecture_refs = ["Dream Packet", "Current Epistemic Position", "Decision Safety Floor"]
+implementation_refs = ["D3a Orientation Product Pulse"]
+
+[[cell]]
+order = 16
+id = "smart.dreamer.clarification"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-orientation"
+hot_path = false
+responsibility = "Produce at most one high-value clarification candidate tied to a material decision dependency."
+public_functions = ["pub fn build_clarification_candidate(position: &CurrentEpistemicPosition, policy: &ClarificationPolicy) -> Result<Option<ClarificationCandidate>, ClarificationError>"]
+algorithm = ["identify unresolved user-answerable dependencies", "exclude questions answerable from admitted evidence", "rank dimensions separately by decision impact, burden, privacy and urgency", "select at most one nondominated question", "attach answer schema and revision effect"]
+invariants = ["one-question cardinality", "no conversational filler", "no question whose answer cannot change a decision", "no hidden data request"]
+degradation = "Return None when no justified clarification exists."
+errors = ["PositionInvalid", "PrivacyViolation", "NoAnswerSchema", "MultipleSelected"]
+tests = ["zero or one result", "answerable-from-context question suppressed", "privacy-expanding question rejected", "question names changed decision"]
+source_files = ["crates/smart/eliot-dreamer-orientation/src/clarification.rs", "crates/smart/eliot-dreamer-orientation/tests/clarification.rs"]
+product_pulse = "D3A_CLARIFICATION_EDGE_01"
+architecture_refs = ["ask only discriminative questions", "attention economy"]
+implementation_refs = ["Clarification job class"]
+
+[[cell]]
+order = 17
+id = "smart.dreamer.architecture_brief"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-self-query"
+hot_path = false
+responsibility = "Project an authority-preserving ArchitectureBrief from the exact accepted Architecture document."
+public_functions = ["pub fn build_architecture_brief(request: &ArchitectureBriefRequest, source: &AcceptedNormativeDocument) -> Result<ArchitectureBrief, SelfQueryError>"]
+algorithm = ["verify exact accepted path, revision, edition and SHA-256", "select requested sections without mixing predecessor material", "retain section anchors and omissions", "state Architecture precedence over Implementation on semantic conflict", "emit projection digest"]
+invariants = ["branch copy is not authority", "wrong digest fails closed", "brief cannot claim current implementation support", "no third normative source"]
+degradation = "Return SourceStale or CoveragePartial with exact missing sections; never substitute memory or old documents."
+errors = ["NormativeDigestMismatch", "WrongAuthorityBranch", "SectionNotFound", "MixedNormativePair", "CoverageIncomplete"]
+tests = ["wrong digest rejected", "retired document rejected", "Implementation override rejected", "omitted section listed"]
+source_files = ["crates/smart/eliot-dreamer-self-query/src/architecture.rs", "crates/smart/eliot-dreamer-self-query/tests/architecture.rs"]
+product_pulse = "D3A_SELF_QUERY_EDGE_01"
+architecture_refs = ["Architecture authority", "Hard Boundaries"]
+implementation_refs = ["normative pair binding"]
+
+[[cell]]
+order = 18
+id = "smart.dreamer.implementation_brief"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-self-query"
+hot_path = false
+responsibility = "Project an ImplementationBrief from the exact accepted Implementation document plus explicit current-system evidence, without prose-only support claims."
+public_functions = ["pub fn build_implementation_brief(request: &ImplementationBriefRequest, source: &AcceptedNormativeDocument, conformance: &CurrentSystemEvidenceSnapshot) -> Result<ImplementationBrief, SelfQueryError>"]
+algorithm = ["verify exact Implementation identity and normative pair", "select requested target contracts", "join only exact current-system evidence by declared relation", "separate target, current observed, verified, blocked and unknown states", "retain evidence handles and proof ceilings"]
+invariants = ["Implementation target is not current support", "successful build alone is not Product Proof", "Architecture semantic precedence is explicit", "stale conformance snapshot cannot support current claims"]
+degradation = "Return target-only brief with current support Unknown when conformance evidence is missing or stale."
+errors = ["NormativeDigestMismatch", "ConformanceFenceMismatch", "EvidenceStale", "UnsupportedSupportClaim", "CoverageIncomplete"]
+tests = ["prose-only support rejected", "mixed digest rejected", "target/current separated", "stale snapshot yields Unknown"]
+source_files = ["crates/smart/eliot-dreamer-self-query/src/implementation.rs", "crates/smart/eliot-dreamer-self-query/tests/implementation.rs"]
+product_pulse = "D3A_SELF_QUERY_EDGE_01"
+architecture_refs = ["Architecture prevails on semantic conflict", "current-system truth requires evidence"]
+implementation_refs = ["Implementation self-query", "Product Proof separation"]
