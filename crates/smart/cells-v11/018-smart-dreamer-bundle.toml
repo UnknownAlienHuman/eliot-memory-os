@@ -1,0 +1,47 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.bundle"
+agent_order = 18
+physical_package = "eliot-dreamer-bundle"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Assemble a disclosure-safe bounded DreamInputBundle only from Governor-admitted reference descriptors."
+
+[agent]
+objective = "Implement deterministic reference manifest and bundle assembly without acquisition or model routing."
+write_scope = ["crates/smart/eliot-dreamer-bundle/src/bundle.rs", "crates/smart/eliot-dreamer-bundle/tests/bundle.rs"]
+integration_owner = "Dreamer input integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-bundle/src/lib.rs", "crates/smart/eliot-dreamer-bundle/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = [
+  "pub fn build_reference_manifest(request: &DreamBundleRequest, descriptors: &[ReferenceDescriptor]) -> Result<ReferenceManifest, DreamBundleError>",
+  "pub fn assemble_dream_input_bundle(request: &DreamBundleRequest, manifest: &ReferenceManifest, expanded: &[ExpandedReference]) -> Result<DreamInputBundle, DreamBundleError>"
+]
+
+[algorithm]
+steps = [
+  "Validate job, privacy, budget, fence and exact admitted descriptors.",
+  "Reserve Decision Safety Floor references and downstream output or review headroom.",
+  "Expand only handles present in the manifest.",
+  "Admit required references before optional references.",
+  "Omit whole optional references with exact handles and reasons.",
+  "Emit a frozen coverage denominator, disclosure manifest and canonical digest."
+]
+
+[limits]
+rules = ["Use DreamBudget maxima for references and bytes.", "Admit whole references only.", "Do not use generative summarization."]
+
+[errors]
+variants = ["InvalidFence", "DescriptorNotAdmitted", "DisclosureViolation", "BudgetExhausted", "MissingRequiredReference", "ExpansionMismatch", "DigestFailure"]
+
+[forbidden]
+operations = ["source acquisition", "storage browsing", "provider selection", "model call", "privacy widening", "canonical write"]
+
+[tests]
+required = ["invented handle is rejected", "required reference remains payload or exact handle", "privacy boundary cannot widen", "input permutation yields identical digest"]
+
+[integration]
+provider = "Governor admitted-reference and read-expansion owners"
+consumer = "external governed model route"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if required reference, disclosure or headroom policy cannot be represented deterministically."
