@@ -1,0 +1,63 @@
+schema_version = "eliot-cognitive-design-authority-v11"
+status = "ACTIVE_WORKING_DRAFT"
+issue = "github:UnknownAlienHuman/eliot-memory-os#94"
+branch = "work/94-cognitive-function-design-audit"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+rust_implementation = "ABSENT"
+root_workspace_admission = false
+base_ref = "main"
+base_commit_at_wave_start = "c77adc67e62854aa9efc16cf3cb1905ad90c11c5"
+authority_rule = "One FunctionalCapabilityCell has one authoritative cell record. Legacy module.toml/api.toml files are donor evidence only and must not be assigned directly."
+agent_routing_rule = "Read this file, the physical topology, and exactly one cell record. Do not infer global ownership or edit package integration files."
+
+[accepted_normative_pair]
+architecture_revision = "4.5-draft"
+architecture_edition = "2026-08-28"
+architecture_sha256 = "c6932eaf26935e752eefb4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+implementation_revision = "0.29-draft"
+implementation_edition = "2026-08-28"
+implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+
+[wave]
+id = "COGNITIVE_V11_WAVE_1"
+scope = "observation classification, epistemic position, cue activation, Context Compiler, common Dreamer validation, Orientation and Research Synthesis"
+functional_cells = 27
+physical_packages = 13
+next_wave = "curation, task-local learning, diagnosis/planning and DreamCycle after this wave passes static and owner review"
+
+invariants = [
+  "Architecture semantic intent and Hard Boundaries outrank this design projection.",
+  "Implementation owns target contracts, owners, defaults and failure behavior where consistent with Architecture.",
+  "No cognitive cell owns canonical truth, support, authority, task completion, scheduler state, provider acquisition, external effects or production promotion.",
+  "A physical crate exists only for a contract, dependency, security, proof, deployment or replacement seam; one function alone is not a crate boundary.",
+  "Every decision-boundary hot-path cell is bounded, deterministic, model-free, storage-scan-free and blocking-I/O-free.",
+  "Every model-produced result remains candidate-only with exact lineage, visible uncertainty and an explicit authority ceiling."
+]
+
+authoritative_files = [
+  "crates/smart/cognitive-physical-topology-v11.toml",
+  "crates/smart/cognitive-hot-path-cells-v11.toml",
+  "crates/smart/cognitive-dreamer-core-cells-v11.toml",
+  "crates/smart/cognitive-design-validation-v11.toml"
+]
+
+superseded_for_assignment = [
+  "crates/smart/cognitive-crate-decisions.toml@rev7",
+  "crates/smart/cognitive-wave-01.toml@pre-v11",
+  "crates/smart/cognitive-wave-02.toml@pre-v11",
+  "standalone module.toml/api.toml pairs not referenced by this authority",
+  "crates/smart/eliot-dreamer-candidate-validation",
+  "crates/smart/eliot-dreamer-memory-repair"
+]
+
+[assignment_gate]
+required = [
+  "branch is rebased or fast-forwarded onto current main",
+  "one authoritative record exists for every assigned cell",
+  "worker source scopes do not overlap",
+  "hot-path cells contain no hidden I/O, model call, storage scan or unbounded traversal",
+  "physical package seam is justified independently of function count",
+  "root Cargo.toml and Cargo.lock remain unchanged",
+  "package proof, affected Edge Proof and named Product Pulse remain pending"
+]
