@@ -1,0 +1,24 @@
+[package]
+name = "eliot-dreamer-influence"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Advisory permitted-influence repair over an externally supplied exact InfluenceDependencyClosure"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "NOT_IMPLEMENTED"
+workspace_admission = "pending_cell_implementation_edge_proof_and_product_pulse"
+functional_cells = ["smart.dreamer.influence_repair"]
+runtime_authority = "NONE"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-security-contracts = { path = "../../foundation/eliot-security-contracts" }
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
