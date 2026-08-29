@@ -177,6 +177,8 @@ struct ReportSpec {
     state_delta: Vec<u8>,
     post_commit_known: bool,
     over_meter: bool,
+    effective_epoch_policy: Option<EpochPolicy>,
+    epoch_ticks: u64,
 }
 
 impl ReportSpec {
@@ -188,6 +190,8 @@ impl ReportSpec {
             state_delta: vec![6],
             post_commit_known: true,
             over_meter: false,
+            effective_epoch_policy: None,
+            epoch_ticks: 10,
         }
     }
 
@@ -695,7 +699,10 @@ impl EngineMock {
                 stack_bytes: Some(1_024),
                 enforced_stack_limit_bytes: None,
                 elapsed_ms: 10,
-                epoch_ticks: Some(10),
+                effective_epoch_policy: spec
+                    .effective_epoch_policy
+                    .unwrap_or(invocation.limits.epoch),
+                epoch_ticks: Some(spec.epoch_ticks),
                 artifact_reads: 1,
                 artifact_bytes: 64,
                 accessed_artifact_digests: vec![invocation.manifest.artifact_digest.clone()],
@@ -816,9 +823,18 @@ fn p03_start_and_separate_receipt_verification_precede_engine() {
 #[test]
 fn engine_receives_exact_admission_limits_and_inert_process_binding() {
     let (mut runtime, state) = runtime(Config::default());
+    let result = runtime.execute(request());
     assert_eq!(
-        runtime.execute(request()).receipt.disposition,
+        result.receipt.disposition,
         InvocationDisposition::Succeeded
+    );
+    assert_eq!(
+        result
+            .receipt
+            .usage
+            .as_ref()
+            .map(|usage| usage.effective_epoch_policy),
+        Some(limits().epoch)
     );
     let state = lock_state(&state);
     let invocation = must_some(state.last_invocation.as_ref());
@@ -1040,6 +1056,56 @@ fn extended_table_instance_stack_epoch_and_artifact_limits_fail_closed() {
     let mut invalid_cancellation = must(serde_json::to_value(limits()));
     invalid_cancellation["epoch"]["cancellation"] = json!("CALLER_CONTROLLED");
     assert!(serde_json::from_value::<InvocationLimits>(invalid_cancellation).is_err());
+}
+
+#[test]
+fn effective_epoch_policy_substitution_and_excess_metering_fail_closed() {
+    let expected = limits().epoch;
+
+    let deadline_substitution = Config {
+        report: ReportSpec {
+            effective_epoch_policy: Some(EpochPolicy {
+                deadline_ticks: expected.deadline_ticks - 1,
+                cancellation: expected.cancellation,
+            }),
+            ..ReportSpec::success()
+        },
+        ..Config::default()
+    };
+    let (mut runtime, _) = runtime(deadline_substitution);
+    assert_eq!(
+        runtime.execute(request()).receipt.error,
+        Some(RuntimeError::EngineContractViolation)
+    );
+
+    let cancellation_substitution = Config {
+        report: ReportSpec {
+            effective_epoch_policy: Some(EpochPolicy {
+                deadline_ticks: expected.deadline_ticks,
+                cancellation: CancellationPolicy::EpochInterruption,
+            }),
+            ..ReportSpec::success()
+        },
+        ..Config::default()
+    };
+    let (mut runtime, _) = runtime(cancellation_substitution);
+    assert_eq!(
+        runtime.execute(request()).receipt.error,
+        Some(RuntimeError::EngineContractViolation)
+    );
+
+    let excess_ticks = Config {
+        report: ReportSpec {
+            epoch_ticks: expected.deadline_ticks + 1,
+            ..ReportSpec::success()
+        },
+        ..Config::default()
+    };
+    let (mut runtime, _) = runtime(excess_ticks);
+    assert_eq!(
+        runtime.execute(request()).receipt.error,
+        Some(RuntimeError::EngineContractViolation)
+    );
 }
 
 #[test]
