@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.learning.closure"
+agent_order = 48
+physical_package = "eliot-learning"
+execution_class = "POST_CAMPAIGN_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Close one task-local learning campaign with an honest reusable, local-only, inconclusive or no-reusable-delta candidate."
+
+[agent]
+objective = "Implement honest campaign closure without cross-task promotion."
+write_scope = ["crates/smart/eliot-learning/src/closure.rs", "crates/smart/eliot-learning/tests/closure.rs"]
+integration_owner = "learning integration owner"
+forbidden_files = ["crates/smart/eliot-learning/src/lib.rs", "crates/smart/eliot-learning/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_campaign_learning_closure(request: &LearningClosureRequest, deltas: &[AttemptLearningDelta], activation: &[HarnessActivationAssessment], adherence: &[HarnessAdherenceAssessment], outcomes: &[AttemptOutcomeEvidence]) -> Result<CampaignLearningClosureCandidate, LearningClosureError>"]
+
+[algorithm]
+steps = [
+  "Validate complete attempt denominator and common task/fence identity.",
+  "Separate mechanism evidence, activation, adherence, decision delta and outcome attribution.",
+  "Preserve failed and null deltas.",
+  "Classify closure as ReusableCandidate, TaskLocalOnly, NoReusableDelta or Inconclusive.",
+  "Require rollback and invalidation for a reusable candidate."
+]
+
+[limits]
+rules = ["Use explicit attempt and evidence maxima.", "Make no cross-task promotion decision."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "MissingAttemptDenominator", "OutcomeAttributionMissing", "MechanismUnestablished", "RollbackMissing"]
+
+[forbidden]
+operations = ["promotion decision", "failed-attempt deletion", "adherence-as-benefit", "missing-denominator pass", "canonical write"]
+
+[tests]
+required = ["one-off external event can close as NoReusableDelta", "adherence without outcome does not prove benefit", "missing denominator yields Inconclusive", "failed attempts remain visible"]
+
+[integration]
+provider = "learning delta, activation, adherence and outcome owners"
+consumer = "smart.learning.retention_transfer and smart.learning.promotion_input"
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if campaign denominator, mechanism evidence or outcome attribution is incomplete."
