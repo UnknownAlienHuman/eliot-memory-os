@@ -164,9 +164,6 @@ impl KernelComposition {
                 if admission.recipient_module_id() != session.module_generation.module_id.as_str() {
                     return Err(TransportError::SessionFenced);
                 }
-                if admission.intent().session_id().as_str() != session.connection_id {
-                    return Err(TransportError::SessionFenced);
-                }
                 if identity.deadline_unix_ms != admission.deadline_unix_ms()
                     || identity.request.state_fence.authority_epoch.value()
                         != admission.state_fence().authority_epoch()
@@ -175,6 +172,13 @@ impl KernelComposition {
                 {
                     return Err(TransportError::SessionFenced);
                 }
+
+                // A pipe connection is replaceable transport routing, not a
+                // durable process/effect Session. Until #79 composes an exact
+                // process-owner/session binding, no Start request can cross
+                // this gateway. In particular, copying `connection_id` into
+                // `ProcessIntent.session_id` no longer grants launch authority.
+                return Err(TransportError::SessionFenced);
             }
             let (_, session_binding) = caller_binding(session)?;
             return Ok(KernelFrameAction::Process {
