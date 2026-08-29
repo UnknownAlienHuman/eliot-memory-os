@@ -1,0 +1,325 @@
+schema_version = "eliot-cognitive-cell-set-v11"
+set_id = "COGNITIVE_V11_LEARNING_PLANNING"
+status = "ACTIVE_WORKING_DRAFT"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+cell_count = 21
+
+[boundary]
+principle = "Online learning may change a bounded task-local overlay after evidence. Cross-task promotion, scheduler state, authority, evaluation and production generation remain externally owned."
+forbidden = ["User-objective mutation", "Evaluator or holdout mutation", "Authority or privacy widening", "DurableJob creation", "Route reservation", "Agent or model launch", "Promotion decision", "Production self-modification"]
+
+[[cell]]
+order = 41
+id = "smart.learning.contracts"
+package = "eliot-learning-contracts"
+execution_class = "CONTRACT_ONLY"
+causal_property = "Define task-local learning state, delta, overlay, activation, adherence, closure and advisory-promotion contracts."
+public_functions = ["pub fn validate_learning_contract(value: &LearningContractEnvelope) -> Result<(), LearningContractError>"]
+owned_types = ["CampaignLearningStateView", "AttemptLearningDelta", "CampaignHarnessOverlayCandidate", "OverlayValidationReport", "HarnessActivationAssessment", "HarnessAdherenceAssessment", "CampaignLearningClosureCandidate", "RetentionTransferAssessment", "PromotionInputCandidate"]
+algorithm = ["Validate exact task, attempt, evaluator, overlay and State Fence identities.", "Keep activation, adherence, decision delta, outcome, retention, transfer, evaluator validity, Product Pulse, rollback and economics as separate dimensions.", "Require every overlay to be task-local, reversible and bounded.", "Require external receipt handles where delivery or activation is claimed."]
+errors = ["InvalidFence", "IdentityMismatch", "MissingEvaluator", "MissingReceipt", "ForbiddenSurface", "MissingDimension", "TooManyItems"]
+bounds = ["Wire maxima are explicit.", "No scalar promotion score."]
+minimum_tests = ["Activation and adherence remain different dimensions.", "Promotion input without external receipt is rejected.", "Overlay cannot contain objective or authority changes."]
+worker_write_scope = ["crates/smart/eliot-learning-contracts/src/contracts.rs", "crates/smart/eliot-learning-contracts/tests/contracts.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+agent_task = "Implement learning contracts only."
+
+[[cell]]
+order = 42
+id = "smart.learning.state_view"
+package = "eliot-learning"
+execution_class = "ATTEMPT_BOUNDARY_HOT"
+causal_property = "Assemble an immutable learning view from exact owner-produced task, attempt, evaluator, context and artifact projections."
+public_functions = ["pub fn build_campaign_learning_state_view(request: &LearningStateViewRequest, projections: &LearningOwnerProjections) -> Result<CampaignLearningStateView, LearningStateViewError>"]
+algorithm = ["Validate owner identities, revisions and common State Fence.", "Require explicit coverage for Task Controller, attempt lineage, Governor admission, Context Compiler, Evaluator and artifacts.", "Represent Partial, Stale, Blocked and Unavailable separately.", "Never fill missing owner state from transcript or model memory.", "Compute canonical view digest."]
+errors = ["IdentityMismatch", "FenceMismatch", "MissingOwnerCoverage", "StaleProjection", "DuplicateProjection", "DigestFailure"]
+bounds = ["Explicit projection and artifact maxima.", "O(n log n) stable merge; no owner callback."]
+minimum_tests = ["Missing Task Controller projection is not inferred from transcript.", "Partial view can authorize only explicitly narrower work.", "Permutation yields identical digest."]
+worker_write_scope = ["crates/smart/eliot-learning/src/state_view.rs", "crates/smart/eliot-learning/tests/state_view.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+agent_task = "Implement immutable owner-view assembly only."
+
+[[cell]]
+order = 43
+id = "smart.learning.attempt_delta"
+package = "eliot-learning"
+execution_class = "POST_ATTEMPT_BOUNDED"
+causal_property = "Derive one evidence-backed learning delta by comparing a predeclared hypothesis and prediction with actual trace, artifact and evaluator evidence."
+public_functions = ["pub fn derive_attempt_learning_delta(request: &AttemptDeltaRequest, state: &CampaignLearningStateView, evidence: &AttemptOutcomeEvidence) -> Result<AttemptLearningDelta, AttemptDeltaError>"]
+algorithm = ["Validate attempt lineage, predeclared hypothesis, prediction, evidence and evaluator identity.", "Classify result as LocalUpdateAdmitted, NextProbeChanged, ReusableCandidateOpened, NoJustifiedChange, Inconclusive or InvalidEvidence.", "Reject materially equivalent retry unless purpose is replication, noise estimation, controlled comparison, exact reproduction, recovery proof or verifier calibration.", "Retain failed prediction, counterevidence and causal uncertainty."]
+errors = ["IdentityMismatch", "FenceMismatch", "MissingHypothesis", "MissingPrediction", "InvalidEvidence", "EquivalentRetryWithoutPurpose", "EvaluatorMismatch"]
+bounds = ["One attempt and bounded evidence set per call.", "No model or tool launch."]
+minimum_tests = ["Equivalent retry without new purpose is rejected.", "Outcome without attribution yields Inconclusive.", "Failed prediction remains in delta.", "No-change result is valid and explicit."]
+worker_write_scope = ["crates/smart/eliot-learning/src/attempt_delta.rs", "crates/smart/eliot-learning/tests/attempt_delta.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+agent_task = "Implement post-attempt delta derivation only."
+
+[[cell]]
+order = 44
+id = "smart.learning.overlay_candidate"
+package = "eliot-learning"
+execution_class = "POST_ATTEMPT_BOUNDED"
+causal_property = "Convert an admitted learning delta into a reversible task-local Harness overlay candidate."
+public_functions = ["pub fn build_campaign_overlay_candidate(request: &OverlayCandidateRequest, delta: &AttemptLearningDelta) -> Result<CampaignHarnessOverlayCandidate, OverlayCandidateError>"]
+algorithm = ["Validate task, attempt, delta and fence identity.", "Permit changes only to local context recipe, working rules, local procedure or Skill variant, tool exposure, decomposition, route preference within policy, probe ordering and bounded stop rule.", "Reject objective, acceptance, finish, authority, privacy, cost ceiling, evaluator, holdout or canonical-write changes.", "Require expected decision delta, verifier, rollback and expiry."]
+errors = ["IdentityMismatch", "FenceMismatch", "DeltaNotAdmitted", "ForbiddenSurface", "MissingVerifier", "RollbackMissing", "ExpiryMissing"]
+bounds = ["Explicit overlay-operation and byte maxima.", "One task-local scope only."]
+minimum_tests = ["Objective mutation is rejected.", "Route preference cannot exceed admitted policy.", "Every overlay is reversible and expires.", "NoJustifiedChange cannot produce overlay."]
+worker_write_scope = ["crates/smart/eliot-learning/src/overlay_candidate.rs", "crates/smart/eliot-learning/tests/overlay_candidate.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+agent_task = "Implement task-local overlay candidate construction only."
+
+[[cell]]
+order = 45
+id = "smart.learning.overlay_validation"
+package = "eliot-learning"
+execution_class = "ATTEMPT_BOUNDARY_HOT"
+causal_property = "Validate an overlay candidate dimension-by-dimension before external Governor admission."
+public_functions = ["pub fn validate_campaign_overlay(request: &OverlayValidationRequest, candidate: &CampaignHarnessOverlayCandidate) -> Result<OverlayValidationReport, OverlayValidationError>"]
+algorithm = ["Validate task, policy, authority epoch and State Fence.", "Evaluate scope, reversibility, objective preservation, acceptance preservation, authority ceiling, privacy ceiling, evaluator integrity, holdout integrity, cost ceiling and rollback separately.", "Return Pass, Fail, Inconclusive or NotApplicable per dimension.", "Emit required external approval handles without granting approval."]
+errors = ["IdentityMismatch", "FenceMismatch", "PolicyMismatch", "MissingDimension", "ForbiddenSurface", "InvalidApprovalReference"]
+bounds = ["Fixed validation dimensions.", "No aggregate score or mutation."]
+minimum_tests = ["Failed holdout-integrity dimension cannot be hidden.", "Unknown authority path is Inconclusive.", "Validator does not admit overlay."]
+worker_write_scope = ["crates/smart/eliot-learning/src/overlay_validation.rs", "crates/smart/eliot-learning/tests/overlay_validation.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+agent_task = "Implement pure overlay validation only."
+
+[[cell]]
+order = 46
+id = "smart.learning.activation_assessment"
+package = "eliot-learning"
+execution_class = "POST_DELIVERY_BOUNDED"
+causal_property = "Assess whether an externally delivered overlay was available and activated, without creating the activation receipt."
+public_functions = ["pub fn assess_harness_activation(request: &ActivationAssessmentRequest, receipt: &HarnessActivationReceipt, trace: &AttemptTraceProjection) -> Result<HarnessActivationAssessment, ActivationAssessmentError>"]
+algorithm = ["Validate external receipt owner, overlay identity, attempt and State Fence.", "Separate delivered, available, selected, activated and unknown states.", "Bind each conclusion to exact trace or receipt handles.", "Return Inconclusive when host integration cannot observe activation."]
+errors = ["IdentityMismatch", "FenceMismatch", "ReceiptOwnerMismatch", "TraceMismatch", "UnobservableActivation"]
+bounds = ["One receipt and bounded trace projection.", "No delivery or receipt mutation."]
+minimum_tests = ["Acknowledgement alone does not prove activation.", "Missing observability yields Inconclusive.", "Assessment cannot create HarnessActivationReceipt."]
+worker_write_scope = ["crates/smart/eliot-learning/src/activation_assessment.rs", "crates/smart/eliot-learning/tests/activation_assessment.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+agent_task = "Implement assessment over externally owned receipt and trace only."
+
+[[cell]]
+order = 47
+id = "smart.learning.adherence_assessment"
+package = "eliot-learning"
+execution_class = "POST_ATTEMPT_BOUNDED"
+causal_property = "Assess whether activated overlay instructions actually influenced the attempted decisions or actions."
+public_functions = ["pub fn assess_harness_adherence(request: &AdherenceAssessmentRequest, activation: &HarnessActivationAssessment, trace: &AttemptTraceProjection) -> Result<HarnessAdherenceAssessment, AdherenceAssessmentError>"]
+algorithm = ["Validate attempt, activation and trace identities.", "Map each overlay instruction to an observable decision or action point.", "Classify followed, contradicted, not reached, unobservable and not applicable separately.", "Do not infer benefit from adherence.", "Retain deviations and competing instructions."]
+errors = ["IdentityMismatch", "FenceMismatch", "ActivationNotEstablished", "TraceMismatch", "MissingDecisionPoint"]
+bounds = ["Explicit instruction and decision-point maxima.", "No outcome interpretation."]
+minimum_tests = ["Activation without use is non-adherence or unobservable.", "Adherence does not imply benefit.", "Instruction not reached is distinct from contradicted."]
+worker_write_scope = ["crates/smart/eliot-learning/src/adherence_assessment.rs", "crates/smart/eliot-learning/tests/adherence_assessment.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+agent_task = "Implement instruction-to-trace adherence assessment only."
+
+[[cell]]
+order = 48
+id = "smart.learning.closure"
+package = "eliot-learning"
+execution_class = "POST_CAMPAIGN_BOUNDED"
+causal_property = "Close one task-local learning campaign with an honest reusable, local-only, inconclusive or no-reusable-delta candidate."
+public_functions = ["pub fn build_campaign_learning_closure(request: &LearningClosureRequest, deltas: &[AttemptLearningDelta], activation: &[HarnessActivationAssessment], adherence: &[HarnessAdherenceAssessment], outcomes: &[AttemptOutcomeEvidence]) -> Result<CampaignLearningClosureCandidate, LearningClosureError>"]
+algorithm = ["Validate complete attempt denominator and common task or fence identity.", "Separate mechanism evidence, activation, adherence, decision delta and outcome attribution.", "Preserve failed or null deltas.", "Classify closure as ReusableCandidate, TaskLocalOnly, NoReusableDelta or Inconclusive.", "Require rollback and invalidation for reusable candidate."]
+errors = ["IdentityMismatch", "FenceMismatch", "MissingAttemptDenominator", "OutcomeAttributionMissing", "MechanismUnestablished", "RollbackMissing"]
+bounds = ["Explicit attempt and evidence maxima.", "No cross-task promotion decision."]
+minimum_tests = ["One-off external event can close as NoReusableDelta.", "Adherence without outcome does not prove benefit.", "Missing denominator yields Inconclusive.", "Failed attempts remain visible."]
+worker_write_scope = ["crates/smart/eliot-learning/src/closure.rs", "crates/smart/eliot-learning/tests/closure.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+agent_task = "Implement honest campaign closure only."
+
+[[cell]]
+order = 49
+id = "smart.learning.retention_transfer"
+package = "eliot-learning"
+execution_class = "BACKGROUND_EVALUATION_BOUNDED"
+causal_property = "Assess retention and transfer evidence independently for a reusable learning candidate."
+public_functions = ["pub fn assess_retention_and_transfer(request: &RetentionTransferRequest, evidence: &RetentionTransferEvidenceSet) -> Result<RetentionTransferAssessment, RetentionTransferError>"]
+algorithm = ["Validate candidate identity, task-family boundaries, evaluator and fence.", "Separate same-task retention, near transfer, far transfer and negative transfer.", "Require independent task instances and current evaluator validity.", "Return dimensioned results with denominators and counterexamples."]
+errors = ["IdentityMismatch", "FenceMismatch", "MissingDenominator", "DependentInstances", "EvaluatorInvalid", "ScopeLeak"]
+bounds = ["Explicit task-instance and evidence maxima.", "No benchmark generation or evaluator mutation."]
+minimum_tests = ["Repeated same trace is not transfer.", "Negative transfer remains visible.", "Invalid evaluator prevents Pass.", "Far transfer cannot be inferred from near transfer."]
+worker_write_scope = ["crates/smart/eliot-learning/src/retention_transfer.rs", "crates/smart/eliot-learning/tests/retention_transfer.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+agent_task = "Implement retention and transfer assessment only."
+
+[[cell]]
+order = 50
+id = "smart.learning.promotion_input"
+package = "eliot-learning"
+execution_class = "BACKGROUND_ADVISORY_BOUNDED"
+causal_property = "Assemble a dimensioned advisory promotion input without making the promotion decision."
+public_functions = ["pub fn build_promotion_input(request: &PromotionInputRequest, closure: &CampaignLearningClosureCandidate, retention_transfer: &RetentionTransferAssessment, product_proof: &ProductPulseEvidence, rollback: &RollbackEvidence) -> Result<PromotionInputCandidate, PromotionInputError>"]
+algorithm = ["Validate candidate, evidence, evaluator, Product Identity and fence.", "Retain applicability, activation, adherence, decision delta, outcome, retention, transfer, evaluator validity, Product Pulse, rollback, economics and authority as independent dimensions.", "Name missing approval and proof handles.", "Return advisory input to Governor or Human owner only."]
+errors = ["IdentityMismatch", "FenceMismatch", "ClosureNotReusable", "ProductIdentityMismatch", "MissingRollback", "MissingDimension", "AuthorityPathUnknown"]
+bounds = ["One reusable candidate per input.", "No scalar score or promotion mutation."]
+minimum_tests = ["Product Pulse mismatch blocks complete input.", "A failed rollback dimension stays failed.", "Function never returns Promoted status.", "Economics cannot hide evaluator failure."]
+worker_write_scope = ["crates/smart/eliot-learning/src/promotion_input.rs", "crates/smart/eliot-learning/tests/promotion_input.rs"]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+agent_task = "Implement advisory promotion input only; promotion remains externally owned."
+
+[[cell]]
+order = 51
+id = "smart.dreamer.conflict_analysis"
+package = "eliot-dreamer-diagnosis"
+execution_class = "COLD_BOUNDED"
+causal_property = "Analyze one conflict while preserving observations, rival interpretations, evidence dependence and unresolved residue."
+public_functions = ["pub fn build_conflict_analysis_candidate(request: &ConflictAnalysisRequest, position: &CurrentEpistemicPosition, draft: &AdmittedDreamDraft) -> Result<ConflictAnalysisCandidate, ConflictAnalysisError>"]
+algorithm = ["Validate conflict identity, participants, position and fence.", "Separate observations from interpretations.", "Mark shared and dependent lineage.", "Retain strong objections and unresolved residue.", "Name temporarily admissible actions, decision owner and discriminative probes without executing them."]
+errors = ["IdentityMismatch", "FenceMismatch", "UnknownConflict", "MissingParticipant", "MissingLineage", "NoDecisionOwner"]
+bounds = ["Explicit participant, evidence and probe maxima.", "No vote-count truth weighting."]
+minimum_tests = ["Majority does not erase independent dissent.", "Shared lineage is not independent evidence.", "Unresolved residue remains explicit."]
+worker_write_scope = ["crates/smart/eliot-dreamer-diagnosis/src/conflict_analysis.rs", "crates/smart/eliot-dreamer-diagnosis/tests/conflict_analysis.rs"]
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+agent_task = "Implement conflict-analysis candidate only."
+
+[[cell]]
+order = 52
+id = "smart.dreamer.development_diagnosis"
+package = "eliot-dreamer-diagnosis"
+execution_class = "COLD_BOUNDED"
+causal_property = "Diagnose a development failure from exact objective, product identity, Failure Capsules, discriminators and conformance gaps."
+public_functions = ["pub fn build_development_diagnosis_candidate(request: &DevelopmentDiagnosisRequest, evidence: &DevelopmentEvidenceSnapshot, draft: &AdmittedDreamDraft) -> Result<DevelopmentDiagnosisCandidate, DevelopmentDiagnosisError>"]
+algorithm = ["Validate Product Identity, objective, acceptance, failure capsules, verifier and fence.", "Group failures by causal mechanism rather than file or symptom count.", "Compare prior repair hypotheses and discriminators.", "Reject materially equivalent retry unless it changes hypothesis, discriminator or controlled purpose.", "Return bounded repair sequence or MechanismReviewCandidate."]
+errors = ["IdentityMismatch", "FenceMismatch", "MissingProductIdentity", "MissingFailureCapsule", "MissingDiscriminator", "EquivalentRetry", "ConformanceSnapshotMissing"]
+bounds = ["Explicit failure, hypothesis and repair-step maxima.", "No code edit or test execution."]
+minimum_tests = ["Same patch strategy without new hypothesis is rejected.", "Build success alone does not close product failure.", "Proxy activity remains separate from outcome.", "MechanismReview is valid output."]
+worker_write_scope = ["crates/smart/eliot-dreamer-diagnosis/src/development_diagnosis.rs", "crates/smart/eliot-dreamer-diagnosis/tests/development_diagnosis.rs"]
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+agent_task = "Implement evidence-bound diagnosis only; no code changes."
+
+[[cell]]
+order = 53
+id = "smart.dreamer.maintenance_plan"
+package = "eliot-dreamer-planning"
+execution_class = "BACKGROUND_ADVISORY_BOUNDED"
+causal_property = "Propose one maintenance plan over an externally owned maintenance-mode and trigger projection."
+public_functions = ["pub fn build_maintenance_plan_candidate(request: &MaintenancePlanRequest, projection: &MaintenancePolicyProjection, draft: &AdmittedDreamDraft) -> Result<MaintenancePlanCandidate, MaintenancePlanError>"]
+algorithm = ["Validate maintenance family, mode, trigger, budget, fence and owner revision.", "Map observed debt or failure to bounded candidate work.", "Name prerequisites, route class, verification, rollback and user-session requirement.", "Respect disabled, advisory, shadow and automatic modes without changing them."]
+errors = ["IdentityMismatch", "FenceMismatch", "PolicyProjectionMissing", "ModeDenied", "TriggerMismatch", "BudgetExceeded", "MissingVerifier"]
+bounds = ["Explicit work-item and cost maxima.", "No DurableJob, WakeIntent, schedule, route reservation or launch."]
+minimum_tests = ["Disabled mode produces no automatic plan.", "Plan does not create DurableJob.", "Missing policy projection fails closed.", "User-session requirement remains explicit."]
+worker_write_scope = ["crates/smart/eliot-dreamer-planning/src/maintenance_plan.rs", "crates/smart/eliot-dreamer-planning/tests/maintenance_plan.rs"]
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+agent_task = "Implement advisory maintenance planning only."
+
+[[cell]]
+order = 54
+id = "smart.dreamer.configuration_intent"
+package = "eliot-dreamer-planning"
+execution_class = "COLD_BOUNDED"
+causal_property = "Translate a natural-language configuration request into a typed reversible intent without editing configuration."
+public_functions = ["pub fn build_configuration_change_intent(request: &ConfigurationIntentRequest, schema: &ConfigurationSchemaProjection, current: &ConfigurationSnapshot, draft: &AdmittedDreamDraft) -> Result<ConfigurationChangeIntentCandidate, ConfigurationIntentError>"]
+algorithm = ["Validate setting schema, current snapshot, owner revision and fence.", "Normalize exact setting deltas and impact classes.", "Reject unknown settings and cost, privacy, remote or authority widening outside policy.", "Require expected benefit, counter-risks, approval, probe or shadow, rollback and review condition."]
+errors = ["IdentityMismatch", "FenceMismatch", "UnknownSetting", "InvalidValue", "OwnerMismatch", "CeilingIncreaseDenied", "RollbackMissing"]
+bounds = ["Explicit setting-delta maxima.", "No file, registry or snapshot mutation."]
+minimum_tests = ["Unknown setting is rejected.", "Authority widening cannot be inferred.", "Intent does not edit config.", "Rollback and review are mandatory."]
+worker_write_scope = ["crates/smart/eliot-dreamer-planning/src/configuration_intent.rs", "crates/smart/eliot-dreamer-planning/tests/configuration_intent.rs"]
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+agent_task = "Implement typed configuration intent only."
+
+[[cell]]
+order = 55
+id = "smart.dreamer.work_decomposition"
+package = "eliot-dreamer-planning"
+execution_class = "COLD_BOUNDED"
+causal_property = "Decompose work by causal property, owner, discriminator, proof ceiling and replacement boundary rather than LOC or file count."
+public_functions = ["pub fn build_work_decomposition_candidate(request: &WorkDecompositionRequest, objective: &ProductObjectiveProjection, evidence: &CurrentSystemEvidenceSnapshot, draft: &AdmittedDreamDraft) -> Result<WorkDecompositionCandidate, WorkDecompositionError>"]
+algorithm = ["Validate objective, acceptance, Product Identity, evidence and fence.", "Identify contract or evidence unit first.", "Create independent module cells with one causal property and one primary owner.", "Add explicit edge-integration cells and final Product Pulse.", "Use size only as empirical review trigger.", "Reject overlapping worker write scopes and hidden integration ownership."]
+errors = ["IdentityMismatch", "FenceMismatch", "ObjectiveMissing", "OwnerAmbiguity", "OverlappingScope", "MissingDiscriminator", "MissingProductPulse"]
+bounds = ["Explicit work-unit and dependency maxima.", "No WorkItem, task or agent creation."]
+minimum_tests = ["One function alone does not force a crate.", "Cross-owner defect includes an edge-integration unit.", "Overlapping scopes are rejected.", "Product Pulse is mandatory."]
+worker_write_scope = ["crates/smart/eliot-dreamer-planning/src/work_decomposition.rs", "crates/smart/eliot-dreamer-planning/tests/work_decomposition.rs"]
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+agent_task = "Implement causal work decomposition only."
+
+[[cell]]
+order = 56
+id = "smart.dreamer.orchestration_plan"
+package = "eliot-dreamer-planning"
+execution_class = "COLD_BOUNDED"
+causal_property = "Propose route, staffing and ordering over already defined work units without creating execution state."
+public_functions = ["pub fn build_orchestration_plan_candidate(request: &OrchestrationPlanRequest, decomposition: &WorkDecompositionCandidate, capabilities: &AgentCapabilityProjection, draft: &AdmittedDreamDraft) -> Result<OrchestrationPlanCandidate, OrchestrationPlanError>"]
+algorithm = ["Validate work-unit identities, dependencies, capability projection, budget and fence.", "Respect declared independent and integration units.", "Propose route classes, staffing constraints, ordering and review points.", "Name conflicts, shared files and required integration owner.", "Return candidate only to Task Controller, Governor and Agent Coordinator owners."]
+errors = ["IdentityMismatch", "FenceMismatch", "UnknownWorkUnit", "CapabilityGap", "DependencyCycle", "SharedScopeConflict", "BudgetExceeded"]
+bounds = ["Explicit work-unit and agent-role maxima.", "No SwarmPlanDefinition, WorkItem, Ready Queue reservation, lease or launch."]
+minimum_tests = ["Dependency cycle is rejected.", "Shared source file requires integration owner.", "Plan cannot create execution state.", "Unavailable capability remains a gap."]
+worker_write_scope = ["crates/smart/eliot-dreamer-planning/src/orchestration_plan.rs", "crates/smart/eliot-dreamer-planning/tests/orchestration_plan.rs"]
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+agent_task = "Implement advisory orchestration planning only."
+
+[[cell]]
+order = 57
+id = "smart.dreamer.cycle_sample"
+package = "eliot-dreamer-cycle"
+execution_class = "BACKGROUND_MAINTENANCE_BOUNDED"
+causal_property = "Select a deterministic bounded DreamCycle sample from an externally materialized owner snapshot."
+public_functions = ["pub fn select_dream_cycle_sample(request: &DreamCycleSampleRequest, snapshot: &DreamCycleSourceSnapshot) -> Result<DreamCycleSample, DreamCycleSampleError>"]
+algorithm = ["Validate snapshot revision, denominator, policy and fence.", "Stratify recent or active episodes, unresolved conflicts, failure evidence, minority evidence, utility or false-activation signals and maintenance debt.", "Select deterministic bounded sample with exact handles.", "Emit included and omitted strata, denominator and coverage."]
+errors = ["IdentityMismatch", "FenceMismatch", "MissingDenominator", "UnknownStratum", "SampleBudgetExceeded", "SnapshotIncomplete"]
+bounds = ["Explicit per-stratum and total sample maxima.", "No storage read, Researcher call, model call or scope expansion."]
+minimum_tests = ["Minority stratum is not erased by frequency.", "Incomplete denominator is visible.", "Same snapshot and policy yield same sample.", "Sampling performs no acquisition."]
+worker_write_scope = ["crates/smart/eliot-dreamer-cycle/src/sample.rs", "crates/smart/eliot-dreamer-cycle/tests/sample.rs"]
+product_pulse = "D6_DREAM_CYCLE_PULSE_01"
+agent_task = "Implement bounded deterministic sampling only."
+
+[[cell]]
+order = 58
+id = "smart.dreamer.cycle_plan"
+package = "eliot-dreamer-cycle"
+execution_class = "BACKGROUND_MAINTENANCE_BOUNDED"
+causal_property = "Map one DreamCycle sample to a finite candidate-only curation or challenge plan without self-scheduling."
+public_functions = ["pub fn build_dream_cycle_plan_candidate(request: &DreamCyclePlanRequest, sample: &DreamCycleSample, registry: &CurationHandlerRegistry) -> Result<DreamCyclePlanCandidate, DreamCyclePlanError>"]
+algorithm = ["Validate sample, maintenance policy, registry and fence.", "Map each sample kind to an exact registered handler.", "Deduplicate by target, problem, lineage and proposed effect.", "Permit at most one automatic experiment per target.", "Respect automation mode, privacy, budget, service-safe route and user-session requirement.", "Emit finite one-cycle horizon without rescheduling itself."]
+errors = ["IdentityMismatch", "FenceMismatch", "UnsupportedSampleKind", "RegistryStale", "DuplicateExperiment", "PolicyDenied", "BudgetExceeded"]
+bounds = ["Explicit plan-item and experiment maxima.", "No scheduler, DurableJob, agent, model or tool launch."]
+minimum_tests = ["Unknown kind is unsupported.", "Plan cannot include itself as next cycle.", "Duplicate target experiment is rejected.", "Disabled mode remains advisory only."]
+worker_write_scope = ["crates/smart/eliot-dreamer-cycle/src/plan.rs", "crates/smart/eliot-dreamer-cycle/tests/plan.rs"]
+product_pulse = "D6_DREAM_CYCLE_PULSE_01"
+agent_task = "Implement finite candidate-only DreamCycle planning."
+
+[[cell]]
+order = 59
+id = "smart.dreamer.architecture_brief"
+package = "eliot-dreamer-self-model"
+execution_class = "COLD_BOUNDED"
+causal_property = "Compile a bounded Architecture intent brief from an exact accepted normative source projection."
+public_functions = ["pub fn build_architecture_brief(request: &ArchitectureBriefRequest, source: &AcceptedNormativeSourceProjection) -> Result<ArchitectureBriefCandidate, ArchitectureBriefError>"]
+algorithm = ["Validate accepted pair key, Architecture digest, source anchors and fence.", "Select only sections relevant to the exact question.", "Preserve Hard Boundaries, invariants, unresolved conflicts and source anchors.", "Separate quotation or projection from model interpretation.", "Emit candidate brief and omission manifest."]
+errors = ["PairKeyMismatch", "DigestMismatch", "FenceMismatch", "AnchorNotFound", "CoverageIncomplete", "BudgetExceeded"]
+bounds = ["Explicit section, anchor and byte maxima.", "No repository or web read."]
+minimum_tests = ["Stale Architecture digest is rejected.", "Hard Boundary cannot be omitted when relevant.", "Interpretation is labelled candidate.", "Omitted section retains anchor."]
+worker_write_scope = ["crates/smart/eliot-dreamer-self-model/src/architecture_brief.rs", "crates/smart/eliot-dreamer-self-model/tests/architecture_brief.rs"]
+product_pulse = "D5_SELF_QUERY_EDGE_01"
+agent_task = "Implement bounded Architecture projection over an externally supplied accepted source."
+
+[[cell]]
+order = 60
+id = "smart.dreamer.implementation_brief"
+package = "eliot-dreamer-self-model"
+execution_class = "COLD_BOUNDED"
+causal_property = "Compile a bounded Implementation target brief from an exact accepted normative source projection."
+public_functions = ["pub fn build_implementation_brief(request: &ImplementationBriefRequest, source: &AcceptedNormativeSourceProjection) -> Result<ImplementationBriefCandidate, ImplementationBriefError>"]
+algorithm = ["Validate accepted pair key, Implementation digest, source anchors and fence.", "Select target owners, contracts, defaults, failure behavior and migration relevant to the question.", "Preserve target versus current-support distinction.", "Emit candidate brief, exact anchors and omissions."]
+errors = ["PairKeyMismatch", "DigestMismatch", "FenceMismatch", "AnchorNotFound", "CoverageIncomplete", "BudgetExceeded"]
+bounds = ["Explicit section, anchor and byte maxima.", "No repository or runtime read."]
+minimum_tests = ["Target mechanism is not labelled current support.", "Stale digest is rejected.", "Failure behavior remains visible.", "Omitted section retains anchor."]
+worker_write_scope = ["crates/smart/eliot-dreamer-self-model/src/implementation_brief.rs", "crates/smart/eliot-dreamer-self-model/tests/implementation_brief.rs"]
+product_pulse = "D5_SELF_QUERY_EDGE_01"
+agent_task = "Implement bounded Implementation projection over an externally supplied accepted source."
+
+[[cell]]
+order = 61
+id = "smart.dreamer.current_system_conformance"
+package = "eliot-dreamer-self-model"
+execution_class = "COLD_BOUNDED"
+causal_property = "Compare accepted target contracts with an exact CurrentSystemEvidenceSnapshot without promoting prose, build success or test count to support."
+public_functions = ["pub fn build_current_system_conformance_candidate(request: &CurrentSystemConformanceRequest, target: &ImplementationBriefCandidate, current: &CurrentSystemEvidenceSnapshot) -> Result<CurrentSystemConformanceCandidate, CurrentSystemConformanceError>"]
+algorithm = ["Validate Product Identity, evidence freshness, target identity and fence.", "Compare owner, contract, source, Cargo, generated metadata, diagnostic, test, artifact and runtime dimensions separately.", "Classify each target as ConfirmedSourceSupport, Partial, Absent, Contradicted, Stale or Unverified.", "Require exact evidence handles and proof ceiling.", "Never infer runtime health from source or build evidence."]
+errors = ["IdentityMismatch", "FenceMismatch", "ProductIdentityMissing", "EvidenceStale", "TargetMismatch", "MissingEvidenceHandle", "ProofOverclaim"]
+bounds = ["Explicit target and evidence maxima.", "No repository, build, test or runtime execution."]
+minimum_tests = ["Successful build does not prove runtime support.", "Prose does not prove current implementation.", "Stale evidence is labelled stale.", "Each conclusion names exact handles and proof ceiling."]
+worker_write_scope = ["crates/smart/eliot-dreamer-self-model/src/current_system_conformance.rs", "crates/smart/eliot-dreamer-self-model/tests/current_system_conformance.rs"]
+product_pulse = "D5_SELF_QUERY_EDGE_01"
+agent_task = "Implement evidence-bound target-versus-current conformance analysis only."
