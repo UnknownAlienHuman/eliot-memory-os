@@ -18,6 +18,17 @@ GitHub issues, pull requests, or the canonical Architecture/Implementation pair.
 
 ## Current programmes
 
+### Regression probes
+
+Issues #7–#10 preserve exact historical failure classes for Claude Desktop,
+agent attach/context, Antigravity terminal reconciliation, and arbitrary JSON
+payload integrity. Historical provider versions, task IDs, revisions, log
+locations, and store generations are discriminators only.
+
+Each issue begins by reproducing or refuting the defect on exact current
+source/runtime/provider/store identities. Implementation follows only after the
+current failing owner/path is established. No shared regression branch exists.
+
 ### Core and daemons
 
 Issues #13–#24 cover Host, Kernel, `eliotd`, Watchdog, Doctor, storage,
@@ -26,9 +37,9 @@ Use [`core-daemons/AGENTS.md`](core-daemons/AGENTS.md). Dreamer is excluded.
 
 ### Cognitive micro-modules
 
-The validated candidate scaffold is now on `main` under `crates/smart/` plus
-its declared Governor/Meta in-place assignment manifests. Issues #38–#45 own
-the current contract, donor-migration, integration, and self-learning gaps.
+The validated candidate scaffold is on `main` under `crates/smart/` plus its
+declared Governor/Meta in-place assignment manifests. Issues #38–#45 own the
+current contract, donor-migration, integration, and self-learning gaps.
 
 The wave, edge, donor, decision, and per-cell `module.toml` files are planning
 and assignment metadata. They do not admit a package to the root workspace,
