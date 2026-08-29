@@ -1,0 +1,44 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.rival_model"
+agent_order = 23
+physical_package = "eliot-dreamer-orientation"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Preserve the strongest working model and real rivals with independent or dependent evidence and invalidation."
+
+[agent]
+objective = "Implement bounded rival-model preservation without adjudicating truth."
+write_scope = ["crates/smart/eliot-dreamer-orientation/src/rival_model.rs", "crates/smart/eliot-dreamer-orientation/tests/rival_model.rs"]
+integration_owner = "Dreamer Orientation integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-orientation/src/lib.rs", "crates/smart/eliot-dreamer-orientation/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_rival_model_set(request: &RivalModelRequest, draft: &AdmittedDreamDraft, position: &CurrentEpistemicPosition) -> Result<RivalModelSet, RivalModelError>"]
+
+[algorithm]
+steps = [
+  "Validate question, fence and Current Epistemic Position identity.",
+  "Extract distinct explanatory models without vote counting.",
+  "Attach shared lineage, independent support, dependent repetitions and strong objections.",
+  "Require discriminating predictions and invalidation conditions.",
+  "Retain a no-model or unknown outcome when alternatives are insufficient.",
+  "Stable-rank by decision relevance and canonical id, not scalar confidence."
+]
+
+[limits]
+rules = ["Use explicit maximum rival models and evidence links.", "Perform no additional model call."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "MissingPrediction", "MissingInvalidation", "DuplicateModel", "UnsupportedPromotion"]
+
+[forbidden]
+operations = ["vote-count epistemology", "dependent-copy amplification", "truth adjudication", "support promotion", "new model call"]
+
+[tests]
+required = ["majority copies do not erase an independent rival", "a single working model does not fabricate a rival", "strong objection remains visible", "no epistemic status is promoted"]
+
+[integration]
+provider = "smart.dreamer.draft_admission and smart.epistemic.position"
+consumer = "smart.dreamer.probe_plan and smart.dreamer.orientation"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if model identity, prediction, lineage-dependence or invalidation cannot be represented."
