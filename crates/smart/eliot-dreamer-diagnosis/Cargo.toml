@@ -1,0 +1,17 @@
+[package]
+name = "eliot-dreamer-diagnosis"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[dependencies]
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
+eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts" }
+eliot-evaluation-contracts = { path = "../../foundation/eliot-evaluation-contracts" }
+
+[package.metadata.eliot]
+status = "prototype-no-rust"
+workspace_admission = "blocked-until-module-edge-and-product-proof"
+cells = "smart.dreamer.conflict_analysis,smart.dreamer.development_diagnosis"
+integration_owner = "Diagnosis Candidate Owner"
