@@ -1,0 +1,295 @@
+{
+  "$schema": "../agent-runtimes/route-profile.schema.json",
+  "schema_version": "eliot.agent-route-profile.v1",
+  "profile_id": "antigravity.local.supervised-stream",
+  "host_family": "antigravity",
+  "route_class": "later-local-sidecar",
+  "implementation_support": "PARTIAL",
+  "evidence_execution_status": "NOT_EXECUTED",
+  "architecture_anchors": [
+    "ARCH-PORT-01",
+    "ARCH-CTX-03",
+    "ARCH-SKL-01",
+    "ARCH-SWM-01",
+    "ARCH-SWM-02",
+    "ARCH-LONG-01",
+    "ARCH-SEC-04",
+    "ARCH-FIN-01"
+  ],
+  "host_surfaces": [
+    {
+      "surface_id": "antigravity.plugin",
+      "kind": "plugin_bundle",
+      "status": "implemented_unverified",
+      "path": "plugin/eliot-antigravity-official/plugin.json",
+      "purpose": [
+        "skill_discovery",
+        "rule_discovery",
+        "future_hook_and_mcp_registration"
+      ],
+      "authority_ceiling": "none"
+    },
+    {
+      "surface_id": "antigravity.skills",
+      "kind": "skills",
+      "status": "implemented_unverified",
+      "path": "plugin/eliot-antigravity-official/skills",
+      "purpose": [
+        "progressive_instruction_disclosure"
+      ],
+      "authority_ceiling": "none"
+    },
+    {
+      "surface_id": "antigravity.hooks",
+      "kind": "hooks",
+      "status": "target",
+      "path": null,
+      "purpose": [
+        "session_observation",
+        "pre_effect_gate_candidate",
+        "child_observation",
+        "finish_candidate"
+      ],
+      "authority_ceiling": "pre_effect_gate_candidate"
+    },
+    {
+      "surface_id": "antigravity.mcp",
+      "kind": "mcp_registration",
+      "status": "target",
+      "path": null,
+      "purpose": [
+        "eliot_semantic_tools",
+        "resource_expansion"
+      ],
+      "authority_ceiling": "none"
+    },
+    {
+      "surface_id": "antigravity.readonly.profile",
+      "kind": "host_instruction",
+      "status": "implemented_unverified",
+      "path": "integrations/antigravity/integration.json",
+      "purpose": [
+        "conservative_read_only_diff_fallback"
+      ],
+      "authority_ceiling": "none"
+    }
+  ],
+  "execution_routes": [
+    {
+      "route_id": "antigravity.exec.persistent-ndjson",
+      "role": "primary_candidate",
+      "status": "target",
+      "transport": "stdio_persistent_ndjson",
+      "execution_identity": "interactive_user",
+      "launch": {
+        "program": "antigravity",
+        "argv": [
+          "exec",
+          "--stdin",
+          "--persistent",
+          "--json"
+        ],
+        "argv_construction": "typed_no_shell",
+        "shell": false,
+        "stdin_mode": "persistent_multi_turn_requests",
+        "environment_policy": "allowlist",
+        "credential_boundary": "authorized user-owned Antigravity profile; provider credentials are not copied into ELIOT"
+      },
+      "schema_and_health_probe": {
+        "version": "antigravity version/help plus executable hash",
+        "schema": "headless NDJSON event schema fingerprint from one disposable read-only run",
+        "health": "start persistent stream, submit one read-only prompt, observe terminal result, cancel, and prove process-tree cleanup",
+        "negative_capability_challenge": "send a harmless invalid optional lifecycle or permission value and require a typed non-success"
+      },
+      "model_selection": {
+        "discovery": "current-account model catalogue from the admitted Antigravity runtime",
+        "selection": "typed per-attempt model argument recorded in ActualRouteReceipt",
+        "fixed_model_id": null,
+        "per_attempt_receipt": true
+      },
+      "session_control": {
+        "start": "persistent headless stream with one ELIOT AgentAttempt identity",
+        "resume": "native session identifier only after exact-version retention and replay probes pass",
+        "fork": null,
+        "cancel": "stream cancellation followed by bounded process-tree cleanup and terminal readback",
+        "continuation_kind": "native_resume"
+      },
+      "event_contract": {
+        "source": "headless NDJSON lifecycle, tool, permission, child, error, and terminal events",
+        "ordering": "native event/session identity wrapped in ELIOT EventEnvelope sequence and durable acknowledgement phases",
+        "durable_bridge_required": true,
+        "terminal_result_separate": true,
+        "coverage_status": "documented_not_observed"
+      },
+      "child_agents": {
+        "native_surface": "native child or workflow behavior is excluded until exact runtime event and closure probes pass",
+        "admission": "disabled_until_probed",
+        "descendant_closure_required": true
+      },
+      "swarm": {
+        "control_plane": "eliot.coordinate",
+        "durable_mailbox": true,
+        "direct_group_chat": false,
+        "recursive_launch_default": "disabled",
+        "context_policy": "minimum_decision_sufficient_packet"
+      },
+      "proof_ceiling": "The persistent stream may execute one bounded candidate attempt only after exact probes; plugin presence and terminal prose do not prove child closure or task completion."
+    },
+    {
+      "route_id": "antigravity.python-sdk.sidecar",
+      "role": "alternative_candidate",
+      "status": "target",
+      "transport": "stdio_ndjson_python_sdk_sidecar",
+      "execution_identity": "interactive_user",
+      "launch": {
+        "program": "eliot-antigravity-sidecar",
+        "argv": [
+          "--stdio"
+        ],
+        "argv_construction": "typed_no_shell",
+        "shell": false,
+        "stdin_mode": "versioned_request_event_stream",
+        "environment_policy": "allowlist",
+        "credential_boundary": "authorized user-owned SDK/runtime with explicit workspace and session handles"
+      },
+      "schema_and_health_probe": {
+        "version": "sidecar artifact hash plus Antigravity SDK package version",
+        "schema": "sidecar request/event digest plus SDK object compatibility probe",
+        "health": "create workspace/session, run one read-only prompt, stream events, close session, and verify cleanup",
+        "negative_capability_challenge": "deny an unintroduced workspace, model, or permission capability without ambient fallback"
+      },
+      "model_selection": {
+        "discovery": "SDK model catalogue for the current user/account when exposed",
+        "selection": "SDK run/session model field recorded per attempt",
+        "fixed_model_id": null,
+        "per_attempt_receipt": true
+      },
+      "session_control": {
+        "start": "SDK workspace/session/run creation",
+        "resume": "SDK session handle only when exact compatibility and retention are proven",
+        "fork": null,
+        "cancel": "SDK cancellation/close plus sidecar process-tree reconciliation",
+        "continuation_kind": "native_resume"
+      },
+      "event_contract": {
+        "source": "SDK callbacks and streaming run events",
+        "ordering": "sidecar sequence plus SDK session/run identities wrapped in ELIOT EventEnvelope",
+        "durable_bridge_required": true,
+        "terminal_result_separate": true,
+        "coverage_status": "unprobed"
+      },
+      "child_agents": {
+        "native_surface": "not admitted in the SDK profile",
+        "admission": "unavailable",
+        "descendant_closure_required": true
+      },
+      "swarm": {
+        "control_plane": "eliot.coordinate",
+        "durable_mailbox": true,
+        "direct_group_chat": false,
+        "recursive_launch_default": "disabled",
+        "context_policy": "minimum_decision_sufficient_packet"
+      },
+      "proof_ceiling": "The SDK sidecar is an alternative execution contour, not a second task, authority, recovery, or swarm owner."
+    },
+    {
+      "route_id": "antigravity.agy.readonly-diff",
+      "role": "fallback",
+      "status": "implemented_unverified",
+      "transport": "governor_managed_process",
+      "execution_identity": "interactive_user",
+      "launch": {
+        "program": "agy",
+        "argv": [
+          "<governor_rendered_readonly_contract>"
+        ],
+        "argv_construction": "typed_no_shell",
+        "shell": false,
+        "stdin_mode": "bounded_prompt",
+        "environment_policy": "allowlist",
+        "credential_boundary": "existing user profile only; credentials and account configuration are neither copied nor changed"
+      },
+      "schema_and_health_probe": {
+        "version": "agy executable version/hash and Governor launch-contract hash",
+        "schema": "candidate unified-diff and invocation-receipt contract",
+        "health": "dry-run render followed by one disposable read-only invocation",
+        "negative_capability_challenge": "prove a forbidden write-set or redispatch request is rejected before execution"
+      },
+      "model_selection": {
+        "discovery": "Governor capability profile for the installed agy route",
+        "selection": "exact model route in the rendered launch contract and ActualRouteReceipt",
+        "fixed_model_id": null,
+        "per_attempt_receipt": true
+      },
+      "session_control": {
+        "start": "Governor-managed one-shot read-only invocation",
+        "resume": null,
+        "fork": null,
+        "cancel": "Job Object cancellation and invocation-status reconciliation",
+        "continuation_kind": "fresh_only"
+      },
+      "event_contract": {
+        "source": "Governor process, stdout/stderr, candidate diff, timeout, and invocation-status receipts",
+        "ordering": "one invocation identity with explicit unknown-outcome reconciliation",
+        "durable_bridge_required": true,
+        "terminal_result_separate": true,
+        "coverage_status": "partial"
+      },
+      "child_agents": {
+        "native_surface": "disabled in the fallback profile",
+        "admission": "unavailable",
+        "descendant_closure_required": true
+      },
+      "swarm": {
+        "control_plane": "eliot.coordinate",
+        "durable_mailbox": true,
+        "direct_group_chat": false,
+        "recursive_launch_default": "disabled",
+        "context_policy": "minimum_decision_sufficient_packet"
+      },
+      "proof_ceiling": "The fallback returns a candidate unified diff under a read-only boundary; it cannot mutate the worktree or prove a full Antigravity lifecycle integration."
+    }
+  ],
+  "skills": {
+    "canonical_source": "integrations/agent-skills",
+    "delivery": "lazy",
+    "index_payload": "name_and_trigger_description",
+    "body_payload": "on_activation",
+    "runtime_payload": "on_reference",
+    "authority_ceiling": "none"
+  },
+  "mcp": {
+    "server_name": "eliot",
+    "status": "target",
+    "transport": "stdio",
+    "semantic_surface": "canonical_eliot_operations",
+    "raw_store_access": false,
+    "tool_visibility": "task_relative_lazy"
+  },
+  "coordination": {
+    "attempt_state_owner": "eliot_agent_coordinator",
+    "message_transport": "durable_mailbox",
+    "meeting_form": "concilium_over_sealed_evidence",
+    "decision_owner": "task_controller_or_human",
+    "transcript_policy": "no_whole_sibling_transcript_by_default",
+    "result_authority": "candidate_only_until_governed_transition"
+  },
+  "probe_requirements": [
+    "pin exact plugin schema, CLI/SDK version, account profile, executable/package hash, and model catalogue",
+    "prove persistent stdin, ordered NDJSON events, permission handling, terminal result, cancellation, and process-tree cleanup",
+    "prove native child agents remain disabled until child-event and descendant-closure coverage is observed",
+    "prove the legacy agy fallback remains read-only and unknown outcomes are non-redispatchable"
+  ],
+  "known_gaps": [
+    "persistent headless and Python SDK adapters are not implemented by this profile change",
+    "the current plugin bundle lacks an admitted hook and MCP registration path",
+    "current-account models, quotas, permission events, resume behavior, and child events are unprobed",
+    "the existing agy route remains a conservative candidate-diff fallback rather than the primary integration"
+  ],
+  "source_refs": [
+    "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/integrations/antigravity/README.md",
+    "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/integrations/antigravity/integration.json",
+    "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/plugin/eliot-antigravity-official/plugin.json",
+    "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/9"
+  ]
+}

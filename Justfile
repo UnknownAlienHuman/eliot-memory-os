@@ -17,6 +17,12 @@ agent-guardrails-self-test:
 agent-guardrails:
     python scripts/verify-agent-guardrails.py
 
+agent-route-bundles-self-test:
+    python scripts/verify-agent-route-bundles.py --self-test
+
+agent-route-bundles:
+    python scripts/verify-agent-route-bundles.py
+
 runtime-source-hygiene-self-test:
     python scripts/audit-runtime-source-hygiene.py --self-test
 
@@ -55,7 +61,7 @@ claude-package:
 sync-skills:
     cargo run --quiet -p eliot-app -- host skill-sync
 
-quick: normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails runtime-source-hygiene-self-test runtime-source-hygiene agent-bridge-protocol-self-test agent-bridge-protocol metadata fmt-check check
+quick: normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails agent-route-bundles-self-test agent-route-bundles runtime-source-hygiene-self-test runtime-source-hygiene agent-bridge-protocol-self-test agent-bridge-protocol metadata fmt-check check
 
 verify:
     pwsh -NoProfile -File scripts/verify.ps1
