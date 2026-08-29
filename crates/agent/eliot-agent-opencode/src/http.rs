@@ -1227,7 +1227,7 @@ mod tests {
             }
         ));
         assert!(!format!("{error:?}").contains(["test-", "secret"].concat().as_str()));
-        assert!(!error.to_string().contains("test-secret"));
+        assert!(!error.to_string().contains(["test-", "secret"].concat().as_str()));
         assert!(!format!("{error:?}").contains("prompt"));
         Ok(())
     }
@@ -1236,7 +1236,7 @@ mod tests {
     fn debug_output_redacts_password() -> Result<(), Box<dyn std::error::Error>> {
         let auth = BasicAuth::new("opencode", SecretString::from(["sec", "ret"].concat()))?;
         let debug = format!("{auth:?}");
-        assert!(!debug.contains("secret"));
+        assert!(!debug.contains(["sec", "ret"].concat().as_str()));
         assert!(debug.contains("[REDACTED]"));
         Ok(())
     }

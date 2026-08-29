@@ -1470,11 +1470,11 @@ async fn standard_managed_environment_clears_unlisted_secrets() -> anyhow::Resul
 fn managed_output_is_redacted_before_persistence() -> anyhow::Result<()> {
     let secret = format!("{}{}{}", "github_", "pat_", "A".repeat(40));
     let jwt = [
-    ["eyJhbGciOi", "JIUzI1NiJ9"].concat(),
-    ["eyJzdWIiOi", "JlbGlvdCJ9"].concat(),
-    ["signature", "bytes"].concat(),
-]
-.join(".");
+        ["eyJhbGciOi", "JIUzI1NiJ9"].concat(),
+        ["eyJzdWIiOi", "JlbGlvdCJ9"].concat(),
+        ["signature", "bytes"].concat(),
+    ]
+    .join(".");
     let output = format!(
         "safe event\napi_key={secret}\n{{\"password\":\"must-not-persist\"}}\napi_token=must-not-persist-either\nAWS_SECRET_ACCESS_KEY=must-not-persist-aws\nAuthorization: Basic must-not-persist-basic\nAuthorization:\n Basic must-not-persist-folded\n second-must-not-persist-folded\nraw={jwt}\ntokens=128\n"
     );
@@ -1483,7 +1483,7 @@ fn managed_output_is_redacted_before_persistence() -> anyhow::Result<()> {
     assert!(sanitized.receipt.redacted);
     assert!(!text.contains(&secret));
     assert!(!text.contains("must-not-persist"));
-    assert!(!text.contains(jwt));
+    assert!(!text.contains(&jwt));
     assert!(text.contains("safe event"));
     assert!(text.contains("tokens=128"));
     assert!(
