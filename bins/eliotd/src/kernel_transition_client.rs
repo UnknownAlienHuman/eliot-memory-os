@@ -81,7 +81,7 @@ impl KernelTransitionPort for DaemonKernelClient {
                 .transact_async_with_identity(
                     "apply_prepared",
                     serde_json::json!({
-                        "context": request,
+                        "context": request.clone(),
                         "transition": transition,
                         "expected_revision_heads": expected_revision_heads,
                         "expected_ordering_heads": expected_ordering_heads,
