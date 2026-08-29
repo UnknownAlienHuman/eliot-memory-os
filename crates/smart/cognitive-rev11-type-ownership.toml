@@ -1,0 +1,147 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "PUBLIC_TYPE_OWNERSHIP_REGISTRY"
+rule = "Every public wire type has one owner crate. Consumers import or re-export the owner type; they do not create compatibility copies, aliases with new semantics, provider-specific substitutes or local lifecycle/status enums."
+
+[[family]]
+owner = "eliot-contracts"
+types = ["ArtifactId", "ContractId", "ContractIdentity", "ContractVersion", "DecisionId", "OperationId", "ProductId", "RequestId", "RequestMetadata", "ResourceGeneration", "SessionId", "SourceId", "StateFence", "TaskId", "TaskRevision"]
+consumers = ["all cognitive contract and implementation crates"]
+forbidden_duplicates = ["string task ids", "local fence structs", "local semantic-version structs", "untyped artifact handles"]
+
+[[family]]
+owner = "eliot-evidence"
+types = ["Assertability", "EpistemicStatus", "EvidenceAuthority", "EvidenceCoverage", "EvidenceEnvelope", "EvidenceFreshness", "LifecycleState", "ObservationRecord", "Provenance", "RelationKind", "SourceRecord"]
+consumers = ["eliot-epistemic-contracts", "eliot-cue-contracts", "eliot-context-contracts", "eliot-memory-curation-contracts", "eliot-learning-contracts"]
+forbidden_duplicates = ["local EpistemicStatus", "local LifecycleState", "string status", "writer-defined provenance"]
+
+[[family]]
+owner = "eliot-receipts"
+types = ["EffectClass", "ProofCeiling", "ReceiptEnvelope", "ReceiptDisposition", "ReceiptId", "WorkScopeBinding", "TaskBinding", "SessionBinding", "CausalBinding"]
+consumers = ["Dreamer admission", "learning evaluation", "delivery and activation boundaries"]
+forbidden_duplicates = ["model-authored receipt", "cognitive completion receipt", "candidate-as-effect receipt"]
+
+[[family]]
+owner = "eliot-epistemic-contracts"
+types = ["AdmittedEpistemicRecord", "ConflictParticipant", "ConflictSet", "CurrentEpistemicPosition", "CurrentPositionRequest", "DiscriminativeInquiry", "EvidenceDependence", "ExplicitAssumption", "InvestigationRequirement", "PositionCoverage", "PositionRecord", "RevisionCondition", "RivalModel"]
+consumers = ["eliot-epistemic", "eliot-dreamer-contracts", "eliot-dreamer-orientation", "eliot-context-contracts", "eliot-dreamer-diagnosis"]
+forbidden_duplicates = ["PositionState copy in a consumer", "implicit assumption flag", "unstructured conflict string", "inquiry string without discriminator"]
+
+[[family]]
+owner = "eliot-dreamer-contracts::common"
+types = ["AdmittedDreamDraft", "DimensionResult", "DraftClaim", "DreamBudget", "DreamInputBundle", "DreamJobClass", "DreamJobEnvelope", "DreamPrivacyProfile", "DreamRequester", "ExpandedReference", "ForbiddenEffectSet", "GroundedClaim", "GroundedDreamDraft", "ModelDraftEnvelope", "ReferenceDescriptor", "ReferenceManifest", "TransformationDimension", "TransformationValidationReport"]
+consumers = ["eliot-dreamer-bundle", "eliot-dreamer-validation", "all Dreamer semantic handler crates"]
+forbidden_duplicates = ["provider SDK request", "generic JSON draft", "boolean preservation report", "scalar transformation score"]
+
+[[family]]
+owner = "eliot-dreamer-contracts::orientation"
+types = ["ClarificationCandidate", "DiscriminativeProbePlan", "DreamPacket", "OrientationRequest", "ProbeCandidate", "RelationCandidate", "RelationCandidateRequest", "RelationCandidateSet", "RelationUseCase", "RivalModelCandidate", "RivalModelSet"]
+consumers = ["eliot-dreamer-orientation", "eliot-dreamer-curation", "Context projection adapters"]
+forbidden_duplicates = ["separate Curation relation type", "free-text relation subtype", "probe execution receipt"]
+
+[[family]]
+owner = "eliot-dreamer-contracts::research"
+types = ["ResearchCounterclaim", "ResearchCoverageAssessment", "ResearchInterpretationCandidate", "ResearchSynthesisPacket", "ResearchSynthesisRequest"]
+consumers = ["eliot-dreamer-research-synthesis", "Governor research admission adapter"]
+forbidden_duplicates = ["Researcher acquisition request copy", "provider route", "credential handle", "invented citation type"]
+
+[[family]]
+owner = "eliot-research-exchange-api"
+types = ["AllowedReferenceManifest", "CompletionDisposition", "ExactCitation", "ResearchClaim", "ResearchEvidenceBundle", "ResearchQueryRequest", "SourceSnapshot"]
+consumers = ["Researcher", "eliot-dreamer-research-synthesis", "Governor research admission"]
+forbidden_duplicates = ["Dreamer-owned source snapshot", "local citation precision enum", "candidate-created source handle"]
+
+[[family]]
+owner = "eliot-dreamer-contracts::curation"
+types = ["CurationCandidateSet", "CurationHandlerDescriptor", "CurationHandlerRegistrySnapshot", "CurationRequest", "CurationSubtype", "TypedCurationHandlerResult", "TypedCurationInput"]
+consumers = ["eliot-dreamer-curation", "all typed curation handler adapters"]
+forbidden_duplicates = ["string subtype", "generic handler result", "catch-all curation payload"]
+
+[[family]]
+owner = "eliot-cue-contracts"
+types = ["ActivationTrace", "AdmittedActivationEdge", "AdmittedCueBinding", "ComparisonProfileId", "CueActivationResult", "CueBindingCandidate", "CueKey", "CueKind", "CueLimits", "CueSnapshot", "DirectCueHit", "DirectCueMatchResult", "MatchMode", "NormalizedCue", "ObservedCue", "RelationSpreadHit", "RelationSpreadResult"]
+consumers = ["eliot-cues", "cue projection adapters", "Context projection providers"]
+forbidden_duplicates = ["lowercased canonical path", "implementation-private CueKind copy", "combined direct/spread hit type without provenance"]
+
+[[family]]
+owner = "eliot-context-contracts::candidate"
+types = ["ContextAtom", "ContextCandidateSet", "ContextRepresentation", "ContextRole", "DecisionDeltaEstimate", "DecisionSafetyFloor", "ProviderContribution", "ProviderCoverage", "ProviderId"]
+consumers = ["eliot-context", "all context projection providers"]
+forbidden_duplicates = ["u16-only expected decision delta", "missing provider as empty result", "partial string fragment as context atom"]
+
+[[family]]
+owner = "eliot-context-contracts::admission"
+types = ["AdmissionDecision", "AdmissionDisposition", "AdmittedContextSet", "ContextRecipe", "DownstreamHeadroom", "ExpansionHandle", "OmissionReason", "RouteBudget", "SelectionIntegrityRecord"]
+consumers = ["eliot-context", "context diagnostics and delivery adapters"]
+forbidden_duplicates = ["boolean included flag", "omission without expansion handle", "budget without reserved headroom"]
+
+[[family]]
+owner = "eliot-context-contracts::view_quality"
+types = ["ActiveUnderstandingView", "ContextSection", "DecisionLocalTail", "DeliveryCapabilityClass", "OmissionManifest", "PacketQualityDimension", "PacketQualityScorecard", "PendingContextInjectionPlan", "QualityResult"]
+consumers = ["eliot-context", "host delivery adapter", "Evaluator"]
+forbidden_duplicates = ["scalar packet quality", "delivery receipt in Smart", "tail detached from view digest"]
+
+[[family]]
+owner = "eliot-memory-curation-contracts"
+types = ["AccessibilityProposal", "CurationCoverage", "CurationDimension", "CurationEvidenceVector", "CurationFinding", "CurationProposal", "CurationRecordProjection", "CurationSnapshot", "DimensionResult", "InfluenceRepairProposal", "ProtectionReason"]
+consumers = ["eliot-memory-curation-screen", "Dreamer memory handlers", "Governor curation admission"]
+forbidden_duplicates = ["utility_score", "confidence u8", "local LifecycleState", "archive action receipt"]
+
+[[family]]
+owner = "eliot-security-contracts"
+types = ["DisclosureDependencyClosure", "InfluenceDependencyClosure", "SelectionIntegrityReceipt", "SourceAssurance", "TransformationLineage"]
+consumers = ["eliot-dreamer-memory-revision", "Governor and Security owners"]
+forbidden_duplicates = ["similarity-derived influence closure", "Dreamer-owned revocation ledger"]
+
+[[family]]
+owner = "eliot-learning-contracts::common"
+types = ["AttemptId", "CampaignId", "LearningDisposition", "LearningEvidenceHandle", "LearningIdentity", "LearningLimits", "LearningScope", "MechanismHypothesis", "ObservedOutcome", "Prediction"]
+consumers = ["eliot-learning-loop", "eliot-learning-evaluation"]
+forbidden_duplicates = ["string attempt lineage", "learning-owned Task", "learning-owned scheduler state"]
+
+[[family]]
+owner = "eliot-learning-contracts::state_view"
+types = ["AgentAttemptLineageView", "ArtifactOutcomeView", "AuthorityView", "CampaignLearningStateView", "ContextRecipeView", "EvaluatorView", "OwnerCoverageState", "OwnerProjectionRef", "TaskGoalView"]
+consumers = ["eliot-learning-loop", "eliot-learning-evaluation"]
+forbidden_duplicates = ["transcript-filled owner projection", "mutable campaign aggregate"]
+
+[[family]]
+owner = "eliot-learning-contracts::adaptation"
+types = ["AdaptationDimension", "AttemptLearningDelta", "CampaignHarnessOverlayCandidate", "DeltaEvidence", "LearningDeltaDimension", "OverlayChange", "OverlaySurface", "OverlayValidationReport"]
+consumers = ["eliot-learning-loop", "Governor overlay admission"]
+forbidden_duplicates = ["global overlay", "objective-changing overlay", "aggregate safety score"]
+
+[[family]]
+owner = "eliot-learning-contracts::evaluation"
+types = ["AdherenceAssessment", "CampaignLearningClosureCandidate", "DecisionDeltaAssessment", "HarnessActivationAssessment", "HarnessActivationReceiptRef", "PromotionEvidenceDimension", "PromotionInputCandidate", "RetentionAssessment", "RollbackAssessment", "TransferAssessment"]
+consumers = ["eliot-learning-evaluation", "Governor/Human promotion review"]
+forbidden_duplicates = ["self-issued activation receipt", "promotion decision", "single promotion score"]
+
+[[external_family]]
+owner = "Governor maintenance owner"
+types = ["MaintenanceModeProjection", "MaintenanceTriggerSnapshot", "MaintenanceFamilyDescriptor"]
+required_by = ["smart.dreamer.maintenance_plan", "smart.dreamer.cycle_plan"]
+status = "OPEN_CONTRACT_CHALLENGE_CC-009"
+
+[[external_family]]
+owner = "host integration and session delivery owner"
+types = ["HostContextCapabilitySnapshot", "DeliveryReceipt", "SessionDeliveryDedupSnapshot"]
+required_by = ["smart.context.reactive_delivery_plan"]
+status = "OPEN_CONTRACT_CHALLENGE_CC-011"
+
+[[external_family]]
+owner = "Harness activation owner"
+types = ["HarnessActivationReceipt"]
+required_by = ["meta.learning.activation_assessment"]
+status = "OPEN_CONTRACT_CHALLENGE_CC-006"
+
+[[external_family]]
+owner = "Task Controller and Agent Coordinator"
+types = ["SwarmPlanDefinition", "SwarmPlanAdmission", "SwarmExecutionState", "AgentCapabilitySnapshot"]
+required_by = ["smart.dreamer.orchestration_plan"]
+status = "OPEN_CONTRACT_CHALLENGE_CC-010"
+
+[worker_rule]
+when_type_missing = "Return ContractChallenge naming expected owner and smallest required shape. Do not define the type inside the worker cell."
+when_owner_type_inconvenient = "Write an internal private adapter, not a second public wire type."
+reexports = "Only the physical-crate integration owner may add package-root re-exports."
