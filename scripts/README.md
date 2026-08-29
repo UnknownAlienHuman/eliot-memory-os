@@ -1,0 +1,75 @@
+# Supported repository scripts
+
+Scripts are narrow wrappers around current source contracts. Their presence does
+not create authority, implementation support, runtime readiness, or Product
+Proof. Start from the owning issue/PR and use the smallest applicable entrypoint.
+
+Do not select a script because its filename sounds broader or more final. A
+script without a current consumer, owner, proof ceiling, and removal path is
+retired rather than preserved as archaeology.
+
+## Repository verification
+
+| Script | Purpose | Proof ceiling |
+|---|---|---|
+| `verify.ps1` | Current Windows developer verification: normative identity, Cargo metadata, formatting, and workspace check | Source/build candidate only |
+| `verify.sh` | Unix-compatible counterpart for the current bounded source checks | Source/build candidate only |
+| `verify-normative.ps1` | Recompute canonical Architecture/Implementation digests and pair key; reject predecessor copies | Normative artifact identity only |
+| `verify-normative.sh` | Unix-compatible normative-pair verifier | Normative artifact identity only |
+| `verify-lint-policy.ps1` | Verify the current Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
+
+Normal iteration uses `just quick` or `scripts/verify.ps1`. The manual Source
+Candidate Gate in `.github/workflows/candidate-release.yml` owns the expensive
+workspace check/Clippy/test/build breadth. Neither path proves an installed or
+healthy runtime.
+
+## Release and installation
+
+| Script | Purpose | Boundary |
+|---|---|---|
+| `build-eliot-windows-x64-release.ps1` | Build the declared Windows x64 release inputs and unsigned bundle | Build/staging only; no signing, installation, or live support |
+| `finalize-eliot-windows-x64-release.ps1` | Sign/finalize and independently read back the declared release artifacts | Release-artifact evidence only; no installed-state claim |
+| `invoke-eliot-windows-x64-production.ps1` | Execute the supported manifest-bound production invocation/installation flow | Uses the current release and installation contracts; live acceptance remains issue #11 |
+
+Read `docs/release/WINDOWS_X64_RELEASE.md` before using these scripts. The
+canonical user/operator command surface is `eliot.exe`; scripts do not create a
+parallel CLI or permit direct storage/process authority.
+
+## Integration packaging and probes
+
+| Script | Purpose | Boundary |
+|---|---|---|
+| `build-claude-desktop-extension.ps1` | Build the current Claude Desktop extension package from repository sources | Package construction only |
+| `test-claude-connector.ps1` | Run the bounded current Claude connector probe/fixture path | Integration evidence for its exact fingerprint only |
+| `eliot-mcp-reference-client.ps1` | Reference MCP client for protocol/bridge diagnostics | Diagnostic/client evidence; no canonical authority |
+
+Current integration semantics live in `docs/integrations/`. Provider versions,
+accounts, routes, and host behavior are requalified per issue; an old successful
+probe is not current support.
+
+## Isolated test execution
+
+| Script | Purpose | Boundary |
+|---|---|---|
+| `run-isolated-tests.ps1` | Provision an owned Windows/Surreal test namespace, run one selected package/test profile, and preserve bounded evidence/cleanup disposition | Exact selected Module/Edge evidence only |
+
+This script is not a generic production runner and cannot turn a fake or
+in-memory test into real store/runtime proof. Invoke it from an owning issue with
+an exact test selector and current Surreal artifact identity.
+
+## Admission rule for a new script
+
+A new script requires:
+
+- one current owning issue and consumer;
+- a stable source contract or command it wraps;
+- exact inputs, identity, side effects, and cleanup boundary;
+- a declared proof ceiling and failure behavior;
+- no hidden credentials, broad filesystem mutation, or alternative authority
+  path;
+- a documentation entry here and a removal condition.
+
+Campaign names, milestone numbers, `final`/`certified` labels, dated audit
+wrappers, and convenience aliases around legacy binaries are rejected. Current
+findings belong in the issue/PR or CI artifacts, not in a new report-generating
+script.

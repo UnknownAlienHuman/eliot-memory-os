@@ -91,6 +91,7 @@ jobs:
               'crates/smart/cognitive-edge-map.toml',
               'crates/smart/cognitive-donor-map.toml',
               'crates/smart/cognitive-crate-decisions.toml',
+              'scripts/README.md',
           ]
           for item in required:
               assert pathlib.Path(item).is_file(), item
@@ -134,6 +135,8 @@ jobs:
             'scripts/run-cognitive-field-certification.ps1'
             'scripts/run-runtime017-primary.ps1'
             'scripts/run-ul-cross-agent-certification.ps1'
+            'scripts/test-m5-isolated-operations.ps1'
+            'scripts/plan-eliot-production-cutover.ps1'
           )
 
           for path in "${forbidden[@]}"; do
@@ -161,6 +164,7 @@ jobs:
             docs/architecture/README.md
             docs/architecture/INDEX.md
             docs/operations/README.md
+            scripts/README.md
             workstreams/README.md
             workstreams/ACTIVE.toml
             workstreams/core-daemons/AGENTS.md

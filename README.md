@@ -12,14 +12,15 @@ Implementation pair for ELIOT core.
 - **Current source and documentation:** `main` only.
 - **Agent rules:** [`AGENTS.md`](AGENTS.md).
 - **Branch/worktree workflow:** [`WORKFLOW.md`](WORKFLOW.md).
-- **Active workstreams and exceptional branches:**
-  [`workstreams/ACTIVE.toml`](workstreams/ACTIVE.toml).
+- **Active programmes:** [`workstreams/ACTIVE.toml`](workstreams/ACTIVE.toml).
 - **Current product/source map:** [`docs/PROJECT_MAP.md`](docs/PROJECT_MAP.md).
+- **Supported repository scripts:** [`scripts/README.md`](scripts/README.md).
 
 Do not continue work from a branch found in local history, agent memory, or an
 old conversation. Fetch/prune, fast-forward `main`, and create a fresh
-issue-numbered branch unless the active-workstream registry explicitly permits
-mutation of an existing branch.
+issue-numbered branch. A nonstandard branch is mutable only when
+`workstreams/ACTIVE.toml` contains an explicit temporary exception; there are no
+active exceptions currently.
 
 ## Canonical documentation
 
@@ -33,9 +34,9 @@ accepted normative pair:
 
 Exact digests and adoption identity are in
 [`docs/normative-pair.toml`](docs/normative-pair.toml). Use the
-[documentation index](docs/architecture/README.md) to load only the relevant
-sections. Documentation describes intent and target contracts; it does not prove
-that a capability is built, installed, running, or accepted.
+[documentation index](docs/README.md) to load only the relevant sections.
+Documentation describes intent and target contracts; it does not prove that a
+capability is built, installed, running, or accepted.
 
 Historical audits, recovery programmes, donor research, progress diaries, and
 generated/local agent state are intentionally absent from the active checkout.
