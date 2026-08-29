@@ -53,6 +53,24 @@ impl KernelComposition {
             .is_ok_and(|state| daemon_status_proves_ready(&state.status))
     }
 
+    fn daemon_failure_error(&self, reason: String) -> KernelBuildError {
+        let mut terminal = reason;
+        if let Err(error) = self.mark_daemon_failed(terminal.clone()) {
+            terminal.push_str("; failed to record and fence eliotd failure: ");
+            terminal.push_str(&error.to_string());
+        }
+        KernelBuildError::Service(terminal)
+    }
+
+    #[cfg(windows)]
+    fn revoke_daemon_agent_bridge_profile(&self) -> Result<(), KernelServiceError> {
+        self.promote_agent_bridge_profile(None).map_err(|error| {
+            KernelServiceError::Platform(format!(
+                "eliotd agent-bridge profile revocation failed: {error}"
+            ))
+        })
+    }
+
     #[cfg(windows)]
     pub(crate) async fn await_daemon_ready(
         &self,
@@ -97,8 +115,7 @@ impl KernelComposition {
                     "eliotd did not complete authenticated Governor recovery and report_ready within {} ms",
                     timeout.as_millis()
                 );
-                let _ = self.mark_daemon_failed(reason.clone());
-                return Err(KernelBuildError::Service(reason));
+                return Err(self.daemon_failure_error(reason));
             }
         }
     }
@@ -284,22 +301,18 @@ impl KernelComposition {
         let attempt = self.daemon_recovery_attempts.fetch_add(1, Ordering::AcqRel);
         if attempt >= ELIOTD_MAX_RECOVERY_ATTEMPTS {
             let reason = "eliotd bounded recovery budget is exhausted".to_owned();
-            let _ = self.mark_daemon_failed(reason.clone());
-            return Err(KernelBuildError::Service(reason));
+            return Err(self.daemon_failure_error(reason));
         }
         if let Some(receipt) = previous_receipt.as_ref() {
             if let Err(error) = self.close_previous_daemon_process(&launch, receipt).await {
-                let reason = error.to_string();
-                let _ = self.mark_daemon_failed(reason.clone());
-                return Err(KernelBuildError::Service(reason));
+                return Err(self.daemon_failure_error(error.to_string()));
             }
         } else if !matches!(
             status,
             DaemonRuntimeStatus::NotLaunched | DaemonRuntimeStatus::Failed(_)
         ) {
             let reason = "eliotd recovery has no exact prior process disposition".to_owned();
-            let _ = self.mark_daemon_failed(reason.clone());
-            return Err(KernelBuildError::Service(reason));
+            return Err(self.daemon_failure_error(reason));
         }
         let next_launch = fresh_eliotd_launch_descriptor(&launch, attempt + 1)?;
         {
@@ -338,20 +351,10 @@ impl KernelComposition {
         self.daemon_status_changed.notify_one();
         let launched = match self.launch_eliotd().await {
             Ok(receipt) => receipt,
-            Err(error) => {
-                let reason = error.to_string();
-                let _ = self.mark_daemon_failed(reason.clone());
-                return Err(KernelBuildError::Service(reason));
-            }
+            Err(error) => return Err(self.daemon_failure_error(error.to_string())),
         };
-        if let Err(error) = self
-            .await_daemon_ready(&launched, self.ipc_limits().operation_timeout)
-            .await
-        {
-            let reason = error.to_string();
-            let _ = self.mark_daemon_failed(reason.clone());
-            return Err(KernelBuildError::Service(reason));
-        }
+        self.await_daemon_ready(&launched, self.ipc_limits().operation_timeout)
+            .await?;
         Ok(launched)
     }
 
@@ -431,6 +434,16 @@ impl KernelComposition {
 
     /// Records a bounded authenticated daemon degradation.
     pub fn mark_daemon_degraded(&self, reason: String) -> Result<(), KernelServiceError> {
+        {
+            let state = self.daemon_runtime.lock().map_err(|_| {
+                KernelServiceError::Platform("daemon runtime lock poisoned".to_owned())
+            })?;
+            if state.receipt.is_none() {
+                return Err(KernelServiceError::ReadinessNotProven);
+            }
+        }
+        #[cfg(windows)]
+        self.revoke_daemon_agent_bridge_profile()?;
         let mut state = self
             .daemon_runtime
             .lock()
@@ -440,10 +453,6 @@ impl KernelComposition {
         }
         state.status = DaemonRuntimeStatus::Degraded(reason);
         drop(state);
-        #[cfg(windows)]
-        let _ = self.promote_agent_bridge_profile(None);
-        #[cfg(windows)]
-        self.note_agent_bridge_peer_set_change();
         self.daemon_status_changed.notify_one();
         Ok(())
     }
@@ -461,6 +470,8 @@ impl KernelComposition {
         reason: &str,
         recovery_fenced: bool,
     ) -> Result<(), KernelServiceError> {
+        #[cfg(windows)]
+        self.revoke_daemon_agent_bridge_profile()?;
         let mut state = self
             .daemon_runtime
             .lock()
@@ -473,10 +484,6 @@ impl KernelComposition {
             state.live_ready = None;
         }
         drop(state);
-        #[cfg(windows)]
-        let _ = self.promote_agent_bridge_profile(None);
-        #[cfg(windows)]
-        self.note_agent_bridge_peer_set_change();
         self.daemon_status_changed.notify_one();
         let mut service = self
             .service
