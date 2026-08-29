@@ -1,0 +1,44 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.clarification"
+agent_order = 27
+physical_package = "eliot-dreamer-orientation"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Produce a bounded clarification candidate only when a named ambiguity changes admissible action, verification or scope."
+
+[agent]
+objective = "Implement clarification-candidate construction only; interaction remains externally owned."
+write_scope = ["crates/smart/eliot-dreamer-orientation/src/clarification.rs", "crates/smart/eliot-dreamer-orientation/tests/clarification.rs"]
+integration_owner = "Dreamer Orientation integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-orientation/src/lib.rs", "crates/smart/eliot-dreamer-orientation/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_clarification_candidate(request: &ClarificationRequest, position: &CurrentEpistemicPosition, draft: &AdmittedDreamDraft) -> Result<ClarificationCandidate, ClarificationError>"]
+owned_types = ["ClarificationRequest", "ClarificationCandidate", "ClarificationQuestion", "ClarificationImpact", "ClarificationError"]
+
+[algorithm]
+steps = [
+  "Validate job, position and fence identity.",
+  "Map each proposed question to a specific unknown, conflict or missing authority input.",
+  "Reject questions whose answers cannot change an admissible decision, verifier or scope.",
+  "Rank by decision impact, urgency, user burden and availability without scalar collapse.",
+  "Retain a bounded non-redundant set with expected answer schema and reopen condition."
+]
+
+[limits]
+rules = ["Use explicit question and byte maxima.", "Perform no user interaction, tool call or provider call."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "NoDecisionRelevantAmbiguity", "RedundantQuestion", "InvalidAnswerSchema", "TooManyQuestions"]
+
+[forbidden]
+operations = ["user interaction", "tool execution", "scope or authority widening", "cosmetic question generation", "generic fallback"]
+
+[tests]
+required = ["cosmetic uncertainty does not open clarification", "two questions for the same missing fact deduplicate", "every question names the decision delta it can change", "question generation cannot widen authority or scope"]
+
+[integration]
+provider = "smart.epistemic.position and smart.dreamer.draft_admission"
+consumer = "external user/agent interaction owner"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if the ambiguity cannot be tied to an explicit decision, verifier, scope or authority dependency."
