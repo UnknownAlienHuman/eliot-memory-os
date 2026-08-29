@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.learning.adherence_assessment"
+agent_order = 47
+physical_package = "eliot-learning"
+execution_class = "POST_ATTEMPT_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Assess whether activated overlay instructions actually influenced the attempted decisions or actions."
+
+[agent]
+objective = "Implement instruction-to-trace adherence assessment only."
+write_scope = ["crates/smart/eliot-learning/src/adherence_assessment.rs", "crates/smart/eliot-learning/tests/adherence_assessment.rs"]
+integration_owner = "learning integration owner"
+forbidden_files = ["crates/smart/eliot-learning/src/lib.rs", "crates/smart/eliot-learning/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn assess_harness_adherence(request: &AdherenceAssessmentRequest, activation: &HarnessActivationAssessment, trace: &AttemptTraceProjection) -> Result<HarnessAdherenceAssessment, AdherenceAssessmentError>"]
+
+[algorithm]
+steps = [
+  "Validate attempt, activation and trace identities.",
+  "Map each overlay instruction to an observable decision or action point.",
+  "Classify followed, contradicted, not reached, unobservable and not applicable separately.",
+  "Do not infer benefit from adherence.",
+  "Retain deviations and competing instructions."
+]
+
+[limits]
+rules = ["Use explicit instruction and decision-point maxima.", "Perform no outcome interpretation or external read."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "ActivationNotEstablished", "TraceMismatch", "MissingDecisionPoint"]
+
+[forbidden]
+operations = ["benefit inference", "outcome attribution", "trace mutation", "instruction rewriting", "model call"]
+
+[tests]
+required = ["activation without use is non-adherence or unobservable", "adherence does not imply benefit", "instruction not reached is distinct from contradicted", "competing instruction remains visible"]
+
+[integration]
+provider = "smart.learning.activation_assessment and attempt trace owner"
+consumer = "smart.learning.closure"
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if instructions cannot be mapped to explicit observable decision points."
