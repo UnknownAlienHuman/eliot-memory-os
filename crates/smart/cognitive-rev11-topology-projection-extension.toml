@@ -1,0 +1,62 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "TARGET_TOPOLOGY_EXTENSION_NOT_WORKSPACE_ADMITTED"
+base_topology = "crates/smart/cognitive-rev11-topology.toml"
+additional_physical_crates = 3
+additional_functional_cells = 6
+combined_physical_crates = 28
+combined_functional_cells = 73
+
+[[crate]]
+path = "crates/smart/eliot-memory-projection-contracts"
+package = "eliot-memory-projection-contracts"
+action = "create_prototype_contract_crate"
+owner = "Canonical Memory Projection Contract Owner"
+cells = ["smart.memory.projection.contracts"]
+seam = "Owner-neutral boundary between Governor canonical reads and Smart deterministic selection; external read adapters must not depend on a Smart implementation crate."
+
+[[crate]]
+path = "crates/smart/eliot-memory-projection"
+package = "eliot-memory-projection"
+action = "create_prototype_crate"
+owner = "Memory Selection and Context Projection Owner"
+cells = ["smart.memory.candidate_query", "smart.memory.context_projection"]
+seam = "One hot pure dependency island over already materialized canonical snapshots and cue activation; owns neither storage read nor Context admission."
+
+[[crate]]
+path = "crates/smart/eliot-experience-projection"
+package = "eliot-experience-projection"
+action = "create_prototype_crate"
+owner = "System Experience Projection Owner"
+cells = ["smart.experience.projection"]
+seam = "Cold immutable causal-attribution projection over task/attempt/evaluator/effect contracts; replaces eliot-system-experience as a mutable state owner."
+
+[[existing_crate_extension]]
+path = "crates/smart/eliot-learning-contracts"
+package = "eliot-learning-contracts"
+added_cells = ["smart.learning.contracts.experience"]
+source_scope = ["src/experience.rs", "tests/experience.rs"]
+reason = "Experience-read and outcome-attribution contracts are shared directly by learning and diagnosis and belong with the existing provider-neutral learning contract family."
+
+[[existing_crate_extension]]
+path = "crates/smart/eliot-dreamer-self-query"
+package = "eliot-dreamer-self-query"
+added_cells = ["smart.self_model.context_projection"]
+source_scope = ["src/context_projection.rs", "tests/context_projection.rs"]
+reason = "Self-model Context projection consumes the exact Architecture/Implementation briefs owned by this package and adds no new dependency or lifecycle seam."
+
+[replacement_effect]
+retired_state_owner = "crates/smart/eliot-memory"
+replacement_contract = "eliot-memory-projection-contracts"
+replacement_implementation = "eliot-memory-projection"
+canonical_owner = "Governor canonical state plus store-neutral storage"
+
+[[replacement_effect]]
+retired_state_owner = "crates/smart/eliot-system-experience"
+replacement_contract = "eliot-learning-contracts::experience"
+replacement_implementation = "eliot-experience-projection"
+canonical_owner = "Task/attempt/evaluator/effect evidence owners plus Governor canonical state"
+
+[workspace_admission]
+current = "BLOCKED"
+required = ["all six cells implemented", "three package proofs", "projection Edge Proofs", "D3B canonical projection pulse", "D4 experience projection pulse"]
