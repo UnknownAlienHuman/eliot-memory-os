@@ -30,8 +30,6 @@ pub use authority_state::{WatchdogAuthorityState, WatchdogReadiness};
 pub struct WatchdogComposition {
     runtime: Runtime,
     admission: Arc<dyn WatchdogAdmissionSource>,
-    kernel_epoch: u64,
-    watchdog_epoch: u64,
     authority_state: WatchdogAuthorityStateCell,
     config: WatchdogConfig,
     task: eliot_runtime::SupervisedHandle,
@@ -59,8 +57,8 @@ impl WatchdogComposition {
     /// # Errors
     ///
     /// Returns an error if runtime configuration is invalid or if the runtime
-    /// denies task admission. An unavailable initial lease is represented by
-    /// zero readiness epochs and remains a nonfatal observation gap.
+    /// denies task admission. An unavailable initial lease remains a nonfatal
+    /// observation gap and publishes no current coverage epochs.
     pub fn start_with_shutdown(
         config: WatchdogConfig,
         admission: Arc<dyn WatchdogAdmissionSource>,
@@ -93,8 +91,8 @@ impl WatchdogComposition {
     /// # Errors
     ///
     /// Returns an error if runtime configuration is invalid or if the runtime
-    /// denies task admission. An unavailable initial lease is represented by
-    /// zero readiness epochs and remains a nonfatal observation gap.
+    /// denies task admission. An unavailable initial lease remains a nonfatal
+    /// observation gap and publishes no current coverage epochs.
     pub fn start_with_shutdown_and_host(
         config: WatchdogConfig,
         admission: Arc<dyn WatchdogAdmissionSource>,
@@ -104,13 +102,6 @@ impl WatchdogComposition {
     ) -> Result<Self, CompositionError> {
         config.validate()?;
         let runtime = config.runtime()?;
-        let initial = admission.reload().ok();
-        let kernel_epoch = initial
-            .as_ref()
-            .map_or(0, |value| value.lease().lease().kernel_epoch.value());
-        let watchdog_epoch = initial
-            .as_ref()
-            .map_or(0, |value| value.watchdog_epoch().value());
         let task_admission = admission.clone();
         let task_host = host;
         let authority_state = WatchdogAuthorityStateCell::new();
@@ -138,8 +129,7 @@ impl WatchdogComposition {
                         let admission = match admission.reload() {
                             Ok(admission) => admission,
                             Err(error) => {
-                                authority_state
-                                    .transition_to(WatchdogAuthorityState::RunningNoAuthority);
+                                authority_state.publish_no_authority();
                                 if let Some(reason) = host_gap {
                                     report_gap_nonfatal(kernel.as_ref(), reason).await;
                                 }
@@ -149,8 +139,7 @@ impl WatchdogComposition {
                             }
                         };
                         if let Some(reason) = host_gap {
-                            authority_state
-                                .transition_to(WatchdogAuthorityState::RunningNoAuthority);
+                            authority_state.publish_no_authority();
                             // Observation/spool failure is nonfatal. The
                             // Watchdog remains alive and will retry on the
                             // next bounded tick; no restart-budget path is
@@ -171,11 +160,12 @@ impl WatchdogComposition {
                             continue;
                         }
                         match kernel.supervise(admission.lease()).await {
-                            Ok(()) => authority_state
-                                .transition_to(WatchdogAuthorityState::AdmittedHeartbeat),
+                            Ok(()) => authority_state.publish_admitted(
+                                admission.lease().lease().kernel_epoch.value(),
+                                admission.watchdog_epoch().value(),
+                            ),
                             Err(error) => {
-                                authority_state
-                                    .transition_to(WatchdogAuthorityState::RunningNoAuthority);
+                                authority_state.publish_no_authority();
                                 report_gap_nonfatal(kernel.as_ref(), kernel_gap_reason(&error))
                                     .await;
                             }
@@ -192,8 +182,6 @@ impl WatchdogComposition {
         Ok(Self {
             runtime,
             admission,
-            kernel_epoch,
-            watchdog_epoch,
             authority_state,
             config,
             task,
@@ -203,14 +191,14 @@ impl WatchdogComposition {
 
     #[must_use]
     pub fn readiness(&self) -> WatchdogReadiness {
-        let authority_state = self.authority_state.load();
+        let snapshot = self.authority_state.load();
         WatchdogReadiness {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
-            authority_state,
-            coverage_claimed: authority_state.coverage_claimed(),
-            kernel_epoch: self.kernel_epoch,
-            watchdog_epoch: self.watchdog_epoch,
+            authority_state: snapshot.state,
+            coverage_claimed: snapshot.state.coverage_claimed(),
+            kernel_epoch: snapshot.kernel_epoch,
+            watchdog_epoch: snapshot.watchdog_epoch,
             tick_interval_ms: self.config.tick_interval.as_millis(),
         }
     }
