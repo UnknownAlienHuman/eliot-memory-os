@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.probe_plan"
+agent_order = 24
+physical_package = "eliot-dreamer-orientation"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Select a bounded Pareto set of safe discriminative probes without executing them."
+
+[agent]
+objective = "Implement effect-free bounded discriminative probe planning."
+write_scope = ["crates/smart/eliot-dreamer-orientation/src/probe_plan.rs", "crates/smart/eliot-dreamer-orientation/tests/probe_plan.rs"]
+integration_owner = "Dreamer Orientation integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-orientation/src/lib.rs", "crates/smart/eliot-dreamer-orientation/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_discriminative_probe_plan(request: &ProbePlanRequest, rivals: &RivalModelSet, position: &CurrentEpistemicPosition) -> Result<DiscriminativeProbePlan, ProbePlanError>"]
+
+[algorithm]
+steps = [
+  "Derive probes only from explicit unknowns or rival predictions.",
+  "Reject unavailable, unauthorized, irreversible or privacy-incompatible probes.",
+  "Evaluate discriminative power, risk, reversibility, cost and latency separately.",
+  "Retain a bounded Pareto frontier with stable tie-break.",
+  "Attach expected observation, verifier, stop and revision conditions."
+]
+
+[limits]
+rules = ["Use explicit generated-probe and Pareto-survivor maxima.", "Do not launch tools, agents, models or providers."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "NoUnknownTarget", "UnsafeProbe", "UnavailableCapability", "InvalidVerifier", "BudgetExceeded"]
+
+[forbidden]
+operations = ["tool execution", "agent launch", "provider call", "authority inference", "scalar utility collapse"]
+
+[tests]
+required = ["unsafe high-information probe is rejected", "dominated probe is removed", "no probe is fabricated when no discriminative unknown exists", "every probe has verifier and stop condition"]
+
+[integration]
+provider = "smart.dreamer.rival_model and smart.epistemic.position"
+consumer = "smart.dreamer.orientation and external Governor/agent planning owner"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if capability availability, authority, verifier or stop condition is not explicit."
