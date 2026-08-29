@@ -1,0 +1,42 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.learning.promotion_input"
+agent_order = 50
+physical_package = "eliot-learning"
+execution_class = "BACKGROUND_ADVISORY_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Assemble a dimensioned advisory promotion input without making the promotion decision."
+
+[agent]
+objective = "Implement advisory promotion-input assembly only."
+write_scope = ["crates/smart/eliot-learning/src/promotion_input.rs", "crates/smart/eliot-learning/tests/promotion_input.rs"]
+integration_owner = "learning integration owner"
+forbidden_files = ["crates/smart/eliot-learning/src/lib.rs", "crates/smart/eliot-learning/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_promotion_input(request: &PromotionInputRequest, closure: &CampaignLearningClosureCandidate, retention_transfer: &RetentionTransferAssessment, product_proof: &ProductPulseEvidence, rollback: &RollbackEvidence) -> Result<PromotionInputCandidate, PromotionInputError>"]
+
+[algorithm]
+steps = [
+  "Validate candidate, evidence, evaluator, Product Identity and fence.",
+  "Retain applicability, activation, adherence, decision delta, outcome, retention, transfer, evaluator validity, Product Pulse, rollback, economics and authority as independent dimensions.",
+  "Name missing approval and proof handles.",
+  "Return advisory input to the Governor/Human owner only."
+]
+
+[limits]
+rules = ["Process one reusable candidate per input.", "Use no scalar score and perform no promotion mutation."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "ClosureNotReusable", "ProductIdentityMismatch", "MissingRollback", "MissingDimension", "AuthorityPathUnknown"]
+
+[forbidden]
+operations = ["promotion decision", "Promoted status", "scalar promotion score", "authority inference", "failed-dimension suppression", "canonical write"]
+
+[tests]
+required = ["Product Pulse mismatch blocks complete input", "failed rollback dimension stays failed", "function never returns Promoted status", "economics cannot hide evaluator failure"]
+
+[integration]
+provider = "smart.learning.closure, smart.learning.retention_transfer and external Product Pulse/rollback owners"
+consumer = "Governor/Human promotion owner"
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if Product Identity, rollback, evaluator or authority-path evidence is unavailable."
