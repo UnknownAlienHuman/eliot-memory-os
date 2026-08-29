@@ -1,0 +1,8 @@
+schema_version = "eliot-cognitive-assignment-router-v11"
+status = "ACTIVE_WORKING_DRAFT"
+issue = "github:UnknownAlienHuman/eliot-memory-os#94"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+authority = "crates/smart/cognitive-assignment-index-v11.toml"
+validation = "crates/smart/cognitive-validation-index-v11.toml"
+rule = "This is the only cognitive swarm-assignment entrypoint. Historical module.toml/api.toml files and removed wave files are donor evidence only."
+workspace_admission = false
