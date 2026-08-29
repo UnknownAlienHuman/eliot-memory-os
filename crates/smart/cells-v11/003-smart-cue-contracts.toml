@@ -1,0 +1,44 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.cue.contracts"
+agent_order = 3
+physical_package = "eliot-cue-contracts"
+execution_class = "CONTRACT_ONLY"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Define stable cue, comparison-profile, binding, snapshot and activation contracts without owning projection state."
+
+[agent]
+objective = "Implement provider-neutral cue wire contracts and validation only."
+write_scope = ["crates/smart/eliot-cue-contracts/src/contracts.rs", "crates/smart/eliot-cue-contracts/tests/contracts.rs"]
+integration_owner = "cue contract integration owner"
+forbidden_files = ["crates/smart/eliot-cue-contracts/src/lib.rs", "crates/smart/eliot-cue-contracts/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn validate_cue_contract(value: &CueContractEnvelope) -> Result<(), CueContractError>"]
+owned_types = ["CueKind", "CueMatchMode", "CueComparisonProfileId", "CueComparisonProfile", "ObservedCue", "NormalizedCue", "CueBindingCandidate", "AdmittedCueBinding", "CueSnapshot", "DirectCueMatchSet", "SpreadActivationSet", "CueActivationResult", "CueActivationTrace"]
+
+[algorithm]
+steps = [
+  "Validate bounded identities, text, modes and comparison-profile compatibility.",
+  "Require canonical_value and comparison_key as separate fields.",
+  "Require every snapshot row to reference an admitted canonical handle.",
+  "Require compatible State Fence identity across every envelope.",
+  "Deny unknown wire fields and preserve deterministic enum spelling."
+]
+
+[limits]
+rules = ["Wire collection maxima are policy fields.", "Contracts perform no lookup, projection mutation or hidden I/O."]
+
+[errors]
+variants = ["InvalidText", "InvalidKindMode", "InvalidProfile", "MissingHandle", "FenceMismatch", "TooManyItems"]
+
+[forbidden]
+operations = ["projection ownership", "filesystem canonicalization", "model call", "canonical write", "ambient platform inference"]
+
+[tests]
+required = ["path spelling round-trips unchanged", "invalid prefix mode is rejected", "snapshot row without admitted handle is rejected", "mixed State Fence is rejected"]
+
+[integration]
+provider = "tool/event adapters and Governor cue admission owner"
+consumer = "eliot-cues cells"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if comparison-profile ownership or canonical handle contract is undefined."
