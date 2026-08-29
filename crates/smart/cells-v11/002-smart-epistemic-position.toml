@@ -1,0 +1,56 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.epistemic.position"
+agent_order = 2
+physical_package = "eliot-epistemic"
+execution_class = "DECISION_BOUNDARY_HOT"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Resolve one explicit question over one admitted fenced evidence set while preserving assumptions, rivals, conflicts and inquiry."
+
+[agent]
+objective = "Extend the existing stateless resolver with explicit assumptions, structured conflicts, evidence dependence and InvestigationRequirements."
+write_scope = ["crates/smart/eliot-epistemic/src/position.rs", "crates/smart/eliot-epistemic/tests/position.rs"]
+integration_owner = "epistemic integration owner"
+forbidden_files = ["crates/smart/eliot-epistemic/src/lib.rs", "crates/smart/eliot-epistemic/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = [
+  "pub fn resolve_current_epistemic_position(request: &PositionRequest, records: &[EpistemicRecordProjection]) -> Result<CurrentEpistemicPosition, EpistemicResolutionError>",
+  "pub fn current_position_digest(position: &CurrentEpistemicPosition) -> Result<String, EpistemicResolutionError>"
+]
+owned_types = ["PositionRequest", "EpistemicRecordProjection", "ExplicitAssumption", "ConflictSet", "ConflictParticipant", "EvidenceDependence", "InvestigationRequirement", "CurrentEpistemicPosition"]
+
+[algorithm]
+steps = [
+  "Validate question, scope, State Fence and unique handles.",
+  "Partition observed, supported, assumed, contested, stale, superseded, rejected and unknown without scalar collapse.",
+  "Admit Assumed only from an explicit assumption input.",
+  "Group conflicts by proposition and shared lineage.",
+  "Separate independent support from dependent repetition.",
+  "Derive minimum discriminative investigations without executing them.",
+  "Retain exact provenance closure and revision conditions.",
+  "Canonicalize and digest the stable output."
+]
+
+[limits]
+rules = ["Use explicit maxima for records, conflict participants and investigations.", "Use O(n log n) stable grouping with no graph traversal or hidden read."]
+
+[errors]
+variants = ["EmptyInput", "InvalidFence", "FenceMismatch", "ScopeMismatch", "DuplicateHandle", "InvalidAssumption", "InvalidConflict", "InvalidInquiry"]
+
+[forbidden]
+operations = ["storage or filesystem scan", "model call", "truth or support promotion", "vote-count epistemology", "wall-clock order as causal order", "blocking I/O", "lock acquisition"]
+
+[tests]
+required = [
+  "fresh outlier remains visible beside majority evidence",
+  "shared-source repetitions are not independent support",
+  "implicit assumption is rejected",
+  "stale verified evidence cannot remain current verified",
+  "record order does not change digest"
+]
+
+[integration]
+provider = "Governor canonical read projection owner"
+consumer = "Governor Dream job and Context owners"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if an input owner cannot provide exact fence, scope or provenance dependencies."
