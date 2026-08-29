@@ -1,0 +1,45 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.work_decomposition"
+agent_order = 55
+physical_package = "eliot-dreamer-planning"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Decompose work by causal property, owner, discriminator, proof ceiling and replacement boundary rather than LOC or file count."
+
+[agent]
+objective = "Implement causal work decomposition only; do not create tasks or execution state."
+write_scope = ["crates/smart/eliot-dreamer-planning/src/work_decomposition.rs", "crates/smart/eliot-dreamer-planning/tests/work_decomposition.rs"]
+integration_owner = "Dreamer planning integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-planning/src/lib.rs", "crates/smart/eliot-dreamer-planning/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_work_decomposition_candidate(request: &WorkDecompositionRequest, objective: &ProductObjectiveProjection, evidence: &CurrentSystemEvidenceSnapshot, draft: &AdmittedDreamDraft) -> Result<WorkDecompositionCandidate, WorkDecompositionError>"]
+
+[algorithm]
+steps = [
+  "Validate objective, acceptance, Product Identity, evidence and fence.",
+  "Identify contract or evidence unit first.",
+  "Create independent module cells with one causal property and one primary owner.",
+  "Add explicit edge-integration cells and a final Product Pulse.",
+  "Use size only as an empirical review trigger.",
+  "Reject overlapping worker write scopes and hidden integration ownership."
+]
+
+[limits]
+rules = ["Use explicit work-unit and dependency maxima.", "Create no WorkItem, task, job or agent."
+]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "ObjectiveMissing", "OwnerAmbiguity", "OverlappingScope", "MissingDiscriminator", "MissingProductPulse"]
+
+[forbidden]
+operations = ["crate-per-function rule", "LOC-only split", "WorkItem/task creation", "hidden integration owner", "overlapping worker scope"]
+
+[tests]
+required = ["one function alone does not force a crate", "cross-owner defect includes an edge-integration unit", "overlapping scopes are rejected", "Product Pulse is mandatory"]
+
+[integration]
+provider = "Product Objective and CurrentSystemEvidenceSnapshot owners"
+consumer = "smart.dreamer.orchestration_plan and external Task Controller owner"
+product_pulse = "D5_DIAGNOSIS_PLANNING_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if objective, owner, discriminator, replacement boundary or Product Pulse cannot be made explicit."
