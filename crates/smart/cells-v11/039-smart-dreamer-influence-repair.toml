@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.influence_repair"
+agent_order = 39
+physical_package = "eliot-dreamer-influence"
+execution_class = "BACKGROUND_SECURITY_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Propose permitted-influence repair only over an exact external InfluenceDependencyClosure."
+
+[agent]
+objective = "Implement advisory influence-repair planning over a supplied exact security closure."
+write_scope = ["crates/smart/eliot-dreamer-influence/src/influence_repair.rs", "crates/smart/eliot-dreamer-influence/tests/influence_repair.rs"]
+integration_owner = "influence repair integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-influence/src/lib.rs", "crates/smart/eliot-dreamer-influence/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_influence_repair_candidate(request: &InfluenceRepairRequest, closure: &InfluenceDependencyClosure) -> Result<InfluenceRepairCandidate, InfluenceRepairError>"]
+
+[algorithm]
+steps = [
+  "Validate closure digest, target identity, fence and security-owner provenance.",
+  "Enumerate every dependent projection, decision, cache and derived artifact in the supplied closure.",
+  "Propose revoke, quarantine, rebuild or revalidate intents without executing them.",
+  "Require closure coverage, rollback and post-repair verifier.",
+  "Reject similarity-derived or inferred dependency lists."
+]
+
+[limits]
+rules = ["Use explicit closure-node and edge maxima.", "Perform no storage traversal or security-state mutation."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "ClosureDigestMismatch", "IncompleteClosure", "InferredDependency", "MissingVerifier", "RollbackMissing"]
+
+[forbidden]
+operations = ["dependency discovery by similarity", "security-state mutation", "influence revocation execution", "storage traversal", "canonical write"]
+
+[tests]
+required = ["similarity cannot revoke influence", "incomplete closure returns Inconclusive", "every dependent projection receives a disposition", "no mutation is executed"]
+
+[integration]
+provider = "external security InfluenceDependencyClosure owner"
+consumer = "smart.dreamer.curation_dispatch and Governor/security review owner"
+product_pulse = "D3C_CURATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if exact closure, security provenance, rollback or post-repair verifier is missing."
