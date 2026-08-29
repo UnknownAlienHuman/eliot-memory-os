@@ -1,0 +1,24 @@
+[package]
+name = "eliot-learning"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Pure task-local adaptation, overlay validation, activation/adherence assessment, closure, retention/transfer and advisory promotion input"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "NOT_IMPLEMENTED"
+workspace_admission = "pending_cell_implementation_edge_proof_and_product_pulse"
+functional_cells = ["smart.learning.state_view", "smart.learning.attempt_delta", "smart.learning.overlay_candidate", "smart.learning.overlay_validation", "smart.learning.activation_assessment", "smart.learning.adherence_assessment", "smart.learning.closure", "smart.learning.retention_transfer", "smart.learning.promotion_input"]
+runtime_authority = "NONE"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-evaluation-contracts = { path = "../../foundation/eliot-evaluation-contracts" }
+eliot-learning-contracts = { path = "../eliot-learning-contracts" }
