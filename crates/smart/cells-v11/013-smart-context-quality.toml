@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.context.quality"
+agent_order = 13
+physical_package = "eliot-context"
+execution_class = "DECISION_BOUNDARY_HOT"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Independently assess the exact admitted packet without changing membership or collapsing dimensions."
+
+[agent]
+objective = "Implement a dimensioned Context quality oracle that cannot repair or mutate admission."
+write_scope = ["crates/smart/eliot-context/src/quality.rs", "crates/smart/eliot-context/tests/quality.rs"]
+integration_owner = "Context Compiler integration owner"
+forbidden_files = ["crates/smart/eliot-context/src/lib.rs", "crates/smart/eliot-context/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn assess_context_quality(request: &ContextQualityRequest, admitted: &AdmittedContextSet) -> Result<PacketQualityVector, ContextQualityError>"]
+
+[algorithm]
+steps = [
+  "Validate identity and frozen membership digest.",
+  "Evaluate goal, epistemic, provenance, fence, uncertainty, Safety Floor, decision readiness, whole-unit integrity, provider coverage, headroom and reversible omission separately.",
+  "Return Pass, Fail, Inconclusive or NotApplicable per dimension.",
+  "Use actual tokenizer evidence when supplied; otherwise mark token fit Inconclusive.",
+  "Retain exact failing handles and reason codes."
+]
+
+[limits]
+rules = ["Operate linearly over admitted atoms and omissions.", "Use no aggregate scalar score."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "MembershipChanged", "InvalidMeasurement", "MissingDenominator"]
+
+[forbidden]
+operations = ["membership change", "self-healing admission", "scalar quality collapse", "fake tokenizer pass", "storage call", "model call", "blocking I/O"]
+
+[tests]
+required = ["failed safety dimension cannot be hidden", "missing tokenizer is Inconclusive", "membership digest mismatch is rejected", "quality call leaves admitted bytes unchanged"]
+
+[integration]
+provider = "smart.context.admission"
+consumer = "Governor/agent decision-boundary policy owner"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if a quality dimension lacks an external denominator or measurement contract."
