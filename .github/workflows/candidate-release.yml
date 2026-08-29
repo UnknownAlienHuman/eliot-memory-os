@@ -1,12 +1,10 @@
-name: Source Candidate Gate
+name: Manual Source Candidate Gate
 
 on:
-  pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
       require_live_windows_scenarios:
-        description: Require the live Windows scenario harness (not integrated yet)
+        description: Require the live Windows scenario harness
         required: false
         default: false
         type: boolean
@@ -15,8 +13,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,9 +29,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
-      - name: Verify normative projection
+      - name: Verify normative identity
         shell: pwsh
         run: pwsh -NoProfile -File scripts/verify-normative.ps1
 
@@ -49,15 +47,14 @@ jobs:
       - name: Configure Cargo environment
         shell: pwsh
         run: |
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$env:RUNNER_TEMP\eliot-candidate-release-target"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$env:RUNNER_TEMP\eliot-source-candidate-target"
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_INCREMENTAL=0"
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_BUILD_JOBS=4"
 
-      # rust-toolchain.toml pins stable Rust and the MSVC target.
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
 
-      - name: Cache cargo
+      - name: Cache Cargo inputs
         uses: actions/cache@v4
         with:
           path: |
@@ -71,22 +68,20 @@ jobs:
       - name: Workspace all-target check
         run: cargo check --workspace --all-targets --locked
 
-      - name: Workspace all-target clippy
+      - name: Workspace all-target Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Workspace tests and execution safeguard
+      - name: Workspace tests with nonzero execution safeguard
         shell: pwsh
         run: |
           $testListOutput = @(& cargo test --workspace --all-targets --locked -- --list 2>&1)
-          $testListExit = $LASTEXITCODE
-          if ($testListExit -ne 0) {
-            throw "TEST_LIST_FAILURE: cargo test --workspace --all-targets --locked -- --list exited $testListExit"
+          if ($LASTEXITCODE -ne 0) {
+            throw "TEST_LIST_FAILURE: cargo test -- --list exited $LASTEXITCODE"
           }
 
           $testOutput = @(& cargo test --workspace --all-targets --locked 2>&1)
-          $testExit = $LASTEXITCODE
-          if ($testExit -ne 0) {
-            throw "TEST_EXECUTION_FAILURE: cargo test --workspace --all-targets --locked exited $testExit"
+          if ($LASTEXITCODE -ne 0) {
+            throw "TEST_EXECUTION_FAILURE: cargo test exited $LASTEXITCODE"
           }
 
           $listedTests = @(
@@ -103,11 +98,8 @@ jobs:
           }
 
           Write-Host "TEST_EVIDENCE: listed=$listedTests executed=$executedTests"
-          if ($listedTests -eq 0) {
-            throw "TEST_CONTRACT_FAILURE: cargo test listed zero test cases"
-          }
-          if ($executedTests -eq 0) {
-            throw "TEST_CONTRACT_FAILURE: cargo test executed zero test cases"
+          if ($listedTests -eq 0 -or $executedTests -eq 0) {
+            throw "TEST_CONTRACT_FAILURE: expected nonzero listed and executed tests"
           }
 
       - name: Workspace all-target build
@@ -116,16 +108,15 @@ jobs:
       - name: Eliot.Operator Release build
         run: dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release
 
-      - name: Source candidate status
+      - name: Record source-candidate ceiling
         shell: pwsh
         run: |
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value 'SOURCE_CANDIDATE_ONLY'
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value 'live-harness-deferred'
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value 'No installed-runtime/store/Product-Pulse claim.'
 
       - name: Live Windows scenario contract challenge
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.require_live_windows_scenarios }}
+        if: ${{ inputs.require_live_windows_scenarios }}
         shell: pwsh
         run: |
-          $failureType = 'CONTRACT_CHALLENGE'
-          Write-Error ("{0}: live Windows scenario harness is not integrated; no scenario success is claimed." -f $failureType)
+          Write-Error 'CONTRACT_CHALLENGE: the live Windows scenario harness is not integrated; no scenario success is claimed.'
           exit 1
