@@ -1,0 +1,40 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "MIGRATION_EXTENSION_NOT_EXECUTED"
+base_migration = "crates/smart/cognitive-rev11-migration.toml"
+
+[[migration]]
+legacy_path = "crates/smart/eliot-memory"
+legacy_disposition = "RETIRE_AS_CANONICAL_STATE_OWNER_AFTER_EDGE_MIGRATION"
+confirmed_problem = "Owns Arc<Mutex<State>>, records, history, status, lifecycle, retrieval delivery and influence flags inside Smart, duplicating Governor canonical ownership."
+keep_as_donor = ["exact-first retrieval discriminators", "negative-memory tests", "append-only intent", "bounded result limits"]
+do_not_copy = ["mutable State", "MemoryRecord schema", "status owner", "lifecycle owner", "session delivery map", "allow_influence mutation", "canonical revision counter"]
+contract_replacement = "crates/smart/eliot-memory-projection-contracts"
+implementation_replacement = "crates/smart/eliot-memory-projection"
+canonical_owner = "Governor canonical state plus store-neutral storage"
+cutover_edges = ["E28_GOVERNOR_READ_TO_MEMORY_SNAPSHOT", "E29_CUE_TO_MEMORY_QUERY", "E30_MEMORY_QUERY_TO_CONTEXT_PROJECTION", "E31_MEMORY_PROJECTION_TO_CONTEXT_MERGE"]
+retirement_gate = "All current consumers use Governor reads plus immutable projection and D3B canonical projection pulse passes."
+
+[[migration]]
+legacy_path = "crates/smart/eliot-system-experience"
+legacy_disposition = "RETIRE_AS_STATE_OWNER_AFTER_EDGE_MIGRATION"
+confirmed_problem = "Maintains a second semantic experience owner rather than projecting exact task, attempt, evaluator and effect evidence."
+keep_as_donor = ["bounded experience query ideas", "attempt/outcome linking discriminators", "contrary-outcome tests"]
+do_not_copy = ["mutable experience store", "local attempt lifecycle", "self-authored system truth", "outcome promotion", "duplicate receipt state"]
+contract_replacement = "eliot-learning-contracts::experience"
+implementation_replacement = "crates/smart/eliot-experience-projection"
+canonical_owners = ["Task Controller", "AgentAttempt owner", "Evaluator", "effect/receipt owner", "Governor canonical state"]
+cutover_edges = ["E32_CANONICAL_EXPERIENCE_TO_PROJECTION", "E33_EXPERIENCE_TO_LEARNING_AND_DIAGNOSIS"]
+retirement_gate = "Learning and diagnosis consume SystemExperienceProjection and D4 experience projection pulse passes."
+
+[[migration]]
+legacy_path = "crates/smart/eliot-understanding"
+legacy_disposition = "MERGE_RENDERING_INTO_CONTEXT_AND_SELF_MODEL_PROJECTIONS"
+keep_as_donor = ["role-preserving rendering", "omission manifest", "decision-tail formatting"]
+do_not_copy = ["second Context Compiler call", "project truth owner", "implicit Architecture support claims"]
+replacements = ["smart.context.assembly", "smart.context.decision_tail", "smart.self_model.context_projection"]
+retirement_gate = "Context and self-model projection edges pass and no direct consumer invokes the duplicate compiler."
+
+[temporary_compatibility]
+rule = "Legacy crates may remain in the root workspace during migration only as explicit compatibility facades. They must not receive new state, APIs or agent assignments."
+forbidden = ["new feature work in legacy state owner", "new consumer depending on legacy schema", "using legacy package green status as target acceptance"]
