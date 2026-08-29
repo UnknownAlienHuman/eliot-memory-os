@@ -1,0 +1,54 @@
+name: One-shot host event identity patch
+
+on:
+  push:
+    branches:
+      - fix/137-agent-route-bundles
+
+permissions:
+  contents: write
+
+concurrency:
+  group: one-shot-host-event-identity
+  cancel-in-progress: false
+
+jobs:
+  patch-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply exact source patch
+        run: python scripts/one-shot-preserve-host-event-identity.py
+
+      - name: Format Rust
+        run: cargo fmt --all
+
+      - name: Verify focused host event behavior
+        run: cargo test --locked -p eliot-engine host_event_tests -- --nocapture
+
+      - name: Verify affected contracts compile
+        run: cargo check --locked -p eliot-types -p eliot-engine
+
+      - name: Verify route bundle contracts
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --no-input -r scripts/requirements-verification.txt
+          python scripts/verify-agent-route-bundles.py --self-test
+          python scripts/verify-agent-route-bundles.py
+
+      - name: Commit verified source changes
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/eliot-types/src/host.rs crates/eliot-engine/src/host.rs
+          if (git diff --cached --quiet) {
+            throw "One-shot patch produced no source changes"
+          }
+          git commit -m "fix(opencode): preserve source host-event identity (#137)"
+          git push origin "HEAD:$env:GITHUB_REF_NAME"
