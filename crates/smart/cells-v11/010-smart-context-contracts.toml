@@ -1,0 +1,45 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.context.contracts"
+agent_order = 10
+physical_package = "eliot-context-contracts"
+execution_class = "CONTRACT_ONLY"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Define whole-unit contribution, admission, view, omission and dimensioned-quality contracts."
+
+[agent]
+objective = "Implement stable owner-neutral Context Compiler contracts only."
+write_scope = ["crates/smart/eliot-context-contracts/src/contracts.rs", "crates/smart/eliot-context-contracts/tests/contracts.rs"]
+integration_owner = "Context contract integration owner"
+forbidden_files = ["crates/smart/eliot-context-contracts/src/lib.rs", "crates/smart/eliot-context-contracts/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn validate_context_contract(value: &ContextContractEnvelope) -> Result<(), ContextContractError>"]
+owned_types = ["ContextProviderId", "ContextAtom", "ContextContribution", "ProviderCoverage", "DecisionSafetyFloor", "ContextBudget", "DecisionDeltaEstimate", "AdmissionDisposition", "AdmittedContextSet", "OmissionRecord", "ActiveUnderstandingView", "PacketQualityVector", "DecisionLocalTail", "PendingContextInjectionPlan"]
+
+[algorithm]
+steps = [
+  "Validate exact owner identity and common State Fence.",
+  "Require whole atoms with exact expansion handles.",
+  "Represent decision delta as Known or Unknown rather than implicit zero.",
+  "Require a ProviderCoverage denominator.",
+  "Require every omission to be typed and reversible.",
+  "Keep quality dimensions separate and deny unknown wire fields."
+]
+
+[limits]
+rules = ["Wire maxima are explicit validated policy fields.", "Contracts perform no retrieval, ranking, rendering or hidden I/O."]
+
+[errors]
+variants = ["InvalidText", "InvalidFence", "MissingLineage", "MissingExpansionHandle", "MissingProviderCoverage", "InvalidBudget", "DuplicateAtom"]
+
+[forbidden]
+operations = ["ranking", "retrieval", "scalar quality score", "canonical ownership", "provider callback"]
+
+[tests]
+required = ["Unknown decision delta survives roundtrip", "omission without expansion handle is rejected", "mixed fence is rejected", "missing provider denominator is rejected"]
+
+[integration]
+provider = "task, attention, epistemic, memory, authority and self-model projection owners"
+consumer = "eliot-context and eliot-context-view"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if provider denominator or whole-unit representation cannot be expressed without importing an implementation owner."
