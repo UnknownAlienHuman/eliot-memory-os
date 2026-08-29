@@ -1,0 +1,42 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.learning.activation_assessment"
+agent_order = 46
+physical_package = "eliot-learning"
+execution_class = "POST_DELIVERY_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Assess whether an externally delivered overlay was available and activated, without creating the activation receipt."
+
+[agent]
+objective = "Implement activation assessment over externally owned receipt and trace only."
+write_scope = ["crates/smart/eliot-learning/src/activation_assessment.rs", "crates/smart/eliot-learning/tests/activation_assessment.rs"]
+integration_owner = "learning integration owner"
+forbidden_files = ["crates/smart/eliot-learning/src/lib.rs", "crates/smart/eliot-learning/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn assess_harness_activation(request: &ActivationAssessmentRequest, receipt: &HarnessActivationReceipt, trace: &AttemptTraceProjection) -> Result<HarnessActivationAssessment, ActivationAssessmentError>"]
+
+[algorithm]
+steps = [
+  "Validate external receipt owner, overlay identity, attempt and State Fence.",
+  "Separate delivered, available, selected, activated and unknown states.",
+  "Bind every conclusion to exact trace or receipt handles.",
+  "Return Inconclusive when host integration cannot observe activation."
+]
+
+[limits]
+rules = ["Process one receipt and bounded trace projection.", "Perform no delivery or receipt mutation."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "ReceiptOwnerMismatch", "TraceMismatch", "UnobservableActivation"]
+
+[forbidden]
+operations = ["creating HarnessActivationReceipt", "delivery claim from acknowledgement", "host state mutation", "adherence or benefit inference", "blocking I/O"]
+
+[tests]
+required = ["acknowledgement alone does not prove activation", "missing observability yields Inconclusive", "assessment cannot create HarnessActivationReceipt", "receipt owner mismatch is rejected"]
+
+[integration]
+provider = "external host/Governor activation receipt owner"
+consumer = "smart.learning.adherence_assessment and smart.learning.closure"
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if activation receipt ownership or host observability contract is absent."
