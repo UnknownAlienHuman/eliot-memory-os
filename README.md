@@ -15,6 +15,7 @@ Implementation pair for ELIOT core.
 - **Active programmes:** [`workstreams/ACTIVE.toml`](workstreams/ACTIVE.toml).
 - **Current product/source map:** [`docs/PROJECT_MAP.md`](docs/PROJECT_MAP.md).
 - **Supported repository scripts:** [`scripts/README.md`](scripts/README.md).
+- **GitHub workflows/templates:** [`.github/README.md`](.github/README.md).
 
 Do not continue work from a branch found in local history, agent memory, or an
 old conversation. Fetch/prune, fast-forward `main`, and create a fresh

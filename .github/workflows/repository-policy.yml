@@ -86,6 +86,10 @@ jobs:
           assert inventory['authority']['branch'] == 'main'
 
           required = [
+              '.github/README.md',
+              '.github/workflows/ci.yml',
+              '.github/workflows/repository-policy.yml',
+              '.github/workflows/source-candidate.yml',
               'crates/smart/cognitive-wave-01.toml',
               'crates/smart/cognitive-wave-02.toml',
               'crates/smart/cognitive-edge-map.toml',
@@ -121,6 +125,7 @@ jobs:
             'UL_PROGRESS.md'
             'crates/smart/.audit-probe'
             '.github/workflows/runtime017-primary.yml'
+            '.github/workflows/candidate-release.yml'
             'scripts/gen-composition-roots.ps1'
             'scripts/verify-composition-roots.ps1'
             'scripts/gen-conformance.ps1'
@@ -158,6 +163,7 @@ jobs:
             README.md
             AGENTS.md
             WORKFLOW.md
+            .github/README.md
             docs/README.md
             docs/ARCHITECTURE_CONTRACT.md
             docs/PROJECT_MAP.md
@@ -170,7 +176,7 @@ jobs:
             workstreams/core-daemons/AGENTS.md
           )
 
-          if grep -nE 'reports/audit/|docs/normative/|RECOVERY_PROGRAM_v1|ELIOT_(ARCHITECTURE|IMPLEMENTATION)_ENGLISH_FINAL_2026-08-28|PR #26 is the sole active' "${files[@]}"; then
+          if grep -nE 'reports/audit/|docs/normative/|RECOVERY_PROGRAM_v1|ELIOT_(ARCHITECTURE|IMPLEMENTATION)_ENGLISH_FINAL_2026-08-28|PR #26 is the sole active|candidate-release\.yml' "${files[@]}"; then
             echo 'Stale authority/reference detected in a current routing surface.'
             exit 1
           fi

@@ -19,7 +19,7 @@ retired rather than preserved as archaeology.
 | `verify-lint-policy.ps1` | Verify the current Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
 
 Normal iteration uses `just quick` or `scripts/verify.ps1`. The manual Source
-Candidate Gate in `.github/workflows/candidate-release.yml` owns the expensive
+Candidate Gate in `.github/workflows/source-candidate.yml` owns the expensive
 workspace check/Clippy/test/build breadth. Neither path proves an installed or
 healthy runtime.
 
