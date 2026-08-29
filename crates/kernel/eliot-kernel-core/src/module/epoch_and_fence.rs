@@ -66,8 +66,9 @@ impl FromStr for RouteScope {
 ///
 /// The fence binds one route to one authority epoch, one resource generation
 /// and one physical [`Generation`]. It is deliberately not approximate: the
-/// [`Self::matches`] check requires field-for-field equality, and an epoch
-/// older than the Kernel's current epoch is rejected as stale.
+/// [`Self::matches`] check requires field-for-field equality, an epoch older
+/// than the Kernel's current epoch is stale, and an unactivated future epoch
+/// is rejected as a fence mismatch.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteFence {
@@ -157,12 +158,13 @@ impl RouteFence {
         self.authority_epoch.value() < current_epoch.value()
     }
 
-    /// Validates that the fence is exact, non-stale and covers `route`.
+    /// Validates that the fence covers `route` at the exact active epoch.
     ///
     /// # Errors
     ///
-    /// Returns [`KernelError::RouteMismatch`] for a different route and
-    /// [`KernelError::StaleEpoch`] for a fenced epoch.
+    /// Returns [`KernelError::RouteMismatch`] for a different route,
+    /// [`KernelError::StaleEpoch`] for a fenced epoch, and
+    /// [`KernelError::FenceMismatch`] for an unactivated future epoch.
     pub fn enforce(
         &self,
         route: &RouteScope,
@@ -176,6 +178,9 @@ impl RouteFence {
                 observed: self.authority_epoch.value(),
                 active: current_epoch.value(),
             });
+        }
+        if self.authority_epoch != current_epoch {
+            return Err(KernelError::FenceMismatch);
         }
         Ok(())
     }
@@ -288,7 +293,6 @@ mod tests {
     fn stale_fence_is_rejected_for_the_exact_route() -> Result<(), KernelError> {
         let fence = fence(2, "store_bridge")?;
         let route = RouteScope::new("store_bridge")?;
-        assert!(fence.enforce(&route, AuthorityEpoch::new(3)?).is_err());
         assert!(matches!(
             fence.enforce(&route, AuthorityEpoch::new(3)?),
             Err(KernelError::StaleEpoch {
@@ -297,6 +301,17 @@ mod tests {
             })
         ));
         assert!(fence.enforce(&route, AuthorityEpoch::new(2)?).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn future_fence_is_rejected_for_the_exact_route() -> Result<(), KernelError> {
+        let fence = fence(3, "store_bridge")?;
+        let route = RouteScope::new("store_bridge")?;
+        assert!(matches!(
+            fence.enforce(&route, AuthorityEpoch::new(2)?),
+            Err(KernelError::FenceMismatch)
+        ));
         Ok(())
     }
 
