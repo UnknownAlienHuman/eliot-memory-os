@@ -1,0 +1,45 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.research_synthesis"
+agent_order = 26
+physical_package = "eliot-dreamer-research"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Interpret one already-acquired ResearchEvidenceBundle while preserving exact citations, counterclaims and coverage gaps."
+
+[agent]
+objective = "Implement Research Synthesis interpretation only: Researcher acquires, Dreamer interprets, Governor governs."
+write_scope = ["crates/smart/eliot-dreamer-research/src/synthesis.rs", "crates/smart/eliot-dreamer-research/tests/synthesis.rs"]
+integration_owner = "Dreamer Research integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-research/src/lib.rs", "crates/smart/eliot-dreamer-research/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn synthesize_research_candidate(request: &ResearchSynthesisRequest, bundle: &ResearchEvidenceBundle, draft: &AdmittedDreamDraft) -> Result<ResearchSynthesisCandidate, ResearchSynthesisError>"]
+owned_types = ["ResearchSynthesisRequest", "ResearchSynthesisCandidate", "ResearchSynthesisError"]
+
+[algorithm]
+steps = [
+  "Validate exchange id, immutable bundle digest, fence, disclosure and AllowedReferenceManifest.",
+  "Require every citation to point to a source in the bundle at allowed precision.",
+  "Retain counterclaims, failed acquisition and frozen coverage denominator.",
+  "Separate source-supported findings from model interpretation.",
+  "Derive no-match only when scope coverage is complete.",
+  "Emit candidate invalidation and required follow-up acquisition without starting it."
+]
+
+[limits]
+rules = ["Use explicit source, claim, excerpt and output-byte maxima.", "Perform no network, provider or Researcher call."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "BundleDigestMismatch", "CitationNotAllowed", "UnsupportedPrecision", "DisclosureViolation", "CoverageOverclaim", "MissingCounterclaim"]
+
+[forbidden]
+operations = ["source acquisition", "provider selection", "network access", "changing source disposition", "canonical support promotion", "no-match on incomplete scope"]
+
+[tests]
+required = ["Researcher acquisition failure remains visible", "incomplete scope cannot produce no-match conclusion", "invented citation is rejected", "model synthesis cannot change source disposition"]
+
+[integration]
+provider = "eliot-research-exchange-api and external Researcher acquisition owner"
+consumer = "Governor/Human research review owner"
+product_pulse = "D3A_RESEARCH_SYNTHESIS_EDGE_01"
+stop_condition = "Stop and return ContractChallenge if bundle digest, allowed citation precision, denominator or disclosure contract is missing."
