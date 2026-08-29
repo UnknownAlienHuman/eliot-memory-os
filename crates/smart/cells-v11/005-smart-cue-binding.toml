@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.cue.binding"
+agent_order = 5
+physical_package = "eliot-cues"
+execution_class = "CAPTURE_SYNC_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Derive cue-binding candidates from admitted observation/evidence projections without publishing an index."
+
+[agent]
+objective = "Implement deterministic cue-binding proposal construction only."
+write_scope = ["crates/smart/eliot-cues/src/binding.rs", "crates/smart/eliot-cues/tests/binding.rs"]
+integration_owner = "cue projection integration owner"
+forbidden_files = ["crates/smart/eliot-cues/src/lib.rs", "crates/smart/eliot-cues/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_cue_binding_candidates(request: &CueBindingRequest, normalized: &[NormalizedCue]) -> Result<CueBindingCandidateSet, CueBindingError>"]
+
+[algorithm]
+steps = [
+  "Validate source revision, targets, fence and comparison profile.",
+  "Derive only rule-declared exact, prefix or signature candidates.",
+  "Attach lineage, strength, freshness and negative-memory role.",
+  "Stable-sort and deduplicate exact candidate identity.",
+  "Return proposals for external Governor admission."
+]
+
+[limits]
+rules = ["Use bounded normalized cues and declared targets.", "Perform no transitive graph expansion."]
+
+[errors]
+variants = ["InvalidFence", "UnknownTarget", "ProfileMismatch", "UnsupportedDerivation", "TooManyBindings"]
+
+[forbidden]
+operations = ["publishing CueSnapshot", "Governor admission", "canonical write", "storage scan", "model call"]
+
+[tests]
+required = ["candidate cannot bypass Governor admission", "negative-memory role is retained", "touched-file derivation is deterministic", "profile mismatch fails closed"]
+
+[integration]
+provider = "smart.cue.normalization"
+consumer = "Governor cue-binding admission owner"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if target projection or Governor admission contract is unavailable."
