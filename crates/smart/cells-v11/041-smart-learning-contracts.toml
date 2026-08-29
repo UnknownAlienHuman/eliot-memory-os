@@ -1,0 +1,44 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.learning.contracts"
+agent_order = 41
+physical_package = "eliot-learning-contracts"
+execution_class = "CONTRACT_ONLY"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Define task-local learning state, delta, overlay, activation, adherence, closure and advisory-promotion contracts."
+
+[agent]
+objective = "Implement task-local learning wire contracts and dimensional validation only."
+write_scope = ["crates/smart/eliot-learning-contracts/src/contracts.rs", "crates/smart/eliot-learning-contracts/tests/contracts.rs"]
+integration_owner = "learning contract integration owner"
+forbidden_files = ["crates/smart/eliot-learning-contracts/src/lib.rs", "crates/smart/eliot-learning-contracts/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn validate_learning_contract(value: &LearningContractEnvelope) -> Result<(), LearningContractError>"]
+owned_types = ["CampaignLearningStateView", "AttemptLearningDelta", "CampaignHarnessOverlayCandidate", "OverlayValidationReport", "HarnessActivationAssessment", "HarnessAdherenceAssessment", "CampaignLearningClosureCandidate", "RetentionTransferAssessment", "PromotionInputCandidate"]
+
+[algorithm]
+steps = [
+  "Validate exact task, attempt, evaluator, overlay and State Fence identities.",
+  "Keep activation, adherence, decision delta, outcome, retention, transfer, evaluator validity, Product Pulse, rollback and economics as separate dimensions.",
+  "Require every overlay to be task-local, reversible, expiring and bounded.",
+  "Require external receipt handles where delivery or activation is claimed.",
+  "Deny unknown fields and forbidden mutation surfaces."
+]
+
+[limits]
+rules = ["Wire maxima are explicit.", "Use no scalar promotion score or hidden owner state."]
+
+[errors]
+variants = ["InvalidFence", "IdentityMismatch", "MissingEvaluator", "MissingReceipt", "ForbiddenSurface", "MissingDimension", "TooManyItems"]
+
+[forbidden]
+operations = ["objective mutation", "evaluator/holdout mutation", "authority/privacy widening", "receipt creation", "promotion decision"]
+
+[tests]
+required = ["activation and adherence remain distinct", "promotion input without external receipt is rejected", "overlay cannot contain objective or authority changes", "failed dimension survives roundtrip"]
+
+[integration]
+provider = "Task Controller, Governor, Evaluator, Context and host receipt owners"
+consumer = "eliot-learning"
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if task, evaluator, activation-receipt or promotion-owner identity is not externally defined."
