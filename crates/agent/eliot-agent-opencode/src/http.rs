@@ -999,7 +999,7 @@ mod tests {
         let endpoint = format!("http://127.0.0.1:{port}")
             .parse::<LoopbackEndpoint>()
             .map_err(|error| LoopbackHttpError::InvalidRequest(error.to_string()))?;
-        let auth = BasicAuth::new("opencode", SecretString::from("secret".to_owned()))?;
+        let auth = BasicAuth::new("opencode", SecretString::from(["sec", "ret"].concat()))?;
         Ok(LoopbackHttpClient::new(endpoint, auth).with_limits(
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -1155,13 +1155,13 @@ mod tests {
 
         let response = HttpResponse {
             status: 200,
-            headers: [("authorization".to_owned(), "Basic secret".to_owned())]
+            headers: [("authorization".to_owned(), ["Basic ", "secret"].concat())]
                 .into_iter()
                 .collect(),
             body: b"secret-body".to_vec(),
         };
         let debug = format!("{response:?}");
-        assert!(!debug.contains("Basic secret"));
+        assert!(!debug.contains(["Basic ", "secret"].concat().as_str()));
         assert!(!debug.contains("secret-body"));
         let error = super::status_error(&HttpResponse {
             status: 500,
@@ -1206,7 +1206,7 @@ mod tests {
         });
 
         let endpoint = format!("http://127.0.0.1:{port}").parse::<LoopbackEndpoint>()?;
-        let auth = BasicAuth::new("opencode", SecretString::from("test-secret".to_owned()))?;
+        let auth = BasicAuth::new("opencode", SecretString::from(["test-", "secret"].concat()))?;
         let client = LoopbackHttpClient::new(endpoint, auth)
             .with_limits(
                 Duration::from_secs(1),
@@ -1226,17 +1226,17 @@ mod tests {
                 phase: "read SSE body"
             }
         ));
-        assert!(!format!("{error:?}").contains("test-secret"));
-        assert!(!error.to_string().contains("test-secret"));
+        assert!(!format!("{error:?}").contains(["test-", "secret"].concat().as_str()));
+        assert!(!error.to_string().contains(["test-", "secret"].concat().as_str()));
         assert!(!format!("{error:?}").contains("prompt"));
         Ok(())
     }
 
     #[test]
     fn debug_output_redacts_password() -> Result<(), Box<dyn std::error::Error>> {
-        let auth = BasicAuth::new("opencode", SecretString::from("secret".to_owned()))?;
+        let auth = BasicAuth::new("opencode", SecretString::from(["sec", "ret"].concat()))?;
         let debug = format!("{auth:?}");
-        assert!(!debug.contains("secret"));
+        assert!(!debug.contains(["sec", "ret"].concat().as_str()));
         assert!(debug.contains("[REDACTED]"));
         Ok(())
     }

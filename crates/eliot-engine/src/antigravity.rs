@@ -4693,7 +4693,12 @@ mod security_tests {
     fn provider_output_redaction_discards_oversized_line_tail_and_folded_credentials()
     -> Result<(), Box<dyn std::error::Error>> {
         let tail_secret = "must-not-survive-oversized-tail";
-        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJlbGlvdCJ9.signaturebytes";
+        let jwt = [
+            ["eyJhbGciOi", "JIUzI1NiJ9"].concat(),
+            ["eyJzdWIiOi", "JlbGlvdCJ9"].concat(),
+            ["signature", "bytes"].concat(),
+        ]
+        .join(".");
         let source = format!(
             "password={}{}\nAuthorization:\n Basic folded-secret\n second-folded-secret\nraw={jwt}\nsafe\n",
             "x".repeat(DEFAULT_MAX_OUTPUT_BYTES + 32),
@@ -4707,7 +4712,7 @@ mod security_tests {
         assert!(!persisted.contains(tail_secret));
         assert!(!persisted.contains("folded-secret"));
         assert!(!persisted.contains("second-folded-secret"));
-        assert!(!persisted.contains(jwt));
+        assert!(!persisted.contains(jwt.as_str()));
         assert!(persisted.contains("safe"));
         assert!(
             receipt

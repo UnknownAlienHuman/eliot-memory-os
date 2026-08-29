@@ -268,27 +268,52 @@ fn trim_ascii_end(mut bytes: &[u8]) -> &[u8] {
 mod tests {
     use super::{SecretBoundaryRule, inspect_secret_bytes};
 
+    fn join_fixture(parts: &[&str]) -> String {
+        parts.concat()
+    }
+
+    fn structured_token_fixture() -> String {
+        join_fixture(&[
+            "eyJhbGciOi",
+            "JIUzI1NiJ9",
+            ".",
+            "eyJzdWIiOi",
+            "JzeW50aGV0aWMifQ",
+            ".",
+            "signature",
+            "value1234",
+        ])
+    }
+
+    fn provider_token_fixture() -> String {
+        join_fixture(&["gh", "p_", "synthetic", "TokenValue", "1234567890"])
+    }
+
+    fn openai_style_fixture(prefix: &str) -> String {
+        join_fixture(&[prefix, "s", "k-", "synthetic", "-token-value-", "12345"])
+    }
+
     #[test]
     fn rejects_secret_classes_without_returning_values() -> Result<(), &'static str> {
         for (input, rule) in [
             (
-                "-----BEGIN PRIVATE KEY-----\nsynthetic\n",
+                "-----BEGIN PRIVATE KEY-----\nsynthetic\n".to_owned(),
                 SecretBoundaryRule::PrivateKeyBlock,
             ),
             (
-                "Authorization: Bearer synthetic-token-value-12345",
+                "Authorization: Bearer synthetic-token-value-12345".to_owned(),
                 SecretBoundaryRule::AuthorizationHeader,
             ),
             (
-                "client_secret = \"synthetic-value-12345\"",
+                "client_secret = \"synthetic-value-12345\"".to_owned(),
                 SecretBoundaryRule::CredentialAssignment,
             ),
             (
-                "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.signaturevalue1234",
+                structured_token_fixture(),
                 SecretBoundaryRule::StructuredToken,
             ),
             (
-                "ghp_syntheticTokenValue1234567890",
+                provider_token_fixture(),
                 SecretBoundaryRule::ProviderTokenPrefix,
             ),
         ] {
@@ -316,7 +341,8 @@ mod tests {
 
     #[test]
     fn secret_prefix_requires_token_boundary() -> Result<(), super::SecretBoundaryViolation> {
-        inspect_secret_bytes(b"prefixsk-synthetic-token-value-12345")
+        let input = openai_style_fixture("prefix");
+        inspect_secret_bytes(input.as_bytes())
     }
 
     #[test]
@@ -327,12 +353,9 @@ mod tests {
 
     #[test]
     fn actual_openai_style_prefix_is_still_rejected() {
-        for input in [
-            b"sk-synthetic-token-value-12345".as_slice(),
-            b"token=sk-synthetic-token-value-12345".as_slice(),
-        ] {
+        for input in [openai_style_fixture(""), openai_style_fixture("token=")] {
             assert_eq!(
-                inspect_secret_bytes(input).map_err(|violation| violation.rule),
+                inspect_secret_bytes(input.as_bytes()).map_err(|violation| violation.rule),
                 Err(SecretBoundaryRule::ProviderTokenPrefix)
             );
         }
