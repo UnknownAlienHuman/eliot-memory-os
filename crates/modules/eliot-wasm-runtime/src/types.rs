@@ -219,6 +219,13 @@ pub enum CancellationPolicy {
     EpochAndFuel,
 }
 
+/// Maximum epoch deadline admitted by this runtime-contract revision.
+///
+/// The current production provider supports no negotiation path. A larger
+/// value therefore requires a contract/configuration revision instead of a
+/// provider-local clamp after admission.
+pub const MAX_EPOCH_DEADLINE_TICKS: u64 = 1024;
+
 /// Bounded epoch/cancellation contract.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -266,6 +273,7 @@ impl InvocationLimits {
             self.artifact_access.max_bytes,
         ]
         .contains(&0)
+            || self.epoch.deadline_ticks > MAX_EPOCH_DEADLINE_TICKS
             || self.max_host_calls == 0
             || self.max_table_elements == 0
             || self.max_instances == 0
@@ -833,5 +841,47 @@ fn canonicalize(value: Value) -> Value {
             Value::Object(sorted)
         }
         scalar => scalar,
+    }
+}
+
+#[cfg(test)]
+mod epoch_limit_tests {
+    use super::*;
+
+    fn limits(artifact: Sha256Digest, deadline_ticks: u64) -> InvocationLimits {
+        InvocationLimits {
+            max_input_bytes: 1,
+            max_output_bytes: 1,
+            max_host_calls: 1,
+            max_fuel: 1,
+            max_memory_bytes: 1,
+            max_table_elements: 1,
+            max_instances: 1,
+            max_stack_bytes: 1,
+            wall_deadline_ms: 1,
+            epoch: EpochPolicy {
+                deadline_ticks,
+                cancellation: CancellationPolicy::EpochInterruption,
+            },
+            artifact_access: ArtifactAccessLimits {
+                allowed_digests: [artifact].into_iter().collect(),
+                max_reads: 1,
+                max_bytes: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn epoch_deadline_ceiling_is_exact_before_process_admission() {
+        let artifact = Sha256Digest::of_bytes(b"artifact");
+        assert!(
+            limits(artifact.clone(), MAX_EPOCH_DEADLINE_TICKS)
+                .validate(&artifact)
+                .is_ok()
+        );
+        assert_eq!(
+            limits(artifact.clone(), MAX_EPOCH_DEADLINE_TICKS + 1).validate(&artifact),
+            Err(RuntimeError::InvalidLimits)
+        );
     }
 }
