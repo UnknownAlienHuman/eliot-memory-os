@@ -1,0 +1,42 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.concept"
+agent_order = 32
+physical_package = "eliot-dreamer-memory-semantics"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Propose a reusable concept abstraction with scope, counterexamples and transfer boundary."
+
+[agent]
+objective = "Implement bounded concept abstraction without deleting dissent."
+write_scope = ["crates/smart/eliot-dreamer-memory-semantics/src/concept.rs", "crates/smart/eliot-dreamer-memory-semantics/tests/concept.rs"]
+integration_owner = "Dreamer memory semantics integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-memory-semantics/src/lib.rs", "crates/smart/eliot-dreamer-memory-semantics/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_concept_candidate(request: &ConceptRequest, draft: &AdmittedDreamDraft) -> Result<ConceptCandidate, ConceptError>"]
+
+[algorithm]
+steps = [
+  "Validate supporting instances, counterexamples and fence.",
+  "Derive the minimal common property without deleting dissent.",
+  "Name applicability scope, non-examples, transfer hypotheses and falsifier.",
+  "Return Inconclusive when abstraction depends on one episode or dependent copies."
+]
+
+[limits]
+rules = ["Use explicit instance, counterexample and predicate maxima.", "Perform no embedding search or external retrieval."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "InsufficientIndependentInstances", "MissingCounterexample", "MissingScope", "MissingFalsifier"]
+
+[forbidden]
+operations = ["one-example generalization", "dependent-copy counting", "counterexample removal", "support promotion", "canonical write"]
+
+[tests]
+required = ["one episode cannot prove reusable concept", "counterexample narrows applicability rather than disappearing", "dependent copies do not count as independent instances", "missing falsifier is rejected"]
+
+[integration]
+provider = "smart.dreamer.draft_admission"
+consumer = "smart.dreamer.curation_dispatch and Governor/Human review owner"
+product_pulse = "D3C_CURATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if independent-instance, applicability or counterexample contracts are missing."
