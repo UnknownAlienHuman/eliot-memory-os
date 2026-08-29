@@ -1,0 +1,109 @@
+schema_version = "eliot-curation-subtype-coverage-v11"
+status = "CLOSED_WORLD_WORKING_DRAFT"
+issue = "github:UnknownAlienHuman/eliot-memory-os#94"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+registry_owner = "external governed CurationHandlerRegistry owner"
+unknown_subtype = "UNSUPPORTED_NO_FALLBACK"
+subtype_count = 11
+
+[[subtype]]
+name = "Classification"
+input = "ClassificationRequest"
+handler_cell = "smart.dreamer.classification"
+output = "ClassificationCandidate"
+owned_dimension = "semantic class candidate"
+
+[[subtype]]
+name = "Relation"
+input = "CurationRelationRequest"
+handler_cell = "smart.dreamer.relation"
+output = "RelationCandidateSet"
+owned_dimension = "typed relation candidate; chronology, similarity and causality remain distinct"
+
+[[subtype]]
+name = "Episode"
+input = "EpisodeRequest"
+handler_cell = "smart.dreamer.episode"
+output = "EpisodeCandidate"
+owned_dimension = "episode chronology plus separately fenced causal hypotheses"
+
+[[subtype]]
+name = "Concept"
+input = "ConceptRequest"
+handler_cell = "smart.dreamer.concept"
+output = "ConceptCandidate"
+owned_dimension = "reusable abstraction with counterexamples and transfer boundary"
+
+[[subtype]]
+name = "Procedure"
+input = "ProcedureRequest"
+handler_cell = "smart.dreamer.procedure"
+output = "ProcedureCandidate"
+owned_dimension = "procedure candidate with preconditions, verifier and stop conditions"
+
+[[subtype]]
+name = "Skill"
+input = "SkillRequest"
+handler_cell = "smart.dreamer.skill"
+output = "SkillCandidate"
+owned_dimension = "compact Skill candidate; no package creation, installation or authority"
+
+[[subtype]]
+name = "FailureFingerprint"
+input = "FailureFingerprintRequest"
+handler_cell = "smart.dreamer.failure_fingerprint"
+output = "FailureFingerprintCandidate"
+owned_dimension = "exact deterministic failure trigger and bounded warning/probe candidate"
+
+[[subtype]]
+name = "MergeSplit"
+input = "StructureRepairRequest"
+handler_cell = "smart.dreamer.structure_repair"
+output = "StructureRepairCandidate"
+owned_dimension = "identity merge/split proposal with lineage, dependency plan and rollback"
+
+[[subtype]]
+name = "Reconsolidation"
+input = "ReconsolidationRequest"
+handler_cell = "smart.dreamer.reconsolidation"
+output = "ReconsolidationCandidate"
+owned_dimension = "forward meaning/applicability/scoped-interpretation revision"
+
+[[subtype]]
+name = "Accessibility"
+input = "AccessibilityRequest"
+handler_cell = "smart.dreamer.accessibility"
+output = "AccessibilityCandidate"
+owned_dimension = "reversible accessibility only; support, existence and influence unchanged"
+
+[[subtype]]
+name = "InfluenceRepair"
+input = "InfluenceRepairRequest"
+handler_cell = "smart.dreamer.influence_repair"
+output = "InfluenceRepairCandidate"
+owned_dimension = "permitted-influence repair over an exact external InfluenceDependencyClosure"
+
+[dispatcher]
+cell = "smart.dreamer.curation_dispatch"
+input = "CurationDispatchRequest"
+output = "TypedCurationHandlerResult"
+assembly_output = "CurationCandidateSet"
+rules = [
+  "Subtype is present before dispatch and is not inferred from model prose.",
+  "Exactly one registered handler owns each subtype.",
+  "The dispatcher cannot import semantic fallbacks, change handler output, transition lifecycle or write canonical state.",
+  "Unknown, ambiguous or stale-registry subtype fails closed and remains inspectable."
+]
+
+[dimension_separation]
+requirements = [
+  "Classification does not change epistemic support.",
+  "Episode chronology does not prove causality.",
+  "Concept formation does not erase counterexamples.",
+  "Procedure and Skill candidates do not install or execute capability.",
+  "FailureFingerprint semantic similarity cannot create a hard block.",
+  "Structure repair retains prior identities and rollback.",
+  "Reconsolidation cannot rewrite raw source or perform accessibility change.",
+  "Accessibility cannot change support, existence or influence.",
+  "Influence repair cannot discover closure by similarity or mutate security state."
+]
