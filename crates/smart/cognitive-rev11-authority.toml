@@ -1,0 +1,103 @@
+schema_version = 1
+authority_id = "eliot-cognitive-function-design-rev11"
+status = "STATIC_FUNCTION_DESIGN_ONLY"
+issue = 94
+branch = "work/94-cognitive-function-design-audit"
+base_main_commit = "c77adc67e62854aa9efc16cf3cb1905ad90c11c5"
+repository = "UnknownAlienHuman/eliot-memory-os"
+
+[normative_pair]
+architecture_revision = "4.5-draft"
+architecture_edition = "2026-08-28"
+architecture_sha256 = "c6932eaf26935e752eefb4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+implementation_revision = "0.29-draft"
+implementation_edition = "2026-08-28"
+implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+precedence = "Architecture defines intent and Hard Boundaries; Implementation defines target owners, contracts, defaults and failure behavior; this design is a non-normative executable projection."
+
+[scope]
+functional_cells = 67
+physical_crates = 25
+root_workspace_admission = false
+rust_implementation = false
+runtime_support = false
+product_acceptance = false
+
+[authority_rules]
+cell_source = "Exactly one [[cell]] record in cognitive-rev11-cells-*.toml is authoritative for each agent assignment and Rust-oriented API."
+no_parallel_module_api_views = "Legacy module.toml and *.api.toml records are not authority and must not be assigned."
+cell_vs_crate = "A FunctionalCapabilityCell is the causal unit assigned to one agent; several cells may share one physical crate when lifecycle owner, dependency island, proof oracle and replacement boundary remain common."
+crate_creation = "A physical crate requires a contract, dependency, security, failure-containment, deployment, package-proof or replacement seam. A different function, enum, file, agent or LOC estimate is insufficient."
+loc = "Ten thousand lines is a review trigger, never a constitutional split rule. Split when causal responsibility, owner, proof, dependency or replacement boundaries diverge."
+public_api = "Public functions and public wire types listed by the cell catalog are an allowlist. Changes require an explicit ContractChallenge and integration-owner decision."
+worker_scope = "One agent writes only the declared src/<cell>.rs and tests/<cell>.rs files. Package roots, Cargo manifests and re-exports belong to the integration owner."
+
+[proof_model]
+module = "Package-local shape, behavior, property and adversarial proof for one implemented cell."
+edge = "Executed proof over the real provider and consumer using exact typed contracts and State Fence."
+product = "Named Product Pulse over an exact Product Identity."
+release = "Outside this design branch."
+current_ceiling = "No TOML record, successful parse, branch, build or test count promotes implementation, runtime or product support."
+
+[hot_path]
+definition = "R5/decision-boundary work that can change what the active agent sees before the next decision."
+requirements = [
+  "no model call",
+  "no storage scan",
+  "no provider SDK",
+  "no blocking I/O",
+  "bounded inputs and outputs",
+  "deterministic ordering and tie-breaks",
+  "explicit complexity ceiling",
+  "visible local degradation",
+]
+cells = [
+  "smart.epistemic.position",
+  "smart.cue.normalizer",
+  "smart.cue.direct_match",
+  "smart.cue.relation_spread",
+  "smart.cue.activation",
+  "smart.context.contribution_merge",
+  "smart.context.admission",
+  "smart.context.assembly",
+  "smart.context.quality",
+  "smart.context.decision_tail",
+  "smart.context.reactive_delivery_plan",
+]
+
+[cold_path]
+definition = "Bounded background or explicit-request work that may prepare candidates but never blocks Kernel liveness or owns decision authority."
+classes = ["Dreamer generation", "curation", "research interpretation", "learning closure", "diagnosis", "planning", "DreamCycle"]
+
+[forbidden_ownership]
+all_cells = [
+  "canonical state",
+  "truth or epistemic promotion",
+  "authority grant or activation",
+  "task finish",
+  "DurableJob lifecycle",
+  "scheduler or Ready Queue",
+  "runtime lease",
+  "provider credential or route execution",
+  "external effect execution",
+  "production-generation self-modification",
+]
+
+[closed_world_ledgers]
+cell_catalogs = [
+  "crates/smart/cognitive-rev11-cells-foundation.toml",
+  "crates/smart/cognitive-rev11-cells-cues-context.toml",
+  "crates/smart/cognitive-rev11-cells-curation-research.toml",
+  "crates/smart/cognitive-rev11-cells-learning.toml",
+  "crates/smart/cognitive-rev11-cells-diagnosis-planning.toml",
+]
+coverage = "crates/smart/cognitive-rev11-coverage.toml"
+topology = "crates/smart/cognitive-rev11-topology.toml"
+waves = "crates/smart/cognitive-rev11-waves.toml"
+migration = "crates/smart/cognitive-rev11-migration.toml"
+
+[admission_gates]
+implementation = ["cell contract frozen", "target source scope exclusive", "package compiles", "minimum tests pass", "proof ceiling honest"]
+integration = ["real provider/consumer Edge Proof", "State Fence compatibility", "failure propagation exercised", "no owner duplication"]
+product = ["named Product Pulse executed", "exact Product Identity", "counter-metrics visible", "rollback evidence present"]
