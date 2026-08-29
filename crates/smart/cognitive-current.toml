@@ -1,0 +1,37 @@
+schema_version = 1
+status = "CURRENT_COGNITIVE_DESIGN_AUTHORITY"
+authority = "crates/smart/cognitive-rev11-authority.toml"
+issue = 94
+branch = "work/94-cognitive-function-design-audit"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+functional_cells = 73
+physical_crates = 28
+orders = "1..73"
+
+[assignment]
+core_index = "crates/smart/cognitive-rev11-cell-index.toml"
+projection_index = "crates/smart/cognitive-rev11-projection-index.toml"
+core_catalogs = [
+  "crates/smart/cognitive-rev11-cells-foundation.toml",
+  "crates/smart/cognitive-rev11-cells-cues-context.toml",
+  "crates/smart/cognitive-rev11-cells-curation-research.toml",
+  "crates/smart/cognitive-rev11-cells-learning.toml",
+  "crates/smart/cognitive-rev11-cells-diagnosis-planning.toml",
+]
+projection_catalog = "crates/smart/cognitive-rev11-projection-bridge.toml"
+waves = ["crates/smart/cognitive-rev11-waves.toml", "crates/smart/cognitive-rev11-waves-projection-extension.toml"]
+agent_handoff = "crates/smart/cognitive-rev11-agent-handoff.toml"
+
+[validation]
+base = "crates/smart/cognitive-rev11-validation.toml"
+projection_extension = "crates/smart/cognitive-rev11-validation-projection-extension.toml"
+require_both = true
+
+[forbidden_assignment_sources]
+paths = [
+  "legacy module.toml",
+  "legacy *.api.toml",
+  "cognitive-crate-decisions rev7",
+  "old cognitive branches",
+  "retired function-only crates listed by migration",
+]
