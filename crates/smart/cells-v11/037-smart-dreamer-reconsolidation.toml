@@ -1,0 +1,43 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.reconsolidation"
+agent_order = 37
+physical_package = "eliot-dreamer-memory-structure"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Propose a forward revision to meaning, applicability or scoped epistemic interpretation without rewriting raw evidence."
+
+[agent]
+objective = "Implement forward reconsolidation proposals only."
+write_scope = ["crates/smart/eliot-dreamer-memory-structure/src/reconsolidation.rs", "crates/smart/eliot-dreamer-memory-structure/tests/reconsolidation.rs"]
+integration_owner = "Dreamer memory structure integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-memory-structure/src/lib.rs", "crates/smart/eliot-dreamer-memory-structure/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_reconsolidation_candidate(request: &ReconsolidationRequest, draft: &AdmittedDreamDraft) -> Result<ReconsolidationCandidate, ReconsolidationError>"]
+
+[algorithm]
+steps = [
+  "Validate target revision, evidence, counterevidence and fence.",
+  "Classify proposed change as meaning, applicability or scoped interpretation.",
+  "Preserve raw source and prior revision unchanged.",
+  "Require transformation validation, forward lineage, rollback and invalidation.",
+  "Reject support or lifecycle mutation disguised as reconsolidation."
+]
+
+[limits]
+rules = ["Process one target revision per request.", "Use explicit evidence and counterevidence maxima."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "InvalidChangeClass", "RawRewriteAttempt", "SupportMutationAttempt", "MissingLineage", "RollbackMissing"]
+
+[forbidden]
+operations = ["raw source rewrite", "prior revision deletion", "support mutation", "accessibility mutation", "canonical write"]
+
+[tests]
+required = ["raw source bytes cannot change", "prior interpretation remains addressable", "accessibility change is rejected as wrong owner", "support promotion is rejected"]
+
+[integration]
+provider = "smart.dreamer.draft_admission"
+consumer = "smart.dreamer.curation_dispatch and Governor/Human review owner"
+product_pulse = "D3C_CURATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if the change cannot be typed as meaning, applicability or scoped interpretation with forward lineage."
