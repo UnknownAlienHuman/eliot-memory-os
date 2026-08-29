@@ -1,0 +1,101 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "STATIC_FUNCTION_DESIGN_EXTENSION"
+issue = 94
+orders = "68..72"
+reason = "Close the previously implicit bridge from Governor canonical reads and cue activation to Context Compiler, learning and diagnosis without preserving eliot-memory or eliot-system-experience as mutable Smart state owners."
+
+[[cell]]
+order = 68
+id = "smart.memory.projection.contracts"
+stage = "W8_CANONICAL_PROJECTION_BRIDGES"
+physical_crate = "eliot-memory-projection-contracts"
+hot_path = false
+responsibility = "Own provider-neutral bounded canonical-memory read, candidate, selection and context-projection contracts without defining storage or lifecycle."
+public_functions = ["pub fn validate_memory_read_snapshot(snapshot: &CanonicalMemoryReadSnapshot) -> Result<(), MemoryProjectionContractError>", "pub fn validate_memory_candidate_set(set: &MemoryCandidateSet) -> Result<(), MemoryProjectionContractError>"]
+public_types = ["CanonicalMemoryReadRequest", "CanonicalMemoryReadSnapshot", "MemoryProjectionRecord", "MemoryQueryIntent", "MemorySelectionPolicy", "MemoryCandidate", "MemoryCandidateSet", "MemorySelectionDimension", "MemorySelectionTrace", "MemoryContextProjectionRequest"]
+algorithm = ["validate exact Governor read operation identity, scope, State Fence, canonical revision and frozen denominator", "require record handles rather than mutable storage references", "represent status, lifecycle, accessibility and permitted influence as separate owner projections", "bound candidates and payload representations", "canonicalize collection order and digest"]
+invariants = ["contract owns no storage client", "record projection cannot mutate lifecycle or support", "missing denominator is distinguishable from empty complete result", "retrieval cannot reinforce or promote a record"]
+degradation = "Partial or stale canonical read remains an explicit coverage state; no guessed records are admitted."
+errors = ["ReadIdentityInvalid", "FenceMismatch", "CanonicalRevisionMissing", "DenominatorMissing", "DuplicateHandle", "ProjectionDimensionCollapsed", "LimitExceeded"]
+tests = ["empty complete differs from unavailable", "support/accessibility/influence remain separate", "duplicate handle rejected", "record order does not change digest"]
+source_files = ["crates/smart/eliot-memory-projection-contracts/src/contracts.rs", "crates/smart/eliot-memory-projection-contracts/tests/contracts.rs"]
+product_pulse = "D3B_CANONICAL_PROJECTION_PULSE_01"
+architecture_refs = ["canonical state is Governor-owned", "derived views are rebuildable", "retrieval does not create truth"]
+implementation_refs = ["Governor Read path", "Context Compiler provider projections"]
+
+[[cell]]
+order = 69
+id = "smart.memory.candidate_query"
+stage = "W8_CANONICAL_PROJECTION_BRIDGES"
+physical_crate = "eliot-memory-projection"
+hot_path = true
+responsibility = "Select a bounded deterministic memory candidate set from one already materialized Governor canonical-read snapshot and cue/context query intent."
+public_functions = ["pub fn query_memory_candidates(snapshot: &CanonicalMemoryReadSnapshot, intent: &MemoryQueryIntent, cues: &CueActivationResult, policy: &MemorySelectionPolicy) -> Result<MemoryCandidateSet, MemoryCandidateQueryError>"]
+algorithm = ["validate one exact snapshot, intent and cue State Fence", "exclude records whose owner projection denies permitted influence while retaining explicit suppression trace", "select exact cue-linked records before broader allowed scope/type filters", "retain negative-memory, rival, unknown, minority and counterevidence records according to protected dimensions", "evaluate applicability, freshness, provenance, decision relevance and activation precision separately", "apply deterministic bounded selection and emit frozen denominator, omissions and trace"]
+complexity = "O(n log n + c log n) over a request-bounded materialized snapshot; no storage I/O, graph traversal beyond supplied cue result, model call or session mutation."
+invariants = ["query does not mark a record used or delivered", "retrieval count does not change support", "activation score is not epistemic weight", "unknown applicability is not zero relevance", "exact negative memory cannot be silently displaced by popularity"]
+degradation = "Partial snapshot yields a partial candidate set with missing-denominator and revalidation requirements; invalid or mixed fence fails closed."
+errors = ["SnapshotInvalid", "IntentInvalid", "FenceMismatch", "CueSnapshotMismatch", "InfluenceProjectionMissing", "SelectionLimitInvalid"]
+tests = ["exact cue precedes broader candidate", "retrieval does not mutate record projection", "negative memory retained", "partial denominator visible", "input permutation deterministic"]
+source_files = ["crates/smart/eliot-memory-projection/src/candidate_query.rs", "crates/smart/eliot-memory-projection/tests/candidate_query.rs"]
+product_pulse = "D3B_CANONICAL_PROJECTION_PULSE_01"
+architecture_refs = ["proactive memory retrieval", "negative memory", "epistemic separation"]
+implementation_refs = ["Governor Read to Smart projection", "D3b Context candidate provider"]
+
+[[cell]]
+order = 70
+id = "smart.memory.context_projection"
+stage = "W8_CANONICAL_PROJECTION_BRIDGES"
+physical_crate = "eliot-memory-projection"
+hot_path = true
+responsibility = "Translate a bounded MemoryCandidateSet into owner-attributed whole ContextAtoms without rendering inaccessible payloads or granting influence."
+public_functions = ["pub fn project_memory_context(request: &MemoryContextProjectionRequest, candidates: &MemoryCandidateSet) -> Result<ProviderContribution, MemoryContextProjectionError>"]
+algorithm = ["validate request, candidate-set digest and one State Fence", "map each selected record to a whole payload, bounded representation or exact expansion handle according to owner-projected accessibility and disclosure", "preserve epistemic status, assertability, negative-memory, rivals, unknowns, cues and provenance", "derive DecisionDeltaEstimate as Known, BoundedRange or Unknown without scalar collapse", "emit provider coverage and frozen denominator"]
+complexity = "O(n log n + total_selected_representation_bytes); no canonical read, storage I/O, model call or admission decision."
+invariants = ["projection cannot admit itself into context", "inaccessible payload is never copied", "handle-only representation preserves exact expansion identity", "record status and influence ceiling are not rewritten", "one memory record becomes one whole addressable atom per declared role"]
+degradation = "Unrenderable optional candidates become handle-only or omitted with exact reason; required protected candidate without safe representation blocks the projection."
+errors = ["CandidateSetMismatch", "FenceMismatch", "DisclosureDenied", "AccessibilityUnknown", "RequiredRepresentationMissing", "ProjectionLimitExceeded"]
+tests = ["inaccessible payload not leaked", "status preserved", "unknown decision delta preserved", "protected handle retained", "projection does not contain admission disposition"]
+source_files = ["crates/smart/eliot-memory-projection/src/context_projection.rs", "crates/smart/eliot-memory-projection/tests/context_projection.rs"]
+product_pulse = "D3B_CANONICAL_PROJECTION_PULSE_01"
+architecture_refs = ["Active Understanding View consumes owner projections", "permitted influence", "reversible omission"]
+implementation_refs = ["Context Compiler provider contribution", "Decision Safety Floor"]
+
+[[cell]]
+order = 71
+id = "smart.experience.projection"
+stage = "W8_CANONICAL_PROJECTION_BRIDGES"
+physical_crate = "eliot-experience-projection"
+hot_path = false
+responsibility = "Build an immutable outcome-linked SystemExperienceProjection from canonical attempt, trace, artifact, evaluator and effect evidence without owning an experience store."
+public_functions = ["pub fn project_system_experience(request: &SystemExperienceProjectionRequest, snapshot: &CanonicalExperienceReadSnapshot) -> Result<SystemExperienceProjection, ExperienceProjectionError>"]
+public_types = ["SystemExperienceProjectionRequest", "CanonicalExperienceReadSnapshot", "AttemptExperience", "OutcomeAttribution", "FailureObservation", "ExperienceCoverage", "SystemExperienceProjection"]
+algorithm = ["validate exact task, attempt, canonical revision and State Fence", "join attempt hypothesis/strategy with traces, artifacts, evaluator observations and effect receipts by exact identities", "separate observed sequence, attributed outcome, confounders and unknowns", "retain failed attempts and contrary outcomes", "emit frozen denominator and immutable projection digest"]
+invariants = ["no mutable experience state", "success/failure count is not causal attribution", "missing effect outcome remains Unknown", "projection cannot promote a procedure or learning delta", "eliot-system-experience is donor-only and not a second state owner"]
+degradation = "Incomplete owner coverage yields partial projection and blocks causal outcome claims while preserving raw handles."
+errors = ["SnapshotInvalid", "AttemptLineageMismatch", "FenceMismatch", "OutcomeUnattributed", "ReceiptMismatch", "CoverageInsufficient"]
+tests = ["unattributed success remains observed only", "failed attempt retained", "unknown external outcome visible", "projection deterministic", "no mutable store API"]
+source_files = ["crates/smart/eliot-experience-projection/src/projection.rs", "crates/smart/eliot-experience-projection/tests/projection.rs"]
+product_pulse = "D4_EXPERIENCE_PROJECTION_PULSE_01"
+architecture_refs = ["system experience is evidence", "online learning requires attributed outcomes"]
+implementation_refs = ["CampaignLearningStateView inputs", "development diagnosis evidence"]
+
+[[cell]]
+order = 72
+id = "smart.self_model.context_projection"
+stage = "W8_CANONICAL_PROJECTION_BRIDGES"
+physical_crate = "eliot-dreamer-self-query"
+hot_path = true
+responsibility = "Project exact accepted Architecture, Implementation target and current conformance evidence into bounded self-model ContextAtoms without treating targets as current support."
+public_functions = ["pub fn project_self_model_context(request: &SelfModelContextProjectionRequest, architecture: &ArchitectureBrief, implementation: &ImplementationBrief) -> Result<ProviderContribution, SelfModelContextProjectionError>"]
+algorithm = ["validate accepted normative-pair identities and exact brief digests", "separate Architecture invariants, Implementation targets, current observed support, blockers and unknowns", "select only decision-relevant sections under bounded policy", "retain exact section/evidence handles and omission manifest", "emit owner coverage and one compatible State Fence"]
+complexity = "O(n log n + selected_bytes) over already materialized briefs; no document read, repository scan, model call or conformance inference."
+invariants = ["Architecture semantic precedence remains explicit", "Implementation target is not current support", "prose-only evidence cannot become current capability", "missing conformance yields Unknown rather than target-as-fact"]
+degradation = "When current-system evidence is stale or missing, emit target-only atoms plus explicit Unknown/Blocked atoms."
+errors = ["NormativePairMismatch", "BriefDigestMismatch", "FenceMismatch", "CurrentSupportOverclaim", "RequiredInvariantMissing", "ProjectionTooLarge"]
+tests = ["target/current separated", "wrong normative pair rejected", "prose-only support rejected", "missing conformance becomes Unknown", "omission remains expandable"]
+source_files = ["crates/smart/eliot-dreamer-self-query/src/context_projection.rs", "crates/smart/eliot-dreamer-self-query/tests/context_projection.rs"]
+product_pulse = "D3B_CANONICAL_PROJECTION_PULSE_01"
+architecture_refs = ["self-model and Architecture awareness", "current-system truth requires evidence"]
+implementation_refs = ["Architecture/Implementation self-query", "Context Compiler self-model provider"]
