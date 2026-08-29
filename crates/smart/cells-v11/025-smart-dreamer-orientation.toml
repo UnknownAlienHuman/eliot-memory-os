@@ -1,0 +1,44 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.orientation"
+agent_order = 25
+physical_package = "eliot-dreamer-orientation"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Assemble a candidate-only Orientation DreamPacket from already typed grounded child outputs."
+
+[agent]
+objective = "Implement typed Orientation packet assembly only; do not recompute child semantics."
+write_scope = ["crates/smart/eliot-dreamer-orientation/src/packet.rs", "crates/smart/eliot-dreamer-orientation/tests/packet.rs"]
+integration_owner = "Dreamer Orientation integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-orientation/src/lib.rs", "crates/smart/eliot-dreamer-orientation/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn assemble_orientation_packet(request: &OrientationPacketRequest, draft: &AdmittedDreamDraft, rivals: RivalModelSet, relations: RelationCandidateSet, probes: DiscriminativeProbePlan) -> Result<DreamPacket, OrientationPacketError>"]
+
+[algorithm]
+steps = [
+  "Validate exact job, fence and child-output identities.",
+  "Place Governor-resolved epistemic position only in the resolved section.",
+  "Place model synthesis only in candidate sections.",
+  "Retain rivals, relation candidates, unknowns, probes, coverage, route or cost and invalidation.",
+  "Enforce output byte and item budget.",
+  "Compute canonical packet digest."
+]
+
+[limits]
+rules = ["Use DreamBudget maximum packet bytes and items.", "Perform no child semantic recomputation."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "SectionAuthorityViolation", "MissingCoverage", "BudgetExceeded", "DigestFailure"]
+
+[forbidden]
+operations = ["writing confirmed evidence from model text", "truth/support promotion", "child semantic recomputation", "canonical write", "effect execution"]
+
+[tests]
+required = ["model text cannot populate confirmed evidence", "unknowns remain visible", "over-budget optional section is omitted whole with handle or fails", "equivalent inputs yield identical digest"]
+
+[integration]
+provider = "smart.dreamer.rival_model, smart.dreamer.relation, smart.dreamer.probe_plan and admitted draft"
+consumer = "Governor/Human orientation review and Context projection owners"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if a child output has incompatible identity, fence or authority section."
