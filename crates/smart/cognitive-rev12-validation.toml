@@ -3,7 +3,7 @@ authority = "eliot-cognitive-function-design-rev12"
 status = "VALIDATION_CONTRACT_NOT_PRODUCT_PROOF"
 issue = 94
 branch = "work/94-cognitive-function-design-rev11"
-expected_base_main = "4960cb928c848293c3b4abc33f7ec7033dc0a8da"
+expected_base_main = "603b70bef8807597f0421e72584db45211949eb7"
 proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
 
 [expected]
