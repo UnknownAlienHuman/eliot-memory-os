@@ -88,16 +88,15 @@ struct EpochDriverTask {
     wall_interrupted: Arc<AtomicBool>,
     epoch_ticks: Arc<AtomicU64>,
     engine: Engine,
-    wall_deadline_ms: u64,
+    wall_deadline: Instant,
     effective_epoch_deadline: u64,
 }
 
 impl EpochDriverTask {
     fn run(self) {
-        let wall_deadline = Instant::now() + Duration::from_millis(self.wall_deadline_ms);
         while !self.stop.load(Ordering::Acquire) {
             thread::sleep(Duration::from_millis(1));
-            if Instant::now() >= wall_deadline {
+            if Instant::now() >= self.wall_deadline {
                 self.wall_interrupted.store(true, Ordering::Release);
                 let emitted = self.epoch_ticks.load(Ordering::Acquire);
                 let remaining = self.effective_epoch_deadline.saturating_sub(emitted);
@@ -270,6 +269,10 @@ impl WasmtimeComponentEngine {
         F: FnOnce(&str, EpochDriverTask) -> io::Result<thread::JoinHandle<()>>,
     {
         validate_epoch_policy(limits)?;
+        let start = Instant::now();
+        let wall_deadline = start
+            .checked_add(Duration::from_millis(limits.wall_deadline_ms))
+            .ok_or(PortError::Denied)?;
         let (invocation_engine, component) = match limits.epoch.cancellation {
             eliot_wasm_runtime::CancellationPolicy::EpochInterruption => {
                 (&self.epoch_engine, &self.epoch_component)
@@ -278,7 +281,6 @@ impl WasmtimeComponentEngine {
                 (&self.fuel_engine, &self.fuel_component)
             }
         };
-        let start = Instant::now();
         let mut store = Store::new(
             invocation_engine,
             StoreState {
@@ -315,7 +317,7 @@ impl WasmtimeComponentEngine {
             wall_interrupted: Arc::clone(&wall_interrupted),
             epoch_ticks: Arc::clone(&epoch_ticks),
             engine: invocation_engine.clone(),
-            wall_deadline_ms: limits.wall_deadline_ms,
+            wall_deadline,
             effective_epoch_deadline,
         };
         let epoch_driver = match spawn_driver(&epoch_driver_identity, epoch_driver_task) {
@@ -772,6 +774,38 @@ mod tests {
         assert!(report.proposed_effects.is_empty());
         assert!(report.observed_state_delta.is_empty());
         assert!(report.post_commit_known);
+        Ok(())
+    }
+
+    #[test]
+    fn unrepresentable_wall_deadline_is_rejected_before_driver_or_guest() -> Result<(), String> {
+        let artifact =
+            wat::parse_file("tests/fixtures/guest.wat").map_err(|error| error.to_string())?;
+        let digest = Sha256Digest::of_bytes(&artifact);
+        let engine = WasmtimeComponentEngine::new(
+            binding(),
+            digest.clone(),
+            &artifact,
+            COMPONENT_CONFIGURATION,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut limits = test_limits(digest);
+        limits.wall_deadline_ms = u64::MAX;
+        let mut driver_called = false;
+
+        let result = engine.invoke_component_with_epoch_driver(
+            &Sha256Digest::of_bytes(b"wall-deadline-overflow"),
+            &limits,
+            b"typed guest input",
+            true,
+            |_identity, _task| {
+                driver_called = true;
+                Err(io::Error::other("epoch driver must not start"))
+            },
+        );
+
+        assert!(matches!(result, Err(PortError::Denied)));
+        assert!(!driver_called);
         Ok(())
     }
 
