@@ -1,0 +1,144 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "AGENT_HANDOFF_CONTRACT"
+assignment_unit = "one FunctionalCapabilityCell"
+implementation_language = "Rust 2024"
+package_msrv = "1.94"
+build_toolchain = "repository-pinned toolchain"
+
+[worker_input]
+required = [
+  "one exact [[cell]] record from a cognitive-rev11-cells-*.toml catalog",
+  "the owning type-family records from cognitive-rev11-type-ownership.toml",
+  "the physical-crate entry from cognitive-rev11-topology.toml",
+  "the package target dependency entry from cognitive-rev11-cargo-plan.toml",
+  "all prerequisite contracts named by the wave and edge maps",
+  "the exact donor keep/replace disposition from cognitive-rev11-migration.toml when a donor exists",
+]
+forbidden_extra_context = [
+  "retired module.toml as authority",
+  "retired *.api.toml as authority",
+  "old cognitive branch claims",
+  "superseded normative documents",
+  "agent memory as current-system evidence",
+]
+
+[worker_write_scope]
+allowed = ["the exact source_files declared by the assigned cell"]
+forbidden = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "src/lib.rs",
+  "package-wide re-export modules",
+  "another cell source or test file",
+  "root workspace membership",
+  "workflows",
+  "normative documentation",
+]
+conflict_rule = "If the required change crosses another cell or owner scope, stop and return ContractChallenge or integration request; do not edit through the boundary."
+
+[worker_implementation]
+required = [
+  "implement only the public signatures allowlisted by the cell",
+  "keep non-allowlisted helpers private",
+  "use owner types rather than compatibility copies",
+  "preserve ordered algorithm obligations or raise a ContractChallenge",
+  "enforce all declared bounds before allocating or traversing",
+  "use deterministic BTree collections or explicit stable sorting for wire-visible output",
+  "return typed errors or explicit degraded dispositions",
+  "forbid unsafe code",
+  "avoid hidden I/O, clocks, randomness, environment reads and global mutable state",
+  "write at least the minimum declared discriminator/property/adversarial tests",
+]
+forbidden = [
+  "generic serde_json::Value public API",
+  "anyhow as public contract error",
+  "provider SDK type in pure contracts",
+  "model call in hot path or pure core",
+  "storage scan or filesystem canonicalize in hot path",
+  "HashMap iteration as output order",
+  "scalar confidence/quality/utility score replacing named dimensions",
+  "automatic fallback for unknown job class, kind or subtype",
+  "truth, authority, finish, job, scheduler, effect or runtime ownership",
+]
+
+[worker_proof_return]
+required_fields = [
+  "cell_id",
+  "physical_crate",
+  "source_files_changed",
+  "public_api_delta",
+  "tests_added",
+  "commands_run",
+  "test_results",
+  "known_inconclusive_dimensions",
+  "external_contract_challenges",
+  "proof_ceiling",
+]
+allowed_ceiling = "MODULE_PROOF_CANDIDATE"
+forbidden_claims = ["Edge Proof", "Product Pulse", "runtime support", "product acceptance"]
+
+[integration_owner_input]
+required = [
+  "all completed worker changes for one physical crate",
+  "worker proof returns",
+  "type-ownership registry",
+  "Cargo plan",
+  "affected edge records",
+]
+
+[integration_owner_write_scope]
+allowed = ["physical-crate Cargo.toml", "physical-crate src/lib.rs", "package-wide re-exports", "integration-only tests inside the physical crate"]
+forbidden = ["semantic rewrite of a worker cell without returning it to the cell owner", "root workspace admission before package/edge/product gates", "new public type without ownership review"]
+
+[integration_owner_tasks]
+ordered = [
+  "verify all expected cell source/test files exist",
+  "verify worker scopes do not overlap",
+  "reconcile package dependencies with cognitive-rev11-cargo-plan.toml",
+  "wire modules and exact public re-exports",
+  "reject duplicate public types and error taxonomies",
+  "run formatting, clippy, package tests and schema roundtrip tests",
+  "produce package-level Module Proof evidence",
+  "handoff to typed Edge Proof owner",
+]
+
+[edge_owner_tasks]
+ordered = [
+  "instantiate the real provider and consumer named by cognitive-edge-map.toml",
+  "bind one exact State Fence and Product Identity",
+  "exercise success, typed failure, stale-fence and local-degradation paths",
+  "prove no hidden fallback or owner expansion",
+  "record exact commands, artifacts and proof ceiling",
+]
+forbidden_claim = "An Edge Proof does not prove the full Product Pulse."
+
+[product_pulse_owner_tasks]
+ordered = [
+  "run the named pulse only after all required edges pass",
+  "use exact current Product Identity and accepted normative pair",
+  "measure the product outcome and counter-metrics",
+  "exercise rollback or safe-degradation path",
+  "publish PASS, FAIL, BLOCKED or INCONCLUSIVE with evidence handles",
+]
+
+[stop_conditions]
+worker = [
+  "contract contradiction",
+  "missing owner-neutral external type",
+  "required behavior exceeds effect or authority ceiling",
+  "source scope overlaps another cell",
+  "algorithm cannot satisfy declared complexity or safety invariant",
+  "donor logic conflicts with current Architecture/Implementation",
+]
+integration_owner = [
+  "duplicate public type owner",
+  "implementation dependency cycle",
+  "package has no independent seam after implementation",
+  "package proof requires another mutable owner",
+]
+
+[completion_definition]
+worker = "Declared source and tests implemented, minimum tests pass, public API unchanged from allowlist, proof return complete and honest."
+physical_crate = "All cells integrated, package proof passes, Cargo direction matches plan and no type owner is duplicated."
+product = "All affected Edge Proofs and named Product Pulse pass on exact Product Identity."
