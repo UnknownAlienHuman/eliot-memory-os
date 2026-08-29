@@ -3,7 +3,7 @@ authority_id = "eliot-cognitive-function-design-rev12"
 status = "STATIC_FUNCTION_DESIGN_ONLY"
 issue = 94
 branch = "work/94-cognitive-function-design-rev11"
-base_main_commit = "4960cb928c848293c3b4abc33f7ec7033dc0a8da"
+base_main_commit = "603b70bef8807597f0421e72584db45211949eb7"
 repository = "UnknownAlienHuman/eliot-memory-os"
 
 [normative_pair]
