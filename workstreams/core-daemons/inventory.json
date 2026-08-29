@@ -1,10 +1,11 @@
 {
-  "schema": "eliot.core-daemon-workstream.v2",
-  "updated_at": "2026-08-28",
+  "schema": "eliot.core-daemon-workstream.v3",
+  "updated_at": "2026-08-29",
   "authority": {
     "branch": "main",
+    "source_audit_base": "89281ebd9828dbf886d105abedfe690183a18562",
     "normative_pair_receipt": "docs/normative-pair.toml",
-    "architecture_sha256": "c6932eaf26935e752eefb4fc5818ec49dc784f23f246f42dc9d3ca5843196b",
+    "architecture_sha256": "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a",
     "implementation_sha256": "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063",
     "product_status": "NOT_ACCEPTED_UNVERIFIED"
   },
@@ -37,33 +38,294 @@
     {
       "issue": 13,
       "priority": "P0",
-      "property": "generated capability-cell ownership, proof surfaces, and current normative-pair bindings"
+      "property": "current-pair capability-cell ownership, runtime bundle and proof registry"
     },
     {
       "issue": 11,
       "priority": "P0",
       "property": "live Windows operational spine and Product Pulse"
+    },
+    {
+      "issue": 64,
+      "priority": "P0",
+      "property": "one lineage-aware authority epoch identity across Host, Kernel, ORS, daemon, store and process contours"
+    },
+    {
+      "issue": 63,
+      "priority": "P0",
+      "property": "one canonical executable request hash recomputed across Governor, Kernel and store"
+    },
+    {
+      "issue": 65,
+      "priority": "P0",
+      "property": "normal workload admission separated from protected Control Reserve at every claimed bottleneck"
+    },
+    {
+      "issue": 79,
+      "priority": "P0",
+      "property": "transport connection identity separated from durable process/session ownership"
+    }
+  ],
+  "merged_source_repairs": [
+    {
+      "issue": 59,
+      "property": "RouteFence rejects unactivated future epochs at the public boundary",
+      "proof_ceiling": "focused source test; build/runtime not executed"
+    },
+    {
+      "issue": 61,
+      "property": "eliotd health cadence is no longer starved by the faster activation poll",
+      "proof_ceiling": "focused async source test; live heartbeat not executed"
+    },
+    {
+      "issue": 68,
+      "property": "Watchdog readiness publishes one coherent admitted epoch pair and clears it on gaps",
+      "proof_ceiling": "focused deterministic source tests; live supervision not executed"
+    },
+    {
+      "issue": 70,
+      "property": "standalone testd no longer creates ambient state or advertises false readiness without Kernel admission",
+      "proof_ceiling": "focused deterministic source test; testd runtime remains blocked"
     }
   ],
   "units": [
-    {"id":"host","issue":14,"source":"present","support":"PARTIAL","disposition":"REWORK"},
-    {"id":"kernel","issue":15,"source":"present","support":"PARTIAL","disposition":"REWORK"},
-    {"id":"governor_daemon","issue":18,"source":"present","support":"CURRENT_UNVERIFIED","disposition":"REWORK"},
-    {"id":"watchdog","issue":16,"source":"present","support":"PARTIAL","disposition":"REWORK"},
-    {"id":"doctor","issue":17,"source":"present","support":"CURRENT_UNVERIFIED","disposition":"REWORK"},
-    {"id":"store_bridge","issue":19,"source":"present","support":"PARTIAL","disposition":"REWORK","related_issues":[7,8,9]},
-    {"id":"surreal_dependency","issue":19,"source":"external_declared","support":"TARGET","disposition":"VERIFY"},
-    {"id":"blob_store","issue":19,"source":"present","support":"CURRENT_UNVERIFIED","disposition":"REWORK"},
-    {"id":"testd","issue":20,"source":"present","support":"PARTIAL","disposition":"REWORK"},
-    {"id":"wasm_host","issue":21,"source":"present","support":"PARTIAL","disposition":"REWORK"},
-    {"id":"native_worker","issue":22,"source":"present","support":"CURRENT_UNVERIFIED","disposition":"REWORK"},
-    {"id":"user_broker","issue":23,"source":"present","support":"CURRENT_UNVERIFIED","disposition":"REWORK"},
-    {"id":"notify","issue":13,"source":"present","support":"CURRENT_UNVERIFIED","disposition":"KEEP_AND_BIND"},
-    {"id":"agent_bridge","issue":13,"source":"present","support":"CURRENT_UNVERIFIED","disposition":"KEEP_AND_BIND"},
-    {"id":"research_provider_process","issue":24,"source":"present","support":"PARTIAL","disposition":"REWORK"}
+    {
+      "id": "host",
+      "primary_issue": 14,
+      "source": "present",
+      "core_support": "PARTIAL",
+      "process_support": "CURRENT_UNVERIFIED",
+      "disposition": "REWORK_COMPOSITION",
+      "confirmed_strengths": [
+        "lineage-aware Host epochs",
+        "one-time launch nonce",
+        "durable PID/start/image/file/Job identity",
+        "fail-closed HostStateJournal"
+      ],
+      "next_issues": [13, 64, 65, 11]
+    },
+    {
+      "id": "kernel",
+      "primary_issue": 15,
+      "source": "present",
+      "core_support": "PARTIAL",
+      "process_support": "PARTIAL",
+      "disposition": "REWORK_CONTRACT_EDGES",
+      "confirmed_strengths": [
+        "small dependency-light pure decision core",
+        "MAC-bound authority tokens",
+        "explicit generation routes and route fences",
+        "separate ORS and store gateway"
+      ],
+      "fixed_issues": [59],
+      "open_issues": [13, 63, 64, 65, 66, 79],
+      "next_product_proof": 11
+    },
+    {
+      "id": "governor_daemon",
+      "primary_issue": 18,
+      "source": "present",
+      "core_support": "PARTIAL",
+      "process_support": "PARTIAL",
+      "disposition": "REWORK_SEMANTIC_EDGE_AND_LEGACY_EXTRACTION",
+      "fixed_issues": [61],
+      "open_issues": [13, 63, 64, 66],
+      "legacy_facade": "crates/eliot-app",
+      "next_product_proof": 11
+    },
+    {
+      "id": "watchdog",
+      "primary_issue": 16,
+      "source": "present",
+      "core_support": "PARTIAL",
+      "process_support": "PARTIAL",
+      "disposition": "WIRE_DETERMINISTIC_ACTION_CORE",
+      "confirmed_strengths": [
+        "independent SCM sibling",
+        "signed admission lease reload",
+        "Host identity observation during authority gaps",
+        "protected non-semantic spool"
+      ],
+      "fixed_issues": [68],
+      "open_issues": [13, 64, 65],
+      "known_gap": "deterministic observe/tick/restart/reap decisions are not connected to production Kernel/Host action receipts",
+      "next_product_proof": 11
+    },
+    {
+      "id": "doctor",
+      "primary_issue": 17,
+      "source": "present",
+      "core_support": "CURRENT_UNVERIFIED",
+      "process_support": "BLOCKED",
+      "disposition": "IMPLEMENT_KERNEL_GATED_REPAIR_EDGE",
+      "confirmed_strengths": [
+        "one-shot fail-closed binary",
+        "candidate-only repair core",
+        "unknown effect preserved",
+        "no direct canonical write"
+      ],
+      "open_issues": [13, 64, 65],
+      "known_gaps": [
+        "no production Kernel Doctor operation",
+        "attempt budget and cooldown are not durable across invocations",
+        "success depends on caller-provided verified boolean rather than an executed VerificationReceipt"
+      ],
+      "next_product_proof": 11
+    },
+    {
+      "id": "store_bridge",
+      "primary_issue": 19,
+      "source": "present",
+      "core_support": "PARTIAL",
+      "process_support": "PARTIAL",
+      "disposition": "REWORK_DIGEST_ERROR_CONCURRENCY_AND_LIFECYCLE_EDGES",
+      "confirmed_strengths": [
+        "provider-neutral closed store API",
+        "protected config and credential boundary",
+        "named-operation manifest",
+        "optimistic RevisionHead and OrderingHead checks",
+        "atomic event/projection/relation/receipt/outbox transaction"
+      ],
+      "open_issues": [10, 13, 63, 64, 67, 76],
+      "next_product_proof": 11
+    },
+    {
+      "id": "surreal_dependency",
+      "primary_issue": 19,
+      "source": "external_declared",
+      "core_support": "NOT_APPLICABLE",
+      "process_support": "TARGET",
+      "disposition": "VERIFY_HOST_MANAGED_GENERATION",
+      "open_issues": [10, 11, 19, 64],
+      "known_gap": "installed artifact, exclusive data-root ownership, crash, restore and update have not been observed"
+    },
+    {
+      "id": "blob_store",
+      "primary_issue": 19,
+      "source": "present",
+      "core_support": "CURRENT_UNVERIFIED",
+      "process_support": "TARGET",
+      "disposition": "CLOSE_STAGE_REACHABILITY_GC_RESIDENCY_AND_CUTOVER",
+      "open_issues": [13, 19, 64],
+      "next_product_proof": 11
+    },
+    {
+      "id": "testd",
+      "primary_issue": 20,
+      "source": "present",
+      "core_support": "PARTIAL",
+      "process_support": "BLOCKED",
+      "disposition": "IMPLEMENT_KERNEL_GATED_EXECUTION_LOOP",
+      "confirmed_strengths": [
+        "durable redb job and event store",
+        "non-serializable consuming ProcessRequest permit",
+        "strict source/build/cache root validation",
+        "exact raw evidence digest and normalized evidence binding"
+      ],
+      "fixed_issues": [70],
+      "open_issues": [13, 64, 65, 72, 79],
+      "known_gap": "no authenticated Kernel/EBP worker loop or real ProcessExecutor evidence publication",
+      "next_product_proof": 11
+    },
+    {
+      "id": "wasm_host",
+      "primary_issue": 21,
+      "source": "present",
+      "core_support": "PARTIAL",
+      "process_support": "BLOCKED",
+      "disposition": "FIX_PROVIDER_IDENTITY_LIMITS_AND_IMPLEMENT_KERNEL_GENERATION_CONTOUR",
+      "confirmed_strengths": [
+        "candidate-only pure runtime",
+        "typed Component Model provider",
+        "empty linker with no WASI/imports",
+        "bounded memory/table/instance/output/fuel/stack limits",
+        "standalone fail-closed binary"
+      ],
+      "open_issues": [13, 64, 73, 75],
+      "next_product_proof": 11
+    },
+    {
+      "id": "native_worker",
+      "primary_issue": 22,
+      "source": "present",
+      "core_support": "PARTIAL",
+      "process_support": "BLOCKED",
+      "disposition": "ADOPT_SHARED_EBP_AND_TYPED_KERNEL_CLAIM",
+      "confirmed_strengths": [
+        "standalone fail-closed binary",
+        "injected ProcessExecutor and capability ports",
+        "candidate-only effect model",
+        "explicit replay/checkpoint/cancel states"
+      ],
+      "open_issues": [13, 64, 65, 79],
+      "known_gap": "worker protocol duplicates EBP identity/fence/ack contracts and Kernel claim is not consumable",
+      "next_product_proof": 11
+    },
+    {
+      "id": "user_broker",
+      "primary_issue": 23,
+      "source": "present",
+      "core_support": "PARTIAL",
+      "process_support": "PARTIAL",
+      "disposition": "REWORK_OPERATION_IDENTITY_READINESS_CLOCK_AND_LOGOFF_EDGE",
+      "confirmed_strengths": [
+        "protected launch declaration",
+        "PID/SID/session/artifact validation",
+        "Kernel re-authorization for each launch",
+        "shared ProcessExecutor and one-shot dispatch permit",
+        "heartbeat loss terminates the process contour"
+      ],
+      "open_issues": [13, 64, 65, 74, 79],
+      "next_product_proof": 11
+    },
+    {
+      "id": "notify",
+      "primary_issue": 13,
+      "source": "present",
+      "core_support": "PARTIAL",
+      "process_support": "PARTIAL",
+      "disposition": "SPLIT_AND_BIND_EFFECT_AND_LEDGER_CELLS",
+      "confirmed_strengths": [
+        "one-shot process",
+        "protected root",
+        "Kernel-backed normal verification",
+        "signed Watchdog fallback",
+        "one-shot ledger"
+      ],
+      "open_issues": [13, 64, 78],
+      "next_product_proof": 11
+    },
+    {
+      "id": "agent_bridge",
+      "primary_issue": 13,
+      "source": "present",
+      "core_support": "PARTIAL",
+      "process_support": "PARTIAL",
+      "disposition": "SPLIT_ACTIVATION_EVENT_AND_REQUEST_TRANSLATION_CELLS",
+      "confirmed_strengths": [
+        "protected client declaration and peer challenge",
+        "one-shot Kernel activation exchange",
+        "durable event replay/ack pure core",
+        "restart-empty process state"
+      ],
+      "open_issues": [7, 8, 9, 13, 64, 66, 77, 79],
+      "known_gap": "normal Request/Cancel raw Frame passthrough is contractually impossible and production forwarding remains a stub",
+      "next_product_proof": 11
+    },
+    {
+      "id": "research_provider_process",
+      "primary_issue": 24,
+      "source": "present",
+      "core_support": "PARTIAL",
+      "process_support": "PARTIAL",
+      "disposition": "MOVE_TO_GOVERNED_PROCESS_CONTOUR",
+      "open_issues": [13, 24, 64, 65, 79],
+      "known_gap": "ambient environment-selected direct process launch bypasses the governed process contour"
+    }
   ],
   "evidence_ceiling": {
     "source_inventory": "OBSERVED",
+    "source_code_review": "OBSERVED_PARTIAL",
     "build": "NOT_EXECUTED",
     "runtime": "NOT_EXECUTED",
     "store": "NOT_EXECUTED",
