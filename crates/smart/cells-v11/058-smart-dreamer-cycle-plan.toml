@@ -1,0 +1,44 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.cycle_plan"
+agent_order = 58
+physical_package = "eliot-dreamer-cycle"
+execution_class = "BACKGROUND_MAINTENANCE_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Map one DreamCycle sample to a finite candidate-only curation or challenge plan without self-scheduling."
+
+[agent]
+objective = "Implement finite candidate-only DreamCycle planning."
+write_scope = ["crates/smart/eliot-dreamer-cycle/src/plan.rs", "crates/smart/eliot-dreamer-cycle/tests/plan.rs"]
+integration_owner = "DreamCycle integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-cycle/src/lib.rs", "crates/smart/eliot-dreamer-cycle/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_dream_cycle_plan_candidate(request: &DreamCyclePlanRequest, sample: &DreamCycleSample, registry: &CurationHandlerRegistry) -> Result<DreamCyclePlanCandidate, DreamCyclePlanError>"]
+
+[algorithm]
+steps = [
+  "Validate sample, maintenance policy, registry and fence.",
+  "Map each sample kind to an exact registered handler.",
+  "Deduplicate by target, problem, lineage and proposed effect.",
+  "Permit at most one automatic experiment per target.",
+  "Respect automation mode, privacy, budget, service-safe route and user-session requirement.",
+  "Emit a finite one-cycle horizon without rescheduling itself."
+]
+
+[limits]
+rules = ["Use explicit plan-item and experiment maxima.", "Perform no scheduler, DurableJob, agent, model or tool launch."]
+
+[errors]
+variants = ["IdentityMismatch", "FenceMismatch", "UnsupportedSampleKind", "RegistryStale", "DuplicateExperiment", "PolicyDenied", "BudgetExceeded"]
+
+[forbidden]
+operations = ["self-scheduling", "DurableJob creation", "agent/model/tool launch", "unknown-kind fallback", "multiple automatic experiments per target"]
+
+[tests]
+required = ["unknown kind is unsupported", "plan cannot include itself as next cycle", "duplicate target experiment is rejected", "disabled mode remains advisory only"]
+
+[integration]
+provider = "smart.dreamer.cycle_sample and external CurationHandlerRegistry owner"
+consumer = "external maintenance/Governor/Agent Coordinator owner"
+product_pulse = "D6_DREAM_CYCLE_PULSE_01"
+stop_condition = "Stop and return ContractChallenge if registry, automation mode, budget, privacy or session requirement is unavailable."
