@@ -1,0 +1,42 @@
+schema_version = "eliot-functional-capability-cell-v11"
+cell_id = "smart.dreamer.implementation_brief"
+agent_order = 60
+physical_package = "eliot-dreamer-self-model"
+execution_class = "COLD_BOUNDED"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+causal_property = "Compile a bounded Implementation target brief from an exact accepted normative source projection."
+
+[agent]
+objective = "Implement bounded Implementation projection over an externally supplied accepted source."
+write_scope = ["crates/smart/eliot-dreamer-self-model/src/implementation_brief.rs", "crates/smart/eliot-dreamer-self-model/tests/implementation_brief.rs"]
+integration_owner = "Dreamer self-model integration owner"
+forbidden_files = ["crates/smart/eliot-dreamer-self-model/src/lib.rs", "crates/smart/eliot-dreamer-self-model/Cargo.toml", "Cargo.toml", "Cargo.lock"]
+
+[api]
+functions = ["pub fn build_implementation_brief(request: &ImplementationBriefRequest, source: &AcceptedNormativeSourceProjection) -> Result<ImplementationBriefCandidate, ImplementationBriefError>"]
+
+[algorithm]
+steps = [
+  "Validate accepted pair key, Implementation digest, source anchors and fence.",
+  "Select target owners, contracts, defaults, failure behavior and migration relevant to the question.",
+  "Preserve target-versus-current-support distinction.",
+  "Emit candidate brief, exact anchors and omissions."
+]
+
+[limits]
+rules = ["Use explicit section, anchor and byte maxima.", "Perform no repository, runtime, storage or web read."]
+
+[errors]
+variants = ["PairKeyMismatch", "DigestMismatch", "FenceMismatch", "AnchorNotFound", "CoverageIncomplete", "BudgetExceeded"]
+
+[forbidden]
+operations = ["repository/runtime read", "target mechanism as current support", "third normative source creation", "failure-behavior omission", "canonical write"]
+
+[tests]
+required = ["target mechanism is not labelled current support", "stale digest is rejected", "failure behavior remains visible", "omitted section retains anchor"]
+
+[integration]
+provider = "accepted normative-source projection owner"
+consumer = "smart.dreamer.current_system_conformance and external self-query review owner"
+product_pulse = "D5_SELF_QUERY_EDGE_01"
+stop_condition = "Stop and return ContractChallenge if accepted pair key, digest, exact anchors or target/current distinction is unavailable."
