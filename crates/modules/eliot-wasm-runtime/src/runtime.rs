@@ -782,10 +782,11 @@ fn report_contract_valid(invocation: &EngineInvocation, report: &EngineReport) -
                 report.termination,
                 EngineTermination::Deadline | EngineTermination::EpochDeadline
             ))
+        && report.usage.effective_epoch_policy == limits.epoch
         && report
             .usage
             .epoch_ticks
-            .is_none_or(|value| value <= limits.epoch.deadline_ticks)
+            .is_none_or(|value| value <= report.usage.effective_epoch_policy.deadline_ticks)
         && report.usage.artifact_reads <= limits.artifact_access.max_reads
         && report.usage.artifact_bytes <= limits.artifact_access.max_bytes
         && u32::try_from(report.host_calls.len()).ok() == Some(report.usage.host_calls)
