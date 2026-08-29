@@ -1,0 +1,258 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+range = "35..48"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[[cell]]
+order = 35
+id = "smart.memory.curation.contracts"
+stage = "W0_CONTRACT_EVIDENCE"
+physical_crate = "eliot-memory-curation-contracts"
+hot_path = false
+responsibility = "Own dimensioned read-only curation evidence and forward proposal contracts while separating existence, support, accessibility and influence."
+public_functions = ["pub fn validate_curation_snapshot(snapshot: &CurationSnapshot) -> Result<(), CurationContractError>", "pub fn validate_curation_proposal(proposal: &CurationProposal) -> Result<(), CurationContractError>"]
+public_types = ["CurationSnapshot", "CurationRecordProjection", "CurationEvidenceVector", "CurationDimension", "DimensionResult", "CurationFinding", "CurationProposal", "AccessibilityProposal", "InfluenceRepairProposal", "ProtectionReason", "CurationCoverage"]
+algorithm = ["validate exact record handles, revisions, State Fence and frozen denominator", "require dimension results instead of scalar utility or confidence", "validate protection reasons and minority/counterevidence handles", "require reversible forward proposal and rollback conditions", "canonicalize records and findings"]
+invariants = ["existence is not support", "support is not accessibility", "accessibility is not permitted influence", "retrieval frequency is not usefulness", "proposal is not lifecycle execution"]
+degradation = "Missing outcome denominator yields Inconclusive dimensions and no destructive proposal."
+errors = ["SnapshotInvalid", "DenominatorMissing", "ScalarShortcutForbidden", "ProtectedRecordViolation", "IrreversibleProposal", "FenceMismatch"]
+tests = ["writer utility float cannot decide", "low-use supported fact protected", "minority evidence retained", "proposal has rollback and no action receipt"]
+source_files = ["crates/smart/eliot-memory-curation-contracts/src/contracts.rs", "crates/smart/eliot-memory-curation-contracts/tests/contracts.rs"]
+product_pulse = "D3A_CURATION_PULSE_01"
+architecture_refs = ["memory lifecycle separation", "minority evidence", "reversibility"]
+implementation_refs = ["I9.7 transformation dimensions", "curation candidate boundary"]
+
+[[cell]]
+order = 36
+id = "smart.memory.curation.screen"
+stage = "W3_CURATED_MEMORY"
+physical_crate = "eliot-memory-curation-screen"
+hot_path = false
+responsibility = "Screen one bounded canonical projection read-only and emit dimensioned findings without selecting lifecycle actions."
+public_functions = ["pub fn screen_curation_snapshot(snapshot: &CurationSnapshot, policy: &CurationScreenPolicy) -> Result<CurationScreenResult, CurationScreenError>"]
+algorithm = ["validate snapshot revision, scope, denominator and bounds", "identify exact duplicates, possible semantic duplicates, scope mismatch, stale/superseded evidence and unsafe instructions", "protect current verified, counterexample, minority, audit and under-supported FailureFingerprint records", "evaluate dimensions independently", "emit stable paged findings with exact evidence and counterevidence handles"]
+invariants = ["read-only", "no scalar confidence", "no archive/suppress execution", "partial scan cannot claim complete absence", "protected records remain visible"]
+degradation = "Truncated or partial scan emits exact coverage state and suppresses conclusions requiring a complete denominator."
+errors = ["SnapshotInvalid", "ScopeMismatch", "DuplicateHandle", "CursorInvalid", "CoverageInsufficient", "LimitExceeded"]
+tests = ["protected record excluded from destructive finding", "partial scan not complete", "duplicate finding deterministic", "writer score ignored"]
+source_files = ["crates/smart/eliot-memory-curation-screen/src/screen.rs", "crates/smart/eliot-memory-curation-screen/tests/screen.rs"]
+product_pulse = "D3A_CURATION_PULSE_01"
+architecture_refs = ["bounded curation", "protected minority evidence"]
+implementation_refs = ["curation screening", "reversible proposal only"]
+
+[[cell]]
+order = 37
+id = "smart.dreamer.classification"
+stage = "W3_CURATED_MEMORY"
+physical_crate = "eliot-dreamer-memory-models"
+hot_path = false
+responsibility = "Propose one semantic record family after Governor first-pass admission without rewriting the observation or inventing support."
+public_functions = ["pub fn build_classification_candidate(request: &ClassificationRequest, draft: &AdmittedDreamDraft) -> Result<ClassificationCandidate, ClassificationError>"]
+algorithm = ["validate admitted observation and allowed record families", "derive discriminating features from grounded claims only", "preserve ambiguous alternatives", "emit proposed family, evidence handles, counterevidence, unknowns and status ceiling", "require a reclassification condition"]
+invariants = ["Governor first-pass classification remains history", "candidate does not mutate canonical kind", "ambiguous subtype remains explicit", "model confidence is not support"]
+degradation = "Return AmbiguousClassification with bounded alternatives rather than force a family."
+errors = ["ObservationMissing", "FamilyUnsupported", "GroundingInsufficient", "StatusCeilingExceeded", "FenceMismatch"]
+tests = ["ambiguous subtype preserved", "first-pass record not rewritten", "unsupported family rejected", "repetition not support"]
+source_files = ["crates/smart/eliot-dreamer-memory-models/src/classification.rs", "crates/smart/eliot-dreamer-memory-models/tests/classification.rs"]
+product_pulse = "D3A_CURATION_PULSE_01"
+architecture_refs = ["capture before classification certainty", "candidate-only transformation"]
+implementation_refs = ["typed classification handler"]
+
+[[cell]]
+order = 38
+id = "smart.dreamer.episode"
+stage = "W3_CURATED_MEMORY"
+physical_crate = "eliot-dreamer-memory-models"
+hot_path = false
+responsibility = "Reconstruct an episode candidate while keeping observed chronology separate from causal hypotheses."
+public_functions = ["pub fn reconstruct_episode_candidate(request: &EpisodeRequest, draft: &AdmittedDreamDraft) -> Result<EpisodeCandidateSet, EpisodeError>"]
+public_types = ["EpisodeChronology", "TemporalRelation", "EpisodeParticipant", "EpisodeBoundary", "CausalHypothesis", "EpisodeCandidate", "EpisodeCandidateSet"]
+algorithm = ["validate exact event handles and clocks", "order only within comparable transaction or stream domains", "represent cross-domain order as Unknown when no bridge exists", "build episode boundaries and participants", "create causal hypotheses separately with mechanism, evidence, counterevidence, rivals and falsifier"]
+invariants = ["observed_before is not causal_predecessor", "wall-clock order is not causal order", "out-of-order events remain representable", "raw events are immutable"]
+degradation = "Emit partial chronology and explicit ordering gaps; omit causal hypothesis when mechanism or falsifier is missing."
+errors = ["EventMissing", "ClockDomainIncomparable", "BoundaryInvalid", "CausalMechanismMissing", "FenceMismatch"]
+tests = ["out-of-order events retained", "temporal relation not causal", "cross-stream order Unknown", "causal hypothesis requires falsifier"]
+source_files = ["crates/smart/eliot-dreamer-memory-models/src/episode.rs", "crates/smart/eliot-dreamer-memory-models/tests/episode.rs"]
+product_pulse = "D3A_CURATION_PULSE_01"
+architecture_refs = ["event history is immutable", "causal semantics"]
+implementation_refs = ["episode reconstruction handler"]
+
+[[cell]]
+order = 39
+id = "smart.dreamer.concept"
+stage = "W3_CURATED_MEMORY"
+physical_crate = "eliot-dreamer-memory-models"
+hot_path = false
+responsibility = "Propose a concept abstraction with applicability, counterexamples and falsifiers without overgeneralizing a single episode."
+public_functions = ["pub fn build_concept_candidates(request: &ConceptRequest, draft: &AdmittedDreamDraft) -> Result<ConceptCandidateSet, ConceptError>"]
+algorithm = ["group grounded examples by shared mechanism or invariant", "retain counterexamples and scope differences", "require minimum diversity or mark single-example hypothesis", "derive applicability and non-applicability boundaries", "emit concept candidates with revision conditions"]
+invariants = ["similar wording is not shared concept", "single example cannot become general rule", "counterexamples are first-class", "concept is candidate-only"]
+degradation = "Return LocalPatternCandidate or NoGeneralization when transfer evidence is insufficient."
+errors = ["ExampleMissing", "ScopeMixed", "CounterexampleLost", "Overgeneralization", "LimitExceeded"]
+tests = ["single example stays local", "counterexample narrows scope", "paraphrase alone insufficient", "candidate has falsifier"]
+source_files = ["crates/smart/eliot-dreamer-memory-models/src/concept.rs", "crates/smart/eliot-dreamer-memory-models/tests/concept.rs"]
+product_pulse = "D3A_CURATION_PULSE_01"
+architecture_refs = ["abstraction with counterexamples", "transfer boundary"]
+implementation_refs = ["concept formation handler"]
+
+[[cell]]
+order = 40
+id = "smart.dreamer.procedure"
+stage = "W3_CURATED_MEMORY"
+physical_crate = "eliot-dreamer-procedural"
+hot_path = false
+responsibility = "Propose a reusable procedure with preconditions, ordered steps, observables, verifier, stop and transfer boundaries."
+public_functions = ["pub fn build_procedure_candidates(request: &ProcedureRequest, draft: &AdmittedDreamDraft) -> Result<ProcedureCandidateSet, ProcedureError>"]
+algorithm = ["identify repeated successful mechanism with attributed outcomes", "extract preconditions and ordered steps", "attach expected observable and verifier to material steps", "derive stop, reopen and rollback conditions", "state transfer and non-applicability boundaries"]
+invariants = ["lucky success is not a procedure", "procedure does not grant tools or authority", "verifier is mandatory", "steps do not contain hidden provider credentials"]
+degradation = "Return OneOffSequence or Inconclusive when repetition, attribution or verifier is missing."
+errors = ["OutcomeUnattributed", "PreconditionMissing", "VerifierMissing", "AuthorityAssumption", "TransferBoundaryMissing"]
+tests = ["lucky success rejected", "verifier required", "authority assumption rejected", "non-applicability retained"]
+source_files = ["crates/smart/eliot-dreamer-procedural/src/procedure.rs", "crates/smart/eliot-dreamer-procedural/tests/procedure.rs"]
+product_pulse = "D3A_CURATION_PULSE_01"
+architecture_refs = ["procedural memory", "verifiable action knowledge"]
+implementation_refs = ["procedure synthesis handler"]
+
+[[cell]]
+order = 41
+id = "smart.dreamer.skill"
+stage = "W3_CURATED_MEMORY"
+physical_crate = "eliot-dreamer-procedural"
+hot_path = false
+responsibility = "Render a Skill candidate from an admitted procedure without installing a package, granting a capability or changing tool exposure."
+public_functions = ["pub fn build_skill_candidates(request: &SkillRequest, procedures: &ProcedureCandidateSet) -> Result<SkillCandidateSet, SkillError>"]
+algorithm = ["select procedure candidates meeting Skill policy", "derive trigger, intent, immediate action and context requirements", "state where not to apply", "attach stop/escalation, dependency and tool constraints", "bind candidate to procedure and source lineage"]
+invariants = ["Skill installation is external", "capability introduction is external", "trigger does not override policy", "package trust is not inferred"]
+degradation = "Return ProcedureOnly when packaging, trust or capability contracts are absent."
+errors = ["ProcedureInvalid", "TriggerAmbiguous", "CapabilityConstraintMissing", "InstallOwnershipViolation"]
+tests = ["candidate cannot install", "where-not-to-apply required", "tool constraint explicit", "untrusted package not inferred"]
+source_files = ["crates/smart/eliot-dreamer-procedural/src/skill.rs", "crates/smart/eliot-dreamer-procedural/tests/skill.rs"]
+product_pulse = "D3A_CURATION_PULSE_01"
+architecture_refs = ["Skills are governed", "capability introduction"]
+implementation_refs = ["Skill candidate boundary"]
+
+[[cell]]
+order = 42
+id = "smart.dreamer.failure"
+stage = "W3_CURATED_MEMORY"
+physical_crate = "eliot-dreamer-procedural"
+hot_path = false
+responsibility = "Construct a FailureFingerprint candidate distinguishing exact deterministic triggers from semantic similarity."
+public_functions = ["pub fn build_failure_fingerprint_candidates(request: &FailureRequest, draft: &AdmittedDreamDraft) -> Result<FailureFingerprintCandidateSet, FailureError>"]
+algorithm = ["bind exact failed attempt, expected observable, actual outcome and verifier", "derive deterministic trigger components and environment scope", "record near-match semantic cues separately", "attach counterexamples, recovery and expiry/revision conditions", "classify hard-block eligibility only for exact deterministic trigger"]
+invariants = ["semantic similarity cannot create hard block", "failure count is not mechanism proof", "counterexample weakens scope", "fingerprint remains candidate until governed admission"]
+degradation = "Emit WarningPatternCandidate when trigger is approximate or denominator incomplete."
+errors = ["AttemptMissing", "OutcomeMissing", "VerifierMissing", "TriggerInexact", "ScopeUnknown"]
+tests = ["near-match not hard block", "exact trigger candidate allowed", "counterexample narrows scope", "missing verifier inconclusive"]
+source_files = ["crates/smart/eliot-dreamer-procedural/src/failure.rs", "crates/smart/eliot-dreamer-procedural/tests/failure.rs"]
+product_pulse = "D3A_CURATION_PULSE_01"
+architecture_refs = ["negative memory", "failure mechanism"]
+implementation_refs = ["FailureFingerprint handler"]
+
+[[cell]]
+order = 43
+id = "smart.dreamer.structure_repair"
+stage = "W3_CURATED_MEMORY"
+physical_crate = "eliot-dreamer-memory-revision"
+hot_path = false
+responsibility = "Propose merge or split identity repair while preserving all prior identities, lineage, dissent and rollback."
+public_functions = ["pub fn build_structure_repair_candidates(request: &StructureRepairRequest, draft: &AdmittedDreamDraft) -> Result<StructureRepairCandidateSet, StructureRepairError>"]
+algorithm = ["validate target identities and lineage closure", "test exact equivalence or separable identity dimensions", "retain conflicting evidence and minority interpretations", "propose forward alias/merge or split mapping", "attach rollback and dependent-influence review requirements"]
+invariants = ["raw records are never rewritten", "false merge is recoverable", "old identities remain addressable", "repair does not revoke influence itself"]
+degradation = "Return NeedsMoreEvidence when equivalence or separability is inconclusive."
+errors = ["IdentityMissing", "LineageIncomplete", "EquivalenceInconclusive", "RollbackMissing", "DependencyReviewMissing"]
+tests = ["false merge prevented", "old identity retained", "minority evidence preserved", "rollback required"]
+source_files = ["crates/smart/eliot-dreamer-memory-revision/src/structure_repair.rs", "crates/smart/eliot-dreamer-memory-revision/tests/structure_repair.rs"]
+product_pulse = "D3A_CURATION_PULSE_01"
+architecture_refs = ["identity lineage", "reversibility"]
+implementation_refs = ["merge/split repair handler"]
+
+[[cell]]
+order = 44
+id = "smart.dreamer.reconsolidation"
+stage = "W3_CURATED_MEMORY"
+physical_crate = "eliot-dreamer-memory-revision"
+hot_path = false
+responsibility = "Propose a forward revision to meaning, applicability or scoped epistemic interpretation after new attributed evidence."
+public_functions = ["pub fn build_reconsolidation_candidates(request: &ReconsolidationRequest, draft: &AdmittedDreamDraft) -> Result<ReconsolidationCandidateSet, ReconsolidationError>"]
+algorithm = ["validate predecessor and new evidence", "identify changed meaning, applicability or interpretation dimension", "retain predecessor, contrary outcomes and unchanged dimensions", "propose forward revision with status ceiling", "attach reopen and rollback conditions"]
+invariants = ["predecessor remains immutable", "new use does not automatically strengthen support", "accessibility changes are out of scope", "contrary outcome remains visible"]
+degradation = "Return NoJustifiedSemanticChange when evidence changes accessibility or frequency only."
+errors = ["PredecessorMissing", "EvidenceUnattributed", "NoSemanticDelta", "AuthorityCeilingExceeded", "RollbackMissing"]
+tests = ["contrary outcome retained", "usage frequency alone no change", "predecessor immutable", "scope narrowing explicit"]
+source_files = ["crates/smart/eliot-dreamer-memory-revision/src/reconsolidation.rs", "crates/smart/eliot-dreamer-memory-revision/tests/reconsolidation.rs"]
+product_pulse = "D3A_CURATION_PULSE_01"
+architecture_refs = ["reconsolidation is forward revision", "support separation"]
+implementation_refs = ["reconsolidation handler"]
+
+[[cell]]
+order = 45
+id = "smart.dreamer.accessibility"
+stage = "W3_CURATED_MEMORY"
+physical_crate = "eliot-dreamer-memory-revision"
+hot_path = false
+responsibility = "Propose reversible accessibility changes from attributed use, outcome and false-activation evidence without changing existence or support."
+public_functions = ["pub fn build_accessibility_candidates(request: &AccessibilityRequest, evidence: &AccessibilityEvidenceSnapshot) -> Result<AccessibilityCandidateSet, AccessibilityError>"]
+algorithm = ["validate frozen use/outcome/false-activation denominator", "separate retrieval opportunity from actual use", "assess usefulness, false activation, retention value and recovery cost independently", "protect supported facts, minority evidence and audit records", "propose reversible suppress, demote, archive or reactivate candidate with restore condition"]
+invariants = ["low use is not low value", "support remains unchanged", "physical purge is out of scope", "candidate does not execute lifecycle transition"]
+degradation = "Incomplete denominator returns Inconclusive and no demotion candidate."
+errors = ["DenominatorMissing", "OutcomeUnattributed", "ProtectedRecord", "SupportMutationAttempt", "PurgeAttempt"]
+tests = ["low-use supported fact protected", "false activation dimension visible", "incomplete denominator no demotion", "support unchanged"]
+source_files = ["crates/smart/eliot-dreamer-memory-revision/src/accessibility.rs", "crates/smart/eliot-dreamer-memory-revision/tests/accessibility.rs"]
+product_pulse = "D3A_CURATION_PULSE_01"
+architecture_refs = ["accessibility separate from support", "forgetting is reversible"]
+implementation_refs = ["accessibility handler"]
+
+[[cell]]
+order = 46
+id = "smart.dreamer.influence_repair"
+stage = "W3_CURATED_MEMORY"
+physical_crate = "eliot-dreamer-memory-revision"
+hot_path = false
+responsibility = "Propose influence repair only over an exact owner-neutral InfluenceDependencyClosure."
+public_functions = ["pub fn build_influence_repair_candidates(request: &InfluenceRepairRequest, closure: &InfluenceDependencyClosure) -> Result<InfluenceRepairCandidateSet, InfluenceRepairError>"]
+algorithm = ["validate closure identity, completeness and State Fence", "locate exact dependents of invalidated source or interpretation", "classify unaffected, revalidate, suppress or revoke-influence proposals", "retain indirect dependency paths and rollback", "emit proposal set for Governor/Security owner"]
+invariants = ["similarity is not dependency", "Dreamer cannot revoke influence", "closure completeness is explicit", "infrastructure and projection repair are out of scope"]
+degradation = "Partial closure permits warnings/revalidation proposals only; no revoke proposal."
+errors = ["ClosureMissing", "ClosurePartial", "FenceMismatch", "UnknownDependent", "ExecutionOwnershipViolation"]
+tests = ["similar record not treated dependent", "partial closure no revoke", "indirect path retained", "proposal contains no effect receipt"]
+source_files = ["crates/smart/eliot-dreamer-memory-revision/src/influence_repair.rs", "crates/smart/eliot-dreamer-memory-revision/tests/influence_repair.rs"]
+product_pulse = "D3A_CURATION_PULSE_01"
+architecture_refs = ["permitted influence", "dependency closure"]
+implementation_refs = ["InfluenceDependencyClosure", "influence repair candidate"]
+
+[[cell]]
+order = 47
+id = "smart.dreamer.curation"
+stage = "W3_CURATED_MEMORY"
+physical_crate = "eliot-dreamer-curation"
+hot_path = false
+responsibility = "Dispatch one typed curation input to the exact registered handler and assemble results without subtype semantics."
+public_functions = ["pub fn dispatch_curation_item(request: &CurationRequest, registry: &CurationHandlerRegistrySnapshot, input: TypedCurationInput) -> Result<TypedCurationHandlerResult, CurationDispatchError>", "pub fn assemble_curation_candidate_set(request: &CurationRequest, results: &[TypedCurationHandlerResult]) -> Result<CurationCandidateSet, CurationDispatchError>"]
+algorithm = ["validate registry revision and State Fence", "look up exact subtype and schema", "return handler invocation descriptor or consume already produced typed result according to integration mode", "validate result subtype and identity", "sort and assemble candidate set"]
+invariants = ["no match over free text", "no handler semantics", "no imports of all concrete handler implementations in pure registry mode", "unknown subtype fails closed"]
+degradation = "Return UnsupportedSubtype or HandlerUnavailable with required contract identity."
+errors = ["RegistryStale", "UnsupportedSubtype", "HandlerUnavailable", "SchemaMismatch", "ResultSubtypeMismatch", "FenceMismatch"]
+tests = ["all eleven subtypes route once", "unknown subtype no fallback", "mismatched result rejected", "result order deterministic"]
+source_files = ["crates/smart/eliot-dreamer-curation/src/dispatch.rs", "crates/smart/eliot-dreamer-curation/tests/dispatch.rs"]
+product_pulse = "D3A_CURATION_PULSE_01"
+architecture_refs = ["typed handler ownership", "candidate-only curation"]
+implementation_refs = ["open curation handler registry"]
+
+[[cell]]
+order = 48
+id = "smart.dreamer.research_synthesis"
+stage = "W4_RESEARCH_SYNTHESIS"
+physical_crate = "eliot-dreamer-research-synthesis"
+hot_path = false
+responsibility = "Interpret one frozen ResearchEvidenceBundle into cited candidate conclusions, rivals and unknowns without acquisition or promotion."
+public_functions = ["pub fn synthesize_research_candidates(request: &ResearchSynthesisRequest, bundle: &ResearchEvidenceBundle, draft: &AdmittedDreamDraft) -> Result<ResearchSynthesisPacket, ResearchSynthesisError>"]
+algorithm = ["validate bundle digest, manifest, State Fence and disclosure", "join every material interpretation claim to exact bundle citations", "retain counterclaims, failed acquisition and coverage unknowns", "derive rival interpretations and decision implications", "evaluate coverage against frozen denominator", "emit candidate-only packet with invalidation conditions"]
+invariants = ["no network or provider call", "no new source handle", "citation precision cannot increase", "Researcher remains acquisition owner", "Governor remains support owner"]
+degradation = "Incomplete or unavailable sources produce Partial or Inconclusive candidate packet; never silent complete answer."
+errors = ["BundleDigestMismatch", "ManifestMismatch", "CitationInvalid", "DisclosureViolation", "CoverageOverclaim", "AcquisitionAttempt"]
+tests = ["invented citation rejected", "failed acquisition retained", "counterclaim visible", "partial coverage cannot become complete", "packet contains no promotion"]
+source_files = ["crates/smart/eliot-dreamer-research-synthesis/src/synthesis.rs", "crates/smart/eliot-dreamer-research-synthesis/tests/synthesis.rs"]
+product_pulse = "D3A_RESEARCH_SYNTHESIS_PULSE_01"
+architecture_refs = ["Researcher acquires; Dreamer interprets; Governor governs", "source authority"]
+implementation_refs = ["I9.3 Research synthesis job", "Research Evidence Bundle"]
