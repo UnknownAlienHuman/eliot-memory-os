@@ -14,6 +14,7 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use eliot_governor::KernelTransitionPort;
 use eliotd::{
@@ -21,6 +22,10 @@ use eliotd::{
     SERVICE_NAME,
 };
 use serde::Serialize;
+use tokio::time::{Instant, Interval, MissedTickBehavior};
+
+const ACTIVATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const HEALTH_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -151,17 +156,42 @@ where
     })
 }
 
+struct LoopCadence {
+    activation_poll: Interval,
+    health_heartbeat: Interval,
+}
+
+impl LoopCadence {
+    fn production() -> Self {
+        Self::with_periods(ACTIVATION_POLL_INTERVAL, HEALTH_HEARTBEAT_INTERVAL)
+    }
+
+    fn with_periods(activation_period: Duration, health_period: Duration) -> Self {
+        let now = Instant::now();
+        let mut activation_poll =
+            tokio::time::interval_at(now + activation_period, activation_period);
+        let mut health_heartbeat = tokio::time::interval_at(now + health_period, health_period);
+        activation_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        health_heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        Self {
+            activation_poll,
+            health_heartbeat,
+        }
+    }
+}
+
 async fn run_loop(
     kernel: Arc<DaemonKernelClient>,
     composition: &DaemonComposition,
 ) -> Result<(), String> {
+    let mut cadence = LoopCadence::production();
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|error| format!("daemon shutdown signal: {error}"))?;
                 return Ok(());
             }
-            () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+            _ = cadence.activation_poll.tick() => {
                 if let Some(ticket) = kernel
                     .claim_agent_activation_ticket()
                     .await
@@ -183,7 +213,7 @@ async fn run_loop(
                     }
                 }
             }
-            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            _ = cadence.health_heartbeat.tick() => {
                 KernelTransitionPort::health(&*kernel)
                     .await
                     .map_err(|error| format!("Kernel health heartbeat: {error}"))?;
@@ -222,4 +252,35 @@ pub(super) fn write_json(message: &ReadyMessage) {
     let _ = serde_json::to_writer(&mut output, message);
     let _ = output.write_all(b"\n");
     let _ = output.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn health_tick_survives_faster_activation_poll() {
+        let mut cadence =
+            LoopCadence::with_periods(Duration::from_millis(5), Duration::from_millis(20));
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut activation_ticks = 0_u32;
+        let mut health_ticks = 0_u32;
+
+        while health_ticks < 2 {
+            tokio::select! {
+                _ = cadence.activation_poll.tick() => {
+                    activation_ticks += 1;
+                }
+                _ = cadence.health_heartbeat.tick() => {
+                    health_ticks += 1;
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    panic!("health cadence was starved by the faster activation poll");
+                }
+            }
+        }
+
+        assert!(activation_ticks >= 2);
+        assert_eq!(health_ticks, 2);
+    }
 }
