@@ -14,6 +14,13 @@ merged_or_closed_branch_is_retired = true
 unlisted_branch_mutation_allowed = false
 
 [[workstream]]
+id = "regression-probes"
+status = "active"
+branch_strategy = "fresh_per_issue_from_current_main"
+issue_refs = [7, 8, 9, 10]
+implementation_rule = "Historical observations are regression discriminators only. Each issue first reproduces or refutes the failure on exact current source/runtime/provider/store identities, then changes one causal owner in its own branch and PR."
+
+[[workstream]]
 id = "core-daemons"
 status = "active"
 branch_strategy = "fresh_per_issue_from_current_main"
@@ -50,6 +57,7 @@ branches = [
   "chore/32-finalize-branch-state",
   "chore/32-retire-stale-branches",
   "chore/32-sync-cognitive-authority",
+  "chore/48-control-plane-cleanup",
   "claude/codex-swarm-audit-p576l9",
   "claude/eliot-search-architecture-45fdpe",
   "claude/loving-wozniak-tw3r2s",
