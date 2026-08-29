@@ -9,6 +9,7 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $architectureAudit = Join-Path $PSScriptRoot 'audit-architecture-boundaries.py'
+$guardrailVerifier = Join-Path $PSScriptRoot 'verify-agent-guardrails.py'
 
 $steps = @(
     [pscustomobject]@{
@@ -22,6 +23,14 @@ $steps = @(
     [pscustomobject]@{
         Name = 'architecture-boundaries'
         Command = { python $architectureAudit --root $repoRoot }
+    },
+    [pscustomobject]@{
+        Name = 'agent-guardrails-self-test'
+        Command = { python $guardrailVerifier --self-test }
+    },
+    [pscustomobject]@{
+        Name = 'agent-guardrails'
+        Command = { python $guardrailVerifier --root $repoRoot }
     },
     [pscustomobject]@{
         Name = 'cargo-metadata'
