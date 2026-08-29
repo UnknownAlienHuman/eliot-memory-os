@@ -11,6 +11,7 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $architectureAudit = Join-Path $PSScriptRoot 'audit-architecture-boundaries.py'
 $guardrailVerifier = Join-Path $PSScriptRoot 'verify-agent-guardrails.py'
 $runtimeHygieneAudit = Join-Path $PSScriptRoot 'audit-runtime-source-hygiene.py'
+$agentBridgeProtocolVerifier = Join-Path $PSScriptRoot 'verify-agent-bridge-protocol.py'
 
 $steps = @(
     [pscustomobject]@{
@@ -40,6 +41,14 @@ $steps = @(
     [pscustomobject]@{
         Name = 'runtime-source-hygiene'
         Command = { python $runtimeHygieneAudit --root $repoRoot }
+    },
+    [pscustomobject]@{
+        Name = 'agent-bridge-protocol-self-test'
+        Command = { python $agentBridgeProtocolVerifier --self-test }
+    },
+    [pscustomobject]@{
+        Name = 'agent-bridge-protocol'
+        Command = { python $agentBridgeProtocolVerifier --root $repoRoot }
     },
     [pscustomobject]@{
         Name = 'cargo-metadata'

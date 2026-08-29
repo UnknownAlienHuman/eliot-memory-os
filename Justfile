@@ -23,6 +23,12 @@ runtime-source-hygiene-self-test:
 runtime-source-hygiene:
     python scripts/audit-runtime-source-hygiene.py
 
+agent-bridge-protocol-self-test:
+    python scripts/verify-agent-bridge-protocol.py --self-test
+
+agent-bridge-protocol:
+    python scripts/verify-agent-bridge-protocol.py
+
 metadata:
     cargo metadata --locked --no-deps --format-version 1 | Out-Null
 
@@ -49,7 +55,7 @@ claude-package:
 sync-skills:
     cargo run --quiet -p eliot-app -- host skill-sync
 
-quick: normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails runtime-source-hygiene-self-test runtime-source-hygiene metadata fmt-check check
+quick: normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails runtime-source-hygiene-self-test runtime-source-hygiene agent-bridge-protocol-self-test agent-bridge-protocol metadata fmt-check check
 
 verify:
     pwsh -NoProfile -File scripts/verify.ps1
