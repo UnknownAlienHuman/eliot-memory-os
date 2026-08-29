@@ -60,6 +60,18 @@ pub enum HostObservationState {
     Unknown,
 }
 
+fn classify_runtime_state_without_identity(state: WatchdogRuntimeState) -> HostObservationState {
+    match state {
+        WatchdogRuntimeState::Stopped | WatchdogRuntimeState::Absent => {
+            HostObservationState::AbsentOrStopped
+        }
+        WatchdogRuntimeState::Starting
+        | WatchdogRuntimeState::Stopping
+        | WatchdogRuntimeState::Running
+        | WatchdogRuntimeState::Unknown => HostObservationState::Unknown,
+    }
+}
+
 /// Retains the last trusted Host process identity and compares every later
 /// platform observation against PID, creation time, and image path.
 #[derive(Debug)]
@@ -174,29 +186,20 @@ impl HostIdentityMonitor {
                 process: Some(process),
                 ..
             } => self.observe_process_identity(process),
-            WatchdogRuntimeReadback::Matching {
-                state:
-                    WatchdogRuntimeState::Stopped
-                    | WatchdogRuntimeState::Starting
-                    | WatchdogRuntimeState::Stopping,
-                ..
-            }
-            | WatchdogRuntimeReadback::Absent => HostObservation {
+            WatchdogRuntimeReadback::Matching { state, .. } => HostObservation {
+                state: classify_runtime_state_without_identity(state),
+                identity: None,
+            },
+            WatchdogRuntimeReadback::Absent => HostObservation {
                 state: HostObservationState::AbsentOrStopped,
                 identity: None,
             },
-            WatchdogRuntimeReadback::Matching {
-                state:
-                    WatchdogRuntimeState::Absent
-                    | WatchdogRuntimeState::Running
-                    | WatchdogRuntimeState::Unknown,
-                ..
+            WatchdogRuntimeReadback::Mismatched | WatchdogRuntimeReadback::Unknown => {
+                HostObservation {
+                    state: HostObservationState::Unknown,
+                    identity: None,
+                }
             }
-            | WatchdogRuntimeReadback::Mismatched
-            | WatchdogRuntimeReadback::Unknown => HostObservation {
-                state: HostObservationState::Unknown,
-                identity: None,
-            },
         }
     }
 
@@ -353,4 +356,41 @@ pub(super) fn read_host_registration_runtime(
         return WatchdogRuntimeReadback::Unknown;
     };
     project_service_runtime_inspection(platform.inspect_service_registration_runtime(registration))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_service_states_are_not_terminal_absence() {
+        assert_eq!(
+            classify_runtime_state_without_identity(WatchdogRuntimeState::Starting),
+            HostObservationState::Unknown
+        );
+        assert_eq!(
+            classify_runtime_state_without_identity(WatchdogRuntimeState::Stopping),
+            HostObservationState::Unknown
+        );
+        assert_eq!(
+            classify_runtime_state_without_identity(WatchdogRuntimeState::Running),
+            HostObservationState::Unknown
+        );
+        assert_eq!(
+            classify_runtime_state_without_identity(WatchdogRuntimeState::Unknown),
+            HostObservationState::Unknown
+        );
+    }
+
+    #[test]
+    fn terminal_absence_states_remain_terminal_absence() {
+        assert_eq!(
+            classify_runtime_state_without_identity(WatchdogRuntimeState::Stopped),
+            HostObservationState::AbsentOrStopped
+        );
+        assert_eq!(
+            classify_runtime_state_without_identity(WatchdogRuntimeState::Absent),
+            HostObservationState::AbsentOrStopped
+        );
+    }
 }

@@ -15,6 +15,7 @@ use eliot_protocol::RequestIdentity;
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{
     OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, StoreHealth, WriteReceipt,
+    validate_store_receipt_envelope,
 };
 
 use super::{DaemonKernelClient, SERVICE_NAME, kernel_port_error, kind_value, unix_ms};
@@ -63,6 +64,7 @@ impl KernelTransitionPort for DaemonKernelClient {
                     ));
                 }
             }
+            let expected_transition = transition.clone();
             let identity = RequestIdentity {
                 request: RequestBinding {
                     metadata: request.clone(),
@@ -79,7 +81,7 @@ impl KernelTransitionPort for DaemonKernelClient {
                 .transact_async_with_identity(
                     "apply_prepared",
                     serde_json::json!({
-                        "context": request,
+                        "context": request.clone(),
                         "transition": transition,
                         "expected_revision_heads": expected_revision_heads,
                         "expected_ordering_heads": expected_ordering_heads,
@@ -89,8 +91,11 @@ impl KernelTransitionPort for DaemonKernelClient {
                 .await
                 .map_err(kernel_port_error)?;
             let value = kind_value(&value, "write_receipt")?;
-            serde_json::from_value(value)
-                .map_err(|error| KernelPortError::Contract(error.to_string()))
+            let receipt: WriteReceipt = serde_json::from_value(value)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            validate_store_receipt_envelope(&request, &expected_transition, &receipt)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            Ok(receipt)
         })
     }
 

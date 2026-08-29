@@ -11,6 +11,7 @@
 //! persistence, synchronization, and effect authority.
 
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
@@ -70,6 +71,16 @@ pub(super) fn runtime_restart_pending_identity(
 }
 
 #[cfg(windows)]
+fn runtime_restart_created_at(now: SystemTime) -> Result<String, HostError> {
+    let millis = now.duration_since(UNIX_EPOCH).map_err(|error| {
+        HostError::RecoveryRequired(format!(
+            "runtime restart pending clock precedes Unix epoch: {error}"
+        ))
+    })?;
+    Ok(millis.as_millis().to_string())
+}
+
+#[cfg(windows)]
 pub(super) fn runtime_restart_pending_payload(
     identity: &RuntimeRestartPendingIdentity,
 ) -> Result<serde_json::Value, HostError> {
@@ -82,11 +93,7 @@ pub(super) fn runtime_restart_pending_payload(
         "request_digest": identity.request_digest,
         "host_epoch": identity.host_epoch,
         "host_lineage": identity.host_lineage,
-        "created_at": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .to_string(),
+        "created_at": runtime_restart_created_at(SystemTime::now())?,
     }))
 }
 
@@ -190,4 +197,28 @@ pub(super) fn read_runtime_restart_pending_identity(
             )
         })?;
     runtime_restart_pending_identity_from_bytes(&bytes, expected_mutation_digest).map(Some)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn created_at_preserves_exact_unix_milliseconds() {
+        let observed = UNIX_EPOCH + Duration::from_millis(42);
+        assert_eq!(runtime_restart_created_at(observed).as_deref(), Ok("42"));
+    }
+
+    #[test]
+    fn created_at_rejects_clock_before_unix_epoch() {
+        let observed = UNIX_EPOCH
+            .checked_sub(Duration::from_secs(1))
+            .expect("one second before Unix epoch must be representable");
+        assert!(matches!(
+            runtime_restart_created_at(observed),
+            Err(HostError::RecoveryRequired(_))
+        ));
+    }
 }
