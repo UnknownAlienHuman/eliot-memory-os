@@ -12,12 +12,13 @@ retired rather than preserved as archaeology.
 
 | Script | Purpose | Proof ceiling |
 |---|---|---|
-| `verify.ps1` | Current Windows developer verification: normative identity, architecture-boundary audit, nearest-path agent guardrails, Cargo metadata, formatting, and workspace check | Source/build candidate only |
+| `verify.ps1` | Current Windows developer verification: normative identity, architecture-boundary audit, nearest-path agent guardrails, runtime-source hygiene, Cargo metadata, formatting, and workspace check | Source/build candidate only |
 | `verify.sh` | Unix-compatible counterpart for the current bounded source checks | Source/build candidate only |
 | `verify-normative.ps1` | Recompute canonical Architecture/Implementation digests and pair key; reject predecessor copies | Normative artifact identity only |
 | `verify-normative.sh` | Unix-compatible normative-pair verifier | Normative artifact identity only |
 | `audit-architecture-boundaries.py` | Scan declared core/daemon runtime roots for forbidden dependencies, SurrealDB leakage, untracked direct process launch, and production placeholders | Static source/build architecture evidence only |
 | `verify-agent-guardrails.py` | Require bounded nearest-path owner/proof/stop instructions for core and daemon source subtrees | Routing/control-plane evidence only |
+| `audit-runtime-source-hygiene.py` | Expose unsafe, panic/unwrap/expect, ambient configuration, unbounded-output, blocking-sleep, and source-concentration risks in runtime roots | Static source-quality signals only |
 | `verify-lint-policy.ps1` | Verify the current Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
 
 Normal iteration uses `just quick` or `scripts/verify.ps1`. The manual Source
@@ -63,6 +64,26 @@ These files narrow work; they cannot grant authority beyond the root
 instructions, owning issue, or normative pair. A clean result proves only that
 the expected routing surfaces exist and contain the required boundaries. It
 does not prove the implementation follows them.
+
+### Runtime-source hygiene
+
+```powershell
+python scripts/audit-runtime-source-hygiene.py --self-test
+python scripts/audit-runtime-source-hygiene.py
+```
+
+The scanner masks comments and literals and ignores the suffix after the first
+file-level `cfg(test)` boundary. Actual unsafe code in a composition binary is a
+`HARD_VIOLATION`. Panic/unwrap/expect, ambient environment/current-directory
+access, potentially unbounded or discarded process output, blocking sleeps,
+missing crate-root unsafe prohibitions, and source concentration remain
+`AUDIT_SIGNAL` review evidence.
+
+Signals do not fail integration and do not force a split by count or line
+volume. Review the exact path, owner, effect, failure behavior, and replacement
+boundary. JSON output is permitted only as a current issue/PR or CI artifact;
+it is not committed as a support report. A clean scan is not runtime, process,
+store, security, or Product proof.
 
 ## Release and installation
 
