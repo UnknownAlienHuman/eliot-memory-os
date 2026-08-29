@@ -46,6 +46,12 @@ COMMON_MARKERS = (
     "stop",
 )
 
+CANONICAL_BOUNDARY_MARKERS = (
+    "canonical write",
+    "canonical store",
+    "canonical transition",
+)
+
 FORBIDDEN_OVERCLAIMS = (
     "current_verified",
     "product verified",
@@ -60,6 +66,17 @@ class Finding:
     code: str
     path: str
     detail: str
+
+
+def normalized_markdown_text(text: str) -> str:
+    """Case-fold simple guardrail prose and ignore Markdown line wrapping."""
+    return " ".join(text.lower().split())
+
+
+def has_canonical_boundary(normalized: str) -> bool:
+    if any(marker in normalized for marker in CANONICAL_BOUNDARY_MARKERS):
+        return True
+    return "semantic admission" in normalized and "preparedtransition" in normalized
 
 
 def verify(root: Path) -> list[Finding]:
@@ -87,20 +104,20 @@ def verify(root: Path) -> list[Finding]:
         if not text.startswith("# "):
             findings.append(Finding("guardrail_title_missing", spec.path, "file must begin with one Markdown title"))
 
-        lowered = text.lower()
+        normalized = normalized_markdown_text(text)
         for marker in COMMON_MARKERS:
-            if marker not in lowered:
+            if marker not in normalized:
                 findings.append(Finding("guardrail_workflow_missing", spec.path, f"missing required marker: {marker}"))
         for issue_ref in spec.required_issue_refs:
             if issue_ref not in text:
                 findings.append(Finding("guardrail_owner_issue_missing", spec.path, f"missing current owner/integration issue {issue_ref}"))
         for phrase in FORBIDDEN_OVERCLAIMS:
-            if phrase in lowered:
+            if phrase in normalized:
                 findings.append(Finding("guardrail_overclaim", spec.path, f"forbidden support/authority claim: {phrase}"))
 
-        if "canonical write" not in lowered and "canonical store" not in lowered:
+        if not has_canonical_boundary(normalized):
             findings.append(Finding("guardrail_canonical_boundary_missing", spec.path, "canonical ownership/write boundary is not stated"))
-        if "authority" not in lowered:
+        if "authority" not in normalized:
             findings.append(Finding("guardrail_authority_boundary_missing", spec.path, "authority boundary is not stated"))
 
     guardrail_paths = {
@@ -176,8 +193,57 @@ def self_test() -> None:
         too_large = verify(root)
         if not any(item.code == "guardrail_too_large" and item.path == large_spec.path for item in too_large):
             raise AssertionError("oversized guardrail fixture did not fail")
+        path.write_text(valid_fixture(large_spec), encoding="utf-8")
 
-    print("AGENT_GUARDRAILS_SELF_TEST: PASS cases=4")
+        wrapped_spec = SPECS[3]
+        path = root / wrapped_spec.path
+        wrapped = valid_fixture(wrapped_spec).replace("one mutable path", "one\nmutable path")
+        path.write_text(wrapped, encoding="utf-8")
+        wrapped_findings = [item for item in verify(root) if item.path == wrapped_spec.path]
+        if wrapped_findings:
+            raise AssertionError(f"wrapped marker fixture failed: {wrapped_findings}")
+        path.write_text(valid_fixture(wrapped_spec), encoding="utf-8")
+
+        transition_spec = SPECS[4]
+        path = root / transition_spec.path
+        transition_only = valid_fixture(transition_spec).replace(
+            "no canonical write path. It cannot become a\ncanonical store owner",
+            "no alternate canonical transition path",
+        )
+        path.write_text(transition_only, encoding="utf-8")
+        transition_findings = [item for item in verify(root) if item.path == transition_spec.path]
+        if transition_findings:
+            raise AssertionError(f"canonical-transition fixture failed: {transition_findings}")
+        path.write_text(valid_fixture(transition_spec), encoding="utf-8")
+
+        prepared_spec = SPECS[5]
+        path = root / prepared_spec.path
+        prepared_transition = valid_fixture(prepared_spec).replace(
+            "This path creates no authority and no canonical write path. It cannot become a\ncanonical store owner.",
+            "Semantic admission emits one `PreparedTransition`; this path creates no authority.",
+        )
+        path.write_text(prepared_transition, encoding="utf-8")
+        prepared_findings = [item for item in verify(root) if item.path == prepared_spec.path]
+        if prepared_findings:
+            raise AssertionError(f"PreparedTransition fixture failed: {prepared_findings}")
+        path.write_text(valid_fixture(prepared_spec), encoding="utf-8")
+
+        no_canonical_spec = SPECS[6]
+        path = root / no_canonical_spec.path
+        no_canonical = valid_fixture(no_canonical_spec).replace(
+            "no canonical write path. It cannot become a\ncanonical store owner",
+            "no durable mutation path",
+        )
+        path.write_text(no_canonical, encoding="utf-8")
+        no_canonical_findings = verify(root)
+        if not any(
+            item.code == "guardrail_canonical_boundary_missing"
+            and item.path == no_canonical_spec.path
+            for item in no_canonical_findings
+        ):
+            raise AssertionError("missing-canonical-boundary fixture did not fail")
+
+    print("AGENT_GUARDRAILS_SELF_TEST: PASS cases=8")
 
 
 def parse_args() -> argparse.Namespace:
