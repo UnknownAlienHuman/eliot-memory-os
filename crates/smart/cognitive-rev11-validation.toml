@@ -1,0 +1,209 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev11"
+status = "VALIDATION_CONTRACT_NOT_PRODUCT_PROOF"
+issue = 94
+branch = "work/94-cognitive-function-design-audit"
+expected_base_main = "c77adc67e62854aa9efc16cf3cb1905ad90c11c5"
+proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+
+[expected]
+functional_cells = 67
+orders = "1..67"
+physical_crates = 25
+hot_path_cells = 11
+dreamer_job_classes = 8
+candidate_kinds = 17
+curation_subtypes = 11
+typed_edges = 27
+product_pulses = 7
+waves = 8
+external_contract_challenges = 12
+normative_architecture_sha256 = "c6932eaf26935e752eefb4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+normative_implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+
+[inputs]
+authority = "crates/smart/cognitive-rev11-authority.toml"
+topology = "crates/smart/cognitive-rev11-topology.toml"
+waves = "crates/smart/cognitive-rev11-waves.toml"
+coverage = "crates/smart/cognitive-rev11-coverage.toml"
+migration = "crates/smart/cognitive-rev11-migration.toml"
+edge_map = "crates/smart/cognitive-edge-map.toml"
+challenges = "crates/smart/cognitive-contract-challenges.toml"
+index = "crates/smart/cognitive-rev11-cell-index.toml"
+catalogs = [
+  "crates/smart/cognitive-rev11-cells-foundation.toml",
+  "crates/smart/cognitive-rev11-cells-cues-context.toml",
+  "crates/smart/cognitive-rev11-cells-curation-research.toml",
+  "crates/smart/cognitive-rev11-cells-learning.toml",
+  "crates/smart/cognitive-rev11-cells-diagnosis-planning.toml",
+]
+
+[[assertion]]
+id = "V01_TOML_PARSE"
+severity = "ERROR"
+rule = "Every changed .toml file parses with a standards-compliant TOML 1.0 parser."
+
+[[assertion]]
+id = "V02_ORDER_CLOSURE"
+severity = "ERROR"
+rule = "Catalog orders and index orders are both the exact integer set 1..67 with no duplicates or gaps."
+
+[[assertion]]
+id = "V03_SINGLE_CELL_AUTHORITY"
+severity = "ERROR"
+rule = "Every indexed cell has exactly one authoritative [[cell]] catalog record. Legacy module.toml and *.api.toml are never assignment authority."
+
+[[assertion]]
+id = "V04_INDEX_CATALOG_EQUALITY"
+severity = "ERROR"
+rule = "For every order, index id, physical crate, catalog and hot_path flag equal the authoritative catalog record."
+
+[[assertion]]
+id = "V05_TOPOLOGY_COVERAGE"
+severity = "ERROR"
+rule = "The topology contains exactly 25 unique physical crates and every one of the 67 cells appears in exactly one crate.cells array."
+
+[[assertion]]
+id = "V06_CRATE_SEAM_JUSTIFICATION"
+severity = "ERROR"
+rule = "Every physical crate declares a contract, dependency, security, failure-containment, deployment, package-proof or replacement seam. Function count, file count, agent count and LOC alone are forbidden justifications."
+
+[[assertion]]
+id = "V07_HOT_PATH_EXACT_SET"
+severity = "ERROR"
+rule = "The exact hot set is epistemic position; cue normalizer, direct match, relation spread and activation; context contribution merge, admission, assembly, quality, decision tail and reactive delivery plan. No Dreamer generation, curation, research, learning closure, diagnosis, planning or DreamCycle cell is hot."
+
+[[assertion]]
+id = "V08_HOT_PATH_BEHAVIOR"
+severity = "ERROR"
+rule = "Every hot cell forbids model calls, storage scans, provider SDKs, blocking I/O and unbounded traversal; declares deterministic ordering, a positive complexity bound and visible local degradation."
+
+[[assertion]]
+id = "V09_CELL_COMPLETENESS"
+severity = "ERROR"
+rule = "Every cell declares order, id, stage, physical_crate, hot_path, one causal responsibility, at least one exact Rust-oriented public signature, an ordered algorithm, invariants, degradation, typed errors, at least three tests, disjoint source/test files, Product Pulse, Architecture references and Implementation references."
+
+[[assertion]]
+id = "V10_SOURCE_SCOPE_EXCLUSIVITY"
+severity = "ERROR"
+rule = "No worker source or test path is owned by two cells. Cargo.toml and src/lib.rs are integration-owner-only and are absent from worker source_files."
+
+[[assertion]]
+id = "V11_JOB_CLASS_CLOSURE"
+severity = "ERROR"
+rule = "Orientation, Curation, Clarification, ResearchSynthesis, Architecture, DevelopmentDiagnosis, Maintenance and OrchestrationPlanning are each mapped to the common Dreamer pipeline and at least one exact handler."
+
+[[assertion]]
+id = "V12_CANDIDATE_KIND_CLOSURE"
+severity = "ERROR"
+rule = "All 17 CandidateKind values are covered. Broad Interpretation, Procedure, Repair, Maintenance and WorkPlan require a typed subtype before dispatch. Unknown kinds fail closed."
+
+[[assertion]]
+id = "V13_CURATION_HANDLER_CLOSURE"
+severity = "ERROR"
+rule = "Classification, Relation, Episode, Concept, Procedure, Skill, FailureFingerprint, MergeSplit, Reconsolidation, Accessibility and InfluenceRepair each map to one semantic owner and typed output."
+
+[[assertion]]
+id = "V14_RELATION_SINGLE_OWNER"
+severity = "ERROR"
+rule = "Orientation and Curation relation entrypoints call one build_relation_candidate_set semantics owner; no second relation implementation or free-text subtype inference exists."
+
+[[assertion]]
+id = "V15_RESEARCH_OWNER_BOUNDARY"
+severity = "ERROR"
+rule = "Researcher owns acquisition, Dreamer Research Synthesis interprets one frozen ResearchEvidenceBundle, and Governor owns admission/support. No cognitive function discovers providers, uses credentials, acquires sources or invents citations."
+
+[[assertion]]
+id = "V16_CHRONOLOGY_NOT_CAUSALITY"
+severity = "ERROR"
+rule = "Episode chronology uses temporal/transaction ordering types. CausalHypothesis is a separate type requiring mechanism, evidence, counterevidence, rivals and falsifier. No causal_predecessor field is derived from sequence alone."
+
+[[assertion]]
+id = "V17_EPISTEMIC_SEPARATION"
+severity = "ERROR"
+rule = "Observed, Supported, ExplicitAssumption, RivalModel, ConflictSet, Stale, Superseded and Unknown remain separately represented. Absence of counterevidence, repetition, retrieval, model agreement and vote count cannot promote support."
+
+[[assertion]]
+id = "V18_CONTEXT_SAFETY"
+severity = "ERROR"
+rule = "Context admission reserves downstream headroom, preserves whole units and Decision Safety Floor roles, treats unknown decision delta as non-zero/unknown, uses provider coverage denominators and emits reversible omissions. Quality is a separate dimension vector and cannot mutate membership."
+
+[[assertion]]
+id = "V19_CUE_SAFETY"
+severity = "ERROR"
+rule = "NormalizedCue separates canonical_value from comparison_key; exact cue firing succeeds with zero relation edges; relation spread is optional, bounded and cannot remove or downgrade direct hits."
+
+[[assertion]]
+id = "V20_TRANSFORMATION_DIMENSIONS"
+severity = "ERROR"
+rule = "Coverage, Preservation, Faithfulness, Lineage, Reversibility, SourceAuthority and DependencyClosure are evaluated separately as Pass, Fail, Inconclusive or NotApplicable. There is no aggregate confidence score."
+
+[[assertion]]
+id = "V21_MEMORY_DIMENSION_SEPARATION"
+severity = "ERROR"
+rule = "Existence, epistemic support, accessibility and permitted influence are independent. No scalar utility/confidence, retrieval count or writer-provided score selects lifecycle or influence action."
+
+[[assertion]]
+id = "V22_LEARNING_OWNER_BOUNDARY"
+severity = "ERROR"
+rule = "Learning overlays are task-local and reversible. Activation assessment consumes but cannot create an external receipt. PromotionInputCandidate is advisory and cannot decide or apply global promotion."
+
+[[assertion]]
+id = "V23_PLANNING_OWNER_BOUNDARY"
+severity = "ERROR"
+rule = "Planning outputs contain no DurableJob, WorkItem, AgentAttempt, WakeIntent, schedule, Ready Queue reservation, RuntimeLease, route allocation, launch, setting mutation or external effect receipt."
+
+[[assertion]]
+id = "V24_DREAM_CYCLE_BOUND"
+severity = "ERROR"
+rule = "DreamCycle uses one frozen denominator, one finite sample and one-cycle candidate plan. It cannot self-schedule, enqueue itself, run a perpetual loop, acquire sources, call a model or launch an agent."
+
+[[assertion]]
+id = "V25_EXTERNAL_CONTRACT_HONESTY"
+severity = "ERROR"
+rule = "Every unavailable external owner-neutral contract is listed as an open ContractChallenge with a narrower fail-closed fallback. Smart and Meta catalogs do not invent the missing owner contract."
+
+[[assertion]]
+id = "V26_DEPENDENCY_DIRECTION"
+severity = "ERROR"
+rule = "Prototype Cargo manifests depend only on owner-neutral contract/foundation crates or a lower pure layer. A logical implementation prerequisite never becomes a dependency on another implementation crate merely for ordering."
+
+[[assertion]]
+id = "V27_DAG_ACYCLIC"
+severity = "ERROR"
+rule = "The declared physical-crate dependency graph is acyclic."
+
+[[assertion]]
+id = "V28_NO_DUPLICATE_OWNERS"
+severity = "ERROR"
+rule = "No cognitive cell owns canonical state, truth/support promotion, authority, task finish, job/scheduler lifecycle, provider credentials, external effects, session delivery dedup or production-generation self-modification."
+
+[[assertion]]
+id = "V29_RETIRED_SURFACES"
+severity = "ERROR"
+rule = "eliot-dreamer-candidate-validation and eliot-dreamer-memory-repair are absent. Function-only cue/context prototypes listed in migration are absent or contain no assignable Cargo/module surface. Retired paths are never referenced by the rev11 index or waves."
+
+[[assertion]]
+id = "V30_REMOTE_DIFF_HYGIENE"
+severity = "ERROR"
+rule = "The branch diff contains only TOML design and prototype Cargo manifests under crates/smart or crates/meta. It contains no .rs, .md, archive, base64 chunk, probe, .eliot path, workflow change, root Cargo.toml or Cargo.lock change."
+
+[[assertion]]
+id = "V31_MAIN_BINDING"
+severity = "ERROR"
+rule = "The branch merge base is the current main used by the authority file. If current main advances across a load-bearing owner or normative contract, rebase/merge and update base_main_commit before approval."
+
+[[assertion]]
+id = "V32_NORMATIVE_BINDING"
+severity = "ERROR"
+rule = "Architecture, Implementation and pair-key identities equal docs/normative-pair.toml. A Git blob SHA is never compared to a document SHA-256."
+
+[[assertion]]
+id = "V33_PROOF_CEILING"
+severity = "ERROR"
+rule = "No file or PR text claims Rust implementation, package behavior, executed Edge Proof, Product Pulse, runtime support or product acceptance."
+
+[pass_definition]
+required = "All ERROR assertions pass on the exact remote branch tree and current main merge base."
+not_proven = ["Rust implementation", "Cargo compilation", "Module behavior", "executed Edge Proof", "Product Pulse", "runtime support", "product acceptance"]
