@@ -703,6 +703,8 @@ name = "eliot-agent-opencode"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "eliot-agent-api",
+ "eliot-agent-coordinator",
  "secrecy",
  "serde",
  "serde_json",
