@@ -35,6 +35,11 @@ agent-bridge-protocol-self-test:
 agent-bridge-protocol:
     python scripts/verify-agent-bridge-protocol.py
 
+opencode-plugin:
+    Get-Content -Raw integrations/opencode/plugins/eliot.js | node --input-type=module --check
+    node --test integrations/opencode/tests/eliot-plugin.test.mjs
+    Get-Content integrations/opencode/plugin-bridge-contract.json -Raw | ConvertFrom-Json | Out-Null
+
 metadata:
     cargo metadata --locked --no-deps --format-version 1 | Out-Null
 
