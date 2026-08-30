@@ -99,46 +99,67 @@ def self_test(generator) -> None:
 
 def verify_current(generator, root: Path, source_sha: str, output: Path | None) -> None:
     registry, findings = generator.compile_registry(root, source_sha)
-    expected_ids = {
-        "meta.runtime-status.report-composition",
-        "meta.runtime-status.service-registration-observation",
-        "meta.runtime-status.supervision-verification",
-        "meta.runtime-status.supervision-projection",
-        "meta.runtime-status.store-live-observation",
-        "meta.runtime-status.eliotd-live-observation",
-        "meta.runtime-status.watchdog-live-observation",
-        "meta.runtime-status.readiness-projection",
+    expected = {
+        "eliot-runtime-status": {
+            "pulse": "D0_RUNTIME_STATUS_RECOVERY_VIEW_01",
+            "ids": {
+                "meta.runtime-status.report-composition",
+                "meta.runtime-status.service-registration-observation",
+                "meta.runtime-status.supervision-verification",
+                "meta.runtime-status.supervision-projection",
+                "meta.runtime-status.store-live-observation",
+                "meta.runtime-status.eliotd-live-observation",
+                "meta.runtime-status.watchdog-live-observation",
+                "meta.runtime-status.readiness-projection",
+            },
+        },
+        "eliot-runtime-contracts": {
+            "pulse": "D0_RUNTIME_CONTRACT_COMPATIBILITY_01",
+            "ids": {
+                "foundation.runtime-contracts.lifecycle-core",
+                "foundation.runtime-contracts.installation-activation",
+                "foundation.runtime-contracts.runtime-live-store-identity",
+                "foundation.runtime-contracts.supervision-authority",
+                "foundation.runtime-contracts.supervision-incarnation",
+                "foundation.runtime-contracts.supervision-lease",
+                "foundation.runtime-contracts.watchdog-admission-publication",
+            },
+        },
     }
-    cells = [cell for cell in registry["cells"] if cell["package"] == "eliot-runtime-status"]
-    observed_ids = {cell["cell_id"] for cell in cells}
-    if observed_ids != expected_ids:
-        fail(
-            "runtime-status cell set mismatch: "
-            f"missing={sorted(expected_ids - observed_ids)} extra={sorted(observed_ids - expected_ids)}"
-        )
-    package_findings = [finding for finding in findings if finding.package == "eliot-runtime-status"]
-    if package_findings:
-        fail(
-            "runtime-status package has registry findings: "
-            + ", ".join(sorted({finding.code for finding in package_findings}))
-        )
-    for cell in cells:
-        if not cell["stateless"] or cell["owned_state"] or cell["allowed_effect_classes"]:
-            fail(f"{cell['cell_id']} exceeds its declared read-only stateless boundary")
-        if (
-            cell["implementation_support"] != "CURRENT_UNVERIFIED"
-            or cell["evidence_execution_status"] != "NOT_EXECUTED"
-        ):
-            fail(f"{cell['cell_id']} overclaims support or executed evidence")
-        if cell["product_pulse"] != "D0_RUNTIME_STATUS_RECOVERY_VIEW_01":
-            fail(f"{cell['cell_id']} is not bound to the D0 runtime-status Product Pulse")
+    checked = 0
+    for package, profile in expected.items():
+        cells = [cell for cell in registry["cells"] if cell["package"] == package]
+        observed_ids = {cell["cell_id"] for cell in cells}
+        if observed_ids != profile["ids"]:
+            fail(
+                f"{package} cell set mismatch: "
+                f"missing={sorted(profile['ids'] - observed_ids)} "
+                f"extra={sorted(observed_ids - profile['ids'])}"
+            )
+        package_findings = [finding for finding in findings if finding.package == package]
+        if package_findings:
+            fail(
+                f"{package} has registry findings: "
+                + ", ".join(sorted({finding.code for finding in package_findings}))
+            )
+        for cell in cells:
+            if not cell["stateless"] or cell["owned_state"] or cell["allowed_effect_classes"]:
+                fail(f"{cell['cell_id']} exceeds its stateless no-effect boundary")
+            if (
+                cell["implementation_support"] != "CURRENT_UNVERIFIED"
+                or cell["evidence_execution_status"] != "NOT_EXECUTED"
+            ):
+                fail(f"{cell['cell_id']} overclaims support or executed evidence")
+            if cell["product_pulse"] != profile["pulse"]:
+                fail(f"{cell['cell_id']} is not bound to {profile['pulse']}")
+            checked += 1
 
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(registry, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(
         "CAPABILITY_CELL_REGISTRY_CURRENT_VERIFY: PASS "
-        f"runtime_status_cells={len(cells)} repository_findings={len(findings)} "
+        f"declared_cells={checked} repository_findings={len(findings)} "
         f"registry_status={registry['status']}"
     )
 
