@@ -4,7 +4,7 @@
   "profile_id": "codex.local.app-server",
   "host_family": "codex",
   "route_class": "primary-1",
-  "implementation_support": "TARGET",
+  "implementation_support": "PARTIAL",
   "evidence_execution_status": "NOT_EXECUTED",
   "architecture_anchors": [
     "ARCH-PORT-01",
@@ -68,8 +68,8 @@
       },
       "schema_and_health_probe": {
         "version": "codex --version plus executable hash",
-        "schema": "initialize followed by stable app-server method probe; experimental methods require explicit opt-in",
-        "health": "initialize response plus bounded thread/start and turn lifecycle challenge",
+        "schema": "stable zero-model initialize -> initialized -> model/list against a pinned generated schema identity",
+        "health": "after zero-model admission, bounded thread/start and turn lifecycle challenge under the production adapter",
         "negative_capability_challenge": "invoke one advertised optional method with a harmless invalid request and require the documented typed failure"
       },
       "model_selection": {
@@ -104,7 +104,7 @@
         "recursive_launch_default": "disabled",
         "context_policy": "minimum_decision_sufficient_packet"
       },
-      "proof_ceiling": "A stable App Server method can produce one bounded candidate attempt; plugin installation alone proves neither route readiness nor task completion."
+      "proof_ceiling": "A stable App Server method can produce one bounded candidate attempt; plugin installation and a zero-model diagnostic alone prove neither route readiness nor task completion."
     }
   ],
   "skills": {
@@ -132,17 +132,20 @@
     "result_authority": "candidate_only_until_governed_transition"
   },
   "probe_requirements": [
-    "pin executable and stable schema fingerprint",
-    "prove initialize, model/list, thread/start, turn/start, terminal event, and turn/interrupt",
+    "pin executable and generated stable schema fingerprint",
+    "execute zero-model initialize -> initialized -> model/list and preserve the exact current-account catalogue receipt",
+    "migrate the production adapter to the same sole stable wire owner before thread or turn execution",
+    "prove thread/start, turn/start, terminal event, and turn/interrupt only after zero-model admission",
     "prove reconnect or rehydration without reviving stale authority",
     "prove plugin hooks are present only when their feature gate and exact event coverage are observed",
     "prove no child or terminal task result is lost before parent reconciliation"
   ],
   "known_gaps": [
-    "the App Server adapter process is not implemented in this profile change",
-    "current-account model and quota behavior are unprobed",
+    "the stable zero-model diagnostic source exists but Rust package execution is still NOT_EXECUTED",
+    "the production adapter still uses the stale wire owner with jsonrpc and an ELIOT-internal protocolVersion",
+    "current-account model, quota, authentication, and billing behavior are unprobed",
     "experimental collaboration methods are excluded from production admission",
-    "existing hook commands still use the legacy bridge and are not a substitute for App Server execution"
+    "existing hook commands remain host surfaces and are not a substitute for App Server execution"
   ],
   "source_refs": [
     "https://developers.openai.com/codex/app-server",
