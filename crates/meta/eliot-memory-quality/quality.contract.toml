@@ -1,0 +1,257 @@
+schema_version = 1
+contract_id = "meta.memory.quality.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-memory-quality"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["meta.memory.ecology_assessment", "meta.memory.gravity_assessment"]
+architecture_refs = ["ARCH-MEM-04", "ARCH-LEARN-01", "ARCH-META-01", "ARCH-CTX-01", "ARCH-EPI-04", "ARCH-SCOPE-01"]
+implementation_refs = ["I12.21", "I12.34", "I7.11", "I16.23", "I2.20"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Assess memory ecology and Context gravity from immutable owner evidence without collapsing dimensions or performing lifecycle, support, accessibility or influence transitions."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((evidence + cohorts + exposures) log n) over request-bounded immutable projections; no storage read, Context compilation, model call or lifecycle mutation."
+replacement_boundary = "Replace assessment algorithms behind this contract; Governor remains owner of lifecycle, support, accessibility, influence and intervention admission."
+
+[closed_sets]
+assessment_verdicts = ["Supported", "Contradicted", "Mixed", "Unknown", "NotApplicable"]
+coverage_dispositions = ["Complete", "Partial", "Unavailable", "Blocked", "Stale", "NotApplicable"]
+memory_ecology_dimensions = ["RetrievalPrecision", "AcknowledgementCoverage", "ExpansionCoverage", "ObservedUse", "VerificationCoverage", "DecisionDelta", "OutcomeUtility", "StaleReuse", "FalseActivation", "FalseBlock", "NegativeTransfer", "RetentionValue", "MinorityValue", "MissingContextRegret", "ContextCost", "MaintenanceCost"]
+influence_stages = ["Retrieved", "Acknowledged", "Expanded", "ObservablyUsed", "Verified", "DecisionChanged", "OutcomeLinked"]
+memory_outcome_classes = ["Beneficial", "Harmful", "Neutral", "Mixed", "Unknown"]
+memory_cohort_kinds = ["Current", "Obsolete", "ContextShift", "ValidNearMatch", "Unknown"]
+memory_ecology_action_kinds = ["Keep", "Narrow", "Split", "Compress", "Suppress", "Archive", "Reactivate", "Review", "ObserveMore"]
+memory_gravity_dimensions = ["PlacementPriority", "Repetition", "TokenShare", "ProtectedRoleDisplacement", "ActivationPrecision", "DecisionDelta", "OutcomeUtility", "SourceSupportAlignment", "CounterevidenceVisibility", "ContextCost"]
+memory_gravity_dispositions = ["Dominance", "BenignProminence", "InsufficientEvidence", "FalseGravityDiagnosis", "Mixed"]
+gravity_intervention_kinds = ["Narrow", "Reorder", "HandleOnly", "Suppress", "Split", "NoChange", "ObserveMore"]
+
+[hard_invariants]
+no_aggregate_utility_or_gravity_score = true
+low_use_never_reduces_epistemic_support = true
+retrieval_repetition_and_prominence_never_reinforce_support = true
+existence_support_accessibility_and_influence_remain_distinct = true
+minority_and_counterevidence_remain_addressable = true
+negative_memory_and_invariants_are_not_suppressed_for_low_decision_delta_alone = true
+complete_assessment_requires_exact_denominators = true
+missing_outcome_or_attribution_yields_unknown_or_inconclusive = true
+action_outputs_are_candidates_only = true
+no_lifecycle_or_support_transition_receipt = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "EpistemicStatus"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "LifecycleState"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "MemoryAccessibility"
+owner = "eliot-memory-projection-contracts"
+
+[[external_type]]
+name = "PermittedInfluence"
+owner = "eliot-memory-projection-contracts"
+
+[[public_type]]
+name = "AssessmentVerdict"
+kind = "enum"
+definition = ["Supported", "Contradicted", "Mixed", "Unknown", "NotApplicable"]
+invariants = ["Unknown is not zero or negative", "Mixed preserves supporting and contradicting evidence", "NotApplicable requires an applicability basis"]
+
+[[public_type]]
+name = "EvidenceCoverageDisposition"
+kind = "enum"
+definition = ["Complete", "Partial", "Unavailable", "Blocked", "Stale", "NotApplicable"]
+
+[[public_type]]
+name = "AssessmentCoverageDenominator"
+kind = "struct"
+definition = ["source_ref: String", "source_revision: String", "method_ref: String", "expected_items: Option<u32>", "expected_item_handles: Vec<ArtifactId>", "horizon_ref: String"]
+invariants = ["source/revision/method/horizon non-blank", "Complete requires expected_items", "expected handles unique", "denominator independently recheckable"]
+
+[[public_type]]
+name = "AssessmentCoverage"
+kind = "struct"
+definition = ["disposition: EvidenceCoverageDisposition", "denominator: Option<AssessmentCoverageDenominator>", "observed_items: u32", "missing_owner_or_reason_refs: Vec<String>"]
+invariants = ["Complete requires exact expected count and no missing refs", "Partial requires denominator and named missing refs", "Unavailable or Blocked requires named owner/reason and no current items", "Stale cannot support current absence or utility claims"]
+
+[[public_type]]
+name = "AssessmentDimensionResult"
+kind = "struct"
+definition = ["verdict: AssessmentVerdict", "evidence_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "coverage: AssessmentCoverage", "measurement: Option<u64>", "measurement_unit: Option<String>", "reason_codes: Vec<String>"]
+invariants = ["evidence/counterevidence unique", "measurement belongs to one named dimension only", "no dimension result is an aggregate subsystem score", "Unknown cannot be converted to zero"]
+
+[[public_type]]
+name = "MemoryEcologySubject"
+kind = "enum"
+definition = ["Record { record_handle: ArtifactId }", "Cluster { cluster_handle: ArtifactId, member_handles: Vec<ArtifactId> }"]
+invariants = ["cluster members non-empty and unique", "subject identity exact"]
+
+[[public_type]]
+name = "MemoryEcologyHorizon"
+kind = "struct"
+definition = ["start_ref: String", "end_ref: String", "outcome_window_ref: String", "retention_window_ref: String", "transfer_window_ref: String"]
+invariants = ["all horizon refs non-blank", "windows remain independent"]
+
+[[public_type]]
+name = "InfluenceStage"
+kind = "enum"
+definition = ["Retrieved", "Acknowledged", "Expanded", "ObservablyUsed", "Verified", "DecisionChanged", "OutcomeLinked"]
+
+[[public_type]]
+name = "InfluenceStageEvidence"
+kind = "struct"
+definition = ["stage: InfluenceStage", "verdict: AssessmentVerdict", "receipt_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "coverage: AssessmentCoverage", "reason_codes: Vec<String>"]
+invariants = ["stages are independent", "retrieval/acknowledgement/expansion are not observable use", "observable use is not decision or outcome attribution"]
+
+[[public_type]]
+name = "MemoryOutcomeClass"
+kind = "enum"
+definition = ["Beneficial", "Harmful", "Neutral", "Mixed", "Unknown"]
+
+[[public_type]]
+name = "MemoryCohortKind"
+kind = "enum"
+definition = ["Current", "Obsolete", "ContextShift", "ValidNearMatch", "Unknown"]
+
+[[public_type]]
+name = "MemoryCohortCoverage"
+kind = "struct"
+definition = ["kind: MemoryCohortKind", "coverage: AssessmentCoverage", "subject_handles: Vec<ArtifactId>", "outcome_class: MemoryOutcomeClass", "evidence_handles: Vec<ArtifactId>"]
+invariants = ["cohorts remain separate", "valid near-match is not exact trigger equivalence", "Unknown cohort does not contribute negative utility"]
+
+[[public_type]]
+name = "MemoryEcologyDimension"
+kind = "enum"
+definition = ["RetrievalPrecision", "AcknowledgementCoverage", "ExpansionCoverage", "ObservedUse", "VerificationCoverage", "DecisionDelta", "OutcomeUtility", "StaleReuse", "FalseActivation", "FalseBlock", "NegativeTransfer", "RetentionValue", "MinorityValue", "MissingContextRegret", "ContextCost", "MaintenanceCost"]
+
+[[public_type]]
+name = "MemoryEcologyDimensionResult"
+kind = "struct"
+definition = ["dimension: MemoryEcologyDimension", "result: AssessmentDimensionResult"]
+
+[[public_type]]
+name = "MemoryEcologyEvidence"
+kind = "struct"
+definition = ["evidence_id: ArtifactId", "subject: MemoryEcologySubject", "scope_id: String", "task_family: String", "product_identity_handle: ArtifactId", "epistemic_status: EpistemicStatus", "lifecycle: LifecycleState", "accessibility: MemoryAccessibility", "permitted_influence: PermittedInfluence", "influence_stages: Vec<InfluenceStageEvidence>", "dimension_results: Vec<MemoryEcologyDimensionResult>", "source_handles: Vec<ArtifactId>", "state_fence: StateFence"]
+invariants = ["scope/product/fence exact", "status/lifecycle/accessibility/influence preserved", "one result per dimension", "source handles non-empty"]
+
+[[public_type]]
+name = "MemoryEcologyAssessmentRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "subject: MemoryEcologySubject", "scope_id: String", "task_family: String", "product_identity_handle: ArtifactId", "horizon: MemoryEcologyHorizon", "state_fence: StateFence", "evidence_coverage: AssessmentCoverage", "maximum_evidence_items: u32", "maximum_action_candidates: u32", "request_sha256: String"]
+invariants = ["identity/scope/horizon/fence exact", "bounds non-zero", "request grants no read/write/lifecycle authority"]
+
+[[public_type]]
+name = "MemoryEcologyActionKind"
+kind = "enum"
+definition = ["Keep", "Narrow", "Split", "Compress", "Suppress", "Archive", "Reactivate", "Review", "ObserveMore"]
+
+[[public_type]]
+name = "MemoryEcologyActionCandidate"
+kind = "struct"
+definition = ["candidate_id: ArtifactId", "kind: MemoryEcologyActionKind", "subject: MemoryEcologySubject", "affected_dimensions: Vec<MemoryEcologyDimension>", "evidence_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "required_authority_ref: String", "rollback_ref: String", "expiry_or_review_ref: String", "reason_codes: Vec<String>"]
+invariants = ["candidate cannot apply itself", "rollback and required authority non-blank", "Archive/Suppress/Reactivate are proposals only", "no epistemic-support mutation"]
+
+[[public_type]]
+name = "MemoryEcologyAssessment"
+kind = "struct"
+definition = ["request_sha256: String", "subject: MemoryEcologySubject", "scope_id: String", "product_identity_handle: ArtifactId", "state_fence: StateFence", "coverage: AssessmentCoverage", "dimensions: Vec<MemoryEcologyDimensionResult>", "cohorts: Vec<MemoryCohortCoverage>", "action_candidates: Vec<MemoryEcologyActionCandidate>", "omitted_or_missing_refs: Vec<String>", "assessment_sha256: String"]
+invariants = ["all requested dimensions represented", "no aggregate utility score", "candidates bounded", "canonical order and digest"]
+
+[[public_type]]
+name = "MemoryGravityDimension"
+kind = "enum"
+definition = ["PlacementPriority", "Repetition", "TokenShare", "ProtectedRoleDisplacement", "ActivationPrecision", "DecisionDelta", "OutcomeUtility", "SourceSupportAlignment", "CounterevidenceVisibility", "ContextCost"]
+
+[[public_type]]
+name = "MemoryContextExposure"
+kind = "struct"
+definition = ["exposure_id: ArtifactId", "record_handle: ArtifactId", "context_view_handle: ArtifactId", "context_recipe_revision: String", "route_fingerprint: String", "task_family: String", "scope_id: String", "placement_rank: u32", "repetition_count: u32", "token_units: u32", "protected_role_displacement_handles: Vec<ArtifactId>", "counterevidence_visibility_handles: Vec<ArtifactId>", "activation_evidence_handles: Vec<ArtifactId>", "decision_delta_evidence_handles: Vec<ArtifactId>", "outcome_evidence_handles: Vec<ArtifactId>", "source_epistemic_status: EpistemicStatus", "state_fence: StateFence"]
+invariants = ["route/recipe/task/scope/fence exact", "prominence fields are observations, not support", "counterevidence displacement is explicit"]
+
+[[public_type]]
+name = "MemoryGravityDisposition"
+kind = "enum"
+definition = ["Dominance", "BenignProminence", "InsufficientEvidence", "FalseGravityDiagnosis", "Mixed"]
+
+[[public_type]]
+name = "MemoryGravityAssessmentRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "subject: MemoryEcologySubject", "scope_id: String", "task_family: String", "route_fingerprint: String", "context_recipe_revision: String", "state_fence: StateFence", "exposure_coverage: AssessmentCoverage", "outcome_coverage: AssessmentCoverage", "maximum_exposures: u32", "maximum_intervention_candidates: u32", "request_sha256: String"]
+invariants = ["exact subject/route/recipe/task/scope/fence", "bounds non-zero", "request owns no Context or lifecycle mutation"]
+
+[[public_type]]
+name = "MemoryGravityDimensionResult"
+kind = "struct"
+definition = ["dimension: MemoryGravityDimension", "result: AssessmentDimensionResult"]
+
+[[public_type]]
+name = "GravityInterventionKind"
+kind = "enum"
+definition = ["Narrow", "Reorder", "HandleOnly", "Suppress", "Split", "NoChange", "ObserveMore"]
+
+[[public_type]]
+name = "GravityInterventionCandidate"
+kind = "struct"
+definition = ["candidate_id: ArtifactId", "kind: GravityInterventionKind", "subject: MemoryEcologySubject", "affected_exposure_handles: Vec<ArtifactId>", "evidence_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "required_authority_ref: String", "rollback_ref: String", "expiry_or_review_ref: String", "reason_codes: Vec<String>"]
+invariants = ["candidate cannot delete or change support", "NoChange is a valid candidate", "negative memory/invariants require explicit protected-role analysis"]
+
+[[public_type]]
+name = "MemoryGravityAssessment"
+kind = "struct"
+definition = ["request_sha256: String", "subject: MemoryEcologySubject", "scope_id: String", "state_fence: StateFence", "exposure_coverage: AssessmentCoverage", "outcome_coverage: AssessmentCoverage", "disposition: MemoryGravityDisposition", "dimensions: Vec<MemoryGravityDimensionResult>", "intervention_candidates: Vec<GravityInterventionCandidate>", "omitted_or_missing_refs: Vec<String>", "assessment_sha256: String"]
+invariants = ["no aggregate gravity score", "insufficient denominator cannot yield auto-suppress", "canonical order and digest"]
+
+[[public_function]]
+name = "assess_memory_ecology"
+signature = "pub fn assess_memory_ecology(request: &MemoryEcologyAssessmentRequest, evidence: &[MemoryEcologyEvidence]) -> Result<MemoryEcologyAssessment, MemoryEcologyAssessmentError>"
+
+[[public_function]]
+name = "assess_memory_gravity"
+signature = "pub fn assess_memory_gravity(request: &MemoryGravityAssessmentRequest, exposures: &[MemoryContextExposure]) -> Result<MemoryGravityAssessment, MemoryGravityAssessmentError>"
+
+[[negative_test]]
+id = "unused-supported-not-demoted"
+property = "Low or zero observed use cannot reduce epistemic support."
+
+[[negative_test]]
+id = "delivery-not-utility"
+property = "Retrieval, acknowledgement or expansion without observable use/outcome yields no utility claim."
+
+[[negative_test]]
+id = "minority-evidence-protected"
+property = "Minority/counterevidence remains addressable under candidate limits."
+
+[[negative_test]]
+id = "prominence-not-support"
+property = "High repetition/token share cannot raise source support."
+
+[[negative_test]]
+id = "no-transition-receipt"
+property = "Assessments expose no applied lifecycle/support/influence transition or receipt."
