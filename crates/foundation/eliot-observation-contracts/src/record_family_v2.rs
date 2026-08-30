@@ -1,17 +1,17 @@
 //! Versioned record-family evidence for observation admission.
 //!
 //! The legacy v1 envelope stores one generic ordinary event plus a caller-selected
-//! family label.  This module adds a field-complete v2 contract in which exact
-//! family evidence is explicit and generic legacy material remains compatible or
-//! ambiguous rather than being promoted by `ObservationKind`, prose, or model
-//! judgement.
+//! family label. This module adds a field-complete v2 contract by reusing the
+//! existing family-specific records as the only exact ordinary payloads. Generic
+//! legacy material remains compatible or ambiguous rather than being promoted by
+//! `ObservationKind`, prose, or model judgement.
 
 use crate::{
-    CaptureMode, CoverageGap, ObservationError, ObservationEventCore, ObservationRecordEnvelope,
-    ObservationRecordKind,
+    AuditRecord, ChangeRecord, CoverageGap, MaintenanceRecord, ObservationError,
+    ObservationEventCore, ObservationRecordEnvelope, ObservationRecordKind, TelemetryRecord,
 };
 use eliot_contracts::{
-    ContractError, ContractIdentity, ContractVersion, StateFence, canonical_json_bytes,
+    ContractError, ContractIdentity, ContractVersion, canonical_json_bytes,
     contract_identity as foundation_contract_identity, sha256_hex,
 };
 use schemars::JsonSchema;
@@ -72,6 +72,9 @@ pub enum RecordFamilyContractError {
     /// A retained legacy canonical digest was changed.
     #[error("legacy canonical digest mismatch")]
     LegacyDigestMismatch,
+    /// The v2 projection no longer matches the deterministic v1 migration.
+    #[error("legacy v2 projection mismatch")]
+    LegacyProjectionMismatch,
 }
 
 impl From<ContractError> for RecordFamilyContractError {
@@ -107,172 +110,137 @@ fn digest(value: &str, field: &'static str) -> Result<(), RecordFamilyContractEr
     Ok(())
 }
 
-/// Exact audit-family evidence for an ordinary audit observation.
+/// Dedicated record wrapper for an explicit coverage gap.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AuditFamilyEvidence {
-    /// Exact action whose occurrence is being audited.
-    pub audit_action: String,
-    /// Fence under which the audited action was observed.
-    pub state_fence: StateFence,
+pub struct CoverageGapRecordV2 {
+    /// Stable journal record identity, distinct from the gap identity when needed.
+    pub record_id: String,
+    /// Field-complete explicit gap payload.
+    pub gap: CoverageGap,
 }
 
-impl AuditFamilyEvidence {
+impl CoverageGapRecordV2 {
     fn validate(&self) -> Result<(), RecordFamilyContractError> {
-        text(&self.audit_action, "family_evidence.audit_action")?;
-        self.state_fence.validate()?;
+        text(&self.record_id, "payload.record_id")?;
+        self.gap.validate()?;
         Ok(())
     }
 }
 
-/// Exact bounded telemetry-family evidence.
+/// Dedicated journal-health/control record.
+///
+/// The marker itself mechanically establishes the audit family. The nested event
+/// remains the original normalized observation and is not reinterpreted as an
+/// ordinary family discriminator.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TelemetryFamilyEvidence {
-    /// Whether the telemetry was captured fully, sampled, or problem-triggered.
-    pub capture_mode: CaptureMode,
-    /// Number of samples represented by the record.
-    pub sample_count: u64,
-    /// Exact raw/aggregate evidence handle when one is required.
-    pub raw_evidence_handle: Option<String>,
+pub struct JournalControlAuditRecordV2 {
+    /// Stable journal record identity.
+    pub record_id: String,
+    /// Normalized control/health observation.
+    pub event: ObservationEventCore,
 }
 
-impl TelemetryFamilyEvidence {
+impl JournalControlAuditRecordV2 {
     fn validate(&self) -> Result<(), RecordFamilyContractError> {
-        if self.sample_count == 0 {
-            return Err(RecordFamilyContractError::InvalidField {
-                field: "family_evidence.sample_count",
-                reason: "must be greater than zero",
-            });
-        }
-        if matches!(self.capture_mode, CaptureMode::Sampled)
-            && self.raw_evidence_handle.is_none()
-        {
-            return Err(RecordFamilyContractError::InvalidField {
-                field: "family_evidence.raw_evidence_handle",
-                reason: "sampled telemetry requires a raw evidence handle",
-            });
-        }
-        if let Some(handle) = &self.raw_evidence_handle {
-            text(handle, "family_evidence.raw_evidence_handle")?;
-        }
+        text(&self.record_id, "payload.record_id")?;
+        self.event.validate()?;
         Ok(())
     }
 }
 
-/// Exact change-family evidence.
+/// Generic ordinary material for which the producer has no exact family payload.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ChangeFamilyEvidence {
-    /// Exact operation that changed the observed resource.
-    pub change_operation: String,
-    /// Source-owned assessment of origin observability, retained as evidence.
-    pub origin_confidence: String,
-    /// Fence under which the changed resource was observed.
-    pub state_fence: StateFence,
-}
-
-impl ChangeFamilyEvidence {
-    fn validate(&self) -> Result<(), RecordFamilyContractError> {
-        text(
-            &self.change_operation,
-            "family_evidence.change_operation",
-        )?;
-        text(
-            &self.origin_confidence,
-            "family_evidence.origin_confidence",
-        )?;
-        self.state_fence.validate()?;
-        Ok(())
-    }
-}
-
-/// Exact maintenance-family evidence.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MaintenanceFamilyEvidence {
-    /// Exact maintenance action observed or requested.
-    pub maintenance_action: String,
-    /// Trigger/obligation that caused the maintenance observation.
-    pub trigger_ref: String,
-}
-
-impl MaintenanceFamilyEvidence {
-    fn validate(&self) -> Result<(), RecordFamilyContractError> {
-        text(
-            &self.maintenance_action,
-            "family_evidence.maintenance_action",
-        )?;
-        text(&self.trigger_ref, "family_evidence.trigger_ref")
-    }
-}
-
-/// Explicit absence of exact ordinary-family evidence.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AmbiguousOrdinaryEvidence {
+pub struct AmbiguousOrdinaryRecordV2 {
+    /// Stable journal record identity.
+    pub record_id: String,
+    /// Common normalized event retained without family promotion.
+    pub event: ObservationEventCore,
     /// Contract/source that supplied the generic ordinary event.
     pub source_contract_ref: String,
     /// Stable reason why exact family evidence is unavailable.
     pub ambiguity_reason_ref: String,
 }
 
-impl AmbiguousOrdinaryEvidence {
+impl AmbiguousOrdinaryRecordV2 {
     fn validate(&self) -> Result<(), RecordFamilyContractError> {
-        text(
-            &self.source_contract_ref,
-            "family_evidence.source_contract_ref",
-        )?;
+        text(&self.record_id, "payload.record_id")?;
+        self.event.validate()?;
+        text(&self.source_contract_ref, "payload.source_contract_ref")?;
         text(
             &self.ambiguity_reason_ref,
-            "family_evidence.ambiguity_reason_ref",
+            "payload.ambiguity_reason_ref",
         )
     }
 }
 
-/// Closed field-level family evidence.
+/// Closed field-complete v2 payload.
 ///
-/// `ObservationKind` remains part of the common event, but deliberately does
-/// not mint exact family status. Exactness comes only from one of these
-/// field-complete variants or from the dedicated coverage-gap/control shape.
+/// Exact ordinary variants carry the already-owned `AuditRecord`,
+/// `TelemetryRecord`, `ChangeRecord`, and `MaintenanceRecord` shapes directly;
+/// this module does not define parallel copies of their fields.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum RecordFamilyEvidence {
-    /// Field-complete ordinary audit evidence.
-    Audit(AuditFamilyEvidence),
-    /// Field-complete telemetry evidence.
-    Telemetry(TelemetryFamilyEvidence),
-    /// Field-complete resource/configuration change evidence.
-    Change(ChangeFamilyEvidence),
-    /// Field-complete maintenance evidence.
-    Maintenance(MaintenanceFamilyEvidence),
+pub enum RecordFamilyPayloadV2 {
+    /// Field-complete ordinary audit record.
+    Audit(AuditRecord),
+    /// Field-complete bounded telemetry record.
+    Telemetry(TelemetryRecord),
+    /// Field-complete resource/configuration change record.
+    Change(ChangeRecord),
+    /// Field-complete maintenance record.
+    Maintenance(MaintenanceRecord),
     /// Dedicated explicit coverage-gap shape.
-    CoverageGap(CoverageGap),
-    /// Dedicated journal-control marker; the enclosing event carries its details.
-    JournalControlAudit,
+    CoverageGap(CoverageGapRecordV2),
+    /// Dedicated journal-control marker and event.
+    JournalControlAudit(JournalControlAuditRecordV2),
     /// Generic ordinary material with no exact family discriminator.
-    AmbiguousOrdinary(AmbiguousOrdinaryEvidence),
+    AmbiguousOrdinary(AmbiguousOrdinaryRecordV2),
 }
 
-impl RecordFamilyEvidence {
+impl RecordFamilyPayloadV2 {
     fn validate(&self) -> Result<(), RecordFamilyContractError> {
         match self {
-            Self::Audit(value) => value.validate(),
-            Self::Telemetry(value) => value.validate(),
-            Self::Change(value) => value.validate(),
-            Self::Maintenance(value) => value.validate(),
-            Self::CoverageGap(value) => {
+            Self::Audit(value) => {
                 value.validate()?;
                 Ok(())
-            },
-            Self::JournalControlAudit => Ok(()),
+            }
+            Self::Telemetry(value) => {
+                value.validate()?;
+                Ok(())
+            }
+            Self::Change(value) => {
+                value.validate()?;
+                Ok(())
+            }
+            Self::Maintenance(value) => {
+                value.validate()?;
+                Ok(())
+            }
+            Self::CoverageGap(value) => value.validate(),
+            Self::JournalControlAudit(value) => value.validate(),
             Self::AmbiguousOrdinary(value) => value.validate(),
+        }
+    }
+
+    /// Returns the stable journal record identity carried by the payload.
+    pub fn record_id(&self) -> &str {
+        match self {
+            Self::Audit(value) => &value.record_id,
+            Self::Telemetry(value) => &value.record_id,
+            Self::Change(value) => &value.record_id,
+            Self::Maintenance(value) => &value.record_id,
+            Self::CoverageGap(value) => &value.record_id,
+            Self::JournalControlAudit(value) => &value.record_id,
+            Self::AmbiguousOrdinary(value) => &value.record_id,
         }
     }
 
     const fn exact_family(&self) -> Option<ObservationRecordKind> {
         match self {
-            Self::Audit(_) | Self::JournalControlAudit => Some(ObservationRecordKind::Audit),
+            Self::Audit(_) | Self::JournalControlAudit(_) => Some(ObservationRecordKind::Audit),
             Self::Telemetry(_) => Some(ObservationRecordKind::Telemetry),
             Self::Change(_) => Some(ObservationRecordKind::Change),
             Self::Maintenance(_) => Some(ObservationRecordKind::Maintenance),
@@ -281,8 +249,8 @@ impl RecordFamilyEvidence {
         }
     }
 
-    const fn is_ordinary(&self) -> bool {
-        !matches!(self, Self::CoverageGap(_))
+    const fn is_journal_control(&self) -> bool {
+        matches!(self, Self::JournalControlAudit(_))
     }
 }
 
@@ -308,63 +276,26 @@ pub enum RecordFamilyClassification {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationRecordEnvelopeV2 {
-    /// Stable record identity.
-    pub record_id: String,
-    /// Common normalized event for every ordinary family.
-    pub event: Option<ObservationEventCore>,
-    /// Exact family evidence or explicit ordinary ambiguity.
-    pub family_evidence: RecordFamilyEvidence,
+    /// Exact family payload or explicit ordinary ambiguity.
+    pub payload: RecordFamilyPayloadV2,
     /// Caller-selected family retained only as a consistency hint.
     pub caller_family_hint: Option<ObservationRecordKind>,
-    /// Dedicated control marker; only `JournalControlAudit` may set it.
-    pub journal_control_event: bool,
-    /// Optional parent record; control events cannot recurse.
+    /// Optional parent record; journal-control events cannot recurse.
     pub parent_record_id: Option<String>,
 }
 
 impl ObservationRecordEnvelopeV2 {
     fn validate_structure(&self) -> Result<(), RecordFamilyContractError> {
-        text(&self.record_id, "record_id")?;
-        self.family_evidence.validate()?;
-
+        self.payload.validate()?;
         if let Some(parent) = &self.parent_record_id {
             text(parent, "parent_record_id")?;
-            if parent == &self.record_id {
+            if parent == self.payload.record_id() {
                 return Err(RecordFamilyContractError::ShapeConflict {
                     reason: "a record cannot be its own parent",
                 });
             }
         }
-
-        if self.family_evidence.is_ordinary() {
-            let event = self.event.as_ref().ok_or(
-                RecordFamilyContractError::ShapeConflict {
-                    reason: "ordinary family evidence requires an event",
-                },
-            )?;
-            event.validate()?;
-        } else if self.event.is_some() {
-            return Err(RecordFamilyContractError::ShapeConflict {
-                reason: "coverage-gap evidence cannot carry an ordinary event",
-            });
-        }
-
-        match (&self.family_evidence, self.journal_control_event) {
-            (RecordFamilyEvidence::JournalControlAudit, true) => {}
-            (RecordFamilyEvidence::JournalControlAudit, false) => {
-                return Err(RecordFamilyContractError::ShapeConflict {
-                    reason: "journal-control audit evidence requires the control marker",
-                });
-            }
-            (_, true) => {
-                return Err(RecordFamilyContractError::ShapeConflict {
-                    reason: "only journal-control audit evidence may set the control marker",
-                });
-            }
-            _ => {}
-        }
-
-        if self.journal_control_event && self.parent_record_id.is_some() {
+        if self.payload.is_journal_control() && self.parent_record_id.is_some() {
             return Err(RecordFamilyContractError::ShapeConflict {
                 reason: "journal-control events cannot have a parent record",
             });
@@ -372,12 +303,17 @@ impl ObservationRecordEnvelopeV2 {
         Ok(())
     }
 
+    /// Returns the stable record identity without duplicating it in the envelope.
+    pub fn record_id(&self) -> &str {
+        self.payload.record_id()
+    }
+
     /// Derives exact, compatible-hint, or ambiguous status without interpreting prose.
     pub fn classification(
         &self,
     ) -> Result<RecordFamilyClassification, RecordFamilyContractError> {
         self.validate_structure()?;
-        if let Some(expected) = self.family_evidence.exact_family() {
+        if let Some(expected) = self.payload.exact_family() {
             if let Some(hinted) = self.caller_family_hint
                 && hinted != expected
             {
@@ -468,7 +404,7 @@ pub struct LegacyV1Import {
 }
 
 impl LegacyV1Import {
-    /// Validates legacy lineage, v2 projection, and the compatibility ceiling.
+    /// Validates legacy lineage, deterministic v2 projection, and compatibility ceiling.
     pub fn validate(&self) -> Result<(), RecordFamilyContractError> {
         self.legacy_record.validate()?;
         text(&self.original_artifact_ref, "original_artifact_ref")?;
@@ -479,30 +415,81 @@ impl LegacyV1Import {
         if sha256_hex(&canonical) != self.legacy_canonical_sha256 {
             return Err(RecordFamilyContractError::LegacyDigestMismatch);
         }
-        self.record_v2.validate()?;
-        let classification = self.record_v2.classification()?;
-        let disposition_matches = matches!(
-            (self.disposition, classification),
-            (
-                LegacyV1ImportDisposition::ExactCoverageGap,
-                RecordFamilyClassification::Exact {
-                    family: ObservationRecordKind::CoverageGap
-                }
-            ) | (
-                LegacyV1ImportDisposition::ExactJournalControlAudit,
-                RecordFamilyClassification::Exact {
-                    family: ObservationRecordKind::Audit
-                }
-            ) | (
-                LegacyV1ImportDisposition::CompatibleHintOnly,
-                RecordFamilyClassification::CompatibleHint { .. }
-            )
-        );
-        if !disposition_matches {
+
+        let (expected_record, expected_disposition) = project_legacy_record(&self.legacy_record)?;
+        if self.record_v2 != expected_record {
+            return Err(RecordFamilyContractError::LegacyProjectionMismatch);
+        }
+        if self.disposition != expected_disposition {
             return Err(RecordFamilyContractError::LegacyDispositionMismatch);
         }
+        self.record_v2.validate()?;
         Ok(())
     }
+}
+
+fn project_legacy_record(
+    legacy_record: &ObservationRecordEnvelope,
+) -> Result<(ObservationRecordEnvelopeV2, LegacyV1ImportDisposition), RecordFamilyContractError> {
+    legacy_record.validate()?;
+
+    let projected = if let Some(gap) = legacy_record.coverage_gap.clone() {
+        (
+            ObservationRecordEnvelopeV2 {
+                payload: RecordFamilyPayloadV2::CoverageGap(CoverageGapRecordV2 {
+                    record_id: legacy_record.record_id.clone(),
+                    gap,
+                }),
+                caller_family_hint: Some(ObservationRecordKind::CoverageGap),
+                parent_record_id: legacy_record.parent_record_id.clone(),
+            },
+            LegacyV1ImportDisposition::ExactCoverageGap,
+        )
+    } else if legacy_record.journal_control_event {
+        let event = legacy_record.event.clone().ok_or(
+            RecordFamilyContractError::ShapeConflict {
+                reason: "validated journal-control v1 record has no event",
+            },
+        )?;
+        (
+            ObservationRecordEnvelopeV2 {
+                payload: RecordFamilyPayloadV2::JournalControlAudit(
+                    JournalControlAuditRecordV2 {
+                        record_id: legacy_record.record_id.clone(),
+                        event,
+                    },
+                ),
+                caller_family_hint: Some(ObservationRecordKind::Audit),
+                parent_record_id: None,
+            },
+            LegacyV1ImportDisposition::ExactJournalControlAudit,
+        )
+    } else {
+        let event = legacy_record.event.clone().ok_or(
+            RecordFamilyContractError::ShapeConflict {
+                reason: "validated ordinary v1 record has no event",
+            },
+        )?;
+        (
+            ObservationRecordEnvelopeV2 {
+                payload: RecordFamilyPayloadV2::AmbiguousOrdinary(
+                    AmbiguousOrdinaryRecordV2 {
+                        record_id: legacy_record.record_id.clone(),
+                        event,
+                        source_contract_ref: LEGACY_OBSERVATION_CONTRACT_REF.to_owned(),
+                        ambiguity_reason_ref:
+                            "legacy-v1-generic-family-evidence-unavailable".to_owned(),
+                    },
+                ),
+                caller_family_hint: Some(legacy_record.kind),
+                parent_record_id: legacy_record.parent_record_id.clone(),
+            },
+            LegacyV1ImportDisposition::CompatibleHintOnly,
+        )
+    };
+
+    projected.0.validate()?;
+    Ok(projected)
 }
 
 /// Imports a v1 generic envelope without treating its ordinary label as exact evidence.
@@ -510,69 +497,15 @@ pub fn import_legacy_v1(
     request: LegacyV1ImportRequest,
 ) -> Result<LegacyV1Import, RecordFamilyContractError> {
     request.validate()?;
-    let LegacyV1ImportRequest {
-        legacy_record,
-        original_artifact_ref,
-        original_bytes_sha256,
-    } = request;
     let legacy_canonical_sha256 = sha256_hex(
-        &canonical_json_bytes(&legacy_record)
+        &canonical_json_bytes(&request.legacy_record)
             .map_err(|error| RecordFamilyContractError::Canonicalization(error.to_string()))?,
     );
-
-    let record_v2 = if let Some(gap) = legacy_record.coverage_gap.clone() {
-        ObservationRecordEnvelopeV2 {
-            record_id: legacy_record.record_id.clone(),
-            event: None,
-            family_evidence: RecordFamilyEvidence::CoverageGap(gap),
-            caller_family_hint: Some(ObservationRecordKind::CoverageGap),
-            journal_control_event: false,
-            parent_record_id: legacy_record.parent_record_id.clone(),
-        }
-    } else if legacy_record.journal_control_event {
-        ObservationRecordEnvelopeV2 {
-            record_id: legacy_record.record_id.clone(),
-            event: legacy_record.event.clone(),
-            family_evidence: RecordFamilyEvidence::JournalControlAudit,
-            caller_family_hint: Some(ObservationRecordKind::Audit),
-            journal_control_event: true,
-            parent_record_id: None,
-        }
-    } else {
-        ObservationRecordEnvelopeV2 {
-            record_id: legacy_record.record_id.clone(),
-            event: legacy_record.event.clone(),
-            family_evidence: RecordFamilyEvidence::AmbiguousOrdinary(
-                AmbiguousOrdinaryEvidence {
-                    source_contract_ref: LEGACY_OBSERVATION_CONTRACT_REF.to_owned(),
-                    ambiguity_reason_ref: "legacy-v1-generic-family-evidence-unavailable"
-                        .to_owned(),
-                },
-            ),
-            caller_family_hint: Some(legacy_record.kind),
-            journal_control_event: false,
-            parent_record_id: legacy_record.parent_record_id.clone(),
-        }
-    };
-
-    let disposition = if matches!(
-        &record_v2.family_evidence,
-        RecordFamilyEvidence::CoverageGap(_)
-    ) {
-        LegacyV1ImportDisposition::ExactCoverageGap
-    } else if matches!(
-        &record_v2.family_evidence,
-        RecordFamilyEvidence::JournalControlAudit
-    ) {
-        LegacyV1ImportDisposition::ExactJournalControlAudit
-    } else {
-        LegacyV1ImportDisposition::CompatibleHintOnly
-    };
-
+    let (record_v2, disposition) = project_legacy_record(&request.legacy_record)?;
     let imported = LegacyV1Import {
-        legacy_record,
-        original_artifact_ref,
-        original_bytes_sha256,
+        legacy_record: request.legacy_record,
+        original_artifact_ref: request.original_artifact_ref,
+        original_bytes_sha256: request.original_bytes_sha256,
         legacy_canonical_sha256,
         record_v2,
         disposition,
@@ -600,11 +533,11 @@ pub fn record_family_contract_identity() -> Result<ContractIdentity, RecordFamil
 mod tests {
     use super::*;
     use crate::{
-        CoverageDisposition, CoverageEvidence, CoverageInterval, GapDisposition,
+        CaptureMode, CoverageDisposition, CoverageEvidence, CoverageInterval, GapDisposition,
         ObservationEventIdentity, ObservationKind, ObservationScope,
         PrivacyRetentionDisclosure, ProducerTrace,
     };
-    use eliot_contracts::{AuthorityEpoch, ClockReading, ResourceGeneration};
+    use eliot_contracts::{AuthorityEpoch, ClockReading, ResourceGeneration, StateFence};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -662,76 +595,86 @@ mod tests {
         }
     }
 
-    fn ordinary(
+    fn exact_records() -> Result<Vec<ObservationRecordEnvelopeV2>, ObservationError> {
+        Ok(vec![
+            ObservationRecordEnvelopeV2 {
+                payload: RecordFamilyPayloadV2::Audit(AuditRecord {
+                    record_id: "record:audit".to_owned(),
+                    core: event(ObservationKind::Security)?,
+                    audit_action: "permission checked".to_owned(),
+                    state_fence: fence(),
+                }),
+                caller_family_hint: Some(ObservationRecordKind::Audit),
+                parent_record_id: None,
+            },
+            ObservationRecordEnvelopeV2 {
+                payload: RecordFamilyPayloadV2::Telemetry(TelemetryRecord {
+                    record_id: "record:telemetry".to_owned(),
+                    core: event(ObservationKind::QueueResource)?,
+                    capture_mode: CaptureMode::Sampled,
+                    sample_count: 4,
+                    raw_evidence_handle: Some("blob:telemetry".to_owned()),
+                }),
+                caller_family_hint: Some(ObservationRecordKind::Telemetry),
+                parent_record_id: None,
+            },
+            ObservationRecordEnvelopeV2 {
+                payload: RecordFamilyPayloadV2::Change(ChangeRecord {
+                    record_id: "record:change".to_owned(),
+                    core: event(ObservationKind::Configuration)?,
+                    change_operation: "configuration updated".to_owned(),
+                    origin_confidence: "host_observed".to_owned(),
+                    state_fence: fence(),
+                }),
+                caller_family_hint: Some(ObservationRecordKind::Change),
+                parent_record_id: None,
+            },
+            ObservationRecordEnvelopeV2 {
+                payload: RecordFamilyPayloadV2::Maintenance(MaintenanceRecord {
+                    record_id: "record:maintenance".to_owned(),
+                    core: event(ObservationKind::Maintenance)?,
+                    maintenance_action: "rebuild projection".to_owned(),
+                    trigger_ref: "problem:1".to_owned(),
+                }),
+                caller_family_hint: Some(ObservationRecordKind::Maintenance),
+                parent_record_id: None,
+            },
+            ObservationRecordEnvelopeV2 {
+                payload: RecordFamilyPayloadV2::CoverageGap(CoverageGapRecordV2 {
+                    record_id: "record:gap".to_owned(),
+                    gap: gap(),
+                }),
+                caller_family_hint: Some(ObservationRecordKind::CoverageGap),
+                parent_record_id: None,
+            },
+        ])
+    }
+
+    fn ambiguous_record(
         record_id: &str,
         kind: ObservationKind,
-        evidence: RecordFamilyEvidence,
         hint: Option<ObservationRecordKind>,
     ) -> Result<ObservationRecordEnvelopeV2, ObservationError> {
         Ok(ObservationRecordEnvelopeV2 {
-            record_id: record_id.to_owned(),
-            event: Some(event(kind)?),
-            family_evidence: evidence,
+            payload: RecordFamilyPayloadV2::AmbiguousOrdinary(AmbiguousOrdinaryRecordV2 {
+                record_id: record_id.to_owned(),
+                event: event(kind)?,
+                source_contract_ref: "source:generic".to_owned(),
+                ambiguity_reason_ref: "family-specific-fields-unavailable".to_owned(),
+            }),
             caller_family_hint: hint,
-            journal_control_event: false,
             parent_record_id: None,
         })
     }
 
     #[test]
     fn every_field_complete_family_roundtrips_as_exact() -> TestResult {
-        let records = vec![
-            ordinary(
-                "record:audit",
-                ObservationKind::Security,
-                RecordFamilyEvidence::Audit(AuditFamilyEvidence {
-                    audit_action: "permission checked".to_owned(),
-                    state_fence: fence(),
-                }),
-                Some(ObservationRecordKind::Audit),
-            )?,
-            ordinary(
-                "record:telemetry",
-                ObservationKind::QueueResource,
-                RecordFamilyEvidence::Telemetry(TelemetryFamilyEvidence {
-                    capture_mode: CaptureMode::Sampled,
-                    sample_count: 4,
-                    raw_evidence_handle: Some("blob:telemetry".to_owned()),
-                }),
-                Some(ObservationRecordKind::Telemetry),
-            )?,
-            ordinary(
-                "record:change",
-                ObservationKind::Configuration,
-                RecordFamilyEvidence::Change(ChangeFamilyEvidence {
-                    change_operation: "configuration updated".to_owned(),
-                    origin_confidence: "host_observed".to_owned(),
-                    state_fence: fence(),
-                }),
-                Some(ObservationRecordKind::Change),
-            )?,
-            ordinary(
-                "record:maintenance",
-                ObservationKind::Maintenance,
-                RecordFamilyEvidence::Maintenance(MaintenanceFamilyEvidence {
-                    maintenance_action: "rebuild projection".to_owned(),
-                    trigger_ref: "problem:1".to_owned(),
-                }),
-                Some(ObservationRecordKind::Maintenance),
-            )?,
-            ObservationRecordEnvelopeV2 {
-                record_id: "record:gap".to_owned(),
-                event: None,
-                family_evidence: RecordFamilyEvidence::CoverageGap(gap()),
-                caller_family_hint: Some(ObservationRecordKind::CoverageGap),
-                journal_control_event: false,
-                parent_record_id: None,
-            },
-        ];
-
-        for record in records {
+        for record in exact_records()? {
             let classification = record.classification()?;
-            assert!(matches!(classification, RecordFamilyClassification::Exact { .. }));
+            assert!(matches!(
+                classification,
+                RecordFamilyClassification::Exact { .. }
+            ));
             let encoded = serde_json::to_string(&record)?;
             let decoded: ObservationRecordEnvelopeV2 = serde_json::from_str(&encoded)?;
             assert_eq!(decoded, record);
@@ -741,14 +684,21 @@ mod tests {
     }
 
     #[test]
+    fn exact_payload_reuses_the_existing_family_record_shape() -> TestResult {
+        let record = exact_records()?.remove(0);
+        let RecordFamilyPayloadV2::Audit(audit) = record.payload else {
+            panic!("expected audit payload");
+        };
+        assert_eq!(audit.audit_action, "permission checked");
+        assert_eq!(audit.core.kind, ObservationKind::Security);
+        Ok(())
+    }
+
+    #[test]
     fn generic_event_hint_remains_compatible_not_exact() -> TestResult {
-        let record = ordinary(
+        let record = ambiguous_record(
             "record:legacy-like",
             ObservationKind::QueueResource,
-            RecordFamilyEvidence::AmbiguousOrdinary(AmbiguousOrdinaryEvidence {
-                source_contract_ref: "source:generic".to_owned(),
-                ambiguity_reason_ref: "family-specific-fields-unavailable".to_owned(),
-            }),
             Some(ObservationRecordKind::Telemetry),
         )?;
         assert_eq!(
@@ -762,13 +712,23 @@ mod tests {
 
     #[test]
     fn generic_event_without_hint_is_explicitly_ambiguous() -> TestResult {
-        let record = ordinary(
+        let record = ambiguous_record(
             "record:ambiguous",
             ObservationKind::ContextPacket,
-            RecordFamilyEvidence::AmbiguousOrdinary(AmbiguousOrdinaryEvidence {
-                source_contract_ref: "source:generic".to_owned(),
-                ambiguity_reason_ref: "no-family-discriminator".to_owned(),
-            }),
+            None,
+        )?;
+        assert_eq!(
+            record.classification()?,
+            RecordFamilyClassification::AmbiguousCandidate
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn observation_kind_does_not_mint_an_exact_family() -> TestResult {
+        let record = ambiguous_record(
+            "record:no-kind-promotion",
+            ObservationKind::Security,
             None,
         )?;
         assert_eq!(
@@ -780,15 +740,8 @@ mod tests {
 
     #[test]
     fn exact_family_rejects_a_conflicting_hint() -> TestResult {
-        let record = ordinary(
-            "record:conflict",
-            ObservationKind::Security,
-            RecordFamilyEvidence::Audit(AuditFamilyEvidence {
-                audit_action: "permission checked".to_owned(),
-                state_fence: fence(),
-            }),
-            Some(ObservationRecordKind::Telemetry),
-        )?;
+        let mut record = exact_records()?.remove(0);
+        record.caller_family_hint = Some(ObservationRecordKind::Telemetry);
         assert_eq!(
             record.classification(),
             Err(RecordFamilyContractError::FamilyHintConflict {
@@ -801,26 +754,16 @@ mod tests {
 
     #[test]
     fn coverage_gap_and_ordinary_shapes_cannot_be_relabelled() -> TestResult {
-        let gap_record = ObservationRecordEnvelopeV2 {
-            record_id: "record:gap-conflict".to_owned(),
-            event: None,
-            family_evidence: RecordFamilyEvidence::CoverageGap(gap()),
-            caller_family_hint: Some(ObservationRecordKind::Audit),
-            journal_control_event: false,
-            parent_record_id: None,
-        };
+        let mut gap_record = exact_records()?.remove(4);
+        gap_record.caller_family_hint = Some(ObservationRecordKind::Audit);
         assert!(matches!(
             gap_record.classification(),
             Err(RecordFamilyContractError::FamilyHintConflict { .. })
         ));
 
-        let ordinary_record = ordinary(
+        let ordinary_record = ambiguous_record(
             "record:ordinary-conflict",
             ObservationKind::TaskProgress,
-            RecordFamilyEvidence::AmbiguousOrdinary(AmbiguousOrdinaryEvidence {
-                source_contract_ref: "source:generic".to_owned(),
-                ambiguity_reason_ref: "no-family-discriminator".to_owned(),
-            }),
             Some(ObservationRecordKind::CoverageGap),
         )?;
         assert!(matches!(
@@ -833,11 +776,13 @@ mod tests {
     #[test]
     fn journal_control_is_exact_audit_and_cannot_be_relabelled() -> TestResult {
         let mut record = ObservationRecordEnvelopeV2 {
-            record_id: "record:control".to_owned(),
-            event: Some(event(ObservationKind::QueueResource)?),
-            family_evidence: RecordFamilyEvidence::JournalControlAudit,
+            payload: RecordFamilyPayloadV2::JournalControlAudit(
+                JournalControlAuditRecordV2 {
+                    record_id: "record:control".to_owned(),
+                    event: event(ObservationKind::QueueResource)?,
+                },
+            ),
             caller_family_hint: Some(ObservationRecordKind::Audit),
-            journal_control_event: true,
             parent_record_id: None,
         };
         assert_eq!(
@@ -850,6 +795,25 @@ mod tests {
         assert!(matches!(
             record.classification(),
             Err(RecordFamilyContractError::FamilyHintConflict { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn journal_control_cannot_form_a_recursive_parent_chain() -> TestResult {
+        let record = ObservationRecordEnvelopeV2 {
+            payload: RecordFamilyPayloadV2::JournalControlAudit(
+                JournalControlAuditRecordV2 {
+                    record_id: "record:control-parent".to_owned(),
+                    event: event(ObservationKind::QueueResource)?,
+                },
+            ),
+            caller_family_hint: Some(ObservationRecordKind::Audit),
+            parent_record_id: Some("record:parent".to_owned()),
+        };
+        assert!(matches!(
+            record.classification(),
+            Err(RecordFamilyContractError::ShapeConflict { .. })
         ));
         Ok(())
     }
@@ -925,14 +889,33 @@ mod tests {
     }
 
     #[test]
+    fn legacy_projection_tampering_is_rejected() -> TestResult {
+        let legacy_record = ObservationRecordEnvelope {
+            record_id: "legacy:tamper".to_owned(),
+            kind: ObservationRecordKind::Change,
+            event: Some(event(ObservationKind::Configuration)?),
+            coverage_gap: None,
+            journal_control_event: false,
+            parent_record_id: None,
+        };
+        let mut imported = import_legacy_v1(LegacyV1ImportRequest {
+            legacy_record,
+            original_artifact_ref: "artifact:tamper".to_owned(),
+            original_bytes_sha256: "d".repeat(64),
+        })?;
+        imported.record_v2.caller_family_hint = Some(ObservationRecordKind::Audit);
+        assert_eq!(
+            imported.validate(),
+            Err(RecordFamilyContractError::LegacyProjectionMismatch)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn unknown_fields_fail_closed() -> TestResult {
-        let record = ordinary(
+        let record = ambiguous_record(
             "record:unknown-field",
             ObservationKind::ContextPacket,
-            RecordFamilyEvidence::AmbiguousOrdinary(AmbiguousOrdinaryEvidence {
-                source_contract_ref: "source:generic".to_owned(),
-                ambiguity_reason_ref: "no-family-discriminator".to_owned(),
-            }),
             None,
         )?;
         let mut value = serde_json::to_value(record)?;
