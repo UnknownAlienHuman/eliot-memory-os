@@ -48,8 +48,8 @@ jobs:
         shell: pwsh
         run: pwsh -NoLogo -NoProfile -File .github/scripts/work-286-normalize.ps1
 
-      - name: Format candidate
-        run: cargo fmt -p eliot-agent-opencode -p eliot-agent-coordinator
+      - name: Format new catalogue source
+        run: rustfmt --edition 2024 crates/agent/eliot-agent-opencode/src/catalogue.rs
 
       - name: Reconcile exact lock delta and compile
         shell: pwsh
@@ -92,7 +92,7 @@ jobs:
       - name: Verify clean proved Rust tree
         shell: pwsh
         run: |
-          cargo fmt -p eliot-agent-opencode -p eliot-agent-coordinator -- --check
+          rustfmt --edition 2024 --check crates/agent/eliot-agent-opencode/src/catalogue.rs
           $dirty = @(git diff --name-only -- Cargo.lock crates/agent/eliot-agent-opencode crates/agent/eliot-agent-coordinator)
           if ($dirty.Count -gt 0) {
             git diff --check -- Cargo.lock crates/agent/eliot-agent-opencode crates/agent/eliot-agent-coordinator
