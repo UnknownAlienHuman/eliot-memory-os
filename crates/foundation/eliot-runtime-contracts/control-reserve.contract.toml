@@ -1,0 +1,566 @@
+schema = "eliot.control-reserve.contract.v1"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+owner_package = "eliot-runtime-contracts"
+functional_cell_id = "foundation.runtime.control-reserve-contract"
+source_issue = 293
+integration_issue = 65
+normative_architecture_refs = ["ARCH-RES-04", "ELIOT_ARCHITECTURE:A13.5"]
+normative_implementation_refs = ["I1.2", "I2.6", "I13.10", "I14.1", "I14.2", "I14.3", "I14.4", "I14.24"]
+public_contract_name = "eliot.foundation.control-reserve"
+public_contract_revision = "1.0.0"
+proof_ceiling = "STATIC_FIELD_AND_ADAPTER_MIGRATION_CONTRACT_ONLY"
+mutable_state = "none"
+allowed_effects = []
+
+[ownership]
+source_maintenance_owner = "foundation-runtime-contract-owner"
+lifecycle_owner = "none_stateless_contract"
+runtime_capacity_owner = "one declared owner per bottleneck"
+profile_compiler_owner = "Kernel composition over owner-produced capacity evidence"
+first_real_consumer = "eliot-kernel-core FrontDoor"
+integration_owner = "issue-65"
+replacement_boundary = "versioned capacity/profile contract plus per-bottleneck adapters and saturation corpus"
+must_not_own = [
+  "queues or semaphores",
+  "ORS transaction or byte accounting",
+  "Store connection or transaction pools",
+  "process or Job Object capacity",
+  "Watchdog spool or notification delivery",
+  "CPU, memory, handles, pipe bytes, or disk queues",
+  "task scheduling, authority, canonical state, health, or recovery lifecycle",
+]
+
+[core_invariant]
+statement = "normal workload is structurally unable to consume protected control/recovery or emergency last-resort capacity at every claimed bottleneck"
+priority_only_is_reserve = false
+single_global_semaphore_is_sufficient = false
+single_scalar_utilization_is_sufficient = false
+normal_borrowing_from_protected = false
+normal_borrowing_from_emergency = false
+protected_borrowing_from_emergency = false
+missing_bottleneck_means_healthy = false
+surviving_process_or_counter_restores_permit_ownership = false
+
+[types.CapacityClass]
+kind = "closed enum"
+values = ["NORMAL_WORKLOAD", "PROTECTED_CONTROL", "EMERGENCY_LAST_RESORT"]
+
+[types.NormalWorkClass]
+kind = "closed enum"
+values = [
+  "INTERACTIVE",
+  "VERIFICATION",
+  "CANONICAL_WRITE",
+  "NORMAL_BACKGROUND",
+  "MODEL_JOB",
+  "SWARM",
+  "REPORTING",
+  "MAINTENANCE",
+]
+invariants = [
+  "maps only to NORMAL_WORKLOAD",
+  "importance, age, retry count, or queue pressure cannot promote it to PROTECTED_CONTROL",
+  "DownstreamHeadroomReservation remains normal pipeline capacity and never maps to Control Reserve",
+]
+
+[types.ControlOperationClass]
+kind = "closed enum"
+values = [
+  "CANCEL_OPERATION",
+  "FENCE_STALE_OWNER",
+  "REVOKE_AUTHORITY",
+  "HEALTH_READINESS_CONTROL",
+  "CRITICAL_TELEMETRY",
+  "CRITICAL_ATTENTION_TRANSITION",
+  "PROBLEM_TRANSITION",
+  "INCIDENT_TRANSITION",
+  "PERSISTENT_NOTIFICATION_TRANSITION",
+  "SAFE_SHUTDOWN",
+  "DRAIN",
+  "RECOVERY",
+  "CONTAINMENT",
+  "UNKNOWN_OUTCOME_RECONCILIATION",
+]
+invariants = [
+  "maps only to PROTECTED_CONTROL",
+  "does not include ordinary read, write, verification, model, swarm, report, or maintenance work",
+  "a protected label does not create authority for the operation",
+]
+
+[types.EmergencyOperationClass]
+kind = "closed enum"
+values = [
+  "RESERVE_EXHAUSTION_GAP_RECORD",
+  "CONTROL_GUARANTEE_LOST_RECORD",
+  "ENTER_MANUAL_RECOVERY",
+]
+invariants = [
+  "maps only to EMERGENCY_LAST_RESORT",
+  "cannot execute ordinary workload or replace protected capacity",
+  "is available only where explicitly preallocated outside normal and protected accounting",
+]
+
+[types.CapacityBottleneck]
+kind = "closed enum"
+values = [
+  "KERNEL_CONTROL_CHANNEL",
+  "KERNEL_RUNNABLE_CONTROL_SLOTS",
+  "ORS_TRANSACTION_SLOTS",
+  "ORS_DURABLE_QUEUE_BYTES",
+  "STORE_CONNECTION_SLOTS",
+  "STORE_TRANSACTION_SLOTS",
+  "STORE_PENDING_WRITE_MEMORY",
+  "PROCESS_LAUNCH_SLOTS",
+  "PROCESS_CANCELLATION_TERMINATION",
+  "NOTIFICATION_PERSISTENT_INBOX",
+  "CPU_CONTROL_TASK_SLOTS",
+  "PROTECTED_MEMORY_BYTES",
+  "PIPE_MESSAGE_BYTES",
+  "FILE_DESCRIPTOR_HANDLE_SLOTS",
+  "DISK_QUEUE_WRITE_CAPACITY",
+]
+invariants = [
+  "one ControlReserveProfile contains exactly one row for every value",
+  "one exhausted bottleneck does not imply that another bottleneck is exhausted",
+  "a claimed bottleneck names one runtime owner and one independent proof profile",
+]
+
+[types.CapacityUnit]
+kind = "closed enum"
+values = [
+  "ITEMS",
+  "BYTES",
+  "CONCURRENT_OPERATIONS",
+  "RUNNABLE_SLOTS",
+  "CONNECTIONS",
+  "TRANSACTIONS",
+  "PROCESS_SLOTS",
+  "CPU_TASK_SLOTS",
+  "MEMORY_BYTES",
+  "HANDLES",
+  "DISK_QUEUE_SLOTS",
+]
+invariants = [
+  "quantities from different units are never summed, averaged, or converted to one utilization percentage",
+  "a bottleneck profile uses exactly its declared unit",
+]
+
+[types.CapacityEnforcement]
+kind = "closed enum"
+values = [
+  "PHYSICAL_PARTITION",
+  "CONFIGURATION_PARTITION",
+  "PLATFORM_PREALLOCATION",
+]
+invariants = [
+  "PRIORITY_ONLY is deliberately not a value",
+  "claimed enforcement has an owner-produced proof showing normal work cannot acquire the reserved partition",
+]
+
+[types.BottleneckCoverageState]
+kind = "closed enum"
+values = ["CLAIMED", "UNSUPPORTED", "UNKNOWN"]
+invariants = [
+  "UNSUPPORTED and UNKNOWN remain explicit rows in the denominator",
+  "neither state may be rendered as protected capacity",
+]
+
+[types.CapacityLimit]
+kind = "closed struct"
+fields = ["unit: CapacityUnit", "quantity: NonZeroU64"]
+invariants = [
+  "quantity is positive",
+  "unit exactly matches the owning bottleneck contract",
+]
+
+[types.BottleneckCapacityProfile]
+kind = "closed struct"
+fields = [
+  "bottleneck: CapacityBottleneck",
+  "coverage_state: BottleneckCoverageState",
+  "owner_ref",
+  "owner_generation_ref",
+  "unit: CapacityUnit",
+  "physical_total_limit: Option<CapacityLimit>",
+  "normal_work_applicable: bool",
+  "normal_limit: Option<CapacityLimit>",
+  "protected_limit: Option<CapacityLimit>",
+  "emergency_limit: Option<CapacityLimit>",
+  "enforcement: Option<CapacityEnforcement>",
+  "normal_may_borrow_protected: false",
+  "normal_may_borrow_emergency: false",
+  "protected_may_borrow_emergency: false",
+  "proof_profile_ref",
+  "evidence_refs",
+  "invalidation_set",
+]
+invariants = [
+  "CLAIMED requires owner, owner generation, physical total, protected limit, enforcement, proof profile, evidence, and invalidation set",
+  "CLAIMED with normal_work_applicable requires a normal limit",
+  "all present limits use the exact row unit",
+  "physical total is at least the sum of all present disjoint partitions without overflow",
+  "UNSUPPORTED and UNKNOWN carry no capacity claim or enforcement claim",
+  "emergency limit is optional, but when present is disjoint and outside normal/protected accounting",
+]
+
+[types.ControlReserveProfile]
+kind = "closed struct"
+fields = [
+  "profile_id",
+  "profile_revision",
+  "product_identity_ref",
+  "source_build_and_runtime_generation_refs",
+  "config_snapshot_ref",
+  "authority_epoch_ref: canonical EpochId",
+  "compiled_at_ms",
+  "bottleneck_rows: Vec<BottleneckCapacityProfile>",
+  "unsupported_or_unknown_guarantees",
+  "profile_evidence_refs",
+  "invalidation_set",
+]
+invariants = [
+  "contains the exact complete CapacityBottleneck denominator",
+  "bottleneck rows and all set-like fields are canonical and duplicate-free",
+  "missing/unsupported/unknown rows lower only guarantees that depend on those dimensions",
+  "profile identity changes when a limit, owner, generation, enforcement, proof, or invalidation dependency changes",
+]
+
+[types.CapacityRequest]
+kind = "closed tagged union"
+variants = [
+  "Normal { class: NormalWorkClass }",
+  "Protected { class: ControlOperationClass }",
+  "Emergency { class: EmergencyOperationClass }",
+]
+common_fields = [
+  "operation_id",
+  "requested_bottleneck: CapacityBottleneck",
+  "requested_limit: CapacityLimit",
+  "requesting_owner_ref",
+  "requesting_generation_ref",
+  "authority_epoch_ref: canonical EpochId",
+  "profile_id_and_revision",
+  "deadline_ms",
+]
+invariants = [
+  "tag determines the only admissible CapacityClass",
+  "caller cannot provide an independent class override",
+  "request carries no authority by itself",
+]
+
+[types.CapacityPermitBinding]
+kind = "owner-produced closed struct"
+fields = [
+  "permit_id",
+  "operation_id",
+  "capacity_class: CapacityClass",
+  "operation_class_ref",
+  "bottleneck: CapacityBottleneck",
+  "granted_limit: CapacityLimit",
+  "capacity_owner_ref",
+  "capacity_owner_generation_ref",
+  "requesting_owner_ref",
+  "requesting_generation_ref",
+  "authority_epoch_ref: canonical EpochId",
+  "profile_id_and_revision",
+  "issued_at_ms",
+  "expires_at_ms",
+  "owner_evidence_refs",
+]
+invariants = [
+  "binding exactly matches one validated request and one current bottleneck row",
+  "stale profile, generation, epoch, owner, unit, amount, or operation identity fails closed",
+  "permit is not serializable authority outside the owning adapter contract",
+  "process survival, a PID, queue membership, or an in-memory counter cannot reconstruct ownership",
+]
+
+[types.PermitTerminalDisposition]
+kind = "closed enum"
+values = [
+  "RELEASED",
+  "RECONCILED_RELEASED",
+  "LEAK_SUSPECTED",
+  "STALE_OWNER",
+  "UNKNOWN",
+]
+
+[types.CapacityReleaseEvidence]
+kind = "owner-produced closed struct"
+fields = [
+  "permit_binding_ref",
+  "operation_id",
+  "terminal_disposition: PermitTerminalDisposition",
+  "released_limit: CapacityLimit",
+  "observed_owner_generation_ref",
+  "authority_epoch_ref: canonical EpochId",
+  "profile_id_and_revision",
+  "released_at_ms",
+  "evidence_refs",
+  "reconciliation_ref",
+]
+invariants = [
+  "release cannot exceed or change the granted unit/quantity",
+  "stale or unknown ownership never silently increases available capacity",
+  "restart reconciliation uses durable operation/permit evidence rather than resetting a counter",
+]
+
+[types.CapacityAdmissionDisposition]
+kind = "closed enum"
+values = [
+  "ADMITTED_NORMAL",
+  "ADMITTED_PROTECTED",
+  "ADMITTED_EMERGENCY",
+  "BACKPRESSURED_NORMAL",
+  "PROTECTED_RESERVE_EXHAUSTED",
+  "EMERGENCY_SLOT_UNAVAILABLE",
+  "BOTTLENECK_UNSUPPORTED",
+  "BOTTLENECK_UNKNOWN",
+  "STALE_BINDING",
+  "INVALID_CAPACITY_CLASS",
+  "CONTROL_GUARANTEE_LOST",
+]
+invariants = [
+  "non-admission names the exact bottleneck, unit, requested amount, observed availability, and recovery directive",
+  "ACCEPTED_PENDING and canonical commit are not capacity dispositions",
+]
+
+[types.ReserveHealthDisposition]
+kind = "closed enum"
+values = [
+  "AVAILABLE",
+  "DEGRADED_DIMENSION",
+  "PROTECTED_EXHAUSTED",
+  "LAST_RESORT_ONLY",
+  "CONTROL_GUARANTEE_LOST",
+  "UNKNOWN",
+]
+invariants = [
+  "derived from the complete bottleneck vector and owner evidence",
+  "one healthy dimension cannot hide an unknown, unsupported, exhausted, or lost required dimension",
+  "CONTROL_GUARANTEE_LOST is an Incident/manual-recovery boundary, never a warning-only metric",
+]
+
+[[bottleneck_contract]]
+id = "KERNEL_CONTROL_CHANNEL"
+unit = "ITEMS"
+owner = "Kernel front-door/control-channel owner"
+
+[[bottleneck_contract]]
+id = "KERNEL_RUNNABLE_CONTROL_SLOTS"
+unit = "RUNNABLE_SLOTS"
+owner = "Kernel runtime/control scheduler owner"
+
+[[bottleneck_contract]]
+id = "ORS_TRANSACTION_SLOTS"
+unit = "TRANSACTIONS"
+owner = "Kernel ORS owner"
+
+[[bottleneck_contract]]
+id = "ORS_DURABLE_QUEUE_BYTES"
+unit = "BYTES"
+owner = "Kernel ORS owner"
+
+[[bottleneck_contract]]
+id = "STORE_CONNECTION_SLOTS"
+unit = "CONNECTIONS"
+owner = "Store bridge generation"
+
+[[bottleneck_contract]]
+id = "STORE_TRANSACTION_SLOTS"
+unit = "TRANSACTIONS"
+owner = "Store bridge generation"
+
+[[bottleneck_contract]]
+id = "STORE_PENDING_WRITE_MEMORY"
+unit = "MEMORY_BYTES"
+owner = "Store bridge generation"
+
+[[bottleneck_contract]]
+id = "PROCESS_LAUNCH_SLOTS"
+unit = "PROCESS_SLOTS"
+owner = "Host/Kernel process-tree owner"
+
+[[bottleneck_contract]]
+id = "PROCESS_CANCELLATION_TERMINATION"
+unit = "CONCURRENT_OPERATIONS"
+owner = "Host/Kernel process-tree owner"
+
+[[bottleneck_contract]]
+id = "NOTIFICATION_PERSISTENT_INBOX"
+unit = "ITEMS"
+owner = "Governor notification/inbox owner with protected delivery path"
+
+[[bottleneck_contract]]
+id = "CPU_CONTROL_TASK_SLOTS"
+unit = "CPU_TASK_SLOTS"
+owner = "Kernel runtime/control scheduler owner"
+
+[[bottleneck_contract]]
+id = "PROTECTED_MEMORY_BYTES"
+unit = "MEMORY_BYTES"
+owner = "Kernel/runtime memory-budget owner"
+
+[[bottleneck_contract]]
+id = "PIPE_MESSAGE_BYTES"
+unit = "BYTES"
+owner = "IPC/control-channel owner"
+
+[[bottleneck_contract]]
+id = "FILE_DESCRIPTOR_HANDLE_SLOTS"
+unit = "HANDLES"
+owner = "platform/process/IPC owner"
+
+[[bottleneck_contract]]
+id = "DISK_QUEUE_WRITE_CAPACITY"
+unit = "DISK_QUEUE_SLOTS"
+owner = "Host/ORS/store/spool owner for the declared path"
+
+[functions]
+public = [
+  "required_control_reserve_bottlenecks() -> [CapacityBottleneck; 15]",
+  "canonicalize_control_reserve_profile(profile) -> Result<ControlReserveProfile, ControlReserveContractError>",
+  "validate_control_reserve_profile(profile) -> Result<(), ControlReserveContractError>",
+  "classify_capacity_request(request) -> Result<CapacityClass, ControlReserveContractError>",
+  "validate_capacity_request(request, profile) -> Result<(), ControlReserveContractError>",
+  "validate_capacity_permit(request, permit, profile) -> Result<(), ControlReserveContractError>",
+  "validate_capacity_release(permit, release, profile) -> Result<(), ControlReserveContractError>",
+  "derive_reserve_health(profile, current_owner_evidence) -> Result<ReserveHealthDisposition, ControlReserveContractError>",
+]
+forbidden = [
+  "allocate or retain a permit inside the contract crate",
+  "one global semaphore",
+  "one scalar reserve percentage",
+  "priority-only reserve enforcement",
+  "normal borrowing from protected/emergency partitions",
+  "implicit promotion of normal work to control",
+  "conversion from DownstreamHeadroomReservation to Control Reserve permit",
+  "capacity reset after restart without durable reconciliation",
+  "inference of owner or availability from a PID/process/queue/counter alone",
+]
+
+[errors]
+closed_values = [
+  "UNSUPPORTED_CONTRACT_REVISION",
+  "MISSING_BOTTLENECK",
+  "DUPLICATE_BOTTLENECK",
+  "NONCANONICAL_PROFILE",
+  "UNKNOWN_OR_UNSUPPORTED_BOTTLENECK",
+  "MISSING_CAPACITY_OWNER",
+  "MISSING_ENFORCEMENT",
+  "PRIORITY_ONLY_ENFORCEMENT_FORBIDDEN",
+  "MISSING_PROOF_PROFILE",
+  "MISSING_EVIDENCE",
+  "MISSING_INVALIDATION_SET",
+  "UNIT_MISMATCH",
+  "ZERO_CAPACITY",
+  "CAPACITY_SUM_OVERFLOW",
+  "PARTITIONS_EXCEED_PHYSICAL_TOTAL",
+  "MISSING_NORMAL_PARTITION",
+  "MISSING_PROTECTED_PARTITION",
+  "INVALID_CAPACITY_CLASS",
+  "NORMAL_BORROWING_FORBIDDEN",
+  "EMERGENCY_BORROWING_FORBIDDEN",
+  "STALE_PROFILE",
+  "STALE_OWNER_GENERATION",
+  "STALE_AUTHORITY_EPOCH",
+  "OPERATION_IDENTITY_MISMATCH",
+  "PERMIT_LIMIT_MISMATCH",
+  "RELEASE_LIMIT_MISMATCH",
+  "CONTROL_GUARANTEE_LOST",
+]
+
+[migration]
+current_defect = "eliot-kernel-core FrontDoor uses one ControlReserve pool for ordinary authorize and explicit long-running control acquisition"
+current_idempotency_limit = "the in-memory FIFO IdempotencyLedger is not durable operation/effect reconciliation"
+normal_pool_target = "ordinary daemon/store/read/write/module work uses a separate normal bounded pool"
+protected_pool_target = "only closed ControlOperationClass operations use protected partitions"
+emergency_target = "optional preallocated slot records reserve loss/gap or enters recovery"
+no_relabel_rule = "renaming the existing ordinary pool or assigning higher priority does not satisfy the contract"
+
+[[migration.wave]]
+order = 1
+owner = "eliot-runtime-contracts"
+scope = ["contract", "canonicalization", "validation", "property/golden fixtures"]
+must_not_touch = ["Kernel pool implementation", "ORS", "Store", "Host", "Watchdog", "Product status"]
+
+[[migration.wave]]
+order = 2
+owner = "Kernel FrontDoor"
+scope = ["normal/protected/emergency split", "typed operation classes", "owner-produced permit evidence"]
+must_not_touch = ["ORS/Store adapter internals", "global Product claim"]
+
+[[migration.wave]]
+order = 3
+owner = "ORS and Store adapters"
+scope = ["transaction/byte/connection/memory partitions", "durable permit reconciliation"]
+must_not_touch = ["process/notification adapter internals"]
+
+[[migration.wave]]
+order = 4
+owner = "Host/process/IPC/Watchdog/notification adapters"
+scope = ["launch/control slots", "pipe/handle/disk paths", "critical signal and inbox delivery"]
+must_not_touch = ["semantic task scheduling or finish"]
+
+[[migration.wave]]
+order = 5
+owner = "integration and Product proof"
+scope = ["multidimensional saturation fault matrix", "lost-last-resort recovery", "issue-11 Product Pulse"]
+must_not_touch = ["support promotion without executed evidence"]
+
+[fixtures]
+minimum = [
+  "complete profile contains exactly all fifteen bottlenecks",
+  "omitted and duplicate bottleneck rows fail closed",
+  "CLAIMED row requires owner, generation, protected partition, enforcement, proof, evidence, and invalidation",
+  "UNKNOWN and UNSUPPORTED remain visible and cannot satisfy a reserve claim",
+  "normal saturation leaves protected capacity available",
+  "normal request for protected or emergency class is rejected",
+  "protected request for normal or emergency class is rejected",
+  "emergency partition is optional but never borrowable",
+  "priority-only configuration is rejected",
+  "limits with different units cannot be aggregated",
+  "partition sum overflow and physical-total overflow fail closed",
+  "one exhausted bottleneck produces a dimension-local disposition",
+  "last-resort loss produces CONTROL_GUARANTEE_LOST",
+  "stale operation, generation, epoch, or profile rejects permit evidence",
+  "release amount/unit mismatch fails",
+  "restart without durable release/reconciliation cannot restore capacity",
+  "profile permutation canonicalizes identically and strict serialized order rejects drift",
+  "DownstreamHeadroomReservation cannot create a protected permit",
+  "ordinary Store/daemon admission cannot consume the final protected slot",
+]
+
+[consumer_proof]
+package = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-runtime-contracts --all-targets",
+  "cargo test --locked -p eliot-runtime-contracts",
+  "cargo clippy --locked -p eliot-runtime-contracts --all-targets -- -D warnings",
+]
+module = [
+  "Kernel normal/protected saturation proof",
+  "owner-local ORS/Store/process/IPC/notification capacity proof",
+  "durable permit release/reconciliation proof",
+]
+edge = [
+  "normal Store writes backpressure while cancellation/fencing/recovery completes",
+  "independent Ordering Scope workload cannot consume another scope's control path",
+  "reserve-loss evidence reaches Watchdog/Problem/Incident path through a remaining protected or emergency route",
+]
+product = [
+  "issue-11 saturation pulse with normal work rejected and control/recovery completed",
+  "manual/platform recovery boundary when last-resort capacity is unavailable",
+]
+
+[stop_conditions]
+contract_challenge = [
+  "a bottleneck cannot identify one owner, unit, or enforceable partition",
+  "the proposed mechanism is priority-only or one global semaphore",
+  "durable operation identity is unavailable for permit reconciliation",
+  "a normal workload requires protected borrowing to pass",
+  "the profile omits an I14.3 bottleneck instead of marking it UNKNOWN or UNSUPPORTED",
+  "the proof measures queue ordering but not preserved capacity",
+  "the implementation would create a second scheduler, authority owner, or recovery ledger",
+]
