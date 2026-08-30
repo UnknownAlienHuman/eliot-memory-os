@@ -1,0 +1,340 @@
+schema_version = 1
+contract_id = "smart.learning.task-local.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-learning-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.learning.contracts.common", "smart.learning.contracts.state_view", "smart.learning.contracts.adaptation", "smart.learning.state_view", "smart.learning.delta", "smart.learning.overlay", "smart.learning.overlay_validation"]
+architecture_refs = ["ARCH-CORE-00", "ARCH-LEARN-01", "ARCH-LEARN-02", "ARCH-META-01", "ARCH-UND-02", "ARCH-EPI-03", "ARCH-EPI-04", "ARCH-SCOPE-01", "ARCH-MOD-03"]
+implementation_refs = ["I12.24", "I14.5", "I16.23", "I2.17", "I2.20"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Represent one immutable campaign learning view, predeclared mechanism comparison, dimensioned attempt delta and reversible task-local harness overlay candidate without task/attempt ownership, equivalent blind retry, global promotion, or protected-boundary mutation."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((owner projections + attempts + evidence + changes + dimensions) log n) over request-bounded immutable inputs; no owner query, model call, route/tool invocation, canonical write, scheduler or admission effect."
+replacement_boundary = "Replace task-local learning assembly/delta/overlay algorithms behind this contract; Task Controller, Governor, Context Compiler, Evaluator, route/config and canonical owners remain authoritative."
+
+[closed_sets]
+learning_scopes = ["AttemptLocal", "CampaignLocal", "ReusableCandidateOnly"]
+owner_kinds = ["TaskController", "AttemptLineage", "GovernorAdmissionAuthority", "ContextCompiler", "Evaluator", "ArtifactOutcome"]
+owner_coverage_states = ["NotQueried", "Unavailable", "Partial", "Complete", "Stale", "Blocked"]
+delta_dispositions = ["LocalUpdateCandidate", "NextProbeChanged", "ReusableCandidateOpened", "NoJustifiedChange", "Inconclusive", "InvalidEvidence"]
+retry_purposes = ["StochasticReplication", "NoiseEstimation", "ControlledComparison", "ExactDefectReproduction", "RecoveryProof", "VerifierCalibration"]
+delta_dimensions = ["HypothesisPredeclaration", "PredictionResult", "StrategyDifference", "TraceEvidence", "ArtifactDelta", "EvaluatorResult", "EffectOutcome", "MechanismAttribution", "Confounders", "NovelEvidence", "RetryPurpose"]
+dimension_states = ["Supports", "Refutes", "Mixed", "Unknown", "NotApplicable", "Invalid"]
+overlay_surfaces = ["ContextRecipe", "WorkingRule", "SkillVariant", "ProcedureVariant", "ToolExposure", "Decomposition", "RoutePreference", "ProbeOrdering", "SearchOrdering", "VerificationOrdering", "StopRule"]
+overlay_validation_dimensions = ["CurrentApplicability", "EvidenceAttribution", "GoalAcceptancePreservation", "AuthorityPreservation", "PrivacyPreservation", "CostPreservation", "EvaluatorPreservation", "HoldoutPreservation", "CanonicalSemanticsPreservation", "Reversibility", "VerifierAvailability", "ExpectedObservable", "ScopeBoundedness"]
+validation_states = ["Pass", "Fail", "Inconclusive", "NotApplicable"]
+
+[hard_invariants]
+task_controller_owns_task_attempt_and_plan_lifecycle = true
+view_is_immutable_and_not_a_second_attempt_journal = true
+missing_owner_projection_is_never_filled_from_transcript_or_model_memory = true
+stale_or_blocked_owner_prevents_material_adaptation = true
+hypothesis_and_prediction_are_fixed_before_outcome_observation = true
+post_hoc_story_without_predeclaration_is_invalid_evidence = true
+equivalent_attempt_requires_explicit_allowed_experimental_purpose = true
+outcome_without_attribution_is_not_learning = true
+no_justified_change_and_inconclusive_are_valid_results = true
+overlay_is_task_local_reversible_and_expiring = true
+overlay_cannot_change_goal_acceptance_finish_authority_privacy_cost_evaluator_holdout_canonical_write_semantics_or_production_generation = true
+validation_is_dimensioned_and_is_not_governor_admission = true
+no_aggregate_learning_confidence_or_utility_score = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskRevision"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "ContractIdentity"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "CampaignId"
+owner = "eliot-learning-contracts/experience.contract.toml"
+
+[[external_type]]
+name = "AttemptId"
+owner = "eliot-learning-contracts/experience.contract.toml"
+
+[[external_type]]
+name = "ExperienceIdentity"
+owner = "eliot-learning-contracts/experience.contract.toml"
+
+[[external_type]]
+name = "OutcomeAttribution"
+owner = "eliot-learning-contracts/experience.contract.toml"
+
+[[external_type]]
+name = "SystemExperienceProjection"
+owner = "eliot-learning-contracts/experience.contract.toml"
+
+[[public_type]]
+name = "LearningScope"
+kind = "enum"
+definition = ["AttemptLocal", "CampaignLocal", "ReusableCandidateOnly"]
+invariants = ["ReusableCandidateOnly grants no cross-task promotion or current influence"]
+
+[[public_type]]
+name = "LearningLimits"
+kind = "struct"
+definition = ["maximum_owner_projections: u32", "maximum_attempts: u32", "maximum_hypotheses: u32", "maximum_predictions: u32", "maximum_evidence_handles: u32", "maximum_overlay_changes: u32", "maximum_dimensions: u32"]
+invariants = ["all limits positive", "limits supplied by immutable policy/request"]
+
+[[public_type]]
+name = "LearningIdentity"
+kind = "struct"
+definition = ["identity_id: ArtifactId", "experience_identity: ExperienceIdentity", "learning_scope: LearningScope", "baseline_attempt_id: AttemptId", "candidate_attempt_id: AttemptId", "task_revision: TaskRevision", "scope_id: String", "state_fence: StateFence", "identity_sha256: String"]
+invariants = ["campaign/task/attempt/scope/revision/fence exact", "baseline and candidate attempts distinct unless allowed retry purpose is supplied later", "identity grants no lifecycle or scheduler authority", "canonical order and digest"]
+
+[[public_type]]
+name = "LearningEvidenceHandle"
+kind = "struct"
+definition = ["handle: ArtifactId", "owner_kind: LearningOwnerKind", "owner_revision: String", "evidence_kind: String", "scope_id: String", "state_fence: StateFence"]
+invariants = ["owner/revision/kind/scope/fence exact", "handle is immutable evidence reference not outcome interpretation"]
+
+[[public_type]]
+name = "MechanismHypothesis"
+kind = "struct"
+definition = ["hypothesis_id: ArtifactId", "statement: String", "mechanism: String", "introduced_before_observation_ref: ArtifactId", "rival_hypothesis_refs: Vec<ArtifactId>", "assumption_refs: Vec<ArtifactId>", "predicted_observable_refs: Vec<ArtifactId>", "falsifier: String", "validity_scope: String", "invalidation_conditions: Vec<String>"]
+invariants = ["predeclaration reference exact", "mechanism/falsifier/scope explicit", "rivals retained for material claim", "hypothesis creates no authority"]
+
+[[public_type]]
+name = "LearningPrediction"
+kind = "struct"
+definition = ["prediction_id: ArtifactId", "hypothesis_ref: ArtifactId", "fixed_before_observation_ref: ArtifactId", "expected_observable: String", "expected_if_rival_holds: String", "measurement_or_verifier_ref: ArtifactId", "falsifier: String", "scope_id: String", "state_fence: StateFence"]
+invariants = ["fixed-before reference precedes outcome evidence", "observable/rival/falsifier/verifier exact", "prediction cannot be rewritten after result"]
+
+[[public_type]]
+name = "LearningOwnerKind"
+kind = "enum"
+definition = ["TaskController", "AttemptLineage", "GovernorAdmissionAuthority", "ContextCompiler", "Evaluator", "ArtifactOutcome"]
+
+[[public_type]]
+name = "LearningOwnerCoverageState"
+kind = "enum"
+definition = ["NotQueried", "Unavailable", "Partial", "Complete", "Stale", "Blocked"]
+
+[[public_type]]
+name = "OwnerProjectionCoverage"
+kind = "struct"
+definition = ["state: LearningOwnerCoverageState", "source_revision: Option<String>", "method_ref: Option<String>", "expected_items: Option<u32>", "observed_items: u32", "missing_owner_or_reason_refs: Vec<String>"]
+invariants = ["Complete requires revision/method/expected count equality and no missing refs", "Partial requires revision/method/expected count and named gaps", "Unavailable/Blocked names owner/reason and has no observed items", "Stale cannot support material adaptation"]
+
+[[public_type]]
+name = "OwnerProjectionRef"
+kind = "struct"
+definition = ["owner: LearningOwnerKind", "projection_handle: Option<ArtifactId>", "projection_sha256: Option<String>", "owner_revision: Option<String>", "scope_id: String", "task_id: TaskId", "campaign_id: CampaignId", "state_fence: StateFence", "coverage: OwnerProjectionCoverage", "evidence_handles: Vec<ArtifactId>"]
+invariants = ["one exact owner/task/campaign/scope/fence", "Complete/Partial/Stale projection has handle/digest/revision", "missing owner stays explicit", "one owner cannot fill another row"]
+
+[[public_type]]
+name = "TaskGoalView"
+kind = "struct"
+definition = ["task_contract_ref: ArtifactId", "task_revision: TaskRevision", "goal_ref: ArtifactId", "acceptance_digest: String", "active_plan_revision: String", "forbidden_goal_changes: Vec<String>"]
+invariants = ["goal/acceptance/plan exact", "view grants no authority to revise them"]
+
+[[public_type]]
+name = "AttemptLineageView"
+kind = "struct"
+definition = ["baseline_attempt_id: AttemptId", "candidate_attempt_id: AttemptId", "predecessor_attempt_ids: Vec<AttemptId>", "strategy_refs: Vec<ArtifactId>", "hypothesis_refs: Vec<ArtifactId>", "prediction_refs: Vec<ArtifactId>", "attempt_state_refs: Vec<ArtifactId>"]
+invariants = ["attempt ids and lineage unique", "candidate belongs to same task/campaign", "lineage is not an attempt journal owner"]
+
+[[public_type]]
+name = "LearningAuthorityView"
+kind = "struct"
+definition = ["authority_snapshot_ref: ArtifactId", "authority_epoch_ref: String", "allowed_local_overlay_surfaces: Vec<OverlaySurface>", "forbidden_effect_refs: Vec<String>", "privacy_ceiling_ref: String", "cost_ceiling_ref: String", "expires_at_ref: String"]
+invariants = ["authority/privacy/cost externally owned", "surface allowlist cannot widen higher boundary", "view cannot activate authority"]
+
+[[public_type]]
+name = "ContextRecipeView"
+kind = "struct"
+definition = ["recipe_ref: ArtifactId", "recipe_revision: String", "recipe_sha256: String", "route_fingerprint: String", "active_overlay_ref: Option<ArtifactId>", "decision_safety_floor_ref: ArtifactId"]
+invariants = ["recipe/route/floor exact", "active overlay is observation not permission to replace evaluator/goal"]
+
+[[public_type]]
+name = "LearningEvaluatorView"
+kind = "struct"
+definition = ["evaluation_contract_ref: ArtifactId", "verifier_generation_ref: String", "sealed_holdout_ref: Option<ArtifactId>", "validity_scope: String", "freshness_ref: String", "known_blind_spots: Vec<String>"]
+invariants = ["evaluator/holdout immutable for current learning comparison", "known blind spots visible", "view cannot redefine evaluation"]
+
+[[public_type]]
+name = "ArtifactOutcomeView"
+kind = "struct"
+definition = ["system_experience_projection_ref: ArtifactId", "system_experience_projection_sha256: String", "artifact_handles: Vec<ArtifactId>", "trace_handles: Vec<ArtifactId>", "evaluator_handles: Vec<ArtifactId>", "effect_handles: Vec<ArtifactId>", "outcome_attribution: OutcomeAttribution", "coverage_reason_codes: Vec<String>"]
+invariants = ["all handles exact and unique", "outcome attribution copied from owner evidence", "success/failure alone is not mechanism proof"]
+
+[[public_type]]
+name = "LearningStateViewRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "identity: LearningIdentity", "expected_owners: Vec<LearningOwnerKind>", "limits: LearningLimits", "request_sha256: String"]
+invariants = ["expected owners exactly all six kinds", "identity/limits valid", "request grants no owner-query or mutable state"]
+
+[[public_type]]
+name = "CampaignLearningStateView"
+kind = "struct"
+definition = ["view_id: ArtifactId", "request_sha256: String", "identity: LearningIdentity", "owner_projections: Vec<OwnerProjectionRef>", "task_goal: TaskGoalView", "attempt_lineage: AttemptLineageView", "authority: LearningAuthorityView", "context_recipe: ContextRecipeView", "evaluator: LearningEvaluatorView", "artifact_outcome: ArtifactOutcomeView", "overall_coverage: LearningOwnerCoverageState", "narrow_safe_next_attempt_constraints: Vec<String>", "view_sha256: String"]
+invariants = ["one row per expected owner", "all typed subviews bind exact owner projections/task/campaign/fence", "Partial permits only explicit narrower constraints", "Stale/Blocked prevents material adaptation", "no transcript substitution, attempt journal or mutable aggregate", "canonical order and digest"]
+
+[[public_type]]
+name = "EquivalentRetryPurpose"
+kind = "enum"
+definition = ["StochasticReplication", "NoiseEstimation", "ControlledComparison", "ExactDefectReproduction", "RecoveryProof", "VerifierCalibration"]
+
+[[public_type]]
+name = "LearningDeltaDimension"
+kind = "enum"
+definition = ["HypothesisPredeclaration", "PredictionResult", "StrategyDifference", "TraceEvidence", "ArtifactDelta", "EvaluatorResult", "EffectOutcome", "MechanismAttribution", "Confounders", "NovelEvidence", "RetryPurpose"]
+
+[[public_type]]
+name = "LearningDeltaDimensionState"
+kind = "enum"
+definition = ["Supports", "Refutes", "Mixed", "Unknown", "NotApplicable", "Invalid"]
+
+[[public_type]]
+name = "DeltaEvidence"
+kind = "struct"
+definition = ["dimension: LearningDeltaDimension", "state: LearningDeltaDimensionState", "evidence_handles: Vec<LearningEvidenceHandle>", "counterevidence_handles: Vec<LearningEvidenceHandle>", "reason_codes: Vec<String>", "required_followup: Option<String>"]
+invariants = ["one result per requested dimension", "evidence/counterevidence separate", "outside-view evidence rejected", "no aggregate score"]
+
+[[public_type]]
+name = "LearningDisposition"
+kind = "enum"
+definition = ["LocalUpdateCandidate", "NextProbeChanged", "ReusableCandidateOpened", "NoJustifiedChange", "Inconclusive", "InvalidEvidence"]
+
+[[public_type]]
+name = "LearningDeltaRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "state_view_sha256: String", "hypothesis: MechanismHypothesis", "predictions: Vec<LearningPrediction>", "baseline_strategy_ref: ArtifactId", "candidate_strategy_ref: ArtifactId", "equivalent_retry_purpose: Option<EquivalentRetryPurpose>", "requested_dimensions: Vec<LearningDeltaDimension>", "request_sha256: String"]
+invariants = ["view/hypothesis/strategies exact", "predictions/dimensions unique", "equivalent strategy requires allowed retry purpose", "request grants no retry scheduling or adaptation"]
+
+[[public_type]]
+name = "AttemptLearningDelta"
+kind = "struct"
+definition = ["delta_id: ArtifactId", "request_sha256: String", "state_view_sha256: String", "identity: LearningIdentity", "hypothesis_ref: ArtifactId", "prediction_refs: Vec<ArtifactId>", "baseline_strategy_ref: ArtifactId", "candidate_strategy_ref: ArtifactId", "equivalent_retry_purpose: Option<EquivalentRetryPurpose>", "dimensions: Vec<DeltaEvidence>", "disposition: LearningDisposition", "next_probe: Option<String>", "reusable_candidate_scope: Option<String>", "evidence_gap_codes: Vec<String>", "delta_sha256: String"]
+invariants = ["all requested dimensions represented", "post-hoc/missing hypothesis yields InvalidEvidence", "NoJustifiedChange/Inconclusive valid", "ReusableCandidateOpened is candidate only", "no scheduler, route, policy or promotion decision", "canonical order and digest"]
+
+[[public_type]]
+name = "OverlaySurface"
+kind = "enum"
+definition = ["ContextRecipe", "WorkingRule", "SkillVariant", "ProcedureVariant", "ToolExposure", "Decomposition", "RoutePreference", "ProbeOrdering", "SearchOrdering", "VerificationOrdering", "StopRule"]
+
+[[public_type]]
+name = "OverlayChange"
+kind = "struct"
+definition = ["change_id: ArtifactId", "surface: OverlaySurface", "current_value_ref: ArtifactId", "candidate_value_handle: ArtifactId", "candidate_value_sha256: String", "scope_id: String", "expected_observable: String", "verifier_ref: ArtifactId", "stop_condition: String", "expiry_condition: String", "rollback_plan: String", "evidence_handles: Vec<ArtifactId>"]
+invariants = ["surface externally allowed", "candidate bounded to task/campaign", "observable/verifier/stop/expiry/rollback mandatory", "change cannot target forbidden protected surface"]
+
+[[public_type]]
+name = "CampaignHarnessOverlayCandidate"
+kind = "struct"
+definition = ["candidate_id: ArtifactId", "state_view_sha256: String", "delta_sha256: String", "campaign_id: CampaignId", "task_id: TaskId", "scope_id: String", "state_fence: StateFence", "changes: Vec<OverlayChange>", "local_only: bool", "effect_ceiling_ref: String", "expiry_condition: String", "rollback_plan: String", "required_governor_admission_ref: String", "candidate_sha256: String"]
+invariants = ["local_only true", "changes non-empty/unique/bounded", "task/campaign/scope/fence exact", "goal/acceptance/finish/authority/privacy/cost/evaluator/holdout/canonical semantics/production generation absent", "candidate cannot admit/apply/promote itself", "canonical order and digest"]
+
+[[public_type]]
+name = "OverlayValidationDimension"
+kind = "enum"
+definition = ["CurrentApplicability", "EvidenceAttribution", "GoalAcceptancePreservation", "AuthorityPreservation", "PrivacyPreservation", "CostPreservation", "EvaluatorPreservation", "HoldoutPreservation", "CanonicalSemanticsPreservation", "Reversibility", "VerifierAvailability", "ExpectedObservable", "ScopeBoundedness"]
+
+[[public_type]]
+name = "OverlayValidationState"
+kind = "enum"
+definition = ["Pass", "Fail", "Inconclusive", "NotApplicable"]
+
+[[public_type]]
+name = "OverlayValidationDimensionResult"
+kind = "struct"
+definition = ["dimension: OverlayValidationDimension", "state: OverlayValidationState", "evidence_handles: Vec<ArtifactId>", "reason_codes: Vec<String>"]
+invariants = ["one result per dimension", "failed/inconclusive load-bearing dimension visible", "no aggregate score"]
+
+[[public_type]]
+name = "OverlayValidationReport"
+kind = "struct"
+definition = ["report_id: ArtifactId", "state_view_sha256: String", "delta_sha256: String", "candidate_sha256: String", "dimensions: Vec<OverlayValidationDimensionResult>", "report_sha256: String"]
+invariants = ["all thirteen dimensions represented", "validation cannot alter candidate or admit it", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_learning_identity"
+signature = "pub fn validate_learning_identity(identity: &LearningIdentity) -> Result<(), LearningContractError>"
+
+[[public_function]]
+name = "validate_learning_state_view_request"
+signature = "pub fn validate_learning_state_view_request(request: &LearningStateViewRequest) -> Result<(), LearningContractError>"
+
+[[public_function]]
+name = "validate_campaign_learning_state_view"
+signature = "pub fn validate_campaign_learning_state_view(request: &LearningStateViewRequest, view: &CampaignLearningStateView) -> Result<(), LearningContractError>"
+
+[[public_function]]
+name = "validate_learning_delta_request"
+signature = "pub fn validate_learning_delta_request(view: &CampaignLearningStateView, request: &LearningDeltaRequest) -> Result<(), LearningContractError>"
+
+[[public_function]]
+name = "validate_attempt_learning_delta"
+signature = "pub fn validate_attempt_learning_delta(view: &CampaignLearningStateView, request: &LearningDeltaRequest, delta: &AttemptLearningDelta) -> Result<(), LearningContractError>"
+
+[[public_function]]
+name = "validate_overlay_candidate"
+signature = "pub fn validate_overlay_candidate(view: &CampaignLearningStateView, delta: &AttemptLearningDelta, candidate: &CampaignHarnessOverlayCandidate) -> Result<(), LearningContractError>"
+
+[[public_function]]
+name = "validate_overlay_report"
+signature = "pub fn validate_overlay_report(view: &CampaignLearningStateView, delta: &AttemptLearningDelta, candidate: &CampaignHarnessOverlayCandidate, report: &OverlayValidationReport) -> Result<(), LearningContractError>"
+
+[[negative_test]]
+id = "missing-owner-not-transcript-filled"
+property = "Missing/stale/blocked owner projection cannot be replaced by transcript or model summary."
+
+[[negative_test]]
+id = "post-hoc-hypothesis-invalid"
+property = "Hypothesis/prediction fixed after outcome observation yields InvalidEvidence."
+
+[[negative_test]]
+id = "equivalent-retry-needs-purpose"
+property = "Materially equivalent strategy without one closed retry purpose is rejected."
+
+[[negative_test]]
+id = "unattributed-outcome-not-learning"
+property = "Outcome without applicable attribution cannot support LocalUpdateCandidate or ReusableCandidateOpened."
+
+[[negative_test]]
+id = "no-change-valid"
+property = "NoJustifiedChange and Inconclusive round-trip without fabricated overlay."
+
+[[negative_test]]
+id = "protected-surface-rejected"
+property = "Overlay change targeting objective, acceptance, finish, authority, privacy, cost, evaluator, holdout, canonical semantics or production generation is rejected."
+
+[[negative_test]]
+id = "overlay-expiry-rollback"
+property = "Every material overlay change and candidate require explicit expiry and rollback."
+
+[[negative_test]]
+id = "validation-not-admission"
+property = "OverlayValidationReport exposes no admission, activation, execution or promotion receipt."
+
+[[negative_test]]
+id = "permutation-deterministic"
+property = "Owner/evidence/change/dimension input permutation does not change canonical identities."
