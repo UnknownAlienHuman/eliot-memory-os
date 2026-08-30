@@ -1,24 +1,28 @@
 [package]
 name = "eliot-cue-contracts"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 publish = false
-description = "Own the minimal provider-neutral cue, binding, snapshot, activation and invalidation schemas."
+description = "Provider-neutral cue observation, normalization, binding, snapshot, direct-match, spread and activation contracts."
 
 [lib]
 path = "src/lib.rs"
 
 [package.metadata.eliot]
-prototype = true
-source_status = "NOT_IMPLEMENTED"
-workspace_admission = "pending_agent_implementation_and_proof"
-functional_cell = "smart.cue.contracts"
-source_layer = "C1"
-runtime_layer = "R5"
-runtime_bundle = "eliotd"
-agent_order = 10
+layer = "C0"
+purpose = "stable exact-cue and bounded activation contract hub"
+source_maintenance_owner = "cognitive-integration-owner"
+functional_cell_refs = ["smart.cue.contracts"]
+independent_proof_profile = "prototype-not-workspace-admitted"
+contract_refs = [
+  "crates/smart/cognitive-current.toml",
+  "crates/smart/eliot-cue-contracts/cue.contract.toml",
+]
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until all cue cells have Rust implementation, ModuleTestCapsule, real Edge Proof and D3B_REACTIVE_CONTEXT_PULSE_01"
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
