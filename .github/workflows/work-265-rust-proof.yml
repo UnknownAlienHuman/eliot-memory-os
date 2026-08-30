@@ -1,0 +1,59 @@
+name: Work 265 Rust Proof
+
+on:
+  push:
+    branches:
+      - work/265-swarm-model-catalogue-control
+
+permissions:
+  contents: read
+
+concurrency:
+  group: work-265-rust-proof
+  cancel-in-progress: true
+
+jobs:
+  coordinator-model-control:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 4
+      RUST_BACKTRACE: 1
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify exact source identity
+        shell: pwsh
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:GITHUB_SHA) {
+            throw "SOURCE_IDENTITY_FAILURE: $actual != $env:GITHUB_SHA"
+          }
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Cache Cargo inputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-work-265-${{ hashFiles('Cargo.lock') }}
+
+      - name: Format coordinator
+        run: cargo fmt -p eliot-agent-coordinator -- --check
+
+      - name: Check coordinator
+        run: cargo check --locked -p eliot-agent-coordinator --all-targets
+
+      - name: Test coordinator
+        run: cargo test --locked -p eliot-agent-coordinator --all-targets
+
+      - name: Clippy coordinator
+        run: cargo clippy --locked -p eliot-agent-coordinator --all-targets -- -D warnings
