@@ -268,6 +268,13 @@ def run_bounded(
         raise AntigravityPreflightError("runtime probe stream read failed")
     if not stdout_receipt["complete"] or not stderr_receipt["complete"]:
         raise AntigravityPreflightError("runtime probe stream drain is incomplete")
+    if (
+        stdout.overflow.is_set()
+        or stderr.overflow.is_set()
+        or stdout_receipt["truncated"]
+        or stderr_receipt["truncated"]
+    ):
+        raise AntigravityPreflightError("runtime probe output exceeded its bound")
     if failure is not None:
         raise AntigravityPreflightError(failure)
     if process.returncode != 0:
