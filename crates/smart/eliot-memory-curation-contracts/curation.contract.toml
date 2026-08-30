@@ -1,0 +1,185 @@
+schema_version = 1
+contract_id = "smart.memory.curation-contracts.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-memory-curation-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.memory.curation.contracts", "smart.memory.curation.screen", "smart.dreamer.curation"]
+architecture_refs = ["ARCH-MEM-01", "ARCH-MEM-02", "ARCH-MEM-03", "ARCH-MEM-04", "ARCH-EPI-04", "ARCH-RES-05", "ARCH-SCOPE-01"]
+implementation_refs = ["I2.20", "I9.7", "I12.19", "I12.20", "I12.21", "I12.34"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Represent bounded read-only memory curation evidence and candidate proposals while keeping existence, epistemic support, accessibility, permitted influence, usefulness and lifecycle independently owned."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((items + pair comparisons + evidence) log n) over request-bounded immutable projections; no canonical read/write, model call, lifecycle transition, deletion or influence mutation."
+replacement_boundary = "Replace deterministic screening and candidate assembly behind this contract; canonical memory/Governor owners retain lifecycle, support, accessibility and influence decisions."
+
+[closed_sets]
+existence_states = ["Present", "Tombstoned", "Unknown"]
+accessibility_states = ["Active", "HandleOnly", "Suppressed", "Archived", "Quarantined", "Unavailable"]
+influence_states = ["Candidate", "WarningOnly", "ExactNegativeBlockCandidate", "RequiresRevalidation", "Denied"]
+protection_classes = ["RawEvidence", "MinorityCounterevidence", "NegativeMemory", "Invariant", "Commitment", "Normative", "Ordinary"]
+dimension_results = ["Pass", "Fail", "Inconclusive", "NotApplicable"]
+curation_dimensions = ["ExactDuplicate", "SemanticEquivalence", "ScopeApplicability", "CurrentSupport", "ObservedUse", "AttributedOutcome", "FalseActivation", "RetentionValue", "MinorityValue", "RollbackCoverage"]
+proposal_actions = ["Keep", "MergeCandidate", "SplitCandidate", "ReconsolidateCandidate", "NarrowScopeCandidate", "CompressCandidate", "SuppressCandidate", "ArchiveCandidate", "ReactivateCandidate", "Review", "ObserveMore", "NoChange"]
+
+[hard_invariants]
+existence_support_accessibility_influence_utility_and_lifecycle_are_separate = true
+retrieval_repetition_or_model_agreement_never_reinforces_support = true
+low_use_never_lowers_support = true
+raw_evidence_minority_counterevidence_negative_memory_invariants_commitments_and_normative_sources_are_protected = true
+semantic_similarity_is_not_identity = true
+merge_split_reconsolidation_are_forward_candidates_only = true
+source_records_and_episodes_are_never_overwritten = true
+accessibility_candidate_does_not_change_support_or_existential_history = true
+influence_repair_requires_exact_external_dependency_closure = true
+proposal_is_not_transition_receipt = true
+rollback_and_provenance_are_required_for_material_change = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "EpistemicStatus"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "LifecycleState"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "OutcomeAttribution"
+owner = "eliot-learning-contracts"
+
+[[public_type]]
+name = "MemoryExistenceState"
+kind = "enum"
+definition = ["Present", "Tombstoned", "Unknown"]
+
+[[public_type]]
+name = "MemoryAccessibilityState"
+kind = "enum"
+definition = ["Active", "HandleOnly", "Suppressed", "Archived", "Quarantined", "Unavailable"]
+
+[[public_type]]
+name = "MemoryPermittedInfluence"
+kind = "enum"
+definition = ["Candidate", "WarningOnly", "ExactNegativeBlockCandidate", "RequiresRevalidation", "Denied"]
+
+[[public_type]]
+name = "MemoryProtectionClass"
+kind = "enum"
+definition = ["RawEvidence", "MinorityCounterevidence", "NegativeMemory", "Invariant", "Commitment", "Normative", "Ordinary"]
+
+[[public_type]]
+name = "MemoryCurationItem"
+kind = "struct"
+definition = ["item_handle: ArtifactId", "item_revision: String", "item_kind: String", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "existence: MemoryExistenceState", "epistemic_status: EpistemicStatus", "lifecycle: LifecycleState", "accessibility: MemoryAccessibilityState", "permitted_influence: MemoryPermittedInfluence", "protection_classes: Vec<MemoryProtectionClass>", "source_handles: Vec<ArtifactId>", "dependency_handles: Vec<ArtifactId>", "rollback_handles: Vec<ArtifactId>"]
+invariants = ["identity/revision/scope/fence exact", "source handles non-empty", "dimensions independent", "protected classes unique", "item carries no writer capability"]
+
+[[public_type]]
+name = "CurationDimension"
+kind = "enum"
+definition = ["ExactDuplicate", "SemanticEquivalence", "ScopeApplicability", "CurrentSupport", "ObservedUse", "AttributedOutcome", "FalseActivation", "RetentionValue", "MinorityValue", "RollbackCoverage"]
+
+[[public_type]]
+name = "CurationDimensionResult"
+kind = "enum"
+definition = ["Pass", "Fail", "Inconclusive", "NotApplicable"]
+
+[[public_type]]
+name = "CurationDimensionAssessment"
+kind = "struct"
+definition = ["dimension: CurationDimension", "result: CurationDimensionResult", "evidence_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "reason_codes: Vec<String>"]
+invariants = ["one row per requested dimension", "evidence/counterevidence exact", "no aggregate confidence or utility score"]
+
+[[public_type]]
+name = "CurationEvidenceVector"
+kind = "struct"
+definition = ["item_handle: ArtifactId", "dimensions: Vec<CurationDimensionAssessment>", "outcome_attribution: OutcomeAttribution", "coverage_denominator_ref: String", "missing_evidence_refs: Vec<String>", "vector_sha256: String"]
+invariants = ["all required dimensions present", "missing evidence explicit", "low use cannot alter CurrentSupport", "canonical order and digest"]
+
+[[public_type]]
+name = "CurationScreenPolicy"
+kind = "struct"
+definition = ["policy_ref: String", "policy_revision: String", "requested_dimensions: Vec<CurationDimension>", "protected_classes: Vec<MemoryProtectionClass>", "maximum_items: u32", "maximum_pair_comparisons: u32", "maximum_proposals: u32", "require_rollback_for_material_change: bool", "policy_sha256: String"]
+invariants = ["dimensions/classes unique", "bounds non-zero", "policy is external/immutable", "policy cannot grant canonical or lifecycle authority"]
+
+[[public_type]]
+name = "MemoryCurationScreenRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "item_snapshot_sha256: String", "coverage_denominator_ref: String", "policy: CurationScreenPolicy", "request_sha256: String"]
+invariants = ["scope/task/fence/snapshot exact", "denominator recheckable", "request grants no storage read or transition authority"]
+
+[[public_type]]
+name = "CurationProposalAction"
+kind = "enum"
+definition = ["Keep", "MergeCandidate", "SplitCandidate", "ReconsolidateCandidate", "NarrowScopeCandidate", "CompressCandidate", "SuppressCandidate", "ArchiveCandidate", "ReactivateCandidate", "Review", "ObserveMore", "NoChange"]
+
+[[public_type]]
+name = "MemoryCurationProposal"
+kind = "struct"
+definition = ["proposal_id: ArtifactId", "action: CurationProposalAction", "source_item_handles: Vec<ArtifactId>", "candidate_revision_handle: Option<ArtifactId>", "evidence_vector_handles: Vec<ArtifactId>", "retained_source_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "validity_scope: String", "expiry_condition: String", "rollback_plan: String", "required_authority_ref: String", "invalidation_conditions: Vec<String>"]
+invariants = ["source identities retained", "material action requires rollback/expiry/authority", "Archive/Suppress/Reactivate candidates cannot change support", "Merge/Split cannot erase original identities", "proposal cannot apply itself"]
+
+[[public_type]]
+name = "MemoryCurationScreenResult"
+kind = "struct"
+definition = ["request_sha256: String", "scope_id: String", "state_fence: StateFence", "item_handles: Vec<ArtifactId>", "evidence_vectors: Vec<CurationEvidenceVector>", "proposals: Vec<MemoryCurationProposal>", "protected_item_handles: Vec<ArtifactId>", "unresolved_or_inconclusive_refs: Vec<String>", "result_sha256: String"]
+invariants = ["one vector per item", "all protected items retained", "proposal count bounded", "no lifecycle/support/influence transition receipt", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_memory_curation_item"
+signature = "pub fn validate_memory_curation_item(item: &MemoryCurationItem) -> Result<(), MemoryCurationContractError>"
+
+[[public_function]]
+name = "validate_curation_evidence_vector"
+signature = "pub fn validate_curation_evidence_vector(item: &MemoryCurationItem, vector: &CurationEvidenceVector) -> Result<(), MemoryCurationContractError>"
+
+[[public_function]]
+name = "validate_memory_curation_screen_request"
+signature = "pub fn validate_memory_curation_screen_request(request: &MemoryCurationScreenRequest) -> Result<(), MemoryCurationContractError>"
+
+[[public_function]]
+name = "validate_memory_curation_screen_result"
+signature = "pub fn validate_memory_curation_screen_result(request: &MemoryCurationScreenRequest, result: &MemoryCurationScreenResult) -> Result<(), MemoryCurationContractError>"
+
+[[negative_test]]
+id = "low-use-not-support-loss"
+property = "Absent/low observed use cannot lower EpistemicStatus or justify Rejected."
+
+[[negative_test]]
+id = "similarity-not-identity"
+property = "Semantic equivalence without exact identity/lineage cannot directly merge records."
+
+[[negative_test]]
+id = "protected-source-retained"
+property = "Raw evidence, minority/counterevidence, negative memory, invariant, commitment and normative source cannot be silently removed."
+
+[[negative_test]]
+id = "archive-not-support-change"
+property = "ArchiveCandidate changes accessibility proposal only and preserves support/existence history."
+
+[[negative_test]]
+id = "proposal-not-transition"
+property = "Result exposes no canonical write, lifecycle receipt, deletion, support promotion or influence mutation."
