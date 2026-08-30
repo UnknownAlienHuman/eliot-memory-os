@@ -1,0 +1,59 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 49
+cell = "smart.learning.contracts.common"
+physical_crate = "eliot-learning-contracts"
+primary_property = "Implement stable campaign/attempt identity, predeclared mechanism/prediction, evidence, retry and attribution contracts without owning task, attempt, evaluator, scheduler or promotion lifecycle."
+field_contract = "crates/smart/eliot-learning-contracts/task-local-learning.contract.toml"
+public_function_selectors = [
+  "validate_learning_identity",
+]
+write_scope = [
+  "crates/smart/eliot-learning-contracts/src/common.rs",
+  "crates/smart/eliot-learning-contracts/tests/common.rs",
+]
+algorithm = [
+  "validate exact campaign, attempt, task, scope and State Fence",
+  "validate source-owner revision and evidence handles",
+  "require mechanism hypothesis and prediction freeze before observation",
+  "preserve rivals, confounders, invalidation and falsification conditions",
+  "validate materially equivalent retry reason",
+  "canonicalize identities and digests",
+]
+minimum_tests = [
+  "missing attempt identity fails",
+  "cross-task/scope/fence evidence rejected",
+  "post-hoc prediction rejected",
+  "equivalent retry with None reason rejected",
+  "common schema contains no scheduler/promotion/effect fields",
+]
+non_goals = [
+  "task or AgentAttempt lifecycle",
+  "retry scheduling",
+  "evidence acquisition",
+  "overlay construction",
+  "promotion decision",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-CORE-00",
+  "ARCH-LEARN-01",
+  "ARCH-LEARN-02",
+  "ARCH-EPI-03",
+  "ARCH-EPI-04",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I7.27",
+  "I12.24",
+  "I12.26",
+  "I16.23",
+]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than accepting post-hoc evidence, inventing missing owner identity, scheduling a retry, or widening reuse beyond scope."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

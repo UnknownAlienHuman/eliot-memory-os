@@ -1,0 +1,64 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 5
+cell = "smart.dreamer.contracts.orientation"
+physical_crate = "eliot-dreamer-contracts"
+primary_property = "Implement candidate-only orientation contracts for rivals, relation hypotheses, discriminative probes, clarification and one problem-oriented packet over an externally resolved epistemic position."
+field_contract = "crates/smart/eliot-dreamer-contracts/orientation.contract.toml"
+public_function_selectors = [
+  "validate_orientation_request",
+  "validate_rival_model_set",
+  "validate_relation_candidate_set",
+  "validate_probe_plan",
+  "validate_clarification_candidate",
+  "validate_dream_packet",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-contracts/src/orientation.rs",
+  "crates/smart/eliot-dreamer-contracts/tests/orientation.rs",
+]
+algorithm = [
+  "bind exact admitted draft, transformation report and Current Epistemic Position",
+  "preserve working model, rivals, strongest objections, shared lineage, independent evidence and invalidation conditions",
+  "represent temporal/similarity/dependency/causal relations as distinct candidate kinds",
+  "require causal candidate mechanism and falsifier",
+  "build bounded probe plan with target, discriminating observable, risk, reversibility, cost, safety, stop and revision conditions",
+  "assemble packet with explicit coverage, unknowns, conflicts, clarifications and labeled model synthesis",
+]
+minimum_tests = [
+  "model synthesis cannot populate resolved Observed/Supported position",
+  "sequence or similarity without mechanism/falsifier cannot be CausalCandidate",
+  "source/model count cannot select truth",
+  "unsafe/unavailable probe is not runnable",
+  "clarification cannot mutate goal/scope/acceptance/authority",
+  "packet remains candidate-only",
+]
+non_goals = [
+  "Current Epistemic Position resolution",
+  "probe/tool/agent execution",
+  "Context admission",
+  "canonical relation write",
+  "task finish",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-DRM-01",
+  "ARCH-DRM-02",
+  "ARCH-EPI-01",
+  "ARCH-EPI-03",
+  "ARCH-EPI-04",
+  "ARCH-UND-02",
+]
+implementation_refs = [
+  "I2.20",
+  "I9.5",
+  "I12.11",
+  "I12.18",
+]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than letting model text overwrite resolved evidence, turning sequence/similarity into causality, or making probe plans executable."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

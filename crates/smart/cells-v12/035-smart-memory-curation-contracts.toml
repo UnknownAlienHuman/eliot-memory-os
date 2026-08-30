@@ -1,0 +1,66 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 35
+cell = "smart.memory.curation.contracts"
+physical_crate = "eliot-memory-curation-contracts"
+primary_property = "Implement frozen read-only curation snapshot, dimensioned finding and reversible forward-proposal contracts while separating existence, support, accessibility, influence, lifecycle and erasure."
+field_contract = "crates/smart/eliot-memory-curation-contracts/curation.contract.toml"
+public_function_selectors = [
+  "validate_curation_snapshot",
+  "validate_curation_screen_policy",
+  "validate_curation_screen_result",
+  "validate_curation_proposal",
+]
+write_scope = [
+  "crates/smart/eliot-memory-curation-contracts/src/contracts.rs",
+  "crates/smart/eliot-memory-curation-contracts/tests/contracts.rs",
+]
+algorithm = [
+  "validate exact records, revisions, scope, State Fence and coverage denominator",
+  "validate independent dimension results rather than scalar utility/confidence",
+  "preserve source, counterevidence, dependency, protection and minority handles",
+  "validate AccessibilityProposal independently from support and existence",
+  "validate InfluenceRepairProposal only against exact external dependency closure",
+  "require material proposal validity scope, expiry, rollback and external authority",
+  "canonicalize records, findings, proposals and digests",
+]
+minimum_tests = [
+  "low-use supported fact cannot lose support",
+  "partial denominator cannot claim absence or safe destructive action",
+  "minority/counterevidence and negative memory stay protected",
+  "accessibility proposal cannot change support or existence",
+  "influence repair without exact closure is rejected",
+  "proposal exposes no canonical transition or privacy purge",
+]
+non_goals = [
+  "canonical memory read/write",
+  "semantic handler implementation",
+  "lifecycle/support/influence execution",
+  "privacy erasure",
+  "model call",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-MEM-02",
+  "ARCH-MEM-03",
+  "ARCH-MEM-04",
+  "ARCH-LIFE-01",
+  "ARCH-EPI-04",
+  "ARCH-SEC-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I5.16",
+  "I9.7",
+  "I12.19",
+  "I12.20",
+  "I12.21",
+  "I13.11",
+]
+product_pulse = "D3A_CURATION_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than adding scalar utility, rewriting raw records, merging support/accessibility/influence, or executing a lifecycle transition."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

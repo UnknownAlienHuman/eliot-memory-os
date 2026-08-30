@@ -1,0 +1,66 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 19
+cell = "smart.cue.contracts"
+physical_crate = "eliot-cue-contracts"
+primary_property = "Implement provider-neutral cue observation, normalization, binding, immutable snapshot, exact match, optional bounded relation spread and activation contracts while preserving canonical source spelling."
+field_contract = "crates/smart/eliot-cue-contracts/cue.contract.toml"
+public_function_selectors = [
+  "validate_observed_cue",
+  "validate_cue_comparison_profile",
+  "validate_normalized_cue",
+  "validate_cue_binding_candidate_set",
+  "validate_cue_snapshot",
+  "cue_snapshot_digest",
+  "validate_direct_cue_match_result",
+  "validate_relation_spread_result",
+  "validate_cue_activation_result",
+]
+write_scope = [
+  "crates/smart/eliot-cue-contracts/src/contracts.rs",
+  "crates/smart/eliot-cue-contracts/tests/contracts.rs",
+]
+algorithm = [
+  "validate observed cue identity, raw value, comparison profile, scope, fence and sources",
+  "preserve canonical value while deriving a separate deterministic comparison key",
+  "validate candidate versus Governor-admitted binding and immutable rebuildable snapshot",
+  "require exact direct firing independent of relation graph",
+  "validate optional bounded spread using best single admissible path and explicit trace",
+  "ensure activation contains handles/trace only and no delivery/use/support semantics",
+]
+minimum_tests = [
+  "mixed-case path canonical spelling survives normalization",
+  "no filesystem canonicalize/symlink/cwd lookup",
+  "parent traversal rejected",
+  "exact firing works with zero relation edges",
+  "spread failure preserves direct hits",
+  "multiple paths cannot accumulate popularity authority",
+  "activation is not delivery/use/support",
+]
+non_goals = [
+  "filesystem resource identity",
+  "Governor binding admission",
+  "canonical memory payload",
+  "Context admission",
+  "session delivery/use",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-CTX-02",
+  "ARCH-CTX-04",
+  "ARCH-MEM-04",
+  "ARCH-SCOPE-01",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I7.19",
+  "I12.14",
+]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than lowercasing canonical spelling, adding filesystem lookup, making direct match graph-dependent, or turning activation into support/use."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

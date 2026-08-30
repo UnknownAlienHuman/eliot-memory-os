@@ -1,0 +1,48 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "VALIDATION_CONTRACT_NOT_IMPLEMENTATION_PROOF"
+issue = 305
+parent_pr = 272
+proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+
+[expected]
+briefs = 15
+orders = [1, 2, 4, 5, 6, 7, 19, 26, 27, 28, 35, 49, 50, 51, 52]
+write_scopes = 30
+local_overlay_source_files = 27
+index = "crates/smart/cognitive-rev12-w0-agent-brief-index.toml"
+disposition_map = "crates/smart/cognitive-rev12-w0-local-overlay-disposition.toml"
+field_contract_index = "crates/smart/cognitive-rev12-all-field-contracts.toml"
+handoff_authority = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+
+[[gate]]
+id = "W0B01_PARSE"
+requirement = "Every new brief/index/disposition artifact parses as TOML."
+
+[[gate]]
+id = "W0B02_ORDER_CLOSURE"
+requirement = "Orders are exactly the fifteen W0 contract cells, unique and complete."
+
+[[gate]]
+id = "W0B03_HANDOFF_MATCH"
+requirement = "Each brief's cell, crate, field contract, function selectors, source/test scope and stop condition match the parent handoff authority."
+
+[[gate]]
+id = "W0B04_NO_PARALLEL_TYPE_AUTHORITY"
+requirement = "Briefs contain no public type or field definitions; the indexed field contract remains the sole wire authority."
+
+[[gate]]
+id = "W0B05_WRITE_ISOLATION"
+requirement = "All thirty source/test paths are unique; Cargo.toml, src/lib.rs, re-exports and integration files are absent."
+
+[[gate]]
+id = "W0B06_LOCAL_OVERLAY_DISPOSITION"
+requirement = "All twenty-seven local draft files have exactly one retained/merged/superseded disposition and SHA-256."
+
+[[gate]]
+id = "W0B07_PAYLOAD_HYGIENE"
+requirement = "Diff contains TOML only and no Rust, Markdown, workflow, root Cargo.toml, Cargo.lock, archive, .eliot or runtime state."
+
+[[gate]]
+id = "W0B08_PROOF_CEILING"
+requirement = "A brief, branch, commit, review or PR cannot claim Rust implementation, package behavior, Edge Proof, Product Pulse, runtime or release support."

@@ -1,0 +1,61 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 50
+cell = "smart.learning.contracts.state_view"
+physical_crate = "eliot-learning-contracts"
+primary_property = "Implement immutable CampaignLearningStateView and exact owner-coverage contracts without creating a transcript, attempt journal, scheduler or mutable campaign aggregate."
+field_contract = "crates/smart/eliot-learning-contracts/task-local-learning.contract.toml"
+public_function_selectors = [
+  "validate_learning_state_view_request",
+  "validate_campaign_learning_state_view",
+]
+write_scope = [
+  "crates/smart/eliot-learning-contracts/src/state_view.rs",
+  "crates/smart/eliot-learning-contracts/tests/state_view.rs",
+]
+algorithm = [
+  "validate declared recipe and exact expected-owner set",
+  "validate one row per TaskController, AgentAttempt, Governor, ContextCompiler, Evaluator, Memory, SystemExperience and Artifact owner",
+  "bind every projection to exact revision and compatible State Fence",
+  "validate complete/partial/stale/blocked/conflicted semantics and denominators",
+  "validate bounded current, experience, adaptation, evaluation and economics positions",
+  "canonicalize owner rows and view digest",
+]
+minimum_tests = [
+  "missing expected owner cannot be CompleteForDeclaredRecipe",
+  "one owner cannot impersonate another",
+  "transcript/model memory cannot fill stale/blocked/unavailable projection",
+  "Partial requires explicit narrower safe attempt",
+  "owner revision change invalidates old view",
+  "view exposes no mutable append/retry/schedule API",
+]
+non_goals = [
+  "owner queries",
+  "transcript storage",
+  "attempt journal",
+  "scheduler or retry",
+  "conflict resolution",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-CORE-00",
+  "ARCH-LEARN-01",
+  "ARCH-LEARN-02",
+  "ARCH-UND-01",
+  "ARCH-EPI-04",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I7.11",
+  "I12.24",
+  "I12.26",
+  "I16.23",
+]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than filling absent owner state from transcript/prose, mutating the view, or claiming complete history/world knowledge."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

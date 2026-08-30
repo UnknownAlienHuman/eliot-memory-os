@@ -1,0 +1,59 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 6
+cell = "smart.dreamer.contracts.research"
+physical_crate = "eliot-dreamer-contracts"
+primary_property = "Implement Dreamer-side Research Synthesis request and packet contracts over one frozen Researcher-owned evidence bundle without source acquisition, provider selection or support promotion."
+field_contract = "crates/smart/eliot-dreamer-contracts/research.contract.toml"
+public_function_selectors = [
+  "validate_research_synthesis_request",
+  "validate_research_interpretation_candidate",
+  "validate_research_synthesis_packet",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-contracts/src/research.rs",
+  "crates/smart/eliot-dreamer-contracts/tests/research.rs",
+]
+algorithm = [
+  "bind exact ResearchEvidenceBundle, AllowedReferenceManifest, evidence freeze, denominator and State Fence",
+  "validate exact citations and prevent precision beyond source anchors",
+  "retain failed acquisition, omitted lanes, source dependence, counterclaims, unresolved contradictions and unknowns",
+  "separate source-derived claims from candidate interpretation and recommendation",
+  "emit bounded candidate packet and invalidation/revision conditions without admission or promotion",
+]
+minimum_tests = [
+  "invented citation/reference rejected",
+  "citation precision cannot exceed source anchor",
+  "failed acquisition remains visible",
+  "partial denominator cannot become Complete",
+  "Researcher acquisition/provider types do not leak into public Dreamer contract",
+  "packet exposes no support/canonical/policy authority",
+]
+non_goals = [
+  "source acquisition/parsing/OCR/indexing",
+  "provider route or credential selection",
+  "Researcher evidence admission",
+  "canonical/support promotion",
+  "model invocation",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-DRM-01",
+  "ARCH-DRM-04",
+  "ARCH-EPI-03",
+  "ARCH-EPI-04",
+  "ARCH-SEC-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I9.3",
+  "I9.14",
+  "I21.8",
+]
+product_pulse = "D3A_RESEARCH_SYNTHESIS_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than expanding the source set, inventing citations, hiding coverage gaps, or combining acquisition, synthesis and promotion ownership."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

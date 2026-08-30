@@ -1,0 +1,119 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W0_PER_AGENT_BRIEF_MATERIALIZATION"
+issue = 305
+parent_pr = 272
+parent_head = "063f18cce74817c4e7c1ea78af2f91024f4e7c91"
+orders = [1, 2, 4, 5, 6, 7, 19, 26, 27, 28, 35, 49, 50, 51, 52]
+brief_count = 15
+field_contract_authority = "crates/smart/cognitive-rev12-all-field-contracts.toml"
+handoff_authority = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+rule = "Briefs materialize one assignment each. They do not redefine public types, wire fields, contract semantics, package integration, proof status or runtime authority."
+
+[[brief]]
+order = 1
+cell = "governor.observation.classifier"
+physical_crate = "eliot-observation"
+path = "crates/smart/cells-v12/001-governor-observation-classifier.toml"
+field_contract = "crates/governor/eliot-observation/classification.contract.toml"
+
+[[brief]]
+order = 2
+cell = "smart.epistemic.contracts"
+physical_crate = "eliot-epistemic-contracts"
+path = "crates/smart/cells-v12/002-smart-epistemic-contracts.toml"
+field_contract = "crates/smart/eliot-epistemic-contracts/current-position.contract.toml"
+
+[[brief]]
+order = 4
+cell = "smart.dreamer.contracts.common"
+physical_crate = "eliot-dreamer-contracts"
+path = "crates/smart/cells-v12/004-smart-dreamer-contracts-common.toml"
+field_contract = "crates/smart/eliot-dreamer-contracts/common.contract.toml"
+
+[[brief]]
+order = 5
+cell = "smart.dreamer.contracts.orientation"
+physical_crate = "eliot-dreamer-contracts"
+path = "crates/smart/cells-v12/005-smart-dreamer-contracts-orientation.toml"
+field_contract = "crates/smart/eliot-dreamer-contracts/orientation.contract.toml"
+
+[[brief]]
+order = 6
+cell = "smart.dreamer.contracts.research"
+physical_crate = "eliot-dreamer-contracts"
+path = "crates/smart/cells-v12/006-smart-dreamer-contracts-research.toml"
+field_contract = "crates/smart/eliot-dreamer-contracts/research.contract.toml"
+
+[[brief]]
+order = 7
+cell = "smart.dreamer.contracts.curation"
+physical_crate = "eliot-dreamer-contracts"
+path = "crates/smart/cells-v12/007-smart-dreamer-contracts-curation.toml"
+field_contract = "crates/smart/eliot-dreamer-contracts/curation.contract.toml"
+
+[[brief]]
+order = 19
+cell = "smart.cue.contracts"
+physical_crate = "eliot-cue-contracts"
+path = "crates/smart/cells-v12/019-smart-cue-contracts.toml"
+field_contract = "crates/smart/eliot-cue-contracts/cue.contract.toml"
+
+[[brief]]
+order = 26
+cell = "smart.context.contracts.candidate"
+physical_crate = "eliot-context-contracts"
+path = "crates/smart/cells-v12/026-smart-context-contracts-candidate.toml"
+field_contract = "crates/smart/eliot-context-contracts/context-compiler.contract.toml"
+
+[[brief]]
+order = 27
+cell = "smart.context.contracts.admission"
+physical_crate = "eliot-context-contracts"
+path = "crates/smart/cells-v12/027-smart-context-contracts-admission.toml"
+field_contract = "crates/smart/eliot-context-contracts/context-compiler.contract.toml"
+
+[[brief]]
+order = 28
+cell = "smart.context.contracts.view_quality"
+physical_crate = "eliot-context-contracts"
+path = "crates/smart/cells-v12/028-smart-context-contracts-view_quality.toml"
+field_contract = "crates/smart/eliot-context-contracts/context-compiler.contract.toml"
+
+[[brief]]
+order = 35
+cell = "smart.memory.curation.contracts"
+physical_crate = "eliot-memory-curation-contracts"
+path = "crates/smart/cells-v12/035-smart-memory-curation-contracts.toml"
+field_contract = "crates/smart/eliot-memory-curation-contracts/curation.contract.toml"
+
+[[brief]]
+order = 49
+cell = "smart.learning.contracts.common"
+physical_crate = "eliot-learning-contracts"
+path = "crates/smart/cells-v12/049-smart-learning-contracts-common.toml"
+field_contract = "crates/smart/eliot-learning-contracts/task-local-learning.contract.toml"
+
+[[brief]]
+order = 50
+cell = "smart.learning.contracts.state_view"
+physical_crate = "eliot-learning-contracts"
+path = "crates/smart/cells-v12/050-smart-learning-contracts-state_view.toml"
+field_contract = "crates/smart/eliot-learning-contracts/task-local-learning.contract.toml"
+
+[[brief]]
+order = 51
+cell = "smart.learning.contracts.adaptation"
+physical_crate = "eliot-learning-contracts"
+path = "crates/smart/cells-v12/051-smart-learning-contracts-adaptation.toml"
+field_contract = "crates/smart/eliot-learning-contracts/task-local-learning.contract.toml"
+
+[[brief]]
+order = 52
+cell = "smart.learning.contracts.evaluation"
+physical_crate = "eliot-learning-contracts"
+path = "crates/smart/cells-v12/052-smart-learning-contracts-evaluation.toml"
+field_contract = "crates/smart/eliot-learning-contracts/learning-evaluation.contract.toml"

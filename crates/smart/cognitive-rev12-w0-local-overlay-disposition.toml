@@ -1,0 +1,172 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "LOCAL_W0_OVERLAY_DISPOSITION_COMPLETE"
+issue = 305
+parent_pr = 272
+local_package = "eliot-cognitive-w0-local-overlay-no-push.zip"
+local_package_sha256 = "e9729f0f924953e517b4671734091bd722a454f5a2e98414b42b39b78f802d74"
+local_file_count = 27
+proof_ceiling = "STATIC_TRACEABILITY_ONLY"
+rule = "Every local file is retained as a materialized brief or mapped to the single current consolidated authority. SUPERSEDE/MERGE means semantic content was incorporated; it does not create a second public contract source."
+
+[[source_file]]
+path = "crates/smart/cells-v12/001-governor-observation-classifier.toml"
+sha256 = "9477b763966e89f316f430bd03cba20a237481d171d24abdedaa73473cdd5619"
+disposition = "RETAIN_MATERIALIZED"
+current_authority_or_materialization = "crates/smart/cells-v12/001-governor-observation-classifier.toml"
+
+[[source_file]]
+path = "crates/smart/cells-v12/002-smart-epistemic-contracts.toml"
+sha256 = "5b8aa94a91b65b903940fe3ad2fd8676cf6c92536185ee97e38c4df1db826b8e"
+disposition = "RETAIN_MATERIALIZED"
+current_authority_or_materialization = "crates/smart/cells-v12/002-smart-epistemic-contracts.toml"
+
+[[source_file]]
+path = "crates/smart/cells-v12/004-smart-dreamer-contracts-common.toml"
+sha256 = "d7be7ef6b1d00624ea8733ec88a62340aab13153eebce5af0a7001e8ba868e67"
+disposition = "RETAIN_MATERIALIZED"
+current_authority_or_materialization = "crates/smart/cells-v12/004-smart-dreamer-contracts-common.toml"
+
+[[source_file]]
+path = "crates/smart/cells-v12/005-smart-dreamer-contracts-orientation.toml"
+sha256 = "9bd990d9af7b1dfb6de1511b7e6fffd78d96abea63a065a8c8bd9c67bce6c822"
+disposition = "RETAIN_MATERIALIZED"
+current_authority_or_materialization = "crates/smart/cells-v12/005-smart-dreamer-contracts-orientation.toml"
+
+[[source_file]]
+path = "crates/smart/cells-v12/006-smart-dreamer-contracts-research.toml"
+sha256 = "135e855a6948d26ccbd8843f17fb68c7d4e21f14405129962997746fc06f57e5"
+disposition = "RETAIN_MATERIALIZED"
+current_authority_or_materialization = "crates/smart/cells-v12/006-smart-dreamer-contracts-research.toml"
+
+[[source_file]]
+path = "crates/smart/cells-v12/007-smart-dreamer-contracts-curation.toml"
+sha256 = "52ce1517b24726c1a803a5d5ee499ed2bdde0ed906bcde58e4c69af85a1f3ba4"
+disposition = "RETAIN_MATERIALIZED"
+current_authority_or_materialization = "crates/smart/cells-v12/007-smart-dreamer-contracts-curation.toml"
+
+[[source_file]]
+path = "crates/smart/cells-v12/019-smart-cue-contracts.toml"
+sha256 = "97d6868c7c2da69da44f245658a40d80f4f52e7e2f19e337295080dd2425c693"
+disposition = "RETAIN_MATERIALIZED"
+current_authority_or_materialization = "crates/smart/cells-v12/019-smart-cue-contracts.toml"
+
+[[source_file]]
+path = "crates/smart/cells-v12/026-smart-context-contracts-candidate.toml"
+sha256 = "9cc3d5036077b237f21ed19417464b1b73487426d3639c062b12f982f8854dcd"
+disposition = "RETAIN_MATERIALIZED"
+current_authority_or_materialization = "crates/smart/cells-v12/026-smart-context-contracts-candidate.toml"
+
+[[source_file]]
+path = "crates/smart/cells-v12/027-smart-context-contracts-admission.toml"
+sha256 = "764b8f54ef16ebfaf81330c13b77e0913beee5bbd4c4a3a93544cb4a07a93f3f"
+disposition = "RETAIN_MATERIALIZED"
+current_authority_or_materialization = "crates/smart/cells-v12/027-smart-context-contracts-admission.toml"
+
+[[source_file]]
+path = "crates/smart/cells-v12/028-smart-context-contracts-view_quality.toml"
+sha256 = "6f87f8c436ffb96a23878767962d45b0d2d31e9b859495bfe37cace710d68094"
+disposition = "RETAIN_MATERIALIZED"
+current_authority_or_materialization = "crates/smart/cells-v12/028-smart-context-contracts-view_quality.toml"
+
+[[source_file]]
+path = "crates/smart/cells-v12/035-smart-memory-curation-contracts.toml"
+sha256 = "d300614f9c4faa314908aadc45fef2c0babc364e38a3a06c3c74f0eebef956f4"
+disposition = "RETAIN_MATERIALIZED"
+current_authority_or_materialization = "crates/smart/cells-v12/035-smart-memory-curation-contracts.toml"
+
+[[source_file]]
+path = "crates/smart/cells-v12/049-smart-learning-contracts-common.toml"
+sha256 = "a5401781d77f043af1732064a906d6d026624c1e0d6d61bab4d79bee2e433871"
+disposition = "RETAIN_MATERIALIZED"
+current_authority_or_materialization = "crates/smart/cells-v12/049-smart-learning-contracts-common.toml"
+
+[[source_file]]
+path = "crates/smart/cells-v12/050-smart-learning-contracts-state_view.toml"
+sha256 = "f2bf89f4a7ec1c82648f11fd4d92145c39a37389dd2b880df5106a8c90697667"
+disposition = "RETAIN_MATERIALIZED"
+current_authority_or_materialization = "crates/smart/cells-v12/050-smart-learning-contracts-state_view.toml"
+
+[[source_file]]
+path = "crates/smart/cells-v12/051-smart-learning-contracts-adaptation.toml"
+sha256 = "784b1bf45991420e1c233b0f854bbeaac1830f99b5c8a4d18ea7be8da9b76153"
+disposition = "RETAIN_MATERIALIZED"
+current_authority_or_materialization = "crates/smart/cells-v12/051-smart-learning-contracts-adaptation.toml"
+
+[[source_file]]
+path = "crates/smart/cells-v12/052-smart-learning-contracts-evaluation.toml"
+sha256 = "71eb3de2a6270ecb82fc4f2764abf8d50c320d297ddd4700604a5a04b4168610"
+disposition = "RETAIN_MATERIALIZED"
+current_authority_or_materialization = "crates/smart/cells-v12/052-smart-learning-contracts-evaluation.toml"
+
+[[source_file]]
+path = "crates/smart/cognitive-rev12-cross-wave-findings.toml"
+sha256 = "e42ce42a7b6cef32cd6ec656cab68c364de9d8c6e8e7fd9d484bf599f380afcc"
+disposition = "MERGED_AS_OPEN_CHALLENGES"
+current_authority_or_materialization = "crates/smart/cognitive-rev12-w0-contract-challenges.toml"
+
+[[source_file]]
+path = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+sha256 = "4b5c7ca7c7e3f75464fe9d6208c8d62167f6bee4f3cac72c46d9ea9ffb5579e0"
+disposition = "MERGED_IN_PLACE"
+current_authority_or_materialization = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+
+[[source_file]]
+path = "crates/smart/cognitive-rev12-w0-contract-challenges.toml"
+sha256 = "4220c281eebdd12c2dadf298099a1495cd60fda66715be3ba99e25da73587c8c"
+disposition = "MERGED_IN_PLACE"
+current_authority_or_materialization = "crates/smart/cognitive-rev12-w0-contract-challenges.toml"
+
+[[source_file]]
+path = "crates/smart/cognitive-rev12-w0-field-contracts.toml"
+sha256 = "4c6617e8992c18a8b7fe6a418136d2391afb3c70cf9133b19e74dabad310a1ed"
+disposition = "MERGED_INTO"
+current_authority_or_materialization = "crates/smart/cognitive-rev12-all-field-contracts.toml"
+
+[[source_file]]
+path = "crates/smart/cognitive-rev12-w0-type-ownership.toml"
+sha256 = "5fb4dea095b0a7904dd044c23db0745f2604230d11f02021a88bef5e9022a74a"
+disposition = "MERGED_INTO"
+current_authority_or_materialization = "crates/smart/cognitive-rev12-all-type-ownership.toml"
+
+[[source_file]]
+path = "crates/smart/cognitive-rev12-w0-validation.toml"
+sha256 = "a7640527ba99189a9bc2764ba37301c8f57a05e94930855c29318e4d1b5cb21a"
+disposition = "MERGED_INTO"
+current_authority_or_materialization = "crates/smart/cognitive-rev12-all-field-validation.toml"
+
+[[source_file]]
+path = "crates/smart/eliot-context-contracts/view-quality.contract.toml"
+sha256 = "07a0ae48b17097410c1d6b45b9571f25842593f3caae8661524da5c001d5ffec"
+disposition = "MERGED_INTO"
+current_authority_or_materialization = "crates/smart/eliot-context-contracts/context-compiler.contract.toml"
+
+[[source_file]]
+path = "crates/smart/eliot-learning-contracts/adaptation.contract.toml"
+sha256 = "b3e3d15db443f7d4d1ac204373cae511c97d28cf1729b6d81e4754053b07a215"
+disposition = "MERGED_INTO"
+current_authority_or_materialization = "crates/smart/eliot-learning-contracts/task-local-learning.contract.toml"
+
+[[source_file]]
+path = "crates/smart/eliot-learning-contracts/common.contract.toml"
+sha256 = "8c126d66fb831bce18a1799560f80641a013dd66ccae13d472f0ad7ae6c9844b"
+disposition = "MERGED_INTO"
+current_authority_or_materialization = "crates/smart/eliot-learning-contracts/task-local-learning.contract.toml"
+
+[[source_file]]
+path = "crates/smart/eliot-learning-contracts/evaluation.contract.toml"
+sha256 = "ba8c1871e180ed01f7801ec7ad60df83fcef0a07fc34f69096463e25c67ef82a"
+disposition = "MERGED_INTO"
+current_authority_or_materialization = "crates/smart/eliot-learning-contracts/learning-evaluation.contract.toml"
+
+[[source_file]]
+path = "crates/smart/eliot-learning-contracts/state-view.contract.toml"
+sha256 = "3ff818dcee1f9efa50f128a1d7f5a31da3e56f55ee0b69a676e1714f94ebf015"
+disposition = "MERGED_INTO"
+current_authority_or_materialization = "crates/smart/eliot-learning-contracts/task-local-learning.contract.toml"
+
+[[source_file]]
+path = "crates/smart/eliot-memory-curation-contracts/curation.contract.toml"
+sha256 = "a4667d14b20c6e6e935b318283082472172a04a2e131d7043df5987c8c268e66"
+disposition = "MERGED_IN_PLACE"
+current_authority_or_materialization = "crates/smart/eliot-memory-curation-contracts/curation.contract.toml"

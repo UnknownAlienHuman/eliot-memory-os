@@ -1,0 +1,56 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 26
+cell = "smart.context.contracts.candidate"
+physical_crate = "eliot-context-contracts"
+primary_property = "Implement whole-unit Context candidate merge contracts over a closed expected-provider denominator without retrieval, expansion, cross-provider ranking or admission."
+field_contract = "crates/smart/eliot-context-contracts/context-compiler.contract.toml"
+public_function_selectors = [
+  "validate_context_candidate_set",
+]
+write_scope = [
+  "crates/smart/eliot-context-contracts/src/candidate.rs",
+  "crates/smart/eliot-context-contracts/tests/candidate.rs",
+]
+algorithm = [
+  "validate exact expected-provider set, scope, task, State Fence and bounds",
+  "validate every ProviderContribution before merge",
+  "create one unchanged ContextCandidate per whole ProviderAtom",
+  "preserve provider coverage, omissions, source handles and dependencies",
+  "detect duplicate identity/payload/role/fence/scope/dependency conflicts rather than last-write-wins",
+  "derive Complete/Partial/Blocked/Stale/Conflicted and canonical digest without ranking/admission",
+]
+minimum_tests = [
+  "missing mandatory provider cannot become empty Complete",
+  "exact zero denominator remains distinct from unqueried/unavailable",
+  "duplicate atom identity with different payload is conflict",
+  "one provider cannot fill another provider denominator",
+  "merge exposes no rank/admission/delivery/use state",
+  "merge has no retrieval/expansion/model/store interface",
+]
+non_goals = [
+  "provider projection",
+  "retrieval/handle expansion",
+  "admission/budgeting",
+  "view rendering",
+  "delivery/use",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-CTX-01",
+  "ARCH-CTX-04",
+  "ARCH-EPI-04",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I7.11",
+  "I12.13",
+]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than ranking or admitting candidates, filling absent providers, slicing atoms, retrieving payloads, or resolving conflicts by order."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

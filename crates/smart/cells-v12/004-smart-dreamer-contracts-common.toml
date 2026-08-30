@@ -1,0 +1,68 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 4
+cell = "smart.dreamer.contracts.common"
+physical_crate = "eliot-dreamer-contracts"
+primary_property = "Implement the common bounded Dreamer job, reference, bundle, draft, grounding, seven-dimensional validation and structural admission contracts while preserving candidate-only semantics."
+field_contract = "crates/smart/eliot-dreamer-contracts/common.contract.toml"
+public_function_selectors = [
+  "validate_dream_job_envelope",
+  "validate_reference_manifest",
+  "validate_dream_input_bundle",
+  "validate_model_draft",
+  "validate_grounded_draft",
+  "validate_transformation_report",
+  "validate_admitted_draft",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-contracts/src/common.rs",
+  "crates/smart/eliot-dreamer-contracts/tests/common.rs",
+]
+algorithm = [
+  "validate exact job identity, job class, allowed candidate kinds, scope/task/fence, privacy, budget, schema and forbidden effects",
+  "validate handle-oriented manifest and bundle with required references, reversible omissions and reserved output/review capacity",
+  "validate model draft against exact job/bundle/route receipt and reject references outside manifest",
+  "validate claim grounding without truth promotion and derive source-authority ceilings from sources",
+  "validate Coverage, Preservation, Faithfulness, Lineage, Reversibility, SourceAuthority and DependencyClosure independently",
+  "validate structural admission while keeping Admitted distinct from canonical, supported, true or executable",
+]
+minimum_tests = [
+  "unknown job/candidate kind fails closed",
+  "invented reference is rejected",
+  "source count cannot substitute for coverage",
+  "model self-certification cannot pass faithfulness or authority",
+  "Inconclusive required dimension is not Pass",
+  "AdmittedDreamDraft contains no canonical/support/finish/policy/effect field",
+]
+non_goals = [
+  "model/provider invocation",
+  "Research acquisition",
+  "semantic job handler logic",
+  "canonical admission/write",
+  "task finish",
+  "policy/authority/scheduler/effect ownership",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-DRM-01",
+  "ARCH-DRM-02",
+  "ARCH-DRM-03",
+  "ARCH-EPI-04",
+  "ARCH-SEC-04",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I9.3",
+  "I9.4",
+  "I9.7",
+  "I9.16",
+  "I12.13",
+]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than accepting unknown kinds, references outside the manifest, scalar validation, model self-certification, or any canonical/authority/effect ownership."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

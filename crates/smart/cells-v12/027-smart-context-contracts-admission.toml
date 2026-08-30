@@ -1,0 +1,59 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 27
+cell = "smart.context.contracts.admission"
+physical_crate = "eliot-context-contracts"
+primary_property = "Implement deterministic whole-unit Context admission contracts with Decision Safety Floor, downstream headroom, provider fairness, reversible omissions and one disposition per candidate."
+field_contract = "crates/smart/eliot-context-contracts/context-compiler.contract.toml"
+public_function_selectors = [
+  "validate_context_recipe",
+  "validate_admitted_context_set",
+]
+write_scope = [
+  "crates/smart/eliot-context-contracts/src/admission.rs",
+  "crates/smart/eliot-context-contracts/tests/admission.rs",
+]
+algorithm = [
+  "validate immutable ContextRecipe, route budget, reservations, role order and Safety Floor",
+  "reserve output/review/tool headroom before optional allocation",
+  "admit required/protected whole units first as payload, exact handle or visible warning",
+  "allocate optional capacity deterministically and provider-fairly",
+  "emit exactly one include/revalidate/suppress/quarantine decision for every candidate",
+  "retain expansion handles and derive complete/partial/blocked/conflicted/overbudget/stale without rendering or delivery",
+]
+minimum_tests = [
+  "no atom can be sliced to fit budget",
+  "optional units cannot consume Safety Floor or downstream headroom",
+  "unknown decision delta cannot be treated as zero",
+  "one verbose provider cannot monopolize all optional capacity",
+  "required omission is visible/expandable or blocks Complete",
+  "AdmittedContextSet contains no rendered view or delivery/use receipt",
+]
+non_goals = [
+  "candidate retrieval/merge",
+  "view rendering",
+  "tokenizer/provider call",
+  "delivery/use/attention resolution",
+  "authority/finish",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-CTX-01",
+  "ARCH-CTX-04",
+  "ARCH-EPI-04",
+  "ARCH-HELP-01",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I7.11",
+  "I12.13",
+  "I14.29",
+]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than truncating atoms, weakening the Safety Floor, consuming reserved headroom, hiding unknowns or claiming delivery."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

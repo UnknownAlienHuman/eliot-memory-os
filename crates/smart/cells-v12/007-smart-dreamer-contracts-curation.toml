@@ -1,0 +1,58 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 7
+cell = "smart.dreamer.contracts.curation"
+physical_crate = "eliot-dreamer-contracts"
+primary_property = "Implement closed typed curation dispatch/envelope contracts so every subtype reaches one registered semantic owner and unknown subtype has no generic model fallback."
+field_contract = "crates/smart/eliot-dreamer-contracts/curation.contract.toml"
+public_function_selectors = [
+  "validate_curation_handler_registry",
+  "validate_curation_request",
+  "validate_curation_candidate_set",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-contracts/src/curation.rs",
+  "crates/smart/eliot-dreamer-contracts/tests/curation.rs",
+]
+algorithm = [
+  "validate closed subtype and exact handler registry generation/schema",
+  "bind typed input/output to one Dreamer job, scope, task and State Fence",
+  "require one semantic owner for each subtype",
+  "reject cross-subtype handler output and mixed-job candidate sets",
+  "represent unknown/unsupported subtype explicitly with required contract information",
+  "canonicalize registry lookup and candidate set identity",
+]
+minimum_tests = [
+  "every supported subtype maps exactly once",
+  "unknown subtype has no generic fallback",
+  "handler cannot return another subtype",
+  "mixed job/fence candidate set rejected",
+  "candidate set exposes no lifecycle action receipt",
+  "registry order does not affect lookup",
+]
+non_goals = [
+  "semantic subtype handler logic",
+  "subtype inference from prose",
+  "memory lifecycle transition",
+  "canonical admission/write",
+  "generic LLM fallback",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-MEM-03",
+  "ARCH-DRM-01",
+  "ARCH-MOD-03",
+  "ARCH-SEC-04",
+]
+implementation_refs = [
+  "I2.20",
+  "I9.7",
+  "I9.8",
+]
+product_pulse = "D3A_CURATION_PULSE_01"
+stop_condition = "Return UnsupportedSubtype or ContractChallenge rather than inferring subtype from text, routing to a generic model, or allowing a handler to own lifecycle/admission."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

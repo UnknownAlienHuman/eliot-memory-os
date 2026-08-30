@@ -1,0 +1,64 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 51
+cell = "smart.learning.contracts.adaptation"
+physical_crate = "eliot-learning-contracts"
+primary_property = "Implement evidence-bound AttemptLearningDelta, reversible task-local overlay and independent dimensional validation contracts without changing protected task/system surfaces."
+field_contract = "crates/smart/eliot-learning-contracts/task-local-learning.contract.toml"
+public_function_selectors = [
+  "validate_learning_delta_request",
+  "validate_attempt_learning_delta",
+  "validate_overlay_candidate",
+  "validate_overlay_report",
+]
+write_scope = [
+  "crates/smart/eliot-learning-contracts/src/adaptation.rs",
+  "crates/smart/eliot-learning-contracts/tests/adaptation.rs",
+]
+algorithm = [
+  "validate state view, source attempt, hypothesis, prediction and evidence lineage",
+  "separate supporting, refuting, noise, unknown and invalid dimensions",
+  "require explicit behavior delta or valid no-change/inconclusive disposition",
+  "validate equivalent retry reason",
+  "validate only allowed task-local overlay surfaces",
+  "reject objective, acceptance, finish, authority, privacy, cost, evaluator, holdout, canonical semantics and production-generation changes",
+  "validate applicability, attribution, reversibility, verifier, preserved success, scope/expiry and effect ceiling independently",
+]
+minimum_tests = [
+  "objective/acceptance mutation rejected",
+  "equivalent retry without experimental purpose rejected",
+  "post-hoc overlay change manifest rejected",
+  "evaluator and sealed holdout immutable",
+  "Inconclusive cannot be Pass",
+  "candidate/report contains no admission or promotion field",
+]
+non_goals = [
+  "Governor overlay admission",
+  "Context activation",
+  "task plan or finish change",
+  "global promotion",
+  "evaluator/holdout modification",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-CORE-00",
+  "ARCH-LEARN-01",
+  "ARCH-LEARN-02",
+  "ARCH-EPI-03",
+  "ARCH-META-01",
+  "ARCH-RES-05",
+]
+implementation_refs = [
+  "I2.20",
+  "I7.27",
+  "I12.24",
+  "I14.5",
+  "I16.23",
+]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than changing a forbidden surface, treating outcome as mechanism proof, weakening the oracle, or representing validation as admission."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

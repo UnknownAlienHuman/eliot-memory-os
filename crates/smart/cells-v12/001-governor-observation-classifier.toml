@@ -1,0 +1,60 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 1
+cell = "governor.observation.classifier"
+physical_crate = "eliot-observation"
+primary_property = "Classify one immutable captured observation into an exact task/scope/cold/quarantine/unknown disposition without rewriting payload or promoting truth, support, authority or task state."
+field_contract = "crates/governor/eliot-observation/classification.contract.toml"
+public_function_selectors = [
+  "validate_observation_classification_policy",
+  "validate_observation_classification_input",
+  "classify_observation",
+  "validate_observation_classification",
+]
+write_scope = [
+  "crates/governor/eliot-observation/src/classifier.rs",
+  "crates/governor/eliot-observation/tests/classifier.rs",
+]
+algorithm = [
+  "validate observation handle, exact payload digest, provenance, bounds and optional capture hints",
+  "evaluate explicit task/scope/fence owner evidence before heuristic evidence",
+  "preserve conflicting alternatives and never select a task by vote, recency or path proximity",
+  "emit TaskBound only for one compatible explicit binding; otherwise preserve ScopeBoundCold, GlobalCold, Quarantined or Unknown",
+  "retain original payload/provenance identity and compute canonical result digest",
+]
+minimum_tests = [
+  "two conflicting exact task bindings never choose a winner",
+  "heuristic-only evidence cannot produce TaskBound",
+  "absent binding preserves cold capture and exact handles",
+  "payload digest is unchanged",
+  "classification exposes no support, authority, persistence, attention or finish transition",
+  "input permutation is deterministic",
+]
+non_goals = [
+  "canonical observation persistence",
+  "semantic support or truth classification",
+  "task creation/revision",
+  "attention opening",
+  "model inference",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-MEM-01",
+  "ARCH-LIFE-01",
+  "ARCH-EPI-04",
+  "ARCH-SCOPE-01",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I5.5",
+  "I5.6",
+  "I12.11",
+]
+product_pulse = "D1_CAPTURE_CLASSIFICATION_EDGE_01"
+stop_condition = "Return a ContractChallenge rather than inventing a task/scope binding, rewriting payload, choosing among conflicts heuristically, or adding canonical/support/authority effects."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

@@ -1,0 +1,65 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 52
+cell = "smart.learning.contracts.evaluation"
+physical_crate = "eliot-learning-contracts"
+primary_property = "Implement activation/adherence assessment, closure and advisory promotion-input contracts while preserving external receipt and promotion-decision ownership."
+field_contract = "crates/smart/eliot-learning-contracts/learning-evaluation.contract.toml"
+public_function_selectors = [
+  "validate_activation_receipt_ref",
+  "validate_activation_assessment",
+  "validate_adherence_assessment",
+  "validate_learning_closure",
+  "validate_promotion_input",
+]
+write_scope = [
+  "crates/smart/eliot-learning-contracts/src/evaluation.rs",
+  "crates/smart/eliot-learning-contracts/tests/evaluation.rs",
+]
+algorithm = [
+  "validate exact external HarnessActivationReceiptRef and common learning identity",
+  "separate eligibility, retrieval, delivery, activation, adherence, decision delta, outcome, retention and transfer",
+  "require qualifying public use for Observed activation and checkpoints for observed adherence",
+  "validate explicit closure disposition including NoReusableDelta and DeferredOutcome",
+  "require external promotion receipt only for recorded ScopedUpdatePromoted",
+  "validate all promotion dimensions independently and derive advisory recommendation only",
+]
+minimum_tests = [
+  "assessment cannot create/self-issue receipt",
+  "acknowledgement is not activation",
+  "early adherence does not imply final adherence",
+  "NoReusableDelta is valid and explicit",
+  "retention and transfer remain independent",
+  "ReadyForOwnerDecision cannot perform promotion",
+]
+non_goals = [
+  "HarnessActivationReceipt creation/commit",
+  "attempt delivery",
+  "promotion decision or execution",
+  "finish decision",
+  "production cutover",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-CORE-00",
+  "ARCH-LEARN-01",
+  "ARCH-LEARN-02",
+  "ARCH-META-01",
+  "ARCH-EPI-03",
+  "ARCH-EPI-04",
+]
+implementation_refs = [
+  "I2.20",
+  "I7.25",
+  "I7.27",
+  "I12.24",
+  "I12.34",
+  "I16.23",
+]
+product_pulse = "D4_TASK_LOCAL_LEARNING_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than self-issuing a receipt, inferring activation/benefit from acknowledgement or success, collapsing dimensions, or deciding promotion."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
