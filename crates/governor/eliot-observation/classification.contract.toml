@@ -1,0 +1,163 @@
+schema_version = 1
+contract_id = "governor.observation.classification.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-observation"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["governor.observation.classifier"]
+architecture_refs = ["ARCH-MEM-01", "ARCH-LIFE-01", "ARCH-EPI-01", "ARCH-SCOPE-01", "ARCH-MOD-03"]
+implementation_refs = ["I5.5", "I5.17", "I7.6", "I12.2", "I12.3", "I2.20"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Classify one immutable capture into a deterministic first-pass semantic family and safe task/reuse disposition without promotion, canonical write, task invention, or data loss."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O(signals log signals) over a policy-bounded immutable input; no model call, store read, graph traversal, task mutation or canonical write."
+replacement_boundary = "Replace the pure classifier behind this contract; Governor observation admission remains the sole owner of canonical capture and semantic promotion."
+
+[closed_sets]
+semantic_families = ["Observation", "Decision", "Failure", "Outcome", "InfluenceAcknowledgement", "Unknown"]
+origin_classes = ["SelfReported", "HarnessObserved", "IndependentlyObserved"]
+evaluation_states = ["Raw", "Screened", "VerifierBacked", "Contested", "Stale"]
+signal_kinds = ["ExplicitObserveOperation", "TypedHostEvent", "CanonicalMetadata", "CallerHint", "Heuristic"]
+signal_precedence = ["ExplicitObserveOperation", "TypedHostEvent", "CanonicalMetadata", "CallerHint", "Heuristic"]
+task_binding_dispositions = ["Bound", "UnboundCold", "Ambiguous", "Conflicted", "NotApplicable"]
+reuse_dispositions = ["ColdObservationCandidate", "TaskLocalCandidate", "ReusableCandidateRequiresAdmission", "Quarantined"]
+
+[hard_invariants]
+safe_capture_survives_ambiguity = true
+raw_capture_and_source_lineage_are_preserved = true
+caller_hint_is_evidence_not_authority = true
+origin_and_evaluation_status_are_independent = true
+classification_cannot_raise_epistemic_status = true
+classification_cannot_create_support_accessibility_or_influence = true
+classification_cannot_create_or_select_a_task = true
+wrong_scope_or_task_conflict_is_not_silently_resolved = true
+unknown_family_has_no_generic_model_fallback = true
+same_input_and_policy_produce_identical_output = true
+output_contains_no_canonical_transition_or_receipt = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "EpistemicStatus"
+owner = "eliot-evidence"
+
+[[public_type]]
+name = "ObservationSemanticFamily"
+kind = "enum"
+definition = ["Observation", "Decision", "Failure", "Outcome", "InfluenceAcknowledgement", "Unknown"]
+invariants = ["closed-world family aligned with the typed eliot.observe suboperations", "Unknown preserves capture and never triggers a model fallback"]
+
+[[public_type]]
+name = "ObservationOriginClass"
+kind = "enum"
+definition = ["SelfReported", "HarnessObserved", "IndependentlyObserved"]
+invariants = ["origin class is provenance, not evaluation or truth"]
+
+[[public_type]]
+name = "ObservationEvaluationState"
+kind = "enum"
+definition = ["Raw", "Screened", "VerifierBacked", "Contested", "Stale"]
+invariants = ["evaluation state remains independent from capture route and first-pass family"]
+
+[[public_type]]
+name = "ClassificationSignalKind"
+kind = "enum"
+definition = ["ExplicitObserveOperation", "TypedHostEvent", "CanonicalMetadata", "CallerHint", "Heuristic"]
+invariants = ["precedence is fixed by policy revision", "CallerHint and Heuristic cannot override an explicit typed operation or exact host event"]
+
+[[public_type]]
+name = "ObservationClassificationSignal"
+kind = "struct"
+definition = ["signal_id: ArtifactId", "kind: ClassificationSignalKind", "candidate_family: ObservationSemanticFamily", "source_handle: ArtifactId", "reason_code: String"]
+invariants = ["signal identity/source exact", "reason code non-blank", "signal grants no epistemic or task authority"]
+
+[[public_type]]
+name = "TaskBindingDisposition"
+kind = "enum"
+definition = ["Bound", "UnboundCold", "Ambiguous", "Conflicted", "NotApplicable"]
+invariants = ["Bound requires exact current task identity already present in the input", "classifier cannot convert a hint into Bound"]
+
+[[public_type]]
+name = "ObservationReuseDisposition"
+kind = "enum"
+definition = ["ColdObservationCandidate", "TaskLocalCandidate", "ReusableCandidateRequiresAdmission", "Quarantined"]
+invariants = ["ReusableCandidateRequiresAdmission is not admission", "Quarantined preserves raw capture and lineage"]
+
+[[public_type]]
+name = "ObservationClassificationPolicy"
+kind = "struct"
+definition = ["policy_id: ArtifactId", "policy_revision: String", "allowed_families: Vec<ObservationSemanticFamily>", "signal_precedence: Vec<ClassificationSignalKind>", "ambiguous_family_fallback: ObservationSemanticFamily", "ambiguous_task_disposition: TaskBindingDisposition", "wrong_task_disposition: TaskBindingDisposition", "unknown_reuse_disposition: ObservationReuseDisposition", "maximum_signals: u32", "maximum_reason_codes: u32", "canonical_tie_break: String", "policy_sha256: String"]
+invariants = ["all closed sets are unique", "fallback family is Unknown", "ambiguous task disposition is UnboundCold or Ambiguous", "wrong-task disposition is Conflicted", "bounds non-zero", "policy cannot grant admission, support, influence or task authority"]
+
+[[public_type]]
+name = "ObservationClassificationInput"
+kind = "struct"
+definition = ["request_id: RequestId", "input_id: ArtifactId", "capture_record_handle: ArtifactId", "raw_payload_handle: Option<ArtifactId>", "scope_id: String", "task_id: Option<TaskId>", "task_hint: Option<TaskId>", "origin_class: ObservationOriginClass", "evaluation_state: ObservationEvaluationState", "observed_epistemic_status: EpistemicStatus", "state_fence: StateFence", "explicit_operation: Option<ObservationSemanticFamily>", "signals: Vec<ObservationClassificationSignal>", "source_handles: Vec<ArtifactId>", "input_sha256: String"]
+invariants = ["capture/source handles exact and unique", "raw payload handle preserved when supplied", "scope/fence exact", "task hint remains distinct from bound task", "observed epistemic status cannot be upgraded", "input ordering canonicalized for digest"]
+
+[[public_type]]
+name = "ObservationClassification"
+kind = "struct"
+definition = ["input_sha256: String", "policy_sha256: String", "family: ObservationSemanticFamily", "task_binding: TaskBindingDisposition", "reuse_disposition: ObservationReuseDisposition", "bound_task_id: Option<TaskId>", "preserved_capture_record_handle: ArtifactId", "preserved_raw_payload_handle: Option<ArtifactId>", "decisive_signal_ids: Vec<ArtifactId>", "conflicting_signal_ids: Vec<ArtifactId>", "source_handles: Vec<ArtifactId>", "reason_codes: Vec<String>", "classification_sha256: String"]
+invariants = ["Bound requires bound_task_id equal to input.task_id", "Unbound/Ambiguous/Conflicted cannot invent bound_task_id", "Unknown family yields cold or quarantined reuse", "conflict remains explicit", "contains no support, lifecycle, accessibility, influence, authority, admission, finish or transition field", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_observation_classification_policy"
+signature = "pub fn validate_observation_classification_policy(policy: &ObservationClassificationPolicy) -> Result<(), ObservationClassificationError>"
+
+[[public_function]]
+name = "validate_observation_classification_input"
+signature = "pub fn validate_observation_classification_input(input: &ObservationClassificationInput) -> Result<(), ObservationClassificationError>"
+
+[[public_function]]
+name = "classify_observation"
+signature = "pub fn classify_observation(input: &ObservationClassificationInput, policy: &ObservationClassificationPolicy) -> Result<ObservationClassification, ObservationClassificationError>"
+
+[[public_function]]
+name = "validate_observation_classification"
+signature = "pub fn validate_observation_classification(input: &ObservationClassificationInput, policy: &ObservationClassificationPolicy, output: &ObservationClassification) -> Result<(), ObservationClassificationError>"
+
+[[negative_test]]
+id = "ambiguous-family-preserves-capture"
+property = "Conflicting family signals produce Unknown/ColdObservationCandidate and retain raw/source handles."
+
+[[negative_test]]
+id = "caller-hint-no-task-authority"
+property = "task_hint without exact input.task_id cannot produce TaskBindingDisposition::Bound."
+
+[[negative_test]]
+id = "wrong-task-conflict"
+property = "Conflicting exact task identity and hint produce Conflicted/Quarantined rather than most-recent-task selection."
+
+[[negative_test]]
+id = "repetition-no-promotion"
+property = "Duplicated or repeated signals do not raise epistemic status or reusable influence."
+
+[[negative_test]]
+id = "output-no-semantic-teleportation"
+property = "Output schema has no support, lifecycle, authority, canonical write, verification or finish field."
+
+[[negative_test]]
+id = "permutation-deterministic"
+property = "Signal/source input permutation does not change classification digest."

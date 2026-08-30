@@ -4,7 +4,21 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Governor-owned observation admission, plan compilation and journal projection"
+description = "Governor-owned observation admission, first-pass classification, plan compilation and journal projection"
+
+[package.metadata.eliot]
+layer = "C1"
+purpose = "Governor-owned deterministic observation classification and admission support"
+source_maintenance_owner = "cognitive-integration-owner"
+functional_cell_refs = ["governor.observation.classifier"]
+independent_proof_profile = "prototype-not-workspace-admitted"
+contract_refs = [
+  "crates/smart/cognitive-current.toml",
+  "crates/governor/eliot-observation/classification.contract.toml",
+]
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until Rust implementation, ModuleTestCapsule, production capture Edge Proof and D1_CAPTURE_CLASSIFICATION_EDGE_01"
 
 [dependencies]
 eliot-contracts = { workspace = true }
