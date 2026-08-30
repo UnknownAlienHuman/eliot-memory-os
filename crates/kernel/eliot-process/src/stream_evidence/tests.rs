@@ -37,7 +37,9 @@ mod tests {
         )
     }
 
-    fn exact_source(bytes: &[u8]) -> Result<DurableProcessStreamSource, ProcessStreamEvidenceError> {
+    fn exact_source(
+        bytes: &[u8],
+    ) -> Result<DurableProcessStreamSource, ProcessStreamEvidenceError> {
         let digest = sha256_hex(bytes);
         DurableProcessStreamSource::exact_transport(
             DurableStreamLocatorKind::Blob,
@@ -157,14 +159,13 @@ mod tests {
                 "a".repeat(64),
                 3,
             );
-            assert!(result.is_err(), "locator unexpectedly accepted: {locator:?}");
+            assert!(
+                result.is_err(),
+                "locator unexpectedly accepted: {locator:?}"
+            );
         }
 
-        for locator in [
-            "eliot://blob/abc",
-            "artifact+cas:v1",
-            "A.b-c+1:value",
-        ] {
+        for locator in ["eliot://blob/abc", "artifact+cas:v1", "A.b-c+1:value"] {
             let result = DurableProcessStreamSource::exact_transport(
                 DurableStreamLocatorKind::ImmutableArtifact,
                 locator,
@@ -190,7 +191,10 @@ mod tests {
             Some(exact_source(b"abc")?),
             vec![StreamEvidenceGap::TransportReadFailed],
         )?;
-        assert_eq!(evidence.persistence(), StreamPersistenceStatus::PartialSource);
+        assert_eq!(
+            evidence.persistence(),
+            StreamPersistenceStatus::PartialSource
+        );
         Ok(())
     }
 
@@ -459,10 +463,8 @@ mod tests {
                 b"abc".to_vec()
             };
             let observed_len = usize_to_u64("test.observed_length", observed.len())?;
-            let preview = ProcessStreamPrefixPreview::from_transport_prefix(
-                observed.clone(),
-                observed_len,
-            )?;
+            let preview =
+                ProcessStreamPrefixPreview::from_transport_prefix(observed.clone(), observed_len)?;
 
             if let Some(expected_gap) = expected {
                 let mut valid_gaps = vec![expected_gap];
@@ -481,7 +483,10 @@ mod tests {
                     None,
                     valid_gaps,
                 );
-                assert!(valid.is_ok(), "expected transport gap rejected for {status:?}");
+                assert!(
+                    valid.is_ok(),
+                    "expected transport gap rejected for {status:?}"
+                );
             }
 
             for wrong_gap in TRANSPORT_GAPS {
@@ -504,7 +509,10 @@ mod tests {
                     None,
                     gaps,
                 );
-                assert!(invalid.is_err(), "contradictory gap accepted for {status:?}");
+                assert!(
+                    invalid.is_err(),
+                    "contradictory gap accepted for {status:?}"
+                );
             }
         }
         Ok(())
