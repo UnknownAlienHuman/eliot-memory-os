@@ -1,0 +1,26 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W9_AGENT_HANDOFF_CONTRACT"
+field_contract_index = "crates/smart/cognitive-rev12-w9-field-contracts.toml"
+
+[worker]
+reads = ["one cells-v12 brief for order 76..86", "the exact field contract named by that brief", "declared Architecture/Implementation anchors", "one-hop external public contracts and fixtures only"]
+writes = ["the brief's declared src/<cell>.rs", "the brief's declared tests/<cell>.rs"]
+forbidden = ["Cargo.toml", "src/lib.rs", "re-exports", "another cell source", "root workspace", "runtime wiring", "canonical state", "policy", "scheduler", "route/tool/model execution", "proof/status files", "local redefinition of an indexed public type", "aggregate score field"]
+return = ["implemented declared function", "typed errors", "all minimum and negative tests", "remaining ContractChallenge", "actual proof ceiling"]
+
+[integration_owner]
+owns = ["Cargo manifests", "lib.rs/re-exports", "cross-cell compatibility", "public-type ownership validation", "package Module Proof", "real Edge Proof", "Product Pulse", "migration/retirement"]
+
+[challenge]
+required_when = ["field contract is absent/contradictory", "declared discriminator cannot fail old behavior", "work needs another mutable owner", "API requires hidden I/O/model/tool/provider SDK", "implementation would infer missing evidence", "worker would need to weaken an oracle", "complete causal workset cannot fit"]
+
+[ordering]
+contracts_precede_workers = true
+parallel_workers_require_disjoint_source_files = true
+shared_contract_change_serialized_by_integration_owner = true
+worker_never_integrates_own_result = true
+memory_quality_precedes_self_quality_view = true
+self_quality_view_precedes_bottleneck = true
+bottleneck_precedes_intervention_candidate = true
+common_ground_and_scoped_understanding_are_independent_cells_in_one_package = true
