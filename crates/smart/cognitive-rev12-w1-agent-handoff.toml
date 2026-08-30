@@ -1,0 +1,77 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W1_AGENT_HANDOFF_CONTRACT"
+stage = "W1_D3A_ORIENTATION"
+brief_index = "crates/smart/cognitive-rev12-w1-agent-brief-index.toml"
+field_contract_index = "crates/smart/cognitive-rev12-w1-field-contracts.toml"
+
+[worker]
+reads = [
+  "one indexed W1 cell brief",
+  "the exact field contract named by that brief",
+  "declared Architecture/Implementation anchors",
+  "one-hop public contracts and test fixtures only",
+]
+writes = [
+  "the brief's declared src/<cell>.rs",
+  "the brief's declared tests/<cell>.rs",
+]
+forbidden = [
+  "Cargo.toml",
+  "src/lib.rs",
+  "re-exports",
+  "another cell source/test",
+  "root workspace or lockfile",
+  "runtime wiring",
+  "canonical state",
+  "support/truth/policy/authority/task-finish mutation",
+  "model/provider/tool/probe/clarification execution",
+  "proof/status files",
+  "local redefinition of an indexed public type",
+  "generic JSON/vendor public type",
+]
+return = [
+  "implemented declared function selectors",
+  "typed errors",
+  "all minimum/adversarial tests",
+  "remaining ContractChallenge",
+  "actual proof ceiling",
+]
+
+[integration_owner]
+owns = [
+  "Cargo manifests and dependency selection",
+  "src/lib.rs and re-exports",
+  "cross-cell API compatibility",
+  "contract-shape ownership validation",
+  "package Module Proof",
+  "real provider/consumer Edge Proof",
+  "Product Pulse",
+  "migration/retirement/runtime admission",
+]
+
+[challenge]
+required_when = [
+  "indexed contract is absent or contradictory",
+  "public type ownership is ambiguous",
+  "declared discriminator cannot fail old behavior",
+  "implementation needs hidden I/O/model/provider/tool execution",
+  "implementation would infer missing support, causality, capability or current conformance",
+  "worker would need to weaken an oracle or protected boundary",
+  "complete causal workset cannot fit the declared source/test scope",
+]
+
+[ordering]
+contracts_precede_workers = true
+cell_3_may_start_after_parent_epistemic_contract = true
+cell_8_precedes_9 = true
+cell_9_precedes_10 = true
+cell_10_precedes_11 = true
+cells_12_13_15_require_3_and_11 = true
+cell_14_requires_12_and_3 = true
+cell_16_requires_3_and_11_and_12_through_15 = true
+cell_17_may_start_after_self_query_contract = true
+cell_18_requires_17 = true
+parallel_workers_require_disjoint_source_files = true
+shared_contract_change_serialized_by_integration_owner = true
+worker_never_integrates_own_result = true
