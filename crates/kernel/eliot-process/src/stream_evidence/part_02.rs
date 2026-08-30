@@ -1,4 +1,8 @@
 /// Policy identities fixed before stream bytes are offered to persistence.
+#[allow(
+    clippy::struct_field_names,
+    reason = "the *_ref suffix is part of the stable public policy-binding schema"
+)]
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct ProcessStreamPolicyBinding {
     policy_ref: String,
@@ -8,6 +12,10 @@ pub struct ProcessStreamPolicyBinding {
     redaction_ref: String,
 }
 
+#[allow(
+    clippy::struct_field_names,
+    reason = "the *_ref suffix must match the stable public policy-binding wire schema"
+)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProcessStreamPolicyBindingWire {
