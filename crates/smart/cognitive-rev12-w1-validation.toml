@@ -1,0 +1,86 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "VALIDATION_CONTRACT_NOT_IMPLEMENTATION_OR_PRODUCT_PROOF"
+stage = "W1_D3A_ORIENTATION"
+proof_ceiling = "STATIC_FIELD_CONTRACT_AND_AGENT_WORK_UNIT_DESIGN_ONLY"
+
+[expected]
+orders = [3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+functional_cells = 12
+physical_crates = 5
+briefs = 12
+write_scopes = 24
+field_contracts_reused = 3
+field_contracts_added = 1
+brief_index = "crates/smart/cognitive-rev12-w1-agent-brief-index.toml"
+field_contract_index = "crates/smart/cognitive-rev12-w1-field-contracts.toml"
+type_ownership = "crates/smart/cognitive-rev12-w1-type-ownership.toml"
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+
+[[gate]]
+id = "W1V01_TOML_PARSE"
+requirement = "Every new field-contract, brief, index, ownership, validation, handoff and challenge artifact parses as TOML."
+
+[[gate]]
+id = "W1V02_ORDER_CLOSURE"
+requirement = "Orders are exactly 3 and 8..18, unique and complete for W1 D3a Orientation."
+
+[[gate]]
+id = "W1V03_CONTRACT_CLOSURE"
+requirement = "Every brief points to one existing owner contract; only self-query adds new public fields."
+
+[[gate]]
+id = "W1V04_TYPE_OWNER"
+requirement = "Every public type resolves to one owner; ArchitectureBrief and ImplementationBrief are owned only by eliot-dreamer-self-query."
+
+[[gate]]
+id = "W1V05_WRITE_ISOLATION"
+requirement = "All twenty-four worker source/test paths are unique; Cargo.toml, src/lib.rs, re-exports and integration files are absent."
+
+[[gate]]
+id = "W1V06_POSITION_VS_MODEL"
+requirement = "Current Epistemic Position is resolved from admitted owner evidence; model synthesis cannot overwrite Observed, Supported, Assumption, Conflict, Stale, Superseded or Unknown roles."
+
+[[gate]]
+id = "W1V07_GROUNDING"
+requirement = "Every material claim resolves exact manifest references, counterevidence and source-authority ceiling; unsupported residue remains visible."
+
+[[gate]]
+id = "W1V08_DIMENSIONAL_VALIDATION"
+requirement = "Coverage, Preservation, Faithfulness, Lineage, Reversibility, SourceAuthority and DependencyClosure are independently assessed; Inconclusive is not Pass and model self-certification is insufficient."
+
+[[gate]]
+id = "W1V09_ADMISSION_BOUNDARY"
+requirement = "Structural Admitted is not canonical, true, supported, executable, authoritative or finished."
+
+[[gate]]
+id = "W1V10_RIVAL_PRESERVATION"
+requirement = "Working model, materially supported rivals, strongest objections, independent/shared evidence, unknowns, falsifiers and revision conditions remain addressable; vote count is irrelevant."
+
+[[gate]]
+id = "W1V11_CAUSALITY"
+requirement = "Temporal order, similarity, dependency and causal candidate are distinct; causal candidate requires mechanism, rival explanation, counterevidence and falsifier."
+
+[[gate]]
+id = "W1V12_PROBE_CLARIFICATION"
+requirement = "Probe and clarification outputs are bounded candidates with safety, reversibility, discrimination, stop and revision conditions; neither executes or mutates protected task fields."
+
+[[gate]]
+id = "W1V13_PACKET_BOUNDARY"
+requirement = "Orientation packet preserves resolved evidence roles and labels all Dreamer synthesis; it performs no Context admission, task mutation, authority or effect."
+
+[[gate]]
+id = "W1V14_SELF_QUERY_PAIR"
+requirement = "Architecture/Implementation briefs bind the exact accepted normative-pair receipt and exact materialized source handles; no runtime document/repository scan exists."
+
+[[gate]]
+id = "W1V15_TARGET_CURRENT_SEPARATION"
+requirement = "Target, ImplementedUnverified, CurrentVerified, OperationalObserved, ExperientialObserved, Contradicted, Unknown and Stale remain separate; file presence, prose or model report cannot certify current support."
+
+[[gate]]
+id = "W1V16_PAYLOAD_HYGIENE"
+requirement = "Diff contains TOML only and no Rust, Markdown, workflow, root Cargo.toml, Cargo.lock, archive, .eliot, generated state or probe file."
+
+[[gate]]
+id = "W1V17_PROOF_CEILING"
+requirement = "Field freeze, agent brief, branch, commit, review or PR cannot claim Rust implementation, Module Proof, Edge Proof, Product Pulse, runtime support or product acceptance."
