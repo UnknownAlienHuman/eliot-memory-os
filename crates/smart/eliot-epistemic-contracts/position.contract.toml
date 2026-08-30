@@ -1,0 +1,181 @@
+schema_version = 1
+contract_id = "smart.epistemic.position.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-epistemic-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.epistemic.contracts", "smart.epistemic.position", "smart.epistemic.context_projection"]
+architecture_refs = ["ARCH-EPI-01", "ARCH-EPI-03", "ARCH-EPI-04", "ARCH-UND-01", "ARCH-SCOPE-01", "ARCH-RES-05"]
+implementation_refs = ["I2.20", "I12.11", "I12.12", "I12.18"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Represent the Current Epistemic Position as a scoped, provenance-complete, rival-aware projection whose roles, conflicts, staleness and required inquiry remain independently addressable."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((claims + conflicts + inquiries + provenance_handles) log n) over request-bounded immutable evidence; no store read, model call, vote or promotion effect."
+replacement_boundary = "Replace deterministic resolution and rendering behind this contract; canonical evidence, support admission, Context admission and investigation execution remain separate owners."
+
+[closed_sets]
+epistemic_roles = ["Observed", "Supported", "ExplicitAssumption", "RivalModel", "ConflictParticipant", "Stale", "Superseded", "Unknown"]
+dependence_classes = ["Independent", "SharedLineage", "Derived", "Circular", "Unknown"]
+conflict_kinds = ["DirectContradiction", "ScopeMismatch", "TemporalRevision", "DefinitionMismatch", "AuthorityMismatch", "VerifierDisagreement", "Unknown"]
+inquiry_kinds = ["AcquireEvidence", "Revalidate", "DiscriminateRivals", "ClarifyScope", "ClarifyDefinition", "CheckVerifier", "InspectDependencyClosure"]
+position_coverage = ["Complete", "Partial", "Unavailable", "Blocked", "Stale", "Conflicted"]
+
+[hard_invariants]
+observed_supported_assumed_and_unknown_are_distinct = true
+assumption_requires_explicit_assumption_input = true
+absence_of_refutation_never_creates_support_or_assumption = true
+rival_models_and_counterevidence_remain_addressable = true
+conflict_is_structured_and_local_not_one_global_flag = true
+shared_lineage_is_not_independent_corroboration = true
+stale_and_superseded_records_remain_visible = true
+unknown_is_not_zero_false_or_irrelevant = true
+inquiry_is_advisory_and_cannot_execute_itself = true
+complete_requires_exact_recheckable_denominator = true
+all_material_claims_have_exact_provenance_closure = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "Assertability"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "EvidenceFreshness"
+owner = "eliot-evidence"
+
+[[public_type]]
+name = "EpistemicRole"
+kind = "enum"
+definition = ["Observed", "Supported", "ExplicitAssumption", "RivalModel", "ConflictParticipant", "Stale", "Superseded", "Unknown"]
+
+[[public_type]]
+name = "EvidenceDependenceClass"
+kind = "enum"
+definition = ["Independent", "SharedLineage", "Derived", "Circular", "Unknown"]
+
+[[public_type]]
+name = "EpistemicCoverageState"
+kind = "enum"
+definition = ["Complete", "Partial", "Unavailable", "Blocked", "Stale", "Conflicted"]
+
+[[public_type]]
+name = "EpistemicCoverageDenominator"
+kind = "struct"
+definition = ["source_ref: String", "source_revision: String", "method_ref: String", "expected_claims: Option<u32>", "expected_claim_handles: Vec<ArtifactId>", "expected_conflicts: Option<u32>", "expected_inquiries: Option<u32>"]
+invariants = ["source/revision/method non-blank", "Complete requires all expected counts", "handles unique", "denominator independently recheckable"]
+
+[[public_type]]
+name = "EpistemicCoverage"
+kind = "struct"
+definition = ["state: EpistemicCoverageState", "denominator: Option<EpistemicCoverageDenominator>", "observed_claims: u32", "observed_conflicts: u32", "observed_inquiries: u32", "missing_owner_or_reason_refs: Vec<String>"]
+invariants = ["Complete requires exact count equality and no missing refs", "Partial requires denominator and named missing refs", "Unavailable or Blocked has no observed items and names owner/reason", "Conflicted preserves conflict identities rather than hiding coverage"]
+
+[[public_type]]
+name = "VerifierCompetence"
+kind = "struct"
+definition = ["verifier_ref: ArtifactId", "competence_scope: String", "revision: String", "applicability_evidence_handles: Vec<ArtifactId>", "limitations: Vec<String>"]
+invariants = ["scope/revision exact", "applicability evidence non-empty for material support", "limitations remain visible"]
+
+[[public_type]]
+name = "EpistemicClaim"
+kind = "struct"
+definition = ["claim_id: ArtifactId", "role: EpistemicRole", "statement_handle: ArtifactId", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "source_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "dependency_handles: Vec<ArtifactId>", "dependence_class: EvidenceDependenceClass", "assertability: Assertability", "freshness: EvidenceFreshness", "verifier_competence: Vec<VerifierCompetence>", "invalidation_conditions: Vec<String>"]
+invariants = ["source handles non-empty and unique", "role is explicit input/result rather than inferred from confidence", "ExplicitAssumption requires an explicit assumption source", "Supported requires applicable verifier/provenance evidence", "Observed is not automatically Assertable", "stale/superseded/unknown cannot be silently omitted"]
+
+[[public_type]]
+name = "ConflictKind"
+kind = "enum"
+definition = ["DirectContradiction", "ScopeMismatch", "TemporalRevision", "DefinitionMismatch", "AuthorityMismatch", "VerifierDisagreement", "Unknown"]
+
+[[public_type]]
+name = "ConflictParticipant"
+kind = "struct"
+definition = ["claim_ref: ArtifactId", "role: EpistemicRole", "source_handles: Vec<ArtifactId>", "dependence_class: EvidenceDependenceClass", "shared_lineage_handles: Vec<ArtifactId>", "scope_id: String", "state_fence: StateFence"]
+invariants = ["participant identity/source/scope/fence exact", "shared lineage explicit", "participant count is not vote weight"]
+
+[[public_type]]
+name = "ConflictSet"
+kind = "struct"
+definition = ["conflict_id: ArtifactId", "kind: ConflictKind", "scope_id: String", "state_fence: StateFence", "participants: Vec<ConflictParticipant>", "common_evidence_handles: Vec<ArtifactId>", "independent_evidence_handles: Vec<ArtifactId>", "resolved_aspects: Vec<String>", "unresolved_aspects: Vec<String>", "temporary_safe_actions: Vec<String>", "revision_conditions: Vec<String>"]
+invariants = ["at least two participants", "unresolved aspects non-empty until explicitly resolved", "independent and shared evidence remain separate", "conflict does not promote one participant by vote or model preference"]
+
+[[public_type]]
+name = "InvestigationKind"
+kind = "enum"
+definition = ["AcquireEvidence", "Revalidate", "DiscriminateRivals", "ClarifyScope", "ClarifyDefinition", "CheckVerifier", "InspectDependencyClosure"]
+
+[[public_type]]
+name = "InvestigationRequirement"
+kind = "struct"
+definition = ["requirement_id: ArtifactId", "kind: InvestigationKind", "question: String", "target_claim_refs: Vec<ArtifactId>", "target_conflict_refs: Vec<ArtifactId>", "expected_discriminative_observable: String", "candidate_probe: String", "required_capability_refs: Vec<String>", "risk_basis_points: u16", "cost_basis_points: u16", "reversibility_basis_points: u16", "stop_conditions: Vec<String>", "revision_conditions: Vec<String>"]
+invariants = ["question/observable/probe non-blank", "at least one target", "basis points within 0..=10000", "requirement is not a job, tool call or effect", "stop/revision conditions explicit"]
+
+[[public_type]]
+name = "CurrentEpistemicPositionRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "coverage: EpistemicCoverage", "maximum_claims: u32", "maximum_conflicts: u32", "maximum_inquiries: u32", "request_sha256: String"]
+invariants = ["scope/task/fence exact", "all bounds non-zero", "request grants no evidence acquisition, support promotion, Context admission or effect authority"]
+
+[[public_type]]
+name = "CurrentEpistemicPosition"
+kind = "struct"
+definition = ["request_sha256: String", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "coverage: EpistemicCoverage", "claims: Vec<EpistemicClaim>", "conflicts: Vec<ConflictSet>", "investigation_requirements: Vec<InvestigationRequirement>", "provenance_closure_handles: Vec<ArtifactId>", "position_sha256: String"]
+invariants = ["all claim/conflict/inquiry identities unique", "all roles independently addressable", "material source handles included in provenance closure", "counts respect request and denominator", "contains no global confidence, truth promotion, Context admission, investigation execution or task-finish field", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_current_position_request"
+signature = "pub fn validate_current_position_request(request: &CurrentEpistemicPositionRequest) -> Result<(), EpistemicContractError>"
+
+[[public_function]]
+name = "validate_current_epistemic_position"
+signature = "pub fn validate_current_epistemic_position(request: &CurrentEpistemicPositionRequest, position: &CurrentEpistemicPosition) -> Result<(), EpistemicContractError>"
+
+[[public_function]]
+name = "current_epistemic_position_digest"
+signature = "pub fn current_epistemic_position_digest(position: &CurrentEpistemicPosition) -> Result<String, EpistemicContractError>"
+
+[[negative_test]]
+id = "absence-not-assumption"
+property = "A claim without explicit assumption source cannot be classified ExplicitAssumption."
+
+[[negative_test]]
+id = "observed-not-supported"
+property = "Observed evidence does not automatically become Supported or Assertable."
+
+[[negative_test]]
+id = "rival-count-not-vote"
+property = "More dependent sources or agents cannot outweigh independent contrary evidence by count."
+
+[[negative_test]]
+id = "conflict-not-global-flag"
+property = "A local conflict remains a ConflictSet and does not collapse every unrelated claim to Conflicted."
+
+[[negative_test]]
+id = "stale-and-superseded-visible"
+property = "Stale and Superseded claims remain explicit with lineage and invalidation conditions."
+
+[[negative_test]]
+id = "inquiry-not-execution"
+property = "InvestigationRequirement schema exposes no job, tool invocation, budget reservation, route or effect receipt."
