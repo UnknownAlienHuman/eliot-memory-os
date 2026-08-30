@@ -1,0 +1,322 @@
+{
+  "schema_version": "eliot.swarm-product-pulse-scenario.v1",
+  "scenario_id": "swarm-four-hosts-simulated-v1",
+  "task": {
+    "task_id": "task:swarm-fixture-001",
+    "work_scope_id": "scope:swarm-fixture-001",
+    "controller_id": "controller:swarm-fixture-001"
+  },
+  "work_items": [
+    {
+      "work_item_id": "work:codex-implementer",
+      "attempt_id": "attempt:codex-001",
+      "host": "codex",
+      "role": "implementer",
+      "route_profile": "integrations/codex/route-profile.json",
+      "selected_model_id": null,
+      "model_selection_receipt_ref": "simulated:model-selection:codex",
+      "provider_execution": false,
+      "native_subagents": false,
+      "context_packet": {
+        "goal_ref": "goal:implement-bounded-change",
+        "scope_refs": [
+          "scope:file-set-a"
+        ],
+        "constraint_refs": [
+          "constraint:no-authority",
+          "constraint:candidate-only"
+        ],
+        "evidence_refs": [
+          "evidence:contract-a"
+        ],
+        "unknown_refs": [
+          "unknown:runtime-unexecuted"
+        ],
+        "skill_index_refs": [
+          "skill-index:eliot-work"
+        ],
+        "mcp_profile_ref": "mcp-profile:task-relative-read-only"
+      },
+      "terminal": "succeeded",
+      "result_ref": "result:codex-001",
+      "cancellation_ref": null
+    },
+    {
+      "work_item_id": "work:opencode-reviewer",
+      "attempt_id": "attempt:opencode-001",
+      "host": "opencode",
+      "role": "reviewer",
+      "route_profile": "integrations/opencode/route-profile.json",
+      "selected_model_id": null,
+      "model_selection_receipt_ref": "simulated:model-selection:opencode",
+      "provider_execution": false,
+      "native_subagents": false,
+      "context_packet": {
+        "goal_ref": "goal:review-bounded-change",
+        "scope_refs": [
+          "scope:file-set-a"
+        ],
+        "constraint_refs": [
+          "constraint:independent-review",
+          "constraint:no-authority"
+        ],
+        "evidence_refs": [
+          "evidence:contract-a",
+          "evidence:candidate-diff-a"
+        ],
+        "unknown_refs": [
+          "unknown:provider-unexecuted"
+        ],
+        "skill_index_refs": [
+          "skill-index:eliot-work"
+        ],
+        "mcp_profile_ref": "mcp-profile:task-relative-read-only"
+      },
+      "terminal": "succeeded",
+      "result_ref": "result:opencode-001",
+      "cancellation_ref": null
+    },
+    {
+      "work_item_id": "work:claude-challenger",
+      "attempt_id": "attempt:claude-001",
+      "host": "claude",
+      "role": "challenger",
+      "route_profile": "integrations/claude/route-profile.json",
+      "selected_model_id": null,
+      "model_selection_receipt_ref": "simulated:model-selection:claude",
+      "provider_execution": false,
+      "native_subagents": false,
+      "context_packet": {
+        "goal_ref": "goal:construct-rival-model",
+        "scope_refs": [
+          "scope:file-set-a"
+        ],
+        "constraint_refs": [
+          "constraint:preserve-dissent",
+          "constraint:no-authority"
+        ],
+        "evidence_refs": [
+          "evidence:contract-a",
+          "evidence:candidate-diff-a"
+        ],
+        "unknown_refs": [
+          "unknown:edge-proof-missing"
+        ],
+        "skill_index_refs": [
+          "skill-index:eliot-work"
+        ],
+        "mcp_profile_ref": "mcp-profile:task-relative-read-only"
+      },
+      "terminal": "succeeded",
+      "result_ref": "result:claude-001",
+      "cancellation_ref": null
+    },
+    {
+      "work_item_id": "work:antigravity-verifier",
+      "attempt_id": "attempt:antigravity-001",
+      "host": "antigravity",
+      "role": "verifier",
+      "route_profile": "integrations/antigravity/route-profile.json",
+      "selected_model_id": null,
+      "model_selection_receipt_ref": "simulated:model-selection:antigravity",
+      "provider_execution": false,
+      "native_subagents": false,
+      "context_packet": {
+        "goal_ref": "goal:verify-cancellation-closure",
+        "scope_refs": [
+          "scope:attempt-antigravity-001"
+        ],
+        "constraint_refs": [
+          "constraint:descendant-closure",
+          "constraint:unknown-outcome-visible"
+        ],
+        "evidence_refs": [
+          "evidence:cancel-request-a"
+        ],
+        "unknown_refs": [
+          "unknown:provider-not-started"
+        ],
+        "skill_index_refs": [
+          "skill-index:eliot-work"
+        ],
+        "mcp_profile_ref": "mcp-profile:task-relative-read-only"
+      },
+      "terminal": "cancelled",
+      "result_ref": null,
+      "cancellation_ref": "cancellation:antigravity-001"
+    }
+  ],
+  "sealed_results": [
+    {
+      "result_ref": "result:codex-001",
+      "attempt_id": "attempt:codex-001",
+      "candidate_only": true,
+      "authority": "none",
+      "packet": {
+        "summary": "A bounded candidate implementation was produced for review.",
+        "claims": [
+          "claim:implementation-matches-declared-scope"
+        ],
+        "artifact_refs": [
+          "artifact:candidate-diff-a"
+        ],
+        "evidence_refs": [
+          "evidence:unit-fixture-a"
+        ],
+        "unknowns": [
+          "unknown:real-runtime-unexecuted"
+        ],
+        "objections": []
+      }
+    },
+    {
+      "result_ref": "result:opencode-001",
+      "attempt_id": "attempt:opencode-001",
+      "candidate_only": true,
+      "authority": "none",
+      "packet": {
+        "summary": "The reviewer found one bounded contract risk and one passing invariant.",
+        "claims": [
+          "claim:scope-is-bounded"
+        ],
+        "artifact_refs": [],
+        "evidence_refs": [
+          "evidence:review-a"
+        ],
+        "unknowns": [
+          "unknown:integration-coverage"
+        ],
+        "objections": [
+          "objection:event-ordering-needs-edge-proof"
+        ]
+      }
+    },
+    {
+      "result_ref": "result:claude-001",
+      "attempt_id": "attempt:claude-001",
+      "candidate_only": true,
+      "authority": "none",
+      "packet": {
+        "summary": "A rival explanation attributes the apparent success to fixture-only coverage.",
+        "claims": [
+          "claim:fixture-proof-is-not-edge-proof"
+        ],
+        "artifact_refs": [],
+        "evidence_refs": [
+          "evidence:rival-model-a"
+        ],
+        "unknowns": [
+          "unknown:provider-event-coverage"
+        ],
+        "objections": [
+          "objection:no-real-provider-execution"
+        ]
+      }
+    }
+  ],
+  "cancellation_receipts": [
+    {
+      "cancellation_ref": "cancellation:antigravity-001",
+      "attempt_id": "attempt:antigravity-001",
+      "provider_cancel_requested": false,
+      "terminal_readback": "simulated_not_started",
+      "process_tree_closed": true,
+      "descendants_closed": true,
+      "unknown_live_descendants": false,
+      "outcome": "cancelled_confirmed"
+    }
+  ],
+  "mailbox": [
+    {
+      "message_id": "mail:controller-codex",
+      "from": "task_controller",
+      "to": "attempt:codex-001",
+      "kind": "context_packet_ref",
+      "reference": "context:work:codex-implementer"
+    },
+    {
+      "message_id": "mail:controller-opencode",
+      "from": "task_controller",
+      "to": "attempt:opencode-001",
+      "kind": "context_packet_ref",
+      "reference": "context:work:opencode-reviewer"
+    },
+    {
+      "message_id": "mail:controller-claude",
+      "from": "task_controller",
+      "to": "attempt:claude-001",
+      "kind": "context_packet_ref",
+      "reference": "context:work:claude-challenger"
+    },
+    {
+      "message_id": "mail:controller-antigravity",
+      "from": "task_controller",
+      "to": "attempt:antigravity-001",
+      "kind": "context_packet_ref",
+      "reference": "context:work:antigravity-verifier"
+    },
+    {
+      "message_id": "mail:codex-result",
+      "from": "attempt:codex-001",
+      "to": "task_controller",
+      "kind": "sealed_result_ref",
+      "reference": "result:codex-001"
+    },
+    {
+      "message_id": "mail:opencode-result",
+      "from": "attempt:opencode-001",
+      "to": "task_controller",
+      "kind": "sealed_result_ref",
+      "reference": "result:opencode-001"
+    },
+    {
+      "message_id": "mail:claude-result",
+      "from": "attempt:claude-001",
+      "to": "task_controller",
+      "kind": "sealed_result_ref",
+      "reference": "result:claude-001"
+    },
+    {
+      "message_id": "mail:antigravity-cancel",
+      "from": "attempt:antigravity-001",
+      "to": "task_controller",
+      "kind": "cancellation_receipt_ref",
+      "reference": "cancellation:antigravity-001"
+    }
+  ],
+  "concilium": {
+    "form": "concilium_over_sealed_evidence",
+    "evidence_refs": [
+      "result:codex-001",
+      "result:opencode-001",
+      "result:claude-001",
+      "cancellation:antigravity-001"
+    ],
+    "rival_models": [
+      "rival:implementation-correct",
+      "rival:fixture-only-success"
+    ],
+    "objections": [
+      "objection:event-ordering-needs-edge-proof",
+      "objection:no-real-provider-execution"
+    ],
+    "discriminative_tests": [
+      "test:exact-version-route-pulse",
+      "test:cancellation-process-tree-readback"
+    ],
+    "preserved_dissent": [
+      "dissent:fixture-proof-does-not-establish-runtime-support"
+    ],
+    "synthesis_ref": "synthesis:swarm-fixture-001",
+    "result_authority": "candidate_only"
+  },
+  "decision": {
+    "owner": "task_controller_or_human",
+    "disposition": "simulated_no_promotion",
+    "eligible_for_route_promotion": false,
+    "reason_refs": [
+      "reason:no-provider-execution",
+      "reason:edge-proof-missing"
+    ]
+  }
+}
