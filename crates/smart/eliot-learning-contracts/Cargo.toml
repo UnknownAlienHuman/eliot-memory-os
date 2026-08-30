@@ -26,6 +26,7 @@ contract_refs = [
   "crates/smart/cognitive-current.toml",
   "crates/smart/eliot-learning-contracts/experience.contract.toml",
   "crates/smart/eliot-learning-contracts/task-local-learning.contract.toml",
+  "crates/smart/eliot-learning-contracts/learning-evaluation.contract.toml",
 ]
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"

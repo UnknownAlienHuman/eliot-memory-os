@@ -1,0 +1,301 @@
+schema_version = 1
+contract_id = "smart.learning.evaluation.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-learning-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.learning.contracts.evaluation", "meta.learning.activation_assessment", "meta.learning.closure", "meta.learning.promotion_input"]
+architecture_refs = ["ARCH-CORE-00", "ARCH-LEARN-01", "ARCH-LEARN-02", "ARCH-META-01", "ARCH-EPI-03", "ARCH-EPI-04", "ARCH-UND-02", "ARCH-SCOPE-01"]
+implementation_refs = ["I7.25", "I7.27", "I12.24", "I14.5", "I16.23"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Assess externally receipted overlay activation, trajectory adherence, decision/outcome delta, learning closure and advisory promotion evidence dimension by dimension without creating receipts, inferring hidden use, or deciding global promotion."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((activation evidence + adherence checkpoints + outcomes + promotion dimensions) log n) over bounded immutable receipts/projections; no model call, route/tool execution, canonical write, promotion or policy mutation."
+replacement_boundary = "Replace learning evaluation algorithms behind this contract; external Harness owner creates activation receipts and Governor/Human owns promotion, policy and rollout decisions."
+
+[closed_sets]
+activation_stages = ["Eligible", "Delivered", "Parsed", "Available", "Invoked", "ObservablyUsed"]
+observation_states = ["Observed", "NotObserved", "Unknown", "NotApplicable"]
+adherence_checkpoints = ["Early", "Mid", "Finish"]
+adherence_states = ["Adhered", "Violated", "Mixed", "Unknown", "NotApplicable"]
+decision_delta_states = ["BeneficialChange", "NeutralChange", "HarmfulChange", "NoObservedChange", "Unknown", "NotApplicable"]nclosure_dispositions = ["ReusableCandidate", "LocalOnlyResidue", "NoReusableDelta", "Inconclusive", "InvalidEvidence"]
+promotion_dimensions = ["CurrentApplicability", "Activation", "Adherence", "DecisionDelta", "Outcome", "Retention", "Transfer", "EvaluatorValidity", "ProductPulse", "Rollback", "Economics", "Authority"]
+promotion_dimension_states = ["Pass", "Fail", "Inconclusive", "NotApplicable"]
+
+[hard_invariants]
+activation_receipt_is_created_only_by_external_observer_owner = true
+assessment_cannot_create_or_modify_activation_receipt = true
+acknowledgement_delivery_or_parsing_is_not_observed_use = true
+hidden_activation_or_adherence_is_never_inferred = true
+activation_adherence_decision_delta_and_outcome_are_separate = true
+success_without_attribution_does_not_prove_overlay_mechanism = true
+one_off_external_event_may_yield_no_reusable_delta = true
+closure_may_honestly_return_no_reusable_delta = true
+retention_transfer_and_current_applicability_are_independent = true
+product_pulse_evaluator_validity_rollback_economics_and_authority_are_independent = true
+no_aggregate_promotion_learning_confidence_or_utility_score = true
+promotion_input_is_advisory_and_contains_no_promotion_decision = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "ContractIdentity"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "CampaignId"
+owner = "eliot-learning-contracts/experience.contract.toml"
+
+[[external_type]]
+name = "AttemptId"
+owner = "eliot-learning-contracts/experience.contract.toml"
+
+[[external_type]]
+name = "OutcomeAttribution"
+owner = "eliot-learning-contracts/experience.contract.toml"
+
+[[external_type]]
+name = "OutcomeStatus"
+owner = "eliot-learning-contracts/experience.contract.toml"
+
+[[external_type]]
+name = "CampaignLearningStateView"
+owner = "eliot-learning-contracts/task-local-learning.contract.toml"
+
+[[external_type]]
+name = "AttemptLearningDelta"
+owner = "eliot-learning-contracts/task-local-learning.contract.toml"
+
+[[external_type]]
+name = "CampaignHarnessOverlayCandidate"
+owner = "eliot-learning-contracts/task-local-learning.contract.toml"
+
+[[public_type]]
+name = "ActivationObservationState"
+kind = "enum"
+definition = ["Observed", "NotObserved", "Unknown", "NotApplicable"]
+
+[[public_type]]
+name = "ActivationStage"
+kind = "enum"
+definition = ["Eligible", "Delivered", "Parsed", "Available", "Invoked", "ObservablyUsed"]
+
+[[public_type]]
+name = "HarnessActivationReceiptRef"
+kind = "struct"
+definition = ["receipt_handle: ArtifactId", "receipt_contract: ContractIdentity", "issuer_owner_ref: String", "issuer_generation: String", "overlay_candidate_sha256: String", "campaign_id: CampaignId", "task_id: TaskId", "attempt_id: AttemptId", "target_route_fingerprint: String", "state_fence: StateFence", "issued_before_attempt_observation_ref: ArtifactId", "evidence_handles: Vec<ArtifactId>", "receipt_sha256: String"]
+invariants = ["receipt created outside this contract by declared owner", "candidate/campaign/task/attempt/route/fence exact", "pre-attempt ordering evidence exact", "evidence handles unique", "ref exposes no receipt-construction method"]
+
+[[public_type]]
+name = "AttemptTraceProjectionRef"
+kind = "struct"
+definition = ["projection_handle: ArtifactId", "projection_sha256: String", "owner_ref: String", "owner_revision: String", "campaign_id: CampaignId", "task_id: TaskId", "attempt_id: AttemptId", "route_fingerprint: String", "state_fence: StateFence", "coverage_state: String", "blind_interval_refs: Vec<ArtifactId>", "evidence_handles: Vec<ArtifactId>"]
+invariants = ["owner/identity/route/fence exact", "blind intervals visible", "partial/unknown coverage cannot prove non-use"]
+
+[[public_type]]
+name = "ActivationStageAssessment"
+kind = "struct"
+definition = ["stage: ActivationStage", "state: ActivationObservationState", "evidence_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "reason_codes: Vec<String>"]
+invariants = ["one result per stage", "later stage cannot be inferred from earlier stage", "Observed requires exact evidence", "Unknown is not NotObserved"]
+
+[[public_type]]
+name = "HarnessActivationAssessment"
+kind = "struct"
+definition = ["assessment_id: ArtifactId", "overlay_candidate_sha256: String", "receipt_sha256: String", "trace_projection_sha256: String", "campaign_id: CampaignId", "task_id: TaskId", "attempt_id: AttemptId", "route_fingerprint: String", "state_fence: StateFence", "stages: Vec<ActivationStageAssessment>", "coverage_reason_codes: Vec<String>", "assessment_sha256: String"]
+invariants = ["exactly six stage assessments", "identity/receipt/trace/fence exact", "acknowledgement alone cannot set ObservablyUsed", "contains no receipt construction, outcome or promotion decision", "canonical order and digest"]
+
+[[public_type]]
+name = "AdherenceCheckpoint"
+kind = "enum"
+definition = ["Early", "Mid", "Finish"]
+
+[[public_type]]
+name = "AdherenceState"
+kind = "enum"
+definition = ["Adhered", "Violated", "Mixed", "Unknown", "NotApplicable"]
+
+[[public_type]]
+name = "AdherenceCheckpointAssessment"
+kind = "struct"
+definition = ["checkpoint: AdherenceCheckpoint", "state: AdherenceState", "expected_behavior_refs: Vec<ArtifactId>", "observed_behavior_refs: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "reason_codes: Vec<String>"]
+invariants = ["one assessment per checkpoint", "silence/coverage gap is Unknown", "early adherence does not imply mid/finish adherence"]
+
+[[public_type]]
+name = "AdherenceAssessment"
+kind = "struct"
+definition = ["assessment_id: ArtifactId", "overlay_candidate_sha256: String", "attempt_id: AttemptId", "trace_projection_sha256: String", "state_fence: StateFence", "checkpoints: Vec<AdherenceCheckpointAssessment>", "coverage_reason_codes: Vec<String>", "assessment_sha256: String"]
+invariants = ["exactly early/mid/finish checkpoints", "identity/fence exact", "no hidden adherence inference", "canonical order and digest"]
+
+[[public_type]]
+name = "DecisionDeltaState"
+kind = "enum"
+definition = ["BeneficialChange", "NeutralChange", "HarmfulChange", "NoObservedChange", "Unknown", "NotApplicable"]
+
+[[public_type]]
+name = "DecisionDeltaAssessment"
+kind = "struct"
+definition = ["assessment_id: ArtifactId", "baseline_decision_ref: Option<ArtifactId>", "candidate_decision_ref: Option<ArtifactId>", "state: DecisionDeltaState", "changed_dimension_refs: Vec<String>", "evidence_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "outcome_attribution: OutcomeAttribution", "reason_codes: Vec<String>"]
+invariants = ["baseline/candidate decision references exact when present", "decision change may be harmful", "missing comparison is Unknown/NotApplicable", "decision delta alone is not outcome benefit"]
+
+[[public_type]]
+name = "LearningOutcomeAssessment"
+kind = "struct"
+definition = ["assessment_id: ArtifactId", "outcome_ref: ArtifactId", "status: OutcomeStatus", "attribution: OutcomeAttribution", "immediate_outcome_horizon: String", "evidence_handles: Vec<ArtifactId>", "effect_receipt_handles: Vec<ArtifactId>", "confounders: Vec<String>", "counterevidence_handles: Vec<ArtifactId>", "reason_codes: Vec<String>"]
+invariants = ["known outcome requires evidence", "mechanism attribution requires applicable activation/adherence/decision/effect evidence", "confounders retained", "outcome cannot promote itself"]
+
+[[public_type]]
+name = "CampaignLearningClosureDisposition"
+kind = "enum"
+definition = ["ReusableCandidate", "LocalOnlyResidue", "NoReusableDelta", "Inconclusive", "InvalidEvidence"]
+
+[[public_type]]
+name = "CampaignLearningClosureCandidate"
+kind = "struct"
+definition = ["closure_id: ArtifactId", "state_view_sha256: String", "delta_sha256: String", "activation_assessment_sha256: String", "adherence_assessment_sha256: String", "decision_delta_assessment_sha256: String", "outcome_assessment_sha256: String", "campaign_id: CampaignId", "task_id: TaskId", "state_fence: StateFence", "disposition: CampaignLearningClosureDisposition", "mechanism_hypothesis_ref: ArtifactId", "mechanism_attribution: OutcomeAttribution", "reusable_scope: Option<String>", "local_only_residue_handles: Vec<ArtifactId>", "supporting_evidence_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "confounders: Vec<String>", "evidence_gap_codes: Vec<String>", "next_discriminator: Option<String>", "closure_sha256: String"]
+invariants = ["all identities and assessments agree", "NoReusableDelta valid without reusable scope", "ReusableCandidate requires attributed activation/adherence/decision/outcome evidence and explicit scope", "one-off/external/confounded success may be local-only/no-delta", "closure contains no promotion decision or current influence", "canonical order and digest"]
+
+[[public_type]]
+name = "PromotionEvidenceDimension"
+kind = "enum"
+definition = ["CurrentApplicability", "Activation", "Adherence", "DecisionDelta", "Outcome", "Retention", "Transfer", "EvaluatorValidity", "ProductPulse", "Rollback", "Economics", "Authority"]
+
+[[public_type]]
+name = "PromotionDimensionState"
+kind = "enum"
+definition = ["Pass", "Fail", "Inconclusive", "NotApplicable"]
+
+[[public_type]]
+name = "PromotionDimensionAssessment"
+kind = "struct"
+definition = ["dimension: PromotionEvidenceDimension", "state: PromotionDimensionState", "evidence_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "reason_codes: Vec<String>", "expiry_or_invalidation: String"]
+invariants = ["one result per dimension", "Pass requires exact current evidence", "Inconclusive is not Pass", "dimensions are never summed into one score"]
+
+[[public_type]]
+name = "RetentionAssessment"
+kind = "struct"
+definition = ["assessment_ref: ArtifactId", "horizon: String", "compatible_attempt_refs: Vec<ArtifactId>", "dimension: PromotionDimensionAssessment"]
+invariants = ["horizon and compatible attempts explicit", "current-task benefit does not imply retention"]
+
+[[public_type]]
+name = "TransferAssessment"
+kind = "struct"
+definition = ["assessment_ref: ArtifactId", "source_scope: String", "target_scope: String", "requalification_probe_ref: ArtifactId", "held_out_or_independent_evidence_handles: Vec<ArtifactId>", "dimension: PromotionDimensionAssessment"]
+invariants = ["source/target scope distinct and exact", "same evidence that generated candidate cannot self-confirm transfer"]
+
+[[public_type]]
+name = "EvaluatorValidityAssessment"
+kind = "struct"
+definition = ["assessment_ref: ArtifactId", "evaluation_contract_ref: ArtifactId", "evaluator_generation_ref: String", "construct_and_scope_validity_refs: Vec<ArtifactId>", "known_blind_spots: Vec<String>", "dimension: PromotionDimensionAssessment"]
+invariants = ["evaluator identity/current validity exact", "same-family judge is not automatically independent"]
+
+[[public_type]]
+name = "ProductPulseAssessment"
+kind = "struct"
+definition = ["assessment_ref: ArtifactId", "product_identity_ref: ArtifactId", "product_pulse_ref: ArtifactId", "pulse_execution_ref: ArtifactId", "affected_edge_refs: Vec<ArtifactId>", "dimension: PromotionDimensionAssessment"]
+invariants = ["exact Product Identity and executed pulse required for Pass", "local Module PASS cannot substitute"]
+
+[[public_type]]
+name = "RollbackAssessment"
+kind = "struct"
+definition = ["assessment_ref: ArtifactId", "rollback_plan_ref: ArtifactId", "rollback_execution_or_rehearsal_ref: Option<ArtifactId>", "state_restoration_scope: String", "unknown_effect_refs: Vec<ArtifactId>", "dimension: PromotionDimensionAssessment"]
+invariants = ["rollback plan exact", "unknown external effect prevents Pass", "candidate cannot execute rollback"]
+
+[[public_type]]
+name = "EconomicsAssessment"
+kind = "struct"
+definition = ["assessment_ref: ArtifactId", "cost_receipt_handles: Vec<ArtifactId>", "benefit_evidence_handles: Vec<ArtifactId>", "opportunity_cost_refs: Vec<ArtifactId>", "dimension: PromotionDimensionAssessment"]
+invariants = ["cost/benefit/opportunity evidence separate", "missing cost remains Inconclusive", "no aggregate economics score"]
+
+[[public_type]]
+name = "AuthorityAssessment"
+kind = "struct"
+definition = ["assessment_ref: ArtifactId", "required_authority_refs: Vec<String>", "current_authority_evidence_handles: Vec<ArtifactId>", "forbidden_boundary_refs: Vec<String>", "dimension: PromotionDimensionAssessment"]
+invariants = ["authority is explicit external evidence", "content/benefit cannot create authority", "assessment cannot activate grant"]
+
+[[public_type]]
+name = "PromotionInputCandidate"
+kind = "struct"
+definition = ["candidate_id: ArtifactId", "closure_sha256: String", "campaign_id: CampaignId", "source_task_id: TaskId", "source_scope: String", "proposed_target_scope: String", "state_fence: StateFence", "dimensions: Vec<PromotionDimensionAssessment>", "retention: RetentionAssessment", "transfer: TransferAssessment", "evaluator_validity: EvaluatorValidityAssessment", "product_pulse: ProductPulseAssessment", "rollback: RollbackAssessment", "economics: EconomicsAssessment", "authority: AuthorityAssessment", "candidate_change_handle: ArtifactId", "validity_scope: String", "expiry_condition: String", "supporting_evidence_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "required_decision_owner_ref: String", "candidate_sha256: String"]
+invariants = ["all twelve dimensions represented", "candidate is advisory-only", "no Promote/Reject/Canary/Apply decision or current influence field", "failed/inconclusive load-bearing dimension remains visible", "validity/expiry/owner/evidence exact", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_activation_receipt_ref"
+signature = "pub fn validate_activation_receipt_ref(candidate: &CampaignHarnessOverlayCandidate, receipt: &HarnessActivationReceiptRef) -> Result<(), LearningContractError>"
+
+[[public_function]]
+name = "validate_activation_assessment"
+signature = "pub fn validate_activation_assessment(candidate: &CampaignHarnessOverlayCandidate, receipt: &HarnessActivationReceiptRef, trace: &AttemptTraceProjectionRef, value: &HarnessActivationAssessment) -> Result<(), LearningContractError>"
+
+[[public_function]]
+name = "validate_adherence_assessment"
+signature = "pub fn validate_adherence_assessment(candidate: &CampaignHarnessOverlayCandidate, trace: &AttemptTraceProjectionRef, value: &AdherenceAssessment) -> Result<(), LearningContractError>"
+
+[[public_function]]
+name = "validate_learning_closure"
+signature = "pub fn validate_learning_closure(view: &CampaignLearningStateView, delta: &AttemptLearningDelta, activation: &HarnessActivationAssessment, adherence: &AdherenceAssessment, decision_delta: &DecisionDeltaAssessment, outcome: &LearningOutcomeAssessment, value: &CampaignLearningClosureCandidate) -> Result<(), LearningContractError>"
+
+[[public_function]]
+name = "validate_promotion_input"
+signature = "pub fn validate_promotion_input(closure: &CampaignLearningClosureCandidate, value: &PromotionInputCandidate) -> Result<(), LearningContractError>"
+
+[[negative_test]]
+id = "self-created-receipt-rejected"
+property = "Assessment package exposes no activation receipt constructor and rejects wrong issuer/candidate/attempt identity."
+
+[[negative_test]]
+id = "acknowledgement-not-activation"
+property = "Delivered/parsed/acknowledged evidence alone cannot set Invoked or ObservablyUsed."
+
+[[negative_test]]
+id = "partial-trace-inconclusive"
+property = "Blind/partial trace produces Unknown/Inconclusive rather than assumed non-use or use."
+
+[[negative_test]]
+id = "early-adherence-not-finish"
+property = "Early adherence cannot imply mid or finish adherence."
+
+[[negative_test]]
+id = "success-not-mechanism"
+property = "Success without attributed activation/adherence/decision/effect evidence cannot yield ReusableCandidate."
+
+[[negative_test]]
+id = "no-reusable-delta-valid"
+property = "One-off external/confounded event may close as NoReusableDelta."
+
+[[negative_test]]
+id = "failed-transfer-visible"
+property = "Current task success with failed/inconclusive transfer remains failed/inconclusive in promotion input."
+
+[[negative_test]]
+id = "product-pulse-required"
+property = "Local package or edge evidence cannot set ProductPulse Pass without exact executed pulse/Product Identity."
+
+[[negative_test]]
+id = "promotion-input-not-decision"
+property = "PromotionInputCandidate exposes no promotion, rollout, canary, policy, authority activation or current influence decision."
+
+[[negative_test]]
+id = "no-aggregate-score"
+property = "No total learning/promotion/confidence/utility score exists and one failed load-bearing dimension cannot be masked."
