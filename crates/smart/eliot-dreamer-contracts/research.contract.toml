@@ -1,0 +1,179 @@
+schema_version = 1
+contract_id = "smart.dreamer.research.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-dreamer-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.dreamer.contracts.research", "smart.dreamer.research_synthesis"]
+architecture_refs = ["ARCH-DRM-01", "ARCH-DRM-03", "ARCH-EPI-04", "ARCH-SCOPE-01", "ARCH-SEC-03", "ARCH-RES-05"]
+implementation_refs = ["I2.20", "I9.4", "I9 research synthesis", "I12.18"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Interpret one frozen Researcher-produced evidence bundle into citation-complete, counterclaim-aware synthesis candidates without acquisition, provider discovery, support promotion or canonical write."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure_interpretation"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((sources + claims + citations + failures + unknowns) log n) over request-bounded immutable research evidence; no network, provider SDK, credential, browser, model route or store I/O."
+replacement_boundary = "Replace interpretation behind this contract; Researcher owns acquisition and source persistence, Governor owns admission/support/influence, and provider/runtime owners execute routes."
+
+[closed_sets]
+source_states = ["Acquired", "PartiallyAcquired", "Failed", "Blocked", "Unavailable", "Stale"]
+source_kinds = ["PrimaryDocument", "OfficialDocumentation", "ResearchPaper", "Dataset", "Repository", "NewsReport", "UserProvided", "Other"]
+claim_dispositions = ["SupportedCandidate", "ContestedCandidate", "AssumptionCandidate", "Unknown", "RejectedCandidate"]
+coverage_states = ["Complete", "Partial", "Blocked", "Unavailable", "Stale", "Conflicted"]
+completion_dispositions = ["SynthesisCandidateReady", "PartialCandidateReady", "RequiresAcquisition", "RequiresClarification", "Blocked"]
+
+[hard_invariants]
+researcher_acquires_dreamer_interprets_governor_governs = true
+synthesis_has_no_network_provider_credential_or_discovery = true
+allowed_reference_manifest_is_closed = true
+exact_citations_and_content_digests_are_preserved = true
+failed_blocked_unavailable_and_stale_acquisition_remain_visible = true
+complete_requires_exact_recheckable_denominator = true
+source_count_is_not_coverage_or_truth = true
+counterclaims_conflicts_and_minor_sources_remain_addressable = true
+citation_does_not_promote_support_or_authority = true
+synthesis_is_candidate_only_and_cannot_update_memory = true
+unknown_or_unresolved_claim_is_not_filled_by_model_memory = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "DreamJobEnvelope"
+owner = "eliot-dreamer-contracts/common.contract.toml"
+
+[[external_type]]
+name = "ReferenceManifest"
+owner = "eliot-dreamer-contracts/common.contract.toml"
+
+[[external_type]]
+name = "AdmittedDreamDraft"
+owner = "eliot-dreamer-contracts/common.contract.toml"
+
+[[public_type]]
+name = "ResearchSourceState"
+kind = "enum"
+definition = ["Acquired", "PartiallyAcquired", "Failed", "Blocked", "Unavailable", "Stale"]
+
+[[public_type]]
+name = "ResearchSourceKind"
+kind = "enum"
+definition = ["PrimaryDocument", "OfficialDocumentation", "ResearchPaper", "Dataset", "Repository", "NewsReport", "UserProvided", "Other"]
+
+[[public_type]]
+name = "ResearchCitationLocator"
+kind = "struct"
+definition = ["source_handle: ArtifactId", "content_sha256: String", "locator_kind: String", "locator_value: String", "exact_excerpt_sha256: Option<String>", "line_or_section_hint: Option<String>"]
+invariants = ["source/content/locator exact", "excerpt digest required when excerpt is used", "locator is not a raw credential or unrestricted URL capability"]
+
+[[public_type]]
+name = "ResearchSourceRecord"
+kind = "struct"
+definition = ["source_handle: ArtifactId", "kind: ResearchSourceKind", "state: ResearchSourceState", "title: String", "publisher_or_owner: String", "source_authority_ceiling: String", "acquisition_receipt_handle: Option<ArtifactId>", "content_sha256: Option<String>", "citation_locators: Vec<ResearchCitationLocator>", "scope_id: String", "state_fence: StateFence", "freshness_revision: String", "dependency_handles: Vec<ArtifactId>", "failure_or_block_reason_codes: Vec<String>"]
+invariants = ["Acquired requires receipt/content digest/citation locator", "Failed/Blocked/Unavailable requires reason", "state and authority ceiling are source-owned", "Dreamer cannot reacquire or repair source"]
+
+[[public_type]]
+name = "ResearchCoverageDenominator"
+kind = "struct"
+definition = ["research_question_sha256: String", "acquisition_plan_ref: ArtifactId", "acquisition_plan_revision: String", "expected_source_handles: Vec<ArtifactId>", "expected_source_kinds: Vec<ResearchSourceKind>", "expected_queries: Option<u32>", "expected_sources: Option<u32>", "method_ref: String"]
+invariants = ["question/plan/method exact", "Complete requires expected queries and sources", "handles/kinds unique", "denominator fixed before synthesis"]
+
+[[public_type]]
+name = "ResearchCoverageState"
+kind = "enum"
+definition = ["Complete", "Partial", "Blocked", "Unavailable", "Stale", "Conflicted"]
+
+[[public_type]]
+name = "ResearchCoverage"
+kind = "struct"
+definition = ["state: ResearchCoverageState", "denominator: Option<ResearchCoverageDenominator>", "executed_queries: u32", "observed_sources: u32", "failed_or_blocked_source_handles: Vec<ArtifactId>", "missing_owner_or_reason_refs: Vec<String>", "coverage_unknowns: Vec<String>"]
+invariants = ["Complete requires exact query/source count and no missing refs", "Partial/Blocked names missing/failed acquisition", "Conflicted names unresolved source conflict", "coverage cannot be inferred from source count alone"]
+
+[[public_type]]
+name = "ResearchEvidenceBundle"
+kind = "struct"
+definition = ["bundle_id: ArtifactId", "research_question: String", "research_question_sha256: String", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "allowed_reference_manifest_sha256: String", "coverage: ResearchCoverage", "sources: Vec<ResearchSourceRecord>", "counterclaim_handles: Vec<ArtifactId>", "conflict_handles: Vec<ArtifactId>", "material_unknown_handles: Vec<ArtifactId>", "bundle_sha256: String"]
+invariants = ["question/scope/task/fence exact", "source handles unique", "all sources occur in allowed manifest", "failed sources and unknowns retained", "canonical order and digest", "bundle carries no acquisition capability"]
+
+[[public_type]]
+name = "ResearchSynthesisRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "job_sha256: String", "evidence_bundle_sha256: String", "admitted_draft_sha256: String", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "maximum_claims: u32", "maximum_citations_per_claim: u32", "maximum_counterclaims: u32", "request_sha256: String"]
+invariants = ["digests/scope/task/fence exact", "bounds non-zero", "job class is ResearchSynthesis", "request grants no acquisition, provider, support or write authority"]
+
+[[public_type]]
+name = "ResearchClaimDisposition"
+kind = "enum"
+definition = ["SupportedCandidate", "ContestedCandidate", "AssumptionCandidate", "Unknown", "RejectedCandidate"]
+
+[[public_type]]
+name = "ResearchClaimCandidate"
+kind = "struct"
+definition = ["claim_id: ArtifactId", "statement: String", "disposition: ResearchClaimDisposition", "citation_locators: Vec<ResearchCitationLocator>", "source_handles: Vec<ArtifactId>", "counterclaim_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "dependence_or_shared_lineage_handles: Vec<ArtifactId>", "unsupported_residue: Option<String>", "source_authority_ceiling: String", "invalidation_conditions: Vec<String>"]
+invariants = ["statement bounded", "material candidate has exact citation/source handles", "shared lineage/counterclaims remain visible", "Unsupported residue prevents SupportedCandidate", "candidate does not promote epistemic support"]
+
+[[public_type]]
+name = "ResearchCompletionDisposition"
+kind = "enum"
+definition = ["SynthesisCandidateReady", "PartialCandidateReady", "RequiresAcquisition", "RequiresClarification", "Blocked"]
+
+[[public_type]]
+name = "ResearchSynthesisCandidate"
+kind = "struct"
+definition = ["request_sha256: String", "evidence_bundle_sha256: String", "admitted_draft_sha256: String", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "coverage: ResearchCoverage", "claims: Vec<ResearchClaimCandidate>", "failed_or_blocked_source_handles: Vec<ArtifactId>", "material_unknown_handles: Vec<ArtifactId>", "conflict_handles: Vec<ArtifactId>", "completion: ResearchCompletionDisposition", "recommended_next_acquisition_questions: Vec<String>", "candidate_sha256: String"]
+invariants = ["claims/failures/unknowns/conflicts bounded and addressable", "Complete candidate requires Complete research coverage", "RequiresAcquisition is advisory and has no acquisition job/tool fields", "contains no canonical write/support promotion/policy/task finish", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_research_evidence_bundle"
+signature = "pub fn validate_research_evidence_bundle(job: &DreamJobEnvelope, manifest: &ReferenceManifest, bundle: &ResearchEvidenceBundle) -> Result<(), ResearchContractError>"
+
+[[public_function]]
+name = "validate_research_synthesis_request"
+signature = "pub fn validate_research_synthesis_request(request: &ResearchSynthesisRequest, bundle: &ResearchEvidenceBundle, admitted: &AdmittedDreamDraft) -> Result<(), ResearchContractError>"
+
+[[public_function]]
+name = "validate_research_synthesis_candidate"
+signature = "pub fn validate_research_synthesis_candidate(request: &ResearchSynthesisRequest, bundle: &ResearchEvidenceBundle, candidate: &ResearchSynthesisCandidate) -> Result<(), ResearchContractError>"
+
+[[negative_test]]
+id = "synthesis-no-acquisition"
+property = "ResearchSynthesisRequest/Candidate contain no URL fetch, provider credential, browser, search, network, tool invocation or acquisition job field."
+
+[[negative_test]]
+id = "failed-source-visible"
+property = "Failed/blocked/unavailable expected source cannot be omitted while claiming Complete coverage."
+
+[[negative_test]]
+id = "citation-outside-manifest-rejected"
+property = "Citation whose source is outside allowed ReferenceManifest is rejected."
+
+[[negative_test]]
+id = "source-count-not-coverage"
+property = "Observed source count without fixed acquisition denominator cannot produce Complete."
+
+[[negative_test]]
+id = "citation-not-support-promotion"
+property = "Citation or multiple dependent sources do not create canonical Supported status."
+
+[[negative_test]]
+id = "candidate-only"
+property = "Research synthesis output contains no canonical write, memory mutation, support promotion, task finish or effect."
