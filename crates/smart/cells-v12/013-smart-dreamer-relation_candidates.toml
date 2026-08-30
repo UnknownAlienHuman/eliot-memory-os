@@ -1,0 +1,48 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+field_contract_is_sole_public_type_authority = true
+order = 13
+cell = "smart.dreamer.relation_candidates"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-orientation"
+primary_property = "Build typed Orientation and Curation relation candidates through one shared semantic core while keeping temporal order, similarity, dependency and causality distinct."
+field_contract = "crates/smart/eliot-dreamer-contracts/orientation.contract.toml"
+public_function_selectors = [
+  "build_orientation_relation_candidates",
+  "build_curation_relation_candidates",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-orientation/src/relation_candidates.rs",
+  "crates/smart/eliot-dreamer-orientation/tests/relation_candidates.rs",
+]
+algorithm = [
+  "validate typed use case, request identity, admitted evidence, scope/task/fence and relation bounds",
+  "normalize exact endpoint identities without merging them",
+  "classify temporal, similarity, dependency, part-of, contradiction and causal-candidate relations separately",
+  "require causal candidate mechanism, supporting evidence, counterevidence, rival explanation and falsifier",
+  "retain provenance, source-authority ceiling, confidence-independent status and revision conditions",
+  "deduplicate only exact semantic duplicates and compute deterministic set digest",
+]
+minimum_tests = [
+  "observed sequence cannot become causal candidate without mechanism and falsifier",
+  "semantic similarity cannot perform identity merge or influence revocation",
+  "orientation and curation entrypoints share semantics but reject wrong typed use case",
+  "counterevidence and rival explanations retained",
+  "dependent evidence is not counted as independent support",
+  "candidate set exposes no canonical relation write",
+]
+non_goals = [
+  "relation admission/canonical write",
+  "merge/split execution",
+  "influence revocation",
+  "truth/support promotion",
+  "model/tool execution",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-MEM-03", "ARCH-DRM-01", "ARCH-EPI-03", "ARCH-UND-02"]
+implementation_refs = ["I2.20", "I9.5", "I9.8", "I12.18"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than converting chronology/similarity to causality, merging identities, revoking influence, or accepting an untyped relation request."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
