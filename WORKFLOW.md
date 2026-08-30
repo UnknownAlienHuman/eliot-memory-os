@@ -1,5 +1,29 @@
 # Development workflow
 
+<!-- eliot-doc-routing:start -->
+## Mandatory documentation routing
+
+Before changing code, configuration, tests, workflows, or normative prose, run
+from the repository root:
+
+```text
+python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+```
+
+Repeat `--path` for every mutable path family, or use `--changed-from
+origin/main` for the complete branch delta, including deletions. The command
+runs the canonical router, verifies every required item against its routed
+SHA-256 and byte count, and renders the bounded content. Read the generated
+bundle before mutation; a route listing by itself does not satisfy this gate.
+
+Record the read receipt ID, bundle SHA-256, matched routes, required handles, and
+an explicit reading attestation in the pull request. Optional fragments are
+loaded only when the current decision crosses their boundary. If no route
+matches, an item is stale, or scope expands, stop and rerun or repair the route.
+See [`docs/architecture/READING_PROTOCOL.md`](docs/architecture/READING_PROTOCOL.md).
+<!-- eliot-doc-routing:end -->
+
+
 ## One authority surface
 
 `main` is the current product source and documentation authority. Issues define
@@ -23,8 +47,9 @@ open issue with owner, causal property, scope, proof, and non-goals
 → fetch/prune and fast-forward main only
 → create a fresh issue-numbered branch from exact origin/main
 → claim one mutable path scope
+→ route, verify, and read the bounded documentation bundle
 → implement and run Module/Edge/Product proof as applicable
-→ open PR to main
+→ open PR to main with read receipt and attestation
 → integrate by squash after current-main and proof checks
 → close issue and retire the branch
 ```
@@ -83,7 +108,8 @@ Do not keep in the active tree:
 - donor research packages or reverse-engineering dumps;
 - copies of documentation owned by Eliot Search or Eliot Research;
 - swarm conversations/results;
-- local databases, code-graph snapshots, runtime state, or credentials.
+- local databases, code-graph snapshots, runtime state, or credentials;
+- generated documentation bundles or read receipts.
 
 Investigation findings belong in the owning issue/PR. Large generated evidence
 belongs in CI artifacts or an external content-addressed store. Retired content
@@ -97,6 +123,7 @@ A PR states:
 - owning issue/workstream;
 - exact base and candidate revisions;
 - changed causal property and path scope;
+- documentation route/read receipt, bundle hash, handles, and agent attestation;
 - proof executed and proof ceiling;
 - affected edges and Product Pulse, or why they are not applicable;
 - migration/rollback/removal consequences;

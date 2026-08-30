@@ -1,5 +1,12 @@
 # ELIOT Memory OS project map
 
+<!-- eliot-doc-routing:start -->
+## Documentation entry point
+
+Start with the [mandatory reading protocol](architecture/READING_PROTOCOL.md), then use the generated route for the exact files and causal property being changed. The stable `ELIOT_*` files are compatibility maps, not task prompts.
+<!-- eliot-doc-routing:end -->
+
+
 Status: current routing map for `main`, 2026-08-29. Navigation only; product
 status remains `NOT_ACCEPTED / UNVERIFIED`.
 

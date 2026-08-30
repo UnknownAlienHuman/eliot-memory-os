@@ -1,3 +1,12 @@
+<!-- generated: eliot-doc-shards-v1 -->
+# ELIOT canonical topic index
+
+For executable routing, use [`ROUTES.md`](ROUTES.md). For an exact section
+handle, use [`HANDLE_INDEX.md`](HANDLE_INDEX.md). The table below preserves the
+pre-sharding topic map; each handle now resolves to a bounded fragment.
+
+## Preserved topic map
+
 # ELIOT canonical topic index
 
 This file is a navigation projection over the accepted pair. It is not a third

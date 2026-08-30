@@ -1,5 +1,12 @@
 # ELIOT Memory OS
 
+<!-- eliot-doc-routing:start -->
+## Documentation entry point
+
+Start with the [mandatory reading protocol](docs/architecture/READING_PROTOCOL.md), then use the generated route for the exact files and causal property being changed. The stable `ELIOT_*` files are compatibility maps, not task prompts.
+<!-- eliot-doc-routing:end -->
+
+
 > Pre-alpha — active development. Not ready for use.
 
 ELIOT is a governed memory, understanding, and learning system for AI agents.

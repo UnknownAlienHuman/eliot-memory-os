@@ -1,0 +1,3075 @@
+{
+  "schema_version": "eliot-doc-shards-v1",
+  "source_key": "architecture",
+  "label": "Architecture",
+  "legacy_compatibility_path": "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "entry_path": "docs/architecture/architecture/README.md",
+  "source_sha256": "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a",
+  "source_bytes": 149403,
+  "source_characters": 148905,
+  "source_lines": 2831,
+  "fragment_count": 123,
+  "fragments": [
+    {
+      "order": 0,
+      "path": "docs/architecture/A-PREFACE-01-eliot-architecture.md",
+      "source_start_char": 0,
+      "source_end_char": 3178,
+      "source_start_line": 1,
+      "source_end_line": 65,
+      "source_sha256": "b99167150e3acd8cf7a761a999c9b206ab8e1f86b888223f9208f2995a890769",
+      "rendered_sha256": "b99167150e3acd8cf7a761a999c9b206ab8e1f86b888223f9208f2995a890769",
+      "source_bytes": 3196,
+      "rendered_bytes": 3196,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "ELIOT Architecture",
+          "handle": null,
+          "source_line": 1,
+          "source_anchor": "eliot-architecture",
+          "fragment_anchor": "eliot-architecture"
+        },
+        {
+          "level": 2,
+          "title": "Architecture of Intent, Understanding, and a Resilient Agent System",
+          "handle": null,
+          "source_line": 2,
+          "source_anchor": "architecture-of-intent-understanding-and-a-resilient-agent-system",
+          "fragment_anchor": "architecture-of-intent-understanding-and-a-resilient-agent-system"
+        }
+      ]
+    },
+    {
+      "order": 1,
+      "path": "docs/architecture/A00-constitutional-meaning-and-interpretation-rules.md",
+      "source_start_char": 3178,
+      "source_end_char": 3233,
+      "source_start_line": 65,
+      "source_end_line": 67,
+      "source_sha256": "50eb69aad8b5a9f0255242fe1fefa20fdec8c63c98b2b227fcbdb32cd176ce8b",
+      "rendered_sha256": "50eb69aad8b5a9f0255242fe1fefa20fdec8c63c98b2b227fcbdb32cd176ce8b",
+      "source_bytes": 55,
+      "rendered_bytes": 55,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A0. Constitutional Meaning and Interpretation Rules",
+          "handle": "A0",
+          "source_line": 65,
+          "source_anchor": "a0-constitutional-meaning-and-interpretation-rules",
+          "fragment_anchor": "a0-constitutional-meaning-and-interpretation-rules"
+        }
+      ]
+    },
+    {
+      "order": 2,
+      "path": "docs/architecture/A00-01-purpose-of-the-architecture.md",
+      "source_start_char": 3233,
+      "source_end_char": 5102,
+      "source_start_line": 67,
+      "source_end_line": 100,
+      "source_sha256": "ee540ede56579ec388e26da2b290759e78ad3bb8a70ba57d56364800a1692750",
+      "rendered_sha256": "ee540ede56579ec388e26da2b290759e78ad3bb8a70ba57d56364800a1692750",
+      "source_bytes": 1871,
+      "rendered_bytes": 1871,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A0.1. Purpose of the Architecture",
+          "handle": "A0.1",
+          "source_line": 67,
+          "source_anchor": "a01-purpose-of-the-architecture",
+          "fragment_anchor": "a01-purpose-of-the-architecture"
+        }
+      ]
+    },
+    {
+      "order": 3,
+      "path": "docs/architecture/A00-02-hierarchy-of-architectural-decisions.md",
+      "source_start_char": 5102,
+      "source_end_char": 6969,
+      "source_start_line": 100,
+      "source_end_line": 129,
+      "source_sha256": "342c67f670714c83bb4c68693447fd7597bc4a662b87d4fa6bae09df3cbaf6e5",
+      "rendered_sha256": "342c67f670714c83bb4c68693447fd7597bc4a662b87d4fa6bae09df3cbaf6e5",
+      "source_bytes": 1867,
+      "rendered_bytes": 1867,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A0.2. Hierarchy of Architectural Decisions",
+          "handle": "A0.2",
+          "source_line": 100,
+          "source_anchor": "a02-hierarchy-of-architectural-decisions",
+          "fragment_anchor": "a02-hierarchy-of-architectural-decisions"
+        }
+      ]
+    },
+    {
+      "order": 4,
+      "path": "docs/architecture/A00-03-hard-boundaries.md",
+      "source_start_char": 6969,
+      "source_end_char": 7790,
+      "source_start_line": 129,
+      "source_end_line": 160,
+      "source_sha256": "695fe5e156e0dde052556e23c34b008009348742d4fc4a1146393b8b13a48bc0",
+      "rendered_sha256": "695fe5e156e0dde052556e23c34b008009348742d4fc4a1146393b8b13a48bc0",
+      "source_bytes": 821,
+      "rendered_bytes": 821,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A0.3. Hard Boundaries",
+          "handle": "A0.3",
+          "source_line": 129,
+          "source_anchor": "a03-hard-boundaries",
+          "fragment_anchor": "a03-hard-boundaries"
+        }
+      ]
+    },
+    {
+      "order": 5,
+      "path": "docs/architecture/A00-04-conflict-resolution.md",
+      "source_start_char": 7790,
+      "source_end_char": 9108,
+      "source_start_line": 160,
+      "source_end_line": 185,
+      "source_sha256": "732d3b9a63973398e07e48691ba56f6538d9168f3102e0702a5ca2e08910f556",
+      "rendered_sha256": "732d3b9a63973398e07e48691ba56f6538d9168f3102e0702a5ca2e08910f556",
+      "source_bytes": 1318,
+      "rendered_bytes": 1318,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A0.4. Conflict Resolution",
+          "handle": "A0.4",
+          "source_line": 160,
+          "source_anchor": "a04-conflict-resolution",
+          "fragment_anchor": "a04-conflict-resolution"
+        }
+      ]
+    },
+    {
+      "order": 6,
+      "path": "docs/architecture/A00-05-concilium.md",
+      "source_start_char": 9108,
+      "source_end_char": 9780,
+      "source_start_line": 185,
+      "source_end_line": 193,
+      "source_sha256": "71ce2362e86f0fd0adf2addebb9634ae233c75cbddae47faee8d9609a56810d2",
+      "rendered_sha256": "71ce2362e86f0fd0adf2addebb9634ae233c75cbddae47faee8d9609a56810d2",
+      "source_bytes": 674,
+      "rendered_bytes": 674,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A0.5. Concilium",
+          "handle": "A0.5",
+          "source_line": 185,
+          "source_anchor": "a05-concilium",
+          "fragment_anchor": "a05-concilium"
+        }
+      ]
+    },
+    {
+      "order": 7,
+      "path": "docs/architecture/A00-06-changing-the-architecture.md",
+      "source_start_char": 9780,
+      "source_end_char": 10628,
+      "source_start_line": 193,
+      "source_end_line": 210,
+      "source_sha256": "c086ee01cc243b7d7dee465bc0ddfca0c36cc3a344b3b3e803a5eb94ff6f68a8",
+      "rendered_sha256": "c086ee01cc243b7d7dee465bc0ddfca0c36cc3a344b3b3e803a5eb94ff6f68a8",
+      "source_bytes": 858,
+      "rendered_bytes": 858,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A0.6. Changing the Architecture",
+          "handle": "A0.6",
+          "source_line": 193,
+          "source_anchor": "a06-changing-the-architecture",
+          "fragment_anchor": "a06-changing-the-architecture"
+        }
+      ]
+    },
+    {
+      "order": 8,
+      "path": "docs/architecture/A00-07-core-vocabulary.md",
+      "source_start_char": 10628,
+      "source_end_char": 20838,
+      "source_start_line": 210,
+      "source_end_line": 280,
+      "source_sha256": "67126dbba1b3b69d43bf010278c42e4c1136eb4a93df74eb3cc542b60b370d60",
+      "rendered_sha256": "67126dbba1b3b69d43bf010278c42e4c1136eb4a93df74eb3cc542b60b370d60",
+      "source_bytes": 10212,
+      "rendered_bytes": 10212,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A0.7. Core Vocabulary",
+          "handle": "A0.7",
+          "source_line": 210,
+          "source_anchor": "a07-core-vocabulary",
+          "fragment_anchor": "a07-core-vocabulary"
+        }
+      ]
+    },
+    {
+      "order": 9,
+      "path": "docs/architecture/A00-08-progressive-conformance.md",
+      "source_start_char": 20838,
+      "source_end_char": 22654,
+      "source_start_line": 280,
+      "source_end_line": 313,
+      "source_sha256": "9a887dc617c81e87bf7badc67086ab04d8531ae40969eaad92fd4d3972b7f561",
+      "rendered_sha256": "9a887dc617c81e87bf7badc67086ab04d8531ae40969eaad92fd4d3972b7f561",
+      "source_bytes": 1818,
+      "rendered_bytes": 1818,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A0.8. Progressive Conformance",
+          "handle": "A0.8",
+          "source_line": 280,
+          "source_anchor": "a08-progressive-conformance",
+          "fragment_anchor": "a08-progressive-conformance"
+        }
+      ]
+    },
+    {
+      "order": 10,
+      "path": "docs/architecture/A00-09-current-strategic-defaults.md",
+      "source_start_char": 22654,
+      "source_end_char": 23848,
+      "source_start_line": 313,
+      "source_end_line": 329,
+      "source_sha256": "7b78f2c9c9d67771fd90f3bec59d996d10e9c065fb5b8cfc365e17d70fde660b",
+      "rendered_sha256": "7b78f2c9c9d67771fd90f3bec59d996d10e9c065fb5b8cfc365e17d70fde660b",
+      "source_bytes": 1194,
+      "rendered_bytes": 1194,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A0.9. Current Strategic Defaults",
+          "handle": "A0.9",
+          "source_line": 313,
+          "source_anchor": "a09-current-strategic-defaults",
+          "fragment_anchor": "a09-current-strategic-defaults"
+        }
+      ]
+    },
+    {
+      "order": 11,
+      "path": "docs/architecture/A01-mission-and-theoretical-core.md",
+      "source_start_char": 23848,
+      "source_end_char": 23884,
+      "source_start_line": 329,
+      "source_end_line": 331,
+      "source_sha256": "8e19cb1097d9f12bea3baae013799604312bd3f6a854d2581dd8fc7a1a252522",
+      "rendered_sha256": "8e19cb1097d9f12bea3baae013799604312bd3f6a854d2581dd8fc7a1a252522",
+      "source_bytes": 36,
+      "rendered_bytes": 36,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A1. Mission and Theoretical Core",
+          "handle": "A1",
+          "source_line": 329,
+          "source_anchor": "a1-mission-and-theoretical-core",
+          "fragment_anchor": "a1-mission-and-theoretical-core"
+        }
+      ]
+    },
+    {
+      "order": 12,
+      "path": "docs/architecture/A01-01-primary-purpose.md",
+      "source_start_char": 23884,
+      "source_end_char": 25411,
+      "source_start_line": 331,
+      "source_end_line": 357,
+      "source_sha256": "21e6a10990bbe9de73a6b091a365f41743f8a80fc8e953cfe32eb2c585dad6f5",
+      "rendered_sha256": "21e6a10990bbe9de73a6b091a365f41743f8a80fc8e953cfe32eb2c585dad6f5",
+      "source_bytes": 1531,
+      "rendered_bytes": 1531,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A1.1. Primary Purpose",
+          "handle": "A1.1",
+          "source_line": 331,
+          "source_anchor": "a11-primary-purpose",
+          "fragment_anchor": "a11-primary-purpose"
+        }
+      ]
+    },
+    {
+      "order": 13,
+      "path": "docs/architecture/A01-02-why-this-is-not-rag.md",
+      "source_start_char": 25411,
+      "source_end_char": 26150,
+      "source_start_line": 357,
+      "source_end_line": 386,
+      "source_sha256": "68474ac1ab57e85e2fbf374c4b63b75abcf1bfcbac9dfd2233bde10fc1dfea1e",
+      "rendered_sha256": "68474ac1ab57e85e2fbf374c4b63b75abcf1bfcbac9dfd2233bde10fc1dfea1e",
+      "source_bytes": 751,
+      "rendered_bytes": 751,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A1.2. Why This Is Not RAG",
+          "handle": "A1.2",
+          "source_line": 357,
+          "source_anchor": "a12-why-this-is-not-rag",
+          "fragment_anchor": "a12-why-this-is-not-rag"
+        }
+      ]
+    },
+    {
+      "order": 14,
+      "path": "docs/architecture/A01-03-core-postulates.md",
+      "source_start_char": 26150,
+      "source_end_char": 28311,
+      "source_start_line": 386,
+      "source_end_line": 414,
+      "source_sha256": "5859376c8b778056ea6e8d78f5c23c3fe487df7199657c5fa0cebcc4de536f5e",
+      "rendered_sha256": "5859376c8b778056ea6e8d78f5c23c3fe487df7199657c5fa0cebcc4de536f5e",
+      "source_bytes": 2161,
+      "rendered_bytes": 2161,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A1.3. Core Postulates",
+          "handle": "A1.3",
+          "source_line": 386,
+          "source_anchor": "a13-core-postulates",
+          "fragment_anchor": "a13-core-postulates"
+        }
+      ]
+    },
+    {
+      "order": 15,
+      "path": "docs/architecture/A01-04-four-planes.md",
+      "source_start_char": 28311,
+      "source_end_char": 29495,
+      "source_start_line": 414,
+      "source_end_line": 441,
+      "source_sha256": "1d6f6794f64428aaaab596769fa0760c8f155d17097530fafa619eaa93b608e2",
+      "rendered_sha256": "1d6f6794f64428aaaab596769fa0760c8f155d17097530fafa619eaa93b608e2",
+      "source_bytes": 1194,
+      "rendered_bytes": 1194,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A1.4. Four Planes",
+          "handle": "A1.4",
+          "source_line": 414,
+          "source_anchor": "a14-four-planes",
+          "fragment_anchor": "a14-four-planes"
+        }
+      ]
+    },
+    {
+      "order": 16,
+      "path": "docs/architecture/A01-05-boundaries.md",
+      "source_start_char": 29495,
+      "source_end_char": 30470,
+      "source_start_line": 441,
+      "source_end_line": 462,
+      "source_sha256": "4b4ae97e7c6ad4732948e7e3d6e95eeaf4029355ccd6d10d844e8f3f31e4800d",
+      "rendered_sha256": "4b4ae97e7c6ad4732948e7e3d6e95eeaf4029355ccd6d10d844e8f3f31e4800d",
+      "source_bytes": 977,
+      "rendered_bytes": 977,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A1.5. Boundaries",
+          "handle": "A1.5",
+          "source_line": 441,
+          "source_anchor": "a15-boundaries",
+          "fragment_anchor": "a15-boundaries"
+        }
+      ]
+    },
+    {
+      "order": 17,
+      "path": "docs/architecture/A02-participants-authority-and-modularity.md",
+      "source_start_char": 30470,
+      "source_end_char": 30517,
+      "source_start_line": 462,
+      "source_end_line": 464,
+      "source_sha256": "06612f4b8427b2623f0a37cf1671ab7204a21011336806b460967f10d9afa5a7",
+      "rendered_sha256": "06612f4b8427b2623f0a37cf1671ab7204a21011336806b460967f10d9afa5a7",
+      "source_bytes": 47,
+      "rendered_bytes": 47,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A2. Participants, Authority, and Modularity",
+          "handle": "A2",
+          "source_line": 462,
+          "source_anchor": "a2-participants-authority-and-modularity",
+          "fragment_anchor": "a2-participants-authority-and-modularity"
+        }
+      ]
+    },
+    {
+      "order": 18,
+      "path": "docs/architecture/A02-01-complementary-fallibility.md",
+      "source_start_char": 30517,
+      "source_end_char": 31870,
+      "source_start_line": 464,
+      "source_end_line": 482,
+      "source_sha256": "91c08b11aab07ffbf23655a48e202a85806606552b0a0e3d41d4b0c406280d4d",
+      "rendered_sha256": "91c08b11aab07ffbf23655a48e202a85806606552b0a0e3d41d4b0c406280d4d",
+      "source_bytes": 1359,
+      "rendered_bytes": 1359,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A2.1. Complementary Fallibility",
+          "handle": "A2.1",
+          "source_line": 464,
+          "source_anchor": "a21-complementary-fallibility",
+          "fragment_anchor": "a21-complementary-fallibility"
+        }
+      ]
+    },
+    {
+      "order": 19,
+      "path": "docs/architecture/A02-02-roles.md",
+      "source_start_char": 31870,
+      "source_end_char": 35128,
+      "source_start_line": 482,
+      "source_end_line": 541,
+      "source_sha256": "bcfddaf37bc39566bd6c49e868f3ddccc2e2eee5086568b33e6ab7a5e2d7f307",
+      "rendered_sha256": "bcfddaf37bc39566bd6c49e868f3ddccc2e2eee5086568b33e6ab7a5e2d7f307",
+      "source_bytes": 3258,
+      "rendered_bytes": 3258,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A2.2. Roles",
+          "handle": "A2.2",
+          "source_line": 482,
+          "source_anchor": "a22-roles",
+          "fragment_anchor": "a22-roles"
+        },
+        {
+          "level": 3,
+          "title": "Human Roles",
+          "handle": null,
+          "source_line": 486,
+          "source_anchor": "human-roles",
+          "fragment_anchor": "human-roles"
+        },
+        {
+          "level": 3,
+          "title": "Main Agent",
+          "handle": null,
+          "source_line": 497,
+          "source_anchor": "main-agent",
+          "fragment_anchor": "main-agent"
+        },
+        {
+          "level": 3,
+          "title": "Task Controller",
+          "handle": null,
+          "source_line": 501,
+          "source_anchor": "task-controller",
+          "fragment_anchor": "task-controller"
+        },
+        {
+          "level": 3,
+          "title": "Governor and Kernel",
+          "handle": null,
+          "source_line": 505,
+          "source_anchor": "governor-and-kernel",
+          "fragment_anchor": "governor-and-kernel"
+        },
+        {
+          "level": 3,
+          "title": "Canonical Memory",
+          "handle": null,
+          "source_line": 509,
+          "source_anchor": "canonical-memory",
+          "fragment_anchor": "canonical-memory"
+        },
+        {
+          "level": 3,
+          "title": "Truth Surfaces and Verifiers",
+          "handle": null,
+          "source_line": 513,
+          "source_anchor": "truth-surfaces-and-verifiers",
+          "fragment_anchor": "truth-surfaces-and-verifiers"
+        },
+        {
+          "level": 3,
+          "title": "Harness and Agent Coordinator",
+          "handle": null,
+          "source_line": 517,
+          "source_anchor": "harness-and-agent-coordinator",
+          "fragment_anchor": "harness-and-agent-coordinator"
+        },
+        {
+          "level": 3,
+          "title": "Host Supervisor",
+          "handle": null,
+          "source_line": 521,
+          "source_anchor": "host-supervisor",
+          "fragment_anchor": "host-supervisor"
+        },
+        {
+          "level": 3,
+          "title": "Watchdog and Doctor",
+          "handle": null,
+          "source_line": 525,
+          "source_anchor": "watchdog-and-doctor",
+          "fragment_anchor": "watchdog-and-doctor"
+        },
+        {
+          "level": 3,
+          "title": "Dreamer",
+          "handle": null,
+          "source_line": 529,
+          "source_anchor": "dreamer",
+          "fragment_anchor": "dreamer"
+        },
+        {
+          "level": 3,
+          "title": "Workers, Auditors, Verifier Agents, Synthesis Agents, and Curators",
+          "handle": null,
+          "source_line": 533,
+          "source_anchor": "workers-auditors-verifier-agents-synthesis-agents-and-curators",
+          "fragment_anchor": "workers-auditors-verifier-agents-synthesis-agents-and-curators"
+        },
+        {
+          "level": 3,
+          "title": "Human Control Plane",
+          "handle": null,
+          "source_line": 537,
+          "source_anchor": "human-control-plane",
+          "fragment_anchor": "human-control-plane"
+        }
+      ]
+    },
+    {
+      "order": 20,
+      "path": "docs/architecture/A02-03-modular-architecture.md",
+      "source_start_char": 35128,
+      "source_end_char": 41233,
+      "source_start_line": 541,
+      "source_end_line": 622,
+      "source_sha256": "6f7d0566576ddfcb88bae531421b58082b44e3ba6cd2b974f55a46990e26fd52",
+      "rendered_sha256": "6f7d0566576ddfcb88bae531421b58082b44e3ba6cd2b974f55a46990e26fd52",
+      "source_bytes": 6133,
+      "rendered_bytes": 6133,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A2.3. Modular Architecture",
+          "handle": "A2.3",
+          "source_line": 541,
+          "source_anchor": "a23-modular-architecture",
+          "fragment_anchor": "a23-modular-architecture"
+        }
+      ]
+    },
+    {
+      "order": 21,
+      "path": "docs/architecture/A03-workscope-and-a-changing-world.md",
+      "source_start_char": 41233,
+      "source_end_char": 42972,
+      "source_start_line": 622,
+      "source_end_line": 673,
+      "source_sha256": "13eee2f2d0ea6d78509edceb4722dd879639ddbf6932bcd577b2e9f3cff9d298",
+      "rendered_sha256": "13eee2f2d0ea6d78509edceb4722dd879639ddbf6932bcd577b2e9f3cff9d298",
+      "source_bytes": 1741,
+      "rendered_bytes": 1741,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A3. WorkScope and a Changing World",
+          "handle": "A3",
+          "source_line": 622,
+          "source_anchor": "a3-workscope-and-a-changing-world",
+          "fragment_anchor": "a3-workscope-and-a-changing-world"
+        }
+      ]
+    },
+    {
+      "order": 22,
+      "path": "docs/architecture/A04-cognitive-inheritance-and-memory.md",
+      "source_start_char": 42972,
+      "source_end_char": 43012,
+      "source_start_line": 673,
+      "source_end_line": 675,
+      "source_sha256": "2c0c30c7f5ffa11417f992df47fd2db08f447aca3a0b23ceb00bb3015a8bda3d",
+      "rendered_sha256": "2c0c30c7f5ffa11417f992df47fd2db08f447aca3a0b23ceb00bb3015a8bda3d",
+      "source_bytes": 40,
+      "rendered_bytes": 40,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A4. Cognitive Inheritance and Memory",
+          "handle": "A4",
+          "source_line": 673,
+          "source_anchor": "a4-cognitive-inheritance-and-memory",
+          "fragment_anchor": "a4-cognitive-inheritance-and-memory"
+        }
+      ]
+    },
+    {
+      "order": 23,
+      "path": "docs/architecture/A04-01-what-eliot-stores.md",
+      "source_start_char": 43012,
+      "source_end_char": 43913,
+      "source_start_line": 675,
+      "source_end_line": 694,
+      "source_sha256": "6a442d45d5f65e9796a0fd2efa83883377d09e49a1124ffb63efba77abcc7a0e",
+      "rendered_sha256": "6a442d45d5f65e9796a0fd2efa83883377d09e49a1124ffb63efba77abcc7a0e",
+      "source_bytes": 901,
+      "rendered_bytes": 901,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A4.1. What ELIOT Stores",
+          "handle": "A4.1",
+          "source_line": 675,
+          "source_anchor": "a41-what-eliot-stores",
+          "fragment_anchor": "a41-what-eliot-stores"
+        }
+      ]
+    },
+    {
+      "order": 24,
+      "path": "docs/architecture/A04-02-capture-first-organize-later.md",
+      "source_start_char": 43913,
+      "source_end_char": 44707,
+      "source_start_line": 694,
+      "source_end_line": 716,
+      "source_sha256": "799292b04425f18728683abf93328bc1bf2a8983051f8dcad771efe9d4d854d5",
+      "rendered_sha256": "799292b04425f18728683abf93328bc1bf2a8983051f8dcad771efe9d4d854d5",
+      "source_bytes": 796,
+      "rendered_bytes": 796,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A4.2. Capture First, Organize Later",
+          "handle": "A4.2",
+          "source_line": 694,
+          "source_anchor": "a42-capture-first-organize-later",
+          "fragment_anchor": "a42-capture-first-organize-later"
+        }
+      ]
+    },
+    {
+      "order": 25,
+      "path": "docs/architecture/A04-03-git-like-history-and-recoverable-fallibility.md",
+      "source_start_char": 44707,
+      "source_end_char": 45634,
+      "source_start_line": 716,
+      "source_end_line": 736,
+      "source_sha256": "d658eb66098cc9b31fafe1fd045aba115f7c32bd179358b6ba3dea2f093496cc",
+      "rendered_sha256": "d658eb66098cc9b31fafe1fd045aba115f7c32bd179358b6ba3dea2f093496cc",
+      "source_bytes": 929,
+      "rendered_bytes": 929,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A4.3. Git-Like History and Recoverable Fallibility",
+          "handle": "A4.3",
+          "source_line": 716,
+          "source_anchor": "a43-git-like-history-and-recoverable-fallibility",
+          "fragment_anchor": "a43-git-like-history-and-recoverable-fallibility"
+        }
+      ]
+    },
+    {
+      "order": 26,
+      "path": "docs/architecture/A04-04-information-lifecycle.md",
+      "source_start_char": 45634,
+      "source_end_char": 46686,
+      "source_start_line": 736,
+      "source_end_line": 764,
+      "source_sha256": "7281148d302c5a53fe0695e43839df899818c45bdadb8232c1d2d01659345fe7",
+      "rendered_sha256": "7281148d302c5a53fe0695e43839df899818c45bdadb8232c1d2d01659345fe7",
+      "source_bytes": 1082,
+      "rendered_bytes": 1082,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A4.4. Information Lifecycle",
+          "handle": "A4.4",
+          "source_line": 736,
+          "source_anchor": "a44-information-lifecycle",
+          "fragment_anchor": "a44-information-lifecycle"
+        }
+      ]
+    },
+    {
+      "order": 27,
+      "path": "docs/architecture/A04-05-evidence-relations-and-continuity.md",
+      "source_start_char": 46686,
+      "source_end_char": 47577,
+      "source_start_line": 764,
+      "source_end_line": 786,
+      "source_sha256": "225e2fadd9c45eb8d8ed16b1ee546d0c4b211671d2cd1275631ce2ae5fa08d56",
+      "rendered_sha256": "225e2fadd9c45eb8d8ed16b1ee546d0c4b211671d2cd1275631ce2ae5fa08d56",
+      "source_bytes": 891,
+      "rendered_bytes": 891,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A4.5. Evidence, Relations, and Continuity",
+          "handle": "A4.5",
+          "source_line": 764,
+          "source_anchor": "a45-evidence-relations-and-continuity",
+          "fragment_anchor": "a45-evidence-relations-and-continuity"
+        }
+      ]
+    },
+    {
+      "order": 28,
+      "path": "docs/architecture/A04-06-memory-transformation.md",
+      "source_start_char": 47577,
+      "source_end_char": 48758,
+      "source_start_line": 786,
+      "source_end_line": 806,
+      "source_sha256": "ea86935fa9bc279ec4e1933c4effc9d1849b4d923df36cb0913a9fedd7b80e68",
+      "rendered_sha256": "ea86935fa9bc279ec4e1933c4effc9d1849b4d923df36cb0913a9fedd7b80e68",
+      "source_bytes": 1183,
+      "rendered_bytes": 1183,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A4.6. Memory Transformation",
+          "handle": "A4.6",
+          "source_line": 786,
+          "source_anchor": "a46-memory-transformation",
+          "fragment_anchor": "a46-memory-transformation"
+        }
+      ]
+    },
+    {
+      "order": 29,
+      "path": "docs/architecture/A04-07-accessibility-support-influence-and-erasure.md",
+      "source_start_char": 48758,
+      "source_end_char": 49407,
+      "source_start_line": 806,
+      "source_end_line": 824,
+      "source_sha256": "c63002e4ed372e427a0e71dd1370a80aba3d2fa690db7348f4d80762fcec8f37",
+      "rendered_sha256": "c63002e4ed372e427a0e71dd1370a80aba3d2fa690db7348f4d80762fcec8f37",
+      "source_bytes": 651,
+      "rendered_bytes": 651,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A4.7. Accessibility, Support, Influence, and Erasure",
+          "handle": "A4.7",
+          "source_line": 806,
+          "source_anchor": "a47-accessibility-support-influence-and-erasure",
+          "fragment_anchor": "a47-accessibility-support-influence-and-erasure"
+        }
+      ]
+    },
+    {
+      "order": 30,
+      "path": "docs/architecture/A05-reality-epistemic-position-and-theories.md",
+      "source_start_char": 49407,
+      "source_end_char": 49456,
+      "source_start_line": 824,
+      "source_end_line": 826,
+      "source_sha256": "b2c0574b7b930f147eba18cba2c2b228b7f9f3e156ae06f1e68a05e9b5807ed4",
+      "rendered_sha256": "b2c0574b7b930f147eba18cba2c2b228b7f9f3e156ae06f1e68a05e9b5807ed4",
+      "source_bytes": 49,
+      "rendered_bytes": 49,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A5. Reality, Epistemic Position, and Theories",
+          "handle": "A5",
+          "source_line": 824,
+          "source_anchor": "a5-reality-epistemic-position-and-theories",
+          "fragment_anchor": "a5-reality-epistemic-position-and-theories"
+        }
+      ]
+    },
+    {
+      "order": 31,
+      "path": "docs/architecture/A05-01-reality-and-observation.md",
+      "source_start_char": 49456,
+      "source_end_char": 49952,
+      "source_start_line": 826,
+      "source_end_line": 842,
+      "source_sha256": "9d19b048fa72976983b9d16104ed3e38aad63a35e1954b2763fe94b78533aab4",
+      "rendered_sha256": "9d19b048fa72976983b9d16104ed3e38aad63a35e1954b2763fe94b78533aab4",
+      "source_bytes": 496,
+      "rendered_bytes": 496,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A5.1. Reality and Observation",
+          "handle": "A5.1",
+          "source_line": 826,
+          "source_anchor": "a51-reality-and-observation",
+          "fragment_anchor": "a51-reality-and-observation"
+        }
+      ]
+    },
+    {
+      "order": 32,
+      "path": "docs/architecture/A05-02-current-epistemic-position.md",
+      "source_start_char": 49952,
+      "source_end_char": 50629,
+      "source_start_line": 842,
+      "source_end_line": 863,
+      "source_sha256": "833af4bdf5f61d4644701678799f1c034818f944226fcd5876f7f176e55c6e06",
+      "rendered_sha256": "833af4bdf5f61d4644701678799f1c034818f944226fcd5876f7f176e55c6e06",
+      "source_bytes": 679,
+      "rendered_bytes": 679,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A5.2. Current Epistemic Position",
+          "handle": "A5.2",
+          "source_line": 842,
+          "source_anchor": "a52-current-epistemic-position",
+          "fragment_anchor": "a52-current-epistemic-position"
+        }
+      ]
+    },
+    {
+      "order": 33,
+      "path": "docs/architecture/A05-03-theory-portfolio-and-epistemic-fitness.md",
+      "source_start_char": 50629,
+      "source_end_char": 51547,
+      "source_start_line": 863,
+      "source_end_line": 892,
+      "source_sha256": "b72b96d7afffbef9707346b28cc8a8d2cfc89c47602f93e9bd7a547a21f0f08c",
+      "rendered_sha256": "b72b96d7afffbef9707346b28cc8a8d2cfc89c47602f93e9bd7a547a21f0f08c",
+      "source_bytes": 920,
+      "rendered_bytes": 920,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A5.3. Theory Portfolio and Epistemic Fitness",
+          "handle": "A5.3",
+          "source_line": 863,
+          "source_anchor": "a53-theory-portfolio-and-epistemic-fitness",
+          "fragment_anchor": "a53-theory-portfolio-and-epistemic-fitness"
+        }
+      ]
+    },
+    {
+      "order": 34,
+      "path": "docs/architecture/A05-04-time-and-state-fence.md",
+      "source_start_char": 51547,
+      "source_end_char": 52119,
+      "source_start_line": 892,
+      "source_end_line": 908,
+      "source_sha256": "3743d518bd4cc3368817246a5c72efc2321148e0cc635426dff331de01d1574e",
+      "rendered_sha256": "3743d518bd4cc3368817246a5c72efc2321148e0cc635426dff331de01d1574e",
+      "source_bytes": 572,
+      "rendered_bytes": 572,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A5.4. Time and State Fence",
+          "handle": "A5.4",
+          "source_line": 892,
+          "source_anchor": "a54-time-and-state-fence",
+          "fragment_anchor": "a54-time-and-state-fence"
+        }
+      ]
+    },
+    {
+      "order": 35,
+      "path": "docs/architecture/A05-05-verifier-and-evaluation-contract.md",
+      "source_start_char": 52119,
+      "source_end_char": 52979,
+      "source_start_line": 908,
+      "source_end_line": 927,
+      "source_sha256": "e984f70ce61942adbdd003278f553fdb51c95b79f2a140ba6b96edde874aece3",
+      "rendered_sha256": "e984f70ce61942adbdd003278f553fdb51c95b79f2a140ba6b96edde874aece3",
+      "source_bytes": 860,
+      "rendered_bytes": 860,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A5.5. Verifier and Evaluation Contract",
+          "handle": "A5.5",
+          "source_line": 908,
+          "source_anchor": "a55-verifier-and-evaluation-contract",
+          "fragment_anchor": "a55-verifier-and-evaluation-contract"
+        }
+      ]
+    },
+    {
+      "order": 36,
+      "path": "docs/architecture/A05-06-inquiry-and-unknowns.md",
+      "source_start_char": 52979,
+      "source_end_char": 54206,
+      "source_start_line": 927,
+      "source_end_line": 958,
+      "source_sha256": "c2ef7558ca16e8c94d0b5e4e187bcae72c7cc130da8a78f22775dc8bb8ce9a32",
+      "rendered_sha256": "c2ef7558ca16e8c94d0b5e4e187bcae72c7cc130da8a78f22775dc8bb8ce9a32",
+      "source_bytes": 1239,
+      "rendered_bytes": 1239,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A5.6. Inquiry and Unknowns",
+          "handle": "A5.6",
+          "source_line": 927,
+          "source_anchor": "a56-inquiry-and-unknowns",
+          "fragment_anchor": "a56-inquiry-and-unknowns"
+        }
+      ]
+    },
+    {
+      "order": 37,
+      "path": "docs/architecture/A05-07-confirmatory-and-exploratory-lanes.md",
+      "source_start_char": 54206,
+      "source_end_char": 57477,
+      "source_start_line": 958,
+      "source_end_line": 991,
+      "source_sha256": "93e9b146e47ab867ea3ce050edacf81c6e4f73daabe306f54e270fa9c09feb78",
+      "rendered_sha256": "93e9b146e47ab867ea3ce050edacf81c6e4f73daabe306f54e270fa9c09feb78",
+      "source_bytes": 3275,
+      "rendered_bytes": 3275,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A5.7. Confirmatory and Exploratory Lanes",
+          "handle": "A5.7",
+          "source_line": 958,
+          "source_anchor": "a57-confirmatory-and-exploratory-lanes",
+          "fragment_anchor": "a57-confirmatory-and-exploratory-lanes"
+        },
+        {
+          "level": 3,
+          "title": "Confirmatory Lane",
+          "handle": null,
+          "source_line": 962,
+          "source_anchor": "confirmatory-lane",
+          "fragment_anchor": "confirmatory-lane"
+        },
+        {
+          "level": 3,
+          "title": "Exploratory Lane",
+          "handle": null,
+          "source_line": 968,
+          "source_anchor": "exploratory-lane",
+          "fragment_anchor": "exploratory-lane"
+        },
+        {
+          "level": 3,
+          "title": "Evidence Freeze",
+          "handle": null,
+          "source_line": 976,
+          "source_anchor": "evidence-freeze",
+          "fragment_anchor": "evidence-freeze"
+        },
+        {
+          "level": 3,
+          "title": "Coverage Denominator",
+          "handle": null,
+          "source_line": 980,
+          "source_anchor": "coverage-denominator",
+          "fragment_anchor": "coverage-denominator"
+        },
+        {
+          "level": 3,
+          "title": "Rigor Is Selected, Not Inherited",
+          "handle": null,
+          "source_line": 986,
+          "source_anchor": "rigor-is-selected-not-inherited",
+          "fragment_anchor": "rigor-is-selected-not-inherited"
+        }
+      ]
+    },
+    {
+      "order": 38,
+      "path": "docs/architecture/A06-understanding-state-and-system-level-understanding.md",
+      "source_start_char": 57477,
+      "source_end_char": 57535,
+      "source_start_line": 991,
+      "source_end_line": 993,
+      "source_sha256": "6cf88030673e45f2a2460f21475e22cd20828bdd7ae597934fc2de4386119d97",
+      "rendered_sha256": "6cf88030673e45f2a2460f21475e22cd20828bdd7ae597934fc2de4386119d97",
+      "source_bytes": 58,
+      "rendered_bytes": 58,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A6. Understanding State and System-Level Understanding",
+          "handle": "A6",
+          "source_line": 991,
+          "source_anchor": "a6-understanding-state-and-system-level-understanding",
+          "fragment_anchor": "a6-understanding-state-and-system-level-understanding"
+        }
+      ]
+    },
+    {
+      "order": 39,
+      "path": "docs/architecture/A06-01-what-counts-as-understanding.md",
+      "source_start_char": 57535,
+      "source_end_char": 58036,
+      "source_start_line": 993,
+      "source_end_line": 1012,
+      "source_sha256": "8e971fe99ec23c561da1ce0429603feb563e3cc21e1d1136a31ad0e0aa43f422",
+      "rendered_sha256": "8e971fe99ec23c561da1ce0429603feb563e3cc21e1d1136a31ad0e0aa43f422",
+      "source_bytes": 501,
+      "rendered_bytes": 501,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A6.1. What Counts as Understanding",
+          "handle": "A6.1",
+          "source_line": 993,
+          "source_anchor": "a61-what-counts-as-understanding",
+          "fragment_anchor": "a61-what-counts-as-understanding"
+        }
+      ]
+    },
+    {
+      "order": 40,
+      "path": "docs/architecture/A06-02-representation-episode-and-competence.md",
+      "source_start_char": 58036,
+      "source_end_char": 59189,
+      "source_start_line": 1012,
+      "source_end_line": 1022,
+      "source_sha256": "f66b6172cbf940a0c37228a2a59e9d1f932cf1d2afe18b47fad28dc2db625e00",
+      "rendered_sha256": "f66b6172cbf940a0c37228a2a59e9d1f932cf1d2afe18b47fad28dc2db625e00",
+      "source_bytes": 1155,
+      "rendered_bytes": 1155,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A6.2. Representation, Episode, and Competence",
+          "handle": "A6.2",
+          "source_line": 1012,
+          "source_anchor": "a62-representation-episode-and-competence",
+          "fragment_anchor": "a62-representation-episode-and-competence"
+        }
+      ]
+    },
+    {
+      "order": 41,
+      "path": "docs/architecture/A06-03-layers-of-understanding.md",
+      "source_start_char": 59189,
+      "source_end_char": 60297,
+      "source_start_line": 1022,
+      "source_end_line": 1047,
+      "source_sha256": "47f64df6824fafe01ac696cccc45ee2ce4cd938be3f2a381187e95323319ccac",
+      "rendered_sha256": "47f64df6824fafe01ac696cccc45ee2ce4cd938be3f2a381187e95323319ccac",
+      "source_bytes": 1136,
+      "rendered_bytes": 1136,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A6.3. Layers of Understanding",
+          "handle": "A6.3",
+          "source_line": 1022,
+          "source_anchor": "a63-layers-of-understanding",
+          "fragment_anchor": "a63-layers-of-understanding"
+        }
+      ]
+    },
+    {
+      "order": 42,
+      "path": "docs/architecture/A06-04-graphs-and-artifacts.md",
+      "source_start_char": 60297,
+      "source_end_char": 61011,
+      "source_start_line": 1047,
+      "source_end_line": 1064,
+      "source_sha256": "0f5edb9275588fc1d1452b85002eeb2f91e4a6e089a301abd482ceb5766ad390",
+      "rendered_sha256": "0f5edb9275588fc1d1452b85002eeb2f91e4a6e089a301abd482ceb5766ad390",
+      "source_bytes": 716,
+      "rendered_bytes": 716,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A6.4. Graphs and Artifacts",
+          "handle": "A6.4",
+          "source_line": 1047,
+          "source_anchor": "a64-graphs-and-artifacts",
+          "fragment_anchor": "a64-graphs-and-artifacts"
+        }
+      ]
+    },
+    {
+      "order": 43,
+      "path": "docs/architecture/A06-05-causality.md",
+      "source_start_char": 61011,
+      "source_end_char": 61926,
+      "source_start_line": 1064,
+      "source_end_line": 1087,
+      "source_sha256": "3d922432c36d63caf1511c02947efba5efa485880c5093805b0200dee7b84fde",
+      "rendered_sha256": "3d922432c36d63caf1511c02947efba5efa485880c5093805b0200dee7b84fde",
+      "source_bytes": 917,
+      "rendered_bytes": 917,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A6.5. Causality",
+          "handle": "A6.5",
+          "source_line": 1064,
+          "source_anchor": "a65-causality",
+          "fragment_anchor": "a65-causality"
+        }
+      ]
+    },
+    {
+      "order": 44,
+      "path": "docs/architecture/A06-06-correctness-and-reconstruction-cost.md",
+      "source_start_char": 61926,
+      "source_end_char": 62465,
+      "source_start_line": 1087,
+      "source_end_line": 1103,
+      "source_sha256": "079ad162a3790bf35f8f3b5b090772a28e1882be8892dbe84b43d2e60885a91f",
+      "rendered_sha256": "079ad162a3790bf35f8f3b5b090772a28e1882be8892dbe84b43d2e60885a91f",
+      "source_bytes": 539,
+      "rendered_bytes": 539,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A6.6. Correctness and Reconstruction Cost",
+          "handle": "A6.6",
+          "source_line": 1087,
+          "source_anchor": "a66-correctness-and-reconstruction-cost",
+          "fragment_anchor": "a66-correctness-and-reconstruction-cost"
+        }
+      ]
+    },
+    {
+      "order": 45,
+      "path": "docs/architecture/A06-07-eliot-self-knowledge.md",
+      "source_start_char": 62465,
+      "source_end_char": 64299,
+      "source_start_line": 1103,
+      "source_end_line": 1128,
+      "source_sha256": "50e6289802803d6f644f1d0aa07ad8cba4b3e548e1af67f6f66de4aee8268e22",
+      "rendered_sha256": "50e6289802803d6f644f1d0aa07ad8cba4b3e548e1af67f6f66de4aee8268e22",
+      "source_bytes": 1846,
+      "rendered_bytes": 1846,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A6.7. ELIOT Self-Knowledge",
+          "handle": "A6.7",
+          "source_line": 1103,
+          "source_anchor": "a67-eliot-self-knowledge",
+          "fragment_anchor": "a67-eliot-self-knowledge"
+        }
+      ]
+    },
+    {
+      "order": 46,
+      "path": "docs/architecture/A07-attention-context-and-skills.md",
+      "source_start_char": 64299,
+      "source_end_char": 64337,
+      "source_start_line": 1128,
+      "source_end_line": 1130,
+      "source_sha256": "de3a95e9cd6b87ab061cedd22bf37182371cb5b9c26c8e30cc85bb9061fac79a",
+      "rendered_sha256": "de3a95e9cd6b87ab061cedd22bf37182371cb5b9c26c8e30cc85bb9061fac79a",
+      "source_bytes": 38,
+      "rendered_bytes": 38,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A7. Attention, Context, and Skills",
+          "handle": "A7",
+          "source_line": 1128,
+          "source_anchor": "a7-attention-context-and-skills",
+          "fragment_anchor": "a7-attention-context-and-skills"
+        }
+      ]
+    },
+    {
+      "order": 47,
+      "path": "docs/architecture/A07-01-active-understanding-view.md",
+      "source_start_char": 64337,
+      "source_end_char": 65422,
+      "source_start_line": 1130,
+      "source_end_line": 1155,
+      "source_sha256": "650d82a931bb996881bc9c093a494ff7aa2a1f1d96838c5bd6308ba65cd5854d",
+      "rendered_sha256": "650d82a931bb996881bc9c093a494ff7aa2a1f1d96838c5bd6308ba65cd5854d",
+      "source_bytes": 1091,
+      "rendered_bytes": 1091,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A7.1. Active Understanding View",
+          "handle": "A7.1",
+          "source_line": 1130,
+          "source_anchor": "a71-active-understanding-view",
+          "fragment_anchor": "a71-active-understanding-view"
+        }
+      ]
+    },
+    {
+      "order": 48,
+      "path": "docs/architecture/A07-02-attention.md",
+      "source_start_char": 65422,
+      "source_end_char": 65959,
+      "source_start_line": 1155,
+      "source_end_line": 1173,
+      "source_sha256": "51626391321c9f1e35c05ff3178c267db04b9c39597a4dc3380c1ecb813b72c3",
+      "rendered_sha256": "51626391321c9f1e35c05ff3178c267db04b9c39597a4dc3380c1ecb813b72c3",
+      "source_bytes": 537,
+      "rendered_bytes": 537,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A7.2. Attention",
+          "handle": "A7.2",
+          "source_line": 1155,
+          "source_anchor": "a72-attention",
+          "fragment_anchor": "a72-attention"
+        }
+      ]
+    },
+    {
+      "order": 49,
+      "path": "docs/architecture/A07-03-three-orientation-channels.md",
+      "source_start_char": 65959,
+      "source_end_char": 67507,
+      "source_start_line": 1173,
+      "source_end_line": 1207,
+      "source_sha256": "747317b7bd7c9e49848679a6fa3295d55a49b530a00adc3d0936f08a4643c491",
+      "rendered_sha256": "747317b7bd7c9e49848679a6fa3295d55a49b530a00adc3d0936f08a4643c491",
+      "source_bytes": 1562,
+      "rendered_bytes": 1562,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A7.3. Three Orientation Channels",
+          "handle": "A7.3",
+          "source_line": 1173,
+          "source_anchor": "a73-three-orientation-channels",
+          "fragment_anchor": "a73-three-orientation-channels"
+        },
+        {
+          "level": 3,
+          "title": "Push",
+          "handle": null,
+          "source_line": 1175,
+          "source_anchor": "push",
+          "fragment_anchor": "push"
+        },
+        {
+          "level": 3,
+          "title": "Pull",
+          "handle": null,
+          "source_line": 1179,
+          "source_anchor": "pull",
+          "fragment_anchor": "pull"
+        },
+        {
+          "level": 3,
+          "title": "Dreamer Orientation",
+          "handle": null,
+          "source_line": 1183,
+          "source_anchor": "dreamer-orientation",
+          "fragment_anchor": "dreamer-orientation"
+        }
+      ]
+    },
+    {
+      "order": 50,
+      "path": "docs/architecture/A07-04-context-as-intervention.md",
+      "source_start_char": 67507,
+      "source_end_char": 68412,
+      "source_start_line": 1207,
+      "source_end_line": 1226,
+      "source_sha256": "12aed6f3ac98c8bf6c66cab772623971545ab50a354255809fc7c8f7991a5448",
+      "rendered_sha256": "12aed6f3ac98c8bf6c66cab772623971545ab50a354255809fc7c8f7991a5448",
+      "source_bytes": 905,
+      "rendered_bytes": 905,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A7.4. Context as Intervention",
+          "handle": "A7.4",
+          "source_line": 1207,
+          "source_anchor": "a74-context-as-intervention",
+          "fragment_anchor": "a74-context-as-intervention"
+        }
+      ]
+    },
+    {
+      "order": 51,
+      "path": "docs/architecture/A07-05-critical-attention.md",
+      "source_start_char": 68412,
+      "source_end_char": 68932,
+      "source_start_line": 1226,
+      "source_end_line": 1246,
+      "source_sha256": "15057b975a8ceba9cc6f0be1ef5bc162b773fecee0a981c31b013a0cfdeb585b",
+      "rendered_sha256": "15057b975a8ceba9cc6f0be1ef5bc162b773fecee0a981c31b013a0cfdeb585b",
+      "source_bytes": 522,
+      "rendered_bytes": 522,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A7.5. Critical Attention",
+          "handle": "A7.5",
+          "source_line": 1226,
+          "source_anchor": "a75-critical-attention",
+          "fragment_anchor": "a75-critical-attention"
+        }
+      ]
+    },
+    {
+      "order": 52,
+      "path": "docs/architecture/A07-06-compaction-and-resume.md",
+      "source_start_char": 68932,
+      "source_end_char": 69440,
+      "source_start_line": 1246,
+      "source_end_line": 1271,
+      "source_sha256": "db7de39c41ef8fa99fec0e28219a31fe7021b02c07899131ee5d76255b3dbdf4",
+      "rendered_sha256": "db7de39c41ef8fa99fec0e28219a31fe7021b02c07899131ee5d76255b3dbdf4",
+      "source_bytes": 508,
+      "rendered_bytes": 508,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A7.6. Compaction and Resume",
+          "handle": "A7.6",
+          "source_line": 1246,
+          "source_anchor": "a76-compaction-and-resume",
+          "fragment_anchor": "a76-compaction-and-resume"
+        }
+      ]
+    },
+    {
+      "order": 53,
+      "path": "docs/architecture/A07-07-governance-profile.md",
+      "source_start_char": 69440,
+      "source_end_char": 69922,
+      "source_start_line": 1271,
+      "source_end_line": 1283,
+      "source_sha256": "c4a05253aeaf3823bcc7a63e7a2c320a280fde9b8be4aaa5a22efa24fadbd6e4",
+      "rendered_sha256": "c4a05253aeaf3823bcc7a63e7a2c320a280fde9b8be4aaa5a22efa24fadbd6e4",
+      "source_bytes": 482,
+      "rendered_bytes": 482,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A7.7. Governance Profile",
+          "handle": "A7.7",
+          "source_line": 1271,
+          "source_anchor": "a77-governance-profile",
+          "fragment_anchor": "a77-governance-profile"
+        }
+      ]
+    },
+    {
+      "order": 54,
+      "path": "docs/architecture/A07-08-effective-context-and-external-metacognition.md",
+      "source_start_char": 69922,
+      "source_end_char": 70694,
+      "source_start_line": 1283,
+      "source_end_line": 1299,
+      "source_sha256": "ba4307bb98180ae50aa7d52480f22c100337e5e18d27c78490928c2c21d266ed",
+      "rendered_sha256": "ba4307bb98180ae50aa7d52480f22c100337e5e18d27c78490928c2c21d266ed",
+      "source_bytes": 782,
+      "rendered_bytes": 782,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A7.8. Effective Context and External Metacognition",
+          "handle": "A7.8",
+          "source_line": 1283,
+          "source_anchor": "a78-effective-context-and-external-metacognition",
+          "fragment_anchor": "a78-effective-context-and-external-metacognition"
+        }
+      ]
+    },
+    {
+      "order": 55,
+      "path": "docs/architecture/A07-09-context-economy.md",
+      "source_start_char": 70694,
+      "source_end_char": 71821,
+      "source_start_line": 1299,
+      "source_end_line": 1307,
+      "source_sha256": "0d6f3e462b32cfa875824adb3f605351ba4590db0bb90194a9e13ba722177fdb",
+      "rendered_sha256": "0d6f3e462b32cfa875824adb3f605351ba4590db0bb90194a9e13ba722177fdb",
+      "source_bytes": 1127,
+      "rendered_bytes": 1127,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A7.9. Context Economy",
+          "handle": "A7.9",
+          "source_line": 1299,
+          "source_anchor": "a79-context-economy",
+          "fragment_anchor": "a79-context-economy"
+        }
+      ]
+    },
+    {
+      "order": 56,
+      "path": "docs/architecture/A07-10-skills.md",
+      "source_start_char": 71821,
+      "source_end_char": 72747,
+      "source_start_line": 1307,
+      "source_end_line": 1326,
+      "source_sha256": "ffc28c1df564f0c724620a883079cfd256df4fec82c2cb8781541a816a0e8760",
+      "rendered_sha256": "ffc28c1df564f0c724620a883079cfd256df4fec82c2cb8781541a816a0e8760",
+      "source_bytes": 930,
+      "rendered_bytes": 930,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A7.10. Skills",
+          "handle": "A7.10",
+          "source_line": 1307,
+          "source_anchor": "a710-skills",
+          "fragment_anchor": "a710-skills"
+        }
+      ]
+    },
+    {
+      "order": 57,
+      "path": "docs/architecture/A08-watchdog.md",
+      "source_start_char": 72747,
+      "source_end_char": 72763,
+      "source_start_line": 1326,
+      "source_end_line": 1328,
+      "source_sha256": "cf6b7570768a26f8f85a618831bd3cd5b1ab7acaf058808af24985052d3e2551",
+      "rendered_sha256": "cf6b7570768a26f8f85a618831bd3cd5b1ab7acaf058808af24985052d3e2551",
+      "source_bytes": 16,
+      "rendered_bytes": 16,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A8. Watchdog",
+          "handle": "A8",
+          "source_line": 1326,
+          "source_anchor": "a8-watchdog",
+          "fragment_anchor": "a8-watchdog"
+        }
+      ]
+    },
+    {
+      "order": 58,
+      "path": "docs/architecture/A08-01-purpose.md",
+      "source_start_char": 72763,
+      "source_end_char": 74478,
+      "source_start_line": 1328,
+      "source_end_line": 1349,
+      "source_sha256": "329090895bcbb79dbc7a8e40af3366ef0707a01bd6ce18cb9c6a24862db5fe4b",
+      "rendered_sha256": "329090895bcbb79dbc7a8e40af3366ef0707a01bd6ce18cb9c6a24862db5fe4b",
+      "source_bytes": 1717,
+      "rendered_bytes": 1717,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A8.1. Purpose",
+          "handle": "A8.1",
+          "source_line": 1328,
+          "source_anchor": "a81-purpose",
+          "fragment_anchor": "a81-purpose"
+        }
+      ]
+    },
+    {
+      "order": 59,
+      "path": "docs/architecture/A08-02-hybrid-structure.md",
+      "source_start_char": 74478,
+      "source_end_char": 75362,
+      "source_start_line": 1349,
+      "source_end_line": 1382,
+      "source_sha256": "27dac5be7847df8cfb14b0d77d82c8e62026ec9576427c29de745b0015ceadb2",
+      "rendered_sha256": "27dac5be7847df8cfb14b0d77d82c8e62026ec9576427c29de745b0015ceadb2",
+      "source_bytes": 886,
+      "rendered_bytes": 886,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A8.2. Hybrid Structure",
+          "handle": "A8.2",
+          "source_line": 1349,
+          "source_anchor": "a82-hybrid-structure",
+          "fragment_anchor": "a82-hybrid-structure"
+        },
+        {
+          "level": 3,
+          "title": "Deterministic Layer",
+          "handle": null,
+          "source_line": 1351,
+          "source_anchor": "deterministic-layer",
+          "fragment_anchor": "deterministic-layer"
+        },
+        {
+          "level": 3,
+          "title": "Watchdog Agents",
+          "handle": null,
+          "source_line": 1367,
+          "source_anchor": "watchdog-agents",
+          "fragment_anchor": "watchdog-agents"
+        }
+      ]
+    },
+    {
+      "order": 60,
+      "path": "docs/architecture/A08-03-signal-problem-and-incident.md",
+      "source_start_char": 75362,
+      "source_end_char": 75975,
+      "source_start_line": 1382,
+      "source_end_line": 1404,
+      "source_sha256": "6ba2529d15cd72c6a46ae37827db7718eeb3ef482fa716ae788bdd8fad493a03",
+      "rendered_sha256": "6ba2529d15cd72c6a46ae37827db7718eeb3ef482fa716ae788bdd8fad493a03",
+      "source_bytes": 619,
+      "rendered_bytes": 619,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A8.3. Signal, Problem, and Incident",
+          "handle": "A8.3",
+          "source_line": 1382,
+          "source_anchor": "a83-signal-problem-and-incident",
+          "fragment_anchor": "a83-signal-problem-and-incident"
+        }
+      ]
+    },
+    {
+      "order": 61,
+      "path": "docs/architecture/A08-04-supervising-agenteliot-interaction.md",
+      "source_start_char": 75975,
+      "source_end_char": 77145,
+      "source_start_line": 1404,
+      "source_end_line": 1433,
+      "source_sha256": "f1f0dc4992d2ecf76d09b7a70191b3a1404c04bd229777f598de3a4b16f6869e",
+      "rendered_sha256": "f1f0dc4992d2ecf76d09b7a70191b3a1404c04bd229777f598de3a4b16f6869e",
+      "source_bytes": 1174,
+      "rendered_bytes": 1174,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A8.4. Supervising Agent–ELIOT Interaction",
+          "handle": "A8.4",
+          "source_line": 1404,
+          "source_anchor": "a84-supervising-agenteliot-interaction",
+          "fragment_anchor": "a84-supervising-agenteliot-interaction"
+        }
+      ]
+    },
+    {
+      "order": 62,
+      "path": "docs/architecture/A08-05-security-supervision.md",
+      "source_start_char": 77145,
+      "source_end_char": 77613,
+      "source_start_line": 1433,
+      "source_end_line": 1450,
+      "source_sha256": "103d38d56f5992af1bc2d9eaa4c8d2c50e7a223f73dd571fd7963024608b451d",
+      "rendered_sha256": "103d38d56f5992af1bc2d9eaa4c8d2c50e7a223f73dd571fd7963024608b451d",
+      "source_bytes": 468,
+      "rendered_bytes": 468,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A8.5. Security Supervision",
+          "handle": "A8.5",
+          "source_line": 1433,
+          "source_anchor": "a85-security-supervision",
+          "fragment_anchor": "a85-security-supervision"
+        }
+      ]
+    },
+    {
+      "order": 63,
+      "path": "docs/architecture/A08-06-recovery-and-escalation.md",
+      "source_start_char": 77613,
+      "source_end_char": 78162,
+      "source_start_line": 1450,
+      "source_end_line": 1467,
+      "source_sha256": "053131eaee1deb655061bd6a8f52014aa15665f54674128c9fd60e3199ce9152",
+      "rendered_sha256": "053131eaee1deb655061bd6a8f52014aa15665f54674128c9fd60e3199ce9152",
+      "source_bytes": 549,
+      "rendered_bytes": 549,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A8.6. Recovery and Escalation",
+          "handle": "A8.6",
+          "source_line": 1450,
+          "source_anchor": "a86-recovery-and-escalation",
+          "fragment_anchor": "a86-recovery-and-escalation"
+        }
+      ]
+    },
+    {
+      "order": 64,
+      "path": "docs/architecture/A09-dreamer.md",
+      "source_start_char": 78162,
+      "source_end_char": 78177,
+      "source_start_line": 1467,
+      "source_end_line": 1469,
+      "source_sha256": "1f39dfb0676f5d42cbdb279d2991ec8e2017bfdcb834d85466e57c0664f84732",
+      "rendered_sha256": "1f39dfb0676f5d42cbdb279d2991ec8e2017bfdcb834d85466e57c0664f84732",
+      "source_bytes": 15,
+      "rendered_bytes": 15,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A9. Dreamer",
+          "handle": "A9",
+          "source_line": 1467,
+          "source_anchor": "a9-dreamer",
+          "fragment_anchor": "a9-dreamer"
+        }
+      ]
+    },
+    {
+      "order": 65,
+      "path": "docs/architecture/A09-01-what-dreamer-is.md",
+      "source_start_char": 78177,
+      "source_end_char": 79957,
+      "source_start_line": 1469,
+      "source_end_line": 1503,
+      "source_sha256": "3d9021228bfb9939dc7d9c0ab5e7ae5fb8967af6b17e6ea07a3e8cd9e71c27f3",
+      "rendered_sha256": "3d9021228bfb9939dc7d9c0ab5e7ae5fb8967af6b17e6ea07a3e8cd9e71c27f3",
+      "source_bytes": 1796,
+      "rendered_bytes": 1796,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A9.1. What Dreamer Is",
+          "handle": "A9.1",
+          "source_line": 1469,
+          "source_anchor": "a91-what-dreamer-is",
+          "fragment_anchor": "a91-what-dreamer-is"
+        }
+      ]
+    },
+    {
+      "order": 66,
+      "path": "docs/architecture/A09-02-primary-modes.md",
+      "source_start_char": 79957,
+      "source_end_char": 82660,
+      "source_start_line": 1503,
+      "source_end_line": 1569,
+      "source_sha256": "0625a8872ab507ca0c24c47a5eb452afb281794c3c40834579fda84a599b8526",
+      "rendered_sha256": "0625a8872ab507ca0c24c47a5eb452afb281794c3c40834579fda84a599b8526",
+      "source_bytes": 2707,
+      "rendered_bytes": 2707,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A9.2. Primary Modes",
+          "handle": "A9.2",
+          "source_line": 1503,
+          "source_anchor": "a92-primary-modes",
+          "fragment_anchor": "a92-primary-modes"
+        },
+        {
+          "level": 3,
+          "title": "Background Curation",
+          "handle": null,
+          "source_line": 1505,
+          "source_anchor": "background-curation",
+          "fragment_anchor": "background-curation"
+        },
+        {
+          "level": 3,
+          "title": "Interactive Orientation",
+          "handle": null,
+          "source_line": 1520,
+          "source_anchor": "interactive-orientation",
+          "fragment_anchor": "interactive-orientation"
+        },
+        {
+          "level": 3,
+          "title": "Clarification",
+          "handle": null,
+          "source_line": 1535,
+          "source_anchor": "clarification",
+          "fragment_anchor": "clarification"
+        },
+        {
+          "level": 3,
+          "title": "Research Synthesis",
+          "handle": null,
+          "source_line": 1549,
+          "source_anchor": "research-synthesis",
+          "fragment_anchor": "research-synthesis"
+        }
+      ]
+    },
+    {
+      "order": 67,
+      "path": "docs/architecture/A09-03-dreamer-and-concilium.md",
+      "source_start_char": 82660,
+      "source_end_char": 83138,
+      "source_start_line": 1569,
+      "source_end_line": 1586,
+      "source_sha256": "01011cbb8df2aef666cdce571563ae0c0a132d86d8787ac97013643fe2f451fa",
+      "rendered_sha256": "01011cbb8df2aef666cdce571563ae0c0a132d86d8787ac97013643fe2f451fa",
+      "source_bytes": 480,
+      "rendered_bytes": 480,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A9.3. Dreamer and Concilium",
+          "handle": "A9.3",
+          "source_line": 1569,
+          "source_anchor": "a93-dreamer-and-concilium",
+          "fragment_anchor": "a93-dreamer-and-concilium"
+        }
+      ]
+    },
+    {
+      "order": 68,
+      "path": "docs/architecture/A09-04-launching-agents-and-swarms.md",
+      "source_start_char": 83138,
+      "source_end_char": 83730,
+      "source_start_line": 1586,
+      "source_end_line": 1605,
+      "source_sha256": "fd15f62e6e47a413350c8eb79bfeb7e32fdc911ab4b38fc100db1c098c3382be",
+      "rendered_sha256": "fd15f62e6e47a413350c8eb79bfeb7e32fdc911ab4b38fc100db1c098c3382be",
+      "source_bytes": 594,
+      "rendered_bytes": 594,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A9.4. Launching Agents and Swarms",
+          "handle": "A9.4",
+          "source_line": 1586,
+          "source_anchor": "a94-launching-agents-and-swarms",
+          "fragment_anchor": "a94-launching-agents-and-swarms"
+        }
+      ]
+    },
+    {
+      "order": 69,
+      "path": "docs/architecture/A09-05-interfaces-and-outputs.md",
+      "source_start_char": 83730,
+      "source_end_char": 84398,
+      "source_start_line": 1605,
+      "source_end_line": 1640,
+      "source_sha256": "c41e16996fa831fb90d31fc559cff4f62a8c4fc08dd09005524ffc286f62c312",
+      "rendered_sha256": "c41e16996fa831fb90d31fc559cff4f62a8c4fc08dd09005524ffc286f62c312",
+      "source_bytes": 674,
+      "rendered_bytes": 674,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A9.5. Interfaces and Outputs",
+          "handle": "A9.5",
+          "source_line": 1605,
+          "source_anchor": "a95-interfaces-and-outputs",
+          "fragment_anchor": "a95-interfaces-and-outputs"
+        }
+      ]
+    },
+    {
+      "order": 70,
+      "path": "docs/architecture/A09-06-remote-dreamer.md",
+      "source_start_char": 84398,
+      "source_end_char": 84867,
+      "source_start_line": 1640,
+      "source_end_line": 1655,
+      "source_sha256": "dce7e7f9c1dcf6045870c645a82ba398de7aa0241353b5be334434290efad814",
+      "rendered_sha256": "dce7e7f9c1dcf6045870c645a82ba398de7aa0241353b5be334434290efad814",
+      "source_bytes": 469,
+      "rendered_bytes": 469,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A9.6. Remote Dreamer",
+          "handle": "A9.6",
+          "source_line": 1640,
+          "source_anchor": "a96-remote-dreamer",
+          "fragment_anchor": "a96-remote-dreamer"
+        }
+      ]
+    },
+    {
+      "order": 71,
+      "path": "docs/architecture/A10-harness-agents-concilium-and-swarm.md",
+      "source_start_char": 84867,
+      "source_end_char": 84913,
+      "source_start_line": 1655,
+      "source_end_line": 1657,
+      "source_sha256": "af210b768da7ed621e1f1eda59e3fb34eb540d907dec495fdb950e54ad7cb9ff",
+      "rendered_sha256": "af210b768da7ed621e1f1eda59e3fb34eb540d907dec495fdb950e54ad7cb9ff",
+      "source_bytes": 46,
+      "rendered_bytes": 46,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A10. Harness, Agents, Concilium, and Swarm",
+          "handle": "A10",
+          "source_line": 1655,
+          "source_anchor": "a10-harness-agents-concilium-and-swarm",
+          "fragment_anchor": "a10-harness-agents-concilium-and-swarm"
+        }
+      ]
+    },
+    {
+      "order": 72,
+      "path": "docs/architecture/A10-01-agent-interaction-loop.md",
+      "source_start_char": 84913,
+      "source_end_char": 86231,
+      "source_start_line": 1657,
+      "source_end_line": 1676,
+      "source_sha256": "ea2935044adb6c614dac597b1127fb34909bb4e4265c5527d9f5a12bc88cdc79",
+      "rendered_sha256": "ea2935044adb6c614dac597b1127fb34909bb4e4265c5527d9f5a12bc88cdc79",
+      "source_bytes": 1318,
+      "rendered_bytes": 1318,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A10.1. Agent Interaction Loop",
+          "handle": "A10.1",
+          "source_line": 1657,
+          "source_anchor": "a101-agent-interaction-loop",
+          "fragment_anchor": "a101-agent-interaction-loop"
+        }
+      ]
+    },
+    {
+      "order": 73,
+      "path": "docs/architecture/A10-02-impact-and-authority.md",
+      "source_start_char": 86231,
+      "source_end_char": 87024,
+      "source_start_line": 1676,
+      "source_end_line": 1692,
+      "source_sha256": "a484150769f112e1080cca50aa19135f66b2cae83c77925ef1096ecec2a8cfe4",
+      "rendered_sha256": "a484150769f112e1080cca50aa19135f66b2cae83c77925ef1096ecec2a8cfe4",
+      "source_bytes": 807,
+      "rendered_bytes": 807,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A10.2. Impact and Authority",
+          "handle": "A10.2",
+          "source_line": 1676,
+          "source_anchor": "a102-impact-and-authority",
+          "fragment_anchor": "a102-impact-and-authority"
+        }
+      ]
+    },
+    {
+      "order": 74,
+      "path": "docs/architecture/A10-03-action-model.md",
+      "source_start_char": 87024,
+      "source_end_char": 87976,
+      "source_start_line": 1692,
+      "source_end_line": 1718,
+      "source_sha256": "8f43ac300f0340acdbb0f61aea90ed898d551f595654e9d8ebd1c8f487cf0838",
+      "rendered_sha256": "8f43ac300f0340acdbb0f61aea90ed898d551f595654e9d8ebd1c8f487cf0838",
+      "source_bytes": 958,
+      "rendered_bytes": 958,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A10.3. Action Model",
+          "handle": "A10.3",
+          "source_line": 1692,
+          "source_anchor": "a103-action-model",
+          "fragment_anchor": "a103-action-model"
+        }
+      ]
+    },
+    {
+      "order": 75,
+      "path": "docs/architecture/A10-04-delegation.md",
+      "source_start_char": 87976,
+      "source_end_char": 89956,
+      "source_start_line": 1718,
+      "source_end_line": 1743,
+      "source_sha256": "fd9c93b5e66ea93a0a2bb171706449ca8d07d2d48caeb99d1acdc57360014cd9",
+      "rendered_sha256": "fd9c93b5e66ea93a0a2bb171706449ca8d07d2d48caeb99d1acdc57360014cd9",
+      "source_bytes": 1980,
+      "rendered_bytes": 1980,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A10.4. Delegation",
+          "handle": "A10.4",
+          "source_line": 1718,
+          "source_anchor": "a104-delegation",
+          "fragment_anchor": "a104-delegation"
+        }
+      ]
+    },
+    {
+      "order": 76,
+      "path": "docs/architecture/A10-05-concilium-and-conflicts.md",
+      "source_start_char": 89956,
+      "source_end_char": 90555,
+      "source_start_line": 1743,
+      "source_end_line": 1764,
+      "source_sha256": "1431aaacd5d512d2d99118387f354a276bc4fef5c526e7b074954ef0899153bd",
+      "rendered_sha256": "1431aaacd5d512d2d99118387f354a276bc4fef5c526e7b074954ef0899153bd",
+      "source_bytes": 603,
+      "rendered_bytes": 603,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A10.5. Concilium and Conflicts",
+          "handle": "A10.5",
+          "source_line": 1743,
+          "source_anchor": "a105-concilium-and-conflicts",
+          "fragment_anchor": "a105-concilium-and-conflicts"
+        }
+      ]
+    },
+    {
+      "order": 77,
+      "path": "docs/architecture/A10-06-agent-swarm-and-pipeline-work.md",
+      "source_start_char": 90555,
+      "source_end_char": 93514,
+      "source_start_line": 1764,
+      "source_end_line": 1821,
+      "source_sha256": "6cf8572e88c4265673a09b037d71bb32e777595af0fb88b494aad3edae977e50",
+      "rendered_sha256": "6cf8572e88c4265673a09b037d71bb32e777595af0fb88b494aad3edae977e50",
+      "source_bytes": 2977,
+      "rendered_bytes": 2977,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A10.6. Agent Swarm and Pipeline Work",
+          "handle": "A10.6",
+          "source_line": 1764,
+          "source_anchor": "a106-agent-swarm-and-pipeline-work",
+          "fragment_anchor": "a106-agent-swarm-and-pipeline-work"
+        }
+      ]
+    },
+    {
+      "order": 78,
+      "path": "docs/architecture/A10-07-long-running-work.md",
+      "source_start_char": 93514,
+      "source_end_char": 94735,
+      "source_start_line": 1821,
+      "source_end_line": 1844,
+      "source_sha256": "430911e0435c9278a96dabe912e92d80ac4d14bc48b6cc29cea5a1d75d02b43a",
+      "rendered_sha256": "430911e0435c9278a96dabe912e92d80ac4d14bc48b6cc29cea5a1d75d02b43a",
+      "source_bytes": 1225,
+      "rendered_bytes": 1225,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A10.7. Long-Running Work",
+          "handle": "A10.7",
+          "source_line": 1821,
+          "source_anchor": "a107-long-running-work",
+          "fragment_anchor": "a107-long-running-work"
+        }
+      ]
+    },
+    {
+      "order": 79,
+      "path": "docs/architecture/A10-08-verification-and-finish.md",
+      "source_start_char": 94735,
+      "source_end_char": 95482,
+      "source_start_line": 1844,
+      "source_end_line": 1866,
+      "source_sha256": "e557865aae5dc3d0e8864b4fa0ba1559989a0790c6429656b5f5f647cdab3ba7",
+      "rendered_sha256": "e557865aae5dc3d0e8864b4fa0ba1559989a0790c6429656b5f5f647cdab3ba7",
+      "source_bytes": 751,
+      "rendered_bytes": 751,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A10.8. Verification and Finish",
+          "handle": "A10.8",
+          "source_line": 1844,
+          "source_anchor": "a108-verification-and-finish",
+          "fragment_anchor": "a108-verification-and-finish"
+        }
+      ]
+    },
+    {
+      "order": 80,
+      "path": "docs/architecture/A11-human-control-and-system-configuration.md",
+      "source_start_char": 95482,
+      "source_end_char": 95529,
+      "source_start_line": 1866,
+      "source_end_line": 1868,
+      "source_sha256": "83ec2cbcfd391526a99218c526f5c0cd0a358ee98e43235eb4d991cacfe3161c",
+      "rendered_sha256": "83ec2cbcfd391526a99218c526f5c0cd0a358ee98e43235eb4d991cacfe3161c",
+      "source_bytes": 47,
+      "rendered_bytes": 47,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A11. Human Control and System Configuration",
+          "handle": "A11",
+          "source_line": 1866,
+          "source_anchor": "a11-human-control-and-system-configuration",
+          "fragment_anchor": "a11-human-control-and-system-configuration"
+        }
+      ]
+    },
+    {
+      "order": 81,
+      "path": "docs/architecture/A11-01-human-authority-and-fallibility.md",
+      "source_start_char": 95529,
+      "source_end_char": 95947,
+      "source_start_line": 1868,
+      "source_end_line": 1883,
+      "source_sha256": "198c88e21b2d42102da937b5683700d1036df9d04afb3fa7c68738b24e572257",
+      "rendered_sha256": "198c88e21b2d42102da937b5683700d1036df9d04afb3fa7c68738b24e572257",
+      "source_bytes": 418,
+      "rendered_bytes": 418,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A11.1. Human Authority and Fallibility",
+          "handle": "A11.1",
+          "source_line": 1868,
+          "source_anchor": "a111-human-authority-and-fallibility",
+          "fragment_anchor": "a111-human-authority-and-fallibility"
+        }
+      ]
+    },
+    {
+      "order": 82,
+      "path": "docs/architecture/A11-02-initial-setup.md",
+      "source_start_char": 95947,
+      "source_end_char": 97004,
+      "source_start_line": 1883,
+      "source_end_line": 1906,
+      "source_sha256": "1747bd63ab8f779c55d66fd28868ff3248d30510dac7203d0d125bf97cc1e03a",
+      "rendered_sha256": "1747bd63ab8f779c55d66fd28868ff3248d30510dac7203d0d125bf97cc1e03a",
+      "source_bytes": 1057,
+      "rendered_bytes": 1057,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A11.2. Initial Setup",
+          "handle": "A11.2",
+          "source_line": 1883,
+          "source_anchor": "a112-initial-setup",
+          "fragment_anchor": "a112-initial-setup"
+        }
+      ]
+    },
+    {
+      "order": 83,
+      "path": "docs/architecture/A11-03-capability-registry.md",
+      "source_start_char": 97004,
+      "source_end_char": 97664,
+      "source_start_line": 1906,
+      "source_end_line": 1923,
+      "source_sha256": "140fb5334e3c3bc42cb88266068e8d01ea796de6a54b00158189f0ccdb8ab7ef",
+      "rendered_sha256": "140fb5334e3c3bc42cb88266068e8d01ea796de6a54b00158189f0ccdb8ab7ef",
+      "source_bytes": 660,
+      "rendered_bytes": 660,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A11.3. Capability Registry",
+          "handle": "A11.3",
+          "source_line": 1906,
+          "source_anchor": "a113-capability-registry",
+          "fragment_anchor": "a113-capability-registry"
+        }
+      ]
+    },
+    {
+      "order": 84,
+      "path": "docs/architecture/A11-04-controlboardview.md",
+      "source_start_char": 97664,
+      "source_end_char": 98449,
+      "source_start_line": 1923,
+      "source_end_line": 1945,
+      "source_sha256": "278d0bfa583935d0f9d69b5e782da4c5977d3299b10a54925287dba52683ce13",
+      "rendered_sha256": "278d0bfa583935d0f9d69b5e782da4c5977d3299b10a54925287dba52683ce13",
+      "source_bytes": 785,
+      "rendered_bytes": 785,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A11.4. ControlBoardView",
+          "handle": "A11.4",
+          "source_line": 1923,
+          "source_anchor": "a114-controlboardview",
+          "fragment_anchor": "a114-controlboardview"
+        }
+      ]
+    },
+    {
+      "order": 85,
+      "path": "docs/architecture/A11-05-notifications.md",
+      "source_start_char": 98449,
+      "source_end_char": 99343,
+      "source_start_line": 1945,
+      "source_end_line": 1961,
+      "source_sha256": "555151577d7c20801c0c6f0277569d58cd21e469961a61d414f89a8efdb0702d",
+      "rendered_sha256": "555151577d7c20801c0c6f0277569d58cd21e469961a61d414f89a8efdb0702d",
+      "source_bytes": 904,
+      "rendered_bytes": 904,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A11.5. Notifications",
+          "handle": "A11.5",
+          "source_line": 1945,
+          "source_anchor": "a115-notifications",
+          "fragment_anchor": "a115-notifications"
+        }
+      ]
+    },
+    {
+      "order": 86,
+      "path": "docs/architecture/A12-security-provenance-and-bounded-influence.md",
+      "source_start_char": 99343,
+      "source_end_char": 99395,
+      "source_start_line": 1961,
+      "source_end_line": 1963,
+      "source_sha256": "07ac2807e9d163981dada2fdcec6bbf3e7d5a78ec54a0bb7eec1c38655f7258d",
+      "rendered_sha256": "07ac2807e9d163981dada2fdcec6bbf3e7d5a78ec54a0bb7eec1c38655f7258d",
+      "source_bytes": 52,
+      "rendered_bytes": 52,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A12. Security, Provenance, and Bounded Influence",
+          "handle": "A12",
+          "source_line": 1961,
+          "source_anchor": "a12-security-provenance-and-bounded-influence",
+          "fragment_anchor": "a12-security-provenance-and-bounded-influence"
+        }
+      ]
+    },
+    {
+      "order": 87,
+      "path": "docs/architecture/A12-01-security-assumes-breach.md",
+      "source_start_char": 99395,
+      "source_end_char": 100084,
+      "source_start_line": 1963,
+      "source_end_line": 1984,
+      "source_sha256": "39ade51b779623fbd9692115353a3ae20c06f64e67d5d489de15bca2e1465b19",
+      "rendered_sha256": "39ade51b779623fbd9692115353a3ae20c06f64e67d5d489de15bca2e1465b19",
+      "source_bytes": 691,
+      "rendered_bytes": 691,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A12.1. Security Assumes Breach",
+          "handle": "A12.1",
+          "source_line": 1963,
+          "source_anchor": "a121-security-assumes-breach",
+          "fragment_anchor": "a121-security-assumes-breach"
+        }
+      ]
+    },
+    {
+      "order": 88,
+      "path": "docs/architecture/A12-02-principal-session-and-visibility.md",
+      "source_start_char": 100084,
+      "source_end_char": 100624,
+      "source_start_line": 1984,
+      "source_end_line": 1996,
+      "source_sha256": "9439239952ca4a5b707301c62e044d207ea7f3414b0c0e28b472dad7ed3ca12b",
+      "rendered_sha256": "9439239952ca4a5b707301c62e044d207ea7f3414b0c0e28b472dad7ed3ca12b",
+      "source_bytes": 546,
+      "rendered_bytes": 546,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A12.2. Principal, Session, and Visibility",
+          "handle": "A12.2",
+          "source_line": 1984,
+          "source_anchor": "a122-principal-session-and-visibility",
+          "fragment_anchor": "a122-principal-session-and-visibility"
+        }
+      ]
+    },
+    {
+      "order": 89,
+      "path": "docs/architecture/A12-03-one-governed-write-path.md",
+      "source_start_char": 100624,
+      "source_end_char": 101492,
+      "source_start_line": 1996,
+      "source_end_line": 2013,
+      "source_sha256": "005f41b3ebdfc08c0748344392762c8e79bdc04bd7a819cc880b5b596fedf2ea",
+      "rendered_sha256": "005f41b3ebdfc08c0748344392762c8e79bdc04bd7a819cc880b5b596fedf2ea",
+      "source_bytes": 876,
+      "rendered_bytes": 876,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A12.3. One Governed Write Path",
+          "handle": "A12.3",
+          "source_line": 1996,
+          "source_anchor": "a123-one-governed-write-path",
+          "fragment_anchor": "a123-one-governed-write-path"
+        }
+      ]
+    },
+    {
+      "order": 90,
+      "path": "docs/architecture/A12-04-source-assurance-and-injection.md",
+      "source_start_char": 101492,
+      "source_end_char": 102574,
+      "source_start_line": 2013,
+      "source_end_line": 2036,
+      "source_sha256": "93b5e60b042f6436b4b3a067fc93ce5b220ac468c35a181ed32797d3bf7d21b2",
+      "rendered_sha256": "93b5e60b042f6436b4b3a067fc93ce5b220ac468c35a181ed32797d3bf7d21b2",
+      "source_bytes": 1082,
+      "rendered_bytes": 1082,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A12.4. Source Assurance and Injection",
+          "handle": "A12.4",
+          "source_line": 2013,
+          "source_anchor": "a124-source-assurance-and-injection",
+          "fragment_anchor": "a124-source-assurance-and-injection"
+        }
+      ]
+    },
+    {
+      "order": 91,
+      "path": "docs/architecture/A12-05-origin-bound-influence.md",
+      "source_start_char": 102574,
+      "source_end_char": 103496,
+      "source_start_line": 2036,
+      "source_end_line": 2054,
+      "source_sha256": "ea53f38b1a09fea7cf08b9338100b2e980b6a9e92e1ab03ba6aba4bdb7f6b909",
+      "rendered_sha256": "ea53f38b1a09fea7cf08b9338100b2e980b6a9e92e1ab03ba6aba4bdb7f6b909",
+      "source_bytes": 924,
+      "rendered_bytes": 924,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A12.5. Origin-Bound Influence",
+          "handle": "A12.5",
+          "source_line": 2036,
+          "source_anchor": "a125-origin-bound-influence",
+          "fragment_anchor": "a125-origin-bound-influence"
+        }
+      ]
+    },
+    {
+      "order": 92,
+      "path": "docs/architecture/A12-06-external-model-routes-and-secrets.md",
+      "source_start_char": 103496,
+      "source_end_char": 104684,
+      "source_start_line": 2054,
+      "source_end_line": 2075,
+      "source_sha256": "d3468afcd649759b149ef2f44cc40bbd96e1e2dd15bc8e5d2d042aa9c2664b45",
+      "rendered_sha256": "d3468afcd649759b149ef2f44cc40bbd96e1e2dd15bc8e5d2d042aa9c2664b45",
+      "source_bytes": 1190,
+      "rendered_bytes": 1190,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A12.6. External Model Routes and Secrets",
+          "handle": "A12.6",
+          "source_line": 2054,
+          "source_anchor": "a126-external-model-routes-and-secrets",
+          "fragment_anchor": "a126-external-model-routes-and-secrets"
+        }
+      ]
+    },
+    {
+      "order": 93,
+      "path": "docs/architecture/A12-07-skills-guards-and-challenge.md",
+      "source_start_char": 104684,
+      "source_end_char": 105283,
+      "source_start_line": 2075,
+      "source_end_line": 2092,
+      "source_sha256": "a9d7b08b4967cd39c8f9c973982ddd2bceb6a53485a1c7fd23ecb69169081125",
+      "rendered_sha256": "a9d7b08b4967cd39c8f9c973982ddd2bceb6a53485a1c7fd23ecb69169081125",
+      "source_bytes": 599,
+      "rendered_bytes": 599,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A12.7. Skills, Guards, and Challenge",
+          "handle": "A12.7",
+          "source_line": 2075,
+          "source_anchor": "a127-skills-guards-and-challenge",
+          "fragment_anchor": "a127-skills-guards-and-challenge"
+        }
+      ]
+    },
+    {
+      "order": 94,
+      "path": "docs/architecture/A12-08-privacy-erasure.md",
+      "source_start_char": 105283,
+      "source_end_char": 105909,
+      "source_start_line": 2092,
+      "source_end_line": 2101,
+      "source_sha256": "79ae479e4ac2a3505fc75285e861061844e2005b0d87309535d44999cd060ca4",
+      "rendered_sha256": "79ae479e4ac2a3505fc75285e861061844e2005b0d87309535d44999cd060ca4",
+      "source_bytes": 628,
+      "rendered_bytes": 628,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A12.8. Privacy Erasure",
+          "handle": "A12.8",
+          "source_line": 2092,
+          "source_anchor": "a128-privacy-erasure",
+          "fragment_anchor": "a128-privacy-erasure"
+        }
+      ]
+    },
+    {
+      "order": 95,
+      "path": "docs/architecture/A13-resilience-recovery-and-observability.md",
+      "source_start_char": 105909,
+      "source_end_char": 105957,
+      "source_start_line": 2101,
+      "source_end_line": 2103,
+      "source_sha256": "9cbd70d8e252b661a30b8e3a04fe1eaed6fe19ea562153480bbb1cec2a79fda4",
+      "rendered_sha256": "9cbd70d8e252b661a30b8e3a04fe1eaed6fe19ea562153480bbb1cec2a79fda4",
+      "source_bytes": 48,
+      "rendered_bytes": 48,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A13. Resilience, Recovery, and Observability",
+          "handle": "A13",
+          "source_line": 2101,
+          "source_anchor": "a13-resilience-recovery-and-observability",
+          "fragment_anchor": "a13-resilience-recovery-and-observability"
+        }
+      ]
+    },
+    {
+      "order": 96,
+      "path": "docs/architecture/A13-01-let-it-fail-locally.md",
+      "source_start_char": 105957,
+      "source_end_char": 106867,
+      "source_start_line": 2103,
+      "source_end_line": 2131,
+      "source_sha256": "5d16f12f407a59fc675d1c41623beb62185bb9c38a39f59f7a63cb78c8e2a763",
+      "rendered_sha256": "5d16f12f407a59fc675d1c41623beb62185bb9c38a39f59f7a63cb78c8e2a763",
+      "source_bytes": 912,
+      "rendered_bytes": 912,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A13.1. Let It Fail Locally",
+          "handle": "A13.1",
+          "source_line": 2103,
+          "source_anchor": "a131-let-it-fail-locally",
+          "fragment_anchor": "a131-let-it-fail-locally"
+        }
+      ]
+    },
+    {
+      "order": 97,
+      "path": "docs/architecture/A13-02-kernel-and-failure-domains.md",
+      "source_start_char": 106867,
+      "source_end_char": 107918,
+      "source_start_line": 2131,
+      "source_end_line": 2150,
+      "source_sha256": "cb96f113bfc45e53d16469d1d20dfe5ca0fad65a2e2f92d2e5ed5964990d401c",
+      "rendered_sha256": "cb96f113bfc45e53d16469d1d20dfe5ca0fad65a2e2f92d2e5ed5964990d401c",
+      "source_bytes": 1051,
+      "rendered_bytes": 1051,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A13.2. Kernel and Failure Domains",
+          "handle": "A13.2",
+          "source_line": 2131,
+          "source_anchor": "a132-kernel-and-failure-domains",
+          "fragment_anchor": "a132-kernel-and-failure-domains"
+        }
+      ]
+    },
+    {
+      "order": 98,
+      "path": "docs/architecture/A13-03-module-supervision-and-doctor.md",
+      "source_start_char": 107918,
+      "source_end_char": 110120,
+      "source_start_line": 2150,
+      "source_end_line": 2205,
+      "source_sha256": "ef3e4c4ee9dcf883a4f16aa09a9eb04e4133d3af534c7334c0d2af958463c217",
+      "rendered_sha256": "ef3e4c4ee9dcf883a4f16aa09a9eb04e4133d3af534c7334c0d2af958463c217",
+      "source_bytes": 2232,
+      "rendered_bytes": 2232,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A13.3. Module Supervision and Doctor",
+          "handle": "A13.3",
+          "source_line": 2150,
+          "source_anchor": "a133-module-supervision-and-doctor",
+          "fragment_anchor": "a133-module-supervision-and-doctor"
+        }
+      ]
+    },
+    {
+      "order": 99,
+      "path": "docs/architecture/A13-04-problem-lifecycle.md",
+      "source_start_char": 110120,
+      "source_end_char": 110713,
+      "source_start_line": 2205,
+      "source_end_line": 2221,
+      "source_sha256": "8b920f4dfac9bd70215f38ad16bd2f5e7dabf431b9d6a9550b97ad248e3e25ab",
+      "rendered_sha256": "8b920f4dfac9bd70215f38ad16bd2f5e7dabf431b9d6a9550b97ad248e3e25ab",
+      "source_bytes": 601,
+      "rendered_bytes": 601,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A13.4. Problem Lifecycle",
+          "handle": "A13.4",
+          "source_line": 2205,
+          "source_anchor": "a134-problem-lifecycle",
+          "fragment_anchor": "a134-problem-lifecycle"
+        }
+      ]
+    },
+    {
+      "order": 100,
+      "path": "docs/architecture/A13-05-bounded-resources-and-control-reserve.md",
+      "source_start_char": 110713,
+      "source_end_char": 111772,
+      "source_start_line": 2221,
+      "source_end_line": 2252,
+      "source_sha256": "3b55e48dd9f22d849f7b0d05187a74cedeb2bcc06b138583adcf5d61843220b5",
+      "rendered_sha256": "3b55e48dd9f22d849f7b0d05187a74cedeb2bcc06b138583adcf5d61843220b5",
+      "source_bytes": 1059,
+      "rendered_bytes": 1059,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A13.5. Bounded Resources and Control Reserve",
+          "handle": "A13.5",
+          "source_line": 2221,
+          "source_anchor": "a135-bounded-resources-and-control-reserve",
+          "fragment_anchor": "a135-bounded-resources-and-control-reserve"
+        }
+      ]
+    },
+    {
+      "order": 101,
+      "path": "docs/architecture/A13-06-operational-recovery-state.md",
+      "source_start_char": 111772,
+      "source_end_char": 112568,
+      "source_start_line": 2252,
+      "source_end_line": 2268,
+      "source_sha256": "8ac0926952955796a76bf5d126f405e6e112605432bac22c9c11776fd327a0fc",
+      "rendered_sha256": "8ac0926952955796a76bf5d126f405e6e112605432bac22c9c11776fd327a0fc",
+      "source_bytes": 796,
+      "rendered_bytes": 796,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A13.6. Operational Recovery State",
+          "handle": "A13.6",
+          "source_line": 2252,
+          "source_anchor": "a136-operational-recovery-state",
+          "fragment_anchor": "a136-operational-recovery-state"
+        }
+      ]
+    },
+    {
+      "order": 102,
+      "path": "docs/architecture/A13-07-backups-restore-and-migration.md",
+      "source_start_char": 112568,
+      "source_end_char": 113762,
+      "source_start_line": 2268,
+      "source_end_line": 2299,
+      "source_sha256": "19926d78353470c3422dcdad01825c3830aa4b48213fec7582b073946e491867",
+      "rendered_sha256": "19926d78353470c3422dcdad01825c3830aa4b48213fec7582b073946e491867",
+      "source_bytes": 1196,
+      "rendered_bytes": 1196,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A13.7. Backups, Restore, and Migration",
+          "handle": "A13.7",
+          "source_line": 2268,
+          "source_anchor": "a137-backups-restore-and-migration",
+          "fragment_anchor": "a137-backups-restore-and-migration"
+        }
+      ]
+    },
+    {
+      "order": 103,
+      "path": "docs/architecture/A13-08-integrity.md",
+      "source_start_char": 113762,
+      "source_end_char": 114285,
+      "source_start_line": 2299,
+      "source_end_line": 2317,
+      "source_sha256": "921362d9b07ef6008b4a319582d45f0e50efba28b407097fe257db4c0259b784",
+      "rendered_sha256": "921362d9b07ef6008b4a319582d45f0e50efba28b407097fe257db4c0259b784",
+      "source_bytes": 523,
+      "rendered_bytes": 523,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A13.8. Integrity",
+          "handle": "A13.8",
+          "source_line": 2299,
+          "source_anchor": "a138-integrity",
+          "fragment_anchor": "a138-integrity"
+        }
+      ]
+    },
+    {
+      "order": 104,
+      "path": "docs/architecture/A13-09-concurrency-and-durable-execution.md",
+      "source_start_char": 114285,
+      "source_end_char": 115640,
+      "source_start_line": 2317,
+      "source_end_line": 2344,
+      "source_sha256": "7d26b0be37f0675d565e5f7c6bb5521cc43bfef4a649e0505c915f3b5eee58ed",
+      "rendered_sha256": "7d26b0be37f0675d565e5f7c6bb5521cc43bfef4a649e0505c915f3b5eee58ed",
+      "source_bytes": 1363,
+      "rendered_bytes": 1363,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A13.9. Concurrency and Durable Execution",
+          "handle": "A13.9",
+          "source_line": 2317,
+          "source_anchor": "a139-concurrency-and-durable-execution",
+          "fragment_anchor": "a139-concurrency-and-durable-execution"
+        }
+      ]
+    },
+    {
+      "order": 105,
+      "path": "docs/architecture/A13-10-observability-and-diagnostic-brief.md",
+      "source_start_char": 115640,
+      "source_end_char": 117556,
+      "source_start_line": 2344,
+      "source_end_line": 2375,
+      "source_sha256": "6c8010493b5a3d9e93b9058bbb098fd39402a7a60196b8b9a01fd60161eb67df",
+      "rendered_sha256": "6c8010493b5a3d9e93b9058bbb098fd39402a7a60196b8b9a01fd60161eb67df",
+      "source_bytes": 1926,
+      "rendered_bytes": 1926,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A13.10. Observability and Diagnostic Brief",
+          "handle": "A13.10",
+          "source_line": 2344,
+          "source_anchor": "a1310-observability-and-diagnostic-brief",
+          "fragment_anchor": "a1310-observability-and-diagnostic-brief"
+        }
+      ]
+    },
+    {
+      "order": 106,
+      "path": "docs/architecture/A13-11-degradation-by-subtraction.md",
+      "source_start_char": 117556,
+      "source_end_char": 119363,
+      "source_start_line": 2375,
+      "source_end_line": 2396,
+      "source_sha256": "9582f877f08da862e0f1611d2eb3ddfc7c86e9849c5ea4608381c93ec42a1c98",
+      "rendered_sha256": "9582f877f08da862e0f1611d2eb3ddfc7c86e9849c5ea4608381c93ec42a1c98",
+      "source_bytes": 1809,
+      "rendered_bytes": 1809,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A13.11. Degradation by Subtraction",
+          "handle": "A13.11",
+          "source_line": 2375,
+          "source_anchor": "a1311-degradation-by-subtraction",
+          "fragment_anchor": "a1311-degradation-by-subtraction"
+        }
+      ]
+    },
+    {
+      "order": 107,
+      "path": "docs/architecture/A13-12-recovery-as-learning.md",
+      "source_start_char": 119363,
+      "source_end_char": 119922,
+      "source_start_line": 2396,
+      "source_end_line": 2415,
+      "source_sha256": "e60ab273d8ebf2d31a6a36f22d8132d996f2065ad36dbec4bec1d04ce7f145bb",
+      "rendered_sha256": "e60ab273d8ebf2d31a6a36f22d8132d996f2065ad36dbec4bec1d04ce7f145bb",
+      "source_bytes": 561,
+      "rendered_bytes": 561,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A13.12. Recovery as Learning",
+          "handle": "A13.12",
+          "source_line": 2396,
+          "source_anchor": "a1312-recovery-as-learning",
+          "fragment_anchor": "a1312-recovery-as-learning"
+        }
+      ]
+    },
+    {
+      "order": 108,
+      "path": "docs/architecture/A14-learning-meta-and-system-development.md",
+      "source_start_char": 119922,
+      "source_end_char": 119969,
+      "source_start_line": 2415,
+      "source_end_line": 2417,
+      "source_sha256": "671a1469a37584d85435296745efc07a9f4d9e69e508bb6a78fcd1229ccb25a4",
+      "rendered_sha256": "671a1469a37584d85435296745efc07a9f4d9e69e508bb6a78fcd1229ccb25a4",
+      "source_bytes": 47,
+      "rendered_bytes": 47,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A14. Learning, Meta, and System Development",
+          "handle": "A14",
+          "source_line": 2415,
+          "source_anchor": "a14-learning-meta-and-system-development",
+          "fragment_anchor": "a14-learning-meta-and-system-development"
+        }
+      ]
+    },
+    {
+      "order": 109,
+      "path": "docs/architecture/A14-01-learning-levels.md",
+      "source_start_char": 119969,
+      "source_end_char": 121871,
+      "source_start_line": 2417,
+      "source_end_line": 2441,
+      "source_sha256": "1b9e34b698c603f660edf650446d63c12e2c54bc48395cf6c6955ae26b0d55d6",
+      "rendered_sha256": "1b9e34b698c603f660edf650446d63c12e2c54bc48395cf6c6955ae26b0d55d6",
+      "source_bytes": 1906,
+      "rendered_bytes": 1906,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A14.1. Learning Levels",
+          "handle": "A14.1",
+          "source_line": 2417,
+          "source_anchor": "a141-learning-levels",
+          "fragment_anchor": "a141-learning-levels"
+        }
+      ]
+    },
+    {
+      "order": 110,
+      "path": "docs/architecture/A14-02-consolidation-and-reconsolidation.md",
+      "source_start_char": 121871,
+      "source_end_char": 122475,
+      "source_start_line": 2441,
+      "source_end_line": 2462,
+      "source_sha256": "63b6cc4b4857c473d327d39075c05e50b0be35ddd48ffcd7dc32cace499049c5",
+      "rendered_sha256": "63b6cc4b4857c473d327d39075c05e50b0be35ddd48ffcd7dc32cace499049c5",
+      "source_bytes": 612,
+      "rendered_bytes": 612,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A14.2. Consolidation and Reconsolidation",
+          "handle": "A14.2",
+          "source_line": 2441,
+          "source_anchor": "a142-consolidation-and-reconsolidation",
+          "fragment_anchor": "a142-consolidation-and-reconsolidation"
+        }
+      ]
+    },
+    {
+      "order": 111,
+      "path": "docs/architecture/A14-03-negative-memory-and-extinction.md",
+      "source_start_char": 122475,
+      "source_end_char": 122930,
+      "source_start_line": 2462,
+      "source_end_line": 2470,
+      "source_sha256": "64c3f9f79bdb58391bc2e7b5e66f3e4b095e03455fff42108845d19d5cfd5743",
+      "rendered_sha256": "64c3f9f79bdb58391bc2e7b5e66f3e4b095e03455fff42108845d19d5cfd5743",
+      "source_bytes": 455,
+      "rendered_bytes": 455,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A14.3. Negative Memory and Extinction",
+          "handle": "A14.3",
+          "source_line": 2462,
+          "source_anchor": "a143-negative-memory-and-extinction",
+          "fragment_anchor": "a143-negative-memory-and-extinction"
+        }
+      ]
+    },
+    {
+      "order": 112,
+      "path": "docs/architecture/A14-04-forgetting-and-memory-ecology.md",
+      "source_start_char": 122930,
+      "source_end_char": 124070,
+      "source_start_line": 2470,
+      "source_end_line": 2505,
+      "source_sha256": "cb0009e8cf33a1e2da536ef3879929d35ded2d726ce15564659ed15ba39137fe",
+      "rendered_sha256": "cb0009e8cf33a1e2da536ef3879929d35ded2d726ce15564659ed15ba39137fe",
+      "source_bytes": 1148,
+      "rendered_bytes": 1148,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A14.4. Forgetting and Memory Ecology",
+          "handle": "A14.4",
+          "source_line": 2470,
+          "source_anchor": "a144-forgetting-and-memory-ecology",
+          "fragment_anchor": "a144-forgetting-and-memory-ecology"
+        }
+      ]
+    },
+    {
+      "order": 113,
+      "path": "docs/architecture/A14-05-meta-learning.md",
+      "source_start_char": 124070,
+      "source_end_char": 127267,
+      "source_start_line": 2505,
+      "source_end_line": 2549,
+      "source_sha256": "7e6b9f742696873753d97f7b78a9ee757033c59ee6c8192261847be236cfdd81",
+      "rendered_sha256": "7e6b9f742696873753d97f7b78a9ee757033c59ee6c8192261847be236cfdd81",
+      "source_bytes": 3225,
+      "rendered_bytes": 3225,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A14.5. Meta-Learning",
+          "handle": "A14.5",
+          "source_line": 2505,
+          "source_anchor": "a145-meta-learning",
+          "fragment_anchor": "a145-meta-learning"
+        },
+        {
+          "level": 3,
+          "title": "Inner Loop — Learning During Work",
+          "handle": null,
+          "source_line": 2509,
+          "source_anchor": "inner-loop--learning-during-work",
+          "fragment_anchor": "inner-loop--learning-during-work"
+        },
+        {
+          "level": 3,
+          "title": "Outer Loop — Consolidation and Promotion",
+          "handle": null,
+          "source_line": 2527,
+          "source_anchor": "outer-loop--consolidation-and-promotion",
+          "fragment_anchor": "outer-loop--consolidation-and-promotion"
+        }
+      ]
+    },
+    {
+      "order": 114,
+      "path": "docs/architecture/A14-06-evaluation.md",
+      "source_start_char": 127267,
+      "source_end_char": 128440,
+      "source_start_line": 2549,
+      "source_end_line": 2565,
+      "source_sha256": "d911b53fbc1f2f79f54774ebf1bf1cb261eb05243657fa1f6a2ce47b8e5f0c39",
+      "rendered_sha256": "d911b53fbc1f2f79f54774ebf1bf1cb261eb05243657fa1f6a2ce47b8e5f0c39",
+      "source_bytes": 1181,
+      "rendered_bytes": 1181,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A14.6. Evaluation",
+          "handle": "A14.6",
+          "source_line": 2549,
+          "source_anchor": "a146-evaluation",
+          "fragment_anchor": "a146-evaluation"
+        }
+      ]
+    },
+    {
+      "order": 115,
+      "path": "docs/architecture/A14-07-cost-authority.md",
+      "source_start_char": 128440,
+      "source_end_char": 129162,
+      "source_start_line": 2565,
+      "source_end_line": 2581,
+      "source_sha256": "2966f4625f57327acc3bfce251109048a3ea867171caf3e79fb07733ce2c66e8",
+      "rendered_sha256": "2966f4625f57327acc3bfce251109048a3ea867171caf3e79fb07733ce2c66e8",
+      "source_bytes": 724,
+      "rendered_bytes": 724,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A14.7. Cost Authority",
+          "handle": "A14.7",
+          "source_line": 2565,
+          "source_anchor": "a147-cost-authority",
+          "fragment_anchor": "a147-cost-authority"
+        }
+      ]
+    },
+    {
+      "order": 116,
+      "path": "docs/architecture/A14-08-development-doctrine.md",
+      "source_start_char": 129162,
+      "source_end_char": 132892,
+      "source_start_line": 2581,
+      "source_end_line": 2640,
+      "source_sha256": "c7da919cd6112e97780407b7a7ae9806185994c2de6a275ed2449cb1b9ca78bb",
+      "rendered_sha256": "c7da919cd6112e97780407b7a7ae9806185994c2de6a275ed2449cb1b9ca78bb",
+      "source_bytes": 3740,
+      "rendered_bytes": 3740,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A14.8. Development Doctrine",
+          "handle": "A14.8",
+          "source_line": 2581,
+          "source_anchor": "a148-development-doctrine",
+          "fragment_anchor": "a148-development-doctrine"
+        }
+      ]
+    },
+    {
+      "order": 117,
+      "path": "docs/architecture/A14-09-architecture-coherence-review.md",
+      "source_start_char": 132892,
+      "source_end_char": 134078,
+      "source_start_line": 2640,
+      "source_end_line": 2663,
+      "source_sha256": "acf37545a0b83044ac46ca0a9adea4d74ea83f394a722a6919d9ecb997cf84aa",
+      "rendered_sha256": "acf37545a0b83044ac46ca0a9adea4d74ea83f394a722a6919d9ecb997cf84aa",
+      "source_bytes": 1186,
+      "rendered_bytes": 1186,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A14.9. Architecture Coherence Review",
+          "handle": "A14.9",
+          "source_line": 2640,
+          "source_anchor": "a149-architecture-coherence-review",
+          "fragment_anchor": "a149-architecture-coherence-review"
+        }
+      ]
+    },
+    {
+      "order": 118,
+      "path": "docs/architecture/A15-end-to-end-scenarios.md",
+      "source_start_char": 134078,
+      "source_end_char": 139644,
+      "source_start_line": 2663,
+      "source_end_line": 2701,
+      "source_sha256": "17735bd4be95145e880bc186ad3d5d066617093c045c49dd9d7a78998541ee69",
+      "rendered_sha256": "17735bd4be95145e880bc186ad3d5d066617093c045c49dd9d7a78998541ee69",
+      "source_bytes": 5566,
+      "rendered_bytes": 5566,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A15. End-to-End Scenarios",
+          "handle": "A15",
+          "source_line": 2663,
+          "source_anchor": "a15-end-to-end-scenarios",
+          "fragment_anchor": "a15-end-to-end-scenarios"
+        }
+      ]
+    },
+    {
+      "order": 119,
+      "path": "docs/architecture/A16-core-architectural-decisions.md",
+      "source_start_char": 139644,
+      "source_end_char": 139681,
+      "source_start_line": 2701,
+      "source_end_line": 2703,
+      "source_sha256": "24aa9df30d3370d37ad8ce1671e53d29da2d60f8501495f48b590a22836837b3",
+      "rendered_sha256": "24aa9df30d3370d37ad8ce1671e53d29da2d60f8501495f48b590a22836837b3",
+      "source_bytes": 37,
+      "rendered_bytes": 37,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 1,
+          "title": "A16. Core Architectural Decisions",
+          "handle": "A16",
+          "source_line": 2701,
+          "source_anchor": "a16-core-architectural-decisions",
+          "fragment_anchor": "a16-core-architectural-decisions"
+        }
+      ]
+    },
+    {
+      "order": 120,
+      "path": "docs/architecture/A16-01-decision-anchors.md",
+      "source_start_char": 139681,
+      "source_end_char": 145323,
+      "source_start_line": 2703,
+      "source_end_line": 2773,
+      "source_sha256": "8ecdc335274e5f9d9f67ffa9fcce535a7d3049e0b03af461a3ab9c362b89058c",
+      "rendered_sha256": "8ecdc335274e5f9d9f67ffa9fcce535a7d3049e0b03af461a3ab9c362b89058c",
+      "source_bytes": 5642,
+      "rendered_bytes": 5642,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A16.1. Decision Anchors",
+          "handle": "A16.1",
+          "source_line": 2703,
+          "source_anchor": "a161-decision-anchors",
+          "fragment_anchor": "a161-decision-anchors"
+        }
+      ]
+    },
+    {
+      "order": 121,
+      "path": "docs/architecture/A16-02-anti-patterns.md",
+      "source_start_char": 145323,
+      "source_end_char": 147821,
+      "source_start_line": 2773,
+      "source_end_line": 2815,
+      "source_sha256": "bdb55c52c842b0dc7889aa406c5fb42c494067c13034621ba33f71cceb27bdf3",
+      "rendered_sha256": "bdb55c52c842b0dc7889aa406c5fb42c494067c13034621ba33f71cceb27bdf3",
+      "source_bytes": 2498,
+      "rendered_bytes": 2498,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A16.2. Anti-Patterns",
+          "handle": "A16.2",
+          "source_line": 2773,
+          "source_anchor": "a162-anti-patterns",
+          "fragment_anchor": "a162-anti-patterns"
+        }
+      ]
+    },
+    {
+      "order": 122,
+      "path": "docs/architecture/A16-03-final-formula.md",
+      "source_start_char": 147821,
+      "source_end_char": 148905,
+      "source_start_line": 2815,
+      "source_end_line": 2832,
+      "source_sha256": "732304d6ea730d33852646e3156ae2d0fb0cd18c939824a3100e222c7297d7c0",
+      "rendered_sha256": "732304d6ea730d33852646e3156ae2d0fb0cd18c939824a3100e222c7297d7c0",
+      "source_bytes": 1084,
+      "rendered_bytes": 1084,
+      "navigation_rewrites": [],
+      "headings": [
+        {
+          "level": 2,
+          "title": "A16.3. Final Formula",
+          "handle": "A16.3",
+          "source_line": 2815,
+          "source_anchor": "a163-final-formula",
+          "fragment_anchor": "a163-final-formula"
+        }
+      ]
+    }
+  ]
+}
