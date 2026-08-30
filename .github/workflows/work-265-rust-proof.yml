@@ -8,10 +8,6 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: work-265-rust-proof
-  cancel-in-progress: true
-
 jobs:
   coordinator-model-control:
     if: github.actor != 'github-actions[bot]'
@@ -48,8 +44,47 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-work-265-${{ hashFiles('Cargo.lock') }}
 
+      - name: Remove redundant direct hash dependency
+        shell: pwsh
+        run: |
+          $sourcePath = 'crates/agent/eliot-agent-coordinator/src/model_control.rs'
+          $source = [IO.File]::ReadAllText($sourcePath)
+          $source = [Text.RegularExpressions.Regex]::Replace(
+            $source,
+            '(?m)^use sha2::\{Digest, Sha256\};\r?\n',
+            ''
+          )
+          $old = 'Ok(format!("sha256:{:x}", Sha256::digest(bytes)))'
+          $new = 'Ok(format!("sha256:{}", eliot_receipts::sha256_hex(&bytes)))'
+          if (-not $source.Contains($old)) {
+            throw 'SOURCE_PATCH_PRECONDITION_FAILED: canonical digest expression not found'
+          }
+          $source = $source.Replace($old, $new)
+          [IO.File]::WriteAllText($sourcePath, $source, [Text.UTF8Encoding]::new($false))
+
+          $cargoPath = 'crates/agent/eliot-agent-coordinator/Cargo.toml'
+          $cargo = [IO.File]::ReadAllText($cargoPath)
+          $cargo = [Text.RegularExpressions.Regex]::Replace(
+            $cargo,
+            '(?m)^sha2\.workspace = true\r?\n',
+            ''
+          )
+          [IO.File]::WriteAllText($cargoPath, $cargo, [Text.UTF8Encoding]::new($false))
+
       - name: Apply canonical Rust formatting
         run: cargo fmt -p eliot-agent-coordinator
+
+      - name: Commit exact candidate before proof
+        shell: pwsh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/agent/eliot-agent-coordinator
+          if (-not (git diff --cached --quiet)) {
+            git commit -m 'fix(swarm): reuse foundation hash contract [proof-bot]'
+            git push origin HEAD:work/265-swarm-model-catalogue-control
+          }
+          Write-Host "PROOF_SOURCE_SHA=$((git rev-parse HEAD).Trim())"
 
       - name: Check coordinator
         run: cargo check --locked -p eliot-agent-coordinator --all-targets
@@ -60,13 +95,12 @@ jobs:
       - name: Clippy coordinator
         run: cargo clippy --locked -p eliot-agent-coordinator --all-targets -- -D warnings
 
-      - name: Commit canonical formatting
+      - name: Verify clean proved tree
         shell: pwsh
         run: |
-          if (-not (git diff --quiet -- crates/agent/eliot-agent-coordinator)) {
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add crates/agent/eliot-agent-coordinator
-            git commit -m 'style(swarm): apply canonical Rust formatting [proof-bot]'
-            git push origin HEAD:work/265-swarm-model-catalogue-control
+          if (-not (git diff --quiet)) {
+            git diff --check
+            git diff
+            throw 'PROOF_TREE_DIRTY'
           }
+          Write-Host "PROOF_SOURCE_SHA=$((git rev-parse HEAD).Trim())"
