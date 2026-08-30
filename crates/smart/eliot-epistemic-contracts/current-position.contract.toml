@@ -1,0 +1,225 @@
+schema_version = 1
+contract_id = "smart.epistemic.current-position.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-epistemic-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.epistemic.contracts", "smart.epistemic.position", "smart.epistemic.context_projection"]
+architecture_refs = ["ARCH-EPI-01", "ARCH-EPI-02", "ARCH-EPI-04", "ARCH-UND-01", "ARCH-UND-02", "ARCH-CONCIL-01", "ARCH-SCOPE-01"]
+implementation_refs = ["I5.20", "I6.12", "I6.16", "I7.11", "I9.5", "I12.12", "I12.13"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Represent one question-, scope-, time- and State-Fence-bound Current Epistemic Position while keeping observation, support, explicit assumption, rivals, local conflicts, stale/superseded state, unknowns and required inquiry separately addressable."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((records + assumptions + rivals + conflicts + inquiries) log n) over policy-bounded immutable inputs; no I/O, model call, canonical write or support transition."
+replacement_boundary = "Replace resolver and renderer implementations behind this contract; Governor/canonical evidence owners retain admission and epistemic-transition authority."
+
+[closed_sets]
+coverage_states = ["Complete", "Partial", "Unavailable", "Blocked", "Stale"]
+position_roles = ["DirectObservation", "SupportedPosition", "StalePosition", "SupersededPosition", "UnknownPosition"]
+dependence_classes = ["IndependentBasis", "SharedSourceLineage", "SharedCaptureRoute", "SharedEvaluator", "CorrelatedModelFamily", "Unknown"]
+conflict_stances = ["Supports", "Counters", "Qualifies", "IncompatibleScope", "Unknown"]
+inquiry_kinds = ["Observation", "Verifier", "Experiment", "CounterexampleSearch", "SourceExpansion", "HumanClarification"]
+inquiry_dispositions = ["RequiredBeforeMaterialAction", "Recommended", "DeferredWithRisk", "BlockedByCapability", "Exhausted"]
+
+[hard_invariants]
+one_question_scope_time_and_fence_per_position = true
+observed_supported_assumed_rival_conflicted_stale_superseded_and_unknown_are_distinct = true
+assumption_requires_explicit_assumption_record = true
+absence_of_counterevidence_is_not_support = true
+record_or_agent_count_is_not_epistemic_weight = true
+shared_lineage_is_not_independent_confirmation = true
+conflict_is_local_to_a_proposition_scope_and_time = true
+minority_and_counterevidence_remain_addressable = true
+unknown_requires_decision_dependency_or_explicit_not_applicable = true
+complete_requires_exact_recheckable_denominator = true
+investigation_names_discriminator_falsifier_revision_and_stop = true
+position_contains_no_truth_authority_admission_or_finish_receipt = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "ClockReading"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "EpistemicStatus"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "Assertability"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "EvidenceFreshness"
+owner = "eliot-evidence"
+
+[[public_type]]
+name = "PositionCoverageState"
+kind = "enum"
+definition = ["Complete", "Partial", "Unavailable", "Blocked", "Stale"]
+
+[[public_type]]
+name = "PositionCoverageDenominator"
+kind = "struct"
+definition = ["source_ref: String", "source_revision: String", "method_ref: String", "expected_record_count: Option<u32>", "expected_record_handles: Vec<ArtifactId>", "expected_owner_refs: Vec<String>"]
+invariants = ["source/revision/method non-blank", "Complete requires expected_record_count", "handles and owners unique", "denominator independently recheckable"]
+
+[[public_type]]
+name = "PositionCoverage"
+kind = "struct"
+definition = ["state: PositionCoverageState", "denominator: Option<PositionCoverageDenominator>", "observed_record_count: u32", "missing_owner_or_reason_refs: Vec<String>"]
+invariants = ["Complete requires exact count equality and no missing refs", "Partial requires denominator and named gaps", "Unavailable or Blocked has no observed records and names owner/reason", "Stale cannot support current automatic action"]
+
+[[public_type]]
+name = "PositionRole"
+kind = "enum"
+definition = ["DirectObservation", "SupportedPosition", "StalePosition", "SupersededPosition", "UnknownPosition"]
+
+[[public_type]]
+name = "EvidenceDependenceClass"
+kind = "enum"
+definition = ["IndependentBasis", "SharedSourceLineage", "SharedCaptureRoute", "SharedEvaluator", "CorrelatedModelFamily", "Unknown"]
+invariants = ["classes are descriptive dimensions, not a scalar independence score"]
+
+[[public_type]]
+name = "EvidenceDependence"
+kind = "struct"
+definition = ["class: EvidenceDependenceClass", "evidence_handles: Vec<ArtifactId>", "shared_lineage_handles: Vec<ArtifactId>", "shared_route_or_evaluator_refs: Vec<String>", "reason_codes: Vec<String>"]
+invariants = ["evidence handles non-empty and unique", "IndependentBasis has no shared-lineage/route/evaluator refs", "Unknown cannot be counted as independent support"]
+
+[[public_type]]
+name = "PositionRecord"
+kind = "struct"
+definition = ["record_id: ArtifactId", "proposition_id: ArtifactId", "proposition: String", "role: PositionRole", "epistemic_status: EpistemicStatus", "assertability: Assertability", "freshness: EvidenceFreshness", "scope_id: String", "task_id: Option<TaskId>", "valid_time_ref: String", "known_at: ClockReading", "state_fence: StateFence", "source_handles: Vec<ArtifactId>", "supporting_evidence_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "dependence: Vec<EvidenceDependence>", "applicability_conditions: Vec<String>", "revision_conditions: Vec<String>"]
+invariants = ["record/proposition/source lineage exact", "role agrees with epistemic status", "DirectObservation is not assertable support by itself", "UnknownPosition has no supported/verified status", "scope/task/time/fence exact", "counterevidence never dropped"]
+
+[[public_type]]
+name = "ExplicitAssumption"
+kind = "struct"
+definition = ["assumption_id: ArtifactId", "proposition_id: ArtifactId", "statement: String", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "introduced_by_ref: ArtifactId", "reason: String", "decision_dependency_refs: Vec<ArtifactId>", "supporting_context_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "invalidation_conditions: Vec<String>", "expiry_or_review_condition: String"]
+invariants = ["assumption is explicitly introduced and never represented as Supported/Verified", "decision dependencies and invalidation conditions remain visible", "absence of contradiction does not create support"]
+
+[[public_type]]
+name = "RevisionCondition"
+kind = "struct"
+definition = ["condition_id: ArtifactId", "subject_ref: ArtifactId", "observable: String", "expected_if_current_model_holds: String", "falsifier: String", "revision_action: String"]
+invariants = ["observable/falsifier/revision action non-blank", "condition grants no automatic transition authority"]
+
+[[public_type]]
+name = "RivalModel"
+kind = "struct"
+definition = ["rival_id: ArtifactId", "question_id: ArtifactId", "statement: String", "mechanism: String", "scope_id: String", "state_fence: StateFence", "supporting_evidence_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "dependence: Vec<EvidenceDependence>", "predicted_observables: Vec<String>", "possible_confounders: Vec<String>", "revision_conditions: Vec<RevisionCondition>", "validity_scope: String"]
+invariants = ["rival remains candidate model, not canonical truth", "support and counterevidence separately addressable", "at least one prediction or explicit untested reason", "validity scope explicit"]
+
+[[public_type]]
+name = "ConflictStance"
+kind = "enum"
+definition = ["Supports", "Counters", "Qualifies", "IncompatibleScope", "Unknown"]
+
+[[public_type]]
+name = "ConflictParticipant"
+kind = "struct"
+definition = ["participant_id: ArtifactId", "record_ref: ArtifactId", "stance: ConflictStance", "evidence_handles: Vec<ArtifactId>", "dependence: Vec<EvidenceDependence>", "scope_id: String", "valid_time_ref: String"]
+invariants = ["participant refers to one exact record", "evidence lineage retained", "IncompatibleScope is not treated as factual contradiction"]
+
+[[public_type]]
+name = "ConflictSet"
+kind = "struct"
+definition = ["conflict_id: ArtifactId", "proposition_id: ArtifactId", "scope_id: String", "valid_time_ref: String", "participants: Vec<ConflictParticipant>", "shared_lineage_handles: Vec<ArtifactId>", "unresolved_residue: Vec<String>", "decision_dependency_refs: Vec<ArtifactId>", "investigation_requirement_refs: Vec<ArtifactId>"]
+invariants = ["at least two participants", "participant ids unique", "conflict is local to proposition/scope/time", "shared lineage and unresolved residue visible", "vote count creates no truth"]
+
+[[public_type]]
+name = "InquiryKind"
+kind = "enum"
+definition = ["Observation", "Verifier", "Experiment", "CounterexampleSearch", "SourceExpansion", "HumanClarification"]
+
+[[public_type]]
+name = "InquiryDisposition"
+kind = "enum"
+definition = ["RequiredBeforeMaterialAction", "Recommended", "DeferredWithRisk", "BlockedByCapability", "Exhausted"]
+
+[[public_type]]
+name = "DiscriminativeInquiry"
+kind = "struct"
+definition = ["inquiry_id: ArtifactId", "kind: InquiryKind", "question: String", "decision_dependency_refs: Vec<ArtifactId>", "rival_model_refs: Vec<ArtifactId>", "expected_if_true: String", "expected_if_false: String", "falsifier: String", "cheapest_safe_probe: String", "required_capability_refs: Vec<String>", "risk_and_cost_notes: Vec<String>", "stop_condition: String"]
+invariants = ["distinguishes at least two alternatives", "expected true/false and falsifier explicit", "probe has no execution receipt or authority"]
+
+[[public_type]]
+name = "InvestigationRequirement"
+kind = "struct"
+definition = ["requirement_id: ArtifactId", "unknown_or_conflict_ref: ArtifactId", "disposition: InquiryDisposition", "inquiry: DiscriminativeInquiry", "revision_conditions: Vec<RevisionCondition>", "owner_ref: String", "expiry_or_review_condition: String"]
+invariants = ["decision relevance and owner explicit", "required inquiry names model-change conditions", "blocked capability remains a visible gap", "requirement cannot execute itself"]
+
+[[public_type]]
+name = "CurrentPositionRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "question_id: ArtifactId", "question: String", "scope_id: String", "task_id: Option<TaskId>", "as_of: ClockReading", "valid_time_ref: String", "state_fence: StateFence", "expected_owner_refs: Vec<String>", "decision_dependency_refs: Vec<ArtifactId>", "maximum_records: u32", "maximum_rivals: u32", "maximum_conflicts: u32", "maximum_inquiries: u32", "request_sha256: String"]
+invariants = ["one exact question/scope/time/fence", "owners/dependencies unique", "bounds non-zero", "request grants no truth/support/authority"]
+
+[[public_type]]
+name = "CurrentEpistemicPosition"
+kind = "struct"
+definition = ["position_id: ArtifactId", "request_sha256: String", "question_id: ArtifactId", "question: String", "scope_id: String", "task_id: Option<TaskId>", "as_of: ClockReading", "valid_time_ref: String", "state_fence: StateFence", "coverage: PositionCoverage", "direct_observations: Vec<PositionRecord>", "supported_positions: Vec<PositionRecord>", "assumptions: Vec<ExplicitAssumption>", "rival_models: Vec<RivalModel>", "conflicts: Vec<ConflictSet>", "stale_positions: Vec<PositionRecord>", "superseded_positions: Vec<PositionRecord>", "unknowns: Vec<PositionRecord>", "investigation_requirements: Vec<InvestigationRequirement>", "source_handles: Vec<ArtifactId>", "position_sha256: String"]
+invariants = ["all role collections remain separate", "all ids unique across collections", "every conflict/inquiry reference resolves", "coverage and limits bind content", "contains no aggregate confidence, truth, admission, authority or finish field", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_position_request"
+signature = "pub fn validate_position_request(request: &CurrentPositionRequest) -> Result<(), EpistemicContractError>"
+
+[[public_function]]
+name = "validate_current_epistemic_position"
+signature = "pub fn validate_current_epistemic_position(request: &CurrentPositionRequest, position: &CurrentEpistemicPosition) -> Result<(), EpistemicContractError>"
+
+[[public_function]]
+name = "current_position_digest"
+signature = "pub fn current_position_digest(position: &CurrentEpistemicPosition) -> Result<String, EpistemicContractError>"
+
+[[negative_test]]
+id = "implicit-assumption-rejected"
+property = "A proposition cannot appear as assumed without an ExplicitAssumption record."
+
+[[negative_test]]
+id = "dependent-duplicates-not-independent"
+property = "Repeated evidence sharing source, capture route, evaluator or model lineage never counts as independent confirmation."
+
+[[negative_test]]
+id = "local-conflict-not-global"
+property = "Conflict on one proposition/scope/time does not mark unrelated records conflicted."
+
+[[negative_test]]
+id = "missing-denominator-not-complete"
+property = "Complete PositionCoverage without expected count/owner denominator is rejected."
+
+[[negative_test]]
+id = "unknown-not-zero"
+property = "Unknown decision-relevant position remains explicit and produces an inquiry or documented non-applicability."
+
+[[negative_test]]
+id = "vote-count-no-truth"
+property = "Participant/model count cannot promote a position or resolve conflict."
+
+[[negative_test]]
+id = "permutation-deterministic"
+property = "Input collection permutation does not change the canonical position digest."

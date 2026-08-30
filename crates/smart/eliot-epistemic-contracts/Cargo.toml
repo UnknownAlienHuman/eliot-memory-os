@@ -1,14 +1,28 @@
 [package]
 name = "eliot-epistemic-contracts"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 publish = false
-description = "Versioned store-neutral contracts for ELIOT Current Epistemic Position"
+description = "Versioned store-neutral contracts for ELIOT Current Epistemic Position."
 
 [lib]
 path = "src/lib.rs"
+
+[package.metadata.eliot]
+layer = "C0"
+purpose = "Current Epistemic Position, explicit assumptions, rivals, conflicts and investigation contracts"
+source_maintenance_owner = "cognitive-integration-owner"
+functional_cell_refs = ["smart.epistemic.contracts"]
+independent_proof_profile = "prototype-not-workspace-admitted"
+contract_refs = [
+  "crates/smart/cognitive-current.toml",
+  "crates/smart/eliot-epistemic-contracts/current-position.contract.toml",
+]
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until Rust implementation, ModuleTestCapsule, affected real Edge Proof and D3A_ORIENTATION_PULSE_01"
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
@@ -16,15 +30,6 @@ eliot-evidence = { path = "../../foundation/eliot-evidence" }
 schemars.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-
-[package.metadata.eliot]
-prototype = true
-workspace_admission = "pending_agent_implementation"
-functional_cell = "smart.epistemic.contracts"
-source_layer = "C1"
-runtime_layer = "R5"
-runtime_bundle = "eliotd"
-agent_order = 6
 
 [lints]
 workspace = true
