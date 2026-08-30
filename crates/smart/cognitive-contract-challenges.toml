@@ -1,4 +1,12 @@
-schema_version = 4
+schema_version = 5
 status = "CURRENT_POINTER"
 authority = "crates/smart/cognitive-current.toml"
-open_contract_challenges = ["CC-PROVIDER-ADAPTERS: Governor-owned GoalTask/CriticalAttention/AuthorityAffordance provider adapters remain outside Smart", "CC-EDGE-PROOF: implementation workers cannot claim real provider-consumer proof", "CC-PRODUCT-PULSE: design contracts are not executed evidence"]
+open_contract_challenges = [
+  "CC-PROVIDER-ADAPTERS: Governor-owned GoalTask/CriticalAttention/AuthorityAffordance provider adapters remain outside Smart",
+  "CC-EDGE-PROOF: implementation workers cannot claim real provider-consumer proof",
+  "CC-PRODUCT-PULSE: design contracts are not executed evidence",
+  "CC-MEMORY-PROJECTION-SCHEMA: rev12 assigns MemoryQueryIntent, MemorySelectionPolicy, MemorySelectionTrace and MemoryContextProjectionRequest to eliot-memory-projection-contracts, but the normative pair, rev11 materialization and retained memory donor do not define one field-complete owner-neutral schema; dependent implementation must stop instead of inventing fields or generic JSON",
+  "CC-FAILURE-OBSERVATION-SCHEMA: rev12 assigns FailureObservation to eliot-learning-contracts, but no field-complete schema was found in the normative pair, rev11 materialization or retained donors; learning cells may consume only an explicitly frozen contract or remain deferred",
+  "CC-PROVIDER-CONTRIBUTION-SCHEMA: rev12 assigns ProviderContribution and ProviderRoleRequirement to eliot-context-contracts and closes ContextProviderClass to GoalTask/CriticalAttention/EpistemicPosition/MemoryRecall/AuthorityAffordance/SelfModel/DecisionTail, but ProviderContribution fields are undefined and the first Rust source wave diverges from the closed class set; freeze the schema and class mapping before claiming cell closure",
+  "CC-WAVE0-PROOF-IDENTITY: the three isolated wave-0 workspaces have no committed dependency lock or repository-hosted exact-head run; author-reported local checks remain NOT_EXECUTED evidence until an immutable dependency identity and manual proof receipt exist",
+]
