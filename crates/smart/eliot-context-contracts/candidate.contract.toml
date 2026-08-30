@@ -1,0 +1,158 @@
+schema_version = 1
+contract_id = "smart.context.candidate.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-context-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.context.contracts.candidate", "smart.context.contribution_merge"]
+architecture_refs = ["ARCH-CTX-01", "ARCH-CTX-04", "ARCH-EPI-04", "ARCH-SCOPE-01", "ARCH-RES-05"]
+implementation_refs = ["I2.20", "I7.11", "I12.13"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Merge exact provider contributions into one whole-unit candidate set with a closed expected-provider denominator, without retrieving new data, ranking across providers or deciding admission."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_hot_path_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((providers + atoms + omissions + source_handles) log n) over request-bounded contributions; no storage, model, provider SDK, blocking I/O or admission."
+replacement_boundary = "Replace merge implementation behind this contract; provider implementations and Context admission/view remain separate owners."
+
+[closed_sets]
+merge_states = ["Complete", "Partial", "Blocked", "Stale", "Conflicted"]
+candidate_conflicts = ["DuplicateAtomIdentity", "ProviderRoleConflict", "PayloadConflict", "FenceConflict", "ScopeConflict", "DependencyConflict"]
+
+[hard_invariants]
+expected_provider_set_is_closed_and_exact = true
+unqueried_unavailable_partial_and_empty_complete_are_distinct = true
+provider_contribution_is_validated_before_merge = true
+one_provider_cannot_fill_another_provider_denominator = true
+whole_provider_atoms_are_preserved = true
+merge_does_not_change_payload_status_assertability_or_loss_policy = true
+merge_does_not_rank_or_admit = true
+merge_does_not_retrieve_or_expand_handles = true
+duplicate_identity_with_different_payload_is_conflict_not_last_write_wins = true
+scope_task_state_fence_and_expected_provider_digest_match = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "ProviderId"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ContextProviderClass"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ContextRole"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ProviderAtom"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ProviderCoverage"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ProviderOmission"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ProviderContribution"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ExpectedContextProviderSet"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[public_type]]
+name = "ContextMergeState"
+kind = "enum"
+definition = ["Complete", "Partial", "Blocked", "Stale", "Conflicted"]
+
+[[public_type]]
+name = "ContextCandidateConflictKind"
+kind = "enum"
+definition = ["DuplicateAtomIdentity", "ProviderRoleConflict", "PayloadConflict", "FenceConflict", "ScopeConflict", "DependencyConflict"]
+
+[[public_type]]
+name = "ContextCandidateConflict"
+kind = "struct"
+definition = ["conflict_id: ArtifactId", "kind: ContextCandidateConflictKind", "atom_ids: Vec<ArtifactId>", "provider_ids: Vec<ProviderId>", "source_handles: Vec<ArtifactId>", "reason_codes: Vec<String>", "blocks_admission: bool"]
+invariants = ["at least two conflicting identities where applicable", "providers/sources unique", "conflict remains visible and cannot be solved by merge order"]
+
+[[public_type]]
+name = "ContextCandidate"
+kind = "struct"
+definition = ["candidate_id: ArtifactId", "provider_id: ProviderId", "provider_class: ContextProviderClass", "atom: ProviderAtom", "source_contribution_id: ArtifactId", "source_contribution_sha256: String", "source_coverage: ProviderCoverage", "source_omission_refs: Vec<ArtifactId>", "dependency_candidate_ids: Vec<ArtifactId>", "conflict_refs: Vec<ArtifactId>"]
+invariants = ["candidate/provider/atom identities reconcile", "atom unchanged from validated contribution", "source contribution digest exact", "dependencies/conflicts exact", "candidate has no admission/rank/delivery/use field"]
+
+[[public_type]]
+name = "ProviderContributionReceiptView"
+kind = "struct"
+definition = ["provider_id: ProviderId", "provider_class: ContextProviderClass", "provider_generation: String", "contribution_id: ArtifactId", "contribution_sha256: String", "coverage: ProviderCoverage", "atom_count: u32", "omission_count: u32"]
+invariants = ["receipt view is immutable evidence of contribution shape, not delivery/use", "counts match contribution"]
+
+[[public_type]]
+name = "ContextCandidateSetRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "expected_provider_set: ExpectedContextProviderSet", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "maximum_providers: u32", "maximum_candidates: u32", "maximum_total_source_handles: u32", "request_sha256: String"]
+invariants = ["expected set/scope/task/fence exact", "bounds non-zero", "request grants no retrieval, expansion, ranking or admission"]
+
+[[public_type]]
+name = "ContextCandidateSet"
+kind = "struct"
+definition = ["request_sha256: String", "expected_provider_set_sha256: String", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "merge_state: ContextMergeState", "provider_receipts: Vec<ProviderContributionReceiptView>", "candidates: Vec<ContextCandidate>", "conflicts: Vec<ContextCandidateConflict>", "provider_omissions: Vec<ProviderOmission>", "missing_provider_refs: Vec<String>", "set_sha256: String"]
+invariants = ["one receipt per expected provider state", "all candidates arise from validated contributions", "Complete requires all mandatory expected providers complete and no blocking conflict", "Partial/Blocked/Stale/Conflicted reasons explicit", "candidate ids unique", "no rank/admission/delivery/use state", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_context_candidate_set_request"
+signature = "pub fn validate_context_candidate_set_request(request: &ContextCandidateSetRequest) -> Result<(), ContextCandidateContractError>"
+
+[[public_function]]
+name = "merge_context_contributions"
+signature = "pub fn merge_context_contributions(request: &ContextCandidateSetRequest, contributions: &[ProviderContribution]) -> Result<ContextCandidateSet, ContextCandidateContractError>"
+
+[[public_function]]
+name = "validate_context_candidate_set"
+signature = "pub fn validate_context_candidate_set(request: &ContextCandidateSetRequest, set: &ContextCandidateSet) -> Result<(), ContextCandidateContractError>"
+
+[[negative_test]]
+id = "missing-mandatory-not-empty-complete"
+property = "Absent or unavailable mandatory provider cannot produce Complete candidate set."
+
+[[negative_test]]
+id = "empty-complete-distinct"
+property = "Validated provider with exact zero denominator is distinct from unqueried/unavailable provider."
+
+[[negative_test]]
+id = "duplicate-not-last-write-wins"
+property = "Same atom identity with different payload/provenance becomes a conflict."
+
+[[negative_test]]
+id = "merge-does-not-rank"
+property = "Candidate contract has no global score, admission disposition, cross-provider ranking or budget selection field."
+
+[[negative_test]]
+id = "merge-does-not-retrieve"
+property = "Merge function accepts only provider contributions and exposes no store/read/expansion/model/tool interface."
