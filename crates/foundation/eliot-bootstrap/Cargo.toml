@@ -6,6 +6,24 @@ rust-version.workspace = true
 license.workspace = true
 description = "ELIOT D0 pure bootstrap snapshot, rule, and brief compilers"
 
+[package.metadata.eliot]
+layer = "C0"
+purpose = "Compile immutable D0 evidence, normative-coverage, and work-unit brief artifacts without acquiring runtime, semantic, or canonical authority."
+source_maintenance_owner = "foundation.bootstrap"
+functional_cell_refs = [
+  "foundation.bootstrap.current-system-evidence",
+  "foundation.bootstrap.rule-catalogue",
+  "foundation.bootstrap.work-unit-brief",
+]
+independent_proof_profile = "eliot-bootstrap"
+contract_refs = [
+  "ELIOT_IMPLEMENTATION:I0.5",
+  "ELIOT_IMPLEMENTATION:I2.8",
+  "ELIOT_IMPLEMENTATION:I2.20",
+  "ELIOT_IMPLEMENTATION:I2.23",
+]
+component_contract_ref = ""
+
 [dependencies]
 eliot-agent-api.workspace = true
 eliot-contracts.workspace = true
