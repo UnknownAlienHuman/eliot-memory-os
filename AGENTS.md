@@ -12,8 +12,9 @@ Read, in order:
 2. [`workstreams/ACTIVE.toml`](workstreams/ACTIVE.toml);
 3. the owning open GitHub issue and current PR, when one exists;
 4. the nearest `AGENTS.md` from the repository root down to every mutable path;
-5. [`docs/ARCHITECTURE_CONTRACT.md`](docs/ARCHITECTURE_CONTRACT.md) and only the
-   applicable canonical Architecture/Implementation sections;
+5. [`docs/ARCHITECTURE_CONTRACT.md`](docs/ARCHITECTURE_CONTRACT.md), the
+   [mandatory documentation route](docs/architecture/AGENT_READING.md), and
+   only the applicable canonical Architecture/Implementation sections;
 6. the exact source, contracts, tests, and one-hop dependencies for the work.
 
 A deeper `AGENTS.md` narrows the work allowed in that subtree. It cannot expand
@@ -51,6 +52,31 @@ owning issue is open, its current PR is open when one exists, and current
 mutable only when `workstreams/ACTIVE.toml` names it as an explicit exception.
 Otherwise stop, preserve any candidate through its issue/PR, and create a fresh
 branch from current `main`.
+
+## Mandatory documentation route
+
+Before the first mutable edit, route the complete planned changed-path set and
+the closest task profile through the accepted normative pair:
+
+```powershell
+python scripts/docs_router.py route `
+  --task <task-profile> `
+  --path <planned-path-1> `
+  --path <planned-path-2> `
+  --write-receipt .eliot/reading/<issue>.json
+```
+
+Read every required source slice returned by the router. Use `--content` or
+`materialize`; an index, summary, agent memory, or generated projection is not a
+substitute for the source bytes. Record the pair key, reading-map SHA-256,
+matched routes, required selectors, and receipt SHA-256 in the issue/PR. The
+local receipt is evidence state and is not committed.
+
+Rerun routing before continuing whenever the changed-path set, causal owner,
+external effect, or task scope expands. An unmapped path/task is a fail-closed
+error. Add an explicit route, or use `--allow-fallback` only as a visible scoped
+deviation recorded in the receipt; never silently load or skip arbitrary parts
+of the books.
 
 ## Work ownership
 
@@ -91,8 +117,8 @@ Do not commit:
   product documentation;
 - dated audit reports, progress diaries, recovery-program transcripts, swarm
   chat/results, or generated certificates;
-- `.eliot/`, `.codebase-memory/`, runtime databases, logs, reports, build output,
-  credentials, or machine-local agent configuration.
+- `.eliot/`, `.eliot-docs/`, `.codebase-memory/`, runtime databases, logs,
+  reports, build output, credentials, or machine-local agent configuration.
 
 Use issue/PR comments for investigation findings, CI artifacts for generated
 reports, and external repositories for Eliot Search or Eliot Research product
