@@ -84,7 +84,24 @@ def self_test(root: Path) -> None:
     clean_plugin = (root / PLUGIN).read_text(encoding="utf-8")
     expect(plugin_errors(clean_plugin + "\nconst leaked = { env: process.env }\n"), "opencode_full_env")
     expect(plugin_errors(clean_plugin + '\nreturn { decision: "passive" }\n'), "opencode_mutation_fail_open")
-    expect(plugin_errors(clean_plugin.replace("MAX_PASSIVE_QUEUE", "REMOVED_QUEUE")), "opencode_plugin_marker_missing")
+    expect(
+        plugin_errors(
+            clean_plugin.replace(
+                "passiveDepth >= maximumPassiveQueue()",
+                "passiveDepth >= Number.POSITIVE_INFINITY",
+            )
+        ),
+        "opencode_plugin_marker_missing",
+    )
+    expect(
+        plugin_errors(
+            clean_plugin.replace(
+                "ELIOT_OPENCODE_PASSIVE_QUEUE_LIMIT",
+                "REMOVED_PASSIVE_QUEUE_LIMIT",
+            )
+        ),
+        "opencode_plugin_marker_missing",
+    )
     expect(
         plugin_errors(clean_plugin.replace('"ELIOT_WORK_LEASE_ID",', "")),
         "opencode_plugin_marker_missing",
@@ -97,7 +114,7 @@ def self_test(root: Path) -> None:
         plugin_errors(clean_plugin + "\nawait Promise.all([stdout, stderr])\n"),
         "opencode_unbounded_stream_wait",
     )
-    print("AGENT_ROUTE_BUNDLES_SELF_TEST: PASS cases=11")
+    print("AGENT_ROUTE_BUNDLES_SELF_TEST: PASS cases=12")
 
 
 def main() -> int:
