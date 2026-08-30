@@ -1,0 +1,52 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W1_PUBLIC_TYPE_OWNERSHIP_EXTENSION"
+field_contract_index = "crates/smart/cognitive-rev12-w1-field-contracts.toml"
+rule = "W0-owned epistemic and Dreamer types retain their existing owners. This extension adds the previously missing self-query family; consumers import it and never redefine fields locally."
+
+[[reused_family]]
+owner = "eliot-epistemic-contracts"
+contract_ref = "crates/smart/eliot-epistemic-contracts/current-position.contract.toml"
+consumer_cells = ["smart.epistemic.position", "smart.dreamer.rival_models", "smart.dreamer.packet_assembly", "smart.epistemic.context_projection"]
+ownership_disposition = "UNCHANGED_FROM_PARENT"
+
+[[reused_family]]
+owner = "eliot-dreamer-contracts"
+contract_ref = "crates/smart/eliot-dreamer-contracts/common.contract.toml"
+consumer_cells = ["smart.dreamer.bundle", "smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+ownership_disposition = "UNCHANGED_FROM_PARENT"
+
+[[reused_family]]
+owner = "eliot-dreamer-contracts"
+contract_ref = "crates/smart/eliot-dreamer-contracts/orientation.contract.toml"
+consumer_cells = ["smart.dreamer.rival_models", "smart.dreamer.relation_candidates", "smart.dreamer.probe_plan", "smart.dreamer.clarification_candidate", "smart.dreamer.packet_assembly"]
+ownership_disposition = "UNCHANGED_FROM_PARENT"
+
+[[family]]
+owner = "eliot-dreamer-self-query"
+contract_ref = "crates/smart/eliot-dreamer-self-query/self-query.contract.toml"
+types = [
+  "SelfQueryCoverageState",
+  "SelfQueryCoverageDenominator",
+  "SelfQueryCoverage",
+  "AcceptedNormativePairIdentity",
+  "ArchitectureSectionClass",
+  "ArchitectureSectionProjection",
+  "ArchitectureBriefRequest",
+  "ArchitectureBrief",
+  "ImplementationSupportState",
+  "ConformanceResult",
+  "ImplementationClaimProjection",
+  "ImplementationBriefRequest",
+  "ImplementationBrief",
+]
+consumer_cells = ["smart.dreamer.architecture_brief", "smart.dreamer.implementation_brief", "smart.self_model.context_projection"]
+
+[forbidden]
+duplicate_field_level_definition = true
+provider_specific_duplicate_self_model_request = true
+model_or_prose_self_certification_type = true
+architecture_or_implementation_mutation_receipt = true
+workspace_or_proof_admission_type = true
+generic_json_or_vendor_type = true
+aggregate_self_quality_or_support_score = true
