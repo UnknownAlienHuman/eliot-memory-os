@@ -1,0 +1,237 @@
+schema_version = 1
+contract_id = "meta.understanding.assessment.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-understanding-assessment"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["meta.common_ground.assessment", "meta.understanding.scoped_assessment"]
+architecture_refs = ["ARCH-PORT-01", "ARCH-SELF-01", "ARCH-UND-01", "ARCH-UND-02", "ARCH-EPI-03", "ARCH-EPI-04", "ARCH-SCOPE-01"]
+implementation_refs = ["I6.16", "I7.15", "I12.18", "I12.23", "I2.20"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Assess public causal inheritance and scoped understanding from predeclared, rival-aware, outcome-bound evidence without global understanding flags, summary-similarity substitution, authority transfer or self-certification."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((inheritance items + evidence + rivals) log n) over request-bounded immutable snapshots; no model call, hidden transcript/native-state read, provider route or task mutation."
+replacement_boundary = "Replace assessment algorithms behind this contract; route/model/harness owners retain execution and requalification authority."
+
+[closed_sets]
+coverage_states = ["Complete", "Partial", "Unavailable", "Blocked", "Stale", "NotApplicable"]
+common_ground_dimensions = ["TerminologyIdentity", "GoalAcceptance", "DecisionRationale", "InvariantNegativeMemory", "RivalCounterevidence", "UnknownInquiry", "Commitment", "ActionConsequence"]
+common_ground_results = ["ExactPreservation", "CompatibleReformulation", "Omission", "Contradiction", "StaleDependency", "UntestedCompetence"]
+common_ground_dispositions = ["AdequateForScope", "Partial", "Incompatible", "Stale", "Untested"]
+scoped_understanding_statuses = ["NotOnboarded", "Untested", "LocallyAdequate", "Refuted", "Inconclusive", "Stale"]
+understanding_dimensions = ["Onboarding", "PublicModel", "Rivals", "MaterialUnknowns", "PriorPrediction", "Discriminator", "OutcomeVerifier", "RevisionDiscipline", "CounterfactualHeldOut", "TransferBoundary", "AbstentionPrecision", "Coverage"]
+understanding_results = ["Satisfied", "Missing", "Contradicted", "Unknown", "NotApplicable", "Stale"]
+
+[hard_invariants]
+summary_similarity_is_not_common_ground = true
+native_continuation_state_is_not_public_inheritance = true
+tacit_competence_or_authority_never_transfers = true
+lost_rival_unknown_invariant_or_commitment_is_material = true
+complete_requires_exact_recheckable_denominator = true
+no_global_understands_boolean_or_scalar_score = true
+prediction_must_be_fixed_before_observation = true
+locally_adequate_requires_rival_aware_model_discriminator_outcome_and_revision_discipline = true
+fluent_prose_graph_size_delivery_or_dependent_agreement_cannot_establish_understanding = true
+product_level_claim_requires_leakage_controlled_held_out_or_counterfactual_evidence = true
+assessment_grants_no_task_finish_authority_or_execution = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[public_type]]
+name = "UnderstandingCoverageState"
+kind = "enum"
+definition = ["Complete", "Partial", "Unavailable", "Blocked", "Stale", "NotApplicable"]
+
+[[public_type]]
+name = "UnderstandingCoverageDenominator"
+kind = "struct"
+definition = ["source_ref: String", "source_revision: String", "method_ref: String", "expected_items: Option<u32>", "expected_item_handles: Vec<ArtifactId>", "evaluation_slice_ref: String"]
+invariants = ["source/revision/method/slice non-blank", "Complete requires expected_items", "handles unique", "denominator independently recheckable"]
+
+[[public_type]]
+name = "UnderstandingCoverage"
+kind = "struct"
+definition = ["state: UnderstandingCoverageState", "denominator: Option<UnderstandingCoverageDenominator>", "observed_items: u32", "missing_owner_or_reason_refs: Vec<String>"]
+invariants = ["Complete requires exact count and no missing refs", "Partial requires denominator and named gaps", "Unavailable or Blocked requires named owner/reason and no observed items", "Stale blocks current adequacy"]
+
+[[public_type]]
+name = "CommonGroundDimension"
+kind = "enum"
+definition = ["TerminologyIdentity", "GoalAcceptance", "DecisionRationale", "InvariantNegativeMemory", "RivalCounterevidence", "UnknownInquiry", "Commitment", "ActionConsequence"]
+
+[[public_type]]
+name = "PublicInheritanceItem"
+kind = "struct"
+definition = ["item_id: ArtifactId", "dimension: CommonGroundDimension", "stable_identity: String", "content_sha256: String", "content_handle: ArtifactId", "source_handles: Vec<ArtifactId>", "required: bool", "protected: bool", "freshness_revision: String", "state_fence: StateFence"]
+invariants = ["stable identity/content/source exact", "required/protected items cannot be silently omitted", "item is public state rather than native model state"]
+
+[[public_type]]
+name = "PublicInheritanceSnapshot"
+kind = "struct"
+definition = ["snapshot_id: ArtifactId", "task_id: TaskId", "product_identity_ref: ArtifactId", "source_route_fingerprint: String", "scope_id: String", "public_inheritance_revision: String", "state_fence: StateFence", "coverage: UnderstandingCoverage", "items: Vec<PublicInheritanceItem>", "snapshot_sha256: String"]
+invariants = ["source route/task/product/scope/fence exact", "item ids and stable identities unique", "Complete coverage exact", "canonical order and digest"]
+
+[[public_type]]
+name = "ReconstructedInheritanceItem"
+kind = "struct"
+definition = ["item_id: ArtifactId", "dimension: CommonGroundDimension", "source_stable_identity: Option<String>", "reconstructed_content_sha256: String", "content_handle: ArtifactId", "evidence_handles: Vec<ArtifactId>", "claimed_action_consequence: Option<String>", "state_fence: StateFence"]
+invariants = ["source identity optional only when item is explicitly new", "no hidden native-state evidence", "reconstruction cannot claim tacit competence"]
+
+[[public_type]]
+name = "ReconstructedInheritanceSnapshot"
+kind = "struct"
+definition = ["snapshot_id: ArtifactId", "task_id: TaskId", "product_identity_ref: ArtifactId", "target_route_fingerprint: String", "scope_id: String", "source_public_inheritance_sha256: String", "state_fence: StateFence", "coverage: UnderstandingCoverage", "items: Vec<ReconstructedInheritanceItem>", "snapshot_sha256: String"]
+invariants = ["target route/task/product/scope/fence exact", "source snapshot digest exact", "item ids unique", "canonical order and digest"]
+
+[[public_type]]
+name = "CommonGroundDimensionResult"
+kind = "enum"
+definition = ["ExactPreservation", "CompatibleReformulation", "Omission", "Contradiction", "StaleDependency", "UntestedCompetence"]
+
+[[public_type]]
+name = "CommonGroundDimensionAssessment"
+kind = "struct"
+definition = ["dimension: CommonGroundDimension", "result: CommonGroundDimensionResult", "source_item_handles: Vec<ArtifactId>", "target_item_handles: Vec<ArtifactId>", "evidence_handles: Vec<ArtifactId>", "reason_codes: Vec<String>"]
+invariants = ["all required dimensions present", "omission/contradiction/stale/untested remain explicit", "no aggregate similarity score"]
+
+[[public_type]]
+name = "CommonGroundGap"
+kind = "struct"
+definition = ["gap_id: ArtifactId", "dimension: CommonGroundDimension", "source_item_handles: Vec<ArtifactId>", "result: CommonGroundDimensionResult", "material: bool", "required_expansion_handles: Vec<ArtifactId>", "requalification_probe: String", "blocks_material_continuation: bool"]
+invariants = ["material required/protected loss blocks material continuation", "probe discriminates the missing property", "gap does not grant authority"]
+
+[[public_type]]
+name = "CommonGroundDisposition"
+kind = "enum"
+definition = ["AdequateForScope", "Partial", "Incompatible", "Stale", "Untested"]
+
+[[public_type]]
+name = "CommonGroundAssessmentRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "task_id: TaskId", "product_identity_ref: ArtifactId", "source_route_fingerprint: String", "target_route_fingerprint: String", "scope_id: String", "state_fence: StateFence", "required_dimensions: Vec<CommonGroundDimension>", "maximum_items: u32", "maximum_gaps: u32", "request_sha256: String"]
+invariants = ["source/target routes differ or explicit requalification requested", "dimensions unique", "bounds non-zero", "request grants no authority or continuation decision"]
+
+[[public_type]]
+name = "CommonGroundAssessment"
+kind = "struct"
+definition = ["request_sha256: String", "source_snapshot_sha256: String", "target_snapshot_sha256: String", "task_id: TaskId", "product_identity_ref: ArtifactId", "scope_id: String", "state_fence: StateFence", "coverage: UnderstandingCoverage", "dimensions: Vec<CommonGroundDimensionAssessment>", "gaps: Vec<CommonGroundGap>", "disposition: CommonGroundDisposition", "assessment_sha256: String"]
+invariants = ["AdequateForScope requires Complete coverage and no material gap", "Partial/Incompatible/Stale/Untested preserve gaps/probes", "no authority, task-finish or route-switch receipt"]
+
+[[public_type]]
+name = "ScopedUnderstandingStatus"
+kind = "enum"
+definition = ["NotOnboarded", "Untested", "LocallyAdequate", "Refuted", "Inconclusive", "Stale"]
+
+[[public_type]]
+name = "UnderstandingEvidenceDimension"
+kind = "enum"
+definition = ["Onboarding", "PublicModel", "Rivals", "MaterialUnknowns", "PriorPrediction", "Discriminator", "OutcomeVerifier", "RevisionDiscipline", "CounterfactualHeldOut", "TransferBoundary", "AbstentionPrecision", "Coverage"]
+
+[[public_type]]
+name = "UnderstandingDimensionResult"
+kind = "enum"
+definition = ["Satisfied", "Missing", "Contradicted", "Unknown", "NotApplicable", "Stale"]
+
+[[public_type]]
+name = "UnderstandingDimensionEvidence"
+kind = "struct"
+definition = ["dimension: UnderstandingEvidenceDimension", "result: UnderstandingDimensionResult", "evidence_handles: Vec<ArtifactId>", "reason_codes: Vec<String>"]
+
+[[public_type]]
+name = "PredeclaredPrediction"
+kind = "struct"
+definition = ["prediction_id: ArtifactId", "fixed_before_observation_ref: ArtifactId", "model_statement: String", "rival_model_refs: Vec<ArtifactId>", "predicted_observable: String", "discriminator_ref: ArtifactId", "invalidation_condition: String", "scope_id: String", "state_fence: StateFence"]
+invariants = ["prediction timestamp/order proof precedes observation", "rivals non-empty for material claim", "observable/discriminator/invalidation exact"]
+
+[[public_type]]
+name = "UnderstandingProbeEvidence"
+kind = "struct"
+definition = ["probe_id: ArtifactId", "prediction_ref: ArtifactId", "action_or_discriminator: String", "outcome_handle: ArtifactId", "verifier_handle: ArtifactId", "verifier_applicable: bool", "observed_delta: String", "contrary_evidence_handles: Vec<ArtifactId>", "evidence_handles: Vec<ArtifactId>", "state_fence: StateFence"]
+invariants = ["probe binds prior prediction to applicable outcome/verifier", "contrary evidence retained", "post-hoc prediction rejected"]
+
+[[public_type]]
+name = "RevisionDisciplineEvidence"
+kind = "struct"
+definition = ["miss_or_contrary_evidence_refs: Vec<ArtifactId>", "model_revision_ref: Option<ArtifactId>", "revision_explanation: String", "unchanged_model_justification: Option<String>"]
+invariants = ["miss/contrary evidence cannot be ignored", "absence of justified revision prevents LocallyAdequate"]
+
+[[public_type]]
+name = "TransferRequalification"
+kind = "struct"
+definition = ["source_scope: String", "target_scope: String", "dependency_revision_refs: Vec<String>", "required_probe: String", "held_out_or_counterfactual_ref: Option<ArtifactId>", "status: UnderstandingDimensionResult"]
+
+[[public_type]]
+name = "ScopedUnderstandingEvidence"
+kind = "struct"
+definition = ["subject_route_fingerprint: String", "coupled_system_ref: ArtifactId", "scope_id: String", "question_or_task_family: String", "product_identity_ref: ArtifactId", "state_fence: StateFence", "coverage: UnderstandingCoverage", "dimensions: Vec<UnderstandingDimensionEvidence>", "public_model_handle: Option<ArtifactId>", "rival_model_handles: Vec<ArtifactId>", "material_unknown_handles: Vec<ArtifactId>", "predictions: Vec<PredeclaredPrediction>", "probes: Vec<UnderstandingProbeEvidence>", "revision_discipline: Vec<RevisionDisciplineEvidence>", "transfer_requalification: Vec<TransferRequalification>", "abstention_precision_evidence_handles: Vec<ArtifactId>", "evidence_leakage_refs: Vec<ArtifactId>"]
+invariants = ["model/rivals/unknowns/predictions/probes remain addressable", "leakage evidence blocks product-level adequacy", "missing onboarding/prediction/probe remains explicit"]
+
+[[public_type]]
+name = "ScopedUnderstandingAssessmentRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "subject_route_fingerprint: String", "coupled_system_ref: ArtifactId", "scope_id: String", "question_or_task_family: String", "product_identity_ref: ArtifactId", "state_fence: StateFence", "required_dimensions: Vec<UnderstandingEvidenceDimension>", "require_held_out_for_product_claim: bool", "maximum_predictions: u32", "maximum_probes: u32", "maximum_rivals: u32", "request_sha256: String"]
+invariants = ["identity/scope/task/product/fence exact", "dimensions unique", "bounds non-zero", "request grants no task finish or authority"]
+
+[[public_type]]
+name = "ScopedUnderstandingAssessment"
+kind = "struct"
+definition = ["request_sha256: String", "subject_route_fingerprint: String", "coupled_system_ref: ArtifactId", "scope_id: String", "question_or_task_family: String", "product_identity_ref: ArtifactId", "state_fence: StateFence", "coverage: UnderstandingCoverage", "dimensions: Vec<UnderstandingDimensionEvidence>", "status: ScopedUnderstandingStatus", "refutation_handles: Vec<ArtifactId>", "missing_requirement_codes: Vec<String>", "transfer_requalification: Vec<TransferRequalification>", "assessment_sha256: String"]
+invariants = ["LocallyAdequate requires Complete coverage, public model, rivals, material unknown visibility, prediction before observation, discriminator, applicable outcome/verifier, and revision discipline", "NotOnboarded/Untested/Stale used instead of guessed adequacy", "no global understands field or scalar score", "no task-finish or authority receipt"]
+
+[[public_function]]
+name = "assess_common_ground"
+signature = "pub fn assess_common_ground(request: &CommonGroundAssessmentRequest, source: &PublicInheritanceSnapshot, target: &ReconstructedInheritanceSnapshot) -> Result<CommonGroundAssessment, CommonGroundAssessmentError>"
+
+[[public_function]]
+name = "assess_scoped_understanding"
+signature = "pub fn assess_scoped_understanding(request: &ScopedUnderstandingAssessmentRequest, evidence: &ScopedUnderstandingEvidence) -> Result<ScopedUnderstandingAssessment, ScopedUnderstandingAssessmentError>"
+
+[[negative_test]]
+id = "summary-similarity-cannot-pass"
+property = "Matching summary with a lost invariant, rival, unknown or commitment cannot yield AdequateForScope."
+
+[[negative_test]]
+id = "native-state-ignored"
+property = "Native continuation/model state is not accepted as PublicInheritanceSnapshot evidence."
+
+[[negative_test]]
+id = "post-hoc-prediction-rejected"
+property = "Prediction fixed after observation cannot support LocallyAdequate."
+
+[[negative_test]]
+id = "fluent-prose-cannot-pass"
+property = "Prose quality, graph size, Context delivery or dependent agent agreement cannot establish understanding."
+
+[[negative_test]]
+id = "miss-without-revision"
+property = "Material miss or contrary evidence without revision discipline yields Refuted or Inconclusive."
+
+[[negative_test]]
+id = "held-out-required-for-product"
+property = "Product-level adequacy with leakage or without required held-out/counterfactual evidence is rejected."
+
+[[negative_test]]
+id = "assessment-no-authority"
+property = "Neither assessment exposes authority transfer, route switch, task finish or product acceptance."
