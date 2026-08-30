@@ -1,0 +1,97 @@
+{
+  "schema_version": "eliot.opencode-http-sse-preflight.v1",
+  "program": "opencode",
+  "launch": {
+    "argv_prefix": [
+      "serve",
+      "--hostname",
+      "127.0.0.1",
+      "--port"
+    ],
+    "shell": false,
+    "hostname": "127.0.0.1",
+    "port_source": "caller_reserved_loopback_port",
+    "credential_environment_variable": "OPENCODE_SERVER_PASSWORD",
+    "username": "opencode",
+    "environment_allowlist": [
+      "PATH",
+      "PATHEXT",
+      "SYSTEMROOT",
+      "WINDIR",
+      "COMSPEC",
+      "HOME",
+      "USERPROFILE",
+      "LOCALAPPDATA",
+      "APPDATA",
+      "TEMP",
+      "TMP",
+      "LANG",
+      "LC_ALL",
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "NO_PROXY"
+    ]
+  },
+  "endpoints": {
+    "health": [
+      "/global/health"
+    ],
+    "openapi": [
+      "/doc",
+      "/openapi.json"
+    ],
+    "providers": [
+      "/config/providers",
+      "/provider"
+    ]
+  },
+  "required_openapi_capabilities": {
+    "session_create": [
+      "POST /session"
+    ],
+    "session_prompt": [
+      "POST /session/{sessionID}/message",
+      "POST /session/{sessionID}/prompt_async"
+    ],
+    "session_abort": [
+      "POST /session/{sessionID}/abort"
+    ],
+    "event_stream": [
+      "GET /event",
+      "GET /global/event"
+    ],
+    "provider_catalogue": [
+      "GET /config/providers",
+      "GET /provider"
+    ]
+  },
+  "optional_openapi_capabilities": {
+    "session_fork": [
+      "POST /session/{sessionID}/fork"
+    ],
+    "session_children": [
+      "GET /session/{sessionID}/children"
+    ]
+  },
+  "bounds": {
+    "startup_timeout_ms": 15000,
+    "request_timeout_ms": 5000,
+    "version_timeout_ms": 5000,
+    "poll_interval_ms": 100,
+    "max_health_bytes": 65536,
+    "max_openapi_bytes": 4194304,
+    "max_provider_bytes": 2097152,
+    "max_stdout_retained_bytes": 65536,
+    "max_stderr_retained_bytes": 65536,
+    "max_providers": 256,
+    "max_models": 4096
+  },
+  "model_execution_allowed": false,
+  "session_creation_allowed": false,
+  "event_stream_connection_allowed": false,
+  "fixed_model_id": null,
+  "route_admitted": false,
+  "process_tree_containment": "DIRECT_CHILD_ONLY_DIAGNOSTIC",
+  "receipt_schema": "eliot.opencode-http-sse-preflight-receipt.v1",
+  "proof_ceiling": "ZERO_MODEL_SERVER_PREFLIGHT_ONLY"
+}
