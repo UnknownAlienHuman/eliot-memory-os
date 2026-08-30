@@ -1,0 +1,46 @@
+{
+  "schema_version": "eliot.agent-model-selection-policy.v1",
+  "minimum_capability_evidence": "observed",
+  "evidence_order": ["unknown", "self_reported", "documented", "observed", "verified"],
+  "admitted_route_statuses": ["admitted"],
+  "current_catalogue_statuses": ["current"],
+  "dispatchable_availability": ["available"],
+  "dispatchable_quota_statuses": ["available"],
+  "allow_candidate_reuse": false,
+  "roles": [
+    {
+      "role": "primary",
+      "required_capabilities": ["code_editing", "tool_use"],
+      "minimum_context_window": 64000,
+      "maximum_cost_class": 4,
+      "maximum_latency_class": 4,
+      "diversity_from": []
+    },
+    {
+      "role": "cheap_worker",
+      "required_capabilities": ["code_editing"],
+      "minimum_context_window": 32000,
+      "maximum_cost_class": 2,
+      "maximum_latency_class": 2,
+      "diversity_from": ["primary"]
+    },
+    {
+      "role": "challenger",
+      "required_capabilities": ["reasoning", "tool_use"],
+      "minimum_context_window": 64000,
+      "maximum_cost_class": 4,
+      "maximum_latency_class": 4,
+      "diversity_from": ["primary"]
+    },
+    {
+      "role": "verifier",
+      "required_capabilities": ["code_review", "reasoning"],
+      "minimum_context_window": 64000,
+      "maximum_cost_class": 4,
+      "maximum_latency_class": 4,
+      "diversity_from": ["primary", "challenger"]
+    }
+  ],
+  "diversity_dimensions": ["host", "route_id", "model_family"],
+  "proof_ceiling": "Deterministic candidate route/model selection over supplied receipts only; no provider execution or dispatch authority."
+}
