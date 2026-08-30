@@ -4,7 +4,26 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
-description = "Governed canonical memory-plane owner for ELIOT"
+description = "Legacy in-memory memory-plane migration donor; not a canonical ELIOT owner"
+
+[package.metadata.eliot]
+layer = "C1"
+purpose = "Temporary legacy migration donor pending exact no-consumer proof and removal; owns no current canonical, lifecycle, influence, retrieval-delivery, or revision authority."
+source_maintenance_owner = "cognitive-migration-owner"
+functional_cell_refs = []
+independent_proof_profile = "legacy-memory-retirement"
+contract_refs = [
+  "ARCH-MOD-03",
+  "ARCH-MEM-01",
+  "ARCH-MEM-04",
+  "ARCH-SEC-02",
+  "ELIOT_IMPLEMENTATION:I4.8",
+  "ELIOT_IMPLEMENTATION:I5.24",
+]
+legacy_disposition = "RETIRE"
+implementation_support = "STALE"
+evidence_execution_status = "NOT_EXECUTED"
+new_consumers_forbidden = true
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
