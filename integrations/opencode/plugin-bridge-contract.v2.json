@@ -1,0 +1,68 @@
+{
+  "schema_version": "eliot.opencode-plugin-bridge.v2",
+  "transport_preference": [
+    "authenticated_loopback_http"
+  ],
+  "endpoint_path": "/v1/host-events",
+  "allowed_schemes": [
+    "http"
+  ],
+  "allowed_hosts": [
+    "127.0.0.1",
+    "localhost",
+    "::1"
+  ],
+  "url_credentials_allowed": false,
+  "url_query_allowed": false,
+  "url_fragment_allowed": false,
+  "credential_source": "bounded_absolute_token_file",
+  "credential_in_payload": false,
+  "credential_in_logs": false,
+  "environment": {
+    "bridge_url": "ELIOT_OPENCODE_BRIDGE_URL",
+    "token_file": "ELIOT_OPENCODE_BRIDGE_TOKEN_FILE",
+    "task_id": "ELIOT_TASK_ID",
+    "work_item_id": "ELIOT_WORK_ITEM_ID",
+    "session_id": "ELIOT_SESSION_ID",
+    "passive_queue_limit": "ELIOT_OPENCODE_PASSIVE_QUEUE_LIMIT",
+    "timeout_ms": "ELIOT_OPENCODE_BRIDGE_TIMEOUT_MS"
+  },
+  "limits": {
+    "request_bytes": 32768,
+    "response_bytes": 65536,
+    "token_file_bytes": 4096,
+    "passive_queue_default": 64,
+    "passive_queue_max": 256,
+    "timeout_ms_default": 5000,
+    "timeout_ms_min": 500,
+    "timeout_ms_max": 15000,
+    "retry_count": 1
+  },
+  "retryable_statuses": [
+    408,
+    425,
+    429,
+    502,
+    503,
+    504
+  ],
+  "idempotency_header": "Idempotency-Key",
+  "event_envelope_schema": "eliot.opencode-host-event.v2",
+  "raw_tool_arguments_allowed": false,
+  "raw_tool_output_allowed": false,
+  "raw_prompt_or_message_allowed": false,
+  "raw_environment_allowed": false,
+  "raw_error_or_stack_allowed": false,
+  "passive_delivery": "bounded_serialized_nonblocking",
+  "attached_mutation_gate": "fail_closed_without_explicit_decision",
+  "accepted_gate_decisions": [
+    "allow",
+    "allowed",
+    "pass",
+    "recorded"
+  ],
+  "denied_gate_decision": "deny",
+  "legacy_process_spawn": false,
+  "authority_ceiling": "observation_and_pre_effect_gate_candidate",
+  "proof_ceiling": "PLUGIN_TRANSPORT_AND_PAYLOAD_BOUNDARY_ONLY"
+}
