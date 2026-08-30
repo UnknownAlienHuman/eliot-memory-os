@@ -20,3 +20,14 @@ pub use stream_evidence::{
     StreamEvaluationStatus, StreamEvidenceGap, StreamParsingStatus, StreamPersistenceStatus,
     StreamPreviewRepresentation, StreamTransportStatus,
 };
+
+mod stream_sink;
+pub use stream_sink::{
+    PROCESS_STREAM_SINK_SCHEMA_VERSION, ProcessStreamDigestAlgorithm, ProcessStreamSinkAbortReason,
+    ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
+    ProcessStreamSinkClient, ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest,
+    ProcessStreamSinkFuture, ProcessStreamSinkLimits, ProcessStreamSinkOpenRequest,
+    ProcessStreamSinkReadback, ProcessStreamSinkSession, ProcessStreamSinkSessionId,
+    ProcessStreamSinkSessionView, ProcessStreamSinkSourceId, ProcessStreamSinkState,
+    ProcessStreamSinkTerminal, ProcessStreamSinkTerminalId, ProcessStreamSinkUnknownOutcome,
+};
