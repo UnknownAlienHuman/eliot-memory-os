@@ -4,7 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ELIOT observation obligation, coverage and gap contracts"
+description = "ELIOT observation obligation, coverage, gap, and record-family contracts"
+
+[lib]
+path = "src/root.rs"
 
 [package.metadata.eliot]
 work_id = "C0-11"
@@ -12,6 +15,9 @@ functional_cell = "observation-contracts"
 lifecycle_owner = "C0-11"
 source_layer = "C0"
 proof_entrypoint = "cargo test -p eliot-observation-contracts"
+contract_challenge_refs = ["#217"]
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
 
 [dependencies]
 eliot-contracts.workspace = true
