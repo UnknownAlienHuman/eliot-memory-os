@@ -1,0 +1,48 @@
+schema_version = 1
+status = "W9_CONTRACT_CHALLENGE_LEDGER"
+authority = "crates/smart/cognitive-rev12-w9-field-contracts.toml"
+
+[[resolved]]
+id = "CC-MEMORY-QUALITY-SCHEMA"
+contract_ref = "crates/meta/eliot-memory-quality/quality.contract.toml"
+resolution = "Coverage, dimensions, stage evidence, cohorts, gravity exposures and reversible candidates now have one field-level owner."
+
+[[resolved]]
+id = "CC-NEGATIVE-MEMORY-EXTINCTION-SCHEMA"
+contract_ref = "crates/smart/eliot-dreamer-memory-revision/negative-memory-extinction.contract.toml"
+resolution = "Exact/near-match trigger separation, re-exposure denominator, candidate boundary, retained history and non-execution ceiling are frozen."
+
+[[resolved]]
+id = "CC-COGNITIVE-QUALITY-SCHEMA"
+contract_ref = "crates/meta/eliot-cognitive-quality/quality.contract.toml"
+resolution = "Skill/tool/Dreamer/self-quality, bottleneck and intervention families now share one closed dimension/coverage/candidate vocabulary."
+
+[[resolved]]
+id = "CC-UNDERSTANDING-ASSESSMENT-SCHEMA"
+contract_ref = "crates/meta/eliot-understanding-assessment/understanding.contract.toml"
+resolution = "Public inheritance, Common Ground gaps, prior predictions, probes, revision discipline, leakage and transfer fields are frozen."
+
+[[open]]
+id = "CC-W9-OWNER-ADAPTERS"
+reason = "Immutable projections from Skill registry, tool exposure, Dreamer jobs, Governor diagnostics, public inheritance and outcome owners are not implemented here."
+required_owner = "respective Governor/runtime/registry owner"
+
+[[open]]
+id = "CC-W9-PACKAGE-PROOF"
+reason = "No Rust source or dependency-locked package execution exists in this field-freeze branch."
+required_owner = "package integration owner"
+
+[[open]]
+id = "CC-W9-EDGE-PROOF"
+reason = "No real provider/consumer Edge Proof has executed across owner projections and W9 consumers."
+required_owner = "integration owner"
+
+[[open]]
+id = "CC-W9-PRODUCT-PULSES"
+reason = "D4_MEMORY_ECOLOGY_PULSE_01, D4_COGNITIVE_QUALITY_PULSE_01, D4_SELF_QUALITY_PULSE_01 and D4_UNDERSTANDING_TRANSFER_PULSE_01 have not executed."
+required_owner = "Product Pulse owner"
+
+[[open]]
+id = "CC-W9-RUNTIME-ADMISSION"
+reason = "No root workspace/runtime admission is permitted before Module/Edge/Product evidence."
+required_owner = "Governor/integration owner"
