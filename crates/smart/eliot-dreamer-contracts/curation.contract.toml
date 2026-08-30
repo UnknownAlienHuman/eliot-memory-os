@@ -1,0 +1,183 @@
+schema_version = 1
+contract_id = "smart.dreamer.curation-dispatch.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-dreamer-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.dreamer.contracts.curation", "smart.dreamer.curation_dispatch"]
+architecture_refs = ["ARCH-DRM-01", "ARCH-MEM-02", "ARCH-MEM-03", "ARCH-MEM-04", "ARCH-LIFE-01", "ARCH-MOD-03", "ARCH-SEC-04", "ARCH-SCOPE-01"]
+implementation_refs = ["I9.2", "I9.6", "I9.7", "I9.8", "I12.19", "I12.21"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Route one explicitly typed curation request to one exact registered semantic handler and return a lineage-preserving candidate set without subtype inference, generic model fallback, lifecycle execution, or cross-handler ownership."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure_validation_and_dispatch"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O(log handlers + candidates log candidates) over a bounded immutable registry snapshot and result; no storage read/write, model call, lifecycle transition or handler discovery."
+replacement_boundary = "Replace dispatcher/registry implementation behind this contract; each subtype handler owns its semantics and Governor/canonical memory owns any resulting transition."
+
+[closed_sets]
+curation_subtypes = ["Classification", "Relation", "Episode", "Concept", "Procedure", "Skill", "FailureFingerprint", "StructureRepair", "Reconsolidation", "Accessibility", "InfluenceRepair"]
+handler_availability = ["Available", "Degraded", "Unavailable", "Stale", "Unsupported"]
+dispatch_dispositions = ["ProducedCandidates", "NoJustifiedChange", "Inconclusive", "Stale", "Rejected"]
+coverage_states = ["Complete", "Partial", "Unavailable", "Blocked", "Stale"]
+
+[hard_invariants]
+subtype_is_explicit_and_closed = true
+dispatcher_never_inferrs_subtype_from_prose = true
+one_subtype_has_one_semantic_handler_owner = true
+unknown_or_unregistered_subtype_has_no_generic_model_fallback = true
+input_and_output_contract_identities_are_exact = true
+handler_cannot_return_another_subtype = true
+all_results_bind_one_job_scope_fence_and_source_lineage = true
+candidate_set_contains_no_lifecycle_transition_write_support_or_authority_receipt = true
+raw_source_episode_and_predecessor_history_are_never_rewritten = true
+complete_requires_exact_recheckable_denominator = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "ContractIdentity"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "DreamJobEnvelope"
+owner = "eliot-dreamer-contracts/common.contract.toml"
+
+[[external_type]]
+name = "AdmittedDreamDraft"
+owner = "eliot-dreamer-contracts/common.contract.toml"
+
+[[public_type]]
+name = "CurationSubtype"
+kind = "enum"
+definition = ["Classification", "Relation", "Episode", "Concept", "Procedure", "Skill", "FailureFingerprint", "StructureRepair", "Reconsolidation", "Accessibility", "InfluenceRepair"]
+invariants = ["closed-world enum", "every variant has exactly one registry descriptor", "unknown variant fails decoding/validation"]
+
+[[public_type]]
+name = "CurationHandlerAvailability"
+kind = "enum"
+definition = ["Available", "Degraded", "Unavailable", "Stale", "Unsupported"]
+
+[[public_type]]
+name = "CurationPayloadBinding"
+kind = "struct"
+definition = ["payload_handle: ArtifactId", "payload_sha256: String", "contract_identity: ContractIdentity", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "source_handles: Vec<ArtifactId>", "coverage_ref: ArtifactId"]
+invariants = ["payload/contract/scope/fence exact", "source handles non-empty and unique", "coverage ref exact", "binding contains no untyped JSON, provider or storage value"]
+
+[[public_type]]
+name = "TypedCurationInput"
+kind = "enum"
+definition = ["Classification(CurationPayloadBinding)", "Relation(CurationPayloadBinding)", "Episode(CurationPayloadBinding)", "Concept(CurationPayloadBinding)", "Procedure(CurationPayloadBinding)", "Skill(CurationPayloadBinding)", "FailureFingerprint(CurationPayloadBinding)", "StructureRepair(CurationPayloadBinding)", "Reconsolidation(CurationPayloadBinding)", "Accessibility(CurationPayloadBinding)", "InfluenceRepair(CurationPayloadBinding)"]
+invariants = ["enum variant equals request subtype", "payload contract equals registered handler input contract", "no generic Any/JSON/string subtype"]
+
+[[public_type]]
+name = "CurationHandlerDescriptor"
+kind = "struct"
+definition = ["handler_id: String", "subtype: CurationSubtype", "generation: String", "input_contract: ContractIdentity", "output_contract: ContractIdentity", "availability: CurationHandlerAvailability", "candidate_only: bool", "maximum_input_bytes: u32", "maximum_output_bytes: u32", "state_fence: StateFence"]
+invariants = ["handler/subtype/generation/contracts exact", "candidate_only true", "bounds non-zero", "descriptor grants no process launch, model route, store or transition authority"]
+
+[[public_type]]
+name = "CurationHandlerRegistrySnapshot"
+kind = "struct"
+definition = ["registry_revision: String", "scope_id: String", "state_fence: StateFence", "handlers: Vec<CurationHandlerDescriptor>", "registry_sha256: String"]
+invariants = ["exactly one descriptor per closed subtype", "handler ids/subtypes unique", "one compatible fence", "Unavailable/Stale handler remains explicit", "canonical order and digest"]
+
+[[public_type]]
+name = "CurationCoverageState"
+kind = "enum"
+definition = ["Complete", "Partial", "Unavailable", "Blocked", "Stale"]
+
+[[public_type]]
+name = "CurationCoverageDenominator"
+kind = "struct"
+definition = ["source_ref: String", "source_revision: String", "method_ref: String", "expected_source_items: Option<u32>", "expected_source_handles: Vec<ArtifactId>"]
+invariants = ["source/revision/method non-blank", "Complete requires expected items", "handles unique", "denominator independently recheckable"]
+
+[[public_type]]
+name = "CurationCoverage"
+kind = "struct"
+definition = ["state: CurationCoverageState", "denominator: Option<CurationCoverageDenominator>", "observed_source_items: u32", "missing_owner_or_reason_refs: Vec<String>"]
+invariants = ["Complete requires exact count equality/no missing refs", "Partial requires denominator/named gaps", "Unavailable/Blocked has no current items and names owner/reason"]
+
+[[public_type]]
+name = "CurationRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "job_sha256: String", "subtype: CurationSubtype", "input: TypedCurationInput", "admitted_draft_sha256: String", "handler_registry_sha256: String", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "coverage: CurationCoverage", "maximum_candidates: u32", "maximum_output_bytes: u32", "request_sha256: String"]
+invariants = ["Dream job class is Curation", "subtype/input/handler contract agree", "draft/registry/scope/task/fence exact", "bounds non-zero", "request grants no handler discovery, model call, write or lifecycle authority"]
+
+[[public_type]]
+name = "TypedCurationHandlerResult"
+kind = "enum"
+definition = ["Classification(CurationPayloadBinding)", "Relation(CurationPayloadBinding)", "Episode(CurationPayloadBinding)", "Concept(CurationPayloadBinding)", "Procedure(CurationPayloadBinding)", "Skill(CurationPayloadBinding)", "FailureFingerprint(CurationPayloadBinding)", "StructureRepair(CurationPayloadBinding)", "Reconsolidation(CurationPayloadBinding)", "Accessibility(CurationPayloadBinding)", "InfluenceRepair(CurationPayloadBinding)"]
+invariants = ["result variant equals request subtype", "payload contract equals registered handler output contract", "result remains candidate-only", "no generic fallback"]
+
+[[public_type]]
+name = "CurationDispatchDisposition"
+kind = "enum"
+definition = ["ProducedCandidates", "NoJustifiedChange", "Inconclusive", "Stale", "Rejected"]
+
+[[public_type]]
+name = "CurationCandidateSet"
+kind = "struct"
+definition = ["candidate_set_id: ArtifactId", "request_sha256: String", "job_sha256: String", "subtype: CurationSubtype", "handler_id: String", "handler_generation: String", "disposition: CurationDispatchDisposition", "result: Option<TypedCurationHandlerResult>", "candidate_ids: Vec<ArtifactId>", "source_handles: Vec<ArtifactId>", "coverage: CurationCoverage", "omitted_or_missing_refs: Vec<String>", "reason_codes: Vec<String>", "state_fence: StateFence", "candidate_set_sha256: String"]
+invariants = ["one request/job/subtype/handler/fence", "ProducedCandidates requires matching typed result and candidate ids", "other dispositions cannot hide a produced payload", "all source/candidate ids unique", "contains no canonical transition, lifecycle action, support/influence change, authority, policy, finish or effect receipt", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_curation_handler_registry"
+signature = "pub fn validate_curation_handler_registry(registry: &CurationHandlerRegistrySnapshot) -> Result<(), DreamContractError>"
+
+[[public_function]]
+name = "validate_curation_request"
+signature = "pub fn validate_curation_request(job: &DreamJobEnvelope, draft: &AdmittedDreamDraft, registry: &CurationHandlerRegistrySnapshot, request: &CurationRequest) -> Result<(), DreamContractError>"
+
+[[public_function]]
+name = "validate_curation_candidate_set"
+signature = "pub fn validate_curation_candidate_set(request: &CurationRequest, registry: &CurationHandlerRegistrySnapshot, set: &CurationCandidateSet) -> Result<(), DreamContractError>"
+
+[[negative_test]]
+id = "all-subtypes-covered-once"
+property = "Registry contains exactly one matching handler descriptor for every one of the eleven closed subtypes."
+
+[[negative_test]]
+id = "unknown-subtype-fails-closed"
+property = "Unknown subtype cannot decode, route or fall back to a generic LLM handler."
+
+[[negative_test]]
+id = "handler-cannot-cross-subtype"
+property = "Classification handler cannot return Episode/Procedure/etc result and vice versa."
+
+[[negative_test]]
+id = "contract-mismatch-rejected"
+property = "Input/output payload contract mismatch against registry is rejected before dispatch/result admission."
+
+[[negative_test]]
+id = "unavailable-handler-visible"
+property = "Unavailable/Stale handler yields typed rejection/inconclusive result rather than another handler."
+
+[[negative_test]]
+id = "candidate-not-lifecycle"
+property = "Candidate set exposes no archive/suppress/reactivate/merge/write receipt or support/influence transition."
+
+[[negative_test]]
+id = "permutation-deterministic"
+property = "Registry/candidate/source ordering does not change lookup or candidate-set identity."

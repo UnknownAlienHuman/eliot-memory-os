@@ -26,6 +26,7 @@ contract_refs = [
   "crates/smart/eliot-dreamer-contracts/common.contract.toml",
   "crates/smart/eliot-dreamer-contracts/orientation.contract.toml",
   "crates/smart/eliot-dreamer-contracts/research.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/curation.contract.toml",
 ]
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
