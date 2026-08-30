@@ -24,6 +24,7 @@ independent_proof_profile = "prototype-not-workspace-admitted"
 contract_refs = [
   "crates/smart/cognitive-current.toml",
   "crates/smart/eliot-context-contracts/provider-contribution.contract.toml",
+  "crates/smart/eliot-context-contracts/context-compiler.contract.toml",
 ]
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"

@@ -1,0 +1,399 @@
+schema_version = 1
+contract_id = "smart.context.compiler-contracts.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-context-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.context.contracts.candidate", "smart.context.contracts.admission", "smart.context.contracts.view_quality", "smart.context.contribution_merge", "smart.context.admission", "smart.context.assembly", "smart.context.quality", "smart.context.decision_tail", "smart.context.reactive_delivery_plan"]
+architecture_refs = ["ARCH-CTX-01", "ARCH-CTX-02", "ARCH-CTX-03", "ARCH-CTX-04", "ARCH-EPI-04", "ARCH-MEM-04", "ARCH-SCOPE-01", "ARCH-MOD-03"]
+implementation_refs = ["I7.10", "I7.11", "I7.16", "I7.19", "I12.13", "I12.14", "I12.31"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Own provider-neutral whole-unit Context candidate, admission, immutable view, decision-tail, reactive-plan and dimensioned quality contracts while preserving Safety Floor, provider denominator, downstream headroom and reversible omission."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "Contract validation is O((providers + atoms + decisions + sections + dimensions) log n); implementations remain bounded and perform no model call, store scan, provider SDK call, delivery or host mutation."
+replacement_boundary = "Replace Context merge/admission/render/quality implementations behind these contracts; Governor owns active recipe/admission policy and external host/session owners own delivery and receipts."
+
+[closed_sets]
+impact_classes = ["Observe", "Reversible", "Material", "Critical"]
+admission_dispositions = ["IncludePayload", "IncludeExactExcerpt", "IncludeHandle", "IncludeWithWarning", "RequireRevalidation", "Suppress", "Quarantine", "Reject"]
+omission_reasons = ["Budget", "HeadroomReservation", "ProviderFairness", "Duplicate", "DisclosureDenied", "UnsafeRepresentation", "Stale", "DeniedInfluence", "RoleUnsupported", "SafetyFloorUnrepresentable", "PolicySuppressed"]
+quality_dimensions = ["GoalAcceptanceCoverage", "CriticalAttentionCoverage", "EpistemicPositionCoverage", "RivalCounterevidenceCoverage", "SemanticCausalModelCoverage", "ContinuityCoverage", "InvariantNegativeMemoryCoverage", "UnknownInquiryCoverage", "ExactEvidenceCoverage", "AuthorityAffordanceCoverage", "DecisionBoundaryCoverage", "StateFenceConsistency", "ProviderDenominatorIntegrity", "WholeUnitIntegrity", "ReversibleOmission", "DownstreamHeadroom", "SelectionIntegrity", "RouteMeasurementValidity"]
+quality_results = ["Pass", "Fail", "Inconclusive", "NotApplicable"]
+host_capability_classes = ["EventIntegrated", "ToolOnly", "ObserveOnly", "OfflineWorker", "Unavailable"]
+delivery_modes = ["PreAction", "NextBoundary", "AttentionOnly", "Unsupported"]
+plan_states = ["Ready", "Partial", "Blocked", "Stale", "Unsupported"]
+
+[hard_invariants]
+provider_contributions_are_candidates_until_context_admission = true
+whole_addressable_atoms_only = true
+unknown_decision_delta_is_not_zero = true
+missing_provider_is_not_empty_complete = true
+one_compatible_state_fence_per_candidate_set_admission_view_and_tail = true
+safety_floor_is_reserved_before_optional_allocation = true
+downstream_headroom_is_reserved_before_optional_allocation = true
+required_or_protected_atom_never_silently_disappears = true
+optional_allocation_is_provider_fair_and_deterministic = true
+quarantine_and_suppression_are_distinct = true
+omission_is_reversible_or_explicitly_blocks_compilation = true
+admission_does_not_claim_delivery_use_outcome_or_helpfulness = true
+assembly_cannot_change_membership_or_disposition = true
+quality_assessment_cannot_change_membership_or_view = true
+quality_uses_dimension_vector_without_aggregate_score = true
+decision_tail_cannot_invent_action_authority_or_verifier = true
+reactive_plan_is_not_delivery_or_prevention_receipt = true
+tool_only_or_unavailable_host_cannot_claim_preaction_prevention = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "ProviderId"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ContextProviderClass"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ContextRole"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ContextAtomClass"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ContextLossPolicy"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "DecisionDelta"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ProviderAtomRepresentation"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ProviderAtom"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ProviderCoverage"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ProviderContribution"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ExpectedContextProviderSet"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[public_type]]
+name = "ContextImpactClass"
+kind = "enum"
+definition = ["Observe", "Reversible", "Material", "Critical"]
+
+[[public_type]]
+name = "ContextCandidateAtom"
+kind = "struct"
+definition = ["candidate_atom_id: ArtifactId", "provider_id: ProviderId", "provider_class: ContextProviderClass", "provider_generation: String", "provider_atom: ProviderAtom", "provider_contribution_sha256: String", "expected_provider_set_sha256: String", "candidate_reason_codes: Vec<String>"]
+invariants = ["provider atom is whole and unchanged", "provider/contribution/expected-set identities exact", "candidate contains no admission disposition"]
+
+[[public_type]]
+name = "DecisionSafetyFloorRequirement"
+kind = "struct"
+definition = ["requirement_id: ArtifactId", "role: ContextRole", "allowed_classes: Vec<ContextAtomClass>", "minimum_whole_units: u32", "protected_source_or_atom_refs: Vec<ArtifactId>", "allow_exact_handle: bool", "allow_warning: bool", "failure_reason_code: String"]
+invariants = ["allowed classes unique", "minimum non-zero", "protected refs unique", "required role cannot be satisfied by unrelated provider or class"]
+
+[[public_type]]
+name = "DecisionSafetyFloor"
+kind = "struct"
+definition = ["floor_id: ArtifactId", "impact_class: ContextImpactClass", "requirements: Vec<DecisionSafetyFloorRequirement>", "active_directive_refs: Vec<ArtifactId>", "floor_sha256: String"]
+invariants = ["requirements/active directives unique", "Material/Critical floor includes goal/acceptance, scope/fence, material unknown/conflict/negative memory, expected effect and verifier roles when applicable", "floor cannot be weakened by recipe"]
+
+[[public_type]]
+name = "ContextCandidateSet"
+kind = "struct"
+definition = ["candidate_set_id: ArtifactId", "request_id: RequestId", "scope_id: String", "task_id: Option<TaskId>", "route_fingerprint: String", "state_fence: StateFence", "expected_provider_set_sha256: String", "provider_contribution_sha256s: Vec<String>", "provider_coverage: Vec<ProviderCoverage>", "atoms: Vec<ContextCandidateAtom>", "safety_floor: DecisionSafetyFloor", "candidate_set_sha256: String"]
+invariants = ["every expected provider has one coverage row", "all contribution digests/atom ids unique", "every atom belongs to one contribution/provider/fence", "missing/partial/unavailable provider visible", "no admission, delivery or authority field", "canonical order and digest"]
+
+[[public_type]]
+name = "ContextSectionBudget"
+kind = "struct"
+definition = ["role: ContextRole", "unit_boundary_kind: String", "minimum_required_whole_units: u32", "protected_floor_or_required_refs: Vec<ArtifactId>", "planning_maximum_units: u32", "planning_maximum_bytes: u32", "allow_handle_fallback: bool", "degradation_reason_code: String"]
+invariants = ["whole-unit boundary explicit", "planning maximum not below required minimum", "bounds non-zero where applicable", "budget cannot authorize dropping floor"]
+
+[[public_type]]
+name = "RouteBudget"
+kind = "struct"
+definition = ["route_fingerprint: String", "actual_tokenizer_ref: String", "maximum_context_bytes: u32", "maximum_context_tokens: u32", "maximum_atoms: u32", "section_budgets: Vec<ContextSectionBudget>", "budget_profile_sha256: String"]
+invariants = ["route/tokenizer exact", "bounds non-zero", "one section budget per role", "budget is planning input not product proof"]
+
+[[public_type]]
+name = "DownstreamHeadroom"
+kind = "struct"
+definition = ["reservation_id: ArtifactId", "tool_result_bytes: u32", "reasoning_review_tokens: u32", "decision_tail_tokens: u32", "output_tokens: u32", "safety_margin_tokens: u32", "reservation_sha256: String"]
+invariants = ["all required reserves non-zero for applicable route", "reservation is subtracted before optional allocation", "headroom cannot be consumed by earlier provider verbosity"]
+
+[[public_type]]
+name = "ProviderFairnessPolicy"
+kind = "struct"
+definition = ["round_order: Vec<ContextProviderClass>", "maximum_optional_units_per_provider_per_round: u32", "maximum_rounds: u32", "canonical_tie_break: String"]
+invariants = ["provider classes unique", "bounds non-zero", "round order grants no epistemic priority or authority"]
+
+[[public_type]]
+name = "ContextRecipe"
+kind = "struct"
+definition = ["recipe_id: ArtifactId", "recipe_revision: String", "applicable_task_family: String", "route_fingerprint: String", "impact_class: ContextImpactClass", "governance_profile_ref: String", "stage_order: Vec<String>", "route_budget: RouteBudget", "headroom: DownstreamHeadroom", "safety_floor: DecisionSafetyFloor", "provider_fairness: ProviderFairnessPolicy", "protected_roles: Vec<ContextRole>", "quarantined_source_refs: Vec<ArtifactId>", "layout_ref: ArtifactId", "quality_blocking_dimensions: Vec<PacketQualityDimension>", "parent_recipe_ref: Option<ArtifactId>", "expiry_or_requalification: String", "recipe_sha256: String"]
+invariants = ["recipe/task/route/impact/governance identity exact", "stages/roles/dimensions unique", "cannot weaken Safety Floor, privacy, authority, active directives, omission reversibility or proof ceiling", "recipe is immutable externally governed input"]
+
+[[public_type]]
+name = "AdmissionDisposition"
+kind = "enum"
+definition = ["IncludePayload", "IncludeExactExcerpt", "IncludeHandle", "IncludeWithWarning", "RequireRevalidation", "Suppress", "Quarantine", "Reject"]
+
+[[public_type]]
+name = "AdmissionOmissionReason"
+kind = "enum"
+definition = ["Budget", "HeadroomReservation", "ProviderFairness", "Duplicate", "DisclosureDenied", "UnsafeRepresentation", "Stale", "DeniedInfluence", "RoleUnsupported", "SafetyFloorUnrepresentable", "PolicySuppressed"]
+
+[[public_type]]
+name = "ExpansionHandle"
+kind = "struct"
+definition = ["handle: ArtifactId", "source_atom_id: ArtifactId", "source_contribution_sha256: String", "required_capability_ref: Option<String>", "validity_condition: String"]
+invariants = ["handle/source identity exact", "expansion revalidates disclosure/scope/fence", "handle never re-executes original effect"]
+
+[[public_type]]
+name = "AdmissionDecision"
+kind = "struct"
+definition = ["decision_id: ArtifactId", "candidate_atom_id: ArtifactId", "provider_id: ProviderId", "role: ContextRole", "disposition: AdmissionDisposition", "selected_representation: Option<ProviderAtomRepresentation>", "omission_reason: Option<AdmissionOmissionReason>", "expansion_handle: Option<ExpansionHandle>", "warning_or_revalidation_codes: Vec<String>", "allocated_units: u32", "allocated_bytes: u32", "selection_round: u32", "reason_codes: Vec<String>"]
+invariants = ["exactly one disposition per candidate", "included disposition has safe representation", "suppressed/quarantined/rejected has omission reason", "required/protected omitted atom has expansion handle or blocks compilation", "decision claims no delivery/use/outcome"]
+
+[[public_type]]
+name = "SelectionIntegrityRecord"
+kind = "struct"
+definition = ["candidate_set_sha256: String", "recipe_sha256: String", "expected_provider_set_sha256: String", "input_atom_ids: Vec<ArtifactId>", "decision_atom_ids: Vec<ArtifactId>", "admitted_atom_ids: Vec<ArtifactId>", "omitted_atom_ids: Vec<ArtifactId>", "safety_floor_requirement_ids: Vec<ArtifactId>", "headroom_reservation_sha256: String", "provider_rounds_executed: u32", "record_sha256: String"]
+invariants = ["every input atom has one decision", "admitted/omitted partition exactly covers input", "Safety Floor/headroom identities exact", "no atom invented or lost", "canonical order and digest"]
+
+[[public_type]]
+name = "AdmittedContextAtom"
+kind = "struct"
+definition = ["candidate_atom_id: ArtifactId", "provider_atom_id: ArtifactId", "provider_id: ProviderId", "role: ContextRole", "class: ContextAtomClass", "loss_policy: ContextLossPolicy", "disposition: AdmissionDisposition", "representation: ProviderAtomRepresentation", "source_handles: Vec<ArtifactId>", "epistemic_status_ref: Option<String>", "warning_or_revalidation_codes: Vec<String>", "allocated_units: u32", "allocated_bytes: u32"]
+invariants = ["membership/disposition/representation exactly derive from candidate and decision", "source lineage retained", "status reference is not rewritten"]
+
+[[public_type]]
+name = "AdmittedContextSet"
+kind = "struct"
+definition = ["admitted_set_id: ArtifactId", "candidate_set_sha256: String", "recipe_sha256: String", "scope_id: String", "task_id: Option<TaskId>", "route_fingerprint: String", "state_fence: StateFence", "atoms: Vec<AdmittedContextAtom>", "decisions: Vec<AdmissionDecision>", "safety_floor_satisfied_requirement_ids: Vec<ArtifactId>", "remaining_headroom: DownstreamHeadroom", "selection_integrity: SelectionIntegrityRecord", "admitted_set_sha256: String"]
+invariants = ["all atoms have Include dispositions", "every candidate has one decision", "required floor satisfied or no admitted set", "remaining headroom non-negative and exact", "contains no delivery/use/outcome", "canonical order and digest"]
+
+[[public_type]]
+name = "ContextLayout"
+kind = "struct"
+definition = ["layout_id: ArtifactId", "layout_revision: String", "route_fingerprint: String", "semantic_role_order: Vec<ContextRole>", "section_heading_templates: Vec<ContextSectionHeading>", "warning_rendering_rule: String", "handle_rendering_rule: String", "maximum_rendered_bytes: u32", "layout_sha256: String"]
+invariants = ["role order/headings unique", "bounds non-zero", "layout cannot change membership/disposition/epistemic meaning"]
+
+[[public_type]]
+name = "ContextSectionHeading"
+kind = "struct"
+definition = ["role: ContextRole", "heading: String"]
+
+[[public_type]]
+name = "ContextSection"
+kind = "struct"
+definition = ["section_id: ArtifactId", "role: ContextRole", "heading: String", "atom_ids: Vec<ArtifactId>", "rendered_content: String", "expansion_handles: Vec<ExpansionHandle>", "warning_codes: Vec<String>", "rendered_sha256: String"]
+invariants = ["atom ids belong to admitted set and are unique", "rendering preserves role/disposition", "handle-only/omission remains expandable", "section cannot change membership"]
+
+[[public_type]]
+name = "ViewOmissionManifest"
+kind = "struct"
+definition = ["omitted_candidate_atom_ids: Vec<ArtifactId>", "admission_decision_ids: Vec<ArtifactId>", "expansion_handles: Vec<ExpansionHandle>", "explicit_losses: Vec<String>", "manifest_sha256: String"]
+invariants = ["all omissions/losses exact and reversible where possible", "no silent truncation", "required loss blocks valid view"]
+
+[[public_type]]
+name = "ActiveUnderstandingView"
+kind = "struct"
+definition = ["view_id: ArtifactId", "admitted_set_sha256: String", "layout_sha256: String", "scope_id: String", "task_id: Option<TaskId>", "route_fingerprint: String", "state_fence: StateFence", "sections: Vec<ContextSection>", "omission_manifest: ViewOmissionManifest", "rendered_bytes: u32", "rendered_tokens: Option<u32>", "tokenizer_measurement_ref: Option<ArtifactId>", "view_sha256: String"]
+invariants = ["sections follow layout role order", "membership equals admitted set", "required atom render failure blocks view", "token measurement absent means unknown not zero", "canonical order and digest"]
+
+[[public_type]]
+name = "PacketQualityDimension"
+kind = "enum"
+definition = ["GoalAcceptanceCoverage", "CriticalAttentionCoverage", "EpistemicPositionCoverage", "RivalCounterevidenceCoverage", "SemanticCausalModelCoverage", "ContinuityCoverage", "InvariantNegativeMemoryCoverage", "UnknownInquiryCoverage", "ExactEvidenceCoverage", "AuthorityAffordanceCoverage", "DecisionBoundaryCoverage", "StateFenceConsistency", "ProviderDenominatorIntegrity", "WholeUnitIntegrity", "ReversibleOmission", "DownstreamHeadroom", "SelectionIntegrity", "RouteMeasurementValidity"]
+
+[[public_type]]
+name = "PacketQualityResult"
+kind = "enum"
+definition = ["Pass", "Fail", "Inconclusive", "NotApplicable"]
+
+[[public_type]]
+name = "PacketQualityDimensionAssessment"
+kind = "struct"
+definition = ["dimension: PacketQualityDimension", "result: PacketQualityResult", "evidence_handles: Vec<ArtifactId>", "reason_codes: Vec<String>"]
+invariants = ["one assessment per required dimension", "Pass requires exact evidence", "missing measurement becomes Inconclusive", "no aggregate score"]
+
+[[public_type]]
+name = "ContextMeasurements"
+kind = "struct"
+definition = ["measurement_id: ArtifactId", "view_sha256: String", "route_fingerprint: String", "serializer_ref: String", "tokenizer_ref: Option<String>", "rendered_bytes: u32", "actual_tokens: Option<u32>", "provider_rewrite_or_truncation_evidence_refs: Vec<ArtifactId>", "measurement_state_fence: StateFence"]
+invariants = ["view/route/serializer/fence exact", "actual tokens absent remains unknown", "truncation evidence cannot be hidden"]
+
+[[public_type]]
+name = "PacketQualityScorecard"
+kind = "struct"
+definition = ["scorecard_id: ArtifactId", "candidate_set_sha256: String", "admitted_set_sha256: String", "view_sha256: String", "recipe_sha256: String", "state_fence: StateFence", "dimensions: Vec<PacketQualityDimensionAssessment>", "blocking_dimension_refs: Vec<PacketQualityDimension>", "scorecard_sha256: String"]
+invariants = ["all recipe-required dimensions represented", "blocking Fail/Inconclusive dimensions visible", "no aggregate quality/confidence score", "scorecard cannot mutate or admit view", "canonical order and digest"]
+
+[[public_type]]
+name = "DecisionBoundary"
+kind = "struct"
+definition = ["boundary_id: ArtifactId", "view_sha256: String", "impact_class: ContextImpactClass", "goal_atom_refs: Vec<ArtifactId>", "acceptance_atom_refs: Vec<ArtifactId>", "load_bearing_atom_refs: Vec<ArtifactId>", "do_not_use_or_revalidate_atom_refs: Vec<ArtifactId>", "next_action_ref: Option<ArtifactId>", "expected_observable: Option<String>", "verifier_ref: Option<ArtifactId>", "stop_or_revision_condition: String", "active_directive_refs: Vec<ArtifactId>", "state_fence: StateFence"]
+invariants = ["all atom/directive refs exist in view/admission lineage", "Material/Critical next action requires expected observable and verifier", "boundary grants no action authority"]
+
+[[public_type]]
+name = "ContextLimits"
+kind = "struct"
+definition = ["maximum_tail_atoms: u32", "maximum_tail_bytes: u32", "maximum_expansion_handles: u32"]
+invariants = ["all bounds positive", "limits cannot remove required directives or floor atoms"]
+
+[[public_type]]
+name = "DecisionLocalTail"
+kind = "struct"
+definition = ["tail_id: ArtifactId", "view_sha256: String", "boundary_id: ArtifactId", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "goal_and_acceptance_atom_refs: Vec<ArtifactId>", "load_bearing_atom_refs: Vec<ArtifactId>", "do_not_use_or_revalidate_atom_refs: Vec<ArtifactId>", "next_action_ref: Option<ArtifactId>", "expected_observable: Option<String>", "verifier_ref: Option<ArtifactId>", "stop_or_revision_condition: String", "active_directive_refs: Vec<ArtifactId>", "expansion_handles: Vec<ExpansionHandle>", "blocked_reason_codes: Vec<String>", "tail_sha256: String"]
+invariants = ["tail binds exact view/boundary/fence", "cannot invent next action/authority/verifier", "security/recovery/conflict directives retained", "blocked action represented explicitly", "canonical order and digest"]
+
+[[public_type]]
+name = "HostContextCapabilityClass"
+kind = "enum"
+definition = ["EventIntegrated", "ToolOnly", "ObserveOnly", "OfflineWorker", "Unavailable"]
+
+[[public_type]]
+name = "HostContextCapabilitySnapshot"
+kind = "struct"
+definition = ["host_profile_ref: ArtifactId", "host_generation: String", "route_fingerprint: String", "capability_class: HostContextCapabilityClass", "pre_action_delivery_observed: bool", "next_boundary_delivery_observed: bool", "durable_attention_available: bool", "enforcement_profile_ref: String", "coverage_manifest_ref: ArtifactId", "state_fence: StateFence", "expires_at_ref: String", "snapshot_sha256: String"]
+invariants = ["host/generation/route/coverage/fence exact", "capabilities are observations not marketing labels", "ToolOnly/ObserveOnly/Offline/Unavailable cannot claim enforced pre-action delivery"]
+
+[[public_type]]
+name = "ReactiveContextPolicy"
+kind = "struct"
+definition = ["policy_id: ArtifactId", "policy_revision: String", "allowed_delivery_modes: Vec<ContextDeliveryMode>", "required_receipt_kind: String", "maximum_payload_bytes: u32", "maximum_handle_count: u32", "dedup_key_rule: String", "deadline_rule: String", "policy_sha256: String"]
+invariants = ["modes unique", "bounds non-zero", "policy grants no host capability, delivery or prevention proof"]
+
+[[public_type]]
+name = "ContextDeliveryMode"
+kind = "enum"
+definition = ["PreAction", "NextBoundary", "AttentionOnly", "Unsupported"]
+
+[[public_type]]
+name = "PendingInjectionPlanState"
+kind = "enum"
+definition = ["Ready", "Partial", "Blocked", "Stale", "Unsupported"]
+
+[[public_type]]
+name = "PendingContextInjectionPlan"
+kind = "struct"
+definition = ["plan_id: ArtifactId", "view_sha256: String", "tail_sha256: String", "host_snapshot_sha256: String", "policy_sha256: String", "mode: ContextDeliveryMode", "state: PendingInjectionPlanState", "payload_section_refs: Vec<ArtifactId>", "expansion_handles: Vec<ExpansionHandle>", "attention_obligation_ref: Option<ArtifactId>", "deadline_ref: String", "dedup_key_suggestion: String", "required_receipt_kind: String", "limitation_reason_codes: Vec<String>", "state_fence: StateFence", "plan_sha256: String"]
+invariants = ["plan/view/tail/host/policy/fence exact", "PreAction only for observed EventIntegrated capability", "ToolOnly uses NextBoundary or AttentionOnly", "plan contains no delivery/acknowledgement/prevention receipt", "session dedup owner external", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_context_candidate_set"
+signature = "pub fn validate_context_candidate_set(expected: &ExpectedContextProviderSet, contributions: &[ProviderContribution], set: &ContextCandidateSet) -> Result<(), ContextContractError>"
+
+[[public_function]]
+name = "validate_context_recipe"
+signature = "pub fn validate_context_recipe(recipe: &ContextRecipe) -> Result<(), ContextContractError>"
+
+[[public_function]]
+name = "validate_admitted_context_set"
+signature = "pub fn validate_admitted_context_set(candidates: &ContextCandidateSet, recipe: &ContextRecipe, set: &AdmittedContextSet) -> Result<(), ContextContractError>"
+
+[[public_function]]
+name = "validate_active_understanding_view"
+signature = "pub fn validate_active_understanding_view(admitted: &AdmittedContextSet, layout: &ContextLayout, view: &ActiveUnderstandingView) -> Result<(), ContextContractError>"
+
+[[public_function]]
+name = "validate_packet_quality"
+signature = "pub fn validate_packet_quality(candidates: &ContextCandidateSet, admitted: &AdmittedContextSet, view: &ActiveUnderstandingView, measurements: &ContextMeasurements, scorecard: &PacketQualityScorecard) -> Result<(), ContextContractError>"
+
+[[public_function]]
+name = "validate_decision_local_tail"
+signature = "pub fn validate_decision_local_tail(view: &ActiveUnderstandingView, boundary: &DecisionBoundary, limits: &ContextLimits, tail: &DecisionLocalTail) -> Result<(), ContextContractError>"
+
+[[public_function]]
+name = "validate_pending_context_injection_plan"
+signature = "pub fn validate_pending_context_injection_plan(view: &ActiveUnderstandingView, tail: &DecisionLocalTail, host: &HostContextCapabilitySnapshot, policy: &ReactiveContextPolicy, plan: &PendingContextInjectionPlan) -> Result<(), ContextContractError>"
+
+[[negative_test]]
+id = "missing-provider-not-empty"
+property = "Missing mandatory provider cannot be represented as empty complete candidate set."
+
+[[negative_test]]
+id = "unknown-delta-not-zero"
+property = "Unknown DecisionDelta cannot justify suppression as zero value."
+
+[[negative_test]]
+id = "safety-floor-before-optional"
+property = "Optional provider atom cannot consume budget required by a Safety Floor requirement."
+
+[[negative_test]]
+id = "headroom-before-optional"
+property = "Optional allocation cannot consume downstream output/tool/reasoning/tail headroom."
+
+[[negative_test]]
+id = "provider-fairness"
+property = "One verbose provider cannot consume the entire optional budget before other eligible providers receive a round."
+
+[[negative_test]]
+id = "every-candidate-dispositioned"
+property = "SelectionIntegrityRecord rejects any missing or duplicated input-atom decision."
+
+[[negative_test]]
+id = "required-omission-reversible"
+property = "Required/protected atom omission without an intelligible exact handle or compilation block is rejected."
+
+[[negative_test]]
+id = "assembly-no-membership-change"
+property = "ActiveUnderstandingView cannot add, remove or change an admitted atom/disposition."
+
+[[negative_test]]
+id = "quality-no-aggregate"
+property = "PacketQualityScorecard exposes no scalar total and a failed Safety Floor dimension remains blocking despite other passes."
+
+[[negative_test]]
+id = "missing-tokenizer-inconclusive"
+property = "Absent exact tokenizer measurement is Inconclusive, not zero tokens or Pass."
+
+[[negative_test]]
+id = "tail-no-authority"
+property = "DecisionLocalTail cannot invent next action, action authority or verifier absent from the boundary/view lineage."
+
+[[negative_test]]
+id = "tool-only-no-prevention"
+property = "ToolOnly/ObserveOnly/Offline/Unavailable host cannot produce Ready PreAction injection or prevention claim."
+
+[[negative_test]]
+id = "plan-not-receipt"
+property = "PendingContextInjectionPlan exposes no delivered, acknowledged, resolved, used, helpful or prevented-failure state."
