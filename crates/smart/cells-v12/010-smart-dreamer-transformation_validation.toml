@@ -1,0 +1,47 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+field_contract_is_sole_public_type_authority = true
+order = 10
+cell = "smart.dreamer.transformation_validation"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-validation"
+primary_property = "Validate Dreamer transformation quality independently across coverage, preservation, faithfulness, lineage, reversibility, source authority and dependency closure without a scalar score or model self-certification."
+field_contract = "crates/smart/eliot-dreamer-contracts/common.contract.toml"
+public_function_selectors = ["validate_dream_transformation"]
+write_scope = [
+  "crates/smart/eliot-dreamer-validation/src/transformation_validation.rs",
+  "crates/smart/eliot-dreamer-validation/tests/transformation_validation.rs",
+]
+algorithm = [
+  "validate grounded draft, manifest, source evidence and one compatible State Fence",
+  "evaluate Coverage against the frozen denominator rather than source count",
+  "evaluate Preservation of required facts, rivals, unknowns, objections and counterevidence",
+  "evaluate Faithfulness using source/verifier evidence external to the drafting model",
+  "evaluate exact Lineage, reversible expansion/rollback surfaces, SourceAuthority ceiling and DependencyClosure",
+  "emit one Pass/Fail/Inconclusive/NotApplicable result for every dimension",
+  "retain failure and inconclusive reasons and compute canonical report digest",
+]
+minimum_tests = [
+  "source count alone cannot pass Coverage",
+  "lost rival or material unknown fails Preservation",
+  "same-model self-report cannot pass Faithfulness",
+  "missing rollback/expansion surface fails Reversibility when required",
+  "unknown dependency closure is Inconclusive, not Pass",
+  "one failed required dimension remains blocking",
+  "report contains no aggregate score or admission decision",
+]
+non_goals = [
+  "claim grounding",
+  "semantic candidate generation",
+  "model invocation",
+  "structural/canonical admission",
+  "policy change",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-DRM-02", "ARCH-EPI-03", "ARCH-EPI-04", "ARCH-MEM-03", "ARCH-RES-05"]
+implementation_refs = ["I2.20", "I9.4", "I9.7", "I12.13"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge or Inconclusive rather than replacing missing evidence with model self-opinion, collapsing dimensions, or treating source count as coverage."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
