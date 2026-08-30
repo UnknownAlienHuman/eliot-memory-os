@@ -1,0 +1,71 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W0_FIELD_CONTRACT_CLOSURE_IN_PROGRESS"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+orders = [1, 2, 4, 5, 6, 7, 19, 26, 27, 28, 35, 49, 50, 51, 52, 68, 71, 74]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+rule = "W0 contract cells freeze public owner-neutral types before semantic workers. This index is complete only when every listed non-W8 cell references one exact field contract and all duplicate type ownership is eliminated."
+
+[[family]]
+id = "governor.observation.classifier.v1"
+orders = [1]
+owner = "eliot-observation"
+path = "crates/governor/eliot-observation/classifier.contract.toml"
+status = "IN_PROGRESS"
+
+[[family]]
+id = "smart.epistemic.position.v1"
+orders = [2]
+owner = "eliot-epistemic-contracts"
+path = "crates/smart/eliot-epistemic-contracts/epistemic.contract.toml"
+status = "IN_PROGRESS"
+
+[[family]]
+id = "smart.dreamer.contracts.v1"
+orders = [4, 5, 6, 7]
+owner = "eliot-dreamer-contracts"
+path = "crates/smart/eliot-dreamer-contracts/dreamer.contract.toml"
+status = "PENDING"
+
+[[family]]
+id = "smart.cue.contracts.v1"
+orders = [19]
+owner = "eliot-cue-contracts"
+path = "crates/smart/eliot-cue-contracts/cue.contract.toml"
+status = "PENDING"
+
+[[family]]
+id = "smart.context.core-contracts.v1"
+orders = [26, 27, 28]
+owner = "eliot-context-contracts"
+path = "crates/smart/eliot-context-contracts/context.contract.toml"
+status = "PENDING"
+
+[[family]]
+id = "smart.memory.curation-contracts.v1"
+orders = [35]
+owner = "eliot-memory-curation-contracts"
+path = "crates/smart/eliot-memory-curation-contracts/curation.contract.toml"
+status = "PENDING"
+
+[[family]]
+id = "smart.learning.contracts.v1"
+orders = [49, 50, 51, 52]
+owner = "eliot-learning-contracts"
+path = "crates/smart/eliot-learning-contracts/learning.contract.toml"
+status = "PENDING"
+
+[[already_frozen]]
+orders = [68, 71, 74]
+index = "crates/smart/cognitive-rev12-field-contracts.toml"
+pr = 212
+status = "STATIC_FIELD_CONTRACT_ONLY"
+
+[forbidden]
+generic_json_or_vendor_types = true
+parallel_field_authority = true
+worker_owned_cargo_or_reexports = true
+aggregate_confidence_or_utility_score = true
+contract_owned_canonical_state_or_effect = true
