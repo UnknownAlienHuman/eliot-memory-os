@@ -4,7 +4,34 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Deterministic A-02 agent staffing, admission, and attempt reconciliation core"
+description = "Deterministic A-02 agent staffing, route selection, admission, and attempt reconciliation core"
+
+[package.metadata.eliot]
+layer = "C1"
+purpose = "Compile candidate staffing and route selections, reconcile externally admitted attempts, and preserve durable attempt/peer lifecycle semantics without owning provider execution, task truth, policy, or finish."
+source_maintenance_owner = "agent.coordinator"
+functional_cell_refs = [
+  "agent.coordinator.staffing-plan",
+  "agent.coordinator.route-selection",
+  "agent.coordinator.provider-admission",
+  "agent.coordinator.attempt-reconciliation",
+  "agent.coordinator.peer-delivery",
+]
+independent_proof_profile = "eliot-agent-coordinator"
+contract_refs = [
+  "ARCH-AUTH-01",
+  "ARCH-SWM-01",
+  "ARCH-SWM-02",
+  "ARCH-ECON-01",
+  "ARCH-SEC-04",
+  "ELIOT_IMPLEMENTATION:I3.4",
+  "ELIOT_IMPLEMENTATION:I3.6",
+  "ELIOT_IMPLEMENTATION:I7.22",
+]
+contract_challenge_refs = ["issue:224", "issue:228"]
+implementation_support = "PARTIAL"
+evidence_execution_status = "NOT_EXECUTED"
+component_contract_ref = ""
 
 [dependencies]
 eliot-agent-api.workspace = true
