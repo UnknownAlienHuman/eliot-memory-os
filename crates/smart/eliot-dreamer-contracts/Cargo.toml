@@ -1,24 +1,33 @@
 [package]
 name = "eliot-dreamer-contracts"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 publish = false
-description = "Own provider-neutral job, bundle, draft, candidate, preservation and result schemas shared by all Dreamer handlers."
+description = "Provider-neutral Dreamer job, input, grounding, validation, orientation, research and curation contracts."
 
 [lib]
 path = "src/lib.rs"
 
 [package.metadata.eliot]
-prototype = true
-source_status = "NOT_IMPLEMENTED"
-workspace_admission = "pending_agent_implementation_and_proof"
-functional_cell = "smart.dreamer.contracts"
-source_layer = "C0"
-runtime_layer = "R6"
-runtime_bundle = "eliot-dreamer"
-agent_order = 3
+layer = "C0"
+purpose = "bounded candidate-only Dreamer contract hub"
+source_maintenance_owner = "cognitive-integration-owner"
+functional_cell_refs = [
+  "smart.dreamer.contracts.common",
+  "smart.dreamer.contracts.orientation",
+  "smart.dreamer.contracts.research",
+  "smart.dreamer.contracts.curation",
+]
+independent_proof_profile = "prototype-not-workspace-admitted"
+contract_refs = [
+  "crates/smart/cognitive-current.toml",
+  "crates/smart/eliot-dreamer-contracts/common.contract.toml",
+]
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until all contract cells have Rust implementation, ModuleTestCapsule, affected real Edge Proof and named Product Pulses"
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }

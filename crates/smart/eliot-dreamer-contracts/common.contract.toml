@@ -1,0 +1,309 @@
+schema_version = 1
+contract_id = "smart.dreamer.common.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-dreamer-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.dreamer.contracts.common", "smart.dreamer.bundle", "smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+architecture_refs = ["ARCH-DRM-01", "ARCH-DRM-02", "ARCH-DRM-03", "ARCH-SEC-04", "ARCH-MEM-03", "ARCH-EPI-04", "ARCH-SCOPE-01", "ARCH-MOD-03"]
+implementation_refs = ["I9.1", "I9.3", "I9.4", "I9.5", "I9.7", "I9.9", "I9.15", "I12.20"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Own one provider-neutral bounded Dreamer job/input/draft/grounding/validation/admission algebra in which every model result remains a candidate and cannot manufacture evidence, authority, coverage, support, execution, or completion."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure_validation"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((references + claims + dimensions) log n + rendered bytes) for validation and canonical identity; no provider SDK, canonical store client, process launch, tool execution or model call in the contract crate."
+replacement_boundary = "Replace Dreamer service/route implementations behind these contracts; Agent Coordinator, Researcher, Governor, canonical memory and effect owners remain separate."
+
+[closed_sets]
+job_classes = ["Orientation", "Curation", "Clarification", "ResearchSynthesis", "Architecture", "DevelopmentDiagnosis", "Maintenance", "OrchestrationPlanning"]
+requester_kinds = ["Human", "MainAgent", "Watchdog", "GovernorMaintenance", "RecoveryOwner"]
+reference_kinds = ["Evidence", "Memory", "EpistemicPosition", "Architecture", "Implementation", "Conformance", "Conflict", "Unknown", "Artifact", "Failure", "Policy"]
+reference_representations = ["InlineExact", "ExactExcerpt", "ExactHandle"]
+draft_claim_roles = ["Interpretation", "Hypothesis", "RelationCandidate", "ProcedureCandidate", "TransformationCandidate", "Question", "Unknown"]
+grounding_states = ["Grounded", "PartiallyGrounded", "Unsupported", "Contradicted", "OutsideManifest"]
+transformation_dimensions = ["Coverage", "Preservation", "Faithfulness", "Lineage", "Reversibility", "SourceAuthority", "DependencyClosure"]
+dimension_states = ["Pass", "Fail", "Unknown", "NotApplicable"]
+draft_admission_states = ["AdmittedCandidate", "RejectedInvalid", "RejectedUngrounded", "RejectedTransformation", "BlockedCoverage", "Stale"]
+
+[hard_invariants]
+dreamer_output_is_always_candidate = true
+model_text_never_populates_confirmed_evidence_or_resolved_state = true
+research_acquisition_is_not_owned_here = true
+agent_or_swarm_launch_is_not_owned_here = true
+canonical_write_support_authority_policy_finish_and_effects_are_forbidden = true
+all_material_claims_have_exact_manifest_grounding_or_visible_unsupported_residue = true
+coverage_requires_exact_recheckable_denominator = true
+transformation_validates_seven_dimensions_without_aggregate_score = true
+source_authority_ceiling_cannot_be_raised = true
+minority_counterevidence_unknowns_and_losses_remain_visible = true
+provider_route_or_sdk_types_do_not_cross_public_contract = true
+same_inputs_produce_identical_digest = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "ContractIdentity"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "EpistemicStatus"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "Assertability"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "EvidenceFreshness"
+owner = "eliot-evidence"
+
+[[public_type]]
+name = "DreamJobClass"
+kind = "enum"
+definition = ["Orientation", "Curation", "Clarification", "ResearchSynthesis", "Architecture", "DevelopmentDiagnosis", "Maintenance", "OrchestrationPlanning"]
+invariants = ["closed-world job class", "unknown class returns UnknownJobClass", "DreamCycle uses an admitted Curation or Maintenance job rather than a ninth scheduler class"]
+
+[[public_type]]
+name = "DreamRequesterKind"
+kind = "enum"
+definition = ["Human", "MainAgent", "Watchdog", "GovernorMaintenance", "RecoveryOwner"]
+invariants = ["requester kind describes origin and grants no authority"]
+
+[[public_type]]
+name = "DreamRequester"
+kind = "struct"
+definition = ["kind: DreamRequesterKind", "principal_ref: String", "session_or_job_ref: Option<ArtifactId>", "trigger_evidence_handles: Vec<ArtifactId>"]
+invariants = ["principal and trigger lineage exact", "requester cannot self-grant route, budget, authority or launch permission"]
+
+[[public_type]]
+name = "DreamBudget"
+kind = "struct"
+definition = ["budget_ref: ArtifactId", "maximum_model_calls: u32", "maximum_agent_attempts: u32", "maximum_input_bytes: u32", "maximum_output_bytes: u32", "maximum_wall_time_ms: u64", "maximum_cost_microunits: u64", "deadline_ref: String", "stop_conditions: Vec<String>"]
+invariants = ["all bounds non-zero", "budget is an externally owned ceiling", "unused budget creates no authority to spend"]
+
+[[public_type]]
+name = "DreamPrivacyProfile"
+kind = "struct"
+definition = ["profile_ref: ArtifactId", "privacy_class: String", "allowed_route_classes: Vec<String>", "allowed_data_classes: Vec<String>", "forbidden_data_classes: Vec<String>", "disclosure_decision_refs: Vec<ArtifactId>", "external_processing_allowed: bool"]
+invariants = ["allowed/forbidden sets disjoint", "external processing requires exact disclosure decision", "fallback cannot expand data access"]
+
+[[public_type]]
+name = "DreamForbiddenEffect"
+kind = "enum"
+definition = ["CanonicalWrite", "EpistemicPromotion", "AuthorityGrant", "PolicyChange", "TaskFinish", "ExternalEffect", "AgentLaunch", "BudgetExpansion", "RouteExpansion", "SecretMaterialization"]
+
+[[public_type]]
+name = "ForbiddenEffectSet"
+kind = "struct"
+definition = ["effects: Vec<DreamForbiddenEffect>", "effect_ceiling_ref: String"]
+invariants = ["effects unique", "all ten forbidden effects required for ordinary Dreamer jobs unless a separate contract proves non-applicability", "set is a ceiling not an execution permit"]
+
+[[public_type]]
+name = "DreamOutputContract"
+kind = "struct"
+definition = ["contract_identity: ContractIdentity", "output_kind: String", "maximum_items: u32", "maximum_bytes: u32", "required_sections: Vec<String>", "candidate_only: bool"]
+invariants = ["contract identity exact", "bounds non-zero", "candidate_only true", "required sections unique"]
+
+[[public_type]]
+name = "DreamJobEnvelope"
+kind = "struct"
+definition = ["job_id: ArtifactId", "request_id: RequestId", "job_class: DreamJobClass", "exact_question: String", "requester: DreamRequester", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "evidence_handles: Vec<ArtifactId>", "memory_handles: Vec<ArtifactId>", "architecture_handles: Vec<ArtifactId>", "implementation_handles: Vec<ArtifactId>", "conformance_handles: Vec<ArtifactId>", "conflict_and_unknown_handles: Vec<ArtifactId>", "privacy_profile: DreamPrivacyProfile", "allowed_tool_definition_refs: Vec<ArtifactId>", "allowed_route_classes: Vec<String>", "budget: DreamBudget", "output_contract: DreamOutputContract", "forbidden_effects: ForbiddenEffectSet", "job_sha256: String"]
+invariants = ["question/scope/fence exact", "all handles and selectors unique", "allowed tools/routes are selectors not executable grants", "input is bounded and handle-oriented", "output contract candidate-only", "canonical order and digest"]
+
+[[public_type]]
+name = "ReferenceKind"
+kind = "enum"
+definition = ["Evidence", "Memory", "EpistemicPosition", "Architecture", "Implementation", "Conformance", "Conflict", "Unknown", "Artifact", "Failure", "Policy"]
+
+[[public_type]]
+name = "ReferenceRepresentationKind"
+kind = "enum"
+definition = ["InlineExact", "ExactExcerpt", "ExactHandle"]
+
+[[public_type]]
+name = "ReferenceDescriptor"
+kind = "struct"
+definition = ["reference_id: ArtifactId", "kind: ReferenceKind", "source_handle: ArtifactId", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "epistemic_status: Option<EpistemicStatus>", "assertability: Assertability", "freshness: EvidenceFreshness", "source_authority_ceiling: String", "required: bool", "protected: bool", "allowed_representation: ReferenceRepresentationKind", "maximum_bytes: u32", "dependency_and_invalidation_handles: Vec<ArtifactId>", "disclosure_decision_ref: Option<ArtifactId>"]
+invariants = ["source/scope/fence exact", "required/protected material cannot be silently omitted", "representation obeys disclosure/assertability", "reference does not raise source status or authority"]
+
+[[public_type]]
+name = "ReferenceCoverageDenominator"
+kind = "struct"
+definition = ["source_ref: String", "source_revision: String", "method_ref: String", "expected_references: Option<u32>", "expected_reference_handles: Vec<ArtifactId>"]
+invariants = ["source/revision/method non-blank", "Complete requires expected_references", "handles unique", "denominator independently recheckable"]
+
+[[public_type]]
+name = "ReferenceCoverageState"
+kind = "enum"
+definition = ["Complete", "Partial", "Unavailable", "Blocked", "Stale"]
+
+[[public_type]]
+name = "ReferenceCoverage"
+kind = "struct"
+definition = ["state: ReferenceCoverageState", "denominator: Option<ReferenceCoverageDenominator>", "observed_references: u32", "missing_owner_or_reason_refs: Vec<String>"]
+invariants = ["Complete requires exact count and no missing refs", "Partial requires denominator and named gaps", "Unavailable/Blocked names owner or reason and has no current references"]
+
+[[public_type]]
+name = "ReferenceManifest"
+kind = "struct"
+definition = ["manifest_id: ArtifactId", "job_sha256: String", "scope_id: String", "state_fence: StateFence", "references: Vec<ReferenceDescriptor>", "coverage: ReferenceCoverage", "omitted_reference_handles: Vec<ArtifactId>", "omission_reason_codes: Vec<String>", "manifest_sha256: String"]
+invariants = ["reference ids/source handles unique", "required reference cannot be omitted", "coverage exact", "canonical order and digest"]
+
+[[public_type]]
+name = "ExpandedReference"
+kind = "struct"
+definition = ["reference_id: ArtifactId", "representation: ReferenceRepresentationKind", "source_handle: ArtifactId", "payload_or_excerpt: Option<String>", "exact_expansion_handle: ArtifactId", "rendered_bytes: u32", "content_sha256: String"]
+invariants = ["belongs to manifest", "inline/excerpt has exact content digest and expansion handle", "handle representation contains no invented payload", "rendered bytes bounded"]
+
+[[public_type]]
+name = "DreamInputBundle"
+kind = "struct"
+definition = ["bundle_id: ArtifactId", "job_sha256: String", "manifest_sha256: String", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "references: Vec<ExpandedReference>", "coverage: ReferenceCoverage", "omitted_reference_handles: Vec<ArtifactId>", "decision_safety_floor_reference_ids: Vec<ArtifactId>", "reserved_output_bytes: u32", "reserved_review_bytes: u32", "bundle_sha256: String"]
+invariants = ["all expanded references occur in manifest", "Safety Floor references represented", "output/review headroom non-zero", "no generative summary replaces material evidence", "canonical order and digest"]
+
+[[public_type]]
+name = "DraftClaimRole"
+kind = "enum"
+definition = ["Interpretation", "Hypothesis", "RelationCandidate", "ProcedureCandidate", "TransformationCandidate", "Question", "Unknown"]
+
+[[public_type]]
+name = "DraftClaim"
+kind = "struct"
+definition = ["claim_id: ArtifactId", "role: DraftClaimRole", "statement: String", "cited_reference_ids: Vec<ArtifactId>", "counterevidence_reference_ids: Vec<ArtifactId>", "declared_scope: String", "declared_uncertainty: String", "invalidation_condition: String"]
+invariants = ["claim cannot declare confirmed canonical status", "citation/counterevidence ids unique", "scope/uncertainty/invalidation explicit"]
+
+[[public_type]]
+name = "ModelDraftEnvelope"
+kind = "struct"
+definition = ["draft_id: ArtifactId", "job_sha256: String", "bundle_sha256: String", "route_receipt_ref: ArtifactId", "raw_output_handle: ArtifactId", "claims: Vec<DraftClaim>", "unknowns: Vec<String>", "self_reported_limitations: Vec<String>", "draft_sha256: String"]
+invariants = ["route/raw output exact", "claims bounded and unique", "model self-report is not verification", "contains no resolved-evidence or admission field", "canonical order and digest"]
+
+[[public_type]]
+name = "GroundingState"
+kind = "enum"
+definition = ["Grounded", "PartiallyGrounded", "Unsupported", "Contradicted", "OutsideManifest"]
+
+[[public_type]]
+name = "GroundedClaim"
+kind = "struct"
+definition = ["claim: DraftClaim", "state: GroundingState", "resolved_reference_ids: Vec<ArtifactId>", "resolved_counterevidence_ids: Vec<ArtifactId>", "unresolved_reference_ids: Vec<ArtifactId>", "source_authority_ceiling: String", "assertability_ceiling: Assertability", "reason_codes: Vec<String>"]
+invariants = ["every material citation resolves against exact manifest or remains unresolved", "contradiction retained", "authority/assertability never exceed sources"]
+
+[[public_type]]
+name = "GroundedDreamDraft"
+kind = "struct"
+definition = ["draft_sha256: String", "manifest_sha256: String", "claims: Vec<GroundedClaim>", "unsupported_residue: Vec<String>", "coverage: ReferenceCoverage", "grounded_sha256: String"]
+invariants = ["every input claim appears once", "unsupported residue visible", "coverage cannot improve over manifest", "canonical order and digest"]
+
+[[public_type]]
+name = "TransformationDimension"
+kind = "enum"
+definition = ["Coverage", "Preservation", "Faithfulness", "Lineage", "Reversibility", "SourceAuthority", "DependencyClosure"]
+
+[[public_type]]
+name = "TransformationDimensionState"
+kind = "enum"
+definition = ["Pass", "Fail", "Unknown", "NotApplicable"]
+
+[[public_type]]
+name = "DimensionResult"
+kind = "struct"
+definition = ["dimension: TransformationDimension", "state: TransformationDimensionState", "evidence_handles: Vec<ArtifactId>", "failure_or_unknown_reason_codes: Vec<String>", "required_followup: Option<String>"]
+invariants = ["one result per dimension", "Pass requires evidence or deterministic not-applicable proof", "no aggregate score"]
+
+[[public_type]]
+name = "TransformationValidationReport"
+kind = "struct"
+definition = ["report_id: ArtifactId", "grounded_sha256: String", "source_manifest_sha256: String", "dimensions: Vec<DimensionResult>", "minority_or_counterevidence_preserved: bool", "temporal_and_scope_distinctions_preserved: bool", "exact_source_reopen_handles: Vec<ArtifactId>", "report_sha256: String"]
+invariants = ["exactly seven dimensions", "any Fail blocks admission", "Unknown blocks material transformation admission unless explicitly not applicable", "source reopen path retained", "canonical order and digest"]
+
+[[public_type]]
+name = "DraftAdmissionState"
+kind = "enum"
+definition = ["AdmittedCandidate", "RejectedInvalid", "RejectedUngrounded", "RejectedTransformation", "BlockedCoverage", "Stale"]
+
+[[public_type]]
+name = "AdmittedDreamDraft"
+kind = "struct"
+definition = ["admission_id: ArtifactId", "job_sha256: String", "grounded_sha256: String", "validation_report_sha256: String", "state: DraftAdmissionState", "candidate_output_kind: String", "candidate_payload_handle: Option<ArtifactId>", "reason_codes: Vec<String>", "state_fence: StateFence", "admission_sha256: String"]
+invariants = ["AdmittedCandidate is still candidate-only", "rejected/blocked state has no payload admitted for influence", "contains no canonical/support/authority/finish/effect receipt", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_dream_job_envelope"
+signature = "pub fn validate_dream_job_envelope(job: &DreamJobEnvelope) -> Result<(), DreamContractError>"
+
+[[public_function]]
+name = "validate_reference_manifest"
+signature = "pub fn validate_reference_manifest(job: &DreamJobEnvelope, manifest: &ReferenceManifest) -> Result<(), DreamContractError>"
+
+[[public_function]]
+name = "validate_dream_input_bundle"
+signature = "pub fn validate_dream_input_bundle(job: &DreamJobEnvelope, manifest: &ReferenceManifest, bundle: &DreamInputBundle) -> Result<(), DreamContractError>"
+
+[[public_function]]
+name = "validate_model_draft"
+signature = "pub fn validate_model_draft(job: &DreamJobEnvelope, bundle: &DreamInputBundle, draft: &ModelDraftEnvelope) -> Result<(), DreamContractError>"
+
+[[public_function]]
+name = "validate_grounded_draft"
+signature = "pub fn validate_grounded_draft(manifest: &ReferenceManifest, draft: &GroundedDreamDraft) -> Result<(), DreamContractError>"
+
+[[public_function]]
+name = "validate_transformation_report"
+signature = "pub fn validate_transformation_report(draft: &GroundedDreamDraft, report: &TransformationValidationReport) -> Result<(), DreamContractError>"
+
+[[public_function]]
+name = "validate_admitted_draft"
+signature = "pub fn validate_admitted_draft(job: &DreamJobEnvelope, draft: &GroundedDreamDraft, report: &TransformationValidationReport, admitted: &AdmittedDreamDraft) -> Result<(), DreamContractError>"
+
+[[negative_test]]
+id = "unknown-job-class-rejected"
+property = "Unknown or added job class fails decoding/validation and cannot fall back to generic output."
+
+[[negative_test]]
+id = "forbidden-effects-required"
+property = "Ordinary Dreamer job missing the complete forbidden-effect set is rejected."
+
+[[negative_test]]
+id = "model-cannot-confirm-evidence"
+property = "ModelDraftEnvelope has no resolved/confirmed evidence or support field."
+
+[[negative_test]]
+id = "citation-outside-manifest"
+property = "Claim citation outside the exact ReferenceManifest is OutsideManifest and blocks admission."
+
+[[negative_test]]
+id = "coverage-needs-denominator"
+property = "Complete reference coverage without exact expected count is rejected."
+
+[[negative_test]]
+id = "seven-dimensions-required"
+property = "Transformation report missing coverage/preservation/faithfulness/lineage/reversibility/source-authority/dependency-closure is rejected."
+
+[[negative_test]]
+id = "candidate-not-authority"
+property = "AdmittedDreamDraft exposes no canonical write, epistemic promotion, authority, task finish, external effect or launch receipt."
+
+[[negative_test]]
+id = "permutation-deterministic"
+property = "Reference/claim/dimension input permutation does not change canonical identities."
