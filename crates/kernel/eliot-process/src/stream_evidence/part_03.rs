@@ -5,7 +5,7 @@
 )]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DurableStreamLocatorKind {
-    /// Provider-neutral BlobStore object/receipt.
+    /// Provider-neutral `BlobStore` object/receipt.
     Blob,
     /// Another admitted immutable artifact/evidence store.
     ImmutableArtifact,
