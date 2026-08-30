@@ -1,0 +1,45 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+field_contract_is_sole_public_type_authority = true
+order = 14
+cell = "smart.dreamer.probe_plan"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-orientation"
+primary_property = "Construct a bounded discriminative ProbePlan candidate that separates live rivals while making capability, safety, reversibility, cost, stop and revision conditions explicit; never execute the probe."
+field_contract = "crates/smart/eliot-dreamer-contracts/orientation.contract.toml"
+public_function_selectors = ["build_probe_plan"]
+write_scope = [
+  "crates/smart/eliot-dreamer-orientation/src/probe_plan.rs",
+  "crates/smart/eliot-dreamer-orientation/tests/probe_plan.rs",
+]
+algorithm = [
+  "validate request, Current Epistemic Position, rival set, available capability references, scope/task/fence and bounds",
+  "identify the smallest material unresolved distinction among rivals",
+  "define action or observation, predicted observable per rival and a discriminating result mapping",
+  "record capability requirements, privacy, safety, risk, reversibility, cost and authority ceilings",
+  "attach explicit unavailable/unsafe disposition, stop conditions, invalidation and revision conditions",
+  "rank candidates deterministically by discriminative power within declared safety/cost ceilings without execution",
+]
+minimum_tests = [
+  "probe that cannot distinguish rivals is rejected",
+  "unsafe or unavailable capability cannot yield runnable disposition",
+  "missing stop condition or reversibility evidence blocks material probe",
+  "cheapest probe does not win when nondiscriminative",
+  "probe plan contains no tool call, job, route reservation or effect receipt",
+  "unknown capability remains explicit rather than assumed available",
+]
+non_goals = [
+  "tool/agent/model execution",
+  "budget or route reservation",
+  "authority grant",
+  "epistemic resolution",
+  "task finish",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-EPI-03", "ARCH-DRM-01", "ARCH-RES-05", "ARCH-SEC-03", "ARCH-UND-02"]
+implementation_refs = ["I2.20", "I9.5", "I12.18", "I14.5"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge or unavailable/unsafe probe candidate rather than executing, reserving resources, inventing capability, or proposing a nondiscriminative action."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
