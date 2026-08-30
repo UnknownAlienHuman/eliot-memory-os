@@ -1,0 +1,192 @@
+schema_version = 1
+contract_id = "smart.dreamer.research-synthesis.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-dreamer-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.dreamer.contracts.research", "smart.dreamer.research_synthesis"]
+architecture_refs = ["ARCH-DRM-01", "ARCH-DRM-02", "ARCH-DRM-04", "ARCH-CONCIL-01", "ARCH-EPI-03", "ARCH-EPI-04", "ARCH-MEM-03", "ARCH-SCOPE-01"]
+implementation_refs = ["I9.2", "I9.3", "I9.5", "I9.14", "I21.7", "I21.9", "I21.11"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Interpret one immutable Researcher-produced evidence bundle into a cited, rival-aware Research Synthesis candidate without acquiring sources, changing evidence grade, closing coverage, or promoting project truth."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure_validation"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((sources + claims + citations + counterclaims + probes) log n) over one bounded immutable ResearchEvidenceBundle; no network, OCR, parsing, indexing, provider call, source discovery, canonical write or admission."
+replacement_boundary = "Replace synthesis implementations behind this contract; Researcher remains acquisition/freeze/denominator owner and Governor remains admission/support/influence owner."
+
+[closed_sets]
+interpretation_states = ["SupportedWithinBundle", "PartiallySupported", "Contested", "Unsupported", "Stale", "Inconclusive"]
+source_dependence_classes = ["Independent", "SharedPrimarySource", "SharedAcquisitionRoute", "SharedPublisherOrInstitution", "SharedDataset", "CorrelatedMethod", "Unknown"]
+coverage_assessments = ["PreservedComplete", "PreservedPartial", "PreservedUnavailable", "PreservedBlocked", "PreservedStale", "Inconclusive"]
+probe_dispositions = ["Recommended", "RequiredBeforeMaterialAction", "DeferredWithRisk", "BlockedByCapability", "Exhausted"]
+
+[hard_invariants]
+researcher_owns_acquisition_source_admission_evidence_freeze_and_denominator = true
+dreamer_owns_interpretation_only = true
+governor_owns_project_admission_support_and_influence = true
+bundle_and_manifest_identity_are_exact_and_immutable = true
+citation_must_resolve_inside_allowed_manifest_and_bundle = true
+citation_precision_never_exceeds_source_anchor = true
+failed_acquisition_coverage_unknowns_negative_results_and_counterclaims_remain_visible = true
+source_dependence_is_not_independent_confirmation = true
+exploration_cannot_confirm_itself_on_same_evidence = true
+synthesis_cannot_raise_evidence_grade_or_completion_disposition = true
+no_source_expansion_network_provider_or_researcher_command = true
+packet_contains_no_truth_support_policy_authority_finish_or_canonical_receipt = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "DreamJobEnvelope"
+owner = "eliot-dreamer-contracts/common.contract.toml"
+
+[[external_type]]
+name = "GroundedDreamDraft"
+owner = "eliot-dreamer-contracts/common.contract.toml"
+
+[[external_type]]
+name = "ResearchEvidenceBundle"
+owner = "eliot-research-exchange-api"
+
+[[external_type]]
+name = "AllowedReferenceManifest"
+owner = "eliot-research-exchange-api"
+
+[[external_type]]
+name = "ExactCitation"
+owner = "eliot-research-exchange-api"
+
+[[external_type]]
+name = "CompletionDisposition"
+owner = "eliot-research-exchange-api"
+
+[[external_type]]
+name = "SourceSnapshot"
+owner = "eliot-research-exchange-api"
+
+[[external_type]]
+name = "ResearchClaim"
+owner = "eliot-research-exchange-api"
+
+[[public_type]]
+name = "ResearchSynthesisRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "job_sha256: String", "research_bundle_digest: String", "allowed_reference_manifest_digest: String", "question: String", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "expected_decision_refs: Vec<ArtifactId>", "required_claim_ids: Vec<String>", "required_source_classes: Vec<String>", "maximum_interpretations: u32", "maximum_counterclaims: u32", "maximum_probes: u32", "maximum_output_bytes: u32", "request_sha256: String"]
+invariants = ["job class is ResearchSynthesis", "bundle/manifest/question/scope/fence exact", "decision/claim/source-class sets unique", "bounds non-zero", "request grants no source acquisition, provider, network, admission or authority"]
+
+[[public_type]]
+name = "ResearchInterpretationState"
+kind = "enum"
+definition = ["SupportedWithinBundle", "PartiallySupported", "Contested", "Unsupported", "Stale", "Inconclusive"]
+invariants = ["SupportedWithinBundle is scoped to the bundle and is not project truth or canonical support"]
+
+[[public_type]]
+name = "ResearchSourceDependenceClass"
+kind = "enum"
+definition = ["Independent", "SharedPrimarySource", "SharedAcquisitionRoute", "SharedPublisherOrInstitution", "SharedDataset", "CorrelatedMethod", "Unknown"]
+
+[[public_type]]
+name = "ResearchSourceDependence"
+kind = "struct"
+definition = ["class: ResearchSourceDependenceClass", "source_handles: Vec<String>", "shared_lineage_refs: Vec<String>", "reason_codes: Vec<String>"]
+invariants = ["source handles non-empty and unique", "Independent has no shared lineage", "Unknown never counts as independent support", "dependence classes are not collapsed to one score"]
+
+[[public_type]]
+name = "ResearchInterpretationCandidate"
+kind = "struct"
+definition = ["candidate_id: ArtifactId", "request_sha256: String", "statement: String", "mechanism_or_explanation: String", "state: ResearchInterpretationState", "claim_ids: Vec<String>", "citations: Vec<ExactCitation>", "counterclaim_ids: Vec<String>", "source_dependence: Vec<ResearchSourceDependence>", "scope_and_population: String", "applicability_conditions: Vec<String>", "possible_confounders: Vec<String>", "strongest_objection: String", "invalidation_condition: String", "transfer_limits: Vec<String>"]
+invariants = ["all claim/citation/counterclaim identities resolve inside bundle/manifest", "statement and mechanism remain model interpretation", "scope/population/applicability/confounders/objection/invalidation explicit", "no support or authority promotion"]
+
+[[public_type]]
+name = "ResearchCounterclaim"
+kind = "struct"
+definition = ["counterclaim_id: String", "statement: String", "claim_ids_countered: Vec<String>", "citations: Vec<ExactCitation>", "source_dependence: Vec<ResearchSourceDependence>", "state: ResearchInterpretationState", "strongest_response: String", "unresolved_residue: Vec<String>"]
+invariants = ["countered claims and citations exact", "counterclaim is not dropped because fewer sources support it", "strongest response and residue visible"]
+
+[[public_type]]
+name = "ResearchCoverageAssessmentState"
+kind = "enum"
+definition = ["PreservedComplete", "PreservedPartial", "PreservedUnavailable", "PreservedBlocked", "PreservedStale", "Inconclusive"]
+
+[[public_type]]
+name = "ResearchCoverageAssessment"
+kind = "struct"
+definition = ["bundle_disposition: CompletionDisposition", "state: ResearchCoverageAssessmentState", "source_count: u32", "claim_count: u32", "cited_claim_count: u32", "coverage_unknowns: Vec<String>", "failed_acquisition: Vec<String>", "missing_required_claim_ids: Vec<String>", "missing_required_source_classes: Vec<String>", "assessment_reason_codes: Vec<String>"]
+invariants = ["state cannot be stronger than bundle disposition", "source count is not coverage denominator", "failed acquisition and unknowns retained", "missing required classes/claims prevent complete synthesis"]
+
+[[public_type]]
+name = "ResearchProbeCandidate"
+kind = "struct"
+definition = ["probe_id: ArtifactId", "question: String", "decision_dependency_refs: Vec<ArtifactId>", "rival_interpretation_refs: Vec<ArtifactId>", "required_new_evidence_class: String", "expected_if_primary_holds: String", "expected_if_rival_holds: String", "falsifier: String", "cheapest_safe_probe: String", "disposition: String", "stop_condition: String"]
+invariants = ["probe explicitly requires new/independent evidence when same bundle generated the hypothesis", "probe has no acquisition or execution authority", "true/rival expectations and falsifier explicit"]
+
+[[public_type]]
+name = "ResearchSynthesisPacket"
+kind = "struct"
+definition = ["packet_id: ArtifactId", "request_sha256: String", "research_bundle_digest: String", "allowed_reference_manifest_digest: String", "question: String", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "coverage: ResearchCoverageAssessment", "interpretations: Vec<ResearchInterpretationCandidate>", "counterclaims: Vec<ResearchCounterclaim>", "strongest_operational_model_ref: Option<ArtifactId>", "rival_interpretation_refs: Vec<ArtifactId>", "shared_lineage_refs: Vec<String>", "unknowns_and_gaps: Vec<String>", "probes: Vec<ResearchProbeCandidate>", "exact_citations: Vec<ExactCitation>", "invalidation_conditions: Vec<String>", "provenance_handles: Vec<ArtifactId>", "packet_sha256: String"]
+invariants = ["all sections bind one bundle/manifest/question/scope/fence", "interpretations/counterclaims/rivals/unknowns/probes/citations stay separate", "coverage cannot exceed Researcher bundle", "contains no source acquisition, evidence-grade promotion, canonical transition, support, authority, policy, finish or effect receipt", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_research_synthesis_request"
+signature = "pub fn validate_research_synthesis_request(job: &DreamJobEnvelope, bundle: &ResearchEvidenceBundle, manifest: &AllowedReferenceManifest, request: &ResearchSynthesisRequest) -> Result<(), DreamContractError>"
+
+[[public_function]]
+name = "validate_research_interpretation_candidate"
+signature = "pub fn validate_research_interpretation_candidate(bundle: &ResearchEvidenceBundle, manifest: &AllowedReferenceManifest, request: &ResearchSynthesisRequest, candidate: &ResearchInterpretationCandidate) -> Result<(), DreamContractError>"
+
+[[public_function]]
+name = "validate_research_synthesis_packet"
+signature = "pub fn validate_research_synthesis_packet(job: &DreamJobEnvelope, bundle: &ResearchEvidenceBundle, manifest: &AllowedReferenceManifest, request: &ResearchSynthesisRequest, grounded: &GroundedDreamDraft, packet: &ResearchSynthesisPacket) -> Result<(), DreamContractError>"
+
+[[negative_test]]
+id = "citation-outside-manifest"
+property = "Citation whose source or precision is outside AllowedReferenceManifest is rejected."
+
+[[negative_test]]
+id = "failed-acquisition-retained"
+property = "ResearchSynthesisPacket cannot omit failed acquisition and coverage unknowns from the bundle."
+
+[[negative_test]]
+id = "partial-cannot-become-complete"
+property = "Partial/inconclusive/unavailable bundle cannot produce preserved-complete synthesis coverage."
+
+[[negative_test]]
+id = "source-count-not-denominator"
+property = "Source count alone cannot justify completeness or no-match."
+
+[[negative_test]]
+id = "same-evidence-no-self-confirmation"
+property = "Interpretation generated from the bundle cannot label itself independently confirmed by the same bundle."
+
+[[negative_test]]
+id = "researcher-boundary"
+property = "Public synthesis request/output expose no URL, provider credential, acquisition command, OCR/parser/index action or source-admission decision."
+
+[[negative_test]]
+id = "candidate-not-truth"
+property = "Packet exposes no project-truth, support-promotion, policy, authority, canonical write or finish field."
+
+[[negative_test]]
+id = "permutation-deterministic"
+property = "Interpretation/counterclaim/citation/probe permutation does not change packet identity."
