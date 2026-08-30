@@ -445,6 +445,7 @@ pub enum DispatchBlocker {
     ModelUnavailable,
     ModelAvailabilityUnknown,
     BillingEvidenceStale,
+    BillingUnknown,
     QuotaEvidenceStale,
     QuotaExhausted,
     QuotaUnknown,
@@ -497,6 +498,9 @@ fn dispatch_blockers(
     }
     if !entry.billing.is_current(now_unix_ms) {
         blockers.insert(DispatchBlocker::BillingEvidenceStale);
+    }
+    if entry.billing.class == BillingClass::Unknown {
+        blockers.insert(DispatchBlocker::BillingUnknown);
     }
     if entry.quota.is_current(now_unix_ms) {
         match entry.quota.disposition {
@@ -1036,6 +1040,7 @@ pub enum AttemptLivenessStatus {
     QuotaExhausted,
     QuotaUnknown,
     ProcessMissing,
+    ProcessUnknown,
     UnknownEffect,
     UnknownOutcome,
     Terminal,
@@ -1187,6 +1192,8 @@ fn derive_attempt_status(
         AttemptLivenessStatus::DeadlineExceeded
     } else if input.process == ProcessObservation::Exited {
         AttemptLivenessStatus::ProcessMissing
+    } else if input.process == ProcessObservation::Unknown {
+        AttemptLivenessStatus::ProcessUnknown
     } else if input.state == CoordinatedAttemptState::CancellationRequested {
         AttemptLivenessStatus::Cancelling
     } else if input.state == CoordinatedAttemptState::Admitted

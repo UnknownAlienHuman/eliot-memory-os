@@ -264,6 +264,39 @@ fn exhausted_and_unknown_quota_are_not_dispatchable() {
 }
 
 #[test]
+fn unknown_billing_is_not_dispatchable() {
+    let catalogue = snapshot(vec![entry(
+        "unknown-billing",
+        "provider-a",
+        "model-a",
+        "family-a",
+        BillingClass::Unknown,
+        QuotaDisposition::Available,
+        0,
+    )]);
+    let human_policy = policy(
+        preference(
+            ModelRole::Worker,
+            Vec::new(),
+            Vec::new(),
+            BTreeSet::from([BillingClass::Unknown]),
+            true,
+        ),
+        "revision-1",
+    );
+    assert!(matches!(
+        compile_model_selection(
+            &catalogue,
+            &human_policy,
+            ModelRole::Worker,
+            "selection-1",
+            NOW
+        ),
+        Err(ModelControlError::NoDispatchableRoute(ModelRole::Worker))
+    ));
+}
+
+#[test]
 fn denied_selector_overrides_preferred_selector() -> TestResult {
     let catalogue = snapshot(vec![
         entry(
@@ -463,6 +496,24 @@ fn stale_heartbeat_and_deadline_overrun_remain_distinct() -> TestResult {
     assert_eq!(
         overdue_projection.status,
         AttemptLivenessStatus::DeadlineExceeded
+    );
+    Ok(())
+}
+
+#[test]
+fn unknown_process_is_not_eligible_for_work() -> TestResult {
+    let mut input = telemetry(CoordinatedAttemptState::Running)?;
+    input.process = ProcessObservation::Unknown;
+    let projection = project_attempt_health(&input, NOW)?;
+    assert_eq!(projection.status, AttemptLivenessStatus::ProcessUnknown);
+    assert_eq!(
+        projection.work_eligibility,
+        AttemptWorkEligibility::Ineligible
+    );
+    assert!(
+        projection
+            .alerts
+            .contains(&AttemptAlertCode::ProcessUnknown)
     );
     Ok(())
 }
