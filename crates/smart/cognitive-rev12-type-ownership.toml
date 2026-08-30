@@ -5,16 +5,16 @@ rule = "Every public wire type has one owner. Consumers import it; adapters and 
 
 [[family]]
 owner = "eliot-context-contracts"
-types = ["ContextProviderClass", "ContextProviderDescriptor", "ContextProviderRegistrySnapshot", "ExpectedContextProvider", "ExpectedContextProviderSet", "ContextProviderProjectionRequest", "ProviderRoleRequirement", "ProviderAvailabilityClass", "ProviderContribution"]
+types = ["ContextProviderClass", "ContextProviderDescriptor", "ContextProviderRegistrySnapshot", "ExpectedContextProvider", "ExpectedContextProviderSet", "ContextProviderProjectionRequest", "ProviderRoleRequirement", "ProviderAvailabilityClass", "ProviderCoverageState", "ProviderRepresentation", "DecisionDelta", "ProviderAtom", "ProviderOmissionReason", "ProviderOmission", "ProviderCoverage", "ProviderContribution"]
 resolution = "The prior unresolved EpistemicContextProjectionRequest is removed. smart.epistemic.context_projection consumes ContextProviderProjectionRequest."
 
 [[family]]
 owner = "eliot-memory-projection-contracts"
-types = ["CanonicalMemoryReadRequest", "CanonicalMemoryReadSnapshot", "MemoryProjectionRecord", "MemoryQueryIntent", "MemorySelectionPolicy", "MemoryCandidate", "MemoryCandidateSet", "MemorySelectionDimension", "MemorySelectionTrace", "MemoryContextProjectionRequest"]
+types = ["CanonicalMemoryReadRequest", "CanonicalMemoryReadSnapshot", "MemoryProjectionRecord", "MemoryQueryIntent", "MemoryProtectionRule", "MemorySelectionPolicy", "MemoryCandidate", "MemoryCandidateSet", "MemorySelectionDimension", "MemorySelectionAssessment", "MemorySuppressionReason", "MemorySelectionTraceEntry", "MemorySelectionTrace", "MemoryContextProjectionRequest"]
 
 [[family]]
 owner = "eliot-learning-contracts"
-types = ["SystemExperienceProjectionRequest", "CanonicalExperienceReadSnapshot", "AttemptExperience", "OutcomeAttribution", "FailureObservation", "ExperienceCoverage", "SystemExperienceProjection"]
+types = ["SystemExperienceProjectionRequest", "CanonicalExperienceReadSnapshot", "AttemptExperience", "ObservedOutcome", "OutcomeAttribution", "FailureObservation", "ExperienceCoverage", "SystemExperienceProjection"]
 
 [[family]]
 owner = "eliot-memory-quality"
