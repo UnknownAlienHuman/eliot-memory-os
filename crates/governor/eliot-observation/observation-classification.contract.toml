@@ -1,0 +1,124 @@
+schema_version = 1
+contract_id = "governor.observation.classification.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-observation"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["governor.observation.classifier"]
+architecture_refs = ["ARCH-CORE-00", "ARCH-EPI-04", "ARCH-SCOPE-01", "ARCH-SEC-02", "ARCH-RES-05"]
+implementation_refs = ["I2.20", "I5 capture", "I12.11 Current Epistemic Position"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Classify one captured observation into a bounded evidence and task-binding disposition without rewriting payload, fabricating scope, or promoting truth/support."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O(bindings log bindings + evidence_handles log evidence_handles) over request-bounded immutable input; no storage, model, provider, network or blocking I/O."
+replacement_boundary = "Replace deterministic classification policy behind this contract; capture persistence, task binding, evidence admission, canonical state and attention remain separate owners."
+
+[closed_sets]
+observation_origins = ["UserInput", "AgentOutput", "ToolResult", "RuntimeEvent", "RepositoryEvent", "ExternalEvidence", "SyntheticTest"]
+payload_integrity = ["Exact", "Extractive", "Truncated", "Malformed", "Missing"]
+binding_relations = ["ExactTask", "ExactScope", "ExplicitCrossTask", "Heuristic", "Conflicting", "Absent"]
+classification_dispositions = ["TaskBound", "ScopeBoundCold", "GlobalCold", "Quarantined", "Unknown"]
+contamination_reasons = ["ConflictingTaskBindings", "ScopeMismatch", "FenceMismatch", "MissingProvenance", "MalformedPayload", "UntrustedSyntheticInput", "AmbiguousCrossTask", "UnsupportedOrigin"]
+
+[hard_invariants]
+raw_payload_identity_is_preserved = true
+classification_never_rewrites_or_summarizes_payload = true
+classification_never_promotes_truth_support_or_authority = true
+exact_binding_requires_explicit_owner_evidence = true
+heuristic_binding_cannot_produce_task_bound = true
+conflicting_binding_never_selects_one_task_by_vote_or_recency = true
+cold_capture_remains_retrievable_by_exact_handle = true
+quarantine_is_visible_and_reasoned = true
+unknown_is_not_treated_as_global_or_irrelevant = true
+scope_task_fence_and_provenance_are_checked_independently = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[public_type]]
+name = "ObservationOrigin"
+kind = "enum"
+definition = ["UserInput", "AgentOutput", "ToolResult", "RuntimeEvent", "RepositoryEvent", "ExternalEvidence", "SyntheticTest"]
+
+[[public_type]]
+name = "ObservationPayloadIntegrity"
+kind = "enum"
+definition = ["Exact", "Extractive", "Truncated", "Malformed", "Missing"]
+
+[[public_type]]
+name = "ObservationBindingRelation"
+kind = "enum"
+definition = ["ExactTask", "ExactScope", "ExplicitCrossTask", "Heuristic", "Conflicting", "Absent"]
+
+[[public_type]]
+name = "ObservationBindingEvidence"
+kind = "struct"
+definition = ["binding_id: ArtifactId", "relation: ObservationBindingRelation", "task_id: Option<TaskId>", "scope_id: Option<String>", "state_fence: Option<StateFence>", "source_handles: Vec<ArtifactId>", "owner_ref: String", "reason_codes: Vec<String>"]
+invariants = ["exact task relation requires task, scope, fence and owner evidence", "source handles non-empty and unique", "heuristic evidence is never silently upgraded", "conflicting relation identifies all competing bindings"]
+
+[[public_type]]
+name = "ObservationClassificationRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "observation_handle: ArtifactId", "payload_sha256: String", "origin: ObservationOrigin", "payload_integrity: ObservationPayloadIntegrity", "captured_scope_hint: Option<String>", "captured_task_hint: Option<TaskId>", "captured_state_fence: Option<StateFence>", "provenance_handles: Vec<ArtifactId>", "binding_evidence: Vec<ObservationBindingEvidence>", "maximum_binding_evidence: u32", "request_sha256: String"]
+invariants = ["payload digest lowercase SHA-256", "observation/provenance identities exact", "bounds non-zero", "request grants no persistence, task mutation, support or authority"]
+
+[[public_type]]
+name = "ObservationClassificationDisposition"
+kind = "enum"
+definition = ["TaskBound", "ScopeBoundCold", "GlobalCold", "Quarantined", "Unknown"]
+
+[[public_type]]
+name = "ObservationContaminationReason"
+kind = "enum"
+definition = ["ConflictingTaskBindings", "ScopeMismatch", "FenceMismatch", "MissingProvenance", "MalformedPayload", "UntrustedSyntheticInput", "AmbiguousCrossTask", "UnsupportedOrigin"]
+
+[[public_type]]
+name = "ObservationClassificationResult"
+kind = "struct"
+definition = ["request_sha256: String", "observation_handle: ArtifactId", "payload_sha256: String", "disposition: ObservationClassificationDisposition", "bound_task_id: Option<TaskId>", "bound_scope_id: Option<String>", "bound_state_fence: Option<StateFence>", "accepted_binding_evidence_handles: Vec<ArtifactId>", "rejected_binding_evidence_handles: Vec<ArtifactId>", "contamination_reasons: Vec<ObservationContaminationReason>", "unknown_reason_codes: Vec<String>", "provenance_handles: Vec<ArtifactId>", "result_sha256: String"]
+invariants = ["TaskBound requires exactly one explicit compatible task/scope/fence binding", "ScopeBoundCold has scope but no task", "GlobalCold has no fabricated task/scope", "Quarantined names contamination reason and preserves exact handles", "Unknown preserves unresolved alternatives", "payload digest unchanged", "contains no truth/support/admission/persistence/attention disposition"]
+
+[[public_function]]
+name = "classify_observation"
+signature = "pub fn classify_observation(request: &ObservationClassificationRequest) -> Result<ObservationClassificationResult, ObservationClassificationError>"
+
+[[negative_test]]
+id = "conflict-does-not-pick-winner"
+property = "Two incompatible exact task bindings yield Quarantined or Unknown, never TaskBound by vote, recency or priority."
+
+[[negative_test]]
+id = "heuristic-not-task-bound"
+property = "Heuristic-only binding cannot produce TaskBound."
+
+[[negative_test]]
+id = "cold-capture-preserved"
+property = "Absent binding yields GlobalCold or Unknown while retaining observation and provenance handles."
+
+[[negative_test]]
+id = "payload-not-rewritten"
+property = "Result carries the exact input payload digest and exposes no transformed payload field."
+
+[[negative_test]]
+id = "classification-no-truth-promotion"
+property = "Result schema contains no epistemic support, authority, canonical write, task finish or attention-opening field."
