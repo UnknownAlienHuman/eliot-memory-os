@@ -2,12 +2,17 @@
   "schema_version": "eliot.agent-model-selection-input.v1",
   "selection_id": "fixture-four-route-01",
   "attempt_scope": "task:fixture/work-item:model-selection",
-  "requested_roles": ["primary", "cheap_worker", "challenger", "verifier"],
+  "requested_roles": [
+    "primary",
+    "cheap_worker",
+    "challenger",
+    "verifier"
+  ],
   "candidates": [
     {
       "host": "codex",
       "route_id": "codex.app-server.stdio",
-      "route_fingerprint": "sha256:codex-route-fixture",
+      "route_fingerprint": "sha256:5420fef6b7e406bc7bba0a132fcb4f002cb201f6e83f7f6d31de0b3d95fb69d5",
       "account_scope": "account:codex-fixture",
       "catalogue_observed_at": "2026-08-29T00:00:00Z",
       "catalogue_status": "current",
@@ -21,16 +26,26 @@
       "latency_class": 2,
       "availability": "available",
       "quota_status": "available",
-      "role_eligibility": ["primary"],
+      "role_eligibility": [
+        "primary"
+      ],
       "capabilities": {
-        "code_editing": {"status": "supported", "evidence": "verified", "receipt_ref": "receipt:codex:edit"},
-        "tool_use": {"status": "supported", "evidence": "observed", "receipt_ref": "receipt:codex:tools"}
+        "code_editing": {
+          "status": "supported",
+          "evidence": "verified",
+          "receipt_ref": "receipt:codex:edit"
+        },
+        "tool_use": {
+          "status": "supported",
+          "evidence": "observed",
+          "receipt_ref": "receipt:codex:tools"
+        }
       }
     },
     {
       "host": "opencode",
       "route_id": "opencode.http-sse",
-      "route_fingerprint": "sha256:opencode-route-fixture",
+      "route_fingerprint": "sha256:3fb3a4c3d78fa59cc0926f4e54b9dc08d8ea14efc5e0d982b0ca344cec598b4b",
       "account_scope": "account:opencode-fixture",
       "catalogue_observed_at": "2026-08-29T00:00:01Z",
       "catalogue_status": "current",
@@ -44,15 +59,21 @@
       "latency_class": 1,
       "availability": "available",
       "quota_status": "available",
-      "role_eligibility": ["cheap_worker"],
+      "role_eligibility": [
+        "cheap_worker"
+      ],
       "capabilities": {
-        "code_editing": {"status": "supported", "evidence": "observed", "receipt_ref": "receipt:opencode:edit"}
+        "code_editing": {
+          "status": "supported",
+          "evidence": "observed",
+          "receipt_ref": "receipt:opencode:edit"
+        }
       }
     },
     {
       "host": "claude",
       "route_id": "claude.agent-sdk.local-sidecar",
-      "route_fingerprint": "sha256:claude-route-fixture",
+      "route_fingerprint": "sha256:0b91376dfb30a2160a7d6e19fdae4abad13167e8152a8a02fa4a695bac00acaa",
       "account_scope": "account:claude-fixture",
       "catalogue_observed_at": "2026-08-29T00:00:02Z",
       "catalogue_status": "current",
@@ -66,16 +87,26 @@
       "latency_class": 3,
       "availability": "available",
       "quota_status": "available",
-      "role_eligibility": ["challenger"],
+      "role_eligibility": [
+        "challenger"
+      ],
       "capabilities": {
-        "reasoning": {"status": "supported", "evidence": "verified", "receipt_ref": "receipt:claude:reason"},
-        "tool_use": {"status": "supported", "evidence": "observed", "receipt_ref": "receipt:claude:tools"}
+        "reasoning": {
+          "status": "supported",
+          "evidence": "verified",
+          "receipt_ref": "receipt:claude:reason"
+        },
+        "tool_use": {
+          "status": "supported",
+          "evidence": "observed",
+          "receipt_ref": "receipt:claude:tools"
+        }
       }
     },
     {
       "host": "antigravity",
       "route_id": "antigravity.exec.persistent-ndjson",
-      "route_fingerprint": "sha256:antigravity-route-fixture",
+      "route_fingerprint": "sha256:3d9ac14c16a7b361239b6094a98925b9a7977b9985e3390262c487b999f3d52e",
       "account_scope": "account:antigravity-fixture",
       "catalogue_observed_at": "2026-08-29T00:00:03Z",
       "catalogue_status": "current",
@@ -89,10 +120,20 @@
       "latency_class": 2,
       "availability": "available",
       "quota_status": "available",
-      "role_eligibility": ["verifier"],
+      "role_eligibility": [
+        "verifier"
+      ],
       "capabilities": {
-        "code_review": {"status": "supported", "evidence": "observed", "receipt_ref": "receipt:antigravity:review"},
-        "reasoning": {"status": "supported", "evidence": "observed", "receipt_ref": "receipt:antigravity:reason"}
+        "code_review": {
+          "status": "supported",
+          "evidence": "observed",
+          "receipt_ref": "receipt:antigravity:review"
+        },
+        "reasoning": {
+          "status": "supported",
+          "evidence": "observed",
+          "receipt_ref": "receipt:antigravity:reason"
+        }
       }
     }
   ]
