@@ -1,5 +1,7 @@
 {
   "schema_version": "eliot.agent-model-selection-policy.v1",
+  "proof_ceiling": "Development differential oracle over supplied synthetic inputs only; no current-account, capability, provider, dispatch, or AgentAttempt proof.",
+  "allowed_host_families": ["codex", "opencode", "claude", "antigravity"],
   "minimum_capability_evidence": "observed",
   "evidence_order": ["unknown", "self_reported", "documented", "observed", "verified"],
   "admitted_route_statuses": ["admitted"],
@@ -41,6 +43,5 @@
       "diversity_from": ["primary", "challenger"]
     }
   ],
-  "diversity_dimensions": ["host", "route_id", "model_family"],
-  "proof_ceiling": "Deterministic candidate route/model selection over supplied receipts only; no provider execution or dispatch authority."
+  "diversity_dimensions": ["host", "route_id", "model_family"]
 }

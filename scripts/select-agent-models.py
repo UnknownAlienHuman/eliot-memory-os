@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
-"""CLI and deterministic negative tests for ELIOT model selection."""
+"""CLI and deterministic negative tests for the development model-selection oracle."""
 from __future__ import annotations
 
 import argparse
 import copy
 from pathlib import Path
 import sys
+import tempfile
 
-from agent_model_selector import SelectionError, canonical_bytes, read_json, select_models, write_receipt
+from agent_model_selector import (
+    PROOF_CEILING,
+    SelectionError,
+    canonical_bytes,
+    read_json,
+    select_models,
+    write_candidate,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_POLICY = ROOT / "integrations/agent-runtimes/model-selection.policy.json"
 DEFAULT_INPUT = ROOT / "integrations/agent-runtimes/model-selection.fixture.json"
 
 
-def expect_failure(name: str, policy: dict, request: dict, contains: str) -> None:
+def expect_failure(name: str, policy: object, request: object, contains: str) -> None:
     try:
         select_models(policy, request)
     except SelectionError as error:
@@ -30,8 +38,15 @@ def self_test() -> None:
     first = select_models(policy, request)
     second = select_models(copy.deepcopy(policy), copy.deepcopy(request))
     assert canonical_bytes(first) == canonical_bytes(second), "determinism"
-    assert [row["host"] for row in first["selections"]] == ["codex", "opencode", "claude", "antigravity"]
+    assert [row["host"] for row in first["selections"]] == [
+        "codex",
+        "opencode",
+        "claude",
+        "antigravity",
+    ]
     assert first["provider_executions"] == 0 and first["dispatch_authority"] is False
+    assert first["production_import_allowed"] is False
+    assert first["proof_ceiling"] == PROOF_CEILING
     assert first["diversity_status"] == "satisfied"
 
     secret = copy.deepcopy(request)
@@ -63,11 +78,53 @@ def self_test() -> None:
     degraded["candidates"][2]["host"] = "codex"
     degraded["candidates"][2]["model_family"] = "codex-family"
     degraded_receipt = select_models(policy, degraded)
-    challenger = next(row for row in degraded_receipt["selections"] if row["role"] == "challenger")
+    challenger = next(
+        row for row in degraded_receipt["selections"] if row["role"] == "challenger"
+    )
     assert challenger["diversity_status"] == "degraded"
     assert degraded_receipt["diversity_status"] == "degraded"
 
-    print("AGENT_MODEL_SELECTOR_SELF_TEST: PASS cases=8")
+    missing_ceiling = copy.deepcopy(policy)
+    missing_ceiling.pop("proof_ceiling")
+    expect_failure("missing proof ceiling", missing_ceiling, request, "proof_ceiling")
+
+    malformed_list = copy.deepcopy(policy)
+    malformed_list["evidence_order"] = ["unknown", {"bad": "shape"}]
+    expect_failure("malformed policy list", malformed_list, request, "nonblank string")
+
+    wrong_boolean = copy.deepcopy(policy)
+    wrong_boolean["allow_candidate_reuse"] = "false"
+    expect_failure("wrong policy boolean", wrong_boolean, request, "boolean required")
+
+    bad_dimension = copy.deepcopy(policy)
+    bad_dimension["diversity_dimensions"] = ["host", "missing_field"]
+    expect_failure("unknown diversity field", bad_dimension, request, "unsupported fields")
+
+    bad_fingerprint = copy.deepcopy(request)
+    bad_fingerprint["candidates"][0]["route_fingerprint"] = "sha256:not-a-digest"
+    expect_failure("bad fingerprint", policy, bad_fingerprint, "canonical sha256")
+
+    extensible = copy.deepcopy(policy)
+    extensible["allowed_host_families"].append("future-host")
+    future = copy.deepcopy(request)
+    future["candidates"][0]["host"] = "future-host"
+    future_result = select_models(extensible, future)
+    assert future_result["selections"][0]["host"] == "future-host"
+
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "candidate.json"
+        write_candidate(output, first)
+        write_candidate(output, copy.deepcopy(first))
+        changed = copy.deepcopy(first)
+        changed["selection_id"] = "conflicting-selection"
+        try:
+            write_candidate(output, changed)
+        except SelectionError as error:
+            assert "immutable candidate conflict" in str(error)
+        else:
+            raise AssertionError("immutable output conflict: expected failure")
+
+    print("AGENT_MODEL_SELECTOR_ORACLE_SELF_TEST: PASS cases=15")
 
 
 def main() -> int:
@@ -81,14 +138,14 @@ def main() -> int:
         if args.self_test:
             self_test()
             return 0
-        receipt = select_models(read_json(args.policy), read_json(args.input))
+        candidate = select_models(read_json(args.policy), read_json(args.input))
         if args.output:
-            write_receipt(args.output, receipt)
+            write_candidate(args.output, candidate)
         else:
-            sys.stdout.buffer.write(canonical_bytes(receipt) + b"\n")
+            sys.stdout.buffer.write(canonical_bytes(candidate) + b"\n")
         return 0
     except (SelectionError, AssertionError) as error:
-        print(f"AGENT_MODEL_SELECTOR: FAIL: {error}", file=sys.stderr)
+        print(f"AGENT_MODEL_SELECTOR_ORACLE: FAIL: {error}", file=sys.stderr)
         return 1
 
 
