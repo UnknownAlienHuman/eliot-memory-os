@@ -1,0 +1,190 @@
+schema = "eliot.capability-cells.v1"
+package = "eliot-runtime-status"
+
+# These cells are read-only projections over owner-supplied Host, Kernel, ORS,
+# installation, service and process evidence. They own no lifecycle, service,
+# process, canonical, ORS, Host-journal or readiness state.
+
+[[cell]]
+cell_id = "meta.runtime-status.report-composition"
+causal_responsibility = "Compose one bounded read-only RuntimeStatusReport without promoting process liveness into semantic readiness."
+lifecycle_owner = "runtime.elio-cli-invocation"
+runtime_owner = "runtime.elio-cli-invocation"
+runtime_bundle = "eliot.exe"
+execution_contour = "surface"
+replacement_class = "offline_release"
+removal_boundary = "Replace only with a consumer-compatible RuntimeStatusReport projection and CLI recovery fallback."
+stateless = true
+allowed_effect_classes = []
+contract_owner = "contract.meta.runtime-status"
+contract_sources = ["crates/meta/eliot-runtime-status/src/lib.rs"]
+proof_entrypoint = "cargo test --locked -p eliot-runtime-status"
+proof_ceiling = "PACKAGE_READ_ONLY_PROJECTION_ONLY"
+edge_profiles = ["runtime-status-cli-readback"]
+product_pulse = "D0_RUNTIME_STATUS_RECOVERY_VIEW_01"
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+providers = ["host-state-journal", "kernel-ors", "installation-registry", "platform-observers"]
+consumers = ["eliot-cli", "legacy-mcp-status-projection"]
+invalidation = ["source_sha", "normative_pair", "contract_digest", "installation_manifest", "host_kernel_watchdog_generation"]
+
+[[cell]]
+cell_id = "meta.runtime-status.service-registration-observation"
+causal_responsibility = "Observe approved Host and Watchdog service registration and project a typed read-only registration state."
+lifecycle_owner = "runtime.elio-cli-invocation"
+runtime_owner = "runtime.elio-cli-invocation"
+runtime_bundle = "eliot.exe"
+execution_contour = "surface"
+replacement_class = "offline_release"
+removal_boundary = "Replace only with equivalent SCM registration identity and negative-state coverage."
+stateless = true
+allowed_effect_classes = []
+contract_owner = "contract.meta.runtime-status"
+contract_sources = ["crates/meta/eliot-runtime-status/src/service_registration_status.rs"]
+proof_entrypoint = "cargo test --locked -p eliot-runtime-status service_registration_status"
+proof_ceiling = "PACKAGE_READ_ONLY_PROJECTION_ONLY"
+edge_profiles = ["windows-scm-registration-readback"]
+product_pulse = "D0_RUNTIME_STATUS_RECOVERY_VIEW_01"
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+providers = ["windows-scm", "approved-generation-registry"]
+consumers = ["runtime-status-report"]
+invalidation = ["source_sha", "contract_digest", "service_configuration", "approved_generation"]
+
+[[cell]]
+cell_id = "meta.runtime-status.supervision-verification"
+causal_responsibility = "Verify current Host/Kernel/Watchdog supervision evidence without becoming a supervision or authority owner."
+lifecycle_owner = "runtime.elio-cli-invocation"
+runtime_owner = "runtime.elio-cli-invocation"
+runtime_bundle = "eliot.exe"
+execution_contour = "surface"
+replacement_class = "offline_release"
+removal_boundary = "Replace only with equivalent signature, freshness, epoch and evidence-binding verification."
+stateless = true
+allowed_effect_classes = []
+contract_owner = "contract.meta.runtime-status"
+contract_sources = ["crates/meta/eliot-runtime-status/src/supervision_verification.rs"]
+proof_entrypoint = "cargo test --locked -p eliot-runtime-status supervision_verification"
+proof_ceiling = "PACKAGE_VERIFICATION_ONLY"
+edge_profiles = ["watchdog-publication-host-ors-readback"]
+product_pulse = "D0_RUNTIME_STATUS_RECOVERY_VIEW_01"
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+providers = ["host-state-journal", "kernel-ors", "watchdog-publication"]
+consumers = ["supervision-evidence-projection", "runtime-status-report"]
+invalidation = ["source_sha", "contract_digest", "authority_epoch", "watchdog_generation", "trust_anchor"]
+
+[[cell]]
+cell_id = "meta.runtime-status.supervision-projection"
+causal_responsibility = "Project verified supervision evidence into a bounded current-status DTO without minting authority."
+lifecycle_owner = "runtime.elio-cli-invocation"
+runtime_owner = "runtime.elio-cli-invocation"
+runtime_bundle = "eliot.exe"
+execution_contour = "surface"
+replacement_class = "offline_release"
+removal_boundary = "Replace only with a field-compatible projection preserving evidence and freshness ceilings."
+stateless = true
+allowed_effect_classes = []
+contract_owner = "contract.meta.runtime-status"
+contract_sources = ["crates/meta/eliot-runtime-status/src/supervision_projection.rs"]
+proof_entrypoint = "cargo test --locked -p eliot-runtime-status supervision_projection"
+proof_ceiling = "PACKAGE_READ_ONLY_PROJECTION_ONLY"
+edge_profiles = ["verified-supervision-projection"]
+product_pulse = "D0_RUNTIME_STATUS_RECOVERY_VIEW_01"
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+providers = ["supervision-verification"]
+consumers = ["runtime-status-report"]
+invalidation = ["source_sha", "contract_digest", "authority_epoch", "watchdog_generation", "freshness_window"]
+
+[[cell]]
+cell_id = "meta.runtime-status.store-live-observation"
+causal_responsibility = "Observe the exact managed store process and semantic readiness boundary without equating TCP reachability with store support."
+lifecycle_owner = "runtime.elio-cli-invocation"
+runtime_owner = "runtime.elio-cli-invocation"
+runtime_bundle = "eliot.exe"
+execution_contour = "surface"
+replacement_class = "offline_release"
+removal_boundary = "Replace only with equivalent managed-process identity, endpoint and semantic-readiness negative coverage."
+stateless = true
+allowed_effect_classes = []
+contract_owner = "contract.meta.runtime-status"
+contract_sources = ["crates/meta/eliot-runtime-status/src/store_live_status.rs"]
+proof_entrypoint = "cargo test --locked -p eliot-runtime-status store_live_status"
+proof_ceiling = "PACKAGE_OBSERVATION_ONLY"
+edge_profiles = ["managed-store-process-and-semantic-readiness"]
+product_pulse = "D0_RUNTIME_STATUS_RECOVERY_VIEW_01"
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+providers = ["host-managed-dependency-record", "store-readiness-probe"]
+consumers = ["runtime-status-report"]
+invalidation = ["source_sha", "contract_digest", "store_artifact", "store_endpoint", "store_generation", "schema_revision"]
+
+[[cell]]
+cell_id = "meta.runtime-status.eliotd-live-observation"
+causal_responsibility = "Observe the exact eliotd process/readiness receipt lineage and return a bounded live-state projection."
+lifecycle_owner = "runtime.elio-cli-invocation"
+runtime_owner = "runtime.elio-cli-invocation"
+runtime_bundle = "eliot.exe"
+execution_contour = "surface"
+replacement_class = "offline_release"
+removal_boundary = "Replace only with equivalent process, readiness, ORS and authenticated-session binding checks."
+stateless = true
+allowed_effect_classes = []
+contract_owner = "contract.meta.runtime-status"
+contract_sources = ["crates/meta/eliot-runtime-status/src/eliotd_live.rs"]
+proof_entrypoint = "cargo test --locked -p eliot-runtime-status eliotd_live"
+proof_ceiling = "PACKAGE_OBSERVATION_ONLY"
+edge_profiles = ["eliotd-process-ready-receipt-readback"]
+product_pulse = "D0_RUNTIME_STATUS_RECOVERY_VIEW_01"
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+providers = ["kernel-generation-registry", "eliotd-live-receipt", "kernel-ors"]
+consumers = ["runtime-status-report"]
+invalidation = ["source_sha", "contract_digest", "eliotd_generation", "authority_epoch", "ready_receipt"]
+
+[[cell]]
+cell_id = "meta.runtime-status.watchdog-live-observation"
+causal_responsibility = "Observe Watchdog service/process/publication identity and report unknown coverage rather than infer supervision from liveness."
+lifecycle_owner = "runtime.elio-cli-invocation"
+runtime_owner = "runtime.elio-cli-invocation"
+runtime_bundle = "eliot.exe"
+execution_contour = "surface"
+replacement_class = "offline_release"
+removal_boundary = "Replace only with equivalent independent-service, process-lineage and publication coverage checks."
+stateless = true
+allowed_effect_classes = []
+contract_owner = "contract.meta.runtime-status"
+contract_sources = ["crates/meta/eliot-runtime-status/src/watchdog_live.rs"]
+proof_entrypoint = "cargo test --locked -p eliot-runtime-status watchdog_live"
+proof_ceiling = "PACKAGE_OBSERVATION_ONLY"
+edge_profiles = ["watchdog-service-process-publication-readback"]
+product_pulse = "D0_RUNTIME_STATUS_RECOVERY_VIEW_01"
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+providers = ["windows-scm", "watchdog-publication", "host-state-journal"]
+consumers = ["runtime-status-report", "supervision-verification"]
+invalidation = ["source_sha", "contract_digest", "watchdog_generation", "service_configuration", "publication_freshness"]
+
+[[cell]]
+cell_id = "meta.runtime-status.readiness-projection"
+causal_responsibility = "Compose capability-scoped readiness from independently observed contours without collapsing health into one boolean."
+lifecycle_owner = "runtime.elio-cli-invocation"
+runtime_owner = "runtime.elio-cli-invocation"
+runtime_bundle = "eliot.exe"
+execution_contour = "surface"
+replacement_class = "offline_release"
+removal_boundary = "Replace only with a capability-scoped readiness projection preserving every unavailable or unknown guarantee."
+stateless = true
+allowed_effect_classes = []
+contract_owner = "contract.meta.runtime-status"
+contract_sources = ["crates/meta/eliot-runtime-status/src/readiness_projection.rs"]
+proof_entrypoint = "cargo test --locked -p eliot-runtime-status readiness_projection"
+proof_ceiling = "PACKAGE_READ_ONLY_PROJECTION_ONLY"
+edge_profiles = ["host-kernel-store-daemon-watchdog-readiness-composition"]
+product_pulse = "D0_RUNTIME_STATUS_RECOVERY_VIEW_01"
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+providers = ["service-registration-observation", "store-live-observation", "eliotd-live-observation", "watchdog-live-observation"]
+consumers = ["runtime-status-report", "controlboard-recovery-view"]
+invalidation = ["source_sha", "contract_digest", "component_generation", "observation_freshness", "governance_profile"]
