@@ -1,0 +1,315 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_SWARM_CONSUMER_MIGRATION"
+implementation_support = "PARTIAL"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "AGENT_HANDOFF_ONLY"
+parent_issue = 66
+handoff_issue = 337
+integration_issue_refs = [18, 15, 23, 11]
+base_branch = "main"
+base_sha = "73a7a8b6fcc2d292fe61d0eeb94fcae4217087e9"
+normative_pair_ref = "docs/normative-pair.toml"
+docs_read_status = "EXECUTED_LOCAL_DOCS_READ_V1"
+dreamer_excluded = true
+
+[work_unit]
+cell_id = "daemon.agent-activation-semantic-result-cutover"
+causal_property = "One Kernel-owned activation ticket receives one exact semantic-resolution result. Expected no-task/scope ambiguity is returned immediately, an internal defect is preserved as diagnostic evidence, and retry occurs only after an explicitly named transient dependency changes."
+old_path_discriminator = "eliotd still resolves through success-only AgentActivationResolutionDecision and daemon_runtime uses if-let-Ok; every resolver error is discarded, leaving decision=None so Kernel reclaims the unchanged ticket after the short claim lease until the deadline produces a generic denial."
+integration_owner = "parent #66 across daemon/Governor #18, Kernel pending-state #15, bridge/onboarding #23, and #11 Product Pulse"
+one_writer_rule = "The existing v2 protocol contract is reviewed/currentized first. Governor mappings, daemon submission, Kernel replay/response and the real attach edge remain separate source writers."
+result = "integration candidate only"
+
+[normative_basis]
+architecture = ["ARCH-SWM-02", "ARCH-OBS-01", "ARCH-RES-04", "ARCH-RES-05", "ARCH-MOD-03", "ARCH-LIFE-01"]
+implementation = ["I4.4.1", "I6.13", "I7.17", "I7.20", "I7.24", "I14"]
+reason = "Task selection, ambiguity, stale state, transient unavailability and internal failure are different observable outcomes. Silence cannot be used as a retry policy or compressed into generic timeout."
+
+[current_source]
+observed_on = "main@73a7a8b6fcc2d292fe61d0eeb94fcae4217087e9"
+source_handles = [
+  "crates/foundation/eliot-protocol/src/activation_resolution.rs",
+  "crates/foundation/eliot-protocol/tests/activation_resolution_v2.rs",
+  "crates/foundation/eliot-protocol/tests/activation_scope_selection.rs",
+  "bins/eliotd/src/activation_projection.rs",
+  "bins/eliotd/src/daemon_runtime.rs",
+  "bins/eliotd/src/daemon_kernel_client.rs",
+  "bins/eliot-kernel/src/agent_bridge.rs",
+  "bins/eliot-kernel/src/daemon_request_dispatch.rs",
+  "bins/eliot-kernel/src/lib.rs",
+  "bins/eliot-agent-bridge/src/kernel_activation_client.rs",
+]
+confirmed_partial_implementation = [
+  "eliot-protocol already contains additive AgentActivationResolutionResult v2 and focused source fixtures.",
+  "The v2 contract already binds exact ticket ID, ticket digest, ticket StateFence, resolved time and a canonical result digest.",
+  "The v2 dispositions already include Resolved, TaskSelectionRequired, ScopeSelectionRequired, ScopeAmbiguous, NotReady with an explicit retry dependency/window, StaleFence, and FailedInternal.",
+  "Candidate handles are bounded and carry COMPLETE, PARTIAL or UNKNOWN coverage rather than an unqualified list.",
+  "NotReady is the only current v2 disposition that advertises transient retry.",
+]
+confirmed_unmigrated_path = [
+  "activation_projection still returns success-only AgentActivationResolutionDecision.",
+  "DaemonKernelClient imports and submits AgentActivationResolutionDecision under agent_activation_submit.",
+  "daemon_runtime still uses if let Ok(decision), discarding every resolver error.",
+  "Kernel pending/replay and AgentBridgeActivationResponse consumers do not reference AgentActivationResolutionResult v2.",
+  "Repository-wide search finds the v2 result only in the protocol module/root and protocol tests, not in production consumers.",
+]
+contract_status = "SOURCE_PRESENT_CURRENT_UNVERIFIED_CONSUMER_CUTOVER_PENDING"
+
+[existing_contract_adoption]
+owner = "eliot-protocol"
+canonical_type = "AgentActivationResolutionResult"
+wire_id = "eliot.protocol.agent-activation-resolution-result"
+wire_version = 2
+required_dispositions = [
+  "RESOLVED",
+  "TASK_SELECTION_REQUIRED",
+  "SCOPE_SELECTION_REQUIRED",
+  "SCOPE_AMBIGUOUS",
+  "NOT_READY",
+  "STALE_FENCE",
+  "FAILED_INTERNAL",
+]
+rules = [
+  "Do not introduce another result enum, daemon-local wire shape or host-specific alias with different semantics.",
+  "Consumer migration must use the existing canonical digest and exact ticket binding.",
+  "Any required schema correction begins as a separate contract-review commit with compatibility impact and all consumers still unmigrated.",
+  "Protocol source/tests are not runtime proof; exact package proof is required before consumer promotion.",
+  "Kernel expiry remains an external race/owner outcome and is not fabricated as a daemon semantic result after the deadline.",
+]
+
+[semantic_owner_mapping]
+governor_owner = "eliotd/Governor activation snapshot and task/scope owner projection"
+kernel_owner = "ticket issuance, claim lease, deadline/expiry, transport Session creation, fence validation and final bridge response"
+daemon_role = "read current Governor owner state and submit one candidate semantic result; no Session or authority issuance"
+bridge_role = "receive the Kernel's final correlated activation response; no task selection or result promotion"
+
+[semantic_mapping]
+resolved = "Exactly one current compatible activation snapshot maps to RESOLVED with the existing field-complete binding."
+task_selection_required = "No current task, missing TaskContract or an explicit task-selection need maps immediately to TASK_SELECTION_REQUIRED with bounded candidate handles/coverage and a recovery handle."
+scope_selection_required = "A scope is not authenticated/resolved but the condition is not multi-candidate ambiguity; return the exact scope-selection directive."
+scope_ambiguous = "At least two exact candidate scope handles remain and coverage is not UNKNOWN; no candidate is selected by recency, path proximity or model preference."
+not_ready = "Only a truly transient named owner dependency maps to NOT_READY and supplies dependency_ref, observed_dependency_revision and not_before before ticket deadline."
+stale_fence = "Ticket, Governor snapshot or owner state fence mismatch maps fail-closed and creates no Session."
+failed_internal = "Malformed snapshot, impossible owner mapping, serialization/contract defect or invariant failure maps to FAILED_INTERNAL with a bounded failure handle, not task ambiguity."
+
+[retry_and_no_progress]
+rules = [
+  "Every non-NOT_READY semantic result is terminal for the exact ticket digest.",
+  "NOT_READY may be reclaimed only after not_before and after the named dependency revision differs from observed_dependency_revision.",
+  "The claim lease is transport/coordinator ownership; its expiry is not itself evidence that semantic state changed.",
+  "Submitting the same canonical result is exact replay and returns the same terminal disposition.",
+  "Submitting a different result for one ticket digest is IDENTITY_CONFLICT.",
+  "Repeated resolution of the same ticket against the same owner revision without a new discriminator is prohibited and emits a bounded no-progress observation.",
+  "A daemon transport failure before proven submission leaves outcome unknown/reconciling; it does not authorize recomputing a different result.",
+  "Kernel deadline/expiry wins races after the deadline but preserves any exact result whose submission/commit was already acknowledged before expiry.",
+]
+
+[kernel_pending_state]
+required_states = [
+  "UNCLAIMED",
+  "CLAIMED",
+  "TRANSIENT_WAIT",
+  "SEMANTIC_RESULT_ACCEPTED",
+  "EXPIRED",
+  "DELIVERED",
+  "RECONCILING",
+]
+rules = [
+  "Pending state stores the exact v2 result or its digest/receipt, never only a bool decision field.",
+  "Candidate/recovery/failure handles remain bounded and role-filtered when projected to the bridge.",
+  "A semantic denial/result is not Kernel authority; Kernel independently validates ticket, current claim owner, deadline, StateFence and current connection binding.",
+  "Only RESOLVED may create an authenticated semantic Session binding after all Kernel checks.",
+  "Expected task/scope outcomes map immediately to stable agent-facing reason codes and next actions.",
+  "FAILED_INTERNAL opens/links bounded diagnostic evidence and does not become TASK_SELECTION_REQUIRED.",
+]
+
+[agent_response_mapping]
+TASK_SELECTION_REQUIRED = "AgentResponseDisposition.INVALID_REQUEST or NEEDS_EVIDENCE according to the active reason-code contract, with exact TASK_SELECTION_REQUIRED and task candidate/recovery handles."
+SCOPE_SELECTION_REQUIRED = "WORKSCOPE_UNAUTHENTICATED or equivalent current reason, with the exact scope resolution path."
+SCOPE_AMBIGUOUS = "AMBIGUOUS_RESULT with candidate coverage and no selected scope/task."
+NOT_READY = "UNAVAILABLE_OR_CAPACITY or RECOVERY_REQUIRED with dependency and retry-after semantics; no generic busy loop."
+STALE_FENCE = "STALE_OR_CONFLICT with stale fence reason; no Session created."
+FAILED_INTERNAL = "FAILED or RECOVERY_REQUIRED with a failure handle and no fabricated user-correctable ambiguity."
+rule = "Use the current shared AgentResponseDisposition/reason registry. Do not invent a second bridge-only failure ontology."
+
+[errors]
+required = [
+  "ACTIVATION_RESULT_CONTRACT_UNSUPPORTED",
+  "ACTIVATION_TICKET_IDENTITY_MISMATCH",
+  "ACTIVATION_RESULT_IDENTITY_CONFLICT",
+  "ACTIVATION_RESULT_AFTER_DEADLINE",
+  "ACTIVATION_CLAIM_OWNER_MISMATCH",
+  "ACTIVATION_RETRY_DEPENDENCY_UNCHANGED",
+  "ACTIVATION_RETRY_NOT_DUE",
+  "TASK_SELECTION_REQUIRED",
+  "WORKSCOPE_UNAUTHENTICATED",
+  "AMBIGUOUS_RESULT",
+  "STALE_STATE_FENCE",
+  "SEMANTIC_RESOLUTION_NOT_READY",
+  "SEMANTIC_RESOLUTION_INTERNAL_FAILURE",
+  "SEMANTIC_RESULT_SUBMISSION_UNKNOWN",
+  "ACTIVATION_NO_PROGRESS",
+]
+behavior = [
+  "No control decision is parsed from log/prose text.",
+  "Expected selection outcomes are not logged as internal failures.",
+  "Internal failures are not downgraded to user ambiguity.",
+  "Unknown submission outcome is reconciled by exact ticket/result identity before another semantic result is admitted.",
+]
+
+[[wave]]
+order = 1
+id = "existing-v2-contract-proof-and-review"
+issue_owner = "new child issue under #66"
+mutable_paths = [
+  "crates/foundation/eliot-protocol/src/activation_resolution.rs only if review finds a contract defect",
+  "crates/foundation/eliot-protocol/tests/activation_resolution_v2.rs",
+  "crates/foundation/eliot-protocol/tests/activation_scope_selection.rs",
+]
+deliverable = "Run exact package proof, verify field/disposition closure against #66, add only missing adversarial fixtures, and publish the exact contract digest for consumers."
+must_not_touch = ["Governor mapping", "daemon loop", "Kernel pending state", "agent bridge"]
+proof_ceiling = "PROTOCOL_CONTRACT_PROOF_ONLY"
+
+[[wave]]
+order = 2
+id = "governor-resolver-mapping"
+issue_owner = "new child issue under #66 and #18"
+mutable_paths = [
+  "bins/eliotd/src/activation_projection.rs",
+  "owning Governor activation snapshot/read projection and focused tests",
+]
+deliverable = "Return AgentActivationResolutionResult v2 for every expected and internal owner-state outcome with bounded candidate/failure/recovery handles."
+must_not_touch = ["daemon polling/submission", "Kernel claim/replay", "bridge response"]
+proof_ceiling = "GOVERNOR_RESOLVER_MODULE_PROOF"
+
+[[wave]]
+order = 3
+id = "daemon-result-submission"
+issue_owner = "new child issue under #66 and #18"
+mutable_paths = [
+  "bins/eliotd/src/daemon_kernel_client.rs",
+  "bins/eliotd/src/daemon_runtime.rs",
+  "focused daemon result/no-progress fixtures",
+]
+deliverable = "Remove if-let-Ok discard, submit every exact result once, retry only declared transient dependencies and preserve unknown submission outcomes."
+must_not_touch = [
+  "#88 supervision heartbeat semantics",
+  "Kernel pending state",
+  "Governor result mapping",
+]
+proof_ceiling = "DAEMON_RESULT_PRODUCER_PROOF_ONLY"
+
+[[wave]]
+order = 4
+id = "kernel-pending-replay-and-response"
+issue_owner = "new child issue under #66 and #15"
+mutable_paths = [
+  "bins/eliot-kernel/src/agent_bridge.rs",
+  "bins/eliot-kernel/src/daemon_request_dispatch.rs",
+  "bins/eliot-kernel/src/lib.rs activation-pending state only",
+  "shared Kernel service/protocol response mapping and focused fixtures",
+]
+deliverable = "Persist/classify the exact v2 semantic result, enforce terminal/retry/expiry races, and map it to one correlated bridge response without creating Session authority from daemon data."
+must_not_touch = ["Governor owner interpretation", "bridge host-request forwarding from #77"]
+proof_ceiling = "KERNEL_ACTIVATION_RESULT_MODULE_PROOF"
+
+[[wave]]
+order = 5
+id = "bridge-onboarding-edge"
+issue_owner = "separate integration owner under #66 and #23"
+mutable_paths = [
+  "bins/eliot-agent-bridge/src/kernel_activation_client.rs",
+  "bounded attach/onboarding edge fixtures",
+]
+deliverable = "One real activation request receives immediate typed task/scope/not-ready/stale/internal outcomes and exact replay behavior."
+proof_ceiling = "AGENT_ATTACH_EDGE_PROOF"
+
+[[wave]]
+order = 6
+id = "product-pulse"
+issue_owner = "issue #11 integration owner"
+mutable_paths = ["agent attach/onboarding Product Pulse evidence only"]
+deliverable = "No-task, ambiguous-scope, stale-fence, transient-not-ready and internal-failure scenarios terminate or retry correctly without generic timeout or duplicate semantic work."
+proof_ceiling = "PRODUCT_PULSE"
+
+[fixtures]
+required = [
+  "unique current binding returns RESOLVED and Kernel creates one current Session only after independent checks",
+  "no task returns TASK_SELECTION_REQUIRED before ticket deadline",
+  "two task/scope candidates return bounded ambiguity and no selected identity",
+  "UNKNOWN candidate coverage never claims an exhaustive absence/list",
+  "NOT_READY retry requires an exact named dependency revision and not-before window",
+  "unchanged dependency cannot re-run semantic resolution",
+  "same canonical result is exact replay; different result for same ticket is conflict",
+  "stale/cross-generation/cross-lineage StateFence creates no Session",
+  "malformed/impossible snapshot returns FAILED_INTERNAL with failure evidence",
+  "daemon submission delivery unknown enters reconciliation and does not recompute another result",
+  "result accepted immediately before deadline survives a later expiry race",
+  "expiry before accepted result yields one Kernel-owned terminal denial",
+  "daemon restart cannot claim/substitute a result owned by a different active claim without explicit recovery",
+  "agent-facing mapping preserves exact reason, candidate/recovery/failure handle and next action",
+]
+
+[dependencies]
+required_before_source_wave = [
+  "#64 lineaged EpochId migration where activation tickets/results/final bindings carry authority identity",
+  "#79 separation of durable semantic/process Session from replaceable transport connection identity",
+  "current shared agent-facing reason/disposition contract from I7.20",
+]
+parallel_owner_rule = "Wave 3 shares daemon_runtime with planned #88 source work. These implementations must use disjoint commits or serialize path ownership; neither assignment PR owns the Rust path yet."
+path_claim_rule = "Before every source wave, query open PRs for exact paths, rebase from then-current main and obtain a real docs_read receipt."
+
+[non_goals]
+items = [
+  "No second activation-result enum.",
+  "No daemon-issued Session, capability or authority.",
+  "No automatic task/scope selection from recency, path or model judgment.",
+  "No retry merely because the claim lease expired.",
+  "No logging-only fix while retaining the silent loop.",
+  "No generic timeout for expected task/scope selection outcomes.",
+  "No modification of #77 host-request forwarding.",
+  "No modification of #88 supervision renewal semantics.",
+  "No Dreamer changes.",
+]
+
+[stop_conditions]
+items = [
+  "The existing v2 contract cannot represent a required #66 outcome without an incompatible revision.",
+  "Governor cannot distinguish expected selection state from internal corruption with current owner evidence.",
+  "A transient retry has no named dependency revision or future retry boundary.",
+  "Kernel cannot persist/reconcile one exact result identity before expiry/transport races.",
+  "The proposed bridge mapping would create task, Session or authority identity outside Kernel/Governor owners.",
+  "Another open PR owns a selected source path.",
+]
+challenge = "Return a ContractChallenge to #66 with exact missing owner/evidence. Do not add another error enum or keep the if-let-Ok loop."
+
+[result_contract]
+required_fields = [
+  "issue_and_cell",
+  "source_base_and_candidate",
+  "existing_contract_revision_and_digest",
+  "causal_property",
+  "old_path_discriminator",
+  "changed_contract_or_source",
+  "owned_state_and_effects",
+  "module_proof",
+  "edge_proof",
+  "product_pulse_or_not_applicable_reason",
+  "evidence_execution_status",
+  "known_uncovered_behavior",
+  "security_privacy_and_authority_delta",
+  "migration_rollback_and_removal",
+  "integration_candidate",
+  "residual_unknowns",
+]
+finish_states = [
+  "VERIFIED_COMPLETE",
+  "PARTIAL",
+  "BLOCKED",
+  "FAILED_VERIFICATION",
+  "DEGRADED_NO_PROOF",
+  "UNSAFE_TO_FINISH",
+  "CANCELLED",
+  "SUPERSEDED",
+]
