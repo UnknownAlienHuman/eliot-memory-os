@@ -1,0 +1,296 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+decision = "FIELD_LEVEL_SCHEMA_FREEZE"
+issue = 196
+normative_pair = "Architecture 4.5-draft / Implementation 0.29-draft / 2026-08-28"
+proof_ceiling = "STATIC_CONTRACT_DESIGN_ONLY"
+rule = "These field sets are closed for wave-0/wave-1 implementation. Consumers import owner types; no generic JSON, provider SDK type, transcript substitute, or parallel local variant is allowed."
+
+[context_provider_contract]
+owner = "eliot-context-contracts"
+provider_classes = [
+  "GoalTask",
+  "CriticalAttention",
+  "EpistemicPosition",
+  "MemoryRecall",
+  "AuthorityAffordance",
+  "SelfModel",
+  "DecisionTail",
+]
+role_requirements = ["Mandatory", "Optional", "Advisory"]
+availability = ["Available", "Degraded", "Unavailable", "Stale", "Unsupported"]
+coverage = ["Complete", "Partial", "Blocked", "Unavailable", "Stale"]
+invariants = [
+  "Complete requires an exact frozen expected-atom count and no missing role or source reference.",
+  "Blocked or Unavailable requires at least one stable missing-owner or blocking-reason code.",
+  "A ProviderContribution contains no admission, ranking, delivery, use, helpfulness, or effect receipt.",
+  "Every atom preserves owner, source handles, epistemic status, assertability, freshness, fence, required/protected flags and decision-delta uncertainty.",
+  "Provider class is a closed enum; unknown or extra classes fail deserialization or validation.",
+]
+
+[[context_provider_contract.types]]
+name = "ProviderRoleRequirement"
+kind = "enum"
+variants = ["Mandatory", "Optional", "Advisory"]
+
+[[context_provider_contract.types]]
+name = "ProviderRepresentation"
+kind = "enum"
+variants = ["Inline", "ExactHandle"]
+fields = [
+  "Inline.value: String",
+  "ExactHandle.handle: ArtifactId",
+]
+
+[[context_provider_contract.types]]
+name = "DecisionDelta"
+kind = "enum"
+variants = ["Known", "BoundedRange", "Unknown", "NotApplicable"]
+fields = [
+  "Known.basis_points: u16",
+  "BoundedRange.minimum_basis_points: u16",
+  "BoundedRange.maximum_basis_points: u16",
+]
+
+[[context_provider_contract.types]]
+name = "ProviderAtom"
+kind = "struct"
+fields = [
+  "atom_id: ArtifactId",
+  "provider_id: ProviderId",
+  "role: ContextRole",
+  "representation: ProviderRepresentation",
+  "source_handles: Vec<ArtifactId>",
+  "status: EpistemicStatus",
+  "assertability: Assertability",
+  "freshness: EvidenceFreshness",
+  "state_fence: StateFence",
+  "required: bool",
+  "protected: bool",
+  "decision_delta: DecisionDelta",
+  "estimated_cost: u32",
+  "cue_keys: Vec<String>",
+]
+
+[[context_provider_contract.types]]
+name = "ProviderOmissionReason"
+kind = "enum"
+variants = [
+  "Budget",
+  "DisclosureDenied",
+  "HandleOnlyRequired",
+  "Stale",
+  "FenceMismatch",
+  "UnsupportedRole",
+  "UnavailableSource",
+  "InvalidSource",
+]
+
+[[context_provider_contract.types]]
+name = "ProviderOmission"
+kind = "struct"
+fields = [
+  "source_handle: ArtifactId",
+  "role: ContextRole",
+  "reason: ProviderOmissionReason",
+  "required: bool",
+  "protected: bool",
+  "expandable: bool",
+]
+
+[[context_provider_contract.types]]
+name = "ProviderCoverage"
+kind = "struct"
+fields = [
+  "state: ProviderCoverageState",
+  "expected_atoms: Option<u32>",
+  "observed_atoms: u32",
+  "expected_roles: Vec<ContextRole>",
+  "represented_roles: Vec<ContextRole>",
+  "missing_refs: Vec<String>",
+]
+
+[[context_provider_contract.types]]
+name = "ProviderContribution"
+kind = "struct"
+fields = [
+  "request_id: RequestId",
+  "provider: ContextProviderDescriptor",
+  "expected_provider_set_sha256: String",
+  "scope_id: String",
+  "task_id: Option<TaskId>",
+  "state_fence: StateFence",
+  "coverage: ProviderCoverage",
+  "atoms: Vec<ProviderAtom>",
+  "omissions: Vec<ProviderOmission>",
+  "contribution_sha256: String",
+]
+
+[memory_projection_contract]
+owner = "eliot-memory-projection-contracts"
+invariants = [
+  "Memory query is pure over an already materialized canonical read snapshot and cue result.",
+  "WorkScope equality is exact; a record from another scope is invalid even if its digest is valid.",
+  "Complete requires an exact expected-record count and read receipt.",
+  "Partial, Stale, Blocked and Unavailable retain exact denominator/missing-owner information.",
+  "Existence, support, lifecycle, accessibility and permitted influence remain independent.",
+  "Exact negative-memory and protected counterevidence cannot be displaced by popularity or broad similarity.",
+]
+
+[[memory_projection_contract.types]]
+name = "MemoryQueryIntent"
+kind = "struct"
+fields = [
+  "request_id: RequestId",
+  "scope_id: String",
+  "task_id: Option<TaskId>",
+  "decision_id: Option<DecisionId>",
+  "state_fence: StateFence",
+  "required_kinds: Vec<MemoryRecordKind>",
+  "required_handles: Vec<ArtifactId>",
+  "protected_handles: Vec<ArtifactId>",
+  "requested_dimensions: Vec<MemorySelectionDimension>",
+]
+
+[[memory_projection_contract.types]]
+name = "MemoryProtectionRule"
+kind = "enum"
+variants = [
+  "ExactNegativeMemory",
+  "RivalModel",
+  "Unknown",
+  "MinorityEvidence",
+  "Counterevidence",
+  "RequiredHandle",
+]
+
+[[memory_projection_contract.types]]
+name = "MemorySelectionPolicy"
+kind = "struct"
+fields = [
+  "policy_id: String",
+  "policy_revision: u64",
+  "maximum_considered: u32",
+  "maximum_candidates: u32",
+  "maximum_per_kind: Option<u32>",
+  "exact_cue_precedes_broad: bool",
+  "allow_broad_candidates: bool",
+  "protection_rules: Vec<MemoryProtectionRule>",
+]
+
+[[memory_projection_contract.types]]
+name = "MemorySuppressionReason"
+kind = "enum"
+variants = [
+  "DeniedInfluence",
+  "Inaccessible",
+  "ScopeMismatch",
+  "Stale",
+  "Superseded",
+  "SelectionBound",
+  "KindBound",
+  "NotApplicable",
+]
+
+[[memory_projection_contract.types]]
+name = "MemorySelectionTraceEntry"
+kind = "struct"
+fields = [
+  "record_handle: ArtifactId",
+  "selected: bool",
+  "reasons: Vec<MemorySuppressionReason>",
+  "assessments: Vec<MemorySelectionAssessment>",
+]
+
+[[memory_projection_contract.types]]
+name = "MemorySelectionTrace"
+kind = "struct"
+fields = [
+  "snapshot_sha256: String",
+  "intent_request_id: RequestId",
+  "policy_id: String",
+  "policy_revision: u64",
+  "considered_handles: Vec<ArtifactId>",
+  "selected_handles: Vec<ArtifactId>",
+  "entries: Vec<MemorySelectionTraceEntry>",
+  "coverage: MemoryReadCoverage",
+  "missing_owner_refs: Vec<String>",
+  "trace_sha256: String",
+]
+
+[[memory_projection_contract.types]]
+name = "MemoryContextProjectionRequest"
+kind = "struct"
+fields = [
+  "provider_request: ContextProviderProjectionRequest",
+  "candidate_set_sha256: String",
+  "required_handles: Vec<ArtifactId>",
+  "protected_handles: Vec<ArtifactId>",
+  "maximum_inline_bytes: u32",
+]
+
+[learning_experience_contract]
+owner = "eliot-learning-contracts"
+invariants = [
+  "Complete owner coverage requires an exact expected-item count.",
+  "SystemExperienceProjection binds to one request, task, campaign, attempt lineage and State Fence.",
+  "Attempt evidence handles never exceed request limits.",
+  "Sequence, association, supported contribution, intervention support, composite benefit, contradiction and unknown attribution stay distinct.",
+  "FailureObservation is evidence, not a retry, lifecycle transition, or promotion decision.",
+]
+
+[[learning_experience_contract.types]]
+name = "FailureObservation"
+kind = "struct"
+fields = [
+  "failure_id: String",
+  "attempt_id: AttemptId",
+  "failure_class: String",
+  "expected_observable: String",
+  "observed_outcome: ObservedOutcome",
+  "verifier_handles: Vec<ArtifactId>",
+  "trigger_evidence_handles: Vec<ArtifactId>",
+  "environment_evidence_handles: Vec<ArtifactId>",
+  "recovery_evidence_handles: Vec<ArtifactId>",
+  "state_fence: StateFence",
+]
+
+[[learning_experience_contract.types]]
+name = "CanonicalExperienceReadSnapshot"
+kind = "struct"
+fields = [
+  "request: SystemExperienceProjectionRequest",
+  "coverage: Vec<ExperienceCoverage>",
+  "attempts: Vec<AttemptExperience>",
+  "failures: Vec<FailureObservation>",
+  "snapshot_sha256: String",
+]
+
+[[learning_experience_contract.types]]
+name = "SystemExperienceProjection"
+kind = "struct"
+fields = [
+  "source_snapshot_sha256: String",
+  "request: SystemExperienceProjectionRequest",
+  "coverage: Vec<ExperienceCoverage>",
+  "attempts: Vec<AttemptExperience>",
+  "failures: Vec<FailureObservation>",
+  "projection_sha256: String",
+]
+
+[resolution]
+resolved_challenges = [
+  "CC-MEMORY-PROJECTION-SCHEMA",
+  "CC-FAILURE-OBSERVATION-SCHEMA",
+  "CC-PROVIDER-CONTRIBUTION-SCHEMA",
+]
+still_open = [
+  "CC-WAVE0-PROOF-IDENTITY",
+]
+implementation_order = [
+  "update design type ownership and closed coverage ledgers",
+  "implement owner types and denominator invariants in cells 68, 71, 74",
+  "add consumer compile fixtures and negative tests",
+  "commit dependency identities and run manual exact-head package proof",
+  "only then implement cells 69, 70, 72, 73, 75",
+]
