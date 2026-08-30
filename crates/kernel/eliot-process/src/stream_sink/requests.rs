@@ -12,6 +12,7 @@ use super::{
     StreamTransportStatus, canonical_digest, validate_binding, validate_digest, validate_gaps,
     validate_preview_limit,
 };
+use super::{ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkTerminalCommandKind};
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -654,6 +655,17 @@ impl ProcessStreamSinkFinalizeRequest {
         value.validate_shape()?;
         Ok(value)
     }
+
+    pub fn command_identity(
+        &self,
+    ) -> Result<ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkError> {
+        self.validate_shape()?;
+        ProcessStreamSinkTerminalCommandIdentity::from_request(
+            self.terminal_id.clone(),
+            ProcessStreamSinkTerminalCommandKind::Finalize,
+            self,
+        )
+    }
 }
 request_accessors!(ProcessStreamSinkFinalizeRequest);
 
@@ -710,6 +722,17 @@ impl ProcessStreamSinkAbortRequest {
 
     pub const fn reason(&self) -> ProcessStreamSinkAbortReason {
         self.reason
+    }
+
+    pub fn command_identity(
+        &self,
+    ) -> Result<ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkError> {
+        self.validate_shape()?;
+        ProcessStreamSinkTerminalCommandIdentity::from_request(
+            self.terminal_id.clone(),
+            ProcessStreamSinkTerminalCommandKind::Abort,
+            self,
+        )
     }
 }
 request_accessors!(ProcessStreamSinkAbortRequest);
@@ -817,8 +840,10 @@ impl ProcessStreamSinkSessionView {
                 reason: "session view counters must agree with the next sequence and offset",
             });
         }
-        if let Some(value) = &self.terminal_sha256 {
-            validate_digest("terminal_sha256", value)?;
+        if self.terminal_sha256.is_some() {
+            return Err(ProcessStreamSinkError::InvalidRequest {
+                reason: "nonterminal session view cannot expose a terminal digest",
+            });
         }
         Ok(())
     }

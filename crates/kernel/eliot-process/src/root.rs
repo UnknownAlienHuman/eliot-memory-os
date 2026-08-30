@@ -29,5 +29,7 @@ pub use stream_sink::{
     ProcessStreamSinkFuture, ProcessStreamSinkLimits, ProcessStreamSinkOpenRequest,
     ProcessStreamSinkReadback, ProcessStreamSinkSession, ProcessStreamSinkSessionId,
     ProcessStreamSinkSessionView, ProcessStreamSinkSourceId, ProcessStreamSinkState,
-    ProcessStreamSinkTerminal, ProcessStreamSinkTerminalId, ProcessStreamSinkUnknownOutcome,
+    ProcessStreamSinkTerminal, ProcessStreamSinkTerminalCommandIdentity,
+    ProcessStreamSinkTerminalCommandKind, ProcessStreamSinkTerminalId,
+    ProcessStreamSinkUnknownOutcome,
 };

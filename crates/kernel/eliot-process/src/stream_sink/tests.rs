@@ -175,6 +175,70 @@ fn withheld_evidence(gap: StreamEvidenceGap) -> TestResult<ProcessStreamEvidence
     )?)
 }
 
+fn terminal_for(
+    session: ProcessStreamSinkSession,
+    state: ProcessStreamSinkState,
+    final_sequence: u64,
+    final_offset: u64,
+    admitted_sha256: impl Into<String>,
+    evidence: ProcessStreamEvidence,
+) -> TestResult<ProcessStreamSinkTerminal> {
+    let terminal_id = session.terminal_id().clone();
+    let transformation = evidence
+        .source()
+        .and_then(|source| source.transformation().cloned());
+    let request_transport = evidence.transport();
+    let request_preview = evidence.preview().clone();
+    let request_observed_sha256 = evidence.observed_sha256().to_owned();
+    let request_observed_bytes = evidence.observed_bytes();
+    let request_gaps = evidence.gaps().to_vec();
+    let admitted_sha256 = admitted_sha256.into();
+    if state == ProcessStreamSinkState::CompleteSource {
+        Ok(ProcessStreamSinkTerminal::from_finalize(
+            session,
+            ProcessStreamSinkFinalizeRequest::new(
+                terminal_id.clone(),
+                final_sequence,
+                final_offset,
+                1,
+                request_transport,
+                request_observed_sha256,
+                request_observed_bytes,
+                request_preview,
+                transformation,
+                request_gaps,
+            )?,
+            state,
+            final_sequence,
+            final_offset,
+            admitted_sha256,
+            evidence,
+        )?)
+    } else {
+        Ok(ProcessStreamSinkTerminal::from_abort(
+            session,
+            ProcessStreamSinkAbortRequest::new(
+                terminal_id,
+                ProcessStreamSinkAbortReason::Cancellation,
+                final_sequence,
+                final_offset,
+                1,
+                request_transport,
+                request_observed_sha256,
+                request_observed_bytes,
+                request_preview,
+                transformation,
+                request_gaps,
+            )?,
+            state,
+            final_sequence,
+            final_offset,
+            admitted_sha256,
+            evidence,
+        )?)
+    }
+}
+
 #[test]
 fn open_fixes_bindings_identities_limits_and_digest_before_bytes() -> TestResult {
     let request = open_request("one")?;
@@ -240,11 +304,9 @@ fn backpressure_deadline_and_cancelled_dispositions_admit_nothing() {
 fn complete_terminal_requires_exact_raw_unassessed_evidence() -> TestResult {
     let session = session("one")?;
     let evidence = complete_evidence(b"abc")?;
-    let terminal = ProcessStreamSinkTerminal::new(
+    let terminal = terminal_for(
         session,
         ProcessStreamSinkState::CompleteSource,
-        1,
-        3,
         1,
         3,
         sha256_hex(b"abc"),
@@ -263,11 +325,9 @@ fn complete_terminal_requires_exact_raw_unassessed_evidence() -> TestResult {
 fn terminal_state_matrix_rejects_unknown_or_persistence_failure_as_complete() -> TestResult {
     let evidence = complete_evidence(b"abc")?;
     assert!(
-        ProcessStreamSinkTerminal::new(
+        terminal_for(
             session("one")?,
             ProcessStreamSinkState::UnknownOutcome,
-            1,
-            3,
             1,
             3,
             sha256_hex(b"abc"),
@@ -276,11 +336,9 @@ fn terminal_state_matrix_rejects_unknown_or_persistence_failure_as_complete() ->
         .is_err()
     );
     assert!(
-        ProcessStreamSinkTerminal::new(
+        terminal_for(
             session("one")?,
             ProcessStreamSinkState::PersistenceFailed,
-            1,
-            3,
             1,
             3,
             sha256_hex(b"abc"),
@@ -469,10 +527,14 @@ fn fake_abort_terminalizes_with_idempotent_replay_and_conflict_fencing() -> Test
         3,
         ProcessStreamPrefixPreview::from_transport_prefix(b"abc".to_vec(), 3)?,
         None,
-        vec![StreamEvidenceGap::CancelledBeforeEof],
+        vec![
+            StreamEvidenceGap::PersistenceUnavailable,
+            StreamEvidenceGap::CancelledBeforeEof,
+        ],
     )?;
     let terminal = futures_ready(fake.abort(session.clone(), abort.clone()))?;
     assert_eq!(terminal.state(), ProcessStreamSinkState::Cancelled);
+    let accepted_identity = terminal.command_identity().clone();
     let replay = futures_ready(fake.abort(session.clone(), abort))?;
     assert_eq!(terminal.terminal_sha256(), replay.terminal_sha256());
 
@@ -487,7 +549,10 @@ fn fake_abort_terminalizes_with_idempotent_replay_and_conflict_fencing() -> Test
         3,
         ProcessStreamPrefixPreview::from_transport_prefix(b"abc".to_vec(), 3)?,
         None,
-        vec![StreamEvidenceGap::CancelledBeforeEof],
+        vec![
+            StreamEvidenceGap::PersistenceUnavailable,
+            StreamEvidenceGap::CancelledBeforeEof,
+        ],
     )?;
     assert!(matches!(
         futures_ready(fake.abort(session.clone(), conflict)),
@@ -500,15 +565,18 @@ fn fake_abort_terminalizes_with_idempotent_replay_and_conflict_fencing() -> Test
         ))?,
         ProcessStreamSinkAppendDisposition::Terminal { .. }
     ));
-    assert!(matches!(
-        futures_ready(fake.readback(session))?,
-        ProcessStreamSinkReadback::Terminal { .. }
-    ));
+    let ProcessStreamSinkReadback::Terminal { terminal: readback } =
+        futures_ready(fake.readback(session))?
+    else {
+        panic!("abort conflict must preserve the terminal");
+    };
+    assert_eq!(terminal.terminal_sha256(), readback.terminal_sha256());
+    assert_eq!(&accepted_identity, readback.command_identity());
     Ok(())
 }
 
 #[test]
-fn fake_readback_preserves_unknown_outcome() -> TestResult {
+fn fake_readback_preserves_unknown_outcome_and_fences_terminalization() -> TestResult {
     let fake = Fake::new();
     let session = futures_ready(fake.open(open_request("one")?))?;
     let outcome = ProcessStreamSinkUnknownOutcome::new(
@@ -518,17 +586,51 @@ fn fake_readback_preserves_unknown_outcome() -> TestResult {
         sha256_hex(b"uncertain"),
     )?;
     fake.set_unknown_outcome(outcome.clone());
-    assert_eq!(
-        futures_ready(fake.readback(session))?,
-        ProcessStreamSinkReadback::UnknownOutcome { outcome }
-    );
-    Ok(())
-}
+    let expected = ProcessStreamSinkReadback::UnknownOutcome { outcome };
+    assert_eq!(futures_ready(fake.readback(session.clone()))?, expected);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FakeTerminalCommand {
-    Finalize,
-    Abort,
+    let finalize = ProcessStreamSinkFinalizeRequest::new(
+        session.terminal_id().clone(),
+        0,
+        0,
+        1,
+        StreamTransportStatus::Complete,
+        sha256_hex(&[]),
+        0,
+        ProcessStreamPrefixPreview::from_transport_prefix(Vec::new(), 0)?,
+        None,
+        Vec::new(),
+    )?;
+    assert!(matches!(
+        futures_ready(fake.finalize(session.clone(), finalize)),
+        Err(ProcessStreamSinkError::ProviderUnavailable)
+    ));
+
+    let abort = ProcessStreamSinkAbortRequest::new(
+        session.terminal_id().clone(),
+        ProcessStreamSinkAbortReason::Cancellation,
+        0,
+        0,
+        1,
+        StreamTransportStatus::CancelledBeforeEof,
+        sha256_hex(&[]),
+        0,
+        ProcessStreamPrefixPreview::from_transport_prefix(Vec::new(), 0)?,
+        None,
+        vec![
+            StreamEvidenceGap::PersistenceUnavailable,
+            StreamEvidenceGap::CancelledBeforeEof,
+        ],
+    )?;
+    assert!(matches!(
+        futures_ready(fake.abort(session.clone(), abort)),
+        Err(ProcessStreamSinkError::ProviderUnavailable)
+    ));
+    assert_eq!(futures_ready(fake.readback(session))?, expected);
+    let state = fake.lock();
+    assert!(state.terminal.is_none());
+    assert!(state.terminal_command.is_none());
+    Ok(())
 }
 
 #[derive(Default)]
@@ -539,7 +641,7 @@ struct FakeState {
     next_offset: u64,
     chunks: Vec<ProcessStreamSinkAppend>,
     terminal: Option<ProcessStreamSinkTerminal>,
-    terminal_command: Option<(FakeTerminalCommand, String)>,
+    terminal_command: Option<ProcessStreamSinkTerminalCommandIdentity>,
     backpressured: bool,
     in_flight_chunks: u32,
     in_flight_bytes: u64,
@@ -576,15 +678,6 @@ impl Fake {
 
     fn admitted_digest(state: &FakeState) -> String {
         sha256_hex(&Self::admitted_bytes(state))
-    }
-
-    fn command_digest<T: serde::Serialize>(request: &T) -> Result<String, ProcessStreamSinkError> {
-        canonical_json_bytes(request)
-            .map(|bytes| sha256_hex(&bytes))
-            .map_err(|_| ProcessStreamSinkError::Serialization {
-                field: "terminal_request",
-                reason: "fake could not encode terminal request".to_owned(),
-            })
     }
 
     fn set_backpressured(&self, backpressured: bool) {
@@ -727,11 +820,12 @@ impl ProcessStreamSinkClient for Fake {
                 if existing != session {
                     return Err(ProcessStreamSinkError::SessionMismatch);
                 }
-                let digest = Self::command_digest(&request)?;
+                if state.unknown_outcome.is_some() {
+                    return Err(ProcessStreamSinkError::ProviderUnavailable);
+                }
+                let identity = request.command_identity()?;
                 if let Some(terminal) = &state.terminal {
-                    return if state.terminal_command
-                        == Some((FakeTerminalCommand::Finalize, digest))
-                    {
+                    return if state.terminal_command.as_ref() == Some(&identity) {
                         Ok(terminal.clone())
                     } else {
                         Err(ProcessStreamSinkError::TerminalIdentityConflict)
@@ -764,17 +858,16 @@ impl ProcessStreamSinkClient for Fake {
                         reason: "fake evidence",
                     }
                 })?;
-                let terminal = ProcessStreamSinkTerminal::new(
+                let terminal = ProcessStreamSinkTerminal::from_finalize(
                     session,
+                    request,
                     ProcessStreamSinkState::CompleteSource,
-                    state.next_sequence,
-                    state.next_offset,
                     state.next_sequence,
                     state.next_offset,
                     Self::admitted_digest(&state),
                     evidence,
                 )?;
-                state.terminal_command = Some((FakeTerminalCommand::Finalize, digest));
+                state.terminal_command = Some(identity);
                 state.terminal = Some(terminal.clone());
                 state.phase = Some(terminal.state());
                 Ok(terminal)
@@ -796,9 +889,12 @@ impl ProcessStreamSinkClient for Fake {
                 if existing != session {
                     return Err(ProcessStreamSinkError::SessionMismatch);
                 }
-                let digest = Self::command_digest(&request)?;
+                if state.unknown_outcome.is_some() {
+                    return Err(ProcessStreamSinkError::ProviderUnavailable);
+                }
+                let identity = request.command_identity()?;
                 if let Some(terminal) = &state.terminal {
-                    return if state.terminal_command == Some((FakeTerminalCommand::Abort, digest)) {
+                    return if state.terminal_command.as_ref() == Some(&identity) {
                         Ok(terminal.clone())
                     } else {
                         Err(ProcessStreamSinkError::TerminalIdentityConflict)
@@ -834,17 +930,16 @@ impl ProcessStreamSinkClient for Fake {
                 .map_err(|_| ProcessStreamSinkError::InvalidRequest {
                     reason: "fake evidence",
                 })?;
-                let terminal = ProcessStreamSinkTerminal::new(
+                let terminal = ProcessStreamSinkTerminal::from_abort(
                     session,
+                    request,
                     ProcessStreamSinkState::Cancelled,
-                    state.next_sequence,
-                    state.next_offset,
                     state.next_sequence,
                     state.next_offset,
                     Self::admitted_digest(&state),
                     evidence,
                 )?;
-                state.terminal_command = Some((FakeTerminalCommand::Abort, digest));
+                state.terminal_command = Some(identity);
                 state.terminal = Some(terminal.clone());
                 state.phase = Some(terminal.state());
                 Ok(terminal)
@@ -1075,11 +1170,9 @@ fn request_budgets_are_relative_and_never_exceed_fixed_limits() -> TestResult {
 
 #[test]
 fn partial_policy_redaction_cancelled_and_unknown_terminals_preserve_gaps() -> TestResult {
-    let partial = ProcessStreamSinkTerminal::new(
+    let partial = terminal_for(
         session("one")?,
         ProcessStreamSinkState::PartialSource,
-        0,
-        6,
         0,
         6,
         sha256_hex(b"abcdef"),
@@ -1088,11 +1181,9 @@ fn partial_policy_redaction_cancelled_and_unknown_terminals_preserve_gaps() -> T
     assert_eq!(partial.state(), ProcessStreamSinkState::PartialSource);
 
     let prohibited = withheld_evidence(StreamEvidenceGap::PolicyProhibited)?;
-    let terminal = ProcessStreamSinkTerminal::new(
+    let terminal = terminal_for(
         session("one")?,
         ProcessStreamSinkState::PolicyProhibited,
-        0,
-        9,
         0,
         9,
         sha256_hex(b"secret=42"),
@@ -1105,11 +1196,9 @@ fn partial_policy_redaction_cancelled_and_unknown_terminals_preserve_gaps() -> T
         StreamEvidenceGap::CancelledBeforeEof,
     )?;
     assert!(
-        ProcessStreamSinkTerminal::new(
+        terminal_for(
             session("one")?,
             ProcessStreamSinkState::Cancelled,
-            0,
-            3,
             0,
             3,
             sha256_hex(b"abc"),
@@ -1122,11 +1211,9 @@ fn partial_policy_redaction_cancelled_and_unknown_terminals_preserve_gaps() -> T
         StreamEvidenceGap::UnknownOutcome,
     )?;
     assert!(
-        ProcessStreamSinkTerminal::new(
+        terminal_for(
             session("one")?,
             ProcessStreamSinkState::UnknownOutcome,
-            0,
-            3,
             0,
             3,
             sha256_hex(b"abc"),
@@ -1139,11 +1226,9 @@ fn partial_policy_redaction_cancelled_and_unknown_terminals_preserve_gaps() -> T
 
 #[test]
 fn terminal_identity_is_idempotent_and_unknown_readback_is_write_fenced() -> TestResult {
-    let terminal = ProcessStreamSinkTerminal::new(
+    let terminal = terminal_for(
         session("one")?,
         ProcessStreamSinkState::CompleteSource,
-        0,
-        0,
         0,
         0,
         sha256_hex(&[]),
