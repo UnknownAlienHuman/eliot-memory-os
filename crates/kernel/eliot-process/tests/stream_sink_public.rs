@@ -6,7 +6,8 @@ use eliot_process::{
     ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest, ProcessStreamSinkFuture,
     ProcessStreamSinkLimits, ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback,
     ProcessStreamSinkSession, ProcessStreamSinkSessionId, ProcessStreamSinkSourceId,
-    ProcessStreamSinkTerminal, ProcessStreamSinkTerminalId,
+    ProcessStreamSinkTerminal, ProcessStreamSinkTerminalCommandIdentity,
+    ProcessStreamSinkTerminalCommandKind, ProcessStreamSinkTerminalId,
 };
 
 fn accepts_object_safe_client(_: Arc<dyn ProcessStreamSinkClient>) {}
@@ -29,6 +30,8 @@ fn sink_contract_is_public_and_object_safe() {
     let _: Option<ProcessStreamSinkSessionId> = None;
     let _: Option<ProcessStreamSinkSourceId> = None;
     let _: Option<ProcessStreamSinkTerminalId> = None;
+    let _: Option<ProcessStreamSinkTerminalCommandIdentity> = None;
+    let _: Option<ProcessStreamSinkTerminalCommandKind> = None;
     let _: Option<ProcessStreamDigestAlgorithm> = None;
     accepts_object_safe_client(Arc::new(NoopClient));
 }

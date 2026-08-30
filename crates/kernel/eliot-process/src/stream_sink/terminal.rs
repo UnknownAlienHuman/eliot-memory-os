@@ -14,6 +14,7 @@ use super::{
     ProcessStreamSinkError, canonical_digest, validate_binding, validate_digest,
     validate_terminal_evidence,
 };
+use super::{ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkTerminalCommandKind};
 
 /// Live in-process capability returned only from a checked open request.
 ///
@@ -164,6 +165,7 @@ struct TerminalMaterial<'a> {
     admitted_chunks: u64,
     admitted_bytes: u64,
     admitted_sha256: &'a str,
+    command_identity: &'a ProcessStreamSinkTerminalCommandIdentity,
     evidence: &'a ProcessStreamEvidence,
 }
 
@@ -184,6 +186,7 @@ pub struct ProcessStreamSinkTerminal {
     admitted_chunks: u64,
     admitted_bytes: u64,
     admitted_sha256: String,
+    command_identity: ProcessStreamSinkTerminalCommandIdentity,
     evidence: ProcessStreamEvidence,
     terminal_sha256: String,
 }
@@ -194,39 +197,121 @@ impl ProcessStreamSinkTerminal {
         clippy::needless_pass_by_value,
         reason = "terminal construction consumes the live capability"
     )]
-    pub fn new(
+    pub fn from_finalize(
         session: ProcessStreamSinkSession,
+        request: ProcessStreamSinkFinalizeRequest,
         state: ProcessStreamSinkState,
         final_sequence: u64,
         final_offset: u64,
-        admitted_chunks: u64,
-        admitted_bytes: u64,
         admitted_sha256: impl Into<String>,
         evidence: ProcessStreamEvidence,
     ) -> Result<Self, ProcessStreamSinkError> {
+        session.validate_finalize(&request)?;
+        let command_identity = request.command_identity()?;
+        let admitted_sha256 = admitted_sha256.into();
+        if command_identity.terminal_id() != session.terminal_id()
+            || final_sequence != request.expected_final_sequence()
+            || final_offset != request.expected_final_offset()
+            || request.observed_sha256() != admitted_sha256
+            || request.observed_bytes() != final_offset
+            || request.transport() != evidence.transport()
+            || request.preview() != evidence.preview()
+            || request.transformation()
+                != evidence.source().and_then(|source| source.transformation())
+            || request.gaps() != evidence.gaps()
+        {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
+        Self::from_checked(
+            &session,
+            &request,
+            command_identity,
+            state,
+            final_sequence,
+            final_offset,
+            admitted_sha256,
+            evidence,
+            ProcessStreamSinkTerminalCommandKind::Finalize,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "terminal construction consumes the live capability"
+    )]
+    pub fn from_abort(
+        session: ProcessStreamSinkSession,
+        request: ProcessStreamSinkAbortRequest,
+        state: ProcessStreamSinkState,
+        final_sequence: u64,
+        final_offset: u64,
+        admitted_sha256: impl Into<String>,
+        evidence: ProcessStreamEvidence,
+    ) -> Result<Self, ProcessStreamSinkError> {
+        session.validate_abort(&request)?;
+        let command_identity = request.command_identity()?;
+        let admitted_sha256 = admitted_sha256.into();
+        if command_identity.terminal_id() != session.terminal_id()
+            || final_sequence != request.expected_final_sequence()
+            || final_offset != request.expected_final_offset()
+            || request.observed_sha256() != admitted_sha256
+            || request.observed_bytes() != final_offset
+            || request.transport() != evidence.transport()
+            || request.preview() != evidence.preview()
+            || request.transformation()
+                != evidence.source().and_then(|source| source.transformation())
+            || request.gaps() != evidence.gaps()
+        {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
+        Self::from_checked(
+            &session,
+            &request,
+            command_identity,
+            state,
+            final_sequence,
+            final_offset,
+            admitted_sha256,
+            evidence,
+            ProcessStreamSinkTerminalCommandKind::Abort,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_checked<R: CommandRequest>(
+        session: &ProcessStreamSinkSession,
+        request: &R,
+        command_identity: ProcessStreamSinkTerminalCommandIdentity,
+        state: ProcessStreamSinkState,
+        final_sequence: u64,
+        final_offset: u64,
+        admitted_sha256: String,
+        evidence: ProcessStreamEvidence,
+        expected_kind: ProcessStreamSinkTerminalCommandKind,
+    ) -> Result<Self, ProcessStreamSinkError> {
         session.validate()?;
+        if command_identity.kind() != expected_kind
+            || command_identity.terminal_id() != session.terminal_id()
+            || command_identity != request.command_identity()?
+        {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
         if !state.is_terminal() {
             return Err(ProcessStreamSinkError::EvidenceInvariant {
                 reason: "terminal state must be write-closed".to_owned(),
             });
         }
-        let admitted_sha256 = admitted_sha256.into();
         validate_digest("admitted_sha256", &admitted_sha256)?;
-        if admitted_chunks > session.limits().max_chunks() {
+        if final_sequence > session.limits().max_chunks() {
             return Err(ProcessStreamSinkError::ChunkCountLimitExceeded);
         }
-        if admitted_bytes > session.limits().max_total_admitted_bytes() {
+        if final_offset > session.limits().max_total_admitted_bytes() {
             return Err(ProcessStreamSinkError::TotalLimitExceeded);
         }
-        if final_sequence != admitted_chunks {
-            return Err(ProcessStreamSinkError::SequenceGap {
-                expected: admitted_chunks,
-                observed: final_sequence,
-            });
-        }
-        if final_offset != admitted_bytes {
+        if final_offset != request.expected_final_offset() {
             return Err(ProcessStreamSinkError::OffsetMismatch {
-                expected: admitted_bytes,
+                expected: request.expected_final_offset(),
                 observed: final_offset,
             });
         }
@@ -240,7 +325,7 @@ impl ProcessStreamSinkTerminal {
             return Err(ProcessStreamSinkError::PolicyMismatch);
         }
         if evidence.observed_sha256() != admitted_sha256
-            || evidence.observed_bytes() != admitted_bytes
+            || evidence.observed_bytes() != final_offset
         {
             return Err(ProcessStreamSinkError::EvidenceInvariant {
                 reason: "evidence must identify every admitted transport byte".to_owned(),
@@ -256,9 +341,10 @@ impl ProcessStreamSinkTerminal {
             state,
             final_sequence,
             final_offset,
-            admitted_chunks,
-            admitted_bytes,
+            admitted_chunks: final_sequence,
+            admitted_bytes: final_offset,
             admitted_sha256,
+            command_identity,
             evidence,
             terminal_sha256: String::new(),
         };
@@ -281,6 +367,7 @@ impl ProcessStreamSinkTerminal {
                 admitted_chunks: self.admitted_chunks,
                 admitted_bytes: self.admitted_bytes,
                 admitted_sha256: &self.admitted_sha256,
+                command_identity: &self.command_identity,
                 evidence: &self.evidence,
             },
         )
@@ -295,6 +382,21 @@ impl ProcessStreamSinkTerminal {
         validate_digest("open_request_sha256", &self.open_request_sha256)?;
         validate_digest("admitted_sha256", &self.admitted_sha256)?;
         validate_digest("terminal_sha256", &self.terminal_sha256)?;
+        self.command_identity.validate()?;
+        if self.command_identity.terminal_id() != &self.terminal_id {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
+        if !self.state.is_terminal() {
+            return Err(ProcessStreamSinkError::EvidenceInvariant {
+                reason: "terminal state must be write-closed".to_owned(),
+            });
+        }
+        if self.final_sequence != self.admitted_chunks {
+            return Err(ProcessStreamSinkError::SequenceGap {
+                expected: self.admitted_chunks,
+                observed: self.final_sequence,
+            });
+        }
         if self.terminal_sha256 != self.compute_digest()? {
             return Err(ProcessStreamSinkError::EvidenceInvariant {
                 reason: "terminal digest does not match its description".to_owned(),
@@ -348,7 +450,70 @@ impl ProcessStreamSinkTerminal {
         &self.terminal_sha256
     }
 
+    pub const fn command_identity(&self) -> &ProcessStreamSinkTerminalCommandIdentity {
+        &self.command_identity
+    }
+
+    pub fn validate_against_finalize(
+        &self,
+        request: &ProcessStreamSinkFinalizeRequest,
+    ) -> Result<(), ProcessStreamSinkError> {
+        self.validate()?;
+        let identity = request.command_identity()?;
+        if identity.kind() != ProcessStreamSinkTerminalCommandKind::Finalize
+            || &identity != self.command_identity()
+        {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
+        Ok(())
+    }
+
+    pub fn validate_against_abort(
+        &self,
+        request: &ProcessStreamSinkAbortRequest,
+    ) -> Result<(), ProcessStreamSinkError> {
+        self.validate()?;
+        let identity = request.command_identity()?;
+        if identity.kind() != ProcessStreamSinkTerminalCommandKind::Abort
+            || &identity != self.command_identity()
+        {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
+        Ok(())
+    }
+
     pub fn identity_sha256(&self) -> &str {
         &self.terminal_sha256
+    }
+}
+
+trait CommandRequest {
+    fn command_identity(
+        &self,
+    ) -> Result<ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkError>;
+    fn expected_final_offset(&self) -> u64;
+}
+
+impl CommandRequest for ProcessStreamSinkFinalizeRequest {
+    fn command_identity(
+        &self,
+    ) -> Result<ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkError> {
+        ProcessStreamSinkFinalizeRequest::command_identity(self)
+    }
+
+    fn expected_final_offset(&self) -> u64 {
+        self.expected_final_offset()
+    }
+}
+
+impl CommandRequest for ProcessStreamSinkAbortRequest {
+    fn command_identity(
+        &self,
+    ) -> Result<ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkError> {
+        ProcessStreamSinkAbortRequest::command_identity(self)
+    }
+
+    fn expected_final_offset(&self) -> u64 {
+        self.expected_final_offset()
     }
 }
