@@ -13,5 +13,23 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 
+[package.metadata.eliot]
+layer = "C0"
+purpose = "Stable owner-neutral primitives shared across authority, state-fence, receipt, and contract boundaries."
+source_maintenance_owner = "foundation-contract-owner"
+functional_cell_refs = [
+  "foundation.contracts.primitives",
+  "foundation.authority.epoch-identity",
+]
+independent_proof_profile = "eliot-contracts"
+contract_refs = [
+  "epoch-id.contract.toml",
+  "ARCH-AUTH-01",
+  "ARCH-RES-03",
+  "ELIOT_IMPLEMENTATION:I6.10",
+]
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+
 [lints]
 workspace = true
