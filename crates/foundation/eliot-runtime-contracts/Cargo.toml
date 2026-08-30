@@ -12,6 +12,8 @@ functional_cell = "runtime-contracts"
 lifecycle_owner = "C0-04"
 source_layer = "C0"
 proof_entrypoint = "cargo test -p eliot-runtime-contracts"
+source_maintenance_owner = "source.foundation.runtime-contracts"
+cell_manifest = "capability-cells.toml"
 
 [dependencies]
 ed25519-dalek.workspace = true
