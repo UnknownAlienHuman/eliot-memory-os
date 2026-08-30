@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::CoordinatedAttemptState;
@@ -83,20 +82,18 @@ fn validate_unique_texts(
 fn canonical_digest<T: Serialize>(value: &T) -> Result<String, ModelControlError> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| ModelControlError::Serialization(error.to_string()))?;
-    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+    Ok(format!("sha256:{}", eliot_receipts::sha256_hex(&bytes)))
 }
 
 fn catalogue_digest(snapshot: &ModelCatalogueSnapshot) -> Result<String, ModelControlError> {
     let mut normalized = snapshot.clone();
-    normalized.entries.sort_by(|left, right| {
-        left.deterministic_key().cmp(&right.deterministic_key())
-    });
+    normalized
+        .entries
+        .sort_by(|left, right| left.deterministic_key().cmp(&right.deterministic_key()));
     canonical_digest(&normalized)
 }
 
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ModelRole {
     MainAgent,
@@ -109,9 +106,7 @@ pub enum ModelRole {
     Dreamer,
 }
 
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BillingClass {
     Free,
@@ -131,9 +126,7 @@ impl BillingClass {
     }
 }
 
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RouteAdmissionStatus {
     Admitted,
@@ -142,9 +135,7 @@ pub enum RouteAdmissionStatus {
     Unknown,
 }
 
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RouteHealthStatus {
     Healthy,
@@ -164,9 +155,7 @@ impl RouteHealthStatus {
     }
 }
 
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ModelAvailability {
     Available,
@@ -186,9 +175,7 @@ impl ModelAvailability {
     }
 }
 
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QuotaDisposition {
     Available,
@@ -271,9 +258,7 @@ impl QuotaObservation {
     }
 }
 
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CapabilityStatus {
     Supported,
@@ -622,17 +607,12 @@ pub fn query_model_catalogue(
         .entries
         .iter()
         .filter(|entry| {
-            (query.host_families.is_empty()
-                || query.host_families.contains(&entry.host_family))
+            (query.host_families.is_empty() || query.host_families.contains(&entry.host_family))
                 && (query.provider_ids.is_empty()
                     || query.provider_ids.contains(&entry.provider_id))
                 && text_matches(entry, query.text.as_deref())
                 && (!query.free_only
-                    || free_filter_matches(
-                        entry,
-                        query.include_subscription_included,
-                        now_unix_ms,
-                    ))
+                    || free_filter_matches(entry, query.include_subscription_included, now_unix_ms))
         })
         .filter_map(|entry| {
             let blockers = dispatch_blockers(
@@ -651,7 +631,11 @@ pub fn query_model_catalogue(
             })
         })
         .collect::<Vec<_>>();
-    hits.sort_by(|left, right| left.entry.deterministic_key().cmp(&right.entry.deterministic_key()));
+    hits.sort_by(|left, right| {
+        left.entry
+            .deterministic_key()
+            .cmp(&right.entry.deterministic_key())
+    });
     hits.truncate(query.limit);
     Ok(ModelQueryReceipt {
         schema_version: MODEL_QUERY_RECEIPT_VERSION.to_owned(),
@@ -880,7 +864,11 @@ fn selection_rejections(
     if !entry.role_eligibility.is_empty() && !entry.role_eligibility.contains(&preference.role) {
         reasons.insert(SelectionRejection::RoleNotEligible);
     }
-    if preference.denied.iter().any(|selector| selector.matches(entry)) {
+    if preference
+        .denied
+        .iter()
+        .any(|selector| selector.matches(entry))
+    {
         reasons.insert(SelectionRejection::DeniedByHumanPolicy);
     }
     if !preference.allowed_billing.contains(&entry.billing.class) {
@@ -1053,9 +1041,7 @@ pub enum AttemptLivenessStatus {
     Terminal,
 }
 
-#[derive(
-    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AttemptAlertCode {
     HeartbeatMissing,
@@ -1093,7 +1079,9 @@ pub fn project_attempt_health(
 ) -> Result<AttemptHealthProjection, ModelControlError> {
     input.validate()?;
     if now_unix_ms < input.observed_at_unix_ms {
-        return Err(ModelControlError::InvalidField("attempt_health.now_unix_ms"));
+        return Err(ModelControlError::InvalidField(
+            "attempt_health.now_unix_ms",
+        ));
     }
     let mut alerts = BTreeSet::new();
     let heartbeat_status = match input.last_heartbeat_unix_ms {
@@ -1242,9 +1230,7 @@ impl SwarmControlCommandDraft {
                 }
                 Ok(())
             }
-            Self::CancelAttempt { reason, .. } => {
-                validate_text(reason, "command.cancel_reason")
-            }
+            Self::CancelAttempt { reason, .. } => validate_text(reason, "command.cancel_reason"),
         }
     }
 }
