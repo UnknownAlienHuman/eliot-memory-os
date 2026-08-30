@@ -1,8 +1,8 @@
-//! Typed terminal semantic-resolution results for agent activation.
+//! Typed semantic-resolution results for agent activation.
 //!
 //! This additive v2 contract represents one exact semantic result for one
 //! Kernel-owned activation ticket. It creates no Session, capability, nonce,
-//! effect authority, or retry loop. The older
+//! effect authority, or hidden retry loop. The older
 //! `AgentActivationResolutionDecision` remains a success-only compatibility
 //! surface until parent issue #66 migrates every consumer.
 
@@ -14,10 +14,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AgentActivationResolutionTicket, ProtocolError};
 
-/// Stable wire identity for the typed terminal semantic-resolution result.
+/// Stable wire identity for the typed semantic-resolution result.
 pub const AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_ID: &str =
     "eliot.protocol.agent-activation-resolution-result";
-/// Additive v2 wire version for the typed terminal semantic-resolution result.
+/// Additive v2 wire version for the typed semantic-resolution result.
 pub const AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_VERSION: u16 = 2;
 /// Maximum number of bounded semantic candidates in one result.
 pub const MAX_AGENT_ACTIVATION_CANDIDATES: usize = 32;
@@ -118,24 +118,34 @@ impl AgentActivationResolvedBinding {
     }
 }
 
-/// Bounded candidate and recovery projection for a semantic selection conflict.
+/// Recheckable denominator state for a candidate set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AgentActivationCandidateCoverage {
+    /// The owner enumerated the complete current candidate set. The set may be
+    /// empty, which is how `NO_ACTIVE_BINDING` is represented without a fake
+    /// task or scope handle.
+    Complete,
+    /// Some exact candidates are known, but the denominator is incomplete.
+    Partial,
+    /// No candidate denominator can currently be established.
+    Unknown,
+}
+
+/// Bounded candidate and recovery projection for semantic selection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentActivationSelectionDirective {
     /// Exact candidate handles in owner-selected order.
     pub candidate_handles: Vec<String>,
+    /// Whether the candidate denominator is complete, partial, or unknown.
+    pub candidate_coverage: AgentActivationCandidateCoverage,
     /// Typed recovery/directive handle explaining the next allowed action.
     pub recovery_handle: String,
 }
 
 impl AgentActivationSelectionDirective {
-    fn validate(&self, field: &'static str) -> Result<(), ProtocolError> {
-        if self.candidate_handles.is_empty() {
-            return Err(ProtocolError::InvalidField {
-                field,
-                reason: "must contain at least one candidate handle",
-            });
-        }
+    fn validate_common(&self, field: &'static str) -> Result<(), ProtocolError> {
         if self.candidate_handles.len() > MAX_AGENT_ACTIVATION_CANDIDATES {
             return Err(ProtocolError::InvalidField {
                 field,
@@ -152,10 +162,42 @@ impl AgentActivationSelectionDirective {
                 });
             }
         }
+        match self.candidate_coverage {
+            AgentActivationCandidateCoverage::Partial if self.candidate_handles.is_empty() => {
+                return Err(ProtocolError::InvalidField {
+                    field,
+                    reason: "PARTIAL coverage requires at least one known candidate",
+                });
+            }
+            AgentActivationCandidateCoverage::Unknown if !self.candidate_handles.is_empty() => {
+                return Err(ProtocolError::InvalidField {
+                    field,
+                    reason: "UNKNOWN coverage cannot claim exact candidate handles",
+                });
+            }
+            _ => {}
+        }
         bounded_text(
             &self.recovery_handle,
             "agent_activation_resolution_result.recovery_handle",
         )
+    }
+
+    fn validate_task_selection(&self) -> Result<(), ProtocolError> {
+        self.validate_common("agent_activation_resolution_result.task_candidate_handles")
+    }
+
+    fn validate_scope_ambiguity(&self) -> Result<(), ProtocolError> {
+        self.validate_common("agent_activation_resolution_result.scope_candidate_handles")?;
+        if self.candidate_handles.len() < 2
+            || self.candidate_coverage == AgentActivationCandidateCoverage::Unknown
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_result.scope_candidate_handles",
+                reason: "SCOPE_AMBIGUOUS requires at least two exact candidates",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -247,12 +289,8 @@ impl AgentActivationResolutionDisposition {
     fn validate(&self) -> Result<(), ProtocolError> {
         match self {
             Self::Resolved { binding } => binding.validate(),
-            Self::TaskSelectionRequired { selection } => selection.validate(
-                "agent_activation_resolution_result.task_candidate_handles",
-            ),
-            Self::ScopeAmbiguous { selection } => selection.validate(
-                "agent_activation_resolution_result.scope_candidate_handles",
-            ),
+            Self::TaskSelectionRequired { selection } => selection.validate_task_selection(),
+            Self::ScopeAmbiguous { selection } => selection.validate_scope_ambiguity(),
             Self::NotReady {
                 recovery_handle,
                 retry,
