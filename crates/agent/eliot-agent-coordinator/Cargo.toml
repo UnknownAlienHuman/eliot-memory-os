@@ -28,6 +28,9 @@ contract_refs = [
   "ELIOT_IMPLEMENTATION:I3.6",
   "ELIOT_IMPLEMENTATION:I7.22",
 ]
+contract_challenge_refs = ["issue:224", "issue:228"]
+implementation_support = "PARTIAL"
+evidence_execution_status = "NOT_EXECUTED"
 component_contract_ref = ""
 
 [dependencies]
