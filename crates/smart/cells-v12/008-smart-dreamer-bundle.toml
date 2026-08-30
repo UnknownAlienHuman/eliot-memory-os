@@ -1,0 +1,48 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+field_contract_is_sole_public_type_authority = true
+order = 8
+cell = "smart.dreamer.bundle"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-core"
+primary_property = "Construct one bounded handle-oriented DreamInputBundle from an admitted job envelope, exact ReferenceManifest and already expanded references without store browsing, model invocation or silent omission of protected material."
+field_contract = "crates/smart/eliot-dreamer-contracts/common.contract.toml"
+public_function_selectors = ["build_dream_input_bundle"]
+write_scope = [
+  "crates/smart/eliot-dreamer-core/src/bundle.rs",
+  "crates/smart/eliot-dreamer-core/tests/bundle.rs",
+]
+algorithm = [
+  "validate job, manifest, expanded references, scope/task/fence, privacy and forbidden-effect ceilings",
+  "reject every expanded reference absent from the exact manifest",
+  "admit required and Decision-Safety-Floor references before optional references",
+  "reserve output and review capacity before optional input allocation",
+  "retain unavailable/disclosure-denied required references as explicit blockers rather than silently dropping them",
+  "preserve source authority, dependency and invalidation handles",
+  "canonicalize references and compute bundle digest",
+]
+minimum_tests = [
+  "reference outside manifest rejected",
+  "required disclosure-denied reference blocks complete bundle",
+  "optional reference cannot consume reserved output/review capacity",
+  "protected rival/unknown/counterevidence cannot be displaced by verbose optional source",
+  "mixed State Fence rejected",
+  "bundle exposes no store/model/provider/effect interface",
+  "input permutation is deterministic",
+]
+non_goals = [
+  "reference acquisition or expansion",
+  "storage/repository scan",
+  "model/provider invocation",
+  "claim grounding",
+  "candidate admission",
+  "canonical write or task finish",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-DRM-01", "ARCH-DRM-02", "ARCH-CTX-01", "ARCH-CTX-04", "ARCH-SEC-03"]
+implementation_refs = ["I2.20", "I9.3", "I9.4", "I9.16", "I12.13"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than browsing for missing data, weakening privacy/budget/effect ceilings, dropping required material, or invoking a model/provider."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
