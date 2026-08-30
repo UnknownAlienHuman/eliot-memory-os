@@ -20,6 +20,10 @@ retired rather than preserved as archaeology.
 | `verify-agent-guardrails.py` | Require bounded nearest-path owner/proof/stop instructions for core and daemon source subtrees | Routing/control-plane evidence only |
 | `audit-runtime-source-hygiene.py` | Expose unsafe, panic/unwrap/expect, ambient configuration, unbounded-output, blocking-sleep, and source-concentration risks in runtime roots | Static source-quality signals only |
 | `verify-agent-bridge-protocol.py` | Reject raw canonical Frame ingress, host-minted authority fields, validation bypass, correlation loss, and mandatory cancellation prose | Static protocol/source-policy evidence only |
+| `verify-agent-route-bundles.py` | Verify static shape and safety guardrails of ELIOT agent route bundles | Static profile/schema evidence only |
+| `agent_route_bundle_checks.py` | Supporting module for agent route bundle schema/profile verification | Internal script module |
+| `agent_route_contract.py` | Host declarations, findings, and error helpers for agent route contracts | Internal script module |
+| `requirements-verification.txt` | Python dependency requirements (`jsonschema`) for verification scripts | Verification dependency manifest |
 | `verify-lint-policy.ps1` | Verify the current Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
 
 Normal iteration uses `just quick` or `scripts/verify.ps1`. The manual Source
@@ -91,6 +95,13 @@ store, security, or Product proof.
 ```powershell
 python scripts/verify-agent-bridge-protocol.py --self-test
 python scripts/verify-agent-bridge-protocol.py
+```
+
+### Agent route bundle verification
+
+```powershell
+python scripts/verify-agent-route-bundles.py --self-test
+python scripts/verify-agent-route-bundles.py
 ```
 
 The verifier is bound to the public `eliot-agent-bridge` stdin request enum, the

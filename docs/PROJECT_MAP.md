@@ -66,10 +66,12 @@ migration under the owning issue, not general development there.
 | store bridge / Surreal generation / BlobStore | closed storage path and single owners | #19; payload regression #10 |
 | `eliot-testd.exe` | isolated Instrument execution | #20 |
 | `eliot-wasm-host.exe` | capability-limited component host | #21 |
-| native worker | isolated OS-heavy generation | #22 |
-| User Broker | interactive-user launch/resource boundary | #23 |
-| notify / agent bridge | stateless or near-stateless surfaces | #13 |
-| Researcher provider process | governed acquisition execution | #24 |
+| `eliot-native-worker.exe` | isolated OS-heavy generation worker | #22 |
+| `eliot-user-broker.exe` | interactive-user launch/resource boundary | #23 |
+| `eliot-notify.exe` | stateless notification delivery surface | #13 |
+| `eliot-agent-bridge.exe` | public agent bridge ingress surface | #13 |
+| `eliot-dreamer.exe` / Dreamer | candidate-only cognitive capability-cell scaffold | #38–#45 |
+| `eliot-mod-research.exe` / Researcher | governed acquisition execution provider process | #24 |
 
 Dreamer is excluded from the core/daemon workstream. Its candidate-only
 cognitive capability-cell scaffold is on `main`; issues #38–#45 own the current
