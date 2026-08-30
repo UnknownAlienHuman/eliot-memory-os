@@ -635,6 +635,7 @@ dependencies = [
  "eliot-agent-bridge-core",
  "eliot-contracts",
  "eliot-ipc",
+ "eliot-mcp",
  "eliot-platform-windows",
  "eliot-protocol",
  "eliot-receipts",

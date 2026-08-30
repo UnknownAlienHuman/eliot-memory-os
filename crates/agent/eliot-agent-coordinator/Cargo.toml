@@ -8,9 +8,12 @@ description = "Deterministic A-02 agent staffing, route selection, admission, an
 
 [package.metadata.eliot]
 layer = "C1"
-purpose = "Compile candidate staffing and route selections, reconcile externally admitted attempts, and preserve durable attempt/peer lifecycle semantics without owning provider execution, task truth, policy, or finish."
+purpose = "Compile current-account model catalogue queries, Human role preferences, candidate staffing and route selections, attempt-health projections, and externally admitted attempt reconciliation without owning provider execution, task truth, policy authority, or finish."
 source_maintenance_owner = "agent.coordinator"
 functional_cell_refs = [
+  "agent.coordinator.model-catalogue-query",
+  "agent.coordinator.model-preference-selection",
+  "agent.coordinator.attempt-health-projection",
   "agent.coordinator.staffing-plan",
   "agent.coordinator.route-selection",
   "agent.coordinator.provider-admission",
@@ -22,13 +25,16 @@ contract_refs = [
   "ARCH-AUTH-01",
   "ARCH-SWM-01",
   "ARCH-SWM-02",
+  "ARCH-HUM-01",
+  "ARCH-WDG-01",
   "ARCH-ECON-01",
   "ARCH-SEC-04",
   "ELIOT_IMPLEMENTATION:I3.4",
+  "ELIOT_IMPLEMENTATION:I3.5",
   "ELIOT_IMPLEMENTATION:I3.6",
   "ELIOT_IMPLEMENTATION:I7.22",
 ]
-contract_challenge_refs = ["issue:224", "issue:228"]
+contract_challenge_refs = ["issue:224", "issue:228", "issue:265"]
 implementation_support = "PARTIAL"
 evidence_execution_status = "NOT_EXECUTED"
 component_contract_ref = ""
