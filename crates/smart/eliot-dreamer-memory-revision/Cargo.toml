@@ -11,10 +11,15 @@ path = "src/lib.rs"
 
 [package.metadata.eliot]
 layer = "C1"
-purpose = "forward-only memory revision candidates"
+purpose = "forward-only reversible memory revision candidates"
 source_maintenance_owner = "cognitive-integration-owner"
 functional_cell_refs = ["smart.dreamer.structure_repair", "smart.dreamer.reconsolidation", "smart.dreamer.accessibility", "smart.dreamer.influence_repair", "smart.dreamer.negative_memory_extinction"]
 independent_proof_profile = "prototype-not-workspace-admitted"
-contract_refs = ["crates/smart/cognitive-current.toml"]
+contract_refs = [
+  "crates/smart/cognitive-current.toml",
+  "crates/smart/cognitive-rev12-w9-field-contracts.toml",
+  "crates/smart/eliot-dreamer-memory-revision/negative-memory-extinction.contract.toml",
+]
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until candidate cells have Rust implementation, package Module Proof and affected real Edge Proof"
