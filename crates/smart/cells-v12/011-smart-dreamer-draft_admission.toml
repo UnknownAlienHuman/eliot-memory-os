@@ -1,0 +1,46 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+field_contract_is_sole_public_type_authority = true
+order = 11
+cell = "smart.dreamer.draft_admission"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-validation"
+primary_property = "Apply fail-closed structural admission to one grounded and dimensionally validated Dreamer draft while keeping Admitted distinct from canonical, true, supported, executable or finished."
+field_contract = "crates/smart/eliot-dreamer-contracts/common.contract.toml"
+public_function_selectors = ["admit_dream_draft"]
+write_scope = [
+  "crates/smart/eliot-dreamer-validation/src/draft_admission.rs",
+  "crates/smart/eliot-dreamer-validation/tests/draft_admission.rs",
+]
+algorithm = [
+  "validate exact job, grounded draft, validation report, schema, candidate kind and one State Fence",
+  "verify privacy, budget, source-authority and forbidden-effect ceilings were not exceeded",
+  "require policy-required transformation dimensions to Pass and retain every rejected/unsupported claim identity",
+  "reject unsupported/unknown candidate kinds without generic fallback",
+  "derive Admitted, Rejected, RequiresReview or UnsupportedKind with typed reason codes",
+  "compute canonical admission digest without producing a canonical write or effect receipt",
+]
+minimum_tests = [
+  "unknown candidate kind yields UnsupportedKind",
+  "required Inconclusive dimension cannot yield Admitted",
+  "privacy or forbidden-effect overreach is Rejected",
+  "unsupported material claim remains traceable",
+  "RequiresReview remains non-executable",
+  "Admitted output has no canonical/support/truth/task-finish/effect field",
+  "input permutation is deterministic",
+]
+non_goals = [
+  "semantic handler execution",
+  "canonical memory/task write",
+  "truth or support promotion",
+  "policy or authority decision",
+  "tool/model/effect execution",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-DRM-01", "ARCH-DRM-03", "ARCH-EPI-04", "ARCH-SEC-04", "ARCH-MOD-03"]
+implementation_refs = ["I2.20", "I9.4", "I9.7", "I9.16"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return Rejected, RequiresReview, UnsupportedKind or ContractChallenge rather than auto-admitting an inconclusive/unknown/overreaching draft or treating structural admission as canonical support."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
