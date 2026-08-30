@@ -1,0 +1,27 @@
+schema_version = 2
+authority = "eliot-cognitive-function-design-rev12"
+decision = "FIELD_LEVEL_SCHEMA_FREEZE_POINTER"
+issue = 196
+status = "SUPERSEDED_BY_OWNER_LOCAL_FIELD_CONTRACTS"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+canonical_index = "crates/smart/cognitive-rev12-field-contracts.toml"
+rule = "This file preserves the base-branch decision identity only. Exact field definitions live once, in the owning crate contract files indexed by canonical_index. Consumers and workers must not treat this pointer, the superseded centralized draft, legacy module.toml, or legacy *.api.toml as a parallel schema source."
+
+[owner_contracts]
+context_provider_contribution = "crates/smart/eliot-context-contracts/provider-contribution.contract.toml"
+memory_projection = "crates/smart/eliot-memory-projection-contracts/projection.contract.toml"
+system_experience = "crates/smart/eliot-learning-contracts/experience.contract.toml"
+
+[compatibility]
+superseded_centralized_draft_commit = "030a2852b9b5adadc01ba6dc8b8c58dacab27673"
+superseded_type_ownership_followup_commit = "27d71619b6b777bd36b18502e8ac749e4a113cad"
+resolution = "The centralized field table was useful evidence but duplicated ownership and omitted several denominator, disclosure, loss-policy, failure-history, request-binding, and negative-case fields. Its concepts were reconciled into the three owner-local contracts; names and fields in those contracts are authoritative for W8 implementation."
+
+[forbidden]
+parallel_field_definitions = true
+generic_json_or_vendor_types = true
+provider_specific_duplicate_request = true
+complete_without_recheckable_denominator = true
+schema_presence_claims_implementation_support = false
