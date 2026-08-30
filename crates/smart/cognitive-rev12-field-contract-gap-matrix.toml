@@ -1,0 +1,85 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "FIELD_CONTRACT_GAP_MATRIX"
+current_field_contracts = [
+  "crates/smart/eliot-context-contracts/provider-contribution.contract.toml",
+  "crates/smart/eliot-memory-projection-contracts/projection.contract.toml",
+  "crates/smart/eliot-learning-contracts/experience.contract.toml",
+  "crates/meta/eliot-memory-quality/quality.contract.toml",
+  "crates/smart/eliot-dreamer-memory-revision/negative-memory-extinction.contract.toml",
+  "crates/meta/eliot-cognitive-quality/quality.contract.toml",
+  "crates/meta/eliot-understanding-assessment/assessment.contract.toml",
+]
+rule = "A semantic worker may implement against fixtures only after every public input/output/error type it consumes resolves to one field-level contract owner. Function signatures or legacy module/api files are insufficient."
+
+[[family]]
+id = "epistemic-contracts"
+physical_crate = "eliot-epistemic-contracts"
+status = "FIELD_CONTRACT_MISSING"
+blocks = ["smart.epistemic.position", "smart.epistemic.context_projection", "Orientation rival/conflict consumers"]
+required_scope = ["CurrentEpistemicPosition algebra", "Observation/Supported/Assumed/Rival/Conflict/Stale/Superseded/Unknown states", "InvestigationRequirement", "provenance/dependence/competence/freshness", "typed resolver errors"]
+priority = "NEXT_CONTRACT_WAVE"
+
+[[family]]
+id = "dreamer-contracts"
+physical_crate = "eliot-dreamer-contracts"
+status = "FIELD_CONTRACT_MISSING"
+blocks = ["bundle/grounding/transformation/admission", "Orientation/clarification", "curation handlers", "research synthesis", "diagnosis/planning", "DreamCycle"]
+required_scope = ["common candidate identity/lineage/fence", "job-class request/result contracts", "Orientation", "Research synthesis", "Curation registry/subtypes", "FailureFingerprint", "candidate-only authority ceiling"]
+priority = "NEXT_CONTRACT_WAVE"
+
+[[family]]
+id = "cue-contracts"
+physical_crate = "eliot-cue-contracts"
+status = "FIELD_CONTRACT_MISSING"
+blocks = ["normalization", "binding", "snapshot/index", "direct match", "bounded spread", "activation", "memory candidate query"]
+required_scope = ["canonical value vs comparison key", "comparison profile", "binding candidate", "immutable snapshot identity", "exact match trace", "bounded relation spread", "activation result and limits"]
+priority = "NEXT_CONTRACT_WAVE"
+
+[[family]]
+id = "context-contracts-base"
+physical_crate = "eliot-context-contracts"
+status = "PARTIAL_FIELD_CONTRACT"
+completed = ["closed provider registry", "generic provider request", "whole ProviderContribution", "coverage denominator and omissions"]
+missing = ["candidate contribution merge input", "ContextRecipe and Decision Safety Floor", "whole-unit admission", "ContextView/ExpansionManifest", "PacketQualityScorecard", "decision-local tail", "reactive delivery plan"]
+blocks = ["Context contribution merge/admission/assembly/quality/tail/reactive plan"]
+priority = "NEXT_CONTRACT_WAVE"
+
+[[family]]
+id = "memory-curation-contracts"
+physical_crate = "eliot-memory-curation-contracts"
+status = "FIELD_CONTRACT_MISSING"
+blocks = ["read-only screening", "classification/relation/episode/concept/procedure/Skill/failure/merge-split/reconsolidation/accessibility/influence handlers", "typed curation dispatch"]
+required_scope = ["existence/support/accessibility/influence dimensions", "CurationItem/CurationCandidate/CurationCandidateSet", "handler registry", "forward revision/rollback/lineage", "no lifecycle execution"]
+priority = "AFTER_CORE_CONTEXT_CONTRACTS"
+
+[[family]]
+id = "learning-contracts-base"
+physical_crate = "eliot-learning-contracts"
+status = "PARTIAL_FIELD_CONTRACT"
+completed = ["System Experience and FailureObservation projection contract"]
+missing = ["CampaignLearningStateView", "AttemptLearningDelta", "CampaignHarnessOverlay", "overlay validation", "activation/adherence assessment", "closure", "promotion input"]
+blocks = ["task-local learning loop", "learning evaluation"]
+priority = "AFTER_W0_CORE_CONTRACTS"
+
+[[family]]
+id = "research-exchange-boundary"
+physical_crate = "eliot-dreamer-contracts"
+status = "DEPENDENT_ON_DREAMER_CONTRACT_FREEZE"
+required_scope = ["ResearchEvidenceBundle", "AllowedReferenceManifest", "exact citation", "counterclaim", "failed acquisition", "frozen coverage denominator", "Researcher/Dreamer/Governor ownership split"]
+priority = "WITH_DREAMER_CONTRACTS"
+
+[[family]]
+id = "diagnosis-planning-external-projections"
+physical_crates = ["eliot-dreamer-diagnosis", "eliot-dreamer-planning", "eliot-dreamer-cycle"]
+status = "EXTERNAL_OWNER_PROJECTIONS_OPEN"
+required_scope = ["maintenance mode projection", "configuration owner/impact projection", "Swarm planning owner projections", "bounded DreamCycle sample snapshot", "no DurableJob/scheduler/route/execution ownership"]
+priority = "AFTER_DREAMER_AND_LEARNING_CONTRACTS"
+
+[closed]
+orders_68_through_75 = "W8 fields frozen; Rust/Edge/Product remain unproven."
+orders_76_through_86 = "W9 fields frozen in the stacked W9 contract wave; Rust/Edge/Product remain unproven."
+
+[next_order]
+families = ["epistemic-contracts", "dreamer-contracts", "cue-contracts", "context-contracts-base", "memory-curation-contracts", "learning-contracts-base"]
+rule = "Freeze contract families first, then release disjoint semantic workers by dependency wave."
