@@ -1,0 +1,46 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+field_contract_is_sole_public_type_authority = true
+order = 16
+cell = "smart.dreamer.packet_assembly"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-orientation"
+primary_property = "Assemble one bounded problem-oriented Orientation packet from the resolved position and candidate rival/relation/probe/clarification outputs without overwriting evidence roles or granting execution/admission."
+field_contract = "crates/smart/eliot-dreamer-contracts/orientation.contract.toml"
+public_function_selectors = ["assemble_orientation_packet"]
+write_scope = [
+  "crates/smart/eliot-dreamer-orientation/src/packet_assembly.rs",
+  "crates/smart/eliot-dreamer-orientation/tests/packet_assembly.rs",
+]
+algorithm = [
+  "validate exact request, Current Epistemic Position, rival set, relation candidates, probe plan, clarifications, scope/task/fence and bounds",
+  "preserve resolved Observed/Supported/Assumption/Rival/Conflict/Stale/Superseded/Unknown roles unchanged",
+  "label all Dreamer interpretation, relation and recommendation material as candidate/model synthesis",
+  "retain strongest objections, counterevidence, source dependence, material unknowns and required inquiries",
+  "include only bounded next probes/clarifications and explicit coverage/omission metadata",
+  "canonicalize sections and compute packet digest without Context admission or task mutation",
+]
+minimum_tests = [
+  "model synthesis cannot populate resolved evidence roles",
+  "lost rival/counterevidence/unknown blocks complete packet",
+  "candidate relation remains candidate",
+  "unsafe/unavailable probe remains non-runnable",
+  "clarification remains unexecuted",
+  "packet contains no Context admission, task mutation, authority, finish or effect receipt",
+  "input permutation is deterministic",
+]
+non_goals = [
+  "epistemic resolution",
+  "Context compilation/admission",
+  "probe or clarification execution",
+  "task/scope/acceptance mutation",
+  "canonical write",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-DRM-01", "ARCH-EPI-01", "ARCH-CTX-01", "ARCH-UND-01", "ARCH-UND-02"]
+implementation_refs = ["I2.20", "I9.5", "I12.11", "I12.13", "I12.18"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than allowing candidate synthesis to overwrite resolved evidence, hiding material gaps, or turning the packet into Context/task/effect admission."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
