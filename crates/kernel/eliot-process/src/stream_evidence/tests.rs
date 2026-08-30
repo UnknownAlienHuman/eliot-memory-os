@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
     fn binding() -> TestResult<ProcessExecutionBinding> {
@@ -73,7 +74,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_preview_and_complete_source_keep_separate_identities() -> TestResult {
+    fn truncated_transport_preview_and_complete_source_keep_separate_identities() -> TestResult {
         let evidence = ProcessStreamEvidence::new_raw(
             binding()?,
             ProcessStreamKind::Stdout,
@@ -133,14 +134,21 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_or_noncanonical_locators_are_rejected() {
+    fn locator_scheme_grammar_and_forbidden_schemes_fail_closed() {
         for locator in [
             "raw:p04-stream:sha256:abc",
             "RAW:p04-stream:sha256:abc",
             "memory:operation-1",
             "MeMoRy:operation-1",
+            "process-memory:operation-1",
+            "process_memory:operation-1",
             " raw:p04-stream:sha256:abc",
             "memory:operation-1 ",
+            ":raw",
+            "1memory:operation-1",
+            "bad scheme:value",
+            "bad_scheme:value",
+            "scheme:",
         ] {
             let result = DurableProcessStreamSource::exact_transport(
                 DurableStreamLocatorKind::ImmutableArtifact,
@@ -150,6 +158,21 @@ mod tests {
                 3,
             );
             assert!(result.is_err(), "locator unexpectedly accepted: {locator:?}");
+        }
+
+        for locator in [
+            "eliot://blob/abc",
+            "artifact+cas:v1",
+            "A.b-c+1:value",
+        ] {
+            let result = DurableProcessStreamSource::exact_transport(
+                DurableStreamLocatorKind::ImmutableArtifact,
+                locator,
+                "receipt:ready",
+                "a".repeat(64),
+                3,
+            );
+            assert!(result.is_ok(), "canonical locator rejected: {locator:?}");
         }
     }
 
@@ -197,10 +220,80 @@ mod tests {
     }
 
     #[test]
-    fn policy_transformed_source_binds_input_output_and_preview_coordinates() -> TestResult {
+    fn shorter_partial_source_is_exact_observed_prefix() -> TestResult {
+        let observed = b"abcdef";
+        let evidence = ProcessStreamEvidence::new_raw(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::PartialSource,
+            sha256_hex(observed),
+            6,
+            ProcessStreamPrefixPreview::from_transport_prefix(observed.to_vec(), 6)?,
+            Some(exact_source(b"abc")?),
+            vec![StreamEvidenceGap::PersistenceFailed],
+        )?;
+        assert_eq!(evidence.source().ok_or("missing source")?.byte_length(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn shorter_partial_source_rejects_mismatched_prefix() -> TestResult {
+        let observed = b"abcdef";
+        let evidence = ProcessStreamEvidence::new_raw(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::PartialSource,
+            sha256_hex(observed),
+            6,
+            ProcessStreamPrefixPreview::from_transport_prefix(observed.to_vec(), 6)?,
+            Some(exact_source(b"xyz")?),
+            vec![StreamEvidenceGap::PersistenceFailed],
+        );
+        assert!(evidence.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn shorter_partial_source_requires_retained_prefix_and_persistence_gap() -> TestResult {
+        let observed = b"abcdef";
+        let missing_prefix = ProcessStreamEvidence::new_raw(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::PartialSource,
+            sha256_hex(observed),
+            6,
+            ProcessStreamPrefixPreview::from_transport_prefix(b"ab".to_vec(), 6)?,
+            Some(exact_source(b"abc")?),
+            vec![StreamEvidenceGap::PersistenceFailed],
+        );
+        assert!(missing_prefix.is_err());
+
+        let no_persistence_gap = ProcessStreamEvidence::new_raw(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::ReadFailed,
+            StreamPersistenceStatus::PartialSource,
+            sha256_hex(observed),
+            6,
+            ProcessStreamPrefixPreview::from_transport_prefix(observed.to_vec(), 6)?,
+            Some(exact_source(b"abc")?),
+            vec![StreamEvidenceGap::TransportReadFailed],
+        );
+        assert!(no_persistence_gap.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn policy_transformed_complete_preview_is_bound_to_source() -> TestResult {
         let input = b"secret=42";
         let output = b"secret=[redacted]";
-        let source = transformed_source(input, output)?;
         let evidence = ProcessStreamEvidence::new_raw(
             binding()?,
             ProcessStreamKind::Stdout,
@@ -210,10 +303,10 @@ mod tests {
             sha256_hex(input),
             usize_to_u64("test.input_length", input.len())?,
             ProcessStreamPrefixPreview::from_source_prefix(
-                output[..6].to_vec(),
+                output.to_vec(),
                 usize_to_u64("test.output_length", output.len())?,
             )?,
-            Some(source),
+            Some(transformed_source(input, output)?),
             Vec::new(),
         )?;
         assert_eq!(
@@ -228,10 +321,68 @@ mod tests {
     }
 
     #[test]
-    fn policy_transformed_source_rejects_raw_transport_preview() -> TestResult {
+    fn policy_transformed_allows_zero_byte_preview() -> TestResult {
         let input = b"secret=42";
         let output = b"secret=[redacted]";
         let evidence = ProcessStreamEvidence::new_raw(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::CompleteSource,
+            sha256_hex(input),
+            usize_to_u64("test.input_length", input.len())?,
+            ProcessStreamPrefixPreview::from_source_prefix(
+                Vec::new(),
+                usize_to_u64("test.output_length", output.len())?,
+            )?,
+            Some(transformed_source(input, output)?),
+            Vec::new(),
+        )?;
+        assert!(evidence.preview().bytes().is_empty());
+        assert!(evidence.preview().is_truncated());
+        Ok(())
+    }
+
+    #[test]
+    fn policy_transformed_rejects_nonempty_truncated_or_raw_preview() -> TestResult {
+        let input = b"secret=42";
+        let output = b"secret=[redacted]";
+        let truncated = ProcessStreamEvidence::new_raw(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::CompleteSource,
+            sha256_hex(input),
+            usize_to_u64("test.input_length", input.len())?,
+            ProcessStreamPrefixPreview::from_source_prefix(
+                output[..6].to_vec(),
+                usize_to_u64("test.output_length", output.len())?,
+            )?,
+            Some(transformed_source(input, output)?),
+            Vec::new(),
+        );
+        assert!(truncated.is_err());
+
+        let raw_mislabeled = ProcessStreamEvidence::new_raw(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::CompleteSource,
+            sha256_hex(input),
+            usize_to_u64("test.input_length", input.len())?,
+            ProcessStreamPrefixPreview::from_source_prefix(
+                input.to_vec(),
+                usize_to_u64("test.output_length", output.len())?,
+            )?,
+            Some(transformed_source(input, output)?),
+            Vec::new(),
+        );
+        assert!(raw_mislabeled.is_err());
+
+        let raw_coordinates = ProcessStreamEvidence::new_raw(
             binding()?,
             ProcessStreamKind::Stdout,
             policy()?,
@@ -246,43 +397,48 @@ mod tests {
             Some(transformed_source(input, output)?),
             Vec::new(),
         );
-        assert!(evidence.is_err());
+        assert!(raw_coordinates.is_err());
         Ok(())
     }
 
     #[test]
-    fn policy_prohibited_source_cannot_retain_inline_bytes() -> TestResult {
+    fn policy_prohibited_and_redaction_failed_withhold_inline_bytes() -> TestResult {
         let input = b"secret=42";
-        let raw_preview = ProcessStreamEvidence::new_raw(
-            binding()?,
-            ProcessStreamKind::Stdout,
-            policy()?,
-            StreamTransportStatus::Complete,
-            StreamPersistenceStatus::SourceUnavailable,
-            sha256_hex(input),
-            usize_to_u64("test.input_length", input.len())?,
-            ProcessStreamPrefixPreview::from_transport_prefix(
-                input.to_vec(),
+        for gap in [
+            StreamEvidenceGap::PolicyProhibited,
+            StreamEvidenceGap::RedactionFailed,
+        ] {
+            let raw_preview = ProcessStreamEvidence::new_raw(
+                binding()?,
+                ProcessStreamKind::Stdout,
+                policy()?,
+                StreamTransportStatus::Complete,
+                StreamPersistenceStatus::SourceUnavailable,
+                sha256_hex(input),
                 usize_to_u64("test.input_length", input.len())?,
-            )?,
-            None,
-            vec![StreamEvidenceGap::PolicyProhibited],
-        );
-        assert!(raw_preview.is_err());
+                ProcessStreamPrefixPreview::from_transport_prefix(
+                    input.to_vec(),
+                    usize_to_u64("test.input_length", input.len())?,
+                )?,
+                None,
+                vec![gap],
+            );
+            assert!(raw_preview.is_err());
 
-        let withheld = ProcessStreamEvidence::new_raw(
-            binding()?,
-            ProcessStreamKind::Stdout,
-            policy()?,
-            StreamTransportStatus::Complete,
-            StreamPersistenceStatus::SourceUnavailable,
-            sha256_hex(input),
-            usize_to_u64("test.input_length", input.len())?,
-            ProcessStreamPrefixPreview::withheld_by_policy(),
-            None,
-            vec![StreamEvidenceGap::PolicyProhibited],
-        )?;
-        assert!(withheld.preview().bytes().is_empty());
+            let withheld = ProcessStreamEvidence::new_raw(
+                binding()?,
+                ProcessStreamKind::Stdout,
+                policy()?,
+                StreamTransportStatus::Complete,
+                StreamPersistenceStatus::SourceUnavailable,
+                sha256_hex(input),
+                usize_to_u64("test.input_length", input.len())?,
+                ProcessStreamPrefixPreview::withheld_by_policy(),
+                None,
+                vec![gap],
+            )?;
+            assert!(withheld.preview().bytes().is_empty());
+        }
         Ok(())
     }
 
@@ -433,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialization_rejects_invalid_process_binding() -> TestResult {
+    fn deserialization_rejects_invalid_binding_or_authority_promotion() -> TestResult {
         let evidence = ProcessStreamEvidence::new_raw(
             binding()?,
             ProcessStreamKind::Stdout,
@@ -446,30 +602,15 @@ mod tests {
             Some(exact_source(b"abc")?),
             Vec::new(),
         )?;
-        let mut value = serde_json::to_value(evidence)?;
-        value["binding"]["authority_epoch"] = serde_json::json!(8);
-        assert!(serde_json::from_value::<ProcessStreamEvidence>(value).is_err());
-        Ok(())
-    }
 
-    #[test]
-    fn deserialization_rejects_parser_or_evaluator_promotion() -> TestResult {
-        let evidence = ProcessStreamEvidence::new_raw(
-            binding()?,
-            ProcessStreamKind::Stdout,
-            policy()?,
-            StreamTransportStatus::Complete,
-            StreamPersistenceStatus::CompleteSource,
-            sha256_hex(b"abc"),
-            3,
-            ProcessStreamPrefixPreview::from_transport_prefix(b"abc".to_vec(), 3)?,
-            Some(exact_source(b"abc")?),
-            Vec::new(),
-        )?;
-        let mut value = serde_json::to_value(evidence)?;
-        value["parsing"] = serde_json::json!("PARSED");
-        value["evaluation"] = serde_json::json!("PASS");
-        assert!(serde_json::from_value::<ProcessStreamEvidence>(value).is_err());
+        let mut invalid_binding = serde_json::to_value(&evidence)?;
+        invalid_binding["binding"]["authority_epoch"] = serde_json::json!(8);
+        assert!(serde_json::from_value::<ProcessStreamEvidence>(invalid_binding).is_err());
+
+        let mut promoted = serde_json::to_value(evidence)?;
+        promoted["parsing"] = serde_json::json!("PARSED");
+        promoted["evaluation"] = serde_json::json!("PASS");
+        assert!(serde_json::from_value::<ProcessStreamEvidence>(promoted).is_err());
         Ok(())
     }
 }

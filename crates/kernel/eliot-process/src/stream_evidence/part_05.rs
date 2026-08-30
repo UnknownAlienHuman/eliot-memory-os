@@ -95,6 +95,13 @@ const TRANSPORT_GAPS: [StreamEvidenceGap; 4] = [
     StreamEvidenceGap::UnknownOutcome,
 ];
 
+const PARTIAL_PERSISTENCE_GAPS: [StreamEvidenceGap; 4] = [
+    StreamEvidenceGap::PersistenceUnavailable,
+    StreamEvidenceGap::PersistenceBackpressure,
+    StreamEvidenceGap::PersistenceFailed,
+    StreamEvidenceGap::PersistenceUnknownOutcome,
+];
+
 const SOURCE_UNAVAILABLE_GAPS: [StreamEvidenceGap; 7] = [
     StreamEvidenceGap::PolicyProhibited,
     StreamEvidenceGap::PersistenceUnavailable,
@@ -139,6 +146,16 @@ fn usize_to_u64(
     })
 }
 
+fn u64_to_usize(
+    field: &'static str,
+    value: u64,
+) -> Result<usize, ProcessStreamEvidenceError> {
+    usize::try_from(value).map_err(|_| ProcessStreamEvidenceError::Invariant {
+        field,
+        reason: "length does not fit usize",
+    })
+}
+
 fn validate_reference(
     field: &'static str,
     value: &str,
@@ -155,11 +172,23 @@ fn validate_reference(
 
 fn validate_locator(value: &str) -> Result<(), ProcessStreamEvidenceError> {
     validate_reference("source.locator", value)?;
-    let (scheme, _) = value
+    let (scheme, remainder) = value
         .split_once(':')
         .ok_or(ProcessStreamEvidenceError::InvalidReference {
             field: "source.locator",
         })?;
+    let bytes = scheme.as_bytes();
+    if bytes.is_empty()
+        || !bytes[0].is_ascii_alphabetic()
+        || !bytes[1..].iter().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'-' | b'.')
+        })
+        || remainder.is_empty()
+    {
+        return Err(ProcessStreamEvidenceError::InvalidReference {
+            field: "source.locator",
+        });
+    }
     let scheme = scheme.to_ascii_lowercase();
     if matches!(
         scheme.as_str(),

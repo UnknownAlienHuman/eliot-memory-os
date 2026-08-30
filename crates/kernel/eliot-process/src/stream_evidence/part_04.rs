@@ -155,21 +155,22 @@ impl ProcessStreamEvidence {
         &self,
         gaps: &BTreeSet<StreamEvidenceGap>,
     ) -> Result<(), ProcessStreamEvidenceError> {
-        let policy_prohibited = gaps.contains(&StreamEvidenceGap::PolicyProhibited);
-        if policy_prohibited {
+        let source_bytes_withheld = gaps.contains(&StreamEvidenceGap::PolicyProhibited)
+            || gaps.contains(&StreamEvidenceGap::RedactionFailed);
+        if source_bytes_withheld {
             if self.persistence != StreamPersistenceStatus::SourceUnavailable
                 || self.source.is_some()
                 || self.preview.representation != StreamPreviewRepresentation::WithheldByPolicy
             {
                 return Err(ProcessStreamEvidenceError::Invariant {
-                    field: "policy_prohibited",
-                    reason: "policy-prohibited evidence cannot retain inline or durable source bytes",
+                    field: "withheld_source",
+                    reason: "prohibited or failed-redaction evidence cannot retain inline or durable source bytes",
                 });
             }
         } else if self.preview.representation == StreamPreviewRepresentation::WithheldByPolicy {
             return Err(ProcessStreamEvidenceError::Invariant {
                 field: "preview.representation",
-                reason: "policy-withheld preview requires POLICY_PROHIBITED",
+                reason: "withheld preview requires POLICY_PROHIBITED or REDACTION_FAILED",
             });
         }
 
@@ -205,6 +206,12 @@ impl ProcessStreamEvidence {
                     return Err(ProcessStreamEvidenceError::Invariant {
                         field: "preview.represented_bytes",
                         reason: "source preview length must match durable source identity",
+                    });
+                }
+                if self.preview.retained_bytes != 0 && self.preview.is_truncated() {
+                    return Err(ProcessStreamEvidenceError::Invariant {
+                        field: "preview",
+                        reason: "non-empty transformed preview must contain the complete durable source",
                     });
                 }
                 if !self.preview.is_truncated() && self.preview.sha256 != source.sha256 {
@@ -309,22 +316,46 @@ impl ProcessStreamEvidence {
                                 reason: "exact durable bytes cannot exceed observed transport bytes",
                             });
                         }
-                        if source.byte_length == self.observed_bytes
-                            && source.sha256 != self.observed_sha256
-                        {
-                            return Err(ProcessStreamEvidenceError::Invariant {
-                                field: "source.sha256",
-                                reason: "full-length exact source must match observed transport identity",
-                            });
-                        }
-                        if self.transport == StreamTransportStatus::Complete
-                            && source.byte_length == self.observed_bytes
-                            && source.sha256 == self.observed_sha256
-                        {
-                            return Err(ProcessStreamEvidenceError::Invariant {
-                                field: "persistence",
-                                reason: "full durable EOF coverage must be COMPLETE_SOURCE",
-                            });
+                        if source.byte_length == self.observed_bytes {
+                            if source.sha256 != self.observed_sha256 {
+                                return Err(ProcessStreamEvidenceError::Invariant {
+                                    field: "source.sha256",
+                                    reason: "full-length exact source must match observed transport identity",
+                                });
+                            }
+                            if self.transport == StreamTransportStatus::Complete {
+                                return Err(ProcessStreamEvidenceError::Invariant {
+                                    field: "persistence",
+                                    reason: "full durable EOF coverage must be COMPLETE_SOURCE",
+                                });
+                            }
+                        } else {
+                            if !PARTIAL_PERSISTENCE_GAPS
+                                .iter()
+                                .any(|gap| gaps.contains(gap))
+                            {
+                                return Err(ProcessStreamEvidenceError::Invariant {
+                                    field: "gaps",
+                                    reason: "shorter exact source requires a persistence coverage gap",
+                                });
+                            }
+                            if self.preview.representation
+                                != StreamPreviewRepresentation::TransportBytes
+                                || self.preview.retained_bytes < source.byte_length
+                            {
+                                return Err(ProcessStreamEvidenceError::Invariant {
+                                    field: "source",
+                                    reason: "shorter exact source prefix is unavailable for validation",
+                                });
+                            }
+                            let prefix_length =
+                                u64_to_usize("source.byte_length", source.byte_length)?;
+                            if sha256_hex(&self.preview.bytes[..prefix_length]) != source.sha256 {
+                                return Err(ProcessStreamEvidenceError::Invariant {
+                                    field: "source.sha256",
+                                    reason: "shorter exact source must match the observed transport prefix",
+                                });
+                            }
                         }
                     }
                     DurableStreamRepresentation::PolicyTransformed => {
