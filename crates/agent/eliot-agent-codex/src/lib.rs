@@ -28,7 +28,7 @@ use thiserror::Error;
 pub const CODEX_ADAPTER_ID: &str = "eliot-agent-codex";
 pub const CODEX_HOST_FAMILY: &str = "codex";
 pub const CODEX_PROTOCOL_TRANSPORT: &str = "app-server+stdio/jsonl";
-pub const CODEX_WIRE_SCHEMA_VERSION: &str = "codex-app-server-jsonl/v1";
+pub const CODEX_WIRE_SCHEMA_VERSION: &str = "codex-app-server-stable-jsonl/v2";
 pub const CODEX_ROUTE_CLASS: &str = "codex-app-server";
 pub const MAX_JSONL_LINE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_EVENT_BYTES: usize = 256 * 1024;
@@ -392,18 +392,16 @@ pub fn begin_attempt(
 #[serde(deny_unknown_fields)]
 pub struct CodexWireMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jsonrpc: Option<String>,
-    #[serde(default)]
     pub id: Option<Value>,
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub message_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<Value>,
 }
 
@@ -425,7 +423,6 @@ impl CodexWireMessage {
 
     pub fn request(id: impl Into<String>, method: impl Into<String>, params: Value) -> Self {
         Self {
-            jsonrpc: Some("2.0".into()),
             id: Some(Value::String(id.into())),
             message_type: None,
             method: Some(method.into()),
@@ -435,7 +432,19 @@ impl CodexWireMessage {
         }
     }
 
-    /// App Server handshake request with only protocol-owned fields.
+    pub fn notification(method: impl Into<String>, params: Option<Value>) -> Self {
+        Self {
+            id: None,
+            message_type: None,
+            method: Some(method.into()),
+            params,
+            result: None,
+            error: None,
+        }
+    }
+
+    /// Stable App Server initialize request. The provider wire deliberately
+    /// omits both a JSON-RPC version header and any ELIOT-internal protocol ID.
     pub fn initialize(
         id: impl Into<String>,
         client_name: impl Into<String>,
@@ -445,10 +454,38 @@ impl CodexWireMessage {
             id,
             "initialize",
             serde_json::json!({
-                "protocolVersion": CODEX_WIRE_SCHEMA_VERSION,
-                "clientInfo": {"name": client_name.into(), "version": client_version.into()}
+                "clientInfo": {"name": client_name.into(), "version": client_version.into()},
+                "capabilities": {"experimentalApi": false}
             }),
         )
+    }
+
+    /// Required lifecycle notification after a successful initialize response.
+    pub fn initialized() -> Self {
+        Self::notification("initialized", None)
+    }
+
+    /// Zero-model current-account catalogue request.
+    pub fn model_list(
+        id: impl Into<String>,
+        cursor: Option<&str>,
+        include_hidden: bool,
+        limit: Option<u32>,
+    ) -> Self {
+        let mut params = Map::new();
+        if let Some(cursor) = cursor {
+            params.insert("cursor".into(), Value::String(cursor.to_owned()));
+        }
+        params.insert("includeHidden".into(), Value::Bool(include_hidden));
+        if let Some(limit) = limit {
+            params.insert("limit".into(), Value::from(limit));
+        }
+        Self::request(id, "model/list", Value::Object(params))
+    }
+
+    /// Zero-model account quota observation request.
+    pub fn account_rate_limits(id: impl Into<String>) -> Self {
+        Self::request(id, "account/rateLimits/read", Value::Object(Map::new()))
     }
 
     pub fn thread_start(id: impl Into<String>, cwd: impl Into<String>) -> Self {
@@ -1021,6 +1058,50 @@ mod tests {
         assert_eq!(wire_schema()["schema_version"], CODEX_WIRE_SCHEMA_VERSION);
         let message = CodexWireMessage::parse_line(br#"{"id":"1","result":{"ok":true}}"#)?;
         assert!(correlate_response(&message, "1").is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn stable_wire_omits_legacy_headers_and_exposes_zero_model_requests() -> TestResult {
+        let initialize = serde_json::to_value(CodexWireMessage::initialize(
+            "initialize-1",
+            "eliot",
+            "0.1.0",
+        ))?;
+        assert_eq!(initialize["method"], "initialize");
+        assert!(initialize.get("jsonrpc").is_none());
+        assert!(initialize.get("result").is_none());
+        assert!(initialize["params"].get("protocolVersion").is_none());
+        assert_eq!(
+            initialize["params"]["capabilities"]["experimentalApi"],
+            false
+        );
+
+        let initialized = serde_json::to_value(CodexWireMessage::initialized())?;
+        assert_eq!(initialized["method"], "initialized");
+        assert!(initialized.get("id").is_none());
+        assert!(initialized.get("params").is_none());
+        assert!(initialized.get("jsonrpc").is_none());
+
+        let model_list = serde_json::to_value(CodexWireMessage::model_list(
+            "models-1",
+            Some("cursor-1"),
+            true,
+            Some(64),
+        ))?;
+        assert_eq!(model_list["method"], "model/list");
+        assert_eq!(model_list["params"]["cursor"], "cursor-1");
+        assert_eq!(model_list["params"]["includeHidden"], true);
+        assert_eq!(model_list["params"]["limit"], 64);
+
+        let quota = serde_json::to_value(CodexWireMessage::account_rate_limits("quota-1"))?;
+        assert_eq!(quota["method"], "account/rateLimits/read");
+        assert!(quota.get("jsonrpc").is_none());
+
+        assert!(
+            CodexWireMessage::parse_line(br#"{"jsonrpc":"2.0","id":"legacy","result":{}}"#)
+                .is_err()
+        );
         Ok(())
     }
 
