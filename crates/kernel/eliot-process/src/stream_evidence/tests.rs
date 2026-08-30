@@ -309,6 +309,10 @@ mod tests {
             )?;
 
             if let Some(expected_gap) = expected {
+                let mut valid_gaps = vec![expected_gap];
+                if status != StreamTransportStatus::CaptureUnavailable {
+                    valid_gaps.push(StreamEvidenceGap::PersistenceUnavailable);
+                }
                 let valid = ProcessStreamEvidence::new_raw(
                     binding()?,
                     ProcessStreamKind::Stdout,
@@ -319,7 +323,7 @@ mod tests {
                     observed_len,
                     preview.clone(),
                     None,
-                    vec![expected_gap],
+                    valid_gaps,
                 );
                 assert!(valid.is_ok(), "expected transport gap rejected for {status:?}");
             }
