@@ -1,0 +1,86 @@
+{
+  "schema_version": "eliot.codex-app-server-preflight.v1",
+  "program": "codex",
+  "argv": [
+    "app-server",
+    "--listen",
+    "stdio://"
+  ],
+  "transport": "stdio_jsonl",
+  "requests": [
+    {
+      "kind": "request",
+      "id": 1,
+      "method": "initialize",
+      "params": {
+        "clientInfo": {
+          "name": "eliot",
+          "title": "ELIOT Memory OS",
+          "version": "0.1.0"
+        },
+        "capabilities": {
+          "experimentalApi": false
+        }
+      }
+    },
+    {
+      "kind": "notification",
+      "method": "initialized",
+      "params": {}
+    },
+    {
+      "kind": "request",
+      "id": 2,
+      "method": "model/list",
+      "params": {
+        "cursor": null,
+        "limit": 100
+      }
+    }
+  ],
+  "forbidden_methods": [
+    "thread/start",
+    "thread/resume",
+    "thread/fork",
+    "turn/start",
+    "turn/interrupt",
+    "collaboration/start",
+    "collaboration/spawn"
+  ],
+  "forbidden_wire_fields": [
+    "jsonrpc",
+    "protocolVersion"
+  ],
+  "environment_allowlist": [
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "HOME",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "TEMP",
+    "TMP",
+    "LANG",
+    "LC_ALL",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY"
+  ],
+  "bounds": {
+    "operation_timeout_ms": 15000,
+    "version_timeout_ms": 5000,
+    "max_line_bytes": 1048576,
+    "max_total_stdout_bytes": 8388608,
+    "max_stderr_bytes": 65536,
+    "max_catalogue_pages": 32,
+    "max_models": 4096
+  },
+  "model_execution_allowed": false,
+  "experimental_api_allowed": false,
+  "fixed_model_id": null,
+  "receipt_schema": "eliot.codex-app-server-preflight-receipt.v1",
+  "proof_ceiling": "ZERO_MODEL_DIAGNOSTIC_PREFLIGHT_ONLY"
+}
