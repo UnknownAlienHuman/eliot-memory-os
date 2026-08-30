@@ -1,0 +1,128 @@
+schema_version = 1
+contract_id = "smart.dreamer.negative-memory-extinction.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-dreamer-memory-revision"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.dreamer.negative_memory_extinction"]
+architecture_refs = ["ARCH-MEM-02", "ARCH-MEM-04", "ARCH-RES-05", "ARCH-EPI-04", "ARCH-SCOPE-01"]
+implementation_refs = ["I12.19", "I12.21", "I13.11", "I2.20"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Produce a reversible candidate for negative-memory activation/influence revision from exact scoped re-exposure evidence while preserving the original failure history and support ceiling."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((exposures + rivals + trigger components) log n) over request-bounded immutable evidence; no model, tool, store write, lifecycle transition or policy mutation."
+replacement_boundary = "Replace candidate derivation behind this contract; Governor remains owner of admission, activation/influence transition and rollback execution."
+
+[closed_sets]
+trigger_match_classes = ["ExactDeterministic", "SemanticNearMatch", "NoMatch", "Unknown"]
+reexposure_outcomes = ["Safe", "Unsafe", "Mixed", "Unknown"]
+extinction_dispositions = ["KeepBlock", "RequireProbe", "NarrowTrigger", "Reopen", "ExtinguishActivation", "NoChange"]
+revision_effect_ceiling = ["ActivationOnly", "PermittedInfluenceOnly", "ActivationAndInfluence"]
+
+[hard_invariants]
+semantic_similarity_never_creates_or_preserves_a_hard_block = true
+exact_trigger_identity_is_preserved_separately = true
+original_failure_episode_and_support_history_are_immutable = true
+one_successful_exposure_never_proves_universal_safety = true
+environment_generation_and_scope_are_exact = true
+candidate_changes_activation_or_permitted_influence_only = true
+candidate_cannot_apply_or_promote_itself = true
+rollback_and_reopen_conditions_are_mandatory = true
+insufficient_or_dependent_evidence_yields_probe_or_no_change = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "FailureFingerprint"
+owner = "eliot-dreamer-contracts"
+
+[[external_type]]
+name = "OutcomeAttribution"
+owner = "eliot-learning-contracts"
+
+[[public_type]]
+name = "TriggerMatchClass"
+kind = "enum"
+definition = ["ExactDeterministic", "SemanticNearMatch", "NoMatch", "Unknown"]
+
+[[public_type]]
+name = "SafeReexposureOutcome"
+kind = "enum"
+definition = ["Safe", "Unsafe", "Mixed", "Unknown"]
+
+[[public_type]]
+name = "ExtinctionDisposition"
+kind = "enum"
+definition = ["KeepBlock", "RequireProbe", "NarrowTrigger", "Reopen", "ExtinguishActivation", "NoChange"]
+invariants = ["disposition is advisory candidate state only", "KeepBlock requires exact current deterministic trigger evidence", "semantic near-match can yield warning/probe but not KeepBlock"]
+
+[[public_type]]
+name = "RevisionEffectCeiling"
+kind = "enum"
+definition = ["ActivationOnly", "PermittedInfluenceOnly", "ActivationAndInfluence"]
+
+[[public_type]]
+name = "NegativeMemoryExtinctionRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "fingerprint_handle: ArtifactId", "fingerprint_revision: String", "scope_id: String", "task_family: String", "task_id: Option<TaskId>", "environment_generation: String", "state_fence: StateFence", "expected_exposure_count: Option<u32>", "expected_exposure_handles: Vec<ArtifactId>", "maximum_exposures: u32", "maximum_rivals: u32", "request_sha256: String"]
+invariants = ["fingerprint/scope/environment/fence exact", "bounds non-zero", "Complete evidence claim requires expected count", "request grants no transition authority"]
+
+[[public_type]]
+name = "SafeReexposureEvidence"
+kind = "struct"
+definition = ["exposure_id: ArtifactId", "fingerprint_handle: ArtifactId", "scope_id: String", "task_family: String", "environment_generation: String", "trigger_match: TriggerMatchClass", "exact_trigger_components: Vec<String>", "semantic_near_match_cues: Vec<String>", "action_handle: ArtifactId", "outcome: SafeReexposureOutcome", "outcome_attribution: OutcomeAttribution", "verifier_handles: Vec<ArtifactId>", "effect_receipt_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "confounders: Vec<String>", "state_fence: StateFence"]
+invariants = ["exact components and semantic cues remain distinct", "known outcome requires verifier/effect evidence", "scope/environment/fence match request", "evidence carries no block or lifecycle decision"]
+
+[[public_type]]
+name = "TriggerBoundaryRevision"
+kind = "struct"
+definition = ["previous_exact_components: Vec<String>", "candidate_exact_components: Vec<String>", "removed_components: Vec<String>", "added_components: Vec<String>", "semantic_warning_cues: Vec<String>", "scope_id: String", "environment_generation: String", "evidence_handles: Vec<ArtifactId>"]
+invariants = ["previous boundary retained", "candidate exact components non-empty for NarrowTrigger/KeepBlock", "semantic warning cues never become exact components automatically"]
+
+[[public_type]]
+name = "NegativeMemoryExtinctionCandidate"
+kind = "struct"
+definition = ["candidate_id: ArtifactId", "request_sha256: String", "fingerprint_handle: ArtifactId", "fingerprint_revision: String", "scope_id: String", "environment_generation: String", "state_fence: StateFence", "disposition: ExtinctionDisposition", "effect_ceiling: RevisionEffectCeiling", "trigger_boundary_revision: Option<TriggerBoundaryRevision>", "evidence_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "rival_hypotheses: Vec<String>", "next_discriminator: String", "required_authority_ref: String", "rollback_ref: String", "reopen_conditions: Vec<String>", "expiry_or_review_ref: String", "candidate_sha256: String"]
+invariants = ["candidate is not a transition receipt", "required authority, rollback, discriminator and review refs non-blank", "original failure/support history unchanged", "canonical order and digest"]
+
+[[public_function]]
+name = "build_negative_memory_extinction_candidate"
+signature = "pub fn build_negative_memory_extinction_candidate(request: &NegativeMemoryExtinctionRequest, fingerprint: &FailureFingerprint, evidence: &[SafeReexposureEvidence]) -> Result<NegativeMemoryExtinctionCandidate, NegativeMemoryExtinctionError>"
+
+[[negative_test]]
+id = "near-match-cannot-hard-block"
+property = "SemanticNearMatch alone cannot yield KeepBlock or populate exact trigger components."
+
+[[negative_test]]
+id = "single-success-not-universal"
+property = "One safe exposure cannot yield broad ExtinguishActivation outside its exact scope/environment."
+
+[[negative_test]]
+id = "history-preserved"
+property = "Candidate contains no field capable of deleting or rewriting the source failure episode/support history."
+
+[[negative_test]]
+id = "candidate-not-receipt"
+property = "Output has no applied transition, authority grant, lifecycle action or execution receipt."
