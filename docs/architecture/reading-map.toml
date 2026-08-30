@@ -1,0 +1,376 @@
+schema_version = "eliot-doc-router-v1"
+
+# Applied to every implementation route. This is intentionally small: purpose,
+# hard boundaries, and the distinction between target claims and current proof.
+[base]
+required = [
+  "A0.1",
+  "A0.3",
+  "I0.3..I0.5",
+]
+optional = [
+  "A0.4",
+  "I0.13",
+]
+
+[[route]]
+id = "documentation-governance"
+description = "Normative pair, repository instructions, documentation structure, links, and policy surfaces."
+priority = 100
+paths = [
+  "docs/**",
+  ".github/**",
+  "AGENTS.md",
+  "WORKFLOW.md",
+  "README.md",
+  "scripts/docs_router.py",
+  "scripts/check_docs_links.py",
+  "tests/test_docs_router.py",
+  "tests/test_docs_links.py",
+]
+tasks = ["documentation", "architecture", "normative", "doc-routing", "doc-links"]
+required = [
+  "A0",
+  "I0.14",
+  "I16",
+  "I19..I20",
+]
+optional = [
+  "A1",
+  "A16.3",
+  "I17",
+]
+
+[[route]]
+id = "kernel-and-recovery"
+description = "Host, Kernel, fencing, ORS, supervision, recovery, and canonical transition ownership."
+priority = 95
+paths = [
+  "bins/eliot-host/**",
+  "bins/eliot-kernel/**",
+  "bins/eliot-watchdog/**",
+  "crates/kernel/**",
+  "crates/platform/**",
+]
+tasks = ["host", "kernel", "watchdog", "recovery", "fencing", "ors"]
+required = [
+  "A2.2..A2.3",
+  "A12.2",
+  "A13.2..A13.12",
+  "I1",
+  "I2.3..I2.5",
+  "I5.5..I5.23",
+  "I14..I16",
+]
+optional = [
+  "A8",
+  "I8",
+  "I17..I18",
+]
+
+[[route]]
+id = "canonical-storage"
+description = "Canonical store, write path, BlobStore, projections, durability, backup, and migration."
+priority = 95
+paths = [
+  "bins/eliot-store-*/**",
+  "crates/storage/**",
+  "crates/**/*store*/**",
+  "crates/**/*blob*/**",
+]
+tasks = ["storage", "store", "surrealdb", "blobstore", "persistence", "backup", "restore"]
+required = [
+  "A4",
+  "A12.3",
+  "A12.8",
+  "A13.6..A13.9",
+  "I5",
+]
+optional = [
+  "I6",
+  "I16",
+  "I19..I20",
+]
+
+[[route]]
+id = "agent-runtime-and-swarm"
+description = "Agent Coordinator, external runtimes, delegation, swarm, route identity, and effect ownership."
+priority = 95
+paths = [
+  "bins/eliot-agent-*/**",
+  "bins/eliot-native-worker/**",
+  "crates/agents/**",
+  "crates/**/*agent*/**",
+  "integrations/**",
+  "skills/**",
+]
+tasks = ["agent", "runtime", "swarm", "codex", "claude", "opencode", "antigravity", "mcp"]
+required = [
+  "A10",
+  "A12",
+  "I3",
+  "I7",
+  "I10.15..I10.18",
+  "I13..I14",
+  "I16",
+  "I18.16..I18.17",
+]
+optional = [
+  "I2.17",
+  "I10",
+  "I17..I18",
+]
+
+[[route]]
+id = "research-and-provider-federation"
+description = "Inquiry, local search provider, ELIOT Research federation, evidence bundles, and research debt."
+priority = 96
+paths = [
+  "crates/**/*research*/**",
+  "crates/**/*search*/**",
+  "bins/**/*research*/**",
+  "bins/**/*search*/**",
+  "integrations/**/*research*/**",
+  "integrations/**/*search*/**",
+]
+tasks = ["research", "inquiry", "search-provider", "research-federation"]
+required = [
+  "A5..A6",
+  "A12",
+  "A14",
+  "I21",
+]
+optional = [
+  "I9",
+  "I12..I13",
+  "I16..I18",
+]
+
+[[route]]
+id = "memory-context-and-dreamer"
+description = "Canonical memory consumers, context, cues, understanding, graphs, Dreamer, and cognitive inheritance."
+priority = 95
+paths = [
+  "bins/eliot-dreamer/**",
+  "crates/**/*memory*/**",
+  "crates/**/*context*/**",
+  "crates/**/*dream*/**",
+  "crates/**/*cognit*/**",
+  "crates/**/*graph*/**",
+  "crates/eliot-engine/**",
+]
+tasks = ["memory", "context", "dreamer", "understanding", "cognition", "graph", "causality"]
+required = [
+  "A4..A7",
+  "A9",
+  "A14.1..A14.4",
+  "I9",
+  "I12..I13",
+  "I16",
+]
+optional = [
+  "A5.5",
+  "I6.16",
+  "I10",
+  "I17..I18",
+]
+
+[[route]]
+id = "instrument-and-verification"
+description = "Deterministic instruments, tests, evidence, code understanding, proof, and strict finish."
+priority = 90
+paths = [
+  "scripts/**",
+  "tests/**",
+  "xtask/**",
+  "crates/**/*instrument*/**",
+  "crates/**/*evidence*/**",
+  "crates/**/*verif*/**",
+  "crates/**/*code*cortex*/**",
+]
+tasks = ["instrument", "verification", "testing", "evidence", "proof", "code-understanding"]
+required = [
+  "A5.5",
+  "A10.8",
+  "A14.6..A14.8",
+  "I2.10..I2.23",
+  "I2.25",
+  "I10.8..I10.10",
+  "I12.9..I12.10",
+  "I16.17",
+  "I17..I18",
+]
+optional = [
+  "I7.9",
+  "I7.27",
+]
+
+[[route]]
+id = "human-surfaces"
+description = "CLI, UI, operator, notification, user broker, configuration, and human control surfaces."
+priority = 85
+paths = [
+  "apps/**",
+  "crates/surfaces/**",
+  "bins/eliot-cli/**",
+  "bins/eliot-ui/**",
+  "bins/eliot-user-broker/**",
+  "bins/eliot-notify/**",
+]
+tasks = ["cli", "ui", "operator", "surface", "notification", "human-control"]
+required = [
+  "A11",
+  "I3",
+  "I11",
+  "I13..I14",
+]
+optional = [
+  "A7",
+  "I7",
+  "I10",
+]
+
+[[route]]
+id = "security-privacy-authority"
+description = "Authority, secrets, provenance, influence, privacy, credentials, and cryptography."
+priority = 90
+paths = [
+  "config/**",
+  "crates/**/*security*/**",
+  "crates/**/*crypto*/**",
+  "crates/**/*authority*/**",
+  "crates/**/*secret*/**",
+  "crates/**/*provenance*/**",
+]
+tasks = ["security", "privacy", "authority", "crypto", "secrets", "provenance"]
+required = [
+  "A12",
+  "I6.10",
+  "I6.15",
+  "I8",
+  "I15",
+]
+optional = [
+  "A2",
+  "I1.8",
+  "I5.26",
+]
+
+[[route]]
+id = "release-migration-and-installation"
+description = "Build/release packaging, installation, compatibility, migration, rollback, and delivery slices."
+priority = 90
+paths = [
+  "packaging/**",
+  "install/**",
+  "release/**",
+  "scripts/build-*/**",
+  "scripts/build-*",
+  "scripts/finalize-*",
+  "scripts/invoke-*production*",
+  ".github/workflows/source-candidate.yml",
+]
+tasks = ["release", "migration", "installation", "packaging", "deployment", "rollback"]
+required = [
+  "A11",
+  "A13",
+  "I0.8..I0.9",
+  "I15..I16",
+  "I18..I20",
+]
+optional = [
+  "I17",
+]
+
+[[route]]
+id = "workspace-and-dependencies"
+description = "Workspace topology, crates, dependencies, build graph, and cross-cutting source policy."
+priority = 80
+paths = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "deny.toml",
+  ".gitattributes",
+  ".gitignore",
+  ".typos.toml",
+  "Justfile",
+  "config/**",
+]
+tasks = ["workspace", "dependency", "build-graph", "repository-policy"]
+required = [
+  "A2.3",
+  "A14.8",
+  "I2",
+  "I15",
+  "I17..I18",
+]
+optional = [
+  "I6",
+]
+
+[[route]]
+id = "generic-capability-cell"
+description = "Fallback for an ordinary source capability with one owner, contract, proof surface, and affected edges."
+priority = 10
+paths = [
+  "bins/**",
+  "crates/**",
+  "apps/**",
+]
+tasks = ["module", "crate", "capability-cell"]
+required = [
+  "A2.3",
+  "A10.4",
+  "A14.8",
+  "I2.1..I2.25",
+  "I6.4..I6.5",
+  "I7.1..I7.5",
+  "I10",
+  "I14.14",
+  "I18",
+]
+optional = [
+  "I17",
+]
+
+[[route]]
+id = "professional-and-multimodal"
+description = "Professional workflows, multimodal capture, and specialized contract surfaces."
+priority = 85
+paths = [
+  "crates/**/*media*/**",
+  "crates/**/*multimodal*/**",
+  "crates/**/*professional*/**",
+]
+tasks = ["professional", "multimodal", "media"]
+required = [
+  "A3",
+  "I4",
+  "I10.13",
+  "I10.20..I10.22",
+  "I12.35",
+  "I18.47",
+]
+optional = [
+  "A7",
+  "I17",
+]
+
+[[route]]
+id = "cross-cutting-fallback"
+description = "Explicit fail-safe fallback when a path/task is not yet mapped; never selected silently."
+priority = 0
+paths = []
+tasks = ["cross-cutting-fallback"]
+required = [
+  "A0..A2",
+  "A10",
+  "A12..A14",
+  "I0..I3",
+  "I5..I7",
+  "I10",
+  "I14..I18",
+]
+optional = [
+  "I19..I20",
+]
