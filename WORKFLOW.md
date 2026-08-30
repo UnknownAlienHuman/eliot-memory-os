@@ -11,6 +11,8 @@ Canonical navigation:
 
 - Architecture authority: `docs/ARCHITECTURE_CONTRACT.md`;
 - exact pair identity: `docs/normative-pair.toml`;
+- mandatory scoped documentation route: `docs/architecture/AGENT_READING.md`;
+- human topic index: `docs/architecture/INDEX.md`;
 - product/source map: `docs/PROJECT_MAP.md`;
 - documentation map: `docs/README.md`;
 - active programmes: `workstreams/ACTIVE.toml`;
@@ -22,9 +24,12 @@ Canonical navigation:
 open issue with owner, causal property, scope, proof, and non-goals
 → fetch/prune and fast-forward main only
 → create a fresh issue-numbered branch from exact origin/main
+→ route every planned mutable path and task through scripts/docs_router.py
+→ read every required source slice and capture the reading receipt identity
 → claim one mutable path scope
-→ implement and run Module/Edge/Product proof as applicable
-→ open PR to main
+→ implement; reroute before continuing whenever the scope expands
+→ run Module/Edge/Product proof as applicable
+→ open PR to main with the current documentation receipt fields
 → integrate by squash after current-main and proof checks
 → close issue and retire the branch
 ```
@@ -36,8 +41,6 @@ Normal branch form:
 ```
 
 Allowed kinds: `work`, `fix`, `docs`, `chore`, `refactor`, `test`.
-Provider-generated names, random adjective names, personal namespaces, and dated
-campaign branches are not accepted for new work.
 
 ## Branch validity
 
@@ -66,6 +69,26 @@ or PR. Two agents may read the same files, but they do not mutate the same scope
 concurrently. Contract changes land before dependent implementation waves, and
 the integration owner revalidates consumers after the contract change.
 
+## Documentation routing and evidence
+
+The accepted books remain at their stable canonical paths. Before the first
+edit, run `scripts/docs_router.py route` with every planned mutable path and the
+closest task profile, then read every required byte-exact slice. The route fails
+closed on an unmapped path/task. If scope expands, reroute and read the newly
+added slices before continuing.
+
+The generated receipt is local evidence, not repository authority. Do not commit
+`.eliot/reading/**` or `.eliot-docs/**`. Put these fields in the issue/PR instead:
+
+```text
+normative pair key
+reading-map SHA-256
+matched routes
+required selectors read
+reading receipt SHA-256
+whether scope expanded after the initial route
+```
+
 ## Documentation and evidence placement
 
 Keep in Git:
@@ -83,7 +106,8 @@ Do not keep in the active tree:
 - donor research packages or reverse-engineering dumps;
 - copies of documentation owned by Eliot Search or Eliot Research;
 - swarm conversations/results;
-- local databases, code-graph snapshots, runtime state, or credentials.
+- local databases, code-graph snapshots, runtime state, or credentials;
+- generated documentation slices or reading receipts.
 
 Investigation findings belong in the owning issue/PR. Large generated evidence
 belongs in CI artifacts or an external content-addressed store. Retired content
@@ -97,6 +121,8 @@ A PR states:
 - owning issue/workstream;
 - exact base and candidate revisions;
 - changed causal property and path scope;
+- normative pair key, reading-map SHA-256, matched routes, required selectors,
+  receipt SHA-256, and whether rerouting was required;
 - proof executed and proof ceiling;
 - affected edges and Product Pulse, or why they are not applicable;
 - migration/rollback/removal consequences;
