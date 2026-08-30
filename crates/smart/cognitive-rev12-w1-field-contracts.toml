@@ -1,0 +1,79 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W1_ORIENTATION_FIELD_CONTRACT_INDEX"
+stage = "W1_D3A_ORIENTATION"
+orders = [3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+functional_cells = 12
+new_field_contracts = 1
+reused_field_contracts = 3
+proof_ceiling = "STATIC_FIELD_CONTRACT_AND_AGENT_WORK_UNIT_DESIGN_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+rule = "Existing W0 contracts remain sole field authority for epistemic and Dreamer common/orientation types. The self-query contract adds the previously missing ArchitectureBrief/ImplementationBrief owner surface. Briefs reference but never redefine these types."
+
+[[contract]]
+id = "smart.epistemic.current-position.v1"
+path = "crates/smart/eliot-epistemic-contracts/current-position.contract.toml"
+owner = "eliot-epistemic-contracts"
+functional_cells = ["smart.epistemic.contracts", "smart.epistemic.position", "smart.epistemic.context_projection"]
+orders_in_this_wave = [3]
+disposition = "REUSE_FROM_PARENT_W0_AUTHORITY"
+
+[[contract]]
+id = "smart.dreamer.common.v1"
+path = "crates/smart/eliot-dreamer-contracts/common.contract.toml"
+owner = "eliot-dreamer-contracts"
+functional_cells = ["smart.dreamer.contracts.common", "smart.dreamer.bundle", "smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+orders_in_this_wave = [8, 9, 10, 11]
+disposition = "REUSE_FROM_PARENT_W0_AUTHORITY"
+
+[[contract]]
+id = "smart.dreamer.orientation.v1"
+path = "crates/smart/eliot-dreamer-contracts/orientation.contract.toml"
+owner = "eliot-dreamer-contracts"
+functional_cells = ["smart.dreamer.contracts.orientation", "smart.dreamer.rival_models", "smart.dreamer.relation_candidates", "smart.dreamer.probe_plan", "smart.dreamer.clarification_candidate", "smart.dreamer.packet_assembly"]
+orders_in_this_wave = [12, 13, 14, 15, 16]
+disposition = "REUSE_FROM_PARENT_W0_AUTHORITY"
+
+[[contract]]
+id = "smart.dreamer.self-query.v1"
+path = "crates/smart/eliot-dreamer-self-query/self-query.contract.toml"
+owner = "eliot-dreamer-self-query"
+functional_cells = ["smart.dreamer.architecture_brief", "smart.dreamer.implementation_brief", "smart.self_model.context_projection"]
+orders_in_this_wave = [17, 18]
+disposition = "NEW_FIELD_CONTRACT_FREEZE"
+resolved_gap = "ArchitectureBrief and ImplementationBrief were consumed by the SelfModel Context provider but lacked one exact field-level owner contract."
+
+[[dependency]]
+provider = "smart.epistemic.current-position.v1"
+consumer = "smart.dreamer.orientation.v1"
+reason = "Orientation semantic cells consume the externally resolved position and cannot overwrite its evidence roles."
+
+[[dependency]]
+provider = "smart.dreamer.common.v1"
+consumer = "smart.dreamer.orientation.v1"
+reason = "Semantic handlers consume one structurally admitted candidate draft whose grounding and transformation proof remain separately addressable."
+
+[[dependency]]
+provider = "smart.dreamer.self-query.v1"
+consumer = "smart.context.provider-contribution.v1"
+reason = "The W8 SelfModel Context provider consumes ArchitectureBrief and ImplementationBrief without redefining them or certifying current support."
+
+[resolved_design_conflicts]
+position_vs_model = "Current Epistemic Position is resolved from admitted owner evidence; model synthesis remains labeled candidate material."
+causality = "Temporal order, similarity, dependency and causal candidate are separate; causality requires mechanism and falsifier."
+relation_use_cases = "Orientation and Curation use typed entrypoints over one relation semantic core."
+probe = "ProbePlan is discriminative and bounded but never executable."
+self_query = "ArchitectureBrief and ImplementationBrief have one owner; target/current/operational/experiential states remain separate."
+
+[still_open]
+challenges = [
+  "real evidence-provider adapters for Current Epistemic Position",
+  "model-route execution and receipt owner",
+  "probe/clarification execution owners",
+  "normative section and current-conformance projection adapters",
+  "dependency-locked package Module Proof",
+  "real provider-consumer Edge Proof",
+  "D3A_ORIENTATION_PULSE_01 and D3A_SELF_QUERY_PULSE_01",
+]
