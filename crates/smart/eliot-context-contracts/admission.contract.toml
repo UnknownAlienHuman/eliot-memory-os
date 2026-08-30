@@ -1,0 +1,195 @@
+schema_version = 1
+contract_id = "smart.context.admission.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-context-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.context.contracts.admission", "smart.context.admission"]
+architecture_refs = ["ARCH-CTX-01", "ARCH-CTX-04", "ARCH-EPI-04", "ARCH-SCOPE-01", "ARCH-SEC-03", "ARCH-RES-05"]
+implementation_refs = ["I2.20", "I7.11", "I12.13"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Admit whole Context candidates under one recipe, Decision Safety Floor, provider-fair budget and downstream headroom while preserving uncertainty, protected evidence, omissions and expansion handles."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_hot_path_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((candidates + dependencies + providers) log n) over request-bounded candidate sets; no retrieval, model call, rendering, delivery or blocking I/O."
+replacement_boundary = "Replace deterministic admission policy behind this contract; provider projections, view assembly, delivery and canonical owners remain separate."
+
+[closed_sets]
+admission_dispositions = ["IncludePayload", "IncludeHandle", "IncludeWithWarning", "RequireRevalidation", "Suppress", "Quarantine"]
+admission_states = ["Complete", "Partial", "Blocked", "Conflicted", "OverBudget", "Stale"]
+budget_units = ["PlanningUnits", "MeasuredTokens", "RenderedBytes"]
+safety_floor_requirement = ["RequiredPayload", "RequiredPayloadOrHandle", "RequiredVisibleWarning"]
+
+[hard_invariants]
+whole_units_only = true
+no_mid_atom_or_mid_claim_truncation = true
+decision_safety_floor_is_reserved_before_optional_allocation = true
+downstream_output_review_and_tool_headroom_is_reserved_before_optional_allocation = true
+required_atom_is_payload_handle_or_explicit_blocker = true
+unknown_decision_delta_is_not_zero_or_safe_to_drop = true
+rivals_unknowns_counterevidence_negative_memory_and_invariants_are_protected = true
+one_verbose_provider_cannot_monopolize_optional_budget = true
+provider_fairness_uses_deterministic_round_robin_or_equivalent_bounded_rule = true
+every_candidate_has_exact_disposition_and_reason = true
+every_omission_has_expansion_handle_when_source_is_expandable = true
+admission_does_not_render_rewrite_or_retrieve = true
+admission_does_not_mark_delivery_use_or_helpfulness = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "ProviderId"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ContextProviderClass"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ContextRole"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ContextLossPolicy"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ProviderAtomRepresentation"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "DecisionDelta"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ContextCandidate"
+owner = "eliot-context-contracts/candidate.contract.toml"
+
+[[external_type]]
+name = "ContextCandidateSet"
+owner = "eliot-context-contracts/candidate.contract.toml"
+
+[[public_type]]
+name = "ContextBudgetUnit"
+kind = "enum"
+definition = ["PlanningUnits", "MeasuredTokens", "RenderedBytes"]
+
+[[public_type]]
+name = "ContextBudget"
+kind = "struct"
+definition = ["unit: ContextBudgetUnit", "maximum_total: u32", "reserved_output: u32", "reserved_review: u32", "reserved_tool_or_effect: u32", "maximum_atoms: u32", "maximum_atoms_per_provider: u32", "minimum_optional_provider_share: u32"]
+invariants = ["all maxima non-zero", "sum of reservations < maximum total", "optional allocation cannot consume reservations", "planning estimate is not measured-token proof"]
+
+[[public_type]]
+name = "DecisionSafetyFloorRequirement"
+kind = "enum"
+definition = ["RequiredPayload", "RequiredPayloadOrHandle", "RequiredVisibleWarning"]
+
+[[public_type]]
+name = "DecisionSafetyFloorItem"
+kind = "struct"
+definition = ["requirement_id: ArtifactId", "role: ContextRole", "provider_classes: Vec<ContextProviderClass>", "candidate_or_source_handles: Vec<ArtifactId>", "requirement: DecisionSafetyFloorRequirement", "reason_codes: Vec<String>", "blocks_when_missing: bool"]
+invariants = ["at least one provider or handle target", "targets unique", "requirement cannot be silently downgraded", "missing blocker remains explicit"]
+
+[[public_type]]
+name = "ContextRecipe"
+kind = "struct"
+definition = ["recipe_id: ArtifactId", "recipe_revision: String", "role_order: Vec<ContextRole>", "required_roles: Vec<ContextRole>", "protected_roles: Vec<ContextRole>", "provider_priority_tiers: Vec<Vec<ContextProviderClass>>", "safety_floor: Vec<DecisionSafetyFloorItem>", "budget: ContextBudget", "canonical_tie_break: String", "recipe_sha256: String"]
+invariants = ["roles/provider classes unique within intended sets", "required/protected roles occur in role order", "safety floor bounded", "recipe immutable and external", "recipe grants no authority beyond candidate source ceilings"]
+
+[[public_type]]
+name = "ContextAdmissionDisposition"
+kind = "enum"
+definition = ["IncludePayload", "IncludeHandle", "IncludeWithWarning", "RequireRevalidation", "Suppress", "Quarantine"]
+
+[[public_type]]
+name = "ContextAdmissionDecision"
+kind = "struct"
+definition = ["candidate_id: ArtifactId", "provider_id: ProviderId", "disposition: ContextAdmissionDisposition", "admitted_representation: Option<ProviderAtomRepresentation>", "cost_units: u32", "safety_floor_requirement_refs: Vec<ArtifactId>", "dependency_candidate_ids: Vec<ArtifactId>", "reason_codes: Vec<String>", "warning_codes: Vec<String>", "expansion_handle: Option<ArtifactId>"]
+invariants = ["exactly one decision per candidate", "Include dispositions require safe representation", "Suppress/Quarantine expose no payload", "required/protected suppression blocks Complete unless safe handle/warning satisfies recipe", "dependencies explicit", "no source field mutation"]
+
+[[public_type]]
+name = "AdmittedContextAtom"
+kind = "struct"
+definition = ["candidate_id: ArtifactId", "provider_id: ProviderId", "role: ContextRole", "representation: ProviderAtomRepresentation", "loss_policy: ContextLossPolicy", "source_handles: Vec<ArtifactId>", "dependency_candidate_ids: Vec<ArtifactId>", "warning_codes: Vec<String>", "cost_units: u32", "required: bool", "protected: bool"]
+invariants = ["representation comes from candidate or stricter safe form", "source/dependency identities preserved", "required/protected markers preserved", "atom remains whole and addressable"]
+
+[[public_type]]
+name = "ContextAdmissionState"
+kind = "enum"
+definition = ["Complete", "Partial", "Blocked", "Conflicted", "OverBudget", "Stale"]
+
+[[public_type]]
+name = "ContextAdmissionRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "candidate_set_sha256: String", "recipe: ContextRecipe", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "actual_tokenizer_ref: Option<String>", "request_sha256: String"]
+invariants = ["candidate/recipe/scope/task/fence exact", "actual tokenizer optional and never fabricated", "request grants no retrieval/render/delivery/effect authority"]
+
+[[public_type]]
+name = "AdmittedContextSet"
+kind = "struct"
+definition = ["request_sha256: String", "candidate_set_sha256: String", "recipe_sha256: String", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "state: ContextAdmissionState", "atoms: Vec<AdmittedContextAtom>", "decisions: Vec<ContextAdmissionDecision>", "provider_allocated_units: Vec<ProviderBudgetAllocation>", "safety_floor_satisfied_refs: Vec<ArtifactId>", "safety_floor_missing_refs: Vec<ArtifactId>", "reserved_headroom_units: u32", "admitted_units: u32", "set_sha256: String"]
+invariants = ["one decision per candidate", "atoms exactly reconcile Include decisions", "reservations preserved", "Complete requires all blocking floor items satisfied and no stale/conflict/overbudget blocker", "provider allocation and total units reconcile", "contains no rendered view or delivery/use receipt", "canonical order and digest"]
+
+[[public_type]]
+name = "ProviderBudgetAllocation"
+kind = "struct"
+definition = ["provider_id: ProviderId", "required_units: u32", "optional_units: u32", "admitted_atom_count: u32", "omitted_atom_count: u32"]
+invariants = ["counts/units reconcile decisions", "optional allocation follows recipe fairness", "zero optional allocation for one provider cannot be caused solely by another provider's verbosity when capacity remains"]
+
+[[public_function]]
+name = "validate_context_recipe"
+signature = "pub fn validate_context_recipe(recipe: &ContextRecipe) -> Result<(), ContextAdmissionContractError>"
+
+[[public_function]]
+name = "validate_context_admission_request"
+signature = "pub fn validate_context_admission_request(request: &ContextAdmissionRequest, candidates: &ContextCandidateSet) -> Result<(), ContextAdmissionContractError>"
+
+[[public_function]]
+name = "validate_admitted_context_set"
+signature = "pub fn validate_admitted_context_set(request: &ContextAdmissionRequest, candidates: &ContextCandidateSet, admitted: &AdmittedContextSet) -> Result<(), ContextAdmissionContractError>"
+
+[[negative_test]]
+id = "whole-unit-only"
+property = "Admission cannot slice a ProviderAtom or candidate payload to fit budget."
+
+[[negative_test]]
+id = "floor-before-optional"
+property = "Optional candidates cannot consume Decision Safety Floor or downstream reserved headroom."
+
+[[negative_test]]
+id = "unknown-not-zero"
+property = "Unknown DecisionDelta cannot be treated as zero to suppress a protected candidate."
+
+[[negative_test]]
+id = "provider-fairness"
+property = "One verbose provider cannot consume all optional budget while another eligible provider has no considered slot."
+
+[[negative_test]]
+id = "required-omission-visible"
+property = "Required candidate without payload/handle/warning representation blocks Complete and is not silently omitted."
+
+[[negative_test]]
+id = "admission-not-view-or-delivery"
+property = "AdmittedContextSet contains no rendered section text, session delivery receipt, observed use or helpfulness field."
