@@ -86,7 +86,9 @@ def plugin_errors(text: str) -> list[Finding]:
         "BRIDGE_ENV_KEYS",
         "ELIOT_WORK_LEASE_ID",
         "bridgeEnvironment",
-        "MAX_PASSIVE_QUEUE",
+        "maximumPassiveQueue",
+        "ELIOT_OPENCODE_PASSIVE_QUEUE_LIMIT",
+        "passiveDepth >= maximumPassiveQueue()",
         "passiveQueue",
         "BRIDGE_TIMEOUT_MS",
         "waitForExit",
@@ -114,7 +116,6 @@ def plugin_errors(text: str) -> list[Finding]:
     if "Promise.all([stdout, stderr])" in text:
         add(out, "opencode_unbounded_stream_wait", PLUGIN, "bridge drains can wait forever after timeout")
     return out
-
 
 
 def verify(root: Path) -> list[Finding]:
