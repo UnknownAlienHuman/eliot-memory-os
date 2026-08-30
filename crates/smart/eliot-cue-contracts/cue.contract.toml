@@ -1,0 +1,193 @@
+schema_version = 1
+contract_id = "smart.cue.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-cue-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.cue.contracts", "smart.cue.normalizer", "smart.cue.binding", "smart.cue.index", "smart.cue.direct_match", "smart.cue.relation_spread", "smart.cue.activation"]
+architecture_refs = ["ARCH-CTX-02", "ARCH-CTX-04", "ARCH-MEM-04", "ARCH-SCOPE-01", "ARCH-SEC-03"]
+implementation_refs = ["I2.20", "I7.19", "I12.14"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Represent deterministic cues, admitted bindings, immutable snapshots, exact direct matches and optional bounded relation spread while preserving canonical spelling and exact-match independence from the graph."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_hot_path_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "Normalization O(input bytes); snapshot O((bindings + edges) log n); direct match O(cues log bindings + hits); spread O(min(policy edge/fanout/depth/result bounds)); no I/O, model, provider SDK or blocking call."
+replacement_boundary = "Replace pure normalization/index/match/spread implementation behind this contract; Governor admission, canonical memory and Context compilation remain separate owners."
+
+[closed_sets]
+cue_kinds = ["Path", "Symbol", "ErrorSignature", "Tool", "Goal", "Task", "UserPhrase", "Repository", "Artifact", "Custom"]
+comparison_profiles = ["Exact", "CaseSensitiveText", "CaseInsensitiveText", "WindowsPath", "PosixPath", "ErrorSignature"]
+binding_states = ["Candidate", "Admitted", "Rejected", "Quarantined", "Stale"]
+target_kinds = ["MemoryRecord", "FailureFingerprint", "Skill", "Procedure", "Evidence", "Invariant", "Problem", "ContextHandle"]
+relation_kinds = ["Alias", "DerivedFrom", "Related", "Precedes", "DependsOn", "Contradicts"]
+match_kinds = ["Exact", "AllowedPrefix", "ErrorSignature"]
+activation_origins = ["Direct", "RelationSpread"]
+
+[hard_invariants]
+canonical_value_preserves_source_spelling = true
+comparison_key_is_separate_and_profile_bound = true
+normalization_has_no_filesystem_or_os_canonicalization = true
+path_parent_traversal_is_rejected = true
+direct_exact_match_works_with_zero_relation_edges = true
+direct_match_uses_no_embedding_similarity_or_graph_traversal = true
+relation_spread_is_optional_and_bounded = true
+spread_failure_never_removes_or_downgrades_direct_hits = true
+multiple_paths_do_not_accumulate_popularity_authority = true
+snapshot_is_immutable_rebuildable_and_not_memory_owner = true
+binding_candidate_does_not_publish_index_before_governor_admission = true
+activation_does_not_mark_delivered_used_helpful_or_supported = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[public_type]]
+name = "CueKind"
+kind = "enum"
+definition = ["Path", "Symbol", "ErrorSignature", "Tool", "Goal", "Task", "UserPhrase", "Repository", "Artifact", "Custom"]
+
+[[public_type]]
+name = "CueComparisonProfile"
+kind = "enum"
+definition = ["Exact", "CaseSensitiveText", "CaseInsensitiveText", "WindowsPath", "PosixPath", "ErrorSignature"]
+
+[[public_type]]
+name = "ObservedCue"
+kind = "struct"
+definition = ["cue_id: ArtifactId", "kind: CueKind", "raw_value: String", "comparison_profile: CueComparisonProfile", "scope_id: String", "state_fence: StateFence", "source_handles: Vec<ArtifactId>"]
+invariants = ["raw value/scope non-blank and bounded", "source handles non-empty and unique", "profile explicit", "no hidden environment lookup"]
+
+[[public_type]]
+name = "NormalizedCue"
+kind = "struct"
+definition = ["cue_id: ArtifactId", "kind: CueKind", "canonical_value: String", "comparison_key: String", "comparison_profile: CueComparisonProfile", "scope_id: String", "state_fence: StateFence", "source_handles: Vec<ArtifactId>", "normalization_sha256: String"]
+invariants = ["canonical value preserves source spelling", "comparison key deterministic under profile", "path normalization rejects parent traversal and does not resolve symlinks/reparse/filesystem", "digest canonical"]
+
+[[public_type]]
+name = "CueTargetKind"
+kind = "enum"
+definition = ["MemoryRecord", "FailureFingerprint", "Skill", "Procedure", "Evidence", "Invariant", "Problem", "ContextHandle"]
+
+[[public_type]]
+name = "CueBindingState"
+kind = "enum"
+definition = ["Candidate", "Admitted", "Rejected", "Quarantined", "Stale"]
+
+[[public_type]]
+name = "CueBindingCandidate"
+kind = "struct"
+definition = ["binding_id: ArtifactId", "cue: NormalizedCue", "target_handle: ArtifactId", "target_kind: CueTargetKind", "state: CueBindingState", "source_revision: String", "strength_basis_points: u16", "negative_memory: bool", "freshness_revision: String", "lineage_handles: Vec<ArtifactId>", "reason_codes: Vec<String>"]
+invariants = ["basis points within 0..=10000", "lineage/source revision exact", "Candidate cannot enter snapshot", "negative memory identity explicit", "strength is activation policy input not epistemic support"]
+
+[[public_type]]
+name = "AdmittedCueBinding"
+kind = "struct"
+definition = ["binding: CueBindingCandidate", "admission_receipt_handle: ArtifactId", "admission_revision: String", "state_fence: StateFence"]
+invariants = ["binding state Admitted", "receipt/revision exact external Governor evidence", "fence compatible", "admission does not mark use or support"]
+
+[[public_type]]
+name = "CueRelationKind"
+kind = "enum"
+definition = ["Alias", "DerivedFrom", "Related", "Precedes", "DependsOn", "Contradicts"]
+
+[[public_type]]
+name = "CueRelationEdge"
+kind = "struct"
+definition = ["edge_id: ArtifactId", "source_target_handle: ArtifactId", "related_target_handle: ArtifactId", "kind: CueRelationKind", "strength_basis_points: u16", "source_handles: Vec<ArtifactId>", "state_fence: StateFence"]
+invariants = ["endpoints differ", "basis points within 0..=10000", "sources non-empty", "edge is projection evidence not causal truth"]
+
+[[public_type]]
+name = "CueIndexSnapshot"
+kind = "struct"
+definition = ["snapshot_id: ArtifactId", "scope_id: String", "state_fence: StateFence", "binding_generation: String", "relation_generation: Option<String>", "bindings: Vec<AdmittedCueBinding>", "relation_edges: Vec<CueRelationEdge>", "snapshot_sha256: String"]
+invariants = ["only admitted bindings", "binding ids/target keys unique under declared policy", "zero relation edges valid", "one fence", "immutable/rebuildable", "canonical order and digest"]
+
+[[public_type]]
+name = "CueMatchKind"
+kind = "enum"
+definition = ["Exact", "AllowedPrefix", "ErrorSignature"]
+
+[[public_type]]
+name = "DirectCueHit"
+kind = "struct"
+definition = ["hit_id: ArtifactId", "observed_cue_id: ArtifactId", "binding_id: ArtifactId", "target_handle: ArtifactId", "target_kind: CueTargetKind", "match_kind: CueMatchKind", "match_basis_points: u16", "negative_memory: bool", "source_handles: Vec<ArtifactId>"]
+invariants = ["binding exists in snapshot", "exact key/profile compatible", "basis points within 0..=10000", "no relation edge required"]
+
+[[public_type]]
+name = "RelationSpreadPolicy"
+kind = "struct"
+definition = ["policy_id: ArtifactId", "policy_revision: String", "maximum_depth: u8", "maximum_fanout_per_node: u16", "maximum_edges_visited: u32", "maximum_results: u32", "minimum_edge_basis_points: u16", "allowed_relation_kinds: Vec<CueRelationKind>", "canonical_tie_break: String", "policy_sha256: String"]
+invariants = ["all bounds non-zero except depth may be zero to disable spread", "basis points within 0..=10000", "relation kinds unique", "policy cannot change direct hits or epistemic support"]
+
+[[public_type]]
+name = "SpreadCueHit"
+kind = "struct"
+definition = ["hit_id: ArtifactId", "origin_direct_hit_id: ArtifactId", "target_handle: ArtifactId", "target_kind: CueTargetKind", "relation_path_edge_ids: Vec<ArtifactId>", "depth: u8", "best_path_basis_points: u16", "source_handles: Vec<ArtifactId>"]
+invariants = ["origin direct hit exists", "path bounded/acyclic under policy", "best single path used rather than multi-path popularity accumulation", "basis points within 0..=10000"]
+
+[[public_type]]
+name = "CueActivationTrace"
+kind = "struct"
+definition = ["snapshot_sha256: String", "observed_cue_ids: Vec<ArtifactId>", "direct_hit_ids: Vec<ArtifactId>", "spread_hit_ids: Vec<ArtifactId>", "visited_edge_ids: Vec<ArtifactId>", "omitted_or_blocked_reason_codes: Vec<String>", "spread_enabled: bool", "spread_failed_or_degraded: bool", "trace_sha256: String"]
+invariants = ["all ids reconcile", "direct hits remain when spread disabled/fails", "trace contains no delivery/use/helpfulness/support claim", "canonical order and digest"]
+
+[[public_type]]
+name = "CueActivationResult"
+kind = "struct"
+definition = ["request_id: RequestId", "scope_id: String", "state_fence: StateFence", "snapshot_sha256: String", "normalized_cues: Vec<NormalizedCue>", "direct_hits: Vec<DirectCueHit>", "spread_hits: Vec<SpreadCueHit>", "trace: CueActivationTrace", "result_sha256: String"]
+invariants = ["cues/hits bounded and unique", "zero-edge exact firing valid", "direct/spread origin separate", "negative-memory markers preserved", "contains no Context admission, delivery/use or canonical mutation", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_observed_cue"
+signature = "pub fn validate_observed_cue(cue: &ObservedCue) -> Result<(), CueContractError>"
+
+[[public_function]]
+name = "validate_normalized_cue"
+signature = "pub fn validate_normalized_cue(observed: &ObservedCue, normalized: &NormalizedCue) -> Result<(), CueContractError>"
+
+[[public_function]]
+name = "validate_cue_index_snapshot"
+signature = "pub fn validate_cue_index_snapshot(snapshot: &CueIndexSnapshot) -> Result<(), CueContractError>"
+
+[[public_function]]
+name = "validate_cue_activation_result"
+signature = "pub fn validate_cue_activation_result(snapshot: &CueIndexSnapshot, result: &CueActivationResult) -> Result<(), CueContractError>"
+
+[[negative_test]]
+id = "canonical-path-spelling-preserved"
+property = "Windows/Posix path comparison normalization cannot lowercase or rewrite canonical_value."
+
+[[negative_test]]
+id = "no-filesystem-normalization"
+property = "Normalizer cannot call filesystem canonicalize, resolve symlink/reparse, access cwd or accept parent traversal."
+
+[[negative_test]]
+id = "zero-edge-exact-firing"
+property = "Exact cue binding fires when relation_edges is empty."
+
+[[negative_test]]
+id = "spread-failure-preserves-direct"
+property = "Disabled/failed/degraded spread does not remove, alter or downrank direct hits."
+
+[[negative_test]]
+id = "no-popularity-accumulation"
+property = "Multiple relation paths cannot sum into authority/support; only best bounded path is retained."
+
+[[negative_test]]
+id = "activation-not-use"
+property = "CueActivationResult exposes no delivered, used, helpful, support-promotion or lifecycle field."
