@@ -23,10 +23,12 @@ paths = [
   "AGENTS.md",
   "WORKFLOW.md",
   "README.md",
-  "scripts/docs_router.py",
+  "scripts/docs_router*.py",
   "scripts/check_docs_links.py",
+  "scripts/README.md",
   "tests/test_docs_router.py",
   "tests/test_docs_links.py",
+  "workstreams/**",
 ]
 tasks = ["documentation", "architecture", "normative", "doc-routing", "doc-links"]
 required = [
@@ -293,6 +295,8 @@ paths = [
   ".gitattributes",
   ".gitignore",
   ".typos.toml",
+  ".cargo/**",
+  "rust-toolchain.toml",
   "Justfile",
   "config/**",
 ]
