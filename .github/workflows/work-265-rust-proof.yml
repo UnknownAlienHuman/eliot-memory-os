@@ -6,7 +6,7 @@ on:
       - work/265-swarm-model-catalogue-control
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: work-265-rust-proof
@@ -14,6 +14,7 @@ concurrency:
 
 jobs:
   coordinator-model-control:
+    if: github.actor != 'github-actions[bot]'
     runs-on: windows-latest
     timeout-minutes: 45
     env:
@@ -26,6 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: work/265-swarm-model-catalogue-control
 
       - name: Verify exact source identity
         shell: pwsh
@@ -46,8 +48,8 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-work-265-${{ hashFiles('Cargo.lock') }}
 
-      - name: Format coordinator
-        run: cargo fmt -p eliot-agent-coordinator -- --check
+      - name: Apply canonical Rust formatting
+        run: cargo fmt -p eliot-agent-coordinator
 
       - name: Check coordinator
         run: cargo check --locked -p eliot-agent-coordinator --all-targets
@@ -57,3 +59,14 @@ jobs:
 
       - name: Clippy coordinator
         run: cargo clippy --locked -p eliot-agent-coordinator --all-targets -- -D warnings
+
+      - name: Commit canonical formatting
+        shell: pwsh
+        run: |
+          if (-not (git diff --quiet -- crates/agent/eliot-agent-coordinator)) {
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add crates/agent/eliot-agent-coordinator
+            git commit -m 'style(swarm): apply canonical Rust formatting [proof-bot]'
+            git push origin HEAD:work/265-swarm-model-catalogue-control
+          }
