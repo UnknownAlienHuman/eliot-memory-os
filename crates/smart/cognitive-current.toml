@@ -1,10 +1,10 @@
-schema_version = 2
+schema_version = 3
 status = "CURRENT_COGNITIVE_DESIGN_AUTHORITY"
 authority = "crates/smart/cognitive-rev12-authority.toml"
 issue = 94
 branch = "work/94-cognitive-function-design-rev11"
-base_main_commit = "0b0b55ac5bf26035576f501742b912092f2b4956"
-proof_ceiling = "STATIC_FUNCTION_DESIGN_ONLY"
+base_main_commit = "59e36385b8e81ef7a328b255ec5ff3330b58b41c"
+proof_ceiling = "STATIC_TOPOLOGY_AND_W8_FIELD_CONTRACT_DESIGN_ONLY"
 functional_cells = 86
 physical_crates = 31
 hot_path_cells = 15
@@ -30,11 +30,18 @@ extension_catalogs = [
 ]
 new_agent_units = "crates/smart/cells-v12/README.toml"
 
+[field_contracts]
+index = "crates/smart/cognitive-rev12-field-contracts.toml"
+scope = "W8 cells 68..75 and their shared context/memory/experience public contracts"
+status = "FIELD_LEVEL_FROZEN_FOR_AGENT_IMPLEMENTATION"
+implementation_status = "TARGET_NOT_EXECUTED"
+
 [control]
 topology = "crates/smart/cognitive-rev12-topology.toml"
 coverage = "crates/smart/cognitive-rev12-coverage.toml"
 dispatch_coverage = "crates/smart/cognitive-rev11-coverage.toml"
 type_ownership = "crates/smart/cognitive-rev12-type-ownership.toml"
+contract_challenges = "crates/smart/cognitive-contract-challenges.toml"
 base_edges = "crates/smart/cognitive-function-edge-map-v11.toml"
 extension_edges = "crates/smart/cognitive-rev12-edge-extension.toml"
 base_product_pulses = "crates/smart/cognitive-product-pulses-v11.toml"

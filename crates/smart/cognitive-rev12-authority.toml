@@ -1,9 +1,9 @@
-schema_version = 2
+schema_version = 3
 authority_id = "eliot-cognitive-function-design-rev12"
-status = "STATIC_FUNCTION_DESIGN_ONLY"
+status = "STATIC_TOPOLOGY_AND_W8_FIELD_CONTRACT_DESIGN_ONLY"
 issue = 94
 branch = "work/94-cognitive-function-design-rev11"
-base_main_commit = "0b0b55ac5bf26035576f501742b912092f2b4956"
+base_main_commit = "59e36385b8e81ef7a328b255ec5ff3330b58b41c"
 repository = "UnknownAlienHuman/eliot-memory-os"
 
 [normative_pair]
@@ -20,6 +20,8 @@ precedence = "Architecture defines intent and Hard Boundaries; Implementation de
 functional_cells = 86
 physical_crates = 31
 hot_path_cells = 15
+field_contract_scope = "W8_68_THROUGH_75"
+field_contract_index = "crates/smart/cognitive-rev12-field-contracts.toml"
 root_workspace_admission = false
 rust_implementation = false
 runtime_support = false
@@ -27,8 +29,9 @@ product_acceptance = false
 
 [authority_rules]
 cell_source = "Exactly one [[cell]] record in the indexed catalogs is authoritative for each agent assignment and Rust-oriented API."
+field_contract_source = "For W8 public types, the indexed *.contract.toml file is the sole field-level source; cells and manifests reference but do not redefine it."
 base_catalog_status = "Rev11 cell catalogs 1..67 are retained after semantic re-audit; rev12 catalogs replace the inconsistent projection/provider extension and add 76..86."
-no_parallel_module_api_views = "Legacy module.toml and *.api.toml records are not assignment authority."
+no_parallel_module_api_views = "Legacy module.toml and *.api.toml records are donor evidence only and are not assignment or field-contract authority."
 cell_vs_crate = "A FunctionalCapabilityCell is assigned independently; several cells share one physical crate only when lifecycle owner, dependency island, proof oracle and replacement boundary remain coherent."
 crate_creation = "A physical crate requires a contract, dependency, security, failure-containment, deployment, package-proof or replacement seam. Function count, agent count or LOC estimate is insufficient."
 loc = "Ten thousand lines is a review trigger, never a constitutional split rule."
@@ -41,8 +44,13 @@ cell_count = 15
 [forbidden_ownership]
 all_cells = ["canonical state", "truth or epistemic promotion", "authority grant or activation", "task finish", "DurableJob lifecycle", "scheduler or Ready Queue", "runtime lease", "provider credential or route execution", "external effect execution", "production-generation self-modification"]
 
+[field_contract_freeze]
+resolved_challenges = ["CC-MEMORY-PROJECTION-SCHEMA", "CC-FAILURE-OBSERVATION-SCHEMA", "CC-PROVIDER-CONTRIBUTION-SCHEMA"]
+remaining_challenges = ["CC-PROVIDER-ADAPTERS", "CC-EDGE-PROOF", "CC-PRODUCT-PULSE", "CC-WAVE0-PROOF-IDENTITY"]
+self_model_request_resolution = "Use ContextProviderProjectionRequest; no SelfModelContextProjectionRequest public type."
+
 [proof_model]
 module = "Package-local shape, behavior, property and adversarial proof for one implemented cell."
 edge = "Executed proof over the real provider and consumer using exact typed contracts and State Fence."
 product = "Named Product Pulse over an exact Product Identity."
-current_ceiling = "TOML parse, branch presence, commit or review cannot promote implementation, runtime or product support."
+current_ceiling = "TOML parse, field-contract freeze, branch presence, commit or review cannot promote implementation, runtime or product support."

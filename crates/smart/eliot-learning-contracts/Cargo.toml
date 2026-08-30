@@ -1,24 +1,34 @@
 [package]
 name = "eliot-learning-contracts"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 publish = false
-description = "Own provider-neutral contracts for CampaignLearningStateView, AttemptLearningDelta, CampaignHarnessOverlay candidate, activation/adherence assessment and closure inputs."
+description = "Provider-neutral task-local learning and immutable System Experience contracts."
 
 [lib]
 path = "src/lib.rs"
 
 [package.metadata.eliot]
-prototype = true
-source_status = "NOT_IMPLEMENTED"
-workspace_admission = "pending_agent_implementation_and_proof"
-functional_cell = "smart.learning.contracts"
-source_layer = "C0"
-runtime_layer = "R5"
-runtime_bundle = "eliotd"
-agent_order = 32
+layer = "C0"
+purpose = "task-local learning and immutable System Experience contract hub"
+source_maintenance_owner = "cognitive-integration-owner"
+functional_cell_refs = [
+  "smart.learning.contracts.common",
+  "smart.learning.contracts.state_view",
+  "smart.learning.contracts.adaptation",
+  "smart.learning.contracts.evaluation",
+  "smart.learning.contracts.experience",
+]
+independent_proof_profile = "prototype-not-workspace-admitted"
+contract_refs = [
+  "crates/smart/cognitive-current.toml",
+  "crates/smart/eliot-learning-contracts/experience.contract.toml",
+]
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until Rust implementation, ModuleTestCapsule, affected Edge Proof and integration-owner review"
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }

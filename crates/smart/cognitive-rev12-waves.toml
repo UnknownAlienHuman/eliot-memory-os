@@ -1,12 +1,13 @@
-schema_version = 2
+schema_version = 3
 authority = "eliot-cognitive-function-design-rev12"
 status = "ORDERED_AGENT_WAVES_NOT_EXECUTED"
 wave_count = 10
+field_contract_index = "crates/smart/cognitive-rev12-field-contracts.toml"
 
 [[wave]]
 id = "W0_CONTRACT_EVIDENCE"
 orders = [1, 2, 4, 5, 6, 7, 19, 26, 27, 28, 35, 49, 50, 51, 52, 68, 71, 74]
-rule = "Freeze public types, owner boundaries and negative fixtures before semantic workers."
+rule = "Freeze public types, owner boundaries and negative fixtures before semantic workers. W8 contract cells 68, 71 and 74 now have field-level target contracts but no Rust/package proof."
 
 [[wave]]
 id = "W1_D3A_ORIENTATION"
@@ -39,7 +40,7 @@ orders = [66, 67]
 [[wave]]
 id = "W8_CANONICAL_PROJECTION_BRIDGES"
 orders = [69, 70, 72, 73, 75]
-rule = "Projection cells integrate only after their contract cells 68, 71 and 74 are frozen."
+rule = "Projection cells integrate only after their exact indexed field contracts are frozen. Provider cells reuse ContextProviderProjectionRequest and return ProviderContribution without admission authority."
 
 [[wave]]
 id = "W9_META_COGNITIVE_QUALITY"

@@ -1,21 +1,22 @@
-schema_version = 2
+schema_version = 3
 authority = "eliot-cognitive-function-design-rev12"
 status = "AGENT_HANDOFF_CONTRACT"
 
 [worker]
-reads = ["crates/smart/cognitive-current.toml", "one indexed cell record", "declared Architecture/Implementation anchors", "one-hop public contracts and fixtures only"]
+reads = ["crates/smart/cognitive-current.toml", "one indexed cell record", "the exact indexed field-contract file when declared", "declared Architecture/Implementation anchors", "one-hop public contracts and fixtures only"]
 writes = ["the cell's declared src/<cell>.rs", "the cell's declared tests/<cell>.rs"]
-forbidden = ["Cargo.toml", "src/lib.rs", "re-exports", "another cell source", "root workspace", "runtime wiring", "canonical state", "policy", "proof/status files"]
+forbidden = ["Cargo.toml", "src/lib.rs", "re-exports", "another cell source", "root workspace", "runtime wiring", "canonical state", "policy", "proof/status files", "local redefinition of an indexed public wire type"]
 return = ["implemented public functions", "typed errors", "minimum tests", "remaining ContractChallenge", "actual proof ceiling"]
 
 [integration_owner]
-owns = ["Cargo manifests", "lib.rs and re-exports", "cross-cell compatibility", "package Module Proof", "real Edge Proof", "Product Pulse", "migration and retirement"]
+owns = ["Cargo manifests", "lib.rs and re-exports", "cross-cell compatibility", "public-type ownership validation", "package Module Proof", "real Edge Proof", "Product Pulse", "migration and retirement"]
 
 [challenge]
-required_when = ["public type owner is ambiguous", "the declared discriminator cannot fail old behavior", "the work needs another mutable owner", "the API requires hidden I/O/model/provider SDK", "the agent would need to weaken an oracle", "the complete causal workset cannot fit"]
+required_when = ["public type owner is ambiguous", "the indexed field contract is absent or contradictory", "the declared discriminator cannot fail old behavior", "the work needs another mutable owner", "the API requires hidden I/O/model/provider SDK", "the agent would need to weaken an oracle", "the complete causal workset cannot fit"]
 
 [ordering]
 contract_first = true
+field_contract_precedes_dependent_worker = true
 parallel_workers_require_disjoint_source_files = true
 shared_contract_change_serialized_by_integration_owner = true
 worker_never_integrates_own_result = true

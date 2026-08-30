@@ -1,12 +1,27 @@
-schema_version = 5
+schema_version = 6
 status = "CURRENT_POINTER"
 authority = "crates/smart/cognitive-current.toml"
 open_contract_challenges = [
   "CC-PROVIDER-ADAPTERS: Governor-owned GoalTask/CriticalAttention/AuthorityAffordance provider adapters remain outside Smart",
   "CC-EDGE-PROOF: implementation workers cannot claim real provider-consumer proof",
   "CC-PRODUCT-PULSE: design contracts are not executed evidence",
-  "CC-MEMORY-PROJECTION-SCHEMA: rev12 assigns MemoryQueryIntent, MemorySelectionPolicy, MemorySelectionTrace and MemoryContextProjectionRequest to eliot-memory-projection-contracts, but the normative pair, rev11 materialization and retained memory donor do not define one field-complete owner-neutral schema; dependent implementation must stop instead of inventing fields or generic JSON",
-  "CC-FAILURE-OBSERVATION-SCHEMA: rev12 assigns FailureObservation to eliot-learning-contracts, but no field-complete schema was found in the normative pair, rev11 materialization or retained donors; learning cells may consume only an explicitly frozen contract or remain deferred",
-  "CC-PROVIDER-CONTRIBUTION-SCHEMA: rev12 assigns ProviderContribution and ProviderRoleRequirement to eliot-context-contracts and closes ContextProviderClass to GoalTask/CriticalAttention/EpistemicPosition/MemoryRecall/AuthorityAffordance/SelfModel/DecisionTail, but ProviderContribution fields are undefined and the first Rust source wave diverges from the closed class set; freeze the schema and class mapping before claiming cell closure",
-  "CC-WAVE0-PROOF-IDENTITY: the three isolated wave-0 workspaces have no committed dependency lock or repository-hosted exact-head run; author-reported local checks remain NOT_EXECUTED evidence until an immutable dependency identity and manual proof receipt exist",
+  "CC-WAVE0-PROOF-IDENTITY: the isolated source workspaces have no committed dependency lock or repository-hosted exact-head run; author-reported local checks remain NOT_EXECUTED evidence until immutable dependency identity and a manual proof receipt exist",
 ]
+
+[[resolved_contract_challenge]]
+id = "CC-MEMORY-PROJECTION-SCHEMA"
+status = "RESOLVED_BY_FIELD_CONTRACT_FREEZE"
+contract_ref = "crates/smart/eliot-memory-projection-contracts/projection.contract.toml"
+resolution = "MemoryQueryIntent, MemorySelectionPolicy, MemorySelectionTrace and MemoryContextProjectionRequest now have one field-level owner; dependent Rust remains unimplemented/unproven."
+
+[[resolved_contract_challenge]]
+id = "CC-FAILURE-OBSERVATION-SCHEMA"
+status = "RESOLVED_BY_FIELD_CONTRACT_FREEZE"
+contract_ref = "crates/smart/eliot-learning-contracts/experience.contract.toml"
+resolution = "FailureObservation now preserves trigger/action/outcome/invariant/scope/reopen/extinction evidence and carries no hard-block or lifecycle authority."
+
+[[resolved_contract_challenge]]
+id = "CC-PROVIDER-CONTRIBUTION-SCHEMA"
+status = "RESOLVED_BY_FIELD_CONTRACT_FREEZE"
+contract_ref = "crates/smart/eliot-context-contracts/provider-contribution.contract.toml"
+resolution = "ProviderContribution, ProviderRoleRequirement, whole ProviderAtoms, coverage/omissions and the exact seven-class provider set are frozen; all providers reuse ContextProviderProjectionRequest."

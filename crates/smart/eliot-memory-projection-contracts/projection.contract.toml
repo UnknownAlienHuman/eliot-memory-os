@@ -1,0 +1,293 @@
+schema_version = 1
+contract_id = "smart.memory.projection-contracts.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-memory-projection-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.memory.projection.contracts", "smart.memory.candidate_query", "smart.memory.context_projection"]
+architecture_refs = ["ARCH-MEM-03", "ARCH-MEM-04", "ARCH-CTX-01", "ARCH-CTX-02", "ARCH-CTX-04", "ARCH-EPI-04", "ARCH-SCOPE-01", "ARCH-SEC-03"]
+implementation_refs = ["I5.20", "I7.19", "I12.13", "I12.14", "I12.20", "I2.20"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Represent one bounded Governor-produced memory read and deterministic candidate/projection request without storage ownership, retrieval reinforcement, admission or delivery state."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O(n log n + c log n) over request-bounded materialized records and cues; no storage read, graph scan, model call, network or blocking I/O."
+replacement_boundary = "Replace selection/projection implementation behind these store-neutral contracts; Governor remains canonical read owner and Context Compiler remains admission owner."
+
+[closed_sets]
+read_coverage = ["Complete", "Partial", "Unavailable", "Blocked", "Stale"]
+query_kinds = ["ExactHandle", "ExactCue", "Current", "History", "Provenance", "Verification", "ChangeImpact", "ContextReconstruction"]
+record_kinds = ["WorkingContinuity", "Episodic", "SemanticClaim", "Procedure", "Commitment", "Decision", "Failure", "Unknown", "RivalModel", "Counterevidence", "Normative"]
+accessibility = ["Payload", "HandleOnly", "Suppressed", "Quarantined", "Unavailable"]
+permitted_influence = ["Candidate", "WarningOnly", "ExactNegativeBlockCandidate", "RequiresRevalidation", "Denied"]
+selection_dimensions = ["ExactCue", "ScopeApplicability", "Freshness", "Provenance", "DecisionRelevance", "ActivationPrecision", "NegativeMemory", "MinorityOrCounterevidence"]
+selection_dispositions = ["Selected", "ExcludedDeniedInfluence", "ExcludedScope", "ExcludedStale", "ExcludedLimit", "RetainedProtectedHandle", "RequiresRevalidation"]
+partial_coverage_behaviors = ["PreservePartial", "RequireComplete", "AllowExactHandlesOnly"]
+
+[hard_invariants]
+read_scope_matches_every_record = true
+searched_state_requires_read_receipt = true
+complete_requires_recheckable_denominator = true
+unavailable_or_blocked_requires_named_owner_or_reason = true
+existence_support_accessibility_and_influence_are_independent = true
+retrieval_or_repetition_never_raise_support = true
+negative_memory_and_counterevidence_are_protected_from_popularity = true
+query_does_not_mark_delivered_used_or_helpful = true
+context_projection_contains_no_admission_disposition = true
+one_state_fence_per_request_snapshot_set_and_projection = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "OperationId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "EpistemicStatus"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "Assertability"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "EvidenceFreshness"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "LifecycleState"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "CueActivationResult"
+owner = "eliot-cues"
+
+[[external_type]]
+name = "ContextProviderProjectionRequest"
+owner = "eliot-context-contracts"
+
+[[external_type]]
+name = "ContextRole"
+owner = "eliot-context-contracts"
+
+[[public_type]]
+name = "MemoryReadCoverage"
+kind = "enum"
+definition = ["Complete", "Partial", "Unavailable", "Blocked", "Stale"]
+
+[[public_type]]
+name = "MemoryRecordKind"
+kind = "enum"
+definition = ["WorkingContinuity", "Episodic", "SemanticClaim", "Procedure", "Commitment", "Decision", "Failure", "Unknown", "RivalModel", "Counterevidence", "Normative"]
+
+[[public_type]]
+name = "MemoryAccessibility"
+kind = "enum"
+definition = ["Payload", "HandleOnly", "Suppressed", "Quarantined", "Unavailable"]
+
+[[public_type]]
+name = "PermittedInfluence"
+kind = "enum"
+definition = ["Candidate", "WarningOnly", "ExactNegativeBlockCandidate", "RequiresRevalidation", "Denied"]
+invariants = ["ExactNegativeBlockCandidate requires exact deterministic negative-memory identity", "semantic similarity never creates a hard block"]
+
+[[public_type]]
+name = "MemoryCoverageDenominator"
+kind = "struct"
+definition = ["source_ref: String", "source_revision: String", "method_ref: String", "expected_records: Option<u32>", "expected_record_handles: Vec<ArtifactId>", "partitions: Vec<String>"]
+invariants = ["source/revision/method non-blank", "Complete requires expected_records", "expected handles/partitions unique", "denominator independently recheckable"]
+
+[[public_type]]
+name = "CanonicalMemoryReadRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "read_operation_id: OperationId", "scope_id: String", "task_id: Option<TaskId>", "canonical_revision: u64", "state_fence: StateFence", "requested_kinds: Vec<MemoryRecordKind>", "maximum_records: u32"]
+invariants = ["scope and canonical revision exact", "requested kinds unique", "bounds non-zero", "request grants no storage or write capability"]
+
+[[public_type]]
+name = "MemoryProjectionRecord"
+kind = "struct"
+definition = [
+  "record_handle: ArtifactId",
+  "payload_handle: Option<ArtifactId>",
+  "kind: MemoryRecordKind",
+  "scope_id: String",
+  "source_revision: String",
+  "epistemic_status: EpistemicStatus",
+  "lifecycle: LifecycleState",
+  "accessibility: MemoryAccessibility",
+  "permitted_influence: PermittedInfluence",
+  "assertability: Assertability",
+  "freshness: EvidenceFreshness",
+  "provenance_handles: Vec<ArtifactId>",
+  "state_fence: StateFence",
+  "bounded_preview: Option<String>",
+  "negative_memory: bool",
+  "minority_or_counterevidence: bool",
+]
+invariants = ["scope equals read request scope", "provenance non-empty", "payload representation obeys accessibility", "status/assertability/influence remain independent", "record cannot raise its own support"]
+
+[[public_type]]
+name = "CanonicalMemoryReadSnapshot"
+kind = "struct"
+definition = ["request: CanonicalMemoryReadRequest", "read_receipt_handle: Option<ArtifactId>", "coverage: MemoryReadCoverage", "denominator: Option<MemoryCoverageDenominator>", "records: Vec<MemoryProjectionRecord>", "missing_owner_or_reason_refs: Vec<String>", "snapshot_sha256: String"]
+invariants = ["searched states require a read receipt and denominator", "Complete requires exact expected count equality and no missing refs", "Partial requires named missing refs", "Unavailable or Blocked has no records/denominator and requires named owner/reason", "every record matches request scope and fence", "canonical order and digest"]
+
+[[public_type]]
+name = "MemoryQueryKind"
+kind = "enum"
+definition = ["ExactHandle", "ExactCue", "Current", "History", "Provenance", "Verification", "ChangeImpact", "ContextReconstruction"]
+
+[[public_type]]
+name = "MemoryQueryIntent"
+kind = "struct"
+definition = ["intent_id: ArtifactId", "request_id: RequestId", "kind: MemoryQueryKind", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "cue_activation_sha256: String", "exact_handle_refs: Vec<ArtifactId>", "requested_record_kinds: Vec<MemoryRecordKind>", "required_context_roles: Vec<ContextRole>", "decision_dependency_refs: Vec<ArtifactId>", "maximum_candidates: u32", "intent_sha256: String"]
+invariants = ["scope/task/fence exact", "cue digest binds the supplied CueActivationResult", "exact handles and kinds unique", "maximum non-zero", "intent is not authority, admission or proof"]
+
+[[public_type]]
+name = "MemorySelectionDimension"
+kind = "enum"
+definition = ["ExactCue", "ScopeApplicability", "Freshness", "Provenance", "DecisionRelevance", "ActivationPrecision", "NegativeMemory", "MinorityOrCounterevidence"]
+
+[[public_type]]
+name = "SelectionDimensionResult"
+kind = "enum"
+definition = ["Known { basis_points: u16 }", "Unknown", "NotApplicable"]
+invariants = ["basis points within 0..=10000", "Unknown is not zero"]
+
+[[public_type]]
+name = "MemorySelectionAssessment"
+kind = "struct"
+definition = ["dimension: MemorySelectionDimension", "result: SelectionDimensionResult", "evidence_handles: Vec<ArtifactId>", "reason_codes: Vec<String>"]
+invariants = ["one result per required dimension", "no aggregate confidence/utility score"]
+
+[[public_type]]
+name = "PartialCoverageBehavior"
+kind = "enum"
+definition = ["PreservePartial", "RequireComplete", "AllowExactHandlesOnly"]
+
+[[public_type]]
+name = "MemorySelectionPolicy"
+kind = "struct"
+definition = [
+  "policy_id: ArtifactId",
+  "policy_revision: String",
+  "policy_sha256: String",
+  "required_dimensions: Vec<MemorySelectionDimension>",
+  "protected_record_kinds: Vec<MemoryRecordKind>",
+  "partial_coverage_behavior: PartialCoverageBehavior",
+  "maximum_candidates: u32",
+  "maximum_inline_bytes: u32",
+  "maximum_source_handles_per_candidate: u32",
+  "protected_influence_classes: Vec<PermittedInfluence>",
+  "canonical_tie_break: String",
+]
+invariants = ["immutable owner-provided selection profile", "cannot grant authority or change epistemic status", "exact-cue precedence and applicable negative-memory/minority/counterevidence protection are contract invariants rather than optional booleans", "all bounds non-zero", "no scalar aggregate rank is normative"]
+
+[[public_type]]
+name = "MemoryCandidateRepresentation"
+kind = "enum"
+definition = ["InlinePreview { value: String }", "ExactExcerpt { value: String, source_handle: ArtifactId }", "ExactHandle { handle: ArtifactId }"]
+invariants = ["inline preview requires payload accessibility", "exact excerpt preserves source wording and handle", "handle/excerpt cannot bypass suppression/quarantine/disclosure"]
+
+[[public_type]]
+name = "MemoryCandidate"
+kind = "struct"
+definition = ["record_handle: ArtifactId", "representation: MemoryCandidateRepresentation", "kind: MemoryRecordKind", "epistemic_status: EpistemicStatus", "accessibility: MemoryAccessibility", "permitted_influence: PermittedInfluence", "assessments: Vec<MemorySelectionAssessment>", "source_handles: Vec<ArtifactId>", "protected: bool"]
+invariants = ["source handles non-empty", "denied/revalidation-only record cannot be selected as current candidate", "status/influence unchanged from source record"]
+
+[[public_type]]
+name = "MemorySelectionDisposition"
+kind = "enum"
+definition = ["Selected", "ExcludedDeniedInfluence", "ExcludedScope", "ExcludedStale", "ExcludedLimit", "RetainedProtectedHandle", "RequiresRevalidation"]
+
+[[public_type]]
+name = "MemorySelectionTraceEntry"
+kind = "struct"
+definition = ["record_handle: ArtifactId", "direct_cue_match: bool", "disposition: MemorySelectionDisposition", "protected: bool", "assessments: Vec<MemorySelectionAssessment>", "reason_codes: Vec<String>"]
+
+[[public_type]]
+name = "MemorySelectionTrace"
+kind = "struct"
+definition = ["snapshot_sha256: String", "intent_sha256: String", "cue_activation_sha256: String", "policy_sha256: String", "coverage: MemoryReadCoverage", "denominator: Option<MemoryCoverageDenominator>", "entries: Vec<MemorySelectionTraceEntry>", "selected_handles: Vec<ArtifactId>", "omitted_or_missing_refs: Vec<String>", "trace_sha256: String"]
+invariants = ["every considered record has one trace entry", "selected handles equal Selected/RetainedProtectedHandle entries", "partial/missing coverage remains explicit", "trace carries no delivery/use/helpfulness claim", "canonical order and digest"]
+
+[[public_type]]
+name = "MemoryCandidateSet"
+kind = "struct"
+definition = ["snapshot_sha256: String", "intent_sha256: String", "policy_sha256: String", "state_fence: StateFence", "coverage: MemoryReadCoverage", "denominator: Option<MemoryCoverageDenominator>", "candidates: Vec<MemoryCandidate>", "trace: MemorySelectionTrace", "set_sha256: String"]
+invariants = ["candidate/trace identities reconcile", "candidate count respects request and policy", "partial denominator retained", "canonical order and digest"]
+
+[[public_type]]
+name = "MemoryContextProjectionRequest"
+kind = "struct"
+definition = ["provider_request: ContextProviderProjectionRequest", "candidate_set_sha256: String", "selection_trace_sha256: String", "disclosure_decision_ref: Option<ArtifactId>", "required_candidate_handles: Vec<ArtifactId>", "maximum_inline_bytes: u32", "allow_exact_excerpt: bool", "allow_handle_only: bool", "request_sha256: String"]
+invariants = ["reuses the one generic provider request rather than duplicating provider identity/scope/fence", "candidate and trace digests exact", "required handles unique and present", "bounds non-zero", "request grants no Context admission or disclosure authority"]
+
+[[public_function]]
+name = "validate_memory_read_snapshot"
+signature = "pub fn validate_memory_read_snapshot(snapshot: &CanonicalMemoryReadSnapshot) -> Result<(), MemoryProjectionContractError>"
+
+[[public_function]]
+name = "validate_memory_query_intent"
+signature = "pub fn validate_memory_query_intent(intent: &MemoryQueryIntent, cues: &CueActivationResult) -> Result<(), MemoryProjectionContractError>"
+
+[[public_function]]
+name = "validate_memory_selection_policy"
+signature = "pub fn validate_memory_selection_policy(policy: &MemorySelectionPolicy) -> Result<(), MemoryProjectionContractError>"
+
+[[public_function]]
+name = "validate_memory_candidate_set"
+signature = "pub fn validate_memory_candidate_set(set: &MemoryCandidateSet) -> Result<(), MemoryProjectionContractError>"
+
+[[public_function]]
+name = "validate_memory_context_projection_request"
+signature = "pub fn validate_memory_context_projection_request(request: &MemoryContextProjectionRequest, candidates: &MemoryCandidateSet) -> Result<(), MemoryProjectionContractError>"
+
+[[negative_test]]
+id = "complete-without-count"
+property = "Complete memory read without denominator.expected_records is rejected."
+
+[[negative_test]]
+id = "wrong-scope-record"
+property = "A record whose scope differs from the read request is rejected before digest acceptance."
+
+[[negative_test]]
+id = "searched-without-receipt"
+property = "Complete, Partial or Stale read without a read receipt is rejected."
+
+[[negative_test]]
+id = "unavailable-without-owner"
+property = "Unavailable or Blocked read without a named missing owner/reason is rejected."
+
+[[negative_test]]
+id = "retrieval-not-reinforcement"
+property = "Candidate query cannot modify epistemic status or lifecycle."
+
+[[negative_test]]
+id = "negative-memory-not-displaced"
+property = "Exact protected negative memory survives broad popularity/limit ordering."
+
+[[negative_test]]
+id = "trace-no-use-claim"
+property = "MemorySelectionTrace schema has no delivered, used, helpful or support-promotion field."

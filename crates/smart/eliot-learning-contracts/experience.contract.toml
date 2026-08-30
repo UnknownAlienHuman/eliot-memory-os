@@ -1,0 +1,230 @@
+schema_version = 1
+contract_id = "smart.learning.system-experience.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-learning-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.learning.contracts.experience", "smart.experience.projection"]
+architecture_refs = ["ARCH-CORE-00", "ARCH-LEARN-01", "ARCH-LEARN-02", "ARCH-UND-02", "ARCH-EPI-04", "ARCH-SCOPE-01", "ARCH-RES-05"]
+implementation_refs = ["I9.3", "I12.24", "I13.11", "I16.23", "I2.20"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Represent one immutable, denominator-bearing task/attempt experience projection with failure evidence and attribution ceilings, without becoming a task, attempt, effect, evaluator or experience-state owner."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((owners + attempts + failures + evidence handles) log n) over request-bounded immutable projections."
+replacement_boundary = "Replace projection implementation behind this contract; existing Task, Attempt, Instrument, Evaluator, Effect and Governor owners remain authoritative."
+
+[closed_sets]
+experience_owner_kinds = ["Task", "Attempt", "Trace", "Artifact", "Evaluator", "Effect"]
+coverage_states = ["NotQueried", "Unavailable", "Partial", "Complete", "Stale", "Blocked"]
+outcome_statuses = ["Succeeded", "Failed", "Partial", "Unknown"]
+outcome_attribution = ["ObservedSequence", "ObservedAssociation", "SupportedContribution", "ObservedUnderIntervention", "CompositeBenefit", "Contradicted", "Unknown"]
+failure_trigger_classes = ["ExactDeterministic", "SemanticNearMatch", "Unknown"]
+failure_classes = ["Verification", "Runtime", "Tool", "Environment", "Authority", "Scope", "Data", "Integration", "Resource", "Unknown"]
+
+[hard_invariants]
+complete_owner_coverage_requires_exact_denominator = true
+all_six_owner_kinds_are_explicit = true
+missing_or_blocked_owner_is_named = true
+failed_attempts_and_failure_observations_are_retained = true
+success_failure_count_is_not_causality = true
+unknown_effect_outcome_remains_unknown = true
+exact_trigger_and_semantic_near_match_are_distinct = true
+failure_observation_creates_no_hard_block_or_lifecycle_action = true
+request_limits_bind_snapshot_and_projection = true
+scope_task_attempt_and_fence_must_match = true
+canonical_order_and_digest_are_deterministic = true
+
+[[donor]]
+artifact = "eliot-cognitive-function-design-rev10-overlay.zip"
+artifact_sha256 = "6dbc1594424c83fa5fc82ce8389a891f3a69d552c25e97154ab217a1cbd3e384"
+path = "crates/smart/eliot-dreamer-failure/api.toml"
+content_sha256 = "2004c1741c88ac8a2b6846bf59184ee109659547772c931bf0cc603322b3bf54"
+disposition = "REWRITE_ADAPT"
+keep = ["failure capsule reference", "exact trigger keys", "failed action and observed outcome", "violated invariants", "rival hypotheses", "attempted repairs", "near-match evidence", "environment/generation scope"]
+replace = ["Dreamer candidate ownership", "fingerprint admission semantics", "unbounded prose fields", "implicit hard-block implication"]
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskRevision"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[public_type]]
+name = "CampaignId"
+kind = "newtype"
+definition = ["String"]
+
+[[public_type]]
+name = "AttemptId"
+kind = "newtype"
+definition = ["String"]
+
+[[public_type]]
+name = "ExperienceIdentity"
+kind = "struct"
+definition = ["campaign_id: CampaignId", "current_attempt_id: AttemptId", "task_id: TaskId", "task_revision: TaskRevision", "scope_id: String", "state_fence: StateFence"]
+invariants = ["campaign/task/attempt/scope exact", "task revision agrees with fence", "identity grants no lifecycle authority"]
+
+[[public_type]]
+name = "ExperienceOwnerKind"
+kind = "enum"
+definition = ["Task", "Attempt", "Trace", "Artifact", "Evaluator", "Effect"]
+
+[[public_type]]
+name = "ExperienceCoverageState"
+kind = "enum"
+definition = ["NotQueried", "Unavailable", "Partial", "Complete", "Stale", "Blocked"]
+
+[[public_type]]
+name = "ExperienceCoverageDenominator"
+kind = "struct"
+definition = ["owner: ExperienceOwnerKind", "source_revision: String", "method_ref: String", "expected_items: Option<u32>", "expected_item_handles: Vec<ArtifactId>"]
+invariants = ["source revision and method non-blank", "Complete requires expected_items", "expected handles unique", "denominator independently recheckable"]
+
+[[public_type]]
+name = "ExperienceCoverage"
+kind = "struct"
+definition = ["owner: ExperienceOwnerKind", "state: ExperienceCoverageState", "denominator: Option<ExperienceCoverageDenominator>", "projection_handle: Option<ArtifactId>", "observed_items: u32", "missing_owner_or_reason_refs: Vec<String>"]
+invariants = ["Complete requires exact denominator count and projection handle with no missing refs", "Partial requires denominator, projection handle and named missing refs", "Unavailable or Blocked has no current items and requires a named owner/reason", "Stale retains revision/handle and cannot support current causal claims"]
+
+[[public_type]]
+name = "OutcomeStatus"
+kind = "enum"
+definition = ["Succeeded", "Failed", "Partial", "Unknown"]
+
+[[public_type]]
+name = "OutcomeAttribution"
+kind = "enum"
+definition = ["ObservedSequence", "ObservedAssociation", "SupportedContribution", "ObservedUnderIntervention", "CompositeBenefit", "Contradicted", "Unknown"]
+invariants = ["chronology, association, contribution and intervention remain distinct", "CompositeBenefit does not prove one mechanism"]
+
+[[public_type]]
+name = "ObservedOutcome"
+kind = "struct"
+definition = ["outcome_id: ArtifactId", "status: OutcomeStatus", "attribution: OutcomeAttribution", "evidence_handles: Vec<ArtifactId>", "effect_receipt_handles: Vec<ArtifactId>", "observed_delta: String", "confounders: Vec<String>"]
+invariants = ["known outcome requires evidence", "mechanism-level attribution requires hypothesis, trace and effect evidence", "unknown effect cannot be rewritten as failure or success"]
+
+[[public_type]]
+name = "FailureTriggerClass"
+kind = "enum"
+definition = ["ExactDeterministic", "SemanticNearMatch", "Unknown"]
+
+[[public_type]]
+name = "FailureClass"
+kind = "enum"
+definition = ["Verification", "Runtime", "Tool", "Environment", "Authority", "Scope", "Data", "Integration", "Resource", "Unknown"]
+
+[[public_type]]
+name = "FailureObservation"
+kind = "struct"
+definition = [
+  "failure_observation_id: ArtifactId",
+  "failure_capsule_ref: Option<ArtifactId>",
+  "attempt_id: AttemptId",
+  "task_id: TaskId",
+  "scope_id: String",
+  "failure_class: FailureClass",
+  "trigger_class: FailureTriggerClass",
+  "failed_action: String",
+  "expected_observable: String",
+  "observed_outcome_ref: ArtifactId",
+  "exact_trigger_components: Vec<String>",
+  "semantic_near_match_cues: Vec<String>",
+  "violated_invariant_refs: Vec<String>",
+  "evidence_handles: Vec<ArtifactId>",
+  "effect_receipt_handles: Vec<ArtifactId>",
+  "competing_causal_hypotheses: Vec<String>",
+  "attempted_repairs_and_observed_deltas: Vec<String>",
+  "environment_generation: String",
+  "state_fence: StateFence",
+  "next_discriminator: String",
+  "reopen_conditions: Vec<String>",
+  "extinction_conditions: Vec<String>",
+  "attribution_ceiling: OutcomeAttribution",
+]
+invariants = ["exact deterministic trigger is distinct from semantic similarity", "evidence and scope are exact", "original failure history is immutable", "near match can warn or require inquiry but cannot create a hard block", "observation grants no lifecycle, action, policy or admission authority", "reopen/extinction conditions do not execute themselves"]
+
+[[public_type]]
+name = "AttemptExperience"
+kind = "struct"
+definition = ["attempt_id: AttemptId", "sequence_index: u32", "strategy: String", "hypothesis_handle: Option<ArtifactId>", "trace_handles: Vec<ArtifactId>", "artifact_handles: Vec<ArtifactId>", "evaluator_handles: Vec<ArtifactId>", "effect_handles: Vec<ArtifactId>", "outcome: ObservedOutcome", "failure_observation_ids: Vec<ArtifactId>"]
+invariants = ["sequence starts at one and is unique", "all evidence vectors bounded/unique", "failed attempt retained", "outcome attribution does not exceed evidence"]
+
+[[public_type]]
+name = "SystemExperienceProjectionRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "identity: ExperienceIdentity", "expected_owners: Vec<ExperienceOwnerKind>", "state_fence: StateFence", "maximum_attempts: u32", "maximum_evidence_handles_per_attempt: u32", "maximum_failures_per_attempt: u32", "request_sha256: String"]
+invariants = ["expected owners are exactly Task/Attempt/Trace/Artifact/Evaluator/Effect", "all limits non-zero", "request/fence/identity compatible", "request owns no query/store capability"]
+
+[[public_type]]
+name = "CanonicalExperienceReadSnapshot"
+kind = "struct"
+definition = ["request_id: RequestId", "request_sha256: String", "identity: ExperienceIdentity", "state_fence: StateFence", "coverage: Vec<ExperienceCoverage>", "attempts: Vec<AttemptExperience>", "failure_observations: Vec<FailureObservation>", "snapshot_sha256: String"]
+invariants = ["one coverage row per expected owner", "request limits bind attempts/evidence/failures", "failure ids unique and referenced by matching attempts", "current attempt present when Attempt coverage is Complete", "canonical order and digest"]
+
+[[public_type]]
+name = "SystemExperienceProjection"
+kind = "struct"
+definition = ["source_snapshot_sha256: String", "request_sha256: String", "identity: ExperienceIdentity", "state_fence: StateFence", "coverage: Vec<ExperienceCoverage>", "attempts: Vec<AttemptExperience>", "failure_observations: Vec<FailureObservation>", "projection_sha256: String"]
+invariants = ["does not own mutable experience state", "preserves failed attempts, contrary outcomes and unknown effects", "cannot create learning delta, Skill, policy, task finish or promotion", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_experience_projection_request"
+signature = "pub fn validate_experience_projection_request(request: &SystemExperienceProjectionRequest) -> Result<(), LearningContractError>"
+
+[[public_function]]
+name = "validate_canonical_experience_read_snapshot"
+signature = "pub fn validate_canonical_experience_read_snapshot(request: &SystemExperienceProjectionRequest, snapshot: &CanonicalExperienceReadSnapshot) -> Result<(), LearningContractError>"
+
+[[public_function]]
+name = "validate_failure_observation"
+signature = "pub fn validate_failure_observation(identity: &ExperienceIdentity, failure: &FailureObservation) -> Result<(), LearningContractError>"
+
+[[public_function]]
+name = "validate_system_experience_projection"
+signature = "pub fn validate_system_experience_projection(request: &SystemExperienceProjectionRequest, projection: &SystemExperienceProjection) -> Result<(), LearningContractError>"
+
+[[negative_test]]
+id = "complete-owner-without-denominator"
+property = "Complete owner coverage without expected_items is rejected."
+
+[[negative_test]]
+id = "blocked-owner-without-reason"
+property = "Unavailable or Blocked owner without named missing owner/reason is rejected."
+
+[[negative_test]]
+id = "request-limit-bypass"
+property = "Snapshot/projection exceeding request attempts, failures or evidence handles is rejected."
+
+[[negative_test]]
+id = "near-match-not-hard-block"
+property = "SemanticNearMatch failure carries no hard-block or action-decision field."
+
+[[negative_test]]
+id = "unattributed-success-observed-only"
+property = "Success without mechanism evidence remains ObservedSequence/Association or Unknown."
+
+[[negative_test]]
+id = "failed-attempt-retained"
+property = "Projection cannot omit a failed attempt or its FailureObservation while claiming Complete Attempt coverage."

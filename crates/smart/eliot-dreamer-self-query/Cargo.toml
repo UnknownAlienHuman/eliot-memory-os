@@ -11,10 +11,14 @@ path = "src/lib.rs"
 
 [package.metadata.eliot]
 layer = "C1"
-purpose = "Architecture/Implementation self-query and self-model projection"
+purpose = "Architecture/Implementation self-query and SelfModel Context projection"
 source_maintenance_owner = "cognitive-integration-owner"
 functional_cell_refs = ["smart.dreamer.architecture_brief", "smart.dreamer.implementation_brief", "smart.self_model.context_projection"]
 independent_proof_profile = "prototype-not-workspace-admitted"
-contract_refs = ["crates/smart/cognitive-current.toml"]
+contract_refs = [
+  "crates/smart/cognitive-current.toml",
+  "crates/smart/eliot-context-contracts/provider-contribution.contract.toml",
+]
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until brief cells and SelfModel projection have package proof and affected real Edge Proof"

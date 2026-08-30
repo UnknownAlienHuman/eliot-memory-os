@@ -11,10 +11,14 @@ path = "src/lib.rs"
 
 [package.metadata.eliot]
 layer = "C1"
-purpose = "immutable task/attempt outcome projection"
+purpose = "immutable task/attempt/failure/outcome projection"
 source_maintenance_owner = "cognitive-integration-owner"
 functional_cell_refs = ["smart.experience.projection"]
 independent_proof_profile = "prototype-not-workspace-admitted"
-contract_refs = ["crates/smart/cognitive-current.toml"]
+contract_refs = [
+  "crates/smart/cognitive-current.toml",
+  "crates/smart/eliot-learning-contracts/experience.contract.toml",
+]
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until package proof and affected real Edge Proof"

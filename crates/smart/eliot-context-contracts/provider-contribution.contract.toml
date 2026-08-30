@@ -1,0 +1,311 @@
+schema_version = 1
+contract_id = "smart.context.provider-contribution.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-context-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = [
+  "smart.context.contracts.candidate",
+  "smart.context.contracts.admission",
+  "smart.context.contracts.view_quality",
+  "smart.context.provider_registry_contracts",
+]
+architecture_refs = ["ARCH-MOD-03", "ARCH-CTX-01", "ARCH-CTX-04", "ARCH-EPI-04", "ARCH-SCOPE-01", "ARCH-UND-01"]
+implementation_refs = ["I2.20", "I2.23", "I7.11", "I12.13", "I5.20"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "One provider-neutral, whole-unit, denominator-bearing contribution contract is shared by every Context provider without granting admission or authority."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((providers + roles + atoms + omissions) log n) over policy-bounded inputs; no I/O, model call, store read, admission or delivery effect."
+replacement_boundary = "Replace implementation behind this contract; provider adapters and Context admission remain separate owners."
+
+[closed_sets]
+context_provider_classes = ["GoalTask", "CriticalAttention", "EpistemicPosition", "MemoryRecall", "AuthorityAffordance", "SelfModel", "DecisionTail"]
+provider_role_requirements = ["Mandatory", "Optional", "Advisory"]
+provider_availability = ["Available", "Degraded", "Unavailable", "Stale", "Unsupported"]
+provider_coverage = ["Complete", "Partial", "Unavailable", "Blocked", "Stale", "NotApplicable", "Conflicted"]
+context_roles = ["TaskFrame", "CriticalAttention", "EpistemicPosition", "SemanticCausalModel", "Continuity", "SafetyNegativeMemory", "UnknownInquiry", "ExactEvidence", "AuthorityAffordance", "DecisionBoundary"]
+
+[hard_invariants]
+provider_class_is_closed = true
+one_generic_provider_request = true
+contribution_contains_no_admission_disposition = true
+complete_requires_recheckable_denominator = true
+whole_units_only = true
+scope_task_fence_and_provider_identity_must_match = true
+missing_mandatory_provider_is_not_empty_complete = true
+provider_cannot_claim_another_provider_role = true
+payload_never_exceeds_source_assertability_or_disclosure = true
+unknown_decision_delta_is_not_zero = true
+canonical_order_and_digest_are_deterministic = true
+
+[[donor]]
+artifact = "eliot-cognitive-function-design-rev10-overlay.zip"
+artifact_sha256 = "6dbc1594424c83fa5fc82ce8389a891f3a69d552c25e97154ab217a1cbd3e384"
+path = "crates/smart/eliot-context-contracts/core.api.toml"
+content_sha256 = "72810812bc695bdca2ab5a04161c0fd2e6550a058e5e75b71798b3a3496cc8b2"
+disposition = "REWRITE_ADAPT"
+keep = ["whole addressable Context atoms", "loss policy", "provider coverage", "exact lineage", "deterministic contribution digest"]
+replace = ["ContextContribution name", "unclosed provider identity", "optional denominator for complete claims", "legacy role/provider vocabulary"]
+
+[[donor]]
+artifact = "eliot-cognitive-function-design-rev10-overlay.zip"
+artifact_sha256 = "6dbc1594424c83fa5fc82ce8389a891f3a69d552c25e97154ab217a1cbd3e384"
+path = "crates/smart/eliot-context-candidates/api.toml"
+content_sha256 = "53a9d9df1b2e4049c1a77b90f34b4e6c8fdb578a0c6358bf900a5a7006b681e1"
+disposition = "REWRITE_ADAPT"
+keep = ["exact expected-provider set", "missing required provider visibility", "duplicate-atom conflict rejection"]
+replace = ["function-only crate boundary", "parallel contribution contract ownership"]
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskRevision"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "ContractIdentity"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "EpistemicStatus"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "Assertability"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "EvidenceFreshness"
+owner = "eliot-evidence"
+
+[[public_type]]
+name = "ProviderId"
+kind = "newtype"
+definition = ["String"]
+invariants = ["non-blank", "bounded", "stable within one provider generation", "not inferred from display text"]
+
+[[public_type]]
+name = "ContextProviderClass"
+kind = "enum"
+definition = ["GoalTask", "CriticalAttention", "EpistemicPosition", "MemoryRecall", "AuthorityAffordance", "SelfModel", "DecisionTail"]
+invariants = ["closed-world enum", "unknown or extra class returns UnknownProviderClass", "class does not grant authority"]
+
+[[public_type]]
+name = "ProviderRoleRequirement"
+kind = "enum"
+definition = ["Mandatory", "Optional", "Advisory"]
+invariants = ["Mandatory absence remains explicit and cannot produce Complete", "requirement is recipe/input state, not provider self-assertion"]
+
+[[public_type]]
+name = "ProviderAvailabilityClass"
+kind = "enum"
+definition = ["Available", "Degraded", "Unavailable", "Stale", "Unsupported"]
+invariants = ["availability is independent from requirement and epistemic support"]
+
+[[public_type]]
+name = "ContextRole"
+kind = "enum"
+definition = ["TaskFrame", "CriticalAttention", "EpistemicPosition", "SemanticCausalModel", "Continuity", "SafetyNegativeMemory", "UnknownInquiry", "ExactEvidence", "AuthorityAffordance", "DecisionBoundary"]
+invariants = ["one primary role per atom", "role order is recipe-versioned rather than enum-order authority"]
+
+[[public_type]]
+name = "ContextAtomClass"
+kind = "enum"
+definition = ["Authority", "Goal", "Scope", "Acceptance", "Source", "Verifier", "MaterialUnknown", "Negative", "Security", "Optional"]
+invariants = ["class controls loss/safety semantics, not factual support"]
+
+[[public_type]]
+name = "ContextLossPolicy"
+kind = "enum"
+definition = ["NonDroppable", "HandleOnly", "Extractive", "Summarizable"]
+invariants = ["NonDroppable cannot be silently omitted", "HandleOnly retains an exact expansion handle", "Extractive retains exact source wording", "Summarizable retains source lineage and omission record"]
+
+[[public_type]]
+name = "DecisionDelta"
+kind = "enum"
+definition = ["Known { basis_points: u16 }", "BoundedRange { minimum_basis_points: u16, maximum_basis_points: u16 }", "Unknown", "NotApplicable"]
+invariants = ["basis points are within 0..=10000", "minimum <= maximum", "Unknown is not zero and cannot alone justify suppression"]
+
+[[public_type]]
+name = "ProviderAtomRepresentation"
+kind = "enum"
+definition = ["InlinePayload { value: String }", "ExactExcerpt { value: String, source_handle: ArtifactId }", "ExactHandle { handle: ArtifactId }"]
+invariants = ["one complete representation per atom", "no silent token slicing", "payload/excerpt must satisfy disclosure and assertability ceilings", "handle remains expandable"]
+
+[[public_type]]
+name = "ProviderAtom"
+kind = "struct"
+definition = [
+  "atom_id: ArtifactId",
+  "provider_id: ProviderId",
+  "provider_generation: String",
+  "role: ContextRole",
+  "class: ContextAtomClass",
+  "loss_policy: ContextLossPolicy",
+  "representation: ProviderAtomRepresentation",
+  "scope_id: String",
+  "task_id: Option<TaskId>",
+  "state_fence: StateFence",
+  "source_handles: Vec<ArtifactId>",
+  "dependency_and_invalidation_handles: Vec<ArtifactId>",
+  "epistemic_status: Option<EpistemicStatus>",
+  "assertability: Assertability",
+  "freshness: EvidenceFreshness",
+  "required: bool",
+  "protected: bool",
+  "cost_units: u32",
+  "expected_decision_delta: DecisionDelta",
+  "risk_rank: u8",
+  "cue_refs: Vec<String>",
+]
+invariants = ["source handles non-empty and unique", "provider/scope/task/fence match contribution", "required/protected safety atoms retain conservative loss policy", "representation never launders status, provenance or authority"]
+
+[[public_type]]
+name = "ProviderCoverageDisposition"
+kind = "enum"
+definition = ["Complete", "Partial", "Unavailable", "Blocked", "Stale", "NotApplicable", "Conflicted"]
+invariants = ["Complete applies only to one exact provider generation and frozen denominator"]
+
+[[public_type]]
+name = "ProviderCoverageDenominator"
+kind = "struct"
+definition = ["source_ref: String", "source_revision: String", "method_ref: String", "expected_atoms: Option<u32>", "expected_source_handles: Vec<ArtifactId>"]
+invariants = ["source, revision and method are non-blank", "Complete requires expected_atoms", "expected handles are exact and unique", "absence/coverage claims are independently recheckable"]
+
+[[public_type]]
+name = "ProviderCoverage"
+kind = "struct"
+definition = ["provider_id: ProviderId", "provider_generation: String", "disposition: ProviderCoverageDisposition", "denominator: Option<ProviderCoverageDenominator>", "provided_atom_count: u32", "missing_owner_or_reason_refs: Vec<String>", "gaps: Vec<String>"]
+invariants = ["Complete requires denominator.expected_atoms and exact count equality", "Partial requires named missing refs", "Unavailable or Blocked requires a named owner/reason and cannot claim atoms", "NotApplicable names the applicability basis"]
+
+[[public_type]]
+name = "ProviderOmissionReason"
+kind = "enum"
+definition = ["Budget", "DisclosureDenied", "HandleOnlyRequired", "Stale", "UnsupportedRole", "SourceUnavailable", "RepresentationUnsafe", "PolicySuppressed"]
+
+[[public_type]]
+name = "ProviderOmission"
+kind = "struct"
+definition = ["source_handle: ArtifactId", "role: ContextRole", "reason: ProviderOmissionReason", "required: bool", "expansion_handle: Option<ArtifactId>", "detail: String"]
+invariants = ["required omission blocks a complete contribution unless a safe exact-handle representation exists", "omission never pretends source absence"]
+
+[[public_type]]
+name = "ContextProviderDescriptor"
+kind = "struct"
+definition = ["provider_id: ProviderId", "class: ContextProviderClass", "generation: String", "contract_identity: ContractIdentity", "supported_roles: Vec<ContextRole>", "availability: ProviderAvailabilityClass", "state_fence: StateFence"]
+invariants = ["roles non-empty and unique", "contract identity and generation exact", "one class from closed set"]
+
+[[public_type]]
+name = "ContextProviderRegistrySnapshot"
+kind = "struct"
+definition = ["registry_revision: TaskRevision", "scope_id: String", "state_fence: StateFence", "providers: Vec<ContextProviderDescriptor>", "snapshot_sha256: String"]
+invariants = ["provider ids unique", "one compatible fence", "canonical ordering and digest"]
+
+[[public_type]]
+name = "ExpectedContextProvider"
+kind = "struct"
+definition = ["provider_id: ProviderId", "class: ContextProviderClass", "generation: String", "contract_shape_sha256: String", "requirement: ProviderRoleRequirement", "supported_roles: Vec<ContextRole>", "required_roles: Vec<ContextRole>", "availability: ProviderAvailabilityClass"]
+invariants = ["required roles are a subset of supported roles", "Mandatory requires at least one required role", "availability cannot be hidden by aggregate state"]
+
+[[public_type]]
+name = "ExpectedProviderSetDisposition"
+kind = "enum"
+definition = ["Complete", "Partial", "Blocked"]
+
+[[public_type]]
+name = "ExpectedContextProviderSet"
+kind = "struct"
+definition = ["registry_snapshot_sha256: String", "scope_id: String", "state_fence: StateFence", "providers: Vec<ExpectedContextProvider>", "disposition: ExpectedProviderSetDisposition", "set_sha256: String"]
+invariants = ["provider ids unique", "missing/unavailable mandatory provider forces Blocked", "degraded optional/advisory provider forces at least Partial", "canonical ordering and digest"]
+
+[[public_type]]
+name = "ContextProviderProjectionRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "provider: ContextProviderDescriptor", "expected_provider_set_sha256: String", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "requested_roles: Vec<ContextRole>", "safety_floor_roles: Vec<ContextRole>", "maximum_atoms: u32", "maximum_rendered_bytes: u32"]
+invariants = ["requested roles unique and supported", "safety-floor roles are requested", "provider/request fences compatible", "Unavailable or Unsupported provider is not executed; its absence stays in the expected-provider set", "bounds non-zero", "same request type used by every provider"]
+
+[[public_type]]
+name = "ProviderContribution"
+kind = "struct"
+definition = [
+  "contribution_id: ArtifactId",
+  "request_id: RequestId",
+  "provider_id: ProviderId",
+  "provider_class: ContextProviderClass",
+  "provider_generation: String",
+  "provider_contract_shape_sha256: String",
+  "expected_provider_set_sha256: String",
+  "scope_id: String",
+  "task_id: Option<TaskId>",
+  "state_fence: StateFence",
+  "atoms: Vec<ProviderAtom>",
+  "coverage: ProviderCoverage",
+  "omissions: Vec<ProviderOmission>",
+  "contribution_sha256: String",
+]
+invariants = ["matches one exact projection request", "atom ids unique", "all atoms and coverage match provider/scope/task/fence", "contains no admission, rank-against-other-provider, delivery, use, utility, authority or finish disposition", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_context_provider_registry"
+signature = "pub fn validate_context_provider_registry(registry: &ContextProviderRegistrySnapshot) -> Result<(), ContextContractError>"
+
+[[public_function]]
+name = "validate_expected_provider_set"
+signature = "pub fn validate_expected_provider_set(expected: &ExpectedContextProviderSet) -> Result<(), ContextContractError>"
+
+[[public_function]]
+name = "validate_context_provider_request"
+signature = "pub fn validate_context_provider_request(request: &ContextProviderProjectionRequest) -> Result<(), ContextContractError>"
+
+[[public_function]]
+name = "validate_provider_contribution"
+signature = "pub fn validate_provider_contribution(request: &ContextProviderProjectionRequest, contribution: &ProviderContribution) -> Result<(), ContextContractError>"
+
+[[public_function]]
+name = "provider_contribution_digest"
+signature = "pub fn provider_contribution_digest(contribution: &ProviderContribution) -> Result<String, ContextContractError>"
+
+[[negative_test]]
+id = "closed-provider-class-set"
+property = "Every legacy/extra provider class fails decoding or validation."
+
+[[negative_test]]
+id = "complete-needs-denominator"
+property = "Complete provider coverage without exact expected count is rejected."
+
+[[negative_test]]
+id = "mandatory-unavailable-blocks"
+property = "Unavailable mandatory provider cannot be represented as Complete or Partial."
+
+[[negative_test]]
+id = "provider-role-overclaim"
+property = "Provider cannot emit an atom outside its supported/requested role set."
+
+[[negative_test]]
+id = "contribution-has-no-admission"
+property = "Consumer compile fixture proves ProviderContribution exposes no admission disposition or authority field."
+
+[[negative_test]]
+id = "payload-disclosure-ceiling"
+property = "Unsafe/inaccessible payload is rejected; exact handle or explicit omission remains."
