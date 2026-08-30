@@ -1,0 +1,45 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+field_contract_is_sole_public_type_authority = true
+order = 15
+cell = "smart.dreamer.clarification_candidate"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-orientation"
+primary_property = "Build a bounded clarification candidate for a material ambiguity in scope, definition, acceptance, authority, evidence or requested outcome without silently resolving or mutating that ambiguity."
+field_contract = "crates/smart/eliot-dreamer-contracts/orientation.contract.toml"
+public_function_selectors = ["build_clarification_candidate"]
+write_scope = [
+  "crates/smart/eliot-dreamer-orientation/src/clarification_candidate.rs",
+  "crates/smart/eliot-dreamer-orientation/tests/clarification_candidate.rs",
+]
+algorithm = [
+  "validate request, epistemic position, conflicts, ambiguity targets, scope/task/fence and bounds",
+  "classify ambiguity as scope, definition, acceptance, authority, evidence, temporal or requested-outcome ambiguity",
+  "retain all materially distinct interpretations and consequences",
+  "form the minimum question whose answer discriminates the alternatives",
+  "attach answer schema, safe default/abstention behavior, expiry, stop and revision conditions",
+  "emit candidate-only clarification with exact source handles and canonical digest",
+]
+minimum_tests = [
+  "material ambiguity cannot be silently defaulted",
+  "question must distinguish at least two live interpretations",
+  "clarification cannot mutate objective, scope, acceptance or authority",
+  "safe abstention/default remains explicit when answer unavailable",
+  "source handles and consequences retained",
+  "candidate contains no user message send, task revision or finish receipt",
+]
+non_goals = [
+  "asking the user or agent",
+  "task/scope/acceptance mutation",
+  "authority resolution",
+  "evidence acquisition",
+  "model/tool execution",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-INTENT-01", "ARCH-EPI-03", "ARCH-UND-01", "ARCH-SCOPE-01"]
+implementation_refs = ["I2.20", "I9.5", "I12.18", "I14"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than choosing an interpretation, mutating protected task fields, or representing a clarification candidate as an executed question/answer."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
