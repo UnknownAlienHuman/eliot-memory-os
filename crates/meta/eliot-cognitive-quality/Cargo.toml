@@ -15,6 +15,12 @@ purpose = "Skill/tool/Dreamer/self-quality assessment and intervention candidate
 source_maintenance_owner = "cognitive-integration-owner"
 functional_cell_refs = ["meta.skill.lifecycle_assessment", "meta.tool.surface_assessment", "meta.dreamer.job_economics", "governor.self_quality.view", "meta.self_quality.learning_bottleneck", "meta.self_quality.intervention_candidate"]
 independent_proof_profile = "prototype-not-workspace-admitted"
-contract_refs = ["crates/smart/cognitive-current.toml"]
+contract_refs = [
+  "crates/smart/cognitive-current.toml",
+  "crates/smart/cognitive-rev12-w9-field-contracts.toml",
+  "crates/meta/eliot-cognitive-quality/quality.contract.toml",
+  "crates/smart/eliot-learning-contracts/experience.contract.toml",
+]
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until all six cells have Rust implementation, package Module Proof and affected real Edge Proof"
