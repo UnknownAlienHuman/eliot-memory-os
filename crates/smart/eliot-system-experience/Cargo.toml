@@ -4,7 +4,22 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
-description = "Governed append-only system-experience evidence owner for ELIOT"
+description = "Stateless bounded projection over Governor-owned system-experience evidence"
+
+[package.metadata.eliot]
+layer = "C1"
+purpose = "Validate and deterministically project one immutable owner-supplied system-experience read set without owning semantic state."
+source_maintenance_owner = "smart.system-experience-projection"
+functional_cell_refs = ["smart.experience.projection.compatibility"]
+independent_proof_profile = "eliot-system-experience"
+contract_refs = [
+  "ARCH-MOD-03",
+  "ARCH-SEC-02",
+  "ARCH-MEM-04",
+  "ELIOT_IMPLEMENTATION:I4.8",
+  "ELIOT_IMPLEMENTATION:I5.24",
+]
+component_contract_ref = ""
 
 [dependencies]
 eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
