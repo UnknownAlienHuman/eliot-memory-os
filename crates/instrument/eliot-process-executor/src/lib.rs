@@ -63,6 +63,138 @@ pub trait DispatchValidationPort: Send + Sync {
     ) -> Result<ValidatedDispatch, ProcessExecutionError>;
 }
 
+/// Availability of one independent executor capability dimension.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutorCapabilityHealth {
+    /// The capability is available for every currently known operation.
+    Available,
+    /// The capability remains available, but one or more operations are
+    /// locally quarantined or have incomplete evidence.
+    Degraded,
+    /// The capability cannot currently be offered by this executor generation.
+    Unavailable,
+}
+
+/// Stable class of an operation-local quarantine cause.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum OperationQuarantineReason {
+    /// A requested stdout/stderr capture owner could not be established or
+    /// completed exactly.
+    Capture,
+    /// The physical child or Job could not be observed exactly.
+    Observation,
+    /// Cancellation or physical containment could not be completed exactly.
+    Cancellation,
+    /// Evidence construction or persistence failed for this operation.
+    Evidence,
+    /// Final stream/Job cleanup could not be proven complete.
+    Cleanup,
+}
+
+/// Executor-generation health split by independent control/evidence dimensions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutorHealthSnapshot {
+    new_starts: ExecutorCapabilityHealth,
+    inspection: ExecutorCapabilityHealth,
+    cancellation: ExecutorCapabilityHealth,
+    evidence: ExecutorCapabilityHealth,
+    cleanup: ExecutorCapabilityHealth,
+    operation_count: usize,
+    quarantined_operations: usize,
+}
+
+impl ExecutorHealthSnapshot {
+    /// Returns whether this generation may admit a new start.
+    pub const fn new_starts(&self) -> ExecutorCapabilityHealth {
+        self.new_starts
+    }
+
+    /// Returns the aggregate existing-operation inspection capability.
+    pub const fn inspection(&self) -> ExecutorCapabilityHealth {
+        self.inspection
+    }
+
+    /// Returns the aggregate cancellation/containment capability.
+    pub const fn cancellation(&self) -> ExecutorCapabilityHealth {
+        self.cancellation
+    }
+
+    /// Returns the aggregate capture/evidence completeness capability.
+    pub const fn evidence(&self) -> ExecutorCapabilityHealth {
+        self.evidence
+    }
+
+    /// Returns the aggregate cleanup/reconciliation capability.
+    pub const fn cleanup(&self) -> ExecutorCapabilityHealth {
+        self.cleanup
+    }
+
+    /// Returns the number of retained operation owners.
+    pub const fn operation_count(&self) -> usize {
+        self.operation_count
+    }
+
+    /// Returns the number of operations requiring local reconciliation or cleanup.
+    pub const fn quarantined_operations(&self) -> usize {
+        self.quarantined_operations
+    }
+}
+
+/// Operation-local health without exposing a raw child or Job handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationHealthSnapshot {
+    operation_id: OperationId,
+    lifecycle: ProcessLifecycle,
+    quarantined: bool,
+    cleanup_required: bool,
+    evidence: ExecutorCapabilityHealth,
+    identity_observed: bool,
+    descendant_evidence_complete: bool,
+    quarantine_reasons: Vec<OperationQuarantineReason>,
+}
+
+impl OperationHealthSnapshot {
+    /// Returns the exact operation identity.
+    pub const fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    /// Returns the provider-neutral process lifecycle.
+    pub const fn lifecycle(&self) -> ProcessLifecycle {
+        self.lifecycle
+    }
+
+    /// Returns whether this operation is locally fenced for reconciliation.
+    pub const fn quarantined(&self) -> bool {
+        self.quarantined
+    }
+
+    /// Returns whether P-04 must retain the physical cleanup owner.
+    pub const fn cleanup_required(&self) -> bool {
+        self.cleanup_required
+    }
+
+    /// Returns the operation-local capture/evidence dimension.
+    pub const fn evidence(&self) -> ExecutorCapabilityHealth {
+        self.evidence
+    }
+
+    /// Returns whether the exact resumed physical identity was observed.
+    pub const fn identity_observed(&self) -> bool {
+        self.identity_observed
+    }
+
+    /// Returns whether complete terminated-tree evidence is currently present.
+    pub const fn descendant_evidence_complete(&self) -> bool {
+        self.descendant_evidence_complete
+    }
+
+    /// Returns the stable local quarantine reason set.
+    pub fn quarantine_reasons(&self) -> &[OperationQuarantineReason] {
+        &self.quarantine_reasons
+    }
+}
+
 /// Bounded stream projection retained by P-04 for diagnostics.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CapturedStream {
@@ -151,6 +283,7 @@ struct Operation {
     cleanup_required: bool,
     termination: Option<TerminatedJobChild>,
     capture_failures: Vec<CaptureFailure>,
+    quarantine_reasons: Vec<OperationQuarantineReason>,
 }
 
 #[cfg(not(windows))]
@@ -165,7 +298,7 @@ pub struct WindowsProcessExecutor {
     operations: Mutex<BTreeMap<OperationId, Arc<Mutex<Operation>>>>,
     reservations: Mutex<std::collections::BTreeSet<OperationId>>,
     capture_limit: usize,
-    poisoned: Arc<AtomicBool>,
+    start_gate_closed: AtomicBool,
 }
 
 struct OperationReservation<'a> {
@@ -177,6 +310,8 @@ impl Drop for OperationReservation<'_> {
     fn drop(&mut self) {
         if let Ok(mut reservations) = self.executor.reservations.lock() {
             reservations.remove(&self.operation_id);
+        } else {
+            self.executor.close_new_starts_for_shared_fault();
         }
     }
 }
@@ -191,7 +326,7 @@ impl WindowsProcessExecutor {
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
-            poisoned: Arc::new(AtomicBool::new(false)),
+            start_gate_closed: AtomicBool::new(false),
         }
     }
 
@@ -207,7 +342,7 @@ impl WindowsProcessExecutor {
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
-            poisoned: Arc::new(AtomicBool::new(false)),
+            start_gate_closed: AtomicBool::new(false),
         }
     }
 
@@ -223,14 +358,156 @@ impl WindowsProcessExecutor {
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
             capture_limit: capture_limit.max(1),
-            poisoned: Arc::new(AtomicBool::new(false)),
+            start_gate_closed: AtomicBool::new(false),
         }
+    }
+
+    /// Closes only new-start admission after evidence of a shared executor-
+    /// generation fault. Existing operation inspection, cancellation and
+    /// cleanup remain reachable and the generation cannot silently reopen.
+    pub fn close_new_starts_for_shared_fault(&self) {
+        self.start_gate_closed.store(true, Ordering::Release);
+    }
+
+    /// Returns the current executor-generation health vector.
+    #[must_use]
+    pub fn health(&self) -> ExecutorHealthSnapshot {
+        #[cfg(windows)]
+        {
+            let new_starts = if self.start_gate_closed.load(Ordering::Acquire) {
+                ExecutorCapabilityHealth::Unavailable
+            } else {
+                ExecutorCapabilityHealth::Available
+            };
+            let operations = match self.operations.lock() {
+                Ok(operations) => operations,
+                Err(_) => {
+                    self.close_new_starts_for_shared_fault();
+                    return ExecutorHealthSnapshot {
+                        new_starts: ExecutorCapabilityHealth::Unavailable,
+                        inspection: ExecutorCapabilityHealth::Unavailable,
+                        cancellation: ExecutorCapabilityHealth::Unavailable,
+                        evidence: ExecutorCapabilityHealth::Unavailable,
+                        cleanup: ExecutorCapabilityHealth::Unavailable,
+                        operation_count: 0,
+                        quarantined_operations: 0,
+                    };
+                }
+            };
+            let operation_count = operations.len();
+            let mut quarantined_operations = 0;
+            let mut inspection_degraded = false;
+            let mut cancellation_degraded = false;
+            let mut evidence_degraded = false;
+            let mut cleanup_degraded = false;
+            for operation in operations.values() {
+                let Ok(guard) = operation.lock() else {
+                    quarantined_operations += 1;
+                    inspection_degraded = true;
+                    cancellation_degraded = true;
+                    evidence_degraded = true;
+                    cleanup_degraded = true;
+                    continue;
+                };
+                if operation_is_quarantined(&guard) {
+                    quarantined_operations += 1;
+                    inspection_degraded = true;
+                    cancellation_degraded = true;
+                }
+                if !guard.capture_failures.is_empty()
+                    || guard.quarantine_reasons.iter().any(|reason| {
+                        matches!(
+                            reason,
+                            OperationQuarantineReason::Capture
+                                | OperationQuarantineReason::Evidence
+                        )
+                    })
+                {
+                    evidence_degraded = true;
+                }
+                if guard.cleanup_required {
+                    cleanup_degraded = true;
+                }
+            }
+            ExecutorHealthSnapshot {
+                new_starts,
+                inspection: health_from_degraded(inspection_degraded),
+                cancellation: health_from_degraded(cancellation_degraded),
+                evidence: health_from_degraded(evidence_degraded),
+                cleanup: health_from_degraded(cleanup_degraded),
+                operation_count,
+                quarantined_operations,
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            ExecutorHealthSnapshot {
+                new_starts: ExecutorCapabilityHealth::Unavailable,
+                inspection: ExecutorCapabilityHealth::Unavailable,
+                cancellation: ExecutorCapabilityHealth::Unavailable,
+                evidence: ExecutorCapabilityHealth::Unavailable,
+                cleanup: ExecutorCapabilityHealth::Unavailable,
+                operation_count: 0,
+                quarantined_operations: 0,
+            }
+        }
+    }
+
+    /// Returns one retained operation's local health and recovery disposition.
+    ///
+    /// # Errors
+    /// Returns an error when the operation is absent, its local lock is
+    /// unavailable, or this is not a Windows target.
+    pub fn operation_health(
+        &self,
+        id: &OperationId,
+    ) -> Result<OperationHealthSnapshot, ProcessExecutionError> {
+        #[cfg(windows)]
+        {
+            let operation = self.operation(id)?;
+            let guard = operation
+                .lock()
+                .map_err(|_| unavailable("operation lock poisoned"))?;
+            let view = guard.state.view();
+            let descendant_evidence_complete = view
+                .descendants()
+                .is_some_and(|evidence| evidence.complete() && evidence.tree_terminated());
+            let evidence_degraded = !guard.capture_failures.is_empty()
+                || guard.quarantine_reasons.iter().any(|reason| {
+                    matches!(
+                        reason,
+                        OperationQuarantineReason::Capture | OperationQuarantineReason::Evidence
+                    )
+                });
+            return Ok(OperationHealthSnapshot {
+                operation_id: id.clone(),
+                lifecycle: view.lifecycle(),
+                quarantined: operation_is_quarantined(&guard),
+                cleanup_required: guard.cleanup_required,
+                evidence: health_from_degraded(evidence_degraded),
+                identity_observed: view.identity().is_some(),
+                descendant_evidence_complete,
+                quarantine_reasons: guard.quarantine_reasons.clone(),
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = id;
+            Err(unavailable(
+                "Windows ProcessExecutor is unavailable on this target",
+            ))
+        }
+    }
+
+    fn shared_unavailable(&self, error: impl std::fmt::Display) -> ProcessExecutionError {
+        self.close_new_starts_for_shared_fault();
+        unavailable(error)
     }
 
     fn operation(&self, id: &OperationId) -> Result<Arc<Mutex<Operation>>, ProcessExecutionError> {
         self.operations
             .lock()
-            .map_err(|_| unavailable("operation registry lock poisoned"))?
+            .map_err(|_| self.shared_unavailable("operation registry lock poisoned"))?
             .get(id)
             .cloned()
             .ok_or(ProcessExecutionError::NotFound)
@@ -243,14 +520,14 @@ impl WindowsProcessExecutor {
         let operations = self
             .operations
             .lock()
-            .map_err(|_| unavailable("operation registry lock poisoned"))?;
+            .map_err(|_| self.shared_unavailable("operation registry lock poisoned"))?;
         if operations.contains_key(&id) {
             return Err(unavailable("operation identity already exists"));
         }
         let mut reservations = self
             .reservations
             .lock()
-            .map_err(|_| unavailable("operation reservation lock poisoned"))?;
+            .map_err(|_| self.shared_unavailable("operation reservation lock poisoned"))?;
         if !reservations.insert(id.clone()) {
             return Err(unavailable("operation identity already exists"));
         }
@@ -310,31 +587,33 @@ impl WindowsProcessExecutor {
             let mut operations = self
                 .operations
                 .lock()
-                .map_err(|_| unavailable("operation registry lock poisoned"))?;
+                .map_err(|_| self.shared_unavailable("operation registry lock poisoned"))?;
             let mut ids = Vec::new();
             let mut cleanup_unknown = false;
             for (id, operation) in operations.iter() {
-                let mut guard = operation
-                    .lock()
-                    .map_err(|_| unavailable("operation lock poisoned"))?;
+                let Ok(mut guard) = operation.lock() else {
+                    cleanup_unknown = true;
+                    continue;
+                };
                 if !guard.state.view().lifecycle().is_terminal() || guard.cleanup_required {
                     continue;
                 }
                 if !join_streams(&mut guard) {
-                    poison_operation(&mut guard, &self.poisoned);
+                    quarantine_operation(&mut guard, OperationQuarantineReason::Cleanup);
                     cleanup_unknown = true;
                     continue;
                 }
                 ids.push(id.clone());
             }
-            if cleanup_unknown {
-                return Err(ProcessExecutionError::UnknownOutcome);
-            }
             let count = ids.len();
             for id in ids {
                 operations.remove(&id);
             }
-            Ok(count)
+            if cleanup_unknown {
+                Err(ProcessExecutionError::UnknownOutcome)
+            } else {
+                Ok(count)
+            }
         }
         #[cfg(not(windows))]
         {
@@ -357,23 +636,24 @@ impl WindowsProcessExecutor {
             let mut operations = self
                 .operations
                 .lock()
-                .map_err(|_| unavailable("operation registry lock poisoned"))?;
+                .map_err(|_| self.shared_unavailable("operation registry lock poisoned"))?;
             let mut retain_cleanup_owners = false;
             for operation in operations.values() {
-                let mut guard = operation
-                    .lock()
-                    .map_err(|_| unavailable("operation lock poisoned"))?;
+                let Ok(mut guard) = operation.lock() else {
+                    retain_cleanup_owners = true;
+                    continue;
+                };
                 retain_cleanup_owners |= guard.cleanup_required
                     || guard.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome;
                 if guard.child.is_some()
                     && guard.termination.is_none()
                     && finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err()
                 {
-                    poison_operation(&mut guard, &self.poisoned);
+                    quarantine_operation(&mut guard, OperationQuarantineReason::Cleanup);
                     retain_cleanup_owners = true;
                 }
                 if !join_streams(&mut guard) {
-                    poison_operation(&mut guard, &self.poisoned);
+                    quarantine_operation(&mut guard, OperationQuarantineReason::Cleanup);
                     retain_cleanup_owners = true;
                 }
             }
@@ -381,7 +661,7 @@ impl WindowsProcessExecutor {
                 operations.clear();
                 self.reservations
                     .lock()
-                    .map_err(|_| unavailable("operation reservation lock poisoned"))?
+                    .map_err(|_| self.shared_unavailable("operation reservation lock poisoned"))?
                     .clear();
                 return Ok(());
             }
@@ -410,8 +690,10 @@ impl ProcessExecutor for WindowsProcessExecutor {
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        if self.poisoned.load(Ordering::Acquire) {
-            return Err(ProcessExecutionError::UnknownOutcome);
+        if self.start_gate_closed.load(Ordering::Acquire) {
+            return Err(unavailable(
+                "shared executor-generation fault closed new process starts",
+            ));
         }
         request.validate()?;
         let operation_id = request.operation_id().clone();
@@ -563,19 +845,20 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 cleanup_required: false,
                 termination: None,
                 capture_failures: capture_failure.into_iter().collect(),
+                quarantine_reasons: Vec::new(),
             }));
             self.operations
                 .lock()
-                .map_err(|_| unavailable("operation registry lock poisoned"))?
+                .map_err(|_| self.shared_unavailable("operation registry lock poisoned"))?
                 .insert(operation_id, Arc::clone(&operation));
             if let Some(error) = capture_spawn_error {
                 let mut guard = operation
                     .lock()
                     .map_err(|_| unavailable("operation lock poisoned"))?;
-                poison_operation(&mut guard, &self.poisoned);
+                quarantine_operation(&mut guard, OperationQuarantineReason::Capture);
                 return Err(error);
             }
-            spawn_deadline_watcher(operation, Arc::clone(&self.poisoned));
+            spawn_deadline_watcher(operation);
             Ok(receipt)
         }
     }
@@ -586,15 +869,12 @@ impl ProcessExecutor for WindowsProcessExecutor {
     ) -> Result<ProcessExecutionView, ProcessExecutionError> {
         #[cfg(windows)]
         {
-            if self.poisoned.load(Ordering::Acquire) {
-                return Err(ProcessExecutionError::UnknownOutcome);
-            }
             let operation = self.operation(&operation_id)?;
             let mut guard = operation
                 .lock()
                 .map_err(|_| unavailable("operation lock poisoned"))?;
             if let Err(error) = refresh_operation(&mut guard) {
-                poison_operation(&mut guard, &self.poisoned);
+                quarantine_operation(&mut guard, OperationQuarantineReason::Observation);
                 return Err(error);
             }
             Ok(guard.state.view())
@@ -614,9 +894,6 @@ impl ProcessExecutor for WindowsProcessExecutor {
     ) -> Result<CancellationReceipt, ProcessExecutionError> {
         #[cfg(windows)]
         {
-            if self.poisoned.load(Ordering::Acquire) {
-                return Err(ProcessExecutionError::UnknownOutcome);
-            }
             let operation = self.operation(&operation_id)?;
             let mut guard = operation
                 .lock()
@@ -625,14 +902,14 @@ impl ProcessExecutor for WindowsProcessExecutor {
             let receipt = match guard.state.cancel(&CancellationRequest::new(binding)) {
                 Ok(receipt) => receipt,
                 Err(error) => {
-                    poison_operation(&mut guard, &self.poisoned);
+                    quarantine_operation(&mut guard, OperationQuarantineReason::Cancellation);
                     return Err(error.into());
                 }
             };
             if guard.state.view().lifecycle() == ProcessLifecycle::Cancelling
                 && let Err(error) = finalize_operation(&mut guard, ExitDisposition::Cancelled, true)
             {
-                poison_operation(&mut guard, &self.poisoned);
+                quarantine_operation(&mut guard, OperationQuarantineReason::Cancellation);
                 return Err(error);
             }
             Ok(receipt)
@@ -652,15 +929,12 @@ impl ProcessExecutor for WindowsProcessExecutor {
     ) -> Result<ProcessEvidence, ProcessExecutionError> {
         #[cfg(windows)]
         {
-            if self.poisoned.load(Ordering::Acquire) {
-                return Err(ProcessExecutionError::UnknownOutcome);
-            }
             let operation = self.operation(&operation_id)?;
             let mut guard = operation
                 .lock()
                 .map_err(|_| unavailable("operation lock poisoned"))?;
             if let Err(error) = refresh_operation(&mut guard) {
-                poison_operation(&mut guard, &self.poisoned);
+                quarantine_operation(&mut guard, OperationQuarantineReason::Observation);
                 return Err(error);
             }
             if guard.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome {
@@ -673,7 +947,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 guard.state.reconcile(descendants)?;
             }
             if !join_streams(&mut guard) {
-                poison_operation(&mut guard, &self.poisoned);
+                quarantine_operation(&mut guard, OperationQuarantineReason::Evidence);
                 return Err(ProcessExecutionError::UnknownOutcome);
             }
             let view = guard.state.view();
@@ -683,7 +957,10 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 capture_ref(&guard.stderr),
                 EvidenceAxes::observed(),
             )?;
-            guard.sink.record(evidence.clone())?;
+            if let Err(error) = guard.sink.record(evidence.clone()) {
+                quarantine_operation(&mut guard, OperationQuarantineReason::Evidence);
+                return Err(error.into());
+            }
             Ok(evidence)
         }
         #[cfg(not(windows))]
@@ -860,7 +1137,8 @@ fn finalize_operation(
 
 #[cfg(windows)]
 fn fence_unknown(operation: &mut Operation) -> Result<(), ProcessExecutionError> {
-    if operation.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome {
+    let lifecycle = operation.state.view().lifecycle();
+    if lifecycle == ProcessLifecycle::UnknownOutcome || lifecycle.is_terminal() {
         return Ok(());
     }
     let view = operation.state.view();
@@ -881,14 +1159,42 @@ fn fence_unknown(operation: &mut Operation) -> Result<(), ProcessExecutionError>
 }
 
 #[cfg(windows)]
-fn poison_operation(operation: &mut Operation, poisoned: &AtomicBool) {
+fn quarantine_operation(operation: &mut Operation, reason: OperationQuarantineReason) {
     operation.cleanup_required = true;
-    poisoned.store(true, Ordering::Release);
+    record_quarantine_reason(&mut operation.quarantine_reasons, reason);
     let _ = fence_unknown(operation);
 }
 
+fn record_quarantine_reason(
+    reasons: &mut Vec<OperationQuarantineReason>,
+    reason: OperationQuarantineReason,
+) {
+    if !reasons.contains(&reason) {
+        reasons.push(reason);
+        reasons.sort_unstable();
+    }
+}
+
 #[cfg(windows)]
-fn spawn_deadline_watcher(operation: Arc<Mutex<Operation>>, poisoned: Arc<AtomicBool>) {
+fn operation_is_quarantined(operation: &Operation) -> bool {
+    operation.cleanup_required
+        || !operation.quarantine_reasons.is_empty()
+        || matches!(
+            operation.state.view().lifecycle(),
+            ProcessLifecycle::UnknownOutcome | ProcessLifecycle::Quarantined
+        )
+}
+
+const fn health_from_degraded(degraded: bool) -> ExecutorCapabilityHealth {
+    if degraded {
+        ExecutorCapabilityHealth::Degraded
+    } else {
+        ExecutorCapabilityHealth::Available
+    }
+}
+
+#[cfg(windows)]
+fn spawn_deadline_watcher(operation: Arc<Mutex<Operation>>) {
     let _ = thread::Builder::new()
         .name("eliot-p04-deadline".to_owned())
         .spawn(move || {
@@ -902,10 +1208,9 @@ fn spawn_deadline_watcher(operation: Arc<Mutex<Operation>>, poisoned: Arc<Atomic
                 }
                 if refresh_operation(&mut guard).is_err() {
                     // A failed observation is an external-state gap, not a
-                    // reason to detach the Job.  Fence the operation as
-                    // unknown and retain it for explicit reconciliation or
-                    // final shutdown cleanup.
-                    poison_operation(&mut guard, &poisoned);
+                    // reason to detach the Job or close independent control.
+                    // Fence only this operation and retain its cleanup owner.
+                    quarantine_operation(&mut guard, OperationQuarantineReason::Observation);
                     return;
                 }
             }
@@ -1130,4 +1435,74 @@ fn now_ms() -> u64 {
 
 fn unavailable(error: impl std::fmt::Display) -> ProcessExecutionError {
     ProcessExecutionError::Unavailable(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RejectingAuthority;
+
+    impl DispatchValidationPort for RejectingAuthority {
+        fn validate_and_consume(
+            &self,
+            _request: ProcessRequest,
+            _observed: SuspendedProcessIdentity,
+        ) -> Result<ValidatedDispatch, ProcessExecutionError> {
+            Err(unavailable("test authority rejects execution"))
+        }
+    }
+
+    fn executor() -> WindowsProcessExecutor {
+        WindowsProcessExecutor::new(Arc::new(RejectingAuthority))
+    }
+
+    #[test]
+    fn shared_fault_closes_only_new_start_admission() {
+        let executor = executor();
+        executor.close_new_starts_for_shared_fault();
+        assert!(executor.start_gate_closed.load(Ordering::Acquire));
+
+        let source = include_str!("lib.rs");
+        assert_eq!(
+            source
+                .matches("start_gate_closed.load(Ordering::Acquire)")
+                .count(),
+            2,
+            "the start gate may be read only by start and the health projection"
+        );
+        assert!(!source.contains("poison_operation"));
+        assert!(!source.contains("poisoned: Arc<AtomicBool>"));
+    }
+
+    #[test]
+    fn local_quarantine_reason_set_is_stable_and_unique() {
+        let mut reasons = Vec::new();
+        record_quarantine_reason(&mut reasons, OperationQuarantineReason::Cleanup);
+        record_quarantine_reason(&mut reasons, OperationQuarantineReason::Capture);
+        record_quarantine_reason(&mut reasons, OperationQuarantineReason::Cleanup);
+        assert_eq!(
+            reasons,
+            vec![
+                OperationQuarantineReason::Capture,
+                OperationQuarantineReason::Cleanup
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregate_health_does_not_conflate_degraded_with_unavailable() {
+        assert_eq!(
+            health_from_degraded(false),
+            ExecutorCapabilityHealth::Available
+        );
+        assert_eq!(
+            health_from_degraded(true),
+            ExecutorCapabilityHealth::Degraded
+        );
+        assert_ne!(
+            health_from_degraded(true),
+            ExecutorCapabilityHealth::Unavailable
+        );
+    }
 }
