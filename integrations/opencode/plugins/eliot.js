@@ -9,6 +9,9 @@ const USEFUL_EVENTS = new Set([
   "file.edited",
   "todo.updated",
 ])
+const TRANSIENT_HTTP_STATUS = new Set([408, 425, 429, 500, 502, 503, 504])
+const ALLOWED_HTTP_HOSTS = new Set(["127.0.0.1", "::1", "[::1]"])
+const ALLOWED_GATE_DECISIONS = new Set(["recorded", "allow", "allowed", "pass"])
 
 const BRIDGE_ENV_KEYS = [
   "APPDATA",
@@ -41,21 +44,25 @@ function boundedInteger(name, fallback, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, parsed))
 }
 
-const BRIDGE_TIMEOUT_MS = boundedInteger("ELIOT_OPENCODE_BRIDGE_TIMEOUT_MS", 5000, 500, 15000)
-const STREAM_SETTLE_MS = boundedInteger("ELIOT_OPENCODE_STREAM_SETTLE_MS", 750, 100, 3000)
-const MAX_PASSIVE_QUEUE = boundedInteger("ELIOT_OPENCODE_PASSIVE_QUEUE_LIMIT", 64, 1, 256)
-const MAX_BRIDGE_OUTPUT_BYTES = boundedInteger(
-  "ELIOT_OPENCODE_BRIDGE_OUTPUT_LIMIT",
-  64 * 1024,
-  4096,
-  256 * 1024,
-)
-const OVERFLOW_LOG_COOLDOWN_MS = boundedInteger(
-  "ELIOT_OPENCODE_OVERFLOW_LOG_COOLDOWN_MS",
-  5000,
-  500,
-  60000,
-)
+function bridgeTimeoutMs() {
+  return boundedInteger("ELIOT_OPENCODE_BRIDGE_TIMEOUT_MS", 5000, 500, 15000)
+}
+
+function streamSettleMs() {
+  return boundedInteger("ELIOT_OPENCODE_STREAM_SETTLE_MS", 750, 100, 3000)
+}
+
+function maximumPassiveQueue() {
+  return boundedInteger("ELIOT_OPENCODE_PASSIVE_QUEUE_LIMIT", 64, 1, 256)
+}
+
+function maximumBridgeOutputBytes() {
+  return boundedInteger("ELIOT_OPENCODE_BRIDGE_OUTPUT_LIMIT", 64 * 1024, 4096, 256 * 1024)
+}
+
+function overflowLogCooldownMs() {
+  return boundedInteger("ELIOT_OPENCODE_OVERFLOW_LOG_COOLDOWN_MS", 5000, 500, 60000)
+}
 
 let nextSequence = 0
 let passiveDepth = 0
@@ -87,8 +94,8 @@ function firstString(...values) {
   return values.find((value) => typeof value === "string" && value.length > 0) ?? null
 }
 
-function firstInteger(...values) {
-  return values.find((value) => Number.isSafeInteger(value) && value >= 0) ?? null
+function firstPositiveInteger(...values) {
+  return values.find((value) => Number.isSafeInteger(value) && value > 0) ?? null
 }
 
 function canonicalIdentityMaterial(value) {
@@ -112,7 +119,7 @@ async function sha256Hex(value) {
 async function compactEvent(kind, input = {}, output = {}) {
   const event = input.event ?? input
   const properties = event.properties ?? {}
-  const nativeSequence = firstInteger(
+  const nativeSequence = firstPositiveInteger(
     event.sequence,
     event.seq,
     properties.sequence,
@@ -148,7 +155,9 @@ async function compactEvent(kind, input = {}, output = {}) {
   const emittedAt =
     firstString(event.emitted_at, event.timestamp, event.time, properties.emitted_at, properties.timestamp) ??
     new Date().toISOString()
-  const argumentKeys = Object.keys(output.args ?? {}).sort()
+  const argumentKeys = Object.keys(
+    input.args ?? input.arguments ?? output.args ?? output.arguments ?? {},
+  ).sort()
   const identityMaterial = JSON.stringify(
     canonicalIdentityMaterial({
       vendor_event_kind: vendorEventKind,
@@ -190,6 +199,144 @@ function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
+class HttpBridgeError extends Error {
+  constructor(message, transient = false) {
+    super(message)
+    this.name = "HttpBridgeError"
+    this.transient = transient
+  }
+}
+
+function httpBridgeConfiguration() {
+  const raw = process.env.ELIOT_OPENCODE_BRIDGE_URL
+  if (!raw) return null
+
+  let base
+  try {
+    base = new URL(raw)
+  } catch {
+    throw new HttpBridgeError("ELIOT OpenCode bridge URL is invalid")
+  }
+  if (base.protocol !== "http:") {
+    throw new HttpBridgeError("ELIOT OpenCode bridge must use loopback HTTP")
+  }
+  if (!ALLOWED_HTTP_HOSTS.has(base.hostname)) {
+    throw new HttpBridgeError("ELIOT OpenCode bridge must use a literal loopback address")
+  }
+  if (!base.port) {
+    throw new HttpBridgeError("ELIOT OpenCode bridge requires an explicit reserved loopback port")
+  }
+  if (base.username || base.password || base.search || base.hash) {
+    throw new HttpBridgeError("ELIOT OpenCode bridge URL cannot contain credentials, query, or fragment")
+  }
+  if (base.pathname !== "/" && base.pathname !== "") {
+    throw new HttpBridgeError("ELIOT OpenCode bridge URL must identify the server root")
+  }
+
+  const token = process.env.ELIOT_OPENCODE_BRIDGE_TOKEN
+  if (!token) {
+    throw new HttpBridgeError("ELIOT OpenCode bridge token is unavailable")
+  }
+  return {
+    endpoint: new URL("/v1/host-events", base).toString(),
+    token,
+  }
+}
+
+async function readBoundedWebStream(stream, maximumBytes) {
+  if (!stream) return ""
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let text = ""
+  let total = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (total + value.byteLength > maximumBytes) {
+        await reader.cancel("ELIOT OpenCode bridge response limit reached").catch(() => {})
+        throw new HttpBridgeError("ELIOT OpenCode bridge response exceeded its bounded contract")
+      }
+      total += value.byteLength
+      text += decoder.decode(value, { stream: true })
+    }
+    text += decoder.decode()
+    return text
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+function parseBridgeResponse(text) {
+  let value
+  try {
+    value = JSON.parse(text)
+  } catch {
+    throw new HttpBridgeError("ELIOT OpenCode bridge returned invalid JSON")
+  }
+  if (!value || Array.isArray(value) || typeof value !== "object") {
+    throw new HttpBridgeError("ELIOT OpenCode bridge returned an invalid response object")
+  }
+  if (typeof value.decision !== "string" || value.decision.length === 0) {
+    throw new HttpBridgeError("ELIOT OpenCode bridge returned no explicit decision")
+  }
+  return value
+}
+
+async function postHttpBridge(config, payload) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), bridgeTimeoutMs())
+  try {
+    const response = await fetch(config.endpoint, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${config.token}`,
+        "Content-Type": "application/json",
+        "Idempotency-Key": payload.event_id,
+        "X-ELIOT-Host": "opencode",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    })
+    if (TRANSIENT_HTTP_STATUS.has(response.status)) {
+      await response.body?.cancel().catch(() => {})
+      throw new HttpBridgeError(
+        `ELIOT OpenCode bridge returned transient HTTP status ${response.status}`,
+        true,
+      )
+    }
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {})
+      throw new HttpBridgeError(`ELIOT OpenCode bridge returned HTTP status ${response.status}`)
+    }
+    const text = await readBoundedWebStream(response.body, maximumBridgeOutputBytes())
+    return parseBridgeResponse(text)
+  } catch (error) {
+    if (error instanceof HttpBridgeError) throw error
+    if (error?.name === "AbortError") {
+      throw new HttpBridgeError("ELIOT OpenCode bridge timed out", true)
+    }
+    throw new HttpBridgeError("ELIOT OpenCode bridge transport failed", true)
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+async function invokeHttpBridge(config, payload) {
+  let lastError
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await postHttpBridge(config, payload)
+    } catch (error) {
+      lastError = error
+      if (!(error instanceof HttpBridgeError) || !error.transient || attempt > 0) break
+      await sleep(50)
+    }
+  }
+  throw lastError
+}
+
 function boundedDrain(stream, maximumBytes) {
   if (!stream) {
     return {
@@ -201,12 +348,10 @@ function boundedDrain(stream, maximumBytes) {
   const reader = stream.getReader()
   const decoder = new TextDecoder()
   let settled = false
-
   const promise = (async () => {
     let text = ""
     let total = 0
     let truncated = false
-
     try {
       while (true) {
         const { done, value } = await reader.read()
@@ -264,14 +409,13 @@ async function waitForExit(child, timeoutMilliseconds) {
   const exited = child.exited.then((status) => ({ timedOut: false, status }))
   const result = await Promise.race([exited, timeout])
   clearTimeout(timeoutId)
-
   if (result.timedOut) {
     try {
       child.kill()
     } catch {
-      // Process cleanup is still checked by the caller's failure disposition.
+      // Cleanup is still reflected in the caller's degraded/denied disposition.
     }
-    await Promise.race([child.exited.catch(() => null), sleep(STREAM_SETTLE_MS)])
+    await Promise.race([child.exited.catch(() => null), sleep(streamSettleMs())])
   }
   return result
 }
@@ -281,10 +425,13 @@ function bridgeFailure(required, reason) {
   return { decision: "degraded", reason }
 }
 
-async function invokeBridge(kind, input, output, { required = false } = {}) {
+async function invokeLegacyProcessBridge(kind, payload, { required = false } = {}) {
   const executable = bridgeExecutable()
   if (!executable) {
     return bridgeFailure(required, "ELIOT ActionGate is unavailable: bridge executable is not configured")
+  }
+  if (!globalThis.Bun?.spawn) {
+    return bridgeFailure(required, "ELIOT legacy process bridge is unavailable in this host runtime")
   }
 
   let child
@@ -300,12 +447,10 @@ async function invokeBridge(kind, input, output, { required = false } = {}) {
     return bridgeFailure(required, "ELIOT lifecycle bridge could not start")
   }
 
-  const stdout = boundedDrain(child.stdout, MAX_BRIDGE_OUTPUT_BYTES)
-  const stderr = boundedDrain(child.stderr, MAX_BRIDGE_OUTPUT_BYTES)
-
+  const stdout = boundedDrain(child.stdout, maximumBridgeOutputBytes())
+  const stderr = boundedDrain(child.stderr, maximumBridgeOutputBytes())
   try {
-    const payload = JSON.stringify(await compactEvent(kind, input, output))
-    await child.stdin.write(payload)
+    await child.stdin.write(JSON.stringify(payload))
     await child.stdin.end()
   } catch {
     try {
@@ -316,25 +461,23 @@ async function invokeBridge(kind, input, output, { required = false } = {}) {
     stdout.cancel("ELIOT lifecycle bridge input failed")
     stderr.cancel("ELIOT lifecycle bridge input failed")
     await Promise.allSettled([
-      settleDrain(stdout, STREAM_SETTLE_MS),
-      settleDrain(stderr, STREAM_SETTLE_MS),
+      settleDrain(stdout, streamSettleMs()),
+      settleDrain(stderr, streamSettleMs()),
     ])
     return bridgeFailure(required, "ELIOT lifecycle bridge input failed")
   }
 
-  const exit = await waitForExit(child, BRIDGE_TIMEOUT_MS)
+  const exit = await waitForExit(child, bridgeTimeoutMs())
   if (exit.timedOut) {
     stdout.cancel("ELIOT lifecycle bridge timed out")
     stderr.cancel("ELIOT lifecycle bridge timed out")
   }
   const [stdoutResult, stderrResult] = await Promise.all([
-    settleDrain(stdout, STREAM_SETTLE_MS),
-    settleDrain(stderr, STREAM_SETTLE_MS),
+    settleDrain(stdout, streamSettleMs()),
+    settleDrain(stderr, streamSettleMs()),
   ])
 
-  if (exit.timedOut) {
-    return bridgeFailure(required, "ELIOT lifecycle bridge timed out")
-  }
+  if (exit.timedOut) return bridgeFailure(required, "ELIOT lifecycle bridge timed out")
   if (stdoutResult.timedOut || stderrResult.timedOut) {
     return bridgeFailure(required, "ELIOT lifecycle bridge streams did not close within the bounded contract")
   }
@@ -344,12 +487,32 @@ async function invokeBridge(kind, input, output, { required = false } = {}) {
   if (exit.status !== 0) {
     return bridgeFailure(required, `ELIOT lifecycle bridge exited with status ${exit.status}`)
   }
-
   try {
-    return JSON.parse(stdoutResult.text)
-  } catch {
-    return bridgeFailure(required, "ELIOT lifecycle bridge returned invalid JSON")
+    return parseBridgeResponse(stdoutResult.text)
+  } catch (error) {
+    return bridgeFailure(required, error.message)
   }
+}
+
+async function invokeBridge(kind, input, output, { required = false } = {}) {
+  const payload = await compactEvent(kind, input, output)
+  let httpConfig
+  try {
+    httpConfig = httpBridgeConfiguration()
+  } catch (error) {
+    return bridgeFailure(required, error.message)
+  }
+
+  if (httpConfig) {
+    try {
+      return await invokeHttpBridge(httpConfig, payload)
+    } catch (error) {
+      // Never cross-transport fail over after an HTTP attempt: the first request may
+      // have reached durable admission even when its response was lost.
+      return bridgeFailure(required, error.message)
+    }
+  }
+  return invokeLegacyProcessBridge(kind, payload, { required })
 }
 
 async function log(client, level, message, extra = {}) {
@@ -370,7 +533,6 @@ async function log(client, level, message, extra = {}) {
 
 function armOverflowLog(client) {
   if (overflowLogScheduled) return
-
   overflowLogScheduled = true
   setTimeout(() => {
     const dropped = droppedPassiveEvents
@@ -380,12 +542,12 @@ function armOverflowLog(client) {
     void log(client, "warn", "Dropped passive ELIOT events because the bounded queue is full", {
       dropped,
       last_kind: lastKind,
-      queue_limit: MAX_PASSIVE_QUEUE,
+      queue_limit: maximumPassiveQueue(),
     }).finally(() => {
       overflowLogScheduled = false
       if (droppedPassiveEvents > 0) armOverflowLog(client)
     })
-  }, OVERFLOW_LOG_COOLDOWN_MS)
+  }, overflowLogCooldownMs())
 }
 
 function notePassiveOverflow(client, kind) {
@@ -395,7 +557,7 @@ function notePassiveOverflow(client, kind) {
 }
 
 function enqueuePassive(client, kind, input, output) {
-  if (passiveDepth >= MAX_PASSIVE_QUEUE) {
+  if (passiveDepth >= maximumPassiveQueue()) {
     notePassiveOverflow(client, kind)
     return
   }
@@ -421,7 +583,7 @@ async function requireMutationGate(input, output) {
   if (gate.decision === "deny") {
     throw new Error(gate.reason ?? "ELIOT ActionGate denied mutation")
   }
-  if (!new Set(["recorded", "allow", "allowed", "pass"]).has(gate.decision)) {
+  if (!ALLOWED_GATE_DECISIONS.has(gate.decision)) {
     throw new Error("ELIOT ActionGate returned no explicit usable decision")
   }
 }
