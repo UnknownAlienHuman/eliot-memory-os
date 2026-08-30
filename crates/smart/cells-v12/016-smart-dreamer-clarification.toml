@@ -1,0 +1,64 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w1-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 16
+cell = "smart.dreamer.clarification"
+physical_crate = "eliot-dreamer-orientation"
+predecessor_orders = [3, 5]
+primary_property = "Produce zero or one decision-relevant clarification candidate with exact answer owner, safe fallback and review condition, interrupting a Human only at a Human-owned boundary."
+field_contracts = [
+  "crates/smart/eliot-epistemic-contracts/current-position.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/orientation.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/w1-policy.contract.toml",
+]
+public_function_signatures = [
+  "pub fn build_clarification_candidate(position: &CurrentEpistemicPosition, policy: &ClarificationPolicy) -> Result<Option<ClarificationCandidate>, ClarificationError>",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-orientation/src/clarification.rs",
+  "crates/smart/eliot-dreamer-orientation/tests/clarification.rs",
+]
+algorithm = [
+  "validate position, policy, owner classes, privacy and bounds",
+  "identify unresolved dependencies whose answer can change a material decision",
+  "exclude questions answerable from admitted evidence or existing exact handles",
+  "separate decision impact, burden, privacy risk and urgency",
+  "select at most one nondominated concise question with deterministic tie-break",
+  "bind answer owner, affected decisions, safe fallback and expiry/review condition",
+]
+minimum_tests = [
+  "returns zero or one candidate",
+  "answerable-from-evidence question suppressed",
+  "question with no decision delta suppressed",
+  "privacy-expanding question rejected",
+  "Human question outside matching Human-owned boundary rejected",
+  "candidate always carries owner, safe fallback and review condition",
+  "no interruption/execution/authority receipt",
+]
+non_goals = [
+  "question delivery or interruption",
+  "answer admission",
+  "goal/acceptance/authority change",
+  "model call",
+  "Context admission",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-HELP-01",
+  "ARCH-HUM-01",
+  "ARCH-EPI-03",
+  "ARCH-DRM-01",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I9.2",
+  "I9.5",
+  "I12.18",
+]
+product_pulse = "D3A_CLARIFICATION_EDGE_01"
+stop_condition = "Return None or ContractChallenge rather than asking filler, requesting hidden data, interrupting a Human outside their boundary, or changing the goal/scope/authority."
+brief_proof_ceiling = "STATIC_W1_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

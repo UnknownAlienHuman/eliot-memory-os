@@ -1,0 +1,110 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W1_D3A_PER_AGENT_BRIEF_MATERIALIZATION"
+issue = 320
+parent_pr = 310
+parent_head = "ff4a7ccda05103151f7abcee98851b2fb79e7c50"
+orders = [3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+brief_count = 12
+field_contract_index = "crates/smart/cognitive-rev12-w1-field-contracts.toml"
+type_ownership = "crates/smart/cognitive-rev12-w1-type-ownership.toml"
+proof_ceiling = "STATIC_W1_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+rule = "Each brief materializes one causal work unit and does not redefine public wire types, package integration, proof status or runtime authority."
+
+[[brief]]
+order = 3
+cell = "smart.epistemic.position"
+physical_crate = "eliot-epistemic"
+path = "crates/smart/cells-v12/003-smart-epistemic-position.toml"
+field_contracts = ["crates/smart/eliot-epistemic-contracts/current-position.contract.toml", "crates/smart/eliot-epistemic-contracts/resolution.contract.toml"]
+predecessor_orders = [2]
+
+[[brief]]
+order = 8
+cell = "smart.dreamer.bundle"
+physical_crate = "eliot-dreamer-bundle"
+path = "crates/smart/cells-v12/008-smart-dreamer-bundle.toml"
+field_contracts = ["crates/smart/eliot-dreamer-contracts/common.contract.toml"]
+predecessor_orders = [4]
+
+[[brief]]
+order = 9
+cell = "smart.dreamer.claim_grounding"
+physical_crate = "eliot-dreamer-validation"
+path = "crates/smart/cells-v12/009-smart-dreamer-claim_grounding.toml"
+field_contracts = ["crates/smart/eliot-dreamer-contracts/common.contract.toml"]
+predecessor_orders = [4, 8]
+
+[[brief]]
+order = 10
+cell = "smart.dreamer.transformation_validation"
+physical_crate = "eliot-dreamer-validation"
+path = "crates/smart/cells-v12/010-smart-dreamer-transformation_validation.toml"
+field_contracts = ["crates/smart/eliot-dreamer-contracts/common.contract.toml", "crates/smart/eliot-dreamer-contracts/w1-policy.contract.toml"]
+predecessor_orders = [4, 8, 9]
+
+[[brief]]
+order = 11
+cell = "smart.dreamer.draft_admission"
+physical_crate = "eliot-dreamer-validation"
+path = "crates/smart/cells-v12/011-smart-dreamer-draft_admission.toml"
+field_contracts = ["crates/smart/eliot-dreamer-contracts/common.contract.toml", "crates/smart/eliot-dreamer-contracts/w1-policy.contract.toml"]
+predecessor_orders = [4, 8, 9, 10]
+
+[[brief]]
+order = 12
+cell = "smart.dreamer.rival_model"
+physical_crate = "eliot-dreamer-orientation"
+path = "crates/smart/cells-v12/012-smart-dreamer-rival_model.toml"
+field_contracts = ["crates/smart/eliot-epistemic-contracts/current-position.contract.toml", "crates/smart/eliot-dreamer-contracts/common.contract.toml", "crates/smart/eliot-dreamer-contracts/orientation.contract.toml"]
+predecessor_orders = [3, 5, 11]
+
+[[brief]]
+order = 13
+cell = "smart.dreamer.relation_candidate"
+physical_crate = "eliot-dreamer-orientation"
+path = "crates/smart/cells-v12/013-smart-dreamer-relation_candidate.toml"
+field_contracts = ["crates/smart/eliot-dreamer-contracts/common.contract.toml", "crates/smart/eliot-dreamer-contracts/orientation.contract.toml", "crates/smart/eliot-dreamer-contracts/curation.contract.toml"]
+predecessor_orders = [5, 11]
+
+[[brief]]
+order = 14
+cell = "smart.dreamer.probe_plan"
+physical_crate = "eliot-dreamer-orientation"
+path = "crates/smart/cells-v12/014-smart-dreamer-probe_plan.toml"
+field_contracts = ["crates/smart/eliot-epistemic-contracts/current-position.contract.toml", "crates/smart/eliot-dreamer-contracts/orientation.contract.toml", "crates/smart/eliot-dreamer-contracts/w1-policy.contract.toml"]
+predecessor_orders = [3, 5, 12]
+
+[[brief]]
+order = 15
+cell = "smart.dreamer.orientation"
+physical_crate = "eliot-dreamer-orientation"
+path = "crates/smart/cells-v12/015-smart-dreamer-orientation.toml"
+field_contracts = ["crates/smart/eliot-epistemic-contracts/current-position.contract.toml", "crates/smart/eliot-dreamer-contracts/common.contract.toml", "crates/smart/eliot-dreamer-contracts/orientation.contract.toml"]
+predecessor_orders = [3, 5, 11, 12, 13, 14]
+
+[[brief]]
+order = 16
+cell = "smart.dreamer.clarification"
+physical_crate = "eliot-dreamer-orientation"
+path = "crates/smart/cells-v12/016-smart-dreamer-clarification.toml"
+field_contracts = ["crates/smart/eliot-epistemic-contracts/current-position.contract.toml", "crates/smart/eliot-dreamer-contracts/orientation.contract.toml", "crates/smart/eliot-dreamer-contracts/w1-policy.contract.toml"]
+predecessor_orders = [3, 5]
+
+[[brief]]
+order = 17
+cell = "smart.dreamer.architecture_brief"
+physical_crate = "eliot-dreamer-self-query"
+path = "crates/smart/cells-v12/017-smart-dreamer-architecture_brief.toml"
+field_contracts = ["crates/smart/eliot-dreamer-self-query/self-query.contract.toml"]
+predecessor_orders = [4]
+
+[[brief]]
+order = 18
+cell = "smart.dreamer.implementation_brief"
+physical_crate = "eliot-dreamer-self-query"
+path = "crates/smart/cells-v12/018-smart-dreamer-implementation_brief.toml"
+field_contracts = ["crates/smart/eliot-dreamer-self-query/self-query.contract.toml"]
+predecessor_orders = [4, 17]

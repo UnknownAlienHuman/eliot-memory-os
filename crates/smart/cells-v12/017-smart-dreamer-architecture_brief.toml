@@ -1,0 +1,62 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w1-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 17
+cell = "smart.dreamer.architecture_brief"
+physical_crate = "eliot-dreamer-self-query"
+predecessor_orders = [4]
+primary_property = "Project a bounded authority-preserving ArchitectureBrief from one exact accepted Architecture document and pair identity without substituting branch copies, summaries, audits or model memory."
+field_contracts = [
+  "crates/smart/eliot-dreamer-self-query/self-query.contract.toml",
+]
+public_function_signatures = [
+  "pub fn build_architecture_brief(request: &ArchitectureBriefRequest, source: &AcceptedNormativeDocument) -> Result<ArchitectureBrief, SelfQueryError>",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-self-query/src/architecture.rs",
+  "crates/smart/eliot-dreamer-self-query/tests/architecture.rs",
+]
+algorithm = [
+  "validate exact accepted role/path/version/edition/document digest/paired digest/pair key and identity receipt",
+  "validate section-index revision and request denominator/bounds",
+  "select only requested sections and required Architecture anchors",
+  "render bounded exact excerpts or exact expansion handles without semantic rewrite",
+  "preserve hard-boundary anchors, omissions and Architecture precedence statement",
+  "canonicalize sections/omissions and compute brief digest",
+]
+minimum_tests = [
+  "wrong/predecessor/branch-copy digest rejected",
+  "Candidate/Superseded/Invalidated document rejected",
+  "section from another pair rejected",
+  "missing requested section makes coverage partial/blocked",
+  "omission remains expandable by exact handle",
+  "brief cannot claim implementation support or modify/accept Architecture",
+  "section permutation deterministic",
+]
+non_goals = [
+  "document discovery/read/acquisition",
+  "Architecture acceptance/change",
+  "Implementation support classification",
+  "model summarization",
+  "repository scan",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-INTENT-01",
+  "ARCH-SELF-01",
+  "ARCH-UND-01",
+  "ARCH-PORT-01",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I0.3",
+  "I0.4",
+  "I0.14",
+  "I12.23",
+]
+product_pulse = "D3A_SELF_QUERY_EDGE_01"
+stop_condition = "Return SourceStale/CoveragePartial or ContractChallenge rather than substituting another document, mixing pair revisions, paraphrasing load-bearing text, or claiming current support."
+brief_proof_ceiling = "STATIC_W1_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

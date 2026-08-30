@@ -1,0 +1,38 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W1_PUBLIC_TYPE_OWNERSHIP_ALLOWLIST"
+field_contract_index = "crates/smart/cognitive-rev12-w1-field-contracts.toml"
+rule = "Every W1 public wire type has exactly one physical owner. Consumers import it; briefs and implementations do not redefine fields locally."
+
+[[family]]
+owner = "eliot-epistemic-contracts"
+contract_ref = "crates/smart/eliot-epistemic-contracts/resolution.contract.toml"
+types = ["EpistemicInputRole", "EpistemicOwnerReadState", "EpistemicOwnerReadDisposition", "AdmittedEpistemicRecord", "AdmittedEpistemicRecordSet"]
+
+[[family]]
+owner = "eliot-dreamer-contracts"
+contract_ref = "crates/smart/eliot-dreamer-contracts/common.contract.toml"
+types = ["DreamCandidateKind"]
+note = "This is an in-place refinement of the existing common owner; it replaces stringly candidate output-kind fields before Rust implementation."
+
+[[family]]
+owner = "eliot-dreamer-contracts"
+contract_ref = "crates/smart/eliot-dreamer-contracts/w1-policy.contract.toml"
+types = ["TransformationDimensionRequirement", "TransformationPolicy", "CandidateKindAdmissionRule", "DraftAdmissionPolicy", "ProbeCapabilityAvailability", "ProbeCapabilityCoverageState", "ProbeCapabilityCoverageDenominator", "ProbeCapabilityCoverage", "ProbeCapabilityDescriptor", "ProbeCapabilitySnapshot", "ProbeDimension", "ProbeDimensionState", "ProbeDimensionAssessment", "ProbePolicy", "ClarificationAnswerOwnerClass", "ClarificationPolicy"]
+
+[[family]]
+owner = "eliot-dreamer-self-query"
+contract_ref = "crates/smart/eliot-dreamer-self-query/self-query.contract.toml"
+types = ["NormativeDocumentRole", "NormativeDocumentAcceptanceState", "AcceptedNormativeSection", "AcceptedNormativeDocument", "SelfQueryCoverageState", "SelfQueryCoverageDenominator", "SelfQueryCoverage", "ArchitectureBriefRequest", "ArchitectureBriefSection", "ArchitectureBrief", "ImplementationBriefState", "ImplementationBriefRequest", "ImplementationTargetSection", "ImplementationEvidenceBinding", "ImplementationBrief"]
+
+[external_owner_registry]
+allowed_owners = ["eliot-contracts", "eliot-evidence", "eliot-bootstrap", "eliot-epistemic-contracts/current-position.contract.toml", "eliot-dreamer-contracts/common.contract.toml"]
+rule = "External types resolve to an indexed owner/path or an admitted foundation contract owner. CurrentSystemEvidenceSnapshot remains owned by eliot-bootstrap."
+
+[forbidden]
+duplicate_field_level_definition = true
+brief_owned_public_type = true
+generic_any_json_or_vendor_type = true
+stringly_candidate_kind = true
+aggregate_confidence_score = true
+execution_or_authority_receipt = true

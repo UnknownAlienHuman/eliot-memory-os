@@ -1,0 +1,67 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w1-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 13
+cell = "smart.dreamer.relation_candidate"
+physical_crate = "eliot-dreamer-orientation"
+predecessor_orders = [5, 11]
+primary_property = "Build typed relation candidates for Orientation and Curation through one semantic core while keeping similarity, sequence, co-change and causality distinct."
+field_contracts = [
+  "crates/smart/eliot-dreamer-contracts/common.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/orientation.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/curation.contract.toml",
+]
+public_function_signatures = [
+  "pub fn build_relation_candidate_set(request: &RelationCandidateRequest, draft: &AdmittedDreamDraft) -> Result<RelationCandidateSet, RelationCandidateError>",
+  "pub fn build_orientation_relation_candidates(request: &OrientationRequest, draft: &AdmittedDreamDraft) -> Result<RelationCandidateSet, RelationCandidateError>",
+  "pub fn build_curation_relation_candidates(request: &CurationRequest, draft: &AdmittedDreamDraft) -> Result<RelationCandidateSet, RelationCandidateError>",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-orientation/src/relation.rs",
+  "crates/smart/eliot-dreamer-orientation/tests/relation.rs",
+]
+algorithm = [
+  "validate exact typed endpoints, use case, allowed relation kinds, manifest and fence",
+  "derive candidate direction and retain exact supporting/counterevidence references",
+  "represent similarity, sequence, co-change, dependency, support/contradiction and causal hypothesis as separate types",
+  "require mechanism, predicted observable, rivals and invalidation for CausalHypothesis",
+  "deduplicate only identical endpoint/type/direction/scope proposals",
+  "emit partial/unsupported coverage explicitly and canonical set digest",
+]
+minimum_tests = [
+  "unknown endpoint rejected",
+  "self-edge rejected unless explicitly allowed",
+  "SequenceBefore/CoChange/Similarity cannot decode as CausalHypothesis",
+  "causal candidate without mechanism/prediction/rival/invalidation rejected",
+  "Orientation and Curation adapters use same core schema",
+  "similarity alone cannot create Supports",
+  "candidate permutation deterministic",
+]
+non_goals = [
+  "graph/canonical relation write",
+  "causal promotion",
+  "endpoint discovery",
+  "model call",
+  "curation lifecycle action",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-MEM-03",
+  "ARCH-UND-02",
+  "ARCH-DRM-02",
+  "ARCH-EPI-04",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I5.18",
+  "I9.5",
+  "I9.8",
+  "I12.18",
+]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return UnsupportedRelationKind or ContractChallenge rather than guessing endpoints, converting proximity/sequence/co-change into causality, or writing a relation."
+brief_proof_ceiling = "STATIC_W1_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

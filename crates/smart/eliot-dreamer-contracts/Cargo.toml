@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Provider-neutral Dreamer job, input, grounding, validation, orientation, research and curation contracts."
+description = "Provider-neutral Dreamer job, input, grounding, validation, orientation, research, curation and W1 policy contracts."
 
 [lib]
 path = "src/lib.rs"
@@ -27,6 +27,7 @@ contract_refs = [
   "crates/smart/eliot-dreamer-contracts/orientation.contract.toml",
   "crates/smart/eliot-dreamer-contracts/research.contract.toml",
   "crates/smart/eliot-dreamer-contracts/curation.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/w1-policy.contract.toml",
 ]
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"

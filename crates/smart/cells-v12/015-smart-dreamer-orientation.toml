@@ -1,0 +1,68 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w1-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 15
+cell = "smart.dreamer.orientation"
+physical_crate = "eliot-dreamer-orientation"
+predecessor_orders = [3, 5, 11, 12, 13, 14]
+primary_property = "Assemble one candidate-only Orientation DreamPacket from already validated typed child outputs while keeping Governor-resolved evidence and model synthesis in separate surfaces."
+field_contracts = [
+  "crates/smart/eliot-epistemic-contracts/current-position.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/common.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/orientation.contract.toml",
+]
+public_function_signatures = [
+  "pub fn assemble_orientation_packet(request: &OrientationRequest, draft: &AdmittedDreamDraft, rivals: RivalModelSet, relations: RelationCandidateSet, probes: DiscriminativeProbePlan) -> Result<DreamPacket, OrientationError>",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-orientation/src/orientation.rs",
+  "crates/smart/eliot-dreamer-orientation/tests/orientation.rs",
+]
+algorithm = [
+  "validate request/draft/position/rival/relation/probe identities, coverage and shared fence",
+  "populate resolved position and anchored-evidence sections only from exact Governor-owned handles",
+  "place synthesized interpretation only in candidate sections",
+  "retain rivals, counterevidence, hidden relation hypotheses, unknowns, probes, coverage gaps, cost and invalidation conditions",
+  "preserve required/protected items and visible omissions under packet bounds",
+  "canonicalize all child collections and compute packet digest without rerunning child semantics",
+]
+minimum_tests = [
+  "model-authored confirmed/resolved evidence section rejected",
+  "missing/mismatched position fails closed",
+  "rivals/counterevidence/unknowns survive size pressure",
+  "partial coverage remains partial",
+  "assembly cannot rerun or change child semantics",
+  "packet contains no Context/canonical/support/authority/finish state",
+  "child permutation yields identical packet",
+]
+non_goals = [
+  "Current Epistemic Position resolution",
+  "child semantic handler execution",
+  "Context admission",
+  "canonical write or support promotion",
+  "tool/model execution",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-DRM-01",
+  "ARCH-DRM-02",
+  "ARCH-CONCIL-01",
+  "ARCH-EPI-01",
+  "ARCH-CTX-01",
+  "ARCH-UND-01",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I7.11",
+  "I9.2",
+  "I9.5",
+  "I12.12",
+  "I12.18",
+]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than letting synthesis occupy resolved-evidence sections, hiding coverage/rivals/unknowns, changing child semantics, or treating the packet as admitted influence."
+brief_proof_ceiling = "STATIC_W1_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

@@ -1,24 +1,28 @@
 [package]
 name = "eliot-dreamer-bundle"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 publish = false
-description = "Bounded Dreamer input-bundle assembly from Governor-provided handles"
+description = "Bounded Dreamer input-bundle assembly from Governor-admitted descriptors."
 
 [lib]
 path = "src/lib.rs"
 
 [package.metadata.eliot]
-prototype = true
-source_status = "NOT_IMPLEMENTED"
-workspace_admission = "pending_agent_implementation_and_proof"
-functional_cell = "smart.dreamer.bundle"
-source_layer = "C1"
-runtime_layer = "R6"
-runtime_bundle = "eliot-dreamer"
-agent_order = 4
+layer = "C1"
+purpose = "bounded disclosure-safe ReferenceManifest and DreamInputBundle assembly"
+source_maintenance_owner = "cognitive-integration-owner"
+functional_cell_refs = ["smart.dreamer.bundle"]
+independent_proof_profile = "prototype-not-workspace-admitted"
+contract_refs = [
+  "crates/smart/cognitive-current.toml",
+  "crates/smart/eliot-dreamer-contracts/common.contract.toml",
+]
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until package Module Proof, affected real Edge Proof and D3A_ORIENTATION_PULSE_01"
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }

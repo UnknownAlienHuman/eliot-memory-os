@@ -1,0 +1,64 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w1-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 10
+cell = "smart.dreamer.transformation_validation"
+physical_crate = "eliot-dreamer-validation"
+predecessor_orders = [4, 8, 9]
+primary_property = "Evaluate Coverage, Preservation, Faithfulness, Lineage, Reversibility, SourceAuthority and DependencyClosure independently under an immutable TransformationPolicy, with Unknown never treated as Pass."
+field_contracts = [
+  "crates/smart/eliot-dreamer-contracts/common.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/w1-policy.contract.toml",
+]
+public_function_signatures = [
+  "pub fn validate_dream_transformation(input: &DreamInputBundle, grounded: &GroundedDreamDraft, policy: &TransformationPolicy) -> Result<TransformationValidationReport, TransformationValidationError>",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-validation/src/transformation.rs",
+  "crates/smart/eliot-dreamer-validation/tests/transformation.rs",
+]
+algorithm = [
+  "validate bundle, grounded draft and policy identities",
+  "evaluate Coverage against the frozen denominator rather than source count",
+  "evaluate Preservation of rivals, counterevidence, unknowns, scope and temporal distinctions",
+  "evaluate Faithfulness using independent/deterministic evidence rather than model self-report",
+  "evaluate Lineage, Reversibility, SourceAuthority and DependencyClosure separately",
+  "emit exactly one Pass/Fail/Unknown/NotApplicable result per required dimension",
+  "preserve exact source reopen handles and canonical report identity",
+]
+minimum_tests = [
+  "source count cannot produce Coverage Pass",
+  "missing rival or unknown fails/unknowns Preservation",
+  "model self-report cannot pass Faithfulness or SourceAuthority",
+  "one failed required dimension is not masked",
+  "Unknown is not Pass",
+  "missing dependency closure fails/unknowns only that dimension",
+  "exactly seven dimension rows required",
+]
+non_goals = [
+  "draft admission",
+  "model invocation",
+  "source acquisition",
+  "support promotion",
+  "aggregate confidence score",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-MEM-03",
+  "ARCH-DRM-01",
+  "ARCH-EPI-03",
+  "ARCH-EPI-04",
+  "ARCH-UND-02",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I9.7",
+  "I12.20",
+]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than using a scalar score, treating Unknown as Pass, letting the model certify itself, or omitting a required dimension."
+brief_proof_ceiling = "STATIC_W1_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

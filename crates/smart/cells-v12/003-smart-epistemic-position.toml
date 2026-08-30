@@ -1,0 +1,68 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w1-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 3
+cell = "smart.epistemic.position"
+physical_crate = "eliot-epistemic"
+predecessor_orders = [2]
+primary_property = "Resolve one question over one bounded externally admitted evidence set into a deterministic Current Epistemic Position without becoming an evidence-admission, support-transition or canonical-state owner."
+field_contracts = [
+  "crates/smart/eliot-epistemic-contracts/current-position.contract.toml",
+  "crates/smart/eliot-epistemic-contracts/resolution.contract.toml",
+]
+public_function_signatures = [
+  "pub fn resolve_current_epistemic_position(request: &CurrentPositionRequest, input: &AdmittedEpistemicRecordSet) -> Result<CurrentEpistemicPosition, EpistemicResolutionError>",
+]
+write_scope = [
+  "crates/smart/eliot-epistemic/src/resolver.rs",
+  "crates/smart/eliot-epistemic/tests/resolver.rs",
+]
+algorithm = [
+  "validate request and admitted record-set digests, exact scope/task/time/fence, owner rows and denominator",
+  "partition direct observations, candidate support, explicit assumptions, rivals, stale, superseded and unknown records without changing source status",
+  "group contradictions only by compatible proposition, scope and valid time",
+  "mark shared lineage, capture route, evaluator and model-family dependence before considering support",
+  "preserve fresh minority and counterevidence independently of record count",
+  "derive typed InvestigationRequirements only for unresolved decision dependencies",
+  "canonicalize all role collections and compute the position digest",
+]
+minimum_tests = [
+  "empty records under partial/unavailable coverage never mean no evidence",
+  "DirectObservation does not become SupportedPosition",
+  "ExplicitAssumption remains explicit and unsupported",
+  "shared-lineage duplicates do not become independent support",
+  "fresh minority counterevidence remains visible",
+  "conflict on one proposition remains local",
+  "record/owner-row permutation yields identical position",
+  "resolver has no I/O, model, write or support-promotion surface",
+]
+non_goals = [
+  "canonical evidence read/admission",
+  "evidence acquisition",
+  "support or truth promotion",
+  "Context admission",
+  "model call",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-EPI-01",
+  "ARCH-EPI-02",
+  "ARCH-EPI-04",
+  "ARCH-CONCIL-01",
+  "ARCH-UND-02",
+  "ARCH-SCOPE-01",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I5.20",
+  "I6.16",
+  "I12.11",
+  "I12.12",
+]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than filling a missing owner from empty input, treating count as epistemic weight, flattening local conflict, or changing source support/assertability."
+brief_proof_ceiling = "STATIC_W1_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

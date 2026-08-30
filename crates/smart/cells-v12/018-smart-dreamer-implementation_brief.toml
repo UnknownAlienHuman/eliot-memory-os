@@ -1,0 +1,66 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w1-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 18
+cell = "smart.dreamer.implementation_brief"
+physical_crate = "eliot-dreamer-self-query"
+predecessor_orders = [4, 17]
+primary_property = "Project an ImplementationBrief from the exact accepted Implementation document plus an exact externally owned CurrentSystemEvidenceSnapshot, preserving target/current/unknown/stale distinctions and Architecture precedence."
+field_contracts = [
+  "crates/smart/eliot-dreamer-self-query/self-query.contract.toml",
+]
+public_function_signatures = [
+  "pub fn build_implementation_brief(request: &ImplementationBriefRequest, source: &AcceptedNormativeDocument, conformance: &CurrentSystemEvidenceSnapshot) -> Result<ImplementationBrief, SelfQueryError>",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-self-query/src/implementation.rs",
+  "crates/smart/eliot-dreamer-self-query/tests/implementation.rs",
+]
+algorithm = [
+  "validate exact accepted Implementation identity, paired Architecture digest and normative pair",
+  "validate request/evidence snapshot identity, State Fence, freshness and bounds",
+  "select requested target sections and exact anchors without converting targets to support",
+  "join current evidence only through exact support-claim/evidence handles and declared target-contract relation",
+  "classify each binding as TargetOnly, CurrentEvidenceBound, Partial, Blocked, Unknown, Stale or NotApplicable",
+  "preserve blind boundaries, gaps, omissions, proof ceilings, invalidation conditions and Architecture precedence",
+  "canonicalize sections/bindings/gaps and compute brief digest",
+]
+minimum_tests = [
+  "prose-only or code-shape support rejected",
+  "build/test presence without exact support binding cannot become CurrentEvidenceBound",
+  "stale/mismatched evidence snapshot yields Stale/Unknown",
+  "target and current evidence remain separate",
+  "mixed normative pair rejected",
+  "Architecture semantic override rejected",
+  "brief exposes no Product/Release acceptance, authority or self-certification",
+]
+non_goals = [
+  "CurrentSystemEvidenceSnapshot acquisition/compilation",
+  "repository/runtime/store probe",
+  "support promotion",
+  "Architecture/Implementation change",
+  "model call",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-INTENT-01",
+  "ARCH-SELF-01",
+  "ARCH-UND-01",
+  "ARCH-EPI-04",
+  "ARCH-PORT-01",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I0.3",
+  "I0.4",
+  "I0.5",
+  "I0.13",
+  "I0.14",
+  "I12.23",
+]
+product_pulse = "D3A_SELF_QUERY_EDGE_01"
+stop_condition = "Return TargetOnly/Unknown/Stale or ContractChallenge rather than treating target prose, code shape, build success or a stale snapshot as current verified implementation support."
+brief_proof_ceiling = "STATIC_W1_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

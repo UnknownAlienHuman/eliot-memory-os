@@ -1,0 +1,64 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w1-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 11
+cell = "smart.dreamer.draft_admission"
+physical_crate = "eliot-dreamer-validation"
+predecessor_orders = [4, 8, 9, 10]
+primary_property = "Apply structural job/kind/schema/fence/privacy/budget/effect-ceiling admission to grounded validated drafts while keeping AdmittedCandidate distinct from canonical, supported, true or executable state."
+field_contracts = [
+  "crates/smart/eliot-dreamer-contracts/common.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/w1-policy.contract.toml",
+]
+public_function_signatures = [
+  "pub fn admit_grounded_dream_draft(job: &DreamJobEnvelope, bundle: &DreamInputBundle, grounded: &GroundedDreamDraft, validation: &TransformationValidationReport, policy: &DraftAdmissionPolicy) -> Result<AdmittedDreamDraft, DraftAdmissionError>",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-validation/src/admission.rs",
+  "crates/smart/eliot-dreamer-validation/tests/admission.rs",
+]
+algorithm = [
+  "validate shared job, candidate-kind, bundle, grounding, report, policy and State Fence identities",
+  "resolve one closed CandidateKindAdmissionRule for the exact job/candidate pair",
+  "reject unknown kind and broad Repair/WorkPlan/Maintenance without exact subtype handoff",
+  "enforce grounding and required dimension states independently",
+  "enforce privacy, disclosure, budget, output schema and forbidden-effect ceilings",
+  "admit or reject affected candidates without rewriting claims or adding references",
+  "canonicalize disposition and compute admission digest",
+]
+minimum_tests = [
+  "unknown or stringly candidate kind rejected",
+  "broad kind without typed subtype rejected",
+  "privacy or effect widening rejected",
+  "budget/schema mismatch rejected",
+  "failed/Unknown required dimension blocks admission",
+  "partial sibling rejection preserves valid siblings only when policy allows",
+  "AdmittedCandidate exposes no canonical/support/authority/finish/effect receipt",
+]
+non_goals = [
+  "semantic handler logic",
+  "claim rewriting",
+  "source addition",
+  "canonical or Context admission",
+  "support/authority promotion",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-DRM-01",
+  "ARCH-SEC-03",
+  "ARCH-SEC-04",
+  "ARCH-EPI-04",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I9.3",
+  "I9.7",
+  "I9.15",
+]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than accepting an unknown/stringly kind, rewriting model text, adding evidence, weakening a failed dimension, or treating candidate admission as canonical influence."
+brief_proof_ceiling = "STATIC_W1_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

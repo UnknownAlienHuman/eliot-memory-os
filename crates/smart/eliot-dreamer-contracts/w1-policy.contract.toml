@@ -1,0 +1,214 @@
+schema_version = 2
+contract_id = "smart.dreamer.w1-policy.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-dreamer-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.dreamer.transformation_validation", "smart.dreamer.draft_admission", "smart.dreamer.probe_plan", "smart.dreamer.clarification"]
+architecture_refs = ["ARCH-DRM-01", "ARCH-DRM-02", "ARCH-EPI-03", "ARCH-EPI-04", "ARCH-UND-02", "ARCH-AUTH-01", "ARCH-HELP-01", "ARCH-HUM-01", "ARCH-MOD-03"]
+implementation_refs = ["I2.20", "I6.12", "I9.5", "I9.7", "I12.18", "I14.5"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Provide immutable owner-supplied validation, admission, probe-capability and clarification policies for W1 without turning policy records into model, tool, job, Context or authority execution surfaces."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((rules + dimensions + capabilities + roles) log n) validation over bounded immutable policy/snapshot inputs; no I/O, model call, tool execution, DurableJob or admission effect."
+replacement_boundary = "Replace pure policy evaluators behind this contract; policy ownership, capability evidence, authority and execution remain external."
+
+[closed_sets]
+probe_capability_states = ["Available", "Degraded", "Unavailable", "Stale", "Unsupported"]
+probe_coverage_states = ["Complete", "Partial", "Unavailable", "Blocked", "Stale"]
+probe_dimensions = ["DiscriminativePower", "Risk", "Reversibility", "Cost", "Latency", "Privacy", "AuthorityCompatibility"]
+probe_dimension_states = ["Pass", "Fail", "Unknown", "NotApplicable"]
+clarification_answer_owners = ["ActiveAgent", "HumanGoalOwner", "HumanApprover", "WorkScopeOwner", "SystemOwner"]
+
+[hard_invariants]
+policy_is_immutable_and_externally_owned = true
+all_seven_transformation_dimensions_remain_independent = true
+unknown_is_not_pass = true
+model_self_report_cannot_satisfy_faithfulness_or_source_authority = true
+unknown_job_or_candidate_kind_fails_closed = true
+probe_capability_availability_requires_exact_generation_and_evidence = true
+probe_plan_has_no_tool_job_lease_effect_or_execution_receipt = true
+no_aggregate_probe_score_can_hide_risk_privacy_or_authority_failure = true
+clarification_has_at_most_one_question = true
+human_interruption_is_limited_to_human_owned_decision_boundaries = true
+answerable_from_admitted_evidence_is_not_a_clarification = true
+policy_contains_no_canonical_write_support_promotion_context_admission_or_finish_state = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "DreamJobClass"
+owner = "eliot-dreamer-contracts/common.contract.toml"
+
+[[external_type]]
+name = "DreamCandidateKind"
+owner = "eliot-dreamer-contracts/common.contract.toml"
+
+[[external_type]]
+name = "TransformationDimension"
+owner = "eliot-dreamer-contracts/common.contract.toml"
+
+[[external_type]]
+name = "TransformationDimensionState"
+owner = "eliot-dreamer-contracts/common.contract.toml"
+
+[[external_type]]
+name = "GroundingState"
+owner = "eliot-dreamer-contracts/common.contract.toml"
+
+[[external_type]]
+name = "InquiryKind"
+owner = "eliot-epistemic-contracts/current-position.contract.toml"
+
+[[public_type]]
+name = "TransformationDimensionRequirement"
+kind = "struct"
+definition = ["dimension: TransformationDimension", "accepted_states: Vec<TransformationDimensionState>", "required_for_candidate_kinds: Vec<DreamCandidateKind>", "independent_evidence_required: bool", "minimum_evidence_handles: u32", "failure_reason_code: String"]
+invariants = ["accepted states non-empty and exclude Fail", "required candidate kinds unique", "minimum evidence non-zero when independent evidence required", "Unknown cannot be accepted where policy requires Pass"]
+
+[[public_type]]
+name = "TransformationPolicy"
+kind = "struct"
+definition = ["policy_ref: ArtifactId", "policy_revision: String", "job_class: DreamJobClass", "requirements: Vec<TransformationDimensionRequirement>", "maximum_followups: u32", "require_preserved_rivals: bool", "require_preserved_unknowns: bool", "require_exact_reopen_handles: bool", "policy_sha256: String"]
+invariants = ["exactly one requirement per seven dimensions", "all bounds non-zero", "policy cannot weaken source authority or candidate-only ceiling", "canonical order and digest"]
+
+[[public_type]]
+name = "CandidateKindAdmissionRule"
+kind = "struct"
+definition = ["job_class: DreamJobClass", "candidate_kind: DreamCandidateKind", "required_grounding_states: Vec<GroundingState>", "required_dimension_states: Vec<TransformationDimensionRequirement>", "required_sections: Vec<String>", "allow_partial_packet: bool", "maximum_candidates: u32", "maximum_bytes: u32"]
+invariants = ["job/kind pair unique within policy", "grounding states and sections non-empty", "bounds non-zero", "Unknown dimension state rejected where Pass required", "partial packet cannot omit required protected sections"]
+
+[[public_type]]
+name = "DraftAdmissionPolicy"
+kind = "struct"
+definition = ["policy_ref: ArtifactId", "policy_revision: String", "rules: Vec<CandidateKindAdmissionRule>", "reject_unknown_job_or_candidate_kind: bool", "reject_privacy_widening: bool", "reject_budget_overrun: bool", "reject_effect_ceiling_widening: bool", "allow_partial_packet: bool", "policy_sha256: String"]
+invariants = ["rules non-empty and unique", "all four rejection controls true", "policy grants no canonical or support admission", "canonical order and digest"]
+
+[[public_type]]
+name = "ProbeCapabilityAvailability"
+kind = "enum"
+definition = ["Available", "Degraded", "Unavailable", "Stale", "Unsupported"]
+
+[[public_type]]
+name = "ProbeCapabilityCoverageState"
+kind = "enum"
+definition = ["Complete", "Partial", "Unavailable", "Blocked", "Stale"]
+
+[[public_type]]
+name = "ProbeCapabilityCoverageDenominator"
+kind = "struct"
+definition = ["source_ref: String", "source_revision: String", "method_ref: String", "expected_capabilities: Option<u32>", "expected_capability_refs: Vec<ArtifactId>"]
+invariants = ["source/revision/method non-blank", "Complete requires exact expected count", "capability refs unique", "denominator independently recheckable"]
+
+[[public_type]]
+name = "ProbeCapabilityCoverage"
+kind = "struct"
+definition = ["state: ProbeCapabilityCoverageState", "denominator: Option<ProbeCapabilityCoverageDenominator>", "observed_capabilities: u32", "missing_owner_or_reason_refs: Vec<String>"]
+invariants = ["Complete requires exact count and no missing refs", "Partial requires denominator and named gaps", "Unavailable or Blocked has zero observed capabilities and names owner/reason", "Stale cannot authorize a probe"]
+
+[[public_type]]
+name = "ProbeCapabilityDescriptor"
+kind = "struct"
+definition = ["capability_ref: ArtifactId", "capability_revision: String", "generation_ref: String", "availability: ProbeCapabilityAvailability", "supported_inquiry_kinds: Vec<InquiryKind>", "effect_class: String", "authority_requirement_ref: String", "privacy_classes: Vec<String>", "risk_basis_points: u16", "reversibility_basis_points: u16", "cost_basis_points: u16", "latency_basis_points: u16", "evidence_handles: Vec<ArtifactId>", "state_fence: StateFence"]
+invariants = ["identity/revision/generation/fence exact", "basis points within 0..=10000", "supported inquiry kinds unique", "Available requires current evidence", "descriptor is capability evidence not an execution handle"]
+
+[[public_type]]
+name = "ProbeCapabilitySnapshot"
+kind = "struct"
+definition = ["snapshot_id: ArtifactId", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "coverage: ProbeCapabilityCoverage", "capabilities: Vec<ProbeCapabilityDescriptor>", "snapshot_sha256: String"]
+invariants = ["capability refs unique", "scope/task/fence exact", "coverage reconciles count", "contains no tool invocation, lease, job or effect permit", "canonical order and digest"]
+
+[[public_type]]
+name = "ProbeDimension"
+kind = "enum"
+definition = ["DiscriminativePower", "Risk", "Reversibility", "Cost", "Latency", "Privacy", "AuthorityCompatibility"]
+
+[[public_type]]
+name = "ProbeDimensionState"
+kind = "enum"
+definition = ["Pass", "Fail", "Unknown", "NotApplicable"]
+
+[[public_type]]
+name = "ProbeDimensionAssessment"
+kind = "struct"
+definition = ["dimension: ProbeDimension", "state: ProbeDimensionState", "basis_points: Option<u16>", "evidence_handles: Vec<ArtifactId>", "reason_codes: Vec<String>"]
+invariants = ["known basis points within 0..=10000", "Pass requires evidence or deterministic NotApplicable basis", "risk/privacy/authority failure cannot be offset by another dimension", "Unknown remains explicit"]
+
+[[public_type]]
+name = "ProbePolicy"
+kind = "struct"
+definition = ["policy_ref: ArtifactId", "policy_revision: String", "allowed_inquiry_kinds: Vec<InquiryKind>", "required_dimensions: Vec<ProbeDimension>", "maximum_candidates: u32", "maximum_risk_basis_points: u16", "minimum_reversibility_basis_points: u16", "maximum_cost_basis_points: u16", "maximum_latency_basis_points: u16", "require_independent_observation_for_critical: bool", "canonical_tie_break: String", "policy_sha256: String"]
+invariants = ["kinds/dimensions unique", "all bounds valid", "risk/privacy/authority are hard filters", "tie-break non-blank", "policy cannot execute or authorize a probe"]
+
+[[public_type]]
+name = "ClarificationAnswerOwnerClass"
+kind = "enum"
+definition = ["ActiveAgent", "HumanGoalOwner", "HumanApprover", "WorkScopeOwner", "SystemOwner"]
+
+[[public_type]]
+name = "ClarificationPolicy"
+kind = "struct"
+definition = ["policy_ref: ArtifactId", "policy_revision: String", "eligible_answer_owner_classes: Vec<ClarificationAnswerOwnerClass>", "human_owned_boundary_refs: Vec<String>", "maximum_questions: u32", "maximum_question_bytes: u32", "maximum_burden_basis_points: u16", "maximum_privacy_risk_basis_points: u16", "suppress_if_answerable_from_admitted_evidence: bool", "require_safe_fallback: bool", "canonical_tie_break: String", "policy_sha256: String"]
+invariants = ["maximum_questions equals one", "bounds valid and non-zero", "owner classes unique", "suppression and safe fallback true", "Human question requires matching human-owned boundary", "policy grants no interruption or answer authority"]
+
+[[public_function]]
+name = "validate_transformation_policy"
+signature = "pub fn validate_transformation_policy(policy: &TransformationPolicy) -> Result<(), DreamW1PolicyError>"
+
+[[public_function]]
+name = "validate_draft_admission_policy"
+signature = "pub fn validate_draft_admission_policy(policy: &DraftAdmissionPolicy) -> Result<(), DreamW1PolicyError>"
+
+[[public_function]]
+name = "validate_probe_capability_snapshot"
+signature = "pub fn validate_probe_capability_snapshot(snapshot: &ProbeCapabilitySnapshot) -> Result<(), DreamW1PolicyError>"
+
+[[public_function]]
+name = "validate_probe_policy"
+signature = "pub fn validate_probe_policy(policy: &ProbePolicy) -> Result<(), DreamW1PolicyError>"
+
+[[public_function]]
+name = "validate_clarification_policy"
+signature = "pub fn validate_clarification_policy(policy: &ClarificationPolicy) -> Result<(), DreamW1PolicyError>"
+
+[[negative_test]]
+id = "self-certification-not-faithfulness"
+property = "Model self-report without independent evidence cannot satisfy Faithfulness or SourceAuthority."
+
+[[negative_test]]
+id = "failed-dimension-not-offset"
+property = "One failed required transformation dimension cannot be offset by passing dimensions."
+
+[[negative_test]]
+id = "unknown-kind-no-fallback"
+property = "Unknown job/candidate kind cannot reach an admission rule or generic model fallback."
+
+[[negative_test]]
+id = "stale-capability-not-probe"
+property = "Stale/unavailable capability cannot be emitted as an executable or recommended probe."
+
+[[negative_test]]
+id = "unsafe-probe-not-offset"
+property = "High discriminative power cannot offset risk, privacy or authority failure."
+
+[[negative_test]]
+id = "clarification-one-question"
+property = "Policy cannot permit more than one question or a Human interruption outside a Human-owned boundary."

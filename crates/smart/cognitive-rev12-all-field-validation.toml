@@ -1,28 +1,33 @@
-schema_version = 1
+schema_version = 2
 authority = "eliot-cognitive-function-design-rev12"
 status = "CONSOLIDATED_FIELD_CONTRACT_VALIDATION_NOT_IMPLEMENTATION_OR_PRODUCT_PROOF"
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
 
 [expected]
-contracts = 18
+contracts = 21
 w0_contracts = 11
+w1_contracts = 3
 w8_contracts = 3
 w9_contracts = 4
 w0_assignments = 15
+w1_assignments = 12
 w0_orders = [1, 2, 4, 5, 6, 7, 19, 26, 27, 28, 35, 49, 50, 51, 52]
+w1_orders = [3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
 all_cell_orders = "1..86"
 normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
 field_contract_index = "crates/smart/cognitive-rev12-all-field-contracts.toml"
 type_ownership = "crates/smart/cognitive-rev12-all-type-ownership.toml"
 w0_agent_handoff = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+w1_agent_handoff = "crates/smart/cognitive-rev12-w1-agent-handoff.toml"
+w1_validation = "crates/smart/cognitive-rev12-w1-validation.toml"
 
 [[gate]]
 id = "CFV01_TOML_PARSE"
-requirement = "Every indexed contract, owner manifest, index, handoff and validation file parses as TOML."
+requirement = "Every indexed contract, owner manifest, index, handoff, correction and validation file parses as TOML."
 
 [[gate]]
 id = "CFV02_CONTRACT_PATH_ID_OWNER"
-requirement = "Exactly eighteen indexed contracts exist; each file contract_id and owner equal its index entry and no path/id pair is duplicated."
+requirement = "Exactly twenty-one indexed contracts exist; each file contract_id and owner equal its index entry and no path/id pair is duplicated."
 
 [[gate]]
 id = "CFV03_NORMATIVE_PAIR"
@@ -42,7 +47,7 @@ requirement = "Every public function has an exact Rust-oriented signature and ev
 
 [[gate]]
 id = "CFV07_CLOSED_ENUMS"
-requirement = "Closed job, subtype, provider, cue, disposition, stage and status families are enums; free-text/generic fallback cannot extend them silently."
+requirement = "Closed job, candidate kind, subtype, provider, cue, disposition, stage and status families are enums; free-text/generic fallback cannot extend them silently."
 
 [[gate]]
 id = "CFV08_DENOMINATOR"
@@ -106,7 +111,7 @@ requirement = "Common Ground preserves public causal inheritance rather than sum
 
 [[gate]]
 id = "CFV23_AGENT_WRITE_ISOLATION"
-requirement = "Exactly fifteen W0 assignments have pairwise-disjoint source/test paths; workers cannot edit Cargo.toml/lib.rs/reexports/contracts/status or another cell."
+requirement = "W0 and W1 assignments have pairwise-disjoint source/test paths within each wave; workers cannot edit Cargo.toml/lib.rs/reexports/contracts/status or another cell."
 
 [[gate]]
 id = "CFV24_CONTRACT_REFS"
@@ -114,7 +119,7 @@ requirement = "Every owning Cargo.toml references each owner-local field contrac
 
 [[gate]]
 id = "CFV25_PAYLOAD_HYGIENE"
-requirement = "Contract-freeze diff contains TOML only: no Rust, Markdown, workflow, archive, probe, .eliot, root Cargo.toml or Cargo.lock changes."
+requirement = "Contract-design diff contains TOML only: no Rust, Markdown, workflow, archive, probe, .eliot, root Cargo.toml or Cargo.lock changes."
 
 [[gate]]
 id = "CFV26_PROOF_CEILING"
@@ -122,8 +127,36 @@ requirement = "Parse, schema completeness, branch, commit, review or type count 
 
 [[gate]]
 id = "CFV27_NEGATIVE_TESTS"
-requirement = "Every contract contains explicit negative tests that fail old/proxy behavior and every W0 worker implements all negative tests before package integration."
+requirement = "Every contract contains explicit negative tests that fail old/proxy behavior and every worker implements all negative tests before package integration."
 
 [[gate]]
 id = "CFV28_CANONICAL_DIGEST"
 requirement = "Every identity-bearing collection specifies deterministic canonical ordering/digest and permutation tests where ordering is non-semantic."
+
+[[gate]]
+id = "CFV29_W1_RESOLUTION_INPUT"
+requirement = "Current-position resolver consumes an exact AdmittedEpistemicRecordSet with owner coverage and denominator; empty/unqueried state cannot become an absence claim."
+
+[[gate]]
+id = "CFV30_W1_TYPED_CANDIDATE_POLICY"
+requirement = "DreamCandidateKind is closed and used by DreamOutputContract/AdmittedDreamDraft; transformation/admission/probe/clarification policies are immutable and contain no execution authority."
+
+[[gate]]
+id = "CFV31_W1_ORIENTATION"
+requirement = "Rivals, relation candidates, probes, clarifications and packet assembly preserve evidence/synthesis separation, local conflict, noncausal proximity and candidate-only status."
+
+[[gate]]
+id = "CFV32_W1_SELF_QUERY"
+requirement = "Only exact accepted normative-pair sources produce briefs; target remains separate from current support; CurrentSystemEvidenceSnapshot is externally owned and stale evidence cannot self-certify support."
+
+[[gate]]
+id = "CFV33_W1_WRITE_ISOLATION"
+requirement = "Exactly twelve W1 briefs have twenty-four pairwise-disjoint source/test paths and no worker-owned integration file."
+
+[[gate]]
+id = "CFV34_W1_STALE_DEPENDENCY"
+requirement = "eliot-dreamer-orientation no longer depends on retired/nonexistent eliot-dreamer-candidate-validation."
+
+[[gate]]
+id = "CFV35_W1_PROOF_CEILING"
+requirement = "W1 fields/briefs/corrections remain TARGET / NOT_EXECUTED and cannot claim model, package, edge, product, runtime or release behavior."

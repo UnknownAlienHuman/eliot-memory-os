@@ -1,0 +1,114 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W1_D3A_AGENT_HANDOFF_CONTRACT"
+field_contract_index = "crates/smart/cognitive-rev12-w1-field-contracts.toml"
+brief_index = "crates/smart/cognitive-rev12-w1-agent-brief-index.toml"
+
+[worker]
+reads = ["one indexed W1 brief", "the exact field contracts named by that brief", "declared Architecture/Implementation anchors", "one-hop public contracts and fixtures only"]
+writes = ["the brief declared src/<cell>.rs", "the brief declared tests/<cell>.rs"]
+forbidden = ["Cargo.toml", "src/lib.rs", "re-exports", "another cell source", "root workspace", "runtime wiring", "canonical state", "policy ownership", "model/provider/tool execution", "scheduler", "authority", "task finish", "proof/status files", "local public-type redefinition", "oracle weakening"]
+return = ["implemented exact declared function", "typed errors", "minimum and contract negative tests", "remaining ContractChallenge", "actual proof ceiling"]
+
+[integration_owner]
+owns = ["Cargo.toml", "src/lib.rs and re-exports", "cross-cell compatibility", "public-type ownership validation", "package Module Proof", "real Edge Proof", "Product Pulse", "migration and retirement"]
+
+[challenge]
+required_when = ["field contract absent or contradictory", "public type owner unresolved", "discriminator cannot fail old behavior", "work requires hidden I/O/model/tool/provider SDK", "work requires another mutable owner", "worker must weaken an oracle", "complete causal workset does not fit"]
+
+[ordering]
+contracts_precede_workers = true
+parallel_workers_require_disjoint_source_files = true
+shared_contract_change_serialized_by_integration_owner = true
+worker_never_integrates_own_result = true
+epistemic_position_precedes_orientation_handlers = true
+bundle_precedes_grounding = true
+grounding_precedes_transformation_validation = true
+transformation_validation_precedes_draft_admission = true
+draft_admission_precedes_rivals_relations_and_packet = true
+rivals_precede_probe_plan = true
+architecture_brief_precedes_implementation_brief = true
+
+[[assignment]]
+order = 3
+cell = "smart.epistemic.position"
+brief = "crates/smart/cells-v12/003-smart-epistemic-position.toml"
+predecessor_orders = [2]
+write_scope = ["crates/smart/eliot-epistemic/src/resolver.rs", "crates/smart/eliot-epistemic/tests/resolver.rs"]
+
+[[assignment]]
+order = 8
+cell = "smart.dreamer.bundle"
+brief = "crates/smart/cells-v12/008-smart-dreamer-bundle.toml"
+predecessor_orders = [4]
+write_scope = ["crates/smart/eliot-dreamer-bundle/src/bundle.rs", "crates/smart/eliot-dreamer-bundle/tests/bundle.rs"]
+
+[[assignment]]
+order = 9
+cell = "smart.dreamer.claim_grounding"
+brief = "crates/smart/cells-v12/009-smart-dreamer-claim_grounding.toml"
+predecessor_orders = [4, 8]
+write_scope = ["crates/smart/eliot-dreamer-validation/src/claim_grounding.rs", "crates/smart/eliot-dreamer-validation/tests/claim_grounding.rs"]
+
+[[assignment]]
+order = 10
+cell = "smart.dreamer.transformation_validation"
+brief = "crates/smart/cells-v12/010-smart-dreamer-transformation_validation.toml"
+predecessor_orders = [4, 8, 9]
+write_scope = ["crates/smart/eliot-dreamer-validation/src/transformation.rs", "crates/smart/eliot-dreamer-validation/tests/transformation.rs"]
+
+[[assignment]]
+order = 11
+cell = "smart.dreamer.draft_admission"
+brief = "crates/smart/cells-v12/011-smart-dreamer-draft_admission.toml"
+predecessor_orders = [4, 8, 9, 10]
+write_scope = ["crates/smart/eliot-dreamer-validation/src/admission.rs", "crates/smart/eliot-dreamer-validation/tests/admission.rs"]
+
+[[assignment]]
+order = 12
+cell = "smart.dreamer.rival_model"
+brief = "crates/smart/cells-v12/012-smart-dreamer-rival_model.toml"
+predecessor_orders = [3, 5, 11]
+write_scope = ["crates/smart/eliot-dreamer-orientation/src/rival_model.rs", "crates/smart/eliot-dreamer-orientation/tests/rival_model.rs"]
+
+[[assignment]]
+order = 13
+cell = "smart.dreamer.relation_candidate"
+brief = "crates/smart/cells-v12/013-smart-dreamer-relation_candidate.toml"
+predecessor_orders = [5, 11]
+write_scope = ["crates/smart/eliot-dreamer-orientation/src/relation.rs", "crates/smart/eliot-dreamer-orientation/tests/relation.rs"]
+
+[[assignment]]
+order = 14
+cell = "smart.dreamer.probe_plan"
+brief = "crates/smart/cells-v12/014-smart-dreamer-probe_plan.toml"
+predecessor_orders = [3, 5, 12]
+write_scope = ["crates/smart/eliot-dreamer-orientation/src/probe_plan.rs", "crates/smart/eliot-dreamer-orientation/tests/probe_plan.rs"]
+
+[[assignment]]
+order = 15
+cell = "smart.dreamer.orientation"
+brief = "crates/smart/cells-v12/015-smart-dreamer-orientation.toml"
+predecessor_orders = [3, 5, 11, 12, 13, 14]
+write_scope = ["crates/smart/eliot-dreamer-orientation/src/orientation.rs", "crates/smart/eliot-dreamer-orientation/tests/orientation.rs"]
+
+[[assignment]]
+order = 16
+cell = "smart.dreamer.clarification"
+brief = "crates/smart/cells-v12/016-smart-dreamer-clarification.toml"
+predecessor_orders = [3, 5]
+write_scope = ["crates/smart/eliot-dreamer-orientation/src/clarification.rs", "crates/smart/eliot-dreamer-orientation/tests/clarification.rs"]
+
+[[assignment]]
+order = 17
+cell = "smart.dreamer.architecture_brief"
+brief = "crates/smart/cells-v12/017-smart-dreamer-architecture_brief.toml"
+predecessor_orders = [4]
+write_scope = ["crates/smart/eliot-dreamer-self-query/src/architecture.rs", "crates/smart/eliot-dreamer-self-query/tests/architecture.rs"]
+
+[[assignment]]
+order = 18
+cell = "smart.dreamer.implementation_brief"
+brief = "crates/smart/cells-v12/018-smart-dreamer-implementation_brief.toml"
+predecessor_orders = [4, 17]
+write_scope = ["crates/smart/eliot-dreamer-self-query/src/implementation.rs", "crates/smart/eliot-dreamer-self-query/tests/implementation.rs"]

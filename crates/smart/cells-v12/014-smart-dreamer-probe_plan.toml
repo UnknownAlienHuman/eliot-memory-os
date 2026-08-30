@@ -1,0 +1,67 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w1-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 14
+cell = "smart.dreamer.probe_plan"
+physical_crate = "eliot-dreamer-orientation"
+predecessor_orders = [3, 5, 12]
+primary_property = "Construct a bounded Pareto set of safe discriminative probe candidates from unresolved decision dependencies and current capability evidence without executing tools, creating jobs or granting authority."
+field_contracts = [
+  "crates/smart/eliot-epistemic-contracts/current-position.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/orientation.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/w1-policy.contract.toml",
+]
+public_function_signatures = [
+  "pub fn build_discriminative_probe_plan(position: &CurrentEpistemicPosition, rivals: &RivalModelSet, capabilities: &ProbeCapabilitySnapshot, policy: &ProbePolicy) -> Result<DiscriminativeProbePlan, ProbePlanError>",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-orientation/src/probe_plan.rs",
+  "crates/smart/eliot-dreamer-orientation/tests/probe_plan.rs",
+]
+algorithm = [
+  "validate position, rivals, capability snapshot, policy, coverage and one compatible fence",
+  "derive unresolved decision dependencies and alternatives to discriminate",
+  "enumerate only currently evidenced capability-compatible probe templates",
+  "reject unavailable/stale/unsafe/privacy-incompatible/authority-exceeding probes before comparison",
+  "assess discriminative power, risk, reversibility, cost, latency, privacy and authority compatibility separately",
+  "retain a bounded nondominated set with deterministic tie-break",
+  "attach expected observables, falsifiers, stop/revision conditions and explicit no-admissible-probe state",
+]
+minimum_tests = [
+  "stale/unavailable capability cannot produce recommended probe",
+  "high discriminative power cannot offset risk/privacy/authority failure",
+  "dominated probe removed while nondominated alternatives remain",
+  "no capability returns explicit BlockedByCapability or no-probe",
+  "each probe distinguishes at least two alternatives",
+  "plan contains no tool/job/lease/effect/outcome receipt",
+  "candidate permutation deterministic",
+]
+non_goals = [
+  "tool/model/agent execution",
+  "DurableJob creation",
+  "authority/lease grant",
+  "result verification",
+  "Context admission",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-EPI-03",
+  "ARCH-UND-02",
+  "ARCH-AUTH-01",
+  "ARCH-RES-05",
+  "ARCH-DRM-02",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I6.12",
+  "I9.5",
+  "I12.18",
+  "I14.5",
+]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return NoAdmissibleProbe or ContractChallenge rather than executing a probe, inventing capability, offsetting a safety/privacy/authority failure, or collapsing dimensions to one score."
+brief_proof_ceiling = "STATIC_W1_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

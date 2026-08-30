@@ -1,0 +1,139 @@
+schema_version = 1
+contract_id = "smart.epistemic.resolution-input.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-epistemic-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.epistemic.position"]
+architecture_refs = ["ARCH-EPI-01", "ARCH-EPI-02", "ARCH-EPI-04", "ARCH-CONCIL-01", "ARCH-UND-02", "ARCH-SCOPE-01", "ARCH-MOD-03"]
+implementation_refs = ["I2.20", "I5.20", "I6.16", "I12.11", "I12.12"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Supply one bounded, owner-attributed and denominator-bearing admitted evidence set to the Current Epistemic Position resolver without making the resolver an evidence-admission or canonical-state owner."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((records + owners + evidence handles) log n) validation and canonicalization over request-bounded immutable input; no I/O, model call, vote, support transition or evidence acquisition."
+replacement_boundary = "Replace resolver input validation behind this contract; canonical evidence admission, support revision and owner read projections remain external."
+
+[closed_sets]
+input_roles = ["DirectObservation", "CandidateSupport", "ExplicitAssumption", "RivalModel", "StalePosition", "SupersededPosition", "UnknownPosition"]
+owner_read_states = ["Complete", "Partial", "Unavailable", "Blocked", "Stale"]
+
+[hard_invariants]
+records_are_already_admitted_by_external_owner = true
+one_question_scope_time_and_fence = true
+complete_requires_exact_recheckable_denominator = true
+missing_owner_state_is_not_inferred_from_empty_records = true
+observed_supported_assumption_rival_stale_superseded_and_unknown_inputs_are_distinct = true
+explicit_assumption_requires_exact_assumption_handle = true
+candidate_support_requires_supporting_evidence_and_applicable_verifier_evidence = true
+shared_lineage_is_not_independent_confirmation = true
+minority_and_counterevidence_remain_addressable = true
+record_count_is_not_epistemic_weight = true
+input_set_contains_no_truth_support_promotion_authority_or_finish_state = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "ClockReading"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "EpistemicStatus"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "Assertability"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "EvidenceFreshness"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "EvidenceDependence"
+owner = "eliot-epistemic-contracts/current-position.contract.toml"
+
+[[external_type]]
+name = "PositionCoverage"
+owner = "eliot-epistemic-contracts/current-position.contract.toml"
+
+[[external_type]]
+name = "CurrentPositionRequest"
+owner = "eliot-epistemic-contracts/current-position.contract.toml"
+
+[[public_type]]
+name = "EpistemicInputRole"
+kind = "enum"
+definition = ["DirectObservation", "CandidateSupport", "ExplicitAssumption", "RivalModel", "StalePosition", "SupersededPosition", "UnknownPosition"]
+
+[[public_type]]
+name = "EpistemicOwnerReadState"
+kind = "enum"
+definition = ["Complete", "Partial", "Unavailable", "Blocked", "Stale"]
+
+[[public_type]]
+name = "EpistemicOwnerReadDisposition"
+kind = "struct"
+definition = ["owner_ref: String", "owner_revision: String", "state: EpistemicOwnerReadState", "expected_records: Option<u32>", "observed_records: u32", "read_receipt_handle: Option<ArtifactId>", "missing_owner_or_reason_refs: Vec<String>"]
+invariants = ["owner/revision non-blank", "Complete requires exact expected count, receipt and no missing refs", "Partial requires expected count, receipt and named gaps", "Unavailable or Blocked has zero observed records and names owner/reason", "Stale retains revision/receipt and cannot support current automatic action"]
+
+[[public_type]]
+name = "AdmittedEpistemicRecord"
+kind = "struct"
+definition = ["record_id: ArtifactId", "proposition_id: ArtifactId", "statement: String", "input_role: EpistemicInputRole", "scope_id: String", "task_id: Option<TaskId>", "valid_time_ref: String", "known_at: ClockReading", "state_fence: StateFence", "epistemic_status: EpistemicStatus", "assertability: Assertability", "freshness: EvidenceFreshness", "source_owner_ref: String", "source_owner_revision: String", "source_handles: Vec<ArtifactId>", "supporting_evidence_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "verifier_evidence_handles: Vec<ArtifactId>", "dependence: Vec<EvidenceDependence>", "explicit_assumption_handle: Option<ArtifactId>", "rival_model_handle: Option<ArtifactId>", "applicability_conditions: Vec<String>", "invalidation_conditions: Vec<String>"]
+invariants = ["record/proposition/source identity exact", "scope/task/time/fence match request", "source handles non-empty and unique", "DirectObservation is not support by itself", "CandidateSupport requires supporting evidence and verifier evidence", "ExplicitAssumption requires explicit assumption handle and cannot be Supported/Verified", "RivalModel requires rival handle", "Stale/Superseded/Unknown cannot be assertable current support", "counterevidence and dependence remain visible"]
+
+[[public_type]]
+name = "AdmittedEpistemicRecordSet"
+kind = "struct"
+definition = ["request_sha256: String", "scope_id: String", "task_id: Option<TaskId>", "valid_time_ref: String", "state_fence: StateFence", "coverage: PositionCoverage", "owner_reads: Vec<EpistemicOwnerReadDisposition>", "records: Vec<AdmittedEpistemicRecord>", "set_sha256: String"]
+invariants = ["request/scope/task/time/fence exact", "one owner-read row per expected owner", "record counts reconcile with owner rows and coverage denominator", "all record ids unique", "empty records under missing/unavailable coverage is not an absence claim", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_admitted_epistemic_record"
+signature = "pub fn validate_admitted_epistemic_record(request: &CurrentPositionRequest, record: &AdmittedEpistemicRecord) -> Result<(), EpistemicResolutionContractError>"
+
+[[public_function]]
+name = "validate_admitted_epistemic_record_set"
+signature = "pub fn validate_admitted_epistemic_record_set(request: &CurrentPositionRequest, input: &AdmittedEpistemicRecordSet) -> Result<(), EpistemicResolutionContractError>"
+
+[[negative_test]]
+id = "empty-is-not-complete"
+property = "An empty record set without an exact complete denominator cannot support an absence claim."
+
+[[negative_test]]
+id = "observation-is-not-support"
+property = "DirectObservation cannot decode as CandidateSupport without supporting and applicable verifier evidence."
+
+[[negative_test]]
+id = "assumption-needs-source"
+property = "ExplicitAssumption without an exact assumption handle is rejected."
+
+[[negative_test]]
+id = "wrong-owner-count"
+property = "Owner read rows and records must reconcile exactly; missing owner state is not inferred."
+
+[[negative_test]]
+id = "dependent-count-not-weight"
+property = "Repeated shared-lineage records remain dependent evidence and cannot gain weight by count."
+
+[[negative_test]]
+id = "permutation-deterministic"
+property = "Record and owner-row input permutation does not change set identity."

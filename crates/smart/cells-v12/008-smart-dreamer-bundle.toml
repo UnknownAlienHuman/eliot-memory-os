@@ -1,0 +1,65 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w1-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 8
+cell = "smart.dreamer.bundle"
+physical_crate = "eliot-dreamer-bundle"
+predecessor_orders = [4]
+primary_property = "Assemble one bounded disclosure-safe DreamInputBundle from externally admitted descriptors while reserving Decision Safety Floor, output and review capacity and preserving every omission by exact handle."
+field_contracts = [
+  "crates/smart/eliot-dreamer-contracts/common.contract.toml",
+]
+public_function_signatures = [
+  "pub fn build_reference_manifest(job: &DreamJobEnvelope, descriptors: &[ReferenceDescriptor]) -> Result<ReferenceManifest, DreamBundleError>",
+  "pub fn assemble_dream_input_bundle(job: &DreamJobEnvelope, manifest: &ReferenceManifest, references: &[ExpandedReference]) -> Result<DreamInputBundle, DreamBundleError>",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-bundle/src/bundle.rs",
+  "crates/smart/eliot-dreamer-bundle/tests/bundle.rs",
+]
+algorithm = [
+  "validate job, closed candidate kind, State Fence, privacy, budget and exact admitted descriptors",
+  "construct a frozen denominator-bearing ReferenceManifest without reading storage",
+  "reserve output and review headroom before optional expansion",
+  "admit required and protected Decision Safety Floor references first",
+  "select only permitted exact payload, excerpt or handle representations within disclosure and byte ceilings",
+  "record every omission with exact source handle and reason",
+  "canonicalize descriptors/references/omissions and compute manifest and bundle digests",
+]
+minimum_tests = [
+  "invented descriptor or expansion handle rejected",
+  "required/protected reference precedes optional material",
+  "output/review headroom cannot be consumed by optional input",
+  "disclosure-denied required reference blocks safe bundle when no handle form is permitted",
+  "generative summary cannot replace material exact evidence",
+  "omission remains reversible by exact handle",
+  "descriptor permutation yields identical manifest and bundle",
+]
+non_goals = [
+  "canonical or blob-store read",
+  "model/provider route selection or execution",
+  "ReferenceDescriptor admission",
+  "Context admission",
+  "generative summarization",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-DRM-01",
+  "ARCH-MEM-03",
+  "ARCH-EPI-04",
+  "ARCH-CTX-01",
+  "ARCH-SEC-03",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I7.11",
+  "I9.4",
+  "I12.13",
+]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than reading storage, inventing references, widening disclosure, consuming reserved headroom, or silently dropping required/protected material."
+brief_proof_ceiling = "STATIC_W1_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

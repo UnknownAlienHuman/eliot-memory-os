@@ -4,11 +4,32 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ELIOT current epistemic position and provenance resolution"
+publish = false
+description = "Bounded deterministic ELIOT Current Epistemic Position resolver."
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+layer = "C1"
+purpose = "resolve one admitted evidence set into one Current Epistemic Position"
+source_maintenance_owner = "cognitive-integration-owner"
+functional_cell_refs = ["smart.epistemic.position", "smart.epistemic.context_projection"]
+independent_proof_profile = "prototype-not-workspace-admitted"
+contract_refs = [
+  "crates/smart/cognitive-current.toml",
+  "crates/smart/eliot-epistemic-contracts/current-position.contract.toml",
+  "crates/smart/eliot-epistemic-contracts/resolution.contract.toml",
+  "crates/smart/eliot-context-contracts/provider-contribution.contract.toml",
+]
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until both cells have package Module Proof, affected real Edge Proof and named Product Pulses"
 
 [dependencies]
 eliot-contracts.workspace = true
 eliot-evidence.workspace = true
+eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts" }
 schemars.workspace = true
 serde.workspace = true
 thiserror.workspace = true

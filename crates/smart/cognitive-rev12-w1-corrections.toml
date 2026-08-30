@@ -1,0 +1,43 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W1_D3A_CATALOGUE_CORRECTION_LAYER"
+issue = 320
+parent_pr = 310
+rule = "This file corrects stale W1 API/package metadata in the legacy base catalogue. It does not create new cells or a parallel field-contract authority."
+
+[[correction]]
+order = 3
+cell = "smart.epistemic.position"
+old = "resolve_current_epistemic_position(request, records: &[AdmittedEpistemicRecord])"
+new = "resolve_current_epistemic_position(request, input: &AdmittedEpistemicRecordSet)"
+reason = "A bare slice cannot carry owner-read coverage, frozen denominator, missing-owner state or exact input digest."
+
+[[correction]]
+orders = [4, 10, 11]
+cells = ["smart.dreamer.contracts.common", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+old = "stringly DreamOutputContract.output_kind / AdmittedDreamDraft.candidate_output_kind"
+new = "closed DreamCandidateKind enum and candidate_kind fields"
+reason = "Unknown/stringly kind creates an implicit generic fallback and violates closed dispatch."
+
+[[correction]]
+orders = [12, 13, 15]
+old_cell_ids = ["smart.dreamer.rivals", "smart.dreamer.relations", "smart.dreamer.orientation_packet"]
+new_cell_ids = ["smart.dreamer.rival_model", "smart.dreamer.relation_candidate", "smart.dreamer.orientation"]
+reason = "The orientation field contract used legacy aliases; the numbered catalogue and agent briefs define the canonical FunctionalCapabilityCell identities."
+
+[[correction]]
+physical_crate = "eliot-dreamer-orientation"
+old_dependency = "eliot-dreamer-candidate-validation"
+new_dependencies = ["eliot-dreamer-contracts", "eliot-epistemic-contracts"]
+reason = "The old validation crate is retired and absent. Post-model grounding/validation/admission belongs to eliot-dreamer-validation; orientation consumes admitted typed contracts only."
+
+[[correction]]
+orders = [17, 18]
+old = "function signatures referenced undefined self-query public types"
+new = "self-query.contract.toml owns AcceptedNormativeDocument, ArchitectureBrief and ImplementationBrief families"
+reason = "Workers must not infer field shapes from documentation prose."
+
+[proof]
+status = "STATIC_CORRECTION_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"

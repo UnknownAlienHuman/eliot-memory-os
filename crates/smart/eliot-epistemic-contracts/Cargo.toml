@@ -5,20 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Versioned store-neutral contracts for ELIOT Current Epistemic Position."
+description = "Versioned store-neutral contracts for ELIOT Current Epistemic Position and resolver inputs."
 
 [lib]
 path = "src/lib.rs"
 
 [package.metadata.eliot]
 layer = "C0"
-purpose = "Current Epistemic Position, explicit assumptions, rivals, conflicts and investigation contracts"
+purpose = "Current Epistemic Position, admitted resolver input, explicit assumptions, rivals, conflicts and investigation contracts"
 source_maintenance_owner = "cognitive-integration-owner"
 functional_cell_refs = ["smart.epistemic.contracts"]
 independent_proof_profile = "prototype-not-workspace-admitted"
 contract_refs = [
   "crates/smart/cognitive-current.toml",
   "crates/smart/eliot-epistemic-contracts/current-position.contract.toml",
+  "crates/smart/eliot-epistemic-contracts/resolution.contract.toml",
 ]
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"

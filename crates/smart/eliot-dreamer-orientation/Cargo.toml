@@ -1,27 +1,34 @@
 [package]
 name = "eliot-dreamer-orientation"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 publish = false
-description = "Build a bounded candidate-only Orientation DreamPacket with epistemic handles, rivals, gaps, hidden relations, and probes"
+description = "Bounded candidate-only rival, relation, probe, clarification and Orientation packet construction."
 
 [lib]
 path = "src/lib.rs"
 
 [package.metadata.eliot]
-prototype = true
-source_status = "NOT_IMPLEMENTED"
-workspace_admission = "pending_agent_implementation_and_proof"
-functional_cell = "smart.dreamer.orientation"
-source_layer = "C1"
-runtime_layer = "R6"
-runtime_bundle = "eliot-dreamer"
-agent_order = 6
+layer = "C1"
+purpose = "candidate-only D3a Orientation handlers over admitted typed contracts"
+source_maintenance_owner = "cognitive-integration-owner"
+functional_cell_refs = ["smart.dreamer.rival_model", "smart.dreamer.relation_candidate", "smart.dreamer.probe_plan", "smart.dreamer.orientation", "smart.dreamer.clarification"]
+independent_proof_profile = "prototype-not-workspace-admitted"
+contract_refs = [
+  "crates/smart/cognitive-current.toml",
+  "crates/smart/eliot-epistemic-contracts/current-position.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/common.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/orientation.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/w1-policy.contract.toml",
+]
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until all five cells have package Module Proof, affected real Edge Proof and D3A Orientation/Clarification Product Pulses"
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
 eliot-evidence = { path = "../../foundation/eliot-evidence" }
+eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts" }
 eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
-eliot-dreamer-candidate-validation = { path = "../eliot-dreamer-candidate-validation" }

@@ -1,0 +1,81 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "VALIDATION_CONTRACT_NOT_IMPLEMENTATION_OR_PRODUCT_PROOF"
+issue = 320
+parent_pr = 310
+proof_ceiling = "STATIC_W1_FIELD_AND_AGENT_WORK_UNIT_DESIGN_ONLY"
+
+[expected]
+orders = [3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+functional_cells = 12
+physical_crates = 6
+new_field_contracts = 3
+refined_existing_contracts = 1
+agent_briefs = 12
+write_scopes = 24
+field_contract_index = "crates/smart/cognitive-rev12-w1-field-contracts.toml"
+type_ownership = "crates/smart/cognitive-rev12-w1-type-ownership.toml"
+brief_index = "crates/smart/cognitive-rev12-w1-agent-brief-index.toml"
+handoff = "crates/smart/cognitive-rev12-w1-agent-handoff.toml"
+corrections = "crates/smart/cognitive-rev12-w1-corrections.toml"
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+
+[[gate]]
+id = "W1V01_TOML_PARSE"
+requirement = "Every changed contract, brief, index, correction, manifest and validation artifact parses as TOML."
+
+[[gate]]
+id = "W1V02_ORDER_CLOSURE"
+requirement = "Orders are exactly 3 and 8..18 with one canonical cell ID and one brief each."
+
+[[gate]]
+id = "W1V03_FIELD_CONTRACT_CLOSURE"
+requirement = "Three new owner-local contracts and one in-place common-contract refinement close every previously undefined W1 public input/policy/self-query type."
+
+[[gate]]
+id = "W1V04_PUBLIC_TYPE_OWNER"
+requirement = "Every new public type has exactly one owner; briefs define no public fields; CurrentSystemEvidenceSnapshot remains externally owned by eliot-bootstrap."
+
+[[gate]]
+id = "W1V05_TYPED_CANDIDATE_KIND"
+requirement = "DreamCandidateKind is closed; DreamOutputContract and AdmittedDreamDraft use candidate_kind; unknown/broad kinds have no generic fallback."
+
+[[gate]]
+id = "W1V06_EPISTEMIC_INPUT"
+requirement = "Resolver consumes AdmittedEpistemicRecordSet with exact owner-read coverage and denominator; empty input cannot imply absence; count cannot become epistemic weight."
+
+[[gate]]
+id = "W1V07_DREAMER_VALIDATION"
+requirement = "Grounding, seven-dimensional transformation validation and structural admission stay independent; model self-certification and scalar shortcuts fail."
+
+[[gate]]
+id = "W1V08_ORIENTATION"
+requirement = "Rivals, relation candidates, probes, clarifications and packet assembly remain candidate-only; proximity/sequence/co-change cannot become causality."
+
+[[gate]]
+id = "W1V09_PROBE_CLARIFICATION"
+requirement = "Probe capability is evidence, not execution; safety/privacy/authority failure cannot be offset; clarification is zero-or-one and Human interruption is limited to Human-owned boundaries."
+
+[[gate]]
+id = "W1V10_SELF_QUERY"
+requirement = "Only exact accepted normative-pair sources are projected; target is not current support; stale/missing CurrentSystemEvidenceSnapshot yields TargetOnly/Unknown/Stale."
+
+[[gate]]
+id = "W1V11_WRITE_ISOLATION"
+requirement = "All twenty-four source/test paths are unique; workers cannot edit contracts, Cargo.toml, lib.rs, re-exports, status or another cell."
+
+[[gate]]
+id = "W1V12_STALE_DEPENDENCY"
+requirement = "eliot-dreamer-orientation contains no dependency on retired/nonexistent eliot-dreamer-candidate-validation."
+
+[[gate]]
+id = "W1V13_HOT_PATH"
+requirement = "Cell 3 remains bounded O(n log n), deterministic and free of I/O/model/provider SDK/storage scan; all other W1 cells remain cold-path pure workers."
+
+[[gate]]
+id = "W1V14_PAYLOAD_HYGIENE"
+requirement = "Diff contains TOML only; no Rust, Markdown, workflow, root Cargo.toml, Cargo.lock, archive, .eliot or runtime state."
+
+[[gate]]
+id = "W1V15_PROOF_CEILING"
+requirement = "Field freeze, brief, branch, commit or review cannot claim Rust behavior, Package/Edge/Product/Release Proof, runtime support or product acceptance."

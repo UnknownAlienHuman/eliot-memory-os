@@ -1,0 +1,84 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W1_D3A_FIELD_LEVEL_CONTRACT_FREEZE"
+issue = 320
+parent_pr = 310
+proof_ceiling = "STATIC_W1_FIELD_AND_AGENT_WORK_UNIT_DESIGN_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+orders = [3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+cell_count = 12
+new_contract_count = 3
+refined_existing_contract_count = 1
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+rule = "These owner-local contracts close missing W1 public inputs/policies/self-query fields. The common Dreamer contract is refined in place to use a closed candidate-kind enum. Cell briefs own assignments only; Rust, Package/Edge/Product proof and runtime support remain unproven."
+
+[[contract]]
+id = "smart.epistemic.resolution-input.v1"
+path = "crates/smart/eliot-epistemic-contracts/resolution.contract.toml"
+owner = "eliot-epistemic-contracts"
+functional_cells = ["smart.epistemic.position"]
+primary_orders = [3]
+resolves = ["missing AdmittedEpistemicRecord", "missing owner-read denominator", "bare-slice input unable to distinguish empty from unqueried"]
+
+[[contract]]
+id = "smart.dreamer.w1-policy.v1"
+path = "crates/smart/eliot-dreamer-contracts/w1-policy.contract.toml"
+owner = "eliot-dreamer-contracts"
+functional_cells = ["smart.dreamer.transformation_validation", "smart.dreamer.draft_admission", "smart.dreamer.probe_plan", "smart.dreamer.clarification"]
+primary_orders = [10, 11, 14, 16]
+resolves = ["missing TransformationPolicy", "missing DraftAdmissionPolicy", "missing ProbeCapabilitySnapshot/ProbePolicy", "missing ClarificationPolicy"]
+
+[[contract]]
+id = "smart.dreamer.self-query.v1"
+path = "crates/smart/eliot-dreamer-self-query/self-query.contract.toml"
+owner = "eliot-dreamer-self-query"
+functional_cells = ["smart.dreamer.architecture_brief", "smart.dreamer.implementation_brief", "smart.self_model.context_projection"]
+primary_orders = [17, 18]
+resolves = ["missing accepted normative source identity", "missing ArchitectureBrief fields", "missing ImplementationBrief/current-evidence binding fields"]
+
+[[refined_contract]]
+id = "smart.dreamer.common.v1"
+path = "crates/smart/eliot-dreamer-contracts/common.contract.toml"
+owner = "eliot-dreamer-contracts"
+refinement = "DreamCandidateKind is now a closed enum; DreamOutputContract and AdmittedDreamDraft use the typed candidate_kind field instead of stringly output-kind text."
+affected_orders = [4, 10, 11]
+migration_status = "TARGET_NOT_IMPLEMENTED_NO_RUNTIME_DATA_MIGRATION"
+
+[[dependency]]
+provider = "smart.epistemic.current-position.v1"
+consumer = "smart.epistemic.resolution-input.v1"
+reason = "Resolution input imports CurrentPositionRequest, PositionCoverage and EvidenceDependence without redefining them."
+
+[[dependency]]
+provider = "smart.dreamer.common.v1"
+consumer = "smart.dreamer.w1-policy.v1"
+reason = "W1 policy imports closed job/candidate/grounding/transformation types."
+
+[[dependency]]
+provider = "smart.dreamer.orientation.v1"
+consumer = "smart.dreamer.w1-policy.v1"
+reason = "Probe and clarification policies constrain orientation outputs without owning them."
+
+[[dependency]]
+provider = "smart.dreamer.self-query.v1"
+consumer = "smart.context.provider-contribution.v1"
+reason = "SelfModel provider consumes exact Architecture/Implementation briefs and cannot raise their support ceiling."
+
+[canonical_cell_id_corrections]
+"smart.dreamer.rivals" = "smart.dreamer.rival_model"
+"smart.dreamer.relations" = "smart.dreamer.relation_candidate"
+"smart.dreamer.orientation_packet" = "smart.dreamer.orientation"
+rule = "Legacy metadata aliases in orientation.contract.toml do not create additional FunctionalCapabilityCells; orders 12, 13 and 15 use the canonical IDs above."
+
+[still_open]
+challenges = ["CurrentSystemEvidenceSnapshot Rust export/consumer edge", "real owner adapters", "dependency-locked package Module Proof", "real provider-consumer Edge Proof", "D3A Product Pulses", "workspace/runtime admission"]
+not_proven = ["Rust implementation", "package behavior", "model route behavior", "runtime support", "Product/Release acceptance"]
+
+[forbidden]
+parallel_field_definition = true
+stringly_candidate_kind = true
+model_self_certification = true
+probe_or_clarification_execution = true
+self_query_support_promotion = true
+candidate_as_transition_or_effect_receipt = true

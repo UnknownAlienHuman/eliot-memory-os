@@ -1,4 +1,4 @@
-schema_version = 1
+schema_version = 2
 contract_id = "smart.dreamer.common.v1"
 authority = "eliot-cognitive-function-design-rev12"
 owner = "eliot-dreamer-contracts"
@@ -10,7 +10,7 @@ functional_cells = ["smart.dreamer.contracts.common", "smart.dreamer.bundle", "s
 architecture_refs = ["ARCH-DRM-01", "ARCH-DRM-02", "ARCH-DRM-03", "ARCH-SEC-04", "ARCH-MEM-03", "ARCH-EPI-04", "ARCH-SCOPE-01", "ARCH-MOD-03"]
 implementation_refs = ["I9.1", "I9.3", "I9.4", "I9.5", "I9.7", "I9.9", "I9.15", "I12.20"]
 normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
-primary_property = "Own one provider-neutral bounded Dreamer job/input/draft/grounding/validation/admission algebra in which every model result remains a candidate and cannot manufacture evidence, authority, coverage, support, execution, or completion."
+primary_property = "Own one provider-neutral bounded Dreamer job/input/draft/grounding/validation/admission algebra in which every model result remains a typed candidate and cannot manufacture evidence, authority, coverage, support, execution, or completion."
 public_api_policy = "allowlist_only"
 async_policy = "synchronous_pure_validation"
 unsafe_policy = "forbid"
@@ -22,6 +22,7 @@ replacement_boundary = "Replace Dreamer service/route implementations behind the
 
 [closed_sets]
 job_classes = ["Orientation", "Curation", "Clarification", "ResearchSynthesis", "Architecture", "DevelopmentDiagnosis", "Maintenance", "OrchestrationPlanning"]
+candidate_kinds = ["Interpretation", "RivalModel", "Relation", "ProbePlan", "Clarification", "Classification", "Episode", "Concept", "Procedure", "Skill", "FailureFingerprint", "Repair", "WorkPlan", "Maintenance", "ResearchSynthesis"]
 requester_kinds = ["Human", "MainAgent", "Watchdog", "GovernorMaintenance", "RecoveryOwner"]
 reference_kinds = ["Evidence", "Memory", "EpistemicPosition", "Architecture", "Implementation", "Conformance", "Conflict", "Unknown", "Artifact", "Failure", "Policy"]
 reference_representations = ["InlineExact", "ExactExcerpt", "ExactHandle"]
@@ -33,6 +34,8 @@ draft_admission_states = ["AdmittedCandidate", "RejectedInvalid", "RejectedUngro
 
 [hard_invariants]
 dreamer_output_is_always_candidate = true
+job_and_candidate_kinds_are_closed = true
+broad_repair_work_plan_and_maintenance_kinds_require_exact_subtype_before_semantic_dispatch = true
 model_text_never_populates_confirmed_evidence_or_resolved_state = true
 research_acquisition_is_not_owned_here = true
 agent_or_swarm_launch_is_not_owned_here = true
@@ -84,6 +87,12 @@ definition = ["Orientation", "Curation", "Clarification", "ResearchSynthesis", "
 invariants = ["closed-world job class", "unknown class returns UnknownJobClass", "DreamCycle uses an admitted Curation or Maintenance job rather than a ninth scheduler class"]
 
 [[public_type]]
+name = "DreamCandidateKind"
+kind = "enum"
+definition = ["Interpretation", "RivalModel", "Relation", "ProbePlan", "Clarification", "Classification", "Episode", "Concept", "Procedure", "Skill", "FailureFingerprint", "Repair", "WorkPlan", "Maintenance", "ResearchSynthesis"]
+invariants = ["closed-world candidate kind", "unknown kind fails closed", "Repair/WorkPlan/Maintenance require an exact typed subtype before semantic dispatch", "kind grants no authority or lifecycle"]
+
+[[public_type]]
 name = "DreamRequesterKind"
 kind = "enum"
 definition = ["Human", "MainAgent", "Watchdog", "GovernorMaintenance", "RecoveryOwner"]
@@ -121,8 +130,8 @@ invariants = ["effects unique", "all ten forbidden effects required for ordinary
 [[public_type]]
 name = "DreamOutputContract"
 kind = "struct"
-definition = ["contract_identity: ContractIdentity", "output_kind: String", "maximum_items: u32", "maximum_bytes: u32", "required_sections: Vec<String>", "candidate_only: bool"]
-invariants = ["contract identity exact", "bounds non-zero", "candidate_only true", "required sections unique"]
+definition = ["contract_identity: ContractIdentity", "candidate_kind: DreamCandidateKind", "maximum_items: u32", "maximum_bytes: u32", "required_sections: Vec<String>", "candidate_only: bool"]
+invariants = ["contract identity exact", "candidate kind closed", "bounds non-zero", "candidate_only true", "required sections unique"]
 
 [[public_type]]
 name = "DreamJobEnvelope"
@@ -245,8 +254,8 @@ definition = ["AdmittedCandidate", "RejectedInvalid", "RejectedUngrounded", "Rej
 [[public_type]]
 name = "AdmittedDreamDraft"
 kind = "struct"
-definition = ["admission_id: ArtifactId", "job_sha256: String", "grounded_sha256: String", "validation_report_sha256: String", "state: DraftAdmissionState", "candidate_output_kind: String", "candidate_payload_handle: Option<ArtifactId>", "reason_codes: Vec<String>", "state_fence: StateFence", "admission_sha256: String"]
-invariants = ["AdmittedCandidate is still candidate-only", "rejected/blocked state has no payload admitted for influence", "contains no canonical/support/authority/finish/effect receipt", "canonical order and digest"]
+definition = ["admission_id: ArtifactId", "job_sha256: String", "grounded_sha256: String", "validation_report_sha256: String", "state: DraftAdmissionState", "candidate_kind: DreamCandidateKind", "candidate_payload_handle: Option<ArtifactId>", "reason_codes: Vec<String>", "state_fence: StateFence", "admission_sha256: String"]
+invariants = ["AdmittedCandidate is still candidate-only", "candidate kind is closed and typed", "rejected/blocked state has no payload admitted for influence", "contains no canonical/support/authority/finish/effect receipt", "canonical order and digest"]
 
 [[public_function]]
 name = "validate_dream_job_envelope"
@@ -279,6 +288,10 @@ signature = "pub fn validate_admitted_draft(job: &DreamJobEnvelope, draft: &Grou
 [[negative_test]]
 id = "unknown-job-class-rejected"
 property = "Unknown or added job class fails decoding/validation and cannot fall back to generic output."
+
+[[negative_test]]
+id = "unknown-candidate-kind-rejected"
+property = "Unknown or stringly candidate kind cannot reach semantic dispatch or admission."
 
 [[negative_test]]
 id = "forbidden-effects-required"

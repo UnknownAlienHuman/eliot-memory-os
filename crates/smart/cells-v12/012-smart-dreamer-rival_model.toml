@@ -1,0 +1,67 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w1-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 12
+cell = "smart.dreamer.rival_model"
+physical_crate = "eliot-dreamer-orientation"
+predecessor_orders = [3, 5, 11]
+primary_property = "Construct a bounded set of genuinely competing candidate models with mechanisms, strongest objections, discriminating predictions, confounders and invalidation conditions without selecting a winner."
+field_contracts = [
+  "crates/smart/eliot-epistemic-contracts/current-position.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/common.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/orientation.contract.toml",
+]
+public_function_signatures = [
+  "pub fn build_rival_model_set(request: &OrientationRequest, draft: &AdmittedDreamDraft) -> Result<RivalModelSet, RivalModelError>",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-orientation/src/rival_model.rs",
+  "crates/smart/eliot-dreamer-orientation/tests/rival_model.rs",
+]
+algorithm = [
+  "validate exact orientation request, admitted draft, current-position and fence identities",
+  "extract distinct candidate mechanisms rather than paraphrase variants",
+  "preserve supporting, counterevidence, shared lineage and independent bases separately",
+  "attach strongest objection, predicted observables, possible confounders and invalidation condition",
+  "collapse only candidates with materially equivalent mechanism and predictions",
+  "emit exact denominator/coverage including explicit missing-rival-search state",
+  "canonicalize candidates and set digest without ranking truth",
+]
+minimum_tests = [
+  "paraphrases with same mechanism/prediction deduplicate",
+  "minority candidate with distinct evidence/prediction remains",
+  "model/agent count does not select truth",
+  "shared lineage remains dependent",
+  "empty set under partial coverage is not no-rivals",
+  "candidate with no mechanism/prediction/invalidation rejected",
+  "candidate permutation deterministic",
+]
+non_goals = [
+  "Current Epistemic Position mutation",
+  "winner selection",
+  "model call",
+  "probe execution",
+  "Context/canonical admission",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-CONCIL-01",
+  "ARCH-EPI-01",
+  "ARCH-EPI-02",
+  "ARCH-DRM-02",
+  "ARCH-UND-02",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I9.2",
+  "I9.5",
+  "I12.12",
+  "I12.18",
+]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge or explicit missing-rival-search gap rather than manufacturing diversity, using vote count, suppressing minority evidence, or promoting a winner."
+brief_proof_ceiling = "STATIC_W1_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"

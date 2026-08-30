@@ -1,7 +1,8 @@
-schema_version = 1
+schema_version = 2
 authority = "eliot-cognitive-function-design-rev12"
-status = "CONSOLIDATED_PUBLIC_TYPE_OWNERSHIP"
+status = "CONSOLIDATED_PUBLIC_TYPE_OWNERSHIP_WITH_W1"
 field_contract_index = "crates/smart/cognitive-rev12-all-field-contracts.toml"
+correction_layers = ["crates/smart/cognitive-rev12-w1-corrections.toml"]
 rule = "For every indexed contract, each [[public_type]].name is owned by that contract's owner and may appear as an [[external_type]] elsewhere. Two indexed contracts may not define the same public_type name. Consumers import rather than redefine fields."
 
 [[owner_family]]
@@ -11,13 +12,18 @@ derive_types_from = "all [[public_type]].name entries"
 
 [[owner_family]]
 owner = "eliot-epistemic-contracts"
-contract_ref = "crates/smart/eliot-epistemic-contracts/current-position.contract.toml"
-derive_types_from = "all [[public_type]].name entries"
+contract_refs = ["crates/smart/eliot-epistemic-contracts/current-position.contract.toml", "crates/smart/eliot-epistemic-contracts/resolution.contract.toml"]
+derive_types_from = "all [[public_type]].name entries; duplicate names across the files are forbidden"
 
 [[owner_family]]
 owner = "eliot-dreamer-contracts"
-contract_refs = ["crates/smart/eliot-dreamer-contracts/common.contract.toml", "crates/smart/eliot-dreamer-contracts/orientation.contract.toml", "crates/smart/eliot-dreamer-contracts/research.contract.toml", "crates/smart/eliot-dreamer-contracts/curation.contract.toml"]
-derive_types_from = "all [[public_type]].name entries; duplicate names across these four files are forbidden"
+contract_refs = ["crates/smart/eliot-dreamer-contracts/common.contract.toml", "crates/smart/eliot-dreamer-contracts/orientation.contract.toml", "crates/smart/eliot-dreamer-contracts/research.contract.toml", "crates/smart/eliot-dreamer-contracts/curation.contract.toml", "crates/smart/eliot-dreamer-contracts/w1-policy.contract.toml"]
+derive_types_from = "all [[public_type]].name entries; duplicate names across these five files are forbidden"
+
+[[owner_family]]
+owner = "eliot-dreamer-self-query"
+contract_ref = "crates/smart/eliot-dreamer-self-query/self-query.contract.toml"
+derive_types_from = "all [[public_type]].name entries"
 
 [[owner_family]]
 owner = "eliot-cue-contracts"
@@ -65,8 +71,8 @@ contract_ref = "crates/meta/eliot-understanding-assessment/understanding.contrac
 derive_types_from = "all [[public_type]].name entries"
 
 [external_owner_registry]
-allowed_owners = ["eliot-contracts", "eliot-evidence", "eliot-observation-contracts", "eliot-research-exchange-api", "eliot-cues", "eliot-dreamer-contracts/common.contract.toml", "eliot-dreamer-contracts/orientation.contract.toml", "eliot-context-contracts/provider-contribution.contract.toml", "eliot-memory-projection-contracts", "eliot-learning-contracts/experience.contract.toml", "eliot-learning-contracts/task-local-learning.contract.toml", "eliot-memory-quality", "eliot-dreamer-contracts"]
-rule = "An external owner is accepted only when it is an indexed contract owner/path or an admitted foundation/runtime contract crate. Unknown owner strings fail validation."
+allowed_owners = ["eliot-contracts", "eliot-evidence", "eliot-observation-contracts", "eliot-research-exchange-api", "eliot-cues", "eliot-bootstrap", "eliot-dreamer-contracts/common.contract.toml", "eliot-dreamer-contracts/orientation.contract.toml", "eliot-context-contracts/provider-contribution.contract.toml", "eliot-epistemic-contracts/current-position.contract.toml", "eliot-memory-projection-contracts", "eliot-learning-contracts/experience.contract.toml", "eliot-learning-contracts/task-local-learning.contract.toml", "eliot-memory-quality", "eliot-dreamer-contracts"]
+rule = "An external owner is accepted only when it is an indexed contract owner/path or an admitted foundation/runtime contract crate. CurrentSystemEvidenceSnapshot remains eliot-bootstrap-owned. Unknown owner strings fail validation."
 
 [collision_rules]
 public_type_name_unique_across_all_indexed_contracts = true

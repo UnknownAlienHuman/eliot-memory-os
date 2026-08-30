@@ -1,14 +1,15 @@
-schema_version = 2
+schema_version = 3
 authority = "eliot-cognitive-function-design-rev12"
-status = "CONSOLIDATED_FIELD_LEVEL_CONTRACT_FREEZE"
+status = "CONSOLIDATED_FIELD_LEVEL_CONTRACT_FREEZE_WITH_W1"
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
-contract_count = 18
-functional_cell_reference_count = 82
-unique_functional_cell_count = 77
+contract_count = 21
+functional_cell_reference_count = 90
+unique_functional_cell_count = 79
 normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
-rule = "Each indexed file is the sole field-level authority for its public_type entries. Cell catalogues define causal responsibility and source scope; Rust, runtime, Edge Proof, Product Pulse and product acceptance remain unproven."
+rule = "Each indexed file is the sole field-level authority for its public_type entries. Cell catalogues plus indexed correction layers define causal responsibility and source scope; Rust, runtime, Edge Proof, Product Pulse and product acceptance remain unproven."
+correction_layers = ["crates/smart/cognitive-rev12-w1-corrections.toml"]
 
 [[contract]]
 stage = "W0_CONTRACT_EVIDENCE"
@@ -27,6 +28,14 @@ primary_orders = [2]
 functional_cells = ["smart.epistemic.contracts", "smart.epistemic.position", "smart.epistemic.context_projection"]
 
 [[contract]]
+stage = "W1_D3A_ORIENTATION"
+id = "smart.epistemic.resolution-input.v1"
+path = "crates/smart/eliot-epistemic-contracts/resolution.contract.toml"
+owner = "eliot-epistemic-contracts"
+primary_orders = [3]
+functional_cells = ["smart.epistemic.position"]
+
+[[contract]]
 stage = "W0_CONTRACT_EVIDENCE"
 id = "smart.dreamer.common.v1"
 path = "crates/smart/eliot-dreamer-contracts/common.contract.toml"
@@ -40,7 +49,7 @@ id = "smart.dreamer.orientation.v1"
 path = "crates/smart/eliot-dreamer-contracts/orientation.contract.toml"
 owner = "eliot-dreamer-contracts"
 primary_orders = [5]
-functional_cells = ["smart.dreamer.contracts.orientation", "smart.dreamer.rivals", "smart.dreamer.relations", "smart.dreamer.probe_plan", "smart.dreamer.clarification", "smart.dreamer.orientation_packet"]
+functional_cells = ["smart.dreamer.contracts.orientation", "smart.dreamer.rival_model", "smart.dreamer.relation_candidate", "smart.dreamer.probe_plan", "smart.dreamer.clarification", "smart.dreamer.orientation"]
 
 [[contract]]
 stage = "W0_CONTRACT_EVIDENCE"
@@ -57,6 +66,22 @@ path = "crates/smart/eliot-dreamer-contracts/curation.contract.toml"
 owner = "eliot-dreamer-contracts"
 primary_orders = [7]
 functional_cells = ["smart.dreamer.contracts.curation", "smart.dreamer.curation_dispatch"]
+
+[[contract]]
+stage = "W1_D3A_ORIENTATION"
+id = "smart.dreamer.w1-policy.v1"
+path = "crates/smart/eliot-dreamer-contracts/w1-policy.contract.toml"
+owner = "eliot-dreamer-contracts"
+primary_orders = [10, 11, 14, 16]
+functional_cells = ["smart.dreamer.transformation_validation", "smart.dreamer.draft_admission", "smart.dreamer.probe_plan", "smart.dreamer.clarification"]
+
+[[contract]]
+stage = "W1_D3A_ORIENTATION"
+id = "smart.dreamer.self-query.v1"
+path = "crates/smart/eliot-dreamer-self-query/self-query.contract.toml"
+owner = "eliot-dreamer-self-query"
+primary_orders = [17, 18]
+functional_cells = ["smart.dreamer.architecture_brief", "smart.dreamer.implementation_brief", "smart.self_model.context_projection"]
 
 [[contract]]
 stage = "W0_CONTRACT_EVIDENCE"
@@ -156,63 +181,98 @@ functional_cells = ["meta.common_ground.assessment", "meta.understanding.scoped_
 
 [[dependency]]
 provider = "smart.epistemic.current-position.v1"
+consumer = "smart.epistemic.resolution-input.v1"
+reason = "Resolution input imports CurrentPositionRequest, PositionCoverage and EvidenceDependence."
+
+[[dependency]]
+provider = "smart.epistemic.current-position.v1"
 consumer = "smart.dreamer.orientation.v1"
+reason = "Orientation consumes the externally resolved Current Epistemic Position."
 
 [[dependency]]
 provider = "smart.dreamer.common.v1"
 consumer = "smart.dreamer.orientation.v1"
+reason = "Orientation imports job, grounding and admitted-draft types."
 
 [[dependency]]
 provider = "smart.dreamer.common.v1"
 consumer = "smart.dreamer.research-synthesis.v1"
+reason = "Research synthesis imports bounded Dreamer job and candidate types."
 
 [[dependency]]
 provider = "smart.dreamer.common.v1"
 consumer = "smart.dreamer.curation-dispatch.v1"
+reason = "Curation dispatch imports bounded Dreamer job and candidate types."
+
+[[dependency]]
+provider = "smart.dreamer.common.v1"
+consumer = "smart.dreamer.w1-policy.v1"
+reason = "W1 policy imports closed job/candidate/grounding/transformation types."
+
+[[dependency]]
+provider = "smart.dreamer.orientation.v1"
+consumer = "smart.dreamer.w1-policy.v1"
+reason = "Probe and clarification policies constrain orientation outputs."
+
+[[dependency]]
+provider = "smart.dreamer.self-query.v1"
+consumer = "smart.context.provider-contribution.v1"
+reason = "SelfModel provider consumes exact briefs without raising support ceiling."
 
 [[dependency]]
 provider = "smart.context.provider-contribution.v1"
 consumer = "smart.context.compiler-contracts.v1"
+reason = "Context compiler imports provider contributions."
 
 [[dependency]]
 provider = "smart.cue.contracts.v1"
 consumer = "smart.memory.projection-contracts.v1"
+reason = "Memory query intent binds exact cue activation."
 
 [[dependency]]
 provider = "smart.memory.projection-contracts.v1"
 consumer = "smart.memory.curation.v1"
+reason = "Curation consumes store-neutral memory projections."
 
 [[dependency]]
 provider = "smart.learning.system-experience.v1"
 consumer = "smart.learning.task-local.v1"
+reason = "Learning state consumes immutable System Experience."
 
 [[dependency]]
 provider = "smart.learning.task-local.v1"
 consumer = "smart.learning.evaluation.v1"
+reason = "Evaluation consumes task-local deltas and overlays."
 
 [[dependency]]
 provider = "smart.learning.system-experience.v1"
 consumer = "smart.learning.evaluation.v1"
+reason = "Evaluation consumes immutable outcomes."
 
 [[dependency]]
 provider = "smart.memory.projection-contracts.v1"
 consumer = "meta.memory.quality.v1"
+reason = "Memory quality consumes exact record/accessibility/influence identities."
 
 [[dependency]]
 provider = "smart.learning.system-experience.v1"
 consumer = "meta.memory.quality.v1"
+reason = "Memory quality consumes outcome attribution."
 
 [[dependency]]
 provider = "smart.learning.system-experience.v1"
 consumer = "smart.dreamer.negative-memory-extinction.v1"
+reason = "Extinction consumes failure/outcome evidence."
 
 [[dependency]]
 provider = "meta.memory.quality.v1"
 consumer = "meta.cognitive.quality.v1"
+reason = "Self-quality consumes immutable memory-quality projections."
 
 [[dependency]]
 provider = "smart.learning.system-experience.v1"
 consumer = "meta.cognitive.quality.v1"
+reason = "Cognitive quality consumes immutable attempt/outcome evidence."
 
 [forbidden]
 parallel_field_definition = true
@@ -222,3 +282,4 @@ aggregate_confidence_utility_or_intelligence_score = true
 complete_without_recheckable_denominator = true
 candidate_as_transition_or_effect_receipt = true
 field_contract_presence_as_implementation_proof = true
+stringly_candidate_kind = true

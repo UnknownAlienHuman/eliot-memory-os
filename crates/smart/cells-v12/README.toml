@@ -1,7 +1,10 @@
-schema_version = 2
+schema_version = 3
 authority = "eliot-cognitive-function-design-rev12"
-orders = "68..86"
-rule = "Give one file to one worker. The worker also receives exact public contract owners and source anchors named by that file, not the whole repository."
+orders = "materialized W0, W1 and 68..86 subsets of the canonical 1..86 catalogue"
+rule = "Give one indexed file to one worker. The worker also receives exact public contract owners and source anchors named by that file, not the whole repository. Briefs are assignment projections and never field-level contract authority."
+w0_index = "crates/smart/cognitive-rev12-w0-agent-brief-index.toml"
+w1_index = "crates/smart/cognitive-rev12-w1-agent-brief-index.toml"
+direct_assignment_range = "68..86"
 
 [[assignment]]
 order = 68

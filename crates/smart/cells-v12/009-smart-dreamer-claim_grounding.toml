@@ -1,0 +1,63 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w1-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 9
+cell = "smart.dreamer.claim_grounding"
+physical_crate = "eliot-dreamer-validation"
+predecessor_orders = [4, 8]
+primary_property = "Ground every material model claim to exact manifest references and counterevidence while retaining unsupported residue and source authority ceilings without judging truth."
+field_contracts = [
+  "crates/smart/eliot-dreamer-contracts/common.contract.toml",
+]
+public_function_signatures = [
+  "pub fn ground_dream_claims(draft: &ModelDraftEnvelope, manifest: &ReferenceManifest) -> Result<GroundedDreamDraft, ClaimGroundingError>",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-validation/src/claim_grounding.rs",
+  "crates/smart/eliot-dreamer-validation/tests/claim_grounding.rs",
+]
+algorithm = [
+  "validate draft/job/bundle/manifest identities and bounds",
+  "enumerate every material claim exactly once",
+  "resolve every cited and counterevidence reference id against the exact manifest",
+  "classify outside-manifest, unresolved, contradicted, partially grounded and grounded claims without status promotion",
+  "derive authority and assertability ceilings from source descriptors rather than model text",
+  "retain unsupported residue and counterevidence explicitly",
+  "canonicalize claims and compute grounded digest",
+]
+minimum_tests = [
+  "invented or similar handle is OutsideManifest",
+  "uncited material claim remains Unsupported",
+  "unsupported residue is never dropped",
+  "counterevidence remains attached",
+  "source authority/assertability cannot be raised",
+  "model self-report is not grounding",
+  "claim permutation yields identical grounded digest",
+]
+non_goals = [
+  "truth or support adjudication",
+  "transformation validation",
+  "draft admission",
+  "source acquisition",
+  "model call",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = [
+  "ARCH-DRM-01",
+  "ARCH-MEM-03",
+  "ARCH-SEC-03",
+  "ARCH-SEC-04",
+  "ARCH-EPI-04",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I9.7",
+  "I12.20",
+]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than fuzzy-resolving handles, dropping unsupported residue/counterevidence, accepting model self-certification, or raising source authority."
+brief_proof_ceiling = "STATIC_W1_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
