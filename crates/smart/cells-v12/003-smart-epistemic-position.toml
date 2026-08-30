@@ -1,0 +1,48 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+field_contract_is_sole_public_type_authority = true
+order = 3
+cell = "smart.epistemic.position"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-epistemic"
+primary_property = "Resolve one scoped Current Epistemic Position from exact admitted owner evidence while keeping observations, support, assumptions, rivals, local conflicts, stale/superseded state, unknowns and required inquiry independent."
+field_contract = "crates/smart/eliot-epistemic-contracts/current-position.contract.toml"
+public_function_selectors = ["resolve_current_epistemic_position"]
+write_scope = [
+  "crates/smart/eliot-epistemic/src/position.rs",
+  "crates/smart/eliot-epistemic/tests/position.rs",
+]
+algorithm = [
+  "validate request, exact evidence projections, scope/task/State Fence and frozen denominator",
+  "classify only from explicit role/source/verifier inputs; never infer support or assumption from absence of refutation",
+  "collapse dependent evidence by shared lineage for corroboration purposes without deleting it",
+  "build local ConflictSets with participants, common versus independent evidence, resolved and unresolved aspects",
+  "preserve stale, superseded, minority and counterevidence claims with invalidation and revision conditions",
+  "derive bounded InvestigationRequirements only for unresolved material questions",
+  "canonicalize claims, conflicts, inquiries and provenance closure and compute digest",
+]
+minimum_tests = [
+  "Observed does not become Supported",
+  "absence of refutation does not create ExplicitAssumption",
+  "three shared-lineage sources do not outweigh one independent contrary source by count",
+  "one local conflict does not mark unrelated claims conflicted",
+  "stale and superseded claims remain visible",
+  "material unknown yields inquiry rather than guessed answer",
+  "result contains no evidence acquisition, support promotion, Context admission or task-finish action",
+]
+non_goals = [
+  "evidence acquisition",
+  "model synthesis",
+  "support or authority promotion",
+  "Context admission",
+  "probe/tool/agent execution",
+  "canonical write",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-EPI-01", "ARCH-EPI-03", "ARCH-EPI-04", "ARCH-UND-01", "ARCH-SCOPE-01"]
+implementation_refs = ["I2.20", "I12.11", "I12.12", "I12.18"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than inferring missing support/assumption, voting among dependent agents, flattening conflict, hiding stale/counterevidence, or executing an inquiry."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
