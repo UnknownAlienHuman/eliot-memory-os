@@ -1,0 +1,45 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+field_contract_is_sole_public_type_authority = true
+order = 12
+cell = "smart.dreamer.rival_models"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-orientation"
+primary_property = "Construct a bounded rival-model set from one resolved epistemic position and admitted candidate draft while preserving objections, shared lineage, independent evidence, falsifiers and revision conditions."
+field_contract = "crates/smart/eliot-dreamer-contracts/orientation.contract.toml"
+public_function_selectors = ["build_rival_model_set"]
+write_scope = [
+  "crates/smart/eliot-dreamer-orientation/src/rival_models.rs",
+  "crates/smart/eliot-dreamer-orientation/tests/rival_models.rs",
+]
+algorithm = [
+  "validate request, Current Epistemic Position, admitted draft, scope/task/fence and bounds",
+  "identify the working interpretation without converting it to resolved truth",
+  "retain every materially supported rival, strongest objection, counterevidence and material unknown",
+  "separate independent evidence from shared-lineage/dependent evidence",
+  "attach discriminating predictions, falsifiers, invalidation and revision conditions to each model",
+  "order deterministically by declared policy and stable identity, never by vote count",
+]
+minimum_tests = [
+  "majority of shared-lineage agents cannot erase one independent rival",
+  "working model remains candidate interpretation",
+  "strongest objection and counterevidence retained",
+  "model lacking falsifier/revision condition remains incomplete",
+  "material unknown cannot be silently assigned to working model",
+  "output has no truth/support/admission decision",
+]
+non_goals = [
+  "epistemic position resolution",
+  "truth or support selection",
+  "probe execution",
+  "model invocation",
+  "Context admission",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-DRM-01", "ARCH-EPI-01", "ARCH-EPI-03", "ARCH-UND-02"]
+implementation_refs = ["I2.20", "I9.5", "I12.11", "I12.18"]
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than selecting a winner by agent/source count, dropping a strong rival/objection, or promoting an interpretation to truth/support."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
