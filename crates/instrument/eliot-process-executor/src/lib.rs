@@ -1464,15 +1464,21 @@ mod tests {
         assert!(executor.start_gate_closed.load(Ordering::Acquire));
 
         let source = include_str!("lib.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix");
         assert_eq!(
-            source
+            production
                 .matches("start_gate_closed.load(Ordering::Acquire)")
                 .count(),
             2,
             "the start gate may be read only by start and the health projection"
         );
-        assert!(!source.contains("poison_operation"));
-        assert!(!source.contains("poisoned: Arc<AtomicBool>"));
+        let old_poison_fn = format!("{}{}", "poison_", "operation");
+        let old_poison_field = format!("{}{}", "poisoned: Arc<", "AtomicBool>");
+        assert!(!production.contains(&old_poison_fn));
+        assert!(!production.contains(&old_poison_field));
     }
 
     #[test]
