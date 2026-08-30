@@ -1,3 +1,13 @@
+<!-- eliot-doc-routing:start -->
+## Documentation read receipt
+
+- Router command:
+- Matched route IDs:
+- Required handles and fragment SHAs read:
+- Receipt ID:
+- Optional expansions opened and reason:
+<!-- eliot-doc-routing:end -->
+
 ## Owning work
 
 - Issue:

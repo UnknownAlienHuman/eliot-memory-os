@@ -1,5 +1,25 @@
 # Core and daemon work units
 
+<!-- eliot-doc-routing:start -->
+## Mandatory documentation routing
+
+Before changing code, configuration, tests, workflows, or normative prose, run
+from the repository root:
+
+```text
+python scripts/docs_router.py route --path <repository/path> --topic "<causal property>"
+```
+
+Read every fragment marked **required**, then record the emitted receipt in the
+work unit or pull request. Optional fragments are loaded only when the current
+decision crosses their stated boundary. A legacy `ELIOT_*` compatibility map is
+never an acceptable reading receipt.
+
+If no non-baseline route matches, stop the mutation and add or obtain a route;
+silence is not permission. See [`../../docs/architecture/READING_PROTOCOL.md`](../../docs/architecture/READING_PROTOCOL.md).
+<!-- eliot-doc-routing:end -->
+
+
 This brief routes issues #13–#24 and their confirmed bounded defect units. It is
 not normative. Current meaning comes from the canonical pair in
 `docs/architecture/`, and the exact issue body is the work-unit contract.
