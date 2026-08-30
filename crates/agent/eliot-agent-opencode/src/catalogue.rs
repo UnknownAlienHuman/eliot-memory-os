@@ -1,21 +1,18 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
-
 use eliot_agent_api::RouteFingerprint;
 use eliot_agent_coordinator::{
-    BillingClass, BillingEvidence, CapabilityObservation, CapabilityStatus, ModelAvailability,
-    ModelCatalogueEntry, ModelCatalogueSnapshot, ModelControlError, ModelRole,
-    QuotaObservation, RouteAdmissionStatus, RouteHealthStatus, ZeroModelExecutionCounters,
-    MODEL_CATALOGUE_SCHEMA_VERSION,
+    BillingClass, BillingEvidence, CapabilityObservation, CapabilityStatus,
+    MODEL_CATALOGUE_SCHEMA_VERSION, ModelAvailability, ModelCatalogueEntry, ModelCatalogueSnapshot,
+    ModelControlError, ModelRole, QuotaObservation, RouteAdmissionStatus, RouteHealthStatus,
+    ZeroModelExecutionCounters,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use crate::{HealthResponse, OpenCodeClient, OpenCodeRunError, ProviderCatalog, ProviderModel};
 
-pub const OPENCODE_CATALOGUE_CONTEXT_VERSION: &str =
-    "eliot.opencode-model-catalogue-context/v1";
+pub const OPENCODE_CATALOGUE_CONTEXT_VERSION: &str = "eliot.opencode-model-catalogue-context/v1";
 pub const OPENCODE_CATALOGUE_COLLECTION_VERSION: &str =
     "eliot.opencode-model-catalogue-collection/v1";
 pub const OPENCODE_HOST_FAMILY: &str = "opencode";
@@ -58,9 +55,7 @@ fn window(
     Ok(())
 }
 
-fn evidence_refs(
-    groups: impl IntoIterator<Item = impl IntoIterator<Item = String>>,
-) -> Result<Vec<String>, OpenCodeCatalogueError> {
+fn evidence_refs(groups: Vec<Vec<String>>) -> Result<Vec<String>, OpenCodeCatalogueError> {
     let mut refs = BTreeSet::new();
     for group in groups {
         for reference in group {
@@ -113,10 +108,7 @@ impl OpenCodeRouteTemplate {
                 self.continuation_behavior.as_str(),
                 "route.continuation_behavior",
             ),
-            (
-                self.feature_flags_hash.as_str(),
-                "route.feature_flags_hash",
-            ),
+            (self.feature_flags_hash.as_str(), "route.feature_flags_hash"),
         ] {
             text(value, field)?;
         }
@@ -317,8 +309,6 @@ struct ProviderModelCost {
 struct ProviderModelLimit {
     #[serde(default)]
     context: Option<u64>,
-    #[serde(default)]
-    output: Option<u64>,
 }
 
 fn routing_metadata(
@@ -334,7 +324,9 @@ fn routing_metadata(
 }
 
 fn number_value(value: &Number) -> Option<f64> {
-    value.as_f64().filter(|value| value.is_finite() && *value >= 0.0)
+    value
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 fn catalogue_price_class(cost: Option<&ProviderModelCost>) -> BillingClass {
@@ -386,10 +378,7 @@ fn billing_class(
     }
 }
 
-fn capability(
-    observed: Option<bool>,
-    receipt_ref: &str,
-) -> CapabilityObservation {
+fn capability(observed: Option<bool>, receipt_ref: &str) -> CapabilityObservation {
     CapabilityObservation {
         status: match observed {
             Some(true) => CapabilityStatus::Supported,
@@ -401,10 +390,7 @@ fn capability(
     }
 }
 
-fn route_health(
-    health: &HealthResponse,
-    configured: RouteHealthStatus,
-) -> RouteHealthStatus {
+fn route_health(health: &HealthResponse, configured: RouteHealthStatus) -> RouteHealthStatus {
     if health.healthy {
         configured
     } else {
@@ -449,7 +435,8 @@ pub fn compile_opencode_model_catalogue(
 
     for provider in ordered_providers {
         text(&provider.id, "provider.id")?;
-        let is_connected = connected.contains(provider.id.as_str()) || provider.connected == Some(true);
+        let is_connected = connected.contains(provider.id.as_str())
+            || provider.connected.is_some_and(|value| value);
         let policy = context.provider_policies.get(&provider.id);
         let mut models = provider.models.iter().collect::<Vec<_>>();
         models.sort_by(|left, right| left.0.cmp(right.0));
@@ -518,17 +505,14 @@ pub fn compile_opencode_model_catalogue(
                 ),
                 (
                     "structured_output".to_owned(),
-                    capability(
-                        metadata.structured_output,
-                        &context.catalogue_receipt_ref,
-                    ),
+                    capability(metadata.structured_output, &context.catalogue_receipt_ref),
                 ),
                 (
                     "tool_call".to_owned(),
                     capability(metadata.tool_call, &context.catalogue_receipt_ref),
                 ),
             ]);
-            let entry_evidence = evidence_refs([
+            let entry_evidence = evidence_refs(vec![
                 context.evidence_refs.clone(),
                 policy.evidence_refs.clone(),
                 vec![
@@ -622,7 +606,7 @@ impl OpenCodeClient {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -647,9 +631,9 @@ mod tests {
     fn metadata(value: Value) -> UnknownFields {
         value
             .as_object()
-            .expect("metadata fixture must be an object")
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
             .collect()
     }
 
@@ -721,7 +705,13 @@ mod tests {
             all: vec![Provider {
                 id: "provider-a".to_owned(),
                 name: Some("Provider A".to_owned()),
-                models: BTreeMap::from([(model.id.clone().expect("model id"), model)]),
+                models: BTreeMap::from([(
+                    model
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| "missing-model-id".to_owned()),
+                    model,
+                )]),
                 connected: Some(connected),
                 extra: BTreeMap::new(),
             }],
@@ -771,8 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn free_name_with_omitted_cost_remains_unknown()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn free_name_with_omitted_cost_remains_unknown() -> Result<(), Box<dyn std::error::Error>> {
         let named_free = model(
             "model-free",
             json!({"limit": {"context": 200000, "output": 32000}}),
@@ -798,13 +787,17 @@ mod tests {
             minimum_context_window: 1,
             limit: 100,
         };
-        assert!(query_model_catalogue(&collection.snapshot, &query, NOW)?.hits.is_empty());
+        assert!(
+            query_model_catalogue(&collection.snapshot, &query, NOW)?
+                .hits
+                .is_empty()
+        );
         Ok(())
     }
 
     #[test]
-    fn subscription_policy_overrides_zero_catalogue_price()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn subscription_policy_overrides_zero_catalogue_price() -> Result<(), Box<dyn std::error::Error>>
+    {
         let zero_price = model(
             "subscription-model",
             json!({
@@ -914,10 +907,8 @@ mod tests {
         let client = OpenCodeClient::new(
             endpoint,
             auth,
-            OpenCodeRunPolicy::new(directory)?.with_timeouts(
-                Duration::from_secs(2),
-                Duration::from_secs(1),
-            ),
+            OpenCodeRunPolicy::new(directory)?
+                .with_timeouts(Duration::from_secs(2), Duration::from_secs(1)),
         )?;
         let collection = client
             .model_catalogue(&context(OpenCodeBillingMode::CataloguePrice))
@@ -933,12 +924,8 @@ mod tests {
     }
 
     #[test]
-    fn missing_context_window_is_visible_omission()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let missing = model(
-            "model-a",
-            json!({"cost": {"input": 0, "output": 0}}),
-        );
+    fn missing_context_window_is_visible_omission() -> Result<(), Box<dyn std::error::Error>> {
+        let missing = model("model-a", json!({"cost": {"input": 0, "output": 0}}));
         let collection = compile_opencode_model_catalogue(
             &health(),
             &providers(missing, true),
@@ -953,8 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_flat_context_limit_remains_supported()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn existing_flat_context_limit_remains_supported() -> Result<(), Box<dyn std::error::Error>> {
         let mut flat = model("model-a", json!({"cost": {"input": 0, "output": 0}}));
         flat.context_limit = Some(128_000);
         let collection = compile_opencode_model_catalogue(
