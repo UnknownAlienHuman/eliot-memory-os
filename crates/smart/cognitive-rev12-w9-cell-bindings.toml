@@ -1,0 +1,84 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W9_FIELD_CONTRACT_BINDING_LEDGER"
+orders = "76..86"
+cell_catalog = "crates/smart/cognitive-rev12-cells-meta-quality.toml"
+field_contract_index = "crates/smart/cognitive-rev12-w9-field-contracts.toml"
+rule = "This ledger binds existing authoritative W9 cell assignments to field contracts; it does not redefine functions or responsibilities."
+
+[[binding]]
+order = 76
+cell = "meta.memory.ecology_assessment"
+physical_crate = "eliot-memory-quality"
+field_contract = "crates/meta/eliot-memory-quality/quality.contract.toml"
+write_scope = ["crates/meta/eliot-memory-quality/src/ecology.rs", "crates/meta/eliot-memory-quality/tests/ecology.rs"]
+
+[[binding]]
+order = 77
+cell = "meta.memory.gravity_assessment"
+physical_crate = "eliot-memory-quality"
+field_contract = "crates/meta/eliot-memory-quality/quality.contract.toml"
+write_scope = ["crates/meta/eliot-memory-quality/src/gravity.rs", "crates/meta/eliot-memory-quality/tests/gravity.rs"]
+
+[[binding]]
+order = 78
+cell = "smart.dreamer.negative_memory_extinction"
+physical_crate = "eliot-dreamer-memory-revision"
+field_contract = "crates/smart/eliot-dreamer-memory-revision/negative-memory-extinction.contract.toml"
+write_scope = ["crates/smart/eliot-dreamer-memory-revision/src/negative_memory_extinction.rs", "crates/smart/eliot-dreamer-memory-revision/tests/negative_memory_extinction.rs"]
+
+[[binding]]
+order = 79
+cell = "meta.skill.lifecycle_assessment"
+physical_crate = "eliot-cognitive-quality"
+field_contract = "crates/meta/eliot-cognitive-quality/quality.contract.toml"
+write_scope = ["crates/meta/eliot-cognitive-quality/src/skill_lifecycle.rs", "crates/meta/eliot-cognitive-quality/tests/skill_lifecycle.rs"]
+
+[[binding]]
+order = 80
+cell = "meta.tool.surface_assessment"
+physical_crate = "eliot-cognitive-quality"
+field_contract = "crates/meta/eliot-cognitive-quality/quality.contract.toml"
+write_scope = ["crates/meta/eliot-cognitive-quality/src/tool_surface.rs", "crates/meta/eliot-cognitive-quality/tests/tool_surface.rs"]
+
+[[binding]]
+order = 81
+cell = "meta.dreamer.job_economics"
+physical_crate = "eliot-cognitive-quality"
+field_contract = "crates/meta/eliot-cognitive-quality/quality.contract.toml"
+write_scope = ["crates/meta/eliot-cognitive-quality/src/dreamer_economics.rs", "crates/meta/eliot-cognitive-quality/tests/dreamer_economics.rs"]
+
+[[binding]]
+order = 82
+cell = "governor.self_quality.view"
+physical_crate = "eliot-cognitive-quality"
+field_contract = "crates/meta/eliot-cognitive-quality/quality.contract.toml"
+write_scope = ["crates/meta/eliot-cognitive-quality/src/self_quality_view.rs", "crates/meta/eliot-cognitive-quality/tests/self_quality_view.rs"]
+
+[[binding]]
+order = 83
+cell = "meta.self_quality.learning_bottleneck"
+physical_crate = "eliot-cognitive-quality"
+field_contract = "crates/meta/eliot-cognitive-quality/quality.contract.toml"
+write_scope = ["crates/meta/eliot-cognitive-quality/src/learning_bottleneck.rs", "crates/meta/eliot-cognitive-quality/tests/learning_bottleneck.rs"]
+
+[[binding]]
+order = 84
+cell = "meta.self_quality.intervention_candidate"
+physical_crate = "eliot-cognitive-quality"
+field_contract = "crates/meta/eliot-cognitive-quality/quality.contract.toml"
+write_scope = ["crates/meta/eliot-cognitive-quality/src/intervention.rs", "crates/meta/eliot-cognitive-quality/tests/intervention.rs"]
+
+[[binding]]
+order = 85
+cell = "meta.common_ground.assessment"
+physical_crate = "eliot-understanding-assessment"
+field_contract = "crates/meta/eliot-understanding-assessment/assessment.contract.toml"
+write_scope = ["crates/meta/eliot-understanding-assessment/src/common_ground.rs", "crates/meta/eliot-understanding-assessment/tests/common_ground.rs"]
+
+[[binding]]
+order = 86
+cell = "meta.understanding.scoped_assessment"
+physical_crate = "eliot-understanding-assessment"
+field_contract = "crates/meta/eliot-understanding-assessment/assessment.contract.toml"
+write_scope = ["crates/meta/eliot-understanding-assessment/src/scoped.rs", "crates/meta/eliot-understanding-assessment/tests/scoped.rs"]
