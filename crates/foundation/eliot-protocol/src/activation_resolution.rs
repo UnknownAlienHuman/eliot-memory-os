@@ -14,12 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AgentActivationResolutionTicket, ProtocolError};
 
-/// Stable wire identity for the typed semantic-resolution result.
 pub const AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_ID: &str =
     "eliot.protocol.agent-activation-resolution-result";
-/// Additive v2 wire version for the typed semantic-resolution result.
 pub const AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_VERSION: u16 = 2;
-/// Maximum number of bounded semantic candidates in one result.
 pub const MAX_AGENT_ACTIVATION_CANDIDATES: usize = 32;
 const MAX_ACTIVATION_RESULT_TEXT_BYTES: usize = 512;
 
@@ -59,10 +56,6 @@ fn lowercase_sha256(value: &str, field: &'static str) -> Result<(), ProtocolErro
     Ok(())
 }
 
-/// Immutable semantic binding selected by the Governor owner set.
-///
-/// This value is a projection only. It contains no Kernel generation,
-/// capability, activation nonce, effect permit, or authority epoch.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentActivationResolvedBinding {
@@ -79,38 +72,14 @@ pub struct AgentActivationResolvedBinding {
 impl AgentActivationResolvedBinding {
     fn validate(&self) -> Result<(), ProtocolError> {
         for (value, field) in [
-            (
-                self.principal_id.as_str(),
-                "agent_activation_resolution_result.principal_id",
-            ),
-            (
-                self.session_id.as_str(),
-                "agent_activation_resolution_result.session_id",
-            ),
-            (
-                self.task_id.as_str(),
-                "agent_activation_resolution_result.task_id",
-            ),
-            (
-                self.work_unit_id.as_str(),
-                "agent_activation_resolution_result.work_unit_id",
-            ),
-            (
-                self.work_scope_id.as_str(),
-                "agent_activation_resolution_result.work_scope_id",
-            ),
-            (
-                self.task_revision.as_str(),
-                "agent_activation_resolution_result.task_revision",
-            ),
-            (
-                self.plan_id.as_str(),
-                "agent_activation_resolution_result.plan_id",
-            ),
-            (
-                self.plan_revision.as_str(),
-                "agent_activation_resolution_result.plan_revision",
-            ),
+            (self.principal_id.as_str(), "agent_activation_resolution_result.principal_id"),
+            (self.session_id.as_str(), "agent_activation_resolution_result.session_id"),
+            (self.task_id.as_str(), "agent_activation_resolution_result.task_id"),
+            (self.work_unit_id.as_str(), "agent_activation_resolution_result.work_unit_id"),
+            (self.work_scope_id.as_str(), "agent_activation_resolution_result.work_scope_id"),
+            (self.task_revision.as_str(), "agent_activation_resolution_result.task_revision"),
+            (self.plan_id.as_str(), "agent_activation_resolution_result.plan_id"),
+            (self.plan_revision.as_str(), "agent_activation_resolution_result.plan_revision"),
         ] {
             bounded_text(value, field)?;
         }
@@ -118,29 +87,19 @@ impl AgentActivationResolvedBinding {
     }
 }
 
-/// Recheckable denominator state for a candidate set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AgentActivationCandidateCoverage {
-    /// The owner enumerated the complete current candidate set. The set may be
-    /// empty, which is how `NO_ACTIVE_BINDING` is represented without a fake
-    /// task or scope handle.
     Complete,
-    /// Some exact candidates are known, but the denominator is incomplete.
     Partial,
-    /// No candidate denominator can currently be established.
     Unknown,
 }
 
-/// Bounded candidate and recovery projection for semantic selection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentActivationSelectionDirective {
-    /// Exact candidate handles in owner-selected order.
     pub candidate_handles: Vec<String>,
-    /// Whether the candidate denominator is complete, partial, or unknown.
     pub candidate_coverage: AgentActivationCandidateCoverage,
-    /// Typed recovery/directive handle explaining the next allowed action.
     pub recovery_handle: String,
 }
 
@@ -187,8 +146,12 @@ impl AgentActivationSelectionDirective {
         self.validate_common("agent_activation_resolution_result.task_candidate_handles")
     }
 
+    fn validate_scope_selection(&self) -> Result<(), ProtocolError> {
+        self.validate_common("agent_activation_resolution_result.scope_candidate_handles")
+    }
+
     fn validate_scope_ambiguity(&self) -> Result<(), ProtocolError> {
-        self.validate_common("agent_activation_resolution_result.scope_candidate_handles")?;
+        self.validate_scope_selection()?;
         if self.candidate_handles.len() < 2
             || self.candidate_coverage == AgentActivationCandidateCoverage::Unknown
         {
@@ -201,11 +164,6 @@ impl AgentActivationSelectionDirective {
     }
 }
 
-/// Explicit transient retry condition for a `NOT_READY` result.
-///
-/// A later daemon attempt may retry only after the named dependency no longer
-/// has `observed_dependency_revision`, after `not_before_unix_ms`, and before
-/// the same Kernel ticket expires.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentActivationRetryDirective {
@@ -255,23 +213,13 @@ impl AgentActivationRetryDirective {
     }
 }
 
-/// Closed semantic disposition for one exact activation-resolution ticket.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(
-    tag = "kind",
-    rename_all = "SCREAMING_SNAKE_CASE",
-    deny_unknown_fields
-)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum AgentActivationResolutionDisposition {
-    Resolved {
-        binding: Box<AgentActivationResolvedBinding>,
-    },
-    TaskSelectionRequired {
-        selection: AgentActivationSelectionDirective,
-    },
-    ScopeAmbiguous {
-        selection: AgentActivationSelectionDirective,
-    },
+    Resolved { binding: Box<AgentActivationResolvedBinding> },
+    TaskSelectionRequired { selection: AgentActivationSelectionDirective },
+    ScopeSelectionRequired { selection: AgentActivationSelectionDirective },
+    ScopeAmbiguous { selection: AgentActivationSelectionDirective },
     NotReady {
         recovery_handle: String,
         retry: AgentActivationRetryDirective,
@@ -280,9 +228,7 @@ pub enum AgentActivationResolutionDisposition {
         recovery_handle: String,
         observed_state_fence: Option<StateFence>,
     },
-    FailedInternal {
-        failure_handle: String,
-    },
+    FailedInternal { failure_handle: String },
 }
 
 impl AgentActivationResolutionDisposition {
@@ -290,25 +236,14 @@ impl AgentActivationResolutionDisposition {
         match self {
             Self::Resolved { binding } => binding.validate(),
             Self::TaskSelectionRequired { selection } => selection.validate_task_selection(),
+            Self::ScopeSelectionRequired { selection } => selection.validate_scope_selection(),
             Self::ScopeAmbiguous { selection } => selection.validate_scope_ambiguity(),
-            Self::NotReady {
-                recovery_handle,
-                retry,
-            } => {
-                bounded_text(
-                    recovery_handle,
-                    "agent_activation_resolution_result.recovery_handle",
-                )?;
+            Self::NotReady { recovery_handle, retry } => {
+                bounded_text(recovery_handle, "agent_activation_resolution_result.recovery_handle")?;
                 retry.validate()
             }
-            Self::StaleFence {
-                recovery_handle,
-                observed_state_fence,
-            } => {
-                bounded_text(
-                    recovery_handle,
-                    "agent_activation_resolution_result.recovery_handle",
-                )?;
+            Self::StaleFence { recovery_handle, observed_state_fence } => {
+                bounded_text(recovery_handle, "agent_activation_resolution_result.recovery_handle")?;
                 if let Some(fence) = observed_state_fence {
                     fence.validate().map_err(ProtocolError::Foundation)?;
                 }
@@ -332,19 +267,19 @@ impl AgentActivationResolutionDisposition {
                 resolved_at_unix_ms,
                 ticket.kernel_deadline_unix_ms,
             ),
-            Self::StaleFence {
-                observed_state_fence: Some(observed),
-                ..
-            } if observed == &ticket.state_fence => Err(ProtocolError::InvalidField {
-                field: "agent_activation_resolution_result.observed_state_fence",
-                reason: "must differ from the ticket fence when supplied",
-            }),
+            Self::StaleFence { observed_state_fence: Some(observed), .. }
+                if observed == &ticket.state_fence =>
+            {
+                Err(ProtocolError::InvalidField {
+                    field: "agent_activation_resolution_result.observed_state_fence",
+                    reason: "must differ from the ticket fence when supplied",
+                })
+            }
             _ => Ok(()),
         }
     }
 }
 
-/// Digest-bound semantic result for one exact Kernel ticket.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentActivationResolutionResult {
@@ -353,7 +288,6 @@ pub struct AgentActivationResolutionResult {
     pub ticket_id: String,
     pub ticket_sha256: String,
     pub ticket_state_fence: StateFence,
-    /// Time at which the Governor observed and sealed this semantic result.
     pub resolved_at_unix_ms: u64,
     pub disposition: AgentActivationResolutionDisposition,
     pub result_sha256: String,
@@ -362,8 +296,6 @@ pub struct AgentActivationResolutionResult {
 impl AgentActivationResolutionResult {
     pub const CONTRACT_VERSION: u16 = AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_VERSION;
 
-    /// Constructs one exact result. The semantic observation must occur before
-    /// the Kernel ticket deadline; expiry remains Kernel-owned.
     pub fn new(
         ticket: &AgentActivationResolutionTicket,
         resolved_at_unix_ms: u64,
@@ -398,9 +330,7 @@ impl AgentActivationResolutionResult {
     }
 
     pub fn compute_digest(&self) -> Result<String, ProtocolError> {
-        Ok(eliot_contracts::sha256_hex(
-            &self.canonical_unsigned_bytes()?,
-        ))
+        Ok(eliot_contracts::sha256_hex(&self.canonical_unsigned_bytes()?))
     }
 
     pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
@@ -417,17 +347,9 @@ impl AgentActivationResolutionResult {
                 reason: "unsupported semantic resolution result",
             });
         }
-        bounded_text(
-            &self.ticket_id,
-            "agent_activation_resolution_result.ticket_id",
-        )?;
-        lowercase_sha256(
-            &self.ticket_sha256,
-            "agent_activation_resolution_result.ticket_sha256",
-        )?;
-        self.ticket_state_fence
-            .validate()
-            .map_err(ProtocolError::Foundation)?;
+        bounded_text(&self.ticket_id, "agent_activation_resolution_result.ticket_id")?;
+        lowercase_sha256(&self.ticket_sha256, "agent_activation_resolution_result.ticket_sha256")?;
+        self.ticket_state_fence.validate().map_err(ProtocolError::Foundation)?;
         if self.resolved_at_unix_ms == 0 {
             return Err(ProtocolError::InvalidField {
                 field: "agent_activation_resolution_result.resolved_at_unix_ms",
@@ -435,10 +357,7 @@ impl AgentActivationResolutionResult {
             });
         }
         self.disposition.validate()?;
-        lowercase_sha256(
-            &self.result_sha256,
-            "agent_activation_resolution_result.result_sha256",
-        )?;
+        lowercase_sha256(&self.result_sha256, "agent_activation_resolution_result.result_sha256")?;
         if self.result_sha256 != self.compute_digest()? {
             return Err(ProtocolError::InvalidField {
                 field: "agent_activation_resolution_result.result_sha256",
@@ -448,8 +367,6 @@ impl AgentActivationResolutionResult {
         Ok(())
     }
 
-    /// Validates that this result resolves exactly `ticket` and that every
-    /// retry remains reachable before ticket expiry.
     pub fn validate_against(
         &self,
         ticket: &AgentActivationResolutionTicket,
@@ -471,16 +388,12 @@ impl AgentActivationResolutionResult {
                 reason: "must be earlier than the Kernel ticket deadline",
             });
         }
-        self.disposition
-            .validate_against(ticket, self.resolved_at_unix_ms)
+        self.disposition.validate_against(ticket, self.resolved_at_unix_ms)
     }
 
     #[must_use]
     pub fn is_transient_retry(&self) -> bool {
-        matches!(
-            &self.disposition,
-            AgentActivationResolutionDisposition::NotReady { .. }
-        )
+        matches!(&self.disposition, AgentActivationResolutionDisposition::NotReady { .. })
     }
 
     #[must_use]
