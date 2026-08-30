@@ -35,6 +35,16 @@ def add_conflicting_package(root: Path) -> None:
     inventory["units"][0]["paths"].append("crates/host-conflict")
     inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
 
+    scope_path = root / "config/capability-cell-registry-scope.toml"
+    scope = scope_path.read_text(encoding="utf-8")
+    scope_path.write_text(
+        scope.replace(
+            'package_roots = ["crates/host"]',
+            'package_roots = ["crates/host", "crates/host-conflict"]',
+        ),
+        encoding="utf-8",
+    )
+
     package = root / "crates/host-conflict"
     (package / "src").mkdir(parents=True)
     (package / "src/lib.rs").write_text("pub struct OtherContract;\n", encoding="utf-8")
@@ -126,6 +136,23 @@ def verify_current(generator, root: Path, source_sha: str, output: Path | None) 
             },
         },
     }
+    scope = registry["scope"]
+    expected_roots = {
+        "crates/foundation/eliot-runtime-contracts",
+        "crates/meta/eliot-runtime-status",
+    }
+    if set(scope["explicit_package_roots"]) != expected_roots:
+        fail(
+            "registry scope package roots mismatch: "
+            f"observed={scope['explicit_package_roots']}"
+        )
+    if scope["selected_inventory_units"]:
+        fail("current slice must not silently select a broad inventory unit")
+    if scope["coverage_status"] != "DECLARED_PARTIAL_SCOPE":
+        fail("current slice must expose partial core-daemon coverage")
+    if not scope["unselected_inventory_units"]:
+        fail("partial scope omitted its unselected inventory denominator")
+
     checked = 0
     for package, profile in expected.items():
         cells = [cell for cell in registry["cells"] if cell["package"] == package]
@@ -156,7 +183,10 @@ def verify_current(generator, root: Path, source_sha: str, output: Path | None) 
 
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps(registry, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        output.write_text(
+            json.dumps(registry, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     print(
         "CAPABILITY_CELL_REGISTRY_CURRENT_VERIFY: PASS "
         f"declared_cells={checked} repository_findings={len(findings)} "
