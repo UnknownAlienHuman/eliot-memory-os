@@ -1,0 +1,95 @@
+{
+  "schema_version": "eliot.agent-host-bundle-manifest.v1",
+  "canonical_skill_root": "integrations/agent-skills",
+  "canonical_skill_manifest": "integrations/agent-skills/skill-pack.manifest.json",
+  "limits": {
+    "max_file_bytes": 1048576,
+    "max_bundle_bytes": 8388608,
+    "max_files": 512
+  },
+  "hosts": {
+    "codex": {
+      "route_profile": "integrations/codex/route-profile.json",
+      "destination_hint": "CODEX_HOME/plugins/eliot-governor",
+      "skill_destination": "skills",
+      "payload": [
+        {
+          "source": "plugin/eliot-governor/.codex-plugin/plugin.json",
+          "destination": ".codex-plugin/plugin.json",
+          "kind": "file"
+        },
+        {
+          "source": "plugin/eliot-governor/.mcp.json",
+          "destination": ".mcp.json",
+          "kind": "file"
+        },
+        {
+          "source": "plugin/eliot-governor/hooks/hooks.json",
+          "destination": "hooks/hooks.json",
+          "kind": "file"
+        }
+      ]
+    },
+    "opencode": {
+      "route_profile": "integrations/opencode/route-profile.json",
+      "destination_hint": "OPENCODE_CONFIG_DIR/eliot",
+      "skill_destination": "skills",
+      "payload": [
+        {
+          "source": "integrations/opencode/opencode.json",
+          "destination": "opencode.json",
+          "kind": "file"
+        },
+        {
+          "source": "integrations/opencode/plugins/eliot.js",
+          "destination": "plugins/eliot.js",
+          "kind": "file"
+        },
+        {
+          "source": "integrations/opencode/instructions/eliot.md",
+          "destination": "instructions/eliot.md",
+          "kind": "file"
+        }
+      ]
+    },
+    "claude": {
+      "route_profile": "integrations/claude/route-profile.json",
+      "destination_hint": "CLAUDE_CODE_PLUGIN_ROOT/eliot",
+      "skill_destination": "skills",
+      "payload": [
+        {
+          "source": "integrations/claude/eliot/.claude-plugin/plugin.json",
+          "destination": ".claude-plugin/plugin.json",
+          "kind": "file"
+        },
+        {
+          "source": "integrations/claude/eliot/.mcp.json",
+          "destination": ".mcp.json",
+          "kind": "file"
+        },
+        {
+          "source": "integrations/claude/eliot/hooks/hooks.json",
+          "destination": "hooks/hooks.json",
+          "kind": "file"
+        }
+      ]
+    },
+    "antigravity": {
+      "route_profile": "integrations/antigravity/route-profile.json",
+      "destination_hint": "ANTIGRAVITY_PLUGIN_ROOT/eliot",
+      "skill_destination": "skills",
+      "payload": [
+        {
+          "source": "plugin/eliot-antigravity-official/plugin.json",
+          "destination": "plugin.json",
+          "kind": "file"
+        },
+        {
+          "source": "plugin/eliot-antigravity-official/rules",
+          "destination": "rules",
+          "kind": "tree"
+        }
+      ]
+    }
+  }
+}
