@@ -1,11 +1,12 @@
-schema_version = 1
+schema_version = 2
 authority = "eliot-cognitive-function-design-rev12"
 status = "CONSOLIDATED_FIELD_LEVEL_CONTRACT_FREEZE"
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 contract_count = 18
-covered_contract_cells = 34
+functional_cell_reference_count = 82
+unique_functional_cell_count = 77
 normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
 rule = "Each indexed file is the sole field-level authority for its public_type entries. Cell catalogues define causal responsibility and source scope; Rust, runtime, Edge Proof, Product Pulse and product acceptance remain unproven."
 
