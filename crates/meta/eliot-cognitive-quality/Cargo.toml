@@ -11,10 +11,16 @@ path = "src/lib.rs"
 
 [package.metadata.eliot]
 layer = "C1"
-purpose = "Skill/tool/Dreamer/self-quality assessment and intervention candidates"
+purpose = "Skill, tool, Dreamer and Governor self-quality assessment plus advisory intervention candidates"
 source_maintenance_owner = "cognitive-integration-owner"
 functional_cell_refs = ["meta.skill.lifecycle_assessment", "meta.tool.surface_assessment", "meta.dreamer.job_economics", "governor.self_quality.view", "meta.self_quality.learning_bottleneck", "meta.self_quality.intervention_candidate"]
 independent_proof_profile = "prototype-not-workspace-admitted"
-contract_refs = ["crates/smart/cognitive-current.toml"]
+contract_refs = [
+  "crates/smart/cognitive-current.toml",
+  "crates/meta/eliot-cognitive-quality/quality.contract.toml",
+  "crates/meta/eliot-memory-quality/quality.contract.toml",
+  "crates/smart/eliot-learning-contracts/experience.contract.toml",
+]
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until all six cells have package Module Proof, affected real Edge Proof and D4_COGNITIVE_QUALITY_PULSE_01/D4_SELF_QUALITY_PULSE_01"
