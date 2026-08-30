@@ -1,0 +1,433 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_SWARM_IMPLEMENTATION"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "AGENT_HANDOFF_ONLY"
+parent_issue = 76
+handoff_issue = 302
+integration_issue_refs = [19, 15, 18, 11]
+base_branch = "main"
+base_sha = "499e27309088e3473c31d95f48f6d75527d4c0fd"
+normative_pair_ref = "docs/normative-pair.toml"
+docs_router_status = "NOT_EXECUTED_CONNECTOR_NO_CHECKOUT"
+dreamer_excluded = true
+
+[work_unit]
+cell_id = "storage.store-failure-wire"
+causal_property = "Every Store failure crosses EBP with typed provider-neutral identity, effect disposition and recovery semantics; protocol behavior never depends on prose and unknown outcome never becomes deterministic failure."
+old_path_discriminator = "Cause RevisionConflict, FenceMismatch, MigrationRequired, ProviderUnavailable and UnknownOutcome. Current StoreResponse collapses most failures to Error { error: String }, while adapter unknown/migration/conflict variants collapse to StoreError::Unavailable."
+integration_owner = "parent issue #76 across Store API, adapters, Kernel, daemon/agent surface, then #11 Product Pulse"
+one_writer_rule = "One writer per wave and mutable path claim; no worker integrates its own result."
+result = "integration candidate only"
+
+[normative_basis]
+architecture = ["ARCH-OBS-01", "ARCH-RES-04", "ARCH-AUTH-01", "ARCH-SEC-02", "ARCH-MOD-03"]
+implementation = ["I2.6", "I5.19", "I6.8", "I6.13", "I7.20", "I7.27"]
+reason = "A process boundary must preserve stable error identity, operation identity, retryability, known-versus-unknown effect state, evidence and the next safe action without promoting provider prose into control logic."
+
+[current_source]
+observed_on = "main@499e27309088e3473c31d95f48f6d75527d4c0fd"
+source_handles = [
+  "crates/storage/eliot-store-api/src/lib.rs",
+  "crates/storage/eliot-store-api/src/wire.rs",
+  "crates/storage/eliot-store-surreal-adapter/src/error.rs",
+  "bins/eliot-store-surreal/src/lib.rs",
+  "crates/kernel/eliot-kernel-service/src/store_exchange.rs",
+]
+confirmed_gap = [
+  "StoreResponse exposes Unknown { operation_id, reason: String } and Error { error: String }.",
+  "Kernel store_exchange converts Error text into StoreError::Serialization and reduces Unknown to StoreError::Unavailable after retaining only local prose.",
+  "Surreal AdapterError distinguishes ProviderUnavailable, MigrationRequired, UnknownOutcome, UnknownMigrationOutcome, PartialOutcome, ProviderConflict, NamedOperationUnavailable, Config and Serialization.",
+  "AdapterError::into_store_error currently collapses every provider/recovery variant above to StoreError::Unavailable.",
+  "StoreError itself already distinguishes validation, manifest, transition/effect ceiling, fence, revision, ordering, projection, outbox, receipt, identity, payload, unavailable and serialization failures.",
+]
+security_boundary = "Provider errors, query text, credentials, secrets and unrestricted human detail never cross the public Store wire."
+
+[contract_owner]
+package = "eliot-store-api"
+source_layer = "C0"
+module_candidate = "store_failure"
+mutable_state = "none"
+allowed_effects = []
+must_not_own = [
+  "provider retry implementation",
+  "Kernel recovery lifecycle",
+  "semantic admission",
+  "canonical receipt lifecycle",
+  "Problem or Incident state",
+  "human-facing localization",
+]
+
+[contract_owner.public_surface]
+types = [
+  "StoreFailure",
+  "StoreFailureDisposition",
+  "StoreReasonCode",
+  "StoreMutationDisposition",
+  "StoreRetryDirective",
+  "StoreRecoveryAction",
+  "StoreConflictObservation",
+  "LegacyStoreFailureV1",
+  "StoreFailureContractError",
+]
+functions = [
+  "StoreFailure::validate() -> Result<(), StoreFailureContractError>",
+  "StoreFailure::from_store_error(error, identity_context) -> Result<StoreFailure, StoreFailureContractError>",
+  "decode_legacy_store_failure_v1(value, request_context) -> Result<StoreFailure, StoreFailureContractError>",
+]
+wire_revision = "eliot.store.failure.v2"
+unknown_fields = "reject"
+unknown_reason_codes = "preserve as validated additive token and handle through coarse disposition"
+human_detail = "bounded, non-authoritative, optional and irrelevant to equality/control behavior"
+
+[types.StoreFailureDisposition]
+kind = "closed enum"
+values = [
+  "DETERMINISTIC_REJECTION",
+  "CONFLICT",
+  "UNAVAILABLE",
+  "BACKPRESSURED",
+  "DEADLINE_EXCEEDED",
+  "MIGRATION_REQUIRED",
+  "UNSUPPORTED",
+  "UNKNOWN_OUTCOME",
+  "INTERNAL_DEFECT",
+]
+rule = "Disposition is the small stable control axis. It does not replace the additive reason code or mutation disposition."
+
+[types.StoreReasonCode]
+kind = "validated additive token"
+format = "uppercase ASCII token with underscore separators and bounded length"
+initial_values = [
+  "INVALID_FIELD",
+  "EMPTY_FIELD",
+  "DUPLICATE_IDENTITY",
+  "FOUNDATION_CONTRACT_REJECTED",
+  "SECURITY_CONTRACT_REJECTED",
+  "RECEIPT_CONTRACT_REJECTED",
+  "UNKNOWN_NAMED_OPERATION",
+  "OPERATION_MANIFEST_MISMATCH",
+  "TRANSITION_CLASS_EXCEEDED",
+  "EFFECT_CEILING_EXCEEDED",
+  "STATE_FENCE_MISMATCH",
+  "REVISION_CONFLICT",
+  "ORDERING_CONFLICT",
+  "INVALID_PROJECTION",
+  "INVALID_OUTBOX",
+  "INVALID_RECEIPT",
+  "IDENTITY_CONFLICT",
+  "RECEIPT_NOT_FOUND",
+  "RECEIPT_ENVELOPE_MISSING",
+  "PAYLOAD_TOO_LARGE",
+  "STORE_UNAVAILABLE",
+  "STORE_BACKPRESSURE",
+  "STORE_DEADLINE_EXCEEDED",
+  "MIGRATION_REQUIRED",
+  "PROVIDER_CONFLICT",
+  "NAMED_OPERATION_UNAVAILABLE",
+  "PROVIDER_OUTCOME_UNKNOWN",
+  "MIGRATION_OUTCOME_UNKNOWN",
+  "PROVIDER_PARTIAL_OUTCOME",
+  "CONFIGURATION_INVALID",
+  "SERIALIZATION_FAILURE",
+  "INTERNAL_STORE_FAILURE",
+]
+rule = "An unknown future valid code is not success, is not discarded and is interpreted only through StoreFailureDisposition and the explicit directives."
+
+[types.StoreMutationDisposition]
+kind = "closed enum"
+values = [
+  "NOT_ATTEMPTED",
+  "PROVEN_NOT_APPLIED",
+  "COMMITTED",
+  "PARTIAL",
+  "UNKNOWN",
+]
+invariants = [
+  "UNKNOWN_OUTCOME requires UNKNOWN.",
+  "A prevalidation rejection requires NOT_ATTEMPTED.",
+  "CONFLICT before transaction is NOT_ATTEMPTED or PROVEN_NOT_APPLIED according to exact adapter evidence.",
+  "COMMITTED is represented by a valid WriteReceipt, not by StoreFailure alone.",
+  "No timeout, disconnect, parse error or missing response may claim PROVEN_NOT_APPLIED.",
+]
+
+[types.StoreRetryDirective]
+kind = "closed enum"
+values = [
+  "DO_NOT_RETRY",
+  "RETRY_SAME_IDENTITY_AFTER_BACKOFF",
+  "QUERY_RECEIPT",
+  "RECONCILE_EXACT_OPERATION",
+  "NEW_IDENTITY_AFTER_CONDITION",
+  "MIGRATE_THEN_RETRY_NEW_IDENTITY",
+  "MANUAL_RECOVERY",
+]
+invariants = [
+  "UNKNOWN mutation disposition permits only QUERY_RECEIPT or RECONCILE_EXACT_OPERATION.",
+  "IDENTITY_CONFLICT permits no same-identity retry.",
+  "A corrected request after deterministic rejection uses the identity rule supplied by the owning admission contract.",
+  "No directive grants authority, extends deadline or changes StateFence.",
+]
+
+[types.StoreRecoveryAction]
+kind = "closed enum"
+values = [
+  "NONE",
+  "REFRESH_STATE_FENCE",
+  "REFRESH_REVISION_HEADS",
+  "WAIT_FOR_CAPACITY",
+  "RESTORE_STORE_CONNECTIVITY",
+  "RUN_SCHEMA_MIGRATION",
+  "RESOLVE_WRITE_RECEIPT",
+  "RECONCILE_UNKNOWN_OUTCOME",
+  "REPAIR_CONFIGURATION",
+  "ESCALATE_INTERNAL_DEFECT",
+  "ENTER_MANUAL_RECOVERY",
+]
+
+[types.StoreConflictObservation]
+kind = "closed optional struct"
+fields = [
+  "expected_state_fence_ref",
+  "observed_state_fence_ref",
+  "revision_key_and_expected_observed_values",
+  "ordering_scope_and_expected_observed_values",
+  "manifest_or_contract_expected_observed_refs",
+]
+rule = "Contains only safe provider-neutral conflict details actually observed. Missing details remain absent; no guessed current revision."
+
+[types.StoreFailure]
+kind = "closed struct"
+fields = [
+  "contract_revision",
+  "disposition: StoreFailureDisposition",
+  "reason_code: StoreReasonCode",
+  "request_id: Option<RequestId>",
+  "operation_id: Option<OperationId>",
+  "idempotency_key_ref_or_digest: Option",
+  "state_fence_ref_or_exact_safe_projection: Option",
+  "mutation_disposition: StoreMutationDisposition",
+  "retry_directive: StoreRetryDirective",
+  "recovery_action: StoreRecoveryAction",
+  "conflict: Option<StoreConflictObservation>",
+  "retry_after_ms: Option",
+  "evidence_ref: Option",
+  "human_detail: Option<bounded String>",
+]
+invariants = [
+  "Any failure for an effect-capable Apply/Genesis request carries exact operation_id.",
+  "UNKNOWN_OUTCOME carries exact operation_id, mutation_disposition UNKNOWN, QUERY_RECEIPT or RECONCILE_EXACT_OPERATION and no blind-retry directive.",
+  "A request-scoped failure carries request_id when the boundary observed it.",
+  "retry_after_ms is present only for a retryable capacity/unavailable/deadline disposition and is bounded.",
+  "human_detail is not parsed, matched or hashed to determine behavior.",
+  "provider names, raw query text, credentials, stack traces and secret material are forbidden.",
+  "StoreFailure cannot be mistaken for WriteReceipt, canonical rejection receipt, task finish or Problem resolution.",
+]
+
+[legacy]
+current_variants = [
+  "StoreResponse::Error { error: String }",
+  "StoreResponse::Unknown { operation_id: OperationId, reason: String }",
+]
+decoder_location = "compatibility boundary in eliot-store-api wire module only"
+rules = [
+  "Legacy Unknown imports as UNKNOWN_OUTCOME with exact operation_id, mutation disposition UNKNOWN and RECONCILE_EXACT_OPERATION.",
+  "Legacy Error text has no reliable machine semantics; it imports as INTERNAL_DEFECT or UNAVAILABLE according to authenticated surrounding transport state, never through substring parsing.",
+  "Legacy string is retained only as bounded human_detail/evidence when privacy permits.",
+  "No new producer emits the legacy variants after v2 cutover.",
+  "Remove legacy encoding only after reverse-consumer and persisted-fixture proof.",
+]
+
+[mapping.StoreError]
+required_exhaustive_variants = [
+  "InvalidField",
+  "Empty",
+  "Duplicate",
+  "Foundation",
+  "Security",
+  "Receipt",
+  "UnknownOperation",
+  "ManifestMismatch",
+  "TransitionClassExceeded",
+  "EffectCeilingExceeded",
+  "FenceMismatch",
+  "RevisionConflict",
+  "OrderingConflict",
+  "InvalidProjection",
+  "InvalidOutbox",
+  "InvalidReceipt",
+  "IdentityConflict",
+  "ReceiptNotFound",
+  "MissingReceiptEnvelope",
+  "PayloadTooLarge",
+  "Unavailable",
+  "Serialization",
+]
+wildcard_mapping = "forbidden"
+compile_time_exhaustiveness = "required"
+
+[mapping.AdapterError]
+required_exhaustive_variants = [
+  "ProviderUnavailable",
+  "MigrationRequired",
+  "UnknownOutcome",
+  "UnknownMigrationOutcome",
+  "PartialOutcome",
+  "ProviderConflict",
+  "NamedOperationUnavailable",
+  "Config",
+  "Serialization",
+  "Store",
+]
+wildcard_mapping = "forbidden"
+critical_rules = [
+  "UnknownOutcome preserves its operation_id and maps to PROVIDER_OUTCOME_UNKNOWN / UNKNOWN_OUTCOME / UNKNOWN / RECONCILE_EXACT_OPERATION.",
+  "UnknownMigrationOutcome preserves migration identity as evidence and maps to MIGRATION_OUTCOME_UNKNOWN / UNKNOWN_OUTCOME / UNKNOWN / MANUAL_RECOVERY or exact migration reconciliation.",
+  "PartialOutcome is never StoreError::Unavailable without PARTIAL or UNKNOWN mutation state.",
+  "ProviderConflict remains CONFLICT and cannot become transient availability.",
+  "MigrationRequired remains MIGRATION_REQUIRED.",
+]
+
+[[wave]]
+order = 1
+id = "store-failure-contract"
+issue_owner = "new child issue under #76"
+mutable_paths = [
+  "crates/storage/eliot-store-api/src/wire.rs",
+  "crates/storage/eliot-store-api/src/store_failure.rs",
+  "crates/storage/eliot-store-api/tests/**",
+]
+deliverable = "Additive v2 StoreFailure wire, validation, legacy decoder and public compatibility fixtures."
+must_not_touch = ["Surreal adapter", "Kernel", "daemon/agent surface"]
+proof = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-store-api --all-targets",
+  "cargo test --locked -p eliot-store-api",
+  "cargo clippy --locked -p eliot-store-api --all-targets -- -D warnings",
+]
+proof_ceiling = "STORE_FAILURE_CONTRACT_PROOF_ONLY"
+
+[[wave]]
+order = 2
+id = "adapter-mapping"
+issue_owner = "new child issue under #76 and #19"
+mutable_paths = [
+  "crates/storage/eliot-store-surreal-adapter/src/error.rs",
+  "crates/storage/eliot-store-surreal-adapter/src/**/focused mapping fixtures",
+  "bins/eliot-store-surreal/src/**",
+  "crates/storage/eliot-store-memory/**",
+]
+deliverable = "Explicit exhaustive StoreError/AdapterError conversion to StoreFailure with no provider leakage or wildcard collapse."
+must_not_touch = ["Kernel recovery policy", "semantic admission"]
+proof_ceiling = "STORE_PROVIDER_MAPPING_MODULE_PROOF_ONLY"
+
+[[wave]]
+order = 3
+id = "kernel-consumer"
+issue_owner = "new child issue under #76 and #15"
+mutable_paths = [
+  "crates/kernel/eliot-kernel-service/src/store_exchange.rs",
+  "crates/kernel/eliot-kernel-service/src/store_client.rs",
+  "direct Kernel Store client fixtures only",
+]
+deliverable = "Kernel consumes typed disposition/directives, preserves exact unknown operation identity and performs no substring matching."
+must_not_touch = ["Store provider mapping", "daemon semantic policy"]
+proof_ceiling = "KERNEL_STORE_CONSUMER_MODULE_PROOF_ONLY"
+
+[[wave]]
+order = 4
+id = "daemon-and-agent-projection"
+issue_owner = "new child issue under #76 and #18"
+mutable_paths = [
+  "bins/eliot-kernel/src/daemon_request_dispatch.rs",
+  "eliotd Store caller and agent-facing projection files selected by current source inspection",
+]
+deliverable = "Map StoreFailure to the owning typed protocol/AgentResponseDisposition and exact reason/recovery directive without changing canonical admission meaning."
+must_not_touch = ["Store wire owner", "task finish semantics"]
+proof_ceiling = "DAEMON_SURFACE_MODULE_PROOF_ONLY"
+
+[[wave]]
+order = 5
+id = "compatibility-edge-product"
+issue_owner = "separate integration owner under #76 and #11"
+mutable_paths = ["cross-process compatibility fixtures and bounded Product Pulse only"]
+deliverable = "Reference and Surreal paths emit identical provider-neutral failures; Kernel/daemon behavior remains identical when human detail wording changes."
+proof_ceiling = "STORE_FAILURE_EDGE_AND_PRODUCT_PULSE"
+
+[fixtures]
+required = [
+  "revision conflict is distinct from ordering conflict",
+  "StateFence mismatch is distinct from identity conflict",
+  "unavailable is distinct from backpressure and deadline",
+  "unknown named operation is distinct from migration required",
+  "transition/effect ceiling failure is deterministic and not retryable",
+  "receipt envelope missing becomes unknown outcome/reconciliation rather than success",
+  "provider unknown outcome preserves exact operation identity and prohibits blind retry",
+  "provider partial outcome cannot become deterministic rejection",
+  "unknown future reason code round-trips and is controlled by coarse disposition",
+  "human detail wording changes do not alter equality, retry or recovery behavior",
+  "legacy Unknown decodes to exact typed unknown outcome",
+  "legacy Error never gains semantics through substring parsing",
+  "reference and Surreal adapters pass one shared wire corpus",
+  "agent-facing response contains stable disposition, exact reason and next safe action",
+]
+static_negatives = [
+  "no match or contains call over human_detail/error text in Kernel/daemon control logic",
+  "no SurrealDB SDK/error type in eliot-store-api public surface",
+  "no wildcard AdapterError/StoreError mapping that erases a new variant",
+  "no UNKNOWN mutation state paired with retry-same-identity",
+  "no success response generated from StoreFailure",
+]
+
+[non_goals]
+items = [
+  "No raw SurrealDB error or query text on public wire.",
+  "No semantic admission or task-finish change.",
+  "No canonical write-owner change.",
+  "No executable request digest migration; #63 owns it.",
+  "No Store concurrency redesign; #67 owns it.",
+  "No authority epoch migration; #64 owns it.",
+  "No global agent reason-code rewrite outside the affected projection.",
+]
+
+[stop_conditions]
+items = [
+  "Another open PR claims any mutable path in the selected wave.",
+  "Current main is not an ancestor of the worker branch.",
+  "A provider outcome cannot be classified without losing known-versus-unknown mutation state.",
+  "The proposed mapping needs raw provider text or substring matching.",
+  "A deterministic StoreError does not have enough identity context at the mapping boundary.",
+  "Legacy string fixtures are persisted but their surrounding operation identity cannot be proven.",
+  "A caller asks to treat unknown outcome as unavailable plus retry.",
+  "The agent-facing projection would create a second Store failure ontology.",
+]
+challenge = "Return a ContractChallenge to #76 with exact unmappable variant and evidence; do not use a generic string fallback."
+
+[result_contract]
+required_fields = [
+  "issue_and_cell",
+  "source_base_and_candidate",
+  "causal_property",
+  "old_path_discriminator",
+  "changed_contract_or_source",
+  "module_proof",
+  "edge_proof",
+  "product_pulse_or_not_applicable_reason",
+  "evidence_execution_status",
+  "known_uncovered_behavior",
+  "security_privacy_and_authority_delta",
+  "migration_rollback_and_removal",
+  "integration_candidate",
+  "residual_unknowns",
+]
+finish_states = [
+  "VERIFIED_COMPLETE",
+  "PARTIAL",
+  "BLOCKED",
+  "FAILED_VERIFICATION",
+  "DEGRADED_NO_PROOF",
+  "UNSAFE_TO_FINISH",
+  "CANCELLED",
+  "SUPERSEDED",
+]
