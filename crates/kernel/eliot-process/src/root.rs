@@ -2,7 +2,7 @@
 //!
 //! The original `src/lib.rs` remains the byte-preserved process-contract v3
 //! implementation. The additive stream-evidence module defines only immutable,
-//! privacy-bound evidence identities; it owns no process, BlobStore, ORS,
+//! privacy-bound evidence identities; it owns no process, `BlobStore`, ORS,
 //! parser, evaluator, canonical, or finish state.
 
 #![forbid(unsafe_code)]
