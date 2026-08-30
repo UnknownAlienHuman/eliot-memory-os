@@ -1,0 +1,159 @@
+schema_version = 1
+contract_id = "smart.dreamer.curation.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-dreamer-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.dreamer.contracts.curation", "smart.dreamer.curation", "smart.dreamer.classification", "smart.dreamer.relation_candidate", "smart.dreamer.episode", "smart.dreamer.concept", "smart.dreamer.procedure", "smart.dreamer.skill", "smart.dreamer.failure", "smart.dreamer.structure_repair", "smart.dreamer.reconsolidation", "smart.dreamer.accessibility", "smart.dreamer.influence_repair"]
+architecture_refs = ["ARCH-DRM-01", "ARCH-DRM-02", "ARCH-MEM-02", "ARCH-MEM-04", "ARCH-EPI-04", "ARCH-RES-05"]
+implementation_refs = ["I2.20", "I9 curation", "I12.19", "I12.21"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Route one admitted curation item to one exact typed semantic handler and assemble candidate-only results without generic fallback, lifecycle mutation, support promotion or canonical write."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure_dispatch_and_validation"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O(registry log registry + items log items + candidate_handles log handles) over bounded immutable inputs; semantic work is isolated in subtype handlers."
+replacement_boundary = "Replace registry/dispatch/assembly behind this contract; semantic subtype handlers, Governor admission, memory lifecycle and canonical writers remain separate owners."
+
+[closed_sets]
+curation_subtypes = ["Classification", "Relation", "Episode", "Concept", "Procedure", "Skill", "FailureFingerprint", "MergeSplit", "Reconsolidation", "Accessibility", "InfluenceRepair"]
+handler_states = ["Registered", "Unavailable", "Stale", "Blocked"]
+item_states = ["Ready", "Partial", "Blocked", "Stale", "Unsupported"]
+handler_result_states = ["CandidateProduced", "NoCandidate", "RequiresEvidence", "RequiresReview", "Unsupported"]
+candidate_effect_classes = ["Descriptive", "Procedural", "IdentityRepair", "MeaningRevision", "AccessibilityRevision", "InfluenceRevision"]
+
+[hard_invariants]
+subtype_is_closed_and_explicit = true
+unknown_subtype_is_unsupported_not_generic_fallback = true
+dispatcher_contains_no_semantic_reasoning = true
+one_item_routes_to_exactly_one_handler = true
+handler_contract_revision_and_state_fence_are_exact = true
+semantic_result_is_candidate_only = true
+existence_support_accessibility_and_influence_remain_separate = true
+raw_source_and_episode_are_never_rewritten_or_deleted = true
+lifecycle_transition_and_canonical_write_are_external = true
+candidate_authority_ceiling_never_exceeds_sources = true
+handler_unavailability_is_visible = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "AdmittedDreamDraft"
+owner = "eliot-dreamer-contracts/common.contract.toml"
+
+[[public_type]]
+name = "CurationSubtype"
+kind = "enum"
+definition = ["Classification", "Relation", "Episode", "Concept", "Procedure", "Skill", "FailureFingerprint", "MergeSplit", "Reconsolidation", "Accessibility", "InfluenceRepair"]
+
+[[public_type]]
+name = "CurationHandlerState"
+kind = "enum"
+definition = ["Registered", "Unavailable", "Stale", "Blocked"]
+
+[[public_type]]
+name = "CurationHandlerRegistration"
+kind = "struct"
+definition = ["subtype: CurationSubtype", "handler_id: String", "handler_generation: String", "contract_shape_sha256: String", "state: CurationHandlerState", "supported_input_schema_refs: Vec<String>", "output_schema_ref: String", "maximum_items: u32", "state_fence: StateFence", "missing_owner_or_reason_refs: Vec<String>"]
+invariants = ["one registration per subtype", "handler/generation/contract exact", "Registered requires schemas and non-zero bound", "Unavailable/Blocked names owner/reason", "registration grants no lifecycle/effect authority"]
+
+[[public_type]]
+name = "CurationHandlerRegistrySnapshot"
+kind = "struct"
+definition = ["registry_revision: String", "scope_id: String", "state_fence: StateFence", "handlers: Vec<CurationHandlerRegistration>", "snapshot_sha256: String"]
+invariants = ["all eleven subtypes represented exactly once", "one fence", "canonical order and digest", "missing handler visible"]
+
+[[public_type]]
+name = "CurationItemState"
+kind = "enum"
+definition = ["Ready", "Partial", "Blocked", "Stale", "Unsupported"]
+
+[[public_type]]
+name = "CurationItemEnvelope"
+kind = "struct"
+definition = ["item_id: ArtifactId", "subtype: CurationSubtype", "state: CurationItemState", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "source_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "dependency_handles: Vec<ArtifactId>", "input_schema_ref: String", "typed_payload_handle: ArtifactId", "source_authority_ceiling: String", "missing_owner_or_reason_refs: Vec<String>", "item_sha256: String"]
+invariants = ["source handles non-empty/unique", "subtype and input schema exact", "typed payload is not untyped JSON fallback", "Partial/Blocked/Stale names gap/reason", "authority ceiling source-owned", "canonical digest"]
+
+[[public_type]]
+name = "CurationRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "job_sha256: String", "admitted_draft_sha256: String", "registry_snapshot_sha256: String", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "items: Vec<CurationItemEnvelope>", "maximum_items: u32", "maximum_candidates: u32", "request_sha256: String"]
+invariants = ["job class Curation", "all identities/scope/task/fence exact", "item ids unique", "bounds non-zero", "request grants no canonical/lifecycle/support/influence authority"]
+
+[[public_type]]
+name = "CurationHandlerResultState"
+kind = "enum"
+definition = ["CandidateProduced", "NoCandidate", "RequiresEvidence", "RequiresReview", "Unsupported"]
+
+[[public_type]]
+name = "CurationCandidateEffectClass"
+kind = "enum"
+definition = ["Descriptive", "Procedural", "IdentityRepair", "MeaningRevision", "AccessibilityRevision", "InfluenceRevision"]
+
+[[public_type]]
+name = "TypedCurationHandlerResult"
+kind = "struct"
+definition = ["item_id: ArtifactId", "subtype: CurationSubtype", "handler_id: String", "handler_generation: String", "handler_contract_shape_sha256: String", "state: CurationHandlerResultState", "candidate_id: Option<ArtifactId>", "candidate_effect_class: Option<CurationCandidateEffectClass>", "typed_candidate_payload_handle: Option<ArtifactId>", "source_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "preserved_raw_handles: Vec<ArtifactId>", "candidate_authority_ceiling: String", "missing_evidence_or_review_reasons: Vec<String>", "invalidation_conditions: Vec<String>", "result_sha256: String"]
+invariants = ["result subtype/handler matches registration/item", "CandidateProduced requires typed candidate fields", "NoCandidate/RequiresEvidence/RequiresReview/Unsupported cannot smuggle candidate payload", "raw sources preserved", "candidate remains reversible/traceable", "contains no transition receipt, write handle or self-application"]
+
+[[public_type]]
+name = "CurationCandidateSet"
+kind = "struct"
+definition = ["request_sha256: String", "registry_snapshot_sha256: String", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "results: Vec<TypedCurationHandlerResult>", "candidate_ids: Vec<ArtifactId>", "unsupported_item_ids: Vec<ArtifactId>", "requires_evidence_item_ids: Vec<ArtifactId>", "requires_review_item_ids: Vec<ArtifactId>", "set_sha256: String"]
+invariants = ["one result per item", "candidate ids reconcile exactly", "unsupported/evidence/review sets explicit", "no generic fallback result", "contains no lifecycle/canonical/support/admission/finish/effect disposition", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_curation_handler_registry"
+signature = "pub fn validate_curation_handler_registry(registry: &CurationHandlerRegistrySnapshot) -> Result<(), CurationContractError>"
+
+[[public_function]]
+name = "validate_curation_request"
+signature = "pub fn validate_curation_request(request: &CurationRequest, admitted: &AdmittedDreamDraft, registry: &CurationHandlerRegistrySnapshot) -> Result<(), CurationContractError>"
+
+[[public_function]]
+name = "validate_typed_curation_result"
+signature = "pub fn validate_typed_curation_result(item: &CurationItemEnvelope, registration: &CurationHandlerRegistration, result: &TypedCurationHandlerResult) -> Result<(), CurationContractError>"
+
+[[public_function]]
+name = "assemble_curation_candidate_set"
+signature = "pub fn assemble_curation_candidate_set(request: &CurationRequest, registry: &CurationHandlerRegistrySnapshot, results: &[TypedCurationHandlerResult]) -> Result<CurationCandidateSet, CurationContractError>"
+
+[[negative_test]]
+id = "unknown-subtype-no-fallback"
+property = "Unknown or unregistered subtype yields Unsupported and never routes to generic model/JSON handler."
+
+[[negative_test]]
+id = "dispatcher-no-semantics"
+property = "Dispatcher operates only on registry/item/result contracts and cannot classify or synthesize semantic content."
+
+[[negative_test]]
+id = "one-item-one-handler"
+property = "One item cannot be handled by multiple registrations or silently rerouted."
+
+[[negative_test]]
+id = "candidate-not-transition"
+property = "Handler result and candidate set expose no canonical write, lifecycle transition, support promotion, accessibility/influence application, task finish or effect receipt."
+
+[[negative_test]]
+id = "raw-history-preserved"
+property = "Merge/split/reconsolidation/accessibility/influence candidates retain raw source and prior revision handles."
