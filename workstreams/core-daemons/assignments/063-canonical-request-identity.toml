@@ -1,0 +1,288 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_SWARM_IMPLEMENTATION"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "AGENT_HANDOFF_ONLY"
+parent_issue = 63
+handoff_issue = 299
+integration_issue_refs = [15, 18, 19, 11]
+base_branch = "main"
+base_sha = "addd713844b32c2300d74c75baabefc9d5dffbef"
+normative_pair_ref = "docs/normative-pair.toml"
+docs_router_status = "EXECUTED_LOCAL_DOCS_READ_V1"
+dreamer_excluded = true
+
+[work_unit]
+cell_id = "storage.executable-request-identity"
+causal_property = "Every executable canonical-store request is hashed from the exact values Governor admitted and Kernel and Store execute; no separately transported load-bearing field can drift under a supplied digest."
+old_path_discriminator = "Mutate one load-bearing Apply field after Governor admission while preserving PreparedTransition.identity.canonical_request_hash. Current Kernel/Store validation accepts shape and same-fence equality without recomputing the complete executable request identity."
+integration_owner = "parent issue #63 across Governor, Kernel, Store, then #11 Product Pulse"
+one_writer_rule = "One writer per wave and mutable path claim; no worker integrates its own result."
+result = "integration candidate only"
+
+[normative_basis]
+architecture = ["ARCH-AUTH-01", "ARCH-SEC-02", "ARCH-LIFE-01", "ARCH-MOD-03"]
+implementation = ["I1.8", "I5.5", "I5.6", "I5.19", "I5.27", "I6.13"]
+reason = "Admission identity, State Fence, named operation, expected heads, commit receipt and idempotency identity must remain mechanically identical across the sole canonical path."
+
+[current_source]
+observed_on = "main@addd713844b32c2300d74c75baabefc9d5dffbef"
+source_handles = [
+  "crates/governor/eliot-canonical/src/lib.rs",
+  "bins/eliot-kernel/src/daemon_request_dispatch.rs",
+  "crates/kernel/eliot-kernel-service/src/store_gateway.rs",
+  "crates/kernel/eliot-kernel-service/src/store_client.rs",
+  "crates/storage/eliot-store-api/src/lib.rs",
+  "crates/storage/eliot-store-api/src/wire.rs",
+  "crates/storage/eliot-store-memory/src/lib.rs",
+  "crates/storage/eliot-store-surreal-adapter/src/apply.rs",
+]
+confirmed_gap = [
+  "Governor supplies a canonical_request_hash inside OperationIdentity.",
+  "StoreRequest::Apply transports RequestMetadata, PreparedTransition, expected revision heads and expected ordering heads as separate values.",
+  "Current Apply validation checks shape, uniqueness and fence agreement but does not recompute one digest over all executable values.",
+  "WriteReceipt repeats the supplied canonical_request_hash, so receipt equality alone cannot prove the first execution used matching context and heads.",
+]
+existing_precedent = "StoreGenesisRequest already excludes its digest field, canonicalizes the remaining request, recomputes SHA-256 and validates equality."
+
+[contract_owner]
+package = "eliot-store-api"
+source_layer = "C0"
+module_candidate = "executable_request_identity"
+mutable_state = "none"
+allowed_effects = []
+must_not_own = [
+  "semantic admission",
+  "Kernel authority or ORS staging",
+  "Store transaction execution",
+  "provider-specific encoding",
+  "receipt lifecycle",
+]
+
+[contract_owner.public_surface]
+types = [
+  "ExecutableStoreRequestIdentityInput",
+  "ExecutableStoreRequestDigest",
+  "ExecutableRequestIdentityError",
+]
+functions = [
+  "canonicalize_executable_store_request(input) -> Result<CanonicalExecutableStoreRequest, ExecutableRequestIdentityError>",
+  "compute_executable_store_request_hash(input) -> Result<ExecutableStoreRequestDigest, ExecutableRequestIdentityError>",
+  "validate_executable_store_request_hash(input, claimed_digest) -> Result<(), ExecutableRequestIdentityError>",
+]
+domain_separator = "eliot.storage.executable-request.v1"
+hash_algorithm = "SHA-256 lowercase hexadecimal"
+encoding = "versioned canonical JSON through the existing ELIOT canonical encoder; the digest field is excluded from its own input"
+unknown_fields = "reject"
+provider_fields = "forbidden"
+
+[identity_input]
+required_fields = [
+  "canonical encoding revision and domain separator",
+  "operation_id and idempotency_key, excluding the claimed canonical_request_hash",
+  "authenticated RequestMetadata including request_id, principal/session/task/product bindings and StateFence",
+  "PreparedTransition scope_id and task_id",
+  "complete OrderingScope set",
+  "transition_class and requested_effect_ceiling",
+  "admission_contract_set_digest",
+  "operation_manifest_digest",
+  "named operations and exact parameters",
+  "event/projection/relation intents",
+  "privacy, origin, taint, provenance and disclosure/influence closure fields present in the admitted transition",
+  "required proof and approval references present in the admitted transition",
+  "expected revision heads",
+  "expected ordering heads",
+]
+must_not_include = [
+  "the claimed digest itself",
+  "provider SDK values",
+  "database connection identity",
+  "runtime PID or pipe connection",
+  "human detail or formatted error text",
+  "debug-format serialization",
+]
+
+[canonicalization]
+set_like = [
+  "ordering_scopes sorted by canonical OrderingScopeId and duplicate-free",
+  "expected_revision_heads sorted by canonical RevisionKey and duplicate-free",
+  "expected_ordering_heads sorted by canonical OrderingScopeId and duplicate-free",
+  "all explicitly set-like proof, approval, provenance or closure references sorted by their typed canonical identity and duplicate-free",
+]
+ordered = [
+  "named operation sequence when order is contract-significant",
+  "event/projection/relation intent sequence when ordinal meaning is contract-significant",
+]
+rule = "The owning type declares whether a collection is set-like or ordered. A worker may not sort an ordered collection merely to obtain stable bytes."
+numeric_and_option_rule = "No lossy numeric coercion; None/null and empty collection remain distinct when the owning contract distinguishes them."
+
+[errors]
+required = [
+  "UNSUPPORTED_ENCODING_REVISION",
+  "NONCANONICAL_COLLECTION",
+  "DUPLICATE_IDENTITY",
+  "INVALID_DIGEST",
+  "TRANSITION_DIGEST_MISMATCH",
+  "IDENTITY_CONFLICT",
+  "SERIALIZATION_FAILURE",
+]
+behavior = [
+  "Digest mismatch is rejected before ORS reservation, idempotency lookup or provider transaction at every consumer boundary.",
+  "Same idempotency key plus different executable request bytes is IDENTITY_CONFLICT and performs no transaction.",
+  "Unknown outcome is never converted into digest mismatch or deterministic rollback.",
+]
+
+[[wave]]
+order = 1
+id = "contract"
+issue_owner = "new child issue under #63"
+mutable_paths = [
+  "crates/storage/eliot-store-api/src/**",
+  "crates/storage/eliot-store-api/tests/**",
+]
+deliverable = "Provider-neutral identity input, canonicalization, digest functions and golden/mutation corpus."
+must_not_touch = [
+  "Governor source",
+  "Kernel source",
+  "Store adapter source",
+  "root Cargo.toml except a separately reviewed package admission need",
+]
+proof = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-store-api --all-targets",
+  "cargo test --locked -p eliot-store-api",
+  "cargo clippy --locked -p eliot-store-api --all-targets -- -D warnings",
+]
+proof_ceiling = "STORE_API_CONTRACT_PROOF_ONLY"
+
+[[wave]]
+order = 2
+id = "governor-producer"
+issue_owner = "new child issue under #63 and #18"
+mutable_paths = [
+  "crates/governor/eliot-canonical/**",
+  "direct Governor producer fixtures only",
+]
+deliverable = "Governor constructs the shared identity input and computes the claimed digest through the sole shared function."
+must_not_touch = ["Kernel", "Store adapters", "canonical encoder semantics"]
+proof_ceiling = "GOVERNOR_PRODUCER_MODULE_PROOF_ONLY"
+
+[[wave]]
+order = 3
+id = "kernel-recompute"
+issue_owner = "new child issue under #63 and #15"
+mutable_paths = [
+  "bins/eliot-kernel/src/daemon_request_dispatch.rs",
+  "crates/kernel/eliot-kernel-service/src/store_gateway.rs",
+  "direct Kernel fixtures only",
+]
+deliverable = "Kernel reconstructs the shared input from the exact values it will stage/forward and rejects mismatch before ORS or Store execution."
+must_not_touch = ["Governor semantic admission", "Store provider transaction"]
+proof_ceiling = "KERNEL_CONSUMER_MODULE_PROOF_ONLY"
+
+[[wave]]
+order = 4
+id = "store-recompute"
+issue_owner = "new child issue under #63 and #19"
+mutable_paths = [
+  "crates/storage/eliot-store-memory/**",
+  "crates/storage/eliot-store-surreal-adapter/**",
+  "bins/eliot-store-surreal/**",
+]
+deliverable = "Reference and Surreal paths recompute before idempotency lookup/transaction; WriteReceipt validation repeats the same digest."
+must_not_touch = ["semantic admission", "provider-specific digest format"]
+proof_ceiling = "STORE_ADAPTER_MODULE_PROOF_ONLY"
+
+[[wave]]
+order = 5
+id = "edge-and-product"
+issue_owner = "separate integration owner under #63 and #11"
+mutable_paths = ["integration fixtures and bounded Product Pulse only"]
+deliverable = "One exact request obtains the same digest at Governor output, Kernel staging, Store transaction and WriteReceipt; every single-field mutation is rejected at Kernel and Store."
+proof_ceiling = "AFFECTED_EDGE_AND_PRODUCT_PULSE"
+
+[fixtures]
+golden = [
+  "one canonical request has exact stable canonical bytes and SHA-256 in every crate",
+  "same semantic set values in different input order canonicalize to identical bytes",
+  "ordered named-operation or intent reordering changes the digest",
+  "unknown fields and unsupported encoding revision fail closed",
+]
+mutation_matrix = [
+  "operation_id",
+  "idempotency_key",
+  "RequestMetadata.request_id",
+  "principal/session/task/product binding",
+  "StateFence",
+  "scope_id",
+  "task_id",
+  "ordering_scopes",
+  "transition_class",
+  "requested_effect_ceiling",
+  "admission_contract_set_digest",
+  "operation_manifest_digest",
+  "named operation name/version/parameter",
+  "event/projection/relation intent",
+  "privacy/origin/taint/provenance/closure",
+  "proof or approval reference",
+  "expected revision head key/value/fence",
+  "expected ordering head scope/sequence/hash/fence",
+]
+required_outcomes = [
+  "each mutation changes the computed digest",
+  "preserving the old claimed digest yields TRANSITION_DIGEST_MISMATCH at Kernel and Store",
+  "same idempotency key with different digest yields IDENTITY_CONFLICT before transaction",
+  "exact replay returns the same terminal receipt",
+  "reference and Surreal adapters pass the identical corpus",
+]
+
+[non_goals]
+items = [
+  "No raw query surface.",
+  "No semantic interpretation in Kernel or Store.",
+  "No provider-specific canonical encoding.",
+  "No authority epoch migration; #64 owns it.",
+  "No store concurrency redesign; #67 owns it.",
+  "No typed StoreFailure wire migration; #76 owns it.",
+  "No Product acceptance from package tests.",
+]
+
+[stop_conditions]
+items = [
+  "Another open PR claims any mutable path in the selected wave.",
+  "Current main is not an ancestor of the worker branch.",
+  "The existing PreparedTransition lacks a field required to represent the exact admitted executable request.",
+  "A collection's set-versus-order semantics cannot be proven from its owning contract.",
+  "A consumer asks for a local/provider-specific hash function.",
+  "Legacy persisted digests cannot be mapped to exact executable bytes without evidence.",
+  "The oracle would need to ignore a load-bearing field or change idempotency semantics.",
+]
+challenge = "Return a ContractChallenge to #63 with exact source/evidence and do not add a lossy compatibility helper."
+
+[result_contract]
+required_fields = [
+  "issue_and_cell",
+  "source_base_and_candidate",
+  "causal_property",
+  "old_path_discriminator",
+  "changed_contract_or_source",
+  "module_proof",
+  "edge_proof",
+  "product_pulse_or_not_applicable_reason",
+  "evidence_execution_status",
+  "known_uncovered_behavior",
+  "migration_rollback_and_removal",
+  "integration_candidate",
+  "residual_unknowns",
+]
+finish_states = [
+  "VERIFIED_COMPLETE",
+  "PARTIAL",
+  "BLOCKED",
+  "FAILED_VERIFICATION",
+  "DEGRADED_NO_PROOF",
+  "UNSAFE_TO_FINISH",
+  "CANCELLED",
+  "SUPERSEDED",
+]
