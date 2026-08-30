@@ -25,7 +25,8 @@ activation_stages = ["Eligible", "Delivered", "Parsed", "Available", "Invoked", 
 observation_states = ["Observed", "NotObserved", "Unknown", "NotApplicable"]
 adherence_checkpoints = ["Early", "Mid", "Finish"]
 adherence_states = ["Adhered", "Violated", "Mixed", "Unknown", "NotApplicable"]
-decision_delta_states = ["BeneficialChange", "NeutralChange", "HarmfulChange", "NoObservedChange", "Unknown", "NotApplicable"]nclosure_dispositions = ["ReusableCandidate", "LocalOnlyResidue", "NoReusableDelta", "Inconclusive", "InvalidEvidence"]
+decision_delta_states = ["BeneficialChange", "NeutralChange", "HarmfulChange", "NoObservedChange", "Unknown", "NotApplicable"]
+closure_dispositions = ["ReusableCandidate", "LocalOnlyResidue", "NoReusableDelta", "Inconclusive", "InvalidEvidence"]
 promotion_dimensions = ["CurrentApplicability", "Activation", "Adherence", "DecisionDelta", "Outcome", "Retention", "Transfer", "EvaluatorValidity", "ProductPulse", "Rollback", "Economics", "Authority"]
 promotion_dimension_states = ["Pass", "Fail", "Inconclusive", "NotApplicable"]
 
