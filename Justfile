@@ -40,6 +40,12 @@ opencode-plugin:
     node --test integrations/opencode/tests/eliot-plugin.test.mjs
     Get-Content integrations/opencode/plugin-bridge-contract.json -Raw | ConvertFrom-Json | Out-Null
 
+codex-app-server-wire-self-test:
+    python scripts/verify-codex-app-server-wire.py --self-test
+
+codex-app-server-wire:
+    python scripts/verify-codex-app-server-wire.py
+
 metadata:
     cargo metadata --locked --no-deps --format-version 1 | Out-Null
 
