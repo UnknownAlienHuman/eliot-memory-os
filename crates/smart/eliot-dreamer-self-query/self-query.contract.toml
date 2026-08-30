@@ -1,0 +1,371 @@
+schema_version = 1
+contract_id = "smart.dreamer.self-query.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-dreamer-self-query"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = [
+  "smart.dreamer.architecture_brief",
+  "smart.dreamer.implementation_brief",
+  "smart.self_model.context_projection",
+]
+architecture_refs = [
+  "ARCH-SELF-01",
+  "ARCH-UND-01",
+  "ARCH-CTX-01",
+  "ARCH-EPI-04",
+  "ARCH-SCOPE-01",
+  "ARCH-MOD-03",
+]
+implementation_refs = [
+  "I2.20",
+  "I12.23",
+  "I12.13",
+]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Project accepted Architecture and target/current Implementation evidence into bounded exact briefs without reading documents at runtime, modifying normative sources, or allowing prose/model self-report to certify current support."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((sections + claims + evidence + gaps) log n) over request-bounded materialized inputs; no repository scan, document read, model call, network, provider SDK or blocking I/O."
+replacement_boundary = "Replace deterministic brief compilation behind this contract; normative-pair acceptance, repository/runtime evidence production, Context admission and authority remain external owners."
+
+[closed_sets]
+brief_coverage_states = ["Complete", "Partial", "Unavailable", "Blocked", "Stale", "Conflicted"]
+architecture_section_classes = ["Intent", "Invariant", "OwnerBoundary", "Flow", "FailureSemantics", "ProofRequirement", "ReplacementBoundary", "OpenQuestion"]
+implementation_support_states = ["Target", "ImplementedUnverified", "CurrentVerified", "OperationalObserved", "ExperientialObserved", "Contradicted", "Unknown", "NotApplicable", "Stale"]
+conformance_results = ["Conformant", "Partial", "NonConformant", "Unknown", "Stale", "NotApplicable"]
+
+[hard_invariants]
+accepted_normative_pair_is_external_and_exact = true
+architecture_precedence_is_explicit = true
+implementation_target_is_not_current_support = true
+implemented_shape_is_not_operational_behavior = true
+operational_observation_is_not_product_outcome = true
+prose_model_report_or_file_presence_cannot_establish_current_verified = true
+missing_current_evidence_is_unknown_not_false_or_zero = true
+contradictions_and_open_questions_remain_visible = true
+briefs_are_read_only_projections_not_normative_mutations = true
+complete_requires_exact_recheckable_denominator = true
+all_material_sections_and_claims_have_exact_source_handles = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "ContractIdentity"
+owner = "eliot-contracts"
+
+[[public_type]]
+name = "SelfQueryCoverageState"
+kind = "enum"
+definition = ["Complete", "Partial", "Unavailable", "Blocked", "Stale", "Conflicted"]
+
+[[public_type]]
+name = "SelfQueryCoverageDenominator"
+kind = "struct"
+definition = [
+  "source_ref: String",
+  "source_revision: String",
+  "method_ref: String",
+  "expected_sections: Option<u32>",
+  "expected_section_handles: Vec<ArtifactId>",
+  "expected_claims: Option<u32>",
+]
+invariants = [
+  "source/revision/method non-blank",
+  "Complete requires expected_sections and expected_claims",
+  "handles unique",
+  "denominator independently recheckable",
+]
+
+[[public_type]]
+name = "SelfQueryCoverage"
+kind = "struct"
+definition = [
+  "state: SelfQueryCoverageState",
+  "denominator: Option<SelfQueryCoverageDenominator>",
+  "observed_sections: u32",
+  "observed_claims: u32",
+  "missing_owner_or_reason_refs: Vec<String>",
+]
+invariants = [
+  "Complete requires exact count equality and no missing refs",
+  "Partial requires denominator and named missing refs",
+  "Unavailable or Blocked has no observed items and names owner/reason",
+  "Stale cannot support current conformance",
+  "Conflicted preserves competing source identities",
+]
+
+[[public_type]]
+name = "AcceptedNormativePairIdentity"
+kind = "struct"
+definition = [
+  "receipt_handle: ArtifactId",
+  "architecture_identity: ContractIdentity",
+  "architecture_sha256: String",
+  "implementation_identity: ContractIdentity",
+  "implementation_sha256: String",
+  "pair_key: String",
+  "accepted_revision: String",
+]
+invariants = [
+  "all digests lowercase SHA-256",
+  "pair key matches the accepted receipt",
+  "identity is input evidence and cannot be issued by this crate",
+]
+
+[[public_type]]
+name = "ArchitectureSectionClass"
+kind = "enum"
+definition = [
+  "Intent",
+  "Invariant",
+  "OwnerBoundary",
+  "Flow",
+  "FailureSemantics",
+  "ProofRequirement",
+  "ReplacementBoundary",
+  "OpenQuestion",
+]
+
+[[public_type]]
+name = "ArchitectureSectionProjection"
+kind = "struct"
+definition = [
+  "section_handle: ArtifactId",
+  "heading_path: String",
+  "section_class: ArchitectureSectionClass",
+  "section_sha256: String",
+  "exact_excerpt_handle: ArtifactId",
+  "owner_refs: Vec<String>",
+  "invariant_refs: Vec<String>",
+  "failure_semantic_refs: Vec<String>",
+  "replacement_boundary_refs: Vec<String>",
+  "dependency_section_handles: Vec<ArtifactId>",
+]
+invariants = [
+  "heading/digest/excerpt exact",
+  "owner/invariant/dependency refs unique",
+  "section projection cannot amend Architecture",
+]
+
+[[public_type]]
+name = "ArchitectureBriefRequest"
+kind = "struct"
+definition = [
+  "request_id: RequestId",
+  "normative_pair: AcceptedNormativePairIdentity",
+  "question_or_decision_ref: String",
+  "scope_id: String",
+  "task_id: Option<TaskId>",
+  "state_fence: StateFence",
+  "coverage: SelfQueryCoverage",
+  "requested_section_classes: Vec<ArchitectureSectionClass>",
+  "required_section_handles: Vec<ArtifactId>",
+  "maximum_sections: u32",
+  "maximum_rendered_bytes: u32",
+  "request_sha256: String",
+]
+invariants = [
+  "question/scope non-blank",
+  "classes/handles unique",
+  "bounds non-zero",
+  "request grants no document read, repository access, Architecture mutation or authority",
+]
+
+[[public_type]]
+name = "ArchitectureBrief"
+kind = "struct"
+definition = [
+  "request_sha256: String",
+  "normative_pair: AcceptedNormativePairIdentity",
+  "scope_id: String",
+  "task_id: Option<TaskId>",
+  "state_fence: StateFence",
+  "coverage: SelfQueryCoverage",
+  "sections: Vec<ArchitectureSectionProjection>",
+  "load_bearing_invariant_refs: Vec<String>",
+  "owner_boundary_refs: Vec<String>",
+  "failure_semantic_refs: Vec<String>",
+  "proof_requirement_refs: Vec<String>",
+  "replacement_boundary_refs: Vec<String>",
+  "open_question_refs: Vec<String>",
+  "omitted_section_handles: Vec<ArtifactId>",
+  "brief_sha256: String",
+]
+invariants = [
+  "all included sections occur in denominator or required handles",
+  "required omission remains explicit",
+  "Architecture precedence and open questions visible",
+  "contains no implementation/current-support or mutation decision",
+  "canonical order and digest",
+]
+
+[[public_type]]
+name = "ImplementationSupportState"
+kind = "enum"
+definition = [
+  "Target",
+  "ImplementedUnverified",
+  "CurrentVerified",
+  "OperationalObserved",
+  "ExperientialObserved",
+  "Contradicted",
+  "Unknown",
+  "NotApplicable",
+  "Stale",
+]
+
+[[public_type]]
+name = "ConformanceResult"
+kind = "enum"
+definition = ["Conformant", "Partial", "NonConformant", "Unknown", "Stale", "NotApplicable"]
+
+[[public_type]]
+name = "ImplementationClaimProjection"
+kind = "struct"
+definition = [
+  "claim_handle: ArtifactId",
+  "target_section_handle: ArtifactId",
+  "claim_identity: String",
+  "support_state: ImplementationSupportState",
+  "conformance: ConformanceResult",
+  "target_statement_handle: ArtifactId",
+  "implemented_shape_handles: Vec<ArtifactId>",
+  "verification_evidence_handles: Vec<ArtifactId>",
+  "operational_evidence_handles: Vec<ArtifactId>",
+  "experiential_evidence_handles: Vec<ArtifactId>",
+  "counterevidence_handles: Vec<ArtifactId>",
+  "dependency_revision_refs: Vec<String>",
+  "invalidation_conditions: Vec<String>",
+]
+invariants = [
+  "Target may have no current evidence",
+  "CurrentVerified requires applicable verification evidence",
+  "OperationalObserved requires operational evidence",
+  "ExperientialObserved requires owner-produced experience/outcome evidence",
+  "file existence or prose-only support cannot produce CurrentVerified",
+  "counterevidence and invalidation remain visible",
+]
+
+[[public_type]]
+name = "ImplementationBriefRequest"
+kind = "struct"
+definition = [
+  "request_id: RequestId",
+  "normative_pair: AcceptedNormativePairIdentity",
+  "architecture_brief_sha256: String",
+  "question_or_decision_ref: String",
+  "scope_id: String",
+  "task_id: Option<TaskId>",
+  "state_fence: StateFence",
+  "coverage: SelfQueryCoverage",
+  "required_target_section_handles: Vec<ArtifactId>",
+  "maximum_claims: u32",
+  "maximum_rendered_bytes: u32",
+  "request_sha256: String",
+]
+invariants = [
+  "Architecture brief and normative pair exact",
+  "target handles unique",
+  "bounds non-zero",
+  "request grants no repository/runtime read, current-support certification or implementation mutation",
+]
+
+[[public_type]]
+name = "ImplementationBrief"
+kind = "struct"
+definition = [
+  "request_sha256: String",
+  "normative_pair: AcceptedNormativePairIdentity",
+  "architecture_brief_sha256: String",
+  "scope_id: String",
+  "task_id: Option<TaskId>",
+  "state_fence: StateFence",
+  "coverage: SelfQueryCoverage",
+  "claims: Vec<ImplementationClaimProjection>",
+  "target_only_claim_handles: Vec<ArtifactId>",
+  "current_verified_claim_handles: Vec<ArtifactId>",
+  "operational_claim_handles: Vec<ArtifactId>",
+  "experiential_claim_handles: Vec<ArtifactId>",
+  "nonconformance_claim_handles: Vec<ArtifactId>",
+  "unknown_or_stale_claim_handles: Vec<ArtifactId>",
+  "missing_evidence_refs: Vec<String>",
+  "brief_sha256: String",
+]
+invariants = [
+  "each claim belongs to exactly one current support bucket",
+  "Target/current/operational/experiential/epistemic states remain separate",
+  "missing evidence remains explicit Unknown or Stale",
+  "Architecture precedence preserved",
+  "contains no self-certification, code mutation, workspace admission or proof promotion",
+  "canonical order and digest",
+]
+
+[[public_function]]
+name = "validate_architecture_brief_request"
+signature = "pub fn validate_architecture_brief_request(request: &ArchitectureBriefRequest) -> Result<(), SelfQueryContractError>"
+
+[[public_function]]
+name = "build_architecture_brief"
+signature = "pub fn build_architecture_brief(request: &ArchitectureBriefRequest, sections: &[ArchitectureSectionProjection]) -> Result<ArchitectureBrief, ArchitectureBriefError>"
+
+[[public_function]]
+name = "validate_architecture_brief"
+signature = "pub fn validate_architecture_brief(request: &ArchitectureBriefRequest, brief: &ArchitectureBrief) -> Result<(), SelfQueryContractError>"
+
+[[public_function]]
+name = "validate_implementation_brief_request"
+signature = "pub fn validate_implementation_brief_request(request: &ImplementationBriefRequest, architecture: &ArchitectureBrief) -> Result<(), SelfQueryContractError>"
+
+[[public_function]]
+name = "build_implementation_brief"
+signature = "pub fn build_implementation_brief(request: &ImplementationBriefRequest, architecture: &ArchitectureBrief, claims: &[ImplementationClaimProjection]) -> Result<ImplementationBrief, ImplementationBriefError>"
+
+[[public_function]]
+name = "validate_implementation_brief"
+signature = "pub fn validate_implementation_brief(request: &ImplementationBriefRequest, architecture: &ArchitectureBrief, brief: &ImplementationBrief) -> Result<(), SelfQueryContractError>"
+
+[[negative_test]]
+id = "wrong-normative-pair-rejected"
+property = "Brief input whose pair key or document digest differs from accepted receipt is rejected."
+
+[[negative_test]]
+id = "target-not-current"
+property = "Target claim without applicable current evidence cannot enter CurrentVerified, OperationalObserved or ExperientialObserved buckets."
+
+[[negative_test]]
+id = "file-presence-not-support"
+property = "File/crate/path presence alone cannot establish CurrentVerified."
+
+[[negative_test]]
+id = "prose-self-report-not-support"
+property = "Model or document prose claiming implementation cannot establish current support without owner-produced verification evidence."
+
+[[negative_test]]
+id = "missing-evidence-visible"
+property = "Missing owner evidence produces Unknown or Stale and an explicit missing-evidence ref."
+
+[[negative_test]]
+id = "brief-no-mutation-or-proof-promotion"
+property = "Neither brief exposes Architecture/Implementation mutation, workspace admission, proof promotion, Context admission, authority or task-finish fields."
