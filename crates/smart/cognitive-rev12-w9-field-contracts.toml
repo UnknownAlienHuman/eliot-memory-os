@@ -1,0 +1,90 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W9_FIELD_LEVEL_CONTRACT_FREEZE"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+orders = "76..86"
+cell_count = 11
+contract_count = 4
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+rule = "These contracts are the sole W9 field-level source for their named public types. Cell briefs own causal responsibility; crates own types; Rust, Edge Proof and Product Pulse remain unproven."
+
+[[contract]]
+id = "meta.memory.quality.v1"
+path = "crates/meta/eliot-memory-quality/quality.contract.toml"
+owner = "eliot-memory-quality"
+functional_cells = ["meta.memory.ecology_assessment", "meta.memory.gravity_assessment"]
+consumers = ["eliot-cognitive-quality", "eliot-dreamer-memory-revision", "Governor Diagnostic Compiler"]
+resolved_gap = "Memory ecology/gravity previously had function-level names but no exact coverage, dimension, evidence or action-candidate fields."
+
+[[contract]]
+id = "smart.dreamer.negative-memory-extinction.v1"
+path = "crates/smart/eliot-dreamer-memory-revision/negative-memory-extinction.contract.toml"
+owner = "eliot-dreamer-memory-revision"
+functional_cells = ["smart.dreamer.negative_memory_extinction"]
+consumers = ["Governor memory lifecycle/influence owner"]
+resolved_gap = "Negative-memory extinction previously lacked exact re-exposure denominator, trigger-match separation, candidate boundary and retained-history fields."
+
+[[contract]]
+id = "meta.cognitive.quality.v1"
+path = "crates/meta/eliot-cognitive-quality/quality.contract.toml"
+owner = "eliot-cognitive-quality"
+functional_cells = ["meta.skill.lifecycle_assessment", "meta.tool.surface_assessment", "meta.dreamer.job_economics", "governor.self_quality.view", "meta.self_quality.learning_bottleneck", "meta.self_quality.intervention_candidate"]
+consumers = ["Governor Diagnostic Compiler", "Governor maintenance/intervention owner", "Human review"]
+resolved_gap = "Skill/tool/Dreamer/self-quality families lacked one owner for stage evidence, coverage, dimension vectors, candidates and intervention boundaries."
+
+[[contract]]
+id = "meta.understanding.assessment.v1"
+path = "crates/meta/eliot-understanding-assessment/understanding.contract.toml"
+owner = "eliot-understanding-assessment"
+functional_cells = ["meta.common_ground.assessment", "meta.understanding.scoped_assessment"]
+consumers = ["route handoff/requalification owner", "Governor diagnostic owner", "Human review"]
+resolved_gap = "Common Ground and scoped understanding lacked exact public inheritance, prior-prediction, probe, revision, leakage and transfer fields."
+
+[[dependency]]
+provider = "smart.memory.projection-contracts.v1"
+consumer = "meta.memory.quality.v1"
+reason = "Memory quality consumes exact record/accessibility/influence identities and never becomes a canonical memory owner."
+
+[[dependency]]
+provider = "smart.learning.system-experience.v1"
+consumer = "meta.memory.quality.v1"
+reason = "Outcome attribution and attempt/effect evidence come from immutable System Experience contracts."
+
+[[dependency]]
+provider = "smart.learning.system-experience.v1"
+consumer = "smart.dreamer.negative-memory-extinction.v1"
+reason = "FailureObservation and outcome attribution remain owned by learning contracts."
+
+[[dependency]]
+provider = "meta.memory.quality.v1"
+consumer = "meta.cognitive.quality.v1"
+reason = "EliotSelfQualityView consumes immutable memory-quality assessments rather than recomputing memory lifecycle state."
+
+[[dependency]]
+provider = "smart.learning.system-experience.v1"
+consumer = "meta.cognitive.quality.v1"
+reason = "Skill/tool/Dreamer/learning quality uses owner-produced attempt/outcome evidence."
+
+[resolved_design_conflicts]
+activity_is_not_quality = "Installed, registered, advertised, generated, completed, delivered or retrieved states never imply use, utility, understanding or support."
+complete_coverage = "Every Complete assessment requires an exact recheckable denominator and exact observed count."
+negative_memory = "Semantic near-match is never a hard-block basis; extinction remains an advisory activation/influence candidate and preserves failure history."
+self_quality_owner = "Governor Diagnostic Compiler remains lifecycle owner; eliot-cognitive-quality only compiles immutable views/candidates."
+common_ground = "Public causal inheritance replaces summary similarity/native continuation state."
+scoped_understanding = "LocallyAdequate is scoped and requires rival-aware model, prior prediction, discriminator, applicable outcome/verifier and revision discipline."
+recurring_failure = "Unchanged failed causal hypothesis requires MechanismReview rather than equivalent retry."
+
+[still_open]
+challenges = ["real owner adapters", "dependency-locked package Module Proof", "real provider-consumer Edge Proof", "named Product Pulses", "runtime admission", "product acceptance"]
+not_proven = ["Rust implementation", "package behavior", "runtime support", "utility or understanding in production"]
+
+[forbidden]
+generic_json_or_vendor_types = true
+aggregate_intelligence_confidence_or_utility_score = true
+assessment_owned_canonical_state = true
+assessment_owned_lifecycle_or_policy_transition = true
+candidate_as_execution_receipt = true
+summary_similarity_as_common_ground = true
+post_hoc_prediction_as_understanding_evidence = true
