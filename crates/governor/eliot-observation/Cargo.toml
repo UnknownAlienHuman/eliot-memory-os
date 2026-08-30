@@ -6,6 +6,27 @@ rust-version.workspace = true
 license.workspace = true
 description = "Governor-owned observation admission, plan compilation and journal projection"
 
+[package.metadata.eliot]
+layer = "C1"
+purpose = "Own Governor observation admission, safe capture fallback, active-plan compilation and the rebuildable journal projection."
+source_maintenance_owner = "governor.observation"
+functional_cell_refs = [
+  "governor.observation.classifier",
+  "governor.observation.admission",
+  "governor.observation.plan_compilation",
+  "governor.observation.journal_projection",
+]
+independent_proof_profile = "eliot-observation"
+contract_refs = [
+  "ARCH-MEM-01",
+  "ARCH-LIFE-01",
+  "ARCH-SEC-02",
+  "ELIOT_IMPLEMENTATION:I4.8",
+  "ELIOT_IMPLEMENTATION:I5.5-I5.6",
+  "ELIOT_IMPLEMENTATION:I7.28",
+]
+component_contract_ref = ""
+
 [dependencies]
 eliot-contracts = { workspace = true }
 eliot-evidence = { workspace = true }
