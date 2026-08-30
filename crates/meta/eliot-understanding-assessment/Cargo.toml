@@ -15,6 +15,11 @@ purpose = "Common Ground and scoped understanding assessment"
 source_maintenance_owner = "cognitive-integration-owner"
 functional_cell_refs = ["meta.common_ground.assessment", "meta.understanding.scoped_assessment"]
 independent_proof_profile = "prototype-not-workspace-admitted"
-contract_refs = ["crates/smart/cognitive-current.toml"]
+contract_refs = [
+  "crates/smart/cognitive-current.toml",
+  "crates/smart/cognitive-rev12-w9-field-contracts.toml",
+  "crates/meta/eliot-understanding-assessment/assessment.contract.toml",
+]
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until both cells have Rust implementation, package Module Proof and affected real Edge/Product proof"
