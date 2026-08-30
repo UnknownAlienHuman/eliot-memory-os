@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema_version": "eliot.codex-app-server-stable-wire.v1",
+  "route_id": "codex.app-server.stdio",
+  "scope": "zero_model_diagnostic_wire_and_current_account_catalogue_parser",
+  "implementation_support": "PARTIAL",
+  "evidence_execution_status": "NOT_EXECUTED",
+  "executes_model": false,
+  "production_route_admission": false,
+  "upstream_schema_identity": {
+    "repository": "openai/codex",
+    "commit_sha": "63d213884daea50e4f74efc192cdc44f549b67d5",
+    "files": [
+      {
+        "path": "codex-rs/app-server-protocol/schema/typescript/v2/ModelListParams.ts",
+        "blob_sha": "dae406dd2dfdfa7c4298023ecd7dbf9729b5270f"
+      },
+      {
+        "path": "codex-rs/app-server-protocol/schema/typescript/v2/ModelListResponse.ts",
+        "blob_sha": "b664b6c0774e3daa1685c942972dcdf5bff28d7c"
+      },
+      {
+        "path": "codex-rs/app-server-protocol/schema/typescript/v2/Model.ts",
+        "blob_sha": "29defcdb3dbd08eb71db7480f6f76d25b8227295"
+      },
+      {
+        "path": "codex-rs/app-server-protocol/schema/typescript/v2/ReasoningEffortOption.ts",
+        "blob_sha": "ec18adfe43d56482e98230049f2af27b7d24c205"
+      },
+      {
+        "path": "codex-rs/app-server-protocol/schema/typescript/ReasoningEffort.ts",
+        "blob_sha": "d40f5bd6578e63f45f9fd0bee8d8979026561de7"
+      },
+      {
+        "path": "codex-rs/app-server-protocol/schema/typescript/InputModality.ts",
+        "blob_sha": "40d598df3db5a5aacdadabe08b94c5799d162775"
+      }
+    ]
+  },
+  "request_sequence": [
+    {
+      "method": "initialize",
+      "id": 1,
+      "params": {
+        "clientInfo": {
+          "name": "eliot",
+          "title": "ELIOT",
+          "version": "<crate-version>"
+        }
+      }
+    },
+    {
+      "method": "initialized",
+      "notification": true,
+      "params": {}
+    },
+    {
+      "method": "model/list",
+      "id": 2,
+      "params": {
+        "cursor": null,
+        "limit": 100,
+        "includeHidden": false
+      }
+    }
+  ],
+  "wire_rules": {
+    "transport": "stdio_jsonl",
+    "jsonrpc_member": "forbidden",
+    "protocolVersion_member": "forbidden_in_initialize",
+    "experimentalApi_member": "omitted_false_by_default",
+    "response_id_correlation": "exact",
+    "server_error_detail": "not_exposed_in_adapter_error",
+    "additive_model_fields": "ignored_without_changing_selected_fields"
+  },
+  "catalogue_contract": {
+    "page_shape": {
+      "data": "array<Model>",
+      "nextCursor": "string_or_null_required"
+    },
+    "selected_model_fields": [
+      "id",
+      "model",
+      "upgrade",
+      "displayName",
+      "description",
+      "modelSpecialty",
+      "hidden",
+      "supportedReasoningEfforts",
+      "defaultReasoningEffort",
+      "inputModalities",
+      "supportsPersonality",
+      "isDefault"
+    ],
+    "duplicate_model_id": "reject",
+    "repeated_cursor": "reject",
+    "empty_complete_catalogue": "honest_success",
+    "model_selection": "not_performed_by_this_diagnostic"
+  },
+  "bounds": {
+    "maximum_jsonl_line_bytes": 4194304,
+    "maximum_pages": 32,
+    "maximum_models": 4096,
+    "default_page_limit": 100
+  },
+  "forbidden_methods_in_this_slice": [
+    "thread/start",
+    "thread/resume",
+    "thread/fork",
+    "turn/start",
+    "turn/interrupt",
+    "experimental collaboration methods"
+  ],
+  "proof_entrypoints": [
+    "python scripts/verify-codex-app-server-wire.py --self-test",
+    "python scripts/verify-codex-app-server-wire.py",
+    "cargo test -p eliot-agent-codex app_server_stable_wire --all-targets",
+    "cargo run -q -p eliot-agent-codex --bin codex_app_server_preflight -- --emit-requests-only"
+  ],
+  "proof_ceiling": "Static verification can prove the declared source shape. Executed Rust package proof is still required. Even after package proof, this slice does not prove installed executable compatibility, current-account authentication, model acceptance, thread/turn execution, cancellation, process-tree containment, AgentAttempt completion, or route admission."
+}
