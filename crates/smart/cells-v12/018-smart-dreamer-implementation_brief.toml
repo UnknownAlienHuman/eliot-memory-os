@@ -1,0 +1,51 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+field_contract_is_sole_public_type_authority = true
+order = 18
+cell = "smart.dreamer.implementation_brief"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-self-query"
+primary_property = "Build a bounded ImplementationBrief that keeps normative target, implemented-unverified shape, current verified support, operational observations, experiential observations, contradiction, unknown and stale evidence separate."
+field_contract = "crates/smart/eliot-dreamer-self-query/self-query.contract.toml"
+public_function_selectors = [
+  "validate_implementation_brief_request",
+  "build_implementation_brief",
+  "validate_implementation_brief",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-self-query/src/implementation_brief.rs",
+  "crates/smart/eliot-dreamer-self-query/tests/implementation_brief.rs",
+]
+algorithm = [
+  "validate exact ArchitectureBrief, accepted normative pair, target sections, question, scope/task/fence and denominator",
+  "bind every implementation claim to one target section and stable claim identity",
+  "classify target, implemented-unverified, current-verified, operational, experiential, contradicted, unknown, not-applicable and stale support from exact owner evidence",
+  "require applicable verification evidence for CurrentVerified, operational evidence for OperationalObserved and experience/outcome evidence for ExperientialObserved",
+  "retain counterevidence, dependency revisions, missing evidence and invalidation conditions",
+  "partition every claim into exactly one current support bucket and compute canonical digest",
+]
+minimum_tests = [
+  "Target without current evidence cannot become CurrentVerified",
+  "file/crate/path presence cannot establish CurrentVerified",
+  "model or documentation prose cannot self-certify implementation",
+  "operational observation is not experiential/product outcome",
+  "counterevidence and stale dependencies remain visible",
+  "wrong ArchitectureBrief or normative pair rejected",
+  "brief contains no code/workspace/proof/Context admission mutation",
+]
+non_goals = [
+  "repository/runtime evidence acquisition",
+  "code or workspace mutation",
+  "self-certification",
+  "proof/workspace admission",
+  "Context admission",
+  "model/provider execution",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-SELF-01", "ARCH-UND-01", "ARCH-EPI-04", "ARCH-MOD-03"]
+implementation_refs = ["I2.20", "I12.23", "I12.34"]
+product_pulse = "D3A_SELF_QUERY_PULSE_01"
+stop_condition = "Return a ContractChallenge or Unknown/Stale/Contradicted claim rather than inferring current support from target text, file presence, prose, model report or unavailable owner evidence."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
