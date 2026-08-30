@@ -1,0 +1,166 @@
+schema = "eliot.capability-cells.v1"
+package = "eliot-runtime-contracts"
+
+# Pure C0 schemas and legality checks. These cells own no process, service,
+# authority, lease, ORS, Host-journal, publication, route or canonical state.
+
+[[cell]]
+cell_id = "foundation.runtime-contracts.lifecycle-core"
+causal_responsibility = "Define provider-neutral process, health, generation, cutover and recovery schemas plus pure legality checks."
+lifecycle_owner = "none.stateless-runtime-contract"
+runtime_owner = "none.stateless-runtime-contract"
+runtime_bundle = "eliot-runtime-contracts.rlib"
+execution_contour = "static_native"
+replacement_class = "offline_release"
+removal_boundary = "Replace only through additive compatibility or an explicit consumer migration of the runtime contract family."
+stateless = true
+allowed_effect_classes = []
+contract_owner = "contract.foundation.runtime-contracts"
+contract_sources = ["crates/foundation/eliot-runtime-contracts/src/lib.rs"]
+proof_entrypoint = "cargo test --locked -p eliot-runtime-contracts"
+proof_ceiling = "PACKAGE_PURE_CONTRACT_ONLY"
+edge_profiles = ["runtime-contract-consumer-compatibility"]
+product_pulse = "D0_RUNTIME_CONTRACT_COMPATIBILITY_01"
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+providers = ["foundation-contract-primitives"]
+consumers = ["host", "kernel", "watchdog", "runtime-status", "installation", "governor"]
+invalidation = ["source_sha", "normative_pair", "contract_digest", "consumer_contract_digest"]
+
+[[cell]]
+cell_id = "foundation.runtime-contracts.installation-activation"
+causal_responsibility = "Define and verify signed installation activation and SCM readback payloads without activating services or authority."
+lifecycle_owner = "none.stateless-runtime-contract"
+runtime_owner = "none.stateless-runtime-contract"
+runtime_bundle = "eliot-runtime-contracts.rlib"
+execution_contour = "static_native"
+replacement_class = "offline_release"
+removal_boundary = "Replace only with signature, nonce, digest, SCM-role and trust-anchor compatible activation contracts."
+stateless = true
+allowed_effect_classes = []
+contract_owner = "contract.foundation.runtime-contracts"
+contract_sources = ["crates/foundation/eliot-runtime-contracts/src/installation_activation.rs"]
+proof_entrypoint = "cargo test --locked -p eliot-runtime-contracts installation_activation"
+proof_ceiling = "PACKAGE_PURE_CONTRACT_ONLY"
+edge_profiles = ["installer-host-activation-contract"]
+product_pulse = "D0_RUNTIME_CONTRACT_COMPATIBILITY_01"
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+providers = ["foundation-contract-primitives", "ed25519-signature-provider"]
+consumers = ["installation", "host", "runtime-status"]
+invalidation = ["source_sha", "contract_digest", "signature_algorithm", "trust_anchor", "scm_role_contract"]
+
+[[cell]]
+cell_id = "foundation.runtime-contracts.runtime-live-store-identity"
+causal_responsibility = "Define exact live-store endpoint, namespace and binding identity without probing or owning the store process."
+lifecycle_owner = "none.stateless-runtime-contract"
+runtime_owner = "none.stateless-runtime-contract"
+runtime_bundle = "eliot-runtime-contracts.rlib"
+execution_contour = "static_native"
+replacement_class = "offline_release"
+removal_boundary = "Replace only with a consumer-compatible live-store identity contract and explicit endpoint migration."
+stateless = true
+allowed_effect_classes = []
+contract_owner = "contract.foundation.runtime-contracts"
+contract_sources = ["crates/foundation/eliot-runtime-contracts/src/runtime_live.rs"]
+proof_entrypoint = "cargo test --locked -p eliot-runtime-contracts runtime_live"
+proof_ceiling = "PACKAGE_PURE_CONTRACT_ONLY"
+edge_profiles = ["store-bridge-runtime-status-identity"]
+product_pulse = "D0_RUNTIME_CONTRACT_COMPATIBILITY_01"
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+providers = ["foundation-contract-primitives"]
+consumers = ["store-bridge", "runtime-status", "installation"]
+invalidation = ["source_sha", "contract_digest", "store_endpoint_contract", "store_namespace_contract"]
+
+[[cell]]
+cell_id = "foundation.runtime-contracts.supervision-authority"
+causal_responsibility = "Define provisioned supervision authority and sealed-key references without materializing keys or granting authority."
+lifecycle_owner = "none.stateless-runtime-contract"
+runtime_owner = "none.stateless-runtime-contract"
+runtime_bundle = "eliot-runtime-contracts.rlib"
+execution_contour = "static_native"
+replacement_class = "offline_release"
+removal_boundary = "Replace only with equivalent service-SID, provider and sealed-key identity semantics."
+stateless = true
+allowed_effect_classes = []
+contract_owner = "contract.foundation.runtime-contracts"
+contract_sources = ["crates/foundation/eliot-runtime-contracts/src/supervision_authority.rs"]
+proof_entrypoint = "cargo test --locked -p eliot-runtime-contracts supervision_authority"
+proof_ceiling = "PACKAGE_PURE_CONTRACT_ONLY"
+edge_profiles = ["installation-watchdog-supervision-authority"]
+product_pulse = "D0_RUNTIME_CONTRACT_COMPATIBILITY_01"
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+providers = ["foundation-contract-primitives"]
+consumers = ["installation", "watchdog", "runtime-status"]
+invalidation = ["source_sha", "contract_digest", "service_sid_contract", "secret_provider_contract"]
+
+[[cell]]
+cell_id = "foundation.runtime-contracts.supervision-incarnation"
+causal_responsibility = "Define canonical supervision journal epoch, lease incarnation, predecessor and scope identities without owning their lifecycle."
+lifecycle_owner = "none.stateless-runtime-contract"
+runtime_owner = "none.stateless-runtime-contract"
+runtime_bundle = "eliot-runtime-contracts.rlib"
+execution_contour = "static_native"
+replacement_class = "offline_release"
+removal_boundary = "Replace only with a lossless incarnation/predecessor identity migration across all supervision consumers."
+stateless = true
+allowed_effect_classes = []
+contract_owner = "contract.foundation.runtime-contracts"
+contract_sources = ["crates/foundation/eliot-runtime-contracts/src/supervision_incarnation.rs"]
+proof_entrypoint = "cargo test --locked -p eliot-runtime-contracts supervision_incarnation"
+proof_ceiling = "PACKAGE_PURE_CONTRACT_ONLY"
+edge_profiles = ["kernel-watchdog-supervision-incarnation"]
+product_pulse = "D0_RUNTIME_CONTRACT_COMPATIBILITY_01"
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+providers = ["foundation-contract-primitives"]
+consumers = ["kernel-ors", "watchdog", "runtime-status"]
+invalidation = ["source_sha", "contract_digest", "epoch_identity_contract", "predecessor_contract"]
+
+[[cell]]
+cell_id = "foundation.runtime-contracts.supervision-lease"
+causal_responsibility = "Define, sign and verify supervision lease payloads and terminal transitions without issuing, renewing or revoking a live lease."
+lifecycle_owner = "none.stateless-runtime-contract"
+runtime_owner = "none.stateless-runtime-contract"
+runtime_bundle = "eliot-runtime-contracts.rlib"
+execution_contour = "static_native"
+replacement_class = "offline_release"
+removal_boundary = "Replace only with signature-, incarnation-, ORS-mirror- and terminal-transition-compatible lease contracts."
+stateless = true
+allowed_effect_classes = []
+contract_owner = "contract.foundation.runtime-contracts"
+contract_sources = ["crates/foundation/eliot-runtime-contracts/src/supervision_lease.rs"]
+proof_entrypoint = "cargo test --locked -p eliot-runtime-contracts supervision_lease"
+proof_ceiling = "PACKAGE_PURE_CONTRACT_ONLY"
+edge_profiles = ["kernel-watchdog-supervision-lease"]
+product_pulse = "D0_RUNTIME_CONTRACT_COMPATIBILITY_01"
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+providers = ["foundation-contract-primitives", "ed25519-signature-provider"]
+consumers = ["kernel-ors", "watchdog", "runtime-status"]
+invalidation = ["source_sha", "contract_digest", "signature_algorithm", "lease_schema", "incarnation_contract"]
+
+[[cell]]
+cell_id = "foundation.runtime-contracts.watchdog-admission-publication"
+causal_responsibility = "Define Watchdog admission, publication bundle and retention-plan shapes without writing publication files or admitting Watchdog."
+lifecycle_owner = "none.stateless-runtime-contract"
+runtime_owner = "none.stateless-runtime-contract"
+runtime_bundle = "eliot-runtime-contracts.rlib"
+execution_contour = "static_native"
+replacement_class = "offline_release"
+removal_boundary = "Replace only with publication-path, retention, bundle and admission-schema compatible contracts."
+stateless = true
+allowed_effect_classes = []
+contract_owner = "contract.foundation.runtime-contracts"
+contract_sources = ["crates/foundation/eliot-runtime-contracts/src/watchdog_admission.rs"]
+proof_entrypoint = "cargo test --locked -p eliot-runtime-contracts watchdog_admission"
+proof_ceiling = "PACKAGE_PURE_CONTRACT_ONLY"
+edge_profiles = ["host-watchdog-admission-publication"]
+product_pulse = "D0_RUNTIME_CONTRACT_COMPATIBILITY_01"
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+providers = ["foundation-contract-primitives"]
+consumers = ["host", "watchdog", "runtime-status"]
+invalidation = ["source_sha", "contract_digest", "publication_schema", "retention_contract", "admission_schema"]
