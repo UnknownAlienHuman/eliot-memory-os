@@ -1,0 +1,64 @@
+{
+  "schema_version": "eliot.claude-agent-sdk-sidecar.v2",
+  "transport": "stdio_ndjson",
+  "requests": [
+    "hello",
+    "probe",
+    "start",
+    "cancel",
+    "shutdown"
+  ],
+  "events": [
+    "attempt.started",
+    "assistant.text",
+    "tool.requested",
+    "tool.result",
+    "provider.error",
+    "attempt.result",
+    "attempt.cancelled",
+    "attempt.failed",
+    "attempt.cleanup"
+  ],
+  "limits": {
+    "max_frame_bytes": 1048576,
+    "max_prompt_bytes": 262144,
+    "max_event_bytes": 262144,
+    "max_result_bytes": 524288,
+    "max_turns": 128,
+    "max_budget_usd": 100.0,
+    "cancel_settle_ms": 5000,
+    "shutdown_settle_ms": 5000
+  },
+  "permission_modes": [
+    "default",
+    "acceptEdits",
+    "plan",
+    "dontAsk"
+  ],
+  "forbidden_permission_modes": [
+    "bypassPermissions"
+  ],
+  "setting_sources": [],
+  "ambient_settings_allowed": false,
+  "raw_mcp_servers_allowed": false,
+  "raw_mcp_commands_allowed": false,
+  "raw_plugin_paths_allowed": false,
+  "raw_skill_bodies_allowed": false,
+  "credentials_in_requests_allowed": false,
+  "profile_resolution": "eliot_registry_ids_only",
+  "model_catalogue_supported": false,
+  "model_selection": "external_receipt_per_attempt",
+  "fixed_model_id": null,
+  "native_subagents": false,
+  "native_subagent_admission": "disabled_until_work_item_event_and_descendant_closure_proof",
+  "terminal_result_separate_from_event_history": true,
+  "cancellation": "attempt_bound_interrupt_then_terminal_and_cleanup_reconciliation",
+  "task_authority": false,
+  "attempt_authority": false,
+  "finish_authority": false,
+  "recovery_authority": false,
+  "swarm_control_plane": "eliot.coordinate",
+  "worker_result_authority": "candidate_only",
+  "route_admitted": false,
+  "proof_ceiling": "FAKE_SDK_AND_PROTOCOL_BEHAVIOR_ONLY"
+}
