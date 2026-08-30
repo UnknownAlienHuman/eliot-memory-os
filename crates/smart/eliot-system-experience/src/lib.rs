@@ -92,7 +92,7 @@ impl ExperienceSourceCoverage {
 pub struct ExperienceProjectionRequest {
     /// Non-zero revision assigned by the real provider/owner.
     pub source_revision: u64,
-    /// Exact WorkScope-relative scope admitted by the provider.
+    /// Exact `WorkScope`-relative scope admitted by the provider.
     pub scope: String,
     /// Frozen source denominator and any known omission.
     pub coverage: ExperienceSourceCoverage,
@@ -164,9 +164,24 @@ impl ExperienceProjection {
                 reason: "must be non-zero",
             });
         }
+        if self.source_record_count > MAX_SOURCE_RECORDS {
+            return Err(ExperienceProjectionError::LimitExceeded {
+                field: "projection.source_record_count",
+                limit: MAX_SOURCE_RECORDS,
+            });
+        }
+        if self.relations.len() > MAX_SOURCE_RELATIONS {
+            return Err(ExperienceProjectionError::LimitExceeded {
+                field: "projection.relations",
+                limit: MAX_SOURCE_RELATIONS,
+            });
+        }
         self.coverage.validate(self.source_record_count)?;
+        validate_normalized_query(&self.query)?;
         if self.returned_record_count != self.matches.len()
+            || self.returned_record_count > self.query.limit
             || self.matched_record_count < self.returned_record_count
+            || self.matched_record_count > self.source_record_count
             || self.omitted_by_limit
                 != self
                     .matched_record_count
@@ -174,18 +189,19 @@ impl ExperienceProjection {
         {
             return Err(ExperienceProjectionError::Invalid {
                 field: "projection.counts",
-                reason: "matched, returned, and omitted counts are inconsistent",
+                reason: "source, matched, returned, and omitted counts are inconsistent",
             });
         }
+
         let mut ids = BTreeSet::new();
+        let mut previous_experience_id: Option<&ArtifactId> = None;
         for (rank, item) in self.matches.iter().enumerate() {
             item.record.validate()?;
-            if item.record.evidence.provenance.scope != self.scope {
-                return Err(ExperienceProjectionError::WrongScope {
-                    experience_id: item.record.experience_id.clone(),
-                    expected: self.scope.clone(),
-                    actual: item.record.evidence.provenance.scope.clone(),
-                });
+            ensure_record_scope(&item.record, &self.scope)?;
+            if !record_matches_query(&item.record, &self.query) {
+                return Err(ExperienceProjectionError::QueryMismatch(
+                    item.record.experience_id.clone(),
+                ));
             }
             if item.rank != rank || !ids.insert(item.record.experience_id.clone()) {
                 return Err(ExperienceProjectionError::Invalid {
@@ -193,15 +209,36 @@ impl ExperienceProjection {
                     reason: "ranks must be contiguous and identities unique",
                 });
             }
+            if previous_experience_id
+                .is_some_and(|previous| previous >= &item.record.experience_id)
+            {
+                return Err(ExperienceProjectionError::Invalid {
+                    field: "projection.matches",
+                    reason: "records must be strictly ordered by identity",
+                });
+            }
+            previous_experience_id = Some(&item.record.experience_id);
         }
+
         let mut relation_ids = BTreeSet::new();
+        let mut previous_relation_id: Option<&ArtifactId> = None;
         for relation in &self.relations {
             relation.validate()?;
+            ensure_relation_scope(relation, &self.scope)?;
             if !relation_ids.insert(relation.relation_id.clone()) {
                 return Err(ExperienceProjectionError::DuplicateRelation(
                     relation.relation_id.clone(),
                 ));
             }
+            if previous_relation_id
+                .is_some_and(|previous| previous >= &relation.relation_id)
+            {
+                return Err(ExperienceProjectionError::Invalid {
+                    field: "projection.relations",
+                    reason: "relations must be strictly ordered by identity",
+                });
+            }
+            previous_relation_id = Some(&relation.relation_id);
             if !ids.contains(&relation.from) {
                 return Err(ExperienceProjectionError::UnknownEndpoint(
                     relation.from.clone(),
@@ -213,6 +250,7 @@ impl ExperienceProjection {
                 ));
             }
         }
+
         let expected = projection_digest(self)?;
         if self.digest != expected {
             return Err(ExperienceProjectionError::DigestMismatch);
@@ -254,6 +292,14 @@ pub enum ExperienceProjectionError {
         expected: String,
         actual: String,
     },
+    #[error("relation {relation_id} belongs to {actual}, expected {expected}")]
+    WrongRelationScope {
+        relation_id: ArtifactId,
+        expected: String,
+        actual: String,
+    },
+    #[error("experience does not satisfy the normalized query: {0}")]
+    QueryMismatch(ArtifactId),
     #[error("projection digest does not match its canonical content")]
     DigestMismatch,
 }
@@ -294,13 +340,7 @@ pub fn project_experience(
     let mut ordered = Vec::with_capacity(experiences.len());
     for record in experiences {
         record.validate()?;
-        if record.evidence.provenance.scope != request.scope {
-            return Err(ExperienceProjectionError::WrongScope {
-                experience_id: record.experience_id.clone(),
-                expected: request.scope.clone(),
-                actual: record.evidence.provenance.scope.clone(),
-            });
-        }
+        ensure_record_scope(record, &request.scope)?;
         if !source_ids.insert(record.experience_id.clone()) {
             return Err(ExperienceProjectionError::DuplicateExperience(
                 record.experience_id.clone(),
@@ -313,6 +353,7 @@ pub fn project_experience(
     let mut relation_ids = BTreeSet::new();
     for relation in relations {
         relation.validate()?;
+        ensure_relation_scope(relation, &request.scope)?;
         if !relation_ids.insert(relation.relation_id.clone()) {
             return Err(ExperienceProjectionError::DuplicateRelation(
                 relation.relation_id.clone(),
@@ -332,26 +373,7 @@ pub fn project_experience(
 
     let filtered = ordered
         .into_iter()
-        .filter(|record| {
-            query
-                .task_id
-                .as_ref()
-                .is_none_or(|task| record.task_id.as_ref() == Some(task))
-        })
-        .filter(|record| {
-            query
-                .lifecycle
-                .is_none_or(|lifecycle| record.lifecycle == lifecycle)
-        })
-        .filter(|record| {
-            query.statuses.is_empty() || query.statuses.contains(&record.evidence.status)
-        })
-        .filter(|record| {
-            query
-                .terms
-                .iter()
-                .all(|term| contains_normalized_term(record, term))
-        })
+        .filter(|record| record_matches_query(record, &query))
         .collect::<Vec<_>>();
     let matched_record_count = filtered.len();
     let returned = filtered
@@ -415,18 +437,7 @@ fn normalize_query(
     let mut terms = Vec::with_capacity(request.terms.len());
     for term in &request.terms {
         let normalized = term.trim().to_lowercase();
-        if normalized.is_empty() || normalized.chars().any(char::is_control) {
-            return Err(ExperienceProjectionError::Invalid {
-                field: "request.terms",
-                reason: "terms must be non-blank and free of control characters",
-            });
-        }
-        if normalized.len() > MAX_QUERY_TERM_BYTES {
-            return Err(ExperienceProjectionError::LimitExceeded {
-                field: "request.term",
-                limit: MAX_QUERY_TERM_BYTES,
-            });
-        }
+        validate_normalized_term(&normalized)?;
         terms.push(normalized);
     }
     terms.sort();
@@ -436,7 +447,7 @@ fn normalize_query(
     statuses.sort_by_key(|status| status_order(*status));
     statuses.dedup();
 
-    Ok(NormalizedExperienceQuery {
+    let query = NormalizedExperienceQuery {
         task_id: request.task_id.clone(),
         lifecycle: request.lifecycle,
         statuses,
@@ -446,7 +457,117 @@ fn normalize_query(
         } else {
             request.limit
         },
-    })
+    };
+    validate_normalized_query(&query)?;
+    Ok(query)
+}
+
+fn validate_normalized_query(
+    query: &NormalizedExperienceQuery,
+) -> Result<(), ExperienceProjectionError> {
+    if query.limit == 0 || query.limit > MAX_QUERY_RESULTS {
+        return Err(ExperienceProjectionError::Invalid {
+            field: "projection.query.limit",
+            reason: "must be within the bounded non-zero result range",
+        });
+    }
+    if query.terms.len() > MAX_QUERY_TERMS {
+        return Err(ExperienceProjectionError::LimitExceeded {
+            field: "projection.query.terms",
+            limit: MAX_QUERY_TERMS,
+        });
+    }
+    for term in &query.terms {
+        validate_normalized_term(term)?;
+        if term.trim() != term || term.to_lowercase() != *term {
+            return Err(ExperienceProjectionError::Invalid {
+                field: "projection.query.terms",
+                reason: "terms must already be trimmed and lowercase",
+            });
+        }
+    }
+    if !strictly_increasing(&query.terms) {
+        return Err(ExperienceProjectionError::Invalid {
+            field: "projection.query.terms",
+            reason: "terms must be strictly ordered and unique",
+        });
+    }
+    if query
+        .statuses
+        .windows(2)
+        .any(|pair| status_order(pair[0]) >= status_order(pair[1]))
+    {
+        return Err(ExperienceProjectionError::Invalid {
+            field: "projection.query.statuses",
+            reason: "statuses must be strictly ordered and unique",
+        });
+    }
+    Ok(())
+}
+
+fn validate_normalized_term(term: &str) -> Result<(), ExperienceProjectionError> {
+    if term.is_empty() || term.chars().any(char::is_control) {
+        return Err(ExperienceProjectionError::Invalid {
+            field: "request.terms",
+            reason: "terms must be non-blank and free of control characters",
+        });
+    }
+    if term.len() > MAX_QUERY_TERM_BYTES {
+        return Err(ExperienceProjectionError::LimitExceeded {
+            field: "request.term",
+            limit: MAX_QUERY_TERM_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn ensure_record_scope(
+    record: &ExperienceRecord,
+    expected_scope: &str,
+) -> Result<(), ExperienceProjectionError> {
+    if record.evidence.provenance.scope == expected_scope {
+        Ok(())
+    } else {
+        Err(ExperienceProjectionError::WrongScope {
+            experience_id: record.experience_id.clone(),
+            expected: expected_scope.to_owned(),
+            actual: record.evidence.provenance.scope.clone(),
+        })
+    }
+}
+
+fn ensure_relation_scope(
+    relation: &RelationRecord,
+    expected_scope: &str,
+) -> Result<(), ExperienceProjectionError> {
+    if relation.provenance.scope == expected_scope {
+        Ok(())
+    } else {
+        Err(ExperienceProjectionError::WrongRelationScope {
+            relation_id: relation.relation_id.clone(),
+            expected: expected_scope.to_owned(),
+            actual: relation.provenance.scope.clone(),
+        })
+    }
+}
+
+fn record_matches_query(record: &ExperienceRecord, query: &NormalizedExperienceQuery) -> bool {
+    query
+        .task_id
+        .as_ref()
+        .is_none_or(|task| record.task_id.as_ref() == Some(task))
+        && query
+            .lifecycle
+            .is_none_or(|lifecycle| record.lifecycle == lifecycle)
+        && (query.statuses.is_empty() || query.statuses.contains(&record.evidence.status))
+        && query
+            .terms
+            .iter()
+            .all(|term| contains_normalized_term(record, term))
+}
+
+fn strictly_increasing(values: &[String]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn validate_text(value: &str, field: &'static str) -> Result<(), ExperienceProjectionError> {
@@ -556,6 +677,7 @@ mod tests {
         id: &str,
         from: &str,
         to: &str,
+        scope: &str,
     ) -> Result<RelationRecord, Box<dyn std::error::Error>> {
         Ok(RelationRecord {
             relation_id: ArtifactId::new(id)?,
@@ -563,7 +685,7 @@ mod tests {
             to: ArtifactId::new(to)?,
             kind: RelationKind::ObservedIn,
             status: EpistemicStatus::Observed,
-            provenance: provenance("scope-a")?,
+            provenance: provenance(scope)?,
             lifecycle: LifecycleState::Active,
         })
     }
@@ -585,7 +707,7 @@ mod tests {
     fn projection_is_permutation_invariant() -> Result<(), Box<dyn std::error::Error>> {
         let first = experience("exp-a", "scope-a", "task-a", "passed")?;
         let second = experience("exp-b", "scope-a", "task-a", "passed")?;
-        let edge = relation("rel-a", "exp-a", "exp-b")?;
+        let edge = relation("rel-a", "exp-a", "exp-b", "scope-a")?;
 
         let left = project_experience(
             request(2),
@@ -638,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_scope_and_unknown_relation_endpoint_fail_closed()
+    fn scope_and_relation_endpoint_failures_are_typed()
     -> Result<(), Box<dyn std::error::Error>> {
         let wrong_scope = experience("exp-a", "scope-b", "task-a", "passed")?;
         assert!(matches!(
@@ -647,9 +769,19 @@ mod tests {
         ));
 
         let record = experience("exp-a", "scope-a", "task-a", "passed")?;
-        let edge = relation("rel-a", "exp-a", "missing")?;
+        let wrong_relation_scope = relation("rel-a", "exp-a", "exp-a", "scope-b")?;
         assert!(matches!(
-            project_experience(request(1), &[record], &[edge]),
+            project_experience(
+                request(1),
+                std::slice::from_ref(&record),
+                &[wrong_relation_scope]
+            ),
+            Err(ExperienceProjectionError::WrongRelationScope { .. })
+        ));
+
+        let missing_endpoint = relation("rel-b", "exp-a", "missing", "scope-a")?;
+        assert!(matches!(
+            project_experience(request(1), &[record], &[missing_endpoint]),
             Err(ExperienceProjectionError::UnknownEndpoint(_))
         ));
         Ok(())
@@ -669,6 +801,44 @@ mod tests {
         assert!(matches!(
             projection.validate(),
             Err(ExperienceProjectionError::DigestMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn forged_query_membership_and_count_cannot_self_validate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let record = experience("exp-a", "scope-a", "task-a", "passed")?;
+        let mut noncanonical_query = project_experience(
+            request(1),
+            std::slice::from_ref(&record),
+            &[],
+        )?;
+        noncanonical_query.query.terms = vec!["PASS".to_owned()];
+        assert!(matches!(
+            noncanonical_query.validate(),
+            Err(ExperienceProjectionError::Invalid {
+                field: "projection.query.terms",
+                ..
+            })
+        ));
+
+        let mut wrong_membership = project_experience(request(1), &[record], &[])?;
+        wrong_membership.query.task_id = Some(TaskId::new("other-task")?);
+        assert!(matches!(
+            wrong_membership.validate(),
+            Err(ExperienceProjectionError::QueryMismatch(_))
+        ));
+
+        let record = experience("exp-b", "scope-a", "task-a", "passed")?;
+        let mut impossible_count = project_experience(request(1), &[record], &[])?;
+        impossible_count.matched_record_count = 2;
+        assert!(matches!(
+            impossible_count.validate(),
+            Err(ExperienceProjectionError::Invalid {
+                field: "projection.counts",
+                ..
+            })
         ));
         Ok(())
     }
