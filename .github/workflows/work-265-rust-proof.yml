@@ -44,49 +44,40 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-work-265-${{ hashFiles('Cargo.lock') }}
 
-      - name: Remove redundant direct hash dependency
+      - name: Verify canonical Rust formatting
+        run: cargo fmt -p eliot-agent-coordinator -- --check
+
+      - name: Reconcile exact lock delta and compile
         shell: pwsh
         run: |
-          $sourcePath = 'crates/agent/eliot-agent-coordinator/src/model_control.rs'
-          $source = [IO.File]::ReadAllText($sourcePath)
-          $source = [Text.RegularExpressions.Regex]::Replace(
-            $source,
-            '(?m)^use sha2::\{Digest, Sha256\};\r?\n',
-            ''
-          )
-          $old = 'Ok(format!("sha256:{:x}", Sha256::digest(bytes)))'
-          $new = 'Ok(format!("sha256:{}", eliot_receipts::sha256_hex(&bytes)))'
-          if (-not $source.Contains($old)) {
-            throw 'SOURCE_PATCH_PRECONDITION_FAILED: canonical digest expression not found'
+          cargo check -p eliot-agent-coordinator --all-targets
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
           }
-          $source = $source.Replace($old, $new)
-          [IO.File]::WriteAllText($sourcePath, $source, [Text.UTF8Encoding]::new($false))
 
-          $cargoPath = 'crates/agent/eliot-agent-coordinator/Cargo.toml'
-          $cargo = [IO.File]::ReadAllText($cargoPath)
-          $cargo = [Text.RegularExpressions.Regex]::Replace(
-            $cargo,
-            '(?m)^sha2\.workspace = true\r?\n',
-            ''
-          )
-          [IO.File]::WriteAllText($cargoPath, $cargo, [Text.UTF8Encoding]::new($false))
+          $changed = @(git diff --name-only)
+          $unexpected = @($changed | Where-Object { $_ -ne 'Cargo.lock' })
+          if ($unexpected.Count -gt 0) {
+            git diff --check
+            git diff
+            throw "UNEXPECTED_GENERATED_CHANGE: $($unexpected -join ', ')"
+          }
 
-      - name: Apply canonical Rust formatting
-        run: cargo fmt -p eliot-agent-coordinator
+          if (-not (git diff --quiet -- Cargo.lock)) {
+            Write-Host 'CARGO_LOCK_DELTA_BEGIN'
+            git diff -- Cargo.lock
+            Write-Host 'CARGO_LOCK_DELTA_END'
 
-      - name: Commit exact candidate before proof
-        shell: pwsh
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add crates/agent/eliot-agent-coordinator
-          if (-not (git diff --cached --quiet)) {
-            git commit -m 'fix(swarm): reuse foundation hash contract [proof-bot]'
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add Cargo.lock
+            git commit -m 'chore(swarm): reconcile coordinator lock entry [proof-bot]'
             git push origin HEAD:work/265-swarm-model-catalogue-control
           }
+
           Write-Host "PROOF_SOURCE_SHA=$((git rev-parse HEAD).Trim())"
 
-      - name: Check coordinator
+      - name: Check coordinator with frozen lock
         run: cargo check --locked -p eliot-agent-coordinator --all-targets
 
       - name: Test coordinator
@@ -98,6 +89,7 @@ jobs:
       - name: Verify clean proved tree
         shell: pwsh
         run: |
+          cargo fmt -p eliot-agent-coordinator -- --check
           if (-not (git diff --quiet)) {
             git diff --check
             git diff
