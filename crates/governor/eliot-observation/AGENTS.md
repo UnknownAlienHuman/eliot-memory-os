@@ -3,113 +3,120 @@
 ## Purpose and owner boundary
 
 This package is the Governor-owned semantic boundary for normalized observation
-capture. It owns deterministic first-pass classification, safe candidate
-fallback, observation admission, active-plan compilation and the rebuildable
-journal projection. It does not own sensors, Host/process truth, Canonical Store
-execution, task selection, epistemic promotion, memory lifecycle, graph
-relations, Context admission, finish or external effects.
+capture. It owns observation admission, safe candidate fallback, active-plan
+compilation and the rebuildable journal projection. It will also host the
+private first-pass classifier after the foundation record-family contract can
+represent the evidence that classifier needs.
 
-Read the repository and `crates/governor/AGENTS.md`, the owning issue/PR,
-`classifier.module.toml`, exact foundation contracts and applicable
-Architecture/Implementation fragments before mutation. Use one issue-numbered
-branch and one primary mutable path scope.
+It does not own sensors, Host/process truth, Canonical Store execution, task
+selection, epistemic promotion, memory lifecycle, graph relations, Context
+admission, finish or external effects.
 
-## Functional cells
+Read the repository and `crates/governor/AGENTS.md`, the owning issue/PR, exact
+foundation contracts and applicable Architecture/Implementation fragments
+before mutation. Use one issue-numbered branch and one primary mutable path
+scope.
 
-### `governor.observation.classifier`
+## Current ContractChallenge: record-family evidence
 
-Target private module:
+Issue #217 blocks ordinary-family classifier implementation.
+
+The current `eliot-observation-contracts::ObservationRecordEnvelope` preserves
+only:
 
 ```text
-src/classifier.rs
+record_id;
+caller-supplied ObservationRecordKind;
+one generic ObservationEventCore for every ordinary family;
+optional CoverageGap;
+journal_control_event;
+parent_record_id.
 ```
 
-Required private API or an equivalently closed representation:
+The foundation crate separately defines richer `AuditRecord`,
+`TelemetryRecord`, `ChangeRecord` and `MaintenanceRecord` values, but those
+family-specific fields do not survive inside the public envelope consumed by
+this package. The contract also contains no accepted
+`ObservationKind -> ObservationRecordKind` matrix.
 
-```rust
-pub(crate) enum FirstPassClassificationDisposition {
-    Exact,
-    CompatibleHint,
-    AmbiguousPreserveCandidate,
-    ConflictingHint,
-}
+Consequences:
 
-pub(crate) struct FirstPassClassification {
-    pub expected_record_kind: Option<ObservationRecordKind>,
-    pub observed_record_kind: ObservationRecordKind,
-    pub disposition: FirstPassClassificationDisposition,
-    pub reason_ref: &'static str,
-}
+- `CoverageGap` is mechanically exact;
+- `journal_control_event` mechanically requires `Audit` and is already checked
+  by the foundation contract;
+- ordinary `Audit`, `Telemetry`, `Change` and `Maintenance` labels cannot be
+  independently confirmed or contradicted from the current envelope;
+- a table inferred from event prose, event kind, producer role, recency or model
+  judgement would create a new public semantic contract in the wrong owner.
 
-pub(crate) fn classify_record(
-    record: &ObservationRecordEnvelope,
-) -> FirstPassClassification;
+Until #217 freezes one field-complete versioned contract and compatibility rule:
 
-pub(crate) fn validate_record_classification(
-    record: &ObservationRecordEnvelope,
-) -> Result<FirstPassClassification, ObservationClassificationError>;
+```text
+do not add src/classifier.rs with an ordinary-family mapping;
+do not report exact, compatible or conflicting ordinary classification;
+do not add a local RecordFamilyEvidence/public schema substitute;
+do not treat caller-supplied kind as independent classification proof;
+do not weaken capture to reject a shape-valid ambiguous observation.
 ```
 
-Classification algorithm:
+Return this ContractChallenge to the integration owner. Work that does not
+require the missing distinction may continue. Shape-valid ordinary material is
+preserved under the existing capture/candidate ceiling; it is not promoted by a
+private guess.
 
-1. Validate or consume only an already normalized bounded record shape. The
-   classifier does not parse raw host payloads or infer a `WorkScope`.
-2. A dedicated `CoverageGap` shape is an exact operational discriminator and
-   cannot be relabelled by a caller hint.
-3. An event family with one unambiguous operational record family may return
-   `Exact`.
-4. When the contract admits several record families, preserve the supplied
-   family only as `CompatibleHint`; do not select from prose, recency,
-   popularity, source role or semantic similarity.
-5. When evidence is insufficient, return `AmbiguousPreserveCandidate`. The
-   normal capture path preserves the observation as a cold/bounded candidate.
-6. When an exact discriminator contradicts the supplied family, return
-   `ConflictingHint`; normal admission must fail into the existing
-   `ObservationCandidate` fallback rather than commit a convenient family.
-7. Results are deterministic, total and side-effect free. Equivalent normalized
-   input produces the same disposition and reason reference.
-8. Classification never changes `EpistemicStatus`, `Assertability`, evidence
-   authority, influence, task binding, lifecycle, relation or finish state.
+## `governor.observation.classifier` after #217
+
+The classifier remains a private module inside this package, not a separate
+crate. Its exact API must consume the accepted foundation contract rather than
+redefine public fields. An acceptable closed private result will distinguish:
+
+```text
+Exact;
+CompatibleHint;
+AmbiguousPreserveCandidate;
+ConflictingHint.
+```
+
+Required behavior after the contract is frozen:
+
+1. Consume only a validated, bounded, versioned record-family representation.
+2. Use only mechanical discriminators owned by the foundation contract.
+3. Preserve ambiguity rather than choose by convenience or textual similarity.
+4. Route a mechanically proved conflict through the existing pre-stage
+   rejection and safe `ObservationCandidate` fallback.
+5. Remain deterministic, total, bounded and side-effect free.
+6. Never change `EpistemicStatus`, `Assertability`, evidence authority,
+   influence, task binding, lifecycle, relation, authority or finish state.
+7. Preserve request/idempotency identity and replay the original disposition.
 
 Donor boundary:
 
 ```text
 crates/smart/eliot-memory::classify
-  retain only the table-driven first-pass idea;
+  retain only the small table-driven idea after it is reconciled with the
+  accepted foundation contract;
 
 MemoryPlane, MemoryId, local revision allocation, delivery dedup, retrieval,
 status/lifecycle/influence mutation and UnderstandingView
   reject completely as duplicate state ownership.
 ```
 
-Integration points:
-
-- `ObservationSubmission::validate` checks exact classification conflicts after
-  the foundation record shape validates;
-- `ObservationJournal::admit` preserves the existing idempotency/replay order;
-- a classification conflict is a typed pre-stage rejection with no accepted
-  journal record and with the existing safe candidate when its base shape is
-  admissible;
-- classification does not add a second receipt or public journal state;
-- a public schema field is added only when an actual consumer cannot obtain the
-  required result through the existing admission contract and a separate
-  compatibility decision approves it.
-
-Minimum fixtures:
+Minimum classifier fixtures after #217:
 
 ```text
-table-driven exact families;
-compatible hint;
+every mechanically exact family;
+compatible caller hint;
 wrong-hint conflict;
 ambiguous record preserved as candidate;
-coverage gap cannot be relabelled;
+coverage gap and journal-control rules;
 same input gives identical result;
 no result raises support/assertability/influence;
 production admission conflict yields fallback and no accepted record;
-replay preserves the original classification-dependent disposition.
+replay preserves the original classification-dependent disposition;
+v1 compatibility input never becomes exact without evidence.
 ```
 
-### `governor.observation.admission`
+## `governor.observation.admission`
 
 Owned entrypoints:
 
@@ -126,7 +133,7 @@ Required order:
 ```text
 canonical request identity and exact replay/conflict check
 → foundation record/evidence/fence validation
-→ first-pass classification consistency
+→ accepted first-pass classification consistency, when available
 → task-selection/scope/durability checks
 → safe candidate fallback on pre-stage rejection
 → immutable accepted receipt or rejection projection.
@@ -146,7 +153,7 @@ Never:
 - mutate an accepted receipt on replay;
 - drop a safe raw candidate merely because reusable classification failed.
 
-### `governor.observation.plan_compilation`
+## `governor.observation.plan_compilation`
 
 Owned entrypoints include `compile_plan` and coverage assessment helpers.
 Compilation consumes registered obligation profiles and exact source visibility;
@@ -154,7 +161,7 @@ it cannot let a producer self-certify complete coverage. Absence means complete
 only against a declared denominator and cursor interval. Blind, unavailable,
 partial and unknown states remain distinct.
 
-### `governor.observation.journal_projection`
+## `governor.observation.journal_projection`
 
 `ObservationJournal` is an in-memory, rebuildable deterministic projection used
 for admission/replay fixtures. It owns no durable storage technology and cannot
@@ -173,6 +180,7 @@ Do not add:
 - semantic classification based on free-form prose or a model;
 - a separate observation-classifier crate while the cell shares this package's
   owner, contract island and proof boundary;
+- a second record-family contract or receipt lifecycle;
 - a catch-all success/error string that erases exact rejection identity;
 - unbounded collections or synchronous work.
 
@@ -193,8 +201,10 @@ cargo clippy --locked -p eliot-observation --all-targets -- -D warnings
 
 A classifier/admission change additionally requires the real capture provider →
 Governor admission fixture, including rejection fallback, replay, task/scope
-mismatch and no-journal-write-on-conflict. Plan/coverage changes require exact
-denominator, blind-interval and producer-silence fixtures.
+mismatch and no-journal-write-on-conflict. A record-envelope contract change
+also requires every serialized producer/consumer compatibility fixture from
+#217. Plan/coverage changes require exact denominator, blind-interval and
+producer-silence fixtures.
 
 Package tests prove only pure classification/admission/projection behavior. They
 do not prove store persistence, daemon wiring, host observation, Context use,
