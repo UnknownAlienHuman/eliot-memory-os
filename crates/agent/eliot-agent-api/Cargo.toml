@@ -4,7 +4,36 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Provider-neutral ELIOT agent admission, attempt and route contracts"
+description = "Provider-neutral ELIOT agent admission, attempt, route and candidate-result contracts"
+
+[package.metadata.eliot]
+layer = "C0"
+purpose = "Own provider-neutral agent boundary contracts while reusing shared ELIOT identities, fences and receipt primitives; no provider execution, route policy, task finish or mutable state."
+source_maintenance_owner = "agent.contracts"
+functional_cell_refs = [
+  "agent.contracts.route-fingerprint",
+  "agent.contracts.attempt",
+  "agent.contracts.host-event",
+  "agent.contracts.effect-candidate",
+  "agent.contracts.result-candidate",
+]
+independent_proof_profile = "eliot-agent-api"
+contract_refs = [
+  "ARCH-MOD-03",
+  "ARCH-AUTH-01",
+  "ARCH-SEC-04",
+  "ARCH-SWM-02",
+  "ARCH-FIN-01",
+  "ELIOT_IMPLEMENTATION:I3.4",
+  "ELIOT_IMPLEMENTATION:I5.19",
+  "ELIOT_IMPLEMENTATION:I6.10",
+  "ELIOT_IMPLEMENTATION:I7.9",
+  "ELIOT_IMPLEMENTATION:I7.22",
+  "ELIOT_IMPLEMENTATION:I7.23",
+]
+contract_challenge_ref = "issue:228"
+implementation_support = "PARTIAL"
+evidence_execution_status = "NOT_EXECUTED"
 
 [dependencies]
 schemars.workspace = true
