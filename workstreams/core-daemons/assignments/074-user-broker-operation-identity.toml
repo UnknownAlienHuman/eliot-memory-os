@@ -1,0 +1,378 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_SWARM_IMPLEMENTATION"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "AGENT_HANDOFF_ONLY"
+parent_issue = 74
+handoff_issue = 331
+integration_issue_refs = [23, 15, 11]
+base_branch = "main"
+base_sha = "73a7a8b6fcc2d292fe61d0eeb94fcae4217087e9"
+normative_pair_ref = "docs/normative-pair.toml"
+docs_read_status = "EXECUTED_LOCAL_DOCS_READ_V1"
+dreamer_excluded = true
+
+[work_unit]
+cell_id = "user-broker.per-operation-request-identity"
+causal_property = "The protected User Broker launch declaration authenticates one stable caller/launch binding, while every register, heartbeat revision, launch authorization and fence/logoff call uses its own exact request, idempotency, deadline and cancellation identity."
+old_path_discriminator = "BrokerLaunchConfig stores one full RequestIdentity. BrokerComposition::self_register installs it once through KernelClient::set_request_identity, after which register, every heartbeat, authorize-launch and fence reuse the same request metadata, idempotency key, absolute deadline and cancellation ID."
+integration_owner = "parent #74 with User Broker integration #23, Kernel front door/ORS #15, and #11 Product Pulse"
+one_writer_rule = "Protected config migration, shared identity contract, Kernel validation, broker consumption and real process edge are separate writers."
+result = "integration candidate only"
+
+[normative_basis]
+architecture = ["ARCH-AUTH-01", "ARCH-LIFE-01", "ARCH-SEC-02", "ARCH-MOD-03", "ARCH-RES-04"]
+implementation = ["I1.3", "I1.8", "I3.4", "I5.27", "I6.10", "I7.2", "I7.3", "I7.14", "I14"]
+reason = "A static installation/SID/session/artifact binding is not an operation. Request, cancellation, deadline and idempotency identity are exact per transition and preserve lineage without collapsing authority or effects."
+
+[current_source]
+observed_on = "main@73a7a8b6fcc2d292fe61d0eeb94fcae4217087e9"
+source_handles = [
+  "bins/eliot-user-broker/src/protected_launch_config.rs",
+  "bins/eliot-user-broker/src/lib.rs",
+  "bins/eliot-user-broker/src/kernel_authority_port.rs",
+  "crates/surfaces/eliot-cli/src/lib.rs",
+  "crates/kernel/eliot-kernel-service/src/protocol.rs",
+  "crates/kernel/eliot-kernel-service/src/user_broker.rs",
+  "crates/kernel/eliot-ors/src/model.rs",
+  "crates/kernel/eliot-ors/src/store.rs",
+  "crates/kernel/eliot-user-broker-core/src/lib.rs",
+]
+confirmed_gap = [
+  "BrokerLaunchConfig contains RegistrationRequest, one full RequestIdentity, and operator artifact configuration.",
+  "protected launch validation validates the full RequestIdentity as if it were durable launch configuration.",
+  "BrokerComposition::self_register clones the launch RequestIdentity and installs it once through set_request_identity.",
+  "heartbeat, launch authorization and close/logoff do not install a new identity before their Kernel call.",
+  "KernelAuthorityPort::kernel_call invokes KernelClient::transact_json with only operation and payload, so the mutable client identity is ambient state.",
+  "launch first performs heartbeat, then authorize-launch, while the resulting ProcessIntent/ProcessRequest has another operation identity; current lineage does not make all three identities explicit.",
+  "An absolute deadline stored in launch.json eventually becomes stale without invalidating the underlying installation/SID/session/artifact binding.",
+]
+
+[stable_launch_binding]
+type = "BrokerLaunchBinding"
+schema_revision = "eliot.user-broker.launch-binding.v2"
+required_fields = [
+  "installation identity",
+  "authorized Windows SID",
+  "interactive Windows session identity",
+  "broker artifact digest and immutable generation",
+  "broker launch nonce/challenge and protected config identity",
+  "initial Kernel endpoint/connection challenge material that is not an operation request identity",
+  "registration policy/config/authority-root references",
+  "operator artifact identity and permitted execution class",
+  "binding creation/expiry or invalidation conditions appropriate to the launch generation",
+]
+forbidden_fields = [
+  "RequestIdentity",
+  "request_id",
+  "idempotency_key",
+  "cancellation_id",
+  "absolute per-operation deadline",
+  "operation payload hash",
+  "heartbeat revision",
+  "launch authorization identity",
+  "fence/logoff identity",
+]
+rules = [
+  "The binding authenticates who/what may begin registration; it does not authorize every future operation.",
+  "Expiry of one operation identity never invalidates the stable binding by itself.",
+  "SID/session/artifact/nonce checks remain fail-closed on every restart.",
+  "Broker restart reuses only a current stable binding and creates a new registration operation.",
+  "The protected file never becomes an ambient replay ledger.",
+]
+
+[operation_identity_contract]
+types = [
+  "BrokerOperationKind",
+  "BrokerOperationIdentityInput",
+  "BrokerOperationIdentity",
+  "BrokerOperationLineage",
+  "BrokerOperationIdentityError",
+]
+operation_kinds = [
+  "REGISTER",
+  "HEARTBEAT_RENEWAL",
+  "AUTHORIZE_LAUNCH",
+  "FENCE_LOGOFF",
+]
+shared_builder_rule = "Use one provider-neutral identity builder/issuer contract in an existing protocol/Kernel client boundary. Do not format request, idempotency or cancellation IDs independently inside User Broker."
+required_fields = [
+  "contract revision and operation-kind domain separator",
+  "stable BrokerLaunchBinding digest",
+  "current registration ID/digest and UserBrokerEpoch when applicable",
+  "exact canonical operation payload digest",
+  "current RequestMetadata and StateFence",
+  "lineaged EpochId after #64 migration",
+  "fresh request_id",
+  "operation-specific idempotency identity",
+  "operation-specific cancellation_id",
+  "bounded deadline selected from the current operation/deadline policy",
+  "parent/causal operation references",
+  "attempt or revision ordinal when the operation contract owns one",
+]
+must_not_include = [
+  "provider secrets",
+  "raw process handles",
+  "mutable client-global ambient identity",
+  "display labels as identity",
+  "scalar epoch compatibility invented in the broker",
+  "one universal deadline or idempotency key for the broker process",
+]
+
+[operation_rules.register]
+identity = "One registration attempt has one exact operation identity derived from the stable binding and exact RegistrationRequest bytes."
+replay = "Exact retry of the same registration bytes returns the same RegistrationGrant/Receipt; changed registration bytes under the same idempotency key are IDENTITY_CONFLICT."
+restart = "A new broker process/generation creates a new registration operation even when the stable installation binding remains current."
+must_not = "A historical protected RequestIdentity cannot be revived as the new registration request."
+
+[operation_rules.heartbeat]
+identity = "Each logical lease-renewal revision has its own operation/request/cancellation identity."
+replay = "Retry of the exact same registration predecessor, observed_at/cursor revision and payload reuses that revision identity and resolves the same result."
+next_revision = "The next heartbeat renewal is a new operation identity even when it renews the same registration."
+deadline = "A heartbeat deadline is bounded from the current clock/policy and is not inherited from launch.json."
+race = "A heartbeat that races fence/logoff resolves against the exact registration/epoch predecessor and cannot reopen a fenced registration."
+
+[operation_rules.authorize_launch]
+identity = "Each LaunchRequest has its own caller request identity and canonical payload hash."
+lineage = [
+  "user/broker LaunchRequest identity",
+  "Kernel authorize-launch operation identity",
+  "LaunchGrant identity",
+  "P-03 ProcessIntent/ProcessRequest operation and effect identity",
+  "ProcessStart/unknown/cancellation/reconciliation receipts",
+]
+rules = [
+  "These identities are linked but never collapsed into one idempotency key.",
+  "Repeating the same LaunchRequest authorization is exact replay only while registration, epoch, fence and payload remain identical.",
+  "A new launch, changed argv/environment/resource limit, or changed registration state is a new operation or an identity conflict.",
+  "Unknown process outcome is reconciled through the process operation identity and is not retried through the authorization request identity.",
+]
+
+[operation_rules.fence]
+identity = "Fence/logoff has a distinct operation identity bound to the exact registration, UserBrokerEpoch, reason and terminal target state."
+replay = "Exact repeat returns the same fence receipt; it cannot duplicate logoff or advance a second terminal transition."
+rules = [
+  "Fence cannot reuse an expired register or heartbeat RequestIdentity.",
+  "Fence is permitted through its protected/control capacity even when ordinary launch authorization is unavailable, subject to #65.",
+  "A stale heartbeat cannot reopen a successfully fenced registration.",
+  "Unknown fence outcome is read back/reconciled before retry with the same identity.",
+]
+
+[builder_and_kernel_validation]
+rules = [
+  "The exact builder/issuer ownership is fixed before code: either Kernel issues/reserves an identity or a shared deterministic builder constructs it from Kernel-admitted policy; the broker never invents a private wire convention.",
+  "Kernel validates operation kind, payload digest, registration/epoch/fence, deadline, cancellation and idempotency identity together.",
+  "Cross-operation reuse of request_id, cancellation_id or idempotency identity is rejected.",
+  "Same idempotency key with different canonical bytes or operation kind is IDENTITY_CONFLICT and performs no state/effect transition.",
+  "An expired operation identity remains historical evidence; it does not invalidate the stable launch binding or authorize another operation.",
+  "KernelClient APIs accept an explicit identity per transaction or an operation-bound closure; a mutable client-global identity must not be the production ownership model.",
+  "Identity creation grants no semantic or process authority; existing Capability/registration/lease checks still decide admission.",
+]
+
+[durable_replay_state]
+owner = "Kernel ORS and the existing User Broker durable registration snapshot each retain only the replay/cursor state they already own"
+rules = [
+  "Protected launch config stores no operation replay ledger.",
+  "BrokerSnapshot operation cursors identify exact broker operations without copying Kernel authority state.",
+  "Kernel/ORS owns request/idempotency conflict and terminal receipt reconciliation for Kernel operations.",
+  "User Broker owns its durable registration/process lifecycle projection and references Kernel operation receipts by identity.",
+  "Restore imports operation state as suspended/history and never reactivates an old RequestIdentity.",
+]
+
+[migration]
+from_schema = "current launch configuration containing request_identity"
+to_schema = "BrokerLaunchBinding v2 without per-operation request fields"
+required_steps = [
+  "read and validate the old protected object under its retained path lease",
+  "classify old RequestIdentity as compatibility-only historical operation evidence",
+  "extract only fields independently justified as stable launch binding",
+  "obtain or regenerate missing stable challenge/policy fields through the authorized installer/Kernel path",
+  "write a new immutable protected binding revision atomically",
+  "retain a migration receipt and old digest without retaining expired operation authority",
+  "restart/register using a new operation identity and verify SID/session/artifact/nonce",
+]
+forbidden = [
+  "silently deserialize v1 as v2",
+  "copy old request_id/idempotency/deadline/cancellation into v2",
+  "extend the old deadline",
+  "rewrite launch.json periodically to simulate per-operation identity",
+  "accept an unversioned partial file after crash",
+]
+rollback = "Before cutover, keep the exact old protected file and current running registration. After cutover, rollback requires an explicit compatible v1 reader only for extraction/recovery, never resurrection of the historical RequestIdentity."
+
+[errors]
+required = [
+  "LAUNCH_BINDING_SCHEMA_UNSUPPORTED",
+  "LAUNCH_BINDING_IDENTITY_MISMATCH",
+  "OPERATION_IDENTITY_REQUIRED",
+  "OPERATION_KIND_MISMATCH",
+  "REQUEST_ID_REUSED",
+  "IDEMPOTENCY_IDENTITY_CONFLICT",
+  "CANCELLATION_ID_REUSED",
+  "REQUEST_DEADLINE_EXPIRED",
+  "REGISTRATION_PREDECESSOR_MISMATCH",
+  "USER_BROKER_EPOCH_STALE",
+  "STATE_FENCE_STALE",
+  "AUTHORITY_EPOCH_STALE",
+  "HEARTBEAT_REVISION_REPLAY_CONFLICT",
+  "LAUNCH_LINEAGE_MISMATCH",
+  "FENCE_RECONCILIATION_REQUIRED",
+  "OPERATION_OUTCOME_UNKNOWN",
+]
+behavior = [
+  "No prose parsing controls replay, retry or conflict behavior.",
+  "Pre-admission identity errors perform no registration, heartbeat, authorization, process effect or fence transition.",
+  "Unknown outcome carries exact operation identity and next readback/reconciliation action.",
+  "Failure of one operation does not poison the stable caller binding or unrelated future operations unless the registration/epoch/fence itself changed.",
+]
+
+[[wave]]
+order = 1
+id = "contract-and-protected-config"
+issue_owner = "new child issue under #74 and #23"
+mutable_paths = [
+  "selected shared identity contract package and tests",
+  "bins/eliot-user-broker/src/protected_launch_config.rs",
+  "versioned protected-config fixtures/migration only",
+]
+deliverable = "Stable BrokerLaunchBinding v2, per-operation identity input/lineage contract, strict schema migration and adversarial fixtures."
+must_not_touch = [
+  "Kernel request dispatch",
+  "broker authority port",
+  "process executor",
+  "root workspace without separate admission",
+]
+proof_ceiling = "BROKER_IDENTITY_AND_CONFIG_CONTRACT_PROOF_ONLY"
+
+[[wave]]
+order = 2
+id = "kernel-identity-builder-and-validation"
+issue_owner = "new child issue under #74 and #15"
+mutable_paths = [
+  "shared protocol/Kernel client request-identity builder or issuer",
+  "Kernel user-broker request dispatch and ORS replay fixtures",
+]
+deliverable = "One explicit per-operation builder/issuer contract plus Kernel validation/replay ledger for register, heartbeat, authorize-launch and fence."
+must_not_touch = ["protected file migration", "P-03 process identity semantics", "User Broker lifecycle core"]
+proof_ceiling = "KERNEL_REQUEST_IDENTITY_MODULE_PROOF"
+
+[[wave]]
+order = 3
+id = "broker-operation-consumer"
+issue_owner = "new child issue under #74 and #23"
+mutable_paths = [
+  "bins/eliot-user-broker/src/lib.rs",
+  "bins/eliot-user-broker/src/kernel_authority_port.rs",
+  "crates/kernel/eliot-user-broker-core focused consumer fixtures",
+]
+deliverable = "Remove one-time ambient set_request_identity; every Kernel call receives/constructs an explicit exact operation identity and records lineage to registration/process state."
+must_not_touch = ["Kernel authority decisions", "ProcessExecutor internals", "notification identities from #78"]
+proof_ceiling = "USER_BROKER_CONSUMER_MODULE_PROOF"
+
+[[wave]]
+order = 4
+id = "race-replay-and-expiry"
+issue_owner = "separate child issue under #74"
+mutable_paths = ["focused broker/Kernel replay, expiry and fault fixtures only"]
+deliverable = "Register, multiple heartbeat revisions, multiple launch authorizations and fence preserve distinct identity, exact replay, identity conflict, deadline and unknown-outcome behavior."
+proof_ceiling = "BROKER_KERNEL_IDENTITY_EDGE_PROOF"
+
+[[wave]]
+order = 5
+id = "real-user-session-edge"
+issue_owner = "integration owner under #23 and #74"
+mutable_paths = ["bounded real Windows User Broker process/session fixtures only"]
+deliverable = "Protected binding, restart, heartbeat, launch, logoff, broker loss and session change operate with exact identities and no stale operation revival."
+proof_ceiling = "REAL_WINDOWS_USER_BROKER_EDGE_PROOF"
+
+[[wave]]
+order = 6
+id = "product-pulse"
+issue_owner = "issue #11 integration owner"
+mutable_paths = ["operational-spine User Broker Product Pulse evidence only"]
+deliverable = "A user-session route registers, renews, launches and logs off; stale/expired single operations fail locally while future authorized operations and canonical control remain correct."
+proof_ceiling = "PRODUCT_PULSE"
+
+[fixtures]
+required = [
+  "register, heartbeat revision 1, heartbeat revision 2, authorize launch A, authorize launch B and fence use distinct request and cancellation identities",
+  "exact register retry returns the same registration result",
+  "exact heartbeat revision retry returns the same result while the next revision uses a new identity",
+  "reusing a heartbeat idempotency key for a later revision is IDENTITY_CONFLICT",
+  "one expired heartbeat identity does not invalidate the stable launch binding or a newly built heartbeat",
+  "two launch requests with different payloads cannot share request/idempotency identity",
+  "launch request, Kernel authorization and process operation identities remain distinct and linked",
+  "unknown process outcome reconciles through process identity without replaying authorization",
+  "fence/logoff exact replay is idempotent and a racing stale heartbeat cannot reopen registration",
+  "unknown fence outcome requires exact readback before retry",
+  "broker restart uses the stable binding and a new registration operation",
+  "old launch-config RequestIdentity is never copied into the migrated binding",
+  "SID/session/artifact/nonce mismatch fails before operation identity issuance/use",
+  "stale EpochId/StateFence/UserBrokerEpoch is distinguishable from expired request deadline",
+]
+
+[dependencies]
+required_before_source_wave = [
+  "#64 lineaged EpochId migration for authority-bearing fields",
+  "#63 canonical request identity/canonical-byte conflict pattern",
+  "#79 durable process/session versus transport connection binding",
+  "#65 protected control capacity for fence/logoff where applicable",
+]
+parallel_owner_rule = "Do not absorb #78 notification child identities or #88 daemon lease renewal into the User Broker operation contract."
+path_claim_rule = "Stop when another open PR owns a selected source path; rebase on then-current main and obtain a fresh documentation reader receipt."
+
+[non_goals]
+items = [
+  "No rotating launch file for every operation.",
+  "No static deadline extension.",
+  "No ambient mutable RequestIdentity in production KernelClient calls.",
+  "No collapse of launch authorization and process/effect identity.",
+  "No broker-local authority or private epoch type.",
+  "No change to provider credentials or user-session consent policy.",
+  "No direct canonical write path.",
+  "No Dreamer changes.",
+  "No Product support claim from contract tests.",
+]
+
+[stop_conditions]
+items = [
+  "The stable caller/launch fields cannot be separated from per-operation fields without installer/Kernel evidence.",
+  "The shared builder/issuer owner cannot be selected without creating two request identity algorithms.",
+  "Kernel cannot validate canonical operation bytes/kind against the supplied identity.",
+  "Heartbeat revision identity cannot be distinguished from exact replay.",
+  "Launch authorization would reuse the process/effect identity.",
+  "Fence/logoff cannot use protected control capacity independently of expired ordinary requests.",
+  "Migration would silently reinterpret or extend the v1 RequestIdentity.",
+  "Another open PR claims the selected path.",
+]
+challenge = "Return a ContractChallenge to #74 with exact source/evidence. Do not fix the defect by changing only the static deadline or ID string format."
+
+[result_contract]
+required_fields = [
+  "issue_and_cell",
+  "source_base_and_candidate",
+  "causal_property",
+  "old_path_discriminator",
+  "changed_contract_or_source",
+  "owned_state_and_effects",
+  "module_proof",
+  "edge_proof",
+  "product_pulse_or_not_applicable_reason",
+  "evidence_execution_status",
+  "known_uncovered_behavior",
+  "security_privacy_and_authority_delta",
+  "migration_rollback_and_removal",
+  "integration_candidate",
+  "residual_unknowns",
+]
+finish_states = [
+  "VERIFIED_COMPLETE",
+  "PARTIAL",
+  "BLOCKED",
+  "FAILED_VERIFICATION",
+  "DEGRADED_NO_PROOF",
+  "UNSAFE_TO_FINISH",
+  "CANCELLED",
+  "SUPERSEDED",
+]
