@@ -4,10 +4,10 @@ use eliot_protocol::{
     AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_VERSION,
     AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID,
     AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
-    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
-    AgentActivationResolutionTicket, AgentActivationResolvedBinding,
-    AgentActivationRetryDirective, AgentActivationSelectionDirective,
-    MAX_AGENT_ACTIVATION_CANDIDATES, ProtocolError,
+    AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
+    AgentActivationResolutionResult, AgentActivationResolutionTicket,
+    AgentActivationResolvedBinding, AgentActivationRetryDirective,
+    AgentActivationSelectionDirective, MAX_AGENT_ACTIVATION_CANDIDATES, ProtocolError,
 };
 use serde_json::Value;
 
@@ -48,6 +48,7 @@ fn binding() -> AgentActivationResolvedBinding {
 fn task_selection() -> AgentActivationSelectionDirective {
     AgentActivationSelectionDirective {
         candidate_handles: vec!["eliot://task/task-1".to_owned()],
+        candidate_coverage: AgentActivationCandidateCoverage::Complete,
         recovery_handle: "eliot://recovery/select-task-1".to_owned(),
     }
 }
@@ -64,7 +65,11 @@ fn dispositions(
         },
         AgentActivationResolutionDisposition::ScopeAmbiguous {
             selection: AgentActivationSelectionDirective {
-                candidate_handles: vec!["eliot://scope/scope-1".to_owned()],
+                candidate_handles: vec![
+                    "eliot://scope/scope-1".to_owned(),
+                    "eliot://scope/scope-2".to_owned(),
+                ],
+                candidate_coverage: AgentActivationCandidateCoverage::Complete,
                 recovery_handle: "eliot://recovery/select-scope-1".to_owned(),
             },
         },
@@ -89,15 +94,18 @@ fn dispositions(
     ])
 }
 
+fn result(
+    ticket: &AgentActivationResolutionTicket,
+    disposition: AgentActivationResolutionDisposition,
+) -> Result<AgentActivationResolutionResult, ProtocolError> {
+    AgentActivationResolutionResult::new(ticket, RESOLVED_AT_UNIX_MS, disposition)
+}
+
 #[test]
 fn every_disposition_round_trips_and_binds_exact_ticket() -> Result<(), ProtocolError> {
     let ticket = ticket()?;
     for disposition in dispositions(&ticket)? {
-        let result = AgentActivationResolutionResult::new(
-            &ticket,
-            RESOLVED_AT_UNIX_MS,
-            disposition,
-        )?;
+        let result = result(&ticket, disposition)?;
         result.validate_against(&ticket)?;
         let encoded =
             serde_json::to_vec(&result).map_err(|error| ProtocolError::Json(error.to_string()))?;
@@ -110,11 +118,79 @@ fn every_disposition_round_trips_and_binds_exact_ticket() -> Result<(), Protocol
 }
 
 #[test]
+fn complete_empty_task_candidate_set_represents_no_active_binding()
+-> Result<(), ProtocolError> {
+    let ticket = ticket()?;
+    result(
+        &ticket,
+        AgentActivationResolutionDisposition::TaskSelectionRequired {
+            selection: AgentActivationSelectionDirective {
+                candidate_handles: Vec::new(),
+                candidate_coverage: AgentActivationCandidateCoverage::Complete,
+                recovery_handle: "eliot://recovery/task-intake".to_owned(),
+            },
+        },
+    )?;
+    Ok(())
+}
+
+#[test]
+fn candidate_coverage_and_scope_ambiguity_are_fail_closed() -> Result<(), ProtocolError> {
+    let ticket = ticket()?;
+    for selection in [
+        AgentActivationSelectionDirective {
+            candidate_handles: vec!["eliot://task/one".to_owned()],
+            candidate_coverage: AgentActivationCandidateCoverage::Unknown,
+            recovery_handle: "eliot://recovery/select-task".to_owned(),
+        },
+        AgentActivationSelectionDirective {
+            candidate_handles: Vec::new(),
+            candidate_coverage: AgentActivationCandidateCoverage::Partial,
+            recovery_handle: "eliot://recovery/select-task".to_owned(),
+        },
+    ] {
+        assert!(
+            result(
+                &ticket,
+                AgentActivationResolutionDisposition::TaskSelectionRequired { selection },
+            )
+            .is_err()
+        );
+    }
+
+    for selection in [
+        AgentActivationSelectionDirective {
+            candidate_handles: Vec::new(),
+            candidate_coverage: AgentActivationCandidateCoverage::Complete,
+            recovery_handle: "eliot://recovery/select-scope".to_owned(),
+        },
+        AgentActivationSelectionDirective {
+            candidate_handles: vec!["eliot://scope/one".to_owned()],
+            candidate_coverage: AgentActivationCandidateCoverage::Complete,
+            recovery_handle: "eliot://recovery/select-scope".to_owned(),
+        },
+        AgentActivationSelectionDirective {
+            candidate_handles: Vec::new(),
+            candidate_coverage: AgentActivationCandidateCoverage::Unknown,
+            recovery_handle: "eliot://recovery/select-scope".to_owned(),
+        },
+    ] {
+        assert!(
+            result(
+                &ticket,
+                AgentActivationResolutionDisposition::ScopeAmbiguous { selection },
+            )
+            .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn wire_identity_is_exact() -> Result<(), ProtocolError> {
     let ticket = ticket()?;
-    let result = AgentActivationResolutionResult::new(
+    let result = result(
         &ticket,
-        RESOLVED_AT_UNIX_MS,
         AgentActivationResolutionDisposition::FailedInternal {
             failure_handle: "eliot://failure/activation-resolution".to_owned(),
         },
@@ -135,9 +211,8 @@ fn not_ready_retry_must_be_future_and_before_ticket_expiry() -> Result<(), Proto
         observed_dependency_revision: "revision-7".to_owned(),
         not_before_unix_ms: RESOLVED_AT_UNIX_MS + 1,
     };
-    AgentActivationResolutionResult::new(
+    result(
         &ticket,
-        RESOLVED_AT_UNIX_MS,
         AgentActivationResolutionDisposition::NotReady {
             recovery_handle: "eliot://recovery/not-ready".to_owned(),
             retry: valid.clone(),
@@ -170,15 +245,16 @@ fn not_ready_retry_must_be_future_and_before_ticket_expiry() -> Result<(), Proto
             ..valid
         },
     ] {
-        let result = AgentActivationResolutionResult::new(
-            &ticket,
-            RESOLVED_AT_UNIX_MS,
-            AgentActivationResolutionDisposition::NotReady {
-                recovery_handle: "eliot://recovery/not-ready".to_owned(),
-                retry,
-            },
+        assert!(
+            result(
+                &ticket,
+                AgentActivationResolutionDisposition::NotReady {
+                    recovery_handle: "eliot://recovery/not-ready".to_owned(),
+                    retry,
+                },
+            )
+            .is_err()
         );
-        assert!(result.is_err());
     }
     Ok(())
 }
@@ -186,7 +262,11 @@ fn not_ready_retry_must_be_future_and_before_ticket_expiry() -> Result<(), Proto
 #[test]
 fn result_observation_must_precede_ticket_expiry() -> Result<(), ProtocolError> {
     let ticket = ticket()?;
-    for observed_at in [0, ticket.kernel_deadline_unix_ms, ticket.kernel_deadline_unix_ms + 1] {
+    for observed_at in [
+        0,
+        ticket.kernel_deadline_unix_ms,
+        ticket.kernel_deadline_unix_ms + 1,
+    ] {
         let result = AgentActivationResolutionResult::new(
             &ticket,
             observed_at,
@@ -203,9 +283,8 @@ fn result_observation_must_precede_ticket_expiry() -> Result<(), ProtocolError> 
 fn ticket_identity_digest_fence_and_result_digest_substitution_fail()
 -> Result<(), ProtocolError> {
     let ticket = ticket()?;
-    let result = AgentActivationResolutionResult::new(
+    let result = result(
         &ticket,
-        RESOLVED_AT_UNIX_MS,
         AgentActivationResolutionDisposition::TaskSelectionRequired {
             selection: task_selection(),
         },
@@ -236,28 +315,29 @@ fn ticket_identity_digest_fence_and_result_digest_substitution_fail()
 }
 
 #[test]
-fn candidate_sets_reject_empty_duplicate_oversized_and_excessive_handles()
+fn candidate_sets_reject_duplicate_oversized_and_excessive_handles()
 -> Result<(), ProtocolError> {
     let ticket = ticket()?;
     for candidate_handles in [
-        Vec::new(),
         vec!["eliot://task/one".to_owned(), "eliot://task/one".to_owned()],
         vec!["x".repeat(513)],
         (0..=MAX_AGENT_ACTIVATION_CANDIDATES)
             .map(|index| format!("eliot://task/{index}"))
             .collect(),
     ] {
-        let result = AgentActivationResolutionResult::new(
-            &ticket,
-            RESOLVED_AT_UNIX_MS,
-            AgentActivationResolutionDisposition::TaskSelectionRequired {
-                selection: AgentActivationSelectionDirective {
-                    candidate_handles,
-                    recovery_handle: "eliot://recovery/select-task".to_owned(),
+        assert!(
+            result(
+                &ticket,
+                AgentActivationResolutionDisposition::TaskSelectionRequired {
+                    selection: AgentActivationSelectionDirective {
+                        candidate_handles,
+                        candidate_coverage: AgentActivationCandidateCoverage::Complete,
+                        recovery_handle: "eliot://recovery/select-task".to_owned(),
+                    },
                 },
-            },
+            )
+            .is_err()
         );
-        assert!(result.is_err());
     }
     Ok(())
 }
@@ -265,24 +345,24 @@ fn candidate_sets_reject_empty_duplicate_oversized_and_excessive_handles()
 #[test]
 fn stale_fence_cannot_repeat_ticket_fence() -> Result<(), ProtocolError> {
     let ticket = ticket()?;
-    let result = AgentActivationResolutionResult::new(
-        &ticket,
-        RESOLVED_AT_UNIX_MS,
-        AgentActivationResolutionDisposition::StaleFence {
-            recovery_handle: "eliot://recovery/stale-fence".to_owned(),
-            observed_state_fence: Some(ticket.state_fence.clone()),
-        },
+    assert!(
+        result(
+            &ticket,
+            AgentActivationResolutionDisposition::StaleFence {
+                recovery_handle: "eliot://recovery/stale-fence".to_owned(),
+                observed_state_fence: Some(ticket.state_fence.clone()),
+            },
+        )
+        .is_err()
     );
-    assert!(result.is_err());
     Ok(())
 }
 
 #[test]
 fn unknown_fields_are_rejected() -> Result<(), ProtocolError> {
     let ticket = ticket()?;
-    let result = AgentActivationResolutionResult::new(
+    let result = result(
         &ticket,
-        RESOLVED_AT_UNIX_MS,
         AgentActivationResolutionDisposition::FailedInternal {
             failure_handle: "eliot://failure/activation-resolution".to_owned(),
         },
