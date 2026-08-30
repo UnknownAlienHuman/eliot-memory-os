@@ -50,6 +50,44 @@ Implementation. In particular, `crates/eliot-app/AGENTS.md` marks the old
 `eliot-governor` surface as a migration/regression facade rather than a current
 composition root.
 
+## Mandatory code and Code Graph routing
+
+Before a material source, manifest, test, or build-configuration change, route
+the exact path:
+
+```text
+python scripts/code_navigation.py route --path <repository/path>
+```
+
+Use the returned package, module locator, nearest `AGENTS.md`, logical blocks,
+documentation routes, and one-hop dependencies as the minimum discovery scope.
+See [`docs/CODE_NAVIGATION.md`](docs/CODE_NAVIGATION.md).
+
+For every nontrivial source change, actively use CodeBase Memory MCP before and
+after editing:
+
+- confirm the exact project, source/worktree revision, index generation/status,
+  and graph schema;
+- query package/symbol ownership, definitions, implementations, references,
+  inbound/outbound calls, tests, and reverse impact;
+- run `check_index_coverage` for every graph-cited path and before any negative,
+  exhaustive, dead-code, or deletion claim;
+- after editing, refresh/reindex, run `detect_changes`, repeat the affected graph
+  queries and coverage checks, then execute exact source/build/test verifiers;
+- record `CodeUnderstandingProof` and `CompletionProof` in the issue or PR.
+
+Code Graph output is derived navigation/impact evidence, not source, semantic,
+runtime, or product authority. Stale, partial, ambiguous, skipped, excluded, or
+unknown coverage cannot prove absence, non-impact, dead code, safe deletion, or
+complete test selection. When CodeBase Memory MCP is unavailable or cannot
+cover the exact scope, record that limitation and fall back to exact source,
+Cargo metadata, compiler/LSP, and owning verifier evidence; never invent a graph
+receipt.
+
+Do not commit `.codebase-memory/` or graph snapshots, let the external MCP write
+ELIOT canonical memory/ADRs, create a second always-on watcher for the same
+repository root, or introduce a runtime dependency on the external MCP.
+
 ## Mandatory preflight
 
 Before reading deeply or changing anything:
@@ -130,8 +168,8 @@ current authority.
 ## Verification
 
 Run the smallest proof that can fail on the changed path. Documentation and
-routing changes must run the shard, router, and read-bundle self-tests/checks
-included in `just quick`. Use `just quick` for bounded documentation/configuration
-changes and the applicable package/edge proof for Rust changes. Run broader
-suites only when the change closure requires them. Report every skipped, failed,
-simulated, or unavailable check exactly.
+routing changes must run the shard, router, read-bundle, and code-navigation
+self-tests/checks included in `just quick`. Use `just quick` for bounded
+documentation/configuration changes and the applicable package/edge proof for
+Rust changes. Run broader suites only when the change closure requires them.
+Report every skipped, failed, simulated, or unavailable check exactly.

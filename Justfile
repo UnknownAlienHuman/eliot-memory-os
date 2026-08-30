@@ -17,6 +17,12 @@ docs-router:
 docs-read-self-test:
     python scripts/docs_read.py self-test
 
+code-navigation-self-test:
+    python scripts/code_navigation.py self-test
+
+code-navigation:
+    python scripts/code_navigation.py check --root .
+
 normative:
     pwsh -NoProfile -File scripts/verify-normative.ps1
 
@@ -81,7 +87,7 @@ claude-package:
 sync-skills:
     cargo run --quiet -p eliot-app -- host skill-sync
 
-quick: docs-shards-self-test docs-shards docs-router-self-test docs-router docs-read-self-test normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails agent-route-bundles-self-test agent-route-bundles runtime-source-hygiene-self-test runtime-source-hygiene agent-bridge-protocol-self-test agent-bridge-protocol metadata fmt-check check
+quick: docs-shards-self-test docs-shards docs-router-self-test docs-router docs-read-self-test code-navigation-self-test code-navigation normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails agent-route-bundles-self-test agent-route-bundles runtime-source-hygiene-self-test runtime-source-hygiene agent-bridge-protocol-self-test agent-bridge-protocol metadata fmt-check check
 
 verify:
     pwsh -NoProfile -File scripts/verify.ps1

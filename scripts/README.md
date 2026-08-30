@@ -12,10 +12,14 @@ retired rather than preserved as archaeology.
 
 | Script | Purpose | Proof ceiling |
 |---|---|---|
-| `verify.ps1` | Current Windows developer verification: normative identity, architecture-boundary audit, nearest-path agent guardrails, runtime-source hygiene, agent-bridge public protocol policy, Cargo metadata, formatting, and workspace check | Source/build candidate only |
+| `verify.ps1` | Current Windows developer verification: documentation reconstruction/routes, code-navigation registry, normative identity, architecture-boundary audit, nearest-path agent guardrails, runtime-source hygiene, agent-bridge public protocol policy, Cargo metadata, formatting, and workspace check | Source/build candidate only |
 | `verify.sh` | Unix-compatible counterpart for the current bounded source checks | Source/build candidate only |
 | `verify-normative.ps1` | Recompute canonical Architecture/Implementation digests and pair key; reject predecessor copies | Normative artifact identity only |
 | `verify-normative.sh` | Unix-compatible normative-pair verifier | Normative artifact identity only |
+| `docs_shards.py` | Reconstruct and hash the sharded normative books; verify generated compatibility/index surfaces and Markdown paths/anchors | Normative content/layout and repository Markdown-link integrity only |
+| `docs_router.py` | Resolve exact changed paths/topics to bounded normative fragments and emit content-addressed route receipts | Documentation routing evidence only |
+| `docs_read.py` | Verify routed files/fragments by hash and byte count, materialize the bounded bundle, and emit a read receipt for explicit attestation | Documentation reading evidence only |
+| `code_navigation.py` | Derive Cargo packages, workspace admission, Rust filesystem-module locators, nearest agent contracts, logical blocks, documentation routes, and local dependency/reverse-dependency edges | Repository navigation and static path/dependency consistency only |
 | `audit-architecture-boundaries.py` | Scan declared core/daemon runtime roots for forbidden dependencies, SurrealDB leakage, untracked direct process launch, and production placeholders | Static source/build architecture evidence only |
 | `verify-agent-guardrails.py` | Require bounded nearest-path owner/proof/stop instructions for core and daemon source subtrees | Routing/control-plane evidence only |
 | `audit-runtime-source-hygiene.py` | Expose unsafe, panic/unwrap/expect, ambient configuration, unbounded-output, blocking-sleep, and source-concentration risks in runtime roots | Static source-quality signals only |
@@ -26,6 +30,37 @@ Normal iteration uses `just quick` or `scripts/verify.ps1`. The manual Source
 Candidate Gate in `.github/workflows/source-candidate.yml` owns the expensive
 workspace check/Clippy/test/build breadth. Neither path proves an installed or
 healthy runtime.
+
+### Documentation and code navigation
+
+```powershell
+python scripts/docs_shards.py verify --root .
+python scripts/docs_router.py check --root .
+python scripts/docs_read.py self-test
+python scripts/code_navigation.py self-test
+python scripts/code_navigation.py check --root .
+python scripts/code_navigation.py route --path <repository/path>
+```
+
+`docs_shards.py` reconstructs the original semantic byte streams by reversing
+only recorded navigation-link rewrites and checks the adopted SHA-256, byte,
+character, order, generated-index, compatibility-map, file-link, and anchor
+invariants. `docs_router.py` selects bounded normative fragments; `docs_read.py`
+verifies and materializes the exact bundle for reading attestation. Their
+receipts are not code-ownership or impact proof.
+
+`code_navigation.py` derives its live registry from root Cargo workspace
+membership/default membership, all discovered package manifests, Rust source
+paths, nearest `AGENTS.md`, `docs/code-navigation/logical-blocks.toml`, the
+generated normative handle index, and the current documentation router. It
+rejects escaping or unmatched configured paths, unknown handles, unowned
+workspace packages, route gaps, and nondeterministic output.
+
+The Rust module name is a filesystem locator, not proof of a `mod` declaration,
+macro expansion, feature-gated reachability, reference, call, implementation, or
+test edge. Use CodeBase Memory MCP plus exact source/compiler/LSP/verifier
+evidence under [`docs/CODE_NAVIGATION.md`](../docs/CODE_NAVIGATION.md). Never
+commit `.codebase-memory/`, graph snapshots, or machine-local receipts.
 
 ### Architecture-boundary audit
 

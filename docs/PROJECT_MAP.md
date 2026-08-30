@@ -7,7 +7,7 @@ Start with the [mandatory reading protocol](architecture/READING_PROTOCOL.md), t
 <!-- eliot-doc-routing:end -->
 
 
-Status: current routing map for `main`, 2026-08-29. Navigation only; product
+Status: current routing map for `main`, 2026-08-30. Navigation only; product
 status remains `NOT_ACCEPTED / UNVERIFIED`.
 
 ## Authority and work
@@ -18,6 +18,7 @@ status remains `NOT_ACCEPTED / UNVERIFIED`.
 | Repository workflow | `AGENTS.md`, `WORKFLOW.md` |
 | Active programmes | `workstreams/ACTIVE.toml` |
 | Documentation routing | `docs/README.md` |
+| Crate/module/logical-block routing and Code Graph procedure | `docs/CODE_NAVIGATION.md`, `scripts/code_navigation.py` |
 | Architecture authority and pair identity | `docs/ARCHITECTURE_CONTRACT.md`, `docs/normative-pair.toml` |
 | Current implementation change | owning open issue and PR |
 | Live Windows operational-spine proof | issue #11 |
@@ -42,6 +43,25 @@ present in the active checkout.
 | Composition roots | `bins/*`, `workspace/tools/*` | runtime executables and bounded tools |
 
 A crate is a source/build boundary, not a lifecycle or authority owner.
+
+## Executable code navigation
+
+Do not infer ownership from package names or this table. Route the exact path:
+
+```powershell
+python scripts/code_navigation.py route --path <repository/path>
+```
+
+The live registry is derived from the root `Cargo.toml`, every discovered package
+manifest, Rust source paths, nearest `AGENTS.md`, the logical-block selectors in
+`docs/code-navigation/logical-blocks.toml`, and the current documentation router.
+It labels packages as default workspace members, other workspace members, or
+nonmember/prototype packages and reports direct/reverse local dependency edges.
+
+For symbol definitions, implementations, references, calls, tests, and blast
+radius, use CodeBase Memory MCP under the coverage and exact-source rules in
+`docs/CODE_NAVIGATION.md`. Filesystem module locators and graph output are
+navigation evidence, not lifecycle ownership or authority.
 
 ## Legacy migration facades
 

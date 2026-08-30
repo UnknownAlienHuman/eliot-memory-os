@@ -33,6 +33,18 @@
 - Changed source/contracts:
 - Explicit non-goals:
 
+## Code navigation and Code Graph proof
+
+- Code-navigation command and resolved package/module/logical blocks:
+- CodeBase Memory MCP version:
+- Project and index generation/status:
+- Source/worktree revision bound to the graph:
+- Qualified symbols, graph queries, and pagination:
+- `check_index_coverage` result for every cited path:
+- Exact-source confirmations and ambiguities/fallbacks:
+- Post-edit `detect_changes`, graph refresh/delta, and repeated coverage:
+- Code Graph evidence status: `NOT_EXECUTED | SIMULATED | EXECUTED | UNKNOWN_OUTCOME`
+
 ## Proof
 
 - Module/shape proof executed:

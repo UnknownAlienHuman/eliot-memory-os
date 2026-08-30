@@ -36,6 +36,8 @@ Canonical navigation:
 - Architecture authority: `docs/ARCHITECTURE_CONTRACT.md`;
 - exact pair identity: `docs/normative-pair.toml`;
 - product/source map: `docs/PROJECT_MAP.md`;
+- crate/module/logical-block and Code Graph navigation:
+  `docs/CODE_NAVIGATION.md`, `scripts/code_navigation.py`;
 - documentation map: `docs/README.md`;
 - active programmes: `workstreams/ACTIVE.toml`;
 - repository agent rules: `AGENTS.md`.
@@ -47,9 +49,11 @@ open issue with owner, causal property, scope, proof, and non-goals
 → fetch/prune and fast-forward main only
 → create a fresh issue-numbered branch from exact origin/main
 → claim one mutable path scope
-→ route, verify, and read the bounded documentation bundle
+→ route and read the exact path through docs_read.py and code_navigation.py
+→ establish CodeUnderstandingProof with CodeBase Memory MCP plus exact source
 → implement and run Module/Edge/Product proof as applicable
-→ open PR to main with read receipt and attestation
+→ refresh Code Graph, run detect_changes/coverage, and record CompletionProof
+→ open PR to main
 → integrate by squash after current-main and proof checks
 → close issue and retire the branch
 ```
@@ -91,6 +95,28 @@ or PR. Two agents may read the same files, but they do not mutate the same scope
 concurrently. Contract changes land before dependent implementation waves, and
 the integration owner revalidates consumers after the contract change.
 
+## Code navigation and graph evidence
+
+`python scripts/code_navigation.py route --path <path>` derives the current
+Cargo package, filesystem module locator, nearest agent contracts, logical
+responsibility blocks, documentation route IDs, and one-hop local dependency
+closure from repository-owned inputs. The root `Cargo.toml` remains the workspace
+admission source; separately discovered manifests are labelled nonmember rather
+than silently promoted or omitted.
+
+CodeBase Memory MCP is the active structural-discovery projection for nontrivial
+source work. Before editing, record project/index/source identity, query
+ownership and the bounded symbol/call/reference/test closure, and check index
+coverage for every cited path. After editing, refresh the same project, run
+`detect_changes`, repeat the affected queries and coverage checks, and bind the
+result to exact source and executed verifiers.
+
+Graph output does not create authority or prove completeness. Any unavailable,
+stale, partial, ambiguous, excluded, skipped, or unknown graph scope is recorded
+as a limitation and resolved through exact source/compiler/LSP/build/test
+evidence or left explicitly unknown. Full procedure and receipt fields are in
+[`docs/CODE_NAVIGATION.md`](docs/CODE_NAVIGATION.md).
+
 ## Documentation and evidence placement
 
 Keep in Git:
@@ -124,6 +150,10 @@ A PR states:
 - exact base and candidate revisions;
 - changed causal property and path scope;
 - documentation route/read receipt, bundle hash, handles, and agent attestation;
+- code-navigation route;
+- CodeUnderstandingProof and CompletionProof, including Code Graph project,
+  generation/status, queries, pagination, per-path coverage, graph delta, exact
+  source confirmations, and limitations;
 - proof executed and proof ceiling;
 - affected edges and Product Pulse, or why they are not applicable;
 - migration/rollback/removal consequences;

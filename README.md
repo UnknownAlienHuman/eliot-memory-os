@@ -21,6 +21,8 @@ Implementation pair for ELIOT core.
 - **Branch/worktree workflow:** [`WORKFLOW.md`](WORKFLOW.md).
 - **Active programmes:** [`workstreams/ACTIVE.toml`](workstreams/ACTIVE.toml).
 - **Current product/source map:** [`docs/PROJECT_MAP.md`](docs/PROJECT_MAP.md).
+- **Crate/module/logical-block and Code Graph navigation:**
+  [`docs/CODE_NAVIGATION.md`](docs/CODE_NAVIGATION.md).
 - **Supported repository scripts:** [`scripts/README.md`](scripts/README.md).
 - **GitHub workflows/templates:** [`.github/README.md`](.github/README.md).
 
@@ -69,14 +71,18 @@ finish authority.
 MSVC Rust 1.97.1 is pinned by `rust-toolchain.toml`.
 
 ```powershell
+python scripts/code_navigation.py route --path <repository/path>
+python scripts/code_navigation.py check --root .
 cargo metadata --no-deps
 just quick
 ```
 
-Use focused package/edge proofs while iterating. Run wider checks only for a
-matching blast radius and report every skipped or unavailable check honestly.
-Cargo output, runtime state, reports, logs, generated code-graph databases, and
-machine-local agent state stay outside Git.
+Use CodeBase Memory MCP before and after nontrivial source edits as defined in
+[`docs/CODE_NAVIGATION.md`](docs/CODE_NAVIGATION.md). Use focused package/edge
+proofs while iterating. Run wider checks only for a matching blast radius and
+report every skipped or unavailable check honestly. Cargo output, runtime state,
+reports, logs, generated code-graph databases, and machine-local agent state
+stay outside Git.
 
 Windows credential operations are documented in
 [`docs/operations/SURREALDB_CREDENTIAL_AUTHORITY.md`](docs/operations/SURREALDB_CREDENTIAL_AUTHORITY.md).

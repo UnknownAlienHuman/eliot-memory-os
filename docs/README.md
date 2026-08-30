@@ -17,6 +17,7 @@ audit archive and no alternate Architecture edition.
 | Architecture authority and precedence | [`ARCHITECTURE_CONTRACT.md`](ARCHITECTURE_CONTRACT.md) |
 | Exact accepted pair identity | [`normative-pair.toml`](normative-pair.toml) |
 | Architecture / Implementation | [`architecture/`](architecture/) |
+| Crates, Rust modules, logical blocks, and CodeBase Memory MCP workflow | [`CODE_NAVIGATION.md`](CODE_NAVIGATION.md) |
 | Current repository and runtime-owner map | [`PROJECT_MAP.md`](PROJECT_MAP.md) |
 | Dependency admission/removal policy | [`DEPENDENCY_POLICY.md`](DEPENDENCY_POLICY.md) |
 | Stable operational guidance | [`operations/`](operations/) |
