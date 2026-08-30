@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema_version": "eliot.opencode-plugin-bridge.v1",
+  "surface": "integrations/opencode/plugins/eliot.js",
+  "role": "host_observation_and_pre_effect_gate_candidate",
+  "authority_ceiling": "candidate_only",
+  "preferred_transport": {
+    "kind": "loopback_http",
+    "configuration": {
+      "server_root_env": "ELIOT_OPENCODE_BRIDGE_URL",
+      "bearer_token_env": "ELIOT_OPENCODE_BRIDGE_TOKEN",
+      "endpoint": "/v1/host-events"
+    },
+    "admission": [
+      "http_only",
+      "literal_127_0_0_1_or_ipv6_loopback",
+      "explicit_port",
+      "no_url_credentials",
+      "no_query_or_fragment",
+      "bearer_token_required"
+    ],
+    "request": {
+      "method": "POST",
+      "content_type": "application/json",
+      "idempotency_header": "Idempotency-Key",
+      "idempotency_value": "event_id",
+      "maximum_attempts": 2,
+      "retry_identity": "same_event_id_and_payload",
+      "transient_statuses": [408, 425, 429, 500, 502, 503, 504]
+    }
+  },
+  "legacy_transport": {
+    "kind": "bounded_one_shot_process",
+    "status": "compatibility_fallback",
+    "selection": "only_when_loopback_http_is_not_configured",
+    "cross_transport_failover_after_http_attempt": false,
+    "environment_policy": "allowlist",
+    "timeout_and_stream_limits": true
+  },
+  "payload": {
+    "allowlisted_fields": [
+      "event_id",
+      "sequence",
+      "emitted_at",
+      "event_kind",
+      "vendor_event_kind",
+      "host_session_id",
+      "task_id",
+      "work_item_id",
+      "tool",
+      "changed_path",
+      "argument_keys",
+      "attached_task"
+    ],
+    "forbidden_classes": [
+      "prompt_or_message_body",
+      "model_output_or_reasoning",
+      "tool_argument_values",
+      "stdout_or_stderr",
+      "command_text",
+      "file_or_diff_contents",
+      "environment_values",
+      "headers_cookies_or_credentials",
+      "arbitrary_error_or_stack_payload"
+    ]
+  },
+  "mutation_gate": {
+    "applies_when": "attached_task_and_mutating_tool",
+    "failure_mode": "fail_closed",
+    "explicit_allow_decisions": ["recorded", "allow", "allowed", "pass"],
+    "explicit_deny_decision": "deny"
+  },
+  "passive_observation": {
+    "failure_mode": "degraded_non_blocking",
+    "queue": "bounded_serialized",
+    "overflow": "drop_with_coalesced_host_warning"
+  },
+  "proof_ceiling": "Static and Node loopback tests prove client transport selection, bounds, idempotency, payload minimization, and fail-closed mutation behavior. They do not prove the server-side durable admission endpoint, current OpenCode hook coverage, Kernel ingress, or a completed AgentAttempt."
+}

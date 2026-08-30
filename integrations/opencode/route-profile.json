@@ -22,7 +22,12 @@
       "kind": "plugin_bundle",
       "status": "implemented_unverified",
       "path": "integrations/opencode/plugins/eliot.js",
-      "purpose": ["lifecycle_observation", "pre_effect_gate_candidate", "bounded_event_forwarding"],
+      "purpose": [
+        "lifecycle_observation",
+        "pre_effect_gate_candidate",
+        "bounded_event_forwarding",
+        "persistent_loopback_bridge_preferred"
+      ],
       "authority_ceiling": "pre_effect_gate_candidate"
     },
     {
@@ -135,13 +140,15 @@
     "pin executable and OpenAPI digest for the exact installed runtime",
     "prove health, provider/model discovery, session create, prompt, SSE terminal event, fork, and abort",
     "prove plugin mutating gates fail closed only for attached mutating tasks",
+    "prove the plugin prefers authenticated literal-loopback HTTP and preserves one event identity across a bounded transient retry",
+    "prove an attempted HTTP delivery never crosses transport into the legacy process fallback",
     "prove passive plugin events use bounded serialized dispatch and cannot exhaust child processes",
-    "prove no environment outside the explicit allowlist reaches the bridge process",
+    "prove no environment outside the explicit allowlist reaches the compatibility process bridge",
     "prove child-session closure and cancellation before parent attempt disposition"
   ],
   "known_gaps": [
-    "the HTTP/SSE adapter and User Broker launch path are not implemented in this profile change",
-    "the existing plugin still invokes the legacy bridge executable for host events",
+    "the server-side /v1/host-events durable admission endpoint and User Broker credential materialization are not implemented in this plugin slice",
+    "the one-shot process bridge remains a compatibility fallback only when the HTTP bridge is entirely unconfigured",
     "current-account provider, model, quota, and auth behavior are unprobed",
     "OpenCode internal runtime storage remains forensic-only and cannot resume ELIOT authority"
   ],
