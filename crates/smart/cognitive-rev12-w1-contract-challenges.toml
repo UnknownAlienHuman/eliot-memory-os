@@ -1,0 +1,63 @@
+schema_version = 1
+status = "W1_CONTRACT_CHALLENGE_LEDGER"
+authority = "crates/smart/cognitive-rev12-w1-field-contracts.toml"
+
+[[resolved]]
+id = "CC-SELF-QUERY-BRIEF-SCHEMA"
+contract_ref = "crates/smart/eliot-dreamer-self-query/self-query.contract.toml"
+resolution = "ArchitectureBrief and ImplementationBrief now have one owner, exact accepted-pair identity, denominator, section/claim evidence, target/current support separation and non-self-certification boundaries."
+
+[[resolved]]
+id = "CC-RELATION-USE-CASE"
+contract_ref = "crates/smart/eliot-dreamer-contracts/orientation.contract.toml"
+resolution = "Orientation and Curation relation candidates use typed entrypoints over one semantic core; chronology, similarity, dependency and causality remain distinct."
+
+[[resolved]]
+id = "CC-ORIENTATION-POSITION-BOUNDARY"
+contract_ref = "crates/smart/eliot-epistemic-contracts/current-position.contract.toml"
+resolution = "Current Epistemic Position is external resolved evidence; Dreamer synthesis is labeled candidate material and cannot overwrite evidence roles."
+
+[[open]]
+id = "CC-W1-EPISTEMIC-EVIDENCE-ADAPTERS"
+reason = "Exact immutable evidence, verifier-competence and dependency-closure projections are not implemented by this design branch."
+required_owner = "Governor/evidence owners"
+
+[[open]]
+id = "CC-W1-MODEL-ROUTE-RECEIPT"
+reason = "Dreamer bundle/grounding contracts refer to an externally owned model-route receipt; route selection and invocation are outside cognitive cells."
+required_owner = "Governor/model router"
+
+[[open]]
+id = "CC-W1-PROBE-EXECUTION"
+reason = "ProbePlan is advisory only; tool/agent/model execution, budget reservation, safety admission and effect receipts require real external owners."
+required_owner = "Governor/AgentCoordinator/effect owner"
+
+[[open]]
+id = "CC-W1-CLARIFICATION-EXECUTION"
+reason = "ClarificationCandidate does not ask a user/agent or mutate objective, scope, acceptance or authority."
+required_owner = "Task Controller/Human interaction owner"
+
+[[open]]
+id = "CC-W1-SELF-QUERY-ADAPTERS"
+reason = "Accepted normative sections and current implementation/conformance evidence must be materialized by their real owners; the pure brief builders perform no document/repository/runtime scan."
+required_owner = "normative receipt owner and repository/runtime evidence owners"
+
+[[open]]
+id = "CC-W1-PACKAGE-PROOF"
+reason = "No Rust source, dependency identity or package execution exists in this design branch."
+required_owner = "package integration owner"
+
+[[open]]
+id = "CC-W1-EDGE-PROOF"
+reason = "No real provider/consumer edge has executed for epistemic resolution, Dreamer validation/orientation or self-query briefs."
+required_owner = "integration owner"
+
+[[open]]
+id = "CC-W1-PRODUCT-PULSES"
+reason = "D3A_ORIENTATION_PULSE_01 and D3A_SELF_QUERY_PULSE_01 have not executed."
+required_owner = "Product Pulse owner"
+
+[[open]]
+id = "CC-W1-RUNTIME-ADMISSION"
+reason = "No root workspace/runtime admission is allowed before package, edge and product evidence."
+required_owner = "Governor/integration owner"
