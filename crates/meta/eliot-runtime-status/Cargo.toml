@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[package.metadata.eliot]
+source_maintenance_owner = "source.meta.runtime-status"
+cell_manifest = "capability-cells.toml"
+
 [dependencies]
 eliot-contracts.workspace = true
 eliot-host-state.workspace = true
