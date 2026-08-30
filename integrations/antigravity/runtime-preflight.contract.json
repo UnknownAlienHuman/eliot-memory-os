@@ -1,0 +1,104 @@
+{
+  "schema_version": "eliot.antigravity-runtime-preflight.v1",
+  "candidate_runtimes": [
+    {
+      "runtime_id": "antigravity.headless",
+      "program_candidates": [
+        "antigravity"
+      ],
+      "version_argv": [
+        "--version"
+      ],
+      "help_argv": [
+        "exec",
+        "--help"
+      ],
+      "required_help_markers": [
+        "stdin",
+        "json"
+      ],
+      "optional_help_markers": [
+        "persistent",
+        "resume",
+        "model",
+        "permission",
+        "workspace"
+      ],
+      "route_role": "primary_candidate",
+      "execution_allowed": false
+    },
+    {
+      "runtime_id": "antigravity.agy-readonly",
+      "program_candidates": [
+        "agy"
+      ],
+      "version_argv": [
+        "--version"
+      ],
+      "help_argv": [
+        "--help"
+      ],
+      "required_help_markers": [],
+      "optional_help_markers": [
+        "diff",
+        "model",
+        "workspace"
+      ],
+      "route_role": "read_only_fallback",
+      "execution_allowed": false
+    }
+  ],
+  "environment_allowlist": [
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "HOME",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "TEMP",
+    "TMP",
+    "LANG",
+    "LC_ALL",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY"
+  ],
+  "bounds": {
+    "version_timeout_ms": 5000,
+    "help_timeout_ms": 5000,
+    "max_version_bytes": 16384,
+    "max_help_bytes": 1048576,
+    "max_stderr_bytes": 65536
+  },
+  "primary_admission_requires": [
+    "exact_executable_sha256",
+    "exact_version_receipt",
+    "exact_help_sha256",
+    "required_help_markers",
+    "observed_request_event_schema",
+    "current_account_model_catalogue",
+    "provider_interrupt_and_terminal_reconciliation",
+    "process_tree_containment",
+    "descendant_closure",
+    "bounded_product_pulse"
+  ],
+  "fallback": {
+    "runtime_id": "antigravity.agy-readonly",
+    "fresh_only": true,
+    "resume": false,
+    "native_subagents": false,
+    "worktree_mutation": false,
+    "output_authority": "candidate_unified_diff_only",
+    "unknown_outcome_redispatch": false,
+    "task_completion_authority": false
+  },
+  "provider_credentials_in_probe": false,
+  "model_calls": 0,
+  "fixed_model_id": null,
+  "route_admitted": false,
+  "receipt_schema": "eliot.antigravity-runtime-preflight-receipt.v1",
+  "proof_ceiling": "ZERO_MODEL_EXECUTABLE_AND_HELP_FINGERPRINT_ONLY"
+}

@@ -1,5 +1,25 @@
 # Module execution source instructions
 
+<!-- eliot-doc-routing:start -->
+## Mandatory documentation routing
+
+Before changing code, configuration, tests, workflows, or normative prose, run
+from the repository root:
+
+```text
+python scripts/docs_router.py route --path <repository/path> --topic "<causal property>"
+```
+
+Read every fragment marked **required**, then record the emitted receipt in the
+work unit or pull request. Optional fragments are loaded only when the current
+decision crosses their stated boundary. A legacy `ELIOT_*` compatibility map is
+never an acceptable reading receipt.
+
+If no non-baseline route matches, stop the mutation and add or obtain a route;
+silence is not permission. See [`../../docs/architecture/READING_PROTOCOL.md`](../../docs/architecture/READING_PROTOCOL.md).
+<!-- eliot-doc-routing:end -->
+
+
 This subtree owns mechanics for immutable WASM/native Module generations. It
 does not own Module admission intent, task semantics, authority/effects,
 promotion, provider policy, canonical writes, or finish. Issues #21 and #22 own

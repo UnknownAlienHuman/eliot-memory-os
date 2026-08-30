@@ -1,0 +1,241 @@
+schema = "eliot.epoch-identity.contract.v1"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+owner_package = "eliot-contracts"
+functional_cell_id = "foundation.authority.epoch-identity"
+source_issue = 289
+integration_issue = 64
+normative_architecture_refs = ["ARCH-AUTH-01", "ARCH-RES-03"]
+normative_implementation_refs = ["I0.5", "I1.8", "I1.9", "I5.6", "I6.10", "I14"]
+public_contract_name = "eliot.foundation.epoch-id"
+public_contract_revision = "1.0.0"
+proof_ceiling = "STATIC_FIELD_AND_MIGRATION_CONTRACT_ONLY"
+mutable_state = "none"
+allowed_effects = []
+
+[ownership]
+source_maintenance_owner = "foundation-contract-owner"
+lifecycle_owner = "none_stateless_contract"
+authority_owner = "none"
+canonical_state_owner = "none"
+runtime_owner = "none"
+first_real_consumer = "eliot-host-state"
+replacement_boundary = "versioned EpochId/EpochTransition wire contract plus cross-owner conformance corpus"
+must_not_own = [
+  "HostStateJournal",
+  "Kernel authority activation or revocation",
+  "ORS epoch state",
+  "daemon or store receipt lifecycle",
+  "restore or break-glass policy",
+  "generation routing",
+  "task or semantic state",
+]
+
+[wire]
+encoding = "serde-compatible closed struct and enum"
+unknown_fields = "reject"
+unknown_enum_values = "reject"
+canonical_lineage_spelling = "lowercase hyphenated UUID"
+canonical_digest_domain_separator = "eliot.foundation.epoch-id.v1"
+cross_lineage_total_order = false
+sequence_zero_allowed = false
+uuid_or_timestamp_order_has_authority_meaning = false
+
+[types.EpochLineageId]
+kind = "validated opaque value"
+fields = ["uuid"]
+invariants = [
+  "exactly 36 ASCII bytes",
+  "hyphens at positions 8, 13, 18, and 23",
+  "all remaining bytes are lowercase hexadecimal",
+  "equality and hashing only; lexical or UUID ordering is never authority",
+  "minting occurs only at the declared Host/recovery owner boundary",
+]
+
+[types.EpochId]
+kind = "closed struct"
+fields = ["lineage_id: EpochLineageId", "sequence: NonZeroU64"]
+invariants = [
+  "exact tuple equality is the normal authority-match rule",
+  "sequence is compared only when lineage_id is exactly equal",
+  "equal sequences from different lineages are unrelated",
+  "a numerically larger sequence from another lineage is not newer",
+  "canonical digest input includes domain separator, lineage_id, and sequence",
+]
+
+[types.EpochTransition]
+kind = "closed struct"
+fields = ["current: EpochId", "parent: Option<EpochId>"]
+invariants = [
+  "genesis is current.sequence == 1 and parent is absent",
+  "non-genesis requires parent in the same lineage",
+  "non-genesis requires current.sequence == parent.sequence + 1 without overflow",
+  "parent identity is explicit and cannot be inferred from a counter",
+  "restore, migration, corruption recovery, or break-glass creates genesis in a new lineage",
+]
+
+[types.EpochRelation]
+kind = "closed enum"
+values = [
+  "SAME",
+  "DIRECT_CHILD",
+  "DIRECT_PARENT",
+  "SAME_LINEAGE_OLDER",
+  "SAME_LINEAGE_NEWER",
+  "UNRELATED_LINEAGE",
+]
+invariants = [
+  "relation is derived only from two validated EpochId values",
+  "UNRELATED_LINEAGE never authorizes, supersedes, finalizes, or orders an operation",
+  "DIRECT_CHILD and DIRECT_PARENT require an exact one-step sequence delta in one lineage",
+]
+
+[types.LegacyScalarEpoch]
+kind = "compatibility-only closed struct"
+fields = [
+  "scalar_sequence: NonZeroU64",
+  "source_record_ref",
+  "source_contract_revision",
+]
+invariants = [
+  "contains no active lineage identity",
+  "cannot satisfy an authority check",
+  "cannot enter StateFence, route fence, MAC, request digest, or active receipt directly",
+]
+
+[types.LegacyEpochImport]
+kind = "closed enum"
+values = [
+  "EVIDENCE_BOUND_ACTIVE",
+  "HISTORICAL_SUSPENDED",
+  "MANUAL_RECOVERY_REQUIRED",
+]
+invariants = [
+  "only EVIDENCE_BOUND_ACTIVE contains an EpochId",
+  "EVIDENCE_BOUND_ACTIVE requires exact installation identity, Host lineage evidence, source record identity, and migration receipt",
+  "HISTORICAL_SUSPENDED preserves the scalar and evidence without authority",
+  "MANUAL_RECOVERY_REQUIRED preserves the scalar and blocks dependent admission",
+  "absence, ambiguity, or conflict in lineage evidence never defaults to the current lineage",
+]
+
+[functions]
+public = [
+  "EpochLineageId::new(canonical_uuid_text) -> Result<EpochLineageId, EpochContractError>",
+  "EpochId::new(lineage_id, sequence) -> Result<EpochId, EpochContractError>",
+  "EpochId::relation_to(other) -> EpochRelation",
+  "EpochTransition::genesis(lineage_id) -> EpochTransition",
+  "EpochTransition::direct_child(parent) -> Result<EpochTransition, EpochContractError>",
+  "EpochTransition::validate() -> Result<(), EpochContractError>",
+  "epoch_identity_digest(epoch_id) -> Result<LowercaseSha256, EpochContractError>",
+  "import_legacy_scalar_epoch(input, evidence) -> Result<LegacyEpochImport, EpochContractError>",
+]
+forbidden = [
+  "EpochId::value() -> u64",
+  "From<EpochId> for u64",
+  "From<LegacyScalarEpoch> for EpochId without evidence",
+  "PartialOrd or Ord on EpochId or EpochLineageId",
+  "comparison of epochs from different lineages by sequence, timestamp, or UUID",
+  "implicit current-lineage fallback",
+  "minting a new lineage in a generic deserializer or report renderer",
+]
+
+[errors]
+closed_values = [
+  "INVALID_LINEAGE_ID",
+  "ZERO_SEQUENCE",
+  "SEQUENCE_OVERFLOW",
+  "INVALID_GENESIS",
+  "PARENT_LINEAGE_MISMATCH",
+  "NOT_DIRECT_CHILD",
+  "LEGACY_LINEAGE_EVIDENCE_MISSING",
+  "LEGACY_LINEAGE_EVIDENCE_AMBIGUOUS",
+  "LEGACY_LINEAGE_EVIDENCE_CONFLICTED",
+  "LEGACY_ACTIVE_BINDING_FORBIDDEN",
+  "SERIALIZATION_FAILURE",
+]
+
+[migration]
+no_third_type_rule = "eliot-host-state must migrate/re-export the canonical types; a parallel EpochIdentity implementation is forbidden"
+legacy_scalar_owner = "compatibility decoder only"
+new_authority_fields = "must use EpochId"
+durable_rewrite = "requires an explicit migration receipt; no in-place guessing"
+restore_rule = "new globally distinct lineage; every previous lineage is fenced before admission"
+rollback_rule = "rollback may read historical scalar records only through the compatibility import; it cannot reactivate them"
+
+[[migration.wave]]
+order = 1
+owner = "eliot-contracts"
+scope = ["canonical EpochId/EpochTransition contract", "codec", "golden/property fixtures"]
+must_not_touch = ["StateFence consumers", "Kernel", "ORS", "daemon", "store", "runtime routes"]
+
+[[migration.wave]]
+order = 2
+owner = "eliot-host-state"
+scope = ["replace local EpochIdentity/EpochTransition implementation", "re-export canonical contract", "preserve Host journal compatibility"]
+must_not_touch = ["Kernel/store consumer migration"]
+
+[[migration.wave]]
+order = 3
+owner = "Kernel authority integration"
+scope = ["StateFence", "authority tokens and MACs", "RouteFence", "GenerationRoute", "readiness snapshots"]
+must_not_touch = ["store durable rewrite"]
+
+[[migration.wave]]
+order = 4
+owner = "ORS/protocol/daemon/store integration"
+scope = ["ORS records", "handshakes", "PreparedTransition", "receipts", "runtime status", "Watchdog", "User Broker"]
+must_not_touch = ["Product acceptance without live proof"]
+
+[[migration.wave]]
+order = 5
+owner = "recovery integration"
+scope = ["restore", "migration", "corruption recovery", "break-glass", "Product/Recovery pulse"]
+must_not_touch = ["historical data erasure or silent authority revival"]
+
+[fixtures]
+minimum = [
+  "same tuple compares SAME",
+  "direct child in one lineage is accepted",
+  "skipped sequence in one lineage is rejected as direct child",
+  "equal sequence in different lineages is UNRELATED_LINEAGE",
+  "larger sequence in another lineage is UNRELATED_LINEAGE",
+  "genesis requires sequence 1 and no parent",
+  "non-genesis requires explicit parent",
+  "sequence overflow fails closed",
+  "noncanonical UUID spelling fails",
+  "canonical digest is stable and changes with lineage or sequence",
+  "legacy scalar with exact lineage evidence binds once",
+  "legacy scalar without evidence remains HISTORICAL_SUSPENDED or MANUAL_RECOVERY_REQUIRED",
+  "conflicting legacy evidence cannot produce active authority",
+  "serde unknown field and enum value fail closed",
+  "no public scalar coercion helper exists",
+]
+
+[consumer_proof]
+package = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-contracts --all-targets",
+  "cargo test --locked -p eliot-contracts",
+  "cargo clippy --locked -p eliot-contracts --all-targets -- -D warnings",
+]
+edge = [
+  "Host local epoch model is removed or re-exported without a second implementation",
+  "StateFence and every authority-bearing consumer use one EpochId corpus",
+  "same-sequence/different-lineage rejection crosses Host -> Kernel -> ORS -> daemon -> store",
+]
+product = [
+  "restart within one lineage accepts only direct child",
+  "restore/break-glass creates a new lineage and fences old sessions/tokens/routes/receipts",
+  "legacy unresolved records enter visible recovery and never active authority",
+]
+
+[stop_conditions]
+contract_challenge = [
+  "a consumer requires cross-lineage numeric ordering",
+  "a migration cannot prove the scalar record's installation and Host lineage",
+  "the proposed source creates a third epoch implementation",
+  "a caller requests a scalar coercion to preserve an old API",
+  "a durable rewrite lacks rollback and a migration receipt",
+  "the discriminator does not fail for equal sequences from different lineages",
+]

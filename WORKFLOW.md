@@ -1,11 +1,53 @@
 # Development workflow
 
+<!-- eliot-doc-routing:start -->
+## Mandatory documentation routing
+
+Before changing code, configuration, tests, workflows, or normative prose, run
+from the repository root:
+
+```text
+python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+```
+
+Repeat `--path` for every mutable path family, or use `--changed-from
+<authority-receipt-sha>` for the complete branch delta, including deletions. The
+command runs the canonical router, verifies every required item against its
+routed SHA-256 and byte count, and renders the bounded content. Read the
+generated bundle before mutation; a route listing by itself does not satisfy
+this gate.
+
+Record the read receipt ID, bundle SHA-256, matched routes, required handles, and
+an explicit reading attestation in the pull request. Optional fragments are
+loaded only when the current decision crosses their boundary. If no route
+matches, an item is stale, or scope expands, stop and rerun or repair the route.
+See [`docs/architecture/READING_PROTOCOL.md`](docs/architecture/READING_PROTOCOL.md).
+<!-- eliot-doc-routing:end -->
+
+
 ## One authority surface
 
 `main` is the current product source and documentation authority. Issues define
 work; branches and worktrees execute it; pull requests integrate it. Reports,
 audits, research dumps, local state, and generated evidence are not parallel
 sources of truth.
+
+Upstream synchronization is root-owned and controller-only. While online agents
+are active, the root controller performs the coordinated upstream fetch
+approximately hourly, and also at an explicit integration boundary when needed,
+then publishes an authority receipt recording:
+- remote URL;
+- upstream ref (`refs/heads/main` / `origin/main`);
+- commit SHA;
+- sync result;
+- timestamp (UTC).
+
+Workers and managers never fetch or pull directly, and must not switch,
+fast-forward, or update the controller/authority checkout or authority branches.
+Issue worktrees and branches are provisioned from the published SHA; ordinary
+issue-branch creation remains allowed in isolated worktrees. They verify their
+local worktree and base revision against the published authority receipt without
+updating refs.
 
 Canonical navigation:
 
@@ -20,11 +62,14 @@ Canonical navigation:
 
 ```text
 open issue with owner, causal property, scope, proof, and non-goals
-→ fetch/prune and fast-forward main only
-→ create a fresh issue-numbered branch from exact origin/main
+→ root/controller sync and publish authority receipt (remote URL, ref, SHA, result, timestamp)
+→ verify local worktree and base commit against authority receipt (no fetch/pull by workers)
+→ create a fresh issue-numbered branch from verified base commit
 → claim one mutable path scope
+→ route, verify, and read the bounded documentation bundle
 → implement and run Module/Edge/Product proof as applicable
-→ open PR to main
+→ report read-only agent operations; escalate to manager audit on drift/anomaly
+→ open PR to main with read receipt, authority receipt, and attestation
 → integrate by squash after current-main and proof checks
 → close issue and retire the branch
 ```
@@ -44,8 +89,9 @@ campaign branches are not accepted for new work.
 A standard issue-numbered branch is valid only when:
 
 1. the branch issue is open and describes the current causal change;
-2. the branch was created from current `origin/main`;
-3. current `origin/main` remains an ancestor before further mutation and merge;
+2. the branch was created from the verified base commit matching the published
+   authority receipt;
+3. verified base commit remains an ancestor before further mutation and merge;
 4. its PR is open when one exists;
 5. the declared mutable path scope has no other writer.
 
@@ -66,6 +112,28 @@ or PR. Two agents may read the same files, but they do not mutate the same scope
 concurrently. Contract changes land before dependent implementation waves, and
 the integration owner revalidates consumers after the contract change.
 
+## Agent operations and audit escalation
+
+Agent operations operate under strict least-privilege governance:
+
+- **Read-only Antigravity operations reporting**: Antigravity is used for
+  read-only operational reporting, session state inspection, routing receipts,
+  and diagnostic telemetry. It does not possess completion, truth-promotion,
+  or patch-application authority, and must never be invoked recursively.
+- **Mandatory manager audit escalation**: Managers must immediately trigger a
+  bounded audit and assign an independent, different verifier when any of the
+  following conditions occur:
+  - *Scope drift*: mutation outside the assigned mutable path scope or issue
+    boundaries;
+  - *Forbidden commands*: attempts to execute uncoordinated `git fetch`,
+    `git pull`, `git push`, unauthorized network calls, or workflow mutations;
+  - *Unsupported claims*: assertions of completion or conformance lacking exact
+    evidence;
+  - *Missing tests*: code changes without matching unit, regression, or edge
+    proofs;
+  - *Provider/session anomalies*: Governor denials, session instability, stale
+    projections, or anomalous tool outputs.
+
 ## Documentation and evidence placement
 
 Keep in Git:
@@ -83,7 +151,8 @@ Do not keep in the active tree:
 - donor research packages or reverse-engineering dumps;
 - copies of documentation owned by Eliot Search or Eliot Research;
 - swarm conversations/results;
-- local databases, code-graph snapshots, runtime state, or credentials.
+- local databases, code-graph snapshots, runtime state, or credentials;
+- generated documentation bundles or read receipts.
 
 Investigation findings belong in the owning issue/PR. Large generated evidence
 belongs in CI artifacts or an external content-addressed store. Retired content
@@ -96,7 +165,9 @@ A PR states:
 
 - owning issue/workstream;
 - exact base and candidate revisions;
+- published authority receipt reference (remote URL, ref, SHA, result, timestamp);
 - changed causal property and path scope;
+- documentation route/read receipt, bundle hash, handles, and agent attestation;
 - proof executed and proof ceiling;
 - affected edges and Product Pulse, or why they are not applicable;
 - migration/rollback/removal consequences;

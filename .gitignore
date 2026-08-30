@@ -60,6 +60,10 @@ history.txt
 *.dmp
 *.core
 
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+
 # Common temporary files
 *.tmp
 *.temp

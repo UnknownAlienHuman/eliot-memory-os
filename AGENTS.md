@@ -1,10 +1,55 @@
 # Repository agent instructions
 
+<!-- eliot-doc-routing:start -->
+## Mandatory documentation routing
+
+Before changing code, configuration, tests, workflows, or normative prose, run
+from the repository root:
+
+```text
+python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+```
+
+Repeat `--path` for every mutable path family, or use `--changed-from
+<authority-receipt-sha>` to include the complete branch delta, including deleted
+paths. The reader runs the deterministic router, verifies every required
+file/fragment against its routed SHA-256 and byte count, and materializes the
+exact bounded bundle. Open and read that bundle before mutation.
+
+Running `scripts/docs_router.py route` alone is navigation, not reading evidence.
+Record the read receipt ID, bundle SHA-256, matched routes, and an explicit
+attestation in the work unit or pull request. Optional fragments are loaded only
+when the current decision crosses their stated boundary. A legacy `ELIOT_*`
+compatibility map never satisfies the gate.
+
+If no non-baseline route matches, a required item is missing/stale, or scope
+expands beyond the receipt, stop and rerun or repair the route; silence is not
+permission. See [`docs/architecture/READING_PROTOCOL.md`](docs/architecture/READING_PROTOCOL.md).
+<!-- eliot-doc-routing:end -->
+
+
 ## Authority
 
 `main` is the only current source and documentation authority. Never treat an
 old branch, worktree, report, audit, generated index, local database, agent
 memory, or prior conversation as current repository state.
+
+Upstream synchronization is root-owned and controller-coordinated. While online
+agents are active, the root controller performs the coordinated upstream fetch
+approximately hourly, and also at an explicit integration boundary when needed,
+then publishes an authority receipt recording:
+- remote URL;
+- tracked ref (`refs/heads/main` / `origin/main`);
+- commit SHA;
+- synchronization result / status;
+- UTC timestamp.
+
+Managers and workers never execute `git fetch`, `git pull`, or ref-mutating
+network operations. They must not switch, fast-forward, or update the
+controller/authority checkout or authority branches. Issue worktrees and branches
+are provisioned from the published SHA; ordinary issue-branch creation remains
+allowed in isolated worktrees. Managers and workers locally verify their base
+commit and worktree against the published authority receipt without updating refs.
 
 Read, in order:
 
@@ -27,16 +72,13 @@ composition root.
 Before reading deeply or changing anything:
 
 ```powershell
-git fetch origin --prune
-git switch main
-git pull --ff-only origin main
 git status --short --branch
 git rev-parse HEAD
-git rev-parse origin/main
 ```
 
-The revisions must match and the worktree must be clean. Create a fresh branch
-from that exact commit:
+Verify that `HEAD` matches the exact base commit SHA from the published authority
+receipt and that the worktree is clean. Create a fresh branch from that exact
+commit:
 
 ```powershell
 git switch -c <kind>/<issue>-<short-slug>
@@ -46,8 +88,8 @@ Allowed kinds: `work`, `fix`, `docs`, `chore`, `refactor`, `test`.
 
 Do not continue in a branch merely because it exists locally or was mentioned
 by another agent. A standard issue-numbered branch is mutable only while its
-owning issue is open, its current PR is open when one exists, and current
-`origin/main` is an ancestor. A nonstandard, shared, or long-lived branch is
+owning issue is open, its current PR is open when one exists, and the verified
+base revision remains an ancestor. A nonstandard, shared, or long-lived branch is
 mutable only when `workstreams/ACTIVE.toml` names it as an explicit exception.
 Otherwise stop, preserve any candidate through its issue/PR, and create a fresh
 branch from current `main`.
@@ -61,6 +103,28 @@ branch from current `main`.
 - Documentation follows the same issue/branch/PR path as source.
 - Core/daemon work follows [`workstreams/core-daemons/AGENTS.md`](workstreams/core-daemons/AGENTS.md).
 - Dreamer is not part of the core/daemon workstream.
+
+## Agent operations and audit escalation
+
+- **Antigravity agent operations**: Antigravity runs in a read-only operations
+  reporting mode for session status, routing evidence, receipt verification,
+  tool execution telemetry, and candidate findings. It has no authority to issue
+  leases, mutate canonical truth, apply unverified patches, or invoke
+  Antigravity recursively.
+- **Mandatory manager-triggered audit**: A manager must immediately trigger a
+  bounded audit and escalate to an independent, different verifier upon
+  detecting:
+  1. *Scope drift*: changes to files outside the declared mutable path scope or
+     work beyond the owning issue;
+  2. *Forbidden commands*: execution of unauthorized network commands, `git fetch`,
+     `git pull`, `git push`, branch resets, or workflow trigger mutations;
+  3. *Unsupported claims*: ungrounded assertions of conformance, missing
+     verification evidence, or premature completion claims;
+  4. *Missing tests*: omitted unit, integration, or edge proofs for modified
+     logic;
+  5. *Provider/session anomalies*: Governor denials, stale memory projections,
+     context corruption, session leaks, or abnormal tool failure loops.
+- Work cannot proceed or integrate while an audit escalation remains open.
 
 ## GitHub Actions policy
 
@@ -101,7 +165,9 @@ current authority.
 
 ## Verification
 
-Run the smallest proof that can fail on the changed path. Use `just quick` for
-bounded documentation/configuration changes and the applicable package/edge
-proof for Rust changes. Run broader suites only when the change closure requires
-them. Report every skipped, failed, simulated, or unavailable check exactly.
+Run the smallest proof that can fail on the changed path. Documentation and
+routing changes must run the shard, router, and read-bundle self-tests/checks
+included in `just quick`. Use `just quick` for bounded documentation/configuration
+changes and the applicable package/edge proof for Rust changes. Run broader
+suites only when the change closure requires them. Report every skipped, failed,
+simulated, or unavailable check exactly.

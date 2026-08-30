@@ -1,5 +1,12 @@
 # Documentation map
 
+<!-- eliot-doc-routing:start -->
+## Documentation entry point
+
+Start with the [mandatory reading protocol](architecture/READING_PROTOCOL.md), then use the generated route for the exact files and causal property being changed. The stable `ELIOT_*` files are compatibility maps, not task prompts.
+<!-- eliot-doc-routing:end -->
+
+
 `main` contains the current documentation. This directory has no historical
 audit archive and no alternate Architecture edition.
 

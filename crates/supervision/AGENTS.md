@@ -1,5 +1,25 @@
 # Supervision source instructions
 
+<!-- eliot-doc-routing:start -->
+## Mandatory documentation routing
+
+Before changing code, configuration, tests, workflows, or normative prose, run
+from the repository root:
+
+```text
+python scripts/docs_router.py route --path <repository/path> --topic "<causal property>"
+```
+
+Read every fragment marked **required**, then record the emitted receipt in the
+work unit or pull request. Optional fragments are loaded only when the current
+decision crosses their stated boundary. A legacy `ELIOT_*` compatibility map is
+never an acceptable reading receipt.
+
+If no non-baseline route matches, stop the mutation and add or obtain a route;
+silence is not permission. See [`../../docs/architecture/READING_PROTOCOL.md`](../../docs/architecture/READING_PROTOCOL.md).
+<!-- eliot-doc-routing:end -->
+
+
 This subtree owns deterministic supervision mechanics and typed Watchdog
 observations. It does not own canonical task/memory truth, semantic diagnosis,
 repair policy, general process control, or finish. Issue #16 is the owner; #13

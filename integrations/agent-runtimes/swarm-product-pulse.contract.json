@@ -1,0 +1,66 @@
+{
+  "schema_version": "eliot.swarm-product-pulse-contract.v1",
+  "scenario_schema": "eliot.swarm-product-pulse-scenario.v1",
+  "receipt_schema": "eliot.swarm-product-pulse-receipt.v1",
+  "required_hosts": [
+    "codex",
+    "opencode",
+    "claude",
+    "antigravity"
+  ],
+  "limits": {
+    "max_work_items": 8,
+    "max_mailbox_messages": 32,
+    "max_context_packet_bytes": 8192,
+    "max_result_packet_bytes": 16384,
+    "max_claims_per_result": 32,
+    "max_evidence_refs_per_result": 64,
+    "max_concilium_tests": 16
+  },
+  "context_packet_allowed_fields": [
+    "goal_ref",
+    "scope_refs",
+    "constraint_refs",
+    "evidence_refs",
+    "unknown_refs",
+    "skill_index_refs",
+    "mcp_profile_ref"
+  ],
+  "result_packet_allowed_fields": [
+    "summary",
+    "claims",
+    "artifact_refs",
+    "evidence_refs",
+    "unknowns",
+    "objections"
+  ],
+  "forbidden_payload_key_fragments": [
+    "password",
+    "secret",
+    "credential",
+    "api_key",
+    "access_token",
+    "refresh_token",
+    "authorization",
+    "cookie",
+    "raw_prompt",
+    "conversation",
+    "transcript",
+    "chat_history",
+    "raw_mcp",
+    "plugin_path",
+    "command_line",
+    "environment"
+  ],
+  "control_plane": "eliot.coordinate",
+  "message_transport": "durable_mailbox",
+  "meeting_form": "concilium_over_sealed_evidence",
+  "direct_group_chat": false,
+  "worker_voting": false,
+  "native_subagents": false,
+  "provider_execution_allowed": false,
+  "worker_result_authority": "candidate_only",
+  "decision_owner": "task_controller_or_human",
+  "promotion_disposition": "simulated_no_promotion",
+  "eligible_for_route_promotion": false
+}

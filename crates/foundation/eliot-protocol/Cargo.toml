@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "ELIOT Bridge Protocol EBP/1 contract and compatibility codecs"
 
+[lib]
+path = "src/root.rs"
+
 [dependencies]
 eliot-agent-contracts.workspace = true
 eliot-contracts.workspace = true

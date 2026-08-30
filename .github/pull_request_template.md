@@ -1,3 +1,17 @@
+<!-- eliot-doc-routing:start -->
+## Documentation read receipt
+
+- Reader command:
+- Matched route IDs:
+- Required handles and fragment SHAs read:
+- Route receipt ID:
+- Read receipt ID:
+- Verified bundle SHA-256:
+- Optional expansions opened and reason:
+- [ ] I opened the verified bundle and read every required item before mutation; no legacy `ELIOT_*` compatibility map was substituted.
+- [ ] I reran the reader after every expansion of mutable paths, causal property, authority boundary, or evidence scope.
+<!-- eliot-doc-routing:end -->
+
 ## Owning work
 
 - Issue:
