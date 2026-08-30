@@ -10,6 +10,7 @@ dist/
 
 # Runtime and machine-local state
 .eliot/
+.eliot-docs/
 .eliot-dev/
 .eliot-governor/
 **/.eliot-governor/
