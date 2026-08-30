@@ -24,6 +24,7 @@ independent_proof_profile = "prototype-not-workspace-admitted"
 contract_refs = [
   "crates/smart/cognitive-current.toml",
   "crates/smart/eliot-dreamer-contracts/common.contract.toml",
+  "crates/smart/eliot-dreamer-contracts/orientation.contract.toml",
 ]
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"

@@ -1,0 +1,230 @@
+schema_version = 1
+contract_id = "smart.dreamer.orientation.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-dreamer-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.dreamer.contracts.orientation", "smart.dreamer.rivals", "smart.dreamer.relations", "smart.dreamer.probe_plan", "smart.dreamer.clarification", "smart.dreamer.orientation_packet"]
+architecture_refs = ["ARCH-DRM-01", "ARCH-DRM-02", "ARCH-CONCIL-01", "ARCH-EPI-01", "ARCH-EPI-04", "ARCH-CTX-01", "ARCH-UND-02", "ARCH-SCOPE-01"]
+implementation_refs = ["I9.2", "I9.5", "I12.12", "I12.18", "I12.23", "I7.11"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Represent a bounded problem-oriented orientation packet that preserves resolved evidence, model synthesis, rivals, hidden relation hypotheses, unknowns and discriminative probes as separate candidate surfaces."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure_validation"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O((rivals + relations + probes + packet items) log n) over a bounded grounded draft; no retrieval, source acquisition, model call, tool execution or admission."
+replacement_boundary = "Replace orientation handler implementations behind this contract; Current Epistemic Position, Context admission, Researcher, Agent Coordinator and Governor remain separate owners."
+
+[closed_sets]
+relation_use_cases = ["Orientation", "Curation"]
+relation_types = ["Supports", "Contradicts", "Qualifies", "DependsOn", "InvalidatedBy", "AppliesTo", "SequenceBefore", "CoChange", "Similarity", "CausalHypothesis"]
+relation_directions = ["Directed", "Symmetric"]
+candidate_states = ["Proposed", "PartiallyGrounded", "Contradicted", "Stale", "Unsupported"]
+probe_dispositions = ["Recommended", "RequiredBeforeMaterialAction", "DeferredWithRisk", "BlockedByCapability", "Exhausted"]
+clarification_dispositions = ["AskActiveAgent", "AskHumanOwner", "UseSafeFallback", "Defer"]
+packet_coverage_states = ["Complete", "Partial", "Unavailable", "Blocked", "Stale"]
+
+[hard_invariants]
+resolved_evidence_sections_are_populated_only_from_governor_handles = true
+model_synthesis_never_masquerades_as_resolved_evidence = true
+rivals_counterevidence_and_shared_lineage_remain_visible = true
+relation_similarity_sequence_and_cochange_do_not_imply_causality = true
+causal_relation_requires_mechanism_prediction_rivals_and_invalidation = true
+probe_plan_has_no_execution_receipt_or_authority = true
+clarification_is_bounded_and_has_safe_fallback = true
+coverage_requires_exact_recheckable_denominator = true
+packet_contains_no_context_admission_canonical_write_or_finish_state = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "EpistemicStatus"
+owner = "eliot-evidence"
+
+[[external_type]]
+name = "CurrentEpistemicPosition"
+owner = "eliot-epistemic-contracts"
+
+[[external_type]]
+name = "EvidenceDependence"
+owner = "eliot-epistemic-contracts"
+
+[[external_type]]
+name = "DreamJobEnvelope"
+owner = "eliot-dreamer-contracts/common.contract.toml"
+
+[[external_type]]
+name = "ReferenceCoverage"
+owner = "eliot-dreamer-contracts/common.contract.toml"
+
+[[external_type]]
+name = "GroundedDreamDraft"
+owner = "eliot-dreamer-contracts/common.contract.toml"
+
+[[public_type]]
+name = "OrientationRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "job_sha256: String", "current_position_handle: ArtifactId", "current_position_sha256: String", "reference_manifest_sha256: String", "goal_and_acceptance_handles: Vec<ArtifactId>", "focus_entity_handles: Vec<ArtifactId>", "active_conflict_handles: Vec<ArtifactId>", "active_unknown_handles: Vec<ArtifactId>", "architecture_anchor_handles: Vec<ArtifactId>", "maximum_rivals: u32", "maximum_relations: u32", "maximum_probes: u32", "maximum_clarifications: u32", "request_sha256: String"]
+invariants = ["job and position identities exact", "all handles unique within role", "bounds non-zero", "request grants no retrieval, model, tool, launch, admission or authority"]
+
+[[public_type]]
+name = "OrientationCandidateState"
+kind = "enum"
+definition = ["Proposed", "PartiallyGrounded", "Contradicted", "Stale", "Unsupported"]
+
+[[public_type]]
+name = "RivalModelCandidate"
+kind = "struct"
+definition = ["candidate_id: ArtifactId", "question_or_position_ref: ArtifactId", "statement: String", "mechanism: String", "scope_id: String", "state_fence: StateFence", "state: OrientationCandidateState", "supporting_reference_ids: Vec<ArtifactId>", "counterevidence_reference_ids: Vec<ArtifactId>", "dependence: Vec<EvidenceDependence>", "predicted_observables: Vec<String>", "possible_confounders: Vec<String>", "strongest_objection: String", "invalidation_condition: String", "validity_scope: String"]
+invariants = ["candidate remains a rival rather than current support", "support/counterevidence/shared dependence stay separate", "mechanism, strongest objection, prediction and invalidation are explicit", "scope/fence exact"]
+
+[[public_type]]
+name = "RivalCoverageDenominator"
+kind = "struct"
+definition = ["source_ref: String", "source_revision: String", "method_ref: String", "expected_candidate_inputs: Option<u32>", "expected_input_handles: Vec<ArtifactId>"]
+invariants = ["source/revision/method non-blank", "Complete requires expected candidate inputs", "handles unique", "denominator independently recheckable"]
+
+[[public_type]]
+name = "RivalModelSet"
+kind = "struct"
+definition = ["set_id: ArtifactId", "orientation_request_sha256: String", "coverage: ReferenceCoverage", "denominator: Option<RivalCoverageDenominator>", "candidates: Vec<RivalModelCandidate>", "omitted_or_missing_refs: Vec<String>", "set_sha256: String"]
+invariants = ["Complete requires exact denominator/count", "empty result under partial/unavailable coverage is not an absence claim", "candidate ids unique", "canonical order and digest"]
+
+[[public_type]]
+name = "RelationUseCase"
+kind = "enum"
+definition = ["Orientation", "Curation"]
+
+[[public_type]]
+name = "RelationCandidateType"
+kind = "enum"
+definition = ["Supports", "Contradicts", "Qualifies", "DependsOn", "InvalidatedBy", "AppliesTo", "SequenceBefore", "CoChange", "Similarity", "CausalHypothesis"]
+
+[[public_type]]
+name = "RelationDirection"
+kind = "enum"
+definition = ["Directed", "Symmetric"]
+
+[[public_type]]
+name = "RelationCandidateRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "use_case: RelationUseCase", "source_entity_handles: Vec<ArtifactId>", "target_entity_handles: Vec<ArtifactId>", "allowed_relation_types: Vec<RelationCandidateType>", "reference_manifest_sha256: String", "scope_id: String", "state_fence: StateFence", "maximum_candidates: u32", "request_sha256: String"]
+invariants = ["source/target/type sets unique", "scope/fence/manifest exact", "bounds non-zero", "request grants no graph write or causal promotion"]
+
+[[public_type]]
+name = "RelationCandidate"
+kind = "struct"
+definition = ["candidate_id: ArtifactId", "request_sha256: String", "source_entity_handle: ArtifactId", "target_entity_handle: ArtifactId", "relation_type: RelationCandidateType", "direction: RelationDirection", "scope_id: String", "state_fence: StateFence", "state: OrientationCandidateState", "supporting_reference_ids: Vec<ArtifactId>", "counterevidence_reference_ids: Vec<ArtifactId>", "mechanism: Option<String>", "predicted_observable: Option<String>", "rival_relation_candidate_ids: Vec<ArtifactId>", "invalidation_condition: String"]
+invariants = ["self-edge rejected unless relation contract explicitly permits it", "support/counterevidence/rivals stay addressable", "CausalHypothesis requires mechanism, prediction and rival/invalidation evidence", "SequenceBefore/CoChange/Similarity never populate causal fields automatically"]
+
+[[public_type]]
+name = "RelationCandidateSet"
+kind = "struct"
+definition = ["request_sha256: String", "candidates: Vec<RelationCandidate>", "coverage: ReferenceCoverage", "omitted_or_missing_refs: Vec<String>", "set_sha256: String"]
+invariants = ["all candidates bind one request/use case/fence", "candidate ids unique", "partial coverage visible", "canonical order and digest"]
+
+[[public_type]]
+name = "ProbeDisposition"
+kind = "enum"
+definition = ["Recommended", "RequiredBeforeMaterialAction", "DeferredWithRisk", "BlockedByCapability", "Exhausted"]
+
+[[public_type]]
+name = "ProbeCandidate"
+kind = "struct"
+definition = ["probe_id: ArtifactId", "question: String", "decision_dependency_refs: Vec<ArtifactId>", "rival_candidate_refs: Vec<ArtifactId>", "proposed_action_or_observation: String", "expected_if_primary_holds: String", "expected_if_rival_holds: String", "falsifier: String", "required_capability_refs: Vec<String>", "risk_notes: Vec<String>", "cost_notes: Vec<String>", "stop_condition: String", "disposition: ProbeDisposition"]
+invariants = ["at least two alternatives discriminated", "true/rival expectations and falsifier explicit", "probe has no execution, authority, lease or receipt field"]
+
+[[public_type]]
+name = "DiscriminativeProbePlan"
+kind = "struct"
+definition = ["plan_id: ArtifactId", "orientation_request_sha256: String", "probe_candidates: Vec<ProbeCandidate>", "recommended_probe_id: Option<ArtifactId>", "coverage: ReferenceCoverage", "unresolved_decision_refs: Vec<ArtifactId>", "plan_sha256: String"]
+invariants = ["recommended id resolves or is absent with reason", "probe ids unique", "required decision dependencies remain visible", "canonical order and digest"]
+
+[[public_type]]
+name = "ClarificationDisposition"
+kind = "enum"
+definition = ["AskActiveAgent", "AskHumanOwner", "UseSafeFallback", "Defer"]
+
+[[public_type]]
+name = "ClarificationCandidate"
+kind = "struct"
+definition = ["clarification_id: ArtifactId", "orientation_request_sha256: String", "question: String", "why_it_matters: String", "affected_decision_refs: Vec<ArtifactId>", "answer_owner_ref: String", "disposition: ClarificationDisposition", "safe_fallback_if_unanswered: String", "expiry_or_review_condition: String"]
+invariants = ["one concise question", "owner and affected decision explicit", "safe fallback and review condition mandatory", "Human is used only for a Human-owned decision boundary"]
+
+[[public_type]]
+name = "DreamPacket"
+kind = "struct"
+definition = ["packet_id: ArtifactId", "orientation_request_sha256: String", "question: String", "scope_id: String", "task_id: Option<TaskId>", "state_fence: StateFence", "source_coverage: ReferenceCoverage", "resolved_epistemic_position_handle: ArtifactId", "anchored_evidence_by_status: Vec<ArtifactId>", "synthesized_interpretation_handles: Vec<ArtifactId>", "rival_model_set: RivalModelSet", "relation_candidate_set: RelationCandidateSet", "unknown_and_gap_handles: Vec<ArtifactId>", "probe_plan: DiscriminativeProbePlan", "clarifications: Vec<ClarificationCandidate>", "architecture_implication_handles: Vec<ArtifactId>", "route_and_cost_receipt_handles: Vec<ArtifactId>", "invalidation_conditions: Vec<String>", "provenance_handles: Vec<ArtifactId>", "packet_sha256: String"]
+invariants = ["resolved evidence and synthesis stay separate", "position/rivals/relations/unknowns/probes all addressable", "all content binds one question/scope/task/fence", "contains no Context admission, canonical transition, authority, execution or finish field", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_orientation_request"
+signature = "pub fn validate_orientation_request(job: &DreamJobEnvelope, request: &OrientationRequest) -> Result<(), DreamContractError>"
+
+[[public_function]]
+name = "validate_rival_model_set"
+signature = "pub fn validate_rival_model_set(request: &OrientationRequest, set: &RivalModelSet) -> Result<(), DreamContractError>"
+
+[[public_function]]
+name = "validate_relation_candidate_set"
+signature = "pub fn validate_relation_candidate_set(request: &RelationCandidateRequest, set: &RelationCandidateSet) -> Result<(), DreamContractError>"
+
+[[public_function]]
+name = "validate_probe_plan"
+signature = "pub fn validate_probe_plan(request: &OrientationRequest, plan: &DiscriminativeProbePlan) -> Result<(), DreamContractError>"
+
+[[public_function]]
+name = "validate_clarification_candidate"
+signature = "pub fn validate_clarification_candidate(request: &OrientationRequest, candidate: &ClarificationCandidate) -> Result<(), DreamContractError>"
+
+[[public_function]]
+name = "validate_dream_packet"
+signature = "pub fn validate_dream_packet(job: &DreamJobEnvelope, request: &OrientationRequest, grounded: &GroundedDreamDraft, packet: &DreamPacket) -> Result<(), DreamContractError>"
+
+[[negative_test]]
+id = "model-authored-resolved-evidence-rejected"
+property = "Synthesized interpretation cannot populate resolved position or anchored evidence sections."
+
+[[negative_test]]
+id = "causality-not-from-proximity"
+property = "Similarity, sequence and co-change candidates cannot decode as CausalHypothesis without mechanism/prediction/rival/invalidation fields."
+
+[[negative_test]]
+id = "empty-rival-search-not-absence"
+property = "Empty rivals under missing/partial denominator remains a gap rather than no-rivals claim."
+
+[[negative_test]]
+id = "probe-not-execution"
+property = "Probe plan exposes no execution, lease, effect or outcome receipt."
+
+[[negative_test]]
+id = "clarification-bounded"
+property = "Clarification count and each question length obey request/output bounds and preserve fallback."
+
+[[negative_test]]
+id = "packet-no-admission"
+property = "DreamPacket exposes no Context admission, canonical write, epistemic promotion or finish field."
+
+[[negative_test]]
+id = "permutation-deterministic"
+property = "Rival/relation/probe/packet collection permutation does not change canonical identities."
