@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
+mod catalogue;
 mod client;
 mod endpoint;
 mod http;
 mod sse;
 mod types;
 
+pub use catalogue::*;
 pub use client::{OpenCodeClient, OpenCodeRunError, OpenCodeRunPolicy};
 pub use endpoint::{LoopbackEndpoint, LoopbackEndpointError};
 pub use http::{
