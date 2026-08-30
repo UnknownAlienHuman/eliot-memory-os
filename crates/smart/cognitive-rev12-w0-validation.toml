@@ -1,0 +1,109 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "VALIDATION_CONTRACT_NOT_IMPLEMENTATION_OR_PRODUCT_PROOF"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[expected]
+orders = [1, 2, 4, 5, 6, 7, 19, 26, 27, 28, 35, 49, 50, 51, 52, 68, 71, 74]
+non_w8_field_contracts = 7
+w8_field_contracts = 3
+contract_index = "crates/smart/cognitive-rev12-w0-field-contracts.toml"
+type_ownership = "crates/smart/cognitive-rev12-w0-type-ownership.toml"
+agent_handoff = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+
+[[gate]]
+id = "W0V01_TOML_PARSE"
+requirement = "Every W0 contract, index, ownership and handoff artifact parses as TOML."
+
+[[gate]]
+id = "W0V02_ORDER_CLOSURE"
+requirement = "Assignments cover exactly the expected W0 orders with no duplicate order or cell ID."
+
+[[gate]]
+id = "W0V03_FIELD_CONTRACT_CLOSURE"
+requirement = "Each expected contract cell points to one existing field contract; W8 contracts are referenced rather than redefined."
+
+[[gate]]
+id = "W0V04_TYPE_OWNER"
+requirement = "Every public type has one physical owner; duplicate field definitions and local worker redefinitions are forbidden."
+
+[[gate]]
+id = "W0V05_CAPTURE_PRESERVATION"
+requirement = "Cold/unbound observation is preserved; heuristic association cannot bind; conflict yields ambiguity; contamination is retained and quarantined as candidate."
+
+[[gate]]
+id = "W0V06_EPISTEMIC_SEPARATION"
+requirement = "Observation, support, explicit assumption, rival, conflict, stale/superseded and unknown remain separate; shared/circular evidence is not independent corroboration."
+
+[[gate]]
+id = "W0V07_DREAMER_CANDIDATE_ONLY"
+requirement = "Dreamer inputs are bounded admitted references; every material claim is grounded; seven transformation dimensions remain separate; no canonical/truth/authority/effect promotion."
+
+[[gate]]
+id = "W0V08_RESEARCH_BOUNDARY"
+requirement = "Researcher acquires, Dreamer interprets, Governor governs; ResearchSynthesis exposes no network/provider discovery/credential surface."
+
+[[gate]]
+id = "W0V09_CURATION_DISPATCH"
+requirement = "Curation subtype is explicit and registered; unknown subtype has no generic model fallback; outputs are candidates only."
+
+[[gate]]
+id = "W0V10_CUE_CANONICALITY"
+requirement = "Canonical cue spelling is preserved separately from comparison key; no filesystem normalization; exact direct match works with zero graph edges."
+
+[[gate]]
+id = "W0V11_CUE_SPREAD_BOUNDARY"
+requirement = "Relation spread is optional and bounded, cannot remove/replace direct hits, and path count cannot accumulate popularity or epistemic weight."
+
+[[gate]]
+id = "W0V12_CONTEXT_WHOLE_UNITS"
+requirement = "Context atoms are whole units; Safety Floor and downstream headroom precede optional filling; required atom is payload/handle/error."
+
+[[gate]]
+id = "W0V13_CONTEXT_PROVIDER_FAIRNESS"
+requirement = "Expected provider denominator is exact and deterministic optional allocation prevents one verbose provider from monopolizing budget."
+
+[[gate]]
+id = "W0V14_CONTEXT_ASSEMBLY_QUALITY"
+requirement = "Assembly cannot rerun admission/change membership; quality is dimensioned and non-mutating; omissions remain reversible."
+
+[[gate]]
+id = "W0V15_REACTIVE_PLAN_NOT_EFFECT"
+requirement = "PendingContextInjectionPlan performs no delivery and creates no DeliveryReceipt/prevention claim."
+
+[[gate]]
+id = "W0V16_MEMORY_SEPARATION"
+requirement = "Existence, support, accessibility, influence, usefulness and lifecycle remain independent; low use/retrieval/repetition cannot alter support."
+
+[[gate]]
+id = "W0V17_MEMORY_PROTECTION"
+requirement = "Raw evidence, minority/counterevidence, negative memory, invariants, commitments and normative sources remain addressable and original identities survive merge/split/reconsolidation candidates."
+
+[[gate]]
+id = "W0V18_LEARNING_TASK_LOCAL"
+requirement = "Learning overlay is task-local/reversible and cannot change goal, acceptance, authority, privacy, cost, evaluator or production generation."
+
+[[gate]]
+id = "W0V19_LEARNING_EVIDENCE_CHAIN"
+requirement = "Hypothesis/prediction precedes attempt; materially equivalent retry requires explicit learning purpose; missing owner evidence is not filled from transcript/model memory."
+
+[[gate]]
+id = "W0V20_ACTIVATION_NOT_RECEIPT"
+requirement = "Activation assessment owns no delivery/activation receipt and preserves activation, adherence, decision delta, outcome, retention and transfer separately."
+
+[[gate]]
+id = "W0V21_PROMOTION_EXTERNAL"
+requirement = "PromotionInputCandidate is dimensioned/advisory and cannot promote globally without external Governor/Human and Product Pulse evidence."
+
+[[gate]]
+id = "W0V22_SOURCE_SCOPE_EXCLUSIVITY"
+requirement = "Worker source/test scopes are disjoint; Cargo.toml, lib.rs and re-exports remain integration-owner files."
+
+[[gate]]
+id = "W0V23_PAYLOAD_HYGIENE"
+requirement = "Field-freeze diff contains TOML only: no Rust, Markdown, workflow, archive, .eliot, root Cargo.toml or Cargo.lock changes."
+
+[[gate]]
+id = "W0V24_PROOF_CEILING"
+requirement = "Field freeze, branch, commit or review cannot claim Rust implementation, package proof, Edge Proof, Product Pulse, runtime support or product acceptance."
