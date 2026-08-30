@@ -1,0 +1,120 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W9_EXTERNAL_EDGE_CHALLENGES"
+field_contract_index = "crates/smart/cognitive-rev12-w9-field-contracts.toml"
+rule = "Pure functions may be implemented and proven on exact fixtures. Live integration is blocked until the named external owner exposes an owner-neutral typed projection/receipt and the real provider-consumer Edge Proof passes."
+
+[[challenge]]
+id = "W9E01_MEMORY_ECOLOGY_EVIDENCE"
+cells = ["meta.memory.ecology_assessment"]
+consumer = "eliot-memory-quality"
+required_owners = ["Governor memory lifecycle owner", "Context delivery/use observation owner", "Evaluator/Product outcome owner"]
+required_projection = "Immutable per-record/cluster ecology evidence with exact stage receipts, outcome horizon, denominator, scope and State Fence."
+forbidden_substitute = ["retrieval count", "model opinion", "transcript prose", "writer-supplied utility", "missing-event-as-nonuse"]
+fixture_implementation_allowed = true
+live_edge_status = "BLOCKED"
+
+[[challenge]]
+id = "W9E02_MEMORY_GRAVITY_EXPOSURE"
+cells = ["meta.memory.gravity_assessment"]
+consumer = "eliot-memory-quality"
+required_owners = ["Context Compiler/View owner", "delivery/use observation owner", "Evaluator/Product outcome owner"]
+required_projection = "Exact Context exposure view containing recipe, route, placement, repetition, token share, protected-role displacement, counterevidence visibility and outcome coverage."
+forbidden_substitute = ["raw prompt scan", "provider self-report", "token share as support", "summary similarity"]
+fixture_implementation_allowed = true
+live_edge_status = "BLOCKED"
+
+[[challenge]]
+id = "W9E03_NEGATIVE_MEMORY_REEXPOSURE"
+cells = ["smart.dreamer.negative_memory_extinction"]
+consumer = "eliot-dreamer-memory-revision"
+required_owners = ["FailureFingerprint contract owner", "Runtime/Effect receipt owner", "Evaluator owner", "Governor memory influence owner"]
+required_projection = "Exact fingerprint revision plus scoped safe-reexposure evidence, verifier/effect receipts, environment generation, confounders and counterevidence."
+forbidden_substitute = ["semantic similarity as exact trigger", "single success as universal safety", "candidate self-application"]
+fixture_implementation_allowed = true
+live_edge_status = "BLOCKED"
+
+[[challenge]]
+id = "W9E04_SKILL_LIFECYCLE_RECEIPTS"
+cells = ["meta.skill.lifecycle_assessment"]
+consumer = "eliot-cognitive-quality"
+required_owners = ["Skill registry/lifecycle owner", "Context delivery/expansion owner", "Harness activation/adherence owner", "Evaluator/Product outcome owner"]
+required_projection = "Exact Skill revision, eligibility, delivery, expansion, execution, activation, early/mid/final adherence, decision/verifier delta, outcome, retention, transfer and dependency freshness."
+forbidden_substitute = ["installed-as-used", "delivery-as-activation", "silence-as-nonadherence", "shared success as attributed utility"]
+fixture_implementation_allowed = true
+live_edge_status = "BLOCKED"
+
+[[challenge]]
+id = "W9E05_TOOL_SURFACE_RECEIPTS"
+cells = ["meta.tool.surface_assessment"]
+consumer = "eliot-cognitive-quality"
+required_owners = ["Tool Definition registry owner", "route tool-surface owner", "ToolExposureReceipt owner", "tool result delivery/use observer", "Evaluator/Product outcome owner"]
+required_projection = "Exact registered/advertised/eligible/selected/called/transport/result-delivered/expanded/used/outcome-linked chain with schema/token cost, truncation, false exposure, loop risk and host coverage."
+forbidden_substitute = ["tool count", "registration as availability", "transport completion as delivered evidence", "missing event as nonuse"]
+fixture_implementation_allowed = true
+live_edge_status = "BLOCKED"
+
+[[challenge]]
+id = "W9E06_DREAMER_JOB_ECONOMICS_RECEIPTS"
+cells = ["meta.dreamer.job_economics"]
+consumer = "eliot-cognitive-quality"
+required_owners = ["Dreamer job owner", "Governor candidate admission owner", "Context delivery/use observer", "Evaluator/Product outcome owner", "cost receipt owner"]
+required_projection = "Exact generated/admitted/delivered/used/verified/expired/outcome-linked identities plus compute/storage/Context/Human/false-change/opportunity costs and horizon denominator."
+forbidden_substitute = ["job completion", "text quality", "source count", "unattributed success", "estimated cost without receipt"]
+fixture_implementation_allowed = true
+live_edge_status = "BLOCKED"
+
+[[challenge]]
+id = "W9E07_SELF_QUALITY_OWNER_DENOMINATOR"
+cells = ["governor.self_quality.view"]
+consumer = "eliot-cognitive-quality"
+required_owners = ["SystemObservationJournal", "EliotSystemExperienceBank", "feedback owner", "Product outcome owner", "runtime evidence owner", "Problem registry", "Context quality owner", "memory quality owner", "Skill quality owner", "tool quality owner", "Dreamer economics owner", "maintenance owner", "Effect owner"]
+required_projection = "One exact revisioned projection and coverage denominator per closed SelfQualityOwnerKind, bound to product identity, scope and State Fence."
+forbidden_substitute = ["global intelligence score", "activity volume", "missing owner filled from prose", "second mutable self-quality store"]
+fixture_implementation_allowed = true
+live_edge_status = "BLOCKED"
+
+[[challenge]]
+id = "W9E08_LEARNING_BOTTLENECK_EVIDENCE"
+cells = ["meta.self_quality.learning_bottleneck"]
+consumer = "eliot-cognitive-quality"
+required_owners = ["SystemExperienceProjection owner", "CampaignHarnessOverlay owner", "HarnessActivationReceipt owner", "Evaluator/Product outcome owner"]
+required_projection = "Exact campaign/route evidence separating update quality, activation, adherence, decision delta, immediate outcome, retention and transfer."
+forbidden_substitute = ["aggregate learning score", "activation inferred from acknowledgement", "decision delta inferred from outcome", "forced single diagnosis"]
+fixture_implementation_allowed = true
+live_edge_status = "BLOCKED"
+
+[[challenge]]
+id = "W9E09_SELF_QUALITY_INTERVENTION_ADMISSION"
+cells = ["meta.self_quality.intervention_candidate"]
+consumer = "eliot-cognitive-quality"
+required_owners = ["Governor policy/authority owner", "configuration/route/Skill/memory/evaluator target owners", "maintenance trigger owner", "Human decision owner when required"]
+required_projection = "Allowed candidate kinds/effect ceilings plus external verifier, authority, rollback and writeback contracts."
+forbidden_substitute = ["candidate as receipt", "self-promotion", "direct config/route/Skill/memory/evaluator mutation"]
+fixture_implementation_allowed = true
+live_edge_status = "BLOCKED"
+
+[[challenge]]
+id = "W9E10_PUBLIC_INHERITANCE"
+cells = ["meta.common_ground.assessment"]
+consumer = "eliot-understanding-assessment"
+required_owners = ["Task/Context public inheritance owner", "source route handoff owner", "target reconstruction owner"]
+required_projection = "Exact public goals, acceptance, decisions/rationale, invariants/negative memory, rivals/counterevidence, unknowns/inquiries, commitments and action consequences with frozen denominator."
+forbidden_substitute = ["native hidden continuation state", "summary similarity", "tacit competence transfer", "authority inheritance"]
+fixture_implementation_allowed = true
+live_edge_status = "BLOCKED"
+
+[[challenge]]
+id = "W9E11_SCOPED_UNDERSTANDING_EVIDENCE"
+cells = ["meta.understanding.scoped_assessment"]
+consumer = "eliot-understanding-assessment"
+required_owners = ["onboarding slice owner", "prediction/discriminator record owner", "Evaluator/outcome owner", "held-out evidence owner", "leakage audit owner"]
+required_projection = "Rival-aware current model, material unknowns, predictions fixed before observation, discriminators, applicable outcomes/verifiers, revision after misses, counterfactual/held-out evidence, transfer boundary and abstention evidence."
+forbidden_substitute = ["fluent prose", "graph size", "self-report", "post-hoc prediction", "dependent-agent agreement", "Context delivery", "uncontrolled holdout"]
+fixture_implementation_allowed = true
+live_edge_status = "BLOCKED"
+
+[proof_boundary]
+module_fixture_proof = "Allowed after Rust implementation against exact fixtures and locked dependencies."
+real_edge_proof = "Blocked until named external owners expose exact typed projections/receipts."
+product_pulse = "Blocked until real edges and exact Product Identity are available."
