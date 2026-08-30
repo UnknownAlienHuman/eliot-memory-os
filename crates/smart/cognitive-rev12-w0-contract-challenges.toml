@@ -1,0 +1,68 @@
+schema_version = 1
+status = "W0_CONTRACT_CHALLENGE_LEDGER"
+authority = "crates/smart/cognitive-rev12-w0-field-contracts.toml"
+
+[[resolved]]
+id = "CC-OBSERVATION-CLASSIFIER-SCHEMA"
+contract_ref = "crates/governor/eliot-observation/classifier.contract.toml"
+resolution = "Cold capture, exact binding evidence, ambiguity, contamination and candidate-only dispositions now have one field-level owner."
+
+[[resolved]]
+id = "CC-EPISTEMIC-POSITION-SCHEMA"
+contract_ref = "crates/smart/eliot-epistemic-contracts/epistemic.contract.toml"
+resolution = "Observed/supported/assumed/rival/conflict/stale/superseded/unknown/inquiry roles and exact coverage fields are frozen."
+
+[[resolved]]
+id = "CC-DREAMER-COMMON-SCHEMA"
+contract_ref = "crates/smart/eliot-dreamer-contracts/dreamer.contract.toml"
+resolution = "Bounded job envelope, reference manifest/bundle, grounding, seven-dimensional validation, candidate admission, orientation, Research Synthesis and typed curation schemas are frozen."
+
+[[resolved]]
+id = "CC-CUE-SCHEMA"
+contract_ref = "crates/smart/eliot-cue-contracts/cue.contract.toml"
+resolution = "Canonical value/comparison key, binding/index/direct/spread/activation contracts and zero-edge exact activation are frozen."
+
+[[resolved]]
+id = "CC-CONTEXT-CORE-SCHEMA"
+contract_ref = "crates/smart/eliot-context-contracts/context.contract.toml"
+resolution = "Contribution set, candidate set, Safety Floor/headroom/fair admission, immutable view, quality vector, Decision-Local Tail and effect-free injection plan are frozen."
+
+[[resolved]]
+id = "CC-MEMORY-CURATION-SCHEMA"
+contract_ref = "crates/smart/eliot-memory-curation-contracts/curation.contract.toml"
+resolution = "Existence/support/accessibility/influence/usefulness/lifecycle dimensions, protected source classes, evidence vectors and reversible proposals are frozen."
+
+[[resolved]]
+id = "CC-TASK-LOCAL-LEARNING-SCHEMA"
+contract_ref = "crates/smart/eliot-learning-contracts/learning.contract.toml"
+resolution = "State view, attempt delta, reversible overlay, dimensional validation, activation assessment, closure and advisory promotion input fields are frozen."
+
+[[open]]
+id = "CC-W0-OWNER-ADAPTERS"
+reason = "Canonical capture/evidence/task, Researcher, Context provider, memory, evaluator and attempt projections are not implemented by these contracts."
+required_owner = "respective Governor/runtime/canonical owner"
+
+[[open]]
+id = "CC-W0-RUST-IMPLEMENTATION"
+reason = "No Rust source has been added in this field-freeze branch."
+required_owner = "one agent per declared FunctionalCapabilityCell"
+
+[[open]]
+id = "CC-W0-PACKAGE-PROOF"
+reason = "No dependency-locked package Module Proof exists for the new/updated contracts and semantic workers."
+required_owner = "package integration owner"
+
+[[open]]
+id = "CC-W0-EDGE-PROOF"
+reason = "No real provider/consumer Edge Proof has executed across canonical owners, contract cells and semantic workers."
+required_owner = "integration owner"
+
+[[open]]
+id = "CC-W0-PRODUCT-PULSES"
+reason = "D1 Capture, D3a Orientation, D3b Reactive Context, curation and task-local learning Product Pulses have not executed."
+required_owner = "Product Pulse owner"
+
+[[open]]
+id = "CC-W0-RUNTIME-ADMISSION"
+reason = "No root workspace/runtime admission is permitted before Module, Edge and Product evidence."
+required_owner = "Governor/integration owner"
