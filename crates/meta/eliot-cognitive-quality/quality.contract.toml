@@ -1,0 +1,257 @@
+schema_version = 1
+contract_id = "meta.cognitive.quality.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-cognitive-quality"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["meta.skill.lifecycle_assessment", "meta.tool.surface_assessment", "meta.dreamer.job_economics", "governor.self_quality.view", "meta.self_quality.learning_bottleneck", "meta.self_quality.intervention_candidate"]
+architecture_refs = ["ARCH-SKL-01", "ARCH-HELP-01", "ARCH-DRM-03", "ARCH-ECON-01", "ARCH-SELF-01", "ARCH-META-01", "ARCH-LEARN-02", "ARCH-RES-05", "ARCH-SCOPE-01"]
+implementation_refs = ["I7.24", "I7.25", "I9.16", "I9.17", "I12.24", "I16.23", "I14"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Compile dimensioned Skill, tool, Dreamer and self-quality assessments from immutable owner evidence and emit advisory candidates only."
+public_api_policy = "allowlist_only"
+owned_mutable_state = []
+allowed_effects = []
+
+[hard_invariants]
+no_global_intelligence_or_quality_score = true
+installed_registered_advertised_or_completed_is_not_utility = true
+activation_adherence_decision_delta_outcome_retention_and_transfer_are_separate = true
+missing_evidence_is_unknown_not_zero = true
+all_complete_claims_require_exact_denominators = true
+views_and_candidates_own_no_state_or_execution = true
+intervention_candidate_is_not_intervention_receipt = true
+same_hypothesis_recurrence_requires_mechanism_review = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+[[external_type]]
+name = "OutcomeAttribution"
+owner = "eliot-learning-contracts"
+
+[[public_type]]
+name = "QualityVerdict"
+kind = "enum"
+definition = ["Supported", "Contradicted", "Mixed", "Unknown", "NotApplicable"]
+[[public_type]]
+name = "QualityCoverage"
+kind = "struct"
+definition = ["source_ref: String", "source_revision: String", "method_ref: String", "expected_items: Option<u32>", "observed_items: u32", "missing_owner_or_reason_refs: Vec<String>", "complete: bool"]
+invariants = ["complete requires expected_items and exact equality", "incomplete names missing owner/reason"]
+[[public_type]]
+name = "QualityDimensionResult"
+kind = "struct"
+definition = ["verdict: QualityVerdict", "evidence_handles: Vec<ArtifactId>", "counterevidence_handles: Vec<ArtifactId>", "coverage: QualityCoverage", "reason_codes: Vec<String>"]
+
+[[public_type]]
+name = "SkillLifecycleDimension"
+kind = "enum"
+definition = ["Eligibility", "Delivery", "Expansion", "Execution", "Activation", "EarlyAdherence", "MidRunAdherence", "FinishAdherence", "DecisionDelta", "VerifierDelta", "ImmediateOutcome", "Retention", "Transfer", "FalseActivation", "Conflict", "DependencyFreshness", "Cost"]
+[[public_type]]
+name = "SkillInteractionEvidence"
+kind = "struct"
+definition = ["attempt_handle: ArtifactId", "dimension: SkillLifecycleDimension", "result: QualityDimensionResult", "route_fingerprint: String", "task_family: String", "state_fence: StateFence"]
+[[public_type]]
+name = "SkillLifecycleEvidence"
+kind = "struct"
+definition = ["skill_handle: ArtifactId", "skill_revision: String", "dependency_revisions: Vec<String>", "interactions: Vec<SkillInteractionEvidence>", "source_handles: Vec<ArtifactId>"]
+[[public_type]]
+name = "SkillLifecycleAssessmentRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "skill_handle: ArtifactId", "skill_revision: String", "route_fingerprint: String", "task_family: String", "scope_id: String", "state_fence: StateFence", "coverage: QualityCoverage", "maximum_interactions: u32", "request_sha256: String"]
+[[public_type]]
+name = "SkillActionKind"
+kind = "enum"
+definition = ["Keep", "Patch", "Split", "Merge", "Suppress", "Archive", "Quarantine", "Restore", "ObserveMore"]
+[[public_type]]
+name = "SkillActionCandidate"
+kind = "struct"
+definition = ["candidate_id: ArtifactId", "kind: SkillActionKind", "skill_handle: ArtifactId", "affected_dimensions: Vec<SkillLifecycleDimension>", "evidence_handles: Vec<ArtifactId>", "required_authority_ref: String", "rollback_ref: String", "review_ref: String"]
+[[public_type]]
+name = "SkillLifecycleAssessment"
+kind = "struct"
+definition = ["request_sha256: String", "skill_handle: ArtifactId", "state_fence: StateFence", "dimensions: Vec<SkillLifecycleDimensionResult>", "candidates: Vec<SkillActionCandidate>", "assessment_sha256: String"]
+[[public_type]]
+name = "SkillLifecycleDimensionResult"
+kind = "struct"
+definition = ["dimension: SkillLifecycleDimension", "result: QualityDimensionResult"]
+
+[[public_type]]
+name = "ToolSurfaceDimension"
+kind = "enum"
+definition = ["Registered", "Advertised", "Eligible", "Selected", "Called", "TransportCompleted", "ResultDelivered", "Expanded", "ObservablyUsed", "OutcomeLinked", "SchemaCost", "TokenCost", "MissingCapabilityRegret", "FalseExposure", "LoopRisk", "ResultIntegrity"]
+[[public_type]]
+name = "ToolExposureReceiptView"
+kind = "struct"
+definition = ["tool_handle: ArtifactId", "tool_revision: String", "route_fingerprint: String", "task_id: Option<TaskId>", "dimensions: Vec<ToolSurfaceDimensionResult>", "result_handle: Option<ArtifactId>", "state_fence: StateFence"]
+[[public_type]]
+name = "ToolSurfaceDimensionResult"
+kind = "struct"
+definition = ["dimension: ToolSurfaceDimension", "result: QualityDimensionResult"]
+[[public_type]]
+name = "ToolSurfaceAssessmentRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "route_fingerprint: String", "task_family: String", "scope_id: String", "state_fence: StateFence", "coverage: QualityCoverage", "maximum_exposures: u32", "request_sha256: String"]
+[[public_type]]
+name = "ToolSurfaceActionKind"
+kind = "enum"
+definition = ["KeepVisible", "LazyLoad", "Hide", "SplitFacet", "Requalify", "ObserveMore"]
+[[public_type]]
+name = "ToolSurfaceActionCandidate"
+kind = "struct"
+definition = ["candidate_id: ArtifactId", "kind: ToolSurfaceActionKind", "tool_handle: ArtifactId", "evidence_handles: Vec<ArtifactId>", "required_authority_ref: String", "rollback_ref: String", "review_ref: String"]
+[[public_type]]
+name = "ToolSurfaceAssessment"
+kind = "struct"
+definition = ["request_sha256: String", "state_fence: StateFence", "dimensions: Vec<ToolSurfaceDimensionResult>", "candidates: Vec<ToolSurfaceActionCandidate>", "assessment_sha256: String"]
+
+[[public_type]]
+name = "DreamerEconomicsDimension"
+kind = "enum"
+definition = ["Generated", "Admitted", "Delivered", "Used", "Verified", "Expired", "OutcomeLinked", "ComputeCost", "StorageCost", "ContextCost", "HumanReviewCost", "FalseChangeCost", "OpportunityCost"]
+[[public_type]]
+name = "DreamerJobOutcomeEvidence"
+kind = "struct"
+definition = ["job_handle: ArtifactId", "job_class: String", "route_fingerprint: String", "candidate_handle: ArtifactId", "dimensions: Vec<DreamerEconomicsDimensionResult>", "outcome_attribution: OutcomeAttribution", "state_fence: StateFence"]
+[[public_type]]
+name = "DreamerEconomicsDimensionResult"
+kind = "struct"
+definition = ["dimension: DreamerEconomicsDimension", "result: QualityDimensionResult"]
+[[public_type]]
+name = "DreamerJobEconomicsRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "job_class: String", "scope_id: String", "route_fingerprint: String", "state_fence: StateFence", "coverage: QualityCoverage", "maximum_jobs: u32", "request_sha256: String"]
+[[public_type]]
+name = "DreamerProfileActionKind"
+kind = "enum"
+definition = ["Keep", "Narrow", "Batch", "RouteChange", "Disable", "MechanismReview", "ObserveMore"]
+[[public_type]]
+name = "DreamerProfileActionCandidate"
+kind = "struct"
+definition = ["candidate_id: ArtifactId", "kind: DreamerProfileActionKind", "job_class: String", "evidence_handles: Vec<ArtifactId>", "required_authority_ref: String", "rollback_ref: String", "review_ref: String"]
+[[public_type]]
+name = "DreamerJobEconomicsAssessment"
+kind = "struct"
+definition = ["request_sha256: String", "state_fence: StateFence", "dimensions: Vec<DreamerEconomicsDimensionResult>", "candidates: Vec<DreamerProfileActionCandidate>", "assessment_sha256: String"]
+
+[[public_type]]
+name = "SelfQualityOwnerKind"
+kind = "enum"
+definition = ["SystemObservationJournal", "SystemExperienceBank", "Feedback", "ProductOutcome", "RuntimeEvidence", "ProblemRegistry", "ContextQuality", "MemoryQuality", "SkillQuality", "ToolQuality", "DreamerEconomics", "Maintenance", "Effects"]
+[[public_type]]
+name = "SelfQualityOwnerCoverage"
+kind = "struct"
+definition = ["owner: SelfQualityOwnerKind", "coverage: QualityCoverage", "projection_handle: Option<ArtifactId>", "projection_sha256: Option<String>"]
+[[public_type]]
+name = "SelfQualityContourKind"
+kind = "enum"
+definition = ["AgentLoop", "ObservationCoverage", "Context", "Memory", "IntelligentJobs", "Maintenance", "Effects", "ProductPulse"]
+[[public_type]]
+name = "SelfQualityCounterMetric"
+kind = "struct"
+definition = ["countermetric_id: ArtifactId", "name: String", "result: QualityDimensionResult"]
+[[public_type]]
+name = "SelfQualityContour"
+kind = "struct"
+definition = ["kind: SelfQualityContourKind", "dimension_results: Vec<QualityDimensionResult>", "problem_handles: Vec<ArtifactId>", "candidate_handles: Vec<ArtifactId>", "countermetrics: Vec<SelfQualityCounterMetric>"]
+[[public_type]]
+name = "SelfQualityOwnerProjection"
+kind = "struct"
+definition = ["owner: SelfQualityOwnerKind", "contract_shape_sha256: String", "revision: String", "scope_id: String", "product_identity_handle: ArtifactId", "state_fence: StateFence", "coverage: SelfQualityOwnerCoverage", "contours: Vec<SelfQualityContour>"]
+[[public_type]]
+name = "EliotSelfQualityViewRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "scope_id: String", "product_identity_handle: ArtifactId", "state_fence: StateFence", "expected_owners: Vec<SelfQualityOwnerKind>", "maximum_projections: u32", "request_sha256: String"]
+[[public_type]]
+name = "EliotSelfQualityView"
+kind = "struct"
+definition = ["request_sha256: String", "scope_id: String", "product_identity_handle: ArtifactId", "state_fence: StateFence", "owner_coverage: Vec<SelfQualityOwnerCoverage>", "contours: Vec<SelfQualityContour>", "open_problem_handles: Vec<ArtifactId>", "candidate_handles: Vec<ArtifactId>", "human_action_handles: Vec<ArtifactId>", "view_sha256: String"]
+invariants = ["no global intelligence/quality score", "missing owner explicit", "activity volume cannot substitute for product/recovery delta"]
+
+[[public_type]]
+name = "LearningBottleneckDimension"
+kind = "enum"
+definition = ["UpdateQuality", "Activation", "Adherence", "DecisionDelta", "ImmediateOutcome", "Retention", "Transfer"]
+[[public_type]]
+name = "LearningBottleneckKind"
+kind = "enum"
+definition = ["RetrievalCueContext", "RouteInstructionUsability", "UpdateWeakness", "BadLesson", "EvaluatorInvalid", "ConfoundedOutcome", "Overfit", "MultiplePlausible", "InsufficientEvidence"]
+[[public_type]]
+name = "LearningBottleneckEvidence"
+kind = "struct"
+definition = ["campaign_handle: ArtifactId", "route_fingerprint: String", "outcome_horizon_ref: String", "dimensions: Vec<LearningBottleneckDimensionResult>", "state_fence: StateFence"]
+[[public_type]]
+name = "LearningBottleneckDimensionResult"
+kind = "struct"
+definition = ["dimension: LearningBottleneckDimension", "result: QualityDimensionResult"]
+[[public_type]]
+name = "LearningBottleneckCandidate"
+kind = "struct"
+definition = ["kind: LearningBottleneckKind", "evidence_handles: Vec<ArtifactId>", "rival_handles: Vec<ArtifactId>", "next_discriminator: String", "invalidation_conditions: Vec<String>"]
+[[public_type]]
+name = "LearningBottleneckAssessment"
+kind = "struct"
+definition = ["campaign_handle: ArtifactId", "state_fence: StateFence", "dimensions: Vec<LearningBottleneckDimensionResult>", "candidates: Vec<LearningBottleneckCandidate>", "assessment_sha256: String"]
+
+[[public_type]]
+name = "SelfQualityInterventionKind"
+kind = "enum"
+definition = ["Observe", "Repair", "Configure", "Reroute", "Experiment", "Abstain", "Escalate", "MechanismReview"]
+[[public_type]]
+name = "DelayedOutcomeWindow"
+kind = "struct"
+definition = ["immediate_window_ref: String", "delayed_window_ref: String", "retention_window_ref: String", "transfer_window_ref: String"]
+[[public_type]]
+name = "SelfQualityInterventionPolicy"
+kind = "struct"
+definition = ["policy_handle: ArtifactId", "policy_revision: String", "allowed_kinds: Vec<SelfQualityInterventionKind>", "forbidden_effect_refs: Vec<String>", "maximum_candidates: u32"]
+[[public_type]]
+name = "SelfQualityInterventionCandidate"
+kind = "struct"
+definition = ["candidate_id: ArtifactId", "kind: SelfQualityInterventionKind", "affected_contour: SelfQualityContourKind", "causal_hypothesis: String", "rival_hypotheses: Vec<String>", "discriminator: String", "candidate_change_handle: Option<ArtifactId>", "required_authority_ref: String", "verifier_handles: Vec<ArtifactId>", "countermetrics: Vec<SelfQualityCounterMetric>", "rollback_ref: String", "validity_scope: String", "outcome_windows: DelayedOutcomeWindow", "writeback_requirements: Vec<String>", "state_fence: StateFence", "candidate_sha256: String"]
+invariants = ["candidate is not receipt", "cannot edit config/route/Skill/memory/evaluator/policy", "rollback/discriminator/authority mandatory"]
+
+[[public_function]]
+name = "assess_skill_lifecycle"
+signature = "pub fn assess_skill_lifecycle(request: &SkillLifecycleAssessmentRequest, evidence: &[SkillLifecycleEvidence]) -> Result<SkillLifecycleAssessment, SkillLifecycleAssessmentError>"
+[[public_function]]
+name = "assess_tool_surface"
+signature = "pub fn assess_tool_surface(request: &ToolSurfaceAssessmentRequest, exposures: &[ToolExposureReceiptView]) -> Result<ToolSurfaceAssessment, ToolSurfaceAssessmentError>"
+[[public_function]]
+name = "assess_dreamer_job_economics"
+signature = "pub fn assess_dreamer_job_economics(request: &DreamerJobEconomicsRequest, jobs: &[DreamerJobOutcomeEvidence]) -> Result<DreamerJobEconomicsAssessment, DreamerJobEconomicsError>"
+[[public_function]]
+name = "compile_eliot_self_quality_view"
+signature = "pub fn compile_eliot_self_quality_view(request: &EliotSelfQualityViewRequest, projections: &[SelfQualityOwnerProjection]) -> Result<EliotSelfQualityView, EliotSelfQualityViewError>"
+[[public_function]]
+name = "diagnose_learning_bottleneck"
+signature = "pub fn diagnose_learning_bottleneck(view: &EliotSelfQualityView, evidence: &LearningBottleneckEvidence) -> Result<LearningBottleneckAssessment, LearningBottleneckError>"
+[[public_function]]
+name = "build_self_quality_intervention_candidate"
+signature = "pub fn build_self_quality_intervention_candidate(view: &EliotSelfQualityView, bottleneck: &LearningBottleneckAssessment, policy: &SelfQualityInterventionPolicy) -> Result<SelfQualityInterventionCandidate, SelfQualityInterventionError>"
+
+[[negative_test]]
+id = "no-stage-collapse"
+property = "Installed/registered/advertised/completed cannot imply activation, use or utility."
+[[negative_test]]
+id = "no-global-score"
+property = "EliotSelfQualityView and all assessments expose no aggregate intelligence/quality score."
+[[negative_test]]
+id = "missing-owner-visible"
+property = "Missing owner projection prevents complete self-quality view."
+[[negative_test]]
+id = "candidate-not-receipt"
+property = "Intervention candidate exposes no applied mutation or execution receipt."
