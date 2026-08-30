@@ -1,0 +1,32 @@
+schema_version = 1
+authority_id = "eliot-cognitive-function-design-rev12-w9-field-freeze"
+status = "STATIC_FIELD_CONTRACT_ONLY"
+stack_base = "work/212-cognitive-field-contract-freeze"
+cell_catalog = "crates/smart/cognitive-rev12-cells-meta-quality.toml"
+cell_bindings = "crates/smart/cognitive-rev12-w9-cell-bindings.toml"
+field_contract_index = "crates/smart/cognitive-rev12-w9-field-contracts.toml"
+type_ownership = "crates/smart/cognitive-rev12-w9-type-ownership.toml"
+validation = "crates/smart/cognitive-rev12-w9-validation.toml"
+orders = "76..86"
+functional_cells = 11
+physical_crates = 4
+field_contracts = 4
+rust_implementation = false
+workspace_admission = false
+runtime_support = false
+product_acceptance = false
+
+[normative_pair]
+architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
+implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+
+[authority_rules]
+cell_semantics = "The existing rev12 W9 catalogue remains responsibility/function authority."
+field_semantics = "The four indexed *.contract.toml files are the sole field-level authority for W9 public types."
+agent_scope = "Each worker reads one cell brief plus its indexed field contract and writes only the declared source/test files."
+integration_scope = "Cargo, lib.rs, reexports, cross-cell compatibility, Module Proof, Edge Proof, Product Pulse and migration remain integration-owner work."
+no_parallel_types = "Workers may not redefine indexed types or create local request/receipt variants."
+
+[forbidden_claims]
+items = ["Rust implemented", "tests executed", "package supported", "Edge proved", "workspace admitted", "runtime supported", "Product Pulse passed", "product accepted"]
