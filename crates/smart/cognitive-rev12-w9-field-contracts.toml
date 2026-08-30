@@ -1,0 +1,68 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W9_FIELD_LEVEL_CONTRACT_FREEZE"
+base_field_contract_index = "crates/smart/cognitive-rev12-field-contracts.toml"
+orders = "76..86"
+functional_cells = 11
+field_contracts = 4
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+rule = "These files are the sole field-level authority for W9 public types. Workers import owner types and write only declared cell source/tests; they do not alter Cargo, lib.rs, authority, policy, state, receipts, or proof status."
+
+[[contract]]
+id = "meta.memory.quality.v1"
+path = "crates/meta/eliot-memory-quality/quality.contract.toml"
+owner = "eliot-memory-quality"
+functional_cells = ["meta.memory.ecology_assessment", "meta.memory.gravity_assessment"]
+consumers = ["Governor Diagnostic Compiler", "maintenance admission", "Context/memory lifecycle owners"]
+
+[[contract]]
+id = "smart.dreamer.negative-memory-extinction.v1"
+path = "crates/smart/eliot-dreamer-memory-revision/negative-memory-extinction.contract.toml"
+owner = "eliot-dreamer-memory-revision"
+functional_cells = ["smart.dreamer.negative_memory_extinction"]
+consumers = ["Governor candidate admission", "memory accessibility/influence owner"]
+
+[[contract]]
+id = "meta.cognitive.quality.v1"
+path = "crates/meta/eliot-cognitive-quality/quality.contract.toml"
+owner = "eliot-cognitive-quality"
+functional_cells = ["meta.skill.lifecycle_assessment", "meta.tool.surface_assessment", "meta.dreamer.job_economics", "governor.self_quality.view", "meta.self_quality.learning_bottleneck", "meta.self_quality.intervention_candidate"]
+consumers = ["Governor Diagnostic Compiler", "maintenance candidate admission", "Human review"]
+
+[[contract]]
+id = "meta.understanding.assessment.v1"
+path = "crates/meta/eliot-understanding-assessment/assessment.contract.toml"
+owner = "eliot-understanding-assessment"
+functional_cells = ["meta.common_ground.assessment", "meta.understanding.scoped_assessment"]
+consumers = ["route handoff", "Governor diagnosis", "Product Pulse evaluation"]
+
+[resolved_schema_gaps]
+items = [
+  "memory ecology/gravity dimensions, denominators, candidates and no-transition boundary",
+  "negative-memory extinction trigger/reexposure/candidate fields and activation-only ceiling",
+  "Skill/tool/Dreamer/self-quality evidence stages, owner denominator and candidate-only intervention",
+  "Common Ground public inheritance and scoped understanding prediction/holdout/transfer fields",
+]
+
+[still_open]
+challenges = [
+  "real owner adapters and receipts",
+  "package Module Proof",
+  "real provider-consumer Edge Proof",
+  "Product Pulse execution",
+  "root workspace admission",
+  "runtime support",
+  "product acceptance",
+]
+
+[forbidden]
+aggregate_intelligence_quality_utility_or_understanding_score = true
+implicit_complete_without_denominator = true
+candidate_as_transition_or_receipt = true
+native_hidden_state_as_public_inheritance = true
+semantic_near_match_as_hard_block = true
+retrieval_prominence_or_activity_as_support_or_utility = true
+generic_json_or_vendor_types = true
