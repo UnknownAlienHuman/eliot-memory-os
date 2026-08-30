@@ -1,0 +1,158 @@
+schema_version = 1
+contract_id = "governor.observation.classifier.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-observation"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["governor.observation.classifier"]
+architecture_refs = ["ARCH-CORE-00", "ARCH-EPI-04", "ARCH-SCOPE-01", "ARCH-SEC-02", "ARCH-RES-05"]
+implementation_refs = ["I2.20", "I5.20", "I12.10", "I13.11"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Classify one immutable captured observation for cold preservation, task-binding candidacy, ambiguity or quarantine without rewriting content, inferring truth, or losing unbound evidence."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O(binding evidence + conflict signals + contamination signals) over request-bounded immutable input; no storage read/write, model call, provider SDK, network or blocking I/O."
+replacement_boundary = "Replace deterministic classification behind this contract; capture journal, task binding admission, quarantine lifecycle and canonical evidence ownership remain external."
+
+[closed_sets]
+binding_bases = ["ExplicitTaskIdentity", "ExplicitScopeIdentity", "ExactArtifactLineage", "ExactOperationLineage", "ExactTemporalEnvelope", "HeuristicAssociation", "Unknown"]
+conflict_kinds = ["MultipleTaskBindings", "ScopeMismatch", "FenceMismatch", "SourceIdentityConflict", "TemporalConflict", "LineageConflict", "Unknown"]
+contamination_kinds = ["ForeignTaskMaterial", "StaleTaskMaterial", "UntrustedEmbeddedInstruction", "DisclosureViolationCandidate", "MalformedSourceIdentity", "Unknown"]
+classifications = ["ColdCapture", "TaskBindingCandidate", "Ambiguous", "Quarantined"]
+dispositions = ["PreserveCold", "ForwardBindingCandidate", "RequireBindingReview", "ForwardQuarantineCandidate"]
+
+[hard_invariants]
+original_observation_is_immutable = true
+cold_unbound_observation_is_preserved = true
+classification_is_not_epistemic_status_or_truth = true
+heuristic_association_cannot_create_task_binding = true
+conflicting_bindings_produce_ambiguity_not_arbitrary_selection = true
+contamination_cannot_be_silently_dropped_or_task_bound = true
+quarantine_is_candidate_only_and_not_a_lifecycle_transition = true
+scope_task_source_lineage_and_fence_are_explicit = true
+reason_and_evidence_handles_are_recheckable = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "OperationId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "ObservationEnvelope"
+owner = "eliot-observation-contracts"
+
+[[public_type]]
+name = "ObservationBindingBasis"
+kind = "enum"
+definition = ["ExplicitTaskIdentity", "ExplicitScopeIdentity", "ExactArtifactLineage", "ExactOperationLineage", "ExactTemporalEnvelope", "HeuristicAssociation", "Unknown"]
+invariants = ["heuristic and unknown bases cannot independently support ForwardBindingCandidate", "basis is evidence classification rather than confidence"]
+
+[[public_type]]
+name = "ObservationBindingEvidence"
+kind = "struct"
+definition = ["evidence_handle: ArtifactId", "candidate_task_id: Option<TaskId>", "candidate_scope_id: Option<String>", "basis: ObservationBindingBasis", "source_revision: String", "state_fence: StateFence", "reason_codes: Vec<String>"]
+invariants = ["at least task or scope candidate present", "exact source revision and fence", "reason codes bounded and unique", "evidence does not admit binding"]
+
+[[public_type]]
+name = "ObservationConflictKind"
+kind = "enum"
+definition = ["MultipleTaskBindings", "ScopeMismatch", "FenceMismatch", "SourceIdentityConflict", "TemporalConflict", "LineageConflict", "Unknown"]
+
+[[public_type]]
+name = "ObservationConflictSignal"
+kind = "struct"
+definition = ["signal_id: ArtifactId", "kind: ObservationConflictKind", "evidence_handles: Vec<ArtifactId>", "reason_codes: Vec<String>"]
+invariants = ["evidence handles non-empty and unique", "signal is not a resolution decision"]
+
+[[public_type]]
+name = "ObservationContaminationKind"
+kind = "enum"
+definition = ["ForeignTaskMaterial", "StaleTaskMaterial", "UntrustedEmbeddedInstruction", "DisclosureViolationCandidate", "MalformedSourceIdentity", "Unknown"]
+
+[[public_type]]
+name = "ObservationContaminationSignal"
+kind = "struct"
+definition = ["signal_id: ArtifactId", "kind: ObservationContaminationKind", "evidence_handles: Vec<ArtifactId>", "reason_codes: Vec<String>", "requires_security_review: bool"]
+invariants = ["signal cannot rewrite/drop source", "security-review flag grants no security disposition"]
+
+[[public_type]]
+name = "ObservationClassifierRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "observation_handle: ArtifactId", "observation_sha256: String", "source_revision: String", "candidate_scope_id: Option<String>", "candidate_task_id: Option<TaskId>", "capture_operation_id: OperationId", "state_fence: StateFence", "binding_evidence: Vec<ObservationBindingEvidence>", "conflict_signals: Vec<ObservationConflictSignal>", "contamination_signals: Vec<ObservationContaminationSignal>", "maximum_signals: u32", "request_sha256: String"]
+invariants = ["observation/source/capture identity exact", "bounds non-zero", "all evidence/signal identities unique", "one compatible fence", "request grants no journal/quarantine/task-binding write authority"]
+
+[[public_type]]
+name = "ObservationClassification"
+kind = "enum"
+definition = ["ColdCapture", "TaskBindingCandidate", "Ambiguous", "Quarantined"]
+
+[[public_type]]
+name = "ObservationDisposition"
+kind = "enum"
+definition = ["PreserveCold", "ForwardBindingCandidate", "RequireBindingReview", "ForwardQuarantineCandidate"]
+
+[[public_type]]
+name = "ObservationBindingCandidate"
+kind = "struct"
+definition = ["task_id: Option<TaskId>", "scope_id: Option<String>", "supporting_evidence_handles: Vec<ArtifactId>", "binding_basis: Vec<ObservationBindingBasis>", "invalidation_conditions: Vec<String>"]
+invariants = ["at least task or scope present", "supporting evidence exact", "no heuristic-only candidate", "candidate grants no task admission"]
+
+[[public_type]]
+name = "ClassifiedObservation"
+kind = "struct"
+definition = ["request_sha256: String", "observation_handle: ArtifactId", "observation_sha256: String", "source_revision: String", "state_fence: StateFence", "classification: ObservationClassification", "disposition: ObservationDisposition", "binding_candidate: Option<ObservationBindingCandidate>", "conflict_signal_ids: Vec<ArtifactId>", "contamination_signal_ids: Vec<ArtifactId>", "evidence_handles: Vec<ArtifactId>", "reason_codes: Vec<String>", "classification_sha256: String"]
+invariants = ["ColdCapture has no binding candidate", "TaskBindingCandidate requires non-heuristic exact candidate and no unresolved material conflict", "Ambiguous retains all competing evidence", "Quarantined retains all contamination evidence and has no task binding", "contains no epistemic promotion, journal receipt, quarantine receipt or canonical mutation", "canonical order and digest"]
+
+[[public_function]]
+name = "classify_observation"
+signature = "pub fn classify_observation(request: &ObservationClassifierRequest, observation: &ObservationEnvelope) -> Result<ClassifiedObservation, ObservationClassificationError>"
+
+[[public_function]]
+name = "classified_observation_digest"
+signature = "pub fn classified_observation_digest(classified: &ClassifiedObservation) -> Result<String, ObservationClassificationError>"
+
+[[negative_test]]
+id = "cold-capture-preserved"
+property = "Observation with no exact binding evidence becomes ColdCapture/PreserveCold rather than dropped or guessed."
+
+[[negative_test]]
+id = "heuristic-not-binding"
+property = "HeuristicAssociation alone cannot produce TaskBindingCandidate."
+
+[[negative_test]]
+id = "conflicting-task-bindings"
+property = "Two incompatible exact task bindings produce Ambiguous and retain both evidence sets."
+
+[[negative_test]]
+id = "contamination-not-task-bound"
+property = "Material contamination produces Quarantined/ForwardQuarantineCandidate and preserves source evidence."
+
+[[negative_test]]
+id = "classification-not-truth"
+property = "Output schema exposes no epistemic support/truth/promotion field."
+
+[[negative_test]]
+id = "candidate-not-receipt"
+property = "Output exposes no journal write, quarantine transition or task-binding admission receipt."
