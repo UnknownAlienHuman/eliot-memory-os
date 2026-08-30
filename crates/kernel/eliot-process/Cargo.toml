@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Provider-neutral, Kernel-authorized ProcessExecutor contract"
 
+[lib]
+path = "src/root.rs"
+
 [dependencies]
 blake3.workspace = true
 eliot-contracts.workspace = true
