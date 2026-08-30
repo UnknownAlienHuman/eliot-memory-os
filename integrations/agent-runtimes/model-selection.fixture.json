@@ -1,0 +1,170 @@
+{
+  "schema_version": "eliot.route-catalogue-set.v1",
+  "catalogue_set_id": "fixture-four-hosts-v1",
+  "routes": [
+    {
+      "host": "codex",
+      "route_id": "codex.app-server.stdio",
+      "route_role": "primary_candidate",
+      "route_fingerprint": "sha256:codex-fixture-route",
+      "account_scope_hash": "sha256:codex-fixture-account",
+      "catalogue_observed_at": "2026-08-29T22:30:00Z",
+      "admission_status": "admitted",
+      "health": "ready",
+      "quota": {
+        "status": "available"
+      },
+      "models": [
+        {
+          "model_id": "codex-fixture-primary",
+          "model_family": "openai-fixture-family",
+          "availability": "available",
+          "context_window_tokens": 200000,
+          "cost_class": "premium",
+          "latency_class": "moderate",
+          "capabilities": {
+            "coding": {
+              "support": true,
+              "evidence_level": "executed"
+            },
+            "tool_use": {
+              "support": true,
+              "evidence_level": "observed"
+            },
+            "reasoning": {
+              "support": true,
+              "evidence_level": "observed"
+            },
+            "structured_output": {
+              "support": true,
+              "evidence_level": "observed"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "host": "opencode",
+      "route_id": "opencode.server.http-sse",
+      "route_role": "primary_candidate",
+      "route_fingerprint": "sha256:opencode-fixture-route",
+      "account_scope_hash": "sha256:opencode-fixture-account",
+      "catalogue_observed_at": "2026-08-29T22:30:00Z",
+      "admission_status": "admitted",
+      "health": "ready",
+      "quota": {
+        "status": "available"
+      },
+      "models": [
+        {
+          "model_id": "opencode-fixture-worker",
+          "model_family": "open-fixture-family",
+          "availability": "available",
+          "context_window_tokens": 128000,
+          "cost_class": "low",
+          "latency_class": "fast",
+          "capabilities": {
+            "coding": {
+              "support": true,
+              "evidence_level": "observed"
+            },
+            "tool_use": {
+              "support": true,
+              "evidence_level": "observed"
+            },
+            "reasoning": {
+              "support": false,
+              "evidence_level": "unknown"
+            },
+            "structured_output": {
+              "support": true,
+              "evidence_level": "observed"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "host": "claude",
+      "route_id": "claude.agent-sdk.local-sidecar",
+      "route_role": "primary_candidate",
+      "route_fingerprint": "sha256:claude-fixture-route",
+      "account_scope_hash": "sha256:claude-fixture-account",
+      "catalogue_observed_at": "2026-08-29T22:30:00Z",
+      "admission_status": "admitted",
+      "health": "ready",
+      "quota": {
+        "status": "available"
+      },
+      "models": [
+        {
+          "model_id": "claude-fixture-challenger",
+          "model_family": "anthropic-fixture-family",
+          "availability": "available",
+          "context_window_tokens": 200000,
+          "cost_class": "premium",
+          "latency_class": "moderate",
+          "capabilities": {
+            "coding": {
+              "support": true,
+              "evidence_level": "executed"
+            },
+            "tool_use": {
+              "support": true,
+              "evidence_level": "observed"
+            },
+            "reasoning": {
+              "support": true,
+              "evidence_level": "executed"
+            },
+            "structured_output": {
+              "support": true,
+              "evidence_level": "observed"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "host": "antigravity",
+      "route_id": "antigravity.exec.persistent-ndjson",
+      "route_role": "primary_candidate",
+      "route_fingerprint": "sha256:antigravity-fixture-route",
+      "account_scope_hash": "sha256:antigravity-fixture-account",
+      "catalogue_observed_at": "2026-08-29T22:30:00Z",
+      "admission_status": "admitted",
+      "health": "ready",
+      "quota": {
+        "status": "limited"
+      },
+      "models": [
+        {
+          "model_id": "antigravity-fixture-verifier",
+          "model_family": "google-fixture-family",
+          "availability": "available",
+          "context_window_tokens": 128000,
+          "cost_class": "standard",
+          "latency_class": "fast",
+          "capabilities": {
+            "coding": {
+              "support": true,
+              "evidence_level": "observed"
+            },
+            "tool_use": {
+              "support": true,
+              "evidence_level": "observed"
+            },
+            "reasoning": {
+              "support": true,
+              "evidence_level": "observed"
+            },
+            "structured_output": {
+              "support": true,
+              "evidence_level": "executed"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
