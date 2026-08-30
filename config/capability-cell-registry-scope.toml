@@ -1,0 +1,11 @@
+schema = "eliot.capability-cell-registry-scope.v1"
+inventory_path = "workstreams/core-daemons/inventory.json"
+
+# The initial registry slice is intentionally narrow. Inventory units are added
+# only after their package/state owners are audited; omission remains visible in
+# the generated coverage denominator and never means conformance.
+inventory_unit_ids = []
+package_roots = [
+  "crates/foundation/eliot-runtime-contracts",
+  "crates/meta/eliot-runtime-status",
+]
