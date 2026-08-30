@@ -151,6 +151,10 @@ impl ProcessStreamEvidence {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the representation invariants are kept together to make fail-closed cross-field review explicit"
+    )]
     fn validate_preview_and_representation(
         &self,
         gaps: &BTreeSet<StreamEvidenceGap>,
@@ -190,12 +194,13 @@ impl ProcessStreamEvidence {
                 }
             }
             StreamPreviewRepresentation::DurableSourceBytes => {
-                let source = self.source.as_ref().ok_or(
-                    ProcessStreamEvidenceError::Invariant {
+                let source = self
+                    .source
+                    .as_ref()
+                    .ok_or(ProcessStreamEvidenceError::Invariant {
                         field: "preview.representation",
                         reason: "durable-source preview requires a durable source",
-                    },
-                )?;
+                    })?;
                 if source.representation != DurableStreamRepresentation::PolicyTransformed {
                     return Err(ProcessStreamEvidenceError::Invariant {
                         field: "preview.representation",
@@ -267,18 +272,23 @@ impl ProcessStreamEvidence {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the persistence-state matrix is reviewed as one fail-closed invariant group"
+    )]
     fn validate_persistence(
         &self,
         gaps: &BTreeSet<StreamEvidenceGap>,
     ) -> Result<(), ProcessStreamEvidenceError> {
         match self.persistence {
             StreamPersistenceStatus::CompleteSource => {
-                let source = self.source.as_ref().ok_or(
-                    ProcessStreamEvidenceError::Invariant {
+                let source = self
+                    .source
+                    .as_ref()
+                    .ok_or(ProcessStreamEvidenceError::Invariant {
                         field: "source",
                         reason: "complete source requires an immutable locator and ready receipt",
-                    },
-                )?;
+                    })?;
                 if self.transport != StreamTransportStatus::Complete || !gaps.is_empty() {
                     return Err(ProcessStreamEvidenceError::Invariant {
                         field: "persistence",
@@ -296,12 +306,13 @@ impl ProcessStreamEvidence {
                 }
             }
             StreamPersistenceStatus::PartialSource => {
-                let source = self.source.as_ref().ok_or(
-                    ProcessStreamEvidenceError::Invariant {
+                let source = self
+                    .source
+                    .as_ref()
+                    .ok_or(ProcessStreamEvidenceError::Invariant {
                         field: "source",
                         reason: "partial source requires an immutable locator and ready receipt",
-                    },
-                )?;
+                    })?;
                 if gaps.is_empty() {
                     return Err(ProcessStreamEvidenceError::Invariant {
                         field: "gaps",
@@ -375,10 +386,7 @@ impl ProcessStreamEvidence {
                         reason: "source-unavailable evidence cannot carry a durable locator",
                     });
                 }
-                if !SOURCE_UNAVAILABLE_GAPS
-                    .iter()
-                    .any(|gap| gaps.contains(gap))
-                {
+                if !SOURCE_UNAVAILABLE_GAPS.iter().any(|gap| gaps.contains(gap)) {
                     return Err(ProcessStreamEvidenceError::Invariant {
                         field: "gaps",
                         reason: "source-unavailable evidence requires a source-availability reason",
@@ -457,12 +465,12 @@ impl ProcessStreamEvidence {
         &self.gaps
     }
 
-    /// Parsing status. Raw ProcessExecutor evidence is always `RAW`.
+    /// Parsing status. Raw `ProcessExecutor` evidence is always `RAW`.
     pub const fn parsing(&self) -> StreamParsingStatus {
         self.parsing
     }
 
-    /// Evaluation status. Raw ProcessExecutor evidence is always `UNASSESSED`.
+    /// Evaluation status. Raw `ProcessExecutor` evidence is always `UNASSESSED`.
     pub const fn evaluation(&self) -> StreamEvaluationStatus {
         self.evaluation
     }
