@@ -1,0 +1,75 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "VALIDATION_CONTRACT_NOT_IMPLEMENTATION_OR_PRODUCT_PROOF"
+orders = "76..86"
+field_contract_index = "crates/smart/cognitive-rev12-w9-field-contracts.toml"
+type_ownership = "crates/smart/cognitive-rev12-w9-type-ownership.toml"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[expected]
+functional_cells = 11
+physical_crates = 4
+field_contracts = 4
+public_type_families = 4
+owned_mutable_state = 0
+allowed_effects = 0
+
+[[gate]]
+id = "W9V01_TOML_PARSE"
+requirement = "Every W9 field contract, cell brief, manifest reference, ownership and validation artifact parses as TOML."
+
+[[gate]]
+id = "W9V02_ORDER_CLOSURE"
+requirement = "Orders are exactly 76..86; every cell appears in one contract and one physical crate."
+
+[[gate]]
+id = "W9V03_FIELD_OWNER"
+requirement = "Every named public type resolves to exactly one of the four indexed contract owners; local redefinition is forbidden."
+
+[[gate]]
+id = "W9V04_DENOMINATOR"
+requirement = "Every Complete evidence, exposure, owner, inheritance or understanding claim has an exact independently recheckable denominator."
+
+[[gate]]
+id = "W9V05_DIMENSION_SEPARATION"
+requirement = "Use, verification, decision delta, outcome, retention, transfer, cost and harm stay distinct; no aggregate intelligence, quality, utility, gravity or understanding score exists."
+
+[[gate]]
+id = "W9V06_MEMORY_BOUNDARY"
+requirement = "Low use cannot reduce support; retrieval/repetition/prominence cannot raise support; assessment candidates perform no lifecycle/support/accessibility/influence transition."
+
+[[gate]]
+id = "W9V07_NEGATIVE_MEMORY"
+requirement = "Exact deterministic trigger is distinct from semantic near-match; extinction changes activation/influence only and preserves original failure history."
+
+[[gate]]
+id = "W9V08_SKILL_TOOL_DREAMER"
+requirement = "Installed/registered/advertised/completed states do not imply activation, use, outcome or utility; assessments cannot edit, invoke, schedule or change budget."
+
+[[gate]]
+id = "W9V09_SELF_QUALITY"
+requirement = "Self-quality view consumes exact owner projections, exposes missing owners and open Problems, owns no state and contains no global score."
+
+[[gate]]
+id = "W9V10_INTERVENTION_CANDIDATE"
+requirement = "Intervention output has hypothesis, rivals, discriminator, required authority, verifier, countermetrics, rollback and outcome windows, but no applied mutation or receipt."
+
+[[gate]]
+id = "W9V11_COMMON_GROUND"
+requirement = "Common Ground checks public goals, decisions, invariants, rivals, unknowns, commitments and action consequences; summary similarity/native hidden state is insufficient."
+
+[[gate]]
+id = "W9V12_SCOPED_UNDERSTANDING"
+requirement = "LocallyAdequate requires onboarding, current rival-aware model, predeclared prediction, discriminator, applicable outcome/verifier and revision discipline; product claim requires leakage-controlled holdout."
+
+[[gate]]
+id = "W9V13_SOURCE_SCOPE"
+requirement = "Each worker writes only its declared source/test files; Cargo, lib.rs, reexports and contract fields belong to integration owner."
+
+[[gate]]
+id = "W9V14_PAYLOAD_HYGIENE"
+requirement = "This design wave contains TOML only and changes no Rust, Markdown, workflow, root Cargo.toml, Cargo.lock, runtime wiring or product status."
+
+[[gate]]
+id = "W9V15_PROOF_CEILING"
+requirement = "Field freeze, parse, branch, commit or review cannot claim package, Edge, Product, runtime or acceptance proof."
