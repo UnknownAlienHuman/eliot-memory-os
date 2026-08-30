@@ -1,0 +1,106 @@
+{
+  "schema_version": "eliot.agent-model-selection-policy.v1",
+  "allowed_hosts": [
+    "codex",
+    "opencode",
+    "claude",
+    "antigravity"
+  ],
+  "catalogue_schema": "eliot.route-catalogue-set.v1",
+  "receipt_schema": "eliot.agent-model-selection-receipt.v1",
+  "fixed_model_id": null,
+  "minimum_capability_evidence": "observed",
+  "dispatchable_route_admission": [
+    "admitted"
+  ],
+  "dispatchable_health": [
+    "ready",
+    "degraded"
+  ],
+  "dispatchable_quota": [
+    "available",
+    "limited"
+  ],
+  "roles": {
+    "primary": {
+      "required_capabilities": [
+        "coding",
+        "tool_use"
+      ],
+      "minimum_context_tokens": 64000,
+      "prefer_cost": false,
+      "prefer_latency": false,
+      "different_host_from": [],
+      "different_family_from": []
+    },
+    "cheap_worker": {
+      "required_capabilities": [
+        "coding"
+      ],
+      "minimum_context_tokens": 32000,
+      "prefer_cost": true,
+      "prefer_latency": true,
+      "different_host_from": [],
+      "different_family_from": []
+    },
+    "challenger": {
+      "required_capabilities": [
+        "coding",
+        "reasoning"
+      ],
+      "minimum_context_tokens": 64000,
+      "prefer_cost": false,
+      "prefer_latency": false,
+      "different_host_from": [
+        "primary"
+      ],
+      "different_family_from": [
+        "primary"
+      ]
+    },
+    "verifier": {
+      "required_capabilities": [
+        "reasoning",
+        "structured_output"
+      ],
+      "minimum_context_tokens": 32000,
+      "prefer_cost": false,
+      "prefer_latency": false,
+      "different_host_from": [
+        "primary",
+        "challenger"
+      ],
+      "different_family_from": [
+        "primary",
+        "challenger"
+      ]
+    }
+  },
+  "ranking": {
+    "route_admitted": 1000,
+    "health_ready": 200,
+    "health_degraded": -100,
+    "quota_available": 100,
+    "quota_limited": 0,
+    "capability_evidence_unit": 100,
+    "context_headroom_unit_tokens": 16000,
+    "context_headroom_unit_score": 10,
+    "context_headroom_max_score": 80,
+    "cost": {
+      "free": 100,
+      "low": 80,
+      "standard": 40,
+      "premium": 0,
+      "unknown": -100
+    },
+    "latency": {
+      "fast": 60,
+      "moderate": 30,
+      "slow": 0,
+      "unknown": -50
+    }
+  },
+  "authority_ceiling": "candidate_route_selection_only",
+  "provider_execution_allowed": false,
+  "dispatch_authority": false
+}
