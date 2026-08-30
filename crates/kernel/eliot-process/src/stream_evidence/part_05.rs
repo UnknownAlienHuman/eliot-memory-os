@@ -49,8 +49,8 @@ struct ProcessExecutionBindingValidationWire {
 fn validate_process_execution_binding(
     binding: &ProcessExecutionBinding,
 ) -> Result<(), ProcessStreamEvidenceError> {
-    let serialized = serde_json::to_value(binding)
-        .map_err(|_| ProcessStreamEvidenceError::InvalidBinding)?;
+    let serialized =
+        serde_json::to_value(binding).map_err(|_| ProcessStreamEvidenceError::InvalidBinding)?;
     let wire: ProcessExecutionBindingValidationWire = serde_json::from_value(serialized)
         .map_err(|_| ProcessStreamEvidenceError::InvalidBinding)?;
 
@@ -136,30 +136,21 @@ fn omitted_suffix(
     }
 }
 
-fn usize_to_u64(
-    field: &'static str,
-    value: usize,
-) -> Result<u64, ProcessStreamEvidenceError> {
+fn usize_to_u64(field: &'static str, value: usize) -> Result<u64, ProcessStreamEvidenceError> {
     u64::try_from(value).map_err(|_| ProcessStreamEvidenceError::Invariant {
         field,
         reason: "length does not fit u64",
     })
 }
 
-fn u64_to_usize(
-    field: &'static str,
-    value: u64,
-) -> Result<usize, ProcessStreamEvidenceError> {
+fn u64_to_usize(field: &'static str, value: u64) -> Result<usize, ProcessStreamEvidenceError> {
     usize::try_from(value).map_err(|_| ProcessStreamEvidenceError::Invariant {
         field,
         reason: "length does not fit usize",
     })
 }
 
-fn validate_reference(
-    field: &'static str,
-    value: &str,
-) -> Result<(), ProcessStreamEvidenceError> {
+fn validate_reference(field: &'static str, value: &str) -> Result<(), ProcessStreamEvidenceError> {
     if value.is_empty()
         || value != value.trim()
         || value.len() > MAX_REFERENCE_BYTES
@@ -172,17 +163,18 @@ fn validate_reference(
 
 fn validate_locator(value: &str) -> Result<(), ProcessStreamEvidenceError> {
     validate_reference("source.locator", value)?;
-    let (scheme, remainder) = value
-        .split_once(':')
-        .ok_or(ProcessStreamEvidenceError::InvalidReference {
-            field: "source.locator",
-        })?;
+    let (scheme, remainder) =
+        value
+            .split_once(':')
+            .ok_or(ProcessStreamEvidenceError::InvalidReference {
+                field: "source.locator",
+            })?;
     let bytes = scheme.as_bytes();
     if bytes.is_empty()
         || !bytes[0].is_ascii_alphabetic()
-        || !bytes[1..].iter().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'-' | b'.')
-        })
+        || !bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'-' | b'.'))
         || remainder.is_empty()
     {
         return Err(ProcessStreamEvidenceError::InvalidReference {
@@ -202,10 +194,7 @@ fn validate_locator(value: &str) -> Result<(), ProcessStreamEvidenceError> {
     Ok(())
 }
 
-fn validate_digest(
-    field: &'static str,
-    value: &str,
-) -> Result<(), ProcessStreamEvidenceError> {
+fn validate_digest(field: &'static str, value: &str) -> Result<(), ProcessStreamEvidenceError> {
     if value.len() != 64
         || !value
             .bytes()
