@@ -61,6 +61,28 @@ migration must preserve compatibility deliberately and prove, at minimum:
 - `NOT_RUNNING` as a valid local domain observation rather than a global
   compiler failure.
 
+Current prerequisite and ownership:
+
+- issue #220 and draft PR #221 define the sole owner-neutral C0 contract for the
+  I0.5 status dimensions and five-domain vocabulary;
+- issue #216 owns the subsequent bootstrap snapshot migration;
+- this package must consume `eliot-conformance-contracts`; it must not define a
+  local copy of `ContractMaturity`, `ImplementationSupport`,
+  `EvidenceExecutionStatus`, `SupportObservationState`, or `EvidenceDomain`;
+- `SourceStatus` remains only the availability of one compiler input projection
+  and must never be exported or interpreted as current implementation support;
+- the existing schema string
+  `eliot-current-system-evidence-snapshot-v2` is not evidence that the current
+  flat wire shape conforms to normative snapshot v2;
+- old flat bytes require an explicit legacy-partial/unknown import disposition;
+  they cannot be reinterpreted silently as complete five-domain evidence;
+- do not mutate snapshot source or serialized consumers until the status
+  contract is implemented, package-proved, and compiled by a real bootstrap
+  consumer fixture.
+
+Return a ContractChallenge instead of creating a convenient bootstrap-owned
+status vocabulary or mapping `EvidenceEvaluation` directly into support.
+
 ### `foundation.bootstrap.rule-catalogue`
 
 Public core entrypoints:
@@ -148,6 +170,12 @@ All three cells are stateless and effect-free at the core boundary.
    create-new/idempotent-readback behavior and exact bytes.
 10. Keep the package dependency-light. A new dependency requires a real contract
     or adapter seam and must not import a higher runtime layer.
+11. The bootstrap compiler may validate a support row but cannot decide or
+    promote support; the supplied exact evidence and owner-neutral I0.5 contract
+    determine the maximum representable state.
+12. Observation availability, contract maturity, implementation support,
+    evidence execution, epistemic status, process health and verifier outcome
+    remain separate axes.
 
 ## Change routing
 
@@ -155,6 +183,10 @@ Use one causal unit and one primary mutable path scope.
 
 - Contract/schema change: update the pure types/compiler and negative fixtures;
   identify every serialized consumer before changing compatibility.
+- I0.5 status-contract change: work in `eliot-conformance-contracts` under #220;
+  do not duplicate the types here.
+- Snapshot-v2 migration: work under #216 only after the #220 package and first
+  consumer fixture are proved.
 - Capture change: stay in `capture.rs`; preserve the pure compiler boundary and
   attribute every observation to an exact capture route.
 - Rule change: modify only provider-owned rule projection/validation behavior;
@@ -173,7 +205,9 @@ work needs:
 - policy, authority, task, finish, or canonical-write decisions;
 - a second evidence/status owner;
 - an unbounded synchronous traversal or model call;
-- a schema guessed from prose where the field-level contract is not closed.
+- a schema guessed from prose where the field-level contract is not closed;
+- silent reinterpretation of an existing flat snapshot as a stronger contract
+  version.
 
 ## Proof
 
@@ -190,6 +224,17 @@ Also run the exact affected consumer fixture for `bins/eliot` or `eliot-cli`
 when the serialized snapshot, catalogue, brief, receipt, or public API changes.
 A filesystem/capture change needs create-new, readback, dirty-tree, missing-Git,
 wrong-root, and interrupted-publication coverage on the real adapter edge.
+
+A snapshot-v2 change additionally requires:
+
+```text
+eliot-conformance-contracts package proof;
+bootstrap imports every status/domain type from that package;
+legacy-flat import remains explicit partial/unknown;
+source-only evidence cannot claim runtime/store/integration support;
+CURRENT_VERIFIED forgery and observation/support conflation negatives;
+every serialized producer/consumer compatibility fixture.
+```
 
 Package proof establishes only the pure compiler or narrow capture behavior. It
 does not establish live runtime/store/integration observation, current system
