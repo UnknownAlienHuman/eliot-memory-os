@@ -1,0 +1,50 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+field_contract_is_sole_public_type_authority = true
+order = 17
+cell = "smart.dreamer.architecture_brief"
+stage = "W1_D3A_ORIENTATION"
+physical_crate = "eliot-dreamer-self-query"
+primary_property = "Build a bounded ArchitectureBrief from materialized sections of the exact accepted normative pair while preserving precedence, owner boundaries, invariants, failure semantics, proof requirements, replacement boundaries and open questions."
+field_contract = "crates/smart/eliot-dreamer-self-query/self-query.contract.toml"
+public_function_selectors = [
+  "validate_architecture_brief_request",
+  "build_architecture_brief",
+  "validate_architecture_brief",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-self-query/src/architecture_brief.rs",
+  "crates/smart/eliot-dreamer-self-query/tests/architecture_brief.rs",
+]
+algorithm = [
+  "validate accepted normative-pair receipt, exact section handles/digests, question, scope/task/fence and denominator",
+  "select required and decision-relevant materialized sections without runtime document/repository access",
+  "preserve section class, exact excerpt handle, owners, invariants, failure semantics, dependencies and replacement boundaries",
+  "retain open questions and every required omission explicitly",
+  "derive bounded load-bearing reference lists without interpreting Architecture as current implementation state",
+  "canonicalize sections and compute brief digest",
+]
+minimum_tests = [
+  "wrong pair key or document digest rejected",
+  "required section omission blocks Complete",
+  "open question remains open",
+  "Architecture owner boundary cannot be replaced by implementation convenience",
+  "brief contains no current-support or mutation field",
+  "no document/repository/model/provider interface exists",
+  "section order does not change digest",
+]
+non_goals = [
+  "reading Architecture file or repository",
+  "modifying Architecture",
+  "evaluating current implementation support",
+  "Context admission",
+  "model/provider execution",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-SELF-01", "ARCH-UND-01", "ARCH-EPI-04", "ARCH-MOD-03"]
+implementation_refs = ["I2.20", "I12.23"]
+product_pulse = "D3A_SELF_QUERY_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than reading undeclared sources, accepting the wrong normative pair, hiding a required/open section, or treating a brief as Architecture mutation/current implementation proof."
+brief_proof_ceiling = "STATIC_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
