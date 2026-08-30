@@ -44,37 +44,122 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-work-265-${{ hashFiles('Cargo.lock') }}
 
-      - name: Apply structural Clippy fixes
+      - name: Apply fail-closed unknown-state fixes
         shell: pwsh
         run: |
-          $utf8 = [Text.Encoding]::UTF8
           $sourcePath = 'crates/agent/eliot-agent-coordinator/src/model_control.rs'
           $source = [IO.File]::ReadAllText($sourcePath).Replace("`r`n", "`n")
 
-          $newQuota = $utf8.GetString([Convert]::FromBase64String('ICAgIGlmIGVudHJ5LnF1b3RhLmlzX2N1cnJlbnQobm93X3VuaXhfbXMpIHsKICAgICAgICBtYXRjaCBlbnRyeS5xdW90YS5kaXNwb3NpdGlvbiB7CiAgICAgICAgICAgIFF1b3RhRGlzcG9zaXRpb246OkF2YWlsYWJsZSB8IFF1b3RhRGlzcG9zaXRpb246OkxvdyA9PiB7fQogICAgICAgICAgICBRdW90YURpc3Bvc2l0aW9uOjpFeGhhdXN0ZWQgPT4gewogICAgICAgICAgICAgICAgYmxvY2tlcnMuaW5zZXJ0KERpc3BhdGNoQmxvY2tlcjo6UXVvdGFFeGhhdXN0ZWQpOwogICAgICAgICAgICB9CiAgICAgICAgICAgIFF1b3RhRGlzcG9zaXRpb246OlVua25vd24gPT4gewogICAgICAgICAgICAgICAgYmxvY2tlcnMuaW5zZXJ0KERpc3BhdGNoQmxvY2tlcjo6UXVvdGFVbmtub3duKTsKICAgICAgICAgICAgfQogICAgICAgICAgICBRdW90YURpc3Bvc2l0aW9uOjpOb3RFeHBvc2VkID0+IHsKICAgICAgICAgICAgICAgIGJsb2NrZXJzLmluc2VydChEaXNwYXRjaEJsb2NrZXI6OlF1b3RhTm90RXhwb3NlZCk7CiAgICAgICAgICAgIH0KICAgICAgICB9CiAgICB9IGVsc2UgewogICAgICAgIGJsb2NrZXJzLmluc2VydChEaXNwYXRjaEJsb2NrZXI6OlF1b3RhRXZpZGVuY2VTdGFsZSk7CiAgICB9Cg=='))
-          $quotaPattern = '(?s)    if !entry\.quota\.is_current\(now_unix_ms\) \{.*?^    \}\n(?=    if entry\.context_window)'
-          $source, $quotaCount = [Text.RegularExpressions.Regex]::Replace($source, $quotaPattern, $newQuota, [Text.RegularExpressions.RegexOptions]::Multiline), 0
-          if (-not $source.Contains($newQuota.TrimEnd("`n"))) {
-            throw 'SOURCE_PATCH_FAILED: quota branch'
-          }
+          $old = @('    BillingEvidenceStale,') -join "`n"
+          $new = @('    BillingEvidenceStale,', '    BillingUnknown,') -join "`n"
+          if (-not $source.Contains($old)) { throw 'PATCH_PRECONDITION: billing enum' }
+          $source = $source.Replace($old, $new)
 
-          $newHealth = $utf8.GetString([Convert]::FromBase64String('I1tkZXJpdmUoQ2xvbmUsIENvcHksIERlYnVnLCBFcSwgUGFydGlhbEVxLCBTZXJpYWxpemUsIERlc2VyaWFsaXplKV0KI1tzZXJkZShyZW5hbWVfYWxsID0gIlNDUkVBTUlOR19TTkFLRV9DQVNFIildCnB1YiBlbnVtIEF0dGVtcHRXb3JrRWxpZ2liaWxpdHkgewogICAgRWxpZ2libGUsCiAgICBJbmVsaWdpYmxlLAp9CgojW2Rlcml2ZShDbG9uZSwgQ29weSwgRGVidWcsIEVxLCBQYXJ0aWFsRXEsIFNlcmlhbGl6ZSwgRGVzZXJpYWxpemUpXQojW3NlcmRlKHJlbmFtZV9hbGwgPSAiU0NSRUFNSU5HX1NOQUtFX0NBU0UiKV0KcHViIGVudW0gQXR0ZW1wdFRlcm1pbmFsUmVjb25jaWxpYXRpb24gewogICAgUmVjb25jaWxlZENhbmRpZGF0ZSwKICAgIFVucmVjb25jaWxlZCwKfQoKI1tkZXJpdmUoQ2xvbmUsIENvcHksIERlYnVnLCBFcSwgUGFydGlhbEVxLCBTZXJpYWxpemUsIERlc2VyaWFsaXplKV0KI1tzZXJkZShyZW5hbWVfYWxsID0gIlNDUkVBTUlOR19TTkFLRV9DQVNFIildCnB1YiBlbnVtIEF0dGVtcHRBdXRvbWF0aW9uRGlzcG9zaXRpb24gewogICAgTWFudWFsT25seSwKfQoKI1tkZXJpdmUoQ2xvbmUsIERlYnVnLCBFcSwgUGFydGlhbEVxLCBTZXJpYWxpemUsIERlc2VyaWFsaXplKV0KI1tzZXJkZShkZW55X3Vua25vd25fZmllbGRzKV0KcHViIHN0cnVjdCBBdHRlbXB0SGVhbHRoUHJvamVjdGlvbiB7CiAgICBwdWIgc2NoZW1hX3ZlcnNpb246IFN0cmluZywKICAgIHB1YiBhdHRlbXB0X2lkOiBBdHRlbXB0SWQsCiAgICBwdWIgb2JzZXJ2ZWRfYXRfdW5peF9tczogdTY0LAogICAgcHViIHN0YXR1czogQXR0ZW1wdExpdmVuZXNzU3RhdHVzLAogICAgcHViIGFsZXJ0czogVmVjPEF0dGVtcHRBbGVydENvZGU+LAogICAgcHViIHdvcmtfZWxpZ2liaWxpdHk6IEF0dGVtcHRXb3JrRWxpZ2liaWxpdHksCiAgICBwdWIgdGVybWluYWxfcmVjb25jaWxpYXRpb246IEF0dGVtcHRUZXJtaW5hbFJlY29uY2lsaWF0aW9uLAogICAgcHViIGF1dG9tYXRpb246IEF0dGVtcHRBdXRvbWF0aW9uRGlzcG9zaXRpb24sCn0KCmZuIGhlYXJ0YmVhdF9zdGF0dXMoCiAgICBpbnB1dDogJkF0dGVtcHRUZWxlbWV0cnlJbnB1dCwKICAgIG5vd191bml4X21zOiB1NjQsCiAgICBhbGVydHM6ICZtdXQgQlRyZWVTZXQ8QXR0ZW1wdEFsZXJ0Q29kZT4sCikgLT4gQXR0ZW1wdExpdmVuZXNzU3RhdHVzIHsKICAgIG1hdGNoIGlucHV0Lmxhc3RfaGVhcnRiZWF0X3VuaXhfbXMgewogICAgICAgIE5vbmUgPT4gewogICAgICAgICAgICBhbGVydHMuaW5zZXJ0KEF0dGVtcHRBbGVydENvZGU6OkhlYXJ0YmVhdE1pc3NpbmcpOwogICAgICAgICAgICBBdHRlbXB0TGl2ZW5lc3NTdGF0dXM6OkhlYXJ0YmVhdE1pc3NpbmcKICAgICAgICB9CiAgICAgICAgU29tZShsYXN0KSBpZiBub3dfdW5peF9tcy5zYXR1cmF0aW5nX3N1YihsYXN0KSA+IGlucHV0LmhlYXJ0YmVhdF90aW1lb3V0X21zID0+IHsKICAgICAgICAgICAgYWxlcnRzLmluc2VydChBdHRlbXB0QWxlcnRDb2RlOjpIZWFydGJlYXRTdGFsZSk7CiAgICAgICAgICAgIEF0dGVtcHRMaXZlbmVzc1N0YXR1czo6SGVhcnRiZWF0U3RhbGUKICAgICAgICB9CiAgICAgICAgU29tZShfKSA9PiBBdHRlbXB0TGl2ZW5lc3NTdGF0dXM6OkxpdmUsCiAgICB9Cn0KCmZuIGNvbGxlY3RfYXR0ZW1wdF9hbGVydHMoCiAgICBpbnB1dDogJkF0dGVtcHRUZWxlbWV0cnlJbnB1dCwKICAgIG5vd191bml4X21zOiB1NjQsCikgLT4gKEJUcmVlU2V0PEF0dGVtcHRBbGVydENvZGU+LCBBdHRlbXB0TGl2ZW5lc3NTdGF0dXMpIHsKICAgIGxldCBtdXQgYWxlcnRzID0gQlRyZWVTZXQ6Om5ldygpOwogICAgbGV0IGhlYXJ0YmVhdCA9IGhlYXJ0YmVhdF9zdGF0dXMoaW5wdXQsIG5vd191bml4X21zLCAmbXV0IGFsZXJ0cyk7CiAgICBpZiBub3dfdW5peF9tcyA+IGlucHV0LmxlYXNlX2V4cGlyZXNfYXRfdW5peF9tcyB7CiAgICAgICAgYWxlcnRzLmluc2VydChBdHRlbXB0QWxlcnRDb2RlOjpMZWFzZUV4cGlyZWQpOwogICAgfQogICAgaWYgbm93X3VuaXhfbXMgPiBpbnB1dC5kZWFkbGluZV91bml4X21zIHsKICAgICAgICBhbGVydHMuaW5zZXJ0KEF0dGVtcHRBbGVydENvZGU6OkRlYWRsaW5lRXhjZWVkZWQpOwogICAgfQogICAgbWF0Y2ggaW5wdXQucXVvdGEuZGlzcG9zaXRpb24gewogICAgICAgIFF1b3RhRGlzcG9zaXRpb246OkF2YWlsYWJsZSA9PiB7fQogICAgICAgIFF1b3RhRGlzcG9zaXRpb246OkxvdyA9PiB7CiAgICAgICAgICAgIGFsZXJ0cy5pbnNlcnQoQXR0ZW1wdEFsZXJ0Q29kZTo6UXVvdGFMb3cpOwogICAgICAgIH0KICAgICAgICBRdW90YURpc3Bvc2l0aW9uOjpFeGhhdXN0ZWQgPT4gewogICAgICAgICAgICBhbGVydHMuaW5zZXJ0KEF0dGVtcHRBbGVydENvZGU6OlF1b3RhRXhoYXVzdGVkKTsKICAgICAgICB9CiAgICAgIFF1b3RhRGlzcG9zaXRpb246OlVua25vd24gfCBRdW90YURpc3Bvc2l0aW9uOjpOb3RFeHBvc2VkID0+IHsKICAgICAgICAgICAgYWxlcnRzLmluc2VydChBdHRlbXB0QWxlcnRDb2RlOjpRdW90YVVua25vd24pOwogICAgICAgIH0KICAgIH0KICAgIGlmICFpbnB1dC5xdW90YS5pc19jdXJyZW50KG5vd191bml4X21zKSB7CiAgICAgICAgYWxlcnRzLmluc2VydChBdHRlbXB0QWxlcnRDb2RlOjpRdW90YVVua25vd24pOwogICAgfQogICAgbWF0Y2ggaW5wdXQucHJvY2VzcyB7CiAgICAgICAgUHJvY2Vzc09ic2VydmF0aW9uOjpBbGl2ZSA9PiB7fQogICAgICAgIFByb2Nlc3NPYnNlcnZhdGlvbjo6RXhpdGVkID0+IHsKICAgICAgICAgICAgYWxlcnRzLmluc2VydChBdHRlbXB0QWxlcnRDb2RlOjpQcm9jZXNzTWlzc2luZyk7CiAgICAgICAgfQogICAgICAgIFByb2Nlc3NPYnNlcnZhdGlvbjo6VW5rbm93biA9PiB7CiAgICAgICAgICAgIGFsZXJ0cy5pbnNlcnQoQXR0ZW1wdEFsZXJ0Q29kZTo6UHJvY2Vzc1Vua25vd24pOwogICAgICAgIH0KICAgIH0KICAgIGlmIGlucHV0LmVmZmVjdCA9PSBBdHRlbXB0RWZmZWN0T2JzZXJ2YXRpb246OlVua25vd24gewogICAgICAgIGFsZXJ0cy5pbnNlcnQoQXR0ZW1wdEFsZXJ0Q29kZTo6RWZmZWN0VW5rbm93bik7CiAgICB9CiAgICBpZiBpbnB1dC5vcGVuX2Rlc2NlbmRhbnRzID4gMCB7CiAgICAgICAgYWxlcnRzLmluc2VydChBdHRlbXB0QWxlcnRDb2RlOjpEZXNjZW5kYW50c09wZW4pOwogICAgICAgIGlmIGlucHV0LnN0YXRlLmlzX3Rlcm1pbmFsKCkgewogICAgICAgICAgICBhbGVydHMuaW5zZXJ0KEF0dGVtcHRBbGVydENvZGU6OlRlcm1pbmFsV2l0aE9wZW5EZXNjZW5kYW50cyk7CiAgICAgICAgfQogICAgfQogICAgaWYgaW5wdXQuc3RhdGUgPT0gQ29vcmRpbmF0ZWRBdHRlbXB0U3RhdGU6OlVua25vd25PdXRjb21lIHsKICAgICAgICBhbGVydHMuaW5zZXJ0KEF0dGVtcHRBbGVydENvZGU6OlVua25vd25PdXRjb21lKTsKICAgIH0KICAgIChhbGVydHMsIGhlYXJ0YmVhdCkKfQoKZm4gZGVyaXZlX2F0dGVtcHRfc3RhdHVzKAogICAgaW5wdXQ6ICZBdHRlbXB0VGVsZW1ldHJ5SW5wdXQsCiAgICBub3dfdW5peF9tczogdTY0LAogICAgaGVhcnRiZWF0OiBBdHRlbXB0TGl2ZW5lc3NTdGF0dXMsCikgLT4gQXR0ZW1wdExpdmVuZXNzU3RhdHVzIHsKICAgIGlmIGlucHV0LnN0YXRlLmlzX3Rlcm1pbmFsKCkgewogICAgICAgIEF0dGVtcHRMaXZlbmVzc1N0YXR1czo6VGVybWluYWwKICAgIH0gZWxzZSBpZiBpbnB1dC5zdGF0ZSA9PSBDb29yZGluYXRlZEF0dGVtcHRTdGF0ZTo6VW5rbm93bk91dGNvbWUgewogICAgICAgIEF0dGVtcHRMaXZlbmVzc1N0YXR1czo6VW5rbm93bk91dGNvbWUKICAgIH0gZWxzZSBpZiBpbnB1dC5lZmZlY3QgPT0gQXR0ZW1wdEVmZmVjdE9ic2VydmF0aW9uOjpVbmtub3duIHsKICAgICAgICBBdHRlbXB0TGl2ZW5lc3NTdGF0dXM6OlVua25vd25FZmZlY3QKICAgIH0gZWxzZSBpZiBpbnB1dC5xdW90YS5kaXNwb3NpdGlvbiA9PSBRdW90YURpc3Bvc2l0aW9uOjpFeGhhdXN0ZWQgewogICAgICAgIEF0dGVtcHRMaXZlbmVzc1N0YXR1czo6UXVvdGFFeGhhdXN0ZWQKICAgIH0gZWxzZSBpZiAhaW5wdXQucXVvdGEuaXNfY3VycmVudChub3dfdW5peF9tcykKICAgICAgICB8fCBtYXRjaGVzISgKICAgICAgICAgICAgaW5wdXQucXVvdGEuZGlzcG9zaXRpb24sCiAgICAgICAgICAgIFF1b3RhRGlzcG9zaXRpb246OlVua25vd24gfCBRdW90YURpc3Bvc2l0aW9uOjpOb3RFeHBvc2VkCiAgICAgICAgKQogICAgewogICAgICAgIEF0dGVtcHRMaXZlbmVzc1N0YXR1czo6UXVvdGFVbmtub3duCiAgICB9IGVsc2UgaWYgbm93X3VuaXhfbXMgPiBpbnB1dC5sZWFzZV9leHBpcmVzX2F0X3VuaXhfbXMgewogICAgICAgIEF0dGVtcHRMaXZlbmVzc1N0YXR1czo6TGVhc2VFeHBpcmVkCiAgICB9IGVsc2UgaWYgbm93X3VuaXhfbXMgPiBpbnB1dC5kZWFkbGluZV91bml4X21zIHsKICAgICAgICBBdHRlbXB0TGl2ZW5lc3NTdGF0dXM6OkRlYWRsaW5lRXhjZWVkZWQKICAgIH0gZWxzZSBpZiBpbnB1dC5wcm9jZXNzID09IFByb2Nlc3NPYnNlcnZhdGlvbjo6RXhpdGVkIHsKICAgICAgICBBdHRlbXB0TGl2ZW5lc3NTdGF0dXM6OlByb2Nlc3NNaXNzaW5nCiAgICB9IGVsc2UgaWYgaW5wdXQuc3RhdGUgPT0gQ29vcmRpbmF0ZWRBdHRlbXB0U3RhdGU6OkNhbmNlbGxhdGlvblJlcXVlc3RlZCB7CiAgICAgICAgQXR0ZW1wdExpdmVuZXNzU3RhdHVzOjpDYW5jZWxsaW5nCiAgICB9IGVsc2UgaWYgaW5wdXQuc3RhdGUgPT0gQ29vcmRpbmF0ZWRBdHRlbXB0U3RhdGU6OkFkbWl0dGVkCiAgICAgICAgJiYgaW5wdXQubGFzdF9oZWFydGJlYXRfdW5peF9tcy5pc19ub25lKCkKICAgIHsKICAgICAgICBBdHRlbXB0TGl2ZW5lc3NTdGF0dXM6OlN0YXJ0aW5nCiAgICB9IGVsc2UgewogICAgICAgIGhlYXJ0YmVhdAogICAgfQp9CgpwdWIgZm4gcHJvamVjdF9hdHRlbXB0X2hlYWx0aCgKICAgIGlucHV0OiAmQXR0ZW1wdFRlbGVtZXRyeUlucHV0LAogICAgbm93X3VuaXhfbXM6IHU2NCwKKSAtPiBSZXN1bHQ8QXR0ZW1wdEhlYWx0aFByb2plY3Rpb24sIE1vZGVsQ29udHJvbEVycm9yPiB7CiAgICBpbnB1dC52YWxpZGF0ZSgpPzsKICAgIGlmIG5vd191bml4X21zIDwgaW5wdXQub2JzZXJ2ZWRfYXRfdW5peF9tcyB7CiAgICAgICAgcmV0dXJuIEVycihNb2RlbENvbnRyb2xFcnJvcjo6SW52YWxpZEZpZWxkKAogICAgICAgICAgICAiYXR0ZW1wdF9oZWFsdGgubm93X3VuaXhfbXMiLAogICAgICAgICkpOwogICAgfQogICAgbGV0IChhbGVydHMsIGhlYXJ0YmVhdCkgPSBjb2xsZWN0X2F0dGVtcHRfYWxlcnRzKGlucHV0LCBub3dfdW5peF9tcyk7CiAgICBsZXQgc3RhdHVzID0gZGVyaXZlX2F0dGVtcHRfc3RhdHVzKGlucHV0LCBub3dfdW5peF9tcywgaGVhcnRiZWF0KTsKICAgIGxldCB0ZXJtaW5hbF9yZWNvbmNpbGlhdGlvbiA9IGlmIGlucHV0LnN0YXRlLmlzX3Rlcm1pbmFsKCkKICAgICAgICAmJiBpbnB1dC5vcGVuX2Rlc2NlbmRhbnRzID09IDAKICAgICAgICAmJiBpbnB1dC5lZmZlY3QgIT0gQXR0ZW1wdEVmZmVjdE9ic2VydmF0aW9uOjpVbmtub3duCiAgICB7CiAgICAgICAgQXR0ZW1wdFRlcm1pbmFsUmVjb25jaWxpYXRpb246OlJlY29uY2lsZWRDYW5kaWRhdGUKICAgIH0gZWxzZSB7CiAgICAgICAgQXR0ZW1wdFRlcm1pbmFsUmVjb25jaWxpYXRpb246OlVucmVjb25jaWxlZAogICAgfTsKICAgIE9rKEF0dGVtcHRIZWFsdGhQcm9qZWN0aW9uIHsKICAgICAgICBzY2hlbWFfdmVyc2lvbjogQVRURU1QVF9IRUFMVEhfUFJPSkVDVElPTl9WRVJTSU9OLnRvX293bmVkKCksCiAgICAgICAgYXR0ZW1wdF9pZDogaW5wdXQuYXR0ZW1wdF9pZC5jbG9uZSgpLAogICAgICAgIG9ic2VydmVkX2F0X3VuaXhfbXM6IG5vd191bml4X21zLAogICAgICAgIHN0YXR1cywKICAgICAgICBhbGVydHM6IGFsZXJ0cy5pbnRvX2l0ZXIoKS5jb2xsZWN0KCksCiAgICAgICAgd29ya19lbGlnaWJpbGl0eTogaWYgbWF0Y2hlcyEoc3RhdHVzLCBBdHRlbXB0TGl2ZW5lc3NTdGF0dXM6OkxpdmUpIHsKICAgICAgICAgICAgQXR0ZW1wdFdvcmtFbGlnaWJpbGl0eTo6RWxpZ2libGUKICAgICAgICB9IGVsc2UgewogICAgICAgICAgICBBdHRlbXB0V29ya0VsaWdpYmlsaXR5OjpJbmVsaWdpYmxlCiAgICAgICAgfSwKICAgICAgICB0ZXJtaW5hbF9yZWNvbmNpbGlhdGlvbiwKICAgICAgICBhdXRvbWF0aW9uOiBBdHRlbXB0QXV0b21hdGlvbkRpc3Bvc2l0aW9uOjpNYW51YWxPbmx5LAogICAgfSkKfQo='))
-          $healthPattern = '(?s)#\[derive\(Clone, Debug, Eq, PartialEq, Serialize, Deserialize\)\]\n#\[serde\(deny_unknown_fields\)\]\npub struct AttemptHealthProjection \{.*?^\}\n\n(?=#\[derive\(Clone, Debug, Eq, PartialEq, Serialize, Deserialize\)\]\n#\[serde\(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind"\)\]\npub enum SwarmControlCommandDraft)'
-          $updated = [Text.RegularExpressions.Regex]::Replace($source, $healthPattern, $newHealth, [Text.RegularExpressions.RegexOptions]::Multiline)
-          if ($updated -eq $source) {
-            throw 'SOURCE_PATCH_FAILED: health projection'
-          }
-          [IO.File]::WriteAllText($sourcePath, $updated, [Text.UTF8Encoding]::new($false))
+          $old = @(
+            '    if !entry.billing.is_current(now_unix_ms) {',
+            '        blockers.insert(DispatchBlocker::BillingEvidenceStale);',
+            '    }',
+            '    if entry.quota.is_current(now_unix_ms) {'
+          ) -join "`n"
+          $new = @(
+            '    if !entry.billing.is_current(now_unix_ms) {',
+            '        blockers.insert(DispatchBlocker::BillingEvidenceStale);',
+            '    }',
+            '    if entry.billing.class == BillingClass::Unknown {',
+            '        blockers.insert(DispatchBlocker::BillingUnknown);',
+            '    }',
+            '    if entry.quota.is_current(now_unix_ms) {'
+          ) -join "`n"
+          if (-not $source.Contains($old)) { throw 'PATCH_PRECONDITION: billing blocker' }
+          $source = $source.Replace($old, $new)
+
+          $old = @('    ProcessMissing,', '    UnknownEffect,') -join "`n"
+          $new = @('    ProcessMissing,', '    ProcessUnknown,', '    UnknownEffect,') -join "`n"
+          if (-not $source.Contains($old)) { throw 'PATCH_PRECONDITION: process status enum' }
+          $source = $source.Replace($old, $new)
+
+          $old = @(
+            '    } else if input.process == ProcessObservation::Exited {',
+            '        AttemptLivenessStatus::ProcessMissing',
+            '    } else if input.state == CoordinatedAttemptState::CancellationRequested {'
+          ) -join "`n"
+          $new = @(
+            '    } else if input.process == ProcessObservation::Exited {',
+            '        AttemptLivenessStatus::ProcessMissing',
+            '    } else if input.process == ProcessObservation::Unknown {',
+            '        AttemptLivenessStatus::ProcessUnknown',
+            '    } else if input.state == CoordinatedAttemptState::CancellationRequested {'
+          ) -join "`n"
+          if (-not $source.Contains($old)) { throw 'PATCH_PRECONDITION: process status derivation' }
+          $source = $source.Replace($old, $new)
+          [IO.File]::WriteAllText($sourcePath, $source, [Text.UTF8Encoding]::new($false))
 
           $testsPath = 'crates/agent/eliot-agent-coordinator/src/model_control_tests.rs'
           $tests = [IO.File]::ReadAllText($testsPath).Replace("`r`n", "`n")
-          $newAssertions = $utf8.GetString([Convert]::FromBase64String('ICAgIGFzc2VydF9lcSEoCiAgICAgICAgcHJvamVjdGlvbi53b3JrX2VsaWdpYmlsaXR5LAogICAgICAgIEF0dGVtcHRXb3JrRWxpZ2liaWxpdHk6OkluZWxpZ2libGUKICAgICk7CiAgICBhc3NlcnRfZXEhKAogICAgICAgIHByb2plY3Rpb24udGVybWluYWxfcmVjb25jaWxpYXRpb24sCiAgICAgICAgQXR0ZW1wdFRlcm1pbmFsUmVjb25jaWxpYXRpb246OlJlY29uY2lsZWRDYW5kaWRhdGUKICAgICk7CiAgICBhc3NlcnRfZXEhKAogICAgICAgIHByb2plY3Rpb24uYXV0b21hdGlvbiwKICAgICAgICBBdHRlbXB0QXV0b21hdGlvbkRpc3Bvc2l0aW9uOjpNYW51YWxPbmx5CiAgICApOwo='))
-          $assertPattern = '(?m)^    assert!\(!projection\.eligible_for_new_work\);\n    assert!\(projection\.candidate_terminal_reconciled\);\n    assert!\(!projection\.automatic_finish\);\n    assert!\(!projection\.automatic_redispatch\);\n'
-          $updatedTests = [Text.RegularExpressions.Regex]::Replace($tests, $assertPattern, $newAssertions)
-          if ($updatedTests -eq $tests) {
-            throw 'TEST_PATCH_FAILED: terminal assertions'
-          }
-          [IO.File]::WriteAllText($testsPath, $updatedTests, [Text.UTF8Encoding]::new($false))
+
+          $marker = @('#[test]', 'fn denied_selector_overrides_preferred_selector() -> TestResult {') -join "`n"
+          $insert = @(
+            '#[test]',
+            'fn unknown_billing_is_not_dispatchable() {',
+            '    let catalogue = snapshot(vec![entry(',
+            '        "unknown-billing",',
+            '        "provider-a",',
+            '        "model-a",',
+            '        "family-a",',
+            '        BillingClass::Unknown,',
+            '        QuotaDisposition::Available,',
+            '        0,',
+            '    )]);',
+            '    let human_policy = policy(',
+            '        preference(',
+            '            ModelRole::Worker,',
+            '            Vec::new(),',
+            '            Vec::new(),',
+            '            BTreeSet::from([BillingClass::Unknown]),',
+            '            true,',
+            '        ),',
+            '        "revision-1",',
+            '    );',
+            '    assert!(matches!(',
+            '        compile_model_selection(',
+            '            &catalogue,',
+            '            &human_policy,',
+            '            ModelRole::Worker,',
+            '            "selection-1",',
+            '            NOW',
+            '        ),',
+            '        Err(ModelControlError::NoDispatchableRoute(ModelRole::Worker))',
+            '    ));',
+            '}',
+            '',
+            '#[test]',
+            'fn denied_selector_overrides_preferred_selector() -> TestResult {'
+          ) -join "`n"
+          if (-not $tests.Contains($marker)) { throw 'TEST_PRECONDITION: billing test marker' }
+          $tests = $tests.Replace($marker, $insert)
+
+          $marker = @('#[test]', 'fn terminal_attempt_is_not_reported_live() -> TestResult {') -join "`n"
+          $insert = @(
+            '#[test]',
+            'fn unknown_process_is_not_eligible_for_work() -> TestResult {',
+            '    let mut input = telemetry(CoordinatedAttemptState::Running)?;',
+            '    input.process = ProcessObservation::Unknown;',
+            '    let projection = project_attempt_health(&input, NOW)?;',
+            '    assert_eq!(projection.status, AttemptLivenessStatus::ProcessUnknown);',
+            '    assert_eq!(',
+            '        projection.work_eligibility,',
+            '        AttemptWorkEligibility::Ineligible',
+            '    );',
+            '    assert!(projection.alerts.contains(&AttemptAlertCode::ProcessUnknown));',
+            '    Ok(())',
+            '}',
+            '',
+            '#[test]',
+            'fn terminal_attempt_is_not_reported_live() -> TestResult {'
+          ) -join "`n"
+          if (-not $tests.Contains($marker)) { throw 'TEST_PRECONDITION: process test marker' }
+          $tests = $tests.Replace($marker, $insert)
+          [IO.File]::WriteAllText($testsPath, $tests, [Text.UTF8Encoding]::new($false))
 
       - name: Format candidate
         run: cargo fmt -p eliot-agent-coordinator
@@ -85,10 +170,8 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add crates/agent/eliot-agent-coordinator
-          if (git diff --cached --quiet) {
-            throw 'NO_STRUCTURAL_FIX_COMMITTED'
-          }
-          git commit -m 'fix(swarm): make attempt health state explicit [proof-bot]'
+          if (git diff --cached --quiet) { throw 'NO_FAIL_CLOSED_FIX_COMMITTED' }
+          git commit -m 'fix(swarm): fail closed on unknown billing and process [proof-bot]'
           git push origin HEAD:work/265-swarm-model-catalogue-control
           Write-Host "PROOF_SOURCE_SHA=$((git rev-parse HEAD).Trim())"
 
@@ -101,13 +184,14 @@ jobs:
       - name: Clippy coordinator
         run: cargo clippy --locked -p eliot-agent-coordinator --all-targets -- -D warnings
 
-      - name: Verify clean proved tree
+      - name: Verify proved Rust tree
         shell: pwsh
         run: |
           cargo fmt -p eliot-agent-coordinator -- --check
-          if (-not (git diff --quiet)) {
-            git diff --check
-            git diff
-            throw 'PROOF_TREE_DIRTY'
+          $dirty = @(git diff --name-only -- Cargo.lock crates/agent/eliot-agent-coordinator)
+          if ($dirty.Count -gt 0) {
+            git diff --check -- Cargo.lock crates/agent/eliot-agent-coordinator
+            git diff -- Cargo.lock crates/agent/eliot-agent-coordinator
+            throw "PROOF_RUST_TREE_DIRTY: $($dirty -join ', ')"
           }
           Write-Host "PROOF_SOURCE_SHA=$((git rev-parse HEAD).Trim())"
