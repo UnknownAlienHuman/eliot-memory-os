@@ -1,0 +1,104 @@
+schema_version = 1
+status = "CONSOLIDATED_CONTRACT_CHALLENGE_LEDGER"
+authority = "crates/smart/cognitive-rev12-all-field-contracts.toml"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[[resolved]]
+id = "CC-OBSERVATION-CLASSIFICATION-SCHEMA"
+contract_ref = "crates/governor/eliot-observation/classification.contract.toml"
+resolution = "First-pass family, task-binding, cold-capture, signal precedence and no-promotion fields are frozen."
+
+[[resolved]]
+id = "CC-CURRENT-EPISTEMIC-POSITION-SCHEMA"
+contract_ref = "crates/smart/eliot-epistemic-contracts/current-position.contract.toml"
+resolution = "Observation/support/assumption/rival/conflict/stale/superseded/unknown/inquiry and dependence fields are frozen."
+
+[[resolved]]
+id = "CC-DREAMER-COMMON-SCHEMA"
+contract_ref = "crates/smart/eliot-dreamer-contracts/common.contract.toml"
+resolution = "Job, budget, privacy, manifest, bundle, draft, grounding, seven-dimensional validation and candidate admission fields are frozen."
+
+[[resolved]]
+id = "CC-DREAMER-ORIENTATION-SCHEMA"
+contract_ref = "crates/smart/eliot-dreamer-contracts/orientation.contract.toml"
+resolution = "Rival, relation, probe, clarification and packet fields are frozen with evidence/synthesis separation and causality safeguards."
+
+[[resolved]]
+id = "CC-DREAMER-RESEARCH-SCHEMA"
+contract_ref = "crates/smart/eliot-dreamer-contracts/research.contract.toml"
+resolution = "Bundle-bound cited interpretation/counterclaim/dependence/coverage/probe fields are frozen without acquisition ownership."
+
+[[resolved]]
+id = "CC-DREAMER-CURATION-DISPATCH-SCHEMA"
+contract_ref = "crates/smart/eliot-dreamer-contracts/curation.contract.toml"
+resolution = "Eleven closed curation subtypes, exact handler contracts and typed candidate-set dispatch fields are frozen."
+
+[[resolved]]
+id = "CC-CUE-ACTIVATION-SCHEMA"
+contract_ref = "crates/smart/eliot-cue-contracts/cue.contract.toml"
+resolution = "Canonical/comparison values, binding/admission, zero-edge direct firing, bounded spread and handles-only activation fields are frozen."
+
+[[resolved]]
+id = "CC-CONTEXT-COMPILER-SCHEMA"
+contract_ref = "crates/smart/eliot-context-contracts/context-compiler.contract.toml"
+resolution = "Whole candidates, Safety Floor, budget/headroom, provider fairness, dispositions, view/tail/quality and reactive-plan fields are frozen."
+
+[[resolved]]
+id = "CC-MEMORY-CURATION-SCHEMA"
+contract_ref = "crates/smart/eliot-memory-curation-contracts/curation.contract.toml"
+resolution = "Dimensioned read-only evidence, protection, accessibility and influence-repair candidate fields are frozen."
+
+[[resolved]]
+id = "CC-TASK-LOCAL-LEARNING-SCHEMA"
+contract_ref = "crates/smart/eliot-learning-contracts/task-local-learning.contract.toml"
+resolution = "Owner state view, predeclared delta, allowed retry purpose, reversible overlay and dimensional validation fields are frozen."
+
+[[resolved]]
+id = "CC-LEARNING-EVALUATION-SCHEMA"
+contract_ref = "crates/smart/eliot-learning-contracts/learning-evaluation.contract.toml"
+resolution = "External activation receipt reference, adherence, decision/outcome, closure and twelve-dimensional promotion-input fields are frozen."
+
+[[resolved]]
+id = "CC-W8-SCHEMA-FAMILIES"
+contract_refs = ["crates/smart/eliot-context-contracts/provider-contribution.contract.toml", "crates/smart/eliot-memory-projection-contracts/projection.contract.toml", "crates/smart/eliot-learning-contracts/experience.contract.toml"]
+resolution = "Provider contribution, canonical memory projection and System Experience public fields remain frozen from the W8 stack."
+
+[[resolved]]
+id = "CC-W9-SCHEMA-FAMILIES"
+contract_refs = ["crates/meta/eliot-memory-quality/quality.contract.toml", "crates/smart/eliot-dreamer-memory-revision/negative-memory-extinction.contract.toml", "crates/meta/eliot-cognitive-quality/quality.contract.toml", "crates/meta/eliot-understanding-assessment/understanding.contract.toml"]
+resolution = "Memory/cognitive quality, negative-memory extinction, Common Ground and scoped-understanding fields remain frozen from the W9 stack."
+
+[[open]]
+id = "CC-OWNER-ADAPTERS"
+reason = "Real immutable projections and adapters from Governor, Task Controller, Researcher, canonical memory, Context, Skill/tool registries, route hosts, Evaluator and Product owners are not implemented by field contracts."
+required_owner = "respective runtime/canonical owner"
+
+[[open]]
+id = "CC-RUST-IMPLEMENTATION"
+reason = "No contract-freeze commit implements the declared Rust modules or tests."
+required_owner = "one worker per FunctionalCapabilityCell"
+
+[[open]]
+id = "CC-PACKAGE-MODULE-PROOF"
+reason = "No dependency-locked package ModuleTestCapsule has executed for these newly frozen contracts."
+required_owner = "package integration owner"
+
+[[open]]
+id = "CC-REAL-EDGE-PROOF"
+reason = "No real provider/consumer interaction has executed on exact Product/State-Fence identities."
+required_owner = "edge integration owner"
+
+[[open]]
+id = "CC-PRODUCT-PULSES"
+reason = "D1_CAPTURE_CLASSIFICATION_EDGE_01, D3A_ORIENTATION_PULSE_01, D3A_RESEARCH_SYNTHESIS_PULSE_01, D3A_CURATION_PULSE_01, D3B_REACTIVE_CONTEXT_PULSE_01, D4_TASK_LOCAL_LEARNING_PULSE_01 and W9 D4 pulses have not executed."
+required_owner = "Product Pulse owner"
+
+[[open]]
+id = "CC-WORKSPACE-RUNTIME-ADMISSION"
+reason = "Root workspace/runtime admission remains forbidden before package, edge and product evidence."
+required_owner = "Governor/integration owner"
+
+[[open]]
+id = "CC-PRODUCT-ACCEPTANCE"
+reason = "Field-level completeness cannot establish user/product value, runtime support, understanding or release acceptance."
+required_owner = "Requester/Product/Release owner"

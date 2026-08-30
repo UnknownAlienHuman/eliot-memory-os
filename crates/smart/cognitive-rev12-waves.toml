@@ -1,33 +1,38 @@
-schema_version = 3
+schema_version = 4
 authority = "eliot-cognitive-function-design-rev12"
 status = "ORDERED_AGENT_WAVES_NOT_EXECUTED"
 wave_count = 10
-field_contract_index = "crates/smart/cognitive-rev12-field-contracts.toml"
+field_contract_index = "crates/smart/cognitive-rev12-all-field-contracts.toml"
 
 [[wave]]
 id = "W0_CONTRACT_EVIDENCE"
 orders = [1, 2, 4, 5, 6, 7, 19, 26, 27, 28, 35, 49, 50, 51, 52, 68, 71, 74]
-rule = "Freeze public types, owner boundaries and negative fixtures before semantic workers. W8 contract cells 68, 71 and 74 now have field-level target contracts but no Rust/package proof."
+rule = "All eighteen Contract/Evidence cells now have owner-local field-level TARGET contracts. Implementation workers must use the exact indexed fields and disjoint source scopes; no W0 contract has Rust/package/edge/product proof yet."
 
 [[wave]]
 id = "W1_D3A_ORIENTATION"
 orders = [3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+rule = "Starts only after W0 epistemic and Dreamer common/orientation contracts are frozen; workers cannot redefine those types."
 
 [[wave]]
 id = "W2_D3B_REACTIVE_CONTEXT"
 orders = [20, 21, 22, 23, 24, 25, 29, 30, 31, 32, 33, 34]
+rule = "Starts only after cue and Context candidate/admission/view/provider field contracts are frozen; exact firing and Safety Floor remain mandatory."
 
 [[wave]]
 id = "W3_CURATION_MODELS"
 orders = [36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
+rule = "Starts only after memory-curation and typed Dreamer curation-dispatch contracts are frozen; every handler keeps one subtype and candidate-only effect ceiling."
 
 [[wave]]
 id = "W4_RESEARCH"
 orders = [48]
+rule = "Research synthesis consumes immutable Researcher bundle/manifest and cannot acquire or admit sources."
 
 [[wave]]
 id = "W5_TASK_LOCAL_LEARNING"
 orders = [53, 54, 55, 56, 57, 58, 59]
+rule = "Starts only after System Experience, task-local learning and learning-evaluation contracts are frozen; receipt ownership and protected overlay surfaces cannot be changed."
 
 [[wave]]
 id = "W6_DIAGNOSIS_PLANNING"
@@ -40,9 +45,14 @@ orders = [66, 67]
 [[wave]]
 id = "W8_CANONICAL_PROJECTION_BRIDGES"
 orders = [69, 70, 72, 73, 75]
-rule = "Projection cells integrate only after their exact indexed field contracts are frozen. Provider cells reuse ContextProviderProjectionRequest and return ProviderContribution without admission authority."
+rule = "Projection cells integrate only after the exact provider, memory and System Experience field contracts are frozen. All providers reuse ContextProviderProjectionRequest and return ProviderContribution without admission authority."
 
 [[wave]]
 id = "W9_META_COGNITIVE_QUALITY"
 orders = [76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86]
-rule = "Meta cells consume immutable owner evidence and remain assessment/candidate-only."
+rule = "Meta cells consume immutable owner evidence and remain assessment/candidate-only under four frozen W9 contract families."
+
+[integration_order]
+steps = ["field contract freeze", "one worker per cell source/test scope", "package integration and ModuleTestCapsule", "affected real Edge Proof", "smallest named Product Pulse", "promotion/narrow/rollback/MechanismReview"]
+worker_never_integrates_own_result = true
+root_workspace_admission_before_edge_and_product_proof = false
