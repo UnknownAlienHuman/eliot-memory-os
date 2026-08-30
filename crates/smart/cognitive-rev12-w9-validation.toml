@@ -1,0 +1,85 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "VALIDATION_CONTRACT_NOT_IMPLEMENTATION_OR_PRODUCT_PROOF"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[expected]
+orders = "76..86"
+functional_cells = 11
+physical_crates = 4
+field_contracts = 4
+contract_index = "crates/smart/cognitive-rev12-w9-field-contracts.toml"
+type_ownership = "crates/smart/cognitive-rev12-w9-type-ownership.toml"
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+
+[[gate]]
+id = "W9V01_TOML_PARSE"
+requirement = "Every W9 contract, index, manifest and agent brief parses as TOML."
+
+[[gate]]
+id = "W9V02_ORDER_CLOSURE"
+requirement = "Orders are exactly 76..86 with one physical crate and one write scope per cell."
+
+[[gate]]
+id = "W9V03_FIELD_CONTRACT_CLOSURE"
+requirement = "Exactly four field contracts cover all eleven cells; each referenced path exists and has one owner."
+
+[[gate]]
+id = "W9V04_TYPE_OWNER"
+requirement = "Every public type named by W9 contracts resolves to exactly one W9 owner or one explicit external owner; local redefinition is forbidden."
+
+[[gate]]
+id = "W9V05_COMPLETE_DENOMINATOR"
+requirement = "Every Complete coverage state requires exact source revision, method, expected count and exact count equality; unavailable/blocked names owner or reason."
+
+[[gate]]
+id = "W9V06_DIMENSION_SEPARATION"
+requirement = "Use, delivery, activation, adherence, decision delta, outcome, retention, transfer, cost and support remain separate; no aggregate intelligence/confidence/utility score exists."
+
+[[gate]]
+id = "W9V07_MEMORY_BOUNDARY"
+requirement = "Memory assessment never changes support/lifecycle/influence; gravity has no Delete action; minority/counterevidence and negative memory remain addressable."
+
+[[gate]]
+id = "W9V08_NEGATIVE_MEMORY_EXTINCTION"
+requirement = "Exact deterministic trigger stays separate from semantic near-match; original failure history is retained; extinction is advisory activation/influence only."
+
+[[gate]]
+id = "W9V09_SKILL_TOOL_DREAMER"
+requirement = "Installed/registered/advertised/generated/completed/transport-complete states never imply utility; outputs are candidates, not registry/schedule/budget/route mutations."
+
+[[gate]]
+id = "W9V10_SELF_QUALITY_OWNER"
+requirement = "EliotSelfQualityView consumes exact owner projections with a closed denominator; the pure compiler owns no journal/experience lifecycle and exposes no global score."
+
+[[gate]]
+id = "W9V11_LEARNING_BOTTLENECK"
+requirement = "Update quality, activation, adherence, decision delta, outcome, retention and transfer remain independent; ambiguous evidence preserves rivals."
+
+[[gate]]
+id = "W9V12_INTERVENTION_BOUNDARY"
+requirement = "Intervention output is advisory only; material change requires discriminator, countermetrics, authority refs, rollback and immediate/delayed outcome windows; unchanged repeated hypothesis requires MechanismReview."
+
+[[gate]]
+id = "W9V13_COMMON_GROUND"
+requirement = "Public causal inheritance covers identity, goal/acceptance, decisions/rationale, invariants/negative memory, rivals/counterevidence, unknowns/inquiries, commitments and action consequences; summary similarity/native state is insufficient."
+
+[[gate]]
+id = "W9V14_SCOPED_UNDERSTANDING"
+requirement = "LocallyAdequate requires complete scoped evidence, public rival-aware model, material unknown visibility, prediction before observation, discriminator, applicable outcome/verifier and revision discipline."
+
+[[gate]]
+id = "W9V15_LEAKAGE_AND_TRANSFER"
+requirement = "Product-level understanding requires leakage-controlled held-out/counterfactual evidence; transfer remains separately requalified."
+
+[[gate]]
+id = "W9V16_SOURCE_SCOPE_EXCLUSIVITY"
+requirement = "Worker source/test scopes do not overlap; Cargo.toml/lib.rs/reexports remain integration-owner files."
+
+[[gate]]
+id = "W9V17_PAYLOAD_HYGIENE"
+requirement = "Field-freeze diff contains TOML only: no Rust, Markdown, workflow, archive, .eliot, root Cargo.toml or Cargo.lock changes."
+
+[[gate]]
+id = "W9V18_PROOF_CEILING"
+requirement = "Parse, field freeze, branch, commit or review cannot claim Rust implementation, runtime support, utility, understanding, Product Pulse or product acceptance."
