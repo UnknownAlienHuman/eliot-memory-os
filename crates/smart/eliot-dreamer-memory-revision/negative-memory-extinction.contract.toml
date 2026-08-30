@@ -1,0 +1,143 @@
+schema_version = 1
+contract_id = "smart.dreamer.negative-memory-extinction.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-dreamer-memory-revision"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.dreamer.negative_memory_extinction"]
+architecture_refs = ["ARCH-MEM-02", "ARCH-MEM-04", "ARCH-RES-05", "ARCH-EPI-04", "ARCH-SCOPE-01"]
+implementation_refs = ["I12.19", "I12.21", "I13.11", "I2.20"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Propose a scoped activation/influence revision for negative memory after bounded safe re-exposure while preserving the original failure episode, fingerprint, evidence and support history."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O(evidence log evidence) over request-bounded immutable re-exposure evidence; no tool call, model call, write, lifecycle transition or policy mutation."
+replacement_boundary = "Replace candidate construction behind this contract; Governor/canonical-memory owners decide and execute any influence or accessibility change."
+
+[closed_sets]
+trigger_matches = ["ExactDeterministic", "SemanticNearMatch", "NoMatch", "Unknown"]
+reexposure_outcomes = ["Safe", "Failed", "Partial", "Unknown", "Confounded"]
+dispositions = ["KeepBlock", "RequireProbe", "NarrowTrigger", "Reopen", "ExtinguishActivation", "NoChange"]
+coverage_states = ["Complete", "Partial", "Unavailable", "Blocked", "Stale"]
+
+[hard_invariants]
+semantic_similarity_never_hard_blocks = true
+one_success_never_proves_universal_safety = true
+original_failure_episode_and_fingerprint_are_immutable = true
+support_history_is_unchanged = true
+candidate_changes_only_activation_or_permitted_influence = true
+complete_requires_exact_recheckable_denominator = true
+insufficient_dependent_or_confounded_evidence_yields_probe_or_no_change = true
+candidate_cannot_apply_or_promote_itself = true
+rollback_expiry_and_validity_scope_are_required_for_material_change = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "FailureFingerprint"
+owner = "eliot-dreamer-contracts"
+
+[[external_type]]
+name = "FailureObservation"
+owner = "eliot-learning-contracts"
+
+[[external_type]]
+name = "OutcomeAttribution"
+owner = "eliot-learning-contracts"
+
+[[public_type]]
+name = "NegativeMemoryEvidenceCoverageState"
+kind = "enum"
+definition = ["Complete", "Partial", "Unavailable", "Blocked", "Stale"]
+
+[[public_type]]
+name = "NegativeMemoryEvidenceDenominator"
+kind = "struct"
+definition = ["source_ref: String", "source_revision: String", "method_ref: String", "expected_exposures: Option<u32>", "expected_evidence_handles: Vec<ArtifactId>", "environment_generation: String"]
+invariants = ["source/revision/method/environment non-blank", "Complete requires expected exposures", "handles unique", "denominator independently recheckable"]
+
+[[public_type]]
+name = "NegativeMemoryEvidenceCoverage"
+kind = "struct"
+definition = ["state: NegativeMemoryEvidenceCoverageState", "denominator: Option<NegativeMemoryEvidenceDenominator>", "observed_exposures: u32", "missing_owner_or_reason_refs: Vec<String>"]
+invariants = ["Complete requires exact count and no missing refs", "Partial requires denominator and named gaps", "Unavailable or Blocked has no observations and names owner/reason", "Stale cannot justify reopen/extinction"]
+
+[[public_type]]
+name = "TriggerMatchClass"
+kind = "enum"
+definition = ["ExactDeterministic", "SemanticNearMatch", "NoMatch", "Unknown"]
+
+[[public_type]]
+name = "SafeReexposureOutcome"
+kind = "enum"
+definition = ["Safe", "Failed", "Partial", "Unknown", "Confounded"]
+
+[[public_type]]
+name = "TriggerBoundaryRevision"
+kind = "struct"
+definition = ["current_exact_components: Vec<String>", "candidate_exact_components: Vec<String>", "excluded_near_match_cues: Vec<String>", "scope_id: String", "environment_generation: String", "validity_conditions: Vec<String>"]
+invariants = ["exact and near-match components stay distinct", "candidate boundary cannot broaden beyond evidence", "scope/environment exact", "components unique and bounded"]
+
+[[public_type]]
+name = "SafeReexposureEvidence"
+kind = "struct"
+definition = ["evidence_id: ArtifactId", "failure_observation_ref: ArtifactId", "fingerprint_ref: ArtifactId", "scope_id: String", "environment_generation: String", "state_fence: StateFence", "trigger_match: TriggerMatchClass", "attempted_action: String", "outcome: SafeReexposureOutcome", "outcome_attribution: OutcomeAttribution", "verifier_evidence_handles: Vec<ArtifactId>", "effect_receipt_handles: Vec<ArtifactId>", "false_activation_observed: bool", "confounders: Vec<String>", "source_handles: Vec<ArtifactId>"]
+invariants = ["identity/scope/environment/fence exact", "known outcome requires verifier evidence", "confounder prevents universal safety claim", "near match cannot count as exact-trigger safety evidence"]
+
+[[public_type]]
+name = "NegativeMemoryExtinctionRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "fingerprint_ref: ArtifactId", "fingerprint_revision: String", "failure_observation_refs: Vec<ArtifactId>", "scope_id: String", "environment_generation: String", "state_fence: StateFence", "coverage: NegativeMemoryEvidenceCoverage", "allowed_dispositions: Vec<ExtinctionDisposition>", "maximum_evidence: u32", "minimum_independent_verifiers: u32", "request_sha256: String"]
+invariants = ["fingerprint/failure refs unique", "scope/environment/fence exact", "bounds non-zero", "allowed dispositions exclude unsupported mutation", "request grants no write or policy authority"]
+
+[[public_type]]
+name = "ExtinctionDisposition"
+kind = "enum"
+definition = ["KeepBlock", "RequireProbe", "NarrowTrigger", "Reopen", "ExtinguishActivation", "NoChange"]
+
+[[public_type]]
+name = "NegativeMemoryExtinctionCandidate"
+kind = "struct"
+definition = ["candidate_id: ArtifactId", "request_sha256: String", "fingerprint_ref: ArtifactId", "retained_failure_observation_refs: Vec<ArtifactId>", "disposition: ExtinctionDisposition", "current_boundary: TriggerBoundaryRevision", "candidate_boundary: Option<TriggerBoundaryRevision>", "evidence_handles: Vec<ArtifactId>", "rival_hypotheses: Vec<String>", "next_probe: Option<String>", "validity_scope: String", "expiry_condition: String", "rollback_plan: String", "required_authority_ref: String", "candidate_sha256: String"]
+invariants = ["all original failure refs retained", "Reopen/ExtinguishActivation require Complete current evidence, independent verifier threshold, candidate boundary, rollback and expiry", "RequireProbe contains a discriminating probe", "candidate contains no transition receipt, write handle or support change", "canonical order and digest"]
+
+[[public_function]]
+name = "build_negative_memory_extinction_candidate"
+signature = "pub fn build_negative_memory_extinction_candidate(request: &NegativeMemoryExtinctionRequest, fingerprint: &FailureFingerprint, evidence: &[SafeReexposureEvidence]) -> Result<NegativeMemoryExtinctionCandidate, NegativeMemoryExtinctionError>"
+
+[[negative_test]]
+id = "near-match-never-hard-blocks"
+property = "SemanticNearMatch cannot support KeepBlock as an exact-trigger decision and cannot create any hard-block authority."
+
+[[negative_test]]
+id = "single-success-not-universal"
+property = "One safe exposure cannot produce broad Reopen or ExtinguishActivation."
+
+[[negative_test]]
+id = "stale-or-confounded-no-extinction"
+property = "Stale, Partial, dependent or confounded evidence yields RequireProbe or NoChange."
+
+[[negative_test]]
+id = "history-retained"
+property = "Candidate retains every source FailureObservation and original fingerprint reference."
+
+[[negative_test]]
+id = "candidate-not-receipt"
+property = "Output exposes no canonical transition, lifecycle receipt, policy write or self-application method."
