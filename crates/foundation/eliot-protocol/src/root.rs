@@ -12,10 +12,8 @@ pub use protocol_v1::*;
 
 mod activation_resolution;
 pub use activation_resolution::{
-    AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_ID,
-    AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_VERSION,
+    AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_ID, AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_VERSION,
     AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
-    AgentActivationResolutionResult, AgentActivationResolvedBinding,
-    AgentActivationRetryDirective, AgentActivationSelectionDirective,
-    MAX_AGENT_ACTIVATION_CANDIDATES,
+    AgentActivationResolutionResult, AgentActivationResolvedBinding, AgentActivationRetryDirective,
+    AgentActivationSelectionDirective, MAX_AGENT_ACTIVATION_CANDIDATES,
 };
