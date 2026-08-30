@@ -498,9 +498,7 @@ fn dispatch_blockers(
     if !entry.billing.is_current(now_unix_ms) {
         blockers.insert(DispatchBlocker::BillingEvidenceStale);
     }
-    if !entry.quota.is_current(now_unix_ms) {
-        blockers.insert(DispatchBlocker::QuotaEvidenceStale);
-    } else {
+    if entry.quota.is_current(now_unix_ms) {
         match entry.quota.disposition {
             QuotaDisposition::Available | QuotaDisposition::Low => {}
             QuotaDisposition::Exhausted => {
@@ -513,6 +511,8 @@ fn dispatch_blockers(
                 blockers.insert(DispatchBlocker::QuotaNotExposed);
             }
         }
+    } else {
+        blockers.insert(DispatchBlocker::QuotaEvidenceStale);
     }
     if entry.context_window < minimum_context_window {
         blockers.insert(DispatchBlocker::ContextWindowTooSmall);
@@ -1059,6 +1059,26 @@ pub enum AttemptAlertCode {
     UnknownOutcome,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AttemptWorkEligibility {
+    Eligible,
+    Ineligible,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AttemptTerminalReconciliation {
+    ReconciledCandidate,
+    Unreconciled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AttemptAutomationDisposition {
+    ManualOnly,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttemptHealthProjection {
@@ -1067,24 +1087,17 @@ pub struct AttemptHealthProjection {
     pub observed_at_unix_ms: u64,
     pub status: AttemptLivenessStatus,
     pub alerts: Vec<AttemptAlertCode>,
-    pub eligible_for_new_work: bool,
-    pub candidate_terminal_reconciled: bool,
-    pub automatic_finish: bool,
-    pub automatic_redispatch: bool,
+    pub work_eligibility: AttemptWorkEligibility,
+    pub terminal_reconciliation: AttemptTerminalReconciliation,
+    pub automation: AttemptAutomationDisposition,
 }
 
-pub fn project_attempt_health(
+fn heartbeat_status(
     input: &AttemptTelemetryInput,
     now_unix_ms: u64,
-) -> Result<AttemptHealthProjection, ModelControlError> {
-    input.validate()?;
-    if now_unix_ms < input.observed_at_unix_ms {
-        return Err(ModelControlError::InvalidField(
-            "attempt_health.now_unix_ms",
-        ));
-    }
-    let mut alerts = BTreeSet::new();
-    let heartbeat_status = match input.last_heartbeat_unix_ms {
+    alerts: &mut BTreeSet<AttemptAlertCode>,
+) -> AttemptLivenessStatus {
+    match input.last_heartbeat_unix_ms {
         None => {
             alerts.insert(AttemptAlertCode::HeartbeatMissing);
             AttemptLivenessStatus::HeartbeatMissing
@@ -1094,7 +1107,15 @@ pub fn project_attempt_health(
             AttemptLivenessStatus::HeartbeatStale
         }
         Some(_) => AttemptLivenessStatus::Live,
-    };
+    }
+}
+
+fn collect_attempt_alerts(
+    input: &AttemptTelemetryInput,
+    now_unix_ms: u64,
+) -> (BTreeSet<AttemptAlertCode>, AttemptLivenessStatus) {
+    let mut alerts = BTreeSet::new();
+    let heartbeat = heartbeat_status(input, now_unix_ms, &mut alerts);
     if now_unix_ms > input.lease_expires_at_unix_ms {
         alerts.insert(AttemptAlertCode::LeaseExpired);
     }
@@ -1137,8 +1158,15 @@ pub fn project_attempt_health(
     if input.state == CoordinatedAttemptState::UnknownOutcome {
         alerts.insert(AttemptAlertCode::UnknownOutcome);
     }
+    (alerts, heartbeat)
+}
 
-    let status = if input.state.is_terminal() {
+fn derive_attempt_status(
+    input: &AttemptTelemetryInput,
+    now_unix_ms: u64,
+    heartbeat: AttemptLivenessStatus,
+) -> AttemptLivenessStatus {
+    if input.state.is_terminal() {
         AttemptLivenessStatus::Terminal
     } else if input.state == CoordinatedAttemptState::UnknownOutcome {
         AttemptLivenessStatus::UnknownOutcome
@@ -1166,24 +1194,45 @@ pub fn project_attempt_health(
     {
         AttemptLivenessStatus::Starting
     } else {
-        heartbeat_status
-    };
-    let candidate_terminal_reconciled = input.state.is_terminal()
+        heartbeat
+    }
+}
+
+pub fn project_attempt_health(
+    input: &AttemptTelemetryInput,
+    now_unix_ms: u64,
+) -> Result<AttemptHealthProjection, ModelControlError> {
+    input.validate()?;
+    if now_unix_ms < input.observed_at_unix_ms {
+        return Err(ModelControlError::InvalidField(
+            "attempt_health.now_unix_ms",
+        ));
+    }
+    let (alerts, heartbeat) = collect_attempt_alerts(input, now_unix_ms);
+    let status = derive_attempt_status(input, now_unix_ms, heartbeat);
+    let terminal_reconciliation = if input.state.is_terminal()
         && input.open_descendants == 0
-        && input.effect != AttemptEffectObservation::Unknown;
+        && input.effect != AttemptEffectObservation::Unknown
+    {
+        AttemptTerminalReconciliation::ReconciledCandidate
+    } else {
+        AttemptTerminalReconciliation::Unreconciled
+    };
     Ok(AttemptHealthProjection {
         schema_version: ATTEMPT_HEALTH_PROJECTION_VERSION.to_owned(),
         attempt_id: input.attempt_id.clone(),
         observed_at_unix_ms: now_unix_ms,
         status,
         alerts: alerts.into_iter().collect(),
-        eligible_for_new_work: matches!(status, AttemptLivenessStatus::Live),
-        candidate_terminal_reconciled,
-        automatic_finish: false,
-        automatic_redispatch: false,
+        work_eligibility: if matches!(status, AttemptLivenessStatus::Live) {
+            AttemptWorkEligibility::Eligible
+        } else {
+            AttemptWorkEligibility::Ineligible
+        },
+        terminal_reconciliation,
+        automation: AttemptAutomationDisposition::ManualOnly,
     })
 }
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind")]
 pub enum SwarmControlCommandDraft {

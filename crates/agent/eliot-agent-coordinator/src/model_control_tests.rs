@@ -472,10 +472,18 @@ fn terminal_attempt_is_not_reported_live() -> TestResult {
     let input = telemetry(CoordinatedAttemptState::CandidateResultSubmitted)?;
     let projection = project_attempt_health(&input, NOW)?;
     assert_eq!(projection.status, AttemptLivenessStatus::Terminal);
-    assert!(!projection.eligible_for_new_work);
-    assert!(projection.candidate_terminal_reconciled);
-    assert!(!projection.automatic_finish);
-    assert!(!projection.automatic_redispatch);
+    assert_eq!(
+        projection.work_eligibility,
+        AttemptWorkEligibility::Ineligible
+    );
+    assert_eq!(
+        projection.terminal_reconciliation,
+        AttemptTerminalReconciliation::ReconciledCandidate
+    );
+    assert_eq!(
+        projection.automation,
+        AttemptAutomationDisposition::ManualOnly
+    );
     Ok(())
 }
 
