@@ -1,0 +1,446 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_PLANNING_BLOCKED_FOR_SOURCE_MUTATION"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "AGENT_HANDOFF_ONLY"
+parent_issue = 79
+handoff_issue = 306
+integration_issue_refs = [15, 20, 22, 23, 100, 11]
+base_branch = "main"
+base_sha = "499e27309088e3473c31d95f48f6d75527d4c0fd"
+normative_pair_ref = "docs/normative-pair.toml"
+docs_router_status = "NOT_EXECUTED_CONNECTOR_NO_CHECKOUT"
+dreamer_excluded = true
+
+[work_unit]
+cell_id = "process.execution-caller-binding"
+causal_property = "Replaceable EBP transport identity is never process-effect ownership. Process start, cancel and reconciliation bind an exact durable owner/session/attempt identity, authority and State Fence; transport reconnect can rebind routing without changing the sealed ProcessIntent or effect digest."
+old_path_discriminator = "Copy one EBP connection_id into ProcessIntent.session_id and attempt Start, then reconnect the same intended durable session under a new connection. The old path either accepted the copied connection convention or invalidated ownership on reconnect."
+integration_owner = "parent issue #79 across Kernel/process/testd/native-worker/User Broker, process integration #100 and #11 Product Pulse"
+one_writer_rule = "One writer per wave and mutable path claim; no worker integrates its own result."
+result = "integration candidate only"
+
+[normative_basis]
+architecture = ["ARCH-AUTH-01", "ARCH-SEC-02", "ARCH-LONG-01", "ARCH-SWM-02", "ARCH-MOD-03"]
+implementation = ["I1.8", "I6.10", "I6.15", "I7.2", "I7.7", "I7.14", "I7.15", "I14"]
+reason = "Transport connection, durable Session/Attempt, process owner, operation identity, Authority Epoch and effect lease are separate owners and lifecycles. Reconnect cannot mint, transfer or destroy process-effect authority implicitly."
+
+[current_source]
+observed_on = "main@499e27309088e3473c31d95f48f6d75527d4c0fd"
+source_handles = [
+  "bins/eliot-kernel/src/frame_dispatch.rs",
+  "bins/eliot-kernel/src/daemon_session_guard.rs",
+  "bins/eliot-kernel/src/lib.rs",
+  "crates/kernel/eliot-process/src/lib.rs",
+  "crates/kernel/eliot-process/src/dispatch_permit.rs",
+  "crates/kernel/eliot-kernel-service/src/**",
+  "crates/kernel/eliot-ors/src/**",
+]
+confirmed_state = [
+  "Kernel frame_dispatch now fail-closes every ProcessExecutionRequest::Start until #79 supplies an exact process-owner/session binding.",
+  "The fail-closed comment explicitly states that copying connection_id into ProcessIntent.session_id no longer grants launch authority.",
+  "caller_binding derives ProcessOwnerBinding from authenticated peer, module generation, current scalar epoch and generation.",
+  "caller_binding still constructs ProcessSessionBinding from session.connection_id and session.session_epoch.",
+  "eliot-process documents ProcessSessionBinding as an ephemeral transport-derived binding that is never persisted as process ownership.",
+  "ProcessIntent carries SessionId inside its sealed effect digest, so changing that identity after reconnect changes the effect identity.",
+]
+current_safe_behavior = "Keep Start closed until the contract and first exact consumer are integrated. Cancel/reconcile may not infer ownership from the currently connected pipe."
+current_gap = "There is no single owner-neutral record joining the authoritative durable process execution session/attempt to the replaceable transport binding and current process owner/lease/fence."
+
+[path_claims]
+blocking_open_prs = [
+  "PR #300 claims ten paths under crates/kernel/eliot-process for durable stream evidence.",
+  "PR #277 claims documentation-comment cleanup in crates/kernel/eliot-process/src/dispatch_permit.rs.",
+]
+rule = "No implementation worker may mutate eliot-process until every overlapping PR is merged/closed and its branch is rebased from then-current main."
+planning_allowed = true
+source_mutation_allowed = false
+
+[prerequisites]
+required_before_contract_merge = [
+  "#64 canonical lineage-aware EpochId contract/source must be available or this wave must remain explicitly scalar-compatibility-only without granting current authority.",
+  "Open path claims #300 and #277 must be resolved.",
+]
+required_before_user_broker_edge = [
+  "#74 distinct User Broker register/heartbeat/launch/fence operation identities.",
+  "Current User Broker SID/session/broker-epoch owner and ORS registration source read on then-current main.",
+]
+required_before_kernel_edge = [
+  "#77 request translation before Kernel RequestIdentity binding where the same ingress path is affected.",
+  "#100 current ProcessExecutor integration identity and no-orphan contract.",
+]
+forbidden_shortcut = "No local connection-to-session string convention and no lossy EpochId-to-u64 coercion."
+
+[contract_owner]
+package = "eliot-process"
+source_layer = "C0/C1 provider-neutral process contract"
+module_candidate = "execution_caller_binding"
+mutable_state = "none"
+allowed_effects = []
+must_not_own = [
+  "EBP connection lifecycle",
+  "canonical semantic Session lifecycle",
+  "Kernel ORS active binding state",
+  "User Broker registration state",
+  "Testd or native-worker task lifecycle",
+  "process launch mechanics",
+  "authority issuance",
+]
+
+[contract_owner.public_surface]
+types = [
+  "ProcessExecutionOwnerClass",
+  "ProcessExecutionOwnerIdentity",
+  "ProcessExecutionSessionIdentity",
+  "ProcessExecutionCallerBinding",
+  "ProcessTransportBinding",
+  "ProcessTransportRebind",
+  "ProcessCallerBindingError",
+]
+functions = [
+  "ProcessExecutionCallerBinding::validate() -> Result<(), ProcessCallerBindingError>",
+  "validate_process_intent_caller(intent, caller_binding) -> Result<(), ProcessCallerBindingError>",
+  "validate_process_transport_binding(caller_binding, transport_binding) -> Result<(), ProcessCallerBindingError>",
+  "validate_process_transport_rebind(caller_binding, prior_transport, next_transport, rebind) -> Result<(), ProcessCallerBindingError>",
+]
+unknown_fields = "reject"
+generic_session_string = "forbidden for cross-class authorization"
+
+[types.ProcessExecutionOwnerClass]
+kind = "closed enum"
+values = [
+  "DAEMON_GENERATION",
+  "TESTD_JOB_ATTEMPT",
+  "NATIVE_WORKER_ATTEMPT",
+  "MODULE_GENERATION_ATTEMPT",
+  "USER_BROKER_INTERACTIVE_ATTEMPT",
+]
+rule = "The class selects an exact tagged identity shape; a role label alone grants no authority."
+
+[types.ProcessExecutionOwnerIdentity]
+kind = "closed tagged union"
+variants = [
+  "DaemonGeneration { module_id, daemon_generation, authenticated_service_principal_ref }",
+  "TestdJobAttempt { testd_generation, durable_job_id, attempt_id, authenticated_service_principal_ref }",
+  "NativeWorkerAttempt { module_id, worker_generation, attempt_id, authenticated_service_principal_ref }",
+  "ModuleGenerationAttempt { module_id, module_generation, attempt_id, authenticated_service_principal_ref }",
+  "UserBrokerInteractiveAttempt { installation_id, user_sid, windows_session_id, broker_epoch, broker_registration_ref, attempt_id }",
+]
+invariants = [
+  "Every variant carries exactly the identity owned by its lifecycle owner.",
+  "No variant accepts connection_id, PID, executable name, cwd or process survival as owner identity.",
+  "User Broker identity includes SID, Windows session, broker epoch and current ORS registration reference.",
+  "Service-owned variants cannot be coerced into User Broker identity or inherit user credentials.",
+  "Attempt identity is explicit where a long-lived service generation can own several executions.",
+]
+
+[types.ProcessExecutionSessionIdentity]
+kind = "closed struct"
+fields = [
+  "session_id: typed durable process/host/interactive session identity",
+  "owner: ProcessExecutionOwnerIdentity",
+  "principal_ref",
+  "workscope_ref: Option",
+  "task_ref: Option",
+  "agent_attempt_ref: Option",
+  "owner_generation_ref",
+  "session_revision",
+]
+invariants = [
+  "session_id is independent of EBP connection_id.",
+  "The identity is stable across a permitted transport reconnect.",
+  "WorkScope/task/attempt fields are references to their owners, not locally interpreted truth.",
+  "A service-generation launch may omit WorkScope/task only when its exact service owner contract permits it.",
+  "A User Broker session cannot outlive logoff, broker epoch revocation or ORS registration expiry as active authority.",
+]
+
+[types.ProcessExecutionCallerBinding]
+kind = "closed struct"
+fields = [
+  "binding_id_and_revision",
+  "session: ProcessExecutionSessionIdentity",
+  "process_owner_binding",
+  "process_intent_session_id",
+  "dispatch_authority_id",
+  "action_lease_ref",
+  "authority_epoch_ref: canonical EpochId",
+  "state_fence",
+  "process_generation",
+  "issued_at_ms",
+  "expires_at_ms",
+  "revocation_and_invalidation_set",
+  "source_activation_and_owner_receipt_refs",
+]
+invariants = [
+  "ProcessIntent.session_id exactly matches the durable session identity represented by this binding.",
+  "ProcessIntent effect digest is computed before transport attachment and does not include connection_id.",
+  "Process owner, session owner, dispatch authority, action lease, epoch, fence and generation must all be current and mutually consistent.",
+  "The binding grants no authority beyond the referenced Kernel-issued dispatch/action records.",
+  "A stale, revoked, expired, wrong-owner or wrong-class binding fails with a distinct typed error.",
+]
+
+[types.ProcessTransportBinding]
+kind = "ephemeral Kernel/ORS operational projection"
+fields = [
+  "transport_binding_id",
+  "connection_id",
+  "protocol_and_encoding_profile",
+  "authenticated_peer_identity_ref",
+  "transport_generation",
+  "transport_session_epoch",
+  "module_or_bridge_generation",
+  "bound_process_execution_session_ref",
+  "authority_epoch_ref",
+  "state_fence",
+  "attached_at_ms",
+  "expires_at_ms",
+  "status: ATTACHING | ACTIVE | DRAINING | DETACHED | EXPIRED | REVOKED | FENCED",
+]
+invariants = [
+  "Transport binding routes frames and replay only; it is not process ownership.",
+  "Exactly one current binding or an explicitly declared bounded handoff state exists for one durable execution session.",
+  "A live connection with stale session, owner, epoch, fence or lease cannot launch or continue new effects.",
+  "Transport status never changes ProcessIntent.session_id or effect digest.",
+]
+
+[types.ProcessTransportRebind]
+kind = "Kernel-owned ORS transition/receipt"
+fields = [
+  "rebind_id",
+  "durable_process_execution_session_ref",
+  "prior_transport_binding_ref_and_terminal_disposition",
+  "next_transport_binding_ref",
+  "authenticated_peer_and_generation_evidence",
+  "authority_epoch_ref",
+  "state_fence",
+  "in_flight_operation_dispositions",
+  "committed_at_ms",
+  "expiry_and_invalidation_set",
+]
+invariants = [
+  "Rebind preserves the exact durable execution-session identity.",
+  "Prior connection cannot remain active for new effects after commit.",
+  "Unknown in-flight external/process outcome is reconciled by operation identity before reassignment.",
+  "Rebind cannot change process owner, action lease, dispatch authority, WorkScope, task, privacy or budget.",
+  "A second transport cannot claim the session without this exact current receipt.",
+]
+
+[errors]
+required = [
+  "PROCESS_CALLER_BINDING_REQUIRED",
+  "TRANSPORT_BINDING_REQUIRED",
+  "TRANSPORT_SESSION_MISMATCH",
+  "TRANSPORT_REBIND_REQUIRED",
+  "TRANSPORT_STALE_OR_FENCED",
+  "DURABLE_SESSION_MISMATCH",
+  "PROCESS_OWNER_MISMATCH",
+  "PROCESS_OWNER_CLASS_MISMATCH",
+  "PRINCIPAL_MISMATCH",
+  "WORKSCOPE_OR_TASK_MISMATCH",
+  "ATTEMPT_MISMATCH",
+  "DISPATCH_AUTHORITY_MISMATCH",
+  "ACTION_LEASE_MISMATCH",
+  "STALE_AUTHORITY_EPOCH",
+  "STALE_STATE_FENCE",
+  "STALE_PROCESS_GENERATION",
+  "BROKER_REGISTRATION_STALE",
+  "BROKER_SESSION_LOGGED_OFF",
+  "BINDING_EXPIRED_OR_REVOKED",
+  "UNKNOWN_INFLIGHT_OUTCOME",
+]
+rule = "Do not collapse transport, durable session, owner, epoch/fence, generation and lease defects into one SessionFenced result above the internal transport boundary."
+
+[start_admission]
+required_order = [
+  "authenticate and validate EBP transport binding",
+  "resolve the current durable ProcessExecutionCallerBinding from Kernel/ORS owner state",
+  "validate exact owner class and identity for the requesting contour",
+  "validate ProcessIntent operation/session/effect digest without connection-derived substitution",
+  "validate dispatch authority, action lease, canonical EpochId, StateFence and process generation",
+  "reserve durable replay/operation identity",
+  "launch suspended under the existing ProcessExecutor authority path",
+  "consume authority and publish the exact start receipt",
+]
+hard_rule = "Until every required binding is present, Start remains fail-closed exactly as current frame_dispatch does."
+
+[cancel_and_reconcile]
+rules = [
+  "Cancel and reconcile use operation_id, process tree/physical identity, process owner and durable execution session; the current pipe connection is optional routing only.",
+  "Loss of the original transport does not erase cancellation or reconciliation authority already held by the correct owner.",
+  "A new transport must present a current rebind receipt before receiving session-bound observations or control responses.",
+  "Unknown outcome remains operation-local and blocks only dependent execution scope.",
+  "No cancel request may target a process merely because it arrived on the connection that launched it.",
+]
+
+[[wave]]
+order = 1
+id = "provider-neutral-contract"
+status = "BLOCKED_BY_OPEN_PATH_CLAIMS"
+issue_owner = "new child issue under #79 after PR #300 and #277 release the paths"
+mutable_paths = [
+  "crates/kernel/eliot-process/src/execution_caller_binding.rs",
+  "crates/kernel/eliot-process/src/lib.rs or current root export after #300 disposition",
+  "crates/kernel/eliot-process/tests/**",
+]
+deliverable = "Typed owner/session/caller and transport-reference contract with digest and mismatch fixtures; no mutable transport state."
+must_not_touch = ["Kernel dispatch", "ORS", "ProcessExecutor mechanics", "User Broker"]
+proof = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-process --all-targets",
+  "cargo test --locked -p eliot-process",
+  "cargo clippy --locked -p eliot-process --all-targets -- -D warnings",
+]
+proof_ceiling = "PROCESS_CALLER_CONTRACT_PROOF_ONLY"
+
+[[wave]]
+order = 2
+id = "kernel-ors-binding-owner"
+status = "BLOCKED_UNTIL_CONTRACT_AND_EPOCH_PREREQUISITES"
+issue_owner = "new child issue under #79 and #15"
+mutable_paths = [
+  "bins/eliot-kernel/src/daemon_session_guard.rs",
+  "bins/eliot-kernel/src/frame_dispatch.rs",
+  "bins/eliot-kernel/src/process_execution.rs",
+  "crates/kernel/eliot-kernel-service/src/** selected exact owner files",
+  "crates/kernel/eliot-ors/src/** selected active-binding files",
+]
+deliverable = "Kernel owns current transport-to-durable-session binding/rebind/revoke state and admits Start only through the exact caller binding."
+must_not_touch = ["ProcessExecutor launch mechanics", "daemon/testd/User Broker owner records"]
+proof_ceiling = "KERNEL_PROCESS_BINDING_MODULE_PROOF_ONLY"
+
+[[wave]]
+order = 3
+id = "daemon-and-testd-consumers"
+status = "BLOCKED_UNTIL_KERNEL_BINDING"
+issue_owner = "separate child issues under #79, #18 and #20"
+mutable_paths = [
+  "eliotd process-launch producer files selected from then-current main",
+  "bins/eliot-testd/**",
+  "crates/instrument/eliot-testd-core/**",
+]
+deliverable = "Daemon generation and Testd job/attempt construct their exact owner/session variant and never copy a connection ID."
+must_not_touch = ["User Broker", "native worker", "Kernel binding owner"]
+proof_ceiling = "DAEMON_TESTD_CONSUMER_MODULE_PROOF_ONLY"
+
+[[wave]]
+order = 4
+id = "native-worker-and-module-consumers"
+status = "BLOCKED_UNTIL_KERNEL_BINDING"
+issue_owner = "separate child issues under #79 and #22"
+mutable_paths = [
+  "bins/eliot-native-worker/**",
+  "crates/modules/eliot-native-worker-core/**",
+  "other module process-launch producers selected by exact reverse-consumer search",
+]
+deliverable = "Each module/worker generation and attempt uses the exact owner class, generation and attempt identity."
+must_not_touch = ["User Broker", "Kernel ORS owner"]
+proof_ceiling = "NATIVE_WORKER_CONSUMER_MODULE_PROOF_ONLY"
+
+[[wave]]
+order = 5
+id = "user-broker-consumer"
+status = "BLOCKED_BY_74_AND_KERNEL_BINDING"
+issue_owner = "new child issue under #79, #74 and #23"
+mutable_paths = [
+  "bins/eliot-user-broker/**",
+  "User Broker Kernel-registration and launch adapter files selected from then-current main",
+]
+deliverable = "Interactive launch binds installation, SID, Windows session, broker epoch, current ORS registration and attempt; logoff/revocation fences new effects."
+must_not_touch = ["service-owned credentials", "canonical semantic Session owner", "generic connection/session convention"]
+proof_ceiling = "USER_BROKER_CONSUMER_MODULE_PROOF_ONLY"
+
+[[wave]]
+order = 6
+id = "reconnect-cancel-no-orphan-edge"
+status = "BLOCKED_UNTIL_ALL_CONSUMERS"
+issue_owner = "separate integration owner under #79, #100 and #11"
+mutable_paths = ["real Windows integration fixtures and bounded Product Pulse only"]
+deliverable = "Real reconnect changes transport identity without changing durable effect identity; stale transports cannot launch; cancellation/reconciliation survives disconnect; no orphan remains."
+proof_ceiling = "REAL_PROCESS_SESSION_EDGE_AND_PRODUCT_PULSE"
+
+[fixtures]
+contract = [
+  "copying connection_id into ProcessIntent.session_id is insufficient to validate caller binding",
+  "same durable execution session under a new authorized transport leaves ProcessIntent and effect digest byte-identical",
+  "different durable execution session under the same connection is rejected",
+  "two connections cannot actively claim one durable session without exact rebind transition",
+  "owner classes cannot be deserialized or coerced into one another",
+  "service owner cannot inherit User Broker credentials or SID identity",
+  "unknown fields and generic session strings fail closed",
+]
+kernel = [
+  "current fail-closed Start remains until exact binding exists",
+  "stale transport, durable session, owner, epoch, fence, generation and lease return distinct failures",
+  "transport alive after durable session revoke cannot launch",
+  "transport gone while exact operation/owner remains can still cancel/reconcile through a new bound route",
+  "rebind fences prior connection before new effect admission",
+  "unknown in-flight effect prevents blind rebind/relaunch",
+]
+real_edge = [
+  "daemon reconnect",
+  "testd reconnect during one durable job",
+  "native-worker reconnect or controller replacement",
+  "User Broker reconnect in the same Windows session",
+  "User Broker logoff/session termination",
+  "broker epoch replacement",
+  "cancel after original connection loss",
+  "Kernel restart and ORS binding reconstruction without authority revival",
+  "process-tree no-orphan verification",
+]
+
+[non_goals]
+items = [
+  "No transport-owned Task, WorkScope or canonical Session semantics.",
+  "No generic Session string accepted across owner classes.",
+  "No authority inferred from connection, PID, process name, path or liveness.",
+  "No ProcessExecutor mechanics change in the contract wave.",
+  "No durable stream-evidence work; PR #300/#85 owns it.",
+  "No User Broker operation-identity implementation; #74 owns it.",
+  "No raw Frame/request-translation implementation; #77 owns it.",
+  "No scalar authority-epoch preservation as the final contract; #64 owns EpochId.",
+  "No Product acceptance from package tests.",
+]
+
+[stop_conditions]
+items = [
+  "Any open PR still claims a mutable path in the selected wave.",
+  "Current main is not an ancestor of the worker branch.",
+  "Canonical EpochId or required owner/session record is unavailable on current main.",
+  "A producer cannot identify its durable owner/session/attempt without a new owner decision.",
+  "A caller requests a generic string, connection-derived SessionId or implicit current-session fallback.",
+  "A reconnect would require changing ProcessIntent or its effect digest.",
+  "A rebind cannot disposition all in-flight operations.",
+  "User Broker SID/session/broker epoch or ORS registration evidence is missing or conflicting.",
+  "The proposed adapter would make Kernel a semantic Session owner.",
+]
+challenge = "Return a ContractChallenge to #79 with the exact missing owner record or conflicting lifecycle; keep Start fail-closed and do not add a connection/session convention."
+
+[result_contract]
+required_fields = [
+  "issue_and_cell",
+  "source_base_and_candidate",
+  "causal_property",
+  "old_path_discriminator",
+  "changed_contract_or_source",
+  "owned_state_and_effects",
+  "module_proof",
+  "edge_proof",
+  "product_pulse_or_not_applicable_reason",
+  "evidence_execution_status",
+  "known_uncovered_behavior",
+  "security_privacy_and_authority_delta",
+  "migration_rollback_and_removal",
+  "integration_candidate",
+  "residual_unknowns",
+]
+finish_states = [
+  "VERIFIED_COMPLETE",
+  "PARTIAL",
+  "BLOCKED",
+  "FAILED_VERIFICATION",
+  "DEGRADED_NO_PROOF",
+  "UNSAFE_TO_FINISH",
+  "CANCELLED",
+  "SUPERSEDED",
+]
