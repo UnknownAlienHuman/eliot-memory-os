@@ -7,16 +7,24 @@ Before changing code, configuration, tests, workflows, or normative prose, run
 from the repository root:
 
 ```text
-python scripts/docs_router.py route --path <repository/path> --topic "<causal property>"
+python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
 ```
 
-Read every fragment marked **required**, then record the emitted receipt in the
-work unit or pull request. Optional fragments are loaded only when the current
-decision crosses their stated boundary. A legacy `ELIOT_*` compatibility map is
-never an acceptable reading receipt.
+Repeat `--path` for every mutable path family, or use `--changed-from
+origin/main` to include the complete branch delta, including deleted paths. The
+reader runs the deterministic router, verifies every required file/fragment
+against its routed SHA-256 and byte count, and materializes the exact bounded
+bundle. Open and read that bundle before mutation.
 
-If no non-baseline route matches, stop the mutation and add or obtain a route;
-silence is not permission. See [`docs/architecture/READING_PROTOCOL.md`](docs/architecture/READING_PROTOCOL.md).
+Running `scripts/docs_router.py route` alone is navigation, not reading evidence.
+Record the read receipt ID, bundle SHA-256, matched routes, and an explicit
+attestation in the work unit or pull request. Optional fragments are loaded only
+when the current decision crosses their stated boundary. A legacy `ELIOT_*`
+compatibility map never satisfies the gate.
+
+If no non-baseline route matches, a required item is missing/stale, or scope
+expands beyond the receipt, stop and rerun or repair the route; silence is not
+permission. See [`docs/architecture/READING_PROTOCOL.md`](docs/architecture/READING_PROTOCOL.md).
 <!-- eliot-doc-routing:end -->
 
 
@@ -121,7 +129,9 @@ current authority.
 
 ## Verification
 
-Run the smallest proof that can fail on the changed path. Use `just quick` for
-bounded documentation/configuration changes and the applicable package/edge
-proof for Rust changes. Run broader suites only when the change closure requires
-them. Report every skipped, failed, simulated, or unavailable check exactly.
+Run the smallest proof that can fail on the changed path. Documentation and
+routing changes must run the shard, router, and read-bundle self-tests/checks
+included in `just quick`. Use `just quick` for bounded documentation/configuration
+changes and the applicable package/edge proof for Rust changes. Run broader
+suites only when the change closure requires them. Report every skipped, failed,
+simulated, or unavailable check exactly.
