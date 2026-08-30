@@ -1,0 +1,388 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_SWARM_IMPLEMENTATION"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "AGENT_HANDOFF_ONLY"
+parent_issue = 88
+handoff_issue = 326
+integration_issue_refs = [15, 16, 18, 11]
+base_branch = "main"
+base_sha = "73a7a8b6fcc2d292fe61d0eeb94fcae4217087e9"
+normative_pair_ref = "docs/normative-pair.toml"
+docs_read_status = "EXECUTED_LOCAL_DOCS_READ_V1"
+dreamer_excluded = true
+
+[work_unit]
+cell_id = "runtime.eliotd-supervision-lease-renewal"
+causal_property = "A current eliotd generation keeps its SupervisionLease only through fresh authenticated progress or explicitly admitted idle evidence accepted by Kernel against the exact lease predecessor; Store health, PID survival, and transport activity cannot self-renew supervision authority."
+old_path_discriminator = "bins/eliotd keeps an independent five-second health cadence whose branch only calls KernelTransitionPort::health and receives StoreHealth; it does not submit daemon progress or admitted-idle evidence. Separately, Windows Kernel ProbeReady already calls renew_daemon_supervision_for_probe -> renew_current_supervision, which gates the exact current lease on renew_before_ms and reconciles/publishes its live receipt. The missing path is authenticated daemon progress/idle evidence from the eliotd cadence, not a production renewal caller."
+integration_owner = "parent #88 across Kernel/ORS #15, Watchdog #16, daemon semantic boundary #18, and #11 Product Pulse"
+one_writer_rule = "One worker owns one contract/consumer wave. The heartbeat producer cannot also define Kernel renewal authority or Watchdog coverage semantics."
+result = "integration candidate only"
+
+[normative_basis]
+architecture = ["ARCH-WDG-01", "ARCH-AUTH-01", "ARCH-RES-01", "ARCH-RES-04", "ARCH-OBS-01", "ARCH-MOD-03"]
+implementation = ["I1.5", "I1.8", "I6.10", "I7.14", "I8", "I14.15", "I14.20"]
+reason = "A supervision claim is revisioned authority/coverage state. Renewal requires fresh observable evidence and one owner; health dimensions remain independent and loss of evidence reduces promises before expiry is hidden."
+
+[current_source]
+observed_on = "main@73a7a8b6fcc2d292fe61d0eeb94fcae4217087e9"
+source_handles = [
+  "bins/eliotd/src/daemon_runtime.rs",
+  "bins/eliot-kernel/src/lib.rs",
+  "bins/eliot-kernel/src/control_plane.rs",
+  "bins/eliot-kernel/src/daemon_supervision.rs",
+  "bins/eliot-kernel/src/daemon_live_receipt.rs",
+  "bins/eliot-kernel/src/supervision_lease_authority.rs",
+  "crates/kernel/eliot-kernel-service/src/protocol.rs",
+  "crates/kernel/eliot-ors/src/model.rs",
+  "crates/kernel/eliot-ors/src/store.rs",
+  "crates/kernel/eliot-ors/src/status.rs",
+  "bins/eliot-watchdog/src/lib.rs",
+]
+confirmed_gap = [
+  "eliotd LoopCadence separates activation polling from a five-second health_heartbeat.",
+  "The health_heartbeat branch calls only KernelTransitionPort::health and labels failure as Kernel health heartbeat.",
+  "Kernel health returns StoreHealth and does not prove daemon progress, idle admissibility, or current SupervisionLease predecessor.",
+  "Kernel defines SUPERVISION_LEASE_VALIDITY_MS = 60000 and SUPERVISION_LEASE_RENEW_AFTER_MS = 30000.",
+  "On Windows, KernelControlCommand::ProbeReady calls renew_daemon_supervision_for_probe before the control-plane response.",
+  "renew_daemon_supervision_for_probe validates the Ready daemon contour and current lease/live receipt; renew_current_supervision returns the current snapshot before renew_before_ms or prepares/commits the exact Renew successor at or after it.",
+  "That ProbeReady path proves an existing threshold-bound production caller; it does not bind eliotd's five-second StoreHealth heartbeat to authenticated progress or admitted-idle evidence.",
+  "classify_eliotd_live_receipt_transition already accepts an exact active Renew successor only when revision, predecessor receipt, process identity, readiness and generation fields match.",
+  "Ready/status projections still carry scalar authority_epoch; #64 owns its migration and this work unit must not create another local epoch type.",
+]
+
+[ownership]
+observation_owner = "eliotd emits a candidate observation about its own current generation; it cannot decide renewal"
+renewal_authority_owner = "Kernel supervision lease authority"
+durable_state_owner = "Kernel ORS SupervisionLease record and receipt lineage"
+coverage_observer = "Watchdog consumes the current signed/live receipt and its sensor evidence; it cannot extend or rewrite the lease"
+semantic_state_owner = "eliotd/Governor remains owner of task/application semantics; heartbeat fields expose only bounded progress identity"
+must_not_own = [
+  "daemon self-issued authority",
+  "Watchdog-issued renewal",
+  "Store semantic readiness",
+  "task completion",
+  "canonical problem resolution",
+  "process adoption",
+  "global wall-clock truth",
+]
+
+[contract]
+types = [
+  "DaemonProgressObservation",
+  "DaemonProgressDisposition",
+  "DaemonSupervisionRenewalRequest",
+  "DaemonSupervisionRenewalDecision",
+  "DaemonSupervisionRenewalReceipt",
+  "DaemonSupervisionHeartbeatError",
+]
+wire_owner_rule = "Place the provider-neutral contract in the lowest existing contract package consumable by daemon, Kernel and Watchdog without importing composition roots. Do not create a crate without a CrateExtractionDecision."
+domain_separator = "eliot.runtime.eliotd-supervision-heartbeat.v1"
+unknown_fields = "reject on the admitted revision; additive future reason codes remain transport-compatible only through the owning protocol policy"
+
+[contract.progress_observation]
+required_fields = [
+  "observation contract revision and domain separator",
+  "installation and activation generation identity",
+  "daemon module/artifact/config/launch generation identity",
+  "authenticated transport Session/connection binding as ephemeral evidence, separate from durable daemon generation",
+  "current SupervisionLease ID, revision, predecessor receipt digest and lease incarnation",
+  "lineaged EpochId and StateFence after #64 migration",
+  "Kernel and daemon boot/session identity sufficient to reject pre-suspend or previous-boot observations",
+  "progress disposition",
+  "bounded event/progress cursor and its previous accepted cursor",
+  "monotonic-compatible observed time plus bounded wall-time observation",
+  "process/transport evidence handles",
+  "independent health dimensions for daemon, transport, Store dependency and application readiness",
+  "idempotency/request identity for this exact observation revision",
+]
+must_not_include = [
+  "raw task content",
+  "model output or self-assessed semantic correctness",
+  "StoreHealth as the sole progress evidence",
+  "PID survival as renewal authority",
+  "generic log prose",
+  "unbounded metrics or event payload",
+  "caller-selected lease expiry",
+]
+
+[contract.progress_dispositions]
+values = [
+  "FORWARD_PROGRESS",
+  "IDLE_ADMITTED",
+  "WAITING_ON_NAMED_DEPENDENCY",
+  "DRAINING",
+  "DEGRADED_PROGRESS",
+  "NO_PROGRESS",
+  "OBSERVATION_GAP",
+]
+rules = [
+  "FORWARD_PROGRESS requires a cursor or exact bounded owner-state delta newer than the accepted predecessor.",
+  "IDLE_ADMITTED requires an explicit current idle/wait contract and no hidden pending effect; process survival alone is insufficient.",
+  "WAITING_ON_NAMED_DEPENDENCY names the dependency revision/condition and cannot renew beyond policy without fresh evidence.",
+  "DRAINING may renew only the authority needed to complete exact drain/reconciliation obligations and cannot admit new work.",
+  "DEGRADED_PROGRESS keeps daemon and Store/application health dimensions separate.",
+  "NO_PROGRESS and OBSERVATION_GAP never silently renew the claim.",
+]
+
+[kernel_renewal]
+preconditions = [
+  "the authenticated caller is the exact active daemon generation",
+  "the observation validates against the current transport binding without treating connection_id as durable Session identity",
+  "the supplied lease ID/revision/receipt is the exact current ORS predecessor",
+  "the current time is inside the lease policy window and renew-after condition",
+  "EpochId, StateFence, daemon generation, boot/session identity, config and artifact match current authority",
+  "the progress disposition is renewal-eligible under one versioned Kernel-owned policy",
+  "the event/progress cursor is exact replay or an admitted successor",
+]
+outcomes = [
+  "EXACT_REPLAY",
+  "RENEWED",
+  "NOT_DUE",
+  "DEGRADED_NO_RENEWAL",
+  "LEASE_EXPIRED",
+  "STALE_PREDECESSOR",
+  "STALE_GENERATION",
+  "STALE_EPOCH_OR_FENCE",
+  "BOOT_OR_SESSION_CHANGED",
+  "OBSERVATION_INSUFFICIENT",
+  "RECONCILIATION_REQUIRED",
+]
+rules = [
+  "Kernel computes expiry and the new lease revision; daemon supplies no expiry or authority widening.",
+  "Exact replay returns the same renewal receipt and live-receipt publication identity.",
+  "A changed observation under the same idempotency identity is IDENTITY_CONFLICT.",
+  "A successful renewal creates one direct successor with previous_receipt_sha256 and revision + 1.",
+  "Live-receipt replacement uses the existing exact renewal-predecessor rule; it is not a file overwrite shortcut.",
+  "Missing or invalid observation reduces/ends only the dependent supervision/effect claim and does not assert process death.",
+  "After expiry, resume uses a new admitted lease/activation path; an old heartbeat cannot revive the lease.",
+]
+
+[health_separation]
+dimensions = [
+  "daemon process liveness",
+  "authenticated transport continuity",
+  "daemon progress or admitted idle",
+  "Store process/bridge health",
+  "Store semantic readiness",
+  "Governor application readiness",
+  "Watchdog sensor/coverage status",
+  "SupervisionLease validity",
+]
+rules = [
+  "No dimension is copied into another as a boolean shortcut.",
+  "Store unavailable with current daemon progress may produce a renewed but explicitly Store-degraded supervision state when policy permits.",
+  "Daemon alive with no authenticated progress cannot retain supervision indefinitely.",
+  "Watchdog absence downgrades independent supervision even if Kernel renews daemon authority.",
+  "A transport reconnect requires explicit current binding and cannot reuse an observation from the old connection blindly.",
+]
+
+[time_and_boot]
+rules = [
+  "Renewal timing uses a Kernel-owned monotonic-compatible observation and exact boot/session identity.",
+  "Clock rollback, missing monotonic evidence, suspend, hibernate, boot change or incompatible session change invalidates prior timing evidence.",
+  "Wall time is diagnostic and deadline-compatible evidence, not the sole lease-order owner.",
+  "Renew-after and validity defaults have one policy owner; dead duplicate constants are removed or generated from that owner during the implementation wave.",
+]
+
+[errors]
+required = [
+  "INVALID_HEARTBEAT_SHAPE",
+  "IDENTITY_CONFLICT",
+  "DAEMON_GENERATION_MISMATCH",
+  "TRANSPORT_BINDING_MISMATCH",
+  "SUPERVISION_LEASE_PREDECESSOR_MISMATCH",
+  "SUPERVISION_LEASE_NOT_DUE",
+  "SUPERVISION_LEASE_EXPIRED",
+  "STALE_AUTHORITY_EPOCH",
+  "STALE_STATE_FENCE",
+  "BOOT_IDENTITY_CHANGED",
+  "PROGRESS_CURSOR_REGRESSION",
+  "PROGRESS_EVIDENCE_INSUFFICIENT",
+  "OBSERVATION_GAP",
+  "WATCHDOG_COVERAGE_UNAVAILABLE",
+  "RENEWAL_OUTCOME_UNKNOWN",
+]
+behavior = [
+  "No error is parsed from prose to decide renewal or retry.",
+  "Unknown renewal persistence/publication outcome is reconciled by exact lease operation identity before another successor is accepted.",
+  "A failed renewal does not fabricate daemon death, Store failure, or a canonical Problem resolution.",
+  "Every non-success identifies whether a new observation, new activation, dependency change, or operator recovery is permitted.",
+]
+
+[[wave]]
+order = 1
+id = "heartbeat-contract"
+issue_owner = "new child issue under #88"
+mutable_paths = [
+  "selected existing runtime/kernel protocol contract package",
+  "focused pure validation and canonical identity fixtures",
+]
+deliverable = "Provider-neutral progress observation, renewal request/result, canonical identity, closed progress dispositions and cross-field invariants."
+must_not_touch = [
+  "daemon runtime loop",
+  "Kernel ORS transition implementation",
+  "Watchdog service",
+  "root workspace without separate admission",
+]
+proof_ceiling = "DAEMON_HEARTBEAT_CONTRACT_PROOF_ONLY"
+
+[[wave]]
+order = 2
+id = "kernel-ors-renewal"
+issue_owner = "new child issue under #88 and #15"
+mutable_paths = [
+  "bins/eliot-kernel/src/supervision_lease_authority.rs",
+  "bins/eliot-kernel/src/daemon_supervision.rs",
+  "bins/eliot-kernel/src/daemon_live_receipt.rs",
+  "crates/kernel/eliot-ors/src/model.rs",
+  "crates/kernel/eliot-ors/src/store.rs",
+  "focused Kernel/ORS fixtures",
+  "bins/eliot-kernel/src/lib.rs",
+  "bins/eliot-kernel/src/control_plane.rs",
+]
+deliverable = "Preserve the existing ProbeReady -> renew_daemon_supervision_for_probe -> renew_current_supervision authority/reconciliation path, extend the same Kernel owner to validate a future typed observed-progress request against exact current evidence, and stage/commit at most one ORS Renew successor plus its matching live receipt."
+must_not_touch = [
+  "daemon semantic state",
+  "StoreHealth semantics",
+  "Watchdog extension authority",
+  "a second renewal decision path outside Kernel supervision lease authority",
+  "classification of ProbeReady or Ready state as authenticated daemon progress or admitted-idle evidence",
+]
+proof_ceiling = "KERNEL_ORS_RENEWAL_MODULE_PROOF"
+
+[[wave]]
+order = 3
+id = "daemon-producer"
+issue_owner = "new child issue under #88 and #18"
+mutable_paths = [
+  "bins/eliotd/src/daemon_runtime.rs",
+  "bins/eliotd/src/daemon_kernel_client.rs",
+  "narrow daemon heartbeat projection and fixtures",
+]
+deliverable = "Keep StoreHealth as a separate five-second probe and add a bounded typed progress/idle observation submission from the daemon cadence to Kernel; the daemon never evaluates renew_before_ms, mutates ORS, or changes/copies the ProbeReady route."
+must_not_touch = [
+  "#66 activation semantic-resolution behavior",
+  "Kernel renewal decision",
+  "Watchdog policy",
+  "bins/eliot-kernel/src/control_plane.rs or renew_current_supervision semantics",
+  "direct ORS or SupervisionLease mutation",
+]
+proof_ceiling = "ELIOTD_HEARTBEAT_PRODUCER_PROOF_ONLY"
+
+[[wave]]
+order = 4
+id = "watchdog-status-consumers"
+issue_owner = "new child issue under #88 and #16"
+mutable_paths = [
+  "bins/eliot-watchdog/**",
+  "runtime-status/Recovery View consumers that display the exact lease and coverage state",
+]
+deliverable = "Watchdog validates/observes the renewed lease/live receipt and reports gaps or expiry without extending it; surfaces keep Store, daemon, transport and supervision dimensions separate."
+proof_ceiling = "WATCHDOG_AND_STATUS_CONSUMER_PROOF_ONLY"
+
+[[wave]]
+order = 5
+id = "real-edge"
+issue_owner = "separate integration owner under #88"
+mutable_paths = ["bounded daemon/Kernel/Watchdog edge fixtures only"]
+deliverable = "Real daemon progress, idle, Store degradation, late heartbeat, reconnect, suspend/resume, predecessor conflict and daemon restart scenarios."
+proof_ceiling = "DAEMON_SUPERVISION_EDGE_PROOF"
+
+[[wave]]
+order = 6
+id = "product-pulse"
+issue_owner = "issue #11 integration owner"
+mutable_paths = ["D0/D1 operational-spine Product Pulse evidence only"]
+deliverable = "Sustained daemon operation renews exactly; lost authenticated progress expires the dependent authority and is visible to Watchdog/Human without collapsing Store or process health."
+proof_ceiling = "PRODUCT_PULSE"
+
+[fixtures]
+required = [
+  "forward progress before renew-after returns NOT_DUE and performs no ORS transition",
+  "eligible forward progress creates exactly revision + 1 with exact predecessor digest",
+  "exact replay returns the same receipt and live-receipt identity",
+  "same request identity with changed cursor/evidence is IDENTITY_CONFLICT",
+  "IDLE_ADMITTED renews only with the exact admitted idle contract and no hidden effect",
+  "Store unavailable plus daemon progress keeps Store degradation separate from lease disposition",
+  "PID alive plus no authenticated progress cannot renew indefinitely",
+  "stale daemon generation, transport binding, EpochId or StateFence fails closed",
+  "predecessor mismatch cannot fork the lease lineage",
+  "clock rollback, suspend/resume and boot/session change invalidate old observation timing",
+  "unknown ORS/live-receipt publication outcome reconciles before another renewal",
+  "daemon restart cannot renew the predecessor using the old process generation",
+  "Watchdog reads the exact successor and cannot issue or extend it",
+  "lease expiry revokes dependent effect admission and remains visible in readiness/Governance Profile",
+  "existing ProbeReady before renew_before_ms returns and republishes the exact current snapshot with no ORS successor; a future typed decision may project NOT_DUE without changing that behavior",
+  "existing ProbeReady at or after renew_before_ms reconciles or commits at most one exact successor and the future daemon progress route cannot create a competing renewal owner",
+  "ProbeReady, Ready state and StoreHealth alone are rejected as daemon progress or admitted-idle evidence",
+]
+
+[dependencies]
+required_before_source_wave = [
+  "#64 lineaged EpochId contract for authority-bearing heartbeat and receipt fields",
+  "#79 durable process/session versus transport binding contract",
+  "#76 typed error/recovery wire behavior where Store or Kernel failures cross EBP",
+]
+parallel_owner_rule = "Assignment 088 wave 3 and assignment 066 wave 3 both own bins/eliotd/src/daemon_runtime.rs and must not run concurrently. The later source wave rebases/currentizes on the integrated earlier wave, rereads the full run loop, preserves the earlier causal property, and reruns its focused eliotd daemon-runtime proofs. This is operational path serialization, not a causal dependency between the two docs-only handoffs."
+path_claim_rule = "Stop when another PR owns a selected source path. Rebase on then-current main and obtain a fresh documentation reader receipt."
+
+[non_goals]
+items = [
+  "No daemon self-certification or self-extension.",
+  "No renewal from PID/process survival alone.",
+  "No renewal from StoreHealth alone.",
+  "No Watchdog renewal authority.",
+  "No conflation of Store readiness, daemon liveness, transport health and semantic readiness.",
+  "No task-content or model-output telemetry in the heartbeat contract.",
+  "No scalar epoch compatibility helper outside #64.",
+  "No changes to Dreamer.",
+  "No Product support claim from contract/package tests.",
+]
+
+[stop_conditions]
+items = [
+  "The active lease predecessor cannot be identified exactly.",
+  "Fresh progress cannot be observed without importing semantic task content into Kernel.",
+  "Transport connection identity would be used as durable daemon Session identity.",
+  "Renewal would require a local scalar epoch or unbound pre-#64 record.",
+  "StoreHealth would remain the only evidence for progress.",
+  "A Watchdog consumer would gain lease mutation authority.",
+  "An unknown ORS/live-receipt outcome could be overwritten by another successor.",
+  "Another open PR claims the selected path.",
+  "The source plan would delete, bypass or duplicate the current ProbeReady renewal/reconciliation path before an exact equivalent owner is proven.",
+  "ProbeReady, Ready state or StoreHealth would be accepted as authenticated daemon progress or admitted-idle evidence.",
+  "Assignment 088 and assignment 066 daemon_runtime source waves would run concurrently or overwrite the other's causal property.",
+]
+challenge = "Return a ContractChallenge to #88 with the exact missing evidence/owner. Do not keep the StoreHealth poll and rename it supervision renewal."
+
+[result_contract]
+required_fields = [
+  "issue_and_cell",
+  "source_base_and_candidate",
+  "causal_property",
+  "old_path_discriminator",
+  "changed_contract_or_source",
+  "owned_state_and_effects",
+  "module_proof",
+  "edge_proof",
+  "product_pulse_or_not_applicable_reason",
+  "evidence_execution_status",
+  "known_uncovered_behavior",
+  "security_privacy_and_authority_delta",
+  "migration_rollback_and_removal",
+  "integration_candidate",
+  "residual_unknowns",
+]
+finish_states = [
+  "VERIFIED_COMPLETE",
+  "PARTIAL",
+  "BLOCKED",
+  "FAILED_VERIFICATION",
+  "DEGRADED_NO_PROOF",
+  "UNSAFE_TO_FINISH",
+  "CANCELLED",
+  "SUPERSEDED",
+]
