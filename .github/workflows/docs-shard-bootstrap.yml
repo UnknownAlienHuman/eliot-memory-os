@@ -1,0 +1,103 @@
+name: One-shot documentation sharding
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/docs-shard-bootstrap.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: one-shot-documentation-sharding
+  cancel-in-progress: false
+
+jobs:
+  migrate-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out exact bootstrap commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Materialize and validate deterministic migration tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64
+          import io
+          import pathlib
+          import tarfile
+
+          root = pathlib.Path('.').resolve()
+          encoded = ''.join(
+              path.read_text(encoding='ascii').strip()
+              for path in sorted((root / '.github/docs-bootstrap').glob('bundle-*.txt'))
+          )
+          data = base64.b64decode(encoded, validate=True)
+          with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
+              for member in archive.getmembers():
+                  target = (root / member.name).resolve()
+                  target.relative_to(root)
+                  if not member.isfile():
+                      raise RuntimeError(f'unexpected bundle member: {member.name}')
+                  source = archive.extractfile(member)
+                  if source is None:
+                      raise RuntimeError(f'cannot read bundle member: {member.name}')
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(source.read())
+          PY
+          python -m py_compile scripts/docs_shards.py scripts/docs_router.py
+          python scripts/docs_shards.py self-test
+          python scripts/docs_router.py self-test
+
+      - name: Split adopted books and generate navigation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/docs_shards.py migrate --root .
+          python scripts/docs_router.py sync --root .
+
+      - name: Verify reconstruction, routes, indexes, and links
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/docs_shards.py verify --root .
+          python scripts/docs_router.py check --root .
+          python scripts/docs_router.py route \
+            --root . \
+            --path scripts/docs_shards.py \
+            --topic "normative documentation layout migration" \
+            --format json \
+            --output "$RUNNER_TEMP/documentation-read-receipt.json"
+          pwsh -NoProfile -File scripts/verify-normative.ps1
+          git diff --check
+
+      - name: Commit verified final tree directly to main
+        shell: bash
+        env:
+          BOOTSTRAP_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -r .github/docs-bootstrap .github/workflows/docs-shard-bootstrap.yml
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No generated documentation changes were produced." >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          current_main="$(git rev-parse origin/main)"
+          if [[ "$current_main" != "$BOOTSTRAP_SHA" ]]; then
+            echo "main advanced from $BOOTSTRAP_SHA to $current_main; refusing stale generated commit" >&2
+            exit 1
+          fi
+          git commit -m "docs: shard normative books and enforce routed reading"
+          git push origin HEAD:main
