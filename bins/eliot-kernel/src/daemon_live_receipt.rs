@@ -401,9 +401,7 @@ impl KernelComposition {
         })?;
         let expected_operation =
             eliotd_operation_id(generation, &launch_identity).map_err(|_| {
-                self.reject_daemon_process_readiness(
-                    "eliotd launch operation identity is invalid",
-                )
+                self.reject_daemon_process_readiness("eliotd launch operation identity is invalid")
             })?;
         let physical = receipt.identity().physical();
         if receipt.operation_id() != &expected_operation

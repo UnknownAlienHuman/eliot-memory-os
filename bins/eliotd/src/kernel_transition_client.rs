@@ -14,8 +14,8 @@ use eliot_governor::{KernelPortError, KernelPortFuture, KernelTransitionPort};
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{
-    OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, StoreHealth, WriteReceipt,
-    validate_store_receipt_envelope,
+    OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, StoreHealth,
+    WriteReceipt, validate_store_receipt_envelope,
 };
 
 use super::{DaemonKernelClient, SERVICE_NAME, kernel_port_error, kind_value, unix_ms};

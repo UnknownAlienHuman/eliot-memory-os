@@ -1230,11 +1230,12 @@ fn project_head_blocked<'a>(
     project_sequence: u64,
     jobs: impl IntoIterator<Item = (&'a str, u64, JobState)>,
 ) -> bool {
-    jobs.into_iter().any(|(other_project, other_sequence, other_state)| {
-        other_project == project_id
-            && other_sequence < project_sequence
-            && !other_state.is_terminal()
-    })
+    jobs.into_iter()
+        .any(|(other_project, other_sequence, other_state)| {
+            other_project == project_id
+                && other_sequence < project_sequence
+                && !other_state.is_terminal()
+        })
 }
 
 fn payload_digest(

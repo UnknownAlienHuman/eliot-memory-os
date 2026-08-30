@@ -1227,7 +1227,11 @@ mod tests {
             }
         ));
         assert!(!format!("{error:?}").contains(["test-", "secret"].concat().as_str()));
-        assert!(!error.to_string().contains(["test-", "secret"].concat().as_str()));
+        assert!(
+            !error
+                .to_string()
+                .contains(["test-", "secret"].concat().as_str())
+        );
         assert!(!format!("{error:?}").contains("prompt"));
         Ok(())
     }
