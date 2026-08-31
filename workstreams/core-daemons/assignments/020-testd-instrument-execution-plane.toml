@@ -1,0 +1,478 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_SWARM_IMPLEMENTATION"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "AGENT_HANDOFF_ONLY"
+parent_issue = 20
+integration_issue_refs = [11, 15, 18, 85, 100, 267, 268, 269, 270, 271]
+base_branch = "main"
+base_sha = "317774c7bf50660e49249e7a74ef5fa798234f91"
+normative_pair_ref = "docs/normative-pair.toml"
+docs_read_status = "ACCEPTED_PAIR_READ_FROM_PROJECT_INPUT / REPOSITORY_READER_MUST_BE_RERUN_BY_SOURCE_WORKER"
+dreamer_excluded = true
+
+[work_unit]
+cell_id = "instrument.testd.execution-plane"
+causal_property = "One admitted typed Instrument job executes in an isolated bounded process/worktree contour and returns exact raw-source, transport, parsing, evaluation, artifact-binding, coverage and cleanup evidence without becoming a scheduler, verifier authority, canonical writer or finish owner."
+old_path_discriminator = "Run a profile whose child exits successfully while stream persistence is partial, parsing fails, the tested artifact is stale, coverage is incomplete or cleanup leaves descendants. The result must preserve every failed dimension and cannot become verified completion from exit code or a non-empty stdout handle."
+integration_owner = "#20 testd execution plane; #15 owns Kernel admission/control; #18 owns semantic acceptance/finish; #85 and #267-#271 own typed durable stream evidence; #100 owns native process mechanics; #11 owns the real Product Pulse"
+one_writer_rule = "One worker per wave and mutable path claim. Workers return candidates and do not merge their own work."
+result = "integration candidate only"
+
+[normative_basis]
+architecture = [
+  "A2.3",
+  "A5.5",
+  "A10.8",
+  "A13.5",
+  "A13.9",
+  "A14.8",
+  "ARCH-FIN-01",
+  "ARCH-GROUND-01",
+  "ARCH-OBS-01",
+  "ARCH-ORD-01",
+  "ARCH-RES-04",
+]
+implementation = [
+  "I1.3",
+  "I2.7",
+  "I2.18",
+  "I2.22",
+  "I7.20",
+  "I7.22",
+  "I7.23",
+  "I7.26",
+  "I7.27",
+  "I10",
+  "I14.6",
+  "I17",
+  "I18",
+  "IP0",
+  "IP1",
+  "IP2",
+  "IP3",
+  "IP4",
+  "IP5",
+]
+reason = "Instrument execution, raw evidence, normalization, evaluation, artifact binding and finish are independent stages with different owners and proof ceilings."
+
+[current_source]
+observed_on = "main@317774c7bf50660e49249e7a74ef5fa798234f91"
+source_handles = [
+  "bins/eliot-testd/Cargo.toml",
+  "bins/eliot-testd/src/lib.rs",
+  "bins/eliot-testd/src/main.rs",
+  "crates/instrument/eliot-testd-core/src/lib.rs",
+  "crates/instrument/eliot-process-executor/src/lib.rs",
+  "crates/kernel/eliot-process/src/lib.rs",
+  "crates/instrument/eliot-instrument-api/src/lib.rs",
+  "crates/kernel/eliot-ors/src/model.rs",
+  "crates/kernel/eliot-ors/src/store.rs",
+]
+required_current_inventory = [
+  "all accepted testd profile kinds and their exact contract owners",
+  "all worktree/build/sandbox provisioning paths",
+  "all direct process launch, cancellation and cleanup paths",
+  "all stdout/stderr evidence producers and consumers",
+  "all parser/normalizer/evaluator adapters",
+  "all active job/checkpoint/retry/dedup state",
+  "all paths that can influence task acceptance or finish",
+]
+source_inventory_rule = "The implementation worker must regenerate the exact reverse-consumer/effect inventory on then-current main. Seed paths do not prove completeness or safe deletion."
+
+[ownership]
+lifecycle_owner = "testd owns only one active Instrument job's operational execution state; Kernel/Governor owners retain durable job, budget, task, plan, semantic acceptance and finish"
+mutable_state = [
+  "bounded active testd execution records",
+  "temporary worktree/build/sandbox roots and declared cache leases",
+  "process operation and cancellation/checkpoint references",
+  "parser/normalizer checkpoints",
+  "cleanup/reconciliation state",
+]
+allowed_effects = [
+  "provision and release an admitted temporary worktree/sandbox",
+  "invoke only an admitted typed Instrument profile through ProcessExecutor",
+  "persist policy-bound raw stream/artifact evidence",
+  "run typed parser/normalizer/evaluator adapters",
+  "publish immutable evidence and operational receipts",
+  "cancel, contain and clean up owned process trees and temporary roots",
+]
+must_not_own = [
+  "Task or WorkItem lifecycle",
+  "scheduler or route/model selection",
+  "canonical semantic writes",
+  "acceptance or VERIFIED_COMPLETE",
+  "generic shell profile",
+  "provider credentials outside exact process/resource bindings",
+  "automatic equivalent retry after unknown outcome",
+]
+
+[contract]
+preferred_location = "existing eliot-instrument-api / eliot-testd-core / process-evidence owners; no new crate unless a reviewed CrateExtractionDecision proves an independent contract, state, consumer and proof seam"
+public_types = [
+  "InstrumentExecutionRequest",
+  "InstrumentProfileBinding",
+  "InstrumentSandboxBinding",
+  "InstrumentProcessBinding",
+  "InstrumentRawEvidenceSet",
+  "InstrumentNormalizationResult",
+  "InstrumentEvaluationResult",
+  "InstrumentCleanupDisposition",
+  "InstrumentExecutionReceipt",
+  "InstrumentReconciliationView",
+]
+closed_job_states = [
+  "ACCEPTED",
+  "SANDBOX_PREPARING",
+  "READY_TO_EXECUTE",
+  "EXECUTING",
+  "CAPTURING_EVIDENCE",
+  "NORMALIZING",
+  "EVALUATING",
+  "CLEANING_UP",
+  "TERMINAL",
+  "RECONCILING",
+]
+closed_execution_states = [
+  "NOT_EXECUTED",
+  "START_REJECTED",
+  "EXECUTED",
+  "CANCELLED_CONFIRMED",
+  "TIMEOUT_CONFIRMED",
+  "CRASHED_OBSERVED",
+  "UNKNOWN_OUTCOME",
+]
+closed_transport_states = [
+  "COMPLETE",
+  "PARTIAL",
+  "READ_ERROR",
+  "CANCELLED",
+  "UNAVAILABLE",
+]
+closed_persistence_states = [
+  "COMPLETE_SOURCE",
+  "PARTIAL_SOURCE",
+  "SOURCE_UNAVAILABLE",
+  "UNKNOWN_PERSISTENCE_OUTCOME",
+  "PURGED_OR_REVOKED",
+]
+closed_parse_states = [
+  "NOT_APPLICABLE",
+  "NOT_EXECUTED",
+  "PARSED_COMPLETE",
+  "PARSED_PARTIAL",
+  "PARSE_FAILED",
+]
+closed_evaluation_states = [
+  "NOT_APPLICABLE",
+  "NOT_EXECUTED",
+  "SIMULATED",
+  "EXECUTED_PASS",
+  "EXECUTED_FAIL",
+  "INCONCLUSIVE",
+  "STALE",
+  "UNKNOWN_OUTCOME",
+]
+closed_coverage_states = [
+  "COMPLETE_DENOMINATOR",
+  "PARTIAL_DENOMINATOR",
+  "UNKNOWN_DENOMINATOR",
+  "NOT_APPLICABLE",
+]
+closed_cleanup_states = [
+  "NOT_REQUIRED",
+  "COMPLETE",
+  "PARTIAL",
+  "UNKNOWN_OUTCOME",
+  "MANUAL_RECOVERY_REQUIRED",
+]
+
+[contract.request]
+required_fields = [
+  "exact Instrument profile id/version/digest and closed profile kind",
+  "parent Task/WorkItem/job/attempt identities without ownership transfer",
+  "operation and idempotency identity",
+  "WorkScope, StateFence and lineaged EpochId",
+  "tested source/worktree/artifact/BuildFingerprint identities",
+  "executable/config/environment/toolchain identities",
+  "resource-limit and Control Reserve class",
+  "privacy, visibility, retention, redaction and disclosure policy",
+  "stdout/stderr/artifact evidence policy and sink contract revision",
+  "deadline, cancellation, retry and cleanup policy",
+  "expected parser/normalizer/evaluator identities",
+  "expected coverage denominator and applicable verifier contract",
+]
+rule = "The request is immutable after admission. testd may narrow execution due to local capacity or policy but cannot widen tool, path, environment, data, resource, evidence, effect or retry dimensions."
+
+[contract.sandbox]
+required_fields = [
+  "canonical source snapshot or worktree identity",
+  "repository/workspace root identity and stable path lease",
+  "BuildFingerprint inputs and digest",
+  "dirty/untracked/submodule/symlink/reparse disposition",
+  "temporary root and cleanup owner",
+  "cache identity, optionality, generation and invalidation set",
+  "read/write/network/device/process permissions",
+]
+rules = [
+  "A cache hit never reuses a verifier verdict or evidence execution status.",
+  "A stale or mismatched artifact/worktree blocks load-bearing evaluation.",
+  "Temporary roots are operation-scoped and cannot become canonical source or mutable shared authority.",
+]
+
+[contract.process]
+required_fields = [
+  "ProcessExecutor request/operation identity",
+  "exact executable artifact/config/argv/working-directory/environment binding",
+  "Job Object/process-tree ownership",
+  "wall deadline and cancellation identity",
+  "CPU/memory/process/handle/pipe/output ceilings",
+  "stdout and stderr typed stream-session identities",
+  "terminal process receipt and unknown-outcome reconciliation owner",
+]
+rule = "testd consumes the one admitted ProcessExecutor. It does not implement local spawn, shell, pipe, timer or descendant-kill mechanics."
+
+[contract.evidence]
+required_dimensions = [
+  "process start and terminal disposition",
+  "stdout transport coverage",
+  "stderr transport coverage",
+  "stdout durable persistence/readback",
+  "stderr durable persistence/readback",
+  "produced artifact set and immutable locators",
+  "tested artifact/source identity",
+  "parser/normalizer execution and coverage",
+  "evaluator execution, applicability and independence",
+  "coverage denominator",
+  "cleanup and descendant disposition",
+]
+rule = "No dimension can promote another. Exit code zero, complete transport, durable bytes, successful parsing, evaluator pass, complete coverage and cleanup are separate facts."
+raw_source_rule = "Every load-bearing complete source resolves to immutable bytes whose digest/count match. A preview or synthetic locator is display/navigation only and cannot satisfy complete proof."
+zero_byte_rule = "A zero-byte stream may be COMPLETE_SOURCE when the typed profile permits it and the immutable zero-byte object/receipt verifies. It is not automatically missing."
+
+[algorithm]
+steps = [
+  "1. Validate the admitted profile, exact owner identities, StateFence/EpochId, artifact/worktree/BuildFingerprint and all resource/evidence ceilings.",
+  "2. Allocate bounded testd capacity without consuming protected Kernel control capacity intended for cancellation/fencing/recovery.",
+  "3. Provision or validate one operation-scoped sandbox/worktree; reject identity drift and record exact cache disposition.",
+  "4. Open stdout/stderr evidence sessions before process execution where required by the accepted sink contract.",
+  "5. Start the typed process only through ProcessExecutor and preserve exact start/unknown outcome.",
+  "6. Drain streams continuously under bounded memory and persist policy-bound source/preview/gap evidence without blocking the child indefinitely.",
+  "7. Reconcile process terminal state independently from stream transport and persistence completion.",
+  "8. Run only the declared parser/normalizer over verified applicable source; parsing never creates evaluator truth.",
+  "9. Run the declared evaluator only when artifact, evidence, parser and denominator prerequisites are satisfied; otherwise return typed inconclusive/not-executed/stale state.",
+  "10. Clean up descendants, handles, temporary roots and leases; cleanup failure remains a separate terminal/recovery disposition.",
+  "11. Publish one immutable receipt containing every dimension and exact evidence handle. Do not mark Task acceptance or finish.",
+  "12. Retry only under the external owner policy and only after exact reconciliation proves the prior operation's permitted retry state.",
+]
+
+[errors]
+required = [
+  "PROFILE_NOT_ADMITTED",
+  "PROFILE_CONTRACT_MISMATCH",
+  "WORK_SCOPE_MISMATCH",
+  "STATE_FENCE_MISMATCH",
+  "EPOCH_LINEAGE_MISMATCH",
+  "SOURCE_SNAPSHOT_STALE",
+  "WORKTREE_IDENTITY_CONFLICT",
+  "BUILD_FINGERPRINT_MISMATCH",
+  "SANDBOX_UNAVAILABLE",
+  "RESOURCE_CAPACITY_EXHAUSTED",
+  "PROCESS_START_REJECTED",
+  "PROCESS_OUTCOME_UNKNOWN",
+  "CANCELLATION_UNCONFIRMED",
+  "STREAM_TRANSPORT_PARTIAL",
+  "STREAM_SOURCE_UNAVAILABLE",
+  "STREAM_PERSISTENCE_UNKNOWN",
+  "ARTIFACT_BINDING_MISMATCH",
+  "PARSER_FAILED",
+  "EVALUATOR_NOT_APPLICABLE",
+  "EVALUATOR_FAILED",
+  "EVALUATION_INCONCLUSIVE",
+  "COVERAGE_DENOMINATOR_PARTIAL",
+  "CLEANUP_INCOMPLETE",
+  "IDENTITY_CONFLICT",
+]
+
+[[wave]]
+order = 1
+id = "instrument-contract-and-core-state-machine"
+issue_owner = "new bounded child issue under #20"
+mutable_paths = [
+  "crates/instrument/eliot-instrument-api/src/**",
+  "crates/instrument/eliot-testd-core/src/**",
+  "crates/instrument/eliot-testd-core/tests/**",
+]
+deliverable = "Closed request/receipt dimension contracts and a pure bounded state machine with no process or canonical effects."
+must_not_touch = ["ProcessExecutor", "BlobStore/evidence sink", "Kernel/ORS", "bins/eliot-testd composition"]
+proof_ceiling = "INSTRUMENT_CONTRACT_AND_TESTD_CORE_MODULE_PROOF_ONLY"
+
+[[wave]]
+order = 2
+id = "sandbox-and-build-fingerprint"
+issue_owner = "separate child issue under #20"
+mutable_paths = [
+  "declared testd sandbox/worktree provisioner modules",
+  "declared BuildFingerprint/cache adapter modules",
+  "focused sandbox/cache fixtures",
+]
+deliverable = "Stable source/worktree/artifact identity, bounded temporary roots, optional identity-bound caches and cleanup ownership."
+must_not_touch = ["process mechanics", "parser/evaluator semantics", "canonical source owner"]
+proof_ceiling = "TESTD_SANDBOX_AND_BUILD_IDENTITY_PROOF_ONLY"
+
+[[wave]]
+order = 3
+id = "process-executor-client"
+issue_owner = "separate child issue under #20 and #100"
+mutable_paths = [
+  "bins/eliot-testd ProcessExecutor adapter modules",
+  "focused start/cancel/timeout/reconcile fixtures",
+]
+deliverable = "Thin typed client of the one ProcessExecutor with no direct spawn/shell/pipe/timer implementation."
+must_not_touch = ["ProcessExecutor owner source", "stream evidence owner", "task/finish owner"]
+proof_ceiling = "TESTD_PROCESS_CLIENT_MODULE_PROOF_ONLY"
+
+[[wave]]
+order = 4
+id = "typed-stream-and-artifact-evidence"
+issue_owner = "separate child issue coordinated with #85 and #267-#271"
+mutable_paths = [
+  "testd typed process-stream consumer paths",
+  "testd artifact binding/readback paths",
+  "focused zero-byte/partial/purged/corrupt fixtures",
+]
+deliverable = "Typed stdout/stderr/artifact evidence consumption with exact readback and no synthetic raw locator."
+must_not_touch = ["BlobStore root ownership", "ProcessExecutor mechanics", "evaluator meaning"]
+proof_ceiling = "TESTD_EVIDENCE_CONSUMER_PROOF_ONLY"
+
+[[wave]]
+order = 5
+id = "parser-normalizer-evaluator-adapters"
+issue_owner = "separate child issue under #20"
+mutable_paths = [
+  "one declared parser/normalizer/evaluator adapter family at a time",
+  "profile-specific conformance fixtures",
+]
+deliverable = "Typed adapters preserving parsing, evaluation, applicability, independence and coverage as separate dimensions."
+must_not_touch = ["Task acceptance", "strict finish", "generic shell or generic JSON profile"]
+proof_ceiling = "INSTRUMENT_ADAPTER_MODULE_PROOF_ONLY"
+
+[[wave]]
+order = 6
+id = "testd-composition-and-operational-recovery"
+issue_owner = "separate child issue under #20 and #15"
+mutable_paths = [
+  "bins/eliot-testd/src/**",
+  "declared ORS testd-job operational projection paths",
+  "focused daemon restart/reconcile fixtures",
+]
+deliverable = "Thin service/composition root, bounded job queue, checkpoint/cancel/cleanup recovery and exact receipt publication."
+must_not_touch = ["canonical task state", "semantic scheduler", "Kernel process mechanics", "finish"]
+proof = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-testd -p eliot-testd-core --all-targets",
+  "cargo test --locked -p eliot-testd -p eliot-testd-core",
+  "cargo clippy --locked -p eliot-testd -p eliot-testd-core --all-targets -- -D warnings",
+]
+proof_ceiling = "TESTD_COMPOSITION_AND_RECOVERY_MODULE_PROOF_ONLY"
+
+[[wave]]
+order = 7
+id = "real-edge-and-product"
+issue_owner = "integration owner under #20 and #11"
+mutable_paths = ["bounded Windows edge fixtures and Product Pulse artifacts only"]
+deliverable = "One real compiler/test Instrument produces expandable evidence, survives process/testd restart, remains distinct across all dimensions and contributes to task acceptance only through the owning Governor verifier/finish path."
+proof_ceiling = "REAL_TESTD_PROCESS_EVIDENCE_EDGE_AND_PRODUCT_PULSE"
+
+[fixtures]
+required = [
+  "admitted profile and complete successful execution",
+  "profile/version mismatch",
+  "stale source snapshot or BuildFingerprint",
+  "sandbox reparse/symlink escape attempt",
+  "cache miss, cache corruption and optional-cache bypass",
+  "child exit zero with partial stdout transport",
+  "child exit zero with source persistence unavailable",
+  "zero-byte complete stdout/stderr",
+  "read error after a persisted prefix",
+  "large output and pipe saturation",
+  "cancellation and timeout races",
+  "process crash with descendants",
+  "unknown process or persistence outcome",
+  "parser failure after complete source",
+  "evaluator unavailable or stale",
+  "partial/unknown coverage denominator",
+  "artifact produced but bound to the wrong source/worktree",
+  "cleanup failure after evaluator pass",
+  "testd restart with a nonterminal operation",
+  "attempted direct task finish from process success",
+]
+required_assertions = [
+  "no direct canonical write or finish authority exists in testd",
+  "process exit cannot promote stream, parse, evaluate, coverage or cleanup dimensions",
+  "partial/unavailable source cannot satisfy a complete verifier",
+  "all descendants and temporary resources are contained or explicitly reported unknown/manual recovery",
+  "retry requires exact prior-operation reconciliation and external policy",
+]
+
+[prerequisites]
+required = [
+  "#64 lineaged EpochId for authority-bearing job/process bindings",
+  "#65 protected capacity for cancellation/fencing/recovery under workload saturation",
+  "#79 durable execution-session binding separated from transport connection",
+  "#85 and #267-#271 accepted typed stream evidence path for load-bearing output",
+  "#100 one admitted ProcessExecutor mechanics owner",
+]
+
+[non_goals]
+items = [
+  "No task scheduler, agent harness or persistent autonomous test agent.",
+  "No canonical store credential or semantic mutation path.",
+  "No generic shell profile or arbitrary caller command.",
+  "No tool exit code, parser success or test count as canonical truth.",
+  "No reuse of an old verifier verdict through build/test cache.",
+  "No Product or VERIFIED_COMPLETE claim from package-local tests alone.",
+]
+
+[stop_conditions]
+items = [
+  "Another open PR owns any selected mutable path.",
+  "Current main is not an ancestor of the worker branch.",
+  "The profile lacks a single field-level owner contract.",
+  "A complete evidence claim would depend on a synthetic/non-resolvable locator.",
+  "The worker would need to duplicate ProcessExecutor, BlobStore or ORS ownership.",
+  "Coverage completeness lacks an exact independently recheckable denominator.",
+  "The requested parser/evaluator would need generic JSON, prose inference or model self-certification.",
+  "The change would allow testd to decide Task acceptance or finish.",
+]
+challenge = "Return a ContractChallenge to #20 with exact source/evidence. Do not add a generic runner, local spawn path, synthetic evidence handle, inferred coverage or finish shortcut."
+
+[result_contract]
+required_fields = [
+  "issue_and_cell",
+  "source_base_and_candidate",
+  "causal_property",
+  "old_path_discriminator",
+  "changed_contract_or_source",
+  "owned_state_and_effects",
+  "module_proof",
+  "edge_proof",
+  "product_pulse_or_not_applicable_reason",
+  "evidence_execution_status",
+  "known_uncovered_behavior",
+  "security_privacy_and_authority_delta",
+  "migration_rollback_and_removal",
+  "integration_candidate",
+  "residual_unknowns",
+]
+finish_states = [
+  "VERIFIED_COMPLETE",
+  "PARTIAL",
+  "BLOCKED",
+  "FAILED_VERIFICATION",
+  "DEGRADED_NO_PROOF",
+  "UNSAFE_TO_FINISH",
+  "CANCELLED",
+  "SUPERSEDED",
+]
