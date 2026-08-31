@@ -251,7 +251,7 @@ impl Drop for OwnedDirectoryPublication {
 
 #[cfg(windows)]
 pub(crate) struct DirectoryPublicationContour {
-    entries: Vec<(PathBuf, FileIdentity, std::fs::File)>,
+    pub(crate) entries: Vec<(PathBuf, FileIdentity, std::fs::File)>,
     pub(crate) canonical_parent: PathBuf,
     parent_identity: FileIdentity,
 }
@@ -353,8 +353,22 @@ fn open_publication_directory(
 fn open_publication_directory_for_create(
     path: &Path,
 ) -> Result<std::fs::File, DirectoryPublicationError> {
-    use windows_sys::Win32::Storage::FileSystem::{FILE_ADD_SUBDIRECTORY, FILE_GENERIC_READ};
-    open_publication_directory_with_access(path, false, FILE_GENERIC_READ | FILE_ADD_SUBDIRECTORY)
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ADD_SUBDIRECTORY, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    };
+    open_publication_directory_with_access(
+        path,
+        false,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_ADD_SUBDIRECTORY,
+    )
+}
+
+#[cfg(windows)]
+fn open_publication_directory_for_sync(
+    path: &Path,
+) -> Result<std::fs::File, DirectoryPublicationError> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+    open_publication_directory_with_access(path, true, FILE_GENERIC_READ | FILE_GENERIC_WRITE)
 }
 
 #[cfg(windows)]
@@ -391,6 +405,29 @@ fn open_publication_directory_with_access(
         return Err(DirectoryPublicationError::InvalidPath);
     }
     Ok(file)
+}
+
+#[cfg(windows)]
+pub(crate) fn sync_directory_handle(
+    directory: &std::fs::File,
+) -> Result<(), DirectoryPublicationError> {
+    crate::flush_directory_handle(directory)
+        .map_err(|code| DirectoryPublicationError::Win32 { code })
+}
+
+/// Opens and flushes one existing directory without following reparse points.
+///
+/// This is the shared directory-durability boundary for callers that do not
+/// retain the publication contour themselves.
+#[cfg(windows)]
+pub fn sync_directory_for_publication(path: &Path) -> Result<(), DirectoryPublicationError> {
+    let directory = open_publication_directory_for_sync(path)?;
+    sync_directory_handle(&directory)
+}
+
+#[cfg(not(windows))]
+pub fn sync_directory_for_publication(_path: &Path) -> Result<(), DirectoryPublicationError> {
+    Err(DirectoryPublicationError::UnsupportedPlatform)
 }
 
 #[cfg(windows)]
@@ -1097,6 +1134,14 @@ impl OwnedDirectoryPublication {
                 source_identity,
             })
         };
+        // The directory entry is not durable until the retained parent is
+        // flushed. A failed flush leaves the move committed but unknown and
+        // must be reconciled from the durable intent.
+        if sync_directory_handle(destination_parent).is_err() {
+            return Ok(unknown(
+                DirectoryPublicationUnknown::PostCommitParentSyncUnavailable,
+            ));
+        }
         if let Some(reason) = injected_postcommit_unknown {
             return Ok(unknown(reason));
         }
@@ -1170,12 +1215,6 @@ impl OwnedDirectoryPublication {
             return Ok(unknown(
                 DirectoryPublicationUnknown::PostCommitIdentityChanged,
             ));
-        }
-        if let Some((_, _, parent)) = self.contour.entries.last() {
-            // NtSetInformationFile is the handle-relative commit boundary.
-            // Some Windows filesystems reject directory FlushFileBuffers, so
-            // this is best-effort reinforcement, not a second fallible commit.
-            let _ = parent.sync_all();
         }
         Ok(DirectoryPublicationOutcome::Published(
             DirectoryPublicationReceipt {

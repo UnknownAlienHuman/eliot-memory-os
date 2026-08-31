@@ -77,6 +77,8 @@ pub enum DirectoryPublicationUnknown {
     PostCommitIdentityUnavailable,
     /// The moved or reopened destination was not the exact source object.
     PostCommitIdentityChanged,
+    /// The move committed but the retained parent entry could not be flushed.
+    PostCommitParentSyncUnavailable,
 }
 
 /// Durable facts retained when the move committed but readback is uncertain.

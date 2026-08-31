@@ -75,6 +75,20 @@ pub mod test_support {
     pub fn force_next_owned_runtime_receipt_unknown() {
         super::runtime_receipt_publication::force_next_owned_runtime_receipt_unknown();
     }
+
+    /// Forces the next retained-directory flush to fail with an access error.
+    /// This exercises the post-commit durability-unknown path without altering
+    /// the production publication protocol.
+    pub fn force_next_directory_sync_failure() {
+        super::TEST_DIRECTORY_SYNC_FAILURE.with(|slot| slot.set(true));
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TEST_DIRECTORY_SYNC_FAILURE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
 }
 
 mod directory_publication;
@@ -104,11 +118,12 @@ use crate::service_registration::{exact_path_text, utf16_text};
 pub use directory_publication::{
     DirectoryPublicationError, DirectoryPublicationOutcome, DirectoryPublicationReceipt,
     DirectoryPublicationUnknown, DirectoryPublicationUnknownReceipt, OwnedDirectoryPublication,
+    sync_directory_for_publication,
 };
 pub(crate) use directory_publication::{
     create_owned_directory_relative, rename_directory_from_handle,
-    retain_directory_publication_contour, validate_directory_publication_absolute,
-    verify_directory_publication_contour,
+    retain_directory_publication_contour, sync_directory_handle,
+    validate_directory_publication_absolute, verify_directory_publication_contour,
 };
 pub use installer_authority_key::{
     INSTALLATION_AUTHORITY_KEY_FILE_BYTES, INSTALLATION_AUTHORITY_KEY_FILE_VERSION,
@@ -171,7 +186,8 @@ pub use owned_directory_retirement::{
     OwnedDirectoryObservation, OwnedDirectoryObservedEntry, OwnedDirectoryRetirementEntry,
     OwnedDirectoryRetirementError, OwnedDirectoryRetirementOutcome,
     OwnedDirectoryRetirementPrecondition, OwnedDirectoryRetirementUnknown,
-    observe_owned_directory_exact, retire_owned_directory_exact,
+    OwnedDirectoryRetirementUnknownReason, observe_owned_directory_exact,
+    retire_owned_directory_exact,
 };
 pub use package_staging::{
     AGENT_BRIDGE_STAGE_WIRE, AGENT_BRIDGE_STAGE_WIRE_VERSION, AgentBridgeStagePrepared,
@@ -249,8 +265,10 @@ pub use supervision_authority_key::{
 pub use tcp_listener_owner::{
     TcpListenerOwnerError, TcpListenerOwnerObservation, observe_loopback_tcp_listener_owner,
 };
+pub(crate) use user_owned_leases::current_process_sid;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use user_owned_leases::protect_user_owned_opened_handle;
 pub use user_owned_leases::{UserOwnedPathLease, UserOwnedRootLease, UserOwnedRootReadLease};
-pub(crate) use user_owned_leases::{current_process_sid, protect_user_owned_opened_handle};
 
 /// Failure returned by a Windows-only primitive before it can be projected
 /// into a provider-neutral P-01 outcome.
@@ -2320,10 +2338,14 @@ impl WindowsPlatform {
             let _ = std::fs::remove_file(&temporary);
         }
         result?;
-        // MoveFileExW uses WRITE_THROUGH; flush the pinned directory when the
-        // filesystem accepts directory flushes, without inventing a second
-        // publication failure after the replacement has committed.
-        flush_directory(&parent_pin);
+        // MoveFileExW uses WRITE_THROUGH, but the parent entry still needs an
+        // explicit flush before the replacement can be reported as published.
+        if flush_directory(&parent_pin).is_err() {
+            return Ok(PublicationOutcome::Unknown(PublicationUnknownReceipt {
+                reason: PublicationUnknown::ParentSyncUnavailable,
+                expected_identity: staged_identity,
+            }));
+        }
         let identity = file_identity(&destination).map_err(|_| {
             // Replacement may already have committed. This is deliberately not
             // retried: the caller must reconcile the externally visible effect.
@@ -3130,14 +3152,25 @@ fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(windows)]
-fn flush_directory(pins: &[std::fs::File]) {
-    if let Some(directory) = pins.last() {
-        let _ = directory.sync_all();
+pub(crate) fn flush_directory_handle(file: &std::fs::File) -> Result<(), u32> {
+    #[cfg(any(test, feature = "test-support"))]
+    if TEST_DIRECTORY_SYNC_FAILURE.with(|slot| slot.replace(false)) {
+        return Err(5);
     }
+
+    file.sync_all()
+        .map_err(|error| u32::try_from(error.raw_os_error().unwrap_or(1)).unwrap_or(1))
 }
 
 #[cfg(not(windows))]
-fn flush_directory(_pins: &[std::fs::File]) {}
+pub(crate) fn flush_directory_handle(_file: &std::fs::File) -> Result<(), u32> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn flush_directory(pins: &[std::fs::File]) -> Result<(), u32> {
+    pins.last().map_or(Ok(()), flush_directory_handle)
+}
 
 #[cfg(windows)]
 fn final_windows_path_from_handle(file: &std::fs::File) -> Result<PathBuf, ProtectedPathError> {
