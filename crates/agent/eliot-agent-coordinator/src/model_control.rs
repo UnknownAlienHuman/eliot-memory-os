@@ -17,7 +17,7 @@ use crate::CoordinatedAttemptState;
 pub const MODEL_CATALOGUE_SCHEMA_VERSION: &str = "eliot.agent-model-catalogue/v1";
 pub const MODEL_PREFERENCE_SCHEMA_VERSION: &str = "eliot.agent-model-preference/v1";
 pub const MODEL_QUERY_RECEIPT_VERSION: &str = "eliot.agent-model-query-receipt/v1";
-pub const MODEL_SELECTION_RECEIPT_VERSION: &str = "eliot.agent-model-selection-receipt/v1";
+pub const MODEL_SELECTION_RECEIPT_VERSION: &str = "eliot.agent-model-selection-receipt/v2";
 pub const ATTEMPT_HEALTH_PROJECTION_VERSION: &str = "eliot.agent-attempt-health/v1";
 
 const MAX_CATALOGUE_ENTRIES: usize = 4096;
@@ -651,7 +651,7 @@ pub fn query_model_catalogue(
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSelector {
     pub host_family: Option<String>,
@@ -769,6 +769,18 @@ impl HumanModelPreferencePolicy {
     }
 }
 
+fn preference_policy_digest(
+    policy: &HumanModelPreferencePolicy,
+) -> Result<String, ModelControlError> {
+    let mut normalized = policy.clone();
+    normalized.roles.sort_by_key(|preference| preference.role);
+    for preference in &mut normalized.roles {
+        preference.denied.sort();
+        preference.denied.dedup();
+    }
+    canonical_digest(&normalized)
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind", content = "detail")]
 pub enum SelectionRejection {
@@ -834,6 +846,7 @@ pub struct ModelSelectionReceipt {
     pub catalogue_digest: String,
     pub preference_policy_id: String,
     pub preference_revision: String,
+    pub preference_policy_digest: String,
     pub selected: ModelCatalogueEntry,
     pub rejected: Vec<RejectedModelCandidate>,
     pub execution: ZeroModelExecutionCounters,
@@ -947,6 +960,7 @@ pub fn compile_model_selection(
         .entry
         .clone();
     let catalogue_digest = catalogue_digest(snapshot)?;
+    let preference_policy_digest = preference_policy_digest(policy)?;
     let selection_digest = canonical_digest(&(
         MODEL_SELECTION_RECEIPT_VERSION,
         selection_id,
@@ -955,6 +969,7 @@ pub fn compile_model_selection(
         catalogue_digest.as_str(),
         policy.policy_id.as_str(),
         policy.revision.as_str(),
+        preference_policy_digest.as_str(),
         selected.entry_id.as_str(),
     ))?;
     Ok(ModelSelectionReceipt {
@@ -967,6 +982,7 @@ pub fn compile_model_selection(
         catalogue_digest,
         preference_policy_id: policy.policy_id.clone(),
         preference_revision: policy.revision.clone(),
+        preference_policy_digest,
         selected,
         rejected,
         execution: ZeroModelExecutionCounters::zero(),
