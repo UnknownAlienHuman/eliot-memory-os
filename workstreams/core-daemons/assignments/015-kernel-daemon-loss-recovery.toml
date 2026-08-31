@@ -1,0 +1,393 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_SWARM_IMPLEMENTATION"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "AGENT_HANDOFF_ONLY"
+parent_issue = 15
+integration_issue_refs = [11, 14, 16, 18]
+base_branch = "main"
+base_sha = "317774c7bf50660e49249e7a74ef5fa798234f91"
+normative_pair_ref = "docs/normative-pair.toml"
+docs_read_status = "ACCEPTED_PAIR_READ_FROM_PROJECT_INPUT / REPOSITORY_READER_MUST_BE_RERUN_BY_SOURCE_WORKER"
+dreamer_excluded = true
+
+[work_unit]
+cell_id = "kernel.daemon-loss-recovery"
+causal_property = "Loss, replacement, or fencing of the active eliotd generation immediately removes daemon-issued admission and effect authority while Kernel preserves every accepted operation identity, cancellation path, reconciliation obligation, and a bounded non-semantic Recovery View."
+old_path_discriminator = "Kill or detach the active eliotd generation after Kernel has accepted work but before all effects and store outcomes are terminal. The successor path must not infer safety from process death, lose accepted-operation identity, revive stale daemon authority, or require semantic reads from the unavailable daemon."
+integration_owner = "#15 small-Kernel boundary; #14 owns physical daemon process replacement; #18 owns semantic admission; #16 observes supervision; #11 owns the real Windows Product Pulse"
+one_writer_rule = "One worker per wave and mutable path claim. Workers return candidates and do not merge their own work."
+result = "integration candidate only"
+
+[normative_basis]
+architecture = [
+  "A2.2",
+  "A10.4",
+  "A13.1",
+  "A13.2",
+  "A13.3",
+  "ARCH-AUTH-01",
+  "ARCH-RES-01",
+  "ARCH-RES-04",
+  "ARCH-SEC-02",
+]
+implementation = [
+  "I1.2",
+  "I1.4",
+  "I1.8",
+  "I2.3",
+  "I2.4",
+  "I2.5",
+  "I5.5",
+  "I6.10",
+  "I14",
+  "I15",
+  "I16",
+]
+reason = "Kernel is the failure-surviving mechanical owner for identity, fencing, ORS, cancellation, generation routing and minimal recovery; eliotd remains the semantic owner and cannot be reconstructed from Kernel caches."
+
+[current_source]
+observed_on = "main@317774c7bf50660e49249e7a74ef5fa798234f91"
+source_handles = [
+  "bins/eliot-kernel/src/lib.rs",
+  "bins/eliot-kernel/src/daemon_supervision.rs",
+  "bins/eliot-kernel/src/supervision_lease_authority.rs",
+  "crates/kernel/eliot-kernel-service/src/lib.rs",
+  "crates/kernel/eliot-kernel-service/src/daemon_live_receipt.rs",
+  "crates/kernel/eliot-ors/src/model.rs",
+  "crates/kernel/eliot-ors/src/store.rs",
+  "crates/kernel/eliot-ors/src/status.rs",
+  "bins/eliotd/src/daemon_runtime.rs",
+]
+confirmed_existing_mechanics = [
+  "Kernel retains daemon runtime status, process receipt, live-readiness evidence and supervision contour.",
+  "Kernel already owns mechanical daemon failure publication and bridge-profile revocation paths.",
+  "ORS owns failure-surviving operational records and supervision lease revisions.",
+  "The daemon live-receipt classifier already distinguishes exact replay, activation predecessor replacement and renewal predecessor replacement.",
+]
+missing_closure = [
+  "one explicit denominator for all accepted operations and daemon-issued effect/admission leases affected by daemon loss",
+  "one typed ordering for close-ingress, revoke authority, preserve/reconcile accepted work and publish Recovery View",
+  "one exact successor-generation admission condition after predecessor fencing",
+  "one cross-process proof that daemon loss leaves cancellation, fencing, ORS and Recovery View available without semantic authority",
+]
+
+[ownership]
+lifecycle_owner = "Kernel for mechanical daemon binding and recovery state; Host for physical process lineage; eliotd/Governor owners for semantic state"
+mutable_state = [
+  "active daemon generation binding",
+  "daemon transport/admission binding",
+  "daemon-issued effect-lease revocation state",
+  "accepted-operation recovery projections in ORS",
+  "minimal Kernel Recovery View projection",
+]
+allowed_effects = [
+  "close daemon ingress",
+  "revoke or fence daemon-issued mechanical authority",
+  "cancel or contain already admitted operations through their existing owners",
+  "append/update ORS operational recovery records",
+  "publish bounded health and Recovery View evidence",
+]
+must_not_own = [
+  "task selection or WorkScope meaning",
+  "plan interpretation",
+  "semantic retry or repair policy",
+  "canonical project-state reconstruction",
+  "store-vendor commands",
+  "physical daemon restart budget",
+  "new semantic admission while eliotd is unavailable",
+]
+
+[contract]
+contract_owner = "eliot-kernel-service with ORS-owned persistence projection"
+preferred_location = "existing Kernel service/ORS modules; no new crate without a reviewed CrateExtractionDecision"
+public_types = [
+  "DaemonLossObservation",
+  "DaemonAuthorityRevocationRequest",
+  "DaemonAuthorityRevocationReceipt",
+  "DaemonAcceptedOperationDenominator",
+  "DaemonLossRecoveryProjection",
+  "KernelRecoveryViewSnapshot",
+  "DaemonSuccessorAdmissionEvidence",
+]
+closed_loss_kinds = [
+  "SUPERVISION_LEASE_EXPIRED",
+  "AUTHENTICATED_TRANSPORT_LOST",
+  "PROCESS_EXIT_OBSERVED",
+  "PROCESS_IDENTITY_CONFLICT",
+  "GENERATION_FENCED",
+  "HOST_ORDERED_DRAIN",
+  "UNKNOWN_LIVENESS",
+]
+closed_recovery_states = [
+  "INGRESS_CLOSED",
+  "AUTHORITY_REVOKING",
+  "AUTHORITY_REVOKED",
+  "OPERATIONS_ENUMERATING",
+  "RECONCILING",
+  "RECOVERY_VIEW_AVAILABLE",
+  "SUCCESSOR_CANDIDATE_BLOCKED",
+  "SUCCESSOR_CANDIDATE_ADMISSIBLE",
+  "MANUAL_RECOVERY_REQUIRED",
+]
+closed_operation_dispositions = [
+  "KNOWN_NOT_STARTED",
+  "RUNNING_CANCELLABLE",
+  "CANCELLATION_PENDING",
+  "KNOWN_TERMINAL",
+  "UNKNOWN_STORE_OUTCOME",
+  "UNKNOWN_EXTERNAL_EFFECT",
+  "RECONCILING",
+  "MANUAL_RECOVERY_REQUIRED",
+]
+
+[contract.identity]
+required_fields = [
+  "installation_id",
+  "Kernel process and generation identity",
+  "lost daemon artifact/config/protocol/generation identity",
+  "lost daemon process-tree identity and retained process receipt",
+  "authenticated transport binding as transport identity only",
+  "current lineaged EpochId from #64",
+  "StateFence",
+  "supervision lease id, revision and ORS receipt digest",
+  "last accepted daemon live-receipt digest",
+  "boot/session/time-observation identity",
+  "loss observation source/evidence handles",
+]
+forbidden_substitutions = [
+  "PID or process name for process ownership",
+  "connection_id for durable Session or operation identity",
+  "scalar epoch for lineaged EpochId",
+  "StoreHealth for daemon liveness or supervision renewal",
+  "daemon cache contents for canonical semantic state",
+]
+
+[contract.accepted_operation_denominator]
+required_fields = [
+  "ORS snapshot revision and completeness disposition",
+  "complete bounded set of accepted nonterminal operation identities",
+  "operation class and owning reconciliation adapter",
+  "request/idempotency identity and canonical request digest",
+  "StateFence and EpochId",
+  "effect ceiling and introduced capability/lease identities",
+  "store mutation certainty and receipt/reconciliation handle",
+  "external-effect certainty and receipt/reconciliation handle",
+  "cancellation/containment capability state",
+]
+completeness = "A complete empty denominator is distinct from unavailable, partial, stale or conflicted ORS evidence. No absence or safe-successor claim is permitted without an independently recheckable complete denominator."
+bounds = "Overflow returns a typed capacity failure and preserves the exact continuation/cursor; truncation cannot be reported as complete."
+
+[contract.recovery_view]
+required_dimensions = [
+  "daemon process observation",
+  "authenticated transport state",
+  "supervision lease state",
+  "daemon generation and fence state",
+  "daemon-issued authority revocation state",
+  "accepted operation denominator completeness",
+  "per-operation reconciliation disposition",
+  "Store route and semantic-readiness observation",
+  "Control Reserve availability required for cancellation/fencing/recovery",
+  "Watchdog coverage observation",
+  "successor admission blockers",
+]
+rule = "The Recovery View exposes operational evidence and allowed next actions only. It does not answer task, plan, epistemic, acceptance or finish questions."
+
+[algorithm]
+steps = [
+  "1. Validate the loss observation against the exact active daemon generation, process identity, transport binding, supervision predecessor, EpochId and StateFence.",
+  "2. Atomically close new daemon ingress and freeze issuance of daemon-derived admission/effect leases before publishing a failed/degraded status.",
+  "3. Revoke every mechanically enumerable daemon-issued lease and bridge/profile admission bound to the lost generation; preserve exact revocation receipts.",
+  "4. Read one coherent ORS denominator of all accepted nonterminal operations affected by the lost generation. Partial or unavailable enumeration blocks automatic successor admission.",
+  "5. Classify each operation without semantic reinterpretation. Preserve unknown Store/external effects and route them to exact-operation reconciliation; never blind retry.",
+  "6. Keep cancellation, containment, fencing, ORS and minimal health/Recovery View paths available through protected capacity.",
+  "7. Publish one revisioned Recovery View bound to the exact loss/revocation/denominator evidence.",
+  "8. Admit a successor candidate only after predecessor ingress is closed, stale authority is revoked/fenced, required unknown outcomes have an explicit recovery owner, and Host supplies an exact successor process/generation binding.",
+  "9. Require successor eliotd to rebuild semantic mirrors from canonical owners and obtain fresh semantic authority; Kernel never transfers old daemon cache meaning.",
+]
+
+[errors]
+required = [
+  "LOSS_OBSERVATION_STALE",
+  "DAEMON_GENERATION_MISMATCH",
+  "PROCESS_IDENTITY_CONFLICT",
+  "TRANSPORT_BINDING_MISMATCH",
+  "EPOCH_LINEAGE_MISMATCH",
+  "STATE_FENCE_MISMATCH",
+  "SUPERVISION_PREDECESSOR_MISMATCH",
+  "AUTHORITY_REVOCATION_INCOMPLETE",
+  "ORS_DENOMINATOR_PARTIAL",
+  "ORS_DENOMINATOR_UNAVAILABLE",
+  "CONTROL_PATH_UNAVAILABLE",
+  "UNKNOWN_STORE_OUTCOME",
+  "UNKNOWN_EXTERNAL_EFFECT",
+  "SUCCESSOR_ADMISSION_BLOCKED",
+  "RECOVERY_VIEW_PUBLICATION_UNKNOWN",
+]
+rule = "A secondary failure while revoking authority, persisting ORS state or publishing the Recovery View remains typed and observable together with the primary daemon-loss disposition."
+
+[[wave]]
+order = 1
+id = "kernel-contract-and-pure-classifier"
+issue_owner = "new bounded child issue under #15"
+mutable_paths = [
+  "crates/kernel/eliot-kernel-service/src/daemon_loss_recovery.rs",
+  "crates/kernel/eliot-kernel-service/src/lib.rs only for module/export wiring",
+  "crates/kernel/eliot-kernel-service/tests/daemon_loss_recovery.rs",
+]
+deliverable = "Typed observation, revocation, denominator, recovery projection and pure transition classifier over existing owner identities."
+must_not_touch = [
+  "Host process launch",
+  "eliotd semantic source",
+  "Watchdog source",
+  "Store provider source",
+  "activation-result paths owned by #66",
+  "daemon heartbeat/renewal paths owned by #88",
+]
+proof = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-kernel-service --all-targets",
+  "cargo test --locked -p eliot-kernel-service daemon_loss_recovery",
+  "cargo clippy --locked -p eliot-kernel-service --all-targets -- -D warnings",
+]
+proof_ceiling = "KERNEL_SERVICE_CONTRACT_AND_CLASSIFIER_PROOF_ONLY"
+
+[[wave]]
+order = 2
+id = "ors-recovery-projection"
+issue_owner = "separate child issue under #15"
+mutable_paths = [
+  "crates/kernel/eliot-ors/src/model.rs",
+  "crates/kernel/eliot-ors/src/codec.rs",
+  "crates/kernel/eliot-ors/src/store.rs",
+  "crates/kernel/eliot-ors/src/status.rs",
+  "crates/kernel/eliot-ors/tests/daemon_loss_recovery.rs",
+]
+deliverable = "Failure-surviving accepted-operation denominator, revocation/reconciliation projection, codec and restart readback."
+must_not_touch = ["canonical semantic records", "Host journal", "Store provider data", "task/plan meaning"]
+proof_ceiling = "ORS_OPERATIONAL_RECOVERY_PROOF_ONLY"
+
+[[wave]]
+order = 3
+id = "kernel-composition-cutover"
+issue_owner = "separate child issue under #15"
+mutable_paths = [
+  "bins/eliot-kernel/src/daemon_supervision.rs",
+  "bins/eliot-kernel/src/supervision_lease_authority.rs",
+  "bins/eliot-kernel/src/lib.rs",
+  "bins/eliot-kernel/src/tests/daemon_loss_recovery.rs",
+]
+deliverable = "Exact ordering of ingress closure, authority revocation, ORS enumeration, Recovery View publication and successor-candidate gating."
+must_not_touch = [
+  "eliotd semantic resolver",
+  "Host restart budget",
+  "Watchdog containment authority",
+  "Store transaction semantics",
+]
+proof_ceiling = "KERNEL_COMPOSITION_MODULE_PROOF_ONLY"
+
+[[wave]]
+order = 4
+id = "host-and-watchdog-consumers"
+issue_owner = "separate consumers under #14 and #16"
+mutable_paths = [
+  "Host successor-generation adapter paths declared by #14",
+  "Watchdog observation/reconciliation paths declared by #16",
+  "runtime-status projection fixtures",
+]
+deliverable = "Host supplies exact successor lineage; Watchdog and runtime status consume, but cannot mint, revoke or renew Kernel authority."
+proof_ceiling = "HOST_WATCHDOG_CONSUMER_PROOF_ONLY"
+
+[[wave]]
+order = 5
+id = "real-edge-and-product"
+issue_owner = "integration owner under #15 and #11"
+mutable_paths = ["bounded Windows edge fixtures and Product Pulse artifacts only"]
+deliverable = "Kill eliotd with accepted work; prove no stale authority, no lost operation identity, working cancellation/fencing/ORS/Recovery View, exact reconciliation and safe successor activation."
+proof_ceiling = "REAL_WINDOWS_DAEMON_LOSS_EDGE_AND_PRODUCT_PULSE"
+
+[fixtures]
+required = [
+  "loss before any accepted operation with complete empty denominator",
+  "loss with one running cancellable operation",
+  "loss after Store request acceptance with unknown commit outcome",
+  "loss after external effect start with unknown outcome",
+  "loss while authority revocation publication fails",
+  "duplicate exact loss observation replay",
+  "conflicting loss observation for another generation",
+  "partial ORS denominator",
+  "Control Reserve unavailable during cancellation/fencing",
+  "Kernel restart while recovery is nonterminal",
+  "successor process starts before predecessor revocation completes",
+  "stale daemon reconnect after successor activation",
+  "Watchdog absent, stale or partial without falsely claiming coverage",
+]
+required_assertions = [
+  "no new semantic admission after ingress closure",
+  "no stale daemon-issued effect authority remains active",
+  "every accepted operation remains enumerable or the denominator is explicitly partial/unavailable",
+  "unknown outcomes are reconciled by exact operation identity and never blindly retried",
+  "Recovery View is available without eliotd semantic reads",
+  "successor receives fresh generation/epoch/fence and rebuilds semantic state from owners",
+]
+
+[prerequisites]
+required = [
+  "#64 canonical lineaged EpochId available to every authority-bearing field used by this wave",
+  "#65 protected cancellation/fencing/recovery capacity contract available for claimed guarantees",
+  "#79 transport connection identity separated from durable process/session ownership",
+  "current #66 and #88 workers have disjoint ownership of shared daemon-loop/composition paths",
+]
+
+[non_goals]
+items = [
+  "No Kernel task scheduler or semantic database.",
+  "No automatic semantic retry or repair recipe.",
+  "No reconstruction of canonical state from ORS.",
+  "No Host process restart implementation in the Kernel wave.",
+  "No Watchdog authority to revoke, renew or activate daemon generations.",
+  "No completion or VERIFIED_COMPLETE claim from process death or successful successor launch.",
+]
+
+[stop_conditions]
+items = [
+  "Another open PR owns any selected mutable path.",
+  "Current main is not an ancestor of the worker branch.",
+  "#64, #65 or #79 would require a lossy local compatibility type.",
+  "ORS cannot produce a bounded independently recheckable accepted-operation denominator.",
+  "The worker would need semantic task/plan interpretation inside Kernel.",
+  "A Store or external-effect unknown outcome lacks an exact reconciliation owner.",
+  "The requested successor rule would transfer old daemon authority instead of minting a fresh binding.",
+]
+challenge = "Return a ContractChallenge to #15 with exact source/evidence and do not add a fallback, guessed safe state, scalar epoch coercion or process-name/PID adoption rule."
+
+[result_contract]
+required_fields = [
+  "issue_and_cell",
+  "source_base_and_candidate",
+  "causal_property",
+  "old_path_discriminator",
+  "changed_contract_or_source",
+  "owned_state_and_effects",
+  "module_proof",
+  "edge_proof",
+  "product_pulse_or_not_applicable_reason",
+  "evidence_execution_status",
+  "known_uncovered_behavior",
+  "security_privacy_and_authority_delta",
+  "migration_rollback_and_removal",
+  "integration_candidate",
+  "residual_unknowns",
+]
+finish_states = [
+  "VERIFIED_COMPLETE",
+  "PARTIAL",
+  "BLOCKED",
+  "FAILED_VERIFICATION",
+  "DEGRADED_NO_PROOF",
+  "UNSAFE_TO_FINISH",
+  "CANCELLED",
+  "SUPERSEDED",
+]
