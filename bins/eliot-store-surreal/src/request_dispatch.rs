@@ -42,7 +42,10 @@ fn request_failure_context(
         ..StoreFailureIdentityContext::default()
     };
     match request {
-        Request::Named { request } | Request::Recovery { request } => {
+        Request::Named { request } => {
+            context.state_fence_ref_or_exact_safe_projection = Some(request.state_fence.clone());
+        }
+        Request::Recovery { request } => {
             context.state_fence_ref_or_exact_safe_projection = Some(request.state_fence.clone());
         }
         Request::Apply {
