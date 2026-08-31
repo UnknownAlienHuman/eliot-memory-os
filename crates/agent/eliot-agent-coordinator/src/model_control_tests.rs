@@ -653,7 +653,12 @@ fn terminal_attempt_is_not_reported_live() -> TestResult {
     );
     assert_eq!(
         projection.terminal_reconciliation,
-        AttemptTerminalReconciliation::ReconciledCandidate
+        AttemptTerminalReconciliation::Unreconciled
+    );
+    assert!(
+        projection
+            .alerts
+            .contains(&AttemptAlertCode::TerminalProcessAlive)
     );
     assert_eq!(
         projection.automation,

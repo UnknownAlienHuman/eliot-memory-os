@@ -1260,6 +1260,7 @@ pub enum AttemptAlertCode {
     QuotaUnknown,
     ProcessMissing,
     ProcessUnknown,
+    TerminalProcessAlive,
     EffectUnknown,
     DescendantsOpen,
     TerminalWithOpenDescendants,
@@ -1345,9 +1346,15 @@ fn collect_attempt_alerts(
         alerts.insert(AttemptAlertCode::QuotaUnknown);
     }
     match input.process {
-        ProcessObservation::Alive => {}
+        ProcessObservation::Alive => {
+            if input.state.is_terminal() {
+                alerts.insert(AttemptAlertCode::TerminalProcessAlive);
+            }
+        }
         ProcessObservation::Exited => {
-            alerts.insert(AttemptAlertCode::ProcessMissing);
+            if !input.state.is_terminal() {
+                alerts.insert(AttemptAlertCode::ProcessMissing);
+            }
         }
         ProcessObservation::Unknown => {
             alerts.insert(AttemptAlertCode::ProcessUnknown);
@@ -1420,6 +1427,7 @@ pub fn project_attempt_health(
     let (alerts, heartbeat) = collect_attempt_alerts(input, now_unix_ms);
     let status = derive_attempt_status(input, now_unix_ms, heartbeat);
     let terminal_reconciliation = if input.state.is_terminal()
+        && input.process == ProcessObservation::Exited
         && input.open_descendants == 0
         && input.effect != AttemptEffectObservation::Unknown
     {
