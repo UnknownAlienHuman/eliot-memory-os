@@ -3,7 +3,7 @@
 <!-- eliot-doc-routing:start -->
 ## Documentation entry point
 
-Start with the [mandatory reading protocol](docs/architecture/READING_PROTOCOL.md), then use the generated route for the exact files and causal property being changed. The stable `ELIOT_*` files are compatibility maps, not task prompts.
+Start with the [mandatory verified-reading protocol](docs/architecture/READING_PROTOCOL.md), then run `python scripts/docs_read.py read ...` for the exact repository paths and causal property being changed. Open the verified bundle and record its read receipt before mutation. A route alone is navigation, not reading evidence. The stable `ELIOT_*` files are compatibility maps, not task prompts.
 <!-- eliot-doc-routing:end -->
 
 
