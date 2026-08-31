@@ -1,0 +1,32 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W2_D3B_CATALOGUE_CORRECTION_LAYER"
+issue = 341
+parent_pr = 338
+rule = "This file corrects W2 API ambiguities in the legacy base catalogue. It creates no new cells and no parallel field authority."
+
+[[correction]]
+order = 24
+cell = "smart.cue.relation_spread"
+old = "RelationSpreadPolicy.single_path_rule: String"
+new = "CueRelationSpreadExecutionPolicy.combination_rule: RelationSpreadCombinationRule::BestSingleAdmissiblePath"
+reason = "The hot-path algorithm must not admit unknown additive/popularity rules."
+
+[[correction]]
+order = 29
+cell = "smart.context.contribution_merge"
+old = "merge_context_contributions(request: &ContextCompilationRequest, contributions, limits: ContextLimits) where ContextCompilationRequest was undefined and ContextLimits was tail-specific"
+new = "merge_context_contributions(request: &ContextCompilationRequest, contributions) with embedded ContextCompilationLimits and exact ExpectedContextProviderSet"
+reason = "Merge needs one exact denominator/request identity and compiler-wide bounds distinct from tail bounds."
+
+[[correction]]
+order = 33
+cell = "smart.context.decision_tail"
+old = "ContextLimits"
+new = "DecisionTailLimits"
+reason = "Tail bounds are not compiler provider/atom/conflict bounds."
+
+[proof]
+status = "STATIC_CORRECTION_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
