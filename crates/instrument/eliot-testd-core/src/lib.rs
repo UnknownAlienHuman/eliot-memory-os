@@ -824,6 +824,52 @@ impl Default for RetryPolicy {
     }
 }
 
+fn corrupt(reason: &'static str) -> TestdError {
+    TestdError::Corrupt(reason.to_owned())
+}
+
+fn decode_project_sequence(bytes: &[u8]) -> Result<u64, TestdError> {
+    serde_json::from_slice(bytes).map_err(|_| corrupt("project sequence metadata is invalid"))
+}
+
+fn decode_event_sequence_suffix(suffix: &str) -> Result<u64, TestdError> {
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(corrupt("event sequence suffix is invalid"));
+    }
+    let sequence = suffix
+        .parse::<u64>()
+        .map_err(|_| corrupt("event sequence suffix is invalid"))?;
+    if sequence == 0 {
+        return Err(corrupt("event sequence suffix is invalid"));
+    }
+    Ok(sequence)
+}
+
+fn validate_sequence_inventory(
+    inventory: &BTreeMap<String, BTreeSet<u64>>,
+    metadata: &BTreeMap<String, u64>,
+) -> Result<(), TestdError> {
+    for (project_id, sequences) in inventory {
+        let highest = sequences
+            .last()
+            .copied()
+            .ok_or_else(|| corrupt("durable project sequence inventory is invalid"))?;
+        if metadata.get(project_id) != Some(&highest) {
+            return Err(corrupt(
+                "durable project sequence metadata conflicts with inventory",
+            ));
+        }
+    }
+    for (project_id, sequence) in metadata {
+        if !inventory.contains_key(project_id) && *sequence != 0 {
+            return Err(corrupt(
+                "durable project sequence metadata has no inventory",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// One durable test-daemon state owner.
 pub struct TestdStore {
     database: Arc<Database>,
@@ -839,12 +885,82 @@ impl TestdStore {
                 reason: "must have bounded attempts and delays",
             });
         }
+        let path = path.as_ref();
+        let existed = path.exists();
         let db = Database::create(path).map_err(database)?;
-        let write = db.begin_write().map_err(database)?;
-        drop(write.open_table(JOBS).map_err(database)?);
-        drop(write.open_table(EVENTS).map_err(database)?);
-        drop(write.open_table(META).map_err(database)?);
-        write.commit().map_err(database)?;
+        if existed {
+            let read = db.begin_read().map_err(database)?;
+            let jobs = read
+                .open_table(JOBS)
+                .map_err(|_| corrupt("durable jobs table is missing"))?;
+            let mut inventory: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+            let mut job_ids = Vec::new();
+            for item in jobs.iter().map_err(database)? {
+                let (key, value) = item.map_err(database)?;
+                let job: TestJob = serde_json::from_slice(value.value())
+                    .map_err(|_| corrupt("durable job record is invalid"))?;
+                if job.job_id != key.value() {
+                    return Err(corrupt("durable job key conflicts with record"));
+                }
+                if job.project_sequence == 0 {
+                    return Err(corrupt("durable job has invalid project sequence"));
+                }
+                if !inventory
+                    .entry(job.project_id.clone())
+                    .or_default()
+                    .insert(job.project_sequence)
+                {
+                    return Err(corrupt("durable project sequence is duplicated"));
+                }
+                job_ids.push(job.job_id);
+            }
+            drop(jobs);
+
+            let meta = read
+                .open_table(META)
+                .map_err(|_| corrupt("durable metadata table is missing"))?;
+            let mut metadata = BTreeMap::new();
+            for item in meta.iter().map_err(database)? {
+                let (key, value) = item.map_err(database)?;
+                if let Some(project_id) = key.value().strip_prefix("project:")
+                    && (project_id.trim().is_empty()
+                        || project_id.chars().any(char::is_control)
+                        || metadata
+                            .insert(
+                                project_id.to_owned(),
+                                decode_project_sequence(value.value())?,
+                            )
+                            .is_some())
+                {
+                    return Err(corrupt("durable project sequence key is invalid"));
+                }
+            }
+            drop(meta);
+            validate_sequence_inventory(&inventory, &metadata)?;
+
+            let events = read
+                .open_table(EVENTS)
+                .map_err(|_| corrupt("durable events table is missing"))?;
+            for job_id in job_ids {
+                let prefix = format!("{job_id}:");
+                let mut sequences = BTreeSet::new();
+                for item in events.iter().map_err(database)? {
+                    let (key, _) = item.map_err(database)?;
+                    if let Some(suffix) = key.value().strip_prefix(&prefix) {
+                        let sequence = decode_event_sequence_suffix(suffix)?;
+                        if !sequences.insert(sequence) {
+                            return Err(corrupt("durable event sequence is ambiguous"));
+                        }
+                    }
+                }
+            }
+        } else {
+            let write = db.begin_write().map_err(database)?;
+            drop(write.open_table(JOBS).map_err(database)?);
+            drop(write.open_table(EVENTS).map_err(database)?);
+            drop(write.open_table(META).map_err(database)?);
+            write.commit().map_err(database)?;
+        }
         Ok(Self {
             database: Arc::new(db),
             retry,
@@ -929,10 +1045,10 @@ impl TestdStore {
             let previous = meta
                 .get(sequence_key.as_str())
                 .map_err(database)?
-                .map_or(0, |value| {
-                    serde_json::from_slice::<u64>(value.value()).unwrap_or(0)
-                });
-            let next = previous.saturating_add(1);
+                .map_or(Ok(0), |value| decode_project_sequence(value.value()))?;
+            let next = previous
+                .checked_add(1)
+                .ok_or_else(|| corrupt("project sequence exhausted"))?;
             let encoded = serde_json::to_vec(&next)
                 .map_err(|error| TestdError::Corrupt(error.to_string()))?;
             meta.insert(sequence_key.as_str(), encoded.as_slice())
@@ -1457,13 +1573,20 @@ fn append_event(
     let sequence = {
         let table = write.open_table(EVENTS).map_err(database)?;
         let mut highest = 0_u64;
+        let mut sequences = BTreeSet::new();
         for item in table.iter().map_err(database)? {
             let (key, _) = item.map_err(database)?;
             if let Some(value) = key.value().strip_prefix(&prefix) {
-                highest = highest.max(value.parse::<u64>().unwrap_or(0));
+                let sequence = decode_event_sequence_suffix(value)?;
+                if !sequences.insert(sequence) {
+                    return Err(corrupt("durable event sequence is ambiguous"));
+                }
+                highest = highest.max(sequence);
             }
         }
-        highest.saturating_add(1)
+        highest
+            .checked_add(1)
+            .ok_or_else(|| corrupt("event sequence exhausted"))?
     };
     let event = JobEvent {
         job_id: job.job_id.clone(),
@@ -1637,5 +1760,58 @@ mod tests {
             .expect("issue contour grant");
         grant.contour_root = "C:\\caller-widened-contour".to_owned();
         assert!(grant.validate_integrity().is_err());
+    }
+
+    #[test]
+    fn durable_sequence_decoders_distinguish_absence_from_corruption() {
+        assert_eq!(decode_project_sequence(b"0").expect("zero is explicit"), 0);
+        assert_eq!(decode_project_sequence(b"42").expect("valid sequence"), 42);
+        assert!(matches!(
+            decode_project_sequence(b""),
+            Err(TestdError::Corrupt(_))
+        ));
+        assert!(matches!(
+            decode_project_sequence(br#"\"42\""#),
+            Err(TestdError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn event_sequence_decoder_rejects_malformed_and_exhausted_suffixes() {
+        assert_eq!(
+            decode_event_sequence_suffix("00000000000000000001").expect("valid event key"),
+            1
+        );
+        for suffix in [
+            "",
+            "not-a-number",
+            "18446744073709551616",
+            "00000000000000000000",
+        ] {
+            assert!(matches!(
+                decode_event_sequence_suffix(suffix),
+                Err(TestdError::Corrupt(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn project_sequence_inventory_requires_matching_durable_metadata() {
+        let inventory = BTreeMap::from([("project-a".to_owned(), BTreeSet::from([1, 3]))]);
+        assert!(
+            validate_sequence_inventory(&inventory, &BTreeMap::from([("project-a".to_owned(), 3)]))
+                .is_ok()
+        );
+        assert!(matches!(
+            validate_sequence_inventory(&inventory, &BTreeMap::from([("project-a".to_owned(), 2)])),
+            Err(TestdError::Corrupt(_))
+        ));
+        assert!(matches!(
+            validate_sequence_inventory(
+                &BTreeMap::new(),
+                &BTreeMap::from([("project-a".to_owned(), 3)])
+            ),
+            Err(TestdError::Corrupt(_))
+        ));
     }
 }
