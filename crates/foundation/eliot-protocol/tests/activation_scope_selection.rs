@@ -1,7 +1,6 @@
 use eliot_contracts::{AuthorityEpoch, RequestId, ResourceGeneration, StateFence};
 use eliot_protocol::{
-    AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID,
-    AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
+    AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID, AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
     AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
     AgentActivationResolutionResult, AgentActivationResolutionTicket,
     AgentActivationSelectionDirective, ProtocolError,
@@ -18,10 +17,7 @@ fn ticket() -> Result<AgentActivationResolutionTicket, ProtocolError> {
         activation_request_sha256: "a".repeat(64),
         peer_admission_receipt_sha256: "b".repeat(64),
         connection_id: "activation-scope-connection-v2-1".to_owned(),
-        state_fence: StateFence::new(
-            AuthorityEpoch::new(7)?,
-            ResourceGeneration::new(11)?,
-        ),
+        state_fence: StateFence::new(AuthorityEpoch::new(7)?, ResourceGeneration::new(11)?),
         kernel_deadline_unix_ms: 10_000,
         ticket_sha256: String::new(),
     }
@@ -29,8 +25,7 @@ fn ticket() -> Result<AgentActivationResolutionTicket, ProtocolError> {
 }
 
 #[test]
-fn complete_empty_scope_set_is_selection_required_not_ambiguity()
--> Result<(), ProtocolError> {
+fn complete_empty_scope_set_is_selection_required_not_ambiguity() -> Result<(), ProtocolError> {
     let ticket = ticket()?;
     AgentActivationResolutionResult::new(
         &ticket,
@@ -62,10 +57,7 @@ fn complete_empty_scope_set_is_selection_required_not_ambiguity()
 #[test]
 fn scope_ambiguity_requires_two_exact_candidates() -> Result<(), ProtocolError> {
     let ticket = ticket()?;
-    for candidate_handles in [
-        Vec::new(),
-        vec!["eliot://scope/one".to_owned()],
-    ] {
+    for candidate_handles in [Vec::new(), vec!["eliot://scope/one".to_owned()]] {
         let result = AgentActivationResolutionResult::new(
             &ticket,
             RESOLVED_AT_UNIX_MS,

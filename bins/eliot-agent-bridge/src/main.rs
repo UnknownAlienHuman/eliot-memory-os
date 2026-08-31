@@ -5,9 +5,9 @@ use eliot_agent_bridge::{
 };
 use eliot_agent_bridge_core::{AttachRequest, BridgeError, HostEventEnvelope};
 use eliot_mcp::{
-    HostCancellationPortOutcome, HostCancellationRequest, HostCancellationResult,
-    HostGatewayError, HostInvocationPortOutcome, HostInvocationRequest, HostInvocationResult,
-    HostRequestGateway, KernelHostRequestPort, PortFailure,
+    HostCancellationPortOutcome, HostCancellationRequest, HostCancellationResult, HostGatewayError,
+    HostInvocationPortOutcome, HostInvocationRequest, HostInvocationResult, HostRequestGateway,
+    KernelHostRequestPort, PortFailure,
 };
 use eliot_protocol::EventEnvelope;
 use serde::{Deserialize, Serialize};
@@ -41,8 +41,12 @@ enum Response {
         observation_forwarding_port: &'static str,
     },
     Attached,
-    Invocation { result: HostInvocationResult },
-    Cancellation { result: HostCancellationResult },
+    Invocation {
+        result: HostInvocationResult,
+    },
+    Cancellation {
+        result: HostCancellationResult,
+    },
     Forwarded,
     Reconciled,
     Stopped,

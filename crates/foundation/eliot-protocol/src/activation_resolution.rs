@@ -72,14 +72,38 @@ pub struct AgentActivationResolvedBinding {
 impl AgentActivationResolvedBinding {
     fn validate(&self) -> Result<(), ProtocolError> {
         for (value, field) in [
-            (self.principal_id.as_str(), "agent_activation_resolution_result.principal_id"),
-            (self.session_id.as_str(), "agent_activation_resolution_result.session_id"),
-            (self.task_id.as_str(), "agent_activation_resolution_result.task_id"),
-            (self.work_unit_id.as_str(), "agent_activation_resolution_result.work_unit_id"),
-            (self.work_scope_id.as_str(), "agent_activation_resolution_result.work_scope_id"),
-            (self.task_revision.as_str(), "agent_activation_resolution_result.task_revision"),
-            (self.plan_id.as_str(), "agent_activation_resolution_result.plan_id"),
-            (self.plan_revision.as_str(), "agent_activation_resolution_result.plan_revision"),
+            (
+                self.principal_id.as_str(),
+                "agent_activation_resolution_result.principal_id",
+            ),
+            (
+                self.session_id.as_str(),
+                "agent_activation_resolution_result.session_id",
+            ),
+            (
+                self.task_id.as_str(),
+                "agent_activation_resolution_result.task_id",
+            ),
+            (
+                self.work_unit_id.as_str(),
+                "agent_activation_resolution_result.work_unit_id",
+            ),
+            (
+                self.work_scope_id.as_str(),
+                "agent_activation_resolution_result.work_scope_id",
+            ),
+            (
+                self.task_revision.as_str(),
+                "agent_activation_resolution_result.task_revision",
+            ),
+            (
+                self.plan_id.as_str(),
+                "agent_activation_resolution_result.plan_id",
+            ),
+            (
+                self.plan_revision.as_str(),
+                "agent_activation_resolution_result.plan_revision",
+            ),
         ] {
             bounded_text(value, field)?;
         }
@@ -216,10 +240,18 @@ impl AgentActivationRetryDirective {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum AgentActivationResolutionDisposition {
-    Resolved { binding: Box<AgentActivationResolvedBinding> },
-    TaskSelectionRequired { selection: AgentActivationSelectionDirective },
-    ScopeSelectionRequired { selection: AgentActivationSelectionDirective },
-    ScopeAmbiguous { selection: AgentActivationSelectionDirective },
+    Resolved {
+        binding: Box<AgentActivationResolvedBinding>,
+    },
+    TaskSelectionRequired {
+        selection: AgentActivationSelectionDirective,
+    },
+    ScopeSelectionRequired {
+        selection: AgentActivationSelectionDirective,
+    },
+    ScopeAmbiguous {
+        selection: AgentActivationSelectionDirective,
+    },
     NotReady {
         recovery_handle: String,
         retry: AgentActivationRetryDirective,
@@ -228,7 +260,9 @@ pub enum AgentActivationResolutionDisposition {
         recovery_handle: String,
         observed_state_fence: Option<StateFence>,
     },
-    FailedInternal { failure_handle: String },
+    FailedInternal {
+        failure_handle: String,
+    },
 }
 
 impl AgentActivationResolutionDisposition {
@@ -238,12 +272,24 @@ impl AgentActivationResolutionDisposition {
             Self::TaskSelectionRequired { selection } => selection.validate_task_selection(),
             Self::ScopeSelectionRequired { selection } => selection.validate_scope_selection(),
             Self::ScopeAmbiguous { selection } => selection.validate_scope_ambiguity(),
-            Self::NotReady { recovery_handle, retry } => {
-                bounded_text(recovery_handle, "agent_activation_resolution_result.recovery_handle")?;
+            Self::NotReady {
+                recovery_handle,
+                retry,
+            } => {
+                bounded_text(
+                    recovery_handle,
+                    "agent_activation_resolution_result.recovery_handle",
+                )?;
                 retry.validate()
             }
-            Self::StaleFence { recovery_handle, observed_state_fence } => {
-                bounded_text(recovery_handle, "agent_activation_resolution_result.recovery_handle")?;
+            Self::StaleFence {
+                recovery_handle,
+                observed_state_fence,
+            } => {
+                bounded_text(
+                    recovery_handle,
+                    "agent_activation_resolution_result.recovery_handle",
+                )?;
                 if let Some(fence) = observed_state_fence {
                     fence.validate().map_err(ProtocolError::Foundation)?;
                 }
@@ -263,18 +309,16 @@ impl AgentActivationResolutionDisposition {
     ) -> Result<(), ProtocolError> {
         self.validate()?;
         match self {
-            Self::NotReady { retry, .. } => retry.validate_window(
-                resolved_at_unix_ms,
-                ticket.kernel_deadline_unix_ms,
-            ),
-            Self::StaleFence { observed_state_fence: Some(observed), .. }
-                if observed == &ticket.state_fence =>
-            {
-                Err(ProtocolError::InvalidField {
-                    field: "agent_activation_resolution_result.observed_state_fence",
-                    reason: "must differ from the ticket fence when supplied",
-                })
+            Self::NotReady { retry, .. } => {
+                retry.validate_window(resolved_at_unix_ms, ticket.kernel_deadline_unix_ms)
             }
+            Self::StaleFence {
+                observed_state_fence: Some(observed),
+                ..
+            } if observed == &ticket.state_fence => Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_result.observed_state_fence",
+                reason: "must differ from the ticket fence when supplied",
+            }),
             _ => Ok(()),
         }
     }
@@ -330,7 +374,9 @@ impl AgentActivationResolutionResult {
     }
 
     pub fn compute_digest(&self) -> Result<String, ProtocolError> {
-        Ok(eliot_contracts::sha256_hex(&self.canonical_unsigned_bytes()?))
+        Ok(eliot_contracts::sha256_hex(
+            &self.canonical_unsigned_bytes()?,
+        ))
     }
 
     pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
@@ -347,9 +393,17 @@ impl AgentActivationResolutionResult {
                 reason: "unsupported semantic resolution result",
             });
         }
-        bounded_text(&self.ticket_id, "agent_activation_resolution_result.ticket_id")?;
-        lowercase_sha256(&self.ticket_sha256, "agent_activation_resolution_result.ticket_sha256")?;
-        self.ticket_state_fence.validate().map_err(ProtocolError::Foundation)?;
+        bounded_text(
+            &self.ticket_id,
+            "agent_activation_resolution_result.ticket_id",
+        )?;
+        lowercase_sha256(
+            &self.ticket_sha256,
+            "agent_activation_resolution_result.ticket_sha256",
+        )?;
+        self.ticket_state_fence
+            .validate()
+            .map_err(ProtocolError::Foundation)?;
         if self.resolved_at_unix_ms == 0 {
             return Err(ProtocolError::InvalidField {
                 field: "agent_activation_resolution_result.resolved_at_unix_ms",
@@ -357,7 +411,10 @@ impl AgentActivationResolutionResult {
             });
         }
         self.disposition.validate()?;
-        lowercase_sha256(&self.result_sha256, "agent_activation_resolution_result.result_sha256")?;
+        lowercase_sha256(
+            &self.result_sha256,
+            "agent_activation_resolution_result.result_sha256",
+        )?;
         if self.result_sha256 != self.compute_digest()? {
             return Err(ProtocolError::InvalidField {
                 field: "agent_activation_resolution_result.result_sha256",
@@ -388,12 +445,16 @@ impl AgentActivationResolutionResult {
                 reason: "must be earlier than the Kernel ticket deadline",
             });
         }
-        self.disposition.validate_against(ticket, self.resolved_at_unix_ms)
+        self.disposition
+            .validate_against(ticket, self.resolved_at_unix_ms)
     }
 
     #[must_use]
     pub fn is_transient_retry(&self) -> bool {
-        matches!(&self.disposition, AgentActivationResolutionDisposition::NotReady { .. })
+        matches!(
+            &self.disposition,
+            AgentActivationResolutionDisposition::NotReady { .. }
+        )
     }
 
     #[must_use]

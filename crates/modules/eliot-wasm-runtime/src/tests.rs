@@ -824,10 +824,7 @@ fn p03_start_and_separate_receipt_verification_precede_engine() {
 fn engine_receives_exact_admission_limits_and_inert_process_binding() {
     let (mut runtime, state) = runtime(Config::default());
     let result = runtime.execute(request());
-    assert_eq!(
-        result.receipt.disposition,
-        InvocationDisposition::Succeeded
-    );
+    assert_eq!(result.receipt.disposition, InvocationDisposition::Succeeded);
     assert_eq!(
         result
             .receipt

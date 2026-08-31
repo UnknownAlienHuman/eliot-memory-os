@@ -209,8 +209,7 @@ impl ExperienceProjection {
                     reason: "ranks must be contiguous and identities unique",
                 });
             }
-            if previous_experience_id
-                .is_some_and(|previous| previous >= &item.record.experience_id)
+            if previous_experience_id.is_some_and(|previous| previous >= &item.record.experience_id)
             {
                 return Err(ExperienceProjectionError::Invalid {
                     field: "projection.matches",
@@ -230,9 +229,7 @@ impl ExperienceProjection {
                     relation.relation_id.clone(),
                 ));
             }
-            if previous_relation_id
-                .is_some_and(|previous| previous >= &relation.relation_id)
-            {
+            if previous_relation_id.is_some_and(|previous| previous >= &relation.relation_id) {
                 return Err(ExperienceProjectionError::Invalid {
                     field: "projection.relations",
                     reason: "relations must be strictly ordered by identity",
@@ -376,10 +373,7 @@ pub fn project_experience(
         .filter(|record| record_matches_query(record, &query))
         .collect::<Vec<_>>();
     let matched_record_count = filtered.len();
-    let returned = filtered
-        .into_iter()
-        .take(query.limit)
-        .collect::<Vec<_>>();
+    let returned = filtered.into_iter().take(query.limit).collect::<Vec<_>>();
     let returned_ids = returned
         .iter()
         .map(|record| record.experience_id.clone())
@@ -717,13 +711,15 @@ mod tests {
         let right = project_experience(request(2), &[first, second], &[edge])?;
 
         assert_eq!(left, right);
-        assert_eq!(left.matches[0].record.experience_id, ArtifactId::new("exp-a")?);
+        assert_eq!(
+            left.matches[0].record.experience_id,
+            ArtifactId::new("exp-a")?
+        );
         Ok(())
     }
 
     #[test]
-    fn complete_coverage_requires_exact_denominator()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn complete_coverage_requires_exact_denominator() -> Result<(), Box<dyn std::error::Error>> {
         let record = experience("exp-a", "scope-a", "task-a", "passed")?;
         assert!(matches!(
             project_experience(request(2), &[record], &[]),
@@ -760,8 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_and_relation_endpoint_failures_are_typed()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn scope_and_relation_endpoint_failures_are_typed() -> Result<(), Box<dyn std::error::Error>> {
         let wrong_scope = experience("exp-a", "scope-b", "task-a", "passed")?;
         assert!(matches!(
             project_experience(request(1), &[wrong_scope], &[]),
@@ -809,11 +804,8 @@ mod tests {
     fn forged_query_membership_and_count_cannot_self_validate()
     -> Result<(), Box<dyn std::error::Error>> {
         let record = experience("exp-a", "scope-a", "task-a", "passed")?;
-        let mut noncanonical_query = project_experience(
-            request(1),
-            std::slice::from_ref(&record),
-            &[],
-        )?;
+        let mut noncanonical_query =
+            project_experience(request(1), std::slice::from_ref(&record), &[])?;
         noncanonical_query.query.terms = vec!["PASS".to_owned()];
         assert!(matches!(
             noncanonical_query.validate(),
