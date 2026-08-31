@@ -1,19 +1,16 @@
 #![allow(clippy::expect_used)]
 
-use std::collections::BTreeMap;
-
 use eliot_contracts::{
     AuthorityEpoch, ClockReading, OperationId, ProductId, RequestId, ResourceGeneration, SourceId,
     StateFence,
 };
 use eliot_store_api::{
-    CommitId, CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents,
-    OperationIdentity, OperationManifestDigest, OrderingScopeId, OWNER_SNAPSHOT_SCHEMA,
-    PreparedTransition, RecoveryRecord, RequestMeta, Resubmission, ScopeId, SecurityContext,
-    StoreError, StoreFailure, StoreFailureDisposition, StoreFailureIdentityContext,
-    StoreGenesisRequest, StoreMutationDisposition, StoreRecoveryAction, StoreRetryDirective,
-    TransitionClass, WriteReceipt, WriteReceiptStatus, genesis_transition,
-    issue_store_receipt_envelope, sha256_hex,
+    CommitId, CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, OperationIdentity,
+    OperationManifestDigest, OrderingScopeId, OWNER_SNAPSHOT_SCHEMA, PreparedTransition,
+    RecoveryRecord, RequestMeta, Resubmission, ScopeId, SecurityContext, StoreError, StoreFailure,
+    StoreFailureDisposition, StoreFailureIdentityContext, StoreGenesisRequest,
+    StoreMutationDisposition, StoreRecoveryAction, StoreRetryDirective, TransitionClass,
+    WriteReceipt, WriteReceiptStatus, genesis_transition, issue_store_receipt_envelope, sha256_hex,
 };
 
 use super::{
@@ -114,7 +111,7 @@ fn typed_failure(response: Response) -> StoreFailure {
 
 fn genesis_request() -> TestResult<StoreGenesisRequest> {
     let payload = br#"{"current_plan":null}"#.to_vec();
-    StoreGenesisRequest {
+    Ok(StoreGenesisRequest {
         contract_version: CONTRACT_VERSION,
         operation_id: OperationId::new("operation-genesis-typed-failure")?,
         idempotency_key: "retry-genesis-typed-failure".to_owned(),
@@ -130,8 +127,7 @@ fn genesis_request() -> TestResult<StoreGenesisRequest> {
             payload,
         }],
     }
-    .with_computed_digest()
-    .map_err(Into::into)
+    .with_computed_digest()?)
 }
 
 fn genesis_receipt(context: &RequestMeta, request: &StoreGenesisRequest) -> TestResult<WriteReceipt> {
