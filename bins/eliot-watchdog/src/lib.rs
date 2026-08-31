@@ -1567,7 +1567,7 @@ mod tests {
                     wait_hint_ms: 250,
                 })
                 .state,
-            HostObservationState::AbsentOrStopped
+            HostObservationState::Unknown
         );
         assert!(monitor.canonical_identity().is_none());
         assert_eq!(
@@ -1670,7 +1670,7 @@ mod tests {
 
     #[test]
     fn watchdog_production_path_is_root_bound_and_read_only() {
-        let source = include_str!("main.rs");
+        let source = include_str!("runtime_loop.rs");
         let library = include_str!("lib.rs");
         assert!(source.contains("host_state_root"));
         assert!(source.contains("FileWatchdogAdmission::from_registry"));
