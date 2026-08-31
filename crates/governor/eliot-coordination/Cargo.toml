@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Durable, idempotent and epoch-fenced multi-actor coordination owner"
 
+[lib]
+path = "src/root.rs"
+
 [dependencies]
 eliot-contracts.workspace = true
 schemars.workspace = true
