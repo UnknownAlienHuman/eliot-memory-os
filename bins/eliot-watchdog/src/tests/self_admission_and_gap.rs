@@ -231,6 +231,10 @@ fn lease_gap_classification_is_typed_and_rebaseline_is_explicit() {
         kernel_gap_reason(&KernelWatchdogError::LeaseFenced),
         GapRecoveryReason::LeaseFenced
     );
+    assert_eq!(
+        kernel_gap_reason(&KernelWatchdogError::SpoolPressure),
+        GapRecoveryReason::SpoolPressure
+    );
 
     let mut monitor = HostIdentityMonitor::new(None);
     let identity = ProcessIdentity {
