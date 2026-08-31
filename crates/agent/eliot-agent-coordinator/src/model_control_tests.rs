@@ -166,6 +166,35 @@ fn query(free_only: bool) -> ModelQuery {
 }
 
 #[test]
+fn catalogue_entry_requires_exact_route_host_family_binding() {
+    let exact = snapshot(vec![entry(
+        "exact-host-family",
+        "provider-a",
+        "model-a",
+        "family-a",
+        BillingClass::Free,
+        QuotaDisposition::Available,
+        1,
+    )]);
+    assert_eq!(exact.validate(), Ok(()));
+
+    let mut mismatched_entry = entry(
+        "mismatched-host-family",
+        "provider-a",
+        "model-a",
+        "family-a",
+        BillingClass::Free,
+        QuotaDisposition::Available,
+        1,
+    );
+    mismatched_entry.host_family = "codex".to_owned();
+    assert_eq!(
+        snapshot(vec![mismatched_entry]).validate(),
+        Err(ModelControlError::InvalidField("entry.route_binding"))
+    );
+}
+
+#[test]
 fn free_query_uses_billing_evidence_not_model_name() -> TestResult {
     let catalogue = snapshot(vec![
         entry(
@@ -507,6 +536,7 @@ fn equivalent_input_permutation_has_same_selection_identity() -> TestResult {
         NOW,
     )?;
     assert_eq!(left.selected.entry_id, right.selected.entry_id);
+    assert_eq!(left.catalogue_digest, right.catalogue_digest);
     assert_eq!(left.selection_digest, right.selection_digest);
     Ok(())
 }
