@@ -25,6 +25,18 @@ pub enum EpistemicError {
     EmptyInput,
     #[error("epistemic input contains duplicate handle {0}")]
     DuplicateHandle(ArtifactId),
+    #[error("record {handle} supersedes itself")]
+    SelfSupersession { handle: ArtifactId },
+    #[error("record {handle} contains duplicate predecessor {predecessor}")]
+    DuplicatePredecessor {
+        handle: ArtifactId,
+        predecessor: ArtifactId,
+    },
+    #[error("record {handle} references missing predecessor {predecessor}")]
+    MissingPredecessor {
+        handle: ArtifactId,
+        predecessor: ArtifactId,
+    },
     #[error("record {handle} has a scope different from the requested scope")]
     ScopeMismatch { handle: ArtifactId },
     #[error("record {handle} is not compatible with the requested state fence")]
@@ -98,6 +110,20 @@ impl EpistemicRecord {
                 handle: self.handle.clone(),
                 reason: source.to_string(),
             })?;
+        let mut predecessors = BTreeSet::new();
+        for predecessor in &self.supersedes {
+            if predecessor == &self.handle {
+                return Err(EpistemicError::SelfSupersession {
+                    handle: self.handle.clone(),
+                });
+            }
+            if !predecessors.insert(predecessor.clone()) {
+                return Err(EpistemicError::DuplicatePredecessor {
+                    handle: self.handle.clone(),
+                    predecessor: predecessor.clone(),
+                });
+            }
+        }
         if let Some(note) = &self.note {
             text(note, "record.note")?;
         }
@@ -133,6 +159,16 @@ impl PositionRequest {
             }
             record.validate(self.scope.as_str(), &self.state_fence)?;
         }
+        for record in &self.records {
+            for predecessor in &record.supersedes {
+                if !handles.contains(predecessor) {
+                    return Err(EpistemicError::MissingPredecessor {
+                        handle: record.handle.clone(),
+                        predecessor: predecessor.clone(),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -167,22 +203,61 @@ pub struct CurrentEpistemicPosition {
     pub provenance: ProvenanceView,
 }
 
+const fn is_current_freshness(freshness: EvidenceFreshness) -> bool {
+    matches!(
+        freshness,
+        EvidenceFreshness::ExactCandidate
+            | EvidenceFreshness::ExactCommit
+            | EvidenceFreshness::ExactQuiescedWorktree
+    )
+}
+
 /// Resolve one question without ranking by prose, vote count, or model output.
+#[allow(clippy::too_many_lines)]
 pub fn resolve(request: &PositionRequest) -> Result<CurrentEpistemicPosition, EpistemicError> {
     request.validate()?;
     let mut direct = BTreeSet::new();
     let mut supporting = BTreeSet::new();
     let mut rivals = BTreeSet::new();
     let mut stale = BTreeSet::new();
-    let mut superseded = BTreeSet::new();
     let mut unknowns = BTreeSet::new();
     let mut inquiries = BTreeSet::new();
     let mut current = Vec::new();
+    let mut superseded = request
+        .records
+        .iter()
+        .flat_map(|record| record.supersedes.iter().cloned())
+        .collect::<BTreeSet<_>>();
 
     for record in &request.records {
-        if record.evidence.freshness == EvidenceFreshness::Stale {
+        if let Some(note) = &record.note {
+            inquiries.insert(note.clone());
+        }
+        if !is_current_freshness(record.evidence.freshness) {
             stale.insert(record.handle.clone());
-            inquiries.insert(format!("revalidate {}", record.handle));
+            let inquiry = if record.evidence.freshness == EvidenceFreshness::Stale {
+                format!("revalidate {}", record.handle)
+            } else {
+                format!("establish freshness for {}", record.handle)
+            };
+            inquiries.insert(inquiry);
+            match record.evidence.status {
+                EpistemicStatus::Unknown => {
+                    unknowns.insert(record.subject.clone());
+                    inquiries.insert(format!("obtain evidence for {}", record.subject));
+                }
+                EpistemicStatus::Superseded => {
+                    superseded.insert(record.handle.clone());
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if superseded.contains(&record.handle) {
+            if record.evidence.status == EpistemicStatus::Unknown {
+                unknowns.insert(record.subject.clone());
+                inquiries.insert(format!("obtain evidence for {}", record.subject));
+            }
             continue;
         }
         match record.evidence.status {
@@ -214,16 +289,6 @@ pub fn resolve(request: &PositionRequest) -> Result<CurrentEpistemicPosition, Ep
                 inquiries.insert(format!("obtain evidence for {}", record.subject));
             }
         }
-        if matches!(
-            record.evidence.freshness,
-            EvidenceFreshness::Stale | EvidenceFreshness::Unknown
-        ) {
-            stale.insert(record.handle.clone());
-            inquiries.insert(format!("establish freshness for {}", record.handle));
-        }
-        if let Some(note) = &record.note {
-            inquiries.insert(note.clone());
-        }
     }
     if current.is_empty() {
         unknowns.insert(request.question.clone());
@@ -245,14 +310,7 @@ pub fn resolve(request: &PositionRequest) -> Result<CurrentEpistemicPosition, Ep
     ) {
         inquiries.insert("perform the cheapest discriminative inquiry".to_owned());
     }
-    let provenance = provenance_for(
-        &request.records,
-        &direct,
-        &supporting,
-        &rivals,
-        &stale,
-        &superseded,
-    );
+    let provenance = provenance_for(&request.records);
     Ok(CurrentEpistemicPosition {
         question: request.question.clone(),
         scope: request.scope.clone(),
@@ -269,22 +327,10 @@ pub fn resolve(request: &PositionRequest) -> Result<CurrentEpistemicPosition, Ep
     })
 }
 
-fn provenance_for(
-    records: &[EpistemicRecord],
-    direct: &BTreeSet<ArtifactId>,
-    supporting: &BTreeSet<ArtifactId>,
-    rivals: &BTreeSet<ArtifactId>,
-    stale: &BTreeSet<ArtifactId>,
-    superseded: &BTreeSet<ArtifactId>,
-) -> ProvenanceView {
-    let selected: BTreeSet<_> = direct
-        .iter()
-        .chain(supporting)
-        .chain(rivals)
-        .chain(stale)
-        .chain(superseded)
-        .cloned()
-        .collect();
+fn provenance_for(records: &[EpistemicRecord]) -> ProvenanceView {
+    // Every admitted record remains addressable, including unknown and stale
+    // evidence that cannot promote the current position.
+    let selected: BTreeSet<_> = records.iter().map(|record| record.handle.clone()).collect();
     let mut sources = BTreeSet::new();
     let mut raw = BTreeSet::new();
     let mut revisions = BTreeSet::new();
@@ -299,7 +345,7 @@ fn provenance_for(
         }
         assertability = lowest_assertability(assertability, record.evidence.assertability);
     }
-    let mixed_sources = sources_len(records, &selected) > 1;
+    let mixed_sources = sources.len() > 1;
     ProvenanceView {
         record_handles: selected.into_iter().collect(),
         source_ids: sources.into_iter().collect(),
@@ -310,15 +356,6 @@ fn provenance_for(
     }
 }
 
-fn sources_len(records: &[EpistemicRecord], selected: &BTreeSet<ArtifactId>) -> usize {
-    records
-        .iter()
-        .filter(|r| selected.contains(&r.handle))
-        .map(|r| r.evidence.provenance.source_id.clone())
-        .collect::<BTreeSet<_>>()
-        .len()
-}
-
 fn lowest_assertability(left: Assertability, right: Assertability) -> Assertability {
     match (left, right) {
         (Assertability::AbstainOrFence, _) | (_, Assertability::AbstainOrFence) => {
@@ -327,5 +364,250 @@ fn lowest_assertability(left: Assertability, right: Assertability) -> Assertabil
         (Assertability::NonAssertableUnverified, _)
         | (_, Assertability::NonAssertableUnverified) => Assertability::NonAssertableUnverified,
         _ => Assertability::Assertable,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use eliot_contracts::{AuthorityEpoch, ContractId, ResourceGeneration, SourceId};
+    use eliot_evidence::{EvidenceAuthority, EvidenceCoverage, Provenance, VerificationBinding};
+
+    fn fence() -> StateFence {
+        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    }
+
+    fn id(value: &str) -> ArtifactId {
+        ArtifactId::new(value).expect("valid fixture artifact id")
+    }
+
+    fn envelope(
+        status: EpistemicStatus,
+        freshness: EvidenceFreshness,
+        source: &str,
+        revision: &str,
+    ) -> EvidenceEnvelope {
+        let assertability = match status {
+            EpistemicStatus::Supported | EpistemicStatus::Verified => Assertability::Assertable,
+            _ => Assertability::NonAssertableUnverified,
+        };
+        let verification = (status == EpistemicStatus::Verified).then(|| VerificationBinding {
+            contract_id: ContractId::new(format!("contract:{source}"))
+                .expect("valid fixture contract id"),
+            run_id: id(&format!("run:{source}:{revision}")),
+            revision: revision.to_owned(),
+        });
+        EvidenceEnvelope {
+            authority: EvidenceAuthority::DeterministicRuntimeTest,
+            freshness,
+            coverage: EvidenceCoverage::CompleteForScope,
+            status,
+            assertability,
+            provenance: Provenance {
+                source_id: SourceId::new(source).expect("valid fixture source id"),
+                capture_route: "fixture.epistemic".to_owned(),
+                scope: "scope".to_owned(),
+                raw_handle: Some(format!("raw:{source}:{revision}")),
+                revision: Some(revision.to_owned()),
+            },
+            verification,
+            state_fence: fence(),
+        }
+    }
+
+    fn record(
+        handle: &str,
+        status: EpistemicStatus,
+        freshness: EvidenceFreshness,
+        supersedes: Vec<ArtifactId>,
+    ) -> EpistemicRecord {
+        EpistemicRecord {
+            handle: id(handle),
+            subject: format!("subject:{handle}"),
+            scope: "scope".to_owned(),
+            evidence: envelope(status, freshness, &format!("source:{handle}"), handle),
+            supersedes,
+            note: None,
+        }
+    }
+
+    fn request(records: Vec<EpistemicRecord>) -> PositionRequest {
+        PositionRequest {
+            question: "question".to_owned(),
+            scope: "scope".to_owned(),
+            state_fence: fence(),
+            records,
+        }
+    }
+
+    #[test]
+    fn only_exact_current_verified_evidence_supports_position() {
+        let current = record(
+            "current",
+            EpistemicStatus::Verified,
+            EvidenceFreshness::ExactCandidate,
+            Vec::new(),
+        );
+        let older = record(
+            "older",
+            EpistemicStatus::Verified,
+            EvidenceFreshness::KnownOlderSnapshot,
+            Vec::new(),
+        );
+        let unknown = record(
+            "unknown",
+            EpistemicStatus::Verified,
+            EvidenceFreshness::Unknown,
+            Vec::new(),
+        );
+        let result = resolve(&request(vec![current, older, unknown])).expect("valid request");
+
+        assert_eq!(result.state, PositionState::Supported);
+        assert_eq!(result.supporting_records, vec![id("current")]);
+        assert_eq!(result.direct_observations, Vec::<ArtifactId>::new());
+        assert_eq!(result.rival_records, Vec::<ArtifactId>::new());
+        assert_eq!(result.stale_records, vec![id("older"), id("unknown")]);
+        assert_eq!(
+            result.provenance.record_handles,
+            vec![id("current"), id("older"), id("unknown")]
+        );
+        assert_eq!(
+            result.provenance.revisions,
+            vec!["current", "older", "unknown"]
+        );
+        assert_eq!(
+            result.provenance.raw_handles,
+            vec![
+                "raw:source:current:current",
+                "raw:source:older:older",
+                "raw:source:unknown:unknown"
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_predecessor_is_rejected_against_admitted_request_set() {
+        let successor = record(
+            "successor",
+            EpistemicStatus::Verified,
+            EvidenceFreshness::ExactCommit,
+            vec![id("missing")],
+        );
+
+        assert!(matches!(
+            resolve(&request(vec![successor])),
+            Err(EpistemicError::MissingPredecessor { handle, predecessor })
+                if handle == id("successor") && predecessor == id("missing")
+        ));
+    }
+
+    #[test]
+    fn self_and_duplicate_predecessors_are_rejected() {
+        let self_reference = record(
+            "self",
+            EpistemicStatus::Supported,
+            EvidenceFreshness::ExactCandidate,
+            vec![id("self")],
+        );
+        assert!(matches!(
+            resolve(&request(vec![self_reference])),
+            Err(EpistemicError::SelfSupersession { handle }) if handle == id("self")
+        ));
+
+        let duplicate = record(
+            "successor",
+            EpistemicStatus::Supported,
+            EvidenceFreshness::ExactCandidate,
+            vec![id("predecessor"), id("predecessor")],
+        );
+        let predecessor = record(
+            "predecessor",
+            EpistemicStatus::Supported,
+            EvidenceFreshness::ExactCandidate,
+            Vec::new(),
+        );
+        assert!(matches!(
+            resolve(&request(vec![duplicate, predecessor])),
+            Err(EpistemicError::DuplicatePredecessor { handle, predecessor })
+                if handle == id("successor") && predecessor == id("predecessor")
+        ));
+    }
+
+    #[test]
+    fn stale_and_unknown_freshness_remain_addressable_without_current_promotion() {
+        let older = record(
+            "older",
+            EpistemicStatus::Verified,
+            EvidenceFreshness::KnownOlderSnapshot,
+            Vec::new(),
+        );
+        let unknown = record(
+            "unknown",
+            EpistemicStatus::Unknown,
+            EvidenceFreshness::Unknown,
+            Vec::new(),
+        );
+        let result = resolve(&request(vec![older, unknown])).expect("valid request");
+
+        assert_eq!(result.state, PositionState::Stale);
+        assert!(result.direct_observations.is_empty());
+        assert!(result.supporting_records.is_empty());
+        assert!(result.rival_records.is_empty());
+        assert_eq!(result.stale_records, vec![id("older"), id("unknown")]);
+        assert!(result.unknowns.contains(&"subject:unknown".to_owned()));
+        assert!(result.provenance.record_handles.contains(&id("older")));
+        assert!(result.provenance.record_handles.contains(&id("unknown")));
+    }
+
+    #[test]
+    fn superseded_lineage_and_provenance_are_permutation_invariant() {
+        let predecessor_a = record(
+            "predecessor-a",
+            EpistemicStatus::Verified,
+            EvidenceFreshness::ExactCommit,
+            Vec::new(),
+        );
+        let predecessor_z = record(
+            "predecessor-z",
+            EpistemicStatus::Verified,
+            EvidenceFreshness::ExactCommit,
+            Vec::new(),
+        );
+        let successor = record(
+            "successor",
+            EpistemicStatus::Verified,
+            EvidenceFreshness::ExactCandidate,
+            vec![id("predecessor-z"), id("predecessor-a")],
+        );
+        let original_verification = successor.evidence.verification.clone();
+
+        let first = resolve(&request(vec![
+            successor.clone(),
+            predecessor_z.clone(),
+            predecessor_a.clone(),
+        ]))
+        .expect("valid request");
+
+        let mut reordered_successor = successor.clone();
+        reordered_successor.supersedes.reverse();
+        let second = resolve(&request(vec![
+            predecessor_a,
+            reordered_successor,
+            predecessor_z,
+        ]))
+        .expect("valid request");
+
+        assert_eq!(first, second);
+        assert_eq!(first.supporting_records, vec![id("successor")]);
+        assert_eq!(
+            first.superseded_records,
+            vec![id("predecessor-a"), id("predecessor-z")]
+        );
+        assert_eq!(
+            first.provenance.record_handles,
+            vec![id("predecessor-a"), id("predecessor-z"), id("successor")]
+        );
+        assert_eq!(successor.evidence.verification, original_verification);
     }
 }
