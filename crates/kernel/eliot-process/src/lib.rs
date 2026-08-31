@@ -31,8 +31,8 @@ pub use dispatch_permit::{
 
 mod execution_evidence;
 pub use execution_evidence::{
-    CancellationReceipt, CancellationRequest, PROCESS_EVIDENCE_SCHEMA_VERSION, ProcessEvidence,
-    ProcessExecutionView,
+    CancellationReceipt, CancellationRequest, PROCESS_EVIDENCE_LEGACY_SCHEMA_VERSION,
+    PROCESS_EVIDENCE_SCHEMA_VERSION, ProcessEvidence, ProcessExecutionView,
 };
 
 /// Current provider-neutral process contract revision.

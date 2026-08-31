@@ -198,12 +198,10 @@ fn validate_legacy_reference_shape(value: &str) -> Result<(), ProcessStreamEvide
     Ok(())
 }
 
-fn parse_legacy_reference(
-    value: &str,
-) -> Result<(String, u64, StreamTransportStatus), ProcessStreamEvidenceError> {
+fn validate_legacy_reference(value: &str) -> Result<(), ProcessStreamEvidenceError> {
     validate_legacy_reference_shape(value)?;
     let Some(payload) = value.strip_prefix("raw:p04-stream:") else {
-        return Ok((sha256_hex(&[]), 0, StreamTransportStatus::UnknownOutcome));
+        return Ok(());
     };
     let fields = payload.split(':').collect::<Vec<_>>();
     if fields.len() != 6
@@ -218,27 +216,19 @@ fn parse_legacy_reference(
     }
     let digest = fields[1].to_owned();
     validate_digest("legacy_reference.sha256", &digest)?;
-    let bytes = fields[3]
+    let _bytes = fields[3]
         .parse::<u64>()
         .map_err(|_| ProcessStreamEvidenceError::Invariant {
             field: "legacy_reference.bytes",
             reason: "legacy p04 stream byte count is invalid",
         })?;
-    let complete = fields[5]
+    let _complete = fields[5]
         .parse::<bool>()
         .map_err(|_| ProcessStreamEvidenceError::Invariant {
             field: "legacy_reference.complete",
             reason: "legacy p04 stream completion flag is invalid",
         })?;
-    Ok((
-        digest,
-        bytes,
-        if complete {
-            StreamTransportStatus::Complete
-        } else {
-            StreamTransportStatus::UnknownOutcome
-        },
-    ))
+    Ok(())
 }
 
 fn validate_digest(field: &'static str, value: &str) -> Result<(), ProcessStreamEvidenceError> {

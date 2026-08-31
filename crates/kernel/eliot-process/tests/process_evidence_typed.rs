@@ -1,10 +1,10 @@
 use eliot_contracts::sha256_hex;
 use eliot_instrument_api::EvidenceAxes;
 use eliot_process::{
-    DurableProcessStreamSource, DurableStreamLocatorKind, PROCESS_EVIDENCE_SCHEMA_VERSION,
-    ProcessEvidence, ProcessExecutionBinding, ProcessExecutionView, ProcessStreamEvidence,
-    ProcessStreamKind, ProcessStreamPolicyBinding, ProcessStreamPrefixPreview,
-    StreamPersistenceStatus, StreamTransportStatus,
+    DurableProcessStreamSource, DurableStreamLocatorKind, PROCESS_EVIDENCE_LEGACY_SCHEMA_VERSION,
+    PROCESS_EVIDENCE_SCHEMA_VERSION, ProcessEvidence, ProcessExecutionBinding,
+    ProcessExecutionView, ProcessStreamEvidence, ProcessStreamKind, ProcessStreamPolicyBinding,
+    ProcessStreamPrefixPreview, StreamPersistenceStatus, StreamTransportStatus,
 };
 use serde_json::{Value, json};
 
@@ -92,6 +92,7 @@ fn legacy_wire(
     stderr_ref: &Value,
 ) -> TestResult<Value> {
     Ok(json!({
+        "schema_version": PROCESS_EVIDENCE_LEGACY_SCHEMA_VERSION,
         "view": serde_json::to_value(view)?,
         "stdout_ref": stdout_ref,
         "stderr_ref": stderr_ref,
@@ -115,6 +116,10 @@ fn typed_stdout_and_stderr_round_trip_without_legacy_fields() -> TestResult {
     assert!(wire.get("stdout_ref").is_none());
     assert!(wire.get("stderr_ref").is_none());
     assert_eq!(serde_json::from_value::<ProcessEvidence>(wire)?, evidence);
+
+    let mut prior_stream_wire = serde_json::to_value(evidence.stdout().ok_or("missing stdout")?)?;
+    prior_stream_wire["schema_version"] = json!("eliot-process-stream-evidence-v1");
+    assert!(serde_json::from_value::<ProcessStreamEvidence>(prior_stream_wire).is_ok());
     Ok(())
 }
 
@@ -216,7 +221,14 @@ fn legacy_raw_references_are_quarantined_as_unresolved_source_unavailable() -> T
         StreamPersistenceStatus::SourceUnavailable
     );
     assert_eq!(stdout.source(), None);
-    assert_eq!(stdout.observed_bytes(), 7);
+    assert_eq!(stdout.observed_sha256(), sha256_hex(&[]));
+    assert_eq!(stdout.observed_bytes(), 0);
+    assert_eq!(stdout.transport(), StreamTransportStatus::UnknownOutcome);
+    assert!(
+        stdout
+            .gaps()
+            .contains(&eliot_process::StreamEvidenceGap::UnknownOutcome)
+    );
     assert_eq!(evidence.stdout_ref(), stdout.legacy_reference());
 
     let reencoded = serde_json::to_value(evidence)?;
@@ -225,6 +237,13 @@ fn legacy_raw_references_are_quarantined_as_unresolved_source_unavailable() -> T
         reencoded["stdout"]["persistence"],
         json!("SOURCE_UNAVAILABLE")
     );
+
+    let mut unversioned = legacy_wire(&view, &Value::Null, &Value::Null)?;
+    unversioned
+        .as_object_mut()
+        .ok_or("expected object")?
+        .remove("schema_version");
+    assert!(serde_json::from_value::<ProcessEvidence>(unversioned).is_err());
     Ok(())
 }
 
@@ -247,6 +266,15 @@ fn malformed_legacy_references_and_completion_forgery_fail_closed() -> TestResul
     let mut forged = serde_json::to_value(evidence)?;
     forged["stdout"]["persistence"] = json!("COMPLETE_SOURCE");
     assert!(serde_json::from_value::<ProcessEvidence>(forged).is_err());
+
+    let forged_binding = crate::binding("operation-2")?;
+    let mut forged_legacy =
+        serde_json::to_value(stream(forged_binding, ProcessStreamKind::Stdout)?)?;
+    forged_legacy["legacy_reference"] = json!(format!(
+        "raw:p04-stream:sha256:{}:bytes:0:complete:true",
+        sha256_hex(&[])
+    ));
+    assert!(serde_json::from_value::<ProcessStreamEvidence>(forged_legacy).is_err());
     Ok(())
 }
 

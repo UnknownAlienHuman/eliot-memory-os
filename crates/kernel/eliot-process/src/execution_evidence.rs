@@ -28,6 +28,8 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 
 /// Current wire revision for reconciliation evidence.
 pub const PROCESS_EVIDENCE_SCHEMA_VERSION: &str = "eliot-process-evidence-v2";
+/// Explicit migration-only wire revision for legacy raw stream references.
+pub const PROCESS_EVIDENCE_LEGACY_SCHEMA_VERSION: &str = "eliot-process-evidence-legacy-v1";
 
 /// Typed process execution view.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -287,6 +289,29 @@ impl<'de> Deserialize<'de> for ProcessEvidence {
                 }
                 (wire.stdout, wire.stderr)
             }
+            LegacyReferenceWire::Value(version)
+                if version == PROCESS_EVIDENCE_LEGACY_SCHEMA_VERSION =>
+            {
+                if has_typed || !has_legacy_value(&wire.stdout_ref, &wire.stderr_ref) {
+                    return Err(de::Error::custom(
+                        "legacy process evidence requires at least one legacy stream reference",
+                    ));
+                }
+                (
+                    legacy_reference_value(wire.stdout_ref)
+                        .map(|reference| {
+                            legacy_stream(&wire.view, ProcessStreamKind::Stdout, reference)
+                        })
+                        .transpose()
+                        .map_err(de::Error::custom)?,
+                    legacy_reference_value(wire.stderr_ref)
+                        .map(|reference| {
+                            legacy_stream(&wire.view, ProcessStreamKind::Stderr, reference)
+                        })
+                        .transpose()
+                        .map_err(de::Error::custom)?,
+                )
+            }
             LegacyReferenceWire::Value(version) => {
                 return Err(de::Error::custom(ContractError::SchemaVersion {
                     expected: PROCESS_EVIDENCE_SCHEMA_VERSION,
@@ -299,28 +324,19 @@ impl<'de> Deserialize<'de> for ProcessEvidence {
                     reason: "schema version cannot be null",
                 }));
             }
-            LegacyReferenceWire::Missing if has_typed => {
+            LegacyReferenceWire::Missing => {
                 return Err(de::Error::custom(
-                    "typed process evidence requires an explicit schema version",
+                    "process evidence requires an explicit schema version",
                 ));
             }
-            LegacyReferenceWire::Missing => (
-                legacy_reference_value(wire.stdout_ref)
-                    .map(|reference| {
-                        legacy_stream(&wire.view, ProcessStreamKind::Stdout, reference)
-                    })
-                    .transpose()
-                    .map_err(de::Error::custom)?,
-                legacy_reference_value(wire.stderr_ref)
-                    .map(|reference| {
-                        legacy_stream(&wire.view, ProcessStreamKind::Stderr, reference)
-                    })
-                    .transpose()
-                    .map_err(de::Error::custom)?,
-            ),
         };
         Self::new_typed(wire.view, stdout, stderr, wire.axes).map_err(de::Error::custom)
     }
+}
+
+fn has_legacy_value(stdout_ref: &LegacyReferenceWire, stderr_ref: &LegacyReferenceWire) -> bool {
+    matches!(stdout_ref, LegacyReferenceWire::Value(_))
+        || matches!(stderr_ref, LegacyReferenceWire::Value(_))
 }
 
 fn legacy_reference_value(reference: LegacyReferenceWire) -> Option<String> {
