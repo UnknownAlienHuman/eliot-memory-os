@@ -56,6 +56,12 @@ agent-bridge-protocol-self-test:
 agent-bridge-protocol:
     python scripts/verify-agent-bridge-protocol.py
 
+core-daemon-inventory-self-test:
+    python scripts/verify-core-daemon-inventory.py --self-test
+
+core-daemon-inventory:
+    python scripts/verify-core-daemon-inventory.py --root .
+
 opencode-plugin:
     Get-Content -Raw integrations/opencode/plugins/eliot.js | node --input-type=module --check
     node --test integrations/opencode/tests/eliot-plugin.test.mjs
@@ -87,7 +93,7 @@ claude-package:
 sync-skills:
     cargo run --quiet -p eliot-app -- host skill-sync
 
-quick: docs-shards-self-test docs-shards docs-router-self-test docs-router docs-read-self-test normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails agent-route-bundles-self-test agent-route-bundles runtime-source-hygiene-self-test runtime-source-hygiene agent-bridge-protocol-self-test agent-bridge-protocol metadata fmt-check check
+quick: docs-shards-self-test docs-shards docs-router-self-test docs-router docs-read-self-test core-daemon-inventory-self-test core-daemon-inventory normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails agent-route-bundles-self-test agent-route-bundles runtime-source-hygiene-self-test runtime-source-hygiene agent-bridge-protocol-self-test agent-bridge-protocol metadata fmt-check check
 
 verify:
     pwsh -NoProfile -File scripts/verify.ps1
