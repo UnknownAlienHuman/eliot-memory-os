@@ -104,7 +104,11 @@ fn request() -> TestResult<StaffingPlanRequest> {
             privacy_profile: "PRIVATE".to_owned(),
             effect_ceiling: EffectCeiling {
                 scope_ref: "task-scope".to_owned(),
-                allowed: BTreeSet::from([EffectKind::WriteCandidate]),
+                allowed: BTreeSet::from([
+                    EffectKind::Observe,
+                    EffectKind::ReadWorkspace,
+                    EffectKind::WriteCandidate,
+                ]),
                 max_external_effects: 0,
             },
             max_depth: 2,
@@ -177,6 +181,23 @@ fn planning_is_deterministic_and_uses_c0_13_route_evidence() -> TestResult {
         "route-arm-0"
     );
     assert_eq!(candidate.lanes[0].routing.rejected_alternatives.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn read_only_root_rejects_mutating_child_without_event() -> TestResult {
+    let mut coordinator = AgentCoordinator::new(config()?, gap())?;
+    let mut request = request()?;
+    request.launch.effect_ceiling.allowed =
+        BTreeSet::from([EffectKind::Observe, EffectKind::ReadWorkspace]);
+    let before = coordinator.events().to_vec();
+
+    assert!(matches!(
+        coordinator.plan(request),
+        Err(CoordinatorError::ProviderContract(message))
+            if message.contains("authority is not sufficient")
+    ));
+    assert_eq!(coordinator.events(), before.as_slice());
     Ok(())
 }
 
