@@ -317,6 +317,7 @@ impl ModelCatalogueEntry {
             validate_text(value, field)?;
         }
         if self.account_scope != account_scope
+            || self.host_family != self.route.host_family
             || self.provider_id != self.route.provider
             || self.model_id != self.route.model
             || self.context_window == 0
