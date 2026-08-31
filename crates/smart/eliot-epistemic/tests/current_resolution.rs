@@ -87,6 +87,45 @@ fn known_older_supported_record_requires_revalidation() -> TestResult {
 }
 
 #[test]
+fn every_non_current_freshness_excludes_every_current_role() -> TestResult {
+    for (freshness_index, freshness) in [
+        EvidenceFreshness::KnownOlderSnapshot,
+        EvidenceFreshness::Stale,
+        EvidenceFreshness::Unknown,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (status_index, status) in [
+            EpistemicStatus::Observed,
+            EpistemicStatus::Supported,
+            EpistemicStatus::Contested,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let handle = ArtifactId::new(format!(
+                "artifact:non-current-{freshness_index}-{status_index}"
+            ))?;
+            let position = resolve(&request(vec![record(
+                handle.as_str(),
+                "non-current role",
+                status,
+                freshness,
+                Vec::new(),
+            )?]))?;
+
+            assert_eq!(position.state, PositionState::Stale);
+            assert!(position.direct_observations.is_empty());
+            assert!(position.supporting_records.is_empty());
+            assert!(position.rival_records.is_empty());
+            assert_eq!(position.stale_records, vec![handle]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn unknown_freshness_preserves_the_subject_gap_without_current_support() -> TestResult {
     let handle = ArtifactId::new("artifact:unknown-freshness")?;
     let position = resolve(&request(vec![record(
