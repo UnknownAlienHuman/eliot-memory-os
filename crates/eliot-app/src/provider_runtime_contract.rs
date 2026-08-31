@@ -1,12 +1,13 @@
 //! Provider runtime contract construction, validation, and zero-model preflight.
 //!
-//! Architecture anchors: `docs/architecture/ELIOT_ARCHITECTURE.md:ARCH-AUTH-01`
-//! keeps authority explicit, scoped, and fenced; the runtime boundary therefore
-//! validates the provider binding without creating authority. Implementation
-//! anchors: `docs/architecture/ELIOT_IMPLEMENTATION.md:R4` assigns runtime
-//! modules to public contracts without canonical ownership, and
-//! `docs/tasks/ELIOT_PROVIDER_RUNTIME_CONSOLIDATION_FINAL_v2_1.md:ARCH-01` and
-//! `ARCH-02` require one route-policy owner and one supervised process path.
+//! Normative handles in `docs/architecture/ELIOT_ARCHITECTURE.md`: `A2.2` and
+//! `A12.2` keep authority explicit, scoped, and fenced; this runtime boundary
+//! validates provider bindings without creating authority. Implementation
+//! handles in `docs/architecture/ELIOT_IMPLEMENTATION.md`: `I10.11` separates
+//! routing from physical model attempts behind provider-neutral contracts, and
+//! `I10.17` keeps external-agent adapters replaceable supervised bridges with
+//! no canonical-write authority. Precedence remains governed by
+//! `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! This cell may construct and inspect candidate runtime contracts and perform
 //! bounded preflight observation. It never mutates canonical state, changes

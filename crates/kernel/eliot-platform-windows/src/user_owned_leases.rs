@@ -6,11 +6,11 @@
 //! installation, durable-write, policy, or canonical-authority decisions; the
 //! facade/control plane remains outside this module.
 //!
-//! Normative anchors (verified in this worktree):
-//! - Architecture `A2.3`, `A12.2`, `ARCH-MOD-01`, `ARCH-MOD-02`, and
-//!   `ARCH-PORT-01` in `docs/normative/ELIOT_ARCHITECTURE.md`.
-//! - Implementation `I2.2`, `I2.23`, and `I6.15` in
-//!   `docs/normative/ELIOT_IMPLEMENTATION.md`.
+//! Normative handles in `docs/architecture/ELIOT_ARCHITECTURE.md`: `A2.3`
+//! defines module and port boundaries, while `A12.2` binds identity and
+//! authority. Implementation handles `I2.2`, `I2.23`, and `I6.15` resolve
+//! through `docs/architecture/ELIOT_IMPLEMENTATION.md`. Authority and
+//! precedence remain governed by `docs/ARCHITECTURE_CONTRACT.md`.
 
 #[cfg(windows)]
 use std::io::{Read, Seek, SeekFrom};

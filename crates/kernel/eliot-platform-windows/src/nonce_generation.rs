@@ -4,14 +4,16 @@
 //! pipe, process, lifecycle, daemon, Host, watchdog, eliotd, canonical-write,
 //! filesystem, credential, listener, or `SurrealDB` authority.
 //!
-//! Normative anchors (verified in this worktree):
-//! - `A12.2` (`docs/normative/ELIOT_ARCHITECTURE.md:1912-1922`) binds identity
-//!   at the harness/installation boundary and gives unknown identity minimum
+//! Normative anchors:
+//! - `docs/architecture/ELIOT_ARCHITECTURE.md` A12.2 binds identity at the
+//!   harness/installation boundary and gives unknown identity minimum
 //!   privilege with no Material authority.
-//! - `I1.8` (`docs/normative/ELIOT_IMPLEMENTATION.md:1687-1708`) assigns
-//!   identity, authority, State Fence, idempotency, ordering, and generation
-//!   checks to Kernel; no component may invent semantics, authorize them, and
-//!   commit them alone.
+//! - `docs/architecture/ELIOT_IMPLEMENTATION.md` I1.8 assigns identity,
+//!   authority, State Fence, idempotency, ordering, and generation checks to
+//!   Kernel; no component may invent semantics, authorize them, and commit
+//!   them alone.
+//! - `docs/ARCHITECTURE_CONTRACT.md` owns normative-pair precedence and
+//!   identity.
 
 use eliot_platform::{KernelActivationNonce, PlatformHandle};
 
