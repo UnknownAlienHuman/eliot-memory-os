@@ -25,6 +25,13 @@ pub enum EpistemicError {
     EmptyInput,
     #[error("epistemic input contains duplicate handle {0}")]
     DuplicateHandle(ArtifactId),
+    #[error("record {handle} supersedes itself")]
+    SelfSupersession { handle: ArtifactId },
+    #[error("record {handle} contains duplicate predecessor {predecessor}")]
+    DuplicatePredecessor {
+        handle: ArtifactId,
+        predecessor: ArtifactId,
+    },
     #[error("record {handle} has a scope different from the requested scope")]
     ScopeMismatch { handle: ArtifactId },
     #[error("record {handle} is not compatible with the requested state fence")]
@@ -98,6 +105,20 @@ impl EpistemicRecord {
                 handle: self.handle.clone(),
                 reason: source.to_string(),
             })?;
+        let mut predecessors = BTreeSet::new();
+        for predecessor in &self.supersedes {
+            if predecessor == &self.handle {
+                return Err(EpistemicError::SelfSupersession {
+                    handle: self.handle.clone(),
+                });
+            }
+            if !predecessors.insert(predecessor.clone()) {
+                return Err(EpistemicError::DuplicatePredecessor {
+                    handle: self.handle.clone(),
+                    predecessor: predecessor.clone(),
+                });
+            }
+        }
         if let Some(note) = &self.note {
             text(note, "record.note")?;
         }
@@ -167,6 +188,15 @@ pub struct CurrentEpistemicPosition {
     pub provenance: ProvenanceView,
 }
 
+const fn is_current_freshness(freshness: EvidenceFreshness) -> bool {
+    matches!(
+        freshness,
+        EvidenceFreshness::ExactCandidate
+            | EvidenceFreshness::ExactCommit
+            | EvidenceFreshness::ExactQuiescedWorktree
+    )
+}
+
 /// Resolve one question without ranking by prose, vote count, or model output.
 pub fn resolve(request: &PositionRequest) -> Result<CurrentEpistemicPosition, EpistemicError> {
     request.validate()?;
@@ -180,9 +210,19 @@ pub fn resolve(request: &PositionRequest) -> Result<CurrentEpistemicPosition, Ep
     let mut current = Vec::new();
 
     for record in &request.records {
-        if record.evidence.freshness == EvidenceFreshness::Stale {
+        superseded.extend(record.supersedes.iter().cloned());
+        if let Some(note) = &record.note {
+            inquiries.insert(note.clone());
+        }
+        if !is_current_freshness(record.evidence.freshness) {
             stale.insert(record.handle.clone());
-            inquiries.insert(format!("revalidate {}", record.handle));
+            inquiries.insert(format!("establish freshness for {}", record.handle));
+            if record.evidence.status == EpistemicStatus::Unknown {
+                unknowns.insert(record.subject.clone());
+                inquiries.insert(format!("obtain evidence for {}", record.subject));
+            } else if record.evidence.status == EpistemicStatus::Superseded {
+                superseded.insert(record.handle.clone());
+            }
             continue;
         }
         match record.evidence.status {
@@ -213,16 +253,6 @@ pub fn resolve(request: &PositionRequest) -> Result<CurrentEpistemicPosition, Ep
                 unknowns.insert(record.subject.clone());
                 inquiries.insert(format!("obtain evidence for {}", record.subject));
             }
-        }
-        if matches!(
-            record.evidence.freshness,
-            EvidenceFreshness::Stale | EvidenceFreshness::Unknown
-        ) {
-            stale.insert(record.handle.clone());
-            inquiries.insert(format!("establish freshness for {}", record.handle));
-        }
-        if let Some(note) = &record.note {
-            inquiries.insert(note.clone());
         }
     }
     if current.is_empty() {
