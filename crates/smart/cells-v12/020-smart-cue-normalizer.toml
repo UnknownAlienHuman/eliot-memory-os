@@ -1,0 +1,50 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w2-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 20
+cell = "smart.cue.normalizer"
+physical_crate = "eliot-cues"
+predecessor_orders = [19]
+primary_property = "Normalize observed cues into preserved canonical spelling plus a profile-scoped comparison key without resolving filesystem/resource identity."
+field_contracts = ["crates/smart/eliot-cue-contracts/cue.contract.toml"]
+public_function_signatures = [
+  "pub fn normalize_observed_cue(cue: &ObservedCue, profile: &CueComparisonProfile) -> Result<NormalizedCue, CueNormalizationError>",
+  "pub fn normalize_observed_cues(cues: &[ObservedCue], profile: &CueComparisonProfile, limits: &CueLimits) -> Result<Vec<NormalizedCue>, CueNormalizationError>",
+]
+write_scope = [
+  "crates/smart/eliot-cues/src/normalizer.rs",
+  "crates/smart/eliot-cues/tests/normalizer.rs",
+]
+algorithm = [
+  "validate cue/profile scope, kind, revision, bounds and State Fence",
+  "preserve canonical_value under only profile-authorized separator/unicode normalization",
+  "reject traversal, malformed signature and unsupported kind/profile",
+  "derive comparison_key without changing canonical display/source spelling",
+  "construct CueKey from kind/profile/key",
+  "sort/deduplicate exact identity while retaining distinct canonical variants",
+]
+minimum_tests = [
+  "mixed-case path preserves canonical spelling",
+  "Windows comparison folds only under Windows profile",
+  "case-sensitive profile keeps distinction",
+  "dot-dot traversal rejected",
+  "no filesystem canonicalize/symlink/cwd lookup surface",
+  "capture/fire use the same profile digest",
+  "permutation deterministic",
+]
+non_goals = [
+  "filesystem/resource identity",
+  "file existence/read",
+  "binding admission",
+  "snapshot publication",
+  "Context admission or delivery",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-CTX-02", "ARCH-CTX-04", "ARCH-GROUND-01", "ARCH-SCOPE-01", "ARCH-MOD-03"]
+implementation_refs = ["I2.15", "I2.20", "I7.19", "I12.14"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than lowercasing canonical spelling globally, resolving filesystem identity, guessing an unsupported profile, or widening cue kind semantics."
+brief_proof_ceiling = "STATIC_W2_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
