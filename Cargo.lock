@@ -622,6 +622,8 @@ dependencies = [
 name = "eliot-agent-api"
 version = "0.1.0"
 dependencies = [
+ "eliot-agent-contracts",
+ "eliot-contracts",
  "schemars",
  "serde",
  "serde_json",
@@ -690,6 +692,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-agent-api",
  "eliot-agent-contracts",
+ "eliot-contracts",
  "eliot-evaluation-contracts",
  "eliot-receipts",
  "eliot-security-contracts",
@@ -1583,6 +1586,7 @@ name = "eliot-native-worker-core"
 version = "0.1.0"
 dependencies = [
  "eliot-agent-api",
+ "eliot-contracts",
  "eliot-process",
  "eliot-receipts",
  "eliot-runtime-contracts",

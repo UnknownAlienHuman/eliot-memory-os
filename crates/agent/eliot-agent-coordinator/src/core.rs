@@ -173,7 +173,7 @@ impl AgentCoordinator {
         validate_text(request.launch.task_id.as_str(), "task_id")?;
         validate_text(&request.task_revision, "task_revision")?;
         validate_text(request.plan_revision.as_str(), "plan_revision")?;
-        validate_text(&request.state_fence, "state_fence")?;
+        validate_state_fence(&request.state_fence)?;
         validate_recipe(&request)?;
 
         if request.lanes.is_empty() {
@@ -1101,9 +1101,7 @@ impl AgentCoordinator {
                 responsibility: work.objective,
                 dependency_ids: Vec::new(),
                 overlap_ids: Vec::new(),
-                assigned_attempt_id: Some(
-                    AgentAttemptId::new(attempt.attempt_id.as_str()).map_err(provider_contract)?,
-                ),
+                assigned_attempt_id: Some(attempt.attempt_id.clone()),
                 assigned_role: Some(attempt.role_id.as_str().to_owned()),
                 mailbox_route_handle: Some(format!("attempt:{}", attempt.attempt_id.as_str())),
             });
@@ -1131,8 +1129,7 @@ impl AgentCoordinator {
         if message.state != LivePeerMessageState::Draft {
             return Err(CoordinatorError::IdentityConflict("message_state"));
         }
-        let sender =
-            AttemptId::new(message.sender_attempt_id.as_str()).map_err(provider_contract)?;
+        let sender = message.sender_attempt_id.clone();
         let sender_attempt = self
             .attempts
             .get(&sender)
@@ -1181,8 +1178,7 @@ impl AgentCoordinator {
         if attempt.state != CoordinatedAttemptState::Running {
             return Err(CoordinatorError::InvalidAttemptState(attempt.state));
         }
-        let contract_attempt =
-            AgentAttemptId::new(recipient_attempt_id.as_str()).map_err(provider_contract)?;
+        let contract_attempt = recipient_attempt_id.clone();
         let contract_work =
             WorkItemId::new(attempt.work_unit_id.as_str()).map_err(provider_contract)?;
         let message_id = self
@@ -1647,8 +1643,6 @@ fn validate_admission_text(receipt: &ProviderAdmissionReceipt) -> Result<(), Coo
         (receipt.task_id.as_str(), "task_id"),
         (&receipt.task_revision, "task_revision"),
         (receipt.plan_revision.as_str(), "plan_revision"),
-        (&receipt.state_fence, "state_fence"),
-        (receipt.controller_epoch.as_str(), "controller_epoch"),
         (receipt.coordinator_lease.as_str(), "coordinator_lease"),
         (
             &receipt.g11_admission_receipt_ref,
@@ -1658,10 +1652,20 @@ fn validate_admission_text(receipt: &ProviderAdmissionReceipt) -> Result<(), Coo
     ] {
         validate_text(value, field)?;
     }
+    validate_state_fence(&receipt.state_fence)?;
+    if receipt.controller_epoch != receipt.state_fence.authority_epoch {
+        return Err(CoordinatorError::StaleController);
+    }
     if receipt.admitted_lanes.is_empty() {
         return Err(CoordinatorError::InvalidField("admitted_lanes"));
     }
     Ok(())
+}
+
+fn validate_state_fence(fence: &eliot_agent_api::StateFence) -> Result<(), CoordinatorError> {
+    fence
+        .validate()
+        .map_err(|error| CoordinatorError::ProviderContract(error.to_string()))
 }
 
 fn validate_candidate_binding(

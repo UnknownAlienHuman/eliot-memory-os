@@ -3,13 +3,14 @@ use std::collections::BTreeSet;
 use eliot_agent_api::{
     ActualRouteReceipt, AgentLaunchRequest, AgentResult, AgentWorkUnitBrief, ArtifactId, AttemptId,
     AuthorityEpoch, BudgetEnvelope, EffectCeiling, EffectKind, LaunchRequestId, QuotaKnowledge,
-    ResultDisposition, RouteFingerprint, RouteFingerprintId, TaskId, UsageReceipt, WorkLeaseId,
-    WorkUnitId,
+    ResourceGeneration, ResultDisposition, RouteFingerprint, RouteFingerprintId, StateFence,
+    TaskId, UsageReceipt, WorkLeaseId, WorkUnitId,
 };
 use eliot_agent_contracts::{
     DeliveryPolicy, DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, RevisionId,
     contract_shape_digest,
 };
+use eliot_contracts::{IntegrationRevision, PolicyRevision, TaskRevision};
 use eliot_evaluation_contracts::BudgetEvidence;
 use eliot_security_contracts::PrivacyClass;
 
@@ -66,6 +67,20 @@ impl ProviderVerifier for TestProvider {
 fn rev(value: &str) -> RevisionId {
     RevisionId::new(value)
         .unwrap_or_else(|error| panic!("valid fixture revision required: {error}"))
+}
+
+fn fence() -> StateFence {
+    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+}
+
+fn full_fence() -> StateFence {
+    StateFence {
+        authority_epoch: AuthorityEpoch::genesis(),
+        resource_generation: ResourceGeneration::genesis(),
+        task_revision: Some(TaskRevision::genesis()),
+        policy_revision: Some(PolicyRevision::genesis()),
+        integration_revision: Some(IntegrationRevision::genesis()),
+    }
 }
 
 fn config(max_attempts: usize, max_route: usize) -> CoordinatorConfig {
@@ -249,7 +264,7 @@ fn request(
         },
         task_revision: "task-rev-1".to_owned(),
         plan_revision: rev(&format!("plan-rev-{tag}")),
-        state_fence: format!("fence-{tag}"),
+        state_fence: fence(),
         privacy_class: PrivacyClass::Private,
         lanes: specs
             .iter()
@@ -301,7 +316,7 @@ fn provider_receipt(
         task_revision: candidate.task_revision.clone(),
         plan_revision: candidate.plan_revision.clone(),
         state_fence: candidate.state_fence.clone(),
-        controller_epoch: AuthorityEpoch::new("controller-epoch-1")?,
+        controller_epoch: AuthorityEpoch::new(1)?,
         coordinator_lease: WorkLeaseId::new(format!("coordinator-lease-{tag}"))?,
         provider_identity: provider_identity(),
         g11_admission_receipt_ref: format!("proof-admission-{tag}"),
@@ -1086,5 +1101,255 @@ fn public_restore_with_missing_provider_remains_plan_gap() -> TestResult {
     let json = coordinator.snapshot_json()?;
     let restored = AgentCoordinator::restore_json(&json, cfg, gap)?;
     assert_eq!(restored.events(), coordinator.events());
+    Ok(())
+}
+
+#[test]
+fn coordinator_case_10_exact_state_fence_is_preserved_through_execution() -> TestResult {
+    let mut coordinator = coordinator(config(2, 2), &["proof-admission-case-10"])?;
+    let mut request = request(
+        "case-10",
+        &[LaneSpec {
+            work: "work-case-10",
+            role: "reader-case-10",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    request.state_fence = full_fence();
+    let expected = request.state_fence.clone();
+    let candidate = coordinator.plan(request)?;
+    assert_eq!(candidate.state_fence, expected);
+    let admitted = coordinator.admit(provider_receipt(&candidate, "case-10")?)?;
+    assert_eq!(admitted.state_fence, expected);
+    let context = ExecutionContext::from(&admitted);
+    let attempt_id = admitted.admitted_lanes[0].attempt_id.clone();
+    coordinator.start_attempt(context.clone(), attempt_id.clone())?;
+    assert_eq!(
+        coordinator
+            .attempt(&attempt_id)
+            .map(|attempt| &attempt.state_fence),
+        Some(&expected)
+    );
+    Ok(())
+}
+
+#[test]
+fn coordinator_case_11_wrong_controller_epoch_has_no_mutation() -> TestResult {
+    let mut coordinator = coordinator(config(2, 2), &["proof-admission-case-11"])?;
+    let candidate = coordinator.plan(request(
+        "case-11",
+        &[LaneSpec {
+            work: "work-case-11",
+            role: "reader-case-11",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?)?;
+    let before = coordinator.snapshot_json()?;
+    let mut receipt = provider_receipt(&candidate, "case-11")?;
+    receipt.controller_epoch = AuthorityEpoch::new(2)?;
+    assert_eq!(
+        coordinator.admit(receipt).err(),
+        Some(CoordinatorError::StaleController)
+    );
+    assert_eq!(coordinator.snapshot_json()?, before);
+    Ok(())
+}
+
+#[test]
+fn coordinator_case_12_all_state_fence_revision_mismatches_are_stale_before_mutation() -> TestResult
+{
+    let mut coordinator = coordinator(
+        config(2, 2),
+        &[
+            "proof-admission-case-12-resource",
+            "proof-admission-case-12-task",
+            "proof-admission-case-12-policy",
+            "proof-admission-case-12-integration",
+        ],
+    )?;
+    let mut plan = request(
+        "case-12",
+        &[LaneSpec {
+            work: "work-case-12",
+            role: "reader-case-12",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    plan.state_fence = full_fence();
+    let candidate = coordinator.plan(plan)?;
+    let baseline = coordinator.snapshot_json()?;
+    let mut mismatches = [
+        ("resource", full_fence()),
+        ("task", full_fence()),
+        ("policy", full_fence()),
+        ("integration", full_fence()),
+    ];
+    mismatches[0].1.resource_generation = ResourceGeneration::new(2)?;
+    mismatches[1].1.task_revision = Some(TaskRevision::new(5)?);
+    mismatches[2].1.policy_revision = Some(PolicyRevision::new(6)?);
+    mismatches[3].1.integration_revision = Some(IntegrationRevision::new(7)?);
+    for (name, mismatch) in mismatches {
+        let mut receipt = provider_receipt(&candidate, &format!("case-12-{name}"))?;
+        receipt.state_fence = mismatch;
+        assert_eq!(
+            coordinator.admit(receipt).err(),
+            Some(CoordinatorError::StaleFence)
+        );
+        assert_eq!(coordinator.snapshot_json()?, baseline);
+    }
+    Ok(())
+}
+
+#[test]
+fn coordinator_case_13_existing_provider_lease_worker_route_and_capacity_guards_remain_green()
+-> TestResult {
+    sealed_verifier_rejects_forged_provider_receipt()?;
+    admission_bijection_and_reassignment_capacity_fail_closed()?;
+    live_capacity_evidence_limits_admission_and_reassignment()?;
+    writer_is_retained_until_authenticated_worker_fence()?;
+    Ok(())
+}
+
+#[test]
+fn coordinator_case_14_attempt_identity_is_used_directly_without_reconstruction() -> TestResult {
+    let mut coordinator = coordinator(config(2, 2), &["proof-admission-case-14"])?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "case-14",
+        &[LaneSpec {
+            work: "work-case-14",
+            role: "reader-case-14",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let expected = admitted.admitted_lanes[0].attempt_id.clone();
+    coordinator.start_attempt(context.clone(), expected.clone())?;
+    let view = coordinator.coordination_map(&context, rev("wave-case-14"))?;
+    assert_eq!(
+        view.entries[0].assigned_attempt_id.as_ref(),
+        Some(&expected)
+    );
+    explicit_peer_delivery_occurs_only_at_next_boundary()?;
+    let source = include_str!("core.rs");
+    assert!(!source.contains("AgentAttemptId::new(attempt.attempt_id"));
+    assert!(!source.contains("AttemptId::new(message.sender_attempt_id"));
+    assert!(!source.contains("AgentAttemptId::new(recipient_attempt_id"));
+    Ok(())
+}
+
+#[test]
+fn coordinator_case_15_snapshot_v4_roundtrip_binds_all_properties() -> TestResult {
+    let mut coordinator = coordinator(config(2, 2), &["proof-admission-case-15"])?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "case-15",
+        &[LaneSpec {
+            work: "work-case-15",
+            role: "reader-case-15",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    coordinator.start_attempt(context, admitted.admitted_lanes[0].attempt_id.clone())?;
+    let snapshot = coordinator.snapshot()?;
+    assert_eq!(snapshot.schema_version, crate::SNAPSHOT_SCHEMA_VERSION);
+    let restored = AgentCoordinator::restore_with_provider(
+        snapshot.clone(),
+        config(2, 2),
+        Box::new(verifier(
+            &["proof-admission-case-15"],
+            snapshot.event_sequence,
+        )),
+    )?;
+    assert_eq!(restored.snapshot()?, snapshot);
+    Ok(())
+}
+
+fn poison_snapshot_fences(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.contains_key("state_fence") {
+                map.insert("state_fence".to_owned(), serde_json::json!("legacy-fence"));
+            }
+            for child in map.values_mut() {
+                poison_snapshot_fences(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                poison_snapshot_fences(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn coordinator_case_16_snapshot_v3_and_v4_legacy_fence_reject_before_replay() -> TestResult {
+    let mut coordinator = coordinator(config(2, 2), &["proof-admission-case-16"])?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "case-16",
+        &[LaneSpec {
+            work: "work-case-16",
+            role: "reader-case-16",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let _ = coordinator.start_attempt(
+        ExecutionContext::from(&admitted),
+        admitted.admitted_lanes[0].attempt_id.clone(),
+    )?;
+    let json = coordinator.snapshot_json()?;
+    let mut v3: serde_json::Value = serde_json::from_str(&json)?;
+    v3["schema_version"] = serde_json::json!("eliot-agent-coordinator/snapshot-v3");
+    assert_eq!(
+        AgentCoordinator::restore_json(
+            &v3.to_string(),
+            config(2, 2),
+            PlanGap::G11Unavailable {
+                reason: "fixture".to_owned()
+            }
+        )
+        .err(),
+        Some(CoordinatorError::UnsupportedSnapshot)
+    );
+    let mut legacy: serde_json::Value = serde_json::from_str(&json)?;
+    poison_snapshot_fences(&mut legacy);
+    assert!(
+        AgentCoordinator::restore_json(
+            &legacy.to_string(),
+            config(2, 2),
+            PlanGap::G11Unavailable {
+                reason: "fixture".to_owned()
+            }
+        )
+        .is_err()
+    );
     Ok(())
 }

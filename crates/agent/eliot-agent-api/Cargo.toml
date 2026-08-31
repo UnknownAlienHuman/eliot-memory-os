@@ -36,6 +36,8 @@ implementation_support = "PARTIAL"
 evidence_execution_status = "NOT_EXECUTED"
 
 [dependencies]
+eliot-agent-contracts.workspace = true
+eliot-contracts.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

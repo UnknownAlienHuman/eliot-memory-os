@@ -402,7 +402,6 @@ fn assigned(
     item.assigned_role = Some(role_id.as_str().to_owned());
     item.mailbox_route_handle = Some(route_id.to_owned());
     item.state = WorkItemState::Assigned;
-    let state_fence_digest = digest(&plan.admission_receipt.core.work_scope.state_fence)?;
     let launch_attempt: LaunchAttempt = serde_json::from_value(json!({
         "id": format!("attempt-{work_item_id}"),
         "launch_request_id": format!("launch-{work_item_id}"),
@@ -438,11 +437,11 @@ fn assigned(
         "budget": {"context_tokens": 10, "wall_time_ms": 10, "output_bytes": 10,
             "cost_microunits": 10, "max_depth": 1, "max_descendants": 0},
         "authority": {
-            "epoch": "1", "scope_ref": "scope-1",
+            "epoch": 1, "scope_ref": "scope-1",
             "effect_ceiling": {"scope_ref": "scope-1", "allowed": ["observe"],
                 "max_external_effects": 0},
             "lease": format!("lease-{work_item_id}"),
-            "state_fence": state_fence_digest,
+            "state_fence": fence(),
             "valid_until": "later"
         },
         "cancellation": "NOT_REQUESTED",
@@ -777,7 +776,13 @@ fn p3_rejects_scope_fence_contract_and_lease_mismatch() -> TestResult {
         Err(SwarmError::AssignmentMismatch)
     );
     let mut wrong_fence = assigned(&plan, "lane-a", "route-a")?;
-    wrong_fence.launch_attempt.authority.state_fence = "wrong-fence".to_owned();
+    wrong_fence.launch_attempt.authority.state_fence = serde_json::from_value(json!({
+        "authority_epoch": 2,
+        "resource_generation": 1,
+        "task_revision": null,
+        "policy_revision": null,
+        "integration_revision": null
+    }))?;
     assert_eq!(
         admit_wave(
             &plan,
@@ -1403,4 +1408,131 @@ fn public_surface_remains_candidate_only_and_read_only() -> TestResult {
     assert_eq!(RECIPE, "NegotiatedInterdependentInvestigation");
     assert_eq!(SYNTHESIS_PROOF_CEILING, ProofCeiling::CandidateArtifact);
     Ok(())
+}
+
+#[test]
+fn swarm_case_23_matching_canonical_epoch_and_whole_fence_admits() -> TestResult {
+    let provider = A02::default();
+    let plan = admitted_plan(
+        &provider,
+        &[WorkSpec {
+            id: "case-23",
+            dependencies: &[],
+        }],
+        1,
+        1,
+        1,
+    )?;
+    let state = begin_execution(&plan, Some(&provider), Some(&Trusted))?;
+    let admission = admit_wave(
+        &plan,
+        &state,
+        vec![assigned(&plan, "case-23", "route-case-23")?],
+        Some(&provider),
+        Some(&Trusted),
+    )?;
+    assert_eq!(
+        admission.state().core.transition_sequence,
+        state.core.transition_sequence + 1
+    );
+    Ok(())
+}
+
+#[test]
+fn swarm_case_24_each_fence_component_rejects_before_state_or_cursor_mutation() -> TestResult {
+    let provider = A02::default();
+    let plan = admitted_plan(
+        &provider,
+        &[WorkSpec {
+            id: "case-24",
+            dependencies: &[],
+        }],
+        1,
+        1,
+        1,
+    )?;
+    let state = begin_execution(&plan, Some(&provider), Some(&Trusted))?;
+    let baseline_state = state.clone();
+    let baseline_cursor = provider.current_cursor(&execution_stream(&plan))?;
+    let mutations = [
+        (
+            "authority_epoch",
+            json!({
+                "authority_epoch": 2,
+                "resource_generation": 1,
+                "task_revision": 1,
+                "policy_revision": null,
+                "integration_revision": null
+            }),
+        ),
+        (
+            "resource_generation",
+            json!({
+                "authority_epoch": 1,
+                "resource_generation": 2,
+                "task_revision": 1,
+                "policy_revision": null,
+                "integration_revision": null
+            }),
+        ),
+        (
+            "task_revision",
+            json!({
+                "authority_epoch": 1,
+                "resource_generation": 1,
+                "task_revision": 2,
+                "policy_revision": null,
+                "integration_revision": null
+            }),
+        ),
+        (
+            "policy_revision",
+            json!({
+                "authority_epoch": 1,
+                "resource_generation": 1,
+                "task_revision": 1,
+                "policy_revision": 2,
+                "integration_revision": null
+            }),
+        ),
+        (
+            "integration_revision",
+            json!({
+                "authority_epoch": 1,
+                "resource_generation": 1,
+                "task_revision": 1,
+                "policy_revision": null,
+                "integration_revision": 2
+            }),
+        ),
+    ];
+    for (name, mutated_fence) in mutations {
+        let mut assignment = assigned(&plan, "case-24", "route-case-24")?;
+        assignment.launch_attempt.authority.state_fence = serde_json::from_value(mutated_fence)?;
+        assert_eq!(
+            admit_wave(
+                &plan,
+                &state,
+                vec![assignment],
+                Some(&provider),
+                Some(&Trusted),
+            ),
+            Err(SwarmError::AssignmentMismatch),
+            "mutation {name} must be rejected"
+        );
+        assert_eq!(state, baseline_state);
+        assert_eq!(
+            provider.current_cursor(&execution_stream(&plan))?,
+            baseline_cursor
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn swarm_case_25_reverse_consumer_source_discriminator_has_no_local_identity_or_fence_bridge() {
+    let source = include_str!("lib.rs");
+    assert!(!source.contains("expected_fence_digest"));
+    assert!(!source.contains("AgentAttemptId::new(recipient_attempt_id"));
+    assert!(!source.contains("digest(&value.launch_attempt.authority.state_fence"));
 }
