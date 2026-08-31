@@ -1,0 +1,49 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w2-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 32
+cell = "smart.context.quality"
+physical_crate = "eliot-context"
+predecessor_orders = [28, 29, 30, 31]
+primary_property = "Assess immutable candidate/admission/view records over independent quality dimensions without changing membership or collapsing failures into one packet score."
+field_contracts = ["crates/smart/eliot-context-contracts/provider-contribution.contract.toml", "crates/smart/eliot-context-contracts/context-compiler.contract.toml"]
+public_function_signatures = [
+  "pub fn assess_context_quality(candidates: &ContextCandidateSet, admitted: &AdmittedContextSet, view: &ActiveUnderstandingView, measurements: &ContextMeasurements) -> Result<PacketQualityScorecard, ContextQualityError>",
+]
+write_scope = [
+  "crates/smart/eliot-context/src/quality.rs",
+  "crates/smart/eliot-context/tests/quality.rs",
+]
+algorithm = [
+  "verify candidate/admitted/view identities and membership immutability",
+  "assess goal/acceptance, attention, epistemic/rival/model/continuity/negative/unknown/evidence/authority/boundary coverage independently",
+  "assess fence, provider denominator, whole-unit integrity, reversible omission, headroom and selection integrity",
+  "assess route/tokenizer/serializer measurement validity separately",
+  "emit Pass/Fail/Inconclusive/NotApplicable per required dimension",
+  "derive blocking dimension refs without aggregate score and compute digest",
+]
+minimum_tests = [
+  "failed Safety Floor dimension remains blocking despite other passes",
+  "missing tokenizer/route measurement is Inconclusive not Pass",
+  "provider denominator integrity checked",
+  "membership mutation detected",
+  "no aggregate score",
+  "assessor cannot modify view",
+  "dimension order deterministic",
+]
+non_goals = [
+  "candidate/admission/view mutation",
+  "tokenizer/provider execution",
+  "model call",
+  "delivery/use/outcome",
+  "Product Proof",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-CTX-01", "ARCH-CTX-03", "ARCH-EPI-04", "ARCH-UND-01", "ARCH-MOD-03"]
+implementation_refs = ["I2.15", "I2.20", "I7.11", "I12.13", "I12.31"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Return Inconclusive or ContractChallenge rather than guessing missing measurements, mutating membership, or hiding a failed dimension in an aggregate score."
+brief_proof_ceiling = "STATIC_W2_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
