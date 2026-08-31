@@ -1206,7 +1206,6 @@ fn validate_assignment(plan: &AdmittedSwarmPlan, value: &WaveAssignment) -> Resu
         .as_ref()
         .ok_or(SwarmError::BindingMismatch)?;
     let route_digest = digest(&value.launch_attempt.route)?;
-    let expected_fence_digest = digest(&plan.admission_receipt.core.work_scope.state_fence)?;
     let mut immutable_projection = value.work_item.clone();
     immutable_projection
         .assigned_attempt_id
@@ -1244,15 +1243,10 @@ fn validate_assignment(plan: &AdmittedSwarmPlan, value: &WaveAssignment) -> Resu
             != plan.admission_receipt.core.work_scope.scope_id.as_str()
         || value.launch_attempt.authority.effect_ceiling.scope_ref
             != plan.admission_receipt.core.work_scope.scope_id.as_str()
-        || value.launch_attempt.authority.state_fence != expected_fence_digest
-        || value.launch_attempt.authority.epoch.as_str()
-            != plan
-                .admission_receipt
-                .core
-                .authority
-                .authority_epoch
-                .value()
-                .to_string()
+        || value.launch_attempt.authority.state_fence
+            != plan.admission_receipt.core.work_scope.state_fence
+        || value.launch_attempt.authority.epoch
+            != plan.admission_receipt.core.authority.authority_epoch
         || value.launch_attempt.authority.effect_ceiling
             != value.launch_attempt.work_unit.effect_ceiling
         || !value

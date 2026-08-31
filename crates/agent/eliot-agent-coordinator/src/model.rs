@@ -1,7 +1,7 @@
 use eliot_agent_api::{
     ActualRouteReceipt, AgentLaunchRequest, AgentResult, AttemptId, AuthorityEpoch, BudgetEnvelope,
-    CancelReason, LaunchRequestId, ResultDisposition, RouteFingerprint, TaskId, WorkLeaseId,
-    WorkUnitId,
+    CancelReason, LaunchRequestId, ResultDisposition, RouteFingerprint, StateFence, TaskId,
+    WorkLeaseId, WorkUnitId,
 };
 use eliot_agent_contracts::{
     DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, MessageId,
@@ -240,7 +240,7 @@ pub struct StaffingPlanRequest {
     pub recipe: RecipeManifest,
     pub task_revision: String,
     pub plan_revision: RevisionId,
-    pub state_fence: String,
+    pub state_fence: StateFence,
     pub privacy_class: PrivacyClass,
     pub lanes: Vec<StaffingLaneRequest>,
 }
@@ -267,7 +267,7 @@ pub struct StaffingPlanCandidate {
     pub recipe_revision: RevisionId,
     pub task_revision: String,
     pub plan_revision: RevisionId,
-    pub state_fence: String,
+    pub state_fence: StateFence,
     pub privacy_class: PrivacyClass,
     pub lanes: Vec<StaffingLaneCandidate>,
 }
@@ -299,7 +299,7 @@ pub struct ProviderAdmissionReceipt {
     pub task_id: TaskId,
     pub task_revision: String,
     pub plan_revision: RevisionId,
-    pub state_fence: String,
+    pub state_fence: StateFence,
     pub controller_epoch: AuthorityEpoch,
     pub coordinator_lease: WorkLeaseId,
     pub provider_identity: ProviderIdentity,
@@ -314,7 +314,7 @@ pub struct ExecutionContext {
     pub admission_id: AdmissionId,
     pub task_revision: String,
     pub plan_revision: RevisionId,
-    pub state_fence: String,
+    pub state_fence: StateFence,
     pub controller_epoch: AuthorityEpoch,
     pub coordinator_lease: WorkLeaseId,
 }
@@ -326,7 +326,7 @@ impl From<&ProviderAdmissionReceipt> for ExecutionContext {
             task_revision: receipt.task_revision.clone(),
             plan_revision: receipt.plan_revision.clone(),
             state_fence: receipt.state_fence.clone(),
-            controller_epoch: receipt.controller_epoch.clone(),
+            controller_epoch: receipt.controller_epoch,
             coordinator_lease: receipt.coordinator_lease.clone(),
         }
     }
@@ -364,7 +364,7 @@ pub struct AttemptRecord {
     pub task_id: TaskId,
     pub task_revision: String,
     pub plan_revision: RevisionId,
-    pub state_fence: String,
+    pub state_fence: StateFence,
     pub work_unit_id: WorkUnitId,
     pub role_id: RoleProfileId,
     pub role_revision: RevisionId,

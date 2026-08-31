@@ -981,7 +981,7 @@ where
         if self.connection_id.as_deref() != Some(frame.connection_id.as_str()) {
             return Err(WorkerError::StaleConnection);
         }
-        if frame.authority_epoch != grant.authority().epoch.as_str() {
+        if frame.authority_epoch != grant.authority().epoch {
             return Err(WorkerError::StaleEpoch);
         }
         if frame.state_fence != grant.authority().state_fence {
@@ -1028,11 +1028,11 @@ where
         }
         if live.admission_id() != grant.admission_id()
             || live.lease() != &grant.authority().lease
-            || live.authority_epoch() != grant.authority().epoch.as_str()
+            || live.authority_epoch() != &grant.authority().epoch
         {
             return Err(WorkerError::StaleLease);
         }
-        if live.state_fence() != grant.authority().state_fence {
+        if live.state_fence() != &grant.authority().state_fence {
             return Err(WorkerError::StaleFence);
         }
         if live.admission_revision() != grant.admission_revision()
@@ -1111,7 +1111,7 @@ where
             grant.stream_id().to_owned(),
             grant.producer_id().to_owned(),
             grant.worker_generation(),
-            grant.authority().epoch.as_str().to_owned(),
+            grant.authority().epoch,
             request_id.to_owned(),
             causal_predecessor_refs,
             delivery_class,
@@ -1258,6 +1258,9 @@ fn validate_grant(
     {
         return Err(WorkerError::AdmissionMismatch("generation"));
     }
+    if grant.authority().epoch != hello.authority_epoch {
+        return Err(WorkerError::AdmissionMismatch("authority_epoch"));
+    }
     if grant.authority().state_fence != hello.state_fence
         || !grant.process_fence().matches(process.fence())
     {
@@ -1380,7 +1383,7 @@ fn validate_effect_grant(
     if effect.lease() != &grant.authority().lease {
         return Err(WorkerError::StaleLease);
     }
-    if effect.state_fence() != grant.authority().state_fence {
+    if effect.state_fence() != &grant.authority().state_fence {
         return Err(WorkerError::StaleFence);
     }
     if effect.admission_revision() != grant.admission_revision()
@@ -1427,7 +1430,7 @@ fn validate_ack(receipt: &EventAckReceipt, grant: &CapabilityGrant) -> Result<()
     {
         return Err(WorkerError::ReplayContract("ack_identity"));
     }
-    if receipt.authority_epoch != grant.authority().epoch.as_str() {
+    if receipt.authority_epoch != grant.authority().epoch {
         return Err(WorkerError::StaleEpoch);
     }
     if receipt.state_fence != grant.authority().state_fence {
@@ -1452,7 +1455,7 @@ fn validate_event(
     if event.stream_id != grant.stream_id()
         || event.producer_id != grant.producer_id()
         || event.producer_generation != grant.worker_generation()
-        || event.authority_epoch != grant.authority().epoch.as_str()
+        || event.authority_epoch != grant.authority().epoch
         || event.state_fence != grant.authority().state_fence
         || event.event_id.trim().is_empty()
         || event.sequence == 0
@@ -1482,7 +1485,7 @@ fn validate_replayed_events(
         if event.stream_id != grant.stream_id()
             || event.producer_id != grant.producer_id()
             || event.producer_generation != grant.worker_generation()
-            || event.authority_epoch != grant.authority().epoch.as_str()
+            || event.authority_epoch != grant.authority().epoch
             || event.state_fence != grant.authority().state_fence
             || event.event_id.trim().is_empty()
             || event.sequence == 0

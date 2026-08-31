@@ -19,4 +19,4 @@ pub use crate::model_control::*;
 
 /// Snapshot wire revision. A different revision must be migrated by an
 /// external owner before replay.
-pub const SNAPSHOT_SCHEMA_VERSION: &str = "eliot-agent-coordinator/snapshot-v3";
+pub const SNAPSHOT_SCHEMA_VERSION: &str = "eliot-agent-coordinator/snapshot-v4";

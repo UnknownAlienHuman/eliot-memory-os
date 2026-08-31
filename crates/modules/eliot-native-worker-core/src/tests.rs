@@ -12,8 +12,9 @@ use std::task::{Context, Poll, Waker};
 
 use eliot_agent_api::{
     AttemptId, AuthorityEnvelope, AuthorityEpoch, AuthorizedEffect, EffectCeiling, EffectKind,
-    ProposedEffect, WorkLeaseId,
+    ProposedEffect, ResourceGeneration, StateFence, WorkLeaseId,
 };
+use eliot_contracts::{IntegrationRevision, PolicyRevision, TaskRevision};
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, CancellationRequest, DescendantEvidence,
     DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext, EnvironmentProjection,
@@ -38,6 +39,7 @@ enum StartMode {
     Unknown,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ExecutorState {
     starts: usize,
     inspections: usize,
@@ -178,7 +180,7 @@ impl ProcessExecutor for FakeExecutor {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 struct AdmissionState {
     admissions: usize,
     revalidations: usize,
@@ -187,6 +189,8 @@ struct AdmissionState {
     stale_lease: bool,
     stale_fence: bool,
     stale_revision: bool,
+    returned_wrong_epoch: bool,
+    returned_wrong_fence: bool,
     effect_rejected: bool,
     effect_revoked: bool,
     effect_expired: bool,
@@ -213,7 +217,17 @@ impl CapabilityAdmissionPort for FakeAdmission {
             state.observed_at_unix_ms = 100;
             state.expires_at_unix_ms = 10_000;
         }
-        let authority = authority(request.hello().state_fence.clone());
+        let mut authority = authority(request.hello().state_fence.clone());
+        if state.returned_wrong_epoch {
+            let wrong_epoch = AuthorityEpoch::new(2)
+                .map_err(|_| ProviderFailure::new("admission", "wrong epoch"))?;
+            authority.epoch = wrong_epoch;
+            authority.state_fence.authority_epoch = wrong_epoch;
+        }
+        if state.returned_wrong_fence {
+            authority.state_fence.resource_generation = ResourceGeneration::new(2)
+                .map_err(|_| ProviderFailure::new("admission", "wrong generation"))?;
+        }
         Ok(CapabilityAdmissionOutcome::Admitted(Box::new(
             CapabilityAdmissionFacts::new(
                 "admission-1",
@@ -265,11 +279,14 @@ impl CapabilityAdmissionPort for FakeAdmission {
             } else {
                 request.lease().clone()
             },
-            request.authority_epoch(),
+            *request.authority_epoch(),
             if state.stale_fence {
-                "state-fence-stale".to_owned()
+                StateFence::new(
+                    AuthorityEpoch::new(1).expect("epoch"),
+                    ResourceGeneration::new(2).expect("generation"),
+                )
             } else {
-                request.state_fence().to_owned()
+                request.state_fence().clone()
             },
             state.observed_at_unix_ms,
             state.expires_at_unix_ms,
@@ -305,14 +322,13 @@ impl CapabilityAdmissionPort for FakeAdmission {
             EffectAdmissionFacts::new(
                 AuthorizedEffect {
                     proposal: request.proposal().clone(),
-                    authority_epoch: AuthorityEpoch::new(request.authority_epoch())
-                        .expect("authority epoch"),
+                    authority_epoch: *request.authority_epoch(),
                     authorization_ref: "effect-authorization-1".to_owned(),
                     authorized_at: "provider-observed".to_owned(),
                     expires_at: "provider-expiry".to_owned(),
                 },
                 request.lease().clone(),
-                request.state_fence(),
+                request.state_fence().clone(),
                 request.admission_revision(),
                 request.revocation_revision(),
                 state.observed_at_unix_ms,
@@ -323,7 +339,7 @@ impl CapabilityAdmissionPort for FakeAdmission {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 struct ReplayState {
     next_sequence: u64,
     requests: BTreeMap<(String, String), String>,
@@ -474,8 +490,8 @@ impl DurableCheckpointPort for FakeReplay {
                 request.request_id(),
                 request.stream_id(),
                 request.producer_generation(),
-                request.authority_epoch(),
-                request.state_fence(),
+                *request.authority_epoch(),
+                request.state_fence().clone(),
                 request.admission_revision(),
                 request.operation_id().clone(),
                 request.process_request_digest(),
@@ -514,9 +530,9 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-fn authority(state_fence: String) -> AuthorityEnvelope {
+fn authority(state_fence: StateFence) -> AuthorityEnvelope {
     AuthorityEnvelope {
-        epoch: AuthorityEpoch::new("epoch-1").expect("epoch"),
+        epoch: AuthorityEpoch::new(1).expect("epoch"),
         scope_ref: "scope-1".to_owned(),
         effect_ceiling: EffectCeiling {
             scope_ref: "scope-1".to_owned(),
@@ -659,7 +675,11 @@ fn hello(connection: &str, request: &str) -> WorkerHello {
         artifact_manifest_digest: "manifest-digest-1".to_owned(),
         launch_nonce: "launch-nonce-1".to_owned(),
         worker_generation: 1,
-        state_fence: "state-fence-1".to_owned(),
+        authority_epoch: AuthorityEpoch::new(1).expect("epoch"),
+        state_fence: StateFence::new(
+            AuthorityEpoch::new(1).expect("epoch"),
+            ResourceGeneration::new(1).expect("generation"),
+        ),
         route_ref: "route-1".to_owned(),
         requested_capabilities: ["inspect".to_owned()].into_iter().collect(),
     }
@@ -675,8 +695,11 @@ fn frame(request_id: &str, body: WorkerFrameBody) -> WorkerFrame {
             .into_iter()
             .collect(),
         deadline_unix_ms: 5_000,
-        authority_epoch: "epoch-1".to_owned(),
-        state_fence: "state-fence-1".to_owned(),
+        authority_epoch: AuthorityEpoch::new(1).expect("epoch"),
+        state_fence: StateFence::new(
+            AuthorityEpoch::new(1).expect("epoch"),
+            ResourceGeneration::new(1).expect("generation"),
+        ),
         lease_id: "lease-1".to_owned(),
         admission_revision: "admission-revision-1".to_owned(),
         producer_generation: 1,
@@ -741,6 +764,23 @@ fn start(core: &mut TestCore) -> ProcessBindingSnapshot {
     let binding = ProcessBindingSnapshot::from_request(&process);
     block_on(core.demand_start(hello("connection-1", "start-1"), process)).expect("demand start");
     binding
+}
+
+#[test]
+fn v1_string_authority_wire_is_rejected_before_admission() {
+    let mut value = serde_json::to_value(hello("connection-1", "request-1")).expect("fixture");
+    value["protocol_version"] = serde_json::json!("eliot-native-worker/v1");
+    value["authority_epoch"] = serde_json::json!("1");
+    value["state_fence"] = serde_json::json!("legacy-fence");
+    assert!(serde_json::from_value::<WorkerHello>(value).is_err());
+
+    let mut value =
+        serde_json::to_value(frame("request-1", WorkerFrameBody::Execute(request(None))))
+            .expect("fixture");
+    value["protocol_version"] = serde_json::json!("eliot-native-worker/v1");
+    value["authority_epoch"] = serde_json::json!("1");
+    value["state_fence"] = serde_json::json!("legacy-fence");
+    assert!(serde_json::from_value::<WorkerFrame>(value).is_err());
 }
 
 #[test]
@@ -843,13 +883,17 @@ fn stale_epoch_and_fence_are_rejected_before_live_provider_use() {
         .expect("admission lock")
         .revalidations;
     let mut stale_epoch = frame("execute-epoch", WorkerFrameBody::Execute(request(None)));
-    stale_epoch.authority_epoch = "epoch-stale".to_owned();
+    stale_epoch.authority_epoch = AuthorityEpoch::new(2).expect("epoch");
+    stale_epoch.state_fence.authority_epoch = AuthorityEpoch::new(2).expect("epoch");
     assert_eq!(
         block_on(core.handle(stale_epoch)),
         Err(WorkerError::StaleEpoch)
     );
     let mut stale_fence = frame("execute-fence", WorkerFrameBody::Execute(request(None)));
-    stale_fence.state_fence = "state-fence-stale".to_owned();
+    stale_fence.state_fence = StateFence::new(
+        AuthorityEpoch::new(1).expect("epoch"),
+        ResourceGeneration::new(2).expect("generation"),
+    );
     assert_eq!(
         block_on(core.handle(stale_fence)),
         Err(WorkerError::StaleFence)
@@ -1066,8 +1110,11 @@ fn reconnect_replays_and_ack_advances_only_through_durable_port() {
             event_id: heartbeat[0].event_id.clone(),
             sequence: heartbeat[0].sequence,
             producer_generation: 1,
-            authority_epoch: "epoch-1".to_owned(),
-            state_fence: "state-fence-1".to_owned(),
+            authority_epoch: AuthorityEpoch::new(1).expect("epoch"),
+            state_fence: StateFence::new(
+                AuthorityEpoch::new(1).expect("epoch"),
+                ResourceGeneration::new(1).expect("generation"),
+            ),
             phase: AckPhase::Normalized,
             acknowledged_at_unix_ms: 200,
         }),
@@ -1326,4 +1373,333 @@ fn restart_rejects_invalid_durable_tail_without_installing_binding() {
 fn serde_rejects_unknown_fields_on_tagged_inputs() {
     let json = r#"{"kind":"HEALTH","unexpected":true}"#;
     assert!(serde_json::from_str::<WorkerFrameBody>(json).is_err());
+}
+
+#[test]
+fn native_case_17_typed_v2_roundtrips_and_sealed_provider_output_matches() {
+    let original_hello = hello("connection-17", "request-17");
+    let hello_wire = serde_json::to_value(&original_hello).expect("hello wire");
+    assert_eq!(hello_wire["protocol_version"], PROTOCOL_VERSION);
+    assert!(hello_wire["authority_epoch"].is_number());
+    assert!(hello_wire["state_fence"].is_object());
+    assert_eq!(
+        serde_json::from_value::<WorkerHello>(hello_wire).expect("hello roundtrip"),
+        original_hello
+    );
+
+    let original_frame = frame("request-17", WorkerFrameBody::Execute(request(None)));
+    let frame_wire = serde_json::to_value(&original_frame).expect("frame wire");
+    assert!(frame_wire["authority_epoch"].is_number());
+    assert!(frame_wire["state_fence"].is_object());
+    assert_eq!(
+        serde_json::from_value::<WorkerFrame>(frame_wire).expect("frame roundtrip"),
+        original_frame
+    );
+
+    let (mut core, _, _admission, replay, _) = fixture();
+    start(&mut core);
+    let event = replay
+        .state
+        .lock()
+        .expect("replay lock")
+        .events
+        .first()
+        .cloned()
+        .expect("start event");
+    let event_wire = serde_json::to_value(&event).expect("event wire");
+    assert!(event_wire["authority_epoch"].is_number());
+    assert!(event_wire["state_fence"].is_object());
+    assert_eq!(
+        serde_json::from_value::<WorkerEventEnvelope>(event_wire).expect("event roundtrip"),
+        event
+    );
+    let ack = EventAckReceipt {
+        stream_id: event.stream_id.clone(),
+        event_id: event.event_id.clone(),
+        sequence: event.sequence,
+        producer_generation: event.producer_generation,
+        authority_epoch: event.authority_epoch,
+        state_fence: event.state_fence.clone(),
+        phase: AckPhase::Durable,
+        acknowledged_at_unix_ms: 1_000,
+    };
+    let ack_wire = serde_json::to_value(&ack).expect("ack wire");
+    assert!(ack_wire["authority_epoch"].is_number());
+    assert!(ack_wire["state_fence"].is_object());
+    assert_eq!(
+        serde_json::from_value::<EventAckReceipt>(ack_wire).expect("ack roundtrip"),
+        ack
+    );
+
+    let mut provider = FakeAdmission::default();
+    let hello_value = hello("connection-17-provider", "request-17-provider");
+    let process = process_request();
+    let request = CapabilityAdmissionRequest::from_start(&hello_value, &process);
+    let outcome = provider.admit(&request).expect("admission facts");
+    let CapabilityAdmissionOutcome::Admitted(facts) = outcome else {
+        panic!("fixture admission must be admitted");
+    };
+    // Positive provider authority is serialize-only; this proves deterministic
+    // sealed-output equivalence, not a public JSON input roundtrip.
+    let facts_wire = serde_json::to_string(&facts).expect("facts wire");
+    assert_eq!(
+        facts_wire,
+        serde_json::to_string(&facts).expect("facts wire repeat")
+    );
+    let sealed = CapabilityGrant::seal(*facts);
+    assert_eq!(sealed.authority().epoch, hello_value.authority_epoch);
+    assert_eq!(sealed.authority().epoch, request.hello().authority_epoch);
+    assert_eq!(sealed.authority().state_fence, hello_value.state_fence);
+    assert_eq!(sealed.authority().state_fence, request.hello().state_fence);
+    let facts_wire: serde_json::Value =
+        serde_json::from_str(&facts_wire).expect("facts JSON object");
+    assert!(facts_wire["authority"]["epoch"].is_number());
+    assert!(facts_wire["authority"]["state_fence"].is_object());
+    assert_eq!(provider.state.lock().expect("admission lock").admissions, 1);
+}
+
+#[test]
+fn native_case_18_v1_old_string_wire_rejects_before_capability_admission() {
+    let mut typed_v1 =
+        serde_json::to_value(hello("connection-18", "request-18")).expect("typed v1 wire");
+    typed_v1["protocol_version"] = serde_json::json!("eliot-native-worker/v1");
+    let typed_v1: WorkerHello = serde_json::from_value(typed_v1).expect("typed v1 shape");
+    let (mut core, executor, admission, _, _) = fixture();
+    assert_eq!(
+        block_on(core.demand_start(typed_v1, process_request())),
+        Err(WorkerError::UnsupportedVersion)
+    );
+    assert_eq!(
+        admission.state.lock().expect("admission lock").admissions,
+        0
+    );
+    assert_eq!(executor.state.lock().expect("executor lock").starts, 0);
+    assert_eq!(core.lifecycle(), WorkerLifecycle::Created);
+    v1_string_authority_wire_is_rejected_before_admission();
+}
+
+#[test]
+fn native_case_19_protocol_label_and_field_shape_must_match_v2() {
+    let mut hello_wire =
+        serde_json::to_value(hello("connection-19", "request-19")).expect("hello wire");
+    hello_wire["authority_epoch"] = serde_json::json!("1");
+    assert!(serde_json::from_value::<WorkerHello>(hello_wire).is_err());
+    let mut frame_wire =
+        serde_json::to_value(frame("request-19", WorkerFrameBody::Execute(request(None))))
+            .expect("frame wire");
+    frame_wire["state_fence"] = serde_json::json!("legacy-fence");
+    assert!(serde_json::from_value::<WorkerFrame>(frame_wire).is_err());
+
+    let mut v1_typed =
+        serde_json::to_value(hello("connection-19-v1", "request-19-v1")).expect("typed v1 wire");
+    v1_typed["protocol_version"] = serde_json::json!("eliot-native-worker/v1");
+    let parsed: WorkerHello = serde_json::from_value(v1_typed).expect("shape remains parseable");
+    let (mut core, executor, admission, _, _) = fixture();
+    assert_eq!(
+        block_on(core.demand_start(parsed, process_request())),
+        Err(WorkerError::UnsupportedVersion)
+    );
+    assert_eq!(
+        admission.state.lock().expect("admission lock").admissions,
+        0
+    );
+    assert_eq!(executor.state.lock().expect("executor lock").starts, 0);
+    assert_eq!(core.lifecycle(), WorkerLifecycle::Created);
+}
+
+#[test]
+fn native_case_20_zero_counters_and_epoch_fence_mismatch_reject() {
+    let mut value = serde_json::to_value(hello("connection-20", "request-20")).expect("hello wire");
+    value["authority_epoch"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<WorkerHello>(value).is_err());
+    let mut value =
+        serde_json::to_value(hello("connection-20b", "request-20b")).expect("hello wire");
+    value["state_fence"]["resource_generation"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<WorkerHello>(value).is_err());
+    let mut mismatched = hello("connection-20c", "request-20c");
+    mismatched.authority_epoch = AuthorityEpoch::new(2).expect("epoch");
+    assert_eq!(
+        mismatched.validate(),
+        Err(WorkerError::InvalidHandshake("epoch_fence"))
+    );
+    let mut mismatched_frame = frame("request-20d", WorkerFrameBody::Execute(request(None)));
+    mismatched_frame.authority_epoch = AuthorityEpoch::new(2).expect("epoch");
+    assert_eq!(
+        mismatched_frame.validate_shape(),
+        Err(WorkerError::InvalidFrame("epoch_fence"))
+    );
+    for (name, wrong_epoch, wrong_fence, expected) in [
+        (
+            "provider-epoch",
+            true,
+            false,
+            WorkerError::AdmissionMismatch("authority_epoch"),
+        ),
+        (
+            "provider-fence",
+            false,
+            true,
+            WorkerError::AdmissionMismatch("state_fence"),
+        ),
+    ] {
+        let (mut core, executor, admission, replay, sink) = fixture();
+        {
+            let mut state = admission.state.lock().expect("admission lock");
+            state.returned_wrong_epoch = wrong_epoch;
+            state.returned_wrong_fence = wrong_fence;
+        }
+        let replay_before = replay.state.lock().expect("replay lock").clone();
+        assert_eq!(
+            block_on(core.demand_start(hello("connection-20", name), process_request())),
+            Err(expected)
+        );
+        assert_eq!(
+            admission.state.lock().expect("admission lock").admissions,
+            1
+        );
+        assert_eq!(executor.state.lock().expect("executor lock").starts, 0);
+        assert_eq!(core.lifecycle(), WorkerLifecycle::Created);
+        assert_eq!(
+            core.process_state(),
+            eliot_runtime_contracts::ServiceProcessState::Stopped
+        );
+        assert!(core.process_start_receipt().is_none());
+        assert!(sink.evidence.lock().expect("evidence lock").is_empty());
+        assert_eq!(*replay.state.lock().expect("replay lock"), replay_before);
+    }
+}
+
+#[test]
+fn native_case_21_stale_resource_task_policy_integration_fences_preserve_provider_state() {
+    let (mut core, _, admission, _, _) = fixture();
+    start(&mut core);
+    let before = admission
+        .state
+        .lock()
+        .expect("admission lock")
+        .revalidations;
+    let baseline_fence = StateFence::new(
+        AuthorityEpoch::new(1).expect("epoch"),
+        ResourceGeneration::new(1).expect("generation"),
+    );
+    for (name, fence) in [
+        (
+            "resource",
+            StateFence {
+                resource_generation: ResourceGeneration::new(2).expect("generation"),
+                ..baseline_fence.clone()
+            },
+        ),
+        (
+            "task",
+            StateFence {
+                task_revision: Some(TaskRevision::new(5).expect("task revision")),
+                ..baseline_fence.clone()
+            },
+        ),
+        (
+            "policy",
+            StateFence {
+                policy_revision: Some(PolicyRevision::new(6).expect("policy revision")),
+                ..baseline_fence.clone()
+            },
+        ),
+        (
+            "integration",
+            StateFence {
+                integration_revision: Some(
+                    IntegrationRevision::new(7).expect("integration revision"),
+                ),
+                ..baseline_fence.clone()
+            },
+        ),
+    ] {
+        let mut stale = frame(
+            &format!("case-21-{name}"),
+            WorkerFrameBody::Execute(request(None)),
+        );
+        stale.state_fence = fence;
+        assert_eq!(block_on(core.handle(stale)), Err(WorkerError::StaleFence));
+    }
+    assert_eq!(
+        admission
+            .state
+            .lock()
+            .expect("admission lock")
+            .revalidations,
+        before
+    );
+    assert_eq!(core.lifecycle(), WorkerLifecycle::Ready);
+
+    for expected in ["lease", "revision", "expired", "revoked"] {
+        let (mut core, executor, admission, replay, sink) = fixture();
+        start(&mut core);
+        {
+            let mut state = admission.state.lock().expect("admission lock");
+            match expected {
+                "lease" => state.stale_lease = true,
+                "revision" => state.stale_revision = true,
+                "expired" => state.observed_at_unix_ms = state.expires_at_unix_ms,
+                "revoked" => state.revoked = true,
+                _ => unreachable!(),
+            }
+        }
+
+        let lifecycle_before = core.lifecycle();
+        let process_state_before = core.process_state();
+        let receipt_before = core.process_start_receipt().cloned();
+        let process_view_before = executor
+            .state
+            .lock()
+            .expect("executor lock")
+            .process
+            .as_ref()
+            .map(ProcessState::view);
+        let executor_before = executor.state.lock().expect("executor lock").clone();
+        let replay_before = replay.state.lock().expect("replay lock").clone();
+        let admission_before = admission.state.lock().expect("admission lock").clone();
+        let evidence_before = sink.evidence.lock().expect("evidence lock").clone();
+
+        let result = block_on(core.handle(frame(
+            &format!("case-21-live-{expected}"),
+            WorkerFrameBody::Execute(request(None)),
+        )));
+        match expected {
+            "lease" | "expired" => assert_eq!(result, Err(WorkerError::StaleLease)),
+            "revision" => assert_eq!(result, Err(WorkerError::StaleRevision)),
+            "revoked" => assert_eq!(result, Err(WorkerError::Revoked("revocation-2".to_owned()))),
+            _ => unreachable!(),
+        }
+
+        assert_eq!(core.lifecycle(), lifecycle_before);
+        assert_eq!(core.process_state(), process_state_before);
+        assert_eq!(core.process_start_receipt().cloned(), receipt_before);
+        let process_view_after = executor
+            .state
+            .lock()
+            .expect("executor lock")
+            .process
+            .as_ref()
+            .map(ProcessState::view);
+        assert_eq!(process_view_after, process_view_before);
+        assert_eq!(
+            *executor.state.lock().expect("executor lock"),
+            executor_before
+        );
+        assert_eq!(*replay.state.lock().expect("replay lock"), replay_before);
+        assert_eq!(
+            sink.evidence.lock().expect("evidence lock").clone(),
+            evidence_before
+        );
+        let admission_after = admission.state.lock().expect("admission lock").clone();
+        let mut expected_admission = admission_before;
+        expected_admission.revalidations += 1;
+        assert_eq!(admission_after, expected_admission);
+    }
+}
+
+#[test]
+fn native_case_22_existing_cancellation_and_unknown_outcome_paths_remain_green() {
+    cancel_calls_p03_once_and_replays_the_same_durable_event();
+    unknown_cancel_blocks_work_until_exact_p03_reconciliation();
 }
