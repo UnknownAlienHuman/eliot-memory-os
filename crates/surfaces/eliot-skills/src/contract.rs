@@ -402,7 +402,7 @@ pub struct HostProfile {
 }
 
 impl HostProfile {
-    fn validate(&self) -> Result<(), SkillContractError> {
+    pub(crate) fn validate(&self) -> Result<(), SkillContractError> {
         validate_text(&self.host, "host.host")?;
         validate_text(&self.profile, "host.profile")?;
         if self.required_tools.is_empty() {
@@ -492,7 +492,7 @@ pub struct SkillBehavior {
 }
 
 impl SkillBehavior {
-    fn validate(&self) -> Result<(), SkillContractError> {
+    pub(crate) fn validate(&self) -> Result<(), SkillContractError> {
         validate_text(&self.intent, "behavior.intent")?;
         validate_text(&self.trigger, "behavior.trigger")?;
         validate_text(&self.action, "behavior.action")?;
