@@ -1,0 +1,293 @@
+schema = "eliot.agent-work-unit.v1"
+issue = 325
+integration_owner_issue = 18
+product_pulse_issue = 11
+status = "READY_FOR_IMPLEMENTATION"
+source_base = "15d6b40d06df0eab8c2fc94a856253f36521b305"
+branch = "fix/325-strict-finish-rehydration"
+primary_owner = "governor-finish-service"
+primary_cell = "governor.finish.strict-derivation"
+causal_property = "A caller submits only a finish candidate. Acceptance requirements, artifact bindings, verifier execution/outcome/freshness and unresolved effect state are rehydrated from current owners and cannot be supplied or weakened by the caller."
+proof_ceiling = "PACKAGE_AND_CONSUMER_CONTRACT_PROOF_UNTIL_REAL_FINISH_EDGE"
+
+[documentation]
+architecture_handles = ["ARCH-FIN-01", "ARCH-LIFE-01", "ARCH-SEC-02", "ARCH-MOD-03", "ARCH-RES-04"]
+implementation_handles = ["I5.19", "I6.11", "I7.9", "I7.27", "I18"]
+required_files_read = [
+  "AGENTS.md",
+  "crates/governor/AGENTS.md",
+  "docs/architecture/I07-09-strict-finish-input-and-outcomes.md",
+  "crates/governor/eliot-canonical/Cargo.toml",
+  "crates/governor/eliot-canonical/src/lib.rs",
+  "crates/governor/eliot-finish/Cargo.toml",
+  "crates/governor/eliot-finish/src/lib.rs",
+  "crates/surfaces/eliot-mcp/src/contract.rs",
+  "crates/surfaces/eliot-mcp/src/schema.rs",
+  "crates/surfaces/eliot-mcp/tests/contract.rs",
+]
+routing_command = "python scripts/docs_router.py route --path crates/governor/eliot-finish/src/lib.rs --path crates/governor/eliot-canonical/src/lib.rs --topic 'strict finish candidate input and owner-rehydrated acceptance verifier and effect evidence'"
+routing_receipt_status = "REQUIRED_BEFORE_FIRST_RUST_MUTATION"
+
+[current_defect]
+public_input = "crates/governor/eliot-finish/src/lib.rs::FinishAttempt"
+unsafe_field = "pub evidence: FinishEvidence"
+contract_export = "eliot-finish contract_identity publishes schema_for!(FinishAttempt)"
+derivation_path = "FinishService::evaluate clones attempt.evidence and passes it to eliot_canonical::derive_finish_decision"
+missing_owner_state = [
+  "FinishContext has no current TaskContract acceptance denominator",
+  "FinishContext has no exact artifact ownership/currentness projection",
+  "FinishContext has no typed verifier execution/outcome/artifact/scope/freshness rows",
+  "FinishContext has no exact current unresolved external-effect denominator beyond descendant closure",
+]
+canonical_gap = [
+  "AcceptanceCoverage.requires_verifier is currently carried by FinishEvidence instead of derived from the TaskContract",
+  "AcceptanceCoverage.satisfied is currently a bool supplied with the evidence object rather than owner-derived item state",
+  "executed_verifier_run_refs and stale_verifier_run_refs are string sets without typed execution and outcome axes",
+  "derive_finish_decision can classify membership in an executed set but cannot distinguish executed-pass, executed-fail, simulated, unknown outcome or artifact-unbound runs",
+  "FinishError::CallerProofRejected is declared but current strict decoding never constructs it",
+]
+old_discriminator = "A deserializable FinishAttempt containing caller-selected acceptance and verifier evidence can reach FinishService::evaluate; the public contract schema advertises that shape."
+
+[contract.current_input]
+type = "FinishAttempt"
+contract_revision = "eliot.governor.finish v2"
+fields = [
+  "attempt_id",
+  "state_fence",
+  "draft",
+  "closure_intent",
+]
+forbidden_fields = [
+  "evidence",
+  "completion_proof",
+  "acceptance",
+  "requires_verifier",
+  "executed_verifier_run_refs",
+  "stale_verifier_run_refs",
+  "unresolved_effect_refs",
+]
+rule = "Current public input is candidate-only. Unknown fields fail closed."
+
+[contract.current_context]
+type = "FinishContext"
+fields = [
+  "task_id",
+  "current_task_revision",
+  "current_state_fence",
+  "lifecycle",
+  "finish_authority_ref",
+  "closure_authority_ref",
+  "task_contract_revision_and_acceptance_digest",
+  "acceptance_items",
+  "artifact_bindings",
+  "verifier_runs",
+  "effect_outcomes",
+  "descendant_closure",
+  "rehydration_snapshot_digest",
+  "rehydrated_at_ms",
+  "fresh_until_ms_or_invalidation_set",
+]
+rule = "Every load-bearing row is produced by its actual owner and bound to the same task revision, State Fence and rehydration snapshot."
+
+[[contract.acceptance_item]]
+field = "item_id"
+meaning = "Exact current TaskContract acceptance identity."
+
+[[contract.acceptance_item]]
+field = "requirement_digest"
+meaning = "Digest of the exact acceptance requirement and evaluator binding."
+
+[[contract.acceptance_item]]
+field = "requires_verifier"
+meaning = "Derived from current TaskContract; never caller-selected."
+
+[[contract.acceptance_item]]
+field = "required_artifact_refs"
+meaning = "Exact required artifact identities or an explicit denominator."
+
+[[contract.acceptance_item]]
+field = "evidence_refs"
+meaning = "Owner-admitted current evidence for this item."
+
+[[contract.acceptance_item]]
+field = "coverage"
+meaning = "SATISFIED | UNSATISFIED | UNKNOWN | STALE | CONFLICTED; not a caller boolean."
+
+[contract.verifier_run]
+required_fields = [
+  "verifier_run_ref",
+  "verifier_contract_ref",
+  "acceptance_item_refs",
+  "execution_status",
+  "evaluation_outcome",
+  "artifact_binding",
+  "scope_ref",
+  "state_fence",
+  "observed_at_ms",
+  "freshness_or_invalidation",
+  "independence_profile_ref",
+  "raw_evidence_refs",
+]
+execution_status = ["NOT_EXECUTED", "SIMULATED", "EXECUTED", "UNKNOWN_OUTCOME"]
+evaluation_outcome = ["UNASSESSED", "PASS", "FAIL", "INCONCLUSIVE", "STALE"]
+artifact_binding = ["UNBOUND", "BOUND_EXACT", "BOUND_PARTIAL"]
+completion_rule = "Only EXECUTED + PASS + BOUND_EXACT + exact current scope/fence/freshness can satisfy a verifier requirement."
+
+[contract.effect_outcome]
+required_fields = [
+  "effect_ref",
+  "operation_id",
+  "disposition",
+  "state_fence",
+  "receipt_or_reconciliation_ref",
+]
+disposition = ["NOT_ATTEMPTED", "COMMITTED", "REJECTED_NO_EFFECT", "COMPENSATED", "UNKNOWN_OUTCOME", "RECONCILING"]
+completion_rule = "UNKNOWN_OUTCOME and RECONCILING block VERIFIED_COMPLETE and every closing disposition that requires reconciled effects."
+
+[compatibility]
+legacy_contract = "eliot.governor.finish v1 FinishAttempt with evidence"
+legacy_current_entrypoint = "A dedicated compatibility decoder may recognize the v1 shape only to return FinishError::CallerProofRejected / LEGACY_FINISH_INPUT_REJECTED."
+forbidden = [
+  "silently dropping the legacy evidence field and continuing",
+  "copying legacy caller evidence into FinishContext",
+  "defaulting missing current context fields",
+  "falling back to v1 derivation when v2 rehydration is unavailable",
+  "accepting a generic serde_json::Value proof blob",
+]
+migration_rule = "Existing immutable v1 receipts remain historical and validate under their own revision. New attempts use v2 only."
+
+[algorithm]
+steps = [
+  "Decode and validate candidate-only FinishAttempt v2; reject proof-shaped or unknown fields.",
+  "Load exact current TaskContract, acceptance denominator and task revision from the canonical owner.",
+  "Load exact current artifacts and their task/scope/revision bindings.",
+  "Load verifier runs from the verification owner and retain execution, outcome, binding, freshness and evidence dimensions separately.",
+  "Load external-effect and descendant dispositions from their current owners.",
+  "Build one immutable FinishContext/RehydratedFinishEvidence snapshot bound to the same State Fence and task revision.",
+  "Reject stale, mixed-revision, incomplete-denominator or conflicting owner data before decision derivation.",
+  "Derive per-acceptance coverage without trusting caller declarations.",
+  "Derive one closed FinishDecisionOutcome; only a complete current denominator can produce VERIFIED_COMPLETE.",
+  "Bind decision, rehydration snapshot digest, authority and lifecycle action into the immutable receipt.",
+  "On exact replay, return the same receipt; changed candidate bytes under one attempt identity fail as IdentityConflict.",
+]
+
+[scope]
+wave_1_mutable_paths = [
+  "crates/governor/eliot-canonical/src/lib.rs",
+  "crates/governor/eliot-canonical/tests/**",
+]
+wave_2_mutable_paths = [
+  "crates/governor/eliot-finish/src/lib.rs",
+  "crates/governor/eliot-finish/tests/**",
+]
+wave_3_mutable_paths = [
+  "crates/surfaces/eliot-mcp/src/contract.rs",
+  "crates/surfaces/eliot-mcp/src/schema.rs",
+  "crates/surfaces/eliot-mcp/tests/contract.rs",
+]
+wave_4_mutable_paths = [
+  "crates/governor/eliot-governor/src/**",
+  "bins/eliotd/src/**",
+]
+wave_rule = "One writer per wave. Wave 4 begins only after the contract/package waves are merged or stacked under the same integration owner."
+forbidden_paths = [
+  "crates/kernel/**",
+  "crates/storage/**",
+  "bins/eliot-host/**",
+  "bins/eliot-watchdog/**",
+  "crates/agent/**",
+  "docs/architecture/**",
+  ".github/workflows/**",
+]
+non_goals = [
+  "execute a verifier inside eliot-finish",
+  "make the finish projection a canonical state owner",
+  "change TaskContract or verifier ownership",
+  "change descendant/process reconciliation semantics",
+  "close task state without the canonical transition owner",
+  "interpret model or worker success as completion",
+  "claim Product Proof from package tests",
+]
+
+[errors]
+required = [
+  "LEGACY_FINISH_INPUT_REJECTED / CallerProofRejected",
+  "TASK_BINDING_MISMATCH",
+  "STALE_TASK_REVISION",
+  "STALE_STATE_FENCE",
+  "ACCEPTANCE_DENOMINATOR_INCOMPLETE",
+  "ARTIFACT_BINDING_MISMATCH",
+  "VERIFIER_NOT_EXECUTED",
+  "VERIFIER_SIMULATED",
+  "VERIFIER_FAILED",
+  "VERIFIER_INCONCLUSIVE",
+  "VERIFIER_STALE",
+  "VERIFIER_ARTIFACT_UNBOUND",
+  "VERIFIER_SCOPE_MISMATCH",
+  "EFFECT_OUTCOME_UNKNOWN",
+  "DESCENDANT_UNRECONCILED",
+  "FINISH_REHYDRATION_CONFLICT",
+  "FINISH_IDENTITY_CONFLICT",
+]
+rule = "Stable machine causes remain typed; human detail is non-controlling."
+
+[fixtures]
+contract = [
+  "current_finish_attempt_has_no_evidence_or_proof_field",
+  "legacy_v1_proof_shaped_input_is_rejected",
+  "unknown_or_missing_v2_fields_do_not_select_legacy_path",
+  "contract_identity_changes_to_v2_and_retains explicit v1 compatibility identity",
+]
+canonical = [
+  "caller_satisfied_true_cannot_close_unsatisfied_owner_item",
+  "caller_omission_cannot_turn_required_verifier_off",
+  "not_executed_verifier_cannot_complete",
+  "simulated_verifier_cannot_complete",
+  "executed_failed_verifier_cannot_complete",
+  "executed_inconclusive_verifier_cannot_complete",
+  "stale_or_wrong_scope_verifier_cannot_complete",
+  "partially_bound_artifact_cannot_complete",
+  "unknown_effect_blocks_completion",
+  "complete_current_owner_evidence_produces_verified_complete",
+]
+service = [
+  "mixed_task_revision_rehydration_fails_before_receipt",
+  "mixed_state_fence_rehydration_fails_before_receipt",
+  "incomplete acceptance denominator fails closed",
+  "exact retry_returns_same_receipt",
+  "changed_candidate_same_attempt_id_is_identity_conflict",
+  "closed_task_rejects_new_attempt",
+  "noncomplete descendant forces nonterminal_or_blocked outcome",
+]
+consumer = [
+  "MCP eliot.finish schema remains candidate-only",
+  "MCP cannot submit rehydrated evidence fields",
+  "Governor composition obtains context from owners rather than surface input",
+  "eliotd does not construct FinishEvidence from requester payload",
+]
+
+[proof]
+package_commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-canonical -p eliot-finish -p eliot-mcp --all-targets",
+  "cargo test --locked -p eliot-canonical -p eliot-finish -p eliot-mcp --all-targets",
+  "cargo clippy --locked -p eliot-canonical -p eliot-finish -p eliot-mcp --all-targets -- -D warnings",
+  "git diff --check",
+]
+required_nonzero_tests = true
+edge_profile = "D1_STRICT_FINISH_OWNER_REHYDRATION_EDGE_01"
+product_pulse = "Issue #11 real task: forged caller proof rejected; valid executed verifier and reconciled effect close exactly once; daemon restart preserves the same decision."
+
+[stop_conditions]
+contract_challenge = [
+  "The TaskContract, verifier-run or effect owner cannot provide the required current denominator without creating a second owner.",
+  "The implementation would accept legacy proof by silently dropping or copying fields.",
+  "The only available test constructs FinishContext directly and never traverses the real owner consumer edge.",
+  "A source worker needs to edit Kernel, Store, Host, agent-provider or verifier-execution code to make the finish package pass.",
+  "The decision requires changing the eight closed FinishDecision outcomes or Architecture finish semantics.",
+]
+
+[integration]
+merge_owner = "eliotd/Governor integration swarm"
+merge_rule = "Do not merge a partial wave that leaves a public path able to construct caller-owned FinishEvidence. Contract, service and active consumers must agree on one revision before cutover."
+result_schema = "issue, source_base, candidate_sha, changed_paths_by_wave, legacy_rejection_proof, owner_rehydration_proof, verifier_and_effect_matrix, package_proof, real_edge_proof, residual_unknowns, finish"
