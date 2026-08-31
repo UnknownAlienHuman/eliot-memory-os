@@ -1,0 +1,51 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w2-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 30
+cell = "smart.context.admission"
+physical_crate = "eliot-context"
+predecessor_orders = [27, 29]
+primary_property = "Admit whole Context units under immutable recipe, Decision Safety Floor, downstream headroom, provider fairness, uncertainty and influence constraints with one disposition per candidate."
+field_contracts = ["crates/smart/eliot-context-contracts/provider-contribution.contract.toml", "crates/smart/eliot-context-contracts/context-compiler.contract.toml", "crates/smart/eliot-context-contracts/w2-execution.contract.toml"]
+public_function_signatures = [
+  "pub fn admit_context_candidates(request: &ContextCompilationRequest, candidates: &ContextCandidateSet, recipe: &ContextRecipe) -> Result<AdmittedContextSet, ContextAdmissionError>",
+]
+write_scope = [
+  "crates/smart/eliot-context/src/admission.rs",
+  "crates/smart/eliot-context/tests/admission.rs",
+]
+algorithm = [
+  "validate request/candidate/recipe identities and fence",
+  "reserve tool/reasoning/review/tail/output/safety headroom before optional allocation",
+  "quarantine denied influence and require revalidation for stale/unknown applicability",
+  "admit mandatory Safety Floor whole payload/excerpt/handle/warning forms first",
+  "allocate optional budget in deterministic provider-fair rounds",
+  "protect rivals, material unknowns, negative memory and counterevidence from ordinary shedding",
+  "emit exactly one disposition/reason/representation/expansion path per input atom",
+  "produce selection-integrity record and remaining headroom",
+]
+minimum_tests = [
+  "no atom slicing",
+  "optional atom cannot consume floor/headroom",
+  "unknown decision delta not zero",
+  "verbose provider cannot monopolize optional budget",
+  "required omission visible/expandable or fails",
+  "one disposition per candidate",
+  "permutation deterministic",
+]
+non_goals = [
+  "provider merge/retrieval",
+  "view rendering",
+  "tokenizer/provider call",
+  "delivery/use",
+  "authority/finish",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-CTX-01", "ARCH-CTX-04", "ARCH-EPI-04", "ARCH-MEM-04", "ARCH-HELP-01", "ARCH-MOD-03"]
+implementation_refs = ["I2.15", "I2.20", "I7.11", "I12.13"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Return SafetyFloorUnrepresentable or ContractChallenge rather than slicing a unit, consuming reserved headroom, treating Unknown as zero, or silently dropping protected material."
+brief_proof_ceiling = "STATIC_W2_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
