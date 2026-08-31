@@ -1,0 +1,49 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w2-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 31
+cell = "smart.context.assembly"
+physical_crate = "eliot-context"
+predecessor_orders = [28, 30]
+primary_property = "Render an immutable role-preserving ActiveUnderstandingView from an already admitted set without changing membership, dispositions or epistemic/authority ceilings."
+field_contracts = ["crates/smart/eliot-context-contracts/provider-contribution.contract.toml", "crates/smart/eliot-context-contracts/context-compiler.contract.toml"]
+public_function_signatures = [
+  "pub fn assemble_active_understanding_view(admitted: &AdmittedContextSet, layout: &ContextLayout) -> Result<ActiveUnderstandingView, ContextAssemblyError>",
+]
+write_scope = [
+  "crates/smart/eliot-context/src/assembly.rs",
+  "crates/smart/eliot-context/tests/assembly.rs",
+]
+algorithm = [
+  "validate admitted-set and layout identities, route and fence",
+  "render sections in exact semantic role order",
+  "render admitted representation without rewriting payload semantics",
+  "preserve warnings, stale/revalidation markers and source lineage",
+  "emit exact handle/omission/boundary metadata for every admitted decision",
+  "verify membership partition unchanged and compute view digest",
+]
+minimum_tests = [
+  "role order stable",
+  "membership/disposition unchanged",
+  "renderer cannot raise status/authority ceiling",
+  "omission manifest exact and reversible",
+  "required render failure stops assembly",
+  "optional handle fallback only when admitted",
+  "input permutation deterministic",
+]
+non_goals = [
+  "candidate merge/admission",
+  "retrieval/provider call",
+  "tokenizer/model call",
+  "quality judgment",
+  "delivery/use",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-CTX-01", "ARCH-CTX-03", "ARCH-CTX-04", "ARCH-UND-01", "ARCH-MOD-03"]
+implementation_refs = ["I2.15", "I2.20", "I7.11", "I12.13"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Return RequiredRenderFailure or ContractChallenge rather than changing membership/disposition, generatively rewriting evidence, or hiding an omission/warning."
+brief_proof_ceiling = "STATIC_W2_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
