@@ -4,6 +4,7 @@ pub mod action;
 pub mod adapter;
 pub mod admission;
 pub mod antigravity;
+pub mod antigravity_persistent;
 pub mod codecortex;
 pub mod cognition;
 pub mod cognitive_disposition;
@@ -66,6 +67,10 @@ pub use antigravity::{
     AntigravityWindowsInstallDiscoveryService, BoxProviderProcessFuture, ProviderProcessOutcome,
     ProviderProcessRunner, ProviderProcessSpec, antigravity_real_report, antigravity_report,
     antigravity_review_request,
+};
+pub use antigravity_persistent::{
+    AntigravityFingerprintService, AntigravityPersistentLaunchService, FakeAntigravityRuntime,
+    FakeRuntimeError,
 };
 pub use codecortex::{CodeCortexMemoryWriter, CodeCortexService};
 pub use cognition::{

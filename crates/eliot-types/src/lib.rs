@@ -2,6 +2,7 @@
 
 pub mod adapter;
 pub mod antigravity;
+pub mod antigravity_persistent;
 pub mod cognition;
 pub mod cognitive_field;
 pub mod cognitive_run;
@@ -64,6 +65,15 @@ pub use antigravity::{
     AntigravitySessionPolicy, AntigravityStdinMode, AntigravityTelemetryReport,
     AntigravityTrustReceipt, AntigravityVersionGateResult, AntigravityVersionGateStatus,
     AntigravityVisibilityReport, AntigravityWindowsInstallDiscovery, AntigravityWorkdirPolicy,
+};
+pub use antigravity_persistent::{
+    ALLOWED_ENV_NAMES, ANTIGRAVITY_PERSISTENT_MAX_FRAME_BYTES, ANTIGRAVITY_PERSISTENT_MAX_FRAMES,
+    ANTIGRAVITY_PERSISTENT_MAX_TIMEOUT_MS, ANTIGRAVITY_PERSISTENT_MAX_TOTAL_BYTES,
+    ANTIGRAVITY_PERSISTENT_MIN_FRAME_BYTES, ANTIGRAVITY_PERSISTENT_MIN_TIMEOUT_MS,
+    ANTIGRAVITY_PERSISTENT_MIN_TOTAL_BYTES, ANTIGRAVITY_PERSISTENT_SCHEMA_VERSION,
+    AntigravityExecutableFingerprint, AntigravityFingerprintStatus, AntigravityFrameKind,
+    AntigravityPersistentBounds, AntigravityPersistentCapabilities, AntigravityPersistentFrame,
+    AntigravityPersistentLaunchContract, AntigravityPersistentLaunchReceipt,
 };
 pub use cognition::{
     ActiveDecisionState, AgentRoutingView, ApprovalView, AutonomyRecoveryRecord,
