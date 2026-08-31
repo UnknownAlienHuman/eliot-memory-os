@@ -5,7 +5,7 @@ use eliot_agent_bridge_core::{
     AckPhase, ActivationPortOutcome, ActivationPortResult, AgentBridgeCore, AttachBinding,
     AttachRequest, BlindInterval, BridgeError, ConnectionId, CoverageGap, CoverageInterval,
     CursorPolicy, DemandId, EventDisposition, EventEnvelope, EventForwardAck, EventForwardStatus,
-    EventPortOutcome, FencingToken, Frame, Generation, HostActivationPort, HostEventEnvelope,
+    EventPortOutcome, FencingToken, Generation, HostActivationPort, HostEventEnvelope,
     McpForwardingPort, PrincipalId, ProofCeiling, ProviderFailure, ProviderReadiness,
     ReconciliationPortOutcome, ReconciliationPortResult, ReconciliationReceiptRef,
     ReconnectRequest, RequiredProvider, SessionId, TaskId, WorkUnitId,
@@ -59,7 +59,6 @@ impl HostActivationPort for SequencedHost {
 
 #[derive(Default)]
 struct ForwardState {
-    frames: usize,
     hooks: usize,
     events: usize,
     gaps: Vec<CoverageGap>,
@@ -72,18 +71,6 @@ struct FakeForwarder {
 }
 
 impl McpForwardingPort for FakeForwarder {
-    fn forward_frame(
-        &mut self,
-        _binding: &AttachBinding,
-        _frame: &Frame,
-    ) -> Result<(), ProviderFailure> {
-        self.state
-            .lock()
-            .map_err(|_| ProviderFailure::new("mcp", "test lock poisoned"))?
-            .frames += 1;
-        Ok(())
-    }
-
     fn forward_hook(
         &mut self,
         _binding: &AttachBinding,
@@ -206,20 +193,6 @@ fn event(class: &str, event_id: &str, sequence: u64) -> Result<EventEnvelope, se
             "policy_revision": null,
             "integration_revision": null
         },
-        "trace_context": {}
-    }))
-}
-
-fn frame(connection: &str) -> Result<Frame, serde_json::Error> {
-    serde_json::from_value(json!({
-        "protocol_version": {"major": 1, "minor": 0},
-        "encoding_profile": "json-v1",
-        "connection_id": connection,
-        "request_id": null,
-        "kind": "heartbeat",
-        "message_type": "Health",
-        "request_identity": null,
-        "payload": {"Json": {}},
         "trace_context": {}
     }))
 }
@@ -400,7 +373,7 @@ fn trusted_activation_rejects_empty_task_binding_fields() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn reconnect_replaces_transport_but_rejects_stale_generation_and_session()
+fn reconnect_replaces_transport_and_rejects_stale_generation_and_session()
 -> Result<(), Box<dyn std::error::Error>> {
     let forward_state = Arc::new(Mutex::new(ForwardState::default()));
     let mut bridge = bridge(
@@ -434,18 +407,6 @@ fn reconnect_replaces_transport_but_rejects_stale_generation_and_session()
     let view = bridge.reconnect(current)?;
     assert_eq!(view.binding().connection_id().as_str(), "connection-2");
     assert_eq!(view.binding().task_binding(), &original_task_binding);
-    assert!(matches!(
-        bridge.forward_frame(&frame("connection-1")?),
-        Err(BridgeError::StaleTransport)
-    ));
-    bridge.forward_frame(&frame("connection-2")?)?;
-    assert_eq!(
-        forward_state
-            .lock()
-            .map_err(|_| "forward state lock poisoned")?
-            .frames,
-        1
-    );
     Ok(())
 }
 
@@ -1024,8 +985,7 @@ fn serde_and_constructors_fail_closed() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[test]
-fn direct_hook_and_frame_contracts_are_validated_before_forwarding()
--> Result<(), Box<dyn std::error::Error>> {
+fn direct_hook_contract_is_validated_before_forwarding() -> Result<(), Box<dyn std::error::Error>> {
     let forward_state = Arc::new(Mutex::new(ForwardState::default()));
     let mut bridge = bridge(
         Arc::new(Mutex::new(HostState::default())),
@@ -1033,13 +993,20 @@ fn direct_hook_and_frame_contracts_are_validated_before_forwarding()
     )?;
     bridge.attach(managed_request("connection-1")?)?;
     bridge.forward_hook(&hook()?)?;
-    bridge.forward_frame(&frame("connection-1")?)?;
     let state = forward_state
         .lock()
         .map_err(|_| "forward state lock poisoned")?;
     assert_eq!(state.hooks, 1);
-    assert_eq!(state.frames, 1);
     Ok(())
+}
+
+#[test]
+fn raw_frame_forwarding_surface_is_absent() {
+    let src = include_str!("../src/lib.rs");
+    let raw_forward = format!("{}{}", "forward_", "frame");
+    let frame_type = format!("{}{}", "Fr", "ame");
+    assert!(!src.contains(&raw_forward));
+    assert!(!src.contains(&frame_type));
 }
 
 #[test]

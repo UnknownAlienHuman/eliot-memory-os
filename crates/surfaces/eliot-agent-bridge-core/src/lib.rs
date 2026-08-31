@@ -18,7 +18,7 @@ pub use eliot_observation_contracts::{
     BlindInterval, CoverageGap, CoverageInterval, GapDisposition,
 };
 pub use eliot_process::{FencingToken, Generation};
-pub use eliot_protocol::{AckPhase, DeliveryClass, EventDisposition, EventEnvelope, Frame};
+pub use eliot_protocol::{AckPhase, DeliveryClass, EventDisposition, EventEnvelope};
 use eliot_protocol::{EventAckReceipt, EventIdentityKey, ReplayLedger};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
@@ -530,12 +530,6 @@ impl EventForwardAck {
 /// Injected A-06/MCP boundary. It owns neither the bridge's local transport
 /// binding nor canonical semantic state.
 pub trait McpForwardingPort {
-    fn forward_frame(
-        &mut self,
-        binding: &AttachBinding,
-        frame: &Frame,
-    ) -> Result<(), ProviderFailure>;
-
     fn forward_hook(
         &mut self,
         binding: &AttachBinding,
@@ -990,25 +984,6 @@ impl AgentBridgeCore {
         })
     }
 
-    pub fn forward_frame(&mut self, frame: &Frame) -> Result<(), BridgeError> {
-        self.ensure_forwardable()?;
-        frame
-            .validate()
-            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
-        if frame.request_identity.is_some() {
-            return Err(BridgeError::InvalidContract {
-                field: "frame.request_identity",
-                reason: "request identity is Kernel-bound and cannot cross the bridge line protocol",
-            });
-        }
-        let binding = self.binding()?.clone();
-        if frame.connection_id != binding.connection_id.as_str() {
-            return Err(BridgeError::StaleTransport);
-        }
-        self.forwarder()?.forward_frame(&binding, frame)?;
-        Ok(())
-    }
-
     pub fn forward_hook(&mut self, event: &HostEventEnvelope) -> Result<(), BridgeError> {
         self.ensure_forwardable()?;
         event
@@ -1304,8 +1279,6 @@ pub enum BridgeError {
     ActivationDenied(&'static str),
     #[error("stale session, generation, or state fence")]
     StaleAuthority,
-    #[error("frame is bound to a stale transport connection")]
-    StaleTransport,
     #[error("EXTERNAL_ATTACH_RECONCILIATION_REQUIRED")]
     ExternalAttachReconciliationRequired,
     #[error("external attach reconciliation denied: {0}")]
