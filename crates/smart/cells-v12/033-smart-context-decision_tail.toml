@@ -1,0 +1,50 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w2-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 33
+cell = "smart.context.decision_tail"
+physical_crate = "eliot-context"
+predecessor_orders = [28, 31, 32]
+primary_property = "Build a bounded decision-local tail naming current goal, scope, load-bearing atoms, do-not-use items, next action, expected observable, verifier and stop/revision condition without inventing authority."
+field_contracts = ["crates/smart/eliot-context-contracts/context-compiler.contract.toml", "crates/smart/eliot-context-contracts/w2-execution.contract.toml"]
+public_function_signatures = [
+  "pub fn build_decision_local_tail(view: &ActiveUnderstandingView, boundary: &DecisionBoundary, limits: &DecisionTailLimits) -> Result<DecisionLocalTail, DecisionTailError>",
+]
+write_scope = [
+  "crates/smart/eliot-context/src/decision_tail.rs",
+  "crates/smart/eliot-context/tests/decision_tail.rs",
+]
+algorithm = [
+  "validate view/boundary/limits identity and fence",
+  "select exact current goal/acceptance/scope and load-bearing atoms",
+  "retain do-not-use/revalidate items and active conflict/recovery/security directives",
+  "for Material/Critical boundary require admitted next action, expected observable and applicable verifier",
+  "preserve stop/revision condition and exact expansion handles",
+  "return DecisionBlocked with missing dependency rather than fabricate content",
+  "canonicalize and compute tail digest",
+]
+minimum_tests = [
+  "goal/acceptance/scope required",
+  "Material/Critical verifier and observable required",
+  "security/recovery directive cannot be shed",
+  "blocked action explicit",
+  "limits cannot remove floor material",
+  "tail points to exact view/boundary",
+  "no action authority field",
+]
+non_goals = [
+  "new retrieval/admission",
+  "action authorization/execution",
+  "verifier execution",
+  "model call",
+  "delivery/use",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-CTX-01", "ARCH-CTX-03", "ARCH-UND-01", "ARCH-AUTH-01", "ARCH-MOD-03"]
+implementation_refs = ["I2.15", "I2.20", "I7.11", "I12.31"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Return DecisionBlocked or ContractChallenge rather than inventing next action authority/verifier, shedding a directive, or substituting compiler-wide limits for DecisionTailLimits."
+brief_proof_ceiling = "STATIC_W2_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
