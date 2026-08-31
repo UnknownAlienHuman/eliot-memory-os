@@ -12,6 +12,20 @@ needed_by = ["eliot-dreamer-accessibility", "future use attribution/usefulness e
 missing_contract = "Canonical attributed inclusion/influence/use/outcome/cost/regret evidence with complete denominator, fence, scope and no-use semantics."
 forbidden_workaround = "writer utility score, retrieval count, recency or model judgment treated as usefulness proof"
 resolution_evidence = ["versioned owner-neutral contract", "producer fixtures", "complete-denominator and attribution tests", "Governor/Meta ownership acceptance"]
+candidate_contracts = [
+  "crates/foundation/eliot-evaluation-contracts/attributed-memory-use.contract.toml",
+  "crates/foundation/eliot-evaluation-contracts/memory-outcome-economics.contract.toml",
+]
+candidate_assessment_cell = "crates/meta/eliot-memory-attribution-assessment/module.toml"
+consumer_gate = "crates/smart/eliot-dreamer-accessibility/module.toml"
+accessibility_assignable = false
+remaining_resolution_evidence = [
+  "Rust contract implementation and package proof",
+  "real producer denominator/outcome/cost fixtures",
+  "Meta assessment package and provider/consumer Edge proof",
+  "Governor/Meta ownership acceptance",
+  "D3A curation Product Pulse before promotion",
+]
 
 [[challenge]]
 id = "CC-002"

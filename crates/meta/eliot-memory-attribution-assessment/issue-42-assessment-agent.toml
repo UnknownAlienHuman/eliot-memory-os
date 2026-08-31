@@ -1,0 +1,53 @@
+schema_version = 1
+work_unit_id = "issue-42-memory-attribution-assessment"
+issue = 42
+challenge = "CC-001"
+role = "meta-assessment-agent"
+status = "BLOCKED_UNTIL_CONTRACT_FREEZE"
+primary_causal_property = "Admitted evidence is reduced to a dimensioned attributed-memory evaluation without inferring hidden use, benefit, or lifecycle authority."
+integration_owner = "cognitive-wave-integrator"
+
+prerequisites = [
+  "accepted eliot.evaluation.attributed-memory-use.v1 Rust contract and fixtures",
+  "accepted eliot.evaluation.memory-outcome-economics.v1 Rust contract and fixtures",
+  "current provider ownership for decision-opportunity denominator, outcome/evaluator evidence, and cost observations",
+]
+write_scope = [
+  "crates/meta/eliot-memory-attribution-assessment/src/**",
+  "crates/meta/eliot-memory-attribution-assessment/tests/**",
+  "crates/meta/eliot-memory-attribution-assessment/Cargo.toml",
+]
+read_scope = [
+  "crates/foundation/eliot-evaluation-contracts/**",
+  "crates/meta/eliot-learning-activation-assessment/**",
+  "crates/smart/eliot-dreamer-accessibility/**",
+  "crates/smart/eliot-learning-contracts/**",
+]
+required_tests = [
+  "complete denominator qualifying non-use",
+  "blind interval remains unknown",
+  "acknowledgement-only remains below UseProof",
+  "exact decision/action/verifier use",
+  "used-but-regressed/harmful outcome",
+  "composite success retains rival causes",
+  "missing/non-exposed cost never becomes zero",
+  "counterfactual absent limits attribution",
+  "delayed outcome window remains open",
+  "protected low-use material cannot receive an automatic demotion recommendation",
+  "input permutation determinism",
+]
+forbidden = [
+  "direct Context, Store, task, effect, evaluator, provider, model, or tool access",
+  "memory support/accessibility/influence/lifecycle/purge transition",
+  "promotion, canary, rollback execution, policy, authority, or finish",
+  "scalar usefulness/confidence/trust/regret score",
+]
+verification = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-memory-attribution-assessment --all-targets",
+  "cargo test --locked -p eliot-memory-attribution-assessment",
+  "cargo clippy --locked -p eliot-memory-attribution-assessment --all-targets -- -D warnings",
+  "real provider/consumer fixtures on exact contract revisions",
+]
+stop_condition = "Return ContractChallenge for every missing producer owner, incomplete denominator, stale evaluator/fence, unresolved effect, unknown outcome window, or requested lifecycle/promotion action."
+proof_ceiling = "Pure Meta assessment Module proof only."

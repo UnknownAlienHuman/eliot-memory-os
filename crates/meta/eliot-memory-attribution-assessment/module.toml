@@ -1,0 +1,135 @@
+schema_version = 3
+module_id = "meta.memory.attribution_assessment"
+crate = "eliot-memory-attribution-assessment"
+status = "PROTOTYPE"
+wave = "cognitive-contract-challenge-cc-001"
+agent_order = 44
+plane = "Meta"
+runtime_layer = "R7"
+delivery_depth = "D4"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "meta.memory.attribution_assessment"
+assignable = false
+blocked_by = [
+  "CC-001 contract implementation and package proof",
+  "accepted Governor/Meta producer ownership and exact provider fixtures",
+]
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Outcome-linked memory evaluation distinguishes delivery, observable use, cost, harm, regret, and causal benefit so future behavior can change without treating retrieval or popularity as reinforcement."
+causal_property = "attributed memory-use and outcome/economics assessment"
+old_failure_or_missing_capability = "delivery, acknowledgement, use, outcome, cost, harm, regret, and causal attribution are absent or can be collapsed into one writer/model utility story"
+discriminator = "negative fixtures keep blind non-use unknown, used-but-harmful outcomes explicit, protected low-use material protected, and composite success below a causal-benefit ceiling"
+primary_responsibility = "Purely assess admitted attributed-use and outcome/economics evidence into one dimensioned AttributedMemoryEvaluation candidate with explicit missingness, rival causes, and proof ceiling."
+owned_mutable_state = []
+allowed_effects = []
+inputs = [
+  "AttributedMemoryUseRecord",
+  "MemoryOutcomeEconomicsRecord",
+  "admitted EvaluationContract and evaluator-validity references",
+  "exact outcome/artifact/effect/verifier and comparison/intervention handles",
+]
+outputs = [
+  "AttributedMemoryEvaluation candidate",
+  "dimensioned coverage and missingness manifest",
+  "rival-cause/confounder disposition",
+  "accessibility-review evidence handle",
+]
+depends_on = [
+  "eliot-evaluation-contracts",
+]
+providers = [
+  "Governor/Context/host delivery and decision-opportunity observations",
+  "Instrument/evaluator outcome and cost evidence",
+  "canonical task/artifact/effect/verifier handles supplied by their owners",
+]
+consumers = [
+  "eliot-dreamer-accessibility",
+  "MemoryEcologyAssessment",
+  "Meta learning closure and self-quality diagnosis",
+]
+non_goals = [
+  "capture, task, Context, evaluator, budget, route, artifact, or effect ownership",
+  "memory support, accessibility, influence, lifecycle, erasure, or purge transition",
+  "Improvement Candidate promotion or active-generation mutation",
+  "single utility/confidence/trust score",
+]
+invariants = [
+  "silence and blind intervals remain unknown",
+  "inclusion, delivery, use, outcome, cost, harm, regret, retention, and transfer remain distinct",
+  "no-use requires a complete decision-opportunity denominator",
+  "use does not imply benefit and a lucky outcome does not prove mechanism",
+  "protected and minority evidence cannot be demoted by low use alone",
+  "same-lineage evidence is not independent",
+  "assessment output remains candidate evidence",
+]
+failure_behavior = "Return explicit incomplete/inconclusive/unknown dimension results with exact missing owners and evidence; never fabricate no-use, no-harm, benefit, lifecycle, or promotion."
+proof_surface = [
+  "complete versus partial denominator",
+  "acknowledged-only versus observable use",
+  "used-but-harmful outcome",
+  "composite benefit with rival causes",
+  "unknown/non-exposed cost",
+  "open delayed-outcome window",
+  "protected low-use material",
+  "input permutation determinism",
+]
+proof_ceiling = "Module proof only; real producer/consumer Edge proof, lifecycle decision, D3A/online-learning Product Pulse, retention, transfer, and promotion remain separate"
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+replacement_boundary = "pure assessor behind the owner-neutral evaluation contracts; package ownership creates no canonical, evaluator, lifecycle, or promotion authority"
+merge_rejoin_condition = "merge with another Meta assessment only when lifecycle owner, contract, proof, consumer, and rollback boundaries are demonstrably identical"
+split_trigger = "a second causal responsibility, mutable owner, evaluator execution, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "ELIOT_ARCHITECTURE A4.7, A14.4-A14.6"
+disposition = "intent and invariants"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I7.27, I12.21, I12.24, I12.34, I18.47"
+disposition = "authoritative target semantics"
+
+[[donor]]
+path = "crates/meta/eliot-learning-activation-assessment/module.toml"
+disposition = "retain activation/adherence assessment as a separate provider; do not absorb benefit attribution"
+
+[agent_task]
+objective = "Implement one pure attributed memory evaluation assessor over the accepted owner-neutral contracts."
+write_scope = [
+  "crates/meta/eliot-memory-attribution-assessment/src/**",
+  "crates/meta/eliot-memory-attribution-assessment/tests/**",
+  "crates/meta/eliot-memory-attribution-assessment/Cargo.toml",
+]
+deliverables = [
+  "public pure assessment API",
+  "cross-dimension validator/assessment logic",
+  "negative, missingness, causal-ceiling, and permutation fixtures",
+  "provider/consumer contract fixture plan",
+]
+acceptance = [
+  "one declared responsibility only",
+  "all dimensions remain inspectable and non-scalar",
+  "missing owner/evidence remains typed unknown",
+  "no lifecycle or promotion authority",
+]
+forbidden = [
+  "canonical writes outside the named Governor transition path",
+  "truth/support/authority/policy/finish/effect/lifecycle promotion",
+  "provider, model, store, task, Context, or evaluator execution",
+  "writer utility, retrieval count, recency, repetition, or model judgment as usefulness proof",
+  "active-generation self-modification",
+]
+stop_condition = "Stop and return ContractChallenge when a producer denominator, evaluator-validity record, comparison/intervention identity, lifecycle owner, or promotion authority is missing."
+challenge_path = "return ContractChallenge to the cognitive-wave integration owner and the exact missing Governor/Meta provider owner"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = [
+  "module/package proof at the declared proof ceiling",
+  "real provider/consumer fixture for every changed edge",
+  "the named Product Pulse before any promotion",
+  "exact donor reuse/rewrite/reject trace",
+]
+writeback = "return implementation artifact, exact proof evidence, provider gaps, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until contract implementation, package proof, affected edge proof, current-main ancestry and integration-owner review"

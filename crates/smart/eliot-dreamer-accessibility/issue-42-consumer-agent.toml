@@ -1,0 +1,54 @@
+schema_version = 1
+work_unit_id = "issue-42-accessibility-consumer-gate"
+issue = 42
+challenge = "CC-001"
+role = "smart-consumer-agent"
+status = "BLOCKED_UNTIL_CONTRACT_AND_PROVIDER_ACCEPTANCE"
+primary_causal_property = "The accessibility handler can consume owner-derived attributed evaluation without inventing usefulness, support, forgetting, or lifecycle evidence."
+integration_owner = "cognitive-wave-integrator"
+
+prerequisites = [
+  "accepted owner-neutral attributed-memory-use and memory-outcome-economics contracts",
+  "eliot-memory-attribution-assessment package proof",
+  "real provider fixtures for denominator, decision/action/verifier, outcome, cost, harm, regret, and protected roles",
+  "Governor/Meta ownership acceptance",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-accessibility/src/**",
+  "crates/smart/eliot-dreamer-accessibility/tests/**",
+  "crates/smart/eliot-dreamer-accessibility/Cargo.toml",
+  "crates/smart/eliot-dreamer-accessibility/module.toml",
+]
+read_scope = [
+  "crates/foundation/eliot-evaluation-contracts/**",
+  "crates/meta/eliot-memory-attribution-assessment/**",
+  "crates/smart/eliot-dreamer-contracts/**",
+  "crates/smart/eliot-dreamer-candidate-validation/**",
+]
+required_tests = [
+  "low-use supported fact remains support-neutral",
+  "protected/minority/counterexample/audit/failure-fingerprint roles cannot be demoted",
+  "retrieval/recency/repetition/writer/model utility cannot produce an accessibility candidate",
+  "complete non-use may produce review evidence but not an automatic transition",
+  "used-but-harmful evidence remains visible",
+  "unknown cost/harm/regret and incomplete denominator return an inconclusive candidate",
+  "restore/review condition and source lineage survive every candidate",
+]
+forbidden = [
+  "canonical write or lifecycle application",
+  "support/epistemic promotion or demotion",
+  "privacy erasure or physical deletion",
+  "single utility/usefulness/confidence score",
+  "direct producer/evaluator/model/store/task/context access",
+  "automatic improvement promotion",
+]
+verification = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-dreamer-accessibility --all-targets",
+  "cargo test --locked -p eliot-dreamer-accessibility",
+  "cargo clippy --locked -p eliot-dreamer-accessibility --all-targets -- -D warnings",
+  "real assessment-provider and curation-consumer Edge fixtures",
+  "D3A_CURATION_PULSE_01 before promotion",
+]
+stop_condition = "Return ContractChallenge when the attributed evaluation is incomplete, stale, scalarized, ownerless, or would require applying a lifecycle/support/purge transition."
+proof_ceiling = "Smart candidate-handler Module/Edge proof only; Governor lifecycle application and Product acceptance remain separate."

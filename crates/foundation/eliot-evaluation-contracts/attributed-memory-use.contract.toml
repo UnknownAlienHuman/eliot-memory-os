@@ -1,0 +1,259 @@
+schema_version = 1
+contract_id = "eliot.evaluation.attributed-memory-use.v1"
+contract_version = "1.0.0"
+status = "STATIC_CANDIDATE"
+issue = 42
+challenge = "CC-001"
+owner_capability = "Governor/Meta evaluation"
+source_layer = "C0"
+state_class = "stateless"
+wire_scope = "owner-neutral"
+proof_ceiling = "Field-level contract candidate only; no producer, persistence, lifecycle, Edge, Product, or promotion proof."
+purpose = "Represent whether one exact memory/candidate was included, delivered, observably used or observably unused for one bounded decision opportunity without inferring hidden cognition or usefulness."
+
+architecture_refs = [
+  "ARCH-MEM-04",
+  "ARCH-LEARN-01",
+  "ARCH-LEARN-02",
+  "ARCH-META-01",
+]
+implementation_refs = [
+  "I7.25",
+  "I7.27",
+  "I12.21",
+  "I12.24",
+  "I12.34",
+  "I18.47",
+]
+
+required_identity_fields = [
+  "evaluation_id",
+  "evaluation_revision",
+  "subject_memory_or_candidate_ref",
+  "subject_record_revision",
+  "workscope_ref",
+  "task_ref",
+  "task_revision",
+  "decision_opportunity_ref",
+  "state_fence",
+  "observation_window",
+  "evaluator_identity_and_revision",
+  "provenance_refs",
+]
+optional_identity_fields = [
+  "session_ref",
+  "attempt_ref",
+  "route_fingerprint_ref",
+  "context_packet_ref",
+  "delivery_receipt_ref",
+  "tool_surface_ref",
+]
+
+[ownership]
+owns = [
+  "owner-neutral evidence vocabulary",
+  "structural validity and cross-dimension consistency",
+  "complete-denominator and no-use preconditions",
+  "attribution-ceiling vocabulary",
+]
+must_not_own = [
+  "canonical memory or task state",
+  "memory accessibility, influence, support, lifecycle, purge, or erasure transition",
+  "Context admission or delivery",
+  "agent scheduling or tool execution",
+  "evaluator execution",
+  "promotion, rollback execution, policy, authority, or finish",
+]
+
+[denominator]
+contract = "DecisionOpportunityDenominator"
+required_fields = [
+  "eligible_subject_refs",
+  "ineligible_subject_refs_with_reason",
+  "opportunity_start",
+  "opportunity_end",
+  "observable_boundaries",
+  "unobservable_boundaries_and_blind_intervals",
+  "coverage_state",
+  "denominator_source_and_revision",
+]
+coverage_values = [
+  "COMPLETE",
+  "PARTIAL",
+  "UNAVAILABLE",
+  "NOT_APPLICABLE",
+  "UNKNOWN",
+]
+no_use_requires = [
+  "coverage_state = COMPLETE",
+  "the subject is in eligible_subject_refs",
+  "the full declared observation window is closed",
+  "all qualifying observable boundaries are covered",
+  "no qualifying use reference exists",
+  "no censoring, route loss, task cancellation, or stale fence invalidates the opportunity",
+]
+
+[[dimension]]
+name = "candidate_inclusion"
+closed_values = [
+  "NOT_CONSIDERED",
+  "CONSIDERED",
+  "ADMITTED_HANDLE",
+  "ADMITTED_FULL",
+  "SUPPRESSED",
+  "QUARANTINED",
+  "REVALIDATION_REQUIRED",
+  "UNKNOWN",
+]
+required_evidence = [
+  "context or admission decision reference when considered",
+  "exact subject revision and StateFence",
+]
+
+[[dimension]]
+name = "delivery"
+closed_values = [
+  "NOT_APPLICABLE",
+  "NOT_DELIVERED",
+  "DELIVERED_PARTIAL",
+  "DELIVERED_FULL",
+  "DELIVERY_UNKNOWN",
+]
+required_evidence = [
+  "delivery or omission receipt for every delivered state",
+  "exact rendered packet/context identity when applicable",
+]
+
+[[dimension]]
+name = "observable_influence"
+closed_values = [
+  "NOT_ASSESSED",
+  "NOT_OBSERVED",
+  "ACKNOWLEDGED_ONLY",
+  "CITED_OR_USED",
+  "CHANGED_DECISION_OR_ACTION",
+  "USED_FOR_VERIFICATION",
+  "PREVENTED_EXACT_FAILURE",
+  "CONTRADICTED_OR_REJECTED",
+  "UNKNOWN",
+]
+required_evidence = [
+  "first qualifying public decision, action, verifier, or exact failure-avoidance reference for states stronger than ACKNOWLEDGED_ONLY",
+  "observation coverage and blind intervals",
+]
+
+[[dimension]]
+name = "use_disposition"
+closed_values = [
+  "QUALIFYING_USE",
+  "QUALIFYING_NON_USE",
+  "CENSORED",
+  "OUT_OF_WINDOW",
+  "INELIGIBLE",
+  "NOT_OBSERVABLE",
+  "UNKNOWN",
+]
+required_evidence = [
+  "complete denominator for QUALIFYING_NON_USE",
+  "qualifying downstream reference for QUALIFYING_USE",
+  "explicit reason for every non-use/non-observable disposition",
+]
+
+[[dimension]]
+name = "protected_role"
+closed_values = [
+  "NONE",
+  "DECISION_SAFETY_FLOOR",
+  "MINORITY_EVIDENCE",
+  "COUNTEREXAMPLE",
+  "AUDIT_EVIDENCE",
+  "FAILURE_FINGERPRINT",
+  "NEGATIVE_MEMORY",
+  "INVARIANT",
+  "HUMAN_PROTECTED",
+]
+required_evidence = [
+  "role owner or source contract",
+  "scope and expiry/review condition when applicable",
+]
+
+[[dimension]]
+name = "attribution_ceiling"
+closed_values = [
+  "DELIVERY_ONLY",
+  "OBSERVED_ASSOCIATION",
+  "SUPPORTED_CONTRIBUTION",
+  "OBSERVED_UNDER_INTERVENTION",
+  "COMPOSITE_BENEFIT",
+  "CONTRADICTED",
+  "UNKNOWN",
+]
+required_evidence = [
+  "competing-cause and confounder disposition",
+  "comparison/intervention identity for ceilings above OBSERVED_ASSOCIATION",
+]
+
+[[invariant]]
+id = "AMU-001"
+statement = "Inclusion, delivery, acknowledgement, observable influence, qualifying use, and outcome are orthogonal fields; no earlier field promotes a later field."
+failure = "Reject the record as dimension-collapsed."
+
+[[invariant]]
+id = "AMU-002"
+statement = "Silence, absent acknowledgement, route loss, missing host coverage, or an open observation window is UNKNOWN or CENSORED, never qualifying non-use."
+failure = "Reject QUALIFYING_NON_USE without complete denominator closure."
+
+[[invariant]]
+id = "AMU-003"
+statement = "Retrieval count, recency, repetition, writer utility, model agreement, confidence, or fluent rationale cannot populate influence/use fields."
+failure = "Reject unsupported influence attribution."
+
+[[invariant]]
+id = "AMU-004"
+statement = "A stronger exact downstream reference may establish a later observable stage without fabricating unobserved intermediate stages."
+failure = "Retain intermediate stages as NOT_ASSESSED or UNKNOWN."
+
+[[invariant]]
+id = "AMU-005"
+statement = "Protected, minority, counterexample, audit, failure-fingerprint, negative-memory, and invariant material cannot be demoted because observed use is low or absent."
+failure = "Return PROTECTED_ROLE_REVIEW_REQUIRED."
+
+[[invariant]]
+id = "AMU-006"
+statement = "One owner or evidence lineage cannot fill another owner's missing denominator, route observation, decision, verifier, or outcome slot."
+failure = "Return OWNER_EVIDENCE_MISSING."
+
+[[invariant]]
+id = "AMU-007"
+statement = "Equivalent set-like inputs produce the same canonical record independent of input order."
+failure = "Reject non-deterministic projection."
+
+[[fixture]]
+id = "complete-denominator-no-use"
+input = "Subject was eligible and fully delivered; every qualifying boundary was observed through the closed window; no qualifying downstream reference exists."
+expected = "use_disposition = QUALIFYING_NON_USE; observable_influence = NOT_OBSERVED"
+
+[[fixture]]
+id = "missing-host-coverage"
+input = "Subject was delivered, but one material action boundary is blind."
+expected = "use_disposition = UNKNOWN or CENSORED; qualifying non-use is forbidden"
+
+[[fixture]]
+id = "acknowledgement-only"
+input = "Agent acknowledged delivery without a public decision/action/verifier reference."
+expected = "observable_influence = ACKNOWLEDGED_ONLY; qualifying use and benefit are forbidden"
+
+[[fixture]]
+id = "exact-decision-use"
+input = "A later decision cites the exact subject revision and changes the selected action."
+expected = "observable_influence = CHANGED_DECISION_OR_ACTION; use_disposition = QUALIFYING_USE"
+
+[[fixture]]
+id = "protected-low-use"
+input = "A failure fingerprint has no qualifying use in the current observation window."
+expected = "no accessibility/support/lifecycle demotion; protected-role review remains required"
+
+[[fixture]]
+id = "order-invariance"
+input = "Equivalent eligible, ineligible, and evidence-reference sets are supplied in different orders."
+expected = "identical canonical contract bytes and projection"
