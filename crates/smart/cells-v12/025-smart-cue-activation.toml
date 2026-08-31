@@ -1,0 +1,49 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w2-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 25
+cell = "smart.cue.activation"
+physical_crate = "eliot-cues"
+predecessor_orders = [19, 23, 24]
+primary_property = "Assemble direct and optional spread results into one bounded handle-only activation result with full provenance/suppression trace and direct-hit preservation."
+field_contracts = ["crates/smart/eliot-cue-contracts/cue.contract.toml"]
+public_function_signatures = [
+  "pub fn assemble_cue_activation(direct: &DirectCueMatchResult, spread: &RelationSpreadResult, limits: &CueLimits) -> Result<CueActivationResult, CueActivationError>",
+]
+write_scope = [
+  "crates/smart/eliot-cues/src/activation.rs",
+  "crates/smart/eliot-cues/tests/activation.rs",
+]
+algorithm = [
+  "validate shared snapshot/request/fence identities",
+  "copy all direct hits before considering spread hits",
+  "deduplicate target handles while preserving direct provenance and strongest single spread path",
+  "apply final bound only after preserving mandatory direct hits",
+  "record overflow/suppression explicitly",
+  "emit handles and trace only and compute deterministic activation digest",
+]
+minimum_tests = [
+  "direct-only assembly succeeds",
+  "Disabled/Unavailable spread yields direct-only result",
+  "duplicate spread target retains direct provenance",
+  "direct hit cannot be removed by final limit",
+  "overflow explicit",
+  "no payload/delivery/use/helpful/support fields",
+  "permutation deterministic",
+]
+non_goals = [
+  "memory payload fetch",
+  "Context admission",
+  "session dedup",
+  "delivery/ack/use/outcome",
+  "support or influence transition",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-CTX-02", "ARCH-CTX-04", "ARCH-MEM-04", "ARCH-EPI-04", "ARCH-MOD-03"]
+implementation_refs = ["I2.15", "I2.20", "I7.19", "I12.14"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than dropping a direct hit, embedding payload, hiding overflow, or treating activation as delivery/use/support."
+brief_proof_ceiling = "STATIC_W2_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
