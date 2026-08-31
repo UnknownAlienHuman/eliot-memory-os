@@ -1,0 +1,110 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W2_D3B_PER_AGENT_BRIEF_MATERIALIZATION"
+issue = 341
+parent_pr = 338
+parent_head = "17277887f33418df5f4aa7ba6bae04cc9b195d2a"
+orders = [20, 21, 22, 23, 24, 25, 29, 30, 31, 32, 33, 34]
+brief_count = 12
+field_contract_index = "crates/smart/cognitive-rev12-w2-field-contracts.toml"
+type_ownership = "crates/smart/cognitive-rev12-w2-type-ownership.toml"
+proof_ceiling = "STATIC_W2_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+rule = "Each brief materializes one causal work unit and does not redefine public wire types, package integration, proof status or runtime authority."
+
+[[brief]]
+order = 20
+cell = "smart.cue.normalizer"
+physical_crate = "eliot-cues"
+path = "crates/smart/cells-v12/020-smart-cue-normalizer.toml"
+field_contracts = ["crates/smart/eliot-cue-contracts/cue.contract.toml"]
+predecessor_orders = [19]
+
+[[brief]]
+order = 21
+cell = "smart.cue.binding"
+physical_crate = "eliot-cues"
+path = "crates/smart/cells-v12/021-smart-cue-binding.toml"
+field_contracts = ["crates/smart/eliot-cue-contracts/cue.contract.toml"]
+predecessor_orders = [19, 20]
+
+[[brief]]
+order = 22
+cell = "smart.cue.index"
+physical_crate = "eliot-cues"
+path = "crates/smart/cells-v12/022-smart-cue-index.toml"
+field_contracts = ["crates/smart/eliot-cue-contracts/cue.contract.toml"]
+predecessor_orders = [19, 21]
+
+[[brief]]
+order = 23
+cell = "smart.cue.direct_match"
+physical_crate = "eliot-cues"
+path = "crates/smart/cells-v12/023-smart-cue-direct_match.toml"
+field_contracts = ["crates/smart/eliot-cue-contracts/cue.contract.toml"]
+predecessor_orders = [19, 20, 22]
+
+[[brief]]
+order = 24
+cell = "smart.cue.relation_spread"
+physical_crate = "eliot-cues"
+path = "crates/smart/cells-v12/024-smart-cue-relation_spread.toml"
+field_contracts = ["crates/smart/eliot-cue-contracts/cue.contract.toml", "crates/smart/eliot-cue-contracts/w2-execution.contract.toml"]
+predecessor_orders = [19, 22, 23]
+
+[[brief]]
+order = 25
+cell = "smart.cue.activation"
+physical_crate = "eliot-cues"
+path = "crates/smart/cells-v12/025-smart-cue-activation.toml"
+field_contracts = ["crates/smart/eliot-cue-contracts/cue.contract.toml"]
+predecessor_orders = [19, 23, 24]
+
+[[brief]]
+order = 29
+cell = "smart.context.contribution_merge"
+physical_crate = "eliot-context"
+path = "crates/smart/cells-v12/029-smart-context-contribution_merge.toml"
+field_contracts = ["crates/smart/eliot-context-contracts/provider-contribution.contract.toml", "crates/smart/eliot-context-contracts/context-compiler.contract.toml", "crates/smart/eliot-context-contracts/w2-execution.contract.toml"]
+predecessor_orders = [26, 28]
+
+[[brief]]
+order = 30
+cell = "smart.context.admission"
+physical_crate = "eliot-context"
+path = "crates/smart/cells-v12/030-smart-context-admission.toml"
+field_contracts = ["crates/smart/eliot-context-contracts/provider-contribution.contract.toml", "crates/smart/eliot-context-contracts/context-compiler.contract.toml", "crates/smart/eliot-context-contracts/w2-execution.contract.toml"]
+predecessor_orders = [27, 29]
+
+[[brief]]
+order = 31
+cell = "smart.context.assembly"
+physical_crate = "eliot-context"
+path = "crates/smart/cells-v12/031-smart-context-assembly.toml"
+field_contracts = ["crates/smart/eliot-context-contracts/provider-contribution.contract.toml", "crates/smart/eliot-context-contracts/context-compiler.contract.toml"]
+predecessor_orders = [28, 30]
+
+[[brief]]
+order = 32
+cell = "smart.context.quality"
+physical_crate = "eliot-context"
+path = "crates/smart/cells-v12/032-smart-context-quality.toml"
+field_contracts = ["crates/smart/eliot-context-contracts/provider-contribution.contract.toml", "crates/smart/eliot-context-contracts/context-compiler.contract.toml"]
+predecessor_orders = [28, 29, 30, 31]
+
+[[brief]]
+order = 33
+cell = "smart.context.decision_tail"
+physical_crate = "eliot-context"
+path = "crates/smart/cells-v12/033-smart-context-decision_tail.toml"
+field_contracts = ["crates/smart/eliot-context-contracts/context-compiler.contract.toml", "crates/smart/eliot-context-contracts/w2-execution.contract.toml"]
+predecessor_orders = [28, 31, 32]
+
+[[brief]]
+order = 34
+cell = "smart.context.reactive_delivery_plan"
+physical_crate = "eliot-context"
+path = "crates/smart/cells-v12/034-smart-context-reactive_delivery_plan.toml"
+field_contracts = ["crates/smart/eliot-context-contracts/context-compiler.contract.toml"]
+predecessor_orders = [28, 31, 33]
