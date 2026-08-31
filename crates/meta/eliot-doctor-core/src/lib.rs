@@ -9,6 +9,7 @@ use time::{Duration, OffsetDateTime};
 pub const CONTRACT_NAME: &str = "eliot.meta.doctor";
 pub const CONTRACT_VERSION: &str = "1.0.0";
 pub const KERNEL_ADMISSION_REQUIRED: &str = "KERNEL_ADMISSION_REQUIRED";
+pub const RECIPE_DIGEST_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -212,45 +213,80 @@ impl RepairRecipe {
     /// issued by Kernel; Doctor never substitutes a local recipe.
     pub fn digest(&self) -> String {
         let mut hasher = Hasher::new();
-        for value in [
-            self.recipe_id.as_str(),
-            &self.revision.to_string(),
-            &format!("{:?}", self.repair_class),
-            &self.required_authority,
-            &self.attempt_budget.to_string(),
-            &self.cooldown.to_string(),
-        ] {
-            hasher.update(value.as_bytes());
-            hasher.update(&[0]);
-        }
-        for values in [
-            &self.problem_classes,
-            &self.components,
-            &self.allowed_effects,
-        ] {
-            for value in values {
-                hasher.update(value.as_bytes());
-                hasher.update(&[0]);
-            }
-        }
-        for values in [
-            &self.prerequisites,
-            &self.operations,
+        hash_field(&mut hasher, b"version", &[RECIPE_DIGEST_VERSION]);
+        hash_field(&mut hasher, b"recipe_id", self.recipe_id.as_bytes());
+        hash_field(&mut hasher, b"revision", &self.revision.to_le_bytes());
+        hash_field(
+            &mut hasher,
+            b"repair_class",
+            &[match self.repair_class {
+                RepairClass::AutomaticSafe => 0,
+                RepairClass::Guarded => 1,
+                RepairClass::DiagnoseOnly => 2,
+            }],
+        );
+        hash_field(
+            &mut hasher,
+            b"required_authority",
+            self.required_authority.as_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"attempt_budget",
+            &self.attempt_budget.to_le_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"cooldown_nanoseconds",
+            &self.cooldown.whole_nanoseconds().to_le_bytes(),
+        );
+        hash_set(&mut hasher, b"problem_classes", &self.problem_classes);
+        hash_set(&mut hasher, b"components", &self.components);
+        hash_set(&mut hasher, b"allowed_effects", &self.allowed_effects);
+        hash_list(&mut hasher, b"prerequisites", &self.prerequisites);
+        hash_list(&mut hasher, b"operations", &self.operations);
+        hash_list(
+            &mut hasher,
+            b"expected_observables",
             &self.expected_observables,
+        );
+        hash_list(
+            &mut hasher,
+            b"verification_contract",
             &self.verification_contract,
+        );
+        hash_list(
+            &mut hasher,
+            b"rollback_or_compensation",
             &self.rollback_or_compensation,
-            &self.stop_conditions,
-        ] {
-            for value in values {
-                hasher.update(value.as_bytes());
-                hasher.update(&[0]);
-            }
-        }
+        );
+        hash_list(&mut hasher, b"stop_conditions", &self.stop_conditions);
         hasher.finalize().to_hex().to_string()
     }
     pub fn applies_to(&self, brief: &DiagnosticBrief) -> bool {
         self.problem_classes.contains(&brief.failure_class)
             && self.components.contains(&brief.component)
+    }
+}
+
+fn hash_field(hasher: &mut Hasher, name: &[u8], value: &[u8]) {
+    hasher.update(&(name.len() as u64).to_le_bytes());
+    hasher.update(name);
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn hash_set(hasher: &mut Hasher, name: &[u8], values: &BTreeSet<String>) {
+    hash_field(hasher, name, &(values.len() as u64).to_le_bytes());
+    for value in values {
+        hash_field(hasher, b"value", value.as_bytes());
+    }
+}
+
+fn hash_list(hasher: &mut Hasher, name: &[u8], values: &[String]) {
+    hash_field(hasher, name, &(values.len() as u64).to_le_bytes());
+    for value in values {
+        hash_field(hasher, b"value", value.as_bytes());
     }
 }
 
@@ -793,6 +829,28 @@ mod tests {
             admitted.validate_for(&request, now()),
             Err(DoctorError::EffectAuthorizationMismatch)
         );
+    }
+
+    #[test]
+    fn recipe_digest_is_versioned_and_binds_each_contract_field() {
+        let recipe = request(RepairClass::AutomaticSafe, &["restart"]).recipe;
+        let baseline = recipe.digest();
+        assert_eq!(
+            baseline,
+            "d29350b431ed108d5b7606ae6009b77711e3da50bb229d419b389bbbbe999cbd"
+        );
+
+        let mut changed = recipe.clone();
+        changed.repair_class = RepairClass::Guarded;
+        assert_ne!(changed.digest(), baseline);
+
+        let mut changed = recipe.clone();
+        changed.operations.push("reconnect".into());
+        assert_ne!(changed.digest(), baseline);
+
+        let mut changed = recipe;
+        changed.components.insert("other-component".into());
+        assert_ne!(changed.digest(), baseline);
     }
 
     #[test]
