@@ -9,7 +9,8 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
-use serde::{Deserialize, Serialize};
+use serde::de::Error as SerdeError;
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::CoordinatedAttemptState;
@@ -17,7 +18,7 @@ use crate::CoordinatedAttemptState;
 pub const MODEL_CATALOGUE_SCHEMA_VERSION: &str = "eliot.agent-model-catalogue/v1";
 pub const MODEL_PREFERENCE_SCHEMA_VERSION: &str = "eliot.agent-model-preference/v1";
 pub const MODEL_QUERY_RECEIPT_VERSION: &str = "eliot.agent-model-query-receipt/v1";
-pub const MODEL_SELECTION_RECEIPT_VERSION: &str = "eliot.agent-model-selection-receipt/v1";
+pub const MODEL_SELECTION_RECEIPT_VERSION: &str = "eliot.agent-model-selection-receipt/v2";
 pub const ATTEMPT_HEALTH_PROJECTION_VERSION: &str = "eliot.agent-attempt-health/v1";
 
 const MAX_CATALOGUE_ENTRIES: usize = 4096;
@@ -83,6 +84,20 @@ fn canonical_digest<T: Serialize>(value: &T) -> Result<String, ModelControlError
     let bytes = serde_json::to_vec(value)
         .map_err(|error| ModelControlError::Serialization(error.to_string()))?;
     Ok(format!("sha256:{}", eliot_receipts::sha256_hex(&bytes)))
+}
+
+fn validate_canonical_digest(value: &str, field: &'static str) -> Result<(), ModelControlError> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(ModelControlError::InvalidField(field));
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(ModelControlError::InvalidField(field));
+    }
+    Ok(())
 }
 
 fn catalogue_digest(snapshot: &ModelCatalogueSnapshot) -> Result<String, ModelControlError> {
@@ -651,7 +666,7 @@ pub fn query_model_catalogue(
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSelector {
     pub host_family: Option<String>,
@@ -769,6 +784,18 @@ impl HumanModelPreferencePolicy {
     }
 }
 
+fn preference_policy_digest(
+    policy: &HumanModelPreferencePolicy,
+) -> Result<String, ModelControlError> {
+    let mut normalized = policy.clone();
+    normalized.roles.sort_by_key(|preference| preference.role);
+    for preference in &mut normalized.roles {
+        preference.denied.sort();
+        preference.denied.dedup();
+    }
+    canonical_digest(&normalized)
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind", content = "detail")]
 pub enum SelectionRejection {
@@ -822,7 +849,7 @@ impl RankedCandidate<'_> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSelectionReceipt {
     pub schema_version: String,
@@ -834,11 +861,172 @@ pub struct ModelSelectionReceipt {
     pub catalogue_digest: String,
     pub preference_policy_id: String,
     pub preference_revision: String,
+    pub preference_policy_digest: String,
     pub selected: ModelCatalogueEntry,
     pub rejected: Vec<RejectedModelCandidate>,
     pub execution: ZeroModelExecutionCounters,
     pub candidate_only: bool,
     pub dispatch_authority: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelSelectionReceiptFields {
+    schema_version: String,
+    selection_id: String,
+    selection_digest: String,
+    role: ModelRole,
+    account_scope: String,
+    catalogue_snapshot_id: String,
+    catalogue_digest: String,
+    preference_policy_id: String,
+    preference_revision: String,
+    preference_policy_digest: String,
+    selected: ModelCatalogueEntry,
+    rejected: Vec<RejectedModelCandidate>,
+    execution: ZeroModelExecutionCounters,
+    candidate_only: bool,
+    dispatch_authority: bool,
+}
+
+impl<'de> Deserialize<'de> for ModelSelectionReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let fields = ModelSelectionReceiptFields::deserialize(deserializer)?;
+        let receipt = Self {
+            schema_version: fields.schema_version,
+            selection_id: fields.selection_id,
+            selection_digest: fields.selection_digest,
+            role: fields.role,
+            account_scope: fields.account_scope,
+            catalogue_snapshot_id: fields.catalogue_snapshot_id,
+            catalogue_digest: fields.catalogue_digest,
+            preference_policy_id: fields.preference_policy_id,
+            preference_revision: fields.preference_revision,
+            preference_policy_digest: fields.preference_policy_digest,
+            selected: fields.selected,
+            rejected: fields.rejected,
+            execution: fields.execution,
+            candidate_only: fields.candidate_only,
+            dispatch_authority: fields.dispatch_authority,
+        };
+        receipt.validate().map_err(D::Error::custom)?;
+        Ok(receipt)
+    }
+}
+
+impl ModelSelectionReceipt {
+    pub fn validate(&self) -> Result<(), ModelControlError> {
+        if self.schema_version != MODEL_SELECTION_RECEIPT_VERSION {
+            return Err(ModelControlError::UnsupportedSchema(
+                "model_selection_receipt",
+            ));
+        }
+        for (value, field) in [
+            (self.selection_id.as_str(), "receipt.selection_id"),
+            (self.account_scope.as_str(), "receipt.account_scope"),
+            (
+                self.catalogue_snapshot_id.as_str(),
+                "receipt.catalogue_snapshot_id",
+            ),
+            (
+                self.preference_policy_id.as_str(),
+                "receipt.preference_policy_id",
+            ),
+            (
+                self.preference_revision.as_str(),
+                "receipt.preference_revision",
+            ),
+        ] {
+            validate_text(value, field)?;
+        }
+        validate_canonical_digest(&self.selection_digest, "receipt.selection_digest")?;
+        validate_canonical_digest(&self.catalogue_digest, "receipt.catalogue_digest")?;
+        validate_canonical_digest(
+            &self.preference_policy_digest,
+            "receipt.preference_policy_digest",
+        )?;
+        self.selected.validate(&self.account_scope)?;
+        if !self.candidate_only || self.dispatch_authority {
+            return Err(ModelControlError::InvalidField("receipt.authority"));
+        }
+        if self.execution != ZeroModelExecutionCounters::zero()
+            || self.rejected.len() > MAX_CATALOGUE_ENTRIES
+        {
+            return Err(ModelControlError::InvalidField(
+                "receipt.execution_or_rejected",
+            ));
+        }
+        let mut rejected_ids = BTreeSet::new();
+        for candidate in &self.rejected {
+            for (value, field) in [
+                (candidate.entry_id.as_str(), "receipt.rejected.entry_id"),
+                (
+                    candidate.host_family.as_str(),
+                    "receipt.rejected.host_family",
+                ),
+                (
+                    candidate.provider_id.as_str(),
+                    "receipt.rejected.provider_id",
+                ),
+                (candidate.model_id.as_str(), "receipt.rejected.model_id"),
+            ] {
+                validate_text(value, field)?;
+            }
+            if candidate.reasons.is_empty() || !rejected_ids.insert(candidate.entry_id.as_str()) {
+                return Err(ModelControlError::InvalidField("receipt.rejected"));
+            }
+        }
+        let expected_selection_digest = canonical_digest(&(
+            MODEL_SELECTION_RECEIPT_VERSION,
+            self.selection_id.as_str(),
+            self.role,
+            self.catalogue_snapshot_id.as_str(),
+            self.catalogue_digest.as_str(),
+            self.preference_policy_id.as_str(),
+            self.preference_revision.as_str(),
+            self.preference_policy_digest.as_str(),
+            self.selected.entry_id.as_str(),
+        ))?;
+        if self.selection_digest != expected_selection_digest {
+            return Err(ModelControlError::InvalidField("receipt.selection_digest"));
+        }
+        Ok(())
+    }
+
+    pub fn validate_against(
+        &self,
+        snapshot: &ModelCatalogueSnapshot,
+        policy: &HumanModelPreferencePolicy,
+        now_unix_ms: u64,
+    ) -> Result<(), ModelControlError> {
+        self.validate()?;
+        snapshot.validate()?;
+        policy.validate()?;
+        if self.account_scope != snapshot.account_scope
+            || self.account_scope != policy.account_scope
+        {
+            return Err(ModelControlError::InvalidField("receipt.account_scope"));
+        }
+        let expected_catalogue_digest = catalogue_digest(snapshot)?;
+        if self.catalogue_digest != expected_catalogue_digest {
+            return Err(ModelControlError::InvalidField("receipt.catalogue_digest"));
+        }
+        let expected_policy_digest = preference_policy_digest(policy)?;
+        if self.preference_policy_digest != expected_policy_digest {
+            return Err(ModelControlError::InvalidField(
+                "receipt.preference_policy_digest",
+            ));
+        }
+        let expected =
+            compile_model_selection(snapshot, policy, self.role, &self.selection_id, now_unix_ms)?;
+        if self != &expected {
+            return Err(ModelControlError::InvalidField("receipt.binding"));
+        }
+        Ok(())
+    }
 }
 
 fn preference_rank(entry: &ModelCatalogueEntry, selectors: &[ModelSelector]) -> usize {
@@ -947,6 +1135,7 @@ pub fn compile_model_selection(
         .entry
         .clone();
     let catalogue_digest = catalogue_digest(snapshot)?;
+    let preference_policy_digest = preference_policy_digest(policy)?;
     let selection_digest = canonical_digest(&(
         MODEL_SELECTION_RECEIPT_VERSION,
         selection_id,
@@ -955,9 +1144,10 @@ pub fn compile_model_selection(
         catalogue_digest.as_str(),
         policy.policy_id.as_str(),
         policy.revision.as_str(),
+        preference_policy_digest.as_str(),
         selected.entry_id.as_str(),
     ))?;
-    Ok(ModelSelectionReceipt {
+    let receipt = ModelSelectionReceipt {
         schema_version: MODEL_SELECTION_RECEIPT_VERSION.to_owned(),
         selection_id: selection_id.to_owned(),
         selection_digest,
@@ -967,12 +1157,15 @@ pub fn compile_model_selection(
         catalogue_digest,
         preference_policy_id: policy.policy_id.clone(),
         preference_revision: policy.revision.clone(),
+        preference_policy_digest,
         selected,
         rejected,
         execution: ZeroModelExecutionCounters::zero(),
         candidate_only: true,
         dispatch_authority: false,
-    })
+    };
+    receipt.validate()?;
+    Ok(receipt)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
