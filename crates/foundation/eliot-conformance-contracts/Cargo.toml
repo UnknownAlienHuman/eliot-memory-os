@@ -1,0 +1,39 @@
+[package]
+name = "eliot-conformance-contracts"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Owner-neutral I0.5 contract maturity, implementation support, evidence execution, and observation-state contracts"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
+
+[package.metadata.eliot]
+prototype = true
+layer = "C0"
+purpose = "Own the exact orthogonal conformance/support/observation dimensions shared by bootstrap, registries, reports, and ControlBoard without probing or promoting support."
+source_maintenance_owner = "foundation-contract-owner"
+functional_cell_refs = ["foundation.conformance.support-contracts"]
+independent_proof_profile = "eliot-conformance-contracts"
+contract_refs = [
+  "ARCH-MOD-03",
+  "ARCH-SELF-01",
+  "ARCH-RES-04",
+  "ELIOT_IMPLEMENTATION:I0.5",
+  "ELIOT_IMPLEMENTATION:I2.20",
+]
+implementation_support = "CURRENT_UNVERIFIED"
+evidence_execution_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until source implementation, package proof, first bootstrap consumer fixture, current-main rebase, and integration-owner review"
+
+[workspace]
+resolver = "3"
