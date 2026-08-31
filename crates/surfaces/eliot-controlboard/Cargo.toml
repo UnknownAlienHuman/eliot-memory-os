@@ -14,6 +14,7 @@ source_layer = "C3"
 proof_entrypoint = "cargo test -p eliot-controlboard --all-targets --all-features"
 
 [dependencies]
+eliot-agent-coordinator.workspace = true
 eliot-evaluation-contracts.workspace = true
 eliot-evidence.workspace = true
 eliot-observation-contracts.workspace = true
