@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 
 use eliot_contracts::{AuthorityEpoch, ClockReading, StateFence};
 use serde::{Deserialize, Serialize};
@@ -203,21 +203,23 @@ impl CoordinationOwner {
         request_id: String,
         provenance: WorkLeaseIssuanceProvenance,
     ) -> Result<(), CoordinationError> {
-        if self
+        match self
             .work_lease_issuance_by_request
-            .contains_key(&request_id)
+            .entry(request_id.clone())
         {
-            return Err(CoordinationError::IdempotencyConflict(request_id));
+            Entry::Vacant(entry) => {
+                entry.insert(provenance);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(CoordinationError::IdempotencyConflict(request_id)),
         }
-        self.work_lease_issuance_by_request
-            .insert(request_id, provenance);
-        Ok(())
     }
 
     fn validate_issuance_snapshot(&self) -> Result<(), CoordinationError> {
         for (request_id, provenance) in &self.work_lease_issuance_by_request {
             if request_id != &provenance.source_request().request_id
                 || provenance.validate().is_err()
+                || !self.events().contains(&provenance.source_decision().event)
             {
                 return Err(CoordinationError::InvalidState);
             }
