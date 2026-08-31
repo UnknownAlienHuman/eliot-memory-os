@@ -8,6 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+mod swarm_read;
+
+pub use swarm_read::*;
+
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -352,6 +356,7 @@ pub enum RequiredProvider {
     AccessResolver,
     CanonicalState,
     OperatorCommand,
+    SwarmProjection,
     G11ReviewProjection,
     I12ReportProjection,
 }
@@ -995,6 +1000,7 @@ pub struct ControlBoard {
     access: Option<Box<dyn AccessResolverPort>>,
     state: Option<Box<dyn CanonicalStatePort>>,
     commands: Option<Box<dyn OperatorCommandPort>>,
+    swarm_projection: Option<Box<dyn SwarmProjectionPort>>,
 }
 
 impl ControlBoard {
@@ -1008,6 +1014,7 @@ impl ControlBoard {
             access,
             state,
             commands,
+            swarm_projection: None,
         }
     }
 
@@ -1271,6 +1278,8 @@ pub enum ControlBoardError {
     DuplicateReference,
     #[error("action binding does not match canonical action bytes")]
     ActionBindingMismatch,
+    #[error("Swarm projection source digest does not match canonical bytes")]
+    SwarmSourceDigestMismatch,
     #[error("hidden or missing action target")]
     HiddenOrMissingTarget,
     #[error("action target has the wrong entity kind")]
@@ -1306,6 +1315,7 @@ impl fmt::Display for RequiredProvider {
             Self::AccessResolver => "ACCESS_RESOLVER",
             Self::CanonicalState => "CANONICAL_STATE",
             Self::OperatorCommand => "OPERATOR_COMMAND",
+            Self::SwarmProjection => "SWARM_PROJECTION",
             Self::G11ReviewProjection => "G11_REVIEW_PROJECTION",
             Self::I12ReportProjection => "I12_REPORT_PROJECTION",
         })

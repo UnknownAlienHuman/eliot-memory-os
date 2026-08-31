@@ -970,6 +970,7 @@ dependencies = [
 name = "eliot-controlboard"
 version = "0.1.0"
 dependencies = [
+ "eliot-agent-coordinator",
  "eliot-evaluation-contracts",
  "eliot-evidence",
  "eliot-observation-contracts",
