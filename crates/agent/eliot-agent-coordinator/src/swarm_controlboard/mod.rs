@@ -2,7 +2,7 @@
 //! control.
 //!
 //! This module composes immutable A-02 catalogue, Human preference, exact
-//! model-selection receipts, and AgentAttempt telemetry into one bounded read
+//! model-selection receipts, and `AgentAttempt` telemetry into one bounded read
 //! model. It performs no provider call, process launch, route admission, retry,
 //! task transition, or finish decision. A-08 remains the Human surface owner.
 
