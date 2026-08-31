@@ -587,18 +587,42 @@ pub fn correlate_response<'a>(
     }
 }
 
-fn event_kind(method: &str) -> HostEventKind {
-    match method {
-        "thread/started" | "thread/resumed" => HostEventKind::SessionStarted,
-        "turn/started" | "turn/created" => HostEventKind::PromptSubmitted,
-        "item/agentMessage/delta" | "item/assistantMessage/delta" => HostEventKind::AssistantDelta,
-        "item/reasoningSummary/delta" | "item/reasoning/delta" => HostEventKind::ReasoningDelta,
-        "item/commandExecution/requestApproval" | "item/toolCall" => HostEventKind::ToolCall,
-        "item/commandExecution/finished" | "item/toolResult" => HostEventKind::ToolResult,
-        "turn/completed" | "turn/completion" => HostEventKind::Completed,
-        "turn/failed" | "error" => HostEventKind::Error,
-        "turn/cancelled" => HostEventKind::CancelRequested,
+fn completed_turn_kind(params: &Value) -> Result<HostEventKind, CodexAdapterError> {
+    let status = params
+        .get("turn")
+        .and_then(Value::as_object)
+        .and_then(|turn| turn.get("status"))
+        .and_then(Value::as_str)
+        .ok_or(CodexAdapterError::MalformedWire(
+            "turn/completed requires string params.turn.status",
+        ))?;
+
+    Ok(match status {
+        "completed" => HostEventKind::Completed,
+        "failed" => HostEventKind::Failed,
+        "interrupted" | "inProgress" => HostEventKind::Unknown,
         _ => HostEventKind::Unknown,
+    })
+}
+
+fn event_kind(method: &str, params: &Value) -> Result<HostEventKind, CodexAdapterError> {
+    match method {
+        "thread/started" | "thread/resumed" => Ok(HostEventKind::SessionStarted),
+        "turn/started" | "turn/created" => Ok(HostEventKind::PromptSubmitted),
+        "item/agentMessage/delta" | "item/assistantMessage/delta" => {
+            Ok(HostEventKind::AssistantDelta)
+        }
+        "item/reasoningSummary/delta" | "item/reasoning/delta" => {
+            Ok(HostEventKind::ReasoningDelta)
+        }
+        "item/commandExecution/requestApproval" | "item/toolCall" => {
+            Ok(HostEventKind::ToolCall)
+        }
+        "item/commandExecution/finished" | "item/toolResult" => Ok(HostEventKind::ToolResult),
+        "turn/completed" => completed_turn_kind(params),
+        "turn/failed" | "error" => Ok(HostEventKind::Error),
+        "turn/completion" | "turn/cancelled" => Ok(HostEventKind::Unknown),
+        _ => Ok(HostEventKind::Unknown),
     }
 }
 
@@ -650,6 +674,7 @@ pub fn translate_host_event(
         .ok_or(CodexAdapterError::MalformedWire("event has no method"))?;
     let params = message.params.clone().unwrap_or(Value::Null);
     validate_event_session(&params, session)?;
+    let kind = event_kind(method, &params)?;
     let bytes = serde_json::to_vec(&message)
         .map_err(|_| CodexAdapterError::MalformedWire("event serialization"))?;
     if bytes.len() > MAX_EVENT_BYTES {
@@ -661,7 +686,7 @@ pub fn translate_host_event(
         attempt_id,
         sequence,
         cursor,
-        kind: event_kind(method),
+        kind,
         route: route.clone(),
         raw_payload_digest: blake3::hash(&bytes).to_hex().to_string(),
         normalized_payload: params,
