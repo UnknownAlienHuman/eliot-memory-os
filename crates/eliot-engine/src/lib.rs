@@ -261,9 +261,11 @@ pub use verification::{
 };
 pub use work::{
     AgentSessionService, WorkClaimRequest, WorkConflictService, WorkCreateRequest,
-    WorkLeaseGuardError, WorkLeaseService, WorkMemoryWriter, WorkQueueService, WorkSessionEvent,
-    WorkState, WorkStatusReport, default_lease_ttl_minutes, default_work_scope,
-    guard_work_lease_for_files, path_in_scope, work_completion_satisfied, work_lease_is_active,
+    WorkLeaseGuardError, WorkLeaseIssuanceDisposition, WorkLeaseIssuanceError,
+    WorkLeaseIssuanceProvenance, WorkLeaseIssuanceResult, WorkLeaseService, WorkMemoryWriter,
+    WorkQueueService, WorkSessionEvent, WorkState, WorkStatusReport, default_lease_ttl_minutes,
+    default_work_scope, guard_work_lease_for_files, path_in_scope, work_completion_satisfied,
+    work_lease_is_active,
 };
 pub use worktree::{
     CandidateCompletionContext, CandidateDiffCaptureInput, CandidateDiffService,

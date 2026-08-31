@@ -1,7 +1,7 @@
 use eliot_engine::{
     ActionLeaseEvaluation, ActionLeaseService, CompletionGate, PatchRunner, PatchRunnerInput,
-    WorkClaimRequest, WorkLeaseService, WorkQueueService, WorkState, codecortex_report_ref,
-    default_lease_ttl_minutes, default_work_scope,
+    WorkClaimRequest, WorkLeaseIssuanceDisposition, WorkLeaseService, WorkQueueService, WorkState,
+    codecortex_report_ref, default_lease_ttl_minutes, default_work_scope,
 };
 use eliot_types::{
     ActionKind, ActionLease, ActionRequest, ActionScope, AgentId, AgentRole, AgentSessionId,
@@ -48,48 +48,43 @@ fn agent_session_create_for_role_persists_requested_role() {
 }
 
 #[test]
-fn agent_session_bind_for_role_reuses_exact_active_session() {
+fn agent_session_bind_for_role_reuses_exact_active_session() -> TestResult {
     let mut state = WorkState::default();
     let project_id = ProjectId::new_v7();
     let agent_session_id = AgentSessionId::new_v7();
 
-    let created = eliot_engine::AgentSessionService
-        .bind_for_role(
-            &mut state,
-            agent_session_id,
-            project_id,
-            AgentRole::Controller,
-        )
-        .expect("bind external controller session");
-    let reused = eliot_engine::AgentSessionService
-        .bind_for_role(
-            &mut state,
-            agent_session_id,
-            project_id,
-            AgentRole::Controller,
-        )
-        .expect("reuse exact controller session");
+    let created = eliot_engine::AgentSessionService.bind_for_role(
+        &mut state,
+        agent_session_id,
+        project_id,
+        AgentRole::Controller,
+    )?;
+    let reused = eliot_engine::AgentSessionService.bind_for_role(
+        &mut state,
+        agent_session_id,
+        project_id,
+        AgentRole::Controller,
+    )?;
 
     assert_eq!(created.agent_session_id, agent_session_id);
     assert_eq!(reused.agent_session_id, created.agent_session_id);
     assert_eq!(reused.project_id, created.project_id);
     assert_eq!(reused.role, created.role);
     assert_eq!(state.sessions.len(), 1);
+    Ok(())
 }
 
 #[test]
-fn agent_session_bind_for_role_rejects_authority_substitution() {
+fn agent_session_bind_for_role_rejects_authority_substitution() -> TestResult {
     let mut state = WorkState::default();
     let project_id = ProjectId::new_v7();
     let agent_session_id = AgentSessionId::new_v7();
-    eliot_engine::AgentSessionService
-        .bind_for_role(
-            &mut state,
-            agent_session_id,
-            project_id,
-            AgentRole::Controller,
-        )
-        .expect("bind external controller session");
+    eliot_engine::AgentSessionService.bind_for_role(
+        &mut state,
+        agent_session_id,
+        project_id,
+        AgentRole::Controller,
+    )?;
 
     let wrong_project = eliot_engine::AgentSessionService.bind_for_role(
         &mut state,
@@ -107,6 +102,7 @@ fn agent_session_bind_for_role_rejects_authority_substitution() {
     assert!(wrong_project.is_err());
     assert!(wrong_role.is_err());
     assert_eq!(state.sessions.len(), 1);
+    Ok(())
 }
 
 #[test]
@@ -132,6 +128,162 @@ fn work_item_create_and_claim() {
 
     assert_eq!(decision.kind, WorkLeaseDecisionKind::Granted);
     assert_eq!(fixture.state.work_items[0].status, WorkItemStatus::Active);
+}
+
+#[test]
+fn work_lease_owner_issuance_emits_exact_canonical_object_with_legacy_provenance() -> TestResult {
+    let mut fixture = WorkFixture::new("src/lib.rs");
+    let result = WorkLeaseService.claim_with_issuance(
+        &mut fixture.state,
+        WorkClaimRequest {
+            work_item_id: fixture.item_id,
+            agent_session_id: fixture.session_id,
+            role: AgentRole::Controller,
+            ttl_minutes: default_lease_ttl_minutes(),
+        },
+    );
+
+    assert_eq!(
+        result.disposition(),
+        WorkLeaseIssuanceDisposition::OwnerIssued
+    );
+    assert!(result.error().is_none());
+    let provenance = result
+        .provenance()
+        .ok_or_else(|| std::io::Error::other("canonical issuance provenance is missing"))?;
+    assert_eq!(
+        result.decision().work_lease_id,
+        Some(provenance.source_lease().work_lease_id)
+    );
+    assert_eq!(
+        provenance.source_work_item().active_lease_id,
+        Some(provenance.source_lease().work_lease_id)
+    );
+    assert_eq!(
+        provenance.source_session().current_work_item_id,
+        Some(provenance.source_lease().work_item_id)
+    );
+
+    let canonical = serde_json::to_value(provenance.canonical_work_lease_id())?;
+    let object = canonical
+        .as_object()
+        .ok_or_else(|| std::io::Error::other("canonical WorkLease must be an object"))?;
+    assert_eq!(
+        object.get("namespace").and_then(serde_json::Value::as_str),
+        Some(eliot_contracts::WORK_LEASE_NAMESPACE)
+    );
+    assert_eq!(
+        object.get("revision").and_then(serde_json::Value::as_str),
+        Some(eliot_contracts::WORK_LEASE_WIRE_REVISION)
+    );
+    let opaque_value = object
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| std::io::Error::other("canonical WorkLease value is missing"))?;
+    assert_eq!(opaque_value, provenance.evidence_commitment_sha256());
+    assert_eq!(opaque_value.len(), 64);
+    assert!(
+        opaque_value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    assert_ne!(
+        opaque_value,
+        provenance.source_lease().work_lease_id.to_string()
+    );
+
+    let legacy_scalar =
+        serde_json::Value::String(provenance.source_lease().work_lease_id.to_string());
+    assert!(serde_json::from_value::<eliot_contracts::WorkLeaseId>(legacy_scalar).is_err());
+    let mut wrong_domain = canonical;
+    wrong_domain
+        .as_object_mut()
+        .ok_or_else(|| std::io::Error::other("canonical WorkLease must be mutable object"))?
+        .insert(
+            "namespace".to_owned(),
+            serde_json::Value::String("eliot.agent.work-lease".to_owned()),
+        );
+    assert!(serde_json::from_value::<eliot_contracts::WorkLeaseId>(wrong_domain).is_err());
+    Ok(())
+}
+
+#[test]
+fn owner_issuance_snapshot_stays_immutable_when_legacy_lifecycle_advances() -> TestResult {
+    let mut fixture = WorkFixture::new("src/lib.rs");
+    let result = WorkLeaseService.claim_with_issuance(
+        &mut fixture.state,
+        WorkClaimRequest {
+            work_item_id: fixture.item_id,
+            agent_session_id: fixture.session_id,
+            role: AgentRole::Controller,
+            ttl_minutes: default_lease_ttl_minutes(),
+        },
+    );
+    let provenance = result
+        .provenance()
+        .ok_or_else(|| std::io::Error::other("owner issuance provenance is missing"))?;
+    let source_work_lease_id = provenance.source_lease().work_lease_id;
+    let canonical_before = serde_json::to_value(provenance.canonical_work_lease_id())?;
+    let commitment_before = provenance.evidence_commitment_sha256().to_owned();
+
+    let renewed = WorkLeaseService.renew(
+        &mut fixture.state,
+        source_work_lease_id,
+        default_lease_ttl_minutes(),
+    );
+    assert_eq!(renewed.kind, WorkLeaseDecisionKind::Renewed);
+    assert_eq!(fixture.state.leases[0].state, WorkLeaseState::Renewed);
+    assert_eq!(provenance.source_lease().state, WorkLeaseState::Granted);
+    assert_eq!(
+        serde_json::to_value(provenance.canonical_work_lease_id())?,
+        canonical_before
+    );
+    assert_eq!(provenance.evidence_commitment_sha256(), commitment_before);
+    Ok(())
+}
+
+#[test]
+fn denied_claim_never_emits_canonical_issuance() {
+    let mut fixture = WorkFixture::new("src/lib.rs");
+    fixture.state.sessions[0].status = AgentSessionStatus::Stopped;
+    let result = WorkLeaseService.claim_with_issuance(
+        &mut fixture.state,
+        WorkClaimRequest {
+            work_item_id: fixture.item_id,
+            agent_session_id: fixture.session_id,
+            role: AgentRole::Controller,
+            ttl_minutes: default_lease_ttl_minutes(),
+        },
+    );
+
+    assert_eq!(result.decision().kind, WorkLeaseDecisionKind::Denied);
+    assert_eq!(
+        result.disposition(),
+        WorkLeaseIssuanceDisposition::NotGranted
+    );
+    assert!(result.provenance().is_none());
+    assert!(result.error().is_none());
+}
+
+#[test]
+fn legacy_cross_role_grant_is_quarantined_from_owner_issued_identity() {
+    let mut fixture = WorkFixture::new("src/lib.rs");
+    let result = WorkLeaseService.claim_with_issuance(
+        &mut fixture.state,
+        WorkClaimRequest {
+            work_item_id: fixture.item_id,
+            agent_session_id: fixture.session_id,
+            role: AgentRole::Implementer,
+            ttl_minutes: default_lease_ttl_minutes(),
+        },
+    );
+
+    assert_eq!(result.decision().kind, WorkLeaseDecisionKind::Granted);
+    assert_eq!(
+        result.disposition(),
+        WorkLeaseIssuanceDisposition::LegacyQuarantined
+    );
+    assert!(result.provenance().is_none());
 }
 
 #[test]

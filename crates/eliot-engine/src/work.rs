@@ -1,4 +1,8 @@
 use crate::{EngineError, WriteAdmissionService, WriterHandle};
+use eliot_contracts::{
+    WORK_LEASE_NAMESPACE, WORK_LEASE_WIRE_REVISION, WorkLeaseId as CanonicalWorkLeaseId,
+    canonical_json_bytes, sha256_hex,
+};
 use eliot_types::{
     ActionLease, AgentId, AgentRole, AgentRun, AgentSession, AgentSessionId, AgentSessionStatus,
     AgentTransport, AuthorityProfile, BlackboardItem, CandidateDiff, CandidateDiffStatus,
@@ -12,6 +16,7 @@ use eliot_types::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 
 const DEFAULT_LEASE_TTL_MINUTES: i64 = 45;
@@ -78,6 +83,167 @@ pub struct WorkClaimRequest {
     pub agent_session_id: AgentSessionId,
     pub role: AgentRole,
     pub ttl_minutes: i64,
+}
+
+/// Classification of one canonical issuance attempt by the incumbent
+/// `WorkLeaseService` owner.
+///
+/// Only [`Self::OwnerIssued`] carries a canonical
+/// `eliot_contracts::WorkLeaseId`.
+/// A normal denial creates no lease, while [`Self::LegacyQuarantined`] records
+/// that the legacy grant exists but its exact owner evidence could not produce
+/// the canonical object. Neither non-owner-issued disposition may satisfy a
+/// later agent authority field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkLeaseIssuanceDisposition {
+    OwnerIssued,
+    NotGranted,
+    LegacyQuarantined,
+}
+
+/// Fail-closed reason why an accepted legacy grant was not emitted as the
+/// canonical owner-neutral `WorkLease` identity.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum WorkLeaseIssuanceError {
+    #[error("granted decision is missing its legacy source identity")]
+    MissingSourceIdentity,
+    #[error("exact owner grant evidence is missing")]
+    MissingOwnerEvidence,
+    #[error("owner grant evidence is ambiguous")]
+    AmbiguousOwnerEvidence,
+    #[error("owner grant evidence is internally inconsistent")]
+    InconsistentOwnerEvidence,
+    #[error("owner grant evidence could not be encoded canonically")]
+    EvidenceEncodingRejected,
+    #[error("canonical WorkLease contract rejected owner-issued evidence")]
+    CanonicalContractRejected,
+}
+
+/// Exact owner evidence that bound one incumbent legacy lease grant to one
+/// canonical owner-neutral `WorkLease` identity.
+///
+/// The canonical value is derived from the complete accepted issuance
+/// snapshot, not from UUID spelling. The original UUID-backed lease, work item
+/// and session remain available only as attributed legacy evidence. The
+/// unkeyed evidence commitment is not authority proof by itself; issuance is
+/// established only by the same-call transition through `WorkLeaseService`.
+/// This package boundary is not a `StateFence`, process fence, durable-store
+/// receipt, or proof that the current Governor daemon issued the lease.
+#[derive(Clone, Debug)]
+pub struct WorkLeaseIssuanceProvenance {
+    canonical_work_lease_id: CanonicalWorkLeaseId,
+    source_lease: WorkLease,
+    source_work_item: WorkItem,
+    source_session: AgentSession,
+    evidence_commitment_sha256: String,
+}
+
+impl WorkLeaseIssuanceProvenance {
+    /// Returns the canonical owner-neutral identity. No raw-text accessor is
+    /// exposed by this boundary.
+    #[must_use]
+    pub const fn canonical_work_lease_id(&self) -> &CanonicalWorkLeaseId {
+        &self.canonical_work_lease_id
+    }
+
+    /// Returns the exact UUID-backed lease retained as legacy source evidence.
+    #[must_use]
+    pub const fn source_lease(&self) -> &WorkLease {
+        &self.source_lease
+    }
+
+    /// Returns the exact active work-item snapshot observed after the grant.
+    #[must_use]
+    pub const fn source_work_item(&self) -> &WorkItem {
+        &self.source_work_item
+    }
+
+    /// Returns the exact active session snapshot observed after the grant.
+    #[must_use]
+    pub const fn source_session(&self) -> &AgentSession {
+        &self.source_session
+    }
+
+    /// Returns the unkeyed commitment to the immutable issuance snapshot.
+    /// This value commits the evidence bytes; it does not prove authority
+    /// independently of the owner-issued result that carries it.
+    #[must_use]
+    pub fn evidence_commitment_sha256(&self) -> &str {
+        &self.evidence_commitment_sha256
+    }
+}
+
+#[derive(Clone, Debug)]
+enum WorkLeaseIssuanceState {
+    OwnerIssued(Box<WorkLeaseIssuanceProvenance>),
+    NotGranted,
+    LegacyQuarantined(WorkLeaseIssuanceError),
+}
+
+/// Result of asking the incumbent owner to claim work and emit canonical
+/// issuance provenance in the same call.
+///
+/// Existing callers continue to use [`WorkLeaseService::claim`] unchanged.
+/// A future #368 consumer is eligible to use only a result whose disposition
+/// is [`WorkLeaseIssuanceDisposition::OwnerIssued`]. That later migration must
+/// preserve this immutable issuance snapshot; this package proof does not add
+/// durable storage or recovery. Raw coordination strings, synthetic
+/// application leases and arbitrary legacy IDs never enter this boundary.
+///
+/// The exact future #368 migration envelope is limited to the lease fields in
+/// `eliot-agent-api/src/lib.rs` (`AuthorityEnvelope::lease` and
+/// `AgentAttempt::lease`), their `eliot-agent-coordinator/src/model.rs`
+/// projections, and the typed lease ports in
+/// `eliot-native-worker-core/src/ports.rs`. The current agent-API wrapper and
+/// coordination strings remain loss-visible legacy/projection data until that
+/// migration consumes an `OwnerIssued` result. UUID-backed engine/application
+/// leases remain source evidence only; direct synthetic application leases are
+/// ineligible. No field may migrate by matching text.
+#[derive(Clone, Debug)]
+pub struct WorkLeaseIssuanceResult {
+    decision: WorkLeaseDecision,
+    issuance: WorkLeaseIssuanceState,
+}
+
+impl WorkLeaseIssuanceResult {
+    /// Returns the existing legacy decision without changing its wire or state.
+    #[must_use]
+    pub const fn decision(&self) -> &WorkLeaseDecision {
+        &self.decision
+    }
+
+    /// Returns the loss-visible issuance classification.
+    #[must_use]
+    pub const fn disposition(&self) -> WorkLeaseIssuanceDisposition {
+        match self.issuance {
+            WorkLeaseIssuanceState::OwnerIssued(_) => WorkLeaseIssuanceDisposition::OwnerIssued,
+            WorkLeaseIssuanceState::NotGranted => WorkLeaseIssuanceDisposition::NotGranted,
+            WorkLeaseIssuanceState::LegacyQuarantined(_) => {
+                WorkLeaseIssuanceDisposition::LegacyQuarantined
+            }
+        }
+    }
+
+    /// Returns provenance only for an exact same-call owner issuance.
+    #[must_use]
+    pub fn provenance(&self) -> Option<&WorkLeaseIssuanceProvenance> {
+        match &self.issuance {
+            WorkLeaseIssuanceState::OwnerIssued(provenance) => Some(provenance.as_ref()),
+            WorkLeaseIssuanceState::NotGranted | WorkLeaseIssuanceState::LegacyQuarantined(_) => {
+                None
+            }
+        }
+    }
+
+    /// Returns the typed quarantine reason when a legacy grant could not be
+    /// bound to exact owner evidence.
+    #[must_use]
+    pub const fn error(&self) -> Option<WorkLeaseIssuanceError> {
+        match self.issuance {
+            WorkLeaseIssuanceState::LegacyQuarantined(error) => Some(error),
+            WorkLeaseIssuanceState::OwnerIssued(_) | WorkLeaseIssuanceState::NotGranted => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -498,6 +664,24 @@ impl WorkLeaseService {
         grant_work_lease(state, request, session, item, now)
     }
 
+    /// Claims work through the existing owner and, only for an exact accepted
+    /// grant, emits the canonical `WorkLease` object with complete source
+    /// provenance.
+    ///
+    /// The existing legacy grant remains the lifecycle/storage identity. This
+    /// additive boundary deliberately performs no engine/store/application or
+    /// coordination migration; it exists so a later consumer migration can
+    /// accept canonical identity only from owner evidence rather than text.
+    #[must_use]
+    pub fn claim_with_issuance(
+        &self,
+        state: &mut WorkState,
+        request: WorkClaimRequest,
+    ) -> WorkLeaseIssuanceResult {
+        let decision = self.claim(state, request);
+        classify_work_lease_issuance(state, decision)
+    }
+
     pub fn renew(
         &self,
         state: &mut WorkState,
@@ -798,6 +982,130 @@ fn grant_reason(item: &WorkItem, role: AgentRole) -> WorkLeaseDecisionReason {
     } else {
         WorkLeaseDecisionReason::NoConflict
     }
+}
+
+#[derive(Serialize)]
+struct WorkLeaseIssuanceEvidence<'a> {
+    revision: &'static str,
+    source_lease: &'a WorkLease,
+    source_work_item: &'a WorkItem,
+    source_session: &'a AgentSession,
+    source_decision: &'a WorkLeaseDecision,
+}
+
+fn classify_work_lease_issuance(
+    state: &WorkState,
+    decision: WorkLeaseDecision,
+) -> WorkLeaseIssuanceResult {
+    if decision.kind != WorkLeaseDecisionKind::Granted {
+        return WorkLeaseIssuanceResult {
+            decision,
+            issuance: WorkLeaseIssuanceState::NotGranted,
+        };
+    }
+    match work_lease_issuance_from_owner_state(state, &decision) {
+        Ok(provenance) => WorkLeaseIssuanceResult {
+            decision,
+            issuance: WorkLeaseIssuanceState::OwnerIssued(Box::new(provenance)),
+        },
+        Err(error) => WorkLeaseIssuanceResult {
+            decision,
+            issuance: WorkLeaseIssuanceState::LegacyQuarantined(error),
+        },
+    }
+}
+
+fn work_lease_issuance_from_owner_state(
+    state: &WorkState,
+    decision: &WorkLeaseDecision,
+) -> Result<WorkLeaseIssuanceProvenance, WorkLeaseIssuanceError> {
+    let source_work_lease_id = decision
+        .work_lease_id
+        .ok_or(WorkLeaseIssuanceError::MissingSourceIdentity)?;
+    let source_lease = exact_owner_record(&state.leases, |lease| {
+        lease.work_lease_id == source_work_lease_id
+    })?;
+    let source_work_item = exact_owner_record(&state.work_items, |item| {
+        item.work_item_id == source_lease.work_item_id
+    })?;
+    let source_session = exact_owner_record(&state.sessions, |session| {
+        session.agent_session_id == source_lease.agent_session_id
+    })?;
+    let decision_matches = canonical_evidence_equal(&source_lease.decision, decision)?;
+    let scope_matches = canonical_evidence_equal(&source_lease.scope, &source_work_item.scope)?;
+    let source_lease_ref_count = source_work_item
+        .lease_refs
+        .iter()
+        .filter(|lease_id| **lease_id == source_work_lease_id)
+        .count();
+    if source_lease.state != WorkLeaseState::Granted
+        || source_lease.work_lease_id != source_work_lease_id
+        || !decision_matches
+        || decision.expires_at != Some(source_lease.expires_at)
+        || source_lease.granted_at >= source_lease.expires_at
+        || source_work_item.status != WorkItemStatus::Active
+        || source_work_item.active_lease_id != Some(source_work_lease_id)
+        || source_lease_ref_count != 1
+        || !scope_matches
+        || !source_work_item.allowed_roles.contains(&source_lease.role)
+        || source_work_item.project_id != source_lease.project_id
+        || source_work_item.task_id != source_lease.task_id
+        || source_session.status != AgentSessionStatus::Active
+        || source_session.current_work_item_id != Some(source_lease.work_item_id)
+        || source_session.project_id != source_lease.project_id
+        || source_session.agent_id != source_lease.agent_id
+        || source_session.role != source_lease.role
+    {
+        return Err(WorkLeaseIssuanceError::InconsistentOwnerEvidence);
+    }
+    let evidence = WorkLeaseIssuanceEvidence {
+        revision: "eliot.engine.work-lease-issuance.v1",
+        source_lease,
+        source_work_item,
+        source_session,
+        source_decision: decision,
+    };
+    let evidence_bytes = canonical_json_bytes(&evidence)
+        .map_err(|_| WorkLeaseIssuanceError::EvidenceEncodingRejected)?;
+    let evidence_commitment_sha256 = sha256_hex(&evidence_bytes);
+    let canonical_work_lease_id = serde_json::from_value(serde_json::json!({
+        "namespace": WORK_LEASE_NAMESPACE,
+        "revision": WORK_LEASE_WIRE_REVISION,
+        "value": evidence_commitment_sha256,
+    }))
+    .map_err(|_| WorkLeaseIssuanceError::CanonicalContractRejected)?;
+    Ok(WorkLeaseIssuanceProvenance {
+        canonical_work_lease_id,
+        source_lease: source_lease.clone(),
+        source_work_item: source_work_item.clone(),
+        source_session: source_session.clone(),
+        evidence_commitment_sha256,
+    })
+}
+
+fn exact_owner_record<T>(
+    records: &[T],
+    mut matches: impl FnMut(&T) -> bool,
+) -> Result<&T, WorkLeaseIssuanceError> {
+    let mut matching = records.iter().filter(|record| matches(record));
+    let record = matching
+        .next()
+        .ok_or(WorkLeaseIssuanceError::MissingOwnerEvidence)?;
+    if matching.next().is_some() {
+        return Err(WorkLeaseIssuanceError::AmbiguousOwnerEvidence);
+    }
+    Ok(record)
+}
+
+fn canonical_evidence_equal<T: Serialize>(
+    left: &T,
+    right: &T,
+) -> Result<bool, WorkLeaseIssuanceError> {
+    let left =
+        canonical_json_bytes(left).map_err(|_| WorkLeaseIssuanceError::EvidenceEncodingRejected)?;
+    let right = canonical_json_bytes(right)
+        .map_err(|_| WorkLeaseIssuanceError::EvidenceEncodingRejected)?;
+    Ok(left == right)
 }
 
 fn mark_claim_active(
@@ -1212,4 +1520,205 @@ fn normalize_path(path: &str) -> String {
 #[must_use]
 pub fn default_lease_ttl_minutes() -> i64 {
     DEFAULT_LEASE_TTL_MINUTES
+}
+
+#[cfg(test)]
+mod issuance_tests {
+    use super::*;
+
+    fn owner_issued_state() -> (WorkState, WorkLeaseDecision) {
+        let mut state = WorkState::default();
+        let project_id = ProjectId::new_v7();
+        let session =
+            AgentSessionService.create_for_role(&mut state, project_id, AgentRole::Implementer);
+        let mut scope = default_work_scope(
+            "C:/repo",
+            vec!["src/lib.rs".to_owned()],
+            Vec::new(),
+            vec!["cargo check".to_owned()],
+        );
+        scope.authority = AuthorityProfile::read_only();
+        let item = WorkQueueService.create_work_item(
+            &mut state,
+            WorkCreateRequest {
+                project_id,
+                task_id: TaskId::new_v7(),
+                project: "issuance-test".to_owned(),
+                task: "owner evidence".to_owned(),
+                goal: "prove exact owner evidence".to_owned(),
+                scope,
+                required: true,
+                created_by: session.agent_session_id,
+                required_verifiers: Vec::new(),
+            },
+        );
+        let result = WorkLeaseService.claim_with_issuance(
+            &mut state,
+            WorkClaimRequest {
+                work_item_id: item.work_item_id,
+                agent_session_id: session.agent_session_id,
+                role: AgentRole::Implementer,
+                ttl_minutes: default_lease_ttl_minutes(),
+            },
+        );
+        assert_eq!(
+            result.disposition(),
+            WorkLeaseIssuanceDisposition::OwnerIssued
+        );
+        (state, result.decision().clone())
+    }
+
+    fn assert_quarantined(
+        state: &WorkState,
+        decision: &WorkLeaseDecision,
+        expected: WorkLeaseIssuanceError,
+    ) {
+        let result = classify_work_lease_issuance(state, decision.clone());
+        assert_eq!(
+            result.disposition(),
+            WorkLeaseIssuanceDisposition::LegacyQuarantined
+        );
+        assert_eq!(result.error(), Some(expected));
+        assert!(result.provenance().is_none());
+    }
+
+    #[test]
+    fn granted_decision_without_exact_owner_evidence_is_loss_visible_quarantine() {
+        let now = OffsetDateTime::now_utc();
+        let source_work_lease_id = WorkLeaseId::new_v7();
+        let missing_state = classify_work_lease_issuance(
+            &WorkState::default(),
+            decision(
+                WorkLeaseDecisionKind::Granted,
+                WorkLeaseDecisionReason::NoConflict,
+                "fabricated grant without owner state",
+                Some(source_work_lease_id),
+                Vec::new(),
+                Some(now + Duration::minutes(1)),
+            ),
+        );
+        assert_eq!(
+            missing_state.disposition(),
+            WorkLeaseIssuanceDisposition::LegacyQuarantined
+        );
+        assert_eq!(
+            missing_state.error(),
+            Some(WorkLeaseIssuanceError::MissingOwnerEvidence)
+        );
+        assert!(missing_state.provenance().is_none());
+
+        let missing_identity = classify_work_lease_issuance(
+            &WorkState::default(),
+            decision(
+                WorkLeaseDecisionKind::Granted,
+                WorkLeaseDecisionReason::NoConflict,
+                "fabricated grant without source identity",
+                None,
+                Vec::new(),
+                Some(now + Duration::minutes(1)),
+            ),
+        );
+        assert_eq!(
+            missing_identity.error(),
+            Some(WorkLeaseIssuanceError::MissingSourceIdentity)
+        );
+        assert!(missing_identity.provenance().is_none());
+    }
+
+    #[test]
+    fn duplicate_owner_records_are_loss_visible_ambiguity() {
+        let (state, decision) = owner_issued_state();
+
+        let mut duplicate_lease = state.clone();
+        duplicate_lease.leases.push(state.leases[0].clone());
+        assert_quarantined(
+            &duplicate_lease,
+            &decision,
+            WorkLeaseIssuanceError::AmbiguousOwnerEvidence,
+        );
+
+        let mut duplicate_item = state.clone();
+        duplicate_item.work_items.push(state.work_items[0].clone());
+        assert_quarantined(
+            &duplicate_item,
+            &decision,
+            WorkLeaseIssuanceError::AmbiguousOwnerEvidence,
+        );
+
+        let mut duplicate_session = state.clone();
+        duplicate_session.sessions.push(state.sessions[0].clone());
+        assert_quarantined(
+            &duplicate_session,
+            &decision,
+            WorkLeaseIssuanceError::AmbiguousOwnerEvidence,
+        );
+    }
+
+    #[test]
+    fn inconsistent_owner_cross_links_are_loss_visible_quarantine() {
+        let (state, decision) = owner_issued_state();
+
+        let mut altered_decision = state.clone();
+        altered_decision.leases[0].decision.message = "substituted decision".to_owned();
+        assert_quarantined(
+            &altered_decision,
+            &decision,
+            WorkLeaseIssuanceError::InconsistentOwnerEvidence,
+        );
+
+        let mut altered_scope = state.clone();
+        altered_scope.leases[0].scope.max_files += 1;
+        assert_quarantined(
+            &altered_scope,
+            &decision,
+            WorkLeaseIssuanceError::InconsistentOwnerEvidence,
+        );
+
+        let mut altered_role = state.clone();
+        altered_role.work_items[0].allowed_roles.clear();
+        assert_quarantined(
+            &altered_role,
+            &decision,
+            WorkLeaseIssuanceError::InconsistentOwnerEvidence,
+        );
+
+        let mut missing_history = state;
+        missing_history.work_items[0].lease_refs.clear();
+        assert_quarantined(
+            &missing_history,
+            &decision,
+            WorkLeaseIssuanceError::InconsistentOwnerEvidence,
+        );
+    }
+
+    #[test]
+    fn legacy_source_identity_is_attributed_input_not_canonical_text()
+    -> Result<(), WorkLeaseIssuanceError> {
+        let (state, decision) = owner_issued_state();
+        let original = work_lease_issuance_from_owner_state(&state, &decision)?;
+
+        let mut rebound_state = state;
+        let mut rebound_decision = decision;
+        let rebound_source_id = WorkLeaseId::new_v7();
+        rebound_state.leases[0].work_lease_id = rebound_source_id;
+        rebound_state.leases[0].decision.work_lease_id = Some(rebound_source_id);
+        rebound_state.work_items[0].active_lease_id = Some(rebound_source_id);
+        rebound_state.work_items[0].lease_refs[0] = rebound_source_id;
+        rebound_decision.work_lease_id = Some(rebound_source_id);
+        let rebound = work_lease_issuance_from_owner_state(&rebound_state, &rebound_decision)?;
+
+        assert_ne!(
+            original.canonical_work_lease_id,
+            rebound.canonical_work_lease_id
+        );
+        assert_ne!(
+            original.evidence_commitment_sha256,
+            rebound.evidence_commitment_sha256
+        );
+        assert_ne!(
+            rebound.evidence_commitment_sha256,
+            rebound_source_id.to_string()
+        );
+        Ok(())
+    }
 }
