@@ -83,6 +83,8 @@ pub enum ContractError {
     ZeroLimit { field: &'static str },
     #[error("child budget exceeds parent budget at {field}")]
     ChildBudgetExceeded { field: &'static str },
+    #[error("child effect ceiling exceeds parent effect ceiling at {field}")]
+    ChildEffectCeilingExceeded { field: &'static str },
     #[error("attempt {attempt} is not allowed to transition from {from:?} to {to:?}")]
     InvalidAttemptTransition {
         attempt: String,
@@ -329,6 +331,24 @@ impl EffectCeiling {
         Ok(())
     }
 
+    /// Proves that this child ceiling is a monotonic narrowing of `parent`.
+    pub fn is_within(&self, parent: &Self) -> Result<(), ContractError> {
+        self.validate()?;
+        parent.validate()?;
+        if self.scope_ref != parent.scope_ref {
+            return Err(ContractError::ChildEffectCeilingExceeded { field: "scope_ref" });
+        }
+        if !self.allowed.is_subset(&parent.allowed) {
+            return Err(ContractError::ChildEffectCeilingExceeded { field: "allowed" });
+        }
+        if self.max_external_effects > parent.max_external_effects {
+            return Err(ContractError::ChildEffectCeilingExceeded {
+                field: "max_external_effects",
+            });
+        }
+        Ok(())
+    }
+
     pub fn permits(&self, effect: EffectKind) -> bool {
         self.allowed.contains(&effect)
     }
@@ -409,7 +429,11 @@ impl AgentWorkUnitBrief {
             return Err(ContractError::EmptyCollection("expected_outputs"));
         }
         self.budget.validate()?;
-        self.effect_ceiling.validate()
+        self.effect_ceiling.validate()?;
+        if self.effect_ceiling.scope_ref != self.scope_ref {
+            return Err(ContractError::ChildEffectCeilingExceeded { field: "scope_ref" });
+        }
+        Ok(())
     }
 }
 
@@ -510,6 +534,7 @@ impl AgentLaunchRequest {
         for work_unit in &self.work_units {
             work_unit.validate()?;
             work_unit.budget.is_within(&self.context_budget)?;
+            work_unit.effect_ceiling.is_within(&self.effect_ceiling)?;
         }
         Ok(())
     }
