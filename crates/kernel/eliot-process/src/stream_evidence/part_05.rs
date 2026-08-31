@@ -187,6 +187,60 @@ fn validate_locator(value: &str) -> Result<(), ProcessStreamEvidenceError> {
     Ok(())
 }
 
+fn validate_legacy_reference_shape(value: &str) -> Result<(), ProcessStreamEvidenceError> {
+    validate_reference("legacy_reference", value)?;
+    if !value.starts_with("raw:") {
+        return Err(ProcessStreamEvidenceError::Invariant {
+            field: "legacy_reference",
+            reason: "legacy stream reference must use the raw scheme",
+        });
+    }
+    Ok(())
+}
+
+fn parse_legacy_reference(
+    value: &str,
+) -> Result<(String, u64, StreamTransportStatus), ProcessStreamEvidenceError> {
+    validate_legacy_reference_shape(value)?;
+    let Some(payload) = value.strip_prefix("raw:p04-stream:") else {
+        return Ok((sha256_hex(&[]), 0, StreamTransportStatus::UnknownOutcome));
+    };
+    let fields = payload.split(':').collect::<Vec<_>>();
+    if fields.len() != 6
+        || fields[0] != "sha256"
+        || fields[2] != "bytes"
+        || fields[4] != "complete"
+    {
+        return Err(ProcessStreamEvidenceError::Invariant {
+            field: "legacy_reference",
+            reason: "legacy p04 stream reference has malformed fields",
+        });
+    }
+    let digest = fields[1].to_owned();
+    validate_digest("legacy_reference.sha256", &digest)?;
+    let bytes = fields[3]
+        .parse::<u64>()
+        .map_err(|_| ProcessStreamEvidenceError::Invariant {
+            field: "legacy_reference.bytes",
+            reason: "legacy p04 stream byte count is invalid",
+        })?;
+    let complete = fields[5]
+        .parse::<bool>()
+        .map_err(|_| ProcessStreamEvidenceError::Invariant {
+            field: "legacy_reference.complete",
+            reason: "legacy p04 stream completion flag is invalid",
+        })?;
+    Ok((
+        digest,
+        bytes,
+        if complete {
+            StreamTransportStatus::Complete
+        } else {
+            StreamTransportStatus::UnknownOutcome
+        },
+    ))
+}
+
 fn validate_digest(field: &'static str, value: &str) -> Result<(), ProcessStreamEvidenceError> {
     if value.len() != 64
         || !value
