@@ -14,6 +14,9 @@ pub struct ProcessStreamEvidence {
     source: Option<DurableProcessStreamSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transport_prefix_identity: Option<ProcessStreamTransportPrefixIdentity>,
+    #[serde(skip_serializing)]
+    #[schemars(skip)]
+    legacy_reference: Option<String>,
     gaps: Vec<StreamEvidenceGap>,
     parsing: StreamParsingStatus,
     evaluation: StreamEvaluationStatus,
@@ -34,6 +37,8 @@ struct ProcessStreamEvidenceWire {
     source: Option<DurableProcessStreamSource>,
     #[serde(default)]
     transport_prefix_identity: Option<ProcessStreamTransportPrefixIdentity>,
+    #[serde(default)]
+    legacy_reference: Option<String>,
     gaps: Vec<StreamEvidenceGap>,
     parsing: StreamParsingStatus,
     evaluation: StreamEvaluationStatus,
@@ -66,8 +71,53 @@ impl ProcessStreamEvidence {
             preview,
             source,
             None,
+            None,
             gaps,
         )
+    }
+
+    /// Converts a legacy raw stream reference into unresolved, source-unavailable evidence.
+    ///
+    /// The reference is retained only as provenance about the rejected legacy shape. It never
+    /// supplies a durable source and therefore can never represent complete evidence.
+    pub fn new_legacy_raw_reference(
+        binding: ProcessExecutionBinding,
+        stream: ProcessStreamKind,
+        reference: impl Into<String>,
+    ) -> Result<Self, ProcessStreamEvidenceError> {
+        let reference = reference.into();
+        validate_legacy_reference(&reference)?;
+        let policy = ProcessStreamPolicyBinding::new(
+            "legacy:unresolved",
+            "legacy:unknown",
+            "legacy:unknown",
+            "legacy:unknown",
+            "legacy:unresolved",
+        )?;
+        let preview = ProcessStreamPrefixPreview::from_transport_prefix(Vec::new(), 0)?;
+        let gaps = vec![
+            StreamEvidenceGap::PersistenceUnknownOutcome,
+            StreamEvidenceGap::UnknownOutcome,
+        ];
+        let value = Self {
+            schema_version: PROCESS_STREAM_EVIDENCE_SCHEMA_VERSION.to_owned(),
+            binding,
+            stream,
+            policy,
+            transport: StreamTransportStatus::UnknownOutcome,
+            persistence: StreamPersistenceStatus::SourceUnavailable,
+            observed_sha256: sha256_hex(&[]),
+            observed_bytes: 0,
+            preview,
+            source: None,
+            transport_prefix_identity: None,
+            legacy_reference: Some(reference),
+            gaps,
+            parsing: StreamParsingStatus::Raw,
+            evaluation: StreamEvaluationStatus::Unassessed,
+        };
+        value.validate()?;
+        Ok(value)
     }
 
     /// Creates raw capture evidence with an explicit physical transport-prefix identity.
@@ -98,6 +148,7 @@ impl ProcessStreamEvidence {
             preview,
             source,
             transport_prefix_identity,
+            None,
             gaps,
         )
     }
@@ -114,6 +165,7 @@ impl ProcessStreamEvidence {
         preview: ProcessStreamPrefixPreview,
         source: Option<DurableProcessStreamSource>,
         transport_prefix_identity: Option<ProcessStreamTransportPrefixIdentity>,
+        legacy_reference: Option<String>,
         mut gaps: Vec<StreamEvidenceGap>,
     ) -> Result<Self, ProcessStreamEvidenceError> {
         gaps.sort_unstable();
@@ -129,6 +181,7 @@ impl ProcessStreamEvidence {
             preview,
             source,
             transport_prefix_identity,
+            legacy_reference,
             gaps,
             parsing: StreamParsingStatus::Raw,
             evaluation: StreamEvaluationStatus::Unassessed,
@@ -150,6 +203,23 @@ impl ProcessStreamEvidence {
         self.preview.validate()?;
         if let Some(prefix) = &self.transport_prefix_identity {
             prefix.validate()?;
+        }
+        if let Some(reference) = &self.legacy_reference {
+            validate_legacy_reference_shape(reference)?;
+            if self.source.is_some()
+                || self.persistence != StreamPersistenceStatus::SourceUnavailable
+                || self.transport != StreamTransportStatus::UnknownOutcome
+                || self.observed_sha256 != sha256_hex(&[])
+                || self.observed_bytes != 0
+                || !self
+                    .gaps
+                    .contains(&StreamEvidenceGap::PersistenceUnknownOutcome)
+            {
+                return Err(ProcessStreamEvidenceError::Invariant {
+                    field: "legacy_reference",
+                    reason: "legacy references require unresolved source-unavailable evidence",
+                });
+            }
         }
         validate_digest("observed_sha256", &self.observed_sha256)?;
         self.validate_gap_shape()?;
@@ -556,6 +626,11 @@ impl ProcessStreamEvidence {
         self.transport_prefix_identity.as_ref()
     }
 
+    /// Legacy reference retained only as unresolved provenance.
+    pub fn legacy_reference(&self) -> Option<&str> {
+        self.legacy_reference.as_deref()
+    }
+
     /// Coverage gaps.
     pub fn gaps(&self) -> &[StreamEvidenceGap] {
         &self.gaps
@@ -587,6 +662,7 @@ impl<'de> Deserialize<'de> for ProcessStreamEvidence {
             preview: wire.preview,
             source: wire.source,
             transport_prefix_identity: wire.transport_prefix_identity,
+            legacy_reference: wire.legacy_reference,
             gaps: wire.gaps,
             parsing: wire.parsing,
             evaluation: wire.evaluation,
