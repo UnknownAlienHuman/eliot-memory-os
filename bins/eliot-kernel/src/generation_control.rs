@@ -14,6 +14,16 @@ use super::KernelComposition;
 use eliot_kernel_core::{CutoverDecision, GenerationRouter};
 use eliot_kernel_service::KernelServiceError;
 
+fn fence_service_after_generation_failure(
+    service: &std::sync::Arc<std::sync::Mutex<eliot_kernel_service::KernelService>>,
+    reason: impl Into<String>,
+) -> Result<(), KernelServiceError> {
+    let mut service = service
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    service.fence_generation(reason)
+}
+
 impl KernelComposition {
     /// Returns a cloned, read-only route projection.  Callers cannot obtain a
     /// mutable router guard or bypass the ORS transition gateway.
@@ -73,13 +83,49 @@ impl KernelComposition {
         })();
         if let Err(reason) = result {
             *poison = Some(reason.clone());
-            if let Ok(mut service) = self.service.lock() {
-                let _ = service.fence_generation(reason.clone());
+            if let Err(fence_error) =
+                fence_service_after_generation_failure(&self.service, reason.clone())
+            {
+                return Err(KernelServiceError::Platform(format!(
+                    "generation cutover failed and service fencing failed: {fence_error}"
+                )));
             }
             return Err(KernelServiceError::Platform(format!(
                 "generation cutover fenced: {reason}"
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_service_lock_is_recovered_and_fenced() {
+        let service = std::sync::Arc::new(std::sync::Mutex::new(
+            eliot_kernel_service::KernelService::new([37; 32], 2, 4)
+                .unwrap_or_else(|_| unreachable!()),
+        ));
+        let poisoned = std::sync::Arc::clone(&service);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap_or_else(|_| unreachable!());
+            panic!("force service lock poisoning");
+        })
+        .join();
+
+        let result = fence_service_after_generation_failure(&service, String::new());
+        assert!(result.is_ok(), "unexpected fencing failure: {result:?}");
+
+        let service = service
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(service.generation_fenced());
+        assert!(matches!(
+            service.failure(),
+            Some(eliot_kernel_service::ServiceFailure::Contract(reason))
+                if reason == "generation fence reason was invalid; canonical reason substituted"
+        ));
     }
 }
