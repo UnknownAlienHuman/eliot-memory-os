@@ -681,7 +681,7 @@ function enqueuePassive(client, kind, input, output) {
 async function requireMutationGate(input, output) {
   const gate = await invokeBridge("tool.execute.before", input, output, { required: true })
   if (gate.decision === "deny") {
-    throw new Error(gate.reason ?? "ELIOT ActionGate denied mutation")
+    throw new Error("ELIOT ActionGate denied mutation")
   }
   if (!ALLOWED_GATE_DECISIONS.has(gate.decision)) {
     throw new Error("ELIOT ActionGate returned no explicit usable decision")
