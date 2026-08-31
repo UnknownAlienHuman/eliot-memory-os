@@ -1,5 +1,27 @@
 # I0.5 conformance-contract source instructions
 
+<!-- eliot-doc-routing:start -->
+## Mandatory documentation routing
+
+Before changing code, configuration, tests, workflows, or normative prose, run
+from the repository root:
+
+```text
+python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+```
+
+Read the verified bundle before mutation and record the route/read receipt IDs,
+required handles, hashes, verified bundle SHA-256, and explicit reading
+attestation in the work unit or pull request. Running `scripts/docs_router.py
+route` alone is navigation, not reading evidence. Re-run the reader whenever the
+mutable path, causal property, authority boundary, or evidence scope expands.
+
+If no non-baseline route matches, a required item is stale or missing, or the
+scope exceeds the read receipt, stop and repair or rerun the route; silence is
+not permission. See
+[`../../../docs/architecture/READING_PROTOCOL.md`](../../../docs/architecture/READING_PROTOCOL.md).
+<!-- eliot-doc-routing:end -->
+
 ## Purpose
 
 This package is the single owner-neutral C0 contract for the orthogonal status dimensions required by Implementation I0.5. It exists so bootstrap, Module/Capability Registry projections, reports, and ControlBoard do not each invent their own support vocabulary.
@@ -134,4 +156,7 @@ Until those commands execute, every source commit remains `CURRENT_UNVERIFIED / 
 
 ## Working discipline
 
-Push every completed atomic source slice immediately to the issue branch. Do not keep a large unpushed local diff while continuing analysis.
+Commit completed atomic slices to the issue branch and hand them to the root
+controller for coordinated push. Do not perform uncoordinated fetch, pull, push,
+ref, workflow, or integration mutations, and do not keep a large uncommitted
+diff while continuing analysis.

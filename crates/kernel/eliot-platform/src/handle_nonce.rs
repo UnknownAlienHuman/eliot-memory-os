@@ -3,13 +3,14 @@
 //! These values remain inert: generation, lifecycle, and authority belong to
 //! their owning platform or control-plane boundaries.
 //!
-//! Normative anchors (verified):
-//! - `docs/normative/ELIOT_ARCHITECTURE.md:A12.2` binds identity at the
+//! Normative anchors:
+//! - `docs/architecture/ELIOT_ARCHITECTURE.md` A12.2 binds identity at the
 //!   harness/installation boundary to Session, `WorkScope`, capabilities,
 //!   visibility, and Authority Epoch.
-//! - `docs/normative/ELIOT_IMPLEMENTATION.md:I1.8` assigns Kernel verification
-//!   of identity, authority, State Fence, idempotency, ordering, and runtime
-//!   generation.
+//! - `docs/architecture/ELIOT_IMPLEMENTATION.md` I1.8 assigns Kernel
+//!   verification of identity, authority, State Fence, idempotency, ordering,
+//!   and runtime generation.
+//! - `docs/ARCHITECTURE_CONTRACT.md` owns pair precedence and identity.
 
 use std::fmt;
 

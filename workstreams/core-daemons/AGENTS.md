@@ -7,16 +7,19 @@ Before changing code, configuration, tests, workflows, or normative prose, run
 from the repository root:
 
 ```text
-python scripts/docs_router.py route --path <repository/path> --topic "<causal property>"
+python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
 ```
 
-Read every fragment marked **required**, then record the emitted receipt in the
-work unit or pull request. Optional fragments are loaded only when the current
-decision crosses their stated boundary. A legacy `ELIOT_*` compatibility map is
-never an acceptable reading receipt.
+Read the verified bundle before mutation and record the route/read receipt IDs,
+required handles, hashes, verified bundle SHA-256, and explicit reading
+attestation in the work unit or pull request. Running `scripts/docs_router.py
+route` alone is navigation, not reading evidence. Re-run the reader whenever the
+mutable path, causal property, authority boundary, or evidence scope expands.
 
-If no non-baseline route matches, stop the mutation and add or obtain a route;
-silence is not permission. See [`../../docs/architecture/READING_PROTOCOL.md`](../../docs/architecture/READING_PROTOCOL.md).
+If no non-baseline route matches, a required item is stale or missing, or the
+scope exceeds the read receipt, stop and repair or rerun the route; silence is
+not permission. See
+[`../../docs/architecture/READING_PROTOCOL.md`](../../docs/architecture/READING_PROTOCOL.md).
 <!-- eliot-doc-routing:end -->
 
 

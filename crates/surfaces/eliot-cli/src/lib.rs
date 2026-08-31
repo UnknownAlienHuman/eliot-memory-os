@@ -2142,10 +2142,11 @@ mod tests {
     fn typed_unimplemented_anchors_resolve_to_normative_headings()
     -> Result<(), Box<dyn std::error::Error>> {
         let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        let architecture =
-            std::fs::read_to_string(repository_root.join("docs/normative/ELIOT_ARCHITECTURE.md"))?;
+        let architecture = std::fs::read_to_string(
+            repository_root.join("docs/architecture/ELIOT_ARCHITECTURE.md"),
+        )?;
         let implementation = std::fs::read_to_string(
-            repository_root.join("docs/normative/ELIOT_IMPLEMENTATION.md"),
+            repository_root.join("docs/architecture/ELIOT_IMPLEMENTATION.md"),
         )?;
         let normative_pair = format!("{architecture}\n{implementation}");
         let mut checked = 0_usize;
