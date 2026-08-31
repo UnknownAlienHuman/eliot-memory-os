@@ -35,6 +35,12 @@ pub(crate) const SPOOL_HIGH_WATER_KEY: u64 = 0;
 pub(crate) const SPOOL_HIGH_WATER_TABLE: TableDefinition<u64, &[u8]> =
     TableDefinition::new("eliot_watchdog_spool_high_water_v1");
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SpoolAppendOutcome {
+    Stored,
+    Pressure { evicted_records: u64 },
+}
+
 #[derive(Debug)]
 pub(crate) struct WatchdogSpool {
     pub(crate) database: Database,
@@ -305,11 +311,15 @@ impl WatchdogSpool {
             .map_err(|error| SpoolError::Database(error.to_string()))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "bounded spool retention, pressure marking, and high-water updates stay one atomic redb transaction"
+    )]
     pub(crate) fn append(
         &self,
         observed_at_ms: u64,
         payload: WatchdogSpoolPayload,
-    ) -> Result<(), SpoolError> {
+    ) -> Result<SpoolAppendOutcome, SpoolError> {
         let write = self
             .database
             .begin_write()
@@ -354,11 +364,45 @@ impl WatchdogSpool {
             schema_version: SPOOL_SCHEMA_VERSION,
             sequence,
             observed_at_ms,
-            payload,
+            payload: payload.clone(),
         };
-        let bytes = encode_entry(&entry)?;
-        while header.record_count >= SPOOL_MAX_RECORDS
-            || header.bytes.saturating_add(bytes.len() as u64) > SPOOL_MAX_BYTES
+        let initial_bytes = encode_entry(&entry)?;
+        let pressure = header.record_count >= SPOOL_MAX_RECORDS
+            || header.bytes.saturating_add(initial_bytes.len() as u64) > SPOOL_MAX_BYTES;
+        let encoded_entries = if pressure {
+            let marker = WatchdogSpoolEntry {
+                schema_version: SPOOL_SCHEMA_VERSION,
+                sequence,
+                observed_at_ms,
+                payload: WatchdogSpoolPayload::Gap {
+                    service: SERVICE_NAME.to_owned(),
+                    reason: crate::GapRecoveryReason::SpoolPressure,
+                    coverage_claimed: false,
+                },
+            };
+            let entry_sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| SpoolError::Corrupt("spool sequence overflow".to_owned()))?;
+            let entry = WatchdogSpoolEntry {
+                schema_version: SPOOL_SCHEMA_VERSION,
+                sequence: entry_sequence,
+                observed_at_ms,
+                payload,
+            };
+            vec![
+                (sequence, encode_entry(&marker)?),
+                (entry_sequence, encode_entry(&entry)?),
+            ]
+        } else {
+            vec![(sequence, initial_bytes)]
+        };
+        let total_bytes = encoded_entries
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>();
+        let mut evicted_records = 0;
+        while header.record_count + encoded_entries.len() as u64 > SPOOL_MAX_RECORDS
+            || header.bytes.saturating_add(total_bytes) > SPOOL_MAX_BYTES
         {
             if header.record_count == 0 {
                 break;
@@ -376,27 +420,34 @@ impl WatchdogSpool {
                 .checked_add(1)
                 .ok_or_else(|| SpoolError::Corrupt("spool sequence overflow".to_owned()))?;
             header.record_count -= 1;
+            evicted_records += 1;
         }
-        table
-            .insert(sequence, bytes.as_slice())
-            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        for (sequence, bytes) in &encoded_entries {
+            table
+                .insert(*sequence, bytes.as_slice())
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            if header.record_count == 0 {
+                header.first_sequence = *sequence;
+            }
+            header.record_count += 1;
+            header.bytes = header
+                .bytes
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| SpoolError::Corrupt("spool byte counter overflow".to_owned()))?;
+        }
         header.schema_version = SPOOL_SCHEMA_VERSION;
-        header.next_sequence = sequence
+        let last_sequence = encoded_entries
+            .last()
+            .map(|(sequence, _)| *sequence)
+            .ok_or_else(|| SpoolError::Corrupt("spool append produced no records".to_owned()))?;
+        header.next_sequence = last_sequence
             .checked_add(1)
             .ok_or_else(|| SpoolError::Corrupt("spool sequence overflow".to_owned()))?;
-        if header.record_count == 0 {
-            header.first_sequence = sequence;
-        }
-        header.record_count += 1;
-        header.bytes = header
-            .bytes
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| SpoolError::Corrupt("spool byte counter overflow".to_owned()))?;
         let header_bytes = encode_header(&header)?;
         table
             .insert(SPOOL_HEADER_KEY, header_bytes.as_slice())
             .map_err(|error| SpoolError::Database(error.to_string()))?;
-        let high_water_bytes = encode_high_water(sequence)?;
+        let high_water_bytes = encode_high_water(last_sequence)?;
         high_water_table
             .insert(SPOOL_HIGH_WATER_KEY, high_water_bytes.as_slice())
             .map_err(|error| SpoolError::Database(error.to_string()))?;
@@ -404,6 +455,13 @@ impl WatchdogSpool {
         drop(high_water_table);
         write
             .commit()
+            .map(|()| {
+                if pressure {
+                    SpoolAppendOutcome::Pressure { evicted_records }
+                } else {
+                    SpoolAppendOutcome::Stored
+                }
+            })
             .map_err(|error| SpoolError::Database(error.to_string()))
     }
 }

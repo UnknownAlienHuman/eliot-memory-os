@@ -82,7 +82,7 @@ use watchdog_publication_readback::{
     observe_watchdog_publication, read_manifest_selected_ors_current, scan_watchdog_publications,
     verify_against_durable_current,
 };
-pub(crate) use watchdog_spool::WatchdogSpool;
+pub(crate) use watchdog_spool::{SpoolAppendOutcome, WatchdogSpool};
 pub use watchdog_spool::{WatchdogSpoolEntry, WatchdogSpoolPayload};
 
 #[cfg(test)]
@@ -223,6 +223,7 @@ pub enum GapRecoveryReason {
     HostImageSubstituted,
     HostIdentityChanged,
     HostUnknown,
+    SpoolPressure,
 }
 
 fn admission_gap_reason(error: &SpoolError) -> GapRecoveryReason {
@@ -238,6 +239,7 @@ fn kernel_gap_reason(error: &KernelWatchdogError) -> GapRecoveryReason {
     match error {
         KernelWatchdogError::LeaseStale => GapRecoveryReason::LeaseStale,
         KernelWatchdogError::LeaseFenced => GapRecoveryReason::LeaseFenced,
+        KernelWatchdogError::SpoolPressure => GapRecoveryReason::SpoolPressure,
         _ => GapRecoveryReason::LeaseInvalid,
     }
 }
@@ -350,7 +352,8 @@ impl IndependentKernelSensor {
         let digest = lease
             .payload_digest()
             .map_err(|_| KernelWatchdogError::LeaseInvalid)?;
-        self.spool
+        match self
+            .spool
             .append(
                 now_ms,
                 WatchdogSpoolPayload::Heartbeat {
@@ -369,7 +372,11 @@ impl IndependentKernelSensor {
                     lease_revision: lease.lease_revision(),
                 },
             )
-            .map_err(|error| KernelWatchdogError::FailedWithDetail(error.to_string()))
+            .map_err(|error| KernelWatchdogError::FailedWithDetail(error.to_string()))?
+        {
+            SpoolAppendOutcome::Stored => Ok(()),
+            SpoolAppendOutcome::Pressure { .. } => Err(KernelWatchdogError::SpoolPressure),
+        }
     }
 
     fn record_gap(&self, disposition: GapRecoveryDisposition) -> Result<(), KernelWatchdogError> {
@@ -382,6 +389,7 @@ impl IndependentKernelSensor {
                     coverage_claimed: disposition.coverage_claimed,
                 },
             )
+            .map(|_| ())
             .map_err(|error| KernelWatchdogError::FailedWithDetail(error.to_string()))
     }
 }
@@ -450,6 +458,8 @@ pub enum KernelWatchdogError {
     LeaseInvalid,
     #[error("kernel supervision failed")]
     Failed,
+    #[error("watchdog spool pressure narrowed supervision coverage")]
+    SpoolPressure,
     #[error("kernel supervision failed: {0}")]
     FailedWithDetail(String),
 }
@@ -1961,13 +1971,26 @@ mod tests {
             corrupt_sequence: None,
             corrupt_digest: "digest".to_owned(),
         };
+        let mut pressure_seen = false;
         for sequence in 0..300 {
-            spool
-                .append(sequence + 1, bounded_payload())
-                .unwrap_or_else(|error| panic!("{error}"));
+            pressure_seen |= matches!(
+                spool
+                    .append(sequence + 1, bounded_payload())
+                    .unwrap_or_else(|error| panic!("{error}")),
+                SpoolAppendOutcome::Pressure { .. }
+            );
         }
+        assert!(pressure_seen);
         let retained = spool.readback().unwrap_or_else(|error| panic!("{error}"));
         assert!(retained.len() < 300);
+        assert!(retained.iter().any(|entry| matches!(
+            entry.payload,
+            WatchdogSpoolPayload::Gap {
+                reason: GapRecoveryReason::SpoolPressure,
+                coverage_claimed: false,
+                ..
+            }
+        )));
         drop(spool);
         let reopened = WatchdogSpool::open_test(&path).unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(
