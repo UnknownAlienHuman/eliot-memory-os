@@ -1,0 +1,50 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w2-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 24
+cell = "smart.cue.relation_spread"
+physical_crate = "eliot-cues"
+predecessor_orders = [19, 22, 23]
+primary_property = "Optionally expand direct hits through a bounded typed graph using only the best single admissible path while preserving direct results unchanged."
+field_contracts = ["crates/smart/eliot-cue-contracts/cue.contract.toml", "crates/smart/eliot-cue-contracts/w2-execution.contract.toml"]
+public_function_signatures = [
+  "pub fn expand_cue_activation(snapshot: &CueSnapshot, direct: &DirectCueMatchResult, policy: &CueRelationSpreadExecutionPolicy) -> Result<RelationSpreadResult, RelationSpreadError>",
+]
+write_scope = [
+  "crates/smart/eliot-cues/src/relation_spread.rs",
+  "crates/smart/eliot-cues/tests/relation_spread.rs",
+]
+algorithm = [
+  "validate shared snapshot/direct identities and closed execution policy",
+  "return Disabled without traversal when disabled",
+  "seed only exact direct target handles",
+  "traverse only allowed edge types/directions under depth/node/edge/hit limits",
+  "compute one best admissible single-path contribution per target without summation",
+  "terminate cycles deterministically and record suppressed/denied/limit paths",
+  "return Unavailable/Partial/Stale locally without modifying direct result",
+]
+minimum_tests = [
+  "disabled spread preserves direct hits",
+  "unavailable graph preserves direct result",
+  "cycle terminates",
+  "multiple paths never sum",
+  "best admissible single path wins deterministically",
+  "unknown/stringly combination rule impossible",
+  "negative-memory direct priority unchanged",
+]
+non_goals = [
+  "direct matching",
+  "graph rebuild/admission",
+  "support/causal inference",
+  "payload retrieval",
+  "Context admission/delivery",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-CTX-02", "ARCH-CTX-04", "ARCH-MEM-04", "ARCH-EPI-04", "ARCH-MOD-03"]
+implementation_refs = ["I2.15", "I2.20", "I7.19", "I12.14"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Return local SpreadUnavailable/Partial or ContractChallenge rather than changing direct hits, summing paths, traversing unboundedly, or converting proximity into support/causality."
+brief_proof_ceiling = "STATIC_W2_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
