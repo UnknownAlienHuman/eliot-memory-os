@@ -10,12 +10,14 @@
 mod core;
 mod model;
 mod model_control;
+mod swarm_controlboard;
 #[cfg(test)]
 mod tests;
 
 pub use crate::core::AgentCoordinator;
 pub use crate::model::*;
 pub use crate::model_control::*;
+pub use crate::swarm_controlboard::*;
 
 /// Snapshot wire revision. A different revision must be migrated by an
 /// external owner before replay.
