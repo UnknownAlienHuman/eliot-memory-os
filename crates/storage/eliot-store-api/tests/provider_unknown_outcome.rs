@@ -4,7 +4,9 @@ use eliot_store_api::{
     StoreMutationDisposition, StoreRecoveryAction, StoreRetryDirective,
 };
 
-fn context() -> Result<StoreFailureIdentityContext, Box<dyn std::error::Error>> {
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+fn context() -> TestResult<StoreFailureIdentityContext> {
     Ok(StoreFailureIdentityContext {
         request_id: Some(RequestId::new("request-provider-unknown")?),
         operation_id: Some(OperationId::new("operation-provider-unknown")?),
@@ -19,8 +21,7 @@ fn context() -> Result<StoreFailureIdentityContext, Box<dyn std::error::Error>> 
 }
 
 #[test]
-fn provider_unknown_outcome_is_exact_and_reconciliation_only()
--> Result<(), Box<dyn std::error::Error>> {
+fn provider_unknown_outcome_is_exact_and_reconciliation_only() -> TestResult {
     let failure = StoreFailure::provider_unknown_outcome(context()?)?;
     failure.validate()?;
 
@@ -44,8 +45,7 @@ fn provider_unknown_outcome_is_exact_and_reconciliation_only()
 }
 
 #[test]
-fn provider_unknown_outcome_requires_operation_identity()
--> Result<(), Box<dyn std::error::Error>> {
+fn provider_unknown_outcome_requires_operation_identity() -> TestResult {
     let mut context = context()?;
     context.operation_id = None;
     assert_eq!(
@@ -56,8 +56,7 @@ fn provider_unknown_outcome_requires_operation_identity()
 }
 
 #[test]
-fn human_wording_does_not_change_provider_unknown_control_equality()
--> Result<(), Box<dyn std::error::Error>> {
+fn human_wording_does_not_change_provider_unknown_control_equality() -> TestResult {
     let mut first = StoreFailure::provider_unknown_outcome(context()?)?;
     first.human_detail = Some("provider response ended before disposition".to_owned());
     first.validate()?;
