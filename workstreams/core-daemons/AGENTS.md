@@ -125,19 +125,25 @@ the primary integration issues above.
 | #66 | submit one typed semantic activation result instead of silently re-claiming tickets |
 | #67 | allow bounded concurrent Store transactions for disjoint Ordering Scopes |
 | #74 | give User Broker register/heartbeat/launch/fence distinct operation identities |
-| #75 | reject or explicitly rebind WASM limits that exceed the provider ceiling; hidden clamp removed, completion depends on #120 |
 | #76 | preserve typed Store errors and recovery directives on EBP |
 | #77 | translate host requests before Kernel RequestIdentity binding; no raw Frame passthrough |
 | #78 | give notification verification/delivery/ledger steps distinct child operation identities |
 | #79 | separate transport connection identity from durable process/session ownership |
-| #120 | persist and independently verify the exact effective WASM epoch/cancellation policy |
 
-Merged local repairs #59, #61, #68, #70, #72 and #73 close only their exact
-source discriminators. #72 now keeps later same-project testd work behind every
-earlier nonterminal durable record, but its focused tests were not executed by
-Actions and #20/#11 still own daemon integration, crash recovery and Product
-Proof. #73 binds provider/config identity to the workspace-pinned Wasmtime
-47.0.4 generation without establishing #21 runtime conformance.
+Open issues #82, #83 and #84 remain outside active core-daemon defect routing;
+their references are retained in the registry as an explicit forbidden set so
+they cannot be reintroduced accidentally.
+
+Merged local repairs #59, #61, #68, #70, #72, #73, #75, #76 and #120 close
+only their exact source discriminators. #72 now keeps later same-project testd
+work behind every earlier nonterminal durable record, but its focused tests were
+not executed by Actions and #20/#11 still own daemon integration, crash
+recovery and Product Proof. #73 binds provider/config identity to the
+workspace-pinned Wasmtime 47.0.4 generation without establishing #21 runtime
+conformance. #75 removes the hidden WASM deadline clamp, while #76 preserves
+typed Store errors and recovery directives; #120 independently persists and
+verifies the effective epoch policy. None establishes runtime or Product
+support.
 
 ### Required wave ordering
 
