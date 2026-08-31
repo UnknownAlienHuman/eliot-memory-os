@@ -12,27 +12,65 @@ runtime_bundle = "eliotd"
 state_class = "stateless"
 hot_path = true
 lifecycle_owner = "smart.context.candidates"
+assignable = false
+blocked_by = ["CC-004", "CC-008"]
 loc_soft_ceiling = 10000
 loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
 product_objective = "Context admission sees complete typed proposals and explicit provider gaps instead of querying arbitrary stores."
 causal_property = "context candidate construction"
-old_failure_or_missing_capability = "The legacy compiler accepts a preassembled mixed input with no explicit cue-activation provider or coverage boundary."
-discriminator = "Missing provider or fence cases return incomplete candidate sets rather than filler atoms."
-primary_responsibility = "Map immutable task, attention, epistemic, cue-activation, negative-memory, evidence and affordance projections into whole context candidates with lineage."
+old_failure_or_missing_capability = "The legacy compiler accepts a preassembled mixed input with no explicit cue-activation or bounded applicable-memory provider/coverage boundary."
+discriminator = "Missing provider/fence/denominator cases and cue-hit-but-not-applicable memory return incomplete or excluded candidates rather than filler/admitted atoms."
+primary_responsibility = "Map immutable task, attention, epistemic, applicable-memory, cue-activation, negative-memory, evidence and affordance projections into whole context candidates with lineage."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["TaskFrame projection", "CriticalAttention and Conflict handles", "CurrentEpistemicPosition", "CueActivationResult", "negative-memory and affordance projections"]
+inputs = [
+  "TaskFrame projection",
+  "CriticalAttention and Conflict handles",
+  "CurrentEpistemicPosition",
+  "ApplicableMemorySet",
+  "CueActivationResult",
+  "negative-memory and affordance projections",
+]
 outputs = ["ContextCandidateSet", "coverage manifest", "missing-input and unknown list"]
-depends_on = ["eliot-cue-contracts", "eliot-cue-activation", "eliot-epistemic", "eliot-context-contracts"]
-providers = ["Governor read projections", "cue activation"]
+depends_on = [
+  "eliot-cue-contracts",
+  "eliot-cue-activation",
+  "eliot-epistemic",
+  "eliot-memory-projection-contracts",
+  "eliot-memory-applicability",
+  "eliot-context-contracts",
+]
+providers = ["Governor read projections", "memory applicability evaluator", "cue activation"]
 consumers = ["context admission"]
-non_goals = ["store queries", "ranking", "rendering", "semantic synthesis"]
-invariants = ["every material candidate has lineage", "one compatible fence governs the set", "CueActivationResult is an explicit input rather than an implicit lookup", "retrieval and activation only propose influence"]
-failure_behavior = "Return an incomplete set with exact missing providers; never cross scope silently or fabricate atoms."
-proof_surface = ["missing cue-activation provider", "duplicate or conflicting identity", "cross-fence rejection", "role and lineage completeness"]
+non_goals = [
+  "store queries",
+  "memory applicability evaluation",
+  "cue firing",
+  "ranking",
+  "rendering",
+  "semantic synthesis",
+  "hard-block or lifecycle application",
+]
+invariants = [
+  "every material candidate has lineage",
+  "one compatible fence governs the set",
+  "ApplicableMemorySet and CueActivationResult are explicit independent inputs",
+  "cue activation without applicability cannot produce an applicable memory candidate",
+  "retrieval and activation only propose influence",
+  "protected/inconclusive/omitted memory remains visible by exact handle",
+]
+failure_behavior = "Return an incomplete set with exact missing providers/denominators and excluded dispositions; never cross scope silently, fabricate atoms, or infer applicability."
+proof_surface = [
+  "missing cue-activation provider",
+  "missing/partial applicable-memory provider",
+  "cue-hit-but-not-applicable exclusion",
+  "duplicate or conflicting identity",
+  "cross-fence rejection",
+  "role, denominator, omission and lineage completeness",
+]
 proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
 product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
-replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime, provider, applicability or semantic authority"
 merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
 split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
 
@@ -44,16 +82,45 @@ disposition = "extract explicit pre-admission candidate boundary"
 path = "ELIOT_IMPLEMENTATION I12.13"
 disposition = "authoritative Context Compiler input contract"
 
+[[donor]]
+path = "ELIOT_ARCHITECTURE A4-A7 and issue #43 / CC-008"
+disposition = "memory applicability provider/consumer boundary and cue-hit-not-applicable invariant"
+
 [agent_task]
-objective = "Create the explicit projection-to-compiler candidate boundary."
+objective = "Create the explicit projection-to-compiler candidate boundary over ApplicableMemorySet and CueActivationResult."
 write_scope = ["crates/smart/eliot-context-candidates/**"]
-deliverables = ["candidate builder", "provider/coverage/fence fixtures", "activation-to-candidate Edge fixtures"]
-acceptance = ["whole candidates only", "bounded deterministic behavior", "missing providers visible"]
-forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
-stop_condition = "Stop if candidate construction needs store access, ranking, rendering, model work or hidden state."
-challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+deliverables = [
+  "candidate builder",
+  "provider/coverage/fence fixtures",
+  "applicability-and-activation-to-candidate Edge fixtures",
+]
+acceptance = [
+  "whole candidates only",
+  "bounded deterministic behavior",
+  "missing providers visible",
+  "cue-hit-but-not-applicable cannot enter applicable candidate output",
+]
+forbidden = [
+  "canonical writes outside the named Governor transition path",
+  "truth/support/authority/policy/finish/effect/lifecycle promotion",
+  "provider or model SDKs in pure cognitive cores",
+  "vendor or storage types in public contracts",
+  "store/query expansion or applicability evaluation",
+  "unbounded synchronous work",
+  "silent truncation",
+  "oracle or verifier weakening in the same work unit",
+  "implicit scope widening",
+  "active-generation self-modification",
+]
+stop_condition = "Stop if candidate construction needs store access, applicability evaluation, cue firing, ranking, rendering, model work, hard-block application or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling, provider denominator or dependency boundary is wrong"
 integration_owner = "cognitive-wave-integrator"
 implementation_language = "Rust 2024"
-required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
+required_verification = [
+  "module/package proof at the declared proof ceiling",
+  "real provider/consumer fixture for every changed edge",
+  "D3B_REACTIVE_CONTEXT_PULSE_01 with cue-hit-but-not-applicable case before promotion",
+  "exact donor reuse/rewrite/reject trace",
+]
 writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
-workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"
+workspace_admission = "forbidden until CC-004/CC-008 contract/provider acceptance, implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"

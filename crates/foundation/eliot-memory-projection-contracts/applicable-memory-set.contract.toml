@@ -1,0 +1,114 @@
+schema_version = 1
+contract_id = "eliot.memory.applicable-set.v1"
+contract_version = "1.0.0"
+status = "STATIC_CANDIDATE"
+issue = 43
+challenge = "CC-008"
+owner_capability = "owner-neutral contract; produced by pure Smart applicability evaluator"
+state_class = "stateless"
+proof_ceiling = "Field-level contract candidate only; no Context admission, delivery, lifecycle, hard block, or Product proof."
+purpose = "Return a bounded record-by-record applicability disposition while preserving denominator, omissions, protected roles, conflicts, and exact source handles."
+
+[result]
+type = "ApplicableMemorySet"
+required_fields = [
+  "evaluation_id",
+  "projection_ref_and_revision",
+  "workscope_ref",
+  "task_ref",
+  "session_ref",
+  "state_fence",
+  "applicable_handles",
+  "handle_only_handles",
+  "warning_handles",
+  "record_dispositions",
+  "unknowns",
+  "revalidation_requirements",
+  "denominator",
+  "omissions",
+  "proof_ceiling",
+]
+rules = [
+  "every projected record has exactly one disposition",
+  "set-like outputs are canonical-order deterministic",
+  "the result cannot strengthen source support, accessibility, influence eligibility, lifecycle, or authority",
+  "Context remains a separate consumer/admission owner",
+]
+
+[[field]]
+name = "record_disposition"
+closed_values = [
+  "APPLICABLE",
+  "APPLICABLE_HANDLE_ONLY",
+  "NOT_APPLICABLE_SCOPE",
+  "NOT_APPLICABLE_TASK",
+  "NOT_APPLICABLE_SESSION",
+  "PRECONDITION_UNSATISFIED",
+  "PRECONDITION_UNKNOWN",
+  "STALE_REVALIDATION_REQUIRED",
+  "CONFLICTED_REVIEW_REQUIRED",
+  "INFLUENCE_INELIGIBLE",
+  "SUPPRESSED",
+  "QUARANTINED",
+  "CUE_EVIDENCE_ONLY",
+  "SEMANTIC_NEAR_WARNING",
+  "EXACT_NEGATIVE_TRIGGER_REQUIRES_GOVERNOR_DECISION",
+  "PROTECTED_REVIEW_REQUIRED",
+  "INCONCLUSIVE_MISSING_DENOMINATOR",
+  "INCONCLUSIVE_MISSING_OWNER_EVIDENCE",
+]
+
+[[invariant]]
+id = "AMS-001"
+statement = "Cue hit, activation rank, graph proximity, or semantic similarity cannot by itself yield APPLICABLE."
+failure = "Return CUE_EVIDENCE_ONLY or SEMANTIC_NEAR_WARNING."
+
+[[invariant]]
+id = "AMS-002"
+statement = "Exact procedure preconditions must be satisfied by owner-derived current evidence; similarity or prose cannot satisfy them."
+failure = "Return PRECONDITION_UNSATISFIED or PRECONDITION_UNKNOWN."
+
+[[invariant]]
+id = "AMS-003"
+statement = "An exact negative trigger creates a Governor-decision requirement, not a Smart-owned action block."
+failure = "Return EXACT_NEGATIVE_TRIGGER_REQUIRES_GOVERNOR_DECISION."
+
+[[invariant]]
+id = "AMS-004"
+statement = "Stale, conflicted, suppressed, quarantined, protected, omitted, and unknown material remains addressable and explicitly classified."
+failure = "Reject silent loss."
+
+[[invariant]]
+id = "AMS-005"
+statement = "A partial/unavailable/unknown denominator cannot support an absence or complete applicability claim."
+failure = "Return INCONCLUSIVE_MISSING_DENOMINATOR."
+
+[[invariant]]
+id = "AMS-006"
+statement = "Applicability is local to exact WorkScope/task/session/StateFence and cannot transfer automatically."
+failure = "Reject scope widening."
+
+[[fixture]]
+id = "cue-hit-not-applicable"
+input = "Exact cue activation exists, but exact task applicability excludes the task."
+expected = "NOT_APPLICABLE_TASK; no applicable handle"
+
+[[fixture]]
+id = "semantic-precondition"
+input = "Semantic-near text resembles an exact procedural precondition."
+expected = "PRECONDITION_UNKNOWN or UNSATISFIED; no applicability"
+
+[[fixture]]
+id = "exact-negative-trigger"
+input = "Exact failure fingerprint/trigger and scope match."
+expected = "EXACT_NEGATIVE_TRIGGER_REQUIRES_GOVERNOR_DECISION; Smart does not block"
+
+[[fixture]]
+id = "partial-denominator"
+input = "Projection is truncated with an unresolved denominator."
+expected = "record dispositions retained; complete absence/applicability claim forbidden"
+
+[[fixture]]
+id = "protected-counterexample"
+input = "Counterexample is not currently applicable to action but is protected."
+expected = "PROTECTED_REVIEW_REQUIRED or handle-only representation; never silent suppression"

@@ -1,0 +1,97 @@
+schema_version = 3
+module_id = "governor.memory.projection_provider"
+crate = "eliot-memory-projection-provider"
+status = "PROTOTYPE"
+challenge = "CC-008"
+wave = "cognitive-contract-challenges"
+agent_order = 46
+plane = "Harness/Governor"
+runtime_layer = "R3"
+delivery_depth = "D3b"
+source_layer = "C2"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "governor.memory.projection_provider"
+assignable = false
+blocked_by = [
+  "accepted memory projection contract implementation/package proof",
+  "exact named-read provider and source-owner fixtures",
+]
+loc_soft_ceiling = 10000
+product_objective = "The pure applicability evaluator receives a bounded, current, provenance-complete canonical projection without direct storage access."
+causal_property = "Governor-owned bounded canonical memory projection"
+old_failure_or_missing_capability = "Smart either has no provider or would need to query/expand canonical memory directly"
+discriminator = "provider fixtures distinguish empty-complete, unavailable, partial/top-k, stale, conflicted, protected, exact-trigger and projection-read failure states"
+primary_responsibility = "Use injected Governor named-read ports to select and project exact canonical memory records into one bounded MemoryProjectionBatch with frozen denominator, omissions and revalidation obligations."
+owned_mutable_state = []
+allowed_effects = ["bounded named canonical read through an injected Governor read port"]
+inputs = [
+  "ProjectionRequest with WorkScope/task/session/StateFence",
+  "named-read capability and query contract",
+  "canonical source records and revision heads from owning read ports",
+  "selection/budget policy",
+]
+outputs = ["MemoryProjectionBatch", "provider gap/recovery evidence"]
+depends_on = ["eliot-memory-projection-contracts"]
+providers = ["Governor read service", "canonical memory/source owners through named read ports"]
+consumers = ["eliot-memory-applicability"]
+non_goals = [
+  "raw store query or vendor adapter",
+  "canonical write/admission/status/lifecycle/influence transition",
+  "applicability evaluation, cue firing, Context admission, model work, delivery, hard block, or finish",
+]
+invariants = [
+  "one exact read capability and StateFence govern the projection",
+  "denominator is frozen and independently recheckable",
+  "selection/truncation/omissions are explicit and reversible",
+  "record support/lifecycle/accessibility/influence values come only from current owners",
+  "provider cannot upgrade stale/conflicted/unknown evidence",
+  "no provider result can be interpreted as applicability",
+]
+failure_behavior = "Return typed unavailable/partial/stale/conflicted projection evidence and exact revalidation requirements; never fabricate empty-complete or broaden the query."
+proof_surface = [
+  "empty-complete versus unavailable",
+  "top-k/budget partial projection",
+  "cross-fence source rejection",
+  "stale/conflicted/protected record retention",
+  "exact cue/negative trigger metadata preservation",
+  "named-read failure and retry identity",
+]
+proof_ceiling = "Provider Module/fake-port proof only; real canonical-store/read Edge, Smart evaluator Edge, Context Edge and Product Pulse remain separate"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+replacement_boundary = "provider behind the owner-neutral projection contract and injected named-read port; no storage-vendor or Smart implementation leaks"
+
+[agent_task]
+objective = "Implement the bounded Governor projection provider without direct store/vendor access or applicability logic."
+write_scope = [
+  "crates/governor/eliot-memory-projection-provider/src/**",
+  "crates/governor/eliot-memory-projection-provider/tests/**",
+  "crates/governor/eliot-memory-projection-provider/Cargo.toml",
+]
+deliverables = [
+  "ProjectionRequest/port/service API",
+  "deterministic bounded projection assembly",
+  "denominator/omission/revalidation logic",
+  "fake named-read fixtures and real-edge plan",
+]
+acceptance = [
+  "one stateless provider responsibility",
+  "all records/omissions preserve exact owner state and lineage",
+  "no applicability/lifecycle authority",
+]
+forbidden = [
+  "SurrealDB/raw query/vendor types",
+  "canonical writes or second memory owner",
+  "model/tool/provider calls",
+  "applicability, Context, lifecycle, hard-block or finish decisions",
+]
+stop_condition = "Return ContractChallenge when the named read, canonical owner fields, denominator source, scope/fence, or selection policy is unavailable."
+required_verification = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-memory-projection-provider --all-targets",
+  "cargo test --locked -p eliot-memory-projection-provider",
+  "cargo clippy --locked -p eliot-memory-projection-provider --all-targets -- -D warnings",
+  "real Governor-read/canonical-source provider fixture before promotion",
+]
+workspace_admission = "forbidden until contract implementation, package proof, real named-read Edge proof, current-main ancestry and integration-owner review"

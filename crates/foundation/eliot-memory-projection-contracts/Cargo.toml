@@ -1,0 +1,25 @@
+[package]
+name = "eliot-memory-projection-contracts"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Owner-neutral bounded canonical memory projection and applicability result contracts."
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "NOT_IMPLEMENTED"
+workspace_admission = "pending_contract_implementation_package_edge_and_integration_proof"
+functional_cell = "foundation.memory.projection_contracts"
+source_layer = "C0"
+runtime_layer = "R3/R5 contract island"
+runtime_bundle = "eliotd"
+agent_order = 45
+
+[dependencies]
+eliot-contracts = { path = "../eliot-contracts" }
+eliot-evidence = { path = "../eliot-evidence" }

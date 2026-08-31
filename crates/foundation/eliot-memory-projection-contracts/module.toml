@@ -1,0 +1,95 @@
+schema_version = 3
+module_id = "foundation.memory.projection_contracts"
+crate = "eliot-memory-projection-contracts"
+status = "PROTOTYPE"
+challenge = "CC-008"
+wave = "cognitive-contract-challenges"
+agent_order = 45
+plane = "shared C0 contract island"
+runtime_layer = "R3/R5"
+delivery_depth = "D3b"
+source_layer = "C0"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "foundation.memory.projection_contracts"
+assignable = false
+blocked_by = [
+  "field-level contract implementation and package proof",
+  "Governor/provider and Smart/evaluator ownership acceptance",
+]
+loc_soft_ceiling = 10000
+product_objective = "A bounded canonical-memory read can cross Governor, Smart applicability, and Context boundaries without exposing storage, hiding omissions, or conflating activation with applicability."
+causal_property = "owner-neutral bounded memory projection and applicability result contract"
+old_failure_or_missing_capability = "the pure applicability evaluator has no owner-neutral bounded provider record, denominator, omission, or consumer result contract"
+discriminator = "shared fixtures distinguish cue-hit-but-not-applicable, exact negative trigger, stale/conflicted/protected/precondition-failed, truncated, and unavailable-denominator cases"
+primary_responsibility = "Own only versioned wire types, validation, canonical ordering, and cross-field invariants for MemoryProjectionBatch/Record and ApplicableMemorySet."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["serialized owner-neutral contract values"]
+outputs = ["validated MemoryProjectionBatch", "validated ApplicableMemorySet"]
+depends_on = ["eliot-contracts", "eliot-evidence"]
+providers = ["Governor bounded projection provider"]
+consumers = ["eliot-memory-applicability", "eliot-context-candidates"]
+non_goals = [
+  "canonical/store reads or writes",
+  "record admission, support, lifecycle, accessibility, influence, erasure, or purge transition",
+  "cue firing, applicability evaluation, Context admission, delivery, hard block, or finish",
+]
+invariants = [
+  "existence, support, accessibility, influence eligibility, applicability, and physical erasure remain distinct",
+  "every record binds exact canonical handle, kind, revision, scope and compatible StateFence",
+  "denominator, selection policy, truncation, omissions and revalidation obligations remain explicit",
+  "cue activation is evidence input and never applicability proof",
+  "similarity cannot satisfy exact preconditions or exact negative-memory triggers",
+  "protected/minority/counterexample/audit/failure-fingerprint roles survive projection and evaluation",
+  "equivalent set-like inputs have deterministic canonical ordering",
+]
+failure_behavior = "Reject malformed/cross-fence/owner-collapsed values or retain explicit incomplete/unknown coverage; never invent a record, denominator, applicability, influence, or lifecycle decision."
+proof_surface = [
+  "complete/partial/unavailable denominator",
+  "cross-fence and duplicate identity rejection",
+  "truncated records with exact omission handles",
+  "cue-hit-but-not-applicable",
+  "similar versus exact negative trigger",
+  "protected and conflicted records",
+  "permutation determinism",
+]
+proof_ceiling = "C0 contract/package proof only; provider, evaluator, Context edge and Orientation Product Pulse remain separate"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+replacement_boundary = "owner-neutral contract crate shared by independently replaceable Governor provider, Smart evaluator, and Context consumer"
+
+[agent_task]
+objective = "Implement the versioned MemoryProjectionBatch/Record and ApplicableMemorySet Rust contract without importing storage, Governor, Smart, Context, model or vendor implementation."
+write_scope = [
+  "crates/foundation/eliot-memory-projection-contracts/src/**",
+  "crates/foundation/eliot-memory-projection-contracts/tests/**",
+  "crates/foundation/eliot-memory-projection-contracts/Cargo.toml",
+]
+deliverables = [
+  "closed enums and deny_unknown_fields DTOs",
+  "structural/cross-dimension validators",
+  "canonical set ordering",
+  "negative and round-trip fixtures",
+  "provider/evaluator/context consumer contract fixtures",
+]
+acceptance = [
+  "one stateless contract responsibility",
+  "all omission/denominator/fence/protection states representable",
+  "no implementation or lifecycle authority",
+]
+forbidden = [
+  "store/provider/model/tool calls",
+  "canonical or lifecycle mutations",
+  "utility or applicability scalar",
+  "silent default for missing scope/fence/denominator",
+  "cue score treated as proof",
+]
+stop_condition = "Return ContractChallenge when a field belongs to canonical record ownership, projection query policy, applicability evaluation, Context admission, delivery, lifecycle, or hard-block authority."
+required_verification = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-memory-projection-contracts --all-targets",
+  "cargo test --locked -p eliot-memory-projection-contracts",
+  "cargo clippy --locked -p eliot-memory-projection-contracts --all-targets -- -D warnings",
+]
+workspace_admission = "forbidden until implementation, package proof, affected consumer fixtures, current-main ancestry and integration-owner review"

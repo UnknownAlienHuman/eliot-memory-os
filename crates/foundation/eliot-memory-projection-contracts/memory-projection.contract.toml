@@ -1,0 +1,232 @@
+schema_version = 1
+contract_id = "eliot.memory.projection.v1"
+contract_version = "1.0.0"
+status = "STATIC_CANDIDATE"
+issue = 43
+challenge = "CC-008"
+owner_capability = "owner-neutral contract; produced by Governor bounded memory projection"
+state_class = "stateless"
+proof_ceiling = "Field-level contract candidate only; no canonical query, provider execution, applicability, Context, lifecycle, or Product proof."
+purpose = "Carry a bounded exact canonical-memory projection from the owning Governor/read path to a pure applicability evaluator."
+
+architecture_refs = [
+  "ARCH-SCOPE-01",
+  "ARCH-MEM-02",
+  "ARCH-MEM-03",
+  "ARCH-MEM-04",
+  "ARCH-CTX-04",
+  "ARCH-SEC-03",
+]
+implementation_refs = [
+  "I4.1",
+  "I4.5",
+  "I5.20",
+  "I5.25",
+  "I5.26",
+  "I7.19",
+  "I12.21",
+]
+
+[batch]
+type = "MemoryProjectionBatch"
+required_fields = [
+  "projection_id",
+  "projection_revision",
+  "workscope_ref",
+  "task_scope",
+  "session_scope",
+  "state_fence",
+  "source_revision_heads",
+  "query_contract_ref",
+  "selection_policy_ref",
+  "denominator",
+  "records",
+  "omissions",
+  "revalidation_requirements",
+  "provenance_manifest_ref",
+]
+rules = [
+  "one compatible StateFence governs the batch",
+  "record identities are unique",
+  "records and omissions are canonical-order deterministic",
+  "projection revision cannot exceed or hide source revisions",
+  "a batch never claims complete coverage without a frozen independently recheckable denominator",
+]
+
+[denominator]
+type = "MemoryProjectionDenominator"
+required_fields = [
+  "candidate_universe_ref",
+  "candidate_universe_revision",
+  "expected_record_count",
+  "returned_record_count",
+  "omitted_record_count",
+  "selection_policy_ref",
+  "coverage_state",
+  "coverage_method_and_recheck_ref",
+]
+coverage_values = ["COMPLETE", "PARTIAL", "UNAVAILABLE", "UNKNOWN"]
+rules = [
+  "counts are consistent but do not substitute for candidate_universe_ref",
+  "top-k/budget exhaustion is PARTIAL unless the frozen denominator proves completeness",
+  "zero returned with COMPLETE differs from unavailable/unknown",
+]
+
+[record]
+type = "MemoryProjectionRecord"
+required_fields = [
+  "canonical_handle",
+  "record_kind",
+  "record_revision",
+  "workscope_ref",
+  "task_applicability",
+  "session_applicability",
+  "record_state_fence",
+  "epistemic_status",
+  "lifecycle_status",
+  "freshness",
+  "accessibility_state",
+  "influence_eligibility",
+  "provenance_refs",
+  "source_and_predecessor_refs",
+  "applicability_limits",
+  "procedure_preconditions",
+  "cue_evidence",
+  "negative_memory_evidence",
+  "protected_roles",
+  "content_or_excerpt_handles",
+]
+
+[[field]]
+name = "record_kind"
+closed_values = [
+  "WORKING_CONTINUITY",
+  "EPISODIC",
+  "SEMANTIC",
+  "PROCEDURAL",
+  "PROSPECTIVE",
+  "SOURCE_EPISTEMIC",
+  "NORMATIVE_SOCIAL",
+  "NEGATIVE",
+]
+
+[[field]]
+name = "task_applicability"
+closed_values = ["ANY_COMPATIBLE_TASK", "EXACT_TASK", "TASK_FAMILY", "TASK_EXCLUDED", "UNKNOWN"]
+
+[[field]]
+name = "session_applicability"
+closed_values = ["ANY_COMPATIBLE_SESSION", "EXACT_SESSION", "SESSION_EXCLUDED", "NOT_APPLICABLE", "UNKNOWN"]
+
+[[field]]
+name = "freshness"
+closed_values = [
+  "EXACT_CANDIDATE",
+  "EXACT_COMMIT",
+  "EXACT_QUIESCED_WORKTREE",
+  "KNOWN_OLDER_SNAPSHOT",
+  "STALE",
+  "UNKNOWN",
+]
+
+[[field]]
+name = "accessibility_state"
+closed_values = ["ACTIVE", "DEMOTED", "ARCHIVED", "SUPPRESSED", "QUARANTINED", "UNKNOWN"]
+
+[[field]]
+name = "influence_eligibility"
+closed_values = [
+  "ELIGIBLE",
+  "HANDLE_ONLY",
+  "WARNING_ONLY",
+  "REVALIDATION_REQUIRED",
+  "SUPPRESSED",
+  "QUARANTINED",
+  "PROHIBITED",
+  "UNKNOWN",
+]
+
+[[field]]
+name = "protected_roles"
+set_values = [
+  "DECISION_SAFETY_FLOOR",
+  "MINORITY_EVIDENCE",
+  "COUNTEREXAMPLE",
+  "AUDIT_EVIDENCE",
+  "FAILURE_FINGERPRINT",
+  "NEGATIVE_MEMORY",
+  "INVARIANT",
+  "HUMAN_PROTECTED",
+]
+
+[cue_evidence]
+required_fields = [
+  "cue_binding_refs",
+  "activation_result_refs",
+  "match_kind",
+  "comparison_profile_ref",
+  "source_revision",
+]
+match_values = ["NONE", "EXACT", "PREFIX", "SIGNATURE", "SEMANTIC_NEAR", "UNKNOWN"]
+rule = "Activation proposes a candidate only; score, rank, repetition, or semantic nearness never proves applicability."
+
+[negative_memory_evidence]
+required_fields = [
+  "failure_fingerprint_refs",
+  "trigger_match",
+  "scope_match",
+  "reopen_condition_refs",
+  "extinction_condition_refs",
+]
+trigger_values = ["NONE", "EXACT_DETERMINISTIC", "SEMANTIC_NEAR", "CONFLICTED", "UNKNOWN"]
+rule = "Only exact deterministic trigger evidence in matching scope may support a Governor hard-block decision; the projection and Smart evaluator never apply the block."
+
+[[invariant]]
+id = "MPR-001"
+statement = "Canonical existence, epistemic support, accessibility, permitted influence, applicability, and physical erasure are orthogonal."
+failure = "Reject the collapsed record."
+
+[[invariant]]
+id = "MPR-002"
+statement = "A record cannot acquire a broader WorkScope, task, session, or StateFence through projection."
+failure = "Reject wrong-scope or incompatible projection."
+
+[[invariant]]
+id = "MPR-003"
+statement = "Content/excerpts never replace exact canonical handle, provenance, predecessor, revision, and source availability."
+failure = "Return incomplete projection."
+
+[[invariant]]
+id = "MPR-004"
+statement = "Retrieval, activation, citation, repetition, or model agreement cannot promote support, accessibility, influence, or applicability."
+failure = "Reject semantic teleportation."
+
+[[invariant]]
+id = "MPR-005"
+statement = "Protected roles and rival/counterevidence remain visible even when omitted from the active payload."
+failure = "Require exact handle-only/omission representation."
+
+[[invariant]]
+id = "MPR-006"
+statement = "Truncation or omission is reversible by exact handle and cannot be represented as absence."
+failure = "Return PARTIAL with omission and expansion handles."
+
+[[fixture]]
+id = "empty-complete"
+input = "Frozen denominator contains zero eligible records and projection returns zero."
+expected = "coverage = COMPLETE; empty is not unavailable"
+
+[[fixture]]
+id = "top-k-partial"
+input = "Provider returns top 8 from a larger frozen universe."
+expected = "coverage = PARTIAL; exact omitted count/handles or omission manifest required"
+
+[[fixture]]
+id = "stale-protected"
+input = "Protected failure fingerprint is known older/stale."
+expected = "retained as protected handle with revalidation requirement; not silently dropped or applied"
+
+[[fixture]]
+id = "cue-hit-record"
+input = "Exact cue fired for a record whose task applicability excludes the current task."
+expected = "record remains a candidate; applicability is not established"

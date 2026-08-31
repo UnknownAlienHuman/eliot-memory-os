@@ -1,0 +1,96 @@
+schema_version = 3
+module_id = "smart.memory.applicability"
+crate = "eliot-memory-applicability"
+status = "PROTOTYPE"
+challenge = "CC-008"
+wave = "cognitive-contract-challenges"
+agent_order = 47
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "smart.memory.applicability"
+assignable = false
+blocked_by = [
+  "accepted memory projection/applicable-set contract implementation",
+  "Governor projection-provider fixture and exact shared-fence corpus",
+]
+loc_soft_ceiling = 10000
+product_objective = "Only currently applicable, source-addressable memory reaches Context candidate construction; cue activation and retrieval remain proposals."
+causal_property = "pure current memory applicability evaluation"
+old_failure_or_missing_capability = "activation/retrieval may be mistaken for applicability or Smart may query/expand storage"
+discriminator = "cue-hit-but-not-applicable, semantic-near-precondition, exact negative-trigger, stale/conflicted/protected/truncated/missing-denominator fixtures produce distinct dispositions"
+primary_responsibility = "Purely evaluate every supplied MemoryProjectionRecord against exact WorkScope/task/session/StateFence, applicability limits, current preconditions, cue/negative evidence, status, lifecycle, freshness and influence eligibility."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["MemoryProjectionBatch", "exact current applicability request and owner-derived precondition evidence already present in the batch"]
+outputs = ["ApplicableMemorySet"]
+depends_on = ["eliot-memory-projection-contracts"]
+providers = ["eliot-memory-projection-provider"]
+consumers = ["eliot-context-candidates"]
+non_goals = [
+  "store/query expansion or retrieval",
+  "cue firing or graph traversal",
+  "support/accessibility/influence/lifecycle/purge transition",
+  "Context ranking/admission/rendering/delivery",
+  "hard-block, policy, authority, model, tool or finish decision",
+]
+invariants = [
+  "evaluate only the supplied bounded projection",
+  "cue hit/score/rank/similarity is never applicability proof",
+  "exact preconditions require exact owner-derived current evidence",
+  "exact negative trigger returns Governor-decision requirement rather than applying a block",
+  "stale/conflicted/protected/omitted/unknown records remain visible and addressable",
+  "partial/unavailable denominator cannot prove absence or complete applicability",
+  "result cannot strengthen source status, accessibility, influence or lifecycle",
+]
+failure_behavior = "Return per-record not-applicable/revalidation/review/inconclusive dispositions with exact missing evidence; never query, widen, silently drop, or apply an effect."
+proof_surface = [
+  "cue-hit-but-not-applicable",
+  "scope/task/session mismatch",
+  "semantic-near versus exact precondition",
+  "exact negative trigger",
+  "stale/conflicted/suppressed/quarantined/protected records",
+  "partial/unavailable denominator",
+  "permutation determinism",
+]
+proof_ceiling = "Pure Smart Module proof only; real provider/Context Edge, Governor hard-block/lifecycle decision and Product Pulse remain separate"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+replacement_boundary = "pure evaluator behind the owner-neutral contracts; no provider, Context, lifecycle or authority implementation leaks"
+
+[agent_task]
+objective = "Implement evaluate_memory_applicability as a deterministic total function over the accepted bounded projection contract."
+write_scope = [
+  "crates/smart/eliot-memory-applicability/src/**",
+  "crates/smart/eliot-memory-applicability/tests/**",
+  "crates/smart/eliot-memory-applicability/Cargo.toml",
+]
+deliverables = [
+  "public pure evaluator",
+  "record-by-record disposition matrix",
+  "negative/adversarial/permutation fixtures",
+  "provider and Context consumer Edge fixture plan",
+]
+acceptance = [
+  "one pure evaluator responsibility",
+  "no query expansion or hidden state",
+  "all uncertain/protected/negative cases remain explicit",
+]
+forbidden = [
+  "store/filesystem/network/model/tool access",
+  "retrieval or graph expansion",
+  "support/accessibility/influence/lifecycle/erasure transition",
+  "Context admission, hard block, authority, finish or promotion",
+]
+stop_condition = "Return ContractChallenge when the supplied batch lacks exact scope/fence/denominator/precondition/owner evidence or evaluation would require another owner."
+required_verification = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-memory-applicability --all-targets",
+  "cargo test --locked -p eliot-memory-applicability",
+  "cargo clippy --locked -p eliot-memory-applicability --all-targets -- -D warnings",
+  "real provider/Context Edge fixture and cue-hit-but-not-applicable Product Pulse before promotion",
+]
+workspace_admission = "forbidden until contract implementation, package proof, provider/consumer Edge proof, current-main ancestry and integration-owner review"
