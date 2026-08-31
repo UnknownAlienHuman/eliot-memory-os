@@ -1,0 +1,115 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W2_D3B_AGENT_HANDOFF_CONTRACT"
+field_contract_index = "crates/smart/cognitive-rev12-w2-field-contracts.toml"
+brief_index = "crates/smart/cognitive-rev12-w2-agent-brief-index.toml"
+
+[worker]
+reads = ["one indexed W2 brief", "the exact field contracts named by that brief", "declared Architecture/Implementation anchors", "one-hop public contracts and fixtures only"]
+writes = ["the brief declared src/<cell>.rs", "the brief declared tests/<cell>.rs"]
+forbidden = ["Cargo.toml", "src/lib.rs", "re-exports", "another cell source", "root workspace", "runtime wiring", "canonical state", "provider acquisition", "storage/filesystem scan", "model/provider/tool execution", "Context delivery/use", "authority", "scheduler", "task finish", "proof/status files", "local public-type redefinition", "oracle weakening"]
+return = ["implemented exact declared function", "typed errors", "minimum and contract negative tests", "remaining ContractChallenge", "actual proof ceiling"]
+
+[integration_owner]
+owns = ["Cargo.toml", "src/lib.rs and re-exports", "cross-cell compatibility", "public-type ownership validation", "package Module Proof", "real Edge Proof", "Product Pulse", "migration and retirement"]
+
+[challenge]
+required_when = ["field contract absent or contradictory", "public type owner unresolved", "discriminator cannot fail old behavior", "work requires hidden I/O/model/tool/provider SDK", "work requires another mutable owner", "worker must weaken an oracle", "complete causal workset does not fit"]
+
+[ordering]
+contracts_precede_workers = true
+parallel_workers_require_disjoint_source_files = true
+shared_contract_change_serialized_by_integration_owner = true
+worker_never_integrates_own_result = true
+normalization_precedes_binding_and_direct_match = true
+binding_precedes_snapshot_build = true
+snapshot_precedes_direct_match_and_spread = true
+direct_match_precedes_spread_and_activation = true
+contribution_merge_precedes_admission = true
+admission_precedes_assembly = true
+assembly_precedes_quality_and_decision_tail = true
+decision_tail_precedes_reactive_plan = true
+
+[[assignment]]
+order = 20
+cell = "smart.cue.normalizer"
+brief = "crates/smart/cells-v12/020-smart-cue-normalizer.toml"
+predecessor_orders = [19]
+write_scope = ["crates/smart/eliot-cues/src/normalizer.rs", "crates/smart/eliot-cues/tests/normalizer.rs"]
+
+[[assignment]]
+order = 21
+cell = "smart.cue.binding"
+brief = "crates/smart/cells-v12/021-smart-cue-binding.toml"
+predecessor_orders = [19, 20]
+write_scope = ["crates/smart/eliot-cues/src/binding.rs", "crates/smart/eliot-cues/tests/binding.rs"]
+
+[[assignment]]
+order = 22
+cell = "smart.cue.index"
+brief = "crates/smart/cells-v12/022-smart-cue-index.toml"
+predecessor_orders = [19, 21]
+write_scope = ["crates/smart/eliot-cues/src/index.rs", "crates/smart/eliot-cues/tests/index.rs"]
+
+[[assignment]]
+order = 23
+cell = "smart.cue.direct_match"
+brief = "crates/smart/cells-v12/023-smart-cue-direct_match.toml"
+predecessor_orders = [19, 20, 22]
+write_scope = ["crates/smart/eliot-cues/src/direct_match.rs", "crates/smart/eliot-cues/tests/direct_match.rs"]
+
+[[assignment]]
+order = 24
+cell = "smart.cue.relation_spread"
+brief = "crates/smart/cells-v12/024-smart-cue-relation_spread.toml"
+predecessor_orders = [19, 22, 23]
+write_scope = ["crates/smart/eliot-cues/src/relation_spread.rs", "crates/smart/eliot-cues/tests/relation_spread.rs"]
+
+[[assignment]]
+order = 25
+cell = "smart.cue.activation"
+brief = "crates/smart/cells-v12/025-smart-cue-activation.toml"
+predecessor_orders = [19, 23, 24]
+write_scope = ["crates/smart/eliot-cues/src/activation.rs", "crates/smart/eliot-cues/tests/activation.rs"]
+
+[[assignment]]
+order = 29
+cell = "smart.context.contribution_merge"
+brief = "crates/smart/cells-v12/029-smart-context-contribution_merge.toml"
+predecessor_orders = [26, 28]
+write_scope = ["crates/smart/eliot-context/src/contribution_merge.rs", "crates/smart/eliot-context/tests/contribution_merge.rs"]
+
+[[assignment]]
+order = 30
+cell = "smart.context.admission"
+brief = "crates/smart/cells-v12/030-smart-context-admission.toml"
+predecessor_orders = [27, 29]
+write_scope = ["crates/smart/eliot-context/src/admission.rs", "crates/smart/eliot-context/tests/admission.rs"]
+
+[[assignment]]
+order = 31
+cell = "smart.context.assembly"
+brief = "crates/smart/cells-v12/031-smart-context-assembly.toml"
+predecessor_orders = [28, 30]
+write_scope = ["crates/smart/eliot-context/src/assembly.rs", "crates/smart/eliot-context/tests/assembly.rs"]
+
+[[assignment]]
+order = 32
+cell = "smart.context.quality"
+brief = "crates/smart/cells-v12/032-smart-context-quality.toml"
+predecessor_orders = [28, 29, 30, 31]
+write_scope = ["crates/smart/eliot-context/src/quality.rs", "crates/smart/eliot-context/tests/quality.rs"]
+
+[[assignment]]
+order = 33
+cell = "smart.context.decision_tail"
+brief = "crates/smart/cells-v12/033-smart-context-decision_tail.toml"
+predecessor_orders = [28, 31, 32]
+write_scope = ["crates/smart/eliot-context/src/decision_tail.rs", "crates/smart/eliot-context/tests/decision_tail.rs"]
+
+[[assignment]]
+order = 34
+cell = "smart.context.reactive_delivery_plan"
+brief = "crates/smart/cells-v12/034-smart-context-reactive_delivery_plan.toml"
+predecessor_orders = [28, 31, 33]
+write_scope = ["crates/smart/eliot-context/src/reactive_plan.rs", "crates/smart/eliot-context/tests/reactive_plan.rs"]
