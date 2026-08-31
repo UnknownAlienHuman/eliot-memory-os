@@ -120,7 +120,7 @@ fn child_external_effect_count_cannot_widen_parent() {
     assert_eq!(
         launch(root, child).validate(),
         Err(ContractError::ChildEffectCeilingExceeded {
-            field: "max_external_effects"
+            field: "max_external_effects",
         })
     );
 }
@@ -152,6 +152,7 @@ fn effect_ceiling_wire_shape_round_trips_without_defaults() {
         0,
     );
     let encoded = serde_json::to_vec(&original).expect("serialize effect ceiling");
-    let decoded = serde_json::from_slice::<EffectCeiling>(&encoded).expect("deserialize effect ceiling");
+    let decoded: EffectCeiling =
+        serde_json::from_slice(&encoded).expect("deserialize effect ceiling");
     assert_eq!(decoded, original);
 }
