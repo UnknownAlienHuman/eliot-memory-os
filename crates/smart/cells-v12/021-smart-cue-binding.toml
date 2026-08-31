@@ -1,0 +1,49 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w2-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 21
+cell = "smart.cue.binding"
+physical_crate = "eliot-cues"
+predecessor_orders = [19, 20]
+primary_property = "Construct bounded cue-binding candidates from one owner-produced target projection without publishing/admitting bindings or copying target payloads."
+field_contracts = ["crates/smart/eliot-cue-contracts/cue.contract.toml"]
+public_function_signatures = [
+  "pub fn build_cue_binding_candidates(source: &CueBindingSourceProjection, cues: &[NormalizedCue], policy: &CueBindingPolicy) -> Result<CueBindingCandidateSet, CueBindingError>",
+]
+write_scope = [
+  "crates/smart/eliot-cues/src/binding.rs",
+  "crates/smart/eliot-cues/tests/binding.rs",
+]
+algorithm = [
+  "validate source owner/revision/target/scope/task/fence and influence decision",
+  "validate normalized cues use the compatible profile/scope/fence",
+  "emit explicit cues and only closed versioned deterministic derived rules",
+  "copy freshness/status/eligibility/negative-memory marker without promotion",
+  "deduplicate exact cue-target-match-mode identity",
+  "emit omitted optional derived cues with typed reasons and canonical set digest",
+]
+minimum_tests = [
+  "unknown target rejected",
+  "candidate exposes no admission receipt",
+  "touched-file derivation deterministic",
+  "negative-memory marker preserves lineage but grants no influence",
+  "payload absent from candidate/index surface",
+  "mixed fence rejected",
+  "candidate permutation deterministic",
+]
+non_goals = [
+  "Governor admission",
+  "target payload retrieval",
+  "canonical memory write",
+  "derived rule invention",
+  "Context admission/delivery",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-CTX-02", "ARCH-CTX-04", "ARCH-MEM-04", "ARCH-SEC-03", "ARCH-MOD-03"]
+implementation_refs = ["I2.20", "I7.19", "I12.14", "I12.20"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than admitting the candidate, inventing a derivation rule, copying payload, or upgrading freshness/status/influence."
+brief_proof_ceiling = "STATIC_W2_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
