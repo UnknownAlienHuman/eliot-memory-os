@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use eliot_contracts::sha256_hex;
@@ -8,12 +8,12 @@ use eliot_process::{
     ProcessStreamPrefixPreview, ProcessStreamSinkAbortReason, ProcessStreamSinkAbortRequest,
     ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition, ProcessStreamSinkClient,
     ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest, ProcessStreamSinkFuture,
-    ProcessStreamSinkLimits, ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback,
-    ProcessStreamSinkSession, ProcessStreamSinkSessionId, ProcessStreamSinkSourceId,
-    ProcessStreamSinkState, ProcessStreamSinkTerminal, ProcessStreamSinkTerminalCommandIdentity,
-    ProcessStreamSinkTerminalCommandKind, ProcessStreamSinkTerminalId,
-    ProcessStreamSinkUnknownOutcome, StreamEvidenceGap, StreamPersistenceStatus,
-    StreamTransportStatus,
+    ProcessStreamSinkLimits, ProcessStreamSinkModel, ProcessStreamSinkOpenRequest,
+    ProcessStreamSinkReadback, ProcessStreamSinkSession, ProcessStreamSinkSessionId,
+    ProcessStreamSinkSourceId, ProcessStreamSinkState, ProcessStreamSinkTerminal,
+    ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkTerminalCommandKind,
+    ProcessStreamSinkTerminalId, ProcessStreamSinkUnknownOutcome, StreamEvidenceGap,
+    StreamPersistenceStatus, StreamTransportStatus,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -162,6 +162,36 @@ fn empty_terminal(
         0,
         sha256_hex(&[]),
         complete_evidence(&[])?,
+    )?)
+}
+
+fn cancelled_terminal(
+    session: ProcessStreamSinkSession,
+    request: ProcessStreamSinkAbortRequest,
+) -> TestResult<ProcessStreamSinkTerminal> {
+    let evidence = ProcessStreamEvidence::new_raw(
+        session.binding().clone(),
+        session.stream(),
+        session.policy().clone(),
+        StreamTransportStatus::CancelledBeforeEof,
+        StreamPersistenceStatus::SourceUnavailable,
+        sha256_hex(&[]),
+        0,
+        ProcessStreamPrefixPreview::from_transport_prefix(Vec::new(), 0)?,
+        None,
+        vec![
+            StreamEvidenceGap::PersistenceUnavailable,
+            StreamEvidenceGap::CancelledBeforeEof,
+        ],
+    )?;
+    Ok(ProcessStreamSinkTerminal::from_abort(
+        session,
+        request,
+        ProcessStreamSinkState::Cancelled,
+        0,
+        0,
+        sha256_hex(&[]),
+        evidence,
     )?)
 }
 
@@ -467,38 +497,75 @@ fn terminal_validators_accept_exact_request_and_reject_kind_or_identity_changes(
 }
 
 #[test]
-fn fake_replay_and_cross_kind_conflicts_preserve_terminal_state() -> TestResult {
-    let fake = OracleFake::new();
-    let session = poll_ready(fake.open(open_request("fake")?))?;
+fn terminal_command_state_binding_is_fail_closed() -> TestResult {
+    let session = session("state-binding")?;
     let finalize = zero_finalize_request(&session)?;
-    let first = poll_ready(fake.finalize(session.clone(), finalize.clone()))?;
-    let replay = poll_ready(fake.finalize(session.clone(), finalize))?;
+    assert!(matches!(
+        ProcessStreamSinkTerminal::from_finalize(
+            session.clone(),
+            finalize,
+            ProcessStreamSinkState::Cancelled,
+            0,
+            0,
+            sha256_hex(&[]),
+            complete_evidence(&[])?,
+        ),
+        Err(ProcessStreamSinkError::TerminalCommandStateMismatch)
+    ));
+
+    let abort = abort_request(&session, ProcessStreamSinkAbortReason::Cancellation)?;
+    assert!(matches!(
+        ProcessStreamSinkTerminal::from_abort(
+            session,
+            abort,
+            ProcessStreamSinkState::CompleteSource,
+            0,
+            0,
+            sha256_hex(&[]),
+            complete_evidence(&[])?,
+        ),
+        Err(ProcessStreamSinkError::TerminalCommandStateMismatch)
+    ));
+    Ok(())
+}
+
+#[test]
+fn model_replay_and_cross_kind_conflicts_preserve_terminal_state() -> TestResult {
+    let model = ProcessStreamSinkModel::new();
+    let active_session = poll_ready(model.open(open_request("model")?))?;
+    let finalize = zero_finalize_request(&active_session)?;
+    let recorded = empty_terminal(active_session.clone(), finalize.clone())?;
+    model.record_terminal(&active_session, recorded)?;
+    let first = poll_ready(model.finalize(active_session.clone(), finalize.clone()))?;
+    let replay = poll_ready(model.finalize(active_session.clone(), finalize))?;
     assert_eq!(first, replay);
     let before = first.terminal_sha256().to_owned();
-    let mut changed_finalize = serde_json::to_value(zero_finalize_request(&session)?)?;
+    let mut changed_finalize = serde_json::to_value(zero_finalize_request(&active_session)?)?;
     changed_finalize["wait_budget_ms"] = serde_json::json!(2);
     let changed_finalize = serde_json::from_value(changed_finalize)?;
     assert!(matches!(
-        poll_ready(fake.finalize(session.clone(), changed_finalize)),
+        poll_ready(model.finalize(active_session.clone(), changed_finalize)),
         Err(ProcessStreamSinkError::TerminalIdentityConflict)
     ));
     assert!(matches!(
-        poll_ready(fake.abort(
-            session.clone(),
-            abort_request(&session, ProcessStreamSinkAbortReason::Cancellation)?,
+        poll_ready(model.abort(
+            active_session.clone(),
+            abort_request(&active_session, ProcessStreamSinkAbortReason::Cancellation)?,
         )),
         Err(ProcessStreamSinkError::TerminalIdentityConflict)
     ));
     let ProcessStreamSinkReadback::Terminal { terminal } =
-        poll_ready(fake.readback(session.clone()))?
+        poll_ready(model.readback(active_session.clone()))?
     else {
         panic!("conflict must preserve the terminal");
     };
     assert_eq!(before, terminal.terminal_sha256());
 
-    let other = OracleFake::new();
+    let other = ProcessStreamSinkModel::new();
     let other_session = poll_ready(other.open(open_request("other")?))?;
     let abort = abort_request(&other_session, ProcessStreamSinkAbortReason::Cancellation)?;
+    let recorded = cancelled_terminal(other_session.clone(), abort.clone())?;
+    other.record_terminal(&other_session, recorded)?;
     let aborted = poll_ready(other.abort(other_session.clone(), abort.clone()))?;
     let aborted_identity = aborted.command_identity().clone();
     assert_eq!(
@@ -531,47 +598,137 @@ fn fake_replay_and_cross_kind_conflicts_preserve_terminal_state() -> TestResult 
 
 #[test]
 fn terminal_readback_exposes_the_accepted_identity() -> TestResult {
-    let fake = OracleFake::new();
-    let session = poll_ready(fake.open(open_request("readback")?))?;
-    let request = zero_finalize_request(&session)?;
-    let terminal = poll_ready(fake.finalize(session.clone(), request.clone()))?;
+    let model = ProcessStreamSinkModel::new();
+    let active_session = poll_ready(model.open(open_request("readback")?))?;
+    let request = zero_finalize_request(&active_session)?;
+    let recorded = empty_terminal(active_session.clone(), request.clone())?;
+    model.record_terminal(&active_session, recorded)?;
+    let terminal = poll_ready(model.finalize(active_session.clone(), request.clone()))?;
     let ProcessStreamSinkReadback::Terminal { terminal: readback } =
-        poll_ready(fake.readback(session))?
+        poll_ready(model.readback(active_session.clone()))?
     else {
         panic!("terminal must be returned by terminal readback");
     };
     assert_eq!(terminal.command_identity(), readback.command_identity());
     assert_eq!(terminal.terminal_sha256(), readback.terminal_sha256());
+    let unknown = ProcessStreamSinkUnknownOutcome::new(
+        active_session.session_id().clone(),
+        active_session.terminal_id().clone(),
+        active_session.open_request_sha256(),
+        sha256_hex(b"uncertain"),
+    )?;
+    assert_eq!(
+        poll_ready(model.reconcile(active_session, unknown))?,
+        ProcessStreamSinkReadback::Terminal { terminal },
+    );
+    assert!(matches!(
+        poll_ready(model.readback(session("foreign")?)),
+        Err(ProcessStreamSinkError::SessionMismatch)
+    ));
+    Ok(())
+}
+
+#[test]
+fn model_rejects_unopened_and_foreign_sessions() -> TestResult {
+    let model = ProcessStreamSinkModel::new();
+    let unopened = session("unopened")?;
+    assert!(matches!(
+        poll_ready(model.readback(unopened.clone())),
+        Err(ProcessStreamSinkError::ProviderUnavailable)
+    ));
+    assert!(matches!(
+        poll_ready(model.finalize(unopened.clone(), zero_finalize_request(&unopened)?)),
+        Err(ProcessStreamSinkError::ProviderUnavailable)
+    ));
+
+    let active = poll_ready(model.open(open_request("active")?))?;
+    assert!(matches!(
+        poll_ready(model.finalize(active.clone(), zero_finalize_request(&active)?,)),
+        Err(ProcessStreamSinkError::ProviderUnavailable)
+    ));
+    assert!(matches!(
+        poll_ready(model.readback(session("foreign")?)),
+        Err(ProcessStreamSinkError::SessionMismatch)
+    ));
+    assert!(matches!(
+        poll_ready(model.finalize(session("foreign")?, zero_finalize_request(&active)?,)),
+        Err(ProcessStreamSinkError::SessionMismatch)
+    ));
     Ok(())
 }
 
 #[test]
 fn unknown_outcome_is_readback_fenced_without_terminalization() -> TestResult {
-    let fake = OracleFake::new();
-    let session = poll_ready(fake.open(open_request("unknown")?))?;
+    let model = ProcessStreamSinkModel::new();
+    let active_session = poll_ready(model.open(open_request("unknown")?))?;
     let outcome = ProcessStreamSinkUnknownOutcome::new(
-        session.session_id().clone(),
-        session.terminal_id().clone(),
-        session.open_request_sha256(),
+        active_session.session_id().clone(),
+        active_session.terminal_id().clone(),
+        active_session.open_request_sha256(),
         sha256_hex(b"uncertain"),
     )?;
-    fake.set_unknown(outcome.clone());
-    let expected = ProcessStreamSinkReadback::UnknownOutcome { outcome };
-    assert_eq!(poll_ready(fake.readback(session.clone()))?, expected);
-
+    model.record_unknown_outcome(outcome.clone())?;
+    let replacement = ProcessStreamSinkUnknownOutcome::new(
+        active_session.session_id().clone(),
+        active_session.terminal_id().clone(),
+        active_session.open_request_sha256(),
+        sha256_hex(b"replacement"),
+    )?;
     assert!(matches!(
-        poll_ready(fake.finalize(session.clone(), zero_finalize_request(&session)?)),
+        model.record_unknown_outcome(replacement),
         Err(ProcessStreamSinkError::ProviderUnavailable)
     ));
+    let expected = ProcessStreamSinkReadback::UnknownOutcome {
+        outcome: outcome.clone(),
+    };
+    assert_eq!(
+        poll_ready(model.readback(active_session.clone()))?,
+        expected
+    );
+    assert_eq!(
+        poll_ready(model.reconcile(active_session.clone(), outcome.clone()))?,
+        expected
+    );
+    let wrong_terminal = ProcessStreamSinkUnknownOutcome::new(
+        active_session.session_id().clone(),
+        ProcessStreamSinkTerminalId::new("terminal:wrong")?,
+        active_session.open_request_sha256(),
+        outcome.uncertainty_sha256(),
+    )?;
     assert!(matches!(
-        poll_ready(fake.abort(
-            session.clone(),
-            abort_request(&session, ProcessStreamSinkAbortReason::Cancellation)?,
+        poll_ready(model.reconcile(active_session.clone(), wrong_terminal)),
+        Err(ProcessStreamSinkError::TerminalIdentityConflict)
+    ));
+    let wrong_open = ProcessStreamSinkUnknownOutcome::new(
+        active_session.session_id().clone(),
+        active_session.terminal_id().clone(),
+        "f".repeat(64),
+        outcome.uncertainty_sha256(),
+    )?;
+    assert!(matches!(
+        poll_ready(model.reconcile(active_session.clone(), wrong_open)),
+        Err(ProcessStreamSinkError::OpenDigestMismatch)
+    ));
+    assert!(matches!(
+        poll_ready(model.readback(session("foreign")?)),
+        Err(ProcessStreamSinkError::SessionMismatch)
+    ));
+
+    assert!(matches!(
+        poll_ready(model.finalize(
+            active_session.clone(),
+            zero_finalize_request(&active_session)?,
         )),
         Err(ProcessStreamSinkError::ProviderUnavailable)
     ));
-    assert_eq!(poll_ready(fake.readback(session))?, expected);
-    assert!(fake.lock().terminal.is_none());
+    assert!(matches!(
+        poll_ready(model.abort(
+            active_session.clone(),
+            abort_request(&active_session, ProcessStreamSinkAbortReason::Cancellation)?,
+        )),
+        Err(ProcessStreamSinkError::ProviderUnavailable)
+    ));
+    assert_eq!(poll_ready(model.readback(active_session))?, expected);
     Ok(())
 }
 
@@ -643,177 +800,5 @@ fn public_exports_and_object_safe_client_remain_intact() {
     let _: Option<ProcessStreamSinkAppend> = None;
     let _: Option<ProcessStreamSinkAppendDisposition> = None;
     let _: Option<ProcessStreamSinkLimits> = None;
-    accepts(Arc::new(OracleFake::new()));
-}
-
-#[derive(Default)]
-struct OracleState {
-    session: Option<ProcessStreamSinkSession>,
-    terminal: Option<ProcessStreamSinkTerminal>,
-    unknown: Option<ProcessStreamSinkUnknownOutcome>,
-}
-
-struct OracleFake {
-    state: Arc<Mutex<OracleState>>,
-}
-
-impl OracleFake {
-    fn new() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(OracleState::default())),
-        }
-    }
-
-    fn set_unknown(&self, unknown: ProcessStreamSinkUnknownOutcome) {
-        self.lock().unknown = Some(unknown);
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, OracleState> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-fn ready<T: Send + 'static>(
-    result: Result<T, ProcessStreamSinkError>,
-) -> ProcessStreamSinkFuture<'static, T> {
-    Box::pin(async move { result })
-}
-
-impl ProcessStreamSinkClient for OracleFake {
-    fn open(
-        &self,
-        request: ProcessStreamSinkOpenRequest,
-    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkSession> {
-        let mut state = self.lock();
-        let result = match state.session.as_ref() {
-            Some(session) if session.open_request_sha256() == request.open_request_sha256() => {
-                Ok(session.clone())
-            }
-            Some(_) => Err(ProcessStreamSinkError::OpenDigestMismatch),
-            None => ProcessStreamSinkSession::from_open_request(request).inspect(|session| {
-                state.session = Some(session.clone());
-            }),
-        };
-        ready(result)
-    }
-
-    fn append(
-        &self,
-        _session: ProcessStreamSinkSession,
-        _request: ProcessStreamSinkAppend,
-    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkAppendDisposition> {
-        ready(Err(ProcessStreamSinkError::ProviderUnavailable))
-    }
-
-    fn finalize(
-        &self,
-        session: ProcessStreamSinkSession,
-        request: ProcessStreamSinkFinalizeRequest,
-    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkTerminal> {
-        let mut state = self.lock();
-        let result = state
-            .session
-            .clone()
-            .ok_or(ProcessStreamSinkError::ProviderUnavailable)
-            .and_then(|existing| {
-                if existing != session {
-                    return Err(ProcessStreamSinkError::SessionMismatch);
-                }
-                if state.unknown.is_some() {
-                    return Err(ProcessStreamSinkError::ProviderUnavailable);
-                }
-                if let Some(terminal) = &state.terminal {
-                    return if terminal.command_identity() == &request.command_identity()? {
-                        Ok(terminal.clone())
-                    } else {
-                        Err(ProcessStreamSinkError::TerminalIdentityConflict)
-                    };
-                }
-                let terminal = empty_terminal(session, request).map_err(|_| {
-                    ProcessStreamSinkError::InvalidRequest {
-                        reason: "oracle fake evidence",
-                    }
-                })?;
-                state.terminal = Some(terminal.clone());
-                Ok(terminal)
-            });
-        ready(result)
-    }
-
-    fn abort(
-        &self,
-        session: ProcessStreamSinkSession,
-        request: ProcessStreamSinkAbortRequest,
-    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkTerminal> {
-        let mut state = self.lock();
-        let result = state
-            .session
-            .clone()
-            .ok_or(ProcessStreamSinkError::ProviderUnavailable)
-            .and_then(|existing| {
-                if existing != session {
-                    return Err(ProcessStreamSinkError::SessionMismatch);
-                }
-                if state.unknown.is_some() {
-                    return Err(ProcessStreamSinkError::ProviderUnavailable);
-                }
-                if let Some(terminal) = &state.terminal {
-                    return if terminal.command_identity() == &request.command_identity()? {
-                        Ok(terminal.clone())
-                    } else {
-                        Err(ProcessStreamSinkError::TerminalIdentityConflict)
-                    };
-                }
-                let terminal = ProcessStreamSinkTerminal::from_abort(
-                    session,
-                    request,
-                    ProcessStreamSinkState::Cancelled,
-                    0,
-                    0,
-                    sha256_hex(&[]),
-                    ProcessStreamEvidence::new_raw(
-                        binding().map_err(|_| ProcessStreamSinkError::InvalidRequest {
-                            reason: "oracle fake binding",
-                        })?,
-                        ProcessStreamKind::Stdout,
-                        policy().map_err(|_| ProcessStreamSinkError::InvalidRequest {
-                            reason: "oracle fake policy",
-                        })?,
-                        StreamTransportStatus::CancelledBeforeEof,
-                        StreamPersistenceStatus::SourceUnavailable,
-                        sha256_hex(&[]),
-                        0,
-                        ProcessStreamPrefixPreview::from_transport_prefix(Vec::new(), 0)?,
-                        None,
-                        vec![
-                            StreamEvidenceGap::PersistenceUnavailable,
-                            StreamEvidenceGap::CancelledBeforeEof,
-                        ],
-                    )?,
-                )?;
-                state.terminal = Some(terminal.clone());
-                Ok(terminal)
-            });
-        ready(result)
-    }
-
-    fn readback(
-        &self,
-        _session: ProcessStreamSinkSession,
-    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkReadback> {
-        let state = self.lock();
-        if let Some(unknown) = &state.unknown {
-            return ready(Ok(ProcessStreamSinkReadback::UnknownOutcome {
-                outcome: unknown.clone(),
-            }));
-        }
-        if let Some(terminal) = &state.terminal {
-            return ready(Ok(ProcessStreamSinkReadback::Terminal {
-                terminal: terminal.clone(),
-            }));
-        }
-        ready(Err(ProcessStreamSinkError::ProviderUnavailable))
-    }
+    accepts(Arc::new(ProcessStreamSinkModel::new()));
 }

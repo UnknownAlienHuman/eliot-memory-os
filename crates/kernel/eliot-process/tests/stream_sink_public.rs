@@ -8,6 +8,7 @@ use eliot_process::{
     ProcessStreamSinkSession, ProcessStreamSinkSessionId, ProcessStreamSinkSourceId,
     ProcessStreamSinkTerminal, ProcessStreamSinkTerminalCommandIdentity,
     ProcessStreamSinkTerminalCommandKind, ProcessStreamSinkTerminalId,
+    ProcessStreamSinkUnknownOutcome,
 };
 
 fn accepts_object_safe_client(_: Arc<dyn ProcessStreamSinkClient>) {}
@@ -73,6 +74,14 @@ impl ProcessStreamSinkClient for NoopClient {
     fn readback(
         &self,
         _session: ProcessStreamSinkSession,
+    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkReadback> {
+        Box::pin(async { Err(ProcessStreamSinkError::ProviderUnavailable) })
+    }
+
+    fn reconcile(
+        &self,
+        _session: ProcessStreamSinkSession,
+        _outcome: ProcessStreamSinkUnknownOutcome,
     ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkReadback> {
         Box::pin(async { Err(ProcessStreamSinkError::ProviderUnavailable) })
     }
