@@ -29,8 +29,6 @@ use eliot_protocol::{
     ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
     ProtocolVersion, ServerHello,
 };
-#[cfg(test)]
-use eliot_store_api::StoreGenesisRequest;
 use eliot_store_api::{
     CAPABILITIES, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, NamedReadRequest,
     NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
@@ -39,6 +37,11 @@ use eliot_store_api::{
 };
 pub use eliot_store_api::{
     ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
+};
+#[cfg(test)]
+use eliot_store_api::{
+    StoreFailureDisposition, StoreFailureIdentityContext, StoreGenesisRequest,
+    StoreMutationDisposition, StoreRecoveryAction, StoreRetryDirective,
 };
 #[cfg(test)]
 use eliot_store_surreal_adapter::SchemaGeneration;
@@ -69,13 +72,11 @@ pub use schema_bootstrap_contract::{
 };
 mod request_dispatch;
 pub use request_dispatch::StoreDispatchBackend;
-#[cfg(test)]
-use request_dispatch::UNKNOWN_GENESIS_REASON;
 pub use request_dispatch::dispatch;
 #[cfg(test)]
-use request_dispatch::map_genesis_dispatch_result;
-#[cfg(test)]
 use request_dispatch::map_recovery_dispatch_result;
+#[cfg(test)]
+use request_dispatch::{map_composition_error, map_genesis_dispatch_result};
 mod adapter_materialization;
 pub use adapter_materialization::materialize_adapter_config;
 use adapter_materialization::resolve_credential;
@@ -648,7 +649,8 @@ pub fn validate_request_frame(
 mod tests {
     use super::*;
     use eliot_contracts::{
-        ArtifactId, AuthorityEpoch, ClockReading, ContractId, ContractVersion, ResourceGeneration,
+        ArtifactId, AuthorityEpoch, ClockReading, ContractId, ContractVersion, ProductId,
+        RequestId, ResourceGeneration, SourceId,
     };
     use eliot_installation::{InstallationEpoch, RuntimeStateRoots};
     use eliot_runtime_contracts::{
@@ -657,6 +659,18 @@ mod tests {
 
     fn handle(value: impl Into<String>) -> PlatformHandle {
         PlatformHandle::new(value).expect("valid test handle")
+    }
+
+    fn request_meta(state_fence: StateFence) -> RequestMeta {
+        RequestMeta {
+            request_id: RequestId::new("request-dispatch").expect("request id"),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("product-dispatch").expect("product id"),
+            source_id: SourceId::new("source-dispatch").expect("source id"),
+            state_fence,
+            clock: ClockReading::default(),
+        }
     }
 
     fn runtime_state_roots() -> RuntimeStateRoots {
@@ -1161,12 +1175,32 @@ mod tests {
 
     #[test]
     fn recovery_dispatch_default_unavailable_is_error() {
+        let request = eliot_store_api::StoreRecoveryRequest {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            records: Vec::new(),
+            include_receipts: false,
+            include_jobs: false,
+        };
+        let Response::Failure { failure } =
+            map_recovery_dispatch_result(&request, Err(StoreError::Unavailable))
+        else {
+            panic!("unavailable recovery must use typed failure");
+        };
+        assert_eq!(failure.disposition, StoreFailureDisposition::Unavailable);
         assert_eq!(
-            map_recovery_dispatch_result(Err(StoreError::Unavailable)),
-            Response::Error {
-                error: "store unavailable".to_owned(),
-            }
+            failure.mutation_disposition,
+            StoreMutationDisposition::NotAttempted
         );
+        assert_eq!(
+            failure.retry_directive,
+            StoreRetryDirective::RetrySameIdentityAfterBackoff
+        );
+        assert_eq!(
+            failure.recovery_action,
+            StoreRecoveryAction::RestoreStoreConnectivity
+        );
+        failure.validate().expect("typed failure validates");
     }
 
     #[test]
@@ -1179,12 +1213,18 @@ mod tests {
             state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
             owner_records: Vec::new(),
         };
+        let context = request_meta(request.state_fence.clone());
+        let Response::Failure { failure } =
+            map_genesis_dispatch_result(&context, &request, Err(StoreError::Unavailable))
+        else {
+            panic!("unavailable genesis must use typed failure");
+        };
         assert_eq!(
-            map_genesis_dispatch_result(request, Err(StoreError::Unavailable)),
-            Response::Error {
-                error: "store unavailable".to_owned(),
-            }
+            failure.operation_id,
+            Some(OperationId::new("genesis-dispatch").expect("operation id"))
         );
+        assert_eq!(failure.disposition, StoreFailureDisposition::Unavailable);
+        failure.validate().expect("typed failure validates");
     }
 
     #[test]
@@ -1209,14 +1249,29 @@ mod tests {
             state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
             owner_records: Vec::new(),
         };
+        let context = request_meta(request.state_fence.clone());
+        let Response::Failure { failure } = map_genesis_dispatch_result(
+            &context,
+            &request,
+            Err(StoreError::MissingReceiptEnvelope),
+        ) else {
+            panic!("missing receipt envelope must use typed unknown failure");
+        };
+        assert_eq!(failure.operation_id, Some(operation_id));
+        assert_eq!(failure.disposition, StoreFailureDisposition::UnknownOutcome);
         assert_eq!(
-            map_genesis_dispatch_result(request, Err(StoreError::MissingReceiptEnvelope)),
-            Response::Unknown {
-                operation_id,
-                reason: UNKNOWN_GENESIS_REASON.to_owned(),
-            }
+            failure.mutation_disposition,
+            StoreMutationDisposition::Unknown
         );
-        assert!(UNKNOWN_GENESIS_REASON.len() <= 256);
+        assert_eq!(
+            failure.retry_directive,
+            StoreRetryDirective::ReconcileExactOperation
+        );
+        assert_eq!(
+            failure.recovery_action,
+            StoreRecoveryAction::ReconcileUnknownOutcome
+        );
+        failure.validate().expect("typed unknown failure validates");
     }
 
     #[test]
@@ -1229,6 +1284,28 @@ mod tests {
             StoreCompositionError::UnknownOutcome { operation_id, .. }
                 if operation_id.as_str() == "operation-test"
         ));
+    }
+
+    #[test]
+    fn unknown_provider_dispatch_emits_typed_failure_for_admitted_operation() {
+        let admitted_operation = OperationId::new("admitted-operation").expect("operation id");
+        let response = map_composition_error(
+            StoreCompositionError::UnknownOutcome {
+                operation_id: OperationId::new("provider-operation").expect("operation id"),
+                reason: "provider wording is not authoritative".to_owned(),
+            },
+            StoreFailureIdentityContext {
+                operation_id: Some(admitted_operation.clone()),
+                ..StoreFailureIdentityContext::default()
+            },
+        );
+        let Response::Failure { failure } = response else {
+            panic!("provider uncertainty must use typed failure");
+        };
+        assert_eq!(failure.operation_id, Some(admitted_operation));
+        assert_eq!(failure.disposition, StoreFailureDisposition::UnknownOutcome);
+        assert_eq!(failure.reason_code.as_str(), "PROVIDER_OUTCOME_UNKNOWN");
+        failure.validate().expect("typed unknown failure validates");
     }
 
     #[test]

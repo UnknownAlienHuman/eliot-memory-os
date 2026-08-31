@@ -14,8 +14,12 @@
 //! responsible for handshake, replay, fence and capability validation).
 
 use eliot_store_api::CanonicalStoreClient;
+use eliot_store_api::RequestMeta;
 use eliot_store_api::StoreError;
+use eliot_store_api::StoreFailure;
+use eliot_store_api::StoreFailureIdentityContext;
 use eliot_store_api::StoreGenesisRequest;
+use eliot_store_api::StoreRecoveryRequest;
 use eliot_store_api::StoreRecoverySnapshot;
 use eliot_store_api::WriteReceipt;
 
@@ -24,33 +28,83 @@ use crate::Response;
 use crate::StoreComposition;
 use crate::StoreCompositionError;
 
-pub(crate) const UNKNOWN_GENESIS_REASON: &str =
-    "genesis receipt envelope is missing; reconcile by exact operation identity";
-
-pub(crate) fn map_recovery_dispatch_result(
-    result: Result<StoreRecoverySnapshot, StoreError>,
-) -> Response {
-    match result {
-        Ok(snapshot) => Response::Recovery { snapshot },
+fn map_store_error(error: StoreError, context: StoreFailureIdentityContext) -> Response {
+    match StoreFailure::from_store_error(error, context) {
+        Ok(failure) => Response::Failure { failure },
         Err(error) => Response::Error {
-            error: error.to_string(),
+            error: format!("store failure contract mapping failed: {error}"),
         },
     }
 }
 
-pub(crate) fn map_genesis_dispatch_result(
-    request: StoreGenesisRequest,
-    result: Result<WriteReceipt, StoreError>,
+pub(crate) fn map_composition_error(
+    error: StoreCompositionError,
+    context: StoreFailureIdentityContext,
+) -> Response {
+    match error {
+        StoreCompositionError::Store(error) => map_store_error(error, context),
+        // The provider-reported identity is diagnostic only. The admitted
+        // transition identity in `context` is the sole reconciliation key.
+        StoreCompositionError::UnknownOutcome { .. } => {
+            match StoreFailure::from_provider_unknown_outcome(&context) {
+                Ok(failure) => Response::Failure { failure },
+                Err(error) => Response::Error {
+                    error: format!("store failure contract mapping failed: {error}"),
+                },
+            }
+        }
+    }
+}
+
+fn failure_context_for_fence(
+    state_fence: eliot_contracts::StateFence,
+) -> StoreFailureIdentityContext {
+    StoreFailureIdentityContext {
+        state_fence_ref_or_exact_safe_projection: Some(state_fence),
+        ..StoreFailureIdentityContext::default()
+    }
+}
+
+fn failure_context_for_operation(
+    context: &eliot_store_api::RequestMeta,
+    operation_id: eliot_store_api::OperationId,
+    idempotency_key: String,
+) -> StoreFailureIdentityContext {
+    StoreFailureIdentityContext {
+        request_id: Some(context.request_id.clone()),
+        operation_id: Some(operation_id),
+        idempotency_key_ref_or_digest: Some(idempotency_key),
+        state_fence_ref_or_exact_safe_projection: Some(context.state_fence.clone()),
+        ..StoreFailureIdentityContext::default()
+    }
+}
+
+pub(crate) fn map_recovery_dispatch_result(
+    request: &StoreRecoveryRequest,
+    result: Result<StoreRecoverySnapshot, StoreError>,
 ) -> Response {
     match result {
+        Ok(snapshot) => Response::Recovery { snapshot },
+        Err(error) => map_store_error(
+            error,
+            failure_context_for_fence(request.state_fence.clone()),
+        ),
+    }
+}
+
+pub(crate) fn map_genesis_dispatch_result(
+    context: &RequestMeta,
+    request: &StoreGenesisRequest,
+    result: Result<WriteReceipt, StoreError>,
+) -> Response {
+    let failure_context = failure_context_for_operation(
+        context,
+        request.operation_id.clone(),
+        request.idempotency_key.clone(),
+    );
+    match result {
         Ok(receipt) => Response::Genesis { receipt },
-        Err(StoreError::MissingReceiptEnvelope) => Response::Unknown {
-            operation_id: request.operation_id,
-            reason: UNKNOWN_GENESIS_REASON.to_owned(),
-        },
-        Err(error) => Response::Error {
-            error: error.to_string(),
-        },
+        Err(error) => map_store_error(error, failure_context),
     }
 }
 
@@ -68,75 +122,69 @@ impl StoreDispatchBackend for StoreComposition {
         match request {
             Request::Health => match self.health().await {
                 Ok(record) => Response::Health { record },
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
+                Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
             },
             Request::Readiness => match self.readiness().await {
                 Ok(receipt) => Response::Readiness { receipt },
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
+                Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
             },
-            Request::Named { request } => match self.named(request).await {
-                Ok(response) => Response::Named { response },
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
-            },
+            Request::Named { request } => {
+                let context = failure_context_for_fence(request.state_fence.clone());
+                match self.named(request).await {
+                    Ok(response) => Response::Named { response },
+                    Err(error) => map_store_error(error, context),
+                }
+            }
             Request::Apply {
                 context,
                 transition,
                 expected_revision_heads,
                 expected_ordering_heads,
-            } => match self
-                .apply(
+            } => {
+                let failure_context = failure_context_for_operation(
                     &context,
-                    transition,
-                    expected_revision_heads,
-                    expected_ordering_heads,
-                )
-                .await
-            {
-                Ok(receipt) => Response::from_transaction_receipt(receipt),
-                Err(StoreCompositionError::UnknownOutcome {
-                    operation_id,
-                    reason,
-                }) => Response::Unknown {
-                    operation_id,
-                    reason,
-                },
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
-            },
-            Request::Receipt { operation_id } => match self.receipt(operation_id).await {
-                Ok(receipt) => Response::from_receipt(receipt),
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
-            },
+                    transition.identity.operation_id.clone(),
+                    transition.identity.idempotency_key.clone(),
+                );
+                match self
+                    .apply(
+                        &context,
+                        transition,
+                        expected_revision_heads,
+                        expected_ordering_heads,
+                    )
+                    .await
+                {
+                    Ok(receipt) => Response::from_transaction_receipt(receipt),
+                    Err(error) => map_composition_error(error, failure_context),
+                }
+            }
+            Request::Receipt { operation_id } => {
+                let context = StoreFailureIdentityContext {
+                    operation_id: Some(operation_id.clone()),
+                    ..StoreFailureIdentityContext::default()
+                };
+                match self.receipt(operation_id).await {
+                    Ok(receipt) => Response::from_receipt(receipt),
+                    Err(error) => map_store_error(error, context),
+                }
+            }
             Request::RevisionHeads { keys } => match self.revision_heads(keys).await {
                 Ok(heads) => Response::RevisionHeads { heads },
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
+                Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
             },
             Request::OrderingHeads { scopes } => match self.ordering_heads(scopes).await {
                 Ok(heads) => Response::OrderingHeads { heads },
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
+                Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
             },
             Request::ValidationSnapshot => match self.validation_snapshot().await {
                 Ok(snapshot) => Response::ValidationSnapshot { snapshot },
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
+                Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
             },
-            Request::Recovery { request } => map_recovery_dispatch_result(
-                CanonicalStoreClient::recovery(&self.store, request).await,
-            ),
+            Request::Recovery { request } => {
+                let result = CanonicalStoreClient::recovery(&self.store, request.clone()).await;
+                map_recovery_dispatch_result(&request, result)
+            }
             Request::InitializeGenesis { context, request } => {
                 let result = CanonicalStoreClient::initialize_genesis(
                     &self.store,
@@ -144,7 +192,7 @@ impl StoreDispatchBackend for StoreComposition {
                     request.clone(),
                 )
                 .await;
-                map_genesis_dispatch_result(request, result)
+                map_genesis_dispatch_result(&context, &request, result)
             }
         }
     }
