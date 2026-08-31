@@ -409,19 +409,59 @@ pub struct CodexWireMessage {
     pub error: Option<Value>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexWireClass {
+    Request,
+    Notification,
+    SuccessResponse,
+    ErrorResponse,
+}
+
+fn validate_wire_label(
+    value: Option<&str>,
+    invalid_field: &'static str,
+) -> Result<(), CodexAdapterError> {
+    if value.is_some_and(|value| {
+        value.is_empty() || value.trim() != value || value.chars().any(char::is_control)
+    }) {
+        return Err(CodexAdapterError::MalformedWire(invalid_field));
+    }
+    Ok(())
+}
+
 impl CodexWireMessage {
+    fn classify(&self) -> Result<CodexWireClass, CodexAdapterError> {
+        validate_wire_label(self.method.as_deref(), "invalid method")?;
+        validate_wire_label(self.message_type.as_deref(), "invalid type")?;
+
+        let has_id = self.id.is_some();
+        let has_method = self.method.is_some();
+        let has_params = self.params.is_some();
+        let has_result = self.result.is_some();
+        let has_error = self.error.is_some();
+
+        if has_result && has_error {
+            return Err(CodexAdapterError::AmbiguousResponse);
+        }
+
+        match (has_id, has_method, has_params, has_result, has_error) {
+            (true, true, _, false, false) => Ok(CodexWireClass::Request),
+            (false, true, _, false, false) => Ok(CodexWireClass::Notification),
+            (true, false, false, true, false) => Ok(CodexWireClass::SuccessResponse),
+            (true, false, false, false, true) => Ok(CodexWireClass::ErrorResponse),
+            _ => Err(CodexAdapterError::MalformedWire(
+                "ambiguous request/notification/response envelope",
+            )),
+        }
+    }
+
     pub fn parse_line(line: &[u8]) -> Result<Self, CodexAdapterError> {
         if line.len() > MAX_JSONL_LINE_BYTES {
             return Err(CodexAdapterError::WireTooLarge);
         }
         let message: Self = serde_json::from_slice(line)
             .map_err(|_| CodexAdapterError::MalformedWire("invalid JSON object"))?;
-        if message.id.is_none() && message.method.is_none() {
-            return Err(CodexAdapterError::MalformedWire("missing id/method"));
-        }
-        if message.result.is_some() && message.error.is_some() {
-            return Err(CodexAdapterError::AmbiguousResponse);
-        }
+        message.classify()?;
         Ok(message)
     }
 
@@ -518,19 +558,33 @@ pub fn correlate_response<'a>(
     message: &'a CodexWireMessage,
     request_id: &str,
 ) -> Result<&'a Value, CodexAdapterError> {
+    let class = message.classify()?;
+    if !matches!(
+        class,
+        CodexWireClass::SuccessResponse | CodexWireClass::ErrorResponse
+    ) {
+        return Err(CodexAdapterError::MalformedWire(
+            "expected a response envelope",
+        ));
+    }
+
     let actual = message.id.as_ref().and_then(Value::as_str);
     if actual != Some(request_id) {
         return Err(CodexAdapterError::ResponseCorrelation {
             expected: request_id.into(),
         });
     }
-    message.result.as_ref().ok_or_else(|| {
-        if message.error.is_some() {
-            CodexAdapterError::MalformedWire("provider returned an error")
-        } else {
-            CodexAdapterError::MissingResult
+
+    match class {
+        CodexWireClass::SuccessResponse => message
+            .result
+            .as_ref()
+            .ok_or(CodexAdapterError::MissingResult),
+        CodexWireClass::ErrorResponse => {
+            Err(CodexAdapterError::MalformedWire("provider returned an error"))
         }
-    })
+        CodexWireClass::Request | CodexWireClass::Notification => unreachable!(),
+    }
 }
 
 fn event_kind(method: &str) -> HostEventKind {
@@ -1114,11 +1168,56 @@ mod tests {
     fn malformed_and_ambiguous_wire_are_rejected() -> TestResult {
         assert!(CodexWireMessage::parse_line(br#"{"id":"1","result":{},"error":{}}"#).is_err());
         assert!(CodexWireMessage::parse_line(br"[]").is_err());
+        assert!(
+            CodexWireMessage::parse_line(
+                br#"{"id":"1","method":"model/list","params":{},"result":{}}"#
+            )
+            .is_err()
+        );
+        assert!(CodexWireMessage::parse_line(br#"{"id":"1","result":{},"params":{}}"#).is_err());
+        assert!(CodexWireMessage::parse_line(br#"{"method":" model/list","params":{}}"#).is_err());
+
         let message = CodexWireMessage::parse_line(br#"{"id":"other","result":{}}"#)?;
         assert!(matches!(
             correlate_response(&message, "1"),
             Err(CodexAdapterError::ResponseCorrelation { .. })
         ));
+
+        let mixed = CodexWireMessage {
+            id: Some(Value::String("1".into())),
+            message_type: None,
+            method: Some("model/list".into()),
+            params: Some(Value::Object(Map::new())),
+            result: Some(Value::Object(Map::new())),
+            error: None,
+        };
+        assert!(correlate_response(&mixed, "1").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn bidirectional_requests_notifications_and_responses_remain_distinct() -> TestResult {
+        let request = CodexWireMessage::parse_line(
+            br#"{"id":"server-1","method":"server/request","params":{"ok":true}}"#,
+        )?;
+        assert!(correlate_response(&request, "server-1").is_err());
+
+        let notification = CodexWireMessage::parse_line(
+            br#"{"method":"server/notification","params":{"ok":true}}"#,
+        )?;
+        assert!(correlate_response(&notification, "server-1").is_err());
+
+        let success =
+            CodexWireMessage::parse_line(br#"{"id":"server-1","result":{"ok":true}}"#)?;
+        assert_eq!(correlate_response(&success, "server-1")?["ok"], true);
+
+        let error = CodexWireMessage::parse_line(
+            br#"{"id":"server-1","error":{"message":"secret-provider-detail"}}"#,
+        )?;
+        let public_error = correlate_response(&error, "server-1")
+            .expect_err("provider error responses are never successful results")
+            .to_string();
+        assert!(!public_error.contains("secret-provider-detail"));
         Ok(())
     }
 
