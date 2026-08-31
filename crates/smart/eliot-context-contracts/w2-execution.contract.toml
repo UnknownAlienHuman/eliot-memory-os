@@ -1,0 +1,106 @@
+schema_version = 1
+contract_id = "smart.context.w2-execution.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-context-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.context.contribution_merge", "smart.context.admission", "smart.context.assembly", "smart.context.quality", "smart.context.decision_tail", "smart.context.reactive_delivery_plan"]
+architecture_refs = ["ARCH-CTX-01", "ARCH-CTX-02", "ARCH-CTX-03", "ARCH-CTX-04", "ARCH-EPI-04", "ARCH-MEM-04", "ARCH-HELP-01", "ARCH-MOD-03"]
+implementation_refs = ["I2.15", "I2.20", "I7.10", "I7.11", "I7.16", "I7.19", "I12.13", "I12.14", "I12.31"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Bind one Context compilation to an exact provider denominator, recipe, route, scope, State Fence and bounded whole-unit workset while separating compiler bounds from Decision Tail bounds and preserving plan-versus-delivery semantics."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O(request fields log fields) validation; Context merge/admission/render/quality/tail/plan implementations remain bounded and perform no provider acquisition, storage scan, model call, tokenizer call, host mutation or delivery."
+replacement_boundary = "Replace Context compilation algorithms behind the existing compiler contracts and these request/limit types; Governor owns recipe/admission policy and external host/session owners own delivery and receipts."
+
+[hard_invariants]
+request_embeds_exact_expected_provider_set = true
+request_recipe_route_scope_task_and_fence_are_exact = true
+compilation_limits_and_tail_limits_are_distinct = true
+all_limits_are_positive_and_request_bounded = true
+merge_never_fetches_missing_providers = true
+whole_units_only = true
+safety_floor_and_downstream_headroom_precede_optional_allocation = true
+optional_allocation_is_provider_fair_and_deterministic = true
+unknown_decision_delta_is_not_zero = true
+assembly_and_quality_cannot_change_admitted_membership = true
+decision_tail_cannot_invent_action_authority_or_verifier = true
+reactive_plan_is_not_delivery_acknowledgement_use_or_prevention_receipt = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "RequestId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "TaskId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "StateFence"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "ExpectedContextProviderSet"
+owner = "eliot-context-contracts/provider-contribution.contract.toml"
+
+[[external_type]]
+name = "ContextImpactClass"
+owner = "eliot-context-contracts/context-compiler.contract.toml"
+
+[[public_type]]
+name = "ContextCompilationLimits"
+kind = "struct"
+definition = ["maximum_provider_contributions: u32", "maximum_atoms_per_contribution: u32", "maximum_total_atoms: u32", "maximum_source_handles_per_atom: u32", "maximum_candidate_bytes: u32", "maximum_conflict_candidates: u32", "maximum_omissions: u32", "maximum_trace_entries: u32"]
+invariants = ["all bounds positive", "per-provider and total bounds internally consistent", "limits cannot authorize omission of required/protected Safety Floor material", "limits are request policy not product proof"]
+
+[[public_type]]
+name = "ContextCompilationRequest"
+kind = "struct"
+definition = ["request_id: RequestId", "scope_id: String", "task_id: Option<TaskId>", "route_fingerprint: String", "impact_class: ContextImpactClass", "state_fence: StateFence", "expected_providers: ExpectedContextProviderSet", "recipe_ref: ArtifactId", "recipe_sha256: String", "limits: ContextCompilationLimits", "request_sha256: String"]
+invariants = ["scope/task/route/fence exact", "expected-provider set scope/fence match request", "recipe identity exact", "bounds positive", "request grants no provider acquisition, Context admission, delivery, authority or finish", "canonical order and digest"]
+
+[[public_type]]
+name = "DecisionTailLimits"
+kind = "struct"
+definition = ["maximum_tail_atoms: u32", "maximum_tail_bytes: u32", "maximum_expansion_handles: u32", "maximum_active_directives: u32", "maximum_do_not_use_or_revalidate_refs: u32"]
+invariants = ["all bounds positive", "limits cannot remove required goal/acceptance/scope/fence/evidence/unknown/directive/action/observable/verifier/stop material", "limits do not grant action authority"]
+
+[[public_function]]
+name = "validate_context_compilation_limits"
+signature = "pub fn validate_context_compilation_limits(limits: &ContextCompilationLimits) -> Result<(), ContextContractError>"
+
+[[public_function]]
+name = "validate_context_compilation_request"
+signature = "pub fn validate_context_compilation_request(request: &ContextCompilationRequest) -> Result<(), ContextContractError>"
+
+[[public_function]]
+name = "validate_decision_tail_limits"
+signature = "pub fn validate_decision_tail_limits(limits: &DecisionTailLimits) -> Result<(), ContextContractError>"
+
+[[negative_test]]
+id = "missing-provider-set-rejected"
+property = "Context compilation without an exact expected-provider denominator is rejected before merge."
+
+[[negative_test]]
+id = "compiler-tail-limits-not-interchangeable"
+property = "ContextCompilationLimits and DecisionTailLimits are distinct types and cannot substitute for one another."
+
+[[negative_test]]
+id = "zero-or-inconsistent-bounds-rejected"
+property = "Zero bounds or per-provider bounds exceeding total bounds are rejected."
+
+[[negative_test]]
+id = "request-not-acquisition"
+property = "ContextCompilationRequest exposes no provider call, storage query, model route, delivery, authority or finish field."
