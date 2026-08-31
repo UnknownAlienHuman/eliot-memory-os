@@ -1,0 +1,54 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "CURRENT_W2_CONTRACT_COMPOSITION"
+issue = 341
+parent_pr = 338
+parent_head = "17277887f33418df5f4aa7ba6bae04cc9b195d2a"
+proof_ceiling = "STATIC_W2_FIELD_REFINEMENT_AND_AGENT_WORK_UNIT_DESIGN_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+rule = "The current cognitive contract authority is the deterministic composition of the accepted 21-contract W0/W1/W8/W9 base index and the two owner-local W2 execution extensions. Composition imports contracts; it never redefines their public fields."
+
+[field_contracts]
+base_index = "crates/smart/cognitive-rev12-all-field-contracts.toml"
+base_contract_count = 21
+extension_indexes = ["crates/smart/cognitive-rev12-w2-field-contracts.toml"]
+extension_contract_count = 2
+effective_contract_count = 23
+extension_contract_ids = ["smart.cue.w2-execution.v1", "smart.context.w2-execution.v1"]
+
+[public_type_ownership]
+base_allowlist = "crates/smart/cognitive-rev12-all-type-ownership.toml"
+extension_allowlists = ["crates/smart/cognitive-rev12-w2-type-ownership.toml"]
+rule = "Public type names are unique across the base and every extension. Consumers import existing cue/Context types; the W2 extensions own only RelationSpreadCombinationRule, CueRelationSpreadExecutionPolicy, ContextCompilationLimits, ContextCompilationRequest and DecisionTailLimits."
+
+[validation]
+base_validation = "crates/smart/cognitive-rev12-all-field-validation.toml"
+extension_validations = ["crates/smart/cognitive-rev12-w2-validation.toml"]
+required_combined_gates = ["TOML parse", "contract path/id/owner closure", "cross-index public-type uniqueness", "external-owner resolution", "exact order closure", "pairwise-disjoint worker write scopes", "bounded hot-path semantics", "payload hygiene", "proof ceiling"]
+
+[agent_materialization]
+base_indexes = ["crates/smart/cognitive-rev12-w0-agent-brief-index.toml", "crates/smart/cognitive-rev12-w1-agent-brief-index.toml"]
+w2_index = "crates/smart/cognitive-rev12-w2-agent-brief-index.toml"
+w2_handoff = "crates/smart/cognitive-rev12-w2-agent-handoff.toml"
+w2_orders = [20, 21, 22, 23, 24, 25, 29, 30, 31, 32, 33, 34]
+
+[hard_invariants]
+base_index_is_not_rewritten_by_extension = true
+extension_contracts_define_no_existing_public_type = true
+cue_direct_firing_remains_graph_independent = true
+relation_paths_never_sum = true
+context_compilation_has_exact_provider_denominator = true
+compiler_and_decision_tail_limits_are_distinct = true
+context_merge_never_acquires_provider_data = true
+whole_unit_safety_floor_and_headroom_precede_optional_allocation = true
+reactive_plan_is_not_delivery_use_or_prevention_receipt = true
+contract_presence_is_not_implementation_or_product_proof = true
+
+[forbidden]
+parallel_wire_authority = true
+implicit_extension_loading = true
+count_without_exact_index_membership = true
+stringly_relation_spread_rule = true
+compiler_tail_limit_alias = true
+runtime_or_product_promotion = true
