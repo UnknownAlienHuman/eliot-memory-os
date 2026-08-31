@@ -79,6 +79,23 @@ jobs:
           assert active.get('exception_branch', []) == []
           assert all(w['status'] == 'active' for w in active['workstream'])
           assert all(w['branch_strategy'] == 'fresh_per_issue_from_current_main' for w in active['workstream'])
+          core_daemons = next(w for w in active['workstream'] if w['id'] == 'core-daemons')
+          defect_sets = {
+              'confirmed_open_defect_refs': core_daemons['confirmed_open_defect_refs'],
+              'merged_source_fix_refs': core_daemons['merged_source_fix_refs'],
+              'forbidden_active_defect_refs': core_daemons['forbidden_active_defect_refs'],
+          }
+          for name, refs in defect_sets.items():
+              assert refs == sorted(set(refs)), f'{name} must be sorted and duplicate-free'
+          names = list(defect_sets)
+          for index, name in enumerate(names):
+              for other_name in names[index + 1:]:
+                  assert set(defect_sets[name]).isdisjoint(defect_sets[other_name]), (
+                      f'{name} overlaps {other_name}'
+                  )
+          assert set(core_daemons['forbidden_active_defect_refs']) == {82, 83, 84}
+          assert set(core_daemons['confirmed_open_defect_refs']).isdisjoint({82, 83, 84, 120})
+          assert {75, 76, 120}.issubset(set(core_daemons['merged_source_fix_refs']))
           assert inventory['authority']['branch'] == 'main'
           assert 'legacy' in legacy_app['package']['description'].lower()
           assert 'migration' in legacy_app['package']['description'].lower()
