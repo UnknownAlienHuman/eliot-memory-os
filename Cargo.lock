@@ -1081,6 +1081,7 @@ name = "eliot-engine"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-contracts",
  "eliot-store",
  "eliot-types",
  "eliot-windows-ipc",
