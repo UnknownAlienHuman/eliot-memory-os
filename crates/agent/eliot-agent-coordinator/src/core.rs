@@ -320,6 +320,12 @@ impl AgentCoordinator {
         mut receipt: ProviderAdmissionReceipt,
     ) -> Result<ProviderAdmissionReceipt, CoordinatorError> {
         validate_admission_text(&receipt)?;
+        receipt.admitted_lanes.sort_by(|left, right| {
+            left.work_unit_id
+                .cmp(&right.work_unit_id)
+                .then_with(|| left.role_id.cmp(&right.role_id))
+                .then_with(|| left.attempt_id.cmp(&right.attempt_id))
+        });
         let canonical_receipt = canonical(&receipt)?;
         self.provider.verify(
             ProviderProofKind::Admission,
@@ -328,12 +334,6 @@ impl AgentCoordinator {
             &canonical_receipt,
         )?;
         self.validate_provider_identity(&receipt.provider_identity)?;
-        receipt.admitted_lanes.sort_by(|left, right| {
-            left.work_unit_id
-                .cmp(&right.work_unit_id)
-                .then_with(|| left.role_id.cmp(&right.role_id))
-                .then_with(|| left.attempt_id.cmp(&right.attempt_id))
-        });
         if let Some(existing) = self.admissions.get(&receipt.admission_id) {
             if existing.receipt == receipt {
                 return Ok(existing.receipt.clone());
@@ -1769,3 +1769,6 @@ fn idempotent<T: Clone>(
         Err(CoordinatorError::IdempotencyConflict)
     }
 }
+
+#[cfg(test)]
+mod admission_normalization_tests;
