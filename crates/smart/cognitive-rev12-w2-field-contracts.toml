@@ -1,0 +1,61 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W2_D3B_FIELD_LEVEL_REFINEMENT"
+issue = 341
+parent_pr = 338
+proof_ceiling = "STATIC_W2_FIELD_REFINEMENT_AND_AGENT_WORK_UNIT_DESIGN_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+orders = [20, 21, 22, 23, 24, 25, 29, 30, 31, 32, 33, 34]
+cell_count = 12
+new_contract_count = 2
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+rule = "The two owner-local refinement contracts close W2 execution-policy/request-limit gaps without replacing the existing full cue/context contracts. Briefs own assignments only; Rust, delivery, Edge Proof and Product Pulse remain unproven."
+
+[[contract]]
+id = "smart.cue.w2-execution.v1"
+path = "crates/smart/eliot-cue-contracts/w2-execution.contract.toml"
+owner = "eliot-cue-contracts"
+functional_cells = ["smart.cue.normalizer", "smart.cue.binding", "smart.cue.index", "smart.cue.direct_match", "smart.cue.relation_spread", "smart.cue.activation"]
+primary_orders = [20, 21, 22, 23, 24, 25]
+resolves = ["stringly relation-spread combination rule", "missing explicit direct-hit preservation policy"]
+
+[[contract]]
+id = "smart.context.w2-execution.v1"
+path = "crates/smart/eliot-context-contracts/w2-execution.contract.toml"
+owner = "eliot-context-contracts"
+functional_cells = ["smart.context.contribution_merge", "smart.context.admission", "smart.context.assembly", "smart.context.quality", "smart.context.decision_tail", "smart.context.reactive_delivery_plan"]
+primary_orders = [29, 30, 31, 32, 33, 34]
+resolves = ["missing ContextCompilationRequest", "compiler bounds conflated with Decision Tail bounds", "missing exact expected-provider-set binding at compilation entry"]
+
+[[dependency]]
+provider = "smart.cue.contracts.v1"
+consumer = "smart.cue.w2-execution.v1"
+reason = "W2 execution policy imports CueActivationEdgeType and constrains the existing cue algebra without redefining it."
+
+[[dependency]]
+provider = "smart.context.provider-contribution.v1"
+consumer = "smart.context.w2-execution.v1"
+reason = "Compilation request embeds the exact ExpectedContextProviderSet."
+
+[[dependency]]
+provider = "smart.context.compiler-contracts.v1"
+consumer = "smart.context.w2-execution.v1"
+reason = "W2 execution request imports ContextImpactClass and constrains the existing compiler algebra without redefining it."
+
+[resolved_design_conflicts]
+relation_spread = "CueRelationSpreadExecutionPolicy uses the closed BestSingleAdmissiblePath rule; the legacy string field is not used by W2 workers."
+context_request = "Contribution merge consumes ContextCompilationRequest embedding the exact expected-provider set, recipe identity, route, scope, State Fence and compiler bounds."
+limit_types = "ContextCompilationLimits and DecisionTailLimits are distinct. The legacy tail-shaped ContextLimits is not used by W2 workers."
+
+[still_open]
+challenges = ["real cue-binding and provider adapters", "host delivery edge", "dependency-locked package Module Proof", "real provider-consumer Edge Proof", "D3B_REACTIVE_CONTEXT_PULSE_01", "workspace/runtime admission"]
+not_proven = ["Rust implementation", "package behavior", "host delivery/prevention", "runtime support", "Product/Release acceptance"]
+
+[forbidden]
+parallel_field_definition = true
+stringly_relation_spread_combination = true
+context_limits_type_reuse = true
+provider_acquisition_in_merge = true
+delivery_plan_as_receipt = true
+activation_as_support_or_use = true
