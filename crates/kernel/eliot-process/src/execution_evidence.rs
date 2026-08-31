@@ -120,22 +120,32 @@ impl ProcessEvidence {
         stderr_ref: Option<String>,
         axes: EvidenceAxes,
     ) -> Result<Self, ContractError> {
-        view.validate_internal()?;
-        axes.validate().map_err(|_| ContractError::InvalidValue {
-            field: "evidence_axes",
-            reason: "C0-05 evidence axes are invalid",
-        })?;
+        let value = Self {
+            view,
+            stdout_ref,
+            stderr_ref,
+            axes,
+        };
+        value.validate()?;
         if axes.status != EvidenceStatus::Observed
             || axes.assertability != Assertability::NonAssertableUnverified
         {
             return Err(ContractError::EvidenceAuthorityEscalation);
         }
-        Ok(Self {
-            view,
-            stdout_ref,
-            stderr_ref,
-            axes,
-        })
+        Ok(value)
+    }
+
+    /// Validates the passive evidence structure without promoting or rejecting
+    /// its epistemic status. Persistence owners apply their own status policy.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        self.view.binding.validate()?;
+        self.view.validate_internal()?;
+        self.axes
+            .validate()
+            .map_err(|_| ContractError::InvalidValue {
+                field: "evidence_axes",
+                reason: "C0-05 evidence axes are invalid",
+            })
     }
 
     /// Returns the exact binding through the view.

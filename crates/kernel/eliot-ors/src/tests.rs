@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, sha256_hex};
 use eliot_platform::SecretReference;
 use eliot_receipts::{ReceiptCore, ReceiptEnvelope};
 use eliot_runtime_contracts::{
@@ -1709,6 +1709,47 @@ fn process_evidence_appends_history_idempotently_and_recovers_in_order() -> Test
         store.persist_process_evidence(&escalated),
         Err(OrsError::IntegrityProblem { .. })
     ));
+
+    for (field, value) in [
+        ("process_tree_id", "other-tree"),
+        ("job_id", "other-job"),
+        ("image_id", "other-image"),
+        ("session_id", "other-session"),
+    ] {
+        let mut mismatched = first.clone();
+        match field {
+            "process_tree_id" => mismatched.process_tree_id = OpaqueLabel::new(value)?,
+            "job_id" => mismatched.job_id = OpaqueLabel::new(value)?,
+            "image_id" => mismatched.image_id = OpaqueLabel::new(value)?,
+            "session_id" => mismatched.session_id = OpaqueLabel::new(value)?,
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            store.persist_process_evidence(&mismatched),
+            Err(OrsError::IntegrityProblem { .. })
+        ));
+    }
+
+    let tampered_path = database_path("process-evidence-verified-readback");
+    let tampered_store = RedbRecoveryStore::open(&tampered_path)?;
+    let mut tampered = first.clone();
+    let mut tampered_wire = serde_json::to_value(&tampered.evidence)?;
+    tampered_wire["axes"]["status"] = json!("VERIFIED");
+    tampered.evidence = serde_json::from_value(tampered_wire)?;
+    tampered.evidence_digest = sha256_hex(&serde_json::to_vec(&tampered.evidence)?);
+    let first_key = first.record_key()?;
+    tampered_store.write_process_evidence_raw_for_test(&first_key, &tampered)?;
+    assert!(matches!(
+        tampered_store.load_process_evidence(&operation_id),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
+    drop(tampered_store);
+    let reopened_tampered = RedbRecoveryStore::open(&tampered_path)?;
+    assert!(matches!(
+        reopened_tampered.load_process_evidence(&operation_id),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
+    cleanup(&tampered_path);
 
     drop(store);
     let reopened = RedbRecoveryStore::open(&path)?;

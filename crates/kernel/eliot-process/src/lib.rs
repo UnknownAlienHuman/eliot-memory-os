@@ -3097,6 +3097,22 @@ mod tests {
     }
 
     #[test]
+    fn process_evidence_deserialization_preserves_status_for_ors_policy() -> TestResult {
+        let evidence = ProcessEvidence::new(
+            running_state()?.view(),
+            None,
+            None,
+            EvidenceAxes::observed(),
+        )?;
+        let mut wire = serde_json::to_value(&evidence)?;
+        wire["axes"]["status"] = serde_json::json!("VERIFIED");
+        let restored: ProcessEvidence = serde_json::from_value(wire)?;
+        assert_eq!(restored.axes().status, EvidenceStatus::Verified);
+        assert!(restored.validate().is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn secret_and_duplicate_boundaries_remain_fail_closed() -> TestResult {
         assert!(matches!(
             EnvironmentProjection::new(

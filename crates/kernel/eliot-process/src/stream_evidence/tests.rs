@@ -318,6 +318,39 @@ mod tests {
     }
 
     #[test]
+    fn deserialization_rejects_tampered_transport_preview_at_durable_prefix_length() -> TestResult {
+        let evidence = shorter_partial_source_uses_exact_transport_prefix_identity_fixture()?;
+        let mut wire = serde_json::to_value(evidence)?;
+        wire["preview"]["bytes"] = serde_json::json!([120, 121, 122]);
+        wire["preview"]["sha256"] = serde_json::json!(sha256_hex(b"xyz"));
+        wire["preview"]["retained_bytes"] = serde_json::json!(3);
+        wire["preview"]["omitted_ranges"] = serde_json::json!([{
+            "start": 3,
+            "end_exclusive": 6
+        }]);
+        assert!(serde_json::from_value::<ProcessStreamEvidence>(wire).is_err());
+        Ok(())
+    }
+
+    fn shorter_partial_source_uses_exact_transport_prefix_identity_fixture(
+    ) -> TestResult<ProcessStreamEvidence> {
+        let observed = b"abcdef";
+        Ok(ProcessStreamEvidence::new_raw_with_transport_prefix_identity(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::PartialSource,
+            sha256_hex(observed),
+            6,
+            ProcessStreamPrefixPreview::from_transport_prefix(b"ab".to_vec(), 6)?,
+            Some(exact_source(b"abc")?),
+            Some(prefix_identity(b"abc")?),
+            vec![StreamEvidenceGap::PersistenceFailed],
+        )?)
+    }
+
+    #[test]
     fn shorter_partial_source_requires_identity_and_persistence_gap() -> TestResult {
         let observed = b"abcdef";
         let missing_identity = ProcessStreamEvidence::new_raw(

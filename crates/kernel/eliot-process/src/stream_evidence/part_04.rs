@@ -256,6 +256,15 @@ impl ProcessStreamEvidence {
                         reason: "transport preview must use physical observed-byte coordinates",
                     });
                 }
+                if let Some(prefix) = &self.transport_prefix_identity
+                    && self.preview.retained_bytes == prefix.byte_length
+                    && self.preview.sha256 != prefix.sha256
+                {
+                    return Err(ProcessStreamEvidenceError::Invariant {
+                        field: "preview.sha256",
+                        reason: "transport preview must match the durable transport prefix identity",
+                    });
+                }
                 if !self.preview.is_truncated() && self.preview.sha256 != self.observed_sha256 {
                     return Err(ProcessStreamEvidenceError::Invariant {
                         field: "observed_sha256",

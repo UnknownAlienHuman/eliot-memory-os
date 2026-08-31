@@ -1186,6 +1186,12 @@ impl ProcessEvidenceRecord {
                 reason: "epoch, generation, and observation time must be positive",
             });
         }
+        self.evidence
+            .validate()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "process_evidence",
+                reason: error.to_string(),
+            })?;
         let axes = self.evidence.axes();
         let axes =
             serde_json::to_value(axes).map_err(|error| OrsError::Encoding(error.to_string()))?;
@@ -1208,18 +1214,22 @@ impl ProcessEvidenceRecord {
             record_type: "process_evidence",
             reason: error.to_string(),
         })?;
+        let binding = self.evidence.binding();
         if owner != self.owner
             || self.authority_epoch != self.owner.authority_epoch()
             || self.generation != self.owner.generation().get()
             || self.operation_id.as_str() != self.evidence.operation_id().as_str()
             || self.request_digest != self.evidence.request_digest()
+            || self.process_tree_id.as_str() != binding.process_tree_id().as_str()
+            || self.job_id.as_str() != binding.job_id().as_str()
+            || self.image_id.as_str() != binding.image_id().as_str()
+            || self.session_id.as_str() != binding.session_id().as_str()
         {
             return Err(OrsError::IntegrityProblem {
                 record_type: "process_evidence",
                 reason: "evidence identity does not match its durable projection".to_owned(),
             });
         }
-        let binding = self.evidence.binding();
         let binding_bytes =
             serde_json::to_vec(binding).map_err(|error| OrsError::Encoding(error.to_string()))?;
         let state_fence_bytes = serde_json::to_vec(binding.state_fence())
