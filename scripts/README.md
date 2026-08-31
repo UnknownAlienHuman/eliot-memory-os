@@ -2,147 +2,130 @@
 
 Scripts are narrow wrappers around current source contracts. Their presence does
 not create authority, implementation support, runtime readiness, or Product
-Proof. Start from the owning issue/PR and use the smallest applicable entrypoint.
+Proof. Start from the owning issue/PR, use the smallest applicable entrypoint,
+and preserve the proof ceiling stated below.
 
-Do not select a script because its filename sounds broader or more final. A
-script without a current consumer, owner, proof ceiling, and removal path is
-retired rather than preserved as archaeology.
+A script without a current consumer, owner, failure boundary, proof ceiling, and
+removal path is retired rather than kept as archaeology. Generated reports,
+receipts, bundles, caches, and runtime state are local/CI evidence and are not
+committed as repository authority.
 
-## Repository verification
+## Repository verification and documentation pipeline
 
 | Script | Purpose | Proof ceiling |
 |---|---|---|
-| `verify.ps1` | Current Windows developer verification: normative identity, architecture-boundary audit, nearest-path agent guardrails, runtime-source hygiene, agent-bridge public protocol policy, Cargo metadata, formatting, and workspace check | Source/build candidate only |
-| `verify.sh` | Unix-compatible counterpart for the current bounded source checks | Source/build candidate only |
+| `verify.ps1` | Windows developer verification for documentation, normative identity, architecture boundaries, agent guardrails/routes, source hygiene, protocol policy, Cargo metadata, formatting, and workspace check | Source/build candidate only |
+| `verify.sh` | Unix entrypoint for the same PowerShell-owned bounded verification profile | Source/build candidate only |
 | `verify-normative.ps1` | Recompute canonical Architecture/Implementation digests and pair key; reject predecessor copies | Normative artifact identity only |
 | `verify-normative.sh` | Unix-compatible normative-pair verifier | Normative artifact identity only |
-| `audit-architecture-boundaries.py` | Scan declared core/daemon runtime roots for forbidden dependencies, SurrealDB leakage, untracked direct process launch, and production placeholders | Static source/build architecture evidence only |
-| `verify-agent-guardrails.py` | Require bounded nearest-path owner/proof/stop instructions for core and daemon source subtrees | Routing/control-plane evidence only |
-| `audit-runtime-source-hygiene.py` | Expose unsafe, panic/unwrap/expect, ambient configuration, unbounded-output, blocking-sleep, and source-concentration risks in runtime roots | Static source-quality signals only |
+| `docs_shards.py` | Public documentation front door: generate/check routed instruction surfaces and verify reconstructed shards, Markdown paths, anchors, exclusions, and exact path case | Normative content/layout and Markdown-link integrity only |
+| `docs_shards_core.py` | Byte-preserved sharding/reconstruction implementation called by `docs_shards.py`; not a separate operator entrypoint | Internal documentation implementation |
+| `docs_router.py` | Public router front door: reject unsafe paths, include deletions in changed-path routing, and emit bounded content-addressed route receipts | Documentation routing evidence only |
+| `docs_router_core.py` | Byte-preserved router implementation called by `docs_router.py`; not a separate operator entrypoint | Internal documentation implementation |
+| `docs_read.py` | Verify routed files/fragments by hash and byte count, materialize a bounded bundle, and emit a read receipt | Documentation reading evidence only |
+| `verify-doc-code-conformance.py` | Public conformance front door for reader instructions, workflow claims, retired/nonexistent references, script/binary maps, owner bindings, and documentation-pipeline integrity | Static repository path/inventory/instruction consistency only |
+| `doc_code_conformance_core.py` | Established deterministic DCC-001…DCC-007 implementation called by the public conformance front door | Internal conformance implementation |
+| `audit-architecture-boundaries.py` | Detect forbidden dependencies, SurrealDB leakage, untracked direct process launch, placeholders, and exact tracked debt | Static source/build architecture evidence only |
+| `verify-agent-guardrails.py` | Require bounded nearest-path owner/proof/stop instructions for declared source subtrees | Routing/control-plane evidence only |
+| `audit-runtime-source-hygiene.py` | Expose unsafe, panic/unwrap/expect, ambient configuration, unbounded-output, blocking-sleep, and source-concentration signals | Static source-quality evidence only |
 | `verify-agent-bridge-protocol.py` | Reject raw canonical Frame ingress, host-minted authority fields, validation bypass, correlation loss, and mandatory cancellation prose | Static protocol/source-policy evidence only |
-| `verify-lint-policy.ps1` | Verify the current Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
+| `verify-lint-policy.ps1` | Verify the Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
+| `requirements-verification.txt` | Python dependency manifest for repository verification scripts | Verification dependency manifest |
 
-Normal iteration uses `just quick` or `scripts/verify.ps1`. The manual Source
-Candidate Gate in `.github/workflows/source-candidate.yml` owns the expensive
-workspace check/Clippy/test/build breadth. Neither path proves an installed or
-healthy runtime.
+The three public documentation entrypoints are intentionally small front doors.
+Their `*_core.py` modules retain the established implementations while the front
+doors own security/portability checks and focused negative fixtures. Call the
+public filenames, not the core modules.
 
-### Architecture-boundary audit
-
-Run the deterministic negative fixtures and then the current-tree scan:
-
-```powershell
-python scripts/audit-architecture-boundaries.py --self-test
-python scripts/audit-architecture-boundaries.py
-```
-
-Use `--json-out <path>` only for a current issue/PR or CI artifact. Generated
-audits are not committed as authority. Findings have three distinct meanings:
-
-- `HARD_VIOLATION` — an untracked contradiction; verification fails;
-- `TRACKED_DEBT` — an exact current path with owning issue and removal condition;
-- `AUDIT_SIGNAL` — review evidence such as a large composition root or stale debt entry; it is not conformance or authority.
-
-The policy is `config/architecture-boundaries.toml`. An exception must name one
-exact path/package, issue, reason, and removal condition. Wildcards and unnamed
-legacy allowances are rejected. A clean audit does not prove runtime behavior,
-process containment, store correctness, or Product acceptance.
-
-### Nearest-path agent guardrails
+Run the documentation checks locally from the exact candidate checkout:
 
 ```powershell
-python scripts/verify-agent-guardrails.py --self-test
-python scripts/verify-agent-guardrails.py
+python -m py_compile scripts/docs_shards.py scripts/docs_shards_core.py scripts/docs_router.py scripts/docs_router_core.py scripts/docs_read.py scripts/verify-doc-code-conformance.py scripts/doc_code_conformance_core.py
+python scripts/docs_shards.py self-test
+python scripts/docs_shards.py verify --root .
+python scripts/docs_router.py self-test
+python scripts/docs_router.py check --root .
+python scripts/docs_read.py self-test
+python scripts/verify-doc-code-conformance.py --self-test
+python scripts/verify-doc-code-conformance.py --root . --json-out .eliot/doc-code-conformance.json
 ```
 
-The verifier requires the routing files at `bins/AGENTS.md` and the declared
-Governor, Instrument, Kernel, Meta, Module, Research, Storage, Supervision, and
-Surface subtrees. Each file must remain bounded, name current owner issues,
-require current-`main` issue/branch/PR/write-scope discipline, state authority
-and canonical-write limits, and expose a proof plus stop condition.
+Issue #291 owns the conformance gate. Its policy is
+`config/doc-code-conformance.toml`; findings fail nonzero:
 
-These files narrow work; they cannot grant authority beyond the root
-instructions, owning issue, or normative pair. A clean result proves only that
-the expected routing surfaces exist and contain the required boundaries. It
-does not prove the implementation follows them.
+- `DCC-001` — verified-reader contract drift across instruction/generator surfaces;
+- `DCC-002` — workflow documentation differs from actual trigger source;
+- `DCC-003` — retired or unstable documentation authority references;
+- `DCC-004` — maintained top-level script missing from this map;
+- `DCC-005` — root Cargo `bins/*` composition package missing from `PROJECT_MAP`;
+- `DCC-006` — stale current-owner/work reference;
+- `DCC-007` — missing/wrong-case `docs/...` path or unknown normative handle;
+- `DCC-010` — Markdown scan omits required generated/local exclusions;
+- `DCC-011` — changed-path routing loses deletions;
+- `DCC-012` — Markdown paths are not checked for exact case cross-platform;
+- `DCC-013` — drive-qualified paths are accepted as repository-relative.
 
-### Runtime-source hygiene
+The conformance gate remains outside `just quick` until the complete exact
+candidate reports zero findings and the result is recorded in the owning PR.
+A clean result still proves no Architecture semantics, compilation, runtime
+behavior, authority correctness, Product acceptance, or release support.
 
-```powershell
-python scripts/audit-runtime-source-hygiene.py --self-test
-python scripts/audit-runtime-source-hygiene.py
-```
+## Agent route, host, and model-selection utilities
 
-The scanner masks comments and literals and ignores the suffix after the first
-file-level `cfg(test)` boundary. Actual unsafe code in a composition binary is a
-`HARD_VIOLATION`. Panic/unwrap/expect, ambient environment/current-directory
-access, potentially unbounded or discarded process output, blocking sleeps,
-missing crate-root unsafe prohibitions, and source concentration remain
-`AUDIT_SIGNAL` review evidence.
+| Script | Purpose | Proof ceiling |
+|---|---|---|
+| `verify-agent-route-bundles.py` | Verify static shape and safety guardrails of agent route bundles | Static profile/schema evidence only |
+| `agent_route_bundle_checks.py` | Supporting route-bundle schema/profile checks | Internal script module |
+| `agent_route_contract.py` | Host declarations, findings, and errors for agent-route contracts | Internal contract module |
+| `agent_host_bundle.py` | Build and validate bounded host-bundle projections | Internal projection module |
+| `materialize-agent-host-bundle.py` | Materialize one bounded agent-host bundle from repository contracts | Generated candidate artifact only |
+| `verify-agent-host-bundles.py` | Validate host-bundle inputs and generated projection boundaries | Static profile/projection evidence only |
+| `agent_model_selector.py` | Development-only model-selection differential oracle; not the production routing owner | Candidate/oracle evidence only |
+| `select-agent-models.py` | CLI wrapper around the development-only model-selection oracle | Candidate/oracle evidence only |
 
-Signals do not fail integration and do not force a split by count or line
-volume. Review the exact path, owner, effect, failure behavior, and replacement
-boundary. JSON output is permitted only as a current issue/PR or CI artifact;
-it is not committed as a support report. A clean scan is not runtime, process,
-store, security, or Product proof.
+These tools do not prove a current provider account, model availability, quota,
+process launch, cancellation containment, route admission, task completion, or
+provider-independent verification.
 
-### Agent-bridge public protocol policy
+## Antigravity and Swarm bounded probes
 
-```powershell
-python scripts/verify-agent-bridge-protocol.py --self-test
-python scripts/verify-agent-bridge-protocol.py
-```
+| Script | Purpose | Proof ceiling |
+|---|---|---|
+| `antigravity_runtime_preflight.py` | Validate Antigravity executable identity, version/help fingerprints, configuration and fail-closed preflight records without a model call | Runtime-integration candidate/preflight evidence only |
+| `run-antigravity-runtime-preflight.py` | Operator wrapper for one exact Antigravity runtime preflight | Same exact preflight ceiling; no provider/model execution proof |
+| `verify-antigravity-runtime-preflight.py` | Deterministic positive/negative fixtures for the Antigravity preflight contract | Static/preflight verification only |
+| `swarm_product_pulse.py` | Deterministic provider-free Swarm control-plane pulse over supplied immutable fixtures | Control-plane candidate evidence only |
+| `verify-swarm-product-pulse.py` | Verify Swarm pulse fixture shape, fail-closed boundaries, and expected dispositions | Static fixture/policy evidence only |
 
-The verifier is bound to the public `eliot-agent-bridge` stdin request enum, the
-inert host request/cancellation contracts, and the stateless host gateway. It
-requires typed `invoke`/`cancel`, strict unknown-field rejection, validation
-before the trusted port call, exact host correlation and cancellation-target
-preservation, optional cancellation prose, and a typed fail-closed Kernel gap.
-
-It rejects public raw canonical `Frame` forwarding and host fields that would
-mint or carry Kernel/Governor-owned principal, Session/task/WorkScope,
-`RequestIdentity`, State Fence, Authority Epoch, idempotency/cancellation
-identity, absolute deadline, or effect ceiling. Its self-test covers both the
-accepted contract and the named regression classes.
-
-A clean result proves only the current public source boundary. It does not
-establish a live Kernel host-request endpoint, RequestIdentity issuance,
-Governor dispatch, external effects, reconnect behavior, Edge Proof, or Product
-support. The complete integration remains owned by issue #77.
+A preflight that identifies an executable or parses help is not evidence that a
+model ran, quota was available, a provider route was admitted, cancellation was
+contained, or a real Product Pulse passed. The provider-free Swarm pulse cannot
+be promoted to live multi-agent/runtime proof.
 
 ## Release and installation
 
 | Script | Purpose | Boundary |
 |---|---|---|
-| `build-eliot-windows-x64-release.ps1` | Build the declared Windows x64 release inputs and unsigned bundle | Build/staging only; no signing, installation, or live support |
-| `finalize-eliot-windows-x64-release.ps1` | Sign/finalize and independently read back the declared release artifacts | Release-artifact evidence only; no installed-state claim |
-| `invoke-eliot-windows-x64-production.ps1` | Execute the supported manifest-bound production invocation/installation flow | Uses the current release and installation contracts; live acceptance remains issue #11 |
+| `build-eliot-windows-x64-release.ps1` | Build declared Windows x64 release inputs and an unsigned bundle | Build/staging only |
+| `finalize-eliot-windows-x64-release.ps1` | Sign/finalize and independently read back declared release artifacts | Release-artifact evidence only |
+| `invoke-eliot-windows-x64-production.ps1` | Execute the manifest-bound production invocation/installation flow | Live acceptance remains issue #11 |
 
-Read `docs/release/WINDOWS_X64_RELEASE.md` before using these scripts. The
-canonical user/operator command surface is `eliot.exe`; scripts do not create a
-parallel CLI or permit direct storage/process authority.
+Read `docs/release/WINDOWS_X64_RELEASE.md` before use. The canonical operator
+surface is `eliot.exe`; scripts do not create a parallel CLI or direct
+storage/process authority.
 
 ## Integration packaging and probes
 
 | Script | Purpose | Boundary |
 |---|---|---|
-| `build-claude-desktop-extension.ps1` | Build the current Claude Desktop extension package from repository sources | Package construction only |
-| `test-claude-connector.ps1` | Run the bounded current Claude connector probe/fixture path | Integration evidence for its exact fingerprint only |
-| `eliot-mcp-reference-client.ps1` | Reference MCP client for protocol/bridge diagnostics | Diagnostic/client evidence; no canonical authority |
+| `build-claude-desktop-extension.ps1` | Build the Claude Desktop extension package from repository sources | Package construction only |
+| `test-claude-connector.ps1` | Run the bounded Claude connector probe/fixture path | Exact integration-fingerprint evidence only |
+| `eliot-mcp-reference-client.ps1` | Reference MCP client for protocol/bridge diagnostics | Diagnostic/client evidence only |
+| `run-isolated-tests.ps1` | Provision an owned Windows/Surreal test namespace and run one selected package/test profile | Exact selected Module/Edge evidence only |
 
-Current integration semantics live in `docs/integrations/`. Provider versions,
-accounts, routes, and host behavior are requalified per issue; an old successful
-probe is not current support.
-
-## Isolated test execution
-
-| Script | Purpose | Boundary |
-|---|---|---|
-| `run-isolated-tests.ps1` | Provision an owned Windows/Surreal test namespace, run one selected package/test profile, and preserve bounded evidence/cleanup disposition | Exact selected Module/Edge evidence only |
-
-This script is not a generic production runner and cannot turn a fake or
-in-memory test into real store/runtime proof. Invoke it from an owning issue with
-an exact test selector and current Surreal artifact identity.
+Provider versions, accounts, routes, and host behavior are requalified per issue;
+an old successful probe is not current support. An in-memory/fake test is not
+real store/runtime proof.
 
 ## Admission rule for a new script
 
@@ -150,13 +133,12 @@ A new script requires:
 
 - one current owning issue and consumer;
 - a stable source contract or command it wraps;
-- exact inputs, identity, side effects, and cleanup boundary;
-- a declared proof ceiling and failure behavior;
+- exact inputs, identity, side effects, cleanup, and failure behavior;
+- a declared proof ceiling;
 - no hidden credentials, broad filesystem mutation, or alternative authority
   path;
-- a documentation entry here and a removal condition.
+- an exact entry in this map and a removal condition.
 
 Campaign names, milestone numbers, `final`/`certified` labels, dated audit
-wrappers, and convenience aliases around legacy binaries are rejected. Current
-findings belong in the issue/PR or CI artifacts, not in a new report-generating
-script.
+wrappers, and aliases around legacy binaries are rejected. Current findings
+belong in the issue/PR or local/CI artifacts, not in a new committed report.

@@ -1,0 +1,141 @@
+schema_version = "eliot-doc-code-conformance-v1"
+
+[documentation_reader]
+command = "python scripts/docs_read.py read"
+required_terms = [
+  "docs-read-bundle.md",
+  "docs-read-receipt.json",
+  "route alone",
+  "verified bundle",
+  "read receipt",
+]
+surfaces = [
+  "AGENTS.md",
+  "WORKFLOW.md",
+  "docs/architecture/READING_PROTOCOL.md",
+  "docs/architecture/README.md",
+]
+scan_all_agent_files = true
+
+[[documentation_reader.generator_scope]]
+path = "scripts/docs_shards.py"
+start = "def routing_block("
+end = "def patch_navigation_surfaces("
+
+[[documentation_reader.generator_scope]]
+path = "scripts/docs_shards.py"
+start = "def render_reading_protocol("
+end = "def render_architecture_readme("
+
+[[documentation_reader.generator_scope]]
+path = "scripts/docs_shards.py"
+start = "def render_architecture_readme("
+end = "def render_topic_index("
+
+[workflows]
+directory = ".github/workflows"
+documentation = ".github/README.md"
+allowed_events = ["workflow_dispatch"]
+required_documentation_terms = ["`workflow_dispatch` only"]
+forbidden_documentation_terms = [
+  "Runs on every branch push and pull request to `main`.",
+  "Runs for pull requests to `main` and may be dispatched manually.",
+]
+require_workflow_filenames = true
+
+[retired_references]
+scan_roots = [
+  ".github",
+  "AGENTS.md",
+  "WORKFLOW.md",
+  "README.md",
+  "apps",
+  "bins",
+  "crates",
+  "integrations",
+  "plugin",
+  "scripts",
+]
+tokens = ["docs/normative/"]
+extensions = [".rs", ".md", ".toml", ".py", ".ps1", ".sh", ".yml", ".yaml", ".json", ".js", ".mjs"]
+# The verifier implementation and its negative self-test must name prohibited
+# examples. Do not copy this exception to another source file.
+ignore_globs = [
+  "scripts/verify-doc-code-conformance.py",
+  "scripts/doc_code_conformance_core.py",
+]
+unstable_line_reference_regex = 'docs/(?:normative|architecture)/ELIOT_(?:ARCHITECTURE|IMPLEMENTATION)\.md:\d+'
+
+[[retired_references.allow]]
+path = ".github/workflows/repository-policy.yml"
+token = "docs/normative/"
+reason = "Repository policy intentionally rejects reintroduced retired authority paths."
+
+[script_inventory]
+directory = "scripts"
+documentation = "scripts/README.md"
+extensions = [".py", ".ps1", ".sh", ".txt"]
+exclude = []
+
+[binary_inventory]
+workspace_manifest = "Cargo.toml"
+documentation = "docs/PROJECT_MAP.md"
+member_prefix = "bins/"
+
+[[owner_binding]]
+path = "crates/agent/eliot-agent-coordinator/AGENTS.md"
+required_phrases = ["#265"]
+forbidden_current_phrases = ["Issue #224 owns current"]
+
+[repository_paths]
+scan_roots = [
+  "AGENTS.md",
+  "WORKFLOW.md",
+  "README.md",
+  "apps",
+  "bins",
+  "crates",
+  "integrations",
+  "plugin",
+  "scripts",
+  "config",
+  "workstreams",
+  "workspace",
+  ".github/pull_request_template.md",
+]
+extensions = [".rs", ".md", ".toml", ".py", ".ps1", ".sh", ".yml", ".yaml", ".json", ".js", ".mjs", ".cs"]
+# The verifier and policy must contain negative examples and reasoned missing-path
+# allowances; neither is an operational documentation consumer.
+ignore_globs = [
+  "scripts/verify-doc-code-conformance.py",
+  "scripts/doc_code_conformance_core.py",
+  "config/doc-code-conformance.toml",
+  ".github/workflows/repository-policy.yml",
+]
+handle_index = "docs/architecture/handle-index.json"
+
+[[repository_paths.allow_missing]]
+source = "scripts/docs_shards_core.py"
+path = "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md"
+reason = "The shard verifier intentionally rejects restoration of the retired predecessor authority file."
+
+[[repository_paths.allow_missing]]
+source = "scripts/docs_shards_core.py"
+path = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
+reason = "The shard verifier intentionally rejects restoration of the retired predecessor authority file."
+
+[documentation_pipeline]
+shards_front_door = "scripts/docs_shards.py"
+router_front_door = "scripts/docs_router.py"
+required_link_skip_parts = [
+  ".eliot",
+  ".eliot-docs",
+  ".codebase-memory",
+  "target",
+  "dist",
+  "node_modules",
+  "obj",
+  "__pycache__",
+]
+exact_case_marker = "DOC_LINK_EXACT_CASE_V1"
+drive_path_rejection_marker = "DRIVE_QUALIFIED_PATH_REJECTED"

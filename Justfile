@@ -17,6 +17,12 @@ docs-router:
 docs-read-self-test:
     python scripts/docs_read.py self-test
 
+doc-code-conformance-self-test:
+    python scripts/verify-doc-code-conformance.py --self-test
+
+doc-code-conformance:
+    python scripts/verify-doc-code-conformance.py --root .
+
 normative:
     pwsh -NoProfile -File scripts/verify-normative.ps1
 
