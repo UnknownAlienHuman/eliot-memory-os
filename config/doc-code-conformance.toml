@@ -1,0 +1,70 @@
+schema_version = "eliot-doc-code-conformance-v1"
+
+[retired_references]
+# These roots are the configured operational source surface. Documentation books
+# are intentionally excluded because their compatibility paths are documented.
+scan_roots = [
+  "AGENTS.md",
+  "WORKFLOW.md",
+  "README.md",
+  "apps",
+  "bins",
+  "crates",
+  "integrations",
+  "plugin",
+  "scripts",
+  "config",
+  "workstreams",
+  "workspace",
+  ".github",
+]
+extensions = [
+  ".rs",
+  ".md",
+  ".toml",
+  ".py",
+  ".ps1",
+  ".sh",
+  ".yml",
+  ".yaml",
+  ".json",
+  ".js",
+  ".mjs",
+  ".cs",
+  ".csproj",
+  ".manifest",
+  ".surql",
+  ".txt",
+  ".wat",
+  ".wit",
+  ".xaml",
+]
+tokens = [
+  "docs/normative/",
+  "docs/tasks/",
+  "eliot-architecture-docs-fa941135",
+  "58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D8",
+  "C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0B",
+  "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md",
+]
+ignore_globs = [
+  "config/doc-code-conformance.toml",
+  "scripts/doc_code_conformance_core.py",
+  "scripts/verify-doc-code-conformance.py",
+]
+
+[[retired_references.allow]]
+path = ".github/workflows/repository-policy.yml"
+token = "docs/normative/"
+reason = "The policy intentionally rejects reintroduced retired authority paths."
+
+[[retired_references.allow]]
+path = ".github/workflows/repository-policy.yml"
+token = "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md"
+reason = "The policy intentionally rejects restoration of the predecessor file."
+
+[[retired_references.allow]]
+path = ".github/workflows/repository-policy.yml"
+token = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
+reason = "The policy intentionally rejects restoration of the predecessor file."
