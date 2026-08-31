@@ -1,0 +1,49 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w2-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 22
+cell = "smart.cue.index"
+physical_crate = "eliot-cues"
+predecessor_orders = [19, 21]
+primary_property = "Build a byte-deterministic immutable cue snapshot from admitted bindings and admitted typed optional edges, with zero edges a valid state."
+field_contracts = ["crates/smart/eliot-cue-contracts/cue.contract.toml"]
+public_function_signatures = [
+  "pub fn build_cue_snapshot(revision: &CueProjectionRevision, bindings: &[AdmittedCueBinding], edges: &[AdmittedActivationEdge], limits: &CueLimits) -> Result<CueSnapshot, CueIndexError>",
+]
+write_scope = [
+  "crates/smart/eliot-cues/src/index.rs",
+  "crates/smart/eliot-cues/tests/index.rs",
+]
+algorithm = [
+  "validate projection revision, source heads, fence and limits",
+  "accept only bindings/edges carrying exact admission receipts",
+  "validate non-future source revisions and compatible scope/fence",
+  "index exact, authorized-prefix and signature keys separately",
+  "validate edge type/direction/fan-out and optional isolated-edge degradation",
+  "canonicalize rows and adjacency lists and compute snapshot digest",
+]
+minimum_tests = [
+  "unadmitted binding rejected",
+  "zero-edge snapshot valid",
+  "mixed fence rejected",
+  "future source revision rejected",
+  "duplicate binding/edge rejected",
+  "fan-out bound enforced",
+  "input permutation yields identical snapshot",
+]
+non_goals = [
+  "binding/edge admission",
+  "canonical memory payload/lifecycle",
+  "relation inference",
+  "filesystem/store read",
+  "hot matching",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-CTX-02", "ARCH-CTX-04", "ARCH-MEM-04", "ARCH-MOD-03"]
+implementation_refs = ["I2.20", "I5.8", "I7.19", "I12.14"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than accepting an unadmitted row, mixed/future fence, unbounded fan-out, or embedding payload/lifecycle state."
+brief_proof_ceiling = "STATIC_W2_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
