@@ -38,6 +38,9 @@ const BRIDGE_ENV_KEYS = [
   "ELIOT_WORK_LEASE_ID",
 ]
 
+const MAX_ARGUMENT_KEYS = 64
+const MAX_ARGUMENT_KEY_LENGTH = 128
+
 function boundedInteger(name, fallback, minimum, maximum) {
   const parsed = Number.parseInt(process.env[name] ?? "", 10)
   if (!Number.isFinite(parsed)) return fallback
@@ -116,6 +119,19 @@ async function sha256Hex(value) {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")
 }
 
+// Argument NAMES are the only argument-derived material the contract admits.
+// A host that hands us a raw string would otherwise yield one Object.keys entry
+// per byte, which both unbounds the request and discloses the command's length.
+function boundedArgumentKeys(candidate) {
+  if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return []
+  const prototype = Object.getPrototypeOf(candidate)
+  if (prototype !== Object.prototype && prototype !== null) return []
+  return Object.keys(candidate)
+    .filter((key) => key.length <= MAX_ARGUMENT_KEY_LENGTH)
+    .sort()
+    .slice(0, MAX_ARGUMENT_KEYS)
+}
+
 async function compactEvent(kind, input = {}, output = {}) {
   const event = input.event ?? input
   const properties = event.properties ?? {}
@@ -155,9 +171,9 @@ async function compactEvent(kind, input = {}, output = {}) {
   const emittedAt =
     firstString(event.emitted_at, event.timestamp, event.time, properties.emitted_at, properties.timestamp) ??
     new Date().toISOString()
-  const argumentKeys = Object.keys(
+  const argumentKeys = boundedArgumentKeys(
     input.args ?? input.arguments ?? output.args ?? output.arguments ?? {},
-  ).sort()
+  )
   const identityMaterial = JSON.stringify(
     canonicalIdentityMaterial({
       vendor_event_kind: vendorEventKind,
@@ -297,6 +313,9 @@ async function postHttpBridge(config, payload) {
         "X-ELIOT-Host": "opencode",
       },
       body: JSON.stringify(payload),
+      // A redirect would re-issue this POST — identities, changed_path and
+      // argument names — at a host the loopback admission never validated.
+      redirect: "error",
       signal: controller.signal,
     })
     if (TRANSIENT_HTTP_STATUS.has(response.status)) {
@@ -309,6 +328,11 @@ async function postHttpBridge(config, payload) {
     if (!response.ok) {
       await response.body?.cancel().catch(() => {})
       throw new HttpBridgeError(`ELIOT OpenCode bridge returned HTTP status ${response.status}`)
+    }
+    const contentType = (response.headers.get("content-type") ?? "").toLowerCase()
+    if (!contentType.startsWith("application/json")) {
+      await response.body?.cancel().catch(() => {})
+      throw new HttpBridgeError("ELIOT OpenCode bridge returned a non-JSON content type")
     }
     const text = await readBoundedWebStream(response.body, maximumBridgeOutputBytes())
     return parseBridgeResponse(text)
