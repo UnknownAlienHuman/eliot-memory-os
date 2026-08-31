@@ -1,16 +1,38 @@
 use std::time::Duration;
 
+use eliot_contracts::RequestId;
 #[cfg(windows)]
 use eliot_ipc::NamedPipeServer;
 use eliot_ipc::TransportLimits;
 use eliot_protocol::MessageType;
+use eliot_store_api::{
+    StoreError, StoreFailure, StoreFailureContractError, StoreFailureIdentityContext,
+};
 use eliot_store_surreal::{
-    SERVICE_NAME, StoreComposition, StoreHandshakeIdentity, admit_handshake, dispatch, load_config,
-    require_semantic_ready_for_pipe, store_bootstrap_descriptor, validate_request_frame,
+    Response, SERVICE_NAME, StoreComposition, StoreHandshakeIdentity, admit_handshake, dispatch,
+    load_config, require_semantic_ready_for_pipe, store_bootstrap_descriptor,
+    validate_request_frame,
 };
 
 mod launch_mode;
 use launch_mode::{LaunchMode, control_frame, parse_launch_mode, prepare_launch};
+
+fn request_frame_failure(
+    request_id: RequestId,
+) -> Result<Response, StoreFailureContractError> {
+    let failure = StoreFailure::from_store_error(
+        StoreError::InvalidField {
+            field: "request_frame",
+            reason: "authenticated request frame rejected",
+        },
+        StoreFailureIdentityContext {
+            request_id: Some(request_id),
+            ..StoreFailureIdentityContext::default()
+        },
+    )?;
+    failure.validate()?;
+    Ok(Response::Failure { failure })
+}
 
 #[tokio::main]
 // This standalone service has no initialized telemetry sink before startup;
@@ -100,14 +122,21 @@ async fn run() -> Result<(), String> {
             .receive_frame(negotiated_limits)
             .await
             .map_err(|error| format!("EBP frame rejected: {error}"))?;
+        let request_id = frame
+            .request_id
+            .clone()
+            .ok_or_else(|| "EBP request frame has no correlation identity".to_owned())?;
         let response = match validate_request_frame(&mut session, &frame) {
-            Ok(request) => Box::pin(dispatch(&composition, request)).await,
-            Err(error) => eliot_store_surreal::Response::Error { error },
+            Ok(request) => Box::pin(dispatch(&composition, request_id.clone(), request))
+                .await
+                .map_err(|_| "typed Store dispatch failure encoding failed".to_owned())?,
+            Err(_) => request_frame_failure(request_id.clone())
+                .map_err(|_| "typed request-frame failure encoding failed".to_owned())?,
         };
         let response_frame = eliot_store_api::response_frame(
             session.connection_id(),
             session.protocol_version(),
-            frame.request_id.clone(),
+            Some(request_id),
             response,
         )
         .map_err(|error| format!("invalid EBP response: {error}"))?;
@@ -132,6 +161,19 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<std::ffi::OsString> {
         values.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[test]
+    fn request_frame_rejection_is_typed_and_correlated() {
+        let request_id = RequestId::new("request-frame-rejected").expect("request id");
+        let response = request_frame_failure(request_id.clone()).expect("typed failure");
+        let Response::Failure { failure } = response else {
+            panic!("request-frame rejection must be a typed failure");
+        };
+        assert_eq!(failure.request_id.as_ref(), Some(&request_id));
+        assert_eq!(failure.reason_code.as_str(), "INVALID_FIELD");
+        assert!(failure.operation_id.is_none());
+        failure.validate().expect("failure validates");
     }
 
     #[test]
