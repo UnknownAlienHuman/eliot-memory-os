@@ -15,6 +15,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod work_lease_issuance;
+
+pub use work_lease_issuance::{
+    WORK_LEASE_ISSUANCE_REVISION, WorkLeaseIssuanceDisposition, WorkLeaseIssuanceError,
+    WorkLeaseIssuanceFailure, WorkLeaseIssuanceProvenance, WorkLeaseIssuanceResult,
+};
+
 pub const CONTRACT_NAME: &str = "eliot.governor.coordination";
 pub const CONTRACT_VERSION: eliot_contracts::ContractVersion =
     eliot_contracts::ContractVersion::new(1, 0, 0);
@@ -32,6 +39,24 @@ fn nonzero(value: u64, field: &'static str) -> Result<(), CoordinationError> {
     } else {
         Ok(())
     }
+}
+
+fn validate_active_session_heartbeat(
+    session: &AgentSession,
+    now: Option<u64>,
+) -> Result<(), CoordinationError> {
+    if session.heartbeat_deadline == 0 || session.last_heartbeat > session.heartbeat_deadline {
+        return Err(CoordinationError::InvalidField("heartbeat_deadline"));
+    }
+    if let Some(now) = now {
+        if session.last_heartbeat > now {
+            return Err(CoordinationError::InvalidField("last_heartbeat"));
+        }
+        if now > session.heartbeat_deadline {
+            return Err(CoordinationError::SessionExpired);
+        }
+    }
+    Ok(())
 }
 
 /// Fail-closed errors returned by coordination commands.
@@ -69,6 +94,10 @@ pub enum CoordinationError {
     NoActiveBinding,
     #[error("multiple active work bindings exist")]
     AmbiguousActiveBinding,
+    #[error("legacy work lease cannot be given canonical issuance provenance")]
+    LegacyWorkLeaseCannotBeCanonicalized,
+    #[error("work lease issuance evidence could not be encoded")]
+    IssuanceEvidenceEncoding,
 }
 
 /// Lifecycle of an attached actor session.
@@ -408,6 +437,8 @@ pub struct CoordinationOwner {
     messages: BTreeMap<String, MailboxMessage>,
     event_by_request: BTreeMap<String, CoordinationEvent>,
     events: Vec<CoordinationEvent>,
+    #[serde(default)]
+    work_lease_issuance_by_request: BTreeMap<String, WorkLeaseIssuanceProvenance>,
 }
 
 impl CoordinationOwner {
@@ -433,14 +464,40 @@ impl CoordinationOwner {
         if snapshot.sequence != snapshot.events.len() as u64 {
             return Err(CoordinationError::CausalPredecessorMismatch);
         }
-        if snapshot
-            .event_by_request
+        for session in snapshot
+            .sessions
             .values()
-            .any(|event| !snapshot.events.contains(event))
+            .filter(|session| session.state == SessionState::Active)
+        {
+            validate_active_session_heartbeat(session, None)?;
+        }
+        let mut request_ids = BTreeSet::new();
+        if snapshot.events.iter().any(|event| {
+            event.predecessor != (event.sequence != 1).then_some(event.sequence.saturating_sub(1))
+                || !request_ids.insert(event.idempotency_key.clone())
+                || snapshot.event_by_request.get(&event.idempotency_key) != Some(event)
+        }) || snapshot.event_by_request.len() != snapshot.events.len()
+            || snapshot.event_by_request.iter().any(|(request_id, event)| {
+                request_id != &event.idempotency_key || !snapshot.events.contains(event)
+            })
         {
             return Err(CoordinationError::InvalidState);
         }
+        snapshot.validate_issuance_snapshot()?;
         Ok(snapshot)
+    }
+
+    /// Rebuilds an owner and binds every current record to one authenticated
+    /// authority epoch and fence.
+    pub fn from_snapshot_at(
+        snapshot: Self,
+        authority_epoch: AuthorityEpoch,
+        state_fence: &StateFence,
+    ) -> Result<Self, CoordinationError> {
+        let owner = Self::from_snapshot(snapshot)?;
+        owner.common(authority_epoch, state_fence)?;
+        owner.validate_current_bindings(authority_epoch, state_fence)?;
+        Ok(owner)
     }
     pub fn current_sequence(&self) -> u64 {
         self.sequence
@@ -480,15 +537,7 @@ impl CoordinationOwner {
         if session.state != SessionState::Active {
             return Err(CoordinationError::InvalidState);
         }
-        if session.heartbeat_deadline == 0 || session.heartbeat_deadline < session.last_heartbeat {
-            return Err(CoordinationError::InvalidField("heartbeat_deadline"));
-        }
-        if session.last_heartbeat > now {
-            return Err(CoordinationError::InvalidField("last_heartbeat"));
-        }
-        if now > session.heartbeat_deadline {
-            return Err(CoordinationError::SessionExpired);
-        }
+        validate_active_session_heartbeat(session, Some(now))?;
         Ok(session.clone())
     }
 
@@ -921,6 +970,12 @@ impl CoordinationOwner {
     /// Extends a lease only when the actor still owns the exact fenced lease.
     pub fn heartbeat(&mut self, req: AgentHeartbeat) -> Result<HeartbeatAck, CoordinationError> {
         self.common(req.authority_epoch, &req.state_fence)?;
+        self.read_active_session(
+            &req.session_id,
+            req.now,
+            req.authority_epoch,
+            &req.state_fence,
+        )?;
         let mut lease = self.lease(
             &req.lease_id,
             &req.session_id,
@@ -1536,6 +1591,86 @@ mod tests {
         assert_eq!(
             owner.read_active_session("session-1", 50, AuthorityEpoch::genesis(), &state_fence,),
             Err(CoordinationError::SessionExpired)
+        );
+        assert_eq!(
+            owner.heartbeat(AgentHeartbeat {
+                request_id: "heartbeat-expired-session".to_owned(),
+                session_id: "session-1".to_owned(),
+                lease_id: "lease-1".to_owned(),
+                authority_epoch: AuthorityEpoch::genesis(),
+                state_fence: state_fence.clone(),
+                now: 50,
+                extend_to: 80,
+            }),
+            Err(CoordinationError::SessionExpired)
+        );
+    }
+
+    #[test]
+    fn active_session_heartbeat_validation_is_shared_by_reads_and_recovery() {
+        let (owner, state_fence) = claimed_owner();
+        let mut zero_deadline = owner.clone();
+        zero_deadline
+            .sessions
+            .get_mut("session-1")
+            .unwrap()
+            .heartbeat_deadline = 0;
+        assert_eq!(
+            zero_deadline.read_active_session(
+                "session-1",
+                50,
+                AuthorityEpoch::genesis(),
+                &state_fence,
+            ),
+            Err(CoordinationError::InvalidField("heartbeat_deadline"))
+        );
+        let mut direct_zero = owner.clone();
+        direct_zero
+            .sessions
+            .get_mut("session-1")
+            .unwrap()
+            .heartbeat_deadline = 0;
+        assert!(matches!(
+            CoordinationOwner::from_snapshot(direct_zero),
+            Err(CoordinationError::InvalidField("heartbeat_deadline"))
+        ));
+        assert!(matches!(
+            CoordinationOwner::from_snapshot_at(
+                zero_deadline,
+                AuthorityEpoch::genesis(),
+                &state_fence,
+            ),
+            Err(CoordinationError::InvalidField("heartbeat_deadline"))
+        ));
+
+        let mut reversed = owner.clone();
+        reversed
+            .sessions
+            .get_mut("session-1")
+            .unwrap()
+            .last_heartbeat = 101;
+        assert!(matches!(
+            CoordinationOwner::from_snapshot_at(reversed, AuthorityEpoch::genesis(), &state_fence,),
+            Err(CoordinationError::InvalidField("heartbeat_deadline"))
+        ));
+
+        let mut future = owner.clone();
+        future.sessions.get_mut("session-1").unwrap().last_heartbeat = 51;
+        assert_eq!(
+            future.read_active_session("session-1", 50, AuthorityEpoch::genesis(), &state_fence),
+            Err(CoordinationError::InvalidField("last_heartbeat"))
+        );
+
+        let mut at_deadline = owner;
+        at_deadline
+            .sessions
+            .get_mut("session-1")
+            .unwrap()
+            .heartbeat_deadline = 50;
+        assert!(
+            at_deadline
+                .read_active_session("session-1", 50, AuthorityEpoch::genesis(), &state_fence)
+                .is_ok()
         );
     }
 
