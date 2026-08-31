@@ -1,0 +1,284 @@
+schema = "eliot.agent-work-unit.v1"
+issue = 458
+parent_issue = 16
+kernel_integration_owner_issue = 15
+daemon_integration_owner_issue = 18
+supervision_renewal_issue = 88
+product_pulse_issue = 11
+status = "READY_FOR_IMPLEMENTATION"
+source_base = "15d6b40d06df0eab8c2fc94a856253f36521b305"
+branch = "fix/458-watchdog-spool-reconciliation"
+primary_owner = "watchdog-spool-reconciliation-edge"
+primary_cell = "supervision.watchdog.spool-export"
+causal_property = "Watchdog-owned protected spool records cross the authenticated Kernel/Governor boundary through bounded replay-stable batches; the source cursor advances only after the exact sink disposition required by the record class, and Watchdog never becomes a semantic or canonical writer."
+proof_ceiling = "WATCHDOG_EXPORT_EDGE_CANDIDATE_UNTIL_REAL_WINDOWS_RESTART_PROOF"
+
+[documentation]
+architecture_handles = ["ARCH-WDG-01", "ARCH-WDG-02", "ARCH-MOD-03", "ARCH-SEC-02", "ARCH-OBS-01", "ARCH-RES-01", "ARCH-RES-04"]
+implementation_handles = ["R0/R7 separation", "I1.4", "I1.5", "I4.8", "I7.2", "I7.23", "I8", "I14", "I18"]
+required_files_read = [
+  "AGENTS.md",
+  "bins/AGENTS.md",
+  "crates/supervision/AGENTS.md",
+  "bins/eliot-watchdog/Cargo.toml",
+  "bins/eliot-watchdog/src/lib.rs",
+  "bins/eliot-watchdog/src/watchdog_spool.rs",
+  "bins/eliot-watchdog/src/watchdog_spool/**",
+  "crates/supervision/eliot-watchdog-core/Cargo.toml",
+  "crates/supervision/eliot-watchdog-core/src/**",
+  "crates/kernel/eliot-kernel-service/src/**watchdog**",
+  "crates/governor/eliot-governor/src/**",
+  "bins/eliotd/src/**",
+]
+routing_commands = [
+  "python scripts/docs_router.py route --path crates/supervision/eliot-watchdog-core --topic 'owner-neutral Watchdog spool export batch cursor and acknowledgement contract'",
+  "python scripts/docs_router.py route --path bins/eliot-watchdog/src/watchdog_spool.rs --topic 'bounded replay-stable protected spool export and cursor retention'",
+]
+routing_receipt_status = "REQUIRED_PER_WAVE_BEFORE_FIRST_RUST_MUTATION"
+
+[current_state]
+confirmed_implemented = [
+  "Watchdog is a separate SCM sibling service.",
+  "WatchdogSpool owns a bounded redb file under a protected runtime path.",
+  "Spool header, sequence and independent high-water metadata are validated.",
+  "Corrupt retained state creates a durable Recovery entry rather than silently resetting the sequence.",
+  "Capacity pressure creates a Gap/SpoolPressure entry and returns a pressure disposition.",
+  "IndependentKernelSensor can append heartbeat/gap entries and exposes a local readback function.",
+]
+confirmed_missing = [
+  "No production caller of IndependentKernelSensor::readback exists outside Watchdog source/tests.",
+  "No durable export cursor exists.",
+  "No bounded item/byte batch identity exists.",
+  "No authenticated external sink claim/application phase or acknowledgement contract exists.",
+  "No production Governor adapter maps retained Heartbeat/Gap/Recovery entries through the canonical transition path.",
+  "Spool pressure/eviction is not acknowledged downstream as reduced supervision coverage.",
+]
+old_discriminator = "Append a Watchdog Gap or Recovery entry, restart Kernel/eliotd, and inspect production consumers: the record remains only in local readback and there is no exact cursor/ack path to canonical observation or coverage state."
+
+[ownership]
+watchdog_spool = "single writer for retained non-semantic records and source cursor"
+kernel = "authenticates process/generation/epoch/transport and fences stale producers; no semantic interpretation"
+governor = "owns semantic admission, coverage/problem candidate meaning and canonical transition"
+canonical_store = "persists accepted semantic/control observations through the existing named transition path"
+watchdog_agent = "may analyze exported evidence only as a candidate; owns no severity/Problem/Incident authority"
+rule = "Runtime control direction does not transfer source/state ownership."
+
+[wave_a_contract]
+owner = "eliot-watchdog-core or existing low-dependency supervision contract island"
+mutable_paths = [
+  "crates/supervision/eliot-watchdog-core/Cargo.toml",
+  "crates/supervision/eliot-watchdog-core/src/**",
+  "crates/supervision/eliot-watchdog-core/tests/**",
+]
+required_types = [
+  "WatchdogSpoolCursor",
+  "WatchdogSpoolExportEntry",
+  "WatchdogSpoolExportBatch",
+  "WatchdogSpoolSinkPhase",
+  "WatchdogSpoolEntryDisposition",
+  "WatchdogSpoolAcknowledgement",
+  "WatchdogSpoolReconciliationError",
+]
+required_sink_phases = [
+  "RECEIVED",
+  "DURABLE",
+  "ADMITTED_CANDIDATE",
+  "APPLIED",
+  "REJECTED",
+  "UNKNOWN",
+  "GAP_REQUIRES_RECOVERY",
+]
+required_fields = [
+  "contract and spool schema revision",
+  "installation and Watchdog generation/epoch",
+  "SupervisionLease and coverage interval refs when applicable",
+  "cursor predecessor",
+  "first/last sequence and high-water sequence",
+  "per-entry payload type and SHA-256 digest",
+  "batch digest and idempotency identity",
+  "sink identity/generation and required terminal phase",
+  "created/expires times and State Fence",
+]
+contract_rules = [
+  "Transport RECEIVED cannot represent durable or canonical application.",
+  "DURABLE cannot represent semantic admission unless the record class declares that as its terminal cursor phase.",
+  "UNKNOWN is never terminal and never advances a cursor.",
+  "REJECTED requires an exact reason and cannot skip a Gap/Recovery record that needs owner action.",
+  "A batch is immutable and exact retry produces the same digest/entries.",
+  "Unknown future payload types are preserved as unsupported/unknown and cannot be dropped as applied.",
+]
+
+[wave_b_spool_export]
+owner = "Watchdog protected spool"
+mutable_paths = [
+  "bins/eliot-watchdog/src/watchdog_spool.rs",
+  "bins/eliot-watchdog/src/watchdog_spool/**",
+  "bins/eliot-watchdog/src/lib.rs",
+  "bins/eliot-watchdog/tests/**",
+]
+required_persistent_state = [
+  "export cursor schema and last acknowledged sequence",
+  "last acknowledged batch digest",
+  "sink identity/generation and terminal phase policy",
+  "pending/unknown batch identity",
+]
+algorithm = [
+  "Validate spool header, retained sequence and high-water metadata before export.",
+  "Read from last acknowledged sequence + 1 under configured item and byte ceilings.",
+  "Do not allocate or return the complete spool when the retained set exceeds the batch limit.",
+  "Bind exact encoded-entry digests into one immutable batch digest.",
+  "Persist pending batch identity before handing it to transport when unknown outcome must be reconciled.",
+  "On exact retry return byte-equivalent batch content and identity.",
+  "Validate acknowledgement against cursor predecessor, batch digest, sink generation and all entry dispositions.",
+  "Advance cursor atomically once and only once after the declared terminal phase for every entry.",
+  "Never acknowledge beyond an unresolved missing/corrupt/pressure/recovery sequence.",
+  "Compact only fully acknowledged entries below every retained recovery/gap boundary and preserve high-water continuity.",
+]
+pressure_rule = "If retention pressure removes records before acknowledgement, the next export begins with a protected Gap record naming the lost range and no later record may be represented as continuous/full coverage."
+
+[wave_c_transport]
+owner = "Kernel Watchdog transport adapter"
+mutable_paths = [
+  "crates/kernel/eliot-kernel-service/src/**watchdog**",
+  "crates/kernel/eliot-kernel-service/tests/**watchdog**",
+  "bins/eliot-kernel/src/**watchdog**",
+]
+requirements = [
+  "Use an authenticated durable-observation EBP message, not raw spool-file access.",
+  "Bind Watchdog process identity, service registration, generation, lineaged epoch, lease and State Fence.",
+  "Reject stale/foreign producer and changed payload under one sequence/batch identity.",
+  "Preserve at-least-once delivery and exact duplicate identity.",
+  "Return transport/durable phases without inventing semantic application.",
+  "Kernel cannot delete Watchdog spool entries or widen severity/meaning.",
+]
+collision_rule = "Do not edit the eliotd SupervisionLease renewal path owned by #88."
+
+[wave_d_governor]
+owner = "eliotd/Governor system-observation admission"
+mutable_paths = [
+  "crates/governor/eliot-governor/src/**watchdog**",
+  "crates/governor/eliot-governor/src/**observation**",
+  "bins/eliotd/src/**watchdog**",
+  "bins/eliotd/tests/**watchdog**",
+]
+requirements = [
+  "Map Heartbeat to bounded supervision evidence, never semantic health truth.",
+  "Map Gap/SpoolPressure/Recovery to explicit coverage degradation and candidate Problem/Signal paths.",
+  "Apply through the existing semantic admission and PreparedTransition path.",
+  "Return one per-entry disposition plus batch acknowledgement only after the applicable durable/canonical stage.",
+  "Canonical store unavailable returns UNKNOWN/DURABLE according to actual staging and leaves cursor unchanged.",
+  "Exact replay does not create a second canonical observation.",
+]
+
+[coverage_rules]
+requirements = [
+  "Every claimed interval names denominator/cursor bounds and known blind ranges.",
+  "Heartbeat silence is not proof of absence outside a complete expected interval.",
+  "A pressure gap reduces only dependent supervision guarantees and is visible in Governance Profile evidence.",
+  "No retrospective model narrative can fill a missing sequence or restore coverage.",
+  "Inactive interval records cannot be rendered as continuous independent supervision without valid lease/obligation evidence.",
+]
+
+[acknowledgement_policy]
+heartbeat_required_phase = "ADMITTED_CANDIDATE or a stricter explicitly configured phase; never RECEIVED"
+gap_required_phase = "APPLIED or GAP_REQUIRES_RECOVERY with exact canonical/problem candidate ref"
+recovery_required_phase = "APPLIED or GAP_REQUIRES_RECOVERY with exact recovery owner/ref"
+unknown_policy = "retain and replay the same batch"
+reject_policy = "advance only when rejection is final for that exact record class and cannot hide a required gap/recovery action"
+
+[errors]
+required = [
+  "SPOOL_CURSOR_MISMATCH",
+  "SPOOL_SEQUENCE_GAP",
+  "SPOOL_BATCH_LIMIT_EXCEEDED",
+  "SPOOL_BATCH_DIGEST_MISMATCH",
+  "SPOOL_ENTRY_MUTATED",
+  "SPOOL_ACK_IDENTITY_MISMATCH",
+  "SPOOL_ACK_PHASE_INSUFFICIENT",
+  "SPOOL_SINK_STALE",
+  "SPOOL_PRODUCER_FENCED",
+  "SPOOL_UNKNOWN_OUTCOME",
+  "SPOOL_GAP_REQUIRES_RECOVERY",
+  "SPOOL_CURSOR_PERSISTENCE_FAILED",
+  "SPOOL_COMPACTION_BLOCKED",
+]
+
+[fixtures.contract]
+required = [
+  "empty_batch_binds_cursor_and_high_water",
+  "canonical_batch_digest_is_permutation_impossible_and_stable_on_retry",
+  "unknown_payload_type_is_not_success",
+  "received_and_durable_do_not_satisfy_applied_phase",
+  "unknown_never_advances",
+  "wrong_sink_generation_or_cursor_predecessor_is_rejected",
+]
+
+[fixtures.spool]
+required = [
+  "bounded_item_and_byte_batch",
+  "exact_export_retry_after_restart",
+  "ack_advances_cursor_once",
+  "changed_ack_same_identity_is_conflict",
+  "later_ack_cannot_skip_gap",
+  "pressure_eviction_exports_lost_range_gap",
+  "compaction_preserves_high_water_and_open_recovery_boundary",
+  "cursor_write_failure_does_not_delete_source_records",
+  "unknown_transport_outcome_keeps_pending_batch",
+]
+
+[fixtures.edge]
+required = [
+  "duplicate_transport_applies_one_canonical_observation",
+  "stale_watchdog_generation_is_fenced",
+  "canonical_store_unavailable_preserves_spool_and_cursor",
+  "host_kernel_daemon_restart_replays_same_batch",
+  "forged_governor_ack_cannot_advance_cursor",
+  "watchdog_dependency_graph_contains_no store SDK or canonical writer",
+  "pressure_gap_downgrades_coverage_on_controlboard/governance projection",
+]
+
+[scope]
+forbidden_paths = [
+  "bins/eliot-host/**",
+  "crates/storage/**",
+  "crates/instrument/**",
+  "crates/agent/**",
+  "docs/architecture/**",
+  ".github/workflows/**",
+]
+non_goals = [
+  "renew SupervisionLease or edit issue #88 owner paths",
+  "change Watchdog process/SCM admission",
+  "add model analysis or semantic diagnosis inside Watchdog",
+  "give Watchdog canonical Store credentials",
+  "execute repair/containment",
+  "replace the spool database/root owner",
+  "claim independent supervision from package tests",
+]
+
+[proof]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-watchdog-core -p eliot-watchdog -p eliot-kernel-service -p eliot-governor -p eliotd --all-targets",
+  "cargo test --locked -p eliot-watchdog-core -p eliot-watchdog -p eliot-kernel-service -p eliot-governor -p eliotd --all-targets",
+  "cargo clippy --locked -p eliot-watchdog-core -p eliot-watchdog -p eliot-kernel-service -p eliot-governor -p eliotd --all-targets -- -D warnings",
+  "git diff --check",
+]
+required_nonzero_tests = true
+required_target = "x86_64-pc-windows-msvc for service/process failure edge"
+edge_profile = "D0_WATCHDOG_SPOOL_GOVERNOR_RECONCILIATION_EDGE_01"
+product_pulse = "With Host/Kernel/eliotd failures, Watchdog remains reachable, preserves exact sequence/cursor, replays one batch through the canonical path, reports pressure gaps honestly, and creates no duplicate observation."
+
+[stop_conditions]
+contract_challenge = [
+  "The accepted Watchdog spool schema or owner changed after this branch base.",
+  "The only proposed transport requires Kernel or Governor to open the Watchdog redb file directly.",
+  "The Governor lacks a current system-observation/coverage candidate path and implementing it here would create a second semantic owner.",
+  "The patch overlaps the active #88 SupervisionLease renewal paths.",
+  "The sink phase needed for cursor advance cannot be stated without conflating durable transport and canonical application.",
+]
+
+[integration]
+merge_owner = "Watchdog/Kernel/Governor integration swarm"
+merge_rule = "Waves A and B may be reviewed independently but do not close #458. Merge full cutover only when authenticated transport, Governor admission and exact restart replay agree on one revision and cursor policy."
+result_schema = "issue, source_base, changed_paths_by_wave, contract_and_cursor_revision, batch_and_ack_matrix, transport_binding, governor_admission_receipts, coverage_gap_behavior, package_and_windows_edge_proof, residual_unknowns, finish"
