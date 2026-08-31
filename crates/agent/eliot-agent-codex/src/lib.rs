@@ -21,6 +21,7 @@ use eliot_process::{
 use eliot_source_assurance::{
     AdmissionExpectation, AdmissionOutcome, SourceAssurance, SourceAssuranceError,
 };
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -395,18 +396,152 @@ pub fn begin_attempt(
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodexWireMessage {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub id: Option<Value>,
-    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub message_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub method: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub params: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub result: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub error: Option<Value>,
+}
+
+fn deserialize_non_null_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)?
+        .ok_or_else(|| de::Error::custom("explicit null is not permitted"))
+        .map(Some)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WireMessageKind {
+    Request,
+    Notification,
+    Response,
+}
+
+fn valid_wire_id(value: &Value) -> bool {
+    let Some(id) = value.as_str() else {
+        return false;
+    };
+    valid_wire_id_text(id)
+}
+
+fn valid_wire_id_text(id: &str) -> bool {
+    let mut bytes = id.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_method(method: &str) -> bool {
+    let mut bytes = method.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && method == method.trim()
+        && bytes
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.'))
+}
+
+fn validate_wire_message(message: &CodexWireMessage) -> Result<WireMessageKind, CodexAdapterError> {
+    if let Some(id) = &message.id
+        && !valid_wire_id(id)
+    {
+        return Err(CodexAdapterError::MalformedWire(
+            "id must be a supported string",
+        ));
+    }
+    if message.params.as_ref().is_some_and(Value::is_null)
+        || message.result.as_ref().is_some_and(Value::is_null)
+        || message.error.as_ref().is_some_and(Value::is_null)
+    {
+        return Err(CodexAdapterError::MalformedWire(
+            "explicit null field is not permitted",
+        ));
+    }
+    if let Some(method) = &message.method
+        && !valid_method(method)
+    {
+        return Err(CodexAdapterError::MalformedWire("invalid method"));
+    }
+    if let Some(message_type) = &message.message_type
+        && !matches!(
+            message_type.as_str(),
+            "request" | "notification" | "response"
+        )
+    {
+        return Err(CodexAdapterError::MalformedWire("unsupported type"));
+    }
+    if message.result.is_some() && message.error.is_some() {
+        return Err(CodexAdapterError::AmbiguousResponse);
+    }
+
+    let kind = if message.result.is_some() || message.error.is_some() {
+        if message.id.is_none() || message.method.is_some() || message.params.is_some() {
+            return Err(CodexAdapterError::MalformedWire(
+                "response contains request or notification fields",
+            ));
+        }
+        WireMessageKind::Response
+    } else if message.method.is_some() {
+        if message.id.is_some() {
+            WireMessageKind::Request
+        } else {
+            WireMessageKind::Notification
+        }
+    } else {
+        return Err(CodexAdapterError::MalformedWire("message has no operation"));
+    };
+
+    if message.message_type.as_deref().is_some_and(|declared| {
+        !matches!(
+            (declared, kind),
+            ("request", WireMessageKind::Request)
+                | ("notification", WireMessageKind::Notification)
+                | ("response", WireMessageKind::Response)
+        )
+    }) {
+        return Err(CodexAdapterError::MalformedWire(
+            "type conflicts with message shape",
+        ));
+    }
+    Ok(kind)
 }
 
 impl CodexWireMessage {
@@ -416,12 +551,7 @@ impl CodexWireMessage {
         }
         let message: Self = serde_json::from_slice(line)
             .map_err(|_| CodexAdapterError::MalformedWire("invalid JSON object"))?;
-        if message.id.is_none() && message.method.is_none() {
-            return Err(CodexAdapterError::MalformedWire("missing id/method"));
-        }
-        if message.result.is_some() && message.error.is_some() {
-            return Err(CodexAdapterError::AmbiguousResponse);
-        }
+        validate_wire_message(&message)?;
         Ok(message)
     }
 
@@ -518,8 +648,13 @@ pub fn correlate_response<'a>(
     message: &'a CodexWireMessage,
     request_id: &str,
 ) -> Result<&'a Value, CodexAdapterError> {
+    if validate_wire_message(message)? != WireMessageKind::Response {
+        return Err(CodexAdapterError::MalformedWire(
+            "message is not a response",
+        ));
+    }
     let actual = message.id.as_ref().and_then(Value::as_str);
-    if actual != Some(request_id) {
+    if !valid_wire_id_text(request_id) || actual != Some(request_id) {
         return Err(CodexAdapterError::ResponseCorrelation {
             expected: request_id.into(),
         });
@@ -564,15 +699,15 @@ fn validate_event_session(
         return Ok(());
     };
     for key in ["threadId", "thread_id"] {
-        if let Some(value) = object.get(key).and_then(Value::as_str)
-            && value != session.thread_id
+        if let Some(value) = object.get(key)
+            && value.as_str() != Some(session.thread_id.as_str())
         {
             return Err(CodexAdapterError::SessionMismatch);
         }
     }
     for key in ["sessionId", "session_id"] {
-        if let Some(value) = object.get(key).and_then(Value::as_str)
-            && value != session.session_id.as_str()
+        if let Some(value) = object.get(key)
+            && value.as_str() != Some(session.session_id.as_str())
         {
             return Err(CodexAdapterError::SessionMismatch);
         }
@@ -602,6 +737,11 @@ pub fn translate_host_event(
         .method
         .as_deref()
         .ok_or(CodexAdapterError::MalformedWire("event has no method"))?;
+    if validate_wire_message(message)? != WireMessageKind::Notification {
+        return Err(CodexAdapterError::MalformedWire(
+            "event must be a notification",
+        ));
+    }
     let params = message.params.clone().unwrap_or(Value::Null);
     validate_event_session(&params, session)?;
     let bytes = serde_json::to_vec(&message)
@@ -610,7 +750,7 @@ pub fn translate_host_event(
         return Err(CodexAdapterError::WireTooLarge);
     }
     let cursor = EventCursor::new(format!("codex:{sequence}"))?;
-    Ok(HostEventEnvelope {
+    let envelope = HostEventEnvelope {
         event_id: EventId::new(format!("codex:{sequence}"))?,
         attempt_id,
         sequence,
@@ -621,7 +761,9 @@ pub fn translate_host_event(
         normalized_payload: params,
         parent_event_id: None,
         observed_at: observed_at.into(),
-    })
+    };
+    envelope.validate()?;
+    Ok(envelope)
 }
 
 /// Result input owned by the caller, assembled from a complete event stream.
@@ -1131,6 +1273,98 @@ mod tests {
     }
 
     #[test]
+    fn wire_grammar_matrix_is_closed_and_disjoint() {
+        for valid in [
+            br#"{"id":"1","method":"turn/start"}"#.as_slice(),
+            br#"{"id":"request_1.2","method":"model/list","params":{}}"#.as_slice(),
+            br#"{"method":"initialized"}"#.as_slice(),
+            br#"{"type":"notification","method":"initialized","params":[]}"#.as_slice(),
+            br#"{"type":"request","id":"request-1","method":"thread/start","params":{}}"#
+                .as_slice(),
+            br#"{"id":"response-1","result":{}}"#.as_slice(),
+            br#"{"type":"response","id":"response-1","error":{"code":1}}"#.as_slice(),
+        ] {
+            assert!(
+                CodexWireMessage::parse_line(valid).is_ok(),
+                "valid wire: {valid:?}"
+            );
+        }
+
+        for invalid in [
+            br"{}".as_slice(),
+            br#"{"id":null,"method":"x"}"#,
+            br#"{"id":1,"result":{}}"#,
+            br#"{"id":true,"result":{}}"#,
+            br#"{"id":{},"result":{}}"#,
+            br#"{"id":[],"result":{}}"#,
+            br#"{"id":"","result":{}}"#,
+            br#"{"id":"bad id","result":{}}"#,
+            br#"{"id":"bad/id","result":{}}"#,
+            br#"{"id":"1","method":""}"#,
+            br#"{"id":"1","method":42}"#,
+            br#"{"id":"1","method":"bad method"}"#,
+            br#"{"method":null}"#,
+            br#"{"method":"x","params":null}"#,
+            br#"{"id":"1","result":null}"#,
+            br#"{"id":"1","error":null}"#,
+            br#"{"id":"1","result":{},"error":{}}"#,
+            br#"{"id":"1","method":"x","result":{}}"#,
+            br#"{"id":"1","method":"x","params":{},"result":{}}"#,
+            br#"{"method":"x","result":{}}"#,
+            br#"{"result":{}}"#,
+            br#"{"type":null,"method":"x"}"#,
+            br#"{"type":"","method":"x"}"#,
+            br#"{"type":"request","method":"x"}"#,
+            br#"{"type":"response","id":"1","method":"x"}"#,
+            br#"{"type":"notification","id":"1","method":"x"}"#,
+            br#"{"type":"unsupported","method":"x"}"#,
+            br#"{"jsonrpc":"2.0","id":"1","result":{}}"#,
+        ] {
+            assert!(
+                CodexWireMessage::parse_line(invalid).is_err(),
+                "invalid wire accepted: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_correlation_rejects_request_and_notification_fields() {
+        let request = CodexWireMessage::request("response-1", "turn/start", serde_json::json!({}));
+        assert!(matches!(
+            correlate_response(&request, "response-1"),
+            Err(CodexAdapterError::MalformedWire(_))
+        ));
+
+        let mixed = CodexWireMessage {
+            id: Some(Value::String("response-1".into())),
+            message_type: Some("response".into()),
+            method: Some("turn/start".into()),
+            params: Some(serde_json::json!({})),
+            result: Some(serde_json::json!({})),
+            error: None,
+        };
+        assert!(matches!(
+            correlate_response(&mixed, "response-1"),
+            Err(CodexAdapterError::MalformedWire(_))
+        ));
+
+        let notification = CodexWireMessage::notification("turn/completed", None);
+        assert!(matches!(
+            correlate_response(&notification, "response-1"),
+            Err(CodexAdapterError::MalformedWire(_))
+        ));
+    }
+
+    #[test]
+    fn wire_size_limit_is_checked_before_decoding() {
+        let oversized = vec![b' '; MAX_JSONL_LINE_BYTES + 1];
+        assert!(matches!(
+            CodexWireMessage::parse_line(&oversized),
+            Err(CodexAdapterError::WireTooLarge)
+        ));
+    }
+
+    #[test]
     fn stale_route_and_authority_widening_fail_closed() -> TestResult {
         let mut bad = attached()?;
         bad.route.host_family = "other".into();
@@ -1166,10 +1400,9 @@ mod tests {
     #[test]
     fn event_from_wrong_session_is_rejected() -> TestResult {
         let a = attached()?;
-        let message = CodexWireMessage::request(
-            "event-1",
+        let message = CodexWireMessage::notification(
             "turn/completed",
-            serde_json::json!({ "threadId": "other-thread" }),
+            Some(serde_json::json!({ "threadId": "other-thread" })),
         );
         assert!(matches!(
             translate_host_event(
@@ -1182,6 +1415,67 @@ mod tests {
                 "now",
             ),
             Err(CodexAdapterError::SessionMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn event_session_fields_are_typed_and_event_shape_is_notification_only() -> TestResult {
+        let a = attached()?;
+        let wrong_type = CodexWireMessage::notification(
+            "turn/completed",
+            Some(serde_json::json!({ "threadId": 42 })),
+        );
+        assert!(matches!(
+            translate_host_event(
+                &wrong_type,
+                AttemptId::new("attempt-1")?,
+                &a.route,
+                &a.session,
+                1,
+                None,
+                "now",
+            ),
+            Err(CodexAdapterError::SessionMismatch)
+        ));
+
+        let request = CodexWireMessage::request(
+            "event-1",
+            "turn/completed",
+            serde_json::json!({ "threadId": "thread-1" }),
+        );
+        assert!(matches!(
+            translate_host_event(
+                &request,
+                AttemptId::new("attempt-1")?,
+                &a.route,
+                &a.session,
+                1,
+                None,
+                "now",
+            ),
+            Err(CodexAdapterError::MalformedWire(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn event_envelope_rejects_missing_observation_time() -> TestResult {
+        let a = attached()?;
+        let message = CodexWireMessage::notification("turn/completed", None);
+        assert!(matches!(
+            translate_host_event(
+                &message,
+                AttemptId::new("attempt-1")?,
+                &a.route,
+                &a.session,
+                1,
+                None,
+                " ",
+            ),
+            Err(CodexAdapterError::Contract(
+                eliot_agent_api::ContractError::EmptyField("observed_at")
+            ))
         ));
         Ok(())
     }
