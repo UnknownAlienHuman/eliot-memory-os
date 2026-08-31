@@ -227,6 +227,15 @@ fn request(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    let root_effects = if specs.iter().any(|spec| spec.write) {
+        BTreeSet::from([
+            EffectKind::Observe,
+            EffectKind::ReadWorkspace,
+            EffectKind::WriteCandidate,
+        ])
+    } else {
+        BTreeSet::from([EffectKind::Observe, EffectKind::ReadWorkspace])
+    };
     Ok(StaffingPlanRequest {
         candidate_id: CandidateId::new(format!("candidate-{tag}"))?,
         launch: AgentLaunchRequest {
@@ -243,7 +252,7 @@ fn request(
             privacy_profile: "PRIVATE".to_owned(),
             effect_ceiling: EffectCeiling {
                 scope_ref: "task-scope".to_owned(),
-                allowed: BTreeSet::from([EffectKind::WriteCandidate]),
+                allowed: root_effects,
                 max_external_effects: 0,
             },
             max_depth: 3,
@@ -810,6 +819,45 @@ fn live_capacity_evidence_limits_admission_and_reassignment() -> TestResult {
             limit: 1,
         })
     );
+    Ok(())
+}
+
+#[test]
+fn child_plan_cannot_widen_parent_effect_ceiling() -> TestResult {
+    let mut coordinator = coordinator(config(4, 4), &["proof-admission-effect-parent"])?;
+    let parent = plan_and_admit(
+        &mut coordinator,
+        "effect-parent",
+        &[LaneSpec {
+            work: "effect-work-parent",
+            role: "effect-role-parent",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let parent_attempt = parent.admitted_lanes[0].attempt_id.clone();
+    let events_before = coordinator.events().len();
+
+    assert!(matches!(
+        coordinator.plan(request(
+            "effect-child",
+            &[LaneSpec {
+                work: "effect-work-child",
+                role: "effect-role-child",
+                route: "b",
+                scope: Some("effect-child-scope"),
+                write: true,
+                priority: 1,
+            }],
+            Some(parent_attempt),
+        )?),
+        Err(CoordinatorError::ProviderContract(message))
+            if message.contains("authority is not sufficient")
+    ));
+    assert_eq!(coordinator.events().len(), events_before);
     Ok(())
 }
 

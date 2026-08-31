@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_agent_api::{AttemptId, EffectKind, ResultDisposition, WorkLeaseId};
+use eliot_agent_api::{
+    AttemptId, ContractError, EffectCeiling, EffectKind, ResultDisposition, WorkLeaseId,
+};
 use eliot_agent_contracts::{
     AgentAttemptId, CoordinationEntry, CoordinationMapView, DescendantTerminalState,
     LivePeerMessage, LivePeerMessageState, MessageId, ParentFinishCeiling, RevisionId, WorkItemId,
@@ -175,6 +177,7 @@ impl AgentCoordinator {
         validate_text(request.plan_revision.as_str(), "plan_revision")?;
         validate_state_fence(&request.state_fence)?;
         validate_recipe(&request)?;
+        self.validate_launch_effect_ceiling(&request.launch)?;
 
         if request.lanes.is_empty() {
             return Err(CoordinatorError::InvalidField("lanes"));
@@ -355,6 +358,7 @@ impl AgentCoordinator {
             .ok_or(CoordinatorError::UnknownCandidate)?;
         validate_candidate_binding(&candidate, &receipt)?;
         let launch = self.launch_for_candidate(&candidate.candidate_id)?.clone();
+        self.validate_launch_effect_ceiling(&launch)?;
 
         let active = self.active_attempt_count();
         if active.saturating_add(receipt.admitted_lanes.len()) > self.config.max_admitted_attempts {
@@ -1527,6 +1531,28 @@ impl AgentCoordinator {
             self.writer_holders.remove(scope);
         }
     }
+
+    fn validate_launch_effect_ceiling(
+        &self,
+        launch: &eliot_agent_api::AgentLaunchRequest,
+    ) -> Result<(), CoordinatorError> {
+        let parent_ceiling = if let Some(parent_attempt) = &launch.parent_attempt {
+            let parent = self
+                .attempts
+                .get(parent_attempt)
+                .ok_or(CoordinatorError::UnknownAttempt)?;
+            self.work_unit_for(parent)?.effect_ceiling
+        } else {
+            launch.effect_ceiling.clone()
+        };
+        if launch.parent_attempt.is_some() {
+            validate_effect_ceiling(&launch.effect_ceiling, &parent_ceiling)?;
+        }
+        for work_unit in &launch.work_units {
+            validate_effect_ceiling(&work_unit.effect_ceiling, &launch.effect_ceiling)?;
+        }
+        Ok(())
+    }
 }
 
 fn validate_recipe(request: &StaffingPlanRequest) -> Result<(), CoordinatorError> {
@@ -1731,6 +1757,18 @@ fn validate_attempt_binding(
 
 fn provider_contract(error: impl std::fmt::Display) -> CoordinatorError {
     CoordinatorError::ProviderContract(error.to_string())
+}
+
+fn validate_effect_ceiling(
+    child: &EffectCeiling,
+    parent: &EffectCeiling,
+) -> Result<(), CoordinatorError> {
+    if !child.allowed.is_subset(&parent.allowed)
+        || child.max_external_effects > parent.max_external_effects
+    {
+        return Err(provider_contract(ContractError::InsufficientAuthority));
+    }
+    Ok(())
 }
 
 fn route_key(route: &eliot_agent_api::RouteFingerprint) -> String {
