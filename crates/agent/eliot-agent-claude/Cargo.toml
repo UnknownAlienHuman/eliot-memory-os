@@ -1,0 +1,15 @@
+[package]
+name = "eliot-agent-claude"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Local Claude Agent SDK sidecar contract and native skeleton (wave1, candidate-only, no authority)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -11,6 +11,7 @@ members = [
   "crates/agent/eliot-agent-acp",
   "crates/agent/eliot-agent-coordinator",
   "crates/agent/eliot-agent-contracts",
+  "crates/agent/eliot-agent-claude",
   "crates/agent/eliot-agent-codex",
   "crates/agent/eliot-agent-opencode",
   "crates/agent/eliot-swarm",
@@ -153,6 +154,7 @@ eliot-agent-api = { path = "crates/agent/eliot-agent-api", version = "0.1.0" }
 eliot-agent-acp = { path = "crates/agent/eliot-agent-acp", version = "0.1.0" }
 eliot-agent-coordinator = { path = "crates/agent/eliot-agent-coordinator", version = "0.1.0" }
 eliot-agent-contracts = { path = "crates/agent/eliot-agent-contracts", version = "0.1.0" }
+eliot-agent-claude = { path = "crates/agent/eliot-agent-claude", version = "0.1.0" }
 eliot-agent-codex = { path = "crates/agent/eliot-agent-codex", version = "0.1.0" }
 eliot-engine = { path = "crates/eliot-engine", version = "0.1.0" }
 eliot-store = { path = "crates/eliot-store", version = "0.1.0" }
