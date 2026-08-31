@@ -123,6 +123,11 @@ impl ReadinessReceipt {
                         "ready readiness needs both schema generations".to_owned(),
                     ));
                 }
+                if self.expected_generation != self.observed_generation {
+                    return Err(StoreWireError::Invalid(
+                        "ready readiness schema generations must match".to_owned(),
+                    ));
+                }
             }
         }
         Ok(())
