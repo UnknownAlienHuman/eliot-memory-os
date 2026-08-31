@@ -12,16 +12,26 @@ import os
 import re
 import shutil
 import subprocess
+import stat
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 CONTRACT_PATH = Path("integrations/antigravity/runtime-preflight.contract.json")
 CONTRACT_VERSION = "eliot.antigravity-runtime-preflight.v1"
 RECEIPT_VERSION = "eliot.antigravity-runtime-preflight-receipt.v1"
 CREDENTIAL_FRAGMENTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "APIKEY", "CREDENTIAL", "PRIVATE_KEY")
+PROOF_CEILING = "ZERO_MODEL_STABLE_EXECUTABLE_PATH_AND_HELP_FINGERPRINT_ONLY"
+EXECUTABLE_STABILITY_CONTRACT = {
+    "snapshot_stages": ["pre_version", "post_version", "post_help"],
+    "snapshot_fields": ["sha256", "byte_length", "file_identity"],
+    "read_through_opened_handle": True,
+    "stability_checked_during_read": True,
+    "path_identity_rechecked": True,
+    "process_image_proof": False,
+}
 
 
 class AntigravityPreflightError(RuntimeError):
@@ -36,12 +46,99 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+@dataclass(frozen=True)
+class ExecutableSnapshot:
+    sha256: str
+    byte_length: int
+    file_identity: dict[str, int | None]
+
+    def receipt(self) -> dict[str, Any]:
+        return {
+            "sha256": self.sha256,
+            "byte_length": self.byte_length,
+            "file_identity": dict(self.file_identity),
+        }
+
+
+def _stat_metadata(info: os.stat_result) -> dict[str, int | None]:
+    return {
+        "device": getattr(info, "st_dev", None),
+        "inode": getattr(info, "st_ino", None),
+        "mode": getattr(info, "st_mode", None),
+        "size": getattr(info, "st_size", None),
+        "mtime_ns": getattr(info, "st_mtime_ns", None),
+        "ctime_ns": getattr(info, "st_ctime_ns", None),
+        "file_attributes": getattr(info, "st_file_attributes", None),
+    }
+
+
+def _stable_metadata(metadata: dict[str, int | None]) -> dict[str, int | None]:
+    return {field: metadata[field] for field in ("device", "inode", "size", "mtime_ns", "file_attributes")}
+
+
+def _is_reparse_point(metadata: dict[str, int | None]) -> bool:
+    attributes = metadata["file_attributes"]
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return isinstance(attributes, int) and bool(reparse_flag and attributes & reparse_flag)
+
+
+def _regular_path_metadata(path: Path) -> dict[str, int | None]:
+    try:
+        metadata = _stat_metadata(path.lstat())
+    except OSError as error:
+        raise AntigravityPreflightError("runtime executable identity could not be resolved") from error
+    if not stat.S_ISREG(metadata["mode"] or 0) or _is_reparse_point(metadata):
+        raise AntigravityPreflightError("runtime executable must be a regular non-reparse file")
+    return metadata
+
+
+def _require_opened_identity(metadata: dict[str, int | None]) -> None:
+    if not all(isinstance(metadata[field], int) and metadata[field] > 0 for field in ("device", "inode")):
+        raise AntigravityPreflightError("runtime executable opened-file identity is unavailable")
+
+
+def _snapshot_executable(path: Path) -> tuple[ExecutableSnapshot, dict[str, Any]]:
+    path_before = _regular_path_metadata(path)
+    try:
+        with path.open("rb") as handle:
+            handle_before = _stat_metadata(os.fstat(handle.fileno()))
+            _require_opened_identity(handle_before)
+            if _stable_metadata(handle_before) != _stable_metadata(path_before):
+                raise AntigravityPreflightError("runtime executable path identity changed during snapshot")
+            digest = hashlib.sha256()
+            byte_length = 0
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                byte_length += len(block)
+                digest.update(block)
+            handle_after = _stat_metadata(os.fstat(handle.fileno()))
+            path_after = _regular_path_metadata(path)
+    except AntigravityPreflightError:
+        raise
+    except (OSError, ValueError) as error:
+        raise AntigravityPreflightError("runtime executable snapshot could not be read") from error
+    if _stable_metadata(handle_before) != _stable_metadata(handle_after) or _stable_metadata(handle_after) != _stable_metadata(
+        path_after
+    ):
+        raise AntigravityPreflightError("runtime executable changed during snapshot")
+    if byte_length != handle_before["size"]:
+        raise AntigravityPreflightError("runtime executable length changed during snapshot")
+    snapshot = ExecutableSnapshot(digest.hexdigest(), byte_length, _stable_metadata(handle_before))
+    return snapshot, {
+        "opened_handle_regular": True,
+        "opened_handle_identity_available": True,
+        "opened_handle_metadata_stable": True,
+        "path_regular_non_symlink": True,
+        "path_reparse_checked": True,
+        "path_identity_matches_opened_handle_before_read": True,
+        "path_identity_matches_opened_handle_after_read": True,
+        "content_read_through_opened_handle": True,
+        "content_length_matches_opened_handle": True,
+        "stable": True,
+    }
+
+
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    return _snapshot_executable(path)[0].sha256
 
 
 def load_contract(root: Path, path: Path = CONTRACT_PATH) -> dict[str, Any]:
@@ -68,6 +165,12 @@ def validate_contract(contract: dict[str, Any]) -> None:
         raise AntigravityPreflightError("fixed universal model ID is forbidden")
     if contract.get("route_admitted") is not False:
         raise AntigravityPreflightError("preflight may not admit the route")
+    if contract.get("proof_ceiling") != PROOF_CEILING:
+        raise AntigravityPreflightError("preflight proof ceiling drifted")
+    if contract.get("process_image_proof") is not False:
+        raise AntigravityPreflightError("preflight may not claim process-image proof")
+    if contract.get("executable_stability") != EXECUTABLE_STABILITY_CONTRACT:
+        raise AntigravityPreflightError("executable stability contract drifted")
     runtimes = contract.get("candidate_runtimes")
     if not isinstance(runtimes, list) or len(runtimes) != 2:
         raise AntigravityPreflightError("exactly two runtime candidates are required")
@@ -310,6 +413,7 @@ def _probe_runtime(
     runtime: dict[str, Any],
     environment: dict[str, str],
     override: ProgramOverride | None,
+    runner: Callable[..., tuple[bytes, dict[str, Any], dict[str, Any], int]] | None = None,
 ) -> dict[str, Any]:
     resolved = _resolve_program(runtime, override)
     if resolved is None:
@@ -318,26 +422,37 @@ def _probe_runtime(
             "route_role": runtime["route_role"],
             "status": "absent",
             "executable_path": None,
+            "executable_snapshot": None,
+            "executable_snapshot_stability": {},
+            "process_image_proof": False,
             "route_admitted": False,
             "execution_calls": 0,
             "model_calls": 0,
         }
     executable, prefix = resolved
+    pre_version_snapshot, pre_version_stability = _snapshot_executable(executable)
+    probe_runner = run_bounded if runner is None else runner
     bounds = contract["bounds"]
-    version_stdout, version_out_receipt, version_err_receipt, version_exit = run_bounded(
+    version_stdout, version_out_receipt, version_err_receipt, version_exit = probe_runner(
         [str(executable), *prefix, *runtime["version_argv"]],
         environment,
         bounds["version_timeout_ms"],
         bounds["max_version_bytes"],
         bounds["max_stderr_bytes"],
     )
-    help_stdout, help_out_receipt, help_err_receipt, help_exit = run_bounded(
+    post_version_snapshot, post_version_stability = _snapshot_executable(executable)
+    if post_version_snapshot != pre_version_snapshot:
+        raise AntigravityPreflightError("runtime executable changed after version probe")
+    help_stdout, help_out_receipt, help_err_receipt, help_exit = probe_runner(
         [str(executable), *prefix, *runtime["help_argv"]],
         environment,
         bounds["help_timeout_ms"],
         bounds["max_help_bytes"],
         bounds["max_stderr_bytes"],
     )
+    post_help_snapshot, post_help_stability = _snapshot_executable(executable)
+    if post_help_snapshot != pre_version_snapshot:
+        raise AntigravityPreflightError("runtime executable changed after help probe")
     try:
         version_text = version_stdout.decode("utf-8").strip()
         help_text = help_stdout.decode("utf-8")
@@ -363,7 +478,18 @@ def _probe_runtime(
         "route_role": runtime["route_role"],
         "status": status,
         "executable_path": str(executable),
-        "executable_sha256": sha256_file(executable),
+        "executable_sha256": pre_version_snapshot.sha256,
+        "executable_byte_length": pre_version_snapshot.byte_length,
+        "executable_file_identity": dict(pre_version_snapshot.file_identity),
+        "executable_snapshot": pre_version_snapshot.receipt(),
+        "executable_snapshot_stability": {
+            "pre_version": pre_version_stability,
+            "post_version": post_version_stability,
+            "post_help": post_help_stability,
+            "same_stable_generation": True,
+            "process_image_proof": False,
+        },
+        "process_image_proof": False,
         "version_text": version_text[:4096],
         "version_stdout": version_out_receipt,
         "version_stderr": version_err_receipt,
@@ -387,6 +513,7 @@ def run_preflight(
     *,
     overrides: dict[str, ProgramOverride] | None = None,
     environment_source: dict[str, str] | None = None,
+    runner: Callable[..., tuple[bytes, dict[str, Any], dict[str, Any], int]] | None = None,
 ) -> dict[str, Any]:
     validate_contract(contract)
     environment = _allowlisted_environment(contract, environment_source)
@@ -396,6 +523,7 @@ def run_preflight(
             runtime,
             environment,
             None if overrides is None else overrides.get(runtime["runtime_id"]),
+            run_bounded if runner is None else runner,
         )
         for runtime in contract["candidate_runtimes"]
     ]
@@ -423,5 +551,6 @@ def run_preflight(
         "execution_calls": 0,
         "model_calls": 0,
         "route_admitted": False,
-        "proof_ceiling": "ZERO_MODEL_EXECUTABLE_AND_HELP_FINGERPRINT_ONLY",
+        "process_image_proof": False,
+        "proof_ceiling": contract["proof_ceiling"],
     }

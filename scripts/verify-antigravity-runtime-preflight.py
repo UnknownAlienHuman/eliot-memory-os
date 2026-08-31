@@ -9,8 +9,9 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
+import antigravity_runtime_preflight as preflight
 from antigravity_runtime_preflight import (
     CONTRACT_PATH,
     AntigravityPreflightError,
@@ -29,6 +30,17 @@ def expect_failure(case: str, operation: Callable[[], object]) -> None:
     except AntigravityPreflightError:
         return
     raise AssertionError(f"expected fail-closed Antigravity preflight case: {case}")
+
+
+def stream_receipt(payload: bytes) -> dict[str, Any]:
+    return {
+        "sha256": preflight.sha256_bytes(payload),
+        "total_bytes": len(payload),
+        "retained_bytes": len(payload),
+        "truncated": False,
+        "complete": True,
+        "read_failed": False,
+    }
 
 
 def overrides(root: Path, primary_mode: str = "full", fallback_mode: str = "full") -> dict[str, ProgramOverride]:
@@ -83,6 +95,7 @@ def self_test(root: Path) -> None:
         "provider_credentials_used",
         "execution_calls",
         "model_calls",
+        "process_image_proof",
         "route_admitted",
         "proof_ceiling",
     )
@@ -97,8 +110,22 @@ def self_test(root: Path) -> None:
     if first["execution_calls"] != 0 or first["model_calls"] != 0 or first["route_admitted"] is not False:
         raise AssertionError("preflight crossed into execution or admission")
     primary = next(item for item in first["runtimes"] if item["route_role"] == "primary_candidate")
+    if first["process_image_proof"] is not False or primary.get("process_image_proof") is not False:
+        raise AssertionError("preflight overclaimed process-image proof")
     if not primary["all_required_help_markers_observed"]:
         raise AssertionError("required help marker closure is false")
+    snapshot = primary["executable_snapshot"]
+    if snapshot["sha256"] != primary["executable_sha256"]:
+        raise AssertionError("receipt did not publish the pre-probe executable digest")
+    if snapshot["byte_length"] != primary["executable_byte_length"]:
+        raise AssertionError("receipt did not publish the pre-probe executable length")
+    if not snapshot["file_identity"]["device"] or not snapshot["file_identity"]["inode"]:
+        raise AssertionError("receipt omitted opened-file identity")
+    stability = primary["executable_snapshot_stability"]
+    if any(stage not in stability for stage in ("pre_version", "post_version", "post_help")):
+        raise AssertionError("receipt omitted executable stability observations")
+    if not stability["same_stable_generation"] or stability["process_image_proof"] is not False:
+        raise AssertionError("preflight overclaimed executable stability or process-image proof")
     if first["primary_missing_admission_requirements"] != [
         "observed_request_event_schema",
         "current_account_model_catalogue",
@@ -143,6 +170,69 @@ def self_test(root: Path) -> None:
             ),
         )
 
+    with tempfile.TemporaryDirectory(prefix="eliot-antigravity-executable-drift-") as temporary:
+        executable = Path(temporary) / "antigravity-candidate"
+        executable.write_bytes(b"generation-a")
+        primary_runtime = next(
+            runtime for runtime in contract["candidate_runtimes"] if runtime["route_role"] == "primary_candidate"
+        )
+
+        def replace_executable_runner(
+            command: list[str],
+            environment: dict[str, str],
+            timeout_ms: int,
+            max_stdout: int,
+            max_stderr: int,
+        ) -> tuple[bytes, dict[str, Any], dict[str, Any], int]:
+            del environment, timeout_ms, max_stdout, max_stderr
+            payload = b"fake-antigravity 1.0\n" if command[-1] == "--version" else b"stdin json\n"
+            replacement = executable.with_name("replacement")
+            replacement.write_bytes(b"generation-b")
+            replacement.replace(executable)
+            return payload, stream_receipt(payload), stream_receipt(b""), 0
+
+        expect_failure(
+            "executable replacement after version",
+            lambda: preflight._probe_runtime(
+                contract,
+                primary_runtime,
+                {},
+                ProgramOverride(executable),
+                replace_executable_runner,
+            ),
+        )
+
+        executable.write_bytes(b"generation-a")
+        calls = 0
+
+        def replace_after_help_runner(
+            command: list[str],
+            environment: dict[str, str],
+            timeout_ms: int,
+            max_stdout: int,
+            max_stderr: int,
+        ) -> tuple[bytes, dict[str, Any], dict[str, Any], int]:
+            del environment, timeout_ms, max_stdout, max_stderr
+            nonlocal calls
+            calls += 1
+            payload = b"fake-antigravity 1.0\n" if command[-1] == "--version" else b"stdin json\n"
+            if calls == 2:
+                replacement = executable.with_name("replacement-after-help")
+                replacement.write_bytes(b"generation-c")
+                replacement.replace(executable)
+            return payload, stream_receipt(payload), stream_receipt(b""), 0
+
+        expect_failure(
+            "executable replacement after help",
+            lambda: preflight._probe_runtime(
+                contract,
+                primary_runtime,
+                {},
+                ProgramOverride(executable),
+                replace_after_help_runner,
+            ),
+        )
+
     with tempfile.TemporaryDirectory(prefix="eliot-antigravity-preflight-") as temporary:
         directory = Path(temporary)
         invalid = {
@@ -170,6 +260,14 @@ def self_test(root: Path) -> None:
     role_drift["candidate_runtimes"][1]["route_role"] = "primary_candidate"
     expect_failure("duplicate primary role", lambda: validate_contract(role_drift))
 
+    ceiling_drift = copy.deepcopy(contract)
+    ceiling_drift["proof_ceiling"] = "ZERO_MODEL_EXECUTABLE_AND_HELP_FINGERPRINT_ONLY"
+    expect_failure("proof ceiling", lambda: validate_contract(ceiling_drift))
+
+    stability_drift = copy.deepcopy(contract)
+    stability_drift["executable_stability"]["process_image_proof"] = True
+    expect_failure("stability contract", lambda: validate_contract(stability_drift))
+
 
 def verify_current(root: Path) -> None:
     contract = load_contract(root, CONTRACT_PATH)
@@ -179,7 +277,7 @@ def verify_current(root: Path) -> None:
         overrides=overrides(root),
         environment_source=secret_rich_environment(),
     )
-    if receipt["proof_ceiling"] != "ZERO_MODEL_EXECUTABLE_AND_HELP_FINGERPRINT_ONLY":
+    if receipt["proof_ceiling"] != "ZERO_MODEL_STABLE_EXECUTABLE_PATH_AND_HELP_FINGERPRINT_ONLY":
         raise AssertionError("Antigravity proof ceiling drifted")
     if receipt["route_admitted"] is not False or receipt["model_calls"] != 0:
         raise AssertionError("Antigravity preflight overclaimed support")
@@ -193,7 +291,7 @@ def main() -> int:
     root = arguments.root.resolve()
     if arguments.self_test:
         self_test(root)
-        print("ANTIGRAVITY_RUNTIME_PREFLIGHT_SELF_TEST: PASS cases=10")
+        print("ANTIGRAVITY_RUNTIME_PREFLIGHT_SELF_TEST: PASS cases=12")
     else:
         verify_current(root)
         print("ANTIGRAVITY_RUNTIME_PREFLIGHT_VERIFY: PASS model_calls=0 route_admitted=false")
