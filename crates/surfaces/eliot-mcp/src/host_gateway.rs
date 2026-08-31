@@ -11,8 +11,7 @@ use thiserror::Error;
 
 use crate::{
     ContractViolation, HostCancellationRequest, HostContractError, HostCorrelationId,
-    HostInvocationRequest, HostOperationHandle, McpResponse, PortFailure,
-    validate_proof_ceiling,
+    HostInvocationRequest, HostOperationHandle, McpResponse, PortFailure, validate_proof_ceiling,
 };
 
 /// Stable revision of the stateless host-request gateway contract.

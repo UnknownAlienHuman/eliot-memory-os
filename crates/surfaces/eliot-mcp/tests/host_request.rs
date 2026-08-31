@@ -5,9 +5,9 @@ use std::{collections::BTreeMap, error::Error};
 use eliot_mcp::{
     ClientCapabilities, HostCancellationRequest, HostContractError, HostCorrelationId,
     HostEventStreamId, HostInvocationRequest, HostObservedContext, HostObservedEventCursor,
-    HostObservedResourceRef, HostOperationHandle, McpProtocolVersion, StateInput, ToolRequest,
-    MAX_HOST_CORRELATION_BYTES, MAX_HOST_DEADLINE_PREFERENCE_MS, MAX_HOST_EVENT_CURSORS,
-    MAX_HOST_RESOURCE_REF_BYTES, MAX_HOST_RESOURCE_REFS, MAX_HOST_TRACE_ENTRIES,
+    HostObservedResourceRef, HostOperationHandle, MAX_HOST_CORRELATION_BYTES,
+    MAX_HOST_DEADLINE_PREFERENCE_MS, MAX_HOST_EVENT_CURSORS, MAX_HOST_RESOURCE_REF_BYTES,
+    MAX_HOST_RESOURCE_REFS, MAX_HOST_TRACE_ENTRIES, McpProtocolVersion, StateInput, ToolRequest,
     canonical_schema,
 };
 use serde_json::{Value, json};
@@ -58,7 +58,10 @@ fn host_invocation_omits_kernel_identity_and_authority() -> Result<(), Box<dyn E
         "cancellation_id",
         "deadline_unix_ms",
     ] {
-        assert!(!object.contains_key(forbidden), "forbidden field {forbidden}");
+        assert!(
+            !object.contains_key(forbidden),
+            "forbidden field {forbidden}"
+        );
     }
 
     let mut forged = value;
@@ -102,9 +105,7 @@ fn host_context_bounds_and_stream_identity_are_enforced() -> Result<(), Box<dyn 
     request.deadline_preference_ms = Some(MAX_HOST_DEADLINE_PREFERENCE_MS + 1);
     assert!(request.validate().is_err());
     assert!(HostCorrelationId::new("x".repeat(MAX_HOST_CORRELATION_BYTES + 1)).is_err());
-    assert!(
-        HostObservedResourceRef::new("x".repeat(MAX_HOST_RESOURCE_REF_BYTES + 1)).is_err()
-    );
+    assert!(HostObservedResourceRef::new("x".repeat(MAX_HOST_RESOURCE_REF_BYTES + 1)).is_err());
 
     let mut request = invocation()?;
     request.observed_context.host_session_hint = Some("x".repeat(513));
@@ -140,9 +141,7 @@ fn host_context_bounds_and_stream_identity_are_enforced() -> Result<(), Box<dyn 
     ];
     assert!(request.validate().is_err());
 
-    assert!(
-        HostObservedEventCursor::new(HostEventStreamId::new("stream-zero")?, 0).is_err()
-    );
+    assert!(HostObservedEventCursor::new(HostEventStreamId::new("stream-zero")?, 0).is_err());
 
     let mut request = invocation()?;
     request
@@ -196,7 +195,10 @@ fn operation_handle_is_opaque_and_unknown_fields_fail_closed() -> Result<(), Box
     value
         .as_object_mut()
         .expect("request must be an object")
-        .insert("effect_ceiling".to_owned(), Value::String("critical".to_owned()));
+        .insert(
+            "effect_ceiling".to_owned(),
+            Value::String("critical".to_owned()),
+        );
     assert!(serde_json::from_value::<HostInvocationRequest>(value).is_err());
 
     let cancel = HostCancellationRequest {
@@ -211,7 +213,10 @@ fn operation_handle_is_opaque_and_unknown_fields_fail_closed() -> Result<(), Box
     value
         .as_object_mut()
         .expect("cancellation must be an object")
-        .insert("cancellation_id".to_owned(), Value::String("forged".to_owned()));
+        .insert(
+            "cancellation_id".to_owned(),
+            Value::String("forged".to_owned()),
+        );
     assert!(serde_json::from_value::<HostCancellationRequest>(value).is_err());
     Ok(())
 }

@@ -42,9 +42,7 @@ const MAX_HOST_CANCELLATION_REASON_BYTES: usize = 1_024;
 macro_rules! opaque_host_id {
     ($name:ident, $field:literal, $maximum:expr, $description:literal) => {
         #[doc = $description]
-        #[derive(
-            Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-        )]
+        #[derive(Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -112,10 +110,7 @@ pub struct HostObservedEventCursor {
 
 impl HostObservedEventCursor {
     /// Creates one validated stream-qualified cursor observation.
-    pub fn new(
-        stream_id: HostEventStreamId,
-        sequence: u64,
-    ) -> Result<Self, HostContractError> {
+    pub fn new(stream_id: HostEventStreamId, sequence: u64) -> Result<Self, HostContractError> {
         let value = Self {
             stream_id,
             sequence,
@@ -336,10 +331,7 @@ fn bounded_text(
     Ok(())
 }
 
-fn ensure_unique<T: Ord>(
-    values: &[T],
-    field: &'static str,
-) -> Result<(), HostContractError> {
+fn ensure_unique<T: Ord>(values: &[T], field: &'static str) -> Result<(), HostContractError> {
     let mut seen = BTreeSet::new();
     for value in values {
         if !seen.insert(value) {

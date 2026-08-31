@@ -5,9 +5,9 @@ use std::{collections::BTreeMap, error::Error};
 use eliot_mcp::{
     ClientCapabilities, HostCancellationOutcome, HostCancellationPortOutcome,
     HostCancellationRequest, HostContractError, HostCorrelationId, HostGatewayError,
-    HostInvocationOutcome, HostInvocationPortOutcome, HostInvocationRequest,
-    HostObservedContext, HostOperationHandle, HostRequestGateway, KernelHostRequestPort,
-    McpProtocolVersion, McpResponse, PortFailure, ResponseKind, StateInput, ToolRequest,
+    HostInvocationOutcome, HostInvocationPortOutcome, HostInvocationRequest, HostObservedContext,
+    HostOperationHandle, HostRequestGateway, KernelHostRequestPort, McpProtocolVersion,
+    McpResponse, PortFailure, ResponseKind, StateInput, ToolRequest,
 };
 use eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
 use eliot_receipts::ProofCeiling;
@@ -146,7 +146,10 @@ fn accepted_invocation_preserves_kernel_operation_handle() -> Result<(), Box<dyn
         HostInvocationOutcome::Accepted { operation_handle: observed }
             if observed == &operation_handle
     ));
-    assert_eq!(result.correlation_id().as_str(), request.correlation_id.as_str());
+    assert_eq!(
+        result.correlation_id().as_str(),
+        request.correlation_id.as_str()
+    );
     Ok(())
 }
 
@@ -299,8 +302,14 @@ fn cancellation_failure_and_terminal_state_remain_exact() -> Result<(), Box<dyn 
         ..FakePort::default()
     };
     let terminal = HostRequestGateway.cancel(&mut terminal_port, &request)?;
-    assert_eq!(terminal.outcome(), &HostCancellationOutcome::AlreadyTerminal);
-    assert_eq!(terminal.operation_handle().as_str(), request.operation_handle.as_str());
+    assert_eq!(
+        terminal.outcome(),
+        &HostCancellationOutcome::AlreadyTerminal
+    );
+    assert_eq!(
+        terminal.operation_handle().as_str(),
+        request.operation_handle.as_str()
+    );
 
     let failure = PortFailure::FenceMismatch;
     let mut rejected_port = FakePort {

@@ -130,7 +130,8 @@ impl Revision {
 
 impl<'de> Deserialize<'de> for Revision {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de>,
+    where
+        D: Deserializer<'de>,
     {
         Self::new(u64::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
