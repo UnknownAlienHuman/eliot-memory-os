@@ -9,7 +9,9 @@ description = "Bounded Codex App Server stdio/JSONL adapter for ELIOT"
 [dependencies]
 blake3.workspace = true
 eliot-agent-api = { path = "../eliot-agent-api", version = "0.1.0" }
+eliot-agent-coordinator = { path = "../eliot-agent-coordinator", version = "0.1.0" }
 eliot-process = { path = "../../kernel/eliot-process", version = "0.1.0" }
+eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
 eliot-source-assurance = { path = "../../security/eliot-source-assurance", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
