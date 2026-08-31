@@ -32,7 +32,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod store_failure;
 mod wire;
+
+pub use store_failure::{
+    LegacyStoreFailureV1, MAX_STORE_FAILURE_DETAIL_LEN, MAX_STORE_FAILURE_REFERENCE_LEN,
+    MAX_STORE_FAILURE_RETRY_AFTER_MS, MAX_STORE_REASON_CODE_LEN, STORE_FAILURE_CONTRACT_REVISION,
+    StoreConflictObservation, StoreFailure, StoreFailureContractError, StoreFailureDisposition,
+    StoreFailureIdentityContext, StoreFailureRequestContext, StoreMutationDisposition,
+    StoreReasonCode, StoreRecoveryAction, StoreRetryDirective, decode_legacy_store_failure_v1,
+};
 
 pub use wire::{
     CAPABILITIES, CAPABILITY_APPLY, CAPABILITY_HEALTH, CAPABILITY_INITIALIZE_GENESIS,
