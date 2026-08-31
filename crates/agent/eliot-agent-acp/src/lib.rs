@@ -1081,12 +1081,25 @@ pub struct AcpCancelRequest {
     pub session_id: String,
     /// A-01 cancellation reason.
     pub reason: eliot_agent_api::CancelReason,
-    /// State fence from the caller-owned authority/attempt projection.
-    pub state_fence: String,
+    /// Canonical typed fence from the caller-owned authority projection.
+    pub state_fence: eliot_contracts::StateFence,
 }
 
 /// Short cancel alias.
 pub type AcpCancel = AcpCancelRequest;
+
+impl AcpCancelRequest {
+    /// Validates that the cancel carries a typed, non-zero fence and non-blank identifiers.
+    pub fn validate(&self) -> Result<(), AcpAdapterError> {
+        if self.operation_id.trim().is_empty() || self.session_id.trim().is_empty() {
+            return Err(AcpAdapterError::InvalidInput("operation_id/session_id"));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| AcpAdapterError::InvalidInput("state_fence"))?;
+        Ok(())
+    }
+}
 
 /// Reconnect projection.  Reconnect never creates a new attempt implicitly.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -1726,6 +1739,98 @@ mod tests {
         })?;
         assert_eq!(unknown.disposition, ResultDisposition::UnknownOutcome);
         assert_eq!(unknown.unknown_reason.as_deref(), Some("transport closed"));
+        Ok(())
+    }
+
+    #[test]
+    fn acp_cancel_carries_typed_state_fence_and_rejects_legacy_string()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let typed = AcpCancelRequest {
+            operation_id: "op-cancel-01".into(),
+            attempt_id: AttemptId::new("attempt-cancel-01")?,
+            session_id: "session-cancel-01".into(),
+            reason: eliot_agent_api::CancelReason::UserRequested,
+            state_fence: eliot_contracts::StateFence::new(
+                eliot_contracts::AuthorityEpoch::new(3)?,
+                eliot_contracts::ResourceGeneration::new(5)?,
+            ),
+        };
+        assert!(typed.validate().is_ok());
+        let wire = serde_json::to_value(&typed)?;
+        assert!(wire["state_fence"].is_object());
+        assert_eq!(wire["state_fence"]["authority_epoch"], 3);
+        assert_eq!(
+            serde_json::from_value::<AcpCancelRequest>(wire.clone())?,
+            typed
+        );
+
+        // Legacy string fence must not deserialize as typed fence.
+        let legacy = serde_json::json!({
+            "operation_id": "op-cancel-01",
+            "attempt_id": "attempt-cancel-01",
+            "session_id": "session-cancel-01",
+            "reason": "user_requested",
+            "state_fence": "legacy-fence-string"
+        });
+        assert!(serde_json::from_value::<AcpCancelRequest>(legacy).is_err());
+
+        // Zero fence must fail closed via validate.
+        let zero = AcpCancelRequest {
+            operation_id: "op-cancel-01".into(),
+            attempt_id: AttemptId::new("attempt-cancel-01")?,
+            session_id: "session-cancel-01".into(),
+            reason: eliot_agent_api::CancelReason::UserRequested,
+            state_fence: eliot_contracts::StateFence::new(
+                eliot_contracts::AuthorityEpoch::default(),
+                eliot_contracts::ResourceGeneration::default(),
+            ),
+        };
+        assert!(zero.validate().is_err());
+        let zero_wire = serde_json::json!({
+            "operation_id": "op-cancel-01",
+            "attempt_id": "attempt-cancel-01",
+            "session_id": "session-cancel-01",
+            "reason": "user_requested",
+            "state_fence": {
+                "authority_epoch": 0,
+                "resource_generation": 0,
+                "task_revision": null,
+                "policy_revision": null,
+                "integration_revision": null
+            }
+        });
+        assert!(serde_json::from_value::<AcpCancelRequest>(zero_wire).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn acp_cancel_schema_is_object_fence_not_string() -> Result<(), Box<dyn std::error::Error>> {
+        let schema = serde_json::to_value(schemars::schema_for!(AcpCancelRequest))?;
+        assert_eq!(schema["type"], "object");
+        // StateFence may be inlined or via $defs; verify it is object-typed.
+        let state_fence_schema = if schema["properties"]["state_fence"]["$ref"].is_string() {
+            let def_name = schema["properties"]["state_fence"]["$ref"]
+                .as_str()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap();
+            schema["$defs"][def_name].clone()
+        } else {
+            schema["properties"]["state_fence"].clone()
+        };
+        // The resolved StateFence schema must be an object, never a string.
+        assert_eq!(state_fence_schema["type"], "object");
+        assert_ne!(state_fence_schema["type"], "string");
+        // Also ensure the canonical StateFence $defs is object-typed if present.
+        if let Some(defs) = schema["$defs"].as_object() {
+            if let Some(sf) = defs.get("StateFence") {
+                assert_eq!(sf["type"], "object");
+            }
+        }
+        // Ensure no legacy string fallback is present.
+        let s = schema.to_string();
+        assert!(!s.contains("\"legacy-fence\""));
         Ok(())
     }
 }
