@@ -40,6 +40,7 @@ const BRIDGE_ENV_KEYS = [
 
 const MAX_ARGUMENT_KEYS = 64
 const MAX_ARGUMENT_KEY_LENGTH = 128
+const MEDIA_TYPE_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
 
 function boundedInteger(name, fallback, minimum, maximum) {
   const parsed = Number.parseInt(process.env[name] ?? "", 10)
@@ -130,6 +131,70 @@ function boundedArgumentKeys(candidate) {
     .filter((key) => key.length <= MAX_ARGUMENT_KEY_LENGTH)
     .sort()
     .slice(0, MAX_ARGUMENT_KEYS)
+}
+
+function isJsonMediaType(value) {
+  if (typeof value !== "string") return false
+  let start = 0
+  let end = value.length
+  while (value[start] === " " || value[start] === "\t") start += 1
+  while (end > start && (value[end - 1] === " " || value[end - 1] === "\t")) end -= 1
+  const mediaType = value.slice(start, end)
+  const separator = mediaType.indexOf("/")
+  if (separator <= 0 || mediaType.slice(separator + 1).length === 0) return false
+  const type = mediaType.slice(0, separator)
+  let position = separator + 1
+  while (position < mediaType.length && MEDIA_TYPE_TOKEN.test(mediaType[position])) position += 1
+  if (type.toLowerCase() !== "application" || mediaType.slice(separator + 1, position).toLowerCase() !== "json") {
+    return false
+  }
+
+  while (position < mediaType.length) {
+    while (mediaType[position] === " " || mediaType[position] === "\t") position += 1
+    if (mediaType[position] !== ";") return false
+    position += 1
+    while (mediaType[position] === " " || mediaType[position] === "\t") position += 1
+
+    const parameterStart = position
+    while (position < mediaType.length && MEDIA_TYPE_TOKEN.test(mediaType[position])) position += 1
+    if (position === parameterStart) return false
+    if (mediaType[position] !== "=") return false
+    position += 1
+    if (mediaType[position] === '"') {
+      position += 1
+      let closed = false
+      while (position < mediaType.length) {
+        const code = mediaType.charCodeAt(position)
+        if (mediaType[position] === "\\") {
+          const escapedCode = mediaType.charCodeAt(position + 1)
+          if (escapedCode < 0x20 || escapedCode > 0x7e) return false
+          position += 2
+        } else if (mediaType[position] === '"') {
+          position += 1
+          closed = true
+          break
+        } else if (code < 0x20 || code === 0x7f || code > 0x7e) {
+          return false
+        } else {
+          position += 1
+        }
+      }
+      if (!closed) return false
+    } else {
+      const valueStart = position
+      while (position < mediaType.length && MEDIA_TYPE_TOKEN.test(mediaType[position])) position += 1
+      if (position === valueStart) return false
+    }
+  }
+  return true
+}
+
+async function cancelResponseBody(response, reason) {
+  try {
+    await response?.body?.cancel?.(reason)
+  } catch {
+    // Rejection remains fail-closed even when the host cannot cancel cleanly.
+  }
 }
 
 async function compactEvent(kind, input = {}, output = {}) {
@@ -265,12 +330,17 @@ async function readBoundedWebStream(stream, maximumBytes) {
   const decoder = new TextDecoder()
   let text = ""
   let total = 0
+  let settled = false
   try {
     while (true) {
       const { done, value } = await reader.read()
-      if (done) break
+      if (done) {
+        settled = true
+        break
+      }
       if (total + value.byteLength > maximumBytes) {
         await reader.cancel("ELIOT OpenCode bridge response limit reached").catch(() => {})
+        settled = true
         throw new HttpBridgeError("ELIOT OpenCode bridge response exceeded its bounded contract")
       }
       total += value.byteLength
@@ -278,6 +348,12 @@ async function readBoundedWebStream(stream, maximumBytes) {
     }
     text += decoder.decode()
     return text
+  } catch (error) {
+    if (!settled) {
+      await reader.cancel("ELIOT OpenCode bridge response read abandoned").catch(() => {})
+      settled = true
+    }
+    throw error
   } finally {
     reader.releaseLock()
   }
@@ -319,19 +395,19 @@ async function postHttpBridge(config, payload) {
       signal: controller.signal,
     })
     if (TRANSIENT_HTTP_STATUS.has(response.status)) {
-      await response.body?.cancel().catch(() => {})
+      await cancelResponseBody(response, "ELIOT OpenCode bridge transient response rejected")
       throw new HttpBridgeError(
         `ELIOT OpenCode bridge returned transient HTTP status ${response.status}`,
         true,
       )
     }
     if (!response.ok) {
-      await response.body?.cancel().catch(() => {})
+      await cancelResponseBody(response, "ELIOT OpenCode bridge non-success response rejected")
       throw new HttpBridgeError(`ELIOT OpenCode bridge returned HTTP status ${response.status}`)
     }
-    const contentType = (response.headers.get("content-type") ?? "").toLowerCase()
-    if (!contentType.startsWith("application/json")) {
-      await response.body?.cancel().catch(() => {})
+    const contentType = response.headers.get("content-type")
+    if (!isJsonMediaType(contentType)) {
+      await cancelResponseBody(response, "ELIOT OpenCode bridge response media type rejected")
       throw new HttpBridgeError("ELIOT OpenCode bridge returned a non-JSON content type")
     }
     const text = await readBoundedWebStream(response.body, maximumBridgeOutputBytes())
