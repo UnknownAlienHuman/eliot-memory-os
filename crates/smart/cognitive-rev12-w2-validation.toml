@@ -1,0 +1,97 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "VALIDATION_CONTRACT_NOT_IMPLEMENTATION_OR_PRODUCT_PROOF"
+issue = 341
+parent_pr = 338
+proof_ceiling = "STATIC_W2_FIELD_REFINEMENT_AND_AGENT_WORK_UNIT_DESIGN_ONLY"
+
+[expected]
+orders = [20, 21, 22, 23, 24, 25, 29, 30, 31, 32, 33, 34]
+functional_cells = 12
+physical_crates = 2
+new_field_contracts = 2
+agent_briefs = 12
+write_scopes = 24
+field_contract_index = "crates/smart/cognitive-rev12-w2-field-contracts.toml"
+type_ownership = "crates/smart/cognitive-rev12-w2-type-ownership.toml"
+brief_index = "crates/smart/cognitive-rev12-w2-agent-brief-index.toml"
+handoff = "crates/smart/cognitive-rev12-w2-agent-handoff.toml"
+corrections = "crates/smart/cognitive-rev12-w2-corrections.toml"
+composition = "crates/smart/cognitive-rev12-w2-composition.toml"
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+
+[[gate]]
+id = "W2V01_TOML_PARSE"
+requirement = "Every changed contract, brief, index, correction, manifest and validation artifact parses as TOML."
+
+[[gate]]
+id = "W2V02_ORDER_CLOSURE"
+requirement = "Orders are exactly 20..25 and 29..34 with one canonical cell ID and one brief each."
+
+[[gate]]
+id = "W2V03_FIELD_CONTRACT_CLOSURE"
+requirement = "Two owner-local refinement contracts close the stringly spread rule and missing/ambiguous Context request/limit types without redefining existing public types."
+
+[[gate]]
+id = "W2V04_WRITE_ISOLATION"
+requirement = "All twenty-four source/test paths are unique; workers cannot edit contracts, Cargo.toml, lib.rs, re-exports, status or another cell."
+
+[[gate]]
+id = "W2V05_NORMALIZATION"
+requirement = "Canonical spelling remains distinct from comparison key; no filesystem identity/symlink/cwd lookup exists."
+
+[[gate]]
+id = "W2V06_BINDING_INDEX"
+requirement = "Binding remains candidate-only; only admitted bindings/edges enter the immutable rebuildable snapshot; zero edges are valid."
+
+[[gate]]
+id = "W2V07_DIRECT_MATCH"
+requirement = "Exact direct firing works with zero edges and is invariant under graph availability; suppressed rows remain traced."
+
+[[gate]]
+id = "W2V08_RELATION_SPREAD"
+requirement = "Spread uses only BestSingleAdmissiblePath; paths never sum; direct results are immutable; traversal is bounded and graph failure local."
+
+[[gate]]
+id = "W2V09_ACTIVATION"
+requirement = "Activation contains handles/traces only and never marks delivery, acknowledgement, use, helpfulness, resolution or support."
+
+[[gate]]
+id = "W2V10_COMPILATION_REQUEST"
+requirement = "Merge starts from ContextCompilationRequest with exact expected-provider set, recipe, route, scope, fence and ContextCompilationLimits."
+
+[[gate]]
+id = "W2V11_CONTEXT_MERGE"
+requirement = "Merge fetches no provider, ranks/admit nothing, preserves denominators and treats conflicting identity as conflict rather than last-write-wins."
+
+[[gate]]
+id = "W2V12_CONTEXT_ADMISSION"
+requirement = "Whole units only; Safety Floor and downstream headroom precede optional provider-fair allocation; every candidate receives one disposition."
+
+[[gate]]
+id = "W2V13_ASSEMBLY_QUALITY"
+requirement = "Assembly and quality cannot change membership; omissions remain reversible; quality is dimensioned and unknown measurement is Inconclusive."
+
+[[gate]]
+id = "W2V14_DECISION_TAIL"
+requirement = "DecisionTailLimits are distinct from compiler limits; Material/Critical tail requires goal, load-bearing atoms, expected observable, verifier and stop/revision condition without action authority."
+
+[[gate]]
+id = "W2V15_REACTIVE_PLAN"
+requirement = "Host capability is exact and observed; ToolOnly/ObserveOnly/Offline/Unavailable cannot claim pre-action prevention; plan is not delivery/ack/use receipt."
+
+[[gate]]
+id = "W2V16_HOT_PATH"
+requirement = "All twelve W2 cells are bounded deterministic and contain no model call, provider SDK, storage/filesystem scan, network wait, host call or blocking I/O."
+
+[[gate]]
+id = "W2V17_COMPOSITION"
+requirement = "Current authority composes the 21-contract base with exactly two W2 extensions and proves cross-index public-type uniqueness without rewriting base contracts."
+
+[[gate]]
+id = "W2V18_PAYLOAD_HYGIENE"
+requirement = "Diff contains TOML only; no Rust, Markdown, workflow, root Cargo.toml, Cargo.lock, archive, .eliot or runtime state."
+
+[[gate]]
+id = "W2V19_PROOF_CEILING"
+requirement = "Field refinement, brief, branch, commit or review cannot claim Rust behavior, delivery/prevention, Package/Edge/Product/Release Proof, runtime support or product acceptance."
