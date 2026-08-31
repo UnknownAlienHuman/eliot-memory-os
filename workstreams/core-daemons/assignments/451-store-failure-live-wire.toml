@@ -1,0 +1,278 @@
+schema = "eliot.agent-work-unit.v1"
+issue = 451
+parent_issue = 76
+store_integration_owner_issue = 19
+kernel_integration_owner_issue = 15
+product_pulse_issue = 11
+status = "READY_FOR_IMPLEMENTATION"
+source_base = "15d6b40d06df0eab8c2fc94a856253f36521b305"
+branch = "fix/451-store-failure-live-wire"
+primary_owner = "store-ebp-failure-contract-edge"
+primary_cell = "store.failure.live-producer-consumer"
+causal_property = "The live Store process emits only typed StoreFailure control semantics, and Kernel consumes them without string collapse, prose parsing, identity adoption, or blind retry."
+proof_ceiling = "STORE_KERNEL_CONTRACT_EDGE_CANDIDATE_UNTIL_REAL_PROCESS_PROOF"
+
+[documentation]
+architecture_handles = ["ARCH-MOD-03", "ARCH-SEC-02", "ARCH-OBS-01", "ARCH-RES-04", "ARCH-ORD-01"]
+implementation_handles = ["I2.6", "I5.1", "I5.19", "I6.13", "I7.20", "I18"]
+required_files_read = [
+  "AGENTS.md",
+  "crates/storage/AGENTS.md",
+  "crates/kernel/AGENTS.md",
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "crates/storage/eliot-store-api/src/store_failure.rs",
+  "crates/storage/eliot-store-api/src/wire.rs",
+  "crates/storage/eliot-store-api/tests/store_failure.rs",
+  "bins/eliot-store-surreal/src/request_dispatch.rs",
+  "crates/kernel/eliot-kernel-service/src/store_exchange.rs",
+  "crates/kernel/eliot-kernel-service/src/store_client.rs",
+]
+routing_commands = [
+  "python scripts/docs_router.py route --path bins/eliot-store-surreal/src/request_dispatch.rs --topic 'typed StoreFailure producer mapping with exact request and operation identity'",
+  "python scripts/docs_router.py route --path crates/kernel/eliot-kernel-service/src/store_exchange.rs --topic 'typed StoreFailure Kernel consumption and exact-operation reconciliation'",
+]
+routing_receipt_status = "REQUIRED_PER_MUTATING_WAVE_BEFORE_FIRST_RUST_CHANGE"
+
+[current_contract]
+typed_payload = "eliot_store_api::StoreFailure"
+contract_revision = "eliot.store.failure.v2"
+constructor = "StoreFailure::from_store_error(StoreError, StoreFailureIdentityContext)"
+legacy_decoder = "decode_legacy_store_failure_v1"
+current_response_variant = "StoreResponse::Failure { failure }"
+legacy_variants = [
+  "StoreResponse::Unknown { operation_id, reason }",
+  "StoreResponse::Error { error }",
+]
+
+[current_defect]
+producer_file = "bins/eliot-store-surreal/src/request_dispatch.rs"
+consumer_files = [
+  "crates/kernel/eliot-kernel-service/src/store_exchange.rs",
+  "crates/kernel/eliot-kernel-service/src/store_client.rs",
+]
+confirmed_paths = [
+  "map_recovery_dispatch_result maps StoreError to Response::Error(error.to_string())",
+  "map_genesis_dispatch_result maps non-envelope StoreError to Response::Error(error.to_string())",
+  "dispatch_request maps health, readiness, named, apply, receipt, revision-head, ordering-head and validation-snapshot failures to Response::Error(error.to_string())",
+  "execute_raw maps StoreResponse::Error to StoreError::Serialization(error)",
+  "execute_raw has no typed StoreResponse::Failure control branch",
+  "RequestFailure::into_store_error discards Unknown reason and returns StoreError::Unavailable",
+  "operation-specific consumers classify unexpected response variants generically after typed failure falls through",
+]
+old_discriminator = "Inject StoreError::FenceMismatch, RevisionConflict, Unavailable and MissingReceiptEnvelope at the live dispatch seam; the wire contains status=error prose or string Unknown, and Kernel loses typed retry/recovery/mutation semantics."
+
+[identity_context]
+required_fields_when_available = [
+  "request_id",
+  "operation_id",
+  "idempotency_key_ref_or_digest",
+  "state_fence_ref_or_exact_safe_projection",
+  "evidence_ref",
+]
+request_rules = [
+  "Apply uses context.request_id, transition.identity.operation_id, transition.identity.idempotency_key and transition.state_fence.",
+  "InitializeGenesis uses context.request_id, request.operation_id, request.idempotency_key and request.state_fence.",
+  "Receipt uses frame request_id plus requested operation_id.",
+  "Named/Recovery use their request fence and frame request identity when present.",
+  "Readiness/Health/head reads preserve request identity but do not invent operation identity.",
+  "The producer never adopts identity from an error string or provider-specific type name.",
+]
+
+[wave_a_store_producer]
+owner = "eliot-store-surreal request dispatch"
+mutable_paths = [
+  "bins/eliot-store-surreal/src/request_dispatch.rs",
+  "bins/eliot-store-surreal/src/tests.rs",
+  "bins/eliot-store-surreal/tests/**",
+]
+required_functions = [
+  "fn failure_context(request_id, request) -> StoreFailureIdentityContext",
+  "fn map_store_error(error, context) -> StoreResponse",
+  "fn map_composition_error(error, context) -> StoreResponse",
+]
+algorithm = [
+  "Build identity context before moving the request into the adapter call.",
+  "Map every deterministic StoreError through StoreFailure::from_store_error.",
+  "Map StoreCompositionError::UnknownOutcome to typed UnknownOutcome with the exact admitted operation identity and unknown mutation disposition.",
+  "Validate the resulting StoreFailure before returning StoreResponse::Failure.",
+  "If failure encoding itself fails, return a bounded typed internal contract defect when one can be constructed without recursion; otherwise terminate/fail the request path rather than emit provider prose.",
+  "Current dispatch code emits neither StoreResponse::Error nor string-shaped StoreResponse::Unknown.",
+]
+forbidden = [
+  "error.to_string() as wire control semantics",
+  "SurrealDB SDK or AdapterError variants on the wire",
+  "wildcard mapping that collapses unknown outcome into deterministic rejection",
+  "NotAttempted mutation status after an uncertain Apply boundary",
+  "parsing error Display text to choose reason codes",
+]
+
+[wave_b_kernel_consumer]
+owner = "Kernel store EBP exchange"
+mutable_paths = [
+  "crates/kernel/eliot-kernel-service/src/store_exchange.rs",
+  "crates/kernel/eliot-kernel-service/src/store_client.rs",
+  "crates/kernel/eliot-kernel-service/src/tests.rs",
+  "crates/kernel/eliot-kernel-service/tests/**",
+]
+required_changes = [
+  "Add a RequestFailure variant carrying the complete validated StoreFailure or a lossless owner-local projection.",
+  "Match StoreResponse::Failure in execute_raw before returning an ordinary response.",
+  "Validate request_id/operation_id binding against the request sent by this Kernel call.",
+  "Preserve disposition, reason code, mutation disposition, retry directive, recovery action, conflict observation and bounded evidence reference.",
+  "UnknownOutcome reconciles only the locally admitted operation identity.",
+  "Remove the current live StoreResponse::Error to StoreError::Serialization path.",
+  "Keep legacy v1 decode behind an explicit negotiated compatibility profile or fixture boundary only.",
+]
+unknown_outcome_rules = [
+  "A write/effect-capable request with uncertain delivery or malformed/mismatched response remains unknown for the locally admitted operation.",
+  "A peer-supplied operation identity is compared as evidence and never adopted as the reconciliation target.",
+  "No blind retry occurs while mutation disposition is Unknown.",
+  "The human detail field never controls branching.",
+]
+
+[wave_c_operation_consumers]
+owner = "Kernel CanonicalStoreClient implementation"
+mutable_paths = [
+  "crates/kernel/eliot-kernel-service/src/store_client.rs",
+  "crates/kernel/eliot-kernel-service/tests/**",
+]
+required_operations = [
+  "verify_readiness",
+  "apply_prepared",
+  "recovery",
+  "initialize_genesis",
+  "receipt",
+  "revision_heads",
+  "ordering_heads",
+  "validation_snapshot",
+  "named reads",
+]
+rule = "Each operation either returns its exact success shape or propagates the typed failure. Unexpected success response kinds remain InvalidReceipt/contract failures; typed failures are not misclassified as unexpected success."
+
+[wave_d_real_edge]
+owner = "Store/Kernel integration swarm"
+mutable_paths = [
+  "tests/**store**",
+  "tests/**kernel**",
+  "crates/test-support/**",
+]
+required_edges = [
+  "reference/in-memory StoreRequest to StoreResponse to Kernel consumer corpus",
+  "real eliot-store-surreal process EBP corpus",
+  "unknown-outcome receipt lookup bound to exact operation A while peer reports operation B",
+  "store restart/reconnect with the same pending operation identity",
+]
+rule = "Use the same golden request/failure corpus for reference and Surreal-backed providers."
+
+[reason_matrix]
+required_reason_codes = [
+  "INVALID_FIELD",
+  "EMPTY_FIELD",
+  "DUPLICATE_IDENTITY",
+  "FOUNDATION_CONTRACT_REJECTED",
+  "SECURITY_CONTRACT_REJECTED",
+  "RECEIPT_CONTRACT_REJECTED",
+  "UNKNOWN_NAMED_OPERATION",
+  "OPERATION_MANIFEST_MISMATCH",
+  "TRANSITION_CLASS_EXCEEDED",
+  "EFFECT_CEILING_EXCEEDED",
+  "STATE_FENCE_MISMATCH",
+  "REVISION_CONFLICT",
+  "ORDERING_CONFLICT",
+  "IDENTITY_CONFLICT",
+  "RECEIPT_NOT_FOUND",
+  "RECEIPT_ENVELOPE_MISSING",
+  "PAYLOAD_TOO_LARGE",
+  "STORE_UNAVAILABLE",
+  "SERIALIZATION_FAILURE",
+]
+additional_adapter_reasons = [
+  "STORE_BACKPRESSURE when the adapter exposes an explicit capacity failure",
+  "STORE_DEADLINE_EXCEEDED when the adapter exposes an explicit deadline failure",
+  "SCHEMA_MIGRATION_REQUIRED when readiness/schema state exposes it",
+]
+rule = "Unknown future reason codes are preserved through the stable disposition/directive axes and never become success."
+
+[compatibility]
+current_producer_profile = "store-failure-v2"
+legacy_profile = "store-failure-v1-string"
+legacy_rules = [
+  "Current store process must not emit the legacy profile.",
+  "Legacy Error human text is never parsed into a specific deterministic reason.",
+  "Legacy Unknown preserves exact operation identity and becomes typed unknown outcome.",
+  "A bounded human detail may be retained but excluded from equality/control semantics.",
+  "Compatibility profile selection is explicit and generation-bound; payload sniffing is not negotiation.",
+]
+
+[fixtures]
+producer = [
+  "current_dispatch_never_emits_error_string_variant",
+  "fence_mismatch_maps_to_typed_conflict",
+  "revision_and_ordering_conflicts_remain_distinct",
+  "unavailable_maps_to_retryable_typed_failure",
+  "missing_receipt_envelope_requires_exact_operation_reconciliation",
+  "composition_unknown_outcome_preserves_exact_operation_and_unknown_mutation",
+  "human_detail_change_does_not_change_control_equality",
+]
+consumer = [
+  "valid_typed_failure_is_not_returned_as_success_response",
+  "malformed_failure_is_contract_error",
+  "wrong_request_id_is_rejected",
+  "wrong_operation_id_is_not_adopted",
+  "operation_b_unknown_cannot_reconcile_operation_a",
+  "deterministic_failure_does_not_trigger_receipt_lookup",
+  "unknown_outcome_does_trigger_exact_receipt_lookup",
+  "legacy_error_uses_explicit_compat_decoder_without_prose_classification",
+]
+edge = [
+  "same_golden_failure_corpus_passes_reference_and_surreal_provider",
+  "reconnect_preserves_pending_operation_identity",
+  "successful_receipt_still_requires_reconciliation_envelope",
+]
+
+[scope]
+forbidden_paths = [
+  "bins/eliot-host/**",
+  "bins/eliot-watchdog/**",
+  "crates/governor/**",
+  "crates/agent/**",
+  "docs/architecture/**",
+  ".github/workflows/**",
+]
+non_goals = [
+  "change PreparedTransition semantic meaning",
+  "change canonical write ownership",
+  "introduce a second store failure registry",
+  "expose vendor/provider error types",
+  "implement global retry policy in the transport cell",
+  "change Host Store-recovery durability",
+  "claim Store or Kernel runtime support from package tests",
+]
+
+[proof]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-store-api -p eliot-store-surreal -p eliot-kernel-service --all-targets",
+  "cargo test --locked -p eliot-store-api -p eliot-store-surreal -p eliot-kernel-service --all-targets",
+  "cargo clippy --locked -p eliot-store-api -p eliot-store-surreal -p eliot-kernel-service --all-targets -- -D warnings",
+  "git diff --check",
+]
+required_nonzero_tests = true
+required_remote_readback = true
+edge_profile = "D1_STORE_FAILURE_TYPED_EBP_EDGE_01"
+product_pulse = "Issue #11: exact conflict, unavailable and unknown-outcome behavior through live Kernel/store process with no prose-dependent branch."
+
+[stop_conditions]
+contract_challenge = [
+  "A producer error cannot be classified without adding a new provider-neutral StoreError/StoreFailure reason owned by store-api.",
+  "A Kernel caller needs semantic interpretation that belongs to Governor rather than mechanical recovery handling.",
+  "The patch would parse human_detail or Display text to recover control semantics.",
+  "The patch would retry an unknown write outcome without exact receipt reconciliation.",
+  "Another active PR claims the same request_dispatch.rs or store_exchange.rs path.",
+]
+
+[integration]
+merge_owner = "Store/Kernel integration swarm"
+merge_rule = "Do not merge the contract-only producer or consumer half as a completed #451 cutover. The current producer, current Kernel consumer and shared edge corpus must agree on v2 before the legacy live path is retired."
+result_schema = "issue, source_base, candidate_sha, changed_paths_by_wave, producer_reason_matrix, Kernel_control_mapping, legacy_profile_disposition, package_proof, reference_and_surreal_edge_proof, residual_unknowns, finish"
