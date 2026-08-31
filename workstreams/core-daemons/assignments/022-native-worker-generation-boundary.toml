@@ -1,0 +1,384 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_SWARM_IMPLEMENTATION"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "AGENT_HANDOFF_ONLY"
+parent_issue = 22
+integration_issue_refs = [11, 15, 18, 21, 23, 100]
+base_branch = "main"
+base_sha = "317774c7bf50660e49249e7a74ef5fa798234f91"
+normative_pair_ref = "docs/normative-pair.toml"
+docs_read_status = "ACCEPTED_PAIR_READ_FROM_PROJECT_INPUT / REPOSITORY_READER_MUST_BE_RERUN_BY_SOURCE_WORKER"
+dreamer_excluded = true
+
+[work_unit]
+cell_id = "runtime.native-worker-generation-boundary"
+causal_property = "One native worker generation executes only the exact immutable artifact, facet, capability, resource, credential, process and authority envelope admitted for one operation, and can be cancelled, drained, fenced, reconciled or replaced without retaining ambient or stale authority."
+old_path_discriminator = "Attempt to start or reconnect a native worker using a matching executable name but a changed artifact, protocol/facet set, resource identity, credential binding, process lineage, EpochId or StateFence. The worker must reject before work/effects and must not adopt or reinterpret the foreign generation."
+integration_owner = "#22 native-worker boundary; #15 owns Kernel authority/generation routing; #18 owns semantic admission; #23 owns interactive-user resource/credential materialization; #100 owns shared process mechanics"
+one_writer_rule = "One worker per wave and mutable path claim. Workers return candidates and do not merge their own work."
+result = "integration candidate only"
+
+[normative_basis]
+architecture = [
+  "A2.3",
+  "A12",
+  "A13.3",
+  "A13.9",
+  "ARCH-AUTH-01",
+  "ARCH-MOD-01",
+  "ARCH-PORT-01",
+  "ARCH-SEC-01",
+  "ARCH-SEC-02",
+]
+implementation = [
+  "I1.3",
+  "I2.10",
+  "I2.19",
+  "I6.10",
+  "I6.15",
+  "I7",
+  "I14.14",
+]
+reason = "Native execution has broad OS/tool/credential effects and therefore requires a separate immutable process generation with exact introduced facets and no implicit authority inheritance."
+
+[current_source]
+observed_on = "main@317774c7bf50660e49249e7a74ef5fa798234f91"
+source_handles = [
+  "bins/eliot-native-worker/Cargo.toml",
+  "bins/eliot-native-worker/src/main.rs",
+  "bins/eliot-native-worker/src/lib.rs",
+  "crates/kernel/eliot-process/src/lib.rs",
+  "crates/instrument/eliot-process-executor/src/lib.rs",
+  "crates/kernel/eliot-kernel-service/src/lib.rs",
+  "crates/foundation/eliot-runtime-contracts/src/lib.rs",
+  "bins/eliot-user-broker/src/lib.rs",
+]
+required_current_inventory = [
+  "all native-worker entrypoints and process-launch clients",
+  "all worker protocol/facet contracts and version owners",
+  "all resource/credential introduction paths",
+  "all checkpoint, cancellation, drain, cleanup and reconnect paths",
+  "all production direct process/environment/filesystem/network uses",
+]
+source_inventory_rule = "The implementation worker must regenerate the current reverse-consumer and effect inventory. These seed paths are not an absence or completeness proof."
+
+[ownership]
+lifecycle_owner = "Kernel owns admitted generation/authority routing; native worker owns only its current process-local execution mechanics; semantic owner remains outside the worker"
+mutable_state = [
+  "one active worker-process generation binding",
+  "operation-local introduced facet/resource handles",
+  "operation-local checkpoint/cancellation/drain state",
+  "bounded process-local caches explicitly declared rebuildable",
+]
+allowed_effects = [
+  "decode and validate admitted worker request",
+  "use only introduced facets and resource/credential handles",
+  "execute one bounded native operation",
+  "emit process/effect/checkpoint evidence",
+  "cancel, drain and clean up owned descendants/resources",
+]
+must_not_own = [
+  "Task, WorkItem, AgentAttempt or plan selection",
+  "canonical memory or task state",
+  "route/provider selection",
+  "retry or repair policy",
+  "approval or finish authority",
+  "credential vault or user-session authority",
+  "generic shell or arbitrary executable service",
+]
+
+[contract]
+preferred_owner = "existing foundation/runtime/process contracts plus thin native-worker adapter; no new crate without a reviewed CrateExtractionDecision"
+public_types = [
+  "NativeWorkerGenerationBinding",
+  "NativeExecutionManifest",
+  "NativeWorkerOperationBinding",
+  "FacetIntroductionSet",
+  "NativeResourceBindingSet",
+  "NativeCredentialBindingSet",
+  "NativeWorkerCheckpoint",
+  "NativeWorkerExecutionReceipt",
+  "NativeWorkerReconciliationView",
+]
+closed_generation_states = [
+  "CANDIDATE",
+  "ADMITTED",
+  "STARTING",
+  "READY",
+  "EXECUTING",
+  "DRAINING",
+  "FENCED",
+  "QUARANTINED",
+  "TERMINAL",
+  "RECONCILING",
+]
+closed_operation_outcomes = [
+  "KNOWN_NOT_STARTED",
+  "RUNNING",
+  "SUCCEEDED_CANDIDATE_ONLY",
+  "FAILED_KNOWN",
+  "CANCELLED_CONFIRMED",
+  "CANCEL_UNKNOWN",
+  "UNKNOWN_EXTERNAL_EFFECT",
+  "CHECKPOINTED",
+  "RECONCILING",
+]
+
+[contract.generation_binding]
+required_fields = [
+  "installation_id",
+  "ModuleId and FunctionalCapabilityCell set from the current registry",
+  "immutable executable artifact identity and SHA-256",
+  "configuration descriptor identity and SHA-256",
+  "worker protocol contract id/version/digest",
+  "FacetManifest id/version/digest",
+  "process-tree and Job Object ownership challenge",
+  "Kernel generation route and activation receipt",
+  "lineaged EpochId from #64",
+  "StateFence",
+  "resource-limit profile and Control Reserve class",
+  "created/observed boot-session identity",
+]
+forbidden_identity_shortcuts = [
+  "file name, process name, PID, port or directory presence",
+  "bare scalar epoch",
+  "caller-supplied path without immutable artifact approval",
+  "ambient environment or inherited credential presence",
+  "provider/native SDK version string without artifact/config digest",
+]
+
+[contract.operation_binding]
+required_fields = [
+  "exact parent request and operation/idempotency identity",
+  "Task/WorkItem/AgentAttempt or service-operation owner reference without transferring ownership",
+  "current generation binding digest",
+  "introduced facet method set",
+  "introduced resource lease set",
+  "introduced credential lease/reference set",
+  "privacy, disclosure, taint and retention envelope",
+  "deadline, cancellation and checkpoint policy",
+  "CPU, memory, process, handle, pipe and output ceilings",
+  "effect class and exact effect ceiling",
+  "expected evidence and terminal reconciliation owner",
+]
+rule = "A worker request may narrow the admitted envelope but can never widen any facet, path, credential, resource, privacy, effect, deadline or descendant-process dimension."
+
+[contract.facets]
+rule = "Native and WASM contours that claim the same semantic capability consume the same ELIOT-owned facet contract and conformance corpus. Adapter code may decode, validate, call core and encode; it cannot add policy, retry, task or finish semantics."
+unknown_method = "typed UNINTRODUCED_FACET_METHOD before execution"
+version_mismatch = "typed FACET_CONTRACT_MISMATCH before execution"
+ambient_capability = "forbidden even when the OS principal could perform it"
+
+[contract.resources_and_credentials]
+resource_rules = [
+  "Every boundary-crossing file/directory/device/network/resource uses an exact NativeResourceLease or admitted equivalent.",
+  "Revalidate stable object identity, path/root, reparse/symlink policy, generation and lease immediately before first use and before each load-bearing effect where replacement is possible.",
+  "Resource substitution or widening fails only the dependent operation and preserves evidence.",
+]
+credential_rules = [
+  "Interactive-user credentials are materialized only by the active User Broker under the exact SID/session/broker epoch and operation lease.",
+  "Service credentials use a separately admitted service credential binding.",
+  "Credential values never appear in argv, logs, receipts, model context, canonical memory or reusable config snapshots.",
+  "Logoff, lease expiry, broker loss, policy change or operation completion revokes materialized access.",
+]
+
+[algorithm]
+steps = [
+  "1. Authenticate the peer and validate the exact worker generation binding against Kernel route, artifact, config, protocol, facet, EpochId and StateFence.",
+  "2. Validate one operation binding and prove that every requested facet, resource, credential and effect is a subset of the admitted generation/operation envelope.",
+  "3. Revalidate resource and credential leases immediately before materialization; retain only operation-scoped handles.",
+  "4. Start and own the worker process through the admitted ProcessExecutor mechanics with Job Object, bounded environment, streams, wall deadline, cancellation and no-orphan semantics.",
+  "5. Execute only typed facet calls. Unknown fields/methods, generic commands and raw shell/query payloads fail closed.",
+  "6. Persist exact process/effect/checkpoint evidence through the owning evidence/ORS contracts; process exit is not semantic success or finish.",
+  "7. On cancellation, timeout, trap/crash or owner loss, contain descendants, revoke introduced resources/credentials and preserve known/unknown effect disposition.",
+  "8. Reconcile unknown outcomes by the exact operation identity before any retry or successor operation.",
+  "9. During cutover, drain/fence the old generation before admitting the successor; stale generation reconnect/effect/checkpoint publication is rejected.",
+]
+
+[errors]
+required = [
+  "GENERATION_NOT_ADMITTED",
+  "ARTIFACT_IDENTITY_MISMATCH",
+  "CONFIG_IDENTITY_MISMATCH",
+  "PROTOCOL_CONTRACT_MISMATCH",
+  "FACET_CONTRACT_MISMATCH",
+  "UNINTRODUCED_FACET_METHOD",
+  "EPOCH_LINEAGE_MISMATCH",
+  "STATE_FENCE_MISMATCH",
+  "PROCESS_OWNERSHIP_UNPROVEN",
+  "RESOURCE_LEASE_INVALID",
+  "RESOURCE_IDENTITY_CHANGED",
+  "CREDENTIAL_BINDING_UNAVAILABLE",
+  "CAPABILITY_WIDENING_DENIED",
+  "LIMIT_EXCEEDED",
+  "CANCELLATION_UNCONFIRMED",
+  "UNKNOWN_EXTERNAL_EFFECT",
+  "STALE_GENERATION",
+  "CHECKPOINT_IDENTITY_CONFLICT",
+  "CLEANUP_INCOMPLETE",
+]
+
+[[wave]]
+order = 1
+id = "contract-and-generation-manifest"
+issue_owner = "new bounded child issue under #22"
+mutable_paths = [
+  "existing owner-neutral runtime/process/facet contract modules selected after dependency review",
+  "focused contract fixtures only",
+]
+deliverable = "Generation, operation, facet/resource/credential binding and receipt contracts without a second authority owner."
+must_not_touch = ["native worker composition", "Kernel routing", "User Broker", "ProcessExecutor implementation"]
+proof_ceiling = "NATIVE_WORKER_CONTRACT_PROOF_ONLY"
+
+[[wave]]
+order = 2
+id = "kernel-admission-and-generation-routing"
+issue_owner = "separate child issue under #15 and #22"
+mutable_paths = [
+  "crates/kernel/eliot-kernel-service native-worker admission modules",
+  "bins/eliot-kernel native-worker route/fixture paths",
+  "direct Kernel generation fixtures only",
+]
+deliverable = "Kernel validates immutable generation and operation envelopes, issues no semantic authority and fences stale generations."
+must_not_touch = ["worker execution mechanics", "User Broker credential values", "semantic task owner"]
+proof_ceiling = "KERNEL_NATIVE_GENERATION_ADMISSION_PROOF_ONLY"
+
+[[wave]]
+order = 3
+id = "native-worker-runtime"
+issue_owner = "separate child issue under #22"
+mutable_paths = [
+  "bins/eliot-native-worker/src/**",
+  "bins/eliot-native-worker/tests/**",
+]
+deliverable = "Thin typed worker runtime with exact facet dispatch, bounded state, checkpoint/cancel/drain and no ambient authority."
+must_not_touch = ["Kernel authority internals", "ProcessExecutor owner", "canonical semantic state", "route policy"]
+proof = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-native-worker --all-targets",
+  "cargo test --locked -p eliot-native-worker",
+  "cargo clippy --locked -p eliot-native-worker --all-targets -- -D warnings",
+]
+proof_ceiling = "NATIVE_WORKER_PACKAGE_PROOF_ONLY"
+
+[[wave]]
+order = 4
+id = "resource-and-credential-adapters"
+issue_owner = "separate consumers under #23 and #22"
+mutable_paths = [
+  "declared User Broker resource/credential adapter paths",
+  "declared service-credential adapter paths",
+  "focused non-disclosure and revocation fixtures",
+]
+deliverable = "Operation-scoped materialization with exact SID/session/lease binding and no disclosure."
+proof_ceiling = "RESOURCE_CREDENTIAL_EDGE_ADAPTER_PROOF_ONLY"
+
+[[wave]]
+order = 5
+id = "process-and-evidence-integration"
+issue_owner = "separate integration under #100, #85 and #22"
+mutable_paths = [
+  "native-worker ProcessExecutor client adapter paths",
+  "typed stream/process evidence consumer paths",
+  "focused no-orphan and unknown-outcome fixtures",
+]
+deliverable = "Shared process start/cancel/deadline/cleanup/evidence behavior without worker-local spawn mechanics."
+proof_ceiling = "NATIVE_WORKER_PROCESS_EDGE_PROOF_ONLY"
+
+[[wave]]
+order = 6
+id = "real-windows-edge-and-product"
+issue_owner = "integration owner under #22 and #11"
+mutable_paths = ["bounded Windows edge and Product Pulse artifacts only"]
+deliverable = "Real approved start, stale generation, artifact/facet mismatch, resource substitution, logoff/revocation, crash/cancel/no-orphan and cutover scenarios."
+proof_ceiling = "REAL_WINDOWS_NATIVE_WORKER_EDGE_AND_PRODUCT_PULSE"
+
+[fixtures]
+required = [
+  "approved immutable worker generation and one successful candidate-only operation",
+  "same executable name with changed artifact bytes",
+  "wrong protocol or FacetManifest digest",
+  "unintroduced facet method",
+  "resource lease replay and stable-object substitution",
+  "reparse/symlink/path widening attempt",
+  "interactive credential requested without active matching User Broker",
+  "credential lease revoked during operation",
+  "stale EpochId lineage or StateFence",
+  "worker crash before effect",
+  "worker crash after effect start with unknown outcome",
+  "cancellation race and unconfirmed cancellation",
+  "pipe/output saturation with bounded draining",
+  "descendant process leak attempt",
+  "checkpoint from stale generation",
+  "old generation reconnect after cutover",
+  "native versus WASM/core differential fixture for a shared facet",
+]
+required_assertions = [
+  "no ambient path, network, process, credential or facet capability is usable",
+  "no task, route, policy, approval or finish authority is created",
+  "every effect is bound to exact operation/generation/facet/resource identities",
+  "unknown effect blocks blind retry and remains reconcilable",
+  "failure degrades only the dependent capability and leaves Kernel/independent work alive",
+]
+
+[prerequisites]
+required = [
+  "#64 lineaged EpochId",
+  "#65 applicable Control Reserve dimension contract",
+  "#79 transport connection versus durable execution-session binding",
+  "#85 typed durable process-stream evidence for load-bearing output",
+  "#100 one admitted ProcessExecutor mechanics owner",
+  "#23 exact User Broker resource/credential binding for interactive-user contours",
+]
+
+[non_goals]
+items = [
+  "No in-process dynamic Rust library loading into Kernel or eliotd.",
+  "No generic shell/native command service.",
+  "No implicit user-token impersonation or credential inheritance.",
+  "No worker-owned retry, repair, scheduler, task, route or finish policy.",
+  "No claim that package tests prove real Windows identity, Job Object or credential behavior.",
+]
+
+[stop_conditions]
+items = [
+  "Another open PR owns any selected mutable path.",
+  "Current main is not an ancestor of the worker branch.",
+  "The worker would need a local scalar epoch or connection-id session convention.",
+  "A required facet has no single ELIOT-owned field-level contract.",
+  "A resource/credential cannot be bound to an exact owner lease without exposing its value.",
+  "ProcessExecutor or stream-evidence prerequisites are unavailable and the proposed patch would duplicate them.",
+  "The requested effect cannot be reconciled by exact operation identity.",
+]
+challenge = "Return a ContractChallenge to #22 with exact source/evidence. Do not add ambient inheritance, a generic command payload, a third facet/epoch/session type, or a worker-local process executor."
+
+[result_contract]
+required_fields = [
+  "issue_and_cell",
+  "source_base_and_candidate",
+  "causal_property",
+  "old_path_discriminator",
+  "changed_contract_or_source",
+  "owned_state_and_effects",
+  "module_proof",
+  "edge_proof",
+  "product_pulse_or_not_applicable_reason",
+  "evidence_execution_status",
+  "known_uncovered_behavior",
+  "security_privacy_and_authority_delta",
+  "migration_rollback_and_removal",
+  "integration_candidate",
+  "residual_unknowns",
+]
+finish_states = [
+  "VERIFIED_COMPLETE",
+  "PARTIAL",
+  "BLOCKED",
+  "FAILED_VERIFICATION",
+  "DEGRADED_NO_PROOF",
+  "UNSAFE_TO_FINISH",
+  "CANCELLED",
+  "SUPERSEDED",
+]
