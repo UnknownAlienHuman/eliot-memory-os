@@ -2178,6 +2178,7 @@ dependencies = [
  "blake3",
  "eliot-context",
  "eliot-contracts",
+ "eliot-evidence",
  "schemars",
  "serde",
  "thiserror",
