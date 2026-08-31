@@ -7,7 +7,7 @@ use eliot_contracts::{
     canonical_json_bytes, sha256_hex,
 };
 use serde::de::value::{Error as ValueError, MapDeserializer, StringDeserializer};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
 
 const WORK_LEASE_ISSUANCE_REVISION: &str = "eliot.governor.work-lease-issuance.v1";
@@ -55,12 +55,39 @@ pub enum WorkLeaseIssuanceFailure {
 /// compatibility evidence only. The SHA-256 commitment is not independent
 /// authority: the authority-bearing fact is the same-call result from the
 /// current [`CoordinationOwner`] and the continuing fenced lease lifecycle.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkLeaseIssuanceProvenance {
     canonical_work_lease_id: CanonicalWorkLeaseId,
     source_request: WorkLeaseRequest,
     source_decision: WorkLeaseDecision,
     evidence_commitment_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkLeaseIssuanceProvenanceWire {
+    canonical_work_lease_id: CanonicalWorkLeaseId,
+    source_request: WorkLeaseRequest,
+    source_decision: WorkLeaseDecision,
+    evidence_commitment_sha256: String,
+}
+
+impl<'de> Deserialize<'de> for WorkLeaseIssuanceProvenance {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = WorkLeaseIssuanceProvenanceWire::deserialize(deserializer)?;
+        let provenance = Self {
+            canonical_work_lease_id: wire.canonical_work_lease_id,
+            source_request: wire.source_request,
+            source_decision: wire.source_decision,
+            evidence_commitment_sha256: wire.evidence_commitment_sha256,
+        };
+        provenance.validate().map_err(de::Error::custom)?;
+        Ok(provenance)
+    }
 }
 
 impl WorkLeaseIssuanceProvenance {
@@ -87,6 +114,21 @@ impl WorkLeaseIssuanceProvenance {
     pub fn evidence_commitment_sha256(&self) -> &str {
         &self.evidence_commitment_sha256
     }
+
+    pub(crate) fn validate(&self) -> Result<(), WorkLeaseIssuanceError> {
+        validate_request_binding(&self.source_request, &self.source_decision)?;
+        validate_owner_evidence(&self.source_request, &self.source_decision)?;
+        let expected = issue_provenance(
+            self.source_request.clone(),
+            self.source_decision.clone(),
+        )?;
+        if expected.canonical_work_lease_id != self.canonical_work_lease_id
+            || expected.evidence_commitment_sha256 != self.evidence_commitment_sha256
+        {
+            return Err(WorkLeaseIssuanceError::InconsistentOwnerEvidence);
+        }
+        Ok(())
+    }
 }
 
 /// Successful result of asking the current coordination owner to acquire and
@@ -104,7 +146,7 @@ impl WorkLeaseIssuanceResult {
         WorkLeaseIssuanceDisposition::OwnerIssued
     }
 
-    /// Returns the accepted current-owner lease decision.
+    /// Returns the immutable accepted current-owner lease decision.
     #[must_use]
     pub const fn decision(&self) -> &WorkLeaseDecision {
         &self.decision
@@ -128,20 +170,34 @@ impl CoordinationOwner {
     /// Acquires one WorkLease and emits canonical issuance provenance from the
     /// exact accepted owner transition.
     ///
-    /// Existing [`Self::acquire_work`] behavior remains the lifecycle source.
-    /// A denied acquisition returns its existing typed coordination failure and
-    /// therefore emits no canonical identity. Exact replay produces identical
-    /// provenance; a changed request under the same request identity fails as an
-    /// idempotency conflict before another lease transition is admitted.
+    /// An exact retry returns the original immutable issuance even after the
+    /// live lease has been renewed or otherwise advanced. Changed bytes under
+    /// the same request identity fail before another owner mutation.
     pub fn acquire_work_with_issuance(
         &mut self,
         request: WorkLeaseRequest,
     ) -> Result<WorkLeaseIssuanceResult, WorkLeaseIssuanceFailure> {
+        if let Some(existing) = self.stored_issuance(&request.request_id) {
+            if existing.source_request() != &request {
+                return Err(CoordinationError::IdempotencyConflict(
+                    request.request_id,
+                )
+                .into());
+            }
+            existing.validate()?;
+            return Ok(WorkLeaseIssuanceResult {
+                decision: existing.source_decision().clone(),
+                provenance: existing.clone(),
+            });
+        }
+
+        preflight_existing_request(self, &request)?;
         let source_request = request.clone();
-        let decision = self.acquire_work(request)?;
+        let decision = self.inner.acquire_work(request)?;
         validate_request_binding(&source_request, &decision)?;
         validate_owner_evidence(&source_request, &decision)?;
-        let provenance = issue_provenance(source_request, decision.clone())?;
+        let provenance = issue_provenance(source_request.clone(), decision.clone())?;
+        self.store_issuance(source_request.request_id, provenance.clone())?;
         Ok(WorkLeaseIssuanceResult {
             decision,
             provenance,
@@ -149,10 +205,35 @@ impl CoordinationOwner {
     }
 }
 
+fn preflight_existing_request(
+    owner: &CoordinationOwner,
+    request: &WorkLeaseRequest,
+) -> Result<(), CoordinationError> {
+    let Some(event) = owner
+        .events()
+        .iter()
+        .find(|event| event.idempotency_key == request.request_id)
+    else {
+        return Ok(());
+    };
+    if event.kind != CoordinationEventKind::WorkClaimed
+        || event.subject_id != request.work_item_id
+        || event.actor_id != request.session_id
+        || event.payload_digest != request.lease_id
+        || event.authority_epoch != request.authority_epoch
+        || event.state_fence != request.state_fence
+    {
+        return Err(CoordinationError::IdempotencyConflict(
+            request.request_id.clone(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_request_binding(
     request: &WorkLeaseRequest,
     decision: &WorkLeaseDecision,
-) -> Result<(), WorkLeaseIssuanceFailure> {
+) -> Result<(), WorkLeaseIssuanceError> {
     let expected_expires_at = request
         .now
         .checked_add(request.lease_duration)
@@ -174,7 +255,7 @@ fn validate_request_binding(
         || event.state_fence != request.state_fence
         || event.payload_digest != request.lease_id
     {
-        return Err(CoordinationError::IdempotencyConflict(request.request_id.clone()).into());
+        return Err(WorkLeaseIssuanceError::InconsistentOwnerEvidence);
     }
     Ok(())
 }

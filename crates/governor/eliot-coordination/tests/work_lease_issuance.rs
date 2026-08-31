@@ -79,10 +79,7 @@ fn current_owner_emits_canonical_work_lease_identity_from_same_call_evidence() -
     );
     assert_eq!(result.decision().lease.lease_id, request.lease_id);
     assert_eq!(result.provenance().source_request(), &request);
-    assert_eq!(
-        result.provenance().source_decision(),
-        result.decision()
-    );
+    assert_eq!(result.provenance().source_decision(), result.decision());
     assert_eq!(
         result.provenance().evidence_commitment_sha256().len(),
         64
@@ -123,10 +120,23 @@ fn changed_request_under_same_identity_is_an_idempotency_conflict() -> TestResul
     let request = lease_request(&state_fence);
     owner.acquire_work_with_issuance(request.clone())?;
 
-    let mut changed = request;
+    let mut changed = request.clone();
     changed.lease_duration = 41;
     let error = match owner.acquire_work_with_issuance(changed) {
         Ok(_) => return Err("changed retry unexpectedly produced an issuance".into()),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error,
+        WorkLeaseIssuanceFailure::Coordination(CoordinationError::IdempotencyConflict(
+            "claim-work".to_owned()
+        ))
+    );
+
+    let mut changed_identity = request;
+    changed_identity.lease_id = "legacy-lease-2".to_owned();
+    let error = match owner.acquire_work_with_issuance(changed_identity) {
+        Ok(_) => return Err("changed lease identity unexpectedly produced an issuance".into()),
         Err(error) => error,
     };
     assert_eq!(
@@ -157,15 +167,16 @@ fn rejected_acquisition_emits_no_canonical_identity() -> TestResult {
 }
 
 #[test]
-fn original_issuance_is_immutable_after_heartbeat_extension() -> TestResult {
+fn exact_retry_after_heartbeat_returns_the_original_immutable_issuance() -> TestResult {
     let (mut owner, state_fence) = ready_owner()?;
-    let result = owner.acquire_work_with_issuance(lease_request(&state_fence))?;
-    let original_id = result.provenance().canonical_work_lease_id().clone();
-    let original_commitment = result
+    let request = lease_request(&state_fence);
+    let original = owner.acquire_work_with_issuance(request.clone())?;
+    let original_id = original.provenance().canonical_work_lease_id().clone();
+    let original_commitment = original
         .provenance()
         .evidence_commitment_sha256()
         .to_owned();
-    let original_decision = result.provenance().source_decision().clone();
+    let original_decision = original.provenance().source_decision().clone();
 
     let heartbeat = owner.heartbeat(AgentHeartbeat {
         request_id: "heartbeat-1".to_owned(),
@@ -177,16 +188,16 @@ fn original_issuance_is_immutable_after_heartbeat_extension() -> TestResult {
         extend_to: 90,
     })?;
     assert_eq!(heartbeat.lease.expires_at, 90);
+
+    let replay = owner.acquire_work_with_issuance(request)?;
+    assert_eq!(replay.decision(), &original_decision);
+    assert_eq!(replay.decision().lease.expires_at, 60);
+    assert_eq!(replay.provenance().canonical_work_lease_id(), &original_id);
     assert_eq!(
-        result.provenance().canonical_work_lease_id(),
-        &original_id
-    );
-    assert_eq!(
-        result.provenance().evidence_commitment_sha256(),
+        replay.provenance().evidence_commitment_sha256(),
         original_commitment
     );
-    assert_eq!(result.provenance().source_decision(), &original_decision);
-    assert_eq!(result.provenance().source_decision().lease.expires_at, 60);
+    assert_eq!(owner.events().len(), 4);
     Ok(())
 }
 
