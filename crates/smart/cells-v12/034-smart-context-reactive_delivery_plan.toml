@@ -1,0 +1,50 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w2-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 34
+cell = "smart.context.reactive_delivery_plan"
+physical_crate = "eliot-context"
+predecessor_orders = [28, 31, 33]
+primary_property = "Plan bounded context delivery for the exact observed host capability without sending, deduplicating, mutating session state or claiming delivery/prevention."
+field_contracts = ["crates/smart/eliot-context-contracts/context-compiler.contract.toml"]
+public_function_signatures = [
+  "pub fn plan_reactive_context_injection(view: &ActiveUnderstandingView, tail: &DecisionLocalTail, host: &HostContextCapabilitySnapshot, policy: &ReactiveContextPolicy) -> Result<PendingContextInjectionPlan, ReactivePlanError>",
+]
+write_scope = [
+  "crates/smart/eliot-context/src/reactive_plan.rs",
+  "crates/smart/eliot-context/tests/reactive_plan.rs",
+]
+algorithm = [
+  "validate exact view/tail/host generation/route/coverage/fence and policy",
+  "choose PreAction only when event-integrated capability is currently observed",
+  "choose NextBoundary for ToolOnly where applicable",
+  "choose AttentionOnly for non-interceptable but durable-attention-capable host",
+  "otherwise emit Unsupported/Blocked with limitation",
+  "attach exact payload/handle selection, deadline, dedup suggestion and required external receipt class",
+  "compute plan digest without sending or mutating session state",
+]
+minimum_tests = [
+  "event-integrated host may plan PreAction",
+  "ToolOnly cannot claim PreAction prevention",
+  "ObserveOnly/Offline/Unavailable degrade honestly",
+  "stale host capability rejected",
+  "plan requires external receipt but contains none",
+  "dedup suggestion does not mutate session state",
+  "no-hook host cannot claim prevention",
+]
+non_goals = [
+  "host call/delivery",
+  "session dedup mutation",
+  "Delivery/Injection Receipt creation",
+  "acknowledgement/use/outcome",
+  "attention resolution",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-CTX-02", "ARCH-CTX-03", "ARCH-ATTN-01", "ARCH-HELP-01", "ARCH-MOD-03"]
+implementation_refs = ["I2.15", "I2.20", "I7.10", "I7.16", "I7.19"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Return UnsupportedHostCapability/AttentionOnly or ContractChallenge rather than sending context, claiming prevention, creating a receipt, or hiding actual host limitations."
+brief_proof_ceiling = "STATIC_W2_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
