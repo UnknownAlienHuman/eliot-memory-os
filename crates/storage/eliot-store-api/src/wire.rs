@@ -16,10 +16,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    CanonicalValidationSnapshot, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    CanonicalValidationSnapshot, MAX_STORE_FAILURE_DETAIL_LEN, NamedReadRequest, NamedReadResponse,
+    OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
+    RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey, StoreError,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
 };
 use schemars::JsonSchema;
 
@@ -356,6 +356,10 @@ pub enum StoreResponse {
     Genesis {
         receipt: WriteReceipt,
     },
+    /// Typed provider-neutral failure introduced by the v2 failure contract.
+    Failure {
+        failure: crate::StoreFailure,
+    },
     /// Explicitly unknown/rejected reconciliation outcome; never a success.
     Unknown {
         operation_id: OperationId,
@@ -463,8 +467,11 @@ impl StoreResponse {
                     .map(|_| ())
                     .map_err(StoreWireError::Store)
             }
-            Self::Unknown { reason, .. } => validate_text(reason, "unknown.reason"),
-            Self::Error { error } => validate_text(error, "error"),
+            Self::Failure { failure } => failure
+                .validate()
+                .map_err(|error| StoreWireError::Invalid(error.to_string())),
+            Self::Unknown { reason, .. } => validate_legacy_failure_text(reason, "unknown.reason"),
+            Self::Error { error } => validate_legacy_failure_text(error, "error"),
         }
     }
 }
@@ -667,6 +674,15 @@ fn validate_text(value: &str, field: &'static str) -> Result<(), StoreWireError>
         )));
     }
     Ok(())
+}
+
+fn validate_legacy_failure_text(value: &str, field: &'static str) -> Result<(), StoreWireError> {
+    if value.len() > MAX_STORE_FAILURE_DETAIL_LEN {
+        return Err(StoreWireError::Invalid(format!(
+            "{field} exceeds the bounded legacy detail limit"
+        )));
+    }
+    validate_text(value, field)
 }
 
 #[cfg(test)]
