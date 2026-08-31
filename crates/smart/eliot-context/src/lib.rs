@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::BTreeSet};
 
 use eliot_contracts::{ArtifactId, ContractVersion, DecisionId, StateFence, TaskRevision};
 use eliot_evidence::{Assertability, EpistemicStatus, EvidenceFreshness};
@@ -33,6 +33,22 @@ pub enum ContextError {
     /// Inputs refer to different causal snapshots.
     #[error("context inputs are not compatible with the requested state fence")]
     FenceMismatch,
+    /// The recipe was compiled for a different task revision.
+    #[error(
+        "context recipe revision {recipe_revision:?} does not match task revision {task_revision:?}"
+    )]
+    RecipeRevisionMismatch {
+        /// Revision carried by the recipe.
+        recipe_revision: TaskRevision,
+        /// Current task revision carried by the input.
+        task_revision: TaskRevision,
+    },
+    /// A semantic identity appears more than once in one admitted set.
+    #[error("duplicate semantic identity in {field}")]
+    DuplicateIdentity {
+        /// Stable field path containing the duplicate.
+        field: &'static str,
+    },
     /// A recipe would remove a required safety section.
     #[error("recipe does not preserve required context role {0:?}")]
     MissingRequiredRole(ContextRole),
@@ -215,8 +231,22 @@ impl ContextRecipe {
                 field: "recipe.total_cost",
             });
         }
+        let mut budget_roles = BTreeSet::new();
+        for budget in &self.role_budgets {
+            if !budget_roles.insert(budget.role) {
+                return Err(ContextError::DuplicateIdentity {
+                    field: "recipe.role_budgets.role",
+                });
+            }
+        }
+        let mut required_roles = BTreeSet::new();
         for role in &self.required_roles {
-            if !self.role_budgets.iter().any(|budget| budget.role == *role) {
+            if !required_roles.insert(*role) {
+                return Err(ContextError::DuplicateIdentity {
+                    field: "recipe.required_roles",
+                });
+            }
+            if !budget_roles.contains(role) {
                 return Err(ContextError::MissingRequiredRole(*role));
             }
         }
@@ -256,7 +286,13 @@ impl ContextInput {
         self.state_fence
             .validate()
             .map_err(|_| ContextError::FenceMismatch)?;
+        let mut atom_ids = BTreeSet::new();
         for atom in &self.atoms {
+            if !atom_ids.insert(atom.atom_id.clone()) {
+                return Err(ContextError::DuplicateIdentity {
+                    field: "input.atoms.atom_id",
+                });
+            }
             atom.validate()?;
             if !self.state_fence.is_compatible_with(&atom.state_fence) {
                 return Err(ContextError::FenceMismatch);
@@ -329,6 +365,12 @@ impl ContextCompiler {
     ) -> Result<CompiledContext, ContextError> {
         input.validate()?;
         recipe.validate()?;
+        if recipe.recipe_revision != input.task_revision {
+            return Err(ContextError::RecipeRevisionMismatch {
+                recipe_revision: recipe.recipe_revision,
+                task_revision: input.task_revision,
+            });
+        }
         let mut candidates = input.atoms.clone();
         candidates.sort_by(Self::candidate_order);
         let mut units = Vec::new();
