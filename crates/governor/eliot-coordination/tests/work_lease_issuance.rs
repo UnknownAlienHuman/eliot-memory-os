@@ -167,7 +167,7 @@ fn rejected_acquisition_emits_no_canonical_identity() -> TestResult {
 }
 
 #[test]
-fn exact_retry_after_heartbeat_returns_the_original_immutable_issuance() -> TestResult {
+fn exact_retry_after_recovery_and_heartbeat_returns_original_issuance() -> TestResult {
     let (mut owner, state_fence) = ready_owner()?;
     let request = lease_request(&state_fence);
     let original = owner.acquire_work_with_issuance(request.clone())?;
@@ -189,7 +189,8 @@ fn exact_retry_after_heartbeat_returns_the_original_immutable_issuance() -> Test
     })?;
     assert_eq!(heartbeat.lease.expires_at, 90);
 
-    let replay = owner.acquire_work_with_issuance(request)?;
+    let mut recovered = CoordinationOwner::from_snapshot(owner.clone())?;
+    let replay = recovered.acquire_work_with_issuance(request)?;
     assert_eq!(replay.decision(), &original_decision);
     assert_eq!(replay.decision().lease.expires_at, 60);
     assert_eq!(replay.provenance().canonical_work_lease_id(), &original_id);
@@ -197,7 +198,7 @@ fn exact_retry_after_heartbeat_returns_the_original_immutable_issuance() -> Test
         replay.provenance().evidence_commitment_sha256(),
         original_commitment
     );
-    assert_eq!(owner.events().len(), 4);
+    assert_eq!(recovered.events().len(), 4);
     Ok(())
 }
 
