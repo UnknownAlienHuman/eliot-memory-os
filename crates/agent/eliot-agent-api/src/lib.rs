@@ -15,7 +15,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTRACT_VERSION: &str = "eliot-agent-api/v2";
+pub const CONTRACT_VERSION: &str = "eliot-agent-api/v3";
 
 /// Compatibility spelling retained as an exact alias of the canonical owner.
 pub type AttemptId = AgentAttemptId;
@@ -842,17 +842,20 @@ pub struct EffectReceipt {
     pub artifact_refs: Vec<ArtifactId>,
 }
 
-/// Result disposition; provider “completed” is not automatically completion.
+/// Result disposition; provider output is structurally candidate-only and never
+/// expresses Task completion. The strongest positive state is
+/// `CandidateSucceeded`, which means only that the provider reports one bounded
+/// candidate artifact for its exact execution unit.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ResultDisposition {
-    VerifiedComplete,
+    CandidateSucceeded,
     Partial,
     Blocked,
     FailedVerification,
     DegradedNoProof,
-    UnsafeToFinish,
-    Cancelled,
+    Unsafe,
+    CancelledObserved,
     Superseded,
     UnknownOutcome,
 }
@@ -865,7 +868,9 @@ pub struct AgentResult {
     pub artifacts: Vec<ArtifactId>,
     pub evidence_refs: Vec<String>,
     pub proposed_effects: Vec<ProposedEffect>,
-    pub effect_receipts: Vec<EffectReceipt>,
+    /// `effect_receipts` is intentionally absent: a provider may only propose
+    /// effects (`proposed_effects`); authoritative `EffectReceipt` minting is
+    /// owned by the canonical effect/transition layer.
     pub unresolved_questions: Vec<String>,
     pub usage: UsageReceipt,
     pub actual_route: ActualRouteReceipt,
@@ -882,10 +887,6 @@ impl AgentResult {
             && self.unknown_reason.as_deref().is_none_or(str::is_empty)
         {
             return Err(ContractError::MissingUnknownReason);
-        }
-        if self.disposition == ResultDisposition::VerifiedComplete && self.evidence_refs.is_empty()
-        {
-            return Err(ContractError::EmptyCollection("evidence_refs"));
         }
         Ok(())
     }
@@ -1117,7 +1118,6 @@ mod tests {
             artifacts: Vec::new(),
             evidence_refs: Vec::new(),
             proposed_effects: Vec::new(),
-            effect_receipts: Vec::new(),
             unresolved_questions: Vec::new(),
             usage: UsageReceipt {
                 input_tokens: None,
@@ -1502,6 +1502,208 @@ mod tests {
             valid_until: "later".into(),
         };
         assert!(envelope.validate().is_ok());
+
+    #[test]
+    fn api_case_13_candidate_result_is_structurally_candidate_only() -> TestResult {
+        // New dispositions: CANDIDATE_SUCCEEDED is the strongest positive, no
+        // VERIFIED_COMPLETE / COMPLETE / DONE / FINISHED is expressible.
+        let dispositions = [
+            "CANDIDATE_SUCCEEDED",
+            "PARTIAL",
+            "BLOCKED",
+            "FAILED_VERIFICATION",
+            "DEGRADED_NO_PROOF",
+            "UNSAFE",
+            "CANCELLED_OBSERVED",
+            "SUPERSEDED",
+            "UNKNOWN_OUTCOME",
+        ];
+        for name in dispositions {
+            let wire = serde_json::json!(name);
+            assert!(
+                serde_json::from_value::<ResultDisposition>(wire).is_ok(),
+                "candidate disposition must decode: {name}"
+            );
+        }
+        for forbidden in [
+            "VERIFIED_COMPLETE",
+            "verified_complete",
+            "COMPLETE",
+            "DONE",
+            "FINISHED",
+            "CANCELLED",
+            "UNSAFE_TO_FINISH",
+        ] {
+            let wire = serde_json::json!(forbidden);
+            assert!(
+                serde_json::from_value::<ResultDisposition>(wire).is_err(),
+                "forbidden disposition must be rejected: {forbidden}"
+            );
+        }
+        // Legacy numeric / untagged forms are rejected because disposition is
+        // a string enum with deny_unknown_fields above.
+        assert!(serde_json::from_value::<ResultDisposition>(serde_json::json!(0)).is_err());
+        assert!(serde_json::from_value::<ResultDisposition>(serde_json::json!(null)).is_err());
+        // Provider result must not contain effect_receipts.
+        let api = AgentResult {
+            attempt_id: AttemptId::new("attempt-case-10")?,
+            disposition: ResultDisposition::CandidateSucceeded,
+            artifacts: Vec::new(),
+            evidence_refs: Vec::new(),
+            proposed_effects: Vec::new(),
+            unresolved_questions: Vec::new(),
+            usage: UsageReceipt {
+                input_tokens: None,
+                output_tokens: None,
+                cost_microunits: None,
+                quota: QuotaKnowledge::Unknown,
+            },
+            actual_route: ActualRouteReceipt {
+                requested: route(),
+                observed: Some(route()),
+                route_id: RouteFingerprintId::new("route-case-10")?,
+                usage: UsageReceipt {
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost_microunits: None,
+                    quota: QuotaKnowledge::Unknown,
+                },
+                started_at: "2026-08-14T00:00:00Z".into(),
+                terminal_at: None,
+            },
+            unknown_reason: None,
+        };
+        api.validate(&ceiling())?;
+        let wire = serde_json::to_value(&api)?;
+        assert!(wire.get("effect_receipts").is_none());
+        // Legacy wire containing effect_receipts must be rejected.
+        let mut legacy = wire.clone();
+        legacy["effect_receipts"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<AgentResult>(legacy).is_err());
+        // Legacy wire containing VERIFIED_COMPLETE must be rejected, not migrated.
+        let mut legacy_disp = wire;
+        legacy_disp["disposition"] = serde_json::json!("VERIFIED_COMPLETE");
+        assert!(serde_json::from_value::<AgentResult>(legacy_disp).is_err());
+        // Aliases with different casing are rejected.
+        let mut alias = serde_json::to_value(&api)?;
+        alias["disposition"] = serde_json::json!("verified_complete");
+        assert!(serde_json::from_value::<AgentResult>(alias).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn api_case_11_candidate_evidence_does_not_raise_proof_ceiling() -> TestResult {
+        let mut result = AgentResult {
+            attempt_id: AttemptId::new("attempt-case-11")?,
+            disposition: ResultDisposition::CandidateSucceeded,
+            artifacts: Vec::new(),
+            evidence_refs: vec!["evidence-1".into(), "evidence-2".into()],
+            proposed_effects: Vec::new(),
+            unresolved_questions: Vec::new(),
+            usage: UsageReceipt {
+                input_tokens: None,
+                output_tokens: None,
+                cost_microunits: None,
+                quota: QuotaKnowledge::Unknown,
+            },
+            actual_route: ActualRouteReceipt {
+                requested: route(),
+                observed: Some(route()),
+                route_id: RouteFingerprintId::new("route-case-11")?,
+                usage: UsageReceipt {
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost_microunits: None,
+                    quota: QuotaKnowledge::Unknown,
+                },
+                started_at: "2026-08-14T00:00:00Z".into(),
+                terminal_at: None,
+            },
+            unknown_reason: None,
+        };
+        // Candidate success with nonempty evidence remains candidate-only; it
+        // does not validate as a FinishDecision or ProofCeiling beyond
+        // CandidateArtifact (checked in coordinator receipt).
+        result.validate(&ceiling())?;
+        // No disposition can carry completion proof; schema has no completion field.
+        let schema = schemars::schema_for!(AgentResult);
+        let schema_value = serde_json::to_value(schema)?;
+        let schema_str = serde_json::to_string(&schema_value)?;
+        assert!(!schema_str.contains("VerifiedComplete"));
+        assert!(!schema_str.contains("CompletionProof"));
+        assert!(!schema_str.contains("FinishDecision"));
+        // Schema properties must not contain authoritative effect_receipts.
+        let props = &schema_value["properties"];
+        assert!(props.get("effect_receipts").is_none());
+        // Even with evidence, validate does not require nonempty for candidate.
+        result.evidence_refs.clear();
+        result.validate(&ceiling())?;
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_wraps)]
+    fn api_case_12_serialized_forgery_is_rejected() -> TestResult {
+        // Forged legacy JSON attempting to claim completion.
+        let forged = serde_json::json!({
+            "attempt_id": "attempt-case-12",
+            "disposition": "VERIFIED_COMPLETE",
+            "artifacts": [],
+            "evidence_refs": ["forged-evidence"],
+            "proposed_effects": [],
+            "unresolved_questions": [],
+            "usage": {"input_tokens": null, "output_tokens": null, "cost_microunits": null, "quota": "unknown"},
+            "actual_route": {
+                "requested": route(),
+                "observed": route(),
+                "route_id": "route-case-12",
+                "usage": {"input_tokens": null, "output_tokens": null, "cost_microunits": null, "quota": "unknown"},
+                "started_at": "2026-08-14T00:00:00Z",
+                "terminal_at": null
+            },
+            "unknown_reason": null
+        });
+        assert!(serde_json::from_value::<AgentResult>(forged).is_err());
+        // Lowercase alias also rejected.
+        let forged_lower = serde_json::json!({
+            "attempt_id": "attempt-case-12",
+            "disposition": "verified_complete",
+            "artifacts": [],
+            "evidence_refs": [],
+            "proposed_effects": [],
+            "unresolved_questions": [],
+            "usage": {"input_tokens": null, "output_tokens": null, "cost_microunits": null, "quota": "unknown"},
+            "actual_route": {
+                "requested": route(),
+                "observed": route(),
+                "route_id": "route-case-12",
+                "usage": {"input_tokens": null, "output_tokens": null, "cost_microunits": null, "quota": "unknown"},
+                "started_at": "2026-08-14T00:00:00Z",
+                "terminal_at": null
+            },
+            "unknown_reason": null
+        });
+        assert!(serde_json::from_value::<AgentResult>(forged_lower).is_err());
+        // Numeric forgery rejected.
+        let forged_num = serde_json::json!({
+            "attempt_id": "attempt-case-12",
+            "disposition": 0,
+            "artifacts": [],
+            "evidence_refs": [],
+            "proposed_effects": [],
+            "unresolved_questions": [],
+            "usage": {"input_tokens": null, "output_tokens": null, "cost_microunits": null, "quota": "unknown"},
+            "actual_route": {
+                "requested": route(),
+                "observed": route(),
+                "route_id": "route-case-12",
+                "usage": {"input_tokens": null, "output_tokens": null, "cost_microunits": null, "quota": "unknown"},
+                "started_at": "2026-08-14T00:00:00Z",
+                "terminal_at": null
+            },
+            "unknown_reason": null
+        });
+        assert!(serde_json::from_value::<AgentResult>(forged_num).is_err());
         Ok(())
     }
 }

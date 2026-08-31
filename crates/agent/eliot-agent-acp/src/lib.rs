@@ -1018,7 +1018,7 @@ impl AcpResultEnvelope {
     ) -> Result<AgentResult, AcpAdapterError> {
         let (disposition, unknown_reason) = match outcome {
             AcpResultOutcome::Completed => (ResultDisposition::DegradedNoProof, None),
-            AcpResultOutcome::Cancelled => (ResultDisposition::Cancelled, None),
+            AcpResultOutcome::Cancelled => (ResultDisposition::CancelledObserved, None),
             AcpResultOutcome::Failed { reason } => {
                 (ResultDisposition::FailedVerification, Some(reason))
             }
@@ -1038,7 +1038,6 @@ impl AcpResultEnvelope {
             artifacts: Vec::new(),
             evidence_refs: Vec::new(),
             proposed_effects: Vec::new(),
-            effect_receipts: Vec::new(),
             unresolved_questions: Vec::new(),
             usage: usage.clone(),
             actual_route: ActualRouteReceipt {
@@ -1703,7 +1702,6 @@ mod tests {
         assert_eq!(result.disposition, ResultDisposition::DegradedNoProof);
         assert!(result.evidence_refs.is_empty());
         assert!(result.proposed_effects.is_empty());
-        assert!(result.effect_receipts.is_empty());
         assert!(result.actual_route.observed.is_none());
         assert_eq!(result.actual_route.usage.quota, QuotaKnowledge::Unknown);
         assert!(result.actual_route.usage.input_tokens.is_none());
@@ -1717,7 +1715,7 @@ mod tests {
     fn result_projection_preserves_cancelled_disposition() -> Result<(), Box<dyn std::error::Error>>
     {
         let result = project_result(AcpResultOutcome::Cancelled)?;
-        assert_eq!(result.disposition, ResultDisposition::Cancelled);
+        assert_eq!(result.disposition, ResultDisposition::CancelledObserved);
         assert!(result.unknown_reason.is_none());
         Ok(())
     }

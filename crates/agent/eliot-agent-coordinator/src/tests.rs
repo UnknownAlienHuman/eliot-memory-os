@@ -1484,3 +1484,271 @@ fn plan_same_identity_changed_bytes_fails_identity_conflict_before_ready_backpre
     );
     Ok(())
 }
+
+#[test]
+fn coordinator_case_17_candidate_disposition_is_candidate_only_and_capped() -> TestResult {
+    let mut coordinator = coordinator(
+        config(2, 2),
+        &["proof-admission-case-17", "proof-result-case-17"],
+    )?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "case-17",
+        &[LaneSpec {
+            work: "work-case-17",
+            role: "reader-case-17",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let result = result_submission("case-17", &lane, ResultDisposition::CandidateSucceeded)?;
+    let receipt = coordinator.submit_result(context, result)?;
+    assert_eq!(
+        receipt.proof_ceiling,
+        eliot_receipts::ProofCeiling::CandidateArtifact
+    );
+    assert_eq!(
+        receipt.provider_disposition,
+        ResultDisposition::CandidateSucceeded
+    );
+    // Coordinator never produces a finish-level proof.
+    assert_ne!(
+        receipt.proof_ceiling,
+        eliot_receipts::ProofCeiling::ScopedVerification
+    );
+    // Serialized receipt is candidate-only.
+    let wire = serde_json::to_value(&receipt)?;
+    assert_eq!(wire["provider_disposition"], "CANDIDATE_SUCCEEDED");
+    // No conversion path exists to FinishDecisionOutcome::VerifiedComplete.
+    let source = include_str!("core.rs");
+    assert!(!source.contains("FinishDecision"));
+    assert!(!source.contains("VerifiedComplete"));
+    Ok(())
+}
+
+#[test]
+fn coordinator_case_18_legacy_verified_complete_and_effect_receipts_rejected() -> TestResult {
+    // Legacy JSON with VERIFIED_COMPLETE must be rejected, not migrated.
+    let legacy_disp = serde_json::json!("VERIFIED_COMPLETE");
+    assert!(serde_json::from_value::<ResultDisposition>(legacy_disp).is_err());
+    for alias in [
+        "VERIFIED_COMPLETE",
+        "verified_complete",
+        "COMPLETE",
+        "DONE",
+        "FINISHED",
+    ] {
+        assert!(serde_json::from_value::<ResultDisposition>(serde_json::json!(alias)).is_err());
+    }
+    // Legacy numeric / null forms rejected.
+    assert!(serde_json::from_value::<ResultDisposition>(serde_json::json!(0)).is_err());
+    // Provider result with effect_receipts field is rejected via deny_unknown_fields.
+    let route_val = serde_json::to_value(route("a"))?;
+    let legacy_result = serde_json::json!({
+        "attempt_id": "attempt-legacy",
+        "disposition": "CANDIDATE_SUCCEEDED",
+        "artifacts": [],
+        "evidence_refs": [],
+        "proposed_effects": [],
+        "effect_receipts": [],
+        "unresolved_questions": [],
+        "usage": {"input_tokens": null, "output_tokens": null, "cost_microunits": null, "quota": "unknown"},
+        "actual_route": {
+            "requested": route_val,
+            "observed": route_val,
+            "route_id": "route-legacy",
+            "usage": {"input_tokens": null, "output_tokens": null, "cost_microunits": null, "quota": "unknown"},
+            "started_at": "2026-08-14T00:00:00Z",
+            "terminal_at": null
+        },
+        "unknown_reason": null
+    });
+    assert!(serde_json::from_value::<AgentResult>(legacy_result).is_err());
+    // Legacy DISPOSITION VERIFIED_COMPLETE with effect_receipts also rejected.
+    let legacy_both = serde_json::json!({
+        "attempt_id": "attempt-legacy-2",
+        "disposition": "VERIFIED_COMPLETE",
+        "artifacts": [],
+        "evidence_refs": ["evidence"],
+        "proposed_effects": [],
+        "effect_receipts": [{"effect_id":"e1","authorization_ref":"a","outcome":"ok","observed_at":"now","artifact_refs":[]}],
+        "unresolved_questions": [],
+        "usage": {"input_tokens": null, "output_tokens": null, "cost_microunits": null, "quota": "unknown"},
+        "actual_route": {
+            "requested": route_val,
+            "observed": route_val,
+            "route_id": "route-legacy-2",
+            "usage": {"input_tokens": null, "output_tokens": null, "cost_microunits": null, "quota": "unknown"},
+            "started_at": "2026-08-14T00:00:00Z",
+            "terminal_at": null
+        },
+        "unknown_reason": null
+    });
+    assert!(serde_json::from_value::<AgentResult>(legacy_both).is_err());
+    Ok(())
+}
+
+#[test]
+fn coordinator_case_19_replay_conflict_and_snapshot_forgery_fail_closed() -> TestResult {
+    let proofs = ["proof-admission-case-19", "proof-result-case-19"];
+    let mut coordinator = coordinator(config(2, 2), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "case-19",
+        &[LaneSpec {
+            work: "work-case-19",
+            role: "reader-case-19",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let first = result_submission("case-19", &lane, ResultDisposition::CandidateSucceeded)?;
+    let first_id = first.submission_id.clone();
+    let first_route = first.result.actual_route.clone();
+    coordinator.submit_result(context.clone(), first)?;
+    // Exact replay under same submission/payload digest is idempotent.
+    let mut replay = result_submission("case-19", &lane, ResultDisposition::CandidateSucceeded)?;
+    replay.submission_id = first_id.clone();
+    replay.result.actual_route = first_route.clone();
+    let replayed = coordinator.submit_result(context.clone(), replay)?;
+    assert_eq!(replayed.submission_id, first_id);
+    // Same identity with different bytes (different disposition) is a conflict.
+    let mut conflict = result_submission("case-19", &lane, ResultDisposition::Partial)?;
+    conflict.submission_id = first_id.clone();
+    assert_eq!(
+        coordinator.submit_result(context.clone(), conflict).err(),
+        Some(CoordinatorError::IdempotencyConflict)
+    );
+    // Snapshot event replay with tampered digest fails.
+    let mut snapshot = coordinator.snapshot()?;
+    let original_digest = snapshot.event_digest.clone();
+    snapshot.event_digest = "0".repeat(64);
+    assert_eq!(
+        AgentCoordinator::restore_with_provider(
+            snapshot,
+            config(2, 2),
+            Box::new(verifier(&proofs, 0))
+        )
+        .err(),
+        Some(CoordinatorError::SnapshotDigest)
+    );
+    // Forged snapshot JSON with VERIFIED_COMPLETE string inside events fails to deserialize.
+    let forged_json = serde_json::to_value(coordinator.snapshot()?)?;
+    let forged_str = serde_json::to_string(&forged_json)?;
+    let forged_str = forged_str.replace("CANDIDATE_SUCCEEDED", "VERIFIED_COMPLETE");
+    assert!(serde_json::from_str::<crate::CoordinatorSnapshot>(&forged_str).is_err());
+    let _ = original_digest;
+    Ok(())
+}
+
+#[test]
+fn coordinator_case_20_parent_closure_is_candidate_only_and_requires_descendant_reconciliation()
+-> TestResult {
+    let proofs = [
+        "proof-admission-parent-20",
+        "proof-admission-child-20",
+        "proof-result-child-20",
+        "proof-result-parent-20",
+    ];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let parent = plan_and_admit(
+        &mut coordinator,
+        "parent-20",
+        &[LaneSpec {
+            work: "work-parent-20",
+            role: "reader-parent-20",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 2,
+        }],
+        None,
+    )?;
+    let parent_context = ExecutionContext::from(&parent);
+    let parent_lane = parent.admitted_lanes[0].clone();
+    coordinator.start_attempt(parent_context.clone(), parent_lane.attempt_id.clone())?;
+    let child = plan_and_admit(
+        &mut coordinator,
+        "child-20",
+        &[LaneSpec {
+            work: "work-child-20",
+            role: "reader-child-20",
+            route: "b",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        Some(parent_lane.attempt_id.clone()),
+    )?;
+    let child_context = ExecutionContext::from(&child);
+    let child_lane = child.admitted_lanes[0].clone();
+    coordinator.start_attempt(child_context.clone(), child_lane.attempt_id.clone())?;
+    coordinator.submit_result(
+        child_context,
+        result_submission(
+            "child-20",
+            &child_lane,
+            ResultDisposition::CandidateSucceeded,
+        )?,
+    )?;
+    // Parent candidate success without descendant closure must fail.
+    let parent_result = result_submission(
+        "parent-20",
+        &parent_lane,
+        ResultDisposition::CandidateSucceeded,
+    )?;
+    assert_eq!(
+        coordinator
+            .submit_result(parent_context.clone(), parent_result.clone())
+            .err(),
+        Some(CoordinatorError::IncompleteDescendantClosure)
+    );
+    // After closing descendants, parent candidate succeeds but proof remains candidate.
+    let closure: eliot_agent_contracts::DescendantClosureReceipt = serde_json::from_value(
+        serde_json::json!({
+            "parent_ref": {"kind":"attempt","id":parent_lane.attempt_id.as_str(),"revision":"parent-rev-1","digest":null},
+            "admitted_descendant_ids": [child_lane.attempt_id.as_str()],
+            "lineage_revision": "lineage-rev-1",
+            "observed_runtime_refs": [{"kind":"runtime","id":"runtime-1","revision":"runtime-rev-1","digest":null}],
+            "dispositions": [{
+                "attempt_id": child_lane.attempt_id.as_str(),
+                "state": "COMPLETED",
+                "evidence_refs": [{"kind":"verifier","id":"child-proof","revision":"proof-rev-1","digest":null}]
+            }],
+            "unreachable_or_unknown_ids": [],
+            "observation_coverage_ref": {"kind":"coverage","id":"coverage-1","revision":"coverage-rev-1","digest":null},
+            "parent_finish_ceiling": "COMPLETE",
+            "coordinator_evidence_refs": [{"kind":"coordinator","id":"coord-proof","revision":"coord-rev-1","digest":null}]
+        }),
+    )?;
+    coordinator.reconcile_descendants(
+        parent_context.clone(),
+        DescendantClosureSubmission {
+            operation_id: OperationId::new("closure-parent-20")?,
+            parent_attempt_id: parent_lane.attempt_id.clone(),
+            receipt: closure,
+        },
+    )?;
+    let receipt = coordinator.submit_result(parent_context, parent_result)?;
+    assert_eq!(
+        receipt.proof_ceiling,
+        eliot_receipts::ProofCeiling::CandidateArtifact
+    );
+    // Even with two levels of CANDIDATE_SUCCEEDED, no task finish is derived.
+    let source = include_str!("core.rs");
+    assert!(!source.contains("FinishDecision"));
+    assert!(!source.contains("CloseCompleted"));
+    Ok(())
+}
