@@ -144,6 +144,9 @@ impl CueKey {
             _ => MatchMode::Exact,
         };
         let normalized = normalize_value(kind, value);
+        if !valid_text(&normalized) {
+            return Err(CueError::InvalidValue);
+        }
         if kind == CueKind::ErrorSignature
             && (normalized.len() != 68
                 || !normalized.starts_with("sig:")
@@ -257,16 +260,7 @@ impl CueRecord {
         if self.lifecycle != next
             && (self.lifecycle == LifecycleState::Extinguished
                 || (self.lifecycle == LifecycleState::Archived
-                    && next == LifecycleState::Suppressed)
-                || matches!(
-                    (self.lifecycle, next),
-                    (
-                        LifecycleState::Active
-                            | LifecycleState::Quarantined
-                            | LifecycleState::Suppressed,
-                        LifecycleState::Extinguished
-                    )
-                ))
+                    && next == LifecycleState::Suppressed))
         {
             return Err(CueError::InvalidLifecycle {
                 from: self.lifecycle,
@@ -389,7 +383,7 @@ impl CueSnapshot {
         cause: InvalidationCause,
         revision: u64,
     ) -> Result<Self, CueError> {
-        if revision < self.revision {
+        if revision <= self.revision {
             return Err(CueError::StaleSnapshot);
         }
         let mut next = self.clone();
