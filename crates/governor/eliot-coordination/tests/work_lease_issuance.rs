@@ -194,10 +194,9 @@ fn original_issuance_is_immutable_after_heartbeat_extension() -> TestResult {
 fn stale_fence_is_rejected_before_issuance() -> TestResult {
     let (mut owner, state_fence) = ready_owner()?;
     let mut request = lease_request(&state_fence);
-    request.state_fence = StateFence::new(
-        AuthorityEpoch::genesis(),
-        ResourceGeneration::new(2).map_err(|error| error.to_string())?,
-    );
+    let stale_generation = ResourceGeneration::new(2)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    request.state_fence = StateFence::new(AuthorityEpoch::genesis(), stale_generation);
     let error = match owner.acquire_work_with_issuance(request) {
         Ok(_) => return Err("stale fence unexpectedly produced an issuance".into()),
         Err(error) => error,
