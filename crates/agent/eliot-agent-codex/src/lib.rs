@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+pub mod catalogue;
+
 pub const CODEX_ADAPTER_ID: &str = "eliot-agent-codex";
 pub const CODEX_HOST_FAMILY: &str = "codex";
 pub const CODEX_PROTOCOL_TRANSPORT: &str = "app-server+stdio/jsonl";
@@ -390,7 +392,7 @@ pub fn begin_attempt(
 
 /// Codex App Server JSONL envelope.  Provider fields remain opaque `Value`s;
 /// callers receive typed A-01 events/results after translation.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodexWireMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
