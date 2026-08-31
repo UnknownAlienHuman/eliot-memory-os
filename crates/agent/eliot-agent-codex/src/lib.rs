@@ -533,7 +533,7 @@ pub fn correlate_response<'a>(
     })
 }
 
-fn event_kind(method: &str) -> HostEventKind {
+fn event_kind(method: &str, params: &Value) -> HostEventKind {
     match method {
         "thread/started" | "thread/resumed" => HostEventKind::SessionStarted,
         "turn/started" | "turn/created" => HostEventKind::PromptSubmitted,
@@ -541,9 +541,17 @@ fn event_kind(method: &str) -> HostEventKind {
         "item/reasoningSummary/delta" | "item/reasoning/delta" => HostEventKind::ReasoningDelta,
         "item/commandExecution/requestApproval" | "item/toolCall" => HostEventKind::ToolCall,
         "item/commandExecution/finished" | "item/toolResult" => HostEventKind::ToolResult,
-        "turn/completed" | "turn/completion" => HostEventKind::Completed,
+        "turn/completed" => match params
+            .get("turn")
+            .and_then(Value::as_object)
+            .and_then(|turn| turn.get("status"))
+            .and_then(Value::as_str)
+        {
+            Some("completed") => HostEventKind::Completed,
+            Some("failed") => HostEventKind::Failed,
+            _ => HostEventKind::Unknown,
+        },
         "turn/failed" | "error" => HostEventKind::Error,
-        "turn/cancelled" => HostEventKind::CancelRequested,
         _ => HostEventKind::Unknown,
     }
 }
@@ -607,7 +615,7 @@ pub fn translate_host_event(
         attempt_id,
         sequence,
         cursor,
-        kind: event_kind(method),
+        kind: event_kind(method, &params),
         route: route.clone(),
         raw_payload_digest: blake3::hash(&bytes).to_hex().to_string(),
         normalized_payload: params,
