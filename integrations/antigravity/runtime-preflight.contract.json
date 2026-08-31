@@ -99,6 +99,23 @@
   "model_calls": 0,
   "fixed_model_id": null,
   "route_admitted": false,
+  "process_image_proof": false,
   "receipt_schema": "eliot.antigravity-runtime-preflight-receipt.v1",
-  "proof_ceiling": "ZERO_MODEL_EXECUTABLE_AND_HELP_FINGERPRINT_ONLY"
+  "proof_ceiling": "ZERO_MODEL_STABLE_EXECUTABLE_PATH_AND_HELP_FINGERPRINT_ONLY",
+  "executable_stability": {
+    "snapshot_stages": [
+      "pre_version",
+      "post_version",
+      "post_help"
+    ],
+    "snapshot_fields": [
+      "sha256",
+      "byte_length",
+      "file_identity"
+    ],
+    "read_through_opened_handle": true,
+    "stability_checked_during_read": true,
+    "path_identity_rechecked": true,
+    "process_image_proof": false
+  }
 }
