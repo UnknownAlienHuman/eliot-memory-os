@@ -3,11 +3,11 @@
 <!-- eliot-doc-routing:start -->
 ## Documentation entry point
 
-Start with the [mandatory reading protocol](architecture/READING_PROTOCOL.md), then use the generated route for the exact files and causal property being changed. The stable `ELIOT_*` files are compatibility maps, not task prompts.
+Start with the [mandatory verified-reading protocol](architecture/READING_PROTOCOL.md), then run `python scripts/docs_read.py read ...` for the exact repository paths and causal property being changed. Open the verified bundle and record its read receipt before mutation. A route alone is navigation, not reading evidence. The stable `ELIOT_*` files are compatibility maps, not task prompts.
 <!-- eliot-doc-routing:end -->
 
 
-Status: current routing map for `main`, 2026-08-29. Navigation only; product
+Status: current routing map for `main`, 2026-08-30. Navigation only; product
 status remains `NOT_ACCEPTED / UNVERIFIED`.
 
 ## Authority and work
@@ -43,6 +43,34 @@ present in the active checkout.
 
 A crate is a source/build boundary, not a lifecycle or authority owner.
 
+## Exact Cargo composition roots
+
+This table is an inventory of root-workspace `bins/*` packages. Presence in the
+workspace proves source/build admission only; it does not prove installation,
+runtime health, authority correctness, Product acceptance, or release support.
+
+| Cargo member | Executable | Intended boundary | Work item |
+|---|---|---|---|
+| `bins/eliot` | `eliot.exe` | canonical one-shot operator/agent CLI and installation/runtime-status front door | current surface/installation issue; live proof #11 |
+| `bins/eliot-agent-bridge` | `eliot-agent-bridge.exe` | thin public agent bridge ingress surface | #13; full bridge integration #77 |
+| `bins/eliot-doctor` | `eliot-doctor.exe` | bounded one-shot repair composition root | #17 |
+| `bins/eliot-dreamer` | `eliot-dreamer.exe` | candidate-only Dreamer execution surface | cognitive issues #38–#45 |
+| `bins/eliot-host` | `eliot-host.exe` | external lifecycle, journal, launch, and recovery boundary | #14 |
+| `bins/eliot-kernel` | `eliot-kernel.exe` | identity, fencing, ORS, reserve, and generation routing | #15 |
+| `bins/eliot-mod-research` | `eliot-mod-research.exe` | governed external-corpus acquisition provider process | #24 |
+| `bins/eliot-native-worker` | `eliot-native-worker.exe` | isolated OS-heavy native generation | #22 |
+| `bins/eliot-notify` | `eliot-notify.exe` | thin stateless/near-stateless notification surface | #13 |
+| `bins/eliot-store-surreal` | `eliot-store-surreal.exe` | closed Surreal store bridge composition root | #19; payload regression #10 |
+| `bins/eliot-testd` | `eliot-testd.exe` | isolated typed Instrument execution | #20 |
+| `bins/eliot-user-broker` | `eliot-user-broker.exe` | SID/session-bound interactive-user launch and resources | #23 |
+| `bins/eliot-wasm-host` | `eliot-wasm-host.exe` | capability-limited WASM/component mechanics | #21 |
+| `bins/eliot-watchdog` | `eliot-watchdog.exe` | independent supervision process | #16 |
+| `bins/eliotd` | `eliotd.exe` | Governor semantic daemon/application owner | #18 |
+
+The executable inventory is checked against the root `Cargo.toml`; a new or
+removed `bins/*` workspace member must update this table in the same bounded
+change.
+
 ## Legacy migration facades
 
 The earlier broad source owners remain in the workspace for compatibility,
@@ -59,28 +87,6 @@ do not make them current runtime or semantic owners.
 
 A regression may still terminate in a facade. That permits a scoped repair or
 migration under the owning issue, not general development there.
-
-## Runtime owners and work items
-
-| Capability | Intended role | Work item |
-|---|---|---|
-| `eliot.exe` | canonical one-shot operator/agent CLI | current surface/installation issue |
-| `eliot-host.exe` | external lifecycle/recovery boundary | #14 |
-| `eliot-kernel.exe` | identity, fencing, ORS, reserve, generation routing | #15 |
-| `eliotd.exe` | Governor semantic daemon | #18 |
-| `eliot-watchdog.exe` | independent supervision | #16 |
-| `eliot-doctor.exe` | bounded one-shot repair | #17 |
-| store bridge / Surreal generation / BlobStore | closed storage path and single owners | #19; payload regression #10 |
-| `eliot-testd.exe` | isolated Instrument execution | #20 |
-| `eliot-wasm-host.exe` | capability-limited component host | #21 |
-| native worker | isolated OS-heavy generation | #22 |
-| User Broker | interactive-user launch/resource boundary | #23 |
-| notify / agent bridge | stateless or near-stateless surfaces | #13 |
-| Researcher provider process | governed acquisition execution | #24 |
-
-Dreamer is excluded from the core/daemon workstream. Its candidate-only
-cognitive capability-cell scaffold is on `main`; issues #38–#45 own the current
-contract, donor-migration, integration, and self-learning gaps.
 
 ## Canonical transition path
 
@@ -123,6 +129,9 @@ cannot grant authority by itself.
 - Cognitive issues #38–#45 use the wave/edge/donor/decision manifests already
   on `main`; every implementation cell receives a fresh issue-numbered branch.
 - Issue #11 owns current live Windows installation and Product-Pulse evidence.
+
+Dreamer remains outside the core/daemon workstream. Its source/build presence is
+not runtime or Product support.
 
 There is no shared long-lived implementation branch. Visible legacy refs are
 non-mutable aliases of `main` until they can be physically deleted. Current

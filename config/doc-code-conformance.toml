@@ -1,8 +1,52 @@
 schema_version = "eliot-doc-code-conformance-v1"
 
+[documentation_reader]
+command = "python scripts/docs_read.py read"
+required_terms = [
+  "docs-read-bundle.md",
+  "docs-read-receipt.json",
+  "route alone",
+  "verified bundle",
+  "read receipt",
+]
+surfaces = [
+  "AGENTS.md",
+  "WORKFLOW.md",
+  "docs/architecture/READING_PROTOCOL.md",
+  "docs/architecture/README.md",
+]
+scan_all_agent_files = true
+
+[[documentation_reader.generator_scope]]
+path = "scripts/docs_shards.py"
+start = "def routing_block("
+end = "def patch_navigation_surfaces("
+
+[[documentation_reader.generator_scope]]
+path = "scripts/docs_shards.py"
+start = "def render_reading_protocol("
+end = "def render_architecture_readme("
+
+[[documentation_reader.generator_scope]]
+path = "scripts/docs_shards.py"
+start = "def render_architecture_readme("
+end = "def render_topic_index("
+
+[workflows]
+directory = ".github/workflows"
+documentation = ".github/README.md"
+allowed_events = ["workflow_dispatch"]
+required_documentation_terms = ["`workflow_dispatch` only"]
+forbidden_documentation_terms = [
+  "Runs on every branch push and pull request to `main`.",
+  "Runs for pull requests to `main` and may be dispatched manually.",
+]
+require_workflow_filenames = true
+
 [retired_references]
-# These roots are the configured operational source surface. Documentation books
-# are intentionally excluded because their compatibility paths are documented.
+# The configured operational source surface is checked fail-closed. The
+# documentation books themselves are excluded because compatibility paths and
+# predecessor identities are documented there intentionally.
 scan_roots = [
   "AGENTS.md",
   "WORKFLOW.md",
@@ -48,11 +92,126 @@ tokens = [
   "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md",
   "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md",
 ]
+# These implementation modules retain pre-sharding traceability markers. Each
+# exception is exact path/token scoped; all other operational source remains
+# fail-closed.
 ignore_globs = [
   "config/doc-code-conformance.toml",
   "scripts/doc_code_conformance_core.py",
   "scripts/verify-doc-code-conformance.py",
+  "scripts/docs_shards_core.py",
 ]
+unstable_line_reference_regex = 'docs/(?:normative|architecture)/ELIOT_(?:ARCHITECTURE|IMPLEMENTATION)\.md:\d+'
+
+[[retired_references.allow]]
+path = "bins/eliot-host/src/credential_control/codec.rs"
+token = "eliot-architecture-docs-fa941135"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "bins/eliot-host/src/journal_append/readiness_append.rs"
+token = "eliot-architecture-docs-fa941135"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "bins/eliot-host/src/kernel_front_door_client.rs"
+token = "eliot-architecture-docs-fa941135"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "bins/eliot-host/src/launch_descriptor_validation.rs"
+token = "eliot-architecture-docs-fa941135"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "bins/eliot-store-surreal/src/adapter_materialization.rs"
+token = "58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D8"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "bins/eliot-store-surreal/src/adapter_materialization.rs"
+token = "C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0B"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "bins/eliot-store-surreal/src/launch_config.rs"
+token = "eliot-architecture-docs-fa941135"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "bins/eliot-store-surreal/src/launch_mode.rs"
+token = "eliot-architecture-docs-fa941135"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "bins/eliot-watchdog/src/self_admission.rs"
+token = "eliot-architecture-docs-fa941135"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "crates/eliot-engine/src/context_contracts.rs"
+token = "eliot-architecture-docs-fa941135"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "crates/eliot-engine/src/project_understanding/continuity.rs"
+token = "58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D8"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "crates/eliot-engine/src/project_understanding/continuity.rs"
+token = "C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0B"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "crates/eliot-engine/src/read/l2_and_graph_health.rs"
+token = "58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D8"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "crates/eliot-engine/src/read/l2_and_graph_health.rs"
+token = "C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0B"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "crates/kernel/eliot-platform-windows/src/directory_publication.rs"
+token = "eliot-architecture-docs-fa941135"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "crates/kernel/eliot-platform-windows/src/kernel_front_door_expectation.rs"
+token = "eliot-architecture-docs-fa941135"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "crates/kernel/eliot-platform-windows/src/kernel_front_door_server.rs"
+token = "eliot-architecture-docs-fa941135"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "crates/kernel/eliot-platform-windows/src/named_pipe_peer_auth.rs"
+token = "eliot-architecture-docs-fa941135"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "crates/kernel/eliot-platform-windows/src/named_pipe_process_admission.rs"
+token = "eliot-architecture-docs-fa941135"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "crates/kernel/eliot-platform-windows/src/process_identity.rs"
+token = "eliot-architecture-docs-fa941135"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "crates/kernel/eliot-platform-windows/src/process_job.rs"
+token = "eliot-architecture-docs-fa941135"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
+
+[[retired_references.allow]]
+path = "crates/kernel/eliot-platform-windows/src/tests.rs"
+token = "eliot-architecture-docs-fa941135"
+reason = "Pre-sharding source traceability marker retained pending the owning source migration."
 
 [[retired_references.allow]]
 path = ".github/workflows/repository-policy.yml"
@@ -68,3 +227,109 @@ reason = "The policy intentionally rejects restoration of the predecessor file."
 path = ".github/workflows/repository-policy.yml"
 token = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
 reason = "The policy intentionally rejects restoration of the predecessor file."
+
+[script_inventory]
+directory = "scripts"
+documentation = "scripts/README.md"
+extensions = [".py", ".ps1", ".sh", ".txt"]
+exclude = []
+
+[binary_inventory]
+workspace_manifest = "Cargo.toml"
+documentation = "docs/PROJECT_MAP.md"
+member_prefix = "bins/"
+
+[[owner_binding]]
+path = "crates/agent/eliot-agent-coordinator/AGENTS.md"
+required_phrases = ["#265"]
+forbidden_current_phrases = ["Issue #224 owns current"]
+
+[repository_paths]
+scan_roots = [
+  "AGENTS.md",
+  "WORKFLOW.md",
+  "README.md",
+  "apps",
+  "bins",
+  "crates",
+  "integrations",
+  "plugin",
+  "scripts",
+  "config",
+  "workstreams",
+  "workspace",
+  ".github/pull_request_template.md",
+]
+extensions = [
+  ".rs",
+  ".md",
+  ".toml",
+  ".py",
+  ".ps1",
+  ".sh",
+  ".yml",
+  ".yaml",
+  ".json",
+  ".js",
+  ".mjs",
+  ".cs",
+  ".csproj",
+  ".manifest",
+  ".surql",
+  ".txt",
+  ".wat",
+  ".wit",
+  ".xaml",
+]
+# The verifier and policy contain negative examples or reasoned missing-path
+# allowances; neither is an operational documentation consumer.
+ignore_globs = [
+  "scripts/docs_read.py",
+  "scripts/docs_shards.py",
+  "scripts/verify-doc-code-conformance.py",
+  "scripts/doc_code_conformance_core.py",
+  "config/doc-code-conformance.toml",
+  ".github/workflows/repository-policy.yml",
+]
+handle_index = "docs/architecture/handle-index.json"
+
+[[repository_paths.allow_missing]]
+source = "scripts/docs_shards_core.py"
+path = "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md"
+reason = "The shard verifier intentionally rejects restoration of the retired predecessor authority file."
+
+[[repository_paths.allow_missing]]
+source = "scripts/docs_shards_core.py"
+path = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
+reason = "The shard verifier intentionally rejects restoration of the retired predecessor authority file."
+
+[[repository_paths.allow_missing]]
+source = "crates/eliot-types/schema/operator-contract-v1.json"
+path = "docs/AGENT_HOST_INTEGRATIONS.md"
+reason = "The schema retains a pre-sharding documentation reference as data; changing it is outside this conformance-surface repair."
+
+[[repository_paths.allow_missing]]
+source = "crates/kernel/eliot-process/src/execution_evidence.rs"
+path = "docs/generated/rust-boundary-interfaces.md"
+reason = "The source comment names a retained candidate mapping that is intentionally not a generated operational artifact."
+
+[[repository_paths.allow_missing]]
+source = "crates/security/eliot-source-assurance/src/lib.rs"
+path = "docs/ELIOT_ARCHITECTURE.md"
+reason = "The unit-test fixture preserves an incoming legacy identity and is not an operational documentation consumer."
+
+[documentation_pipeline]
+shards_front_door = "scripts/docs_shards.py"
+router_front_door = "scripts/docs_router.py"
+required_link_skip_parts = [
+  ".eliot",
+  ".eliot-docs",
+  ".codebase-memory",
+  "target",
+  "dist",
+  "node_modules",
+  "obj",
+  "__pycache__",
+]
+exact_case_marker = "DOC_LINK_EXACT_CASE_V1"
+drive_path_rejection_marker = "DRIVE_QUALIFIED_PATH_REJECTED"

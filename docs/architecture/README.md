@@ -4,12 +4,22 @@
 Do not open the former monoliths as task context.
 
 1. Read [`READING_PROTOCOL.md`](READING_PROTOCOL.md).
-2. Run `python scripts/docs_router.py route ...`.
-3. Open every required fragment returned by the command.
-4. Record the generated receipt.
+2. Run the verified reader for the exact path and causal property:
+
+   ```text
+   python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+   ```
+
+3. Open the verified bundle and read every required item before mutation.
+4. Record the route/read receipt IDs, verified bundle SHA-256, matched routes,
+   required handles, and explicit reading attestation.
+
+A route alone is navigation, not reading evidence. The local
+`.eliot/docs-read-bundle.md` and read receipt are not committed.
 
 ## Navigation
 
+- [Mandatory verified-reading protocol](READING_PROTOCOL.md)
 - [Task/path route matrix](ROUTES.md)
 - [Exact handle index](HANDLE_INDEX.md)
 - [Architecture bounded index](architecture/README.md)

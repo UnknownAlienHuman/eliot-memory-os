@@ -11,17 +11,19 @@ python scripts/docs_read.py read --path <repository/path> --topic "<causal prope
 ```
 
 Repeat `--path` for every mutable path family, or use `--changed-from
-<authority-receipt-sha>` for the complete branch delta, including deletions. The
-command runs the canonical router, verifies every required item against its
-routed SHA-256 and byte count, and renders the bounded content. Read the
-generated bundle before mutation; a route listing by itself does not satisfy
-this gate.
+origin/main` for the complete branch delta, including deletions. Open the
+verified bundle and read every required item before mutation. A route alone is
+navigation, not reading evidence.
 
-Record the read receipt ID, bundle SHA-256, matched routes, required handles, and
-an explicit reading attestation in the pull request. Optional fragments are
-loaded only when the current decision crosses their boundary. If no route
-matches, an item is stale, or scope expands, stop and rerun or repair the route.
-See [`docs/architecture/READING_PROTOCOL.md`](docs/architecture/READING_PROTOCOL.md).
+Record the route receipt ID, read receipt ID, matched routes, required handles,
+fragment paths and SHA-256 values, verified bundle SHA-256, and explicit reading
+attestation in the work unit or pull request. Optional fragments are loaded only
+when the current decision crosses their stated boundary. A legacy `ELIOT_*`
+compatibility map is never an acceptable read receipt.
+
+If no non-baseline route matches, a required item is stale or missing, or scope
+expands beyond the receipt, stop and rerun or repair the route; silence is not
+permission. See [`docs/architecture/READING_PROTOCOL.md`](docs/architecture/READING_PROTOCOL.md).
 <!-- eliot-doc-routing:end -->
 
 

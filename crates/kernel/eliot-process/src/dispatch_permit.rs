@@ -5,13 +5,14 @@
 //! process execution, lifecycle, daemon/host/watchdog/eliotd, canonical-write,
 //! filesystem, network, credential, or `SurrealDB` authority.
 //!
-//! Normative anchors verified in `docs/normative/ELIOT_ARCHITECTURE.md`: A2.2
-//! requires explicit authority for state/effect changes, and A12.2 binds
+//! Normative handles in `docs/architecture/ELIOT_ARCHITECTURE.md`: `A2.2`
+//! requires explicit authority for state/effect changes, and `A12.2` binds
 //! principal, session, capabilities, visibility, and Authority Epoch. In
-//! `docs/normative/ELIOT_IMPLEMENTATION.md`, I1.8 assigns Kernel verification
-//! of identity, authority, State Fence, idempotency, ordering, and generation;
-//! I6.10 limits Kernel to generic authority/fence decisions and exact
-//! continuation permits.
+//! `docs/architecture/ELIOT_IMPLEMENTATION.md`, `I1.8` assigns Kernel
+//! verification of identity, authority, State Fence, idempotency, ordering,
+//! and generation; `I6.10` limits Kernel to generic authority/fence decisions
+//! and exact continuation permits. Authority and precedence remain governed by
+//! `docs/ARCHITECTURE_CONTRACT.md`.
 
 use super::{
     ActionLeaseRef, ContractError, DispatchAuthorityId, DispatchValidationContext, FencingToken,

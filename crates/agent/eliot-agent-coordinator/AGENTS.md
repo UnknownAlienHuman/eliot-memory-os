@@ -7,42 +7,130 @@ Before changing code, configuration, tests, workflows, or normative prose, run
 from the repository root:
 
 ```text
-python scripts/docs_router.py route --path <repository/path> --topic "<causal property>"
+python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
 ```
 
-Read every fragment marked **required**, then record the emitted receipt in the
-work unit or pull request. Optional fragments are loaded only when the current
-decision crosses their stated boundary. A legacy `ELIOT_*` compatibility map is
-never an acceptable reading receipt.
+Repeat `--path` for every mutable path family, or use `--changed-from
+origin/main` for the complete branch delta, including deletions. Open the
+verified bundle and read every required item before mutation. A route alone is
+navigation, not reading evidence.
 
-If no non-baseline route matches, stop the mutation and add or obtain a route;
-silence is not permission. See [`../../../docs/architecture/READING_PROTOCOL.md`](../../../docs/architecture/READING_PROTOCOL.md).
+Record the route receipt ID, read receipt ID, matched routes, required handles,
+fragment paths and SHA-256 values, verified bundle SHA-256, and explicit reading
+attestation in the work unit or pull request. Optional fragments are loaded only
+when the current decision crosses their stated boundary. A legacy `ELIOT_*`
+compatibility map is never an acceptable read receipt.
+
+If no non-baseline route matches, a required item is stale or missing, or scope
+expands beyond the receipt, stop and rerun or repair the route; silence is not
+permission. See [`../../../docs/architecture/READING_PROTOCOL.md`](../../../docs/architecture/READING_PROTOCOL.md).
 <!-- eliot-doc-routing:end -->
 
 
 ## Purpose and authority
 
-This package is the existing Rust A-02 owner for deterministic candidate
-staffing, route selection, externally admitted attempt reconciliation and
-bounded peer delivery. It owns no provider process, model execution, current
-account catalogue, credentials, task truth, global policy, canonical writer or
-task finish.
+This package is the existing Rust A-02 owner for deterministic zero-model model
+catalogue queries, Human role preferences, candidate model selection, read-only
+attempt-health projection, staffing, route selection, externally admitted
+attempt reconciliation, and bounded peer delivery.
+
+It owns no provider process, provider/account catalogue collection, model
+execution, credentials, task truth, global policy authority, canonical writer,
+automatic redispatch, or task finish. Runtime/provider adapters supply immutable
+observations; this package validates and compiles candidate/read-only projections
+from them.
 
 The public contract owner for route identity is
 `eliot-agent-api::RouteFingerprint`. This package consumes that field-complete
-value and produces candidate-only `RoutingReceipt` values inside a
-`StaffingPlanCandidate`.
+value and produces candidate-only route/model selection artifacts. Existing
+`RoutingReceipt` values remain inside `StaffingPlanCandidate`; the newer model
+selection receipt is also candidate-only and carries no dispatch authority.
 
-Issue #224 owns current route-selection migration and hardening. Issue #187
-remains the product/integration objective. Read both issues, repository
-instructions and the applicable Architecture/Implementation fragments before
-mutation.
+Issue #224 is completed historical route-selection migration work. The current
+catalogue/preference/liveness continuation is owned by open issue #265; the Rust
+core merged through #284/#285 does not prove provider execution, live catalogue
+collection, route admission, current quota, cancellation containment, or finish.
+Issue #187 remains the broader product/integration objective. Read the current
+open issue, repository instructions, and applicable Architecture/Implementation
+fragments before mutation.
 
 ## Functional capability cells
 
 Several cells share this package because they use one plan/attempt contract
 island and one package proof boundary. They do not acquire each other's
 external authority.
+
+### `agent.coordinator.model-catalogue-query`
+
+Owned entrypoint:
+
+```rust
+query_model_catalogue(
+    &ModelCatalogueSnapshot,
+    &ModelQuery,
+    now_unix_ms,
+) -> Result<ModelQueryReceipt, ModelControlError>
+```
+
+Responsibility:
+
+- validate one immutable account-scoped catalogue snapshot and exact evidence
+  windows;
+- filter/search deterministically without a provider or model call;
+- treat `FREE`/included billing only as explicit current evidence, never a name
+  heuristic;
+- preserve unavailable, stale, exhausted, unknown, or unsupported blockers;
+- emit zero execution counters and no route admission.
+
+The catalogue collector, provider credentials, and truth of the supplied
+billing/quota observations remain outside this package.
+
+### `agent.coordinator.model-preference-selection`
+
+Owned entrypoint:
+
+```rust
+compile_model_selection(
+    &ModelCatalogueSnapshot,
+    &HumanModelPreferencePolicy,
+    ModelRole,
+    selection_id,
+    now_unix_ms,
+) -> Result<ModelSelectionReceipt, ModelControlError>
+```
+
+Responsibility:
+
+- apply exact Human-owned preferred/denied selectors and paid-fallback policy;
+- keep billing, quota, health, availability, admission, capability, context,
+  latency, and cost dimensions separate;
+- reject stale/unknown/non-dispatchable candidates;
+- rank equivalent admitted inputs deterministically;
+- bind selection identity to catalogue and preference revisions;
+- return a candidate-only receipt with `dispatch_authority = false` and zero
+  provider/model execution counters.
+
+Human preference is policy input, not capability evidence or provider authority.
+
+### `agent.coordinator.attempt-health-projection`
+
+Owned entrypoint:
+
+```rust
+project_attempt_health(
+    &AttemptTelemetryInput,
+    now_unix_ms,
+) -> Result<AttemptHealthProjection, ModelControlError>
+```
+
+Responsibility:
+
+- keep heartbeat missing/stale, lease expiry, deadline overrun, process state,
+  quota state, unknown effects, terminal state, and descendant closure distinct;
+- expose read-only work eligibility and typed alerts;
+- never present a terminal or unknown attempt as live;
+- remain `ManualOnly` and create no process, Watchdog, cancellation, retry,
+  automatic reassignment, or finish authority.
 
 ### `agent.coordinator.staffing-plan`
 
@@ -119,11 +207,12 @@ Owns read-only coordination-map projection and explicit queued/delivered peer
 message state. It is not a group-chat control plane and does not create shared
 mutable task intent.
 
-## Current Python prototype disposition
+## Python prototype disposition
 
 `scripts/agent_model_selector.py` and
 `integrations/agent-runtimes/model-selection.*.json` are a
-`development_only / differential_oracle` prototype under #224.
+`development_only / differential_oracle` prototype originating from completed
+issue #224. The current production lifecycle owner is this Rust package.
 
 They are not:
 
@@ -136,7 +225,7 @@ a provider admission surface;
 a production control-plane implementation.
 ```
 
-Until the prototype is migrated:
+While the prototype remains:
 
 - no production Rust/daemon/bridge surface may import or execute it as routing
   authority;
@@ -145,9 +234,8 @@ Until the prototype is migrated:
 - placeholder fixture identities are synthetic;
 - a Python selection cannot be called a current route, provider acceptance,
   capability proof or AgentAttempt result;
-- retained deterministic behavior must move into this package or its existing
-  public contract owner, then be differential-tested before the prototype is
-  removed.
+- retained deterministic behavior must be differential-tested against the Rust
+  owner before prototype removal.
 
 Do not create a second route-selection crate merely because the prototype has a
 separate file. The current owner, consumer and proof boundary already exist.
@@ -305,7 +393,8 @@ Do not add:
 
 Return a ContractChallenge when work needs:
 
-- a current-account catalogue contract that has no accepted owner;
+- provider/account catalogue collection or quota evidence not exposed by an
+  accepted adapter;
 - new field-level CapabilityEvidence/IndependenceProfile semantics;
 - provider execution or user-broker credentials;
 - policy expansion;
@@ -331,19 +420,22 @@ It cannot claim Rust/current-account integration.
 
 ### Contract/Evidence unit
 
-Owns exact current-account catalogue/capability/policy input types in the
-existing public contract owner. Do not define them privately in `core.rs` or
-Python.
+Extends the existing owner-neutral types in this package or their existing
+public contract owner. Do not duplicate catalogue, preference, health,
+RouteFingerprint, or receipt fields privately in `core.rs`, Python, a provider
+adapter, or a new selector crate.
 
 ### Coordinator Module-cell unit
 
-Changes route eligibility/ranking inside this package and focused tests only.
-It does not also change provider adapters, policy or Capability Registry.
+Changes catalogue query, preference/model selection, attempt-health projection,
+or route eligibility/ranking inside this package and focused tests only. It does
+not also change provider adapters, policy authority, process ownership, or
+Capability Registry.
 
 ### Edge unit
 
-Wires real Capability Registry/Policy/Capacity evidence to
-`StaffingPlanCandidate` and the sealed provider admission path.
+Wires real Capability Registry/Policy/Capacity/provider observations to the
+candidate surfaces and sealed provider admission path.
 
 ## Proof
 
@@ -358,17 +450,23 @@ cargo test --locked -p eliot-agent-coordinator
 cargo clippy --locked -p eliot-agent-api -p eliot-agent-coordinator --all-targets -- -D warnings
 ```
 
-Required route-selection package fixtures:
+Required model-control and route-selection fixtures:
 
 ```text
+explicit billing evidence rather than model-name free inference;
+stale catalogue and stale billing/quota evidence rejection;
+exhausted, unknown, or unexposed quota is not dispatchable;
+denied selector overrides preferred selector;
+paid fallback disabled returns a typed no-route result;
+equivalent input permutation has identical ordering/digest;
+preference revision changes selection identity;
+heartbeat missing/stale and deadline overrun remain distinct;
+terminal or unknown process/effect state is not live/eligible;
+query/selection execution counters remain zero;
 field-complete RouteFingerprint round-trip;
 changed serializer/tool/adapter/runtime fingerprint invalidates evidence;
 caller self-report cannot mint current/admitted/healthy/available;
-unknown quota is not dispatchable;
-missing capability evidence is unsupported;
 Task/plan/fence/privacy/budget/policy/capacity mismatch;
-permutation determinism;
-no model-name inference or universal model ID;
 independence/degraded-diversity behavior;
 exact replay and changed-byte conflict;
 no provider execution or dispatch before admission.
@@ -380,7 +478,7 @@ cases, but that proof ceiling remains development-oracle only.
 Real Edge Proof requires:
 
 ```text
-current-account Capability Registry and policy input;
+current-account provider collector and policy input;
 one exact admitted route per supported host;
 provider admission and ActualRouteReceipt;
 quota/route-drift/cancellation/tool-outcome negatives;
