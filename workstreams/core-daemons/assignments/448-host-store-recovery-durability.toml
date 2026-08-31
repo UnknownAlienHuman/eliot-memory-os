@@ -1,0 +1,178 @@
+schema = "eliot.agent-work-unit.v1"
+issue = 448
+parent_issue = 334
+integration_owner_issue = 14
+product_pulse_issue = 11
+status = "READY_FOR_IMPLEMENTATION"
+source_base = "15d6b40d06df0eab8c2fc94a856253f36521b305"
+branch = "fix/448-host-store-recovery-durability"
+primary_owner = "host-lifecycle-and-journal"
+primary_cell = "host.store-recovery-persistence"
+causal_property = "A successful Store-recovery journal publication means the exact bytes and directory entry are committed to the Windows volume; file or directory flush failure is typed and visible."
+proof_ceiling = "SOURCE_CANDIDATE_UNTIL_WINDOWS_DURABILITY_PROOF"
+
+[documentation]
+architecture_handles = ["ARCH-MOD-03", "ARCH-SEC-02", "ARCH-RES-03", "ARCH-OBS-01"]
+implementation_handles = ["I1.2", "I1.9", "I5.13", "I14", "I18"]
+required_files_read = [
+  "AGENTS.md",
+  "bins/AGENTS.md",
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "bins/eliot-host/Cargo.toml",
+  "bins/eliot-host/src/store_recovery_persistence.rs",
+]
+routing_command = "python scripts/docs_router.py route --path bins/eliot-host/src/store_recovery_persistence.rs --topic 'power-loss durability of Host-owned Store-recovery journals on Windows'"
+routing_receipt_status = "REQUIRED_BEFORE_FIRST_RUST_MUTATION"
+
+[old_path]
+file = "bins/eliot-host/src/store_recovery_persistence.rs"
+confirmed_fail_open = [
+  "sync_store_recovery_dir opens a Windows directory without FILE_FLAG_BACKUP_SEMANTICS and discards sync_all errors",
+  "persist_store_recovery_pending writes through std::fs::write, reopens read-only, and discards file sync failure",
+  "persist_store_recovery_termination_evidence repeats the same non-durable file and directory publication",
+  "persist_store_recovery_inner_binding repeats the same non-durable file and directory publication",
+  "persist_store_recovery_receipt repeats the same non-durable file and directory publication",
+  "cleanup_store_recovery_supporting_evidence_for discards final directory sync",
+  "cleanup_completed_store_recovery_supporting_evidence discards final directory sync",
+]
+sibling_pr = 445
+sibling_file = "bins/eliot-host/src/runtime_restart_state.rs"
+sibling_rule = "Do not edit or reimplement the sibling path; use its reviewed Windows durability semantics without creating a second owner or overlapping mutable path."
+
+[scope]
+mutable_paths = [
+  "bins/eliot-host/src/store_recovery_persistence.rs",
+  "bins/eliot-host/src/tests.rs",
+]
+forbidden_paths = [
+  "bins/eliot-host/src/runtime_restart_state.rs",
+  "crates/kernel/**",
+  "crates/storage/**",
+  "docs/architecture/**",
+  "Cargo.lock",
+  ".github/workflows/**",
+]
+non_goals = [
+  "change Store recovery state-machine meaning",
+  "change request, mutation, receipt, Host epoch, lineage, process or Job identity",
+  "change startup admission or fencing semantics",
+  "extract a new shared platform crate while PR 445 remains active",
+  "claim installed Windows or Product proof from source/package tests",
+]
+
+[implementation.helpers]
+directory_commit_signature = "fn sync_store_recovery_dir(dir: &Path) -> Result<(), HostError>"
+file_commit_signature = "fn write_durable_store_recovery_file(path: &Path, bytes: &[u8]) -> Result<(), HostError>"
+directory_open = "std::os::windows::fs::OpenOptionsExt::custom_flags(FILE_FLAG_BACKUP_SEMANTICS)"
+directory_flag = "0x0200_0000"
+directory_tolerated_error_kinds = ["InvalidInput", "PermissionDenied", "Unsupported"]
+file_write_sequence = ["File::create", "write_all", "sync_all"]
+error_mapping = "HostError::Platform with the original std::io::Error text"
+
+[[implementation.site]]
+function = "persist_store_recovery_pending"
+required_order = [
+  "serialize exact pending payload",
+  "write and sync unique temporary file through writable handle",
+  "publish by no-replace hard link",
+  "sync recovery directory before returning Created",
+  "remove temporary file",
+  "sync recovery directory after cleanup",
+]
+replay_rule = "Existing exact identity returns Replay; a conflicting winner remains RecoveryRequired."
+
+[[implementation.site]]
+function = "persist_store_recovery_termination_evidence"
+required_order = [
+  "validate exact durable pending identity",
+  "write and sync unique temporary termination evidence",
+  "publish by no-replace hard link",
+  "sync recovery directory before returning success",
+  "remove temporary file and sync cleanup",
+]
+
+[[implementation.site]]
+function = "persist_store_recovery_inner_binding"
+required_order = [
+  "validate pending and predecessor termination evidence",
+  "validate successor is not the terminated predecessor",
+  "write and sync unique temporary inner binding",
+  "publish by no-replace hard link",
+  "sync recovery directory before returning success",
+  "remove temporary file and sync cleanup",
+]
+
+[[implementation.site]]
+function = "persist_store_recovery_receipt"
+required_order = [
+  "validate and serialize exact final receipt",
+  "write and sync unique temporary receipt",
+  "publish by no-replace hard link",
+  "sync final receipt directory entry before any supporting evidence cleanup",
+  "remove temporary file",
+  "sync cleanup before success",
+]
+
+[[implementation.site]]
+function = "cleanup_store_recovery_supporting_evidence_for"
+required_order = [
+  "read and validate exact final receipt first",
+  "remove only pending, termination and inner evidence for that mutation",
+  "propagate final directory sync result",
+]
+
+[[implementation.site]]
+function = "cleanup_completed_store_recovery_supporting_evidence"
+required_order = [
+  "enumerate validated durable recovery fences",
+  "clean only records with an exact final receipt",
+  "propagate final directory sync result",
+]
+
+[failure_precedence]
+rules = [
+  "Publication failure remains the primary returned failure even when temporary cleanup also fails.",
+  "After successful publication, temporary cleanup or cleanup-directory-sync failure is returned and cannot be renamed success.",
+  "A filesystem that explicitly reports directory sync unsupported may use the documented tolerated branch; other directory open/sync errors fail closed.",
+  "No success disposition is returned after a discarded file or directory flush error.",
+]
+
+[fixtures]
+required = [
+  "file_sync_failure_is_not_success",
+  "directory_sync_failure_is_not_success",
+  "pending_publication_survives_reopen_with_exact_identity",
+  "exact_existing_record_is_idempotent_replay",
+  "conflicting_existing_record_fails_closed",
+  "receipt_is_committed_before_supporting_evidence_cleanup",
+  "cleanup_file_failure_is_visible",
+  "cleanup_directory_sync_failure_is_visible",
+]
+fault_injection = "Operation-local injected persistence port or closure; process-global mutable test flags are forbidden."
+windows_edge = "Run at least one x86_64-pc-windows-msvc abrupt-termination or equivalent FlushFileBuffers/directory-entry durability fixture on the exact candidate."
+
+[proof]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-host --all-targets",
+  "cargo test --locked -p eliot-host",
+  "cargo clippy --locked -p eliot-host --all-targets -- -D warnings",
+  "git diff --check",
+]
+required_nonzero_tests = true
+required_remote_readback = true
+required_windows_execution = true
+
+[stop_conditions]
+contract_challenge = [
+  "The repair requires editing runtime_restart_state.rs while PR 445 is active.",
+  "A shared helper extraction would change the sibling PR or a public platform contract.",
+  "The only available fixture proves Linux file semantics but not the claimed Windows durability property.",
+  "The proposed patch changes Store recovery identity, authority, fencing or receipt semantics instead of persistence durability.",
+]
+
+[integration]
+merge_owner = "Host integration owner / active swarm"
+merge_rule = "Do not merge until PR 445 interaction is reviewed and exact-head Windows proof is attached."
+result_schema = "issue, source_base, candidate_sha, changed_paths, file_and_directory_durability_proof, replay_and_conflict_proof, Windows evidence, residual_unknowns, finish"
