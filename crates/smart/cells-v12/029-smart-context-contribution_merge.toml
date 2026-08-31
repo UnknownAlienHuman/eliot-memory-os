@@ -1,0 +1,50 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w2-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 29
+cell = "smart.context.contribution_merge"
+physical_crate = "eliot-context"
+predecessor_orders = [26, 28]
+primary_property = "Merge bounded owner-produced ProviderContributions into one whole-unit ContextCandidateSet under an exact compilation request without fetching providers, ranking or admitting membership."
+field_contracts = ["crates/smart/eliot-context-contracts/provider-contribution.contract.toml", "crates/smart/eliot-context-contracts/context-compiler.contract.toml", "crates/smart/eliot-context-contracts/w2-execution.contract.toml"]
+public_function_signatures = [
+  "pub fn merge_context_contributions(request: &ContextCompilationRequest, contributions: &[ProviderContribution]) -> Result<ContextCandidateSet, ContextMergeError>",
+]
+write_scope = [
+  "crates/smart/eliot-context/src/contribution_merge.rs",
+  "crates/smart/eliot-context/tests/contribution_merge.rs",
+]
+algorithm = [
+  "validate request/expected-provider-set/recipe/route/scope/task/fence and compilation limits",
+  "validate every contribution against the exact expected provider identity/generation/contract",
+  "create one unchanged candidate atom per whole ProviderAtom",
+  "preserve coverage denominators, omissions, source/dependency handles and Safety Floor",
+  "deduplicate only identical stable identity and digest",
+  "retain conflicting same-id payloads as conflict candidates rather than last-write-wins",
+  "canonicalize providers/atoms/conflicts and compute candidate-set digest",
+]
+minimum_tests = [
+  "missing mandatory provider visible and blocks complete",
+  "empty complete provider distinct from unavailable/unqueried",
+  "one provider cannot fill another denominator",
+  "conflicting same-id payload not last-write-wins",
+  "no retrieval/ranking/admission output",
+  "limits enforced",
+  "input permutation deterministic",
+]
+non_goals = [
+  "provider execution/acquisition",
+  "storage/graph/model call",
+  "candidate ranking/admission",
+  "view rendering",
+  "delivery/use",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-CTX-01", "ARCH-CTX-04", "ARCH-EPI-04", "ARCH-SCOPE-01", "ARCH-MOD-03"]
+implementation_refs = ["I2.15", "I2.20", "I7.11", "I12.13"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than fetching a missing provider, ranking/admitting atoms, merging conflicts by order, or inventing a denominator."
+brief_proof_ceiling = "STATIC_W2_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
