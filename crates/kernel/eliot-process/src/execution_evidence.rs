@@ -94,6 +94,7 @@ impl ProcessExecutionView {
     }
 
     fn validate_internal(&self) -> Result<(), ContractError> {
+        self.binding.validate()?;
         if let Some(identity) = &self.identity
             && !self.binding.matches_identity(identity)
         {
@@ -123,25 +124,29 @@ pub struct ProcessEvidence {
 #[serde(deny_unknown_fields)]
 struct ProcessEvidenceWire {
     #[serde(default)]
-    schema_version: Option<String>,
+    schema_version: NullableStringWire,
     view: ProcessExecutionView,
     #[serde(default)]
     stdout: Option<ProcessStreamEvidence>,
     #[serde(default)]
     stderr: Option<ProcessStreamEvidence>,
     #[serde(default)]
-    stdout_ref: Option<LegacyReferenceWire>,
+    stdout_ref: LegacyReferenceWire,
     #[serde(default)]
-    stderr_ref: Option<LegacyReferenceWire>,
+    stderr_ref: LegacyReferenceWire,
     axes: EvidenceAxes,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(untagged)]
 enum LegacyReferenceWire {
     Value(String),
     Null,
+    #[default]
+    Missing,
 }
+
+type NullableStringWire = LegacyReferenceWire;
 
 impl ProcessEvidence {
     /// Creates raw process evidence with C0-05 observation-only axes.
@@ -270,10 +275,11 @@ impl ProcessEvidence {
 impl<'de> Deserialize<'de> for ProcessEvidence {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = ProcessEvidenceWire::deserialize(deserializer)?;
-        let has_legacy = wire.stdout_ref.is_some() || wire.stderr_ref.is_some();
+        let has_legacy = !matches!(wire.stdout_ref, LegacyReferenceWire::Missing)
+            || !matches!(wire.stderr_ref, LegacyReferenceWire::Missing);
         let has_typed = wire.stdout.is_some() || wire.stderr.is_some();
-        let (stdout, stderr) = match wire.schema_version.as_deref() {
-            Some(version) if version == PROCESS_EVIDENCE_SCHEMA_VERSION => {
+        let (stdout, stderr) = match wire.schema_version {
+            LegacyReferenceWire::Value(version) if version == PROCESS_EVIDENCE_SCHEMA_VERSION => {
                 if has_legacy {
                     return Err(de::Error::custom(
                         "typed process evidence cannot contain legacy stream references",
@@ -281,18 +287,24 @@ impl<'de> Deserialize<'de> for ProcessEvidence {
                 }
                 (wire.stdout, wire.stderr)
             }
-            Some(version) => {
+            LegacyReferenceWire::Value(version) => {
                 return Err(de::Error::custom(ContractError::SchemaVersion {
                     expected: PROCESS_EVIDENCE_SCHEMA_VERSION,
-                    observed: version.to_owned(),
+                    observed: version,
                 }));
             }
-            None if has_typed => {
+            LegacyReferenceWire::Null => {
+                return Err(de::Error::custom(ContractError::InvalidValue {
+                    field: "schema_version",
+                    reason: "schema version cannot be null",
+                }));
+            }
+            LegacyReferenceWire::Missing if has_typed => {
                 return Err(de::Error::custom(
                     "typed process evidence requires an explicit schema version",
                 ));
             }
-            None => (
+            LegacyReferenceWire::Missing => (
                 legacy_reference_value(wire.stdout_ref)
                     .map(|reference| {
                         legacy_stream(&wire.view, ProcessStreamKind::Stdout, reference)
@@ -311,10 +323,10 @@ impl<'de> Deserialize<'de> for ProcessEvidence {
     }
 }
 
-fn legacy_reference_value(reference: Option<LegacyReferenceWire>) -> Option<String> {
+fn legacy_reference_value(reference: LegacyReferenceWire) -> Option<String> {
     match reference {
-        Some(LegacyReferenceWire::Value(value)) => Some(value),
-        Some(LegacyReferenceWire::Null) | None => None,
+        LegacyReferenceWire::Value(value) => Some(value),
+        LegacyReferenceWire::Null | LegacyReferenceWire::Missing => None,
     }
 }
 

@@ -120,10 +120,10 @@ fn typed_stdout_and_stderr_round_trip_without_legacy_fields() -> TestResult {
 
 #[test]
 fn typed_stream_identity_and_version_are_strict() -> TestResult {
-    let binding = binding("operation-1")?;
+    let initial_binding = binding("operation-1")?;
     let evidence = ProcessEvidence::new_typed(
-        view(&binding)?,
-        Some(stream(binding.clone(), ProcessStreamKind::Stdout)?),
+        view(&initial_binding)?,
+        Some(stream(initial_binding, ProcessStreamKind::Stdout)?),
         None,
         EvidenceAxes::observed(),
     )?;
@@ -142,6 +142,27 @@ fn typed_stream_identity_and_version_are_strict() -> TestResult {
     let mut unknown_field = serde_json::to_value(evidence)?;
     unknown_field["unexpected"] = json!(true);
     assert!(serde_json::from_value::<ProcessEvidence>(unknown_field).is_err());
+
+    let invalid_view_binding = binding("operation-2")?;
+    let empty = ProcessEvidence::new_typed(
+        view(&invalid_view_binding)?,
+        None,
+        None,
+        EvidenceAxes::observed(),
+    )?;
+    let mut invalid_binding = serde_json::to_value(empty)?;
+    invalid_binding["view"]["binding"]["authority_epoch"] = json!(0);
+    assert!(serde_json::from_value::<ProcessEvidence>(invalid_binding).is_err());
+
+    let null_schema_binding = crate::binding("operation-3")?;
+    let mut null_schema = serde_json::to_value(ProcessEvidence::new_typed(
+        view(&null_schema_binding)?,
+        None,
+        None,
+        EvidenceAxes::observed(),
+    )?)?;
+    null_schema["schema_version"] = Value::Null;
+    assert!(serde_json::from_value::<ProcessEvidence>(null_schema).is_err());
     Ok(())
 }
 
