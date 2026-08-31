@@ -865,7 +865,7 @@ fn selection_rejections(
     ) {
         reasons.insert(SelectionRejection::Dispatch(blocker));
     }
-    if !entry.role_eligibility.is_empty() && !entry.role_eligibility.contains(&preference.role) {
+    if !entry.role_eligibility.contains(&preference.role) {
         reasons.insert(SelectionRejection::RoleNotEligible);
     }
     if preference

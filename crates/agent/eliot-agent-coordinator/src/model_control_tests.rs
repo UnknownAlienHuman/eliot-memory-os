@@ -297,6 +297,90 @@ fn unknown_billing_is_not_dispatchable() {
 }
 
 #[test]
+fn empty_catalogue_returns_no_dispatchable_route() {
+    let human_policy = policy(
+        preference(
+            ModelRole::Worker,
+            Vec::new(),
+            Vec::new(),
+            BTreeSet::from([BillingClass::Free]),
+            false,
+        ),
+        "revision-1",
+    );
+    assert!(matches!(
+        compile_model_selection(
+            &snapshot(Vec::new()),
+            &human_policy,
+            ModelRole::Worker,
+            "selection-empty-catalogue",
+            NOW
+        ),
+        Err(ModelControlError::NoDispatchableRoute(ModelRole::Worker))
+    ));
+}
+
+#[test]
+fn mixed_role_eligibility_selects_explicit_entry_and_preserves_rejection() -> TestResult {
+    let mut empty_role = entry(
+        "empty-role",
+        "provider-a",
+        "model-empty-role",
+        "family-a",
+        BillingClass::Free,
+        QuotaDisposition::Available,
+        0,
+    );
+    empty_role.role_eligibility.clear();
+    let explicit_role = entry(
+        "explicit-role",
+        "provider-b",
+        "model-explicit-role",
+        "family-b",
+        BillingClass::Free,
+        QuotaDisposition::Available,
+        1,
+    );
+    let human_policy = policy(
+        preference(
+            ModelRole::Worker,
+            vec![selector("model-empty-role")],
+            Vec::new(),
+            BTreeSet::from([BillingClass::Free]),
+            false,
+        ),
+        "revision-1",
+    );
+    let left = compile_model_selection(
+        &snapshot(vec![empty_role.clone(), explicit_role.clone()]),
+        &human_policy,
+        ModelRole::Worker,
+        "selection-mixed-role",
+        NOW,
+    )?;
+    let right = compile_model_selection(
+        &snapshot(vec![explicit_role, empty_role]),
+        &human_policy,
+        ModelRole::Worker,
+        "selection-mixed-role",
+        NOW,
+    )?;
+
+    assert_eq!(left.selected.entry_id, "explicit-role");
+    assert_eq!(left.rejected.len(), 1);
+    assert_eq!(left.rejected, right.rejected);
+    assert_eq!(left.selection_digest, right.selection_digest);
+    assert_eq!(
+        left.rejected[0].reasons,
+        vec![SelectionRejection::RoleNotEligible]
+    );
+    assert_eq!(left.execution, ZeroModelExecutionCounters::zero());
+    assert!(left.candidate_only);
+    assert!(!left.dispatch_authority);
+    Ok(())
+}
+
+#[test]
 fn denied_selector_overrides_preferred_selector() -> TestResult {
     let catalogue = snapshot(vec![
         entry(
