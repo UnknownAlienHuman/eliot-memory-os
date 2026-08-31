@@ -5,15 +5,15 @@
 //! transport-level reconciliation.  It never reports durable application
 //! commit or sink acceptance.
 
-use std::future::Future;
 use std::time::Duration;
+use std::{cmp::Ordering, future::Future};
 
 use eliot_protocol::{
     AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge,
     ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolError, ProtocolPayload,
     ProtocolRange, ProtocolVersion, ServerHello, negotiate,
 };
-use eliot_runtime_contracts::ModuleGeneration;
+use eliot_runtime_contracts::{HealthDimension, ModuleGeneration, ModuleGenerationState};
 use thiserror::Error;
 
 mod frame_codec;
@@ -1284,6 +1284,11 @@ pub enum ReplayDisposition {
     Conflict,
 }
 
+/// Identity used by replay and cancellation registries.
+///
+/// Its total order is lexicographic over `stream_id`, every
+/// `ModuleGeneration` field in declaration order, then `id`. This order is
+/// structural and independent of wire serialization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundIdentity {
     pub stream_id: String,
@@ -1291,23 +1296,112 @@ pub struct BoundIdentity {
     pub id: String,
 }
 
+fn module_generation_state_rank(state: ModuleGenerationState) -> u8 {
+    match state {
+        ModuleGenerationState::Discovered => 0,
+        ModuleGenerationState::Staged => 1,
+        ModuleGenerationState::Starting => 2,
+        ModuleGenerationState::Recovering => 3,
+        ModuleGenerationState::Ready => 4,
+        ModuleGenerationState::Active => 5,
+        ModuleGenerationState::Degraded => 6,
+        ModuleGenerationState::Quiescing => 7,
+        ModuleGenerationState::Drained => 8,
+        ModuleGenerationState::Stopped => 9,
+        ModuleGenerationState::Retired => 10,
+        ModuleGenerationState::Failed => 11,
+        ModuleGenerationState::RestartWait => 12,
+        ModuleGenerationState::Quarantined => 13,
+        ModuleGenerationState::ManualRecovery => 14,
+    }
+}
+
+fn health_dimension_rank(dimension: HealthDimension) -> u8 {
+    match dimension {
+        HealthDimension::Unknown => 0,
+        HealthDimension::Healthy => 1,
+        HealthDimension::Degraded => 2,
+        HealthDimension::Failed => 3,
+    }
+}
+
+/// Compares every `ModuleGeneration` field in stable declaration order.
+///
+/// The lifecycle and health enums use their explicit contract declaration
+/// ranks. All identifier, counter and optional fence fields use their typed
+/// `Ord`; no wire serialization participates in this order.
+fn compare_module_generation(left: &ModuleGeneration, right: &ModuleGeneration) -> Ordering {
+    left.module_id
+        .cmp(&right.module_id)
+        .then_with(|| left.generation.cmp(&right.generation))
+        .then_with(|| left.artifact_id.cmp(&right.artifact_id))
+        .then_with(|| {
+            module_generation_state_rank(left.state).cmp(&module_generation_state_rank(right.state))
+        })
+        .then_with(|| {
+            health_dimension_rank(left.health.liveness)
+                .cmp(&health_dimension_rank(right.health.liveness))
+        })
+        .then_with(|| {
+            health_dimension_rank(left.health.readiness)
+                .cmp(&health_dimension_rank(right.health.readiness))
+        })
+        .then_with(|| {
+            health_dimension_rank(left.health.freshness)
+                .cmp(&health_dimension_rank(right.health.freshness))
+        })
+        .then_with(|| {
+            health_dimension_rank(left.health.compatibility)
+                .cmp(&health_dimension_rank(right.health.compatibility))
+        })
+        .then_with(|| {
+            health_dimension_rank(left.health.integrity)
+                .cmp(&health_dimension_rank(right.health.integrity))
+        })
+        .then_with(|| {
+            health_dimension_rank(left.health.capacity)
+                .cmp(&health_dimension_rank(right.health.capacity))
+        })
+        .then_with(|| {
+            left.state_fence
+                .authority_epoch
+                .cmp(&right.state_fence.authority_epoch)
+        })
+        .then_with(|| {
+            left.state_fence
+                .resource_generation
+                .cmp(&right.state_fence.resource_generation)
+        })
+        .then_with(|| {
+            left.state_fence
+                .task_revision
+                .cmp(&right.state_fence.task_revision)
+        })
+        .then_with(|| {
+            left.state_fence
+                .policy_revision
+                .cmp(&right.state_fence.policy_revision)
+        })
+        .then_with(|| {
+            left.state_fence
+                .integration_revision
+                .cmp(&right.state_fence.integration_revision)
+        })
+}
+
 impl Ord for BoundIdentity {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (
-            &self.stream_id,
-            serde_json::to_string(&self.module_generation).unwrap_or_default(),
-            &self.id,
-        )
-            .cmp(&(
-                &other.stream_id,
-                serde_json::to_string(&other.module_generation).unwrap_or_default(),
-                &other.id,
-            ))
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.stream_id
+            .cmp(&other.stream_id)
+            .then_with(|| {
+                compare_module_generation(&self.module_generation, &other.module_generation)
+            })
+            .then_with(|| self.id.cmp(&other.id))
     }
 }
 
 impl PartialOrd for BoundIdentity {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
@@ -2262,6 +2356,7 @@ mod tests {
         AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentBridgeClientDeclaration,
         AgentBridgePeerChallenge, EncodingProfile, FrameKind, MessageType, ProtocolPayload,
     };
+    use eliot_runtime_contracts::{HealthDimension, ModuleGenerationState};
     use std::collections::BTreeMap;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -2288,6 +2383,237 @@ mod tests {
                 "integration_revision": null
             }
         }))
+    }
+
+    #[test]
+    fn module_generation_state_order_is_explicit() -> TestResult {
+        let states = [
+            ModuleGenerationState::Discovered,
+            ModuleGenerationState::Staged,
+            ModuleGenerationState::Starting,
+            ModuleGenerationState::Recovering,
+            ModuleGenerationState::Ready,
+            ModuleGenerationState::Active,
+            ModuleGenerationState::Degraded,
+            ModuleGenerationState::Quiescing,
+            ModuleGenerationState::Drained,
+            ModuleGenerationState::Stopped,
+            ModuleGenerationState::Retired,
+            ModuleGenerationState::Failed,
+            ModuleGenerationState::RestartWait,
+            ModuleGenerationState::Quarantined,
+            ModuleGenerationState::ManualRecovery,
+        ];
+        for window in states.windows(2) {
+            let mut lower = module_generation(1)?;
+            lower.state = window[0];
+            let mut higher = module_generation(1)?;
+            higher.state = window[1];
+            let lower = BoundIdentity::new("stream", lower, "request")?;
+            let higher = BoundIdentity::new("stream", higher, "request")?;
+            assert_eq!(lower.cmp(&higher), std::cmp::Ordering::Less);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn health_dimension_order_is_explicit() -> TestResult {
+        let dimensions = [
+            HealthDimension::Unknown,
+            HealthDimension::Healthy,
+            HealthDimension::Degraded,
+            HealthDimension::Failed,
+        ];
+        for window in dimensions.windows(2) {
+            let mut lower = module_generation(1)?;
+            lower.health.liveness = window[0];
+            let mut higher = module_generation(1)?;
+            higher.health.liveness = window[1];
+            let lower = BoundIdentity::new("stream", lower, "request")?;
+            let higher = BoundIdentity::new("stream", higher, "request")?;
+            assert_eq!(lower.cmp(&higher), std::cmp::Ordering::Less);
+        }
+        Ok(())
+    }
+
+    fn identity_variants() -> Result<Vec<(String, BoundIdentity)>, Box<dyn std::error::Error>> {
+        let base = BoundIdentity::new("stream", module_generation(1)?, "request")?;
+        let mut variants = Vec::new();
+
+        let mut variant = base.clone();
+        variant.stream_id = "stream.variant".to_owned();
+        variants.push(("stream_id".to_owned(), variant));
+
+        let mut variant = base.clone();
+        variant.module_generation.module_id =
+            serde_json::from_value(serde_json::json!("module.variant"))?;
+        variants.push(("module_id".to_owned(), variant));
+
+        let mut variant = base.clone();
+        variant.module_generation.generation = serde_json::from_value(serde_json::json!(2))?;
+        variants.push(("generation".to_owned(), variant));
+
+        let mut variant = base.clone();
+        variant.module_generation.artifact_id =
+            serde_json::from_value(serde_json::json!("artifact.variant"))?;
+        variants.push(("artifact_id".to_owned(), variant));
+
+        for state in [
+            ModuleGenerationState::Discovered,
+            ModuleGenerationState::Staged,
+            ModuleGenerationState::Starting,
+            ModuleGenerationState::Recovering,
+            ModuleGenerationState::Ready,
+            ModuleGenerationState::Degraded,
+            ModuleGenerationState::Quiescing,
+            ModuleGenerationState::Drained,
+            ModuleGenerationState::Stopped,
+            ModuleGenerationState::Retired,
+            ModuleGenerationState::Failed,
+            ModuleGenerationState::RestartWait,
+            ModuleGenerationState::Quarantined,
+            ModuleGenerationState::ManualRecovery,
+        ] {
+            let mut variant = base.clone();
+            variant.module_generation.state = state;
+            variants.push((format!("state::{state:?}"), variant));
+        }
+
+        for (name, dimension) in [
+            ("liveness", HealthDimension::Unknown),
+            ("readiness", HealthDimension::Degraded),
+            ("freshness", HealthDimension::Failed),
+            ("compatibility", HealthDimension::Unknown),
+            ("integrity", HealthDimension::Degraded),
+            ("capacity", HealthDimension::Failed),
+        ] {
+            let mut variant = base.clone();
+            match name {
+                "liveness" => variant.module_generation.health.liveness = dimension,
+                "readiness" => variant.module_generation.health.readiness = dimension,
+                "freshness" => variant.module_generation.health.freshness = dimension,
+                "compatibility" => variant.module_generation.health.compatibility = dimension,
+                "integrity" => variant.module_generation.health.integrity = dimension,
+                "capacity" => variant.module_generation.health.capacity = dimension,
+                _ => unreachable!("identity fixture field is exhaustive"),
+            }
+            variants.push((name.to_owned(), variant));
+        }
+
+        let mut variant = base.clone();
+        variant.module_generation.state_fence.authority_epoch =
+            serde_json::from_value(serde_json::json!(2))?;
+        variants.push(("authority_epoch".to_owned(), variant));
+
+        let mut variant = base.clone();
+        variant.module_generation.state_fence.resource_generation =
+            serde_json::from_value(serde_json::json!(2))?;
+        variants.push(("resource_generation".to_owned(), variant));
+
+        let mut variant = base.clone();
+        variant.module_generation.state_fence.task_revision =
+            Some(serde_json::from_value(serde_json::json!(2))?);
+        variants.push(("task_revision".to_owned(), variant));
+
+        let mut variant = base.clone();
+        variant.module_generation.state_fence.policy_revision =
+            Some(serde_json::from_value(serde_json::json!(2))?);
+        variants.push(("policy_revision".to_owned(), variant));
+
+        let mut variant = base.clone();
+        variant.module_generation.state_fence.integration_revision =
+            Some(serde_json::from_value(serde_json::json!(2))?);
+        variants.push(("integration_revision".to_owned(), variant));
+
+        let mut variant = base;
+        variant.id = "request.variant".to_owned();
+        variants.push(("id".to_owned(), variant));
+
+        Ok(variants)
+    }
+
+    #[test]
+    fn bound_identity_order_is_total_and_preserves_every_field() -> TestResult {
+        let base = BoundIdentity::new("stream", module_generation(1)?, "request")?;
+        let variants = identity_variants()?;
+        let mut keys = vec![base.clone()];
+        keys.extend(variants.iter().map(|(_, key)| key.clone()));
+
+        for left in &keys {
+            for right in &keys {
+                assert_eq!(left.cmp(right) == std::cmp::Ordering::Equal, left == right);
+                assert_eq!(left.cmp(right), right.cmp(left).reverse());
+            }
+        }
+        for left in &keys {
+            for middle in &keys {
+                for right in &keys {
+                    if left <= middle && middle <= right {
+                        assert!(left <= right);
+                    }
+                }
+            }
+        }
+
+        let mut set = std::collections::BTreeSet::new();
+        let mut map = BTreeMap::new();
+        for (index, key) in keys.iter().enumerate() {
+            assert!(set.insert(key.clone()));
+            assert!(map.insert(key.clone(), index).is_none());
+        }
+        assert_eq!(set.len(), keys.len());
+        assert_eq!(map.len(), keys.len());
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(set.iter().cloned().collect::<Vec<_>>(), sorted);
+        assert_eq!(map.keys().cloned().collect::<Vec<_>>(), sorted);
+
+        let frame = heartbeat();
+        let mut replay = ReplayLedger::with_capacity(keys.len())?;
+        let mut cancellation = CancellationRegistry::with_capacity(keys.len())?;
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(
+                replay.observe_bound(key.clone(), &frame)?,
+                ReplayDisposition::New,
+                "replay key collision at {index}"
+            );
+            assert_eq!(
+                cancellation.register_bound(key.clone(), format!("fingerprint-{index}"))?,
+                CancellationDisposition::New,
+                "cancellation key collision at {index}"
+            );
+            assert_eq!(
+                cancellation.cancel_bound(key),
+                CancellationDisposition::New,
+                "cancellation transition failed at {index}"
+            );
+            assert_eq!(
+                cancellation.reap_bound(key),
+                CancellationDisposition::New,
+                "cancellation reap failed at {index}"
+            );
+            assert_eq!(
+                cancellation.cancel_bound(key),
+                CancellationDisposition::Duplicate,
+                "cancellation terminal state changed at {index}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_identity_order_is_independent_of_serialization_field_order() -> TestResult {
+        let first: ModuleGeneration = serde_json::from_str(
+            r#"{"module_id":"module.test","generation":1,"artifact_id":"artifact","state":"ACTIVE","health":{"liveness":"HEALTHY","readiness":"HEALTHY","freshness":"HEALTHY","compatibility":"HEALTHY","integrity":"HEALTHY","capacity":"HEALTHY"},"state_fence":{"authority_epoch":1,"resource_generation":1,"task_revision":null,"policy_revision":null,"integration_revision":null}}"#,
+        )?;
+        let second: ModuleGeneration = serde_json::from_str(
+            r#"{"state_fence":{"integration_revision":null,"policy_revision":null,"task_revision":null,"resource_generation":1,"authority_epoch":1},"health":{"capacity":"HEALTHY","integrity":"HEALTHY","compatibility":"HEALTHY","freshness":"HEALTHY","readiness":"HEALTHY","liveness":"HEALTHY"},"state":"ACTIVE","artifact_id":"artifact","generation":1,"module_id":"module.test"}"#,
+        )?;
+        let first = BoundIdentity::new("stream", first, "request")?;
+        let second = BoundIdentity::new("stream", second, "request")?;
+        assert_eq!(first, second);
+        assert_eq!(first.cmp(&second), std::cmp::Ordering::Equal);
+        Ok(())
     }
 
     fn limits() -> TransportLimits {
