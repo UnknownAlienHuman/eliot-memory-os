@@ -1,0 +1,77 @@
+schema_version = 1
+contract_id = "smart.cue.w2-execution.v1"
+authority = "eliot-cognitive-function-design-rev12"
+owner = "eliot-cue-contracts"
+status = "FIELD_LEVEL_FROZEN"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+functional_cells = ["smart.cue.normalizer", "smart.cue.binding", "smart.cue.index", "smart.cue.direct_match", "smart.cue.relation_spread", "smart.cue.activation"]
+architecture_refs = ["ARCH-CTX-02", "ARCH-CTX-04", "ARCH-MEM-04", "ARCH-GROUND-01", "ARCH-SCOPE-01", "ARCH-EPI-04", "ARCH-MOD-03"]
+implementation_refs = ["I2.15", "I2.20", "I7.19", "I12.14", "I17.11"]
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+primary_property = "Constrain W2 cue execution to profile-scoped deterministic normalization, admitted immutable projections, graph-independent direct firing and one closed best-single-path spread rule without payload retrieval, support reinforcement or delivery state."
+public_api_policy = "allowlist_only"
+async_policy = "synchronous_pure"
+unsafe_policy = "forbid"
+panic_policy = "no_panic_for_admitted_input"
+owned_mutable_state = []
+allowed_effects = []
+complexity = "O(policy fields log fields) validation; W2 implementations remain separately request-bounded and perform no I/O, model, provider, filesystem-identity or payload-fetch operation."
+replacement_boundary = "Replace cue algorithms behind the existing cue contract and this execution policy; Governor admission, canonical memory, Context admission and delivery remain separate owners."
+
+[closed_sets]
+relation_spread_combination_rules = ["BestSingleAdmissiblePath"]
+
+[hard_invariants]
+canonical_value_and_comparison_key_remain_distinct = true
+filesystem_identity_is_never_resolved_by_normalization = true
+only_admitted_bindings_and_edges_enter_snapshot = true
+exact_direct_firing_is_independent_of_graph_availability = true
+direct_hits_are_immutable_inputs_to_spread = true
+relation_paths_never_sum_into_popularity_authority = true
+only_best_single_admissible_path_contributes = true
+cycles_and_expansion_are_bounded = true
+activation_contains_handles_and_trace_not_payload = true
+activation_never_marks_delivered_used_helpful_resolved_or_supported = true
+canonical_order_and_digest_are_deterministic = true
+
+[[external_type]]
+name = "ArtifactId"
+owner = "eliot-contracts"
+
+[[external_type]]
+name = "CueActivationEdgeType"
+owner = "eliot-cue-contracts/cue.contract.toml"
+
+[[public_type]]
+name = "RelationSpreadCombinationRule"
+kind = "enum"
+definition = ["BestSingleAdmissiblePath"]
+invariants = ["closed-world rule", "unknown/stringly rule rejected", "multiple paths never sum", "rule grants no support or influence authority"]
+
+[[public_type]]
+name = "CueRelationSpreadExecutionPolicy"
+kind = "struct"
+definition = ["policy_id: ArtifactId", "policy_revision: String", "enabled: bool", "allowed_edge_types: Vec<CueActivationEdgeType>", "maximum_depth: u8", "maximum_nodes: u32", "maximum_edges: u32", "maximum_hits: u32", "combination_rule: RelationSpreadCombinationRule", "preserve_direct_hits: bool", "emit_suppression_trace: bool", "policy_sha256: String"]
+invariants = ["limits positive when enabled", "edge types unique", "combination rule closed", "preserve_direct_hits and emit_suppression_trace true", "policy cannot modify canonical influence, source status or direct result", "canonical order and digest"]
+
+[[public_function]]
+name = "validate_cue_relation_spread_execution_policy"
+signature = "pub fn validate_cue_relation_spread_execution_policy(policy: &CueRelationSpreadExecutionPolicy) -> Result<(), CueContractError>"
+
+[[negative_test]]
+id = "stringly-spread-rule-rejected"
+property = "An unknown or free-text relation-path combination rule is rejected."
+
+[[negative_test]]
+id = "path-summing-unrepresentable"
+property = "The closed combination-rule set contains no additive or popularity-summing rule."
+
+[[negative_test]]
+id = "direct-hit-preservation-required"
+property = "A policy that can remove or reweight direct hits is rejected."
+
+[[negative_test]]
+id = "unbounded-spread-rejected"
+property = "Enabled spread with zero/unbounded depth, node, edge or hit limits is rejected."
