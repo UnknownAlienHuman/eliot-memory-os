@@ -1,0 +1,244 @@
+schema_version = 1
+contract_id = "eliot.skill.governed-procedure-portable-candidate.v1"
+status = "TARGET_STATIC_CONTRACT_CANDIDATE"
+issue = 44
+challenge = "CC-009"
+contract_owner = "surface.skill.procedure_projection_contracts"
+provider_owner = "governor.skill"
+candidate_mapper_owner = "smart.dreamer.skill_projection"
+admission_lifecycle_owner = "governor.skill"
+authority_ceiling = "CANDIDATE_ONLY_NO_INSTALLATION_REGISTRATION_ACTIVATION_OR_EXECUTION"
+proof_ceiling = "Field contract and fixture design only; provider, mapper, admission, installation, execution, Edge and Product proof remain separate."
+
+purpose = "Bind one owner-accepted procedure revision to a portable Skill-package candidate without allowing a Dreamer candidate to promote itself or creating another Skill lifecycle owner."
+
+existing_contract_reuse = [
+  "eliot_skills::RegistrationIdentity",
+  "eliot_skills::PackageDigests",
+  "eliot_skills::HostProfile",
+  "eliot_skills::SkillBehavior",
+  "eliot_skills::SkillPackage",
+  "eliot_skills::MaterializationOutcome",
+  "eliot_skill::SkillLifecycleView",
+  "eliot_skill::SkillCandidate",
+  "eliot_skill::PromotionGate",
+  "eliot_skill::SkillPromotionReceipt",
+]
+
+[governed_procedure_projection]
+type_name = "GovernedProcedureProjection"
+owner = "governor.skill"
+description = "Immutable read projection derived only from an accepted procedure revision and exact owner-issued admission or promotion evidence."
+required_fields = [
+  "schema_version",
+  "projection_id",
+  "projection_digest",
+  "procedure_id",
+  "procedure_revision",
+  "procedure_digest",
+  "accepted_status",
+  "acceptance_or_promotion_receipt_ref",
+  "acceptance_owner_ref",
+  "workscope_ref",
+  "task_scope_or_explicit_none",
+  "state_fence",
+  "source_episode_refs",
+  "source_evidence_refs",
+  "counterexample_refs",
+  "applicability_triggers",
+  "preconditions",
+  "where_not_apply",
+  "negative_trigger_refs",
+  "ordered_steps",
+  "required_outputs",
+  "required_writebacks",
+  "verifier_ref",
+  "rollback_ref",
+  "rollback_artifact_digest",
+  "stop_condition",
+  "reopen_condition",
+  "safety_constraints",
+  "privacy_class",
+  "disclosure_closure_ref",
+  "dependency_requirements",
+  "tool_definition_requirements",
+  "capability_requirements",
+  "transfer_boundary",
+  "omission_manifest",
+  "source_authority_ceiling",
+  "validity_and_invalidation",
+]
+closed_status_values = [
+  "ACCEPTED_CURRENT",
+  "ACCEPTED_PROVISIONAL",
+  "STALE",
+  "SUPERSEDED",
+  "CONFLICTED",
+  "QUARANTINED",
+]
+forbidden_sources = [
+  "raw ProcedureCandidate",
+  "Dreamer draft or model self-rating",
+  "procedure text without exact accepted revision and owner receipt",
+  "retrieval, repetition, popularity, or successful import treated as acceptance",
+]
+
+[portable_skill_package_candidate]
+type_name = "PortableSkillPackageCandidate"
+owner = "smart.dreamer.skill_projection"
+description = "Inert proposed package revision assembled from one GovernedProcedureProjection and explicit target compatibility evidence."
+required_fields = [
+  "candidate_id",
+  "candidate_digest",
+  "source_projection_id",
+  "source_projection_digest",
+  "package_id",
+  "package_revision",
+  "supersedes_package_revision_or_none",
+  "source_kind",
+  "source_locator_or_generated_handle",
+  "retained_snapshot_digest",
+  "source_view_workscope_and_provenance",
+  "registration_candidate",
+  "package_digest_candidates",
+  "skill_behavior_candidate",
+  "target_compatibility_dispositions",
+  "declared_dependencies",
+  "required_tool_definitions",
+  "required_capabilities",
+  "configuration_requirements",
+  "verification_entrypoint_ref",
+  "rollback_ref",
+  "safety_constraints",
+  "privacy_constraints",
+  "reference_script_and_asset_inventory",
+  "omission_manifest",
+  "challenge_path",
+  "state_fence",
+  "package_admission_disposition",
+  "authority_ceiling",
+]
+fixed_values = [
+  "source_kind = ELIOT_GENERATED_CANDIDATE",
+  "package_admission_disposition = QUARANTINED",
+  "authority_ceiling = CANDIDATE_ONLY",
+]
+forbidden_outputs = [
+  "PortableSkillPackageRevision with TRUSTED_SCOPED admission",
+  "MaterializedSkill",
+  "SkillPromotionReceipt",
+  "installation or registration receipt",
+  "capability grant or tool introduction",
+  "executable script authority",
+]
+
+[target_compatibility_disposition]
+type_name = "TargetCompatibilityDisposition"
+owner = "smart.dreamer.skill_projection"
+description = "One exact target/profile result. Unsupported, missing, stale, unsafe, private, and unknown targets remain explicit rather than silently dropped."
+closed_status_values = [
+  "COMPATIBLE_CANDIDATE",
+  "UNSUPPORTED_TARGET",
+  "MISSING_TOOL",
+  "MISSING_CAPABILITY",
+  "STALE_DEPENDENCY",
+  "PRIVACY_CONFLICT",
+  "SAFETY_CONFLICT",
+  "UNKNOWN",
+]
+required_fields = [
+  "target_host",
+  "target_profile",
+  "target_fingerprint_or_unknown",
+  "status",
+  "required_and_observed_versions",
+  "missing_or_conflicting_requirements",
+  "omitted_material",
+  "revalidation_requirement",
+  "proof_ceiling",
+]
+
+[[invariant]]
+id = "GPS-001"
+rule = "A raw Dreamer ProcedureCandidate can never satisfy GovernedProcedureProjection input."
+
+[[invariant]]
+id = "GPS-002"
+rule = "Accepted procedure status requires exact procedure identity/revision/digest, owner identity, and acceptance or promotion receipt bound to the same WorkScope and StateFence."
+
+[[invariant]]
+id = "GPS-003"
+rule = "Source episodes, evidence, counterexamples, negative triggers, applicability limits, uncertainty, omissions, and revocation dependencies remain independently addressable."
+
+[[invariant]]
+id = "GPS-004"
+rule = "Verifier, rollback, stop/reopen, safety, privacy, and disclosure constraints are mandatory and cannot be invented or defaulted by the mapper."
+
+[[invariant]]
+id = "GPS-005"
+rule = "The mapper reuses current SkillBehavior, HostProfile, PackageDigests, lifecycle, and materialization contracts; it does not define a parallel Skill registry, package owner, or lifecycle machine."
+
+[[invariant]]
+id = "GPS-006"
+rule = "Generated package output is untrusted and quarantined until the existing Governor/Skill admission and sealed materialization paths accept it."
+
+[[invariant]]
+id = "GPS-007"
+rule = "References, scripts, assets, tool names, and capability names are inert declarations; they grant no execution, credential, installation, or effect authority."
+
+[[invariant]]
+id = "GPS-008"
+rule = "Target compatibility is evaluated per exact target/profile/fingerprint; unsupported or unobserved targets are reported, never omitted as if compatible."
+
+[[invariant]]
+id = "GPS-009"
+rule = "A StateFence, procedure revision, dependency, Tool Definition, privacy, safety, or source-revocation change invalidates dependent candidates without deleting history."
+
+[[invariant]]
+id = "GPS-010"
+rule = "Candidate projection is deterministic under permutation of set-like evidence, requirement, target, and omission inputs."
+
+[[fixture]]
+id = "GPS-FX-001"
+case = "accepted procedure with complete evidence, verifier, rollback, safety, privacy, and one compatible target"
+expected = "one quarantined PortableSkillPackageCandidate with COMPATIBLE_CANDIDATE target disposition"
+
+[[fixture]]
+id = "GPS-FX-002"
+case = "raw ProcedureCandidate supplied without owner acceptance receipt"
+expected = "reject candidate-on-candidate promotion"
+
+[[fixture]]
+id = "GPS-FX-003"
+case = "procedure receipt identity or StateFence differs from the accepted procedure projection"
+expected = "reject identity or fence mismatch"
+
+[[fixture]]
+id = "GPS-FX-004"
+case = "verifier, rollback, safety, privacy, or disclosure closure missing"
+expected = "return incomplete projection challenge; no package candidate"
+
+[[fixture]]
+id = "GPS-FX-005"
+case = "one compatible target and one unsupported runtime"
+expected = "retain both target dispositions and exact unsupported reason"
+
+[[fixture]]
+id = "GPS-FX-006"
+case = "required tool or capability version is absent or stale"
+expected = "MISSING_TOOL, MISSING_CAPABILITY, or STALE_DEPENDENCY; no silent downgrade"
+
+[[fixture]]
+id = "GPS-FX-007"
+case = "script or verification entrypoint appears in the inventory"
+expected = "preserve inert reference only; no execution or capability grant"
+
+[[fixture]]
+id = "GPS-FX-008"
+case = "source evidence or accepted procedure is revoked, superseded, conflicted, or quarantined"
+expected = "candidate becomes stale/ineligible while history and provenance remain"
+
+[[fixture]]
+id = "GPS-FX-009"
+case = "input arrays are permuted without semantic change"
+expected = "identical canonical candidate digest and dispositions"

@@ -1,0 +1,26 @@
+[package]
+name = "eliot-dreamer-skill-projection"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Map one governed accepted procedure projection into an inert portable Skill-package candidate."
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "NOT_IMPLEMENTED"
+workspace_admission = "pending_contract_provider_package_edge_and_product_proof"
+functional_cell = "smart.dreamer.skill_projection"
+source_layer = "C1"
+runtime_layer = "R6"
+runtime_bundle = "eliot-dreamer"
+agent_order = 50
+
+[dependencies]
+eliot-skills = { path = "../../surfaces/eliot-skills" }
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
+eliot-dreamer-candidate-validation = { path = "../eliot-dreamer-candidate-validation" }

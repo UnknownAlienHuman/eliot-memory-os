@@ -1,0 +1,57 @@
+schema_version = 1
+work_unit_id = "issue-44-governed-procedure-portable-contract"
+issue = 44
+challenge = "CC-009"
+agent_order = 48
+role = "skill-contract-agent"
+status = "BLOCKED_UNTIL_OWNER_FREEZE"
+primary_causal_property = "One accepted procedure revision crosses an owner-neutral field contract into an inert portable Skill-package candidate without becoming installed, trusted, active, executed, or useful."
+integration_owner = "cognitive-wave-integrator"
+
+prerequisites = [
+  "exact current eliot-skills public package/materialization contracts",
+  "exact current eliot-skill lifecycle/proposal/promotion contracts",
+  "accepted owner split for GovernedProcedureProjection, portable candidate mapping, and existing Skill admission/lifecycle",
+]
+write_scope = [
+  "crates/surfaces/eliot-skills/src/procedure_projection.rs",
+  "crates/surfaces/eliot-skills/tests/procedure_projection.rs",
+  "crates/surfaces/eliot-skills/src/lib.rs",
+  "crates/surfaces/eliot-skills/Cargo.toml",
+]
+read_scope = [
+  "crates/surfaces/eliot-skills/**",
+  "crates/governor/eliot-skill/**",
+  "crates/smart/eliot-dreamer-procedure/**",
+  "docs/architecture/I07-25-skill-lifecycle-interaction-and-execution-evidence.md",
+  "docs/architecture/I07-29-portableskillpackage.md",
+  "docs/architecture/I09-06-curation-candidate.md",
+]
+required_tests = [
+  "accepted procedure and receipt exact identity/fence binding",
+  "raw ProcedureCandidate candidate-on-candidate rejection",
+  "missing verifier, rollback, safety, privacy, or disclosure closure",
+  "mixed compatible and unsupported targets",
+  "missing/stale tool and capability versions",
+  "scripts/assets remain inert",
+  "source revocation/supersession/conflict/quarantine",
+  "existing SkillBehavior/HostProfile/PackageDigests reuse",
+  "quarantined candidate cannot deserialize or mint MaterializedSkill/SkillPromotionReceipt",
+  "set-input permutation determinism",
+]
+forbidden = [
+  "new Skill registry, lifecycle machine, materialization owner, policy owner, or package-admission owner",
+  "procedure admission/promotion or canonical write",
+  "signing, installation, registration, activation, execution, credential, provider, tool, or capability-grant effect",
+  "Smart/Governor implementation dependency in provider-neutral contract logic",
+  "trusted package status or causal usefulness claim",
+]
+verification = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-skills --all-targets",
+  "cargo test --locked -p eliot-skills",
+  "cargo clippy --locked -p eliot-skills --all-targets -- -D warnings",
+  "Governor-provider and Smart-mapper contract fixtures",
+]
+stop_condition = "Return ContractChallenge for missing procedure owner/receipt semantics, duplicate existing Skill contract ownership, unrepresentable safety/privacy/rollback state, or requested runtime/lifecycle authority."
+proof_ceiling = "Provider-neutral contract-cell Module proof only."

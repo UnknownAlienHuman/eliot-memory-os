@@ -1,0 +1,56 @@
+schema_version = 1
+work_unit_id = "issue-44-governed-procedure-provider"
+issue = 44
+challenge = "CC-009"
+agent_order = 49
+role = "governor-procedure-projection-agent"
+status = "BLOCKED_UNTIL_CONTRACT_FREEZE"
+primary_causal_property = "Exact owner-accepted procedure state is exposed as one immutable GovernedProcedureProjection without admitting, mapping, installing, or executing a Skill."
+integration_owner = "cognitive-wave-integrator"
+
+prerequisites = [
+  "accepted eliot.skill.governed-procedure-portable-candidate.v1 Rust contract and fixtures",
+  "exact current accepted-procedure owner/read projection and acceptance or promotion receipt",
+  "exact source/evidence/verifier/rollback/privacy/disclosure dependency owners",
+]
+write_scope = [
+  "crates/governor/eliot-skill/src/governed_procedure_projection.rs",
+  "crates/governor/eliot-skill/tests/governed_procedure_projection.rs",
+  "crates/governor/eliot-skill/src/lib.rs",
+  "crates/governor/eliot-skill/Cargo.toml",
+]
+read_scope = [
+  "crates/governor/eliot-skill/**",
+  "crates/surfaces/eliot-skills/**",
+  "crates/smart/eliot-dreamer-procedure/**",
+  "current canonical procedure/admission read contracts and fixtures",
+]
+required_tests = [
+  "accepted procedure exact receipt and StateFence",
+  "raw Dreamer ProcedureCandidate rejected",
+  "receipt identity/revision/workscope/task/fence mismatch",
+  "missing counterexample/applicability/negative-trigger coverage",
+  "missing verifier or rollback artifact binding",
+  "missing safety/privacy/disclosure owner evidence",
+  "stale/superseded/conflicted/quarantined procedure",
+  "revoked source/dependency/Tool Definition",
+  "bounded omissions and explicit unknown owner",
+  "input permutation determinism",
+]
+forbidden = [
+  "direct store/vendor query or canonical write",
+  "procedure admission/promotion/revision/lifecycle transition",
+  "portable package mapping or materialization",
+  "Skill signing, registration, installation, activation, execution, or usefulness evaluation",
+  "model/provider/tool/credential/capability-grant effect",
+  "scope widening or candidate-on-candidate fallback",
+]
+verification = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-skill --all-targets",
+  "cargo test --locked -p eliot-skill",
+  "cargo clippy --locked -p eliot-skill --all-targets -- -D warnings",
+  "real accepted-procedure provider and Smart mapper consumer fixtures",
+]
+stop_condition = "Return ContractChallenge for every missing accepted-procedure owner, receipt binding, current scope/fence, evidence denominator, verifier, rollback, safety/privacy/disclosure, or requested package/lifecycle effect."
+proof_ceiling = "Governor accepted-procedure projection Module proof only."

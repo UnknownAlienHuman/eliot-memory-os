@@ -1,0 +1,60 @@
+schema_version = 1
+work_unit_id = "issue-44-dreamer-skill-projection"
+issue = 44
+challenge = "CC-009"
+agent_order = 50
+role = "smart-skill-projection-agent"
+status = "BLOCKED_UNTIL_CONTRACT_AND_PROVIDER_FREEZE"
+primary_causal_property = "One GovernedProcedureProjection maps to an inert, quarantined, target-explicit portable Skill-package candidate without package admission, installation, execution, or lifecycle authority."
+integration_owner = "cognitive-wave-integrator"
+
+prerequisites = [
+  "accepted eliot.skill.governed-procedure-portable-candidate.v1 Rust contract and fixtures",
+  "accepted Governor GovernedProcedureProjection provider and exact fixture",
+  "accepted common Dreamer candidate-validation contract",
+  "current eliot-skills package/materialization and eliot-skill candidate/lifecycle consumer contracts",
+]
+write_scope = [
+  "crates/smart/eliot-dreamer-skill-projection/src/**",
+  "crates/smart/eliot-dreamer-skill-projection/tests/**",
+  "crates/smart/eliot-dreamer-skill-projection/Cargo.toml",
+]
+read_scope = [
+  "crates/smart/eliot-dreamer-skill-projection/**",
+  "crates/smart/eliot-dreamer-procedure/**",
+  "crates/smart/eliot-dreamer-contracts/**",
+  "crates/smart/eliot-dreamer-candidate-validation/**",
+  "crates/surfaces/eliot-skills/**",
+  "crates/governor/eliot-skill/**",
+]
+required_tests = [
+  "raw ProcedureCandidate rejected",
+  "accepted GovernedProcedureProjection happy path",
+  "missing verifier/rollback/safety/privacy/disclosure",
+  "mixed compatible and unsupported targets",
+  "missing/stale dependency, tool, capability, and fingerprint",
+  "source revocation/supersession/conflict/quarantine",
+  "provenance/counterexample/negative-trigger/omission preservation",
+  "scripts/assets/verification entrypoint remain inert",
+  "candidate fixed to ELIOT_GENERATED_CANDIDATE and QUARANTINED",
+  "cannot mint MaterializedSkill, SkillPromotionReceipt, install/registration receipt, or capability grant",
+  "set-input permutation determinism",
+]
+forbidden = [
+  "eliot-skill implementation import or direct Governor/store read",
+  "model/provider/tool/credential/runtime SDK or effect",
+  "procedure admission/promotion/revision",
+  "Skill trust/admission/signing/registration/installation/activation/execution/lifecycle/usefulness/causal-credit transition",
+  "silent unsupported target, privacy, safety, or omission loss",
+  "active-generation self-modification",
+]
+verification = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-dreamer-skill-projection --all-targets",
+  "cargo test --locked -p eliot-dreamer-skill-projection",
+  "cargo clippy --locked -p eliot-dreamer-skill-projection --all-targets -- -D warnings",
+  "real Governor provider and existing Skill consumer Edge fixtures",
+  "D3A_CURATION_PULSE_01 before promotion",
+]
+stop_condition = "Return ContractChallenge for raw/candidate procedure input, missing target/Tool Definition/capability evidence, missing verifier/rollback/safety/privacy/disclosure/provenance, or requested package/lifecycle/execution authority."
+proof_ceiling = "Pure Smart portable-candidate mapper Module proof only."

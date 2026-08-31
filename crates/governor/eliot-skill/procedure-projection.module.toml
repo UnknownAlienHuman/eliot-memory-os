@@ -1,0 +1,118 @@
+schema_version = 3
+module_id = "governor.skill.governed_procedure_projection"
+crate = "eliot-skill"
+status = "PROTOTYPE"
+challenge = "CC-009"
+wave = "cognitive-contract-challenges"
+agent_order = 49
+plane = "Harness/Governor"
+runtime_layer = "R3"
+delivery_depth = "D3a"
+source_layer = "C2"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "governor.skill"
+assignable = false
+blocked_by = [
+  "accepted procedure-projection contract implementation/package proof",
+  "exact accepted-procedure owner projection and receipt fixtures",
+]
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Smart receives a bounded accepted-procedure projection rather than a raw Dreamer candidate or direct canonical access."
+causal_property = "Governor-owned accepted procedure read projection"
+old_failure_or_missing_capability = "Dreamer Skill projection has no owner-derived accepted procedure identity, evidence, applicability, verifier, rollback, safety, privacy, or fence boundary."
+discriminator = "raw candidate, missing/mismatched receipt, stale fence, incomplete evidence, conflicted/superseded/quarantined procedure, and revoked source fixtures never produce an accepted projection."
+primary_responsibility = "Compile one immutable GovernedProcedureProjection from exact owner-supplied accepted procedure state and evidence through injected read ports."
+owned_mutable_state = []
+allowed_effects = []
+inputs = [
+  "exact accepted procedure identity, revision, digest, status, and owner-issued receipt",
+  "WorkScope/task applicability and StateFence",
+  "source episodes, evidence, counterexamples, negative triggers, verifier, rollback, safety, privacy, disclosure, dependencies, and Tool Definition requirements",
+]
+outputs = [
+  "GovernedProcedureProjection",
+  "typed missing/stale/conflicted/revoked projection disposition",
+]
+depends_on = [
+  "eliot-skills procedure projection contract",
+  "existing Governor canonical read/projection ports",
+]
+providers = [
+  "canonical procedure/admission owner through an injected bounded read projection",
+  "evidence, verifier, artifact, privacy, disclosure, dependency, and Tool Definition owners through exact handles",
+]
+consumers = [
+  "eliot-dreamer-skill-projection",
+]
+non_goals = [
+  "creating, admitting, promoting, revising, or executing a procedure",
+  "building or materializing a Skill package",
+  "Skill signing, registration, installation, activation, lifecycle mutation, or usefulness evaluation",
+  "direct store/vendor query, model work, provider SDK, tool execution, capability grant, policy, authority, or finish",
+]
+invariants = [
+  "only owner-accepted procedure state can produce the projection",
+  "procedure, receipt, WorkScope, task scope, and StateFence identities agree exactly",
+  "all evidence, counterexamples, applicability, negative triggers, verifier, rollback, safety, privacy, disclosure, omissions, and revocation dependencies preserve owner meaning",
+  "stale, superseded, conflicted, quarantined, revoked, incomplete, or unavailable state remains explicit",
+  "projection grants no package, lifecycle, tool, effect, or execution authority",
+]
+failure_behavior = "Return typed unavailable/incomplete/stale/conflicted/revoked disposition with exact missing owner or evidence; never substitute a Dreamer candidate, broaden scope, invent defaults, or emit a package candidate."
+proof_surface = [
+  "accepted versus raw candidate procedure",
+  "receipt/procedure/workscope/task/fence identity mismatch",
+  "missing verifier/rollback/safety/privacy/disclosure evidence",
+  "counterexample and negative-trigger preservation",
+  "stale/superseded/conflicted/quarantined procedure",
+  "revoked source or dependency",
+  "input permutation determinism",
+]
+proof_ceiling = "Governor provider Module/fake-port proof only; canonical-read Edge, Smart mapper Edge, Skill admission/materialization and Product proof remain separate"
+product_pulse = "D3A_CURATION_PULSE_01"
+replacement_boundary = "pure projection service inside the existing Governor Skill owner behind owner-neutral contracts and injected read ports"
+merge_rejoin_condition = "merge with another Governor Skill projection only when source owner, contract, consumers, proof, and replacement boundary are identical"
+split_trigger = "a mutable state owner, admission transition, installation effect, independent consumer family, or separate rollback boundary appears"
+
+[agent_task]
+objective = "Implement compile_governed_procedure_projection over exact owner-supplied accepted procedure state without package mapping, direct storage, or lifecycle effects."
+write_scope = [
+  "crates/governor/eliot-skill/src/governed_procedure_projection.rs",
+  "crates/governor/eliot-skill/tests/governed_procedure_projection.rs",
+  "crates/governor/eliot-skill/src/lib.rs",
+  "crates/governor/eliot-skill/Cargo.toml",
+]
+deliverables = [
+  "bounded projection request/port/service API",
+  "identity/fence/evidence completeness validation",
+  "typed stale/conflict/revocation/missing-owner dispositions",
+  "fake-port fixtures and real canonical-read Edge plan",
+]
+acceptance = [
+  "one stateless provider responsibility",
+  "only exact owner-derived accepted state crosses the boundary",
+  "no package, lifecycle, execution, policy, or authority effect",
+]
+forbidden = [
+  "raw store/SurrealDB/vendor types",
+  "Dreamer/model/provider/tool SDK or execution",
+  "procedure admission, promotion, lifecycle mutation, or canonical write",
+  "Skill package materialization, registration, installation, activation, execution, or usefulness evaluation",
+  "candidate-on-candidate fallback",
+]
+stop_condition = "Return ContractChallenge when accepted-procedure identity/receipt, owner projection, scope/fence, verifier, rollback, safety/privacy/disclosure, or source dependency evidence is missing."
+challenge_path = "return ContractChallenge to the cognitive-wave integration owner and exact missing procedure/evidence owner"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-skill --all-targets",
+  "cargo test --locked -p eliot-skill",
+  "cargo clippy --locked -p eliot-skill --all-targets -- -D warnings",
+  "real accepted-procedure/read provider fixture before promotion",
+  "real Smart mapper consumer fixture",
+]
+writeback = "return implementation artifact, exact proof evidence, provider gaps, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "existing workspace package; new cell remains unsupported until contract/package proof, real provider/consumer Edge proof, current-main ancestry and integration-owner review"

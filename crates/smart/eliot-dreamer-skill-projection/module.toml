@@ -1,0 +1,150 @@
+schema_version = 3
+module_id = "smart.dreamer.skill_projection"
+crate = "eliot-dreamer-skill-projection"
+status = "PROTOTYPE"
+challenge = "CC-009"
+wave = "cognitive-contract-challenges"
+agent_order = 50
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.skill_projection"
+assignable = false
+blocked_by = [
+  "accepted governed-procedure/portable-candidate contract implementation and package proof",
+  "Governor accepted-procedure projection provider fixture",
+  "common Dreamer candidate-validation fixture",
+]
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "A reusable procedure can be proposed as a portable, target-explicit, safety/privacy-complete Skill candidate while existing Governor and surface owners retain every admission and effect."
+causal_property = "pure governed-procedure to portable Skill-package candidate mapping"
+old_failure_or_missing_capability = "a Dreamer procedure candidate can be confused with an accepted reusable procedure or mapped into a package without exact compatibility, verifier, rollback, safety, privacy, provenance, omission, and owner boundaries."
+discriminator = "raw candidate, unsupported target, stale dependency, missing verifier/rollback/privacy, inert-script, source-revocation, and permutation fixtures produce explicit candidate-only outcomes without lifecycle effects."
+primary_responsibility = "Purely map one GovernedProcedureProjection plus bounded target profiles into a PortableSkillPackageCandidate set with exact compatibility and omission dispositions."
+owned_mutable_state = []
+allowed_effects = []
+inputs = [
+  "GovernedProcedureProjection",
+  "bounded exact target host/profile/fingerprint capability observations",
+  "current eliot-skills SkillBehavior, HostProfile, PackageDigests and package-candidate contract",
+  "common Dreamer candidate-validation result",
+]
+outputs = [
+  "PortableSkillPackageCandidate",
+  "per-target TargetCompatibilityDisposition",
+  "provenance, omission, and unsupported-target manifest",
+]
+depends_on = [
+  "eliot-skills",
+  "eliot-dreamer-contracts",
+  "eliot-dreamer-candidate-validation",
+]
+providers = [
+  "governor.skill.governed_procedure_projection",
+  "target capability and Tool Definition observations supplied by their owners",
+]
+consumers = [
+  "existing Governor Skill candidate/proposal path",
+  "existing eliot-skills sealed materialization path after separate admission",
+  "eliot-dreamer-curation",
+]
+non_goals = [
+  "reading canonical procedure state or accepting a raw ProcedureCandidate",
+  "procedure admission, promotion, or revision",
+  "Skill package trust/admission, signing, registration, installation, activation, execution, lifecycle mutation, or usefulness evaluation",
+  "provider/runtime/tool SDK, credential, capability grant, policy, authority, finish, or external effect",
+]
+invariants = [
+  "only GovernedProcedureProjection input is accepted",
+  "procedure/source/evidence/receipt/StateFence identity and authority ceiling are preserved",
+  "verifier, rollback, stop/reopen, safety, privacy, disclosure, applicability, negative triggers, counterexamples, and omissions cannot be defaulted away",
+  "one exact disposition exists for every target considered",
+  "generated package source is ELIOT_GENERATED_CANDIDATE and admission remains QUARANTINED",
+  "script/tool/capability declarations are inert",
+  "existing SkillBehavior/package/materialization/lifecycle owners are reused rather than copied",
+  "output is deterministic and carries no installation or execution authority",
+]
+failure_behavior = "Return no candidate or an explicit incomplete/unsupported/stale/privacy/safety disposition with exact missing owner and revalidation path; never fabricate compatibility, trust, admission, installation, use, or benefit."
+proof_surface = [
+  "accepted governed projection versus raw ProcedureCandidate",
+  "complete versus missing verifier/rollback/safety/privacy/disclosure",
+  "compatible and unsupported mixed targets",
+  "missing/stale tool, capability, dependency, or target fingerprint",
+  "inert script/verification-entrypoint inventory",
+  "source revocation/supersession/conflict/quarantine",
+  "omission and lineage preservation",
+  "input permutation determinism",
+]
+proof_ceiling = "Pure Smart mapper Module proof only; real Governor provider/Skill consumer Edge, package admission/materialization, installation/execution, lifecycle, and Product proof remain separate"
+product_pulse = "D3A_CURATION_PULSE_01"
+replacement_boundary = "pure mapper behind the owner-neutral contract; no Governor implementation, runtime provider, package installer, or lifecycle owner leaks into the cell"
+merge_rejoin_condition = "merge with another Dreamer handler only when input subtype, output contract, proof, consumer, and replacement boundary are identical"
+split_trigger = "a second candidate kind, mutable state owner, effect, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-procedure/module.toml"
+disposition = "consume only after Governor acceptance; raw ProcedureCandidate is explicitly rejected"
+
+[[donor]]
+path = "crates/governor/eliot-skill/src/lib.rs"
+disposition = "reuse lifecycle/proposal/promotion contracts by reference; do not import implementation"
+
+[[donor]]
+path = "crates/surfaces/eliot-skills/src/contract.rs"
+disposition = "reuse SkillBehavior, HostProfile, PackageDigests, SkillPackage and sealed materialization contracts"
+
+[[donor]]
+path = "ELIOT_ARCHITECTURE A7.10, A9.1-A9.2, A14.1-A14.5"
+disposition = "intent, candidate-only and procedural-learning boundaries"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I7.25, I7.29, I9.6-I9.7"
+disposition = "authoritative target package, lifecycle, curation and transformation semantics"
+
+[agent_task]
+objective = "Implement project_governed_procedure_to_portable_skill_candidate as a deterministic total function over the accepted contract."
+write_scope = [
+  "crates/smart/eliot-dreamer-skill-projection/src/**",
+  "crates/smart/eliot-dreamer-skill-projection/tests/**",
+  "crates/smart/eliot-dreamer-skill-projection/Cargo.toml",
+]
+deliverables = [
+  "public pure mapper API",
+  "target-by-target compatibility and omission matrix",
+  "canonical candidate identity/order logic",
+  "negative/adversarial/permutation fixtures",
+  "Governor provider and existing Skill consumer Edge fixture plan",
+]
+acceptance = [
+  "one pure candidate-mapping responsibility",
+  "no raw candidate or hidden canonical read",
+  "all target, provenance, safety, privacy, verifier, rollback, omission, and authority ceilings remain explicit",
+  "no package or lifecycle effect",
+]
+forbidden = [
+  "dependency on eliot-skill implementation",
+  "store/filesystem/network/model/provider/tool/credential access",
+  "procedure admission/promotion or canonical write",
+  "Skill signing, registration, installation, activation, execution, lifecycle mutation, usefulness evaluation, or causal credit",
+  "silent target omission, capability fallback, privacy widening, or script execution",
+  "active-generation self-modification",
+]
+stop_condition = "Return ContractChallenge when the governed input, target capability evidence, current Tool Definition, verifier, rollback, safety/privacy/disclosure, compatibility owner, or existing Skill consumer contract is missing."
+challenge_path = "return ContractChallenge to the cognitive-wave integration owner and exact missing Governor/Skill/capability owner"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-dreamer-skill-projection --all-targets",
+  "cargo test --locked -p eliot-dreamer-skill-projection",
+  "cargo clippy --locked -p eliot-dreamer-skill-projection --all-targets -- -D warnings",
+  "real Governor provider and existing Skill candidate/materialization consumer fixtures",
+  "D3A_CURATION_PULSE_01 before promotion",
+]
+writeback = "return implementation artifact, exact proof evidence, target/provider gaps, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until contract/provider implementation, package proof, affected Edge proof, Product Pulse, current-main ancestry and integration-owner review"

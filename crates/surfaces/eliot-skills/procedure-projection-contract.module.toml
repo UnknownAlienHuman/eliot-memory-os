@@ -1,0 +1,123 @@
+schema_version = 3
+module_id = "surface.skill.procedure_projection_contracts"
+crate = "eliot-skills"
+status = "PROTOTYPE"
+challenge = "CC-009"
+wave = "cognitive-contract-challenges"
+agent_order = 48
+plane = "Harness/Surface"
+runtime_layer = "R9"
+delivery_depth = "D3a"
+source_layer = "C0"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "surface.skill.procedure_projection_contracts"
+assignable = false
+blocked_by = [
+  "field-level contract implementation and package proof",
+  "Governor procedure-projection provider acceptance",
+  "Smart candidate-mapper provider/consumer fixtures",
+]
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "An accepted procedure can be projected into an inert portable Skill candidate without duplicating current Skill package, lifecycle, materialization, or authority owners."
+causal_property = "owner-neutral governed-procedure and portable-Skill-candidate contract"
+old_failure_or_missing_capability = "Dreamer procedure candidates have no accepted-procedure read projection or owner-neutral bridge into the existing portable Skill package and lifecycle contracts."
+discriminator = "candidate-on-candidate, stale-fence, missing-verifier/rollback/privacy, unsupported-target, source-revocation, and inert-script fixtures remain distinct and fail closed."
+primary_responsibility = "Own only the provider-neutral GovernedProcedureProjection, PortableSkillPackageCandidate, target-compatibility disposition, validation, and canonical identity rules while reusing existing eliot-skills and eliot-skill contracts."
+owned_mutable_state = []
+allowed_effects = []
+inputs = [
+  "serialized provider-neutral procedure projection values",
+  "existing eliot-skills SkillBehavior, HostProfile, PackageDigests, SkillPackage and materialization contracts",
+  "existing eliot-skill lifecycle and promotion identity references",
+]
+outputs = [
+  "validated GovernedProcedureProjection",
+  "validated PortableSkillPackageCandidate",
+  "validated TargetCompatibilityDisposition set",
+]
+depends_on = [
+  "existing eliot-skills contract surface",
+  "eliot-receipts",
+  "eliot-rules",
+]
+providers = [
+  "Governor Skill/procedure projection provider",
+]
+consumers = [
+  "eliot-dreamer-skill-projection",
+  "existing Governor Skill candidate/admission and sealed materialization paths",
+]
+non_goals = [
+  "procedure admission or promotion",
+  "Skill signing, registration, installation, activation, execution, or lifecycle mutation",
+  "tool/provider/runtime SDK or credential handling",
+  "another package, registry, policy, capability-grant, or authority owner",
+]
+invariants = [
+  "raw ProcedureCandidate cannot satisfy the governed input contract",
+  "accepted procedure identity and receipt share exact WorkScope and StateFence",
+  "verifier, rollback, safety, privacy, provenance, counterexamples, omissions, and unsupported targets remain explicit",
+  "generated package candidates are quarantined and authority-free",
+  "scripts and tool/capability declarations are inert",
+  "existing Skill/package/lifecycle contracts remain the single current owners",
+]
+failure_behavior = "Reject malformed, ownerless, candidate-on-candidate, cross-fence, stale, unsafe, privacy-incompatible, or authority-escalating values; preserve explicit unsupported/unknown target dispositions."
+proof_surface = [
+  "accepted versus raw candidate procedure",
+  "receipt/procedure identity and fence binding",
+  "mandatory verifier/rollback/safety/privacy",
+  "compatible and unsupported mixed target set",
+  "stale dependency and Tool Definition",
+  "source revocation and omission preservation",
+  "inert scripts/assets/capability requirements",
+  "permutation determinism",
+]
+proof_ceiling = "Contract/package proof only; Governor provider, Smart mapper, Skill admission/materialization, installation/execution, Edge and Product proof remain separate"
+product_pulse = "D3A_CURATION_PULSE_01"
+replacement_boundary = "contract cell inside the existing eliot-skills hub; no new runtime or lifecycle owner"
+merge_rejoin_condition = "merge into another contract cell only when public contract, consumers, proof, compatibility, and replacement boundaries are identical"
+split_trigger = "a mutable owner, execution effect, separate public consumer family, or independent rollback boundary appears"
+
+[agent_task]
+objective = "Implement the owner-neutral procedure-to-portable-candidate contract in the existing eliot-skills crate without duplicating current Skill lifecycle or materialization owners."
+write_scope = [
+  "crates/surfaces/eliot-skills/src/procedure_projection.rs",
+  "crates/surfaces/eliot-skills/tests/procedure_projection.rs",
+  "crates/surfaces/eliot-skills/src/lib.rs",
+  "crates/surfaces/eliot-skills/Cargo.toml",
+]
+deliverables = [
+  "deny_unknown_fields DTOs and closed dispositions",
+  "cross-field identity/fence/authority validators",
+  "canonical ordering and digest derivation",
+  "negative, round-trip, and permutation fixtures",
+  "Governor-provider and Smart-mapper consumer fixture contracts",
+]
+acceptance = [
+  "one stateless contract responsibility",
+  "all required evidence, safety, privacy, rollback, omission, and compatibility states are representable",
+  "no duplicate lifecycle/materialization/package owner",
+]
+forbidden = [
+  "canonical or lifecycle mutation",
+  "installation, registration, signing, activation, execution, credential, or provider effects",
+  "import of Smart or Governor implementation into the public contract core",
+  "trusted/admitted package status minted from candidate input",
+  "model judgment, retrieval, repetition, or import success treated as procedure acceptance",
+]
+stop_condition = "Return ContractChallenge when a field belongs to procedure admission, Skill lifecycle, sealed materialization, installation, tool execution, capability grant, policy, authority, or another owner."
+challenge_path = "return ContractChallenge to the cognitive-wave integration owner and exact missing Governor/Skill owner"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-skills --all-targets",
+  "cargo test --locked -p eliot-skills",
+  "cargo clippy --locked -p eliot-skills --all-targets -- -D warnings",
+  "real provider/consumer fixture for every changed edge",
+]
+writeback = "return implementation artifact, exact proof evidence, owner/compatibility gaps, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "existing workspace package; new cell remains unsupported until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"
