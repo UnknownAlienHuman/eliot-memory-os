@@ -1,0 +1,68 @@
+schema_version = 1
+work_unit_id = "issue-42-attributed-memory-evaluation-contracts"
+issue = 42
+challenge = "CC-001"
+role = "contract-agent"
+status = "READY_FOR_AGENT_AFTER_CURRENT_MAIN_REBASE"
+primary_causal_property = "Complete-denominator attributed memory use and dimensioned outcome/economics can be represented without hidden owner substitution or scalar utility."
+integration_owner = "cognitive-wave-integrator"
+
+write_scope = [
+  "crates/foundation/eliot-evaluation-contracts/src/**",
+  "crates/foundation/eliot-evaluation-contracts/tests/**",
+  "crates/foundation/eliot-evaluation-contracts/Cargo.toml",
+]
+read_scope = [
+  "crates/foundation/eliot-evaluation-contracts/**",
+  "crates/foundation/eliot-contracts/**",
+  "crates/foundation/eliot-evidence/**",
+  "crates/instrument/eliot-instrument-api/**",
+  "crates/foundation/eliot-receipts/**",
+  "crates/meta/eliot-learning-activation-assessment/**",
+  "crates/smart/eliot-dreamer-accessibility/**",
+  "docs/architecture/A04-07-accessibility-support-influence-and-erasure.md",
+  "docs/architecture/A14-04-forgetting-and-memory-ecology.md",
+  "docs/architecture/A14-05-meta-learning.md",
+  "docs/architecture/A14-06-evaluation.md",
+  "docs/architecture/I07-27-evidence-execution-parsing-evaluation-and-independence.md",
+  "docs/architecture/I12-21-memory-ecology-residual-experience-and-transfer.md",
+  "docs/architecture/I12-34-cognitive-proof-ladder-and-ecological-field-proof.md",
+  "docs/architecture/I18-47-evaluator-benchmark-budget-and-credit-assignment-integrity.md",
+]
+deliverables = [
+  "versioned Rust DTOs and closed enums for both field contracts",
+  "deny_unknown_fields Serde and JsonSchema surfaces",
+  "structural and cross-dimension validators",
+  "canonical set ordering or explicit order-insensitive validation",
+  "negative and permutation fixtures",
+  "consumer contract fixtures without importing a concrete Meta assessor",
+]
+required_tests = [
+  "complete denominator can establish qualifying non-use",
+  "partial/blind denominator cannot establish non-use",
+  "acknowledgement cannot establish use",
+  "exact downstream decision/verifier reference can establish observable use",
+  "retrieval count/recency/repetition/writer utility/model judgment are rejected as attribution",
+  "cost missingness is distinct from zero",
+  "used-but-harmful and lucky-outcome cases remain representable",
+  "confounders, rival causes, contamination, and crossover remain explicit",
+  "protected/minority/counterexample/audit/failure-fingerprint roles cannot be demoted by low use",
+  "equivalent set-like input permutations produce identical output",
+]
+forbidden = [
+  "canonical writes, evaluator execution, provider/model/tool calls, or task scheduling",
+  "accessibility, support, influence, forgetting, lifecycle, purge, or erasure transition",
+  "promotion, policy, authority, finish, Product, or release decision",
+  "single utility, usefulness, trust, confidence, or regret score",
+  "owner substitution or silence interpreted as evidence",
+  "changing an evaluator/oracle to make fixtures pass",
+]
+verification = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-evaluation-contracts --all-targets",
+  "cargo test --locked -p eliot-evaluation-contracts",
+  "cargo clippy --locked -p eliot-evaluation-contracts --all-targets -- -D warnings",
+  "consumer compile/fixture proof for every changed public edge",
+]
+stop_condition = "Return ContractChallenge when field ownership requires canonical memory/task/effect/evaluator state, when a denominator cannot be frozen, or when a requested causal claim exceeds the available comparison/intervention evidence."
+proof_ceiling = "Contract and package proof only; production producers, Meta assessment, accessibility consumption, lifecycle application, Product Pulse, and promotion remain separate."

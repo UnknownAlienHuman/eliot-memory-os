@@ -1,0 +1,273 @@
+schema_version = 1
+contract_id = "eliot.evaluation.memory-outcome-economics.v1"
+contract_version = "1.0.0"
+status = "STATIC_CANDIDATE"
+issue = 42
+challenge = "CC-001"
+owner_capability = "Governor/Meta evaluation"
+source_layer = "C0"
+state_class = "stateless"
+wire_scope = "owner-neutral"
+proof_ceiling = "Field-level contract candidate only; no evaluator run, causal benefit, lifecycle, promotion, or Product proof."
+purpose = "Represent downstream outcome, multidimensional cost, harm, regret, rollback, and causal-attribution limits for one attributed memory-use opportunity."
+
+architecture_refs = [
+  "ARCH-MEM-04",
+  "ARCH-EPI-02",
+  "ARCH-LEARN-01",
+  "ARCH-LEARN-02",
+  "ARCH-META-01",
+  "ARCH-ECON-01",
+]
+implementation_refs = [
+  "I7.27",
+  "I12.21",
+  "I12.24",
+  "I12.34",
+  "I16.23",
+  "I18.47",
+]
+
+required_identity_fields = [
+  "evaluation_id",
+  "attributed_use_record_ref",
+  "product_or_task_identity",
+  "workscope_ref",
+  "task_ref",
+  "state_fence",
+  "outcome_window",
+  "evaluation_contract_ref",
+  "evaluator_identity_and_revision",
+  "provenance_refs",
+]
+optional_identity_fields = [
+  "attempt_ref",
+  "artifact_refs",
+  "effect_receipt_refs",
+  "verifier_run_refs",
+  "comparison_arm_ref",
+  "rollback_receipt_ref",
+  "delayed_outcome_window_ref",
+]
+
+[ownership]
+owns = [
+  "owner-neutral outcome/economics/attribution vocabulary",
+  "structural validity and cross-dimension consistency",
+  "comparison, confounder, missingness, and proof-ceiling requirements",
+]
+must_not_own = [
+  "evaluator execution or verifier registration",
+  "canonical task, memory, artifact, effect, budget, or route state",
+  "accessibility, support, influence, forgetting, purge, or lifecycle transition",
+  "promotion, canary, rollback execution, policy, authority, or finish",
+]
+
+[[dimension]]
+name = "outcome"
+closed_values = [
+  "IMPROVED",
+  "NO_CHANGE",
+  "REGRESSED",
+  "INCONCLUSIVE",
+  "UNKNOWN",
+  "CENSORED",
+  "NOT_APPLICABLE",
+]
+required_evidence = [
+  "declared outcome measure and evaluation window",
+  "artifact/effect/verifier references when observed",
+  "missingness or censoring reason when not fully observed",
+]
+
+[[dimension]]
+name = "comparison_basis"
+closed_values = [
+  "EXACT_PRECHANGE_BEHAVIOR",
+  "MATCHED_CONTROL",
+  "MEMORY_FREE_CONTROL",
+  "HISTORICAL_REFERENCE",
+  "STRONG_COUNTERFACTUAL",
+  "NOT_APPLICABLE_WITH_REASON",
+  "NONE",
+  "UNKNOWN",
+]
+required_evidence = [
+  "exact arm and stack identities when a comparison exists",
+  "reason when comparison is not applicable",
+  "claim ceiling when comparison is absent or unknown",
+]
+
+[[dimension]]
+name = "attribution"
+closed_values = [
+  "DELIVERY_ONLY",
+  "OBSERVED_ASSOCIATION",
+  "SUPPORTED_CONTRIBUTION",
+  "OBSERVED_UNDER_INTERVENTION",
+  "COMPOSITE_BENEFIT",
+  "CONTRADICTED",
+  "UNKNOWN",
+]
+required_evidence = [
+  "rival-cause set",
+  "confounder disposition",
+  "treatment/control or intervention identity for causal ceilings",
+  "contamination and crossover status",
+  "uncertainty and scope limits",
+]
+
+[[dimension]]
+name = "cost"
+vector_fields = [
+  "provider_money",
+  "input_tokens",
+  "output_tokens",
+  "cache_tokens_or_cost",
+  "model_calls_and_retries",
+  "tool_and_process_calls",
+  "cpu_time",
+  "ram_peak",
+  "gpu_time_and_memory",
+  "disk_bytes_and_io",
+  "network_bytes_and_time",
+  "queue_wait",
+  "wall_clock",
+  "human_attention",
+  "maintenance_and_recovery_cost",
+]
+missing_values = [
+  "KNOWN",
+  "ESTIMATED",
+  "UNKNOWN",
+  "NOT_EXPOSED",
+  "NOT_APPLICABLE",
+]
+rule = "Every cost component carries value, units, source, confidence/missingness, observation interval, and attribution scope; absent values are never zero."
+
+[[dimension]]
+name = "harm"
+closed_values = [
+  "NONE_OBSERVED",
+  "WRONG_DECISION_OR_ACTION",
+  "MISSED_OR_WEAKENED_VERIFIER",
+  "STALE_OR_WRONG_SCOPE_INFLUENCE",
+  "FALSE_WARNING_OR_BLOCK",
+  "ARTIFACT_OR_EFFECT_REGRESSION",
+  "PRIVACY_SECURITY_OR_AUTHORITY_HARM",
+  "REWORK",
+  "OPPORTUNITY_COST",
+  "DELAYED_OR_RESIDUAL_HARM",
+  "INCONCLUSIVE",
+  "UNKNOWN",
+]
+required_evidence = [
+  "affected artifact/action/effect/verifier or explicit observation gap",
+  "severity, reversibility, residual state, and affected scope",
+]
+
+[[dimension]]
+name = "regret"
+closed_values = [
+  "NO_REGRET_OBSERVED",
+  "AVOIDABLE_ACTION_REGRET",
+  "AVOIDABLE_INACTION_REGRET",
+  "POLICY_OR_ROUTE_REGRET",
+  "ROLLBACK_REGRET",
+  "COUNTERFACTUAL_REGRET_ESTIMATE",
+  "INCONCLUSIVE",
+  "UNKNOWN",
+]
+required_evidence = [
+  "foregone or alternative action",
+  "available information at the original decision boundary",
+  "counterfactual status and uncertainty",
+  "avoidability and reversibility",
+]
+
+[[dimension]]
+name = "rollback_and_reopen"
+closed_values = [
+  "NOT_REQUIRED",
+  "AVAILABLE_NOT_USED",
+  "EXECUTED_VERIFIED",
+  "EXECUTED_UNVERIFIED",
+  "PARTIAL",
+  "FAILED",
+  "UNKNOWN_OUTCOME",
+  "NO_ROLLBACK_PATH",
+]
+required_evidence = [
+  "rollback/compensation identity and receipt when executed",
+  "residual effect and reopen/review condition",
+]
+
+[[invariant]]
+id = "MOE-001"
+statement = "Outcome, cost, harm, regret, attribution, retention, and transfer remain independent; no scalar utility/confidence collapses them."
+failure = "Reject the dimension-collapsed record."
+
+[[invariant]]
+id = "MOE-002"
+statement = "Use or decision delta does not prove benefit; benefit above observed association requires applicable outcome evidence and comparison/counterfactual support."
+failure = "Lower attribution ceiling or return UNKNOWN."
+
+[[invariant]]
+id = "MOE-003"
+statement = "A lucky outcome does not prove decision quality or mechanism; available evidence, alternatives, risk, evaluator validity, and confounders remain visible."
+failure = "Return INCONCLUSIVE or COMPOSITE_BENEFIT with explicit rivals."
+
+[[invariant]]
+id = "MOE-004"
+statement = "Missing cost, harm, delayed outcome, or comparator evidence remains typed missingness and is never encoded as zero, none, or success."
+failure = "Reject unsupported zero/no-harm/no-regret claims."
+
+[[invariant]]
+id = "MOE-005"
+statement = "Same-model, same-route, shared-evidence, shared-evaluator, and shared-parent-context dependencies remain explicit and cannot be labelled independent."
+failure = "Lower independence/attribution ceiling."
+
+[[invariant]]
+id = "MOE-006"
+statement = "This contract emits evaluation evidence only; it cannot apply accessibility/support/lifecycle transitions or promote an Improvement Candidate."
+failure = "Return OWNER_AUTHORITY_REQUIRED."
+
+[[invariant]]
+id = "MOE-007"
+statement = "Outcome windows may remain open after task finish; unfinished delayed evidence is CENSORED, DEFERRED, or UNKNOWN rather than mature success."
+failure = "Reject premature terminal outcome."
+
+[[fixture]]
+id = "delivered-unused-no-outcome"
+input = "Memory was fully delivered, complete denominator establishes non-use, and no downstream outcome is attributable."
+expected = "use evidence may be complete; outcome = NOT_APPLICABLE or UNKNOWN; benefit is forbidden"
+
+[[fixture]]
+id = "used-harmful"
+input = "Exact memory changed an action and the verifier/artifact regressed."
+expected = "attribution at most SUPPORTED_CONTRIBUTION or OBSERVED_UNDER_INTERVENTION as evidence permits; outcome = REGRESSED; harm is explicit"
+
+[[fixture]]
+id = "composite-success"
+input = "Memory, tool change, route change, and Human correction occurred together."
+expected = "attribution = COMPOSITE_BENEFIT or UNKNOWN; rival causes and confounders retained"
+
+[[fixture]]
+id = "unknown-cost"
+input = "Provider exposes no billing and tool CPU cost is unavailable."
+expected = "cost fields = NOT_EXPOSED or UNKNOWN; never zero"
+
+[[fixture]]
+id = "counterfactual-absent"
+input = "Outcome improved, but no applicable control, intervention, or strong counterfactual exists."
+expected = "outcome = IMPROVED; attribution ceiling no stronger than OBSERVED_ASSOCIATION"
+
+[[fixture]]
+id = "delayed-window-open"
+input = "Immediate result improved; recurrence and retention window remains open."
+expected = "immediate outcome recorded; delayed outcome = CENSORED/UNKNOWN; retention or transfer claim forbidden"
+
+[[fixture]]
+id = "protected-regret"
+input = "Protected minority evidence produced no immediate use and incurred context cost."
+expected = "cost is recorded; no automatic suppression/demotion; protected-role review required"
