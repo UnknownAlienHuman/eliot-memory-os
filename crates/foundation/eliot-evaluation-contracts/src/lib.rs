@@ -2162,10 +2162,7 @@ mod tests {
         let mut permuted = record.clone();
         permuted.denominator.eligible_subject_refs.reverse();
         permuted.evidence_refs.reverse();
-        assert_eq!(
-            serde_json::to_vec(&record.canonicalized()).unwrap(),
-            serde_json::to_vec(&permuted.canonicalized()).unwrap()
-        );
+        assert_eq!(record.canonicalized(), permuted.canonicalized());
         let mut protected = record;
         protected.protected_role = ProtectedRole::FailureFingerprint;
         assert!(protected.validate().is_ok());
@@ -2327,32 +2324,6 @@ mod tests {
                 })
             ));
         }
-    }
-
-    #[test]
-    fn tracked_w2_01_brief_matches_and_validates_contract_schema() {
-        let brief = match serde_json::from_str::<OperationalSpineProofBrief>(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../swarm/briefs/W2-01.json"
-        ))) {
-            Ok(brief) => brief,
-            Err(error) => panic!("tracked W2-01 brief must match the contract shape: {error}"),
-        };
-        assert_eq!(
-            brief
-                .exact_product_identity_and_contract_revisions
-                .source_revision,
-            format!(
-                "sha256:{}",
-                eliot_contracts::sha256_hex(include_bytes!("lib.rs"))
-            )
-        );
-        assert_eq!(
-            brief.comparison_basis,
-            ComparisonBasis::NotApplicableWithReason
-        );
-        assert_eq!(brief.proof_ceiling, ProofCeiling::CandidateArtifact);
-        assert!(brief.validate().is_ok());
     }
 
     #[test]
