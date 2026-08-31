@@ -1203,8 +1203,12 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
         }
         let coordination_wire: CoordinationOwner =
             decode_owner_snapshot(recovery, RecoveryOwner::Coordination)?;
-        let coordination = CoordinationOwner::from_snapshot(coordination_wire)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let coordination = CoordinationOwner::from_snapshot_at(
+            coordination_wire,
+            state_fence.authority_epoch,
+            state_fence,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let finish_receipts: Vec<FinishDecisionReceipt> =
             decode_owner_snapshot(recovery, RecoveryOwner::Finish)?;
         if finish_receipts
@@ -2727,6 +2731,42 @@ mod tests {
             GovernorComposition::new(Arc::new(expired), &expected, QueueLimits::default())
                 .expect("composition");
         assert!(composition.read_unique_agent_activation(20).is_err());
+    }
+
+    #[test]
+    fn recovery_rejects_malformed_coordination_heartbeat_before_readiness() {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let valid = GovernorComposition::new(
+            Arc::new(activation_fake(&observed)),
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("valid coordination heartbeat");
+        assert!(valid.read_unique_agent_activation(20).is_ok());
+
+        for (name, field, value) in [
+            ("zero deadline", "heartbeat_deadline", 0),
+            ("heartbeat after deadline", "last_heartbeat", 101),
+        ] {
+            let mut fake = activation_fake(&observed);
+            let mut coordination: serde_json::Value = serde_json::from_slice(
+                fake.payloads
+                    .get(&RecoveryOwner::Coordination)
+                    .expect("coordination payload"),
+            )
+            .expect("coordination snapshot");
+            coordination["sessions"]["session-1"][field] = serde_json::Value::from(value);
+            fake.payloads.insert(
+                RecoveryOwner::Coordination,
+                canonical_json_bytes(&coordination).expect("coordination bytes"),
+            );
+            assert!(
+                GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default())
+                    .is_err(),
+                "recovery accepted {name}"
+            );
+        }
     }
 
     #[test]
