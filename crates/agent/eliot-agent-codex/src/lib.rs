@@ -27,6 +27,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 pub mod catalogue;
+pub mod preflight;
 
 pub const CODEX_ADAPTER_ID: &str = "eliot-agent-codex";
 pub const CODEX_HOST_FAMILY: &str = "codex";
@@ -72,6 +73,16 @@ pub enum CodexAdapterError {
     MissingResult,
     #[error("Codex result is already terminal")]
     TerminalAttempt,
+    #[error("Codex preflight is incomplete: initialize→initialized→model/list required")]
+    PreflightIncomplete,
+    #[error("Codex wire is stale or legacy: {0}")]
+    StaleWire(&'static str),
+    #[error("Codex catalogue is stale or expired")]
+    CatalogueStale,
+    #[error("Codex catalogue binding mismatch: {0}")]
+    CatalogueMismatch(&'static str),
+    #[error("Codex model is not present in the bound catalogue snapshot")]
+    ModelNotInCatalogue,
 }
 
 /// Exact route constructor.  The resulting value is still the A-01 route
@@ -363,6 +374,30 @@ pub fn begin_attempt(
     attempt_id: AttemptId,
     continuity: ContinuityKind,
 ) -> Result<AgentAttempt, CodexAdapterError> {
+    begin_attempt_with_gate(attached, None, lease, attempt_id, continuity)
+}
+
+/// Per-attempt binding that requires a ready preflight gate with a validated
+/// `ModelCatalogueSnapshot` identity. The bound model must exactly match
+/// `attached.route.model` and the snapshot must be current.
+pub fn begin_attempt_with_gate(
+    attached: &CodexAttachReceipt,
+    gate: Option<&crate::preflight::CodexPreflightGate>,
+    lease: WorkLeaseId,
+    attempt_id: AttemptId,
+    continuity: ContinuityKind,
+) -> Result<AgentAttempt, CodexAdapterError> {
+    if let Some(gate) = gate {
+        gate.require_ready()?;
+        let bound_model = gate
+            .bound_model_id()
+            .ok_or(CodexAdapterError::ModelNotInCatalogue)?;
+        if bound_model != attached.route.model {
+            return Err(CodexAdapterError::CatalogueMismatch(
+                "bound model does not match route",
+            ));
+        }
+    }
     let work_unit: AgentWorkUnitBrief = attached
         .launch
         .work_units
@@ -389,6 +424,19 @@ pub fn begin_attempt(
     attempt.validate()?;
     attempt.transition(AttemptState::Started)?;
     Ok(attempt)
+}
+
+/// Strict per-attempt binding that fails when no catalogue snapshot is bound.
+/// Use this in production to prevent caller-invented universal model strings.
+pub fn begin_attempt_strict(
+    attached: &CodexAttachReceipt,
+    gate: &crate::preflight::CodexPreflightGate,
+    lease: WorkLeaseId,
+    attempt_id: AttemptId,
+    continuity: ContinuityKind,
+) -> Result<AgentAttempt, CodexAdapterError> {
+    gate.require_ready()?;
+    begin_attempt_with_gate(attached, Some(gate), lease, attempt_id, continuity)
 }
 
 /// Codex App Server JSONL envelope.  Provider fields remain opaque `Value`s;
@@ -626,12 +674,41 @@ impl CodexWireMessage {
         Self::request(id, "thread/start", serde_json::json!({ "cwd": cwd.into() }))
     }
 
+    /// Gated thread/start that requires a ready preflight gate.
+    pub fn thread_start_checked(
+        id: impl Into<String>,
+        cwd: impl Into<String>,
+        gate: &crate::preflight::CodexPreflightGate,
+    ) -> Result<Self, CodexAdapterError> {
+        gate.require_ready()?;
+        Ok(Self::request(
+            id,
+            "thread/start",
+            serde_json::json!({ "cwd": cwd.into() }),
+        ))
+    }
+
     pub fn turn_start(id: impl Into<String>, thread_id: &str, input: &Value) -> Self {
         Self::request(
             id,
             "turn/start",
             serde_json::json!({ "threadId": thread_id, "input": input }),
         )
+    }
+
+    /// Gated turn/start that requires a ready preflight gate.
+    pub fn turn_start_checked(
+        id: impl Into<String>,
+        thread_id: &str,
+        input: &Value,
+        gate: &crate::preflight::CodexPreflightGate,
+    ) -> Result<Self, CodexAdapterError> {
+        gate.require_ready()?;
+        Ok(Self::request(
+            id,
+            "turn/start",
+            serde_json::json!({ "threadId": thread_id, "input": input }),
+        ))
     }
 
     pub fn turn_interrupt(id: impl Into<String>, thread_id: &str, turn_id: &str) -> Self {
@@ -882,6 +959,13 @@ pub fn wire_schema() -> Value {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps
+)]
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
@@ -1548,6 +1632,326 @@ mod tests {
         );
         assert!(attached.process_request().is_none());
         assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    fn make_gate_and_snapshot(
+        now: u64,
+        model: &str,
+    ) -> TestResult<(
+        crate::preflight::CodexPreflightGate,
+        eliot_agent_coordinator::ModelCatalogueSnapshot,
+    )> {
+        use crate::catalogue::{
+            CODEX_CATALOGUE_CONTEXT_VERSION, CodexModelWire, CodexProviderPolicy,
+            CodexRouteTemplate, compile_codex_model_catalogue,
+        };
+        use eliot_agent_coordinator::{
+            ModelRole, QuotaDisposition, QuotaObservation, RouteAdmissionStatus, RouteHealthStatus,
+        };
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut gate = crate::preflight::CodexPreflightGate::new();
+        gate.observe(&CodexWireMessage::initialize("init-1", "eliot", "0.1.0"))?;
+        gate.observe(&CodexWireMessage {
+            id: Some(Value::String("init-1".to_owned())),
+            message_type: None,
+            method: None,
+            params: None,
+            result: Some(serde_json::json!({})),
+            error: None,
+        })?;
+        gate.observe(&CodexWireMessage::initialized())?;
+        gate.observe(&CodexWireMessage::model_list("ml-1", None, false, None))?;
+        gate.observe(&CodexWireMessage {
+            id: Some(Value::String("ml-1".to_owned())),
+            message_type: None,
+            method: None,
+            params: None,
+            result: Some(serde_json::json!({"data": {}})),
+            error: None,
+        })?;
+        let ctx = crate::catalogue::CodexCatalogueContext {
+            schema_version: CODEX_CATALOGUE_CONTEXT_VERSION.to_owned(),
+            snapshot_id: "snapshot-1".to_owned(),
+            account_scope: "account-1".to_owned(),
+            collector_identity: "codex-provider-catalogue-v1".to_owned(),
+            observed_at_unix_ms: now - 50,
+            expires_at_unix_ms: now + 50,
+            health_receipt_ref: "health-receipt".to_owned(),
+            catalogue_receipt_ref: "catalogue-receipt".to_owned(),
+            provider_id: "codex".to_owned(),
+            provider_policy: CodexProviderPolicy {
+                route: CodexRouteTemplate {
+                    runtime_hash: "runtime-hash".to_owned(),
+                    adapter_hash: "adapter-hash".to_owned(),
+                    auth_billing: "account-1".to_owned(),
+                    serializer_hash: "serializer-hash".to_owned(),
+                    tool_semantics_hash: "tool-semantics-hash".to_owned(),
+                    reasoning_mode: "catalogue-default".to_owned(),
+                    continuation_behavior: "native-resume".to_owned(),
+                    feature_flags_hash: "feature-flags-hash".to_owned(),
+                },
+                route_admission: RouteAdmissionStatus::Admitted,
+                route_health: RouteHealthStatus::Healthy,
+                billing_mode: crate::catalogue::CodexBillingMode::CataloguePrice,
+                model_billing_overrides: BTreeMap::new(),
+                billing_source: "codex-billing".to_owned(),
+                billing_receipt_ref: "billing-receipt".to_owned(),
+                quota: Some(QuotaObservation {
+                    disposition: QuotaDisposition::Available,
+                    source: "codex-quota".to_owned(),
+                    receipt_ref: "quota-receipt".to_owned(),
+                    observed_at_unix_ms: now - 50,
+                    expires_at_unix_ms: now + 50,
+                    reset_at_unix_ms: Some(now + 1000),
+                    remaining_microunits: Some(10),
+                }),
+                quota_source: "codex-quota".to_owned(),
+                quota_receipt_ref: "quota-receipt".to_owned(),
+                cost_class: 1,
+                latency_class: 1,
+                role_eligibility: BTreeSet::from([ModelRole::Worker]),
+                evidence_refs: vec!["route-policy-receipt".to_owned()],
+            },
+            provider_connected: true,
+            provider_health: RouteHealthStatus::Healthy,
+            evidence_refs: vec!["collector-receipt".to_owned()],
+        };
+        let mut models = BTreeMap::new();
+        models.insert(
+            model.to_owned(),
+            CodexModelWire {
+                id: Some(model.to_owned()),
+                display_name: Some(model.to_owned()),
+                family: Some("family-a".to_owned()),
+                context_window: Some(200_000),
+                context_limit: None,
+                limit: None,
+                cost: Some(crate::catalogue::CodexModelCost {
+                    input: Some(serde_json::Number::from(0)),
+                    output: Some(serde_json::Number::from(0)),
+                }),
+                capabilities: None,
+                extra: BTreeMap::new(),
+            },
+        );
+        let collection = compile_codex_model_catalogue(&ctx, &models)?;
+        let mut snapshot = collection.snapshot;
+        snapshot.observed_at_unix_ms = now - 50;
+        snapshot.expires_at_unix_ms = now + 50;
+        for entry in &mut snapshot.entries {
+            entry.billing.observed_at_unix_ms = now - 50;
+            entry.billing.expires_at_unix_ms = now + 50;
+            entry.quota.observed_at_unix_ms = now - 50;
+            entry.quota.expires_at_unix_ms = now + 50;
+        }
+        snapshot.validate()?;
+        // bind catalogue using the exact route that the attached receipt will use
+        let route = crate::codex_route(
+            "runtime-hash",
+            "adapter-hash",
+            "codex",
+            model,
+            "account-1",
+            "serializer-hash",
+            "tool-semantics-hash",
+            "catalogue-default",
+            "native-resume",
+            "feature-flags-hash",
+        );
+        gate.bind_catalogue(&snapshot, &route, now)?;
+        Ok((gate, snapshot))
+    }
+
+    #[test]
+    fn preflight_gate_blocks_thread_turn_before_ready() -> TestResult {
+        let gate = crate::preflight::CodexPreflightGate::new();
+        assert!(matches!(
+            CodexWireMessage::thread_start_checked("t-1", "C:\\workspace", &gate),
+            Err(CodexAdapterError::PreflightIncomplete)
+        ));
+        assert!(matches!(
+            CodexWireMessage::turn_start_checked(
+                "turn-1",
+                "thread-1",
+                &serde_json::json!({}),
+                &gate
+            ),
+            Err(CodexAdapterError::PreflightIncomplete)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_gate_allows_thread_turn_after_ready() -> TestResult {
+        let now = 10_000;
+        let (gate, _) = make_gate_and_snapshot(now, "model-a")?;
+        assert!(CodexWireMessage::thread_start_checked("t-1", "C:\\workspace", &gate).is_ok());
+        assert!(
+            CodexWireMessage::turn_start_checked(
+                "turn-1",
+                "thread-1",
+                &serde_json::json!({ "prompt": "hi" }),
+                &gate
+            )
+            .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn begin_attempt_strict_requires_bound_catalogue() -> TestResult {
+        let attached = attached()?;
+        let gate = crate::preflight::CodexPreflightGate::new();
+        assert!(matches!(
+            begin_attempt_strict(
+                &attached,
+                &gate,
+                WorkLeaseId::new("lease-1")?,
+                AttemptId::new("attempt-1")?,
+                ContinuityKind::Fresh
+            ),
+            Err(CodexAdapterError::PreflightIncomplete)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn begin_attempt_strict_rejects_mismatched_catalogue() -> TestResult {
+        let now = 10_000;
+        // gate bound to model-a but attached route is for generic "model"
+        let (gate, snapshot) = make_gate_and_snapshot(now, "model-a")?;
+        let attached = attached()?; // route model == "model"
+        // gate bound to model-a, attached expects model-a? Actually attached route model == "model", so mismatch
+        assert!(matches!(
+            begin_attempt_strict(
+                &attached,
+                &gate,
+                WorkLeaseId::new("lease-1")?,
+                AttemptId::new("attempt-1")?,
+                ContinuityKind::Fresh
+            ),
+            Err(CodexAdapterError::CatalogueMismatch(_))
+        ));
+        // also test mismatched snapshot directly via gate binding: try bind wrong model
+        let wrong_route = crate::codex_route(
+            "runtime-hash",
+            "adapter-hash",
+            "codex",
+            "other-model",
+            "account-1",
+            "serializer-hash",
+            "tool-semantics-hash",
+            "catalogue-default",
+            "native-resume",
+            "feature-flags-hash",
+        );
+        let mut fresh_gate = crate::preflight::CodexPreflightGate::new();
+        fresh_gate.observe(&CodexWireMessage::initialize("init-1", "eliot", "0.1.0"))?;
+        fresh_gate.observe(&CodexWireMessage {
+            id: Some(Value::String("init-1".to_owned())),
+            message_type: None,
+            method: None,
+            params: None,
+            result: Some(serde_json::json!({})),
+            error: None,
+        })?;
+        fresh_gate.observe(&CodexWireMessage::initialized())?;
+        fresh_gate.observe(&CodexWireMessage::model_list("ml-1", None, false, None))?;
+        fresh_gate.observe(&CodexWireMessage {
+            id: Some(Value::String("ml-1".to_owned())),
+            message_type: None,
+            method: None,
+            params: None,
+            result: Some(serde_json::json!({})),
+            error: None,
+        })?;
+        assert!(matches!(
+            fresh_gate.bind_catalogue(&snapshot, &wrong_route, now),
+            Err(CodexAdapterError::ModelNotInCatalogue)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn begin_attempt_strict_rejects_absent_snapshot_and_stale_wire() -> TestResult {
+        // absent: gate without catalogue Observed phase
+        let mut gate = crate::preflight::CodexPreflightGate::new();
+        gate.observe(&CodexWireMessage::initialize("init-1", "eliot", "0.1.0"))?;
+        // not completing remaining phases -> require_ready fails
+        assert!(gate.require_ready().is_err());
+        // legacy wire rejected via parse_line
+        assert!(
+            CodexWireMessage::parse_line(
+                br#"{"jsonrpc":"2.0","id":"1","method":"initialize","params":{}}"#
+            )
+            .is_err()
+        );
+        // stale protocolVersion via gate
+        let mut gate2 = crate::preflight::CodexPreflightGate::new();
+        let mut legacy = CodexWireMessage::initialize("init-1", "eliot", "0.1.0");
+        legacy.params = Some(serde_json::json!({"protocolVersion": "0.1.0"}));
+        assert!(matches!(
+            gate2.observe(&legacy),
+            Err(CodexAdapterError::StaleWire(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn begin_attempt_strict_succeeds_with_exact_binding() -> TestResult {
+        let now = 10_000;
+        // Create an attached receipt whose route matches the snapshot's model
+        // Build a custom attached with runtime-hash etc matching snapshot
+        let (source_assurance, source_expectation) = source()?;
+        let launch = launch()?;
+        let route = crate::codex_route(
+            "runtime-hash",
+            "adapter-hash",
+            "codex",
+            "model-a",
+            "account-1",
+            "serializer-hash",
+            "tool-semantics-hash",
+            "catalogue-default",
+            "native-resume",
+            "feature-flags-hash",
+        );
+        let authority = eliot_agent_api::AuthorityEnvelope {
+            epoch: eliot_agent_api::AuthorityEpoch::new(1)?,
+            scope_ref: "scope-1".into(),
+            effect_ceiling: ceiling(),
+            lease: WorkLeaseId::new("lease-1")?,
+            state_fence: eliot_agent_api::StateFence::new(
+                eliot_agent_api::AuthorityEpoch::new(1)?,
+                eliot_agent_api::ResourceGeneration::new(1)?,
+            ),
+            valid_until: "never".into(),
+        };
+        let attached = attach(crate::CodexAttachInput {
+            launch,
+            authority,
+            route: route.clone(),
+            session: CodexSessionBinding {
+                session_id: SessionId::new("session-1")?,
+                thread_id: "thread-1".into(),
+                runtime_hash: "runtime-hash".into(),
+                working_directory: "C:\\workspace".into(),
+            },
+            process_request: process_request()?,
+            source_assurance,
+            source_expectation,
+        })?;
+        let (gate, _) = make_gate_and_snapshot(now, "model-a")?;
+        let attempt = begin_attempt_strict(
+            &attached,
+            &gate,
+            WorkLeaseId::new("lease-1")?,
+            AttemptId::new("attempt-1")?,
+            ContinuityKind::Fresh,
+        )?;
+        assert_eq!(attempt.route.model, "model-a");
+        assert_eq!(attempt.route.provider, "codex");
         Ok(())
     }
 }
