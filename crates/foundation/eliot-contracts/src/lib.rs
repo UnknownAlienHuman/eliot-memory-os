@@ -125,6 +125,136 @@ string_id!(/// Identity of an immutable artifact or generation.
 string_id!(/// Identity of a contract surface.
     ContractId, "contract_id");
 
+/// Stable contract name for the owner-neutral `WorkLease` identity family.
+pub const WORK_LEASE_CONTRACT_NAME: &str = "eliot.foundation.work-lease-id";
+/// Exact namespace tag carried by every `WorkLease` wire value.
+pub const WORK_LEASE_NAMESPACE: &str = "eliot.governor.work-lease";
+/// Exact version tag carried by every `WorkLease` wire value.
+pub const WORK_LEASE_WIRE_REVISION: &str = "v1";
+/// Semantic version of the `WorkLease` contract surface.
+pub const WORK_LEASE_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+/// Maximum `WorkLease` value length, measured in Unicode scalar values.
+pub const WORK_LEASE_MAX_VALUE_LENGTH: usize = 128;
+/// Legacy scalar and wrong-domain `WorkLease` wires are rejected at this boundary.
+pub const WORK_LEASE_LEGACY_WIRE_DISPOSITION: &str =
+    "rejected: unversioned scalar and wrong-domain legacy wire";
+
+/// Shape-only validation failure for an owner-neutral `WorkLease` value.
+///
+/// Errors identify only the failing field and never include the supplied value.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum WorkLeaseIdError {
+    /// The value is empty or consists only of whitespace.
+    #[error("{field} must be non-blank")]
+    Blank { field: &'static str },
+    /// The value contains a control character.
+    #[error("{field} contains a control character")]
+    ControlCharacter { field: &'static str },
+    /// The value has whitespace at either boundary.
+    #[error("{field} must not have boundary whitespace")]
+    BoundaryWhitespace { field: &'static str },
+    /// The value exceeds the bounded opaque-text limit.
+    #[error("{field} exceeds the maximum Unicode scalar value length")]
+    TooLong { field: &'static str },
+}
+
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+enum WorkLeaseNamespace {
+    #[serde(rename = "eliot.governor.work-lease")]
+    #[schemars(rename = "eliot.governor.work-lease")]
+    GovernorWorkLease,
+}
+
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+enum WorkLeaseWireRevision {
+    #[serde(rename = "v1")]
+    #[schemars(rename = "v1")]
+    V1,
+}
+
+/// Owner-neutral identity for one bounded unit of work.
+///
+/// The value is opaque text accepted only through this exact versioned wire.
+/// This contract validates shape only; it cannot prove or promote a UUID,
+/// provider, process, session, `StateFence`, map-key, API, coordination, or
+/// legacy identity. The namespace tag—not the spelling of the value—determines
+/// this identity family.
+///
+/// # Compatibility
+///
+/// Issue #378 intentionally exposes no string-only issuance or promotion
+/// constructor. Issue #368 owns issuance and provenance-preserving consumer
+/// migration.
+#[derive(Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkLeaseId {
+    namespace: WorkLeaseNamespace,
+    revision: WorkLeaseWireRevision,
+    #[schemars(length(min = 1, max = 128))]
+    value: String,
+}
+
+fn validate_work_lease_value(value: &str) -> Result<(), WorkLeaseIdError> {
+    const FIELD: &str = "work_lease_id.value";
+    if value.trim().is_empty() {
+        return Err(WorkLeaseIdError::Blank { field: FIELD });
+    }
+    if value.chars().any(char::is_control) {
+        return Err(WorkLeaseIdError::ControlCharacter { field: FIELD });
+    }
+    if value != value.trim() {
+        return Err(WorkLeaseIdError::BoundaryWhitespace { field: FIELD });
+    }
+    if value.chars().count() > WORK_LEASE_MAX_VALUE_LENGTH {
+        return Err(WorkLeaseIdError::TooLong { field: FIELD });
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkLeaseIdWire {
+    namespace: WorkLeaseNamespace,
+    revision: WorkLeaseWireRevision,
+    value: String,
+}
+
+impl<'de> Deserialize<'de> for WorkLeaseId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = WorkLeaseIdWire::deserialize(deserializer)?;
+        validate_work_lease_value(&wire.value).map_err(de::Error::custom)?;
+        Ok(Self {
+            namespace: wire.namespace,
+            revision: wire.revision,
+            value: wire.value,
+        })
+    }
+}
+
+/// Returns the deterministic contract/schema identity for `WorkLeaseId`.
+pub fn work_lease_contract_identity() -> Result<ContractIdentity, ContractError> {
+    contract_identity(
+        WORK_LEASE_CONTRACT_NAME,
+        WORK_LEASE_CONTRACT_VERSION,
+        &serde_json::json!({
+            "contract_name": WORK_LEASE_CONTRACT_NAME,
+            "contract_version": WORK_LEASE_CONTRACT_VERSION,
+            "legacy_wire_disposition": WORK_LEASE_LEGACY_WIRE_DISPOSITION,
+            "max_value_length": WORK_LEASE_MAX_VALUE_LENGTH,
+            "namespace": WORK_LEASE_NAMESPACE,
+            "schema": schemars::schema_for!(WorkLeaseId),
+            "wire_revision": WORK_LEASE_WIRE_REVISION,
+        }),
+    )
+}
+
 macro_rules! counter {
     ($(#[$meta:meta])* $name:ident, $label:literal) => {
         $(#[$meta])*
@@ -565,6 +695,14 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+    fn decode_test_wire(value: &str) -> Result<WorkLeaseId, serde_json::Error> {
+        serde_json::from_value(serde_json::json!({
+            "namespace": WORK_LEASE_NAMESPACE,
+            "revision": WORK_LEASE_WIRE_REVISION,
+            "value": value,
+        }))
+    }
+
     #[test]
     fn identifiers_reject_blank_and_controls() -> TestResult {
         assert!(ProductId::new(" ").is_err());
@@ -641,6 +779,210 @@ mod tests {
             let decoded: ProductId = serde_json::from_str(&wire)?;
             assert_eq!(decoded.as_str(), value);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn work_lease_wire_schema_roundtrip_and_identity_are_stable() -> TestResult {
+        assert_eq!(WORK_LEASE_CONTRACT_NAME, "eliot.foundation.work-lease-id");
+        assert_eq!(WORK_LEASE_NAMESPACE, "eliot.governor.work-lease");
+        assert_eq!(WORK_LEASE_WIRE_REVISION, "v1");
+        assert_eq!(WORK_LEASE_CONTRACT_VERSION, ContractVersion::new(1, 0, 0));
+        assert_eq!(WORK_LEASE_MAX_VALUE_LENGTH, 128);
+        assert!(WORK_LEASE_LEGACY_WIRE_DISPOSITION.contains("unversioned scalar"));
+        assert!(WORK_LEASE_LEGACY_WIRE_DISPOSITION.contains("wrong-domain legacy wire"));
+
+        let id = decode_test_wire("owner-a")?;
+        let encoded = serde_json::to_string(&id)?;
+        assert_eq!(
+            encoded,
+            r#"{"namespace":"eliot.governor.work-lease","revision":"v1","value":"owner-a"}"#
+        );
+        assert_eq!(serde_json::from_str::<WorkLeaseId>(&encoded)?, id);
+
+        let schema = serde_json::to_value(schemars::schema_for!(WorkLeaseId))?;
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"].as_object().map(Map::len), Some(3));
+        assert_eq!(schema["required"].as_array().map(Vec::len), Some(3));
+        assert_eq!(schema["properties"]["value"]["minLength"], 1);
+        assert_eq!(
+            schema["properties"]["value"]["maxLength"],
+            WORK_LEASE_MAX_VALUE_LENGTH
+        );
+        assert_eq!(
+            schema["$defs"]["WorkLeaseNamespace"]["enum"],
+            serde_json::json!([WORK_LEASE_NAMESPACE])
+        );
+        assert_eq!(
+            schema["$defs"]["WorkLeaseWireRevision"]["enum"],
+            serde_json::json!([WORK_LEASE_WIRE_REVISION])
+        );
+        let schema_bytes = serde_json::to_vec(&schema)?;
+        let repeated_schema_bytes =
+            serde_json::to_vec(&serde_json::to_value(schemars::schema_for!(WorkLeaseId))?)?;
+        assert_eq!(schema_bytes, repeated_schema_bytes);
+        assert_eq!(schema.to_string().matches(WORK_LEASE_NAMESPACE).count(), 1);
+        assert_eq!(
+            schema.to_string().matches(WORK_LEASE_WIRE_REVISION).count(),
+            1
+        );
+
+        let first = work_lease_contract_identity()?;
+        let second = work_lease_contract_identity()?;
+        assert_eq!(first, second);
+        assert_eq!(first.name, ContractId::new(WORK_LEASE_CONTRACT_NAME)?);
+        assert_eq!(first.version, WORK_LEASE_CONTRACT_VERSION);
+        assert_eq!(
+            first.shape_sha256,
+            "abd7f2032837bb968b78072102f633e3b0871d856c40845008d225162b7c11d4"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn work_lease_value_validation_is_bounded_and_field_only() {
+        assert!(matches!(
+            validate_work_lease_value(""),
+            Err(WorkLeaseIdError::Blank {
+                field: "work_lease_id.value"
+            })
+        ));
+        assert!(matches!(
+            validate_work_lease_value("   "),
+            Err(WorkLeaseIdError::Blank {
+                field: "work_lease_id.value"
+            })
+        ));
+        assert!(matches!(
+            validate_work_lease_value("owner\u{7}value"),
+            Err(WorkLeaseIdError::ControlCharacter {
+                field: "work_lease_id.value"
+            })
+        ));
+        assert!(matches!(
+            validate_work_lease_value(" owner"),
+            Err(WorkLeaseIdError::BoundaryWhitespace {
+                field: "work_lease_id.value"
+            })
+        ));
+        assert!(matches!(
+            validate_work_lease_value("owner "),
+            Err(WorkLeaseIdError::BoundaryWhitespace {
+                field: "work_lease_id.value"
+            })
+        ));
+        assert!(matches!(
+            validate_work_lease_value(&"x".repeat(WORK_LEASE_MAX_VALUE_LENGTH + 1)),
+            Err(WorkLeaseIdError::TooLong {
+                field: "work_lease_id.value"
+            })
+        ));
+        assert!(validate_work_lease_value(&"🙂".repeat(WORK_LEASE_MAX_VALUE_LENGTH)).is_ok());
+        assert!(decode_test_wire(&"🙂".repeat(WORK_LEASE_MAX_VALUE_LENGTH)).is_ok());
+    }
+
+    #[test]
+    fn work_lease_wire_rejects_legacy_wrong_domain_and_malformed_objects() {
+        let legacy_uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let legacy_forms = [
+            "lease-1".to_owned(),
+            String::new(),
+            legacy_uuid.to_owned(),
+            legacy_uuid.replace('-', ""),
+            format!("urn:uuid:{legacy_uuid}"),
+            format!("{{{legacy_uuid}}}"),
+        ];
+        for legacy in legacy_forms {
+            assert!(serde_json::from_value::<WorkLeaseId>(serde_json::json!(legacy)).is_err());
+        }
+
+        let malformed = [
+            serde_json::json!({
+                "namespace": "other.domain.work-lease",
+                "revision": WORK_LEASE_WIRE_REVISION,
+                "value": "owner"
+            }),
+            serde_json::json!({
+                "namespace": WORK_LEASE_NAMESPACE,
+                "revision": "v2",
+                "value": "owner"
+            }),
+            serde_json::json!({
+                "namespace": WORK_LEASE_NAMESPACE,
+                "revision": WORK_LEASE_WIRE_REVISION,
+                "value": "owner",
+                "unknown": true
+            }),
+            serde_json::json!({
+                "namespace": WORK_LEASE_NAMESPACE,
+                "revision": WORK_LEASE_WIRE_REVISION
+            }),
+            serde_json::json!({
+                "namespace": WORK_LEASE_NAMESPACE,
+                "value": "owner"
+            }),
+            serde_json::json!({
+                "revision": WORK_LEASE_WIRE_REVISION,
+                "value": "owner"
+            }),
+        ];
+        for value in malformed {
+            assert!(serde_json::from_value::<WorkLeaseId>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn work_lease_deserializer_revalidates_value_shape() {
+        let cases = [
+            (
+                serde_json::json!(""),
+                "work_lease_id.value must be non-blank",
+            ),
+            (
+                serde_json::json!(" "),
+                "work_lease_id.value must be non-blank",
+            ),
+            (
+                serde_json::json!(" owner"),
+                "work_lease_id.value must not have boundary whitespace",
+            ),
+            (
+                serde_json::json!("owner "),
+                "work_lease_id.value must not have boundary whitespace",
+            ),
+            (
+                serde_json::json!("owner\u{7}value"),
+                "work_lease_id.value contains a control character",
+            ),
+            (
+                serde_json::json!("x".repeat(WORK_LEASE_MAX_VALUE_LENGTH + 1)),
+                "work_lease_id.value exceeds the maximum Unicode scalar value length",
+            ),
+        ];
+
+        for (value, expected_error) in cases {
+            let wire = serde_json::json!({
+                "namespace": WORK_LEASE_NAMESPACE,
+                "revision": WORK_LEASE_WIRE_REVISION,
+                "value": value,
+            });
+            let Err(error) = serde_json::from_value::<WorkLeaseId>(wire) else {
+                panic!("invalid value must be rejected by custom deserializer")
+            };
+            assert_eq!(error.to_string(), expected_error);
+        }
+    }
+
+    #[test]
+    fn work_lease_uuid_spelling_does_not_gain_legacy_equivalence() -> TestResult {
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let id = decode_test_wire(uuid)?;
+        let wire = serde_json::to_value(&id)?;
+        assert_eq!(wire["namespace"], WORK_LEASE_NAMESPACE);
+        assert_eq!(wire["revision"], WORK_LEASE_WIRE_REVISION);
+        assert!(serde_json::from_value::<WorkLeaseId>(serde_json::json!(uuid)).is_err());
+        // The namespace tag, not UUID spelling, determines this distinct identity.
         Ok(())
     }
 }
