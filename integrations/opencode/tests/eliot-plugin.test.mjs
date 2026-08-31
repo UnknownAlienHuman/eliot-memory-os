@@ -116,6 +116,107 @@ test("non-loopback bridge configuration fails closed for attached mutations", as
   )
 })
 
+test("a redirecting bridge never re-issues the payload and never decides the gate", async () => {
+  let redirectTargetHits = 0
+  await withServer(async (request, response) => {
+    for await (const _chunk of request) {
+      // Drain before responding.
+    }
+    redirectTargetHits += 1
+    response.writeHead(200, { "content-type": "application/json" })
+    response.end(JSON.stringify({ decision: "allow" }))
+  }, async (targetUrl) => {
+    await withServer(async (request, response) => {
+      for await (const _chunk of request) {
+        // Drain before redirecting.
+      }
+      response.writeHead(308, { location: targetUrl })
+      response.end()
+    }, async (bridgeUrl) => {
+      process.env.ELIOT_TASK_ID = "task-1"
+      process.env.ELIOT_OPENCODE_BRIDGE_URL = bridgeUrl
+      process.env.ELIOT_OPENCODE_BRIDGE_TOKEN = "unit-token"
+      const plugin = await hooks()
+      await assert.rejects(
+        plugin["tool.execute.before"]({ tool: "bash", callID: "call-redirect", args: {} }, {}),
+        /transport failed|bridge/,
+      )
+    })
+  })
+
+  assert.equal(redirectTargetHits, 0)
+})
+
+test("a non-JSON bridge response cannot decide the gate", async () => {
+  await withServer(async (request, response) => {
+    for await (const _chunk of request) {
+      // Drain before responding.
+    }
+    response.writeHead(200, { "content-type": "text/html" })
+    response.end('{"decision":"allow"}')
+  }, async (url) => {
+    process.env.ELIOT_TASK_ID = "task-1"
+    process.env.ELIOT_OPENCODE_BRIDGE_URL = url
+    process.env.ELIOT_OPENCODE_BRIDGE_TOKEN = "unit-token"
+    const plugin = await hooks()
+    await assert.rejects(
+      plugin["tool.execute.before"]({ tool: "write", callID: "call-html", args: {} }, {}),
+      /non-JSON content type/,
+    )
+  })
+})
+
+test("the gate payload carries exactly the contract allowlist and nothing else", async () => {
+  const contract = JSON.parse(
+    await readFile(resolve("integrations/opencode/plugin-bridge-contract.json"), "utf8"),
+  )
+  const allowlist = [...contract.payload.allowlisted_fields].sort()
+
+  await withServer(async (request, response) => {
+    const chunks = []
+    for await (const chunk of request) chunks.push(chunk)
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"))
+
+    assert.deepEqual(Object.keys(payload).sort(), allowlist)
+
+    response.writeHead(200, { "content-type": "application/json" })
+    response.end(JSON.stringify({ decision: "allow" }))
+  }, async (url) => {
+    process.env.ELIOT_TASK_ID = "task-1"
+    process.env.ELIOT_OPENCODE_BRIDGE_URL = url
+    process.env.ELIOT_OPENCODE_BRIDGE_TOKEN = "unit-token"
+    const plugin = await hooks()
+    await plugin["tool.execute.before"](
+      { tool: "edit", callID: "call-allowlist", args: { path: "a", content: "b" } },
+      {},
+    )
+  })
+})
+
+test("string-shaped tool arguments never become one key per byte", async () => {
+  await withServer(async (request, response) => {
+    const chunks = []
+    for await (const chunk of request) chunks.push(chunk)
+    const text = Buffer.concat(chunks).toString("utf8")
+    const payload = JSON.parse(text)
+
+    assert.deepEqual(payload.argument_keys, [])
+    assert.equal(text.includes("top-secret-command"), false)
+
+    response.writeHead(200, { "content-type": "application/json" })
+    response.end(JSON.stringify({ decision: "allow" }))
+  }, async (url) => {
+    process.env.ELIOT_TASK_ID = "task-1"
+    process.env.ELIOT_OPENCODE_BRIDGE_URL = url
+    process.env.ELIOT_OPENCODE_BRIDGE_TOKEN = "unit-token"
+    const plugin = await hooks()
+    await plugin["tool.execute.before"](
+      { tool: "bash", callID: "call-string-args", args: "top-secret-command" },
+      {},
+    )
+  })
+})
+
 test("configured HTTP outage never crosses transport into the legacy process bridge", async () => {
   let legacySpawns = 0
   globalThis.Bun = {
