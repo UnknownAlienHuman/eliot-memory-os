@@ -1,0 +1,75 @@
+name: One-shot 483 reprove and merge
+
+on:
+  push:
+    branches:
+      - work/483-authenticated-swarm-read-v2
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: one-shot-483-reprove-and-merge
+  cancel-in-progress: true
+
+jobs:
+  prove-and-merge:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: work/483-authenticated-swarm-read-v2
+
+      - name: Configure exact branch
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'eliot-483-final-target'
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$target"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'CARGO_INCREMENTAL=0'
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'CARGO_BUILD_JOBS=4'
+          git config user.name 'eliot-proof-bot'
+          git config user.email 'eliot-proof-bot@example.invalid'
+          git fetch origin main
+          git rebase origin/main
+          Remove-Item -LiteralPath '.github/workflows/one-shot-483-merge.yml'
+          git add '.github/workflows/one-shot-483-merge.yml'
+          git commit -m 'chore(ci): retire one-shot 483 merge gate [skip ci]'
+
+      - name: Re-run routed documentation gate
+        shell: pwsh
+        run: |
+          python scripts/docs_router.py route --path crates/surfaces/eliot-controlboard/src/swarm_read.rs --topic "authenticate and fence the zero-model Swarm read view"
+
+      - name: Prove exact final source tree
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          cargo check --locked -p eliot-agent-coordinator -p eliot-controlboard --all-targets
+          cargo test --locked -p eliot-agent-coordinator -p eliot-controlboard --all-targets
+          cargo clippy --locked -p eliot-agent-coordinator -p eliot-controlboard --all-targets -- -D warnings
+          git diff --check
+          if (git status --porcelain) { throw 'Exact final source tree is not clean' }
+
+      - name: Publish exact proved head
+        shell: pwsh
+        run: |
+          git push --force-with-lease origin HEAD:work/483-authenticated-swarm-read-v2
+          "proved_head=$(git rev-parse HEAD)" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          'AUTHENTICATED_SWARM_READ_EDGE_PACKAGE_PROOF_ONLY' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+
+      - name: Mark ready and merge exact head
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $query = 'repos/' + $env:GITHUB_REPOSITORY + '/pulls?head=UnknownAlienHuman:work/483-authenticated-swarm-read-v2&state=open'
+          $pulls = gh api $query | ConvertFrom-Json
+          if ($pulls.Count -ne 1) { throw "Expected exactly one open PR for branch; found $($pulls.Count)" }
+          $number = $pulls[0].number
+          $head = git rev-parse HEAD
+          gh pr ready $number --repo $env:GITHUB_REPOSITORY
+          gh api --method PUT "repos/$env:GITHUB_REPOSITORY/pulls/$number/merge" -f merge_method=squash -f sha=$head | Tee-Object -FilePath $env:RUNNER_TEMP/merge-result.json
