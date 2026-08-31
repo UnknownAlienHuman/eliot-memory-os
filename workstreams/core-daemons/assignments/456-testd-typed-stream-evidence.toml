@@ -1,0 +1,364 @@
+schema = "eliot.agent-work-unit.v1"
+issue = 456
+parent_consumer_tracker = 271
+testd_integration_owner_issue = 20
+process_provider_issue = 267
+process_executor_issue = 268
+process_integration_owner_issue = 100
+strict_finish_issue = 325
+product_pulse_issue = 11
+status = "BLOCKED_ON_267_268_THEN_READY"
+source_base = "15d6b40d06df0eab8c2fc94a856253f36521b305"
+branch = "fix/456-testd-typed-stream-evidence"
+primary_owner = "testd-evidence-consumer"
+primary_cell = "instrument.testd.typed-process-evidence"
+causal_property = "Testd resolves and validates typed immutable stdout/stderr sources before parsing, evaluation, verification or durable citation; process exit, preview, legacy reference and caller-provided bytes never impersonate complete evidence."
+proof_ceiling = "TESTD_PACKAGE_EDGE_CANDIDATE_UNTIL_REAL_PROCESS_BLOB_RESTART_PROOF"
+
+[dependencies]
+required_before_consumer_cutover = [
+  "Issue #267 provides a production immutable stream source adapter.",
+  "Issue #268 makes WindowsProcessExecutor emit current typed ProcessStreamEvidence and removes production raw:p04-stream generation.",
+  "The exact ProcessStreamEvidence schema revision and immutable source locator/receipt contract are recorded in the branch base after rebase.",
+]
+allowed_before_dependencies = [
+  "pure testd-core contract work against the current typed evidence API",
+  "negative fixtures proving legacy refs and arbitrary bytes cannot satisfy current verification",
+]
+forbidden_substitutes = [
+  "synthetic raw:p04-stream locator",
+  "caller-populated handle-to-bytes map as current raw evidence",
+  "captured preview as parser source",
+  "process exit status as parser/evaluator result",
+  "direct Blob filesystem access in testd-core",
+]
+
+[documentation]
+architecture_handles = ["ARCH-MOD-03", "ARCH-OBS-01", "ARCH-SEC-02", "ARCH-FIN-01", "ARCH-RES-04"]
+implementation_handles = ["Instrument Plane IP0-IP5", "I1.3 eliot-testd", "I5.12", "I7.23", "I7.26", "I7.27", "I18"]
+required_files_read = [
+  "AGENTS.md",
+  "crates/instrument/AGENTS.md",
+  "crates/kernel/AGENTS.md",
+  "crates/storage/AGENTS.md",
+  "crates/instrument/eliot-testd-core/Cargo.toml",
+  "crates/instrument/eliot-testd-core/src/lib.rs",
+  "bins/eliot-testd/Cargo.toml",
+  "bins/eliot-testd/src/lib.rs",
+  "crates/kernel/eliot-process/src/execution_evidence.rs",
+  "crates/kernel/eliot-process/src/stream_evidence/**",
+  "crates/kernel/eliot-process/src/stream_sink/**",
+  "workstreams/core-daemons/assignments/267-process-stream-blob-sink.toml",
+  "workstreams/core-daemons/assignments/268-process-executor-stream-sessions.toml",
+]
+routing_commands = [
+  "python scripts/docs_router.py route --path crates/instrument/eliot-testd-core/src/lib.rs --topic 'testd typed process stream evidence source readback parse and verification boundaries'",
+  "python scripts/docs_router.py route --path bins/eliot-testd/src/lib.rs --topic 'testd composition of ProcessExecutor typed streams and immutable source readback'",
+]
+routing_receipt_status = "REQUIRED_PER_WAVE_BEFORE_FIRST_RUST_MUTATION"
+
+[current_defect]
+typed_provider = "eliot_process::ProcessEvidence::stdout()/stderr() -> Option<&ProcessStreamEvidence>"
+legacy_provider = "eliot_process::ProcessEvidence::stdout_ref()/stderr_ref() -> quarantined legacy reference only"
+confirmed_paths = [
+  "EvidenceCollector::verification_receipt iterates stdout_ref/stderr_ref only and therefore omits current typed streams.",
+  "RawArtifact accepts arbitrary nonblank handle plus caller-provided inline bytes.",
+  "record_raw_artifact binds no ProcessExecutionBinding, stream kind, source locator, ready receipt, policy, transformation, State Fence or readback receipt.",
+  "VerificationReceipt::validate proves only local byte/hash consistency and membership of string handles.",
+  "NormalizedEvidence collapses execution, transport, persistence, parsing, evaluation, artifact binding and freshness into prose plus one ExecutionStatus.",
+  "TestdComposition::start_claimed accepts an arbitrary ProcessEvidenceSink instead of constructing the production evidence consumer from the exact job/attempt.",
+  "compose_process_executor creates WindowsProcessExecutor without an immutable stream sink/provider.",
+  "TestReceipt exposes a debug-formatted state string and no typed evidence/recovery disposition.",
+]
+old_discriminator = "Record current typed stdout/stderr with no legacy references, then call EvidenceCollector::verification_receipt: the typed sources are absent; alternatively inject arbitrary bytes under the expected legacy handle and local validation cannot prove process/source origin."
+
+[ownership]
+process_executor = "owns physical process and stream capture; emits ProcessEvidence"
+blob_store = "owns immutable stream bytes and ready/readback receipts"
+testd_core = "owns durable test job/attempt state and provider-neutral evidence admission"
+testd_composition = "wires process evidence, source resolver, parser/evaluator adapters and durable attempt owner"
+parser = "owns parsing result only"
+evaluator = "owns scoped evaluation result only"
+governor_finish = "owns task acceptance and FinishDecision"
+rule = "No wave may move another owner's lifecycle or authority into testd-core."
+
+[wave_a_core_contract]
+owner = "eliot-testd-core"
+mutable_paths = [
+  "crates/instrument/eliot-testd-core/Cargo.toml",
+  "crates/instrument/eliot-testd-core/src/**",
+  "crates/instrument/eliot-testd-core/tests/**",
+]
+required_public_or_owner_local_types = [
+  "TestdProcessEvidenceBundle",
+  "TestdStreamEvidenceBinding",
+  "ProcessStreamSourceReadbackRequest",
+  "ProcessStreamSourceReadbackObservation",
+  "ProcessStreamSourceReadbackPort",
+  "TestdParsingObservation",
+  "TestdEvaluationObservation",
+  "TestdEvidenceDisposition",
+  "TestdEvidenceError",
+]
+reuse_required = [
+  "eliot_process::ProcessEvidence",
+  "eliot_process::ProcessStreamEvidence",
+  "eliot_process::ProcessStreamKind",
+  "eliot_process transport/persistence/gap/source types",
+  "eliot_instrument_api parsing/evaluation/evidence axes when semantically compatible",
+  "existing receipt and artifact identity types when semantically compatible",
+]
+forbidden_parallel_types = [
+  "second ProcessStreamEvidence",
+  "second Blob locator/receipt type",
+  "generic passed bool",
+  "generic status string",
+  "raw provider JSON",
+]
+
+[core_contract.stream_binding]
+required_fields = [
+  "exact ProcessExecutionBinding",
+  "ProcessStreamKind",
+  "ProcessStreamEvidence schema version and exact evidence value",
+  "durable source locator kind/value",
+  "source ready-receipt identity",
+  "source SHA-256 and byte length",
+  "source representation and transformation binding",
+  "policy/privacy/visibility/retention/erasure binding",
+  "transport status",
+  "persistence status",
+  "coverage gaps",
+  "readback observation/receipt identity",
+  "State Fence and freshness/invalidation set",
+]
+validation = [
+  "stream binding equals the enclosing process evidence binding",
+  "stream kind is unique and matches stdout/stderr position",
+  "CompleteSource requires Complete transport, immutable source, no gap and successful exact readback",
+  "zero-byte complete source is valid",
+  "partial source requires explicit gaps and cannot satisfy a complete-source requirement",
+  "legacy reference has no durable source and remains migration unavailable",
+  "policy-prohibited/redaction-failed source exposes no raw bytes",
+]
+
+[core_contract.readback_port]
+signature_shape = "resolve(ProcessStreamSourceReadbackRequest) -> Future<Result<ProcessStreamSourceReadbackObservation, TestdEvidenceError>>"
+request_fields = [
+  "job/attempt/invocation identity",
+  "process binding and stream kind",
+  "immutable source locator",
+  "ready-receipt identity",
+  "expected source digest and length",
+  "policy/disclosure binding",
+  "State Fence",
+  "maximum bytes and deadline",
+]
+observation_fields = [
+  "exact returned bytes or bounded stream reader handle",
+  "observed digest and length",
+  "locator and ready-receipt binding",
+  "source owner generation",
+  "readback operation/receipt identity",
+  "observed State Fence and time",
+  "availability/integrity disposition",
+]
+rules = [
+  "The readback port grants no parsing, evaluation or finish authority.",
+  "A byte buffer is ephemeral input and is not embedded unbounded in the durable job or receipt.",
+  "Missing, purged, retention-blocked, stale or integrity-broken sources remain typed and cannot be recreated from preview.",
+]
+
+[wave_b_composition]
+owner = "eliot-testd binary composition"
+mutable_paths = [
+  "bins/eliot-testd/Cargo.toml",
+  "bins/eliot-testd/src/**",
+  "bins/eliot-testd/tests/**",
+  "Cargo.lock when dependency edges change",
+]
+required_changes = [
+  "Construct the production ProcessEvidenceSink/EvidenceCollector internally from the exact TestJob, Lease, ProcessAdmission and source-readback dependency.",
+  "Wire the accepted #267 provider into the #268 production ProcessExecutor constructor.",
+  "Do not accept a caller-selected evidence sink on the production start path.",
+  "On ProcessEvidence arrival, consume stdout()/stderr() typed values; do not query stdout_ref()/stderr_ref() for current evidence.",
+  "Require an explicit disposition for every requested stream, including missing/unavailable/zero-byte.",
+  "Bind evidence collection to one attempt and reject cross-job, cross-operation, cross-stream, cross-fence and duplicate terminal evidence.",
+  "Persist sufficient immutable identities before operation memory may be cleaned.",
+]
+
+[wave_c_parse_evaluate]
+owner = "testd evidence admission with injected parser/evaluator ports"
+required_pipeline = [
+  "validate ProcessEvidence and stream denominator",
+  "resolve immutable source under policy",
+  "verify readback locator/receipt/digest/length/fence",
+  "run applicable typed parser",
+  "persist parsing observation with raw source identity",
+  "run applicable evaluator only on admitted parsed evidence",
+  "persist evaluation observation with exact artifact/verifier binding",
+  "derive TestdEvidenceDisposition without changing task finish",
+]
+parsing_status = ["NOT_EXECUTED", "PARSED", "PARSE_FAILED", "NOT_APPLICABLE", "SOURCE_UNAVAILABLE"]
+evaluation_status = ["UNASSESSED", "PASS", "FAIL", "INCONCLUSIVE", "STALE"]
+artifact_binding = ["UNBOUND", "BOUND_EXACT", "BOUND_PARTIAL"]
+rules = [
+  "Process exit zero never sets PARSED or PASS.",
+  "Parser success never sets evaluator PASS.",
+  "Evaluator PASS with stale fence, wrong artifact or partial binding is non-verifying.",
+  "The evaluator cannot redefine the expected property or acceptance requirement.",
+]
+
+[wave_d_receipt_and_recovery]
+owner = "testd durable attempt owner"
+required_receipt_fields = [
+  "job/attempt/operation/process-tree/generation/epoch identities",
+  "invocation and InstrumentProfile identities",
+  "typed stdout and stderr evidence bindings",
+  "readback observations",
+  "parser/evaluator contracts and results",
+  "artifact bindings",
+  "coverage denominator and missing streams",
+  "State Fence and freshness",
+  "terminal evidence disposition",
+  "proof ceiling",
+]
+recovery = [
+  "Restart reconstructs source/readback/parser/evaluator identity from durable job/receipt state, not from operation memory.",
+  "Unknown source/provider outcome reconciles by the same stream session and Blob operation identity.",
+  "No daemon restart converts a legacy, partial or unknown source to complete.",
+  "Operation cleanup cannot invalidate a cited immutable source.",
+]
+
+[legacy_migration]
+legacy_inputs = [
+  "ProcessEvidence legacy-v1 stdout_ref/stderr_ref",
+  "raw:p04-stream:* synthetic locator",
+  "RawArtifact arbitrary handle + inline bytes",
+]
+disposition = "LEGACY_MIGRATION_REQUIRED / SOURCE_UNAVAILABLE"
+rules = [
+  "Legacy identifier text is retained only as provenance.",
+  "Supplying bytes whose digest resembles the legacy string cannot promote it.",
+  "Current verification receipt cannot contain a legacy-only stream.",
+  "Historical receipts remain readable under their old schema and proof ceiling; they are not rewritten as current.",
+]
+removal = [
+  "Remove production EvidenceCollector traversal of stdout_ref/stderr_ref.",
+  "Remove or quarantine record_raw_artifact from current production receipt construction.",
+  "Do not retain an arbitrary public handle-to-bytes mutation API as a compatibility shortcut.",
+]
+
+[errors]
+required = [
+  "PROCESS_EVIDENCE_BINDING_MISMATCH",
+  "STREAM_DENOMINATOR_INCOMPLETE",
+  "STREAM_SOURCE_UNAVAILABLE",
+  "STREAM_SOURCE_PARTIAL",
+  "STREAM_SOURCE_POLICY_PROHIBITED",
+  "STREAM_SOURCE_REDACTION_FAILED",
+  "STREAM_SOURCE_PURGED",
+  "STREAM_SOURCE_RETENTION_BLOCKED",
+  "STREAM_SOURCE_INTEGRITY_BROKEN",
+  "STREAM_SOURCE_STALE",
+  "STREAM_SOURCE_UNKNOWN_OUTCOME",
+  "STREAM_READBACK_IDENTITY_MISMATCH",
+  "STREAM_READBACK_DIGEST_MISMATCH",
+  "STREAM_READBACK_LENGTH_MISMATCH",
+  "PARSER_NOT_EXECUTED",
+  "PARSER_INCOMPATIBLE",
+  "PARSER_FAILED",
+  "EVALUATOR_NOT_EXECUTED",
+  "EVALUATOR_FAILED",
+  "EVALUATOR_INCONCLUSIVE",
+  "EVALUATION_STALE",
+  "ARTIFACT_BINDING_MISMATCH",
+  "LEGACY_STREAM_EVIDENCE_UNAVAILABLE",
+]
+
+[fixtures.core]
+required = [
+  "typed_stdout_and_stderr_are_consumed_without_legacy_refs",
+  "arbitrary_handle_and_bytes_cannot_satisfy_current_binding",
+  "cross_operation_stream_is_rejected",
+  "duplicate_stdout_or_missing_requested_stderr_is_explicit_gap",
+  "zero_byte_complete_source_is_valid",
+  "complete_transport_without_complete_persistence_is_not_complete",
+  "locator_ready_receipt_digest_and_length_must_all_match_readback",
+  "preview_bytes_are_never_substituted_for_source",
+  "legacy_ref_remains_unavailable_even_with_matching_caller_bytes",
+]
+
+[fixtures.pipeline]
+required = [
+  "exit_zero_plus_parser_not_executed_is_unverified",
+  "parser_failure_and_evaluator_failure_are_distinct",
+  "parser_success_does_not_imply_evaluator_pass",
+  "evaluator_pass_wrong_artifact_is_non_verifying",
+  "evaluator_pass_stale_fence_is_non_verifying",
+  "partial_source_supported_parser_still_cannot_claim_complete_coverage",
+  "policy_prohibited_and_redaction_failed_never expose raw bytes",
+  "purged_retention_blocked_and_broken_integrity_remain_distinct",
+]
+
+[fixtures.recovery]
+required = [
+  "immutable_source_survives_process_operation_cleanup",
+  "testd_restart_reconstructs_same_source_and_evaluation_identity",
+  "unknown_source_outcome_reconciles_same_operation_only",
+  "legacy_or_partial_evidence_does_not_upgrade_after_restart",
+  "typed receipt retains both stream dispositions and coverage denominator",
+]
+
+[scope]
+wave_a_forbidden_paths = [
+  "crates/storage/**",
+  "crates/instrument/eliot-process-executor/**",
+  "crates/kernel/eliot-process/**",
+  "crates/governor/**",
+  "docs/architecture/**",
+]
+wave_b_c_forbidden_paths = [
+  "crates/storage/eliot-blob-api/**",
+  "crates/storage/eliot-blob/**",
+  "crates/instrument/eliot-process-executor/**",
+  "crates/kernel/eliot-process/**",
+  "crates/governor/eliot-finish/**",
+  "docs/architecture/**",
+  ".github/workflows/**",
+]
+non_goals = [
+  "change ProcessExecutor capture or BlobStore semantics",
+  "implement a second parser/evaluator owner inside the durable scheduling store",
+  "turn TestReceipt into a task FinishDecision",
+  "migrate User Broker, Kernel, native worker or legacy-engine consumers",
+  "copy unbounded raw stream bytes into redb receipt state",
+  "claim Product proof from package fixtures",
+]
+
+[proof]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-testd-core -p eliot-testd --all-targets",
+  "cargo test --locked -p eliot-testd-core -p eliot-testd --all-targets",
+  "cargo clippy --locked -p eliot-testd-core -p eliot-testd --all-targets -- -D warnings",
+  "git diff --check",
+]
+required_nonzero_tests = true
+required_target = "x86_64-pc-windows-msvc for composition/process edge"
+edge_profile = "D1_TESTD_TYPED_STREAM_EVIDENCE_EDGE_01"
+product_pulse = "Run a real cargo/test Instrument through testd; emit output beyond preview; validate immutable source and parser/evaluator result; remove operation memory; restart testd; expand the same source; prove exit zero/truncated preview cannot substitute; then submit only owner-derived verifier evidence to strict Finish."
+
+[stop_conditions]
+contract_challenge = [
+  "The accepted #267/#268 source contracts differ from those assumed here.",
+  "No provider-neutral source readback can be expressed without changing BlobStore or ProcessStreamEvidence contracts.",
+  "The actual parser/evaluator owner is not identifiable and implementing it here would create a second owner.",
+  "A proposed receipt requires unbounded raw bytes instead of immutable source references.",
+  "Another active PR claims the same testd-core or testd source wave.",
+]
+
+[integration]
+merge_owner = "testd/Instrument integration swarm"
+merge_rule = "Implement Wave A only after confirming the accepted process-stream contract. Implement Waves B-D after #267/#268. Do not merge a state where current typed streams are ignored or caller-supplied RawArtifact bytes remain an accepted verification path."
+result_schema = "issue, dependency_revisions, source_base, changed_paths_by_wave, typed_stream_denominator, readback_and_identity_proof, parser_evaluator_matrix, recovery_proof, package_and_windows_edge_evidence, residual_unknowns, finish"
