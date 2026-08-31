@@ -156,11 +156,45 @@ pub(super) enum RuntimeRestartPendingPublication {
     Replay,
 }
 
+/// Commits a directory entry to the volume.
+///
+/// A directory handle on Windows requires `FILE_FLAG_BACKUP_SEMANTICS`; without
+/// it the open fails with `ERROR_ACCESS_DENIED` and the sync silently never
+/// happens. This mirrors `sync_parent_directory` in
+/// `crates/kernel/eliot-installation/src/redb_state.rs`, including its tolerance
+/// for filesystems that cannot sync a directory at all.
 #[cfg(windows)]
-fn sync_runtime_restart_store_dir(dir: &Path) {
-    if let Ok(file) = std::fs::OpenOptions::new().read(true).open(dir) {
-        let _ = file.sync_all();
-    }
+fn sync_runtime_restart_store_dir(dir: &Path) -> Result<(), HostError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .and_then(|file| file.sync_all())
+        .or_else(|error| match error.kind() {
+            std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::Unsupported => Ok(()),
+            _ => Err(error),
+        })
+        .map_err(|error| HostError::Platform(error.to_string()))
+}
+
+/// Writes `bytes` to `path` and commits them to the volume.
+///
+/// `sync_all` maps to `FlushFileBuffers`, which needs write access; syncing
+/// through a re-opened read-only handle is a no-op that reports success.
+#[cfg(windows)]
+fn write_durable_file(path: &Path, bytes: &[u8]) -> Result<(), HostError> {
+    use std::io::Write as _;
+
+    let mut file = std::fs::File::create(path).map_err(|e| HostError::Platform(e.to_string()))?;
+    file.write_all(bytes)
+        .map_err(|e| HostError::Platform(e.to_string()))?;
+    file.sync_all()
+        .map_err(|e| HostError::Platform(e.to_string()))
 }
 
 #[cfg(windows)]
@@ -200,15 +234,12 @@ pub(super) fn persist_runtime_restart_pending(
         Uuid::new_v4().simple()
     ));
     let publication = (|| {
-        std::fs::write(&tmp, bytes).map_err(|e| HostError::Platform(e.to_string()))?;
-        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&tmp) {
-            let _ = file.sync_all();
-        }
+        write_durable_file(&tmp, &bytes)?;
         // A hard-link publication is atomic and, unlike rename, never replaces
         // a final record that won a concurrent create race.
         match std::fs::hard_link(&tmp, &path) {
             Ok(()) => {
-                sync_runtime_restart_store_dir(&dir);
+                sync_runtime_restart_store_dir(&dir)?;
                 Ok(RuntimeRestartPendingPublication::Created)
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -230,12 +261,14 @@ pub(super) fn persist_runtime_restart_pending(
         }
     })();
     let cleanup = std::fs::remove_file(&tmp);
-    sync_runtime_restart_store_dir(&dir);
+    let cleanup_sync = sync_runtime_restart_store_dir(&dir);
     match publication {
         Err(error) => Err(error),
         Ok(value) => match cleanup {
-            Ok(()) => Ok(value),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(value),
+            Ok(()) => cleanup_sync.map(|()| value),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                cleanup_sync.map(|()| value)
+            }
             Err(error) => Err(HostError::RecoveryRequired(format!(
                 "runtime restart pending temporary cleanup failed: {error}"
             ))),
@@ -252,25 +285,19 @@ pub(super) fn persist_runtime_restart_receipt(
     std::fs::create_dir_all(&dir).map_err(|e| HostError::Platform(e.to_string()))?;
     let path = runtime_restart_receipt_path(host_state_root, receipt.mutation_digest.as_str());
     let tmp = dir.join(format!(".{}.receipt.tmp", receipt.mutation_digest.as_str()));
-    std::fs::write(
-        &tmp,
-        serde_json::to_vec(receipt).map_err(|e| HostError::Platform(e.to_string()))?,
-    )
-    .map_err(|e| HostError::Platform(e.to_string()))?;
-    {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&tmp)
-            .map_err(|e| HostError::Platform(e.to_string()))?;
-        let _ = file.sync_all();
-    }
+    let bytes = serde_json::to_vec(receipt).map_err(|e| HostError::Platform(e.to_string()))?;
+    write_durable_file(&tmp, &bytes)?;
     std::fs::rename(&tmp, &path).map_err(|e| HostError::Platform(e.to_string()))?;
+    // The receipt must be on the volume before the pending record it retires is
+    // removed; otherwise a crash here leaves neither on disk.
+    sync_runtime_restart_store_dir(&dir)?;
     let pending = runtime_restart_pending_path(host_state_root, receipt.mutation_digest.as_str());
-    let _ = std::fs::remove_file(pending);
-    if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&dir) {
-        let _ = file.sync_all();
+    match std::fs::remove_file(pending) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(HostError::Platform(error.to_string())),
     }
-    Ok(())
+    sync_runtime_restart_store_dir(&dir)
 }
 
 #[cfg(windows)]
