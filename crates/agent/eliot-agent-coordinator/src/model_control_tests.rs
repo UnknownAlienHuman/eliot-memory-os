@@ -501,6 +501,16 @@ fn stale_heartbeat_and_deadline_overrun_remain_distinct() -> TestResult {
 }
 
 #[test]
+fn heartbeat_exactly_at_timeout_remains_live() -> TestResult {
+    let mut input = telemetry(CoordinatedAttemptState::Running)?;
+    input.last_heartbeat_unix_ms = Some(NOW - input.heartbeat_timeout_ms);
+
+    let projection = project_attempt_health(&input, NOW)?;
+    assert_eq!(projection.status, AttemptLivenessStatus::Live);
+    Ok(())
+}
+
+#[test]
 fn unknown_process_is_not_eligible_for_work() -> TestResult {
     let mut input = telemetry(CoordinatedAttemptState::Running)?;
     input.process = ProcessObservation::Unknown;
