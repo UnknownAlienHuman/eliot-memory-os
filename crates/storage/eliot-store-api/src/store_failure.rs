@@ -364,6 +364,15 @@ impl StoreFailure {
         Ok(())
     }
 
+    /// Constructs the typed failure for a provider outcome that cannot yet be
+    /// reconciled. The admitted operation identity is the only identity this
+    /// constructor accepts; provider-reported identities stay outside it.
+    pub fn from_provider_unknown_outcome(
+        context: &StoreFailureIdentityContext,
+    ) -> Result<Self, StoreFailureContractError> {
+        Self::unknown_outcome(context, "PROVIDER_OUTCOME_UNKNOWN")
+    }
+
     /// Converts the complete current `StoreError` set without wildcard collapse.
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::needless_pass_by_value)]
@@ -415,16 +424,7 @@ impl StoreFailure {
                 StoreRecoveryAction::ResolveWriteReceipt,
             ),
             StoreError::MissingReceiptEnvelope => {
-                if failure.operation_id.is_none() {
-                    return Err(StoreFailureContractError::MissingOperationIdentity);
-                }
-                (
-                    StoreFailureDisposition::UnknownOutcome,
-                    "RECEIPT_ENVELOPE_MISSING",
-                    StoreMutationDisposition::Unknown,
-                    StoreRetryDirective::ReconcileExactOperation,
-                    StoreRecoveryAction::ReconcileUnknownOutcome,
-                )
+                return Self::unknown_outcome(&context, "RECEIPT_ENVELOPE_MISSING");
             }
             StoreError::PayloadTooLarge => deterministic("PAYLOAD_TOO_LARGE"),
             StoreError::Unavailable => (
@@ -443,6 +443,23 @@ impl StoreFailure {
         failure.mutation_disposition = mutation;
         failure.retry_directive = retry;
         failure.recovery_action = recovery;
+        failure.validate()?;
+        Ok(failure)
+    }
+
+    fn unknown_outcome(
+        context: &StoreFailureIdentityContext,
+        reason_code: &'static str,
+    ) -> Result<Self, StoreFailureContractError> {
+        let mut failure = Self::base(context);
+        if failure.operation_id.is_none() {
+            return Err(StoreFailureContractError::MissingOperationIdentity);
+        }
+        failure.disposition = StoreFailureDisposition::UnknownOutcome;
+        failure.reason_code = StoreReasonCode::new(reason_code)?;
+        failure.mutation_disposition = StoreMutationDisposition::Unknown;
+        failure.retry_directive = StoreRetryDirective::ReconcileExactOperation;
+        failure.recovery_action = StoreRecoveryAction::ReconcileUnknownOutcome;
         failure.validate()?;
         Ok(failure)
     }
