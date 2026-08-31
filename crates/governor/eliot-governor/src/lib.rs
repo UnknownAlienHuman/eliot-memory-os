@@ -32,8 +32,10 @@
 
 #![forbid(unsafe_code)]
 
+mod activation_outcome;
 mod composition;
 
+pub use activation_outcome::*;
 pub use composition::*;
 
 use std::collections::BTreeMap;
