@@ -19,8 +19,6 @@ use eliot_store_api::{
     StoreFailureContractError, StoreFailureIdentityContext, StoreGenesisRequest, WriteReceipt,
     validate_genesis_receipt_envelope, validate_store_receipt_envelope,
 };
-#[cfg(test)]
-use eliot_store_api::StoreRecoverySnapshot;
 
 use crate::Request;
 use crate::Response;
@@ -220,10 +218,9 @@ impl StoreDispatchBackend for StoreComposition {
                     Ok(receipt) => {
                         map_apply_receipt(&context, &transition, failure_context, receipt)
                     }
-                    Err(StoreCompositionError::UnknownOutcome {
-                        operation_id,
-                        reason: _,
-                    }) => map_provider_unknown_outcome(failure_context, &operation_id),
+                    Err(StoreCompositionError::UnknownOutcome { operation_id, .. }) => {
+                        map_provider_unknown_outcome(failure_context, &operation_id)
+                    }
                     Err(StoreCompositionError::Store(error)) => {
                         typed_failure_response(error, failure_context)
                     }
@@ -275,7 +272,7 @@ pub(crate) const UNKNOWN_GENESIS_REASON: &str =
 
 #[cfg(test)]
 pub(crate) fn map_recovery_dispatch_result(
-    result: Result<StoreRecoverySnapshot, StoreError>,
+    result: Result<eliot_store_api::StoreRecoverySnapshot, StoreError>,
 ) -> Response {
     match result {
         Ok(snapshot) => Response::Recovery { snapshot },
