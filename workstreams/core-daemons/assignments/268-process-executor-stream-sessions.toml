@@ -1,0 +1,230 @@
+schema = "eliot.agent-work-unit.v1"
+issue = 268
+parent_issue = 85
+process_integration_owner_issue = 100
+provider_issue = 267
+provider_pr = 454
+testd_consumer_issue = 20
+consumer_tracker_issue = 271
+product_pulse_issue = 11
+status = "BLOCKED_ON_PROVIDER_THEN_READY"
+source_base = "15d6b40d06df0eab8c2fc94a856253f36521b305"
+branch = "fix/268-process-executor-stream-sessions"
+primary_owner = "windows-process-executor"
+primary_cell = "instrument.process-executor.stream-capture"
+causal_property = "WindowsProcessExecutor owns exactly one stdout and one stderr capture session per operation, drains both continuously, publishes typed resolvable ProcessStreamEvidence, and never returns a synthetic locator or lets evidence persistence failure orphan the process or poison unrelated operations."
+proof_ceiling = "WINDOWS_PROCESS_EXECUTOR_EDGE_CANDIDATE_UNTIL_REAL_BLOB_AND_RESTART_PROOF"
+
+[dependencies]
+required_before_first_rust_mutation = [
+  "PR #454 or another accepted implementation of issue #267 provides a current production ProcessStreamSinkClient adapter and exact contract identity.",
+  "Current main contains the accepted #82, #83 and #84 operation-local quarantine, deadline-owner and post-resume containment behavior.",
+  "Current main contains the accepted ProcessStreamEvidence and ProcessStreamSink contracts from #266/#270.",
+]
+forbidden_substitute = [
+  "fake sink in production",
+  "in-memory Vec as immutable source",
+  "raw:p04-stream locator compatibility generation",
+  "direct filesystem or BlobStore calls inside WindowsProcessExecutor",
+]
+
+[documentation]
+architecture_handles = ["ARCH-MOD-03", "ARCH-SEC-02", "ARCH-OBS-01", "ARCH-RES-01", "ARCH-RES-04"]
+implementation_handles = ["I2 Instrument Plane IP0-IP3", "I7.23", "I7.26", "I7.27", "I14.14", "I18"]
+required_files_read = [
+  "AGENTS.md",
+  "crates/instrument/AGENTS.md",
+  "crates/kernel/AGENTS.md",
+  "crates/instrument/eliot-process-executor/Cargo.toml",
+  "crates/instrument/eliot-process-executor/src/lib.rs",
+  "crates/instrument/eliot-process-executor/src/tests.rs",
+  "crates/kernel/eliot-process/src/root.rs",
+  "crates/kernel/eliot-process/src/stream_evidence/**",
+  "crates/kernel/eliot-process/src/stream_sink/**",
+  "workstreams/core-daemons/assignments/267-process-stream-blob-sink.toml",
+]
+routing_command = "python scripts/docs_router.py route --path crates/instrument/eliot-process-executor/src/lib.rs --topic 'Windows ProcessExecutor typed stdout stderr capture sessions and immutable evidence publication'"
+routing_receipt_status = "REQUIRED_AFTER_PROVIDER_REBASE_BEFORE_FIRST_RUST_MUTATION"
+
+[current_defect]
+file = "crates/instrument/eliot-process-executor/src/lib.rs"
+confirmed_old_state = [
+  "Operation owns Arc<Mutex<StreamCapture>> for stdout and stderr, with retained in-memory Vec prefixes.",
+  "stream_ref returns raw:p04-stream:sha256:<prefix>:bytes:<total>:complete:<bool> rather than a resolvable immutable source.",
+  "The synthetic digest is over retained prefix bytes while the label also carries total drained bytes, so it cannot prove full-source identity after truncation.",
+  "No ProcessStreamSinkClient is installed before child resume.",
+  "ProcessEvidence receives optional string refs instead of typed terminal stream evidence.",
+  "cleanup_finished can remove the operation that owns the only retained prefix.",
+  "The executor-wide poisoned flag still exists in the current source and must not be broadened by the stream integration; operation-local evidence failure is the required disposition.",
+]
+old_discriminator = "Run a child whose stdout exceeds the preview limit, then inspect/cleanup the operation: the evidence contains raw:p04-stream and cannot expand to the full bytes or survive operation cleanup as an independently verified source."
+
+[constructor_and_ports]
+required_dependency = "Arc<dyn ProcessStreamSinkClient> or a narrow factory that creates one bound client/session per exact operation and stream"
+required_constructors = [
+  "Keep a test-only/no-sink constructor only when it returns explicit SourceUnavailable evidence and cannot be used by production composition.",
+  "Production constructor requires the admitted sink/factory and its capability/generation binding.",
+]
+required_operation_fields = [
+  "stdout_session owner",
+  "stderr_session owner",
+  "stdout terminal/readback state",
+  "stderr terminal/readback state",
+  "stream worker handles",
+  "stream cancellation/abort identities",
+  "capture setup disposition",
+  "cleanup/readback obligations",
+]
+forbidden_fields = [
+  "raw synthetic locator string",
+  "unbounded stream Vec",
+  "BlobStore client or filesystem path",
+  "global mutable fault flag",
+]
+
+[start_state_machine]
+required_order = [
+  "Validate ProcessRequest and reserve operation identity.",
+  "Create the suspended child and bind exact suspended-process evidence.",
+  "Consume the dispatch permit through the existing P-07 authority port.",
+  "Open requested stdout/stderr ProcessStreamSink sessions with exact ProcessExecutionBinding, policy, transformation, limits and source identities.",
+  "Install physical reader threads/tasks, session owners and the autonomous deadline watcher.",
+  "Register every owner needed for containment and cleanup.",
+  "Resume the child only after all mandatory owners are installed.",
+  "Return ProcessStartReceipt only after operation registration proves those owners are retained.",
+]
+setup_failure = "Any mandatory sink/session/reader/watcher failure before resume terminates the suspended child and proves no guest effect; any failure after resume contains the exact Job tree, retains operation-local evidence and returns UnknownOutcome."
+
+[reader_loop]
+requirements = [
+  "Read stdout and stderr independently in bounded chunks until EOF, cancellation, read failure or contained termination.",
+  "Append each chunk with exact monotonically increasing sequence and byte offset.",
+  "Never hold the Operation mutex or a stream-state mutex while awaiting/blocking on sink/provider I/O.",
+  "Bound sink append wait. On backpressure/failure, enter the adapter's declared drain-with-gap disposition rather than blocking the pipe indefinitely.",
+  "Maintain only the bounded diagnostic preview already exposed by captured_output; it is non-authoritative and never used as the durable source.",
+  "One stream reaching EOF cannot prevent the other stream from draining or being cancelled.",
+]
+
+[terminalization]
+requirements = [
+  "EOF finalizes the exact stream session once with an immutable terminal command identity.",
+  "Cancellation/read failure/process containment aborts or finalizes with the exact typed gap and bytes already admitted.",
+  "Sink unknown outcome preserves the exact session and Blob operation identity for reconciliation; no second finalize or restage under a new identity is allowed.",
+  "ProcessEvidence is emitted only after each requested stream has a typed terminal or explicitly unknown/unavailable disposition.",
+  "Zero-byte EOF is Complete transport and may be CompleteSource when the sink readback proves the zero-byte object.",
+  "Process exit status never promotes transport, persistence, parsing or evaluation status.",
+]
+
+[evidence_mapping]
+stdout_field = "typed stdout ProcessStreamEvidence or explicit not-requested/unavailable projection"
+stderr_field = "typed stderr ProcessStreamEvidence or explicit not-requested/unavailable projection"
+legacy_string_rule = "Production ProcessEvidence construction must not call stream_ref or create raw:p04-stream. Historical records remain cold/unavailable migration evidence outside P-04."
+full_source_rule = "CompleteSource requires sink terminal + immutable source + exact readback digest/count; captured_output prefix is insufficient."
+preview_rule = "CapturedStream may remain as a bounded diagnostics API, but its prefix digest/count is never copied into the durable-source identity."
+
+[operation_local_failure]
+requirements = [
+  "A stdout persistence failure does not mark unrelated operation B poisoned, unavailable or uncancellable.",
+  "A stderr failure does not silently convert stdout complete evidence to unavailable, or vice versa.",
+  "Operation remains retained while a child, reader, deadline watcher, sink session, immutable-source readback or unknown outcome still needs reconciliation.",
+  "cleanup_finished removes operation memory only after descendant cleanup and every cited immutable source is independent of that memory.",
+  "shutdown joins or retains every stream owner; it never drops a cited but unpublished source.",
+]
+
+[scope]
+mutable_paths = [
+  "crates/instrument/eliot-process-executor/Cargo.toml",
+  "crates/instrument/eliot-process-executor/src/lib.rs",
+  "crates/instrument/eliot-process-executor/src/tests.rs",
+  "crates/instrument/eliot-process-executor/tests/**",
+  "Cargo.lock",
+]
+allowed_dependency_path = "crates/instrument/eliot-process-stream-blob only after #267 is accepted"
+forbidden_paths = [
+  "crates/kernel/eliot-process/src/stream_evidence/**",
+  "crates/kernel/eliot-process/src/stream_sink/**",
+  "crates/storage/eliot-blob-api/**",
+  "crates/storage/eliot-blob/**",
+  "crates/kernel/eliot-ors/**",
+  "crates/instrument/eliot-testd-core/**",
+  "bins/eliot-testd/**",
+  "crates/kernel/eliot-kernel-service/**",
+  "docs/architecture/**",
+  ".github/workflows/**",
+]
+non_goals = [
+  "define or revise BlobStore or ProcessStreamEvidence contracts",
+  "migrate testd, User Broker, Kernel or legacy-engine consumers",
+  "parse or evaluate stdout/stderr",
+  "change process authority, dispatch permit, Job Object, deadline or cancellation ownership beyond exact stream integration",
+  "introduce a second ProcessExecutor",
+  "claim Product completion from process/package tests",
+]
+
+[compatibility_and_removal]
+remove_production = [
+  "stream_ref",
+  "raw:p04-stream construction",
+  "any ProcessEvidence path that carries only stdout_ref/stderr_ref strings for a new execution",
+]
+retain_temporarily = [
+  "captured_output bounded prefix for diagnostics if it is clearly non-authoritative",
+  "legacy deserialization only outside the current executor and with unavailable/migration disposition",
+]
+removal_test = "Repository/source scanner fails if raw:p04-stream appears in non-test production ProcessExecutor code."
+
+[fixtures]
+setup_and_start = [
+  "sink_open_failure_before_resume_executes_no_child_code",
+  "stdout_reader_spawn_failure_before_resume_is_contained",
+  "stderr_reader_spawn_failure_before_resume_is_contained",
+  "deadline_owner_failure_does_not_regress_issue_83",
+  "post_resume_sink_owner_loss_does_not_regress_issue_84",
+]
+stream = [
+  "zero_byte_stdout_and_stderr_complete",
+  "stdout_over_preview_limit_expands_to_exact_full_source",
+  "stderr_over_preview_limit_expands_to_exact_full_source",
+  "stdout_eof_while_stderr_blocks",
+  "stderr_eof_while_stdout_blocks",
+  "pipe_saturation_does_not_deadlock_on_sink_backpressure",
+  "read_error_preserves_admitted_bytes_and_gap",
+  "cancel_during_append_preserves_typed_terminal",
+  "sink_finalize_unknown_outcome_requires_same_session_reconciliation",
+  "sink_readback_mismatch_never_reports_complete",
+]
+cleanup_and_isolation = [
+  "immutable_source_survives_cleanup_finished",
+  "executor_restart_recovers_source_from_sink_or_ORS_handoff_without_operation_memory",
+  "operation_a_persistence_failure_does_not_disable_operation_b",
+  "shutdown_with_active_stream_sessions_retains_unknown_cleanup_owner",
+  "no_production_raw_p04_stream_locator",
+]
+
+[proof]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-process-executor --all-targets",
+  "cargo test --locked -p eliot-process-executor --all-targets",
+  "cargo clippy --locked -p eliot-process-executor --all-targets -- -D warnings",
+  "git diff --check",
+]
+required_nonzero_tests = true
+required_target = "x86_64-pc-windows-msvc"
+real_edge_profile = "WINDOWS_PROCESS_STREAM_BLOB_CAPTURE_EDGE_01"
+edge_scenario = "Launch a real bounded child that emits >preview bytes on both streams, verify exact Blob readback, clean operation memory, restart the consumer, expand the same sources, and cancel an independent concurrent process during injected sink pressure."
+
+[stop_conditions]
+contract_challenge = [
+  "Issue #267/PR #454 is not accepted or the provider contract changed after this assignment base.",
+  "Current main no longer contains the expected #82-#84 start/containment state machine.",
+  "The sink cannot drain under bounded backpressure without changing the provider-neutral contract.",
+  "The integration requires direct BlobStore/filesystem ownership inside WindowsProcessExecutor.",
+  "Another active PR claims eliot-process-executor source.",
+  "Only Linux fake execution is available for a Windows Job/pipe claim.",
+]
+
+[integration]
+merge_owner = "ProcessExecutor integration swarm"
+merge_rule = "Rebase after #267. Merge only after exact-head Windows package/fault proof and real immutable-source readback. Then hand typed evidence to the separate #271 consumer waves."
+result_schema = "issue, provider_contract_and_candidate, source_base, changed_paths, start_state_proof, stream_fault_matrix, immutable_source_readback, cleanup_and_isolation_proof, Windows evidence, residual_unknowns, finish"
