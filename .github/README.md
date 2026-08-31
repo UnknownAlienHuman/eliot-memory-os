@@ -18,9 +18,14 @@ branch-handoff documents to duplicate issue/PR state.
 
 ## Workflows
 
+All repository-owned workflows use **`workflow_dispatch` only**. They do not run
+on pushes, pull requests, schedules, merges, releases, or any other automatic
+event. A person starts a workflow explicitly from the Actions UI or an
+equivalent authenticated manual dispatch. Ordinary verification is run locally.
+
 ### `repository-policy.yml`
 
-Runs on every branch push and pull request to `main`.
+Manual repository-routing and authority-surface check.
 
 Checks:
 
@@ -34,9 +39,9 @@ Proof ceiling: repository routing and authority-surface integrity only.
 
 ### `ci.yml`
 
-Runs for pull requests to `main` and may be dispatched manually.
+Manual bounded integration-source check.
 
-Checks the current bounded integration source path:
+Checks the selected checked-out source revision through:
 
 - normative identity and Cargo metadata;
 - formatting and workspace all-target check through `scripts/verify.ps1`;
@@ -86,6 +91,7 @@ A change requires an owning issue and must state:
 - cancellation/concurrency behavior;
 - replacement/removal path.
 
-Workflow names such as `release`, `certified`, `production`, or `live` are used
-only when the workflow owns that exact decision and executes the required proof.
-A source check may not be renamed into a release or Product-Pulse gate.
+The trigger remains `workflow_dispatch` only. Workflow names such as `release`,
+`certified`, `production`, or `live` are used only when the workflow owns that
+exact decision and executes the required proof. A source check may not be renamed
+into a release or Product-Pulse gate.

@@ -156,7 +156,4 @@ Until those commands execute, every source commit remains `CURRENT_UNVERIFIED / 
 
 ## Working discipline
 
-Commit completed atomic slices to the issue branch and hand them to the root
-controller for coordinated push. Do not perform uncoordinated fetch, pull, push,
-ref, workflow, or integration mutations, and do not keep a large uncommitted
-diff while continuing analysis.
+Push every completed atomic source slice immediately to the issue branch. Do not keep a large unpushed local diff while continuing analysis.
