@@ -1,0 +1,337 @@
+schema = "eliot.agent-work-unit.v1"
+issue = 461
+parent_issue = 17
+host_owner_issue = 14
+kernel_owner_issue = 15
+epoch_migration_issue = 64
+process_integration_owner_issue = 100
+product_pulse_issue = 11
+status = "BLOCKED_ON_AUTHORITY_CONTRACT_THEN_READY"
+source_base = "15d6b40d06df0eab8c2fc94a856253f36521b305"
+branch = "fix/461-doctor-kernel-runtime"
+primary_owner = "doctor-one-shot-recovery-integration"
+primary_cell = "meta.doctor.kernel-admitted-repair"
+causal_property = "A short-lived Doctor executes only one immutable registered repair attempt admitted by Kernel under exact recovery authority, persists intent before effect, reconciles unknown outcomes by the same identity, and leaves independent verification and semantic resolution to their actual owners."
+proof_ceiling = "DOCTOR_RECOVERY_EDGE_CANDIDATE_UNTIL_REAL_WINDOWS_REPAIR_AND_VERIFIER_PROOF"
+
+[dependencies]
+required = [
+  "Canonical lineaged EpochId/StateFence migration from #64 for authority-bearing public/runtime fields.",
+  "Kernel recovery authority/ORS ownership from #15.",
+  "One admitted ProcessExecutor contour from #100 for any native effect process.",
+  "Host last-known-good restoration remains #14/#445/#449 ownership.",
+]
+allowed_before_dependencies = [
+  "pure canonical recipe/attempt/effect identity and typed evidence contract",
+  "negative fixtures for diagnose-only, arbitrary operations, self-verification and ambiguous terminal outcome",
+]
+forbidden_substitutes = [
+  "local scalar epoch coercion",
+  "Doctor-local durable lease authority",
+  "caller-supplied executable recipe",
+  "generic shell/PowerShell/SQL/HTTP operation",
+  "self-reported verified bool",
+]
+
+[documentation]
+architecture_handles = ["ARCH-RES-02", "ARCH-RES-05", "ARCH-SEC-02", "ARCH-MOD-03", "ARCH-OBS-01"]
+implementation_handles = ["I1.3", "I2.6", "I5.19", "I6", "I7.27", "I13", "I14", "I18"]
+required_files_read = [
+  "AGENTS.md",
+  "crates/meta/AGENTS.md",
+  "crates/kernel/AGENTS.md",
+  "bins/AGENTS.md",
+  "crates/meta/eliot-doctor-core/Cargo.toml",
+  "crates/meta/eliot-doctor-core/src/lib.rs",
+  "bins/eliot-doctor/Cargo.toml",
+  "bins/eliot-doctor/src/lib.rs",
+  "bins/eliot-doctor/src/main.rs",
+  "crates/kernel/eliot-kernel-service/src/**doctor**",
+  "crates/kernel/eliot-ors/src/**doctor**",
+]
+routing_commands = [
+  "python scripts/docs_router.py route --path crates/meta/eliot-doctor-core/src/lib.rs --topic 'canonical registered Doctor recipe attempt effect and verification contract'",
+  "python scripts/docs_router.py route --path bins/eliot-doctor/src/main.rs --topic 'one-shot authenticated Doctor Kernel IPC and exact repair attempt execution'",
+]
+routing_receipt_status = "REQUIRED_PER_WAVE_BEFORE_FIRST_RUST_MUTATION"
+
+[current_defect]
+confirmed_paths = [
+  "No production impl KernelDoctorClient exists outside eliot-doctor-core trait/tests.",
+  "bins/eliot-doctor/src/main.rs always prints KERNEL_ADMISSION_REQUIRED and exits 78.",
+  "eliot-doctor-core defines duplicate scalar StateFence and RecoveryLease types.",
+  "RepairRecipe.allowed_effects and operations are arbitrary String collections without registered named adapter identity.",
+  "RepairPlan effect identity hashes raw concatenated text and operation bytes rather than canonical versioned encoding.",
+  "AttemptReceipt uses verified: bool and collapses effect, verification, artifact binding, freshness and independence.",
+  "invoke_once calls record_attempt immediately after effect receipt; no independent verifier owner participates.",
+  "Attempts, budget, cooldown, intent and unknown outcome are only in process memory/client abstraction, not proven durable ORS state.",
+  "InvocationOutcome::Completed may contain JobState::Failed.",
+]
+old_discriminator = "Run eliot-doctor with any request: the process exits 78 before authenticated admission. In core fixtures, an AttemptReceipt with verified=true can produce Succeeded without an executed independent verifier contract."
+
+[ownership]
+doctor_core = "stateless repair contract/state-machine candidate; no durable authority or external effect"
+kernel_ors = "recovery authority, attempt/effect identity, durable intent/outcome/reconciliation, budget/cooldown/quarantine"
+governor = "registered recipe semantic admission and Problem/repair-state transition"
+effect_adapter = "one named infrastructure effect implementation under exact permit"
+process_executor = "native process mechanics when an adapter requires a child process"
+verifier_owner = "executes EvaluationContract and owns verifier result"
+host = "restores Doctor or another service last-known-good generation"
+rule = "No package/runtime arrow transfers semantic or authority ownership."
+
+[wave_a_core_contract]
+owner = "eliot-doctor-core"
+mutable_paths = [
+  "crates/meta/eliot-doctor-core/Cargo.toml",
+  "crates/meta/eliot-doctor-core/src/**",
+  "crates/meta/eliot-doctor-core/tests/**",
+]
+required_types = [
+  "RepairRecipeId",
+  "RepairRecipeManifest",
+  "RepairOperationRef",
+  "RepairAttemptId",
+  "RepairEffectId",
+  "RepairEffectIntent",
+  "RepairEffectDisposition",
+  "RepairVerificationObservation",
+  "RepairAttemptDisposition",
+  "DoctorContractError",
+]
+canonical_identity_rules = [
+  "Use repository canonical encoding with explicit schema revision and domain separator.",
+  "Bind Problem/Diagnostic evidence, target resource/generation, recipe revision/digest, repair class, State Fence/Epoch, RecoveryLease, approval, effect set, budget, deadline and cancellation.",
+  "Bind each effect to attempt identity plus exact operation manifest, target and effect parameters.",
+  "Exact serialization/restart yields the same identity; any load-bearing field changes identity.",
+  "Do not expose From/Into conversions that erase lineage or type meaning.",
+]
+operation_rules = [
+  "Executable operation is a registered RepairOperationRef, never arbitrary command text.",
+  "Manifest names exact adapter contract revision, effect class, required target type, idempotency/reconciliation class, timeout/resource profile, compensation class and verifier contract.",
+  "Human description/prerequisites/expected observables are not executable fields.",
+  "DIAGNOSE_ONLY has no effect operations and cannot be widened by admission.",
+]
+
+[evidence_axes]
+effect_execution = ["NOT_EXECUTED", "STARTED", "REJECTED_NO_EFFECT", "COMMITTED", "COMPENSATED", "UNKNOWN_OUTCOME", "RECONCILING"]
+verification_execution = ["NOT_EXECUTED", "SIMULATED", "EXECUTED", "UNKNOWN_OUTCOME"]
+evaluation = ["UNASSESSED", "PASS", "FAIL", "INCONCLUSIVE", "STALE"]
+artifact_binding = ["UNBOUND", "BOUND_EXACT", "BOUND_PARTIAL"]
+cleanup = ["NOT_REQUIRED", "COMPLETE", "PARTIAL", "FAILED", "UNKNOWN"]
+attempt_disposition = [
+  "DIAGNOSED",
+  "REPAIR_PENDING",
+  "REPAIRED_PENDING_VERIFICATION",
+  "REPAIRED_VERIFIED",
+  "REPAIR_FAILED",
+  "PARTIAL",
+  "UNKNOWN_EFFECT_OUTCOME",
+  "RECONCILING",
+  "CANCELLED",
+  "QUARANTINED",
+  "ESCALATED",
+]
+verified_rule = "REPAIRED_VERIFIED requires effect COMMITTED or applicable COMPENSATED state, verification EXECUTED, evaluation PASS, exact target/artifact binding, current fence/freshness, required independence and complete cleanup. Doctor effect code cannot set it alone."
+
+[wave_b_kernel_ors]
+owner = "Kernel recovery authority + ORS"
+mutable_paths = [
+  "crates/kernel/eliot-kernel-service/src/**doctor**",
+  "crates/kernel/eliot-kernel-service/tests/**doctor**",
+  "crates/kernel/eliot-ors/src/**doctor**",
+  "crates/kernel/eliot-ors/tests/**doctor**",
+  "bins/eliot-kernel/src/**doctor**",
+]
+required_records = [
+  "DoctorRepairAdmission",
+  "DoctorAttemptState",
+  "DoctorEffectIntentRecord",
+  "DoctorEffectOutcomeRecord",
+  "DoctorReconciliationState",
+  "DoctorBudgetCooldownState",
+]
+algorithm = [
+  "Governor selects one registered immutable recipe revision for exact Problem/target evidence.",
+  "Kernel verifies mechanically enforceable authority, lineaged epoch, fence, effect ceiling, approval, budget/deadline and adapter manifest.",
+  "Kernel persists exact attempt admission and intent in ORS before effect execution.",
+  "Kernel consumes the effect permit exactly once and records receipt or UnknownOutcome.",
+  "Exact retry returns the same admission/outcome; changed bytes under one identity fail as IdentityConflict.",
+  "Unknown outcome permits only exact reconciliation named by the attempt/effect identity.",
+  "Budget/cooldown/quarantine remain durable across Doctor process loss and Kernel restart.",
+]
+forbidden = [
+  "Kernel choosing repair semantics or recipe based on prose",
+  "Doctor creating/renewing RecoveryLease",
+  "process-local attempts vector as durable owner",
+  "blind retry after unknown effect",
+]
+
+[wave_c_effect_adapter]
+owner = "named repair adapter"
+initial_candidate_rule = "Choose one existing owner-approved automatic-safe operation with a real reversible/discriminative edge; do not invent a generic operation to make the path compile."
+required_adapter_contract = [
+  "operation/manifest revision",
+  "exact target resource/generation and ownership challenge",
+  "effect identity and permit",
+  "input parameter schema",
+  "precondition/readback",
+  "effect class and no-effect rejection",
+  "deadline/cancellation/resource profile",
+  "idempotency and unknown-outcome reconciliation",
+  "effect receipt",
+  "rollback/compensation operation ref when applicable",
+]
+process_rule = "If native process execution is needed, use the single admitted ProcessExecutor; no direct Command/shell implementation in Doctor."
+
+[wave_d_binary]
+owner = "eliot-doctor one-shot process"
+mutable_paths = [
+  "bins/eliot-doctor/Cargo.toml",
+  "bins/eliot-doctor/src/**",
+  "bins/eliot-doctor/tests/**",
+  "Cargo.lock when dependencies change",
+]
+required_runtime = [
+  "authenticated generation-bound Kernel IPC/bootstrap",
+  "no stdin/argv/environment repair authority",
+  "one admitted execute or reconcile request",
+  "exact deadline and cancellation",
+  "typed result/evidence flush",
+  "bounded exit after one job",
+  "parent/Job Object loss containment",
+]
+exit_rules = [
+  "No admitted request or stale/invalid admission exits with a typed no-effect failure.",
+  "Unknown effect exits with exact reconciliation-required result, not success/failure inference.",
+  "Effect receipt without independent verifier exits repaired-pending-verification.",
+  "No persistent model/agent/repair loop.",
+]
+
+[wave_e_verifier_governor]
+owner = "Verifier/Instrument + Governor Problem transition"
+requirements = [
+  "Execute registered verifier independently against exact target/artifacts/effect receipt.",
+  "Bind execution/evaluation/artifact/scope/fence/freshness/independence axes.",
+  "Doctor cannot submit or modify its own verifier result.",
+  "Governor applies repaired/failed/partial/quarantined Problem transition through PreparedTransition.",
+  "Missing/stale/inconclusive verifier cannot resolve the Problem.",
+  "Host/installer, not Doctor, restores Doctor's own active generation.",
+]
+
+[legacy_migration]
+current_duplicate_types = ["eliot_doctor_core::StateFence", "eliot_doctor_core::RecoveryLease"]
+rule = "Migrate/re-export canonical owner types after #64/#15. Do not add adapters that convert lineaged epoch to scalar u64. Existing serialized test fixtures remain explicit legacy inputs with no active authority."
+current_verified_bool = "AttemptReceipt.verified"
+verified_migration = "Legacy true imports as historical self-reported evidence only; it cannot become EXECUTED/PASS/BOUND_EXACT or REPAIRED_VERIFIED."
+
+[errors]
+required = [
+  "KERNEL_ADMISSION_REQUIRED",
+  "STALE_AUTHORITY_EPOCH",
+  "STALE_STATE_FENCE",
+  "RECOVERY_LEASE_REQUIRED",
+  "RECOVERY_LEASE_EXPIRED",
+  "RECIPE_NOT_REGISTERED",
+  "RECIPE_REVISION_MISMATCH",
+  "REPAIR_OPERATION_NOT_ADMITTED",
+  "REPAIR_TARGET_MISMATCH",
+  "APPROVAL_REQUIRED",
+  "APPROVAL_MISMATCH",
+  "DIAGNOSE_ONLY_EFFECT_FORBIDDEN",
+  "ATTEMPT_IDENTITY_CONFLICT",
+  "EFFECT_INTENT_PERSISTENCE_FAILED",
+  "EFFECT_UNKNOWN_OUTCOME",
+  "RECONCILIATION_REQUIRED",
+  "BUDGET_EXHAUSTED",
+  "COOLDOWN_ACTIVE",
+  "COMPONENT_QUARANTINED",
+  "VERIFIER_REQUIRED",
+  "VERIFIER_NOT_EXECUTED",
+  "VERIFIER_FAILED",
+  "VERIFIER_INCONCLUSIVE",
+  "VERIFIER_STALE",
+  "ARTIFACT_BINDING_MISMATCH",
+  "CLEANUP_INCOMPLETE",
+]
+
+[fixtures.core]
+required = [
+  "canonical_recipe_attempt_effect_identity_is_restart_stable",
+  "every_load_bearing_field_changes_identity",
+  "raw_concatenation_collision_corpus_is_rejected",
+  "diagnose_only_has_no_effect",
+  "guarded_requires_exact_approval",
+  "unregistered_operation_cannot_construct_executable intent",
+  "legacy_verified_true_never_becomes repaired_verified",
+  "failed_verification_is_not outer completed success",
+]
+
+[fixtures.kernel]
+required = [
+  "intent_persistence_failure_executes_no_effect",
+  "exact_admission_retry_is_idempotent",
+  "changed_retry_is_identity_conflict",
+  "crash_after_effect_start_is_unknown",
+  "unknown_reconciles_same_effect_only",
+  "blind_retry_is_rejected",
+  "budget_and_cooldown_survive restart",
+  "budget_exhaustion_quarantines",
+  "stale epoch/fence/lease cannot execute",
+]
+
+[fixtures.runtime]
+required = [
+  "valid_admission_reaches_one_shot adapter and exits",
+  "missing_or_forged admission executes no effect",
+  "caller recipe on stdin/argv/environment is ignored/rejected",
+  "parent loss cancels/contains exact child effect",
+  "effect receipt without verifier returns pending_verification",
+  "not_executed_simulated_fail_inconclusive_stale_or_unbound verifier cannot verify",
+  "independent executed exact PASS can produce Governor repair candidate",
+  "doctor dependency graph has no Store SDK credentials model client or generic shell",
+]
+
+[scope]
+forbidden_paths = [
+  "bins/eliot-host/**",
+  "crates/storage/**",
+  "crates/governor/eliot-finish/**",
+  "crates/agent/**",
+  "docs/architecture/**",
+  ".github/workflows/**",
+]
+non_goals = [
+  "implement canonical Epoch migration inside Doctor",
+  "change Host last-known-good logic",
+  "add generic repair language or scripting",
+  "let Doctor resolve Problem/Incident/task",
+  "let Doctor verify/promote itself",
+  "claim Product/release support from package tests",
+]
+
+[proof]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-doctor-core -p eliot-doctor -p eliot-kernel-service -p eliot-ors --all-targets",
+  "cargo test --locked -p eliot-doctor-core -p eliot-doctor -p eliot-kernel-service -p eliot-ors --all-targets",
+  "cargo clippy --locked -p eliot-doctor-core -p eliot-doctor -p eliot-kernel-service -p eliot-ors --all-targets -- -D warnings",
+  "git diff --check",
+]
+required_nonzero_tests = true
+required_target = "x86_64-pc-windows-msvc for one-shot process/effect edge"
+edge_profile = "D2_DOCTOR_ONE_SHOT_REPAIR_RECONCILIATION_EDGE_01"
+product_pulse = "Inject one real owner-approved automatic-safe recoverable failure, execute one-shot Doctor through Kernel/ORS, crash after intent/effect boundary, reconcile exact outcome, run independent verifier, apply Governor Problem transition, and prove budget/quarantine behavior."
+
+[stop_conditions]
+contract_challenge = [
+  "Canonical Epoch/RecoveryLease owner is unavailable and the proposed fix requires another local authority type.",
+  "No safe named effect exists for the first edge without inventing a generic shell or widening authority.",
+  "The actual verifier owner/contract cannot be identified without creating a second evaluator.",
+  "Another active PR claims the same Doctor/Kernel/ORS source wave.",
+  "Only in-process fake effect tests are available for a claimed Windows recovery edge.",
+]
+
+[integration]
+merge_owner = "Doctor/Kernel/Governor recovery integration swarm"
+merge_rule = "Wave A may land only if it removes, not multiplies, authority/evidence duplicates. Full #461 closes only after one-shot IPC, durable intent/unknown reconciliation and independent verifier/Governor transition agree on one revision."
+result_schema = "issue, dependency_revisions, source_base, changed_paths_by_wave, identity_and_manifest_contract, Kernel_ORS_attempt_records, effect_adapter_and_process_evidence, one_shot_runtime, independent_verifier_and_problem_transition, package_and_windows_edge_proof, residual_unknowns, finish"
