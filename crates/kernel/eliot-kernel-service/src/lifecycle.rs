@@ -21,6 +21,8 @@ use crate::validate_text;
 /// Recovery may fast-forward to a durable epoch, but an unbounded value is
 /// treated as corrupt rather than allowed to become an implicit replay loop.
 const MAX_EPOCH_SYNC_GAP: u64 = 4_096;
+const GENERATION_FENCE_REASON_SUBSTITUTED: &str =
+    "generation fence reason was invalid; canonical reason substituted";
 
 /// Lifecycle states owned by the Kernel service.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -298,8 +300,12 @@ impl KernelService {
         reason: impl Into<String>,
     ) -> Result<(), KernelServiceError> {
         let reason = reason.into();
-        validate_text(&reason, "generation_fence.reason")?;
         self.generation_fenced = true;
+        let reason = if validate_text(&reason, "generation_fence.reason").is_ok() {
+            reason
+        } else {
+            GENERATION_FENCE_REASON_SUBSTITUTED.to_owned()
+        };
         self.failure = Some(ServiceFailure::Contract(reason));
         if matches!(
             self.state,
@@ -1205,6 +1211,76 @@ mod tests {
         ));
         assert!(matches!(
             service.acquire_admission(),
+            Err(KernelServiceError::GenerationFenced)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_generation_fence_reason_does_not_prevent_fencing() {
+        let mut service = KernelService::new([10; 32], 2, 4).unwrap_or_else(|_| unreachable!());
+
+        let result = service.fence_generation("invalid\nreason");
+
+        assert!(result.is_ok());
+        assert!(service.generation_fenced());
+        assert_eq!(
+            service.failure(),
+            Some(&ServiceFailure::Contract(
+                GENERATION_FENCE_REASON_SUBSTITUTED.to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn generation_fence_preserves_valid_reason_exactly() {
+        let mut service = KernelService::new([12; 32], 2, 4).unwrap_or_else(|_| unreachable!());
+        let reason = "publication failed: retry is not safe";
+
+        service
+            .fence_generation(reason)
+            .unwrap_or_else(|_| unreachable!());
+
+        assert_eq!(
+            service.failure(),
+            Some(&ServiceFailure::Contract(reason.to_owned()))
+        );
+    }
+
+    #[test]
+    fn empty_and_oversized_generation_fence_reasons_use_the_same_substitution() {
+        for (key, reason) in [(14, String::new()), (16, "x".repeat(1025))] {
+            let mut service =
+                KernelService::new([key; 32], 2, 4).unwrap_or_else(|_| unreachable!());
+
+            service
+                .fence_generation(reason)
+                .unwrap_or_else(|_| unreachable!());
+
+            assert!(service.generation_fenced());
+            assert_eq!(
+                service.failure(),
+                Some(&ServiceFailure::Contract(
+                    GENERATION_FENCE_REASON_SUBSTITUTED.to_owned()
+                ))
+            );
+            assert!(matches!(
+                service.apply(KernelControlCommand::Shadow),
+                Err(KernelServiceError::GenerationFenced)
+            ));
+        }
+    }
+
+    #[test]
+    fn fenced_generation_rejects_readiness_replay() -> Result<(), Box<dyn std::error::Error>> {
+        let mut service = KernelService::new([18; 32], 2, 4)?;
+        let candidate = candidate();
+        let activation = activate(&mut service, candidate.clone());
+        service.publish_ready(ready_receipt(&candidate, &activation, "ready-initial"))?;
+        service.fence_generation(String::new())?;
+
+        assert!(matches!(
+            service.mark_ready(ready_receipt(&candidate, &activation, "ready-replay")),
             Err(KernelServiceError::GenerationFenced)
         ));
         Ok(())

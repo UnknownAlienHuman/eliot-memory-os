@@ -831,22 +831,31 @@ impl KernelComposition {
         &self,
         gateway: &Arc<KernelStoreGateway>,
         reason: impl Into<String>,
-    ) {
+    ) -> Result<(), KernelBuildError> {
         let reason = reason.into();
-        if let Ok(mut service) = self.service.lock() {
-            let _ = service.fence_generation(reason);
+        {
+            let mut service = self
+                .service
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            service.fence_generation(reason).map_err(|error| {
+                KernelBuildError::Service(format!("generation fence failed: {error}"))
+            })?;
         }
         gateway.fence();
         let old = self
             .canonical_store_gateway
             .lock()
-            .ok()
-            .and_then(|guard| guard.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         if let Some(old) = old
             && !Arc::ptr_eq(&old, gateway)
         {
-            let _ = old.fence_and_drain(Duration::from_secs(5)).await;
+            old.fence_and_drain(Duration::from_secs(5))
+                .await
+                .map_err(KernelBuildError::Service)?;
         }
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -1210,7 +1219,7 @@ impl KernelComposition {
                                                 "Store rebind abort readback failed: {readback_error}"
                                             ),
                                         )
-                                        .await;
+                                        .await?;
                                         return Err(KernelBuildError::Service(format!(
                                             "Store rebind begin outcome is uncertain after abort: {begin_error}; abort readback: {readback_error}"
                                         )));
@@ -1243,7 +1252,7 @@ impl KernelComposition {
                                             "Store rebind begin abort remained durable: {begin_error}"
                                         ),
                                     )
-                                    .await;
+                                    .await?;
                                         return Err(KernelBuildError::Service(format!(
                                             "Store rebind begin outcome is uncertain after abort: {begin_error}"
                                         )));
@@ -1258,7 +1267,7 @@ impl KernelComposition {
                                     "Store rebind begin abort failed ({begin_error}): {abort_error}"
                                 ),
                             )
-                            .await;
+                            .await?;
                                 return Err(KernelBuildError::Service(format!(
                                     "Store rebind begin outcome is uncertain: {begin_error}; abort: {abort_error}"
                                 )));
@@ -1281,7 +1290,7 @@ impl KernelComposition {
                                 record.operation_id.as_str()
                             ),
                         )
-                        .await;
+                        .await?;
                         return Err(KernelBuildError::Service(
                             "Store rebind begin readback conflicted".to_owned(),
                         ));
@@ -1294,7 +1303,7 @@ impl KernelComposition {
                                 "Store rebind begin readback failed ({begin_error}): {readback_error}"
                             ),
                         )
-                        .await;
+                        .await?;
                         return Err(KernelBuildError::Service(format!(
                             "Store rebind begin outcome is uncertain: {begin_error}; readback: {readback_error}"
                         )));
@@ -1378,7 +1387,7 @@ impl KernelComposition {
                                         &gateway,
                                         "Store rebind commit abort readback remained non-terminal",
                                     )
-                                    .await;
+                                    .await?;
                                     return Err(KernelBuildError::Service(
                                         "Store rebind commit outcome is uncertain after abort"
                                             .to_owned(),
@@ -1392,7 +1401,7 @@ impl KernelComposition {
                                         "Store rebind commit abort readback failed: {readback_error}"
                                     ),
                                 )
-                                .await;
+                                    .await?;
                                     return Err(KernelBuildError::Service(format!(
                                         "Store rebind commit outcome is uncertain: {error}; abort readback: {readback_error}"
                                     )));
@@ -1407,7 +1416,7 @@ impl KernelComposition {
                                     "Store rebind commit abort failed ({error}): {abort_error}"
                                 ),
                             )
-                            .await;
+                            .await?;
                             return Err(KernelBuildError::Service(format!(
                                 "Store rebind commit outcome is uncertain: {error}; abort: {abort_error}"
                             )));
@@ -1430,7 +1439,7 @@ impl KernelComposition {
                             record.operation_id.as_str()
                         ),
                     )
-                    .await;
+                    .await?;
                     return Err(KernelBuildError::Service(
                         "Store rebind commit readback conflicted".to_owned(),
                     ));
@@ -1441,7 +1450,7 @@ impl KernelComposition {
                         &gateway,
                         format!("Store rebind commit readback failed ({error}): {readback_error}"),
                     )
-                    .await;
+                    .await?;
                     return Err(KernelBuildError::Service(format!(
                         "Store rebind commit outcome is uncertain: {error}; readback: {readback_error}"
                     )));
@@ -1468,7 +1477,7 @@ impl KernelComposition {
                     &gateway,
                     "Store rebind service lock poisoned after ORS commit",
                 )
-                .await;
+                .await?;
                 return Err(error);
             }
         };
@@ -1478,14 +1487,14 @@ impl KernelComposition {
                 &gateway,
                 format!("Store rebind service commit publication failed: {error}"),
             )
-            .await;
+            .await?;
             return Err(KernelBuildError::Service(error));
         }
         let old_gateway_for_drain = self
             .canonical_store_gateway
             .lock()
-            .ok()
-            .and_then(|guard| guard.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         if let Some(old) = old_gateway_for_drain
             && !Arc::ptr_eq(&old, &gateway)
             && let Err(error) = old.fence_and_drain(Duration::from_secs(5)).await
@@ -1495,39 +1504,43 @@ impl KernelComposition {
                 &gateway,
                 format!("Store rebind old gateway drain failed: {error}"),
             )
-            .await;
+            .await?;
             return Err(KernelBuildError::Service(format!(
                 "Store rebind old gateway drain failed: {error}"
             )));
         }
-        let old_gateway = match (|| {
-            let mut gw_guard = self
-                .canonical_store_gateway
-                .lock()
-                .map_err(|_| KernelBuildError::Service("store gateway lock poisoned".to_owned()))?;
-            let mut handoff_guard = self
-                .store_handoff
-                .lock()
-                .map_err(|_| KernelBuildError::Service("Store handoff lock poisoned".to_owned()))?;
-            let old = gw_guard.replace(Arc::clone(&gateway));
-            *handoff_guard = Some(eliot_kernel_service::StoreBootstrapHandoff {
-                requirement: handoff.requirement.clone(),
-                process_binding: handoff.process_binding.clone(),
-            });
-            Ok::<Option<Arc<KernelStoreGateway>>, KernelBuildError>(old)
-        })() {
-            Ok(old) => old,
-            Err(error) => {
-                Self::commit_store_rebind_attachment(&mut attachment);
-                let mut svc = self
-                    .service
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _ = svc.fence_generation(format!("store rebind composition fenced: {error}"));
-                gateway.fence();
-                return Err(error);
-            }
-        };
+        let old_gateway =
+            match (|| {
+                let mut gw_guard = self.canonical_store_gateway.lock().map_err(|_| {
+                    KernelBuildError::Service("store gateway lock poisoned".to_owned())
+                })?;
+                let mut handoff_guard = self.store_handoff.lock().map_err(|_| {
+                    KernelBuildError::Service("Store handoff lock poisoned".to_owned())
+                })?;
+                let old = gw_guard.replace(Arc::clone(&gateway));
+                *handoff_guard = Some(eliot_kernel_service::StoreBootstrapHandoff {
+                    requirement: handoff.requirement.clone(),
+                    process_binding: handoff.process_binding.clone(),
+                });
+                Ok::<Option<Arc<KernelStoreGateway>>, KernelBuildError>(old)
+            })() {
+                Ok(old) => old,
+                Err(error) => {
+                    Self::commit_store_rebind_attachment(&mut attachment);
+                    let mut svc = self
+                        .service
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    svc.fence_generation(format!("store rebind composition fenced: {error}"))
+                        .map_err(|fence_error| {
+                            KernelBuildError::Service(format!(
+                                "store rebind composition fencing failed: {fence_error}"
+                            ))
+                        })?;
+                    gateway.fence();
+                    return Err(error);
+                }
+            };
         Self::commit_store_rebind_attachment(&mut attachment);
         if let Some(old) = old_gateway {
             old.fence();
@@ -1563,7 +1576,9 @@ impl KernelComposition {
         };
         *generation_poison = Some("test publication failure".to_owned());
         if let Ok(mut service) = self.service.lock() {
-            let _ = service.fence_generation("test publication failure");
+            service
+                .fence_generation("test publication failure")
+                .unwrap_or_else(|_| unreachable!());
         }
     }
 
