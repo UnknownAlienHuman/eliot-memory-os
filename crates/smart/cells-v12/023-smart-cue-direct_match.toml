@@ -1,0 +1,49 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+assignment_authority = "crates/smart/cognitive-rev12-w2-agent-handoff.toml"
+field_contract_is_sole_public_type_authority = true
+assignment_status = "READY_FOR_SWARM_IMPLEMENTATION_AFTER_PARENT_CONTRACT_MERGE"
+order = 23
+cell = "smart.cue.direct_match"
+physical_crate = "eliot-cues"
+predecessor_orders = [19, 20, 22]
+primary_property = "Match normalized observed cues directly against exact, authorized-prefix and canonical-signature rows with no relation-graph dependency."
+field_contracts = ["crates/smart/eliot-cue-contracts/cue.contract.toml"]
+public_function_signatures = [
+  "pub fn match_direct_cues(snapshot: &CueSnapshot, observed: &[NormalizedCue], request: &CueMatchRequest) -> Result<DirectCueMatchResult, CueMatchError>",
+]
+write_scope = [
+  "crates/smart/eliot-cues/src/direct_match.rs",
+  "crates/smart/eliot-cues/tests/direct_match.rs",
+]
+algorithm = [
+  "validate snapshot/request/observed profile, scope, task and fence",
+  "perform exact-key lookup before optional authorized-prefix/signature lookup",
+  "suppress denied, stale, mismatched or over-limit rows with trace",
+  "retain negative-memory exact hits and source lineage",
+  "sort by negative-memory priority, match strength and stable target identity",
+  "compute result digest independently of snapshot edge state",
+]
+minimum_tests = [
+  "exact firing succeeds with zero edges",
+  "removing all relation edges leaves direct result unchanged",
+  "prefix applies only to authorized kinds",
+  "stale/denied row suppressed with trace",
+  "negative exact hit ordered first",
+  "hit limit explicit",
+  "input permutation deterministic",
+]
+non_goals = [
+  "relation traversal",
+  "payload retrieval",
+  "session dedup",
+  "Context admission",
+  "delivery/use/support mutation",
+  "Cargo.toml/lib.rs/re-export integration",
+]
+architecture_refs = ["ARCH-CTX-02", "ARCH-CTX-04", "ARCH-MEM-04", "ARCH-EPI-04", "ARCH-MOD-03"]
+implementation_refs = ["I2.15", "I2.20", "I7.19", "I12.14", "I17.11"]
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+stop_condition = "Return a ContractChallenge rather than requiring graph state for exact firing, fetching payload, hiding suppressed rows, or treating activation priority as support."
+brief_proof_ceiling = "STATIC_W2_AGENT_WORK_UNIT_MATERIALIZATION_ONLY"
+implementation_proof_ceiling = "PACKAGE_MODULE_PROOF_ONLY_AFTER_RUST_AND_TEST_EXECUTION"
