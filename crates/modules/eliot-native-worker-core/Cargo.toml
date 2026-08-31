@@ -15,6 +15,7 @@ proof_entrypoint = "cargo test -p eliot-native-worker-core --all-targets --all-f
 
 [dependencies]
 eliot-agent-api.workspace = true
+eliot-contracts.workspace = true
 eliot-process.workspace = true
 eliot-receipts.workspace = true
 eliot-runtime-contracts.workspace = true

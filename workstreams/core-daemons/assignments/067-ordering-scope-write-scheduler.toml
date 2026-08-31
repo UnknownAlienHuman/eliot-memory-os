@@ -1,0 +1,325 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_SWARM_IMPLEMENTATION"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "AGENT_HANDOFF_ONLY"
+parent_issue = 67
+handoff_issue = 308
+integration_issue_refs = [15, 19, 11]
+base_branch = "main"
+base_sha = "5a48bb5252c1fa1bb0e7dd31eb760ff2970eb436"
+normative_pair_ref = "docs/normative-pair.toml"
+docs_read_status = "EXECUTED_LOCAL_DOCS_READ_V1"
+dreamer_excluded = true
+
+[work_unit]
+cell_id = "storage.ordering-scope-write-scheduler"
+causal_property = "Disjoint canonical-store transitions may execute concurrently while every overlapping OrderingScope set follows one deterministic precedence, one canonical receipt path, and one scope-local reconciliation boundary."
+old_path_discriminator = "SurrealStoreAdapter.write_lock is one global tokio Mutex acquired by both apply_migration and every apply_prepared; normal writes hold it across idempotency lookup, fence/head reads, planning, provider transaction, and receipt validation."
+integration_owner = "parent issue #67 with storage boundary #19, Kernel/ORS owner #15, and #11 Product Pulse"
+one_writer_rule = "One mutable owner per wave. The worker implementing a scheduler does not also integrate ORS, Surreal, and Product Pulse."
+result = "integration candidate only"
+
+[normative_basis]
+architecture = ["ARCH-ORD-01", "ARCH-MOD-03", "ARCH-SEC-02", "ARCH-RES-01", "ARCH-RES-04"]
+implementation = ["I1.8", "I5.7", "I5.9", "I5.19", "I13.5", "I13.9", "I14"]
+reason = "One logical canonical write authority does not imply one global execution lane. Conflicting state is ordered by complete OrderingScope ownership; independent scopes retain bounded progress."
+
+[current_source]
+observed_on = "main@5a48bb5252c1fa1bb0e7dd31eb760ff2970eb436"
+source_handles = [
+  "crates/storage/eliot-store-surreal-adapter/src/lib.rs",
+  "crates/storage/eliot-store-surreal-adapter/src/apply.rs",
+  "crates/storage/eliot-store-surreal-adapter/src/apply/atomic_write.rs",
+  "crates/storage/eliot-store-surreal-adapter/src/client.rs",
+  "crates/storage/eliot-store-memory/src/lib.rs",
+  "crates/storage/eliot-store-api/src/lib.rs",
+  "crates/kernel/eliot-ors/src/model.rs",
+  "crates/kernel/eliot-ors/src/store.rs",
+]
+confirmed_gap = [
+  "SurrealStoreAdapter owns one write_lock initialized in both constructors.",
+  "apply_migration acquires the same write_lock used by normal canonical writes.",
+  "apply_prepared acquires write_lock after validation/readiness and retains it across idempotency lookup, fence and head reads, deterministic plan construction, provider transaction, and receipt validation.",
+  "The current memory store is an intentionally sequential semantic reference model; it is not evidence that the real provider must remain globally serialized.",
+  "The current adapter has one lazily connected RpcTransport and no demonstrated bounded concurrent transaction/client profile.",
+]
+existing_invariants = [
+  "PreparedTransition declares the complete OrderingScope set before execution.",
+  "Expected RevisionHead and OrderingHead checks remain inside the provider transaction boundary.",
+  "ORS owns uncommitted reservation order; Canonical Store OrderingHead owns committed history.",
+  "Unknown provider outcome is reconciled by exact operation identity before retry or successor release.",
+]
+
+[owner_decision]
+functional_cell = "OrderingScopeWriteScheduler"
+source_layer = "C1 pure scheduling core plus narrow provider adapters"
+mutable_state = "bounded queue, scope ownership table, ready set, in-flight permit ownership, migration-drain state"
+lifecycle_owner = "the selected storage execution service generation"
+must_not_own = [
+  "semantic admission",
+  "canonical OrderingHead truth",
+  "ORS reservation truth",
+  "provider transaction semantics",
+  "Authority Epoch issuance",
+  "Store schema migration policy",
+  "task or finish state",
+]
+package_rule = "Do not create a new crate by name alone. The contract worker must record a CrateExtractionDecision. Prefer an ordinary module in an existing storage package unless independent consumers, dependency isolation, and package proof justify extraction."
+
+[contract]
+types = [
+  "OrderingScopeSet",
+  "StoreSchedulingKey",
+  "StoreWriteAdmission",
+  "StoreWritePermit",
+  "StoreWriteCompletion",
+  "StoreWriteReconciliationBarrier",
+  "MigrationDrainPermit",
+  "OrderingScopeSchedulerSnapshot",
+  "OrderingScopeSchedulerError",
+]
+required_inputs = [
+  "operation_id and idempotency identity",
+  "complete canonical sorted unique OrderingScope set",
+  "ORS WriterReservationToken identity and reservation_order",
+  "PreparedTransition/admission digest",
+  "State Fence and lineaged EpochId once #64 lands",
+  "deadline and cancellation identity",
+  "provider transaction capacity class",
+]
+forbidden_inputs = [
+  "raw query text",
+  "provider credentials",
+  "semantic command interpretation",
+  "task priority inferred from prose",
+  "process connection identity as durable ownership",
+]
+
+[invariants]
+items = [
+  "A write is admitted only with a non-empty, canonical, duplicate-free complete OrderingScope set.",
+  "Multi-scope readiness is acquired atomically for the complete set or not at all; incremental per-scope locking is forbidden.",
+  "Two operations that overlap in any scope observe one consistent precedence in every shared scope.",
+  "Disjoint scope sets may be ready and in provider execution concurrently within bounded capacity.",
+  "An operation waiting for a predecessor or retry time holds no provider transaction/client permit.",
+  "A provider permit is acquired only after the operation is conflict-ready and the migration gate admits normal writes.",
+  "Cancellation before provider dispatch releases queue/scope claims without fabricating a receipt.",
+  "After provider dispatch, an unknown result creates a scope-local reconciliation barrier and cannot be converted to cancellation or deterministic rejection.",
+  "Exact replay of the same operation/result is idempotent; another digest under the same identity is IDENTITY_CONFLICT.",
+  "Retry delay, poison, or unknown outcome blocks only dependent scopes; independent scopes remain schedulable.",
+  "Migration/cutover exclusivity is a separate drain gate, not the normal write scheduler.",
+  "Scheduler state never advances canonical OrderingHead or marks a write committed.",
+]
+
+[fairness_and_bounds]
+queue_policy = "bounded FIFO by ORS reservation_order among conflict-ready candidates, with deterministic tie-break by operation identity"
+multi_scope_policy = "one atomic claim over the canonical OrderingScopeSet; no lock-order wait graph"
+writer_capacity = "bounded configuration profile; normal writes never consume protected Control Reserve from #65"
+provider_capacity = "bounded client/transaction permits measured against the exact Surreal RPC transport; no connection per request"
+saturation = "reject or backpressure new normal work with typed capacity state while cancellation, fencing, health, reconciliation, and migration drain retain their declared protected path"
+required_metrics = [
+  "queue depth and oldest-ready age",
+  "per-scope wait age",
+  "conflict-ready to provider-permit wait",
+  "active provider transactions",
+  "scope sets blocked by reconciliation",
+  "identity conflicts and optimistic head conflicts",
+  "migration drain age and remaining in-flight operations",
+  "capacity rejection count by class",
+]
+
+[migration_gate]
+states = ["NORMAL", "DRAINING", "EXCLUSIVE", "REOPENING", "DEGRADED_RECOVERY"]
+rules = [
+  "Entering DRAINING closes new normal admissions but permits exact cancellation and reconciliation.",
+  "Every admitted/in-flight operation receives a terminal or explicit unknown/reconciling disposition before EXCLUSIVE.",
+  "EXCLUSIVE holds the migration/store-generation permit and no normal provider transaction permit.",
+  "A failed migration never silently reopens normal writes; it yields a typed recovery disposition.",
+  "Reopening validates the new provider/schema generation and scheduler generation before new admission.",
+]
+
+[errors]
+required = [
+  "EMPTY_ORDERING_SCOPE_SET",
+  "NONCANONICAL_ORDERING_SCOPE_SET",
+  "DUPLICATE_ORDERING_SCOPE",
+  "RESERVATION_TOKEN_MISMATCH",
+  "STALE_STATE_FENCE",
+  "STALE_AUTHORITY_EPOCH",
+  "IDENTITY_CONFLICT",
+  "QUEUE_CAPACITY_EXHAUSTED",
+  "PROVIDER_CAPACITY_EXHAUSTED",
+  "MIGRATION_DRAIN_ACTIVE",
+  "SCOPE_RECONCILIATION_REQUIRED",
+  "CANCELLED_BEFORE_DISPATCH",
+  "UNKNOWN_OUTCOME",
+  "INTERNAL_SCHEDULER_CONTRACT_FAILURE",
+]
+behavior = [
+  "No error string controls retry, scope release, or migration behavior.",
+  "UNKNOWN_OUTCOME carries exact operation and affected scope identities and prohibits blind retry.",
+  "Capacity rejection performs no provider transaction and allocates no canonical sequence.",
+  "A scheduler internal defect fences only its generation and preserves ORS/canonical evidence for recovery.",
+]
+
+[[wave]]
+order = 1
+id = "contract-and-pure-scheduler"
+issue_owner = "new child issue under #67"
+mutable_paths = [
+  "selected storage contract/core module and its focused tests",
+  "CrateExtractionDecision evidence if a new package is proposed",
+]
+deliverable = "Provider-neutral scheduler state machine, canonical scope-set contract, bounded fairness policy, migration gate, and model/property corpus."
+must_not_touch = [
+  "Surreal adapter production path",
+  "Kernel/ORS persistence",
+  "root workspace without separate admission",
+  "provider credentials or SQL",
+]
+proof = [
+  "deterministic model/property tests for overlap, disjointness, multi-scope atomic claim, fairness, cancellation, unknown barrier, and migration drain",
+  "package fmt/check/test/clippy with nonzero tests",
+]
+proof_ceiling = "SCHEDULER_CONTRACT_AND_MODEL_PROOF_ONLY"
+
+[[wave]]
+order = 2
+id = "ors-reservation-integration"
+issue_owner = "new child issue under #67 and #15"
+mutable_paths = [
+  "crates/kernel/eliot-ors/src/model.rs",
+  "crates/kernel/eliot-ors/src/store.rs",
+  "direct ORS reservation/scheduler adapter fixtures",
+]
+deliverable = "Bind scheduler keys to the exact WriterReservationToken/reservation_order and recovery state without moving committed ordering truth into ORS."
+must_not_touch = ["Surreal provider transaction", "semantic admission"]
+proof_ceiling = "ORS_SCHEDULER_EDGE_PROOF_ONLY"
+
+[[wave]]
+order = 3
+id = "surreal-adapter"
+issue_owner = "new child issue under #67 and #19"
+mutable_paths = [
+  "crates/storage/eliot-store-surreal-adapter/src/lib.rs",
+  "crates/storage/eliot-store-surreal-adapter/src/apply.rs",
+  "crates/storage/eliot-store-surreal-adapter/src/client.rs",
+  "focused adapter concurrency fixtures",
+]
+deliverable = "Remove the global normal-write mutex, retain a distinct exclusive migration gate, and execute ready disjoint transactions through a bounded proven client/transaction set."
+must_not_touch = ["Governor semantics", "Kernel authority", "raw query surface"]
+proof_ceiling = "SURREAL_ADAPTER_MODULE_AND_FAKE_PROVIDER_PROOF"
+
+[[wave]]
+order = 4
+id = "reference-conformance"
+issue_owner = "new child issue under #67"
+mutable_paths = [
+  "crates/storage/eliot-store-memory/**",
+  "shared scheduler/store conformance fixtures",
+]
+deliverable = "Run the same ordering/idempotency/reconciliation corpus against the sequential reference semantics and concurrent adapter without requiring the reference model to become physically concurrent."
+proof_ceiling = "REFERENCE_SEMANTIC_CONFORMANCE_ONLY"
+
+[[wave]]
+order = 5
+id = "real-provider-edge"
+issue_owner = "separate integration owner under #67 and #19"
+mutable_paths = ["bounded real Surreal concurrency/fault fixtures only"]
+deliverable = "Observe disjoint transactions concurrently, overlapping sets consistently ordered, bounded provider capacity, unknown-outcome scope isolation, and exclusive migration drain on exact current provider identity."
+proof_ceiling = "REAL_STORE_EDGE_PROOF"
+
+[[wave]]
+order = 6
+id = "product-pulse"
+issue_owner = "issue #11 integration owner"
+mutable_paths = ["D0/D1 Product Pulse scenario and evidence only"]
+deliverable = "One blocked/slow/unknown OrderingScope does not stop a disjoint scope, while cancellation/recovery and canonical receipt correctness remain intact."
+proof_ceiling = "PRODUCT_PULSE"
+
+[fixtures]
+required = [
+  "two disjoint single-scope operations overlap in provider execution and commit valid independent heads",
+  "two operations sharing one scope never execute provider transactions concurrently",
+  "multi-scope A+B and B+C obtain one deterministic precedence without cyclic wait",
+  "insertion-order permutations produce the same schedule",
+  "queue capacity is bounded and does not leak scope ownership",
+  "waiting predecessor does not hold provider permit",
+  "cancellation before dispatch releases claims and performs no transaction",
+  "unknown commit blocks only the exact affected scopes until receipt reconciliation",
+  "exact concurrent replay returns one receipt; changed digest is IDENTITY_CONFLICT",
+  "migration drain closes normal admission, waits for dispositions, enters one exclusive operation, then reopens only after readiness",
+  "provider client failure and delayed receipt preserve operation identity and scope-local recovery",
+]
+property_invariants = [
+  "at most one in-flight operation per OrderingScope",
+  "no operation holds a strict subset of its declared scope set",
+  "no provider permit is held by a non-ready operation",
+  "committed order is derived only from canonical receipts/heads",
+  "all admitted operations remain terminal or explicitly reconciling",
+]
+
+[dependencies]
+required_before_source_wave = [
+  "#63 shared executable-request identity at the boundary being mutated",
+  "#64 lineaged EpochId where authority-bearing scheduler records are added",
+  "#65 normal versus protected capacity class contract",
+  "#76 typed Store failure contract for retry/unknown/capacity behavior",
+]
+path_claim_rule = "Stop if an open PR owns any selected mutable path. Rebase from then-current main and rerun the documentation reader before mutation."
+
+[non_goals]
+items = [
+  "No second canonical writer.",
+  "No raw query or generic transaction API.",
+  "No weakening of atomic event/projection/relation/receipt/outbox commit.",
+  "No global normal-write mutex under a new name.",
+  "No unbounded task spawning or connection-per-request.",
+  "No semantic priority inference in the scheduler.",
+  "No performance or support claim without exact provider/client/workload evidence.",
+  "No Dreamer changes.",
+]
+
+[stop_conditions]
+items = [
+  "The complete OrderingScope set cannot be known before scheduling.",
+  "ORS reservation precedence and scheduler precedence would diverge.",
+  "A provider client cannot support bounded concurrency and no measured bounded client-set design exists.",
+  "The proposed scheduler would advance canonical OrderingHeads or interpret commands.",
+  "A migration path cannot drain or disposition every in-flight effect-capable operation.",
+  "Another open PR claims the selected path.",
+  "The required #63/#64/#65/#76 contract revision is absent or incompatible.",
+  "The discriminator requires changing the canonical oracle rather than execution scheduling.",
+]
+challenge = "Return a ContractChallenge to #67 with exact source/evidence. Do not replace one global mutex with an unreviewed concurrent map."
+
+[result_contract]
+required_fields = [
+  "issue_and_cell",
+  "source_base_and_candidate",
+  "causal_property",
+  "old_path_discriminator",
+  "changed_contract_or_source",
+  "owned_state_and_effects",
+  "module_proof",
+  "edge_proof",
+  "product_pulse_or_not_applicable_reason",
+  "evidence_execution_status",
+  "known_uncovered_behavior",
+  "security_privacy_and_authority_delta",
+  "migration_rollback_and_removal",
+  "integration_candidate",
+  "residual_unknowns",
+]
+finish_states = [
+  "VERIFIED_COMPLETE",
+  "PARTIAL",
+  "BLOCKED",
+  "FAILED_VERIFICATION",
+  "DEGRADED_NO_PROOF",
+  "UNSAFE_TO_FINISH",
+  "CANCELLED",
+  "SUPERSEDED",
+]

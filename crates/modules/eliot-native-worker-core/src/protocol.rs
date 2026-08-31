@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{AttemptId, AuthorizedEffect, ProposedEffect};
+use eliot_contracts::{AuthorityEpoch, StateFence};
 use eliot_process::{CancellationStatus, ProcessLifecycle, ProcessStartReceipt};
 use eliot_receipts::ReceiptDisposition;
 use eliot_runtime_contracts::ServiceProcessState;
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::WorkerError;
 
 /// Stable version of A-13's language-neutral native-worker protocol.
-pub const PROTOCOL_VERSION: &str = "eliot-native-worker/v1";
+pub const PROTOCOL_VERSION: &str = "eliot-native-worker/v2";
 /// The only encoding profile admitted by the first native-worker contract.
 pub const JSON_ENCODING_PROFILE: &str = "json-v1";
 
@@ -86,7 +87,8 @@ pub struct WorkerHello {
     pub artifact_manifest_digest: String,
     pub launch_nonce: String,
     pub worker_generation: u64,
-    pub state_fence: String,
+    pub authority_epoch: AuthorityEpoch,
+    pub state_fence: StateFence,
     pub route_ref: String,
     pub requested_capabilities: BTreeSet<String>,
 }
@@ -104,7 +106,6 @@ impl WorkerHello {
             ("request_id", &self.request_id),
             ("artifact_manifest_digest", &self.artifact_manifest_digest),
             ("launch_nonce", &self.launch_nonce),
-            ("state_fence", &self.state_fence),
             ("route_ref", &self.route_ref),
         ] {
             if value.trim().is_empty() {
@@ -124,6 +125,12 @@ impl WorkerHello {
                 .any(|(key, value)| key.trim().is_empty() || value.trim().is_empty())
         {
             return Err(WorkerError::InvalidHandshake("bounded_fields"));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| WorkerError::InvalidHandshake("state_fence"))?;
+        if self.authority_epoch != self.state_fence.authority_epoch {
+            return Err(WorkerError::InvalidHandshake("epoch_fence"));
         }
         Ok(())
     }
@@ -212,8 +219,8 @@ pub struct EventAckReceipt {
     pub event_id: String,
     pub sequence: u64,
     pub producer_generation: u64,
-    pub authority_epoch: String,
-    pub state_fence: String,
+    pub authority_epoch: AuthorityEpoch,
+    pub state_fence: StateFence,
     pub phase: AckPhase,
     pub acknowledged_at_unix_ms: u64,
 }
@@ -228,8 +235,8 @@ pub struct WorkerFrame {
     pub request_id: String,
     pub trace_context: BTreeMap<String, String>,
     pub deadline_unix_ms: u64,
-    pub authority_epoch: String,
-    pub state_fence: String,
+    pub authority_epoch: AuthorityEpoch,
+    pub state_fence: StateFence,
     pub lease_id: String,
     pub admission_revision: String,
     pub producer_generation: u64,
@@ -247,8 +254,6 @@ impl WorkerFrame {
         for (field, value) in [
             ("connection_id", &self.connection_id),
             ("request_id", &self.request_id),
-            ("authority_epoch", &self.authority_epoch),
-            ("state_fence", &self.state_fence),
             ("lease_id", &self.lease_id),
             ("admission_revision", &self.admission_revision),
         ] {
@@ -264,6 +269,12 @@ impl WorkerFrame {
                 .any(|(key, value)| key.trim().is_empty() || value.trim().is_empty())
         {
             return Err(WorkerError::InvalidFrame("bounded_fields"));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| WorkerError::InvalidFrame("state_fence"))?;
+        if self.authority_epoch != self.state_fence.authority_epoch {
+            return Err(WorkerError::InvalidFrame("epoch_fence"));
         }
         Ok(())
     }
@@ -344,7 +355,7 @@ pub struct WorkerEventDraft {
     stream_id: String,
     producer_id: String,
     producer_generation: u64,
-    authority_epoch: String,
+    authority_epoch: AuthorityEpoch,
     request_id: String,
     causal_predecessor_refs: Vec<String>,
     delivery_class: DeliveryClass,
@@ -352,7 +363,7 @@ pub struct WorkerEventDraft {
     payload_type: String,
     payload: WorkerEventPayload,
     disposition: ReceiptDisposition,
-    state_fence: String,
+    state_fence: StateFence,
     trace_context: BTreeMap<String, String>,
 }
 
@@ -362,7 +373,7 @@ impl WorkerEventDraft {
         stream_id: String,
         producer_id: String,
         producer_generation: u64,
-        authority_epoch: String,
+        authority_epoch: AuthorityEpoch,
         request_id: String,
         causal_predecessor_refs: Vec<String>,
         delivery_class: DeliveryClass,
@@ -370,7 +381,7 @@ impl WorkerEventDraft {
         payload_type: impl Into<String>,
         payload: WorkerEventPayload,
         disposition: ReceiptDisposition,
-        state_fence: String,
+        state_fence: StateFence,
         trace_context: BTreeMap<String, String>,
     ) -> Self {
         Self {
@@ -437,7 +448,7 @@ pub struct WorkerEventEnvelope {
     pub stream_id: String,
     pub producer_id: String,
     pub producer_generation: u64,
-    pub authority_epoch: String,
+    pub authority_epoch: AuthorityEpoch,
     pub event_id: String,
     pub sequence: u64,
     pub request_id: String,
@@ -447,7 +458,7 @@ pub struct WorkerEventEnvelope {
     pub payload_type: String,
     pub payload: WorkerEventPayload,
     pub disposition: ReceiptDisposition,
-    pub state_fence: String,
+    pub state_fence: StateFence,
     pub trace_context: BTreeMap<String, String>,
 }
 

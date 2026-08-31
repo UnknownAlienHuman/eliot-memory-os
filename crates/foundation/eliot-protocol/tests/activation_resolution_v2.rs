@@ -1,9 +1,7 @@
 use eliot_contracts::{AuthorityEpoch, RequestId, ResourceGeneration, StateFence};
 use eliot_protocol::{
-    AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_ID,
-    AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_VERSION,
-    AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID,
-    AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
+    AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_ID, AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_VERSION,
+    AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID, AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
     AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
     AgentActivationResolutionResult, AgentActivationResolutionTicket,
     AgentActivationResolvedBinding, AgentActivationRetryDirective,
@@ -22,10 +20,7 @@ fn ticket() -> Result<AgentActivationResolutionTicket, ProtocolError> {
         activation_request_sha256: "a".repeat(64),
         peer_admission_receipt_sha256: "b".repeat(64),
         connection_id: "activation-connection-v2-1".to_owned(),
-        state_fence: StateFence::new(
-            AuthorityEpoch::new(7)?,
-            ResourceGeneration::new(11)?,
-        ),
+        state_fence: StateFence::new(AuthorityEpoch::new(7)?, ResourceGeneration::new(11)?),
         kernel_deadline_unix_ms: 10_000,
         ticket_sha256: String::new(),
     }
@@ -118,8 +113,7 @@ fn every_disposition_round_trips_and_binds_exact_ticket() -> Result<(), Protocol
 }
 
 #[test]
-fn complete_empty_task_candidate_set_represents_no_active_binding()
--> Result<(), ProtocolError> {
+fn complete_empty_task_candidate_set_represents_no_active_binding() -> Result<(), ProtocolError> {
     let ticket = ticket()?;
     result(
         &ticket,
@@ -280,8 +274,7 @@ fn result_observation_must_precede_ticket_expiry() -> Result<(), ProtocolError> 
 }
 
 #[test]
-fn ticket_identity_digest_fence_and_result_digest_substitution_fail()
--> Result<(), ProtocolError> {
+fn ticket_identity_digest_fence_and_result_digest_substitution_fail() -> Result<(), ProtocolError> {
     let ticket = ticket()?;
     let result = result(
         &ticket,
@@ -301,10 +294,8 @@ fn ticket_identity_digest_fence_and_result_digest_substitution_fail()
     assert!(other_digest.validate_against(&ticket).is_err());
 
     let mut other_fence = result.clone();
-    other_fence.ticket_state_fence = StateFence::new(
-        AuthorityEpoch::new(8)?,
-        ResourceGeneration::new(11)?,
-    );
+    other_fence.ticket_state_fence =
+        StateFence::new(AuthorityEpoch::new(8)?, ResourceGeneration::new(11)?);
     other_fence = other_fence.with_computed_digest()?;
     assert!(other_fence.validate_against(&ticket).is_err());
 
@@ -315,8 +306,7 @@ fn ticket_identity_digest_fence_and_result_digest_substitution_fail()
 }
 
 #[test]
-fn candidate_sets_reject_duplicate_oversized_and_excessive_handles()
--> Result<(), ProtocolError> {
+fn candidate_sets_reject_duplicate_oversized_and_excessive_handles() -> Result<(), ProtocolError> {
     let ticket = ticket()?;
     for candidate_handles in [
         vec!["eliot://task/one".to_owned(), "eliot://task/one".to_owned()],
@@ -382,8 +372,8 @@ fn unknown_fields_are_rejected() -> Result<(), ProtocolError> {
 }
 
 #[test]
-fn resolved_projection_contains_no_kernel_activation_authority_fields()
--> Result<(), ProtocolError> {
+fn resolved_projection_contains_no_kernel_activation_authority_fields() -> Result<(), ProtocolError>
+{
     let value =
         serde_json::to_value(binding()).map_err(|error| ProtocolError::Json(error.to_string()))?;
     let object = value.as_object().ok_or(ProtocolError::InvalidField {

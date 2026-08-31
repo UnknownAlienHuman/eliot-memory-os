@@ -300,7 +300,8 @@ impl<E: ProcessExecutor + 'static> CodexAdapter<E> {
             return Err(CodexAdapterError::StaleFence);
         }
         Ok(CodexLaunchReceipt {
-            attempt_id: AttemptId::new(attached.launch.id.as_str())?,
+            attempt_id: AttemptId::new(attached.launch.id.as_str())
+                .map_err(|_| CodexAdapterError::MalformedWire("attempt_id"))?,
             process: start,
             route: attached.route.clone(),
             session: attached.session.clone(),
@@ -317,7 +318,8 @@ impl<E: ProcessExecutor + 'static> CodexAdapter<E> {
             .cancel(attached.operation_id().clone())
             .await?;
         Ok(CodexCancelReceipt {
-            attempt_id: AttemptId::new(attached.launch.id.as_str())?,
+            attempt_id: AttemptId::new(attached.launch.id.as_str())
+                .map_err(|_| CodexAdapterError::MalformedWire("attempt_id"))?,
             reason,
             process,
         })
@@ -734,7 +736,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use eliot_agent_api::{
-        AuthorityEpoch, BudgetEnvelope, EffectKind, LaunchRequestId, QuotaKnowledge, WorkUnitId,
+        AuthorityEpoch, BudgetEnvelope, EffectKind, LaunchRequestId, QuotaKnowledge,
+        ResourceGeneration, StateFence, WorkUnitId,
     };
     use eliot_process::{
         ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
@@ -989,11 +992,11 @@ mod tests {
         Ok(attach(CodexAttachInput {
             launch: launch()?,
             authority: AuthorityEnvelope {
-                epoch: AuthorityEpoch::new("epoch-1")?,
+                epoch: AuthorityEpoch::new(1)?,
                 scope_ref: "scope-1".into(),
                 effect_ceiling: ceiling(),
                 lease: WorkLeaseId::new("lease-1")?,
-                state_fence: "fence".into(),
+                state_fence: StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
                 valid_until: "never".into(),
             },
             route: route(),

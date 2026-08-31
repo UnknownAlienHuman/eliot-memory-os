@@ -42,6 +42,7 @@ component_contract_ref = ""
 [dependencies]
 eliot-agent-api.workspace = true
 eliot-agent-contracts.workspace = true
+eliot-contracts.workspace = true
 eliot-evaluation-contracts.workspace = true
 eliot-receipts.workspace = true
 eliot-security-contracts.workspace = true

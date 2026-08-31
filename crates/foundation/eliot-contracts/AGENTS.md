@@ -1,94 +1,79 @@
-# `eliot-contracts` epoch-identity work
+# `eliot-contracts` package instructions
 
-## Scope
+## Durable package boundary
 
-Issue #289 freezes the field and migration contract for parent #64. This directory is the existing C0 contract hub; do **not** create `eliot-epoch-contracts` or another package merely to move one type. The first Rust implementation belongs in a private `epoch.rs` module of this package and is exported through the existing package surface.
+`eliot-contracts` is the dependency-light, stateless C0 island for ELIOT-owned,
+owner-neutral contract primitives: shared identifiers, counters, revisions,
+fences, receipt metadata, digest/time values, and other policy-free values.
+Package membership does not grant lifecycle, authority, storage, or runtime
+ownership. Keep the hard dependency direction one-way from contracts to domain
+and ports; do not expose vendor, process, runtime, storage, provider, or UI
+types.
 
-This work unit is contract-only. It must not edit Rust, `StateFence`, Host/Kernel/ORS/store consumers, the root workspace, `Cargo.lock`, runtime manifests, or support status.
+One issue and pull request introduces or migrates one primitive family and its
+exact compatibility contour. Select the actual semantic owner before editing.
+Reuse an existing owner and never create a third same-meaning type, package,
+wrapper, or string facade. Every public primitive has an explicit namespace and
+non-interchangeability rule; identical spelling does not establish equality.
 
-## Functional capability cell
+## Contract and migration rules
 
-```text
-cell_id: foundation.authority.epoch-identity
-lifecycle_owner: none; stateless contract
-mutable_state: none
-effects: none
-current source owner: eliot-contracts
-first consumer migration: eliot-host-state
-integration owner: #64
-```
+Before Rust mutation, record the causal property, owner, affected fields and
+schemas, direct and reverse consumers, dependency/lockfile decision, old
+failure or representation gap, negative cases, migration/removal path, rollback
+boundary, and proportional independent proof. Validation, serde, schema,
+versioning, compatibility, and reverse-consumer proof must match the future
+impact of the family. A contract or package test cannot claim consumer,
+runtime, store, or Product conformance by itself.
 
-The contract is justified inside the existing hub because epoch identity is a stable, dependency-light primitive used across Host, Kernel, ORS, protocol, daemon, store, Watchdog, User Broker, runtime-status, recovery, receipts, MACs, and State Fences. A new crate would add a third physical/type owner before any consumer migration.
+Compatibility is explicit and loss-visible. Reject ambiguous or stale input at
+the boundary, preserve provenance where legacy input is evidence, and never
+use an implicit `From<String>`, default/genesis upgrade, lossy scalar
+conversion, or infallible adapter to manufacture authority or equality.
+Foundation values own no runtime, process, provider, policy, admission,
+completion, effect, store, or lifecycle behavior.
 
-## Required source design for the later implementation unit
+## Authority, scope, and routing
 
-Implement exactly one canonical family:
+Root `AGENTS.md`, `WORKFLOW.md`, the current open issue/PR, Architecture and
+Implementation authority, and the routed documentation receipt determine the
+current task. These package instructions provide durable boundaries; an open
+issue may narrow the exact path and proof but cannot widen higher-level
+authority. One mutable path has one writer. Workers do not perform
+uncoordinated fetch, pull, push, ref, workflow, or integration mutations.
 
-```rust
-EpochLineageId
-EpochId
-EpochTransition
-EpochRelation
-LegacyScalarEpoch
-LegacyEpochImport
-EpochContractError
-```
-
-Expected source functions are listed in `epoch-id.contract.toml`. Preserve these rules:
-
-1. `EpochId` authority is exact tuple identity: `(lineage_id, sequence)`.
-2. Numeric sequence comparison is valid only inside one exact lineage.
-3. No `Ord` or `PartialOrd` implementation is allowed for `EpochId` or `EpochLineageId`.
-4. A direct child is exactly one sequence step in one lineage with an explicit parent.
-5. Restore, migration, corruption recovery, and break-glass mint genesis in a globally distinct lineage.
-6. Canonical digest input binds the versioned domain separator, lineage, and sequence.
-7. Legacy scalar input is compatibility evidence only; it cannot authorize anything until exact installation/Host lineage evidence produces an explicit migration result.
-8. Unknown, ambiguous, or conflicted legacy lineage becomes suspended/manual recovery, never “current lineage”.
-9. No `EpochId -> u64`, `as_u64`, `value`, implicit `From`, default lineage, or lossy compatibility adapter is allowed.
-
-## No-third-type migration
-
-`eliot-host-state` currently owns a local `EpochIdentity`/`EpochTransition`. The first consumer wave must remove that implementation or convert it to a compatibility re-export/type alias of this package. It must not retain two independent validators, two serde shapes, or a wrapper that reintroduces ordering.
-
-The old scalar `eliot_contracts::AuthorityEpoch` remains only as a bounded compatibility input while consumers migrate. New authority-bearing fields cannot use it. Removing or renaming it belongs to the integration wave after reverse-consumer proof; do not break the workspace in the contract implementation unit.
-
-## Required proof for the Rust implementation
+Before any material source or contract change, verify the published authority
+receipt, clean issue worktree/base, nearest instructions, current issue path
+claim, and one-writer ownership. Run the canonical documentation reader from
+the repository root and read every required fragment in the emitted bundle:
 
 ```text
-cargo fmt --all -- --check
-cargo check --locked -p eliot-contracts --all-targets
-cargo test --locked -p eliot-contracts
-cargo clippy --locked -p eliot-contracts --all-targets -- -D warnings
-git diff --check
+python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
 ```
 
-Package tests must include every minimum fixture named by the TOML contract. Then the Host consumer wave must run `eliot-host-state` package proof plus a shared golden corpus. Package proof does not establish Kernel/store/recovery behavior.
+Record the route/read receipt, matched routes, handles, hashes, and attestation
+in the work unit or pull request. Re-route when path, causal property,
+authority boundary, or evidence scope expands. A missing route, stale required
+item, unresolved owner, duplicate identity, dependency inversion, scope drift,
+or unattainable proof is a STOP condition; preserve the unknown and escalate
+through the issue owner, integration owner, or Contract Challenge rather than
+weakening the oracle.
 
-## Prohibited shortcuts
+## Historical contract context
 
-Do not:
+Issue #289 and its epoch-identity contract are historical context, not the
+active work unit. Preserve its accepted no-third-type and explicit migration
+rules. When the epoch family is touched, read the exact
+`crates/foundation/eliot-contracts/epoch-id.contract.toml` input and route the
+applicable Architecture/Implementation fragments. Do not infer that a later
+issue inherits #289's scope, owner, proof ceiling, or prohibitions.
 
-- order UUIDs, timestamps, or unrelated lineages;
-- infer lineage from a process, PID, current directory, latest Host record, largest scalar, or current runtime;
-- reuse Host-specific `PlatformHandle` in the public foundation contract;
-- expose vendor, storage, Windows, Tokio, process, or runtime types;
-- rewrite durable scalar records in place;
-- close #64 from a contract/package test;
-- change the oracle to accept a scalar-only consumer;
-- merge this PR while another writer owns `crates/foundation/eliot-contracts`.
+## Verification
 
-## Working discipline
-
-Create one fresh issue branch per migration wave. Push each completed atomic slice immediately. Before editing a consumer, re-read current `main`, open PR path claims, the nearest `AGENTS.md`, and `epoch-id.contract.toml`. Stop with a Contract Challenge when exact legacy lineage evidence is unavailable or a consumer requires lossy scalar compatibility.
-
-## Proof ceiling
-
-The present PR is:
-
-```text
-STATIC_FIELD_AND_MIGRATION_CONTRACT_ONLY
-TARGET
-NOT_EXECUTED
-```
-
-It changes no Rust, runtime, authority, durable state, support, or Product behavior.
+Documentation-only policy edits do not authorize Rust, Cargo, schema, runtime,
+store, or Product-semantic changes. `docs_router.py route` alone is navigation,
+not reading evidence. After a docs-only policy edit, run the routed post-read
+checks, `just quick`, and `git diff --check`; report baseline, unrelated,
+skipped, failed, or unavailable checks honestly. Future Rust changes use exact
+issue-owned package and consumer gates proportional to causal closure; this
+file hard-codes no primitive family or implementation gate.

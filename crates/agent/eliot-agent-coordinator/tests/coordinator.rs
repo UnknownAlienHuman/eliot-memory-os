@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 
 use eliot_agent_api::{
-    AgentLaunchRequest, AgentWorkUnitBrief, AllowedMode, BudgetEnvelope, EffectCeiling, EffectKind,
-    LaunchRequestId, RouteFingerprint, TaskId, WorkUnitId,
+    AgentLaunchRequest, AgentWorkUnitBrief, AllowedMode, AuthorityEpoch, BudgetEnvelope,
+    EffectCeiling, EffectKind, LaunchRequestId, ResourceGeneration, RouteFingerprint, StateFence,
+    TaskId, WorkUnitId,
 };
 use eliot_agent_contracts::RevisionId;
 use eliot_agent_coordinator::{
@@ -25,6 +26,10 @@ fn budget() -> BudgetEnvelope {
         max_depth: 2,
         max_descendants: 4,
     }
+}
+
+fn fence() -> StateFence {
+    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
 }
 
 fn route(name: &str) -> RouteFingerprint {
@@ -126,7 +131,7 @@ fn request() -> TestResult<StaffingPlanRequest> {
         },
         task_revision: "task-rev-1".to_owned(),
         plan_revision: RevisionId::new("plan-rev-1")?,
-        state_fence: "fence-1".to_owned(),
+        state_fence: fence(),
         privacy_class: PrivacyClass::Private,
         lanes: vec![StaffingLaneRequest {
             work_unit_id: WorkUnitId::new("work-a")?,
@@ -157,7 +162,7 @@ fn route_evidence(route: RouteFingerprint, rank: u16) -> RouteCandidateEvidence 
 
 fn gap() -> PlanGap {
     PlanGap::A01Unaccepted {
-        contract_version: "eliot-agent-api/v1".to_owned(),
+        contract_version: "eliot-agent-api/v2".to_owned(),
         reason: "A-01 is not accepted".to_owned(),
     }
 }
@@ -199,7 +204,7 @@ fn caller_fabricated_admission_cannot_bypass_plan_gap() -> TestResult {
         task_revision: candidate.task_revision.clone(),
         plan_revision: candidate.plan_revision.clone(),
         state_fence: candidate.state_fence.clone(),
-        controller_epoch: eliot_agent_api::AuthorityEpoch::new("epoch-forged")?,
+        controller_epoch: AuthorityEpoch::new(1)?,
         coordinator_lease: eliot_agent_api::WorkLeaseId::new("lease-forged")?,
         provider_identity: forged_identity,
         g11_admission_receipt_ref: "forged-g11-admission".to_owned(),

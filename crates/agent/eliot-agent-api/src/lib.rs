@@ -7,11 +7,16 @@
 
 use std::collections::BTreeSet;
 
+pub use eliot_agent_contracts::AgentAttemptId;
+pub use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTRACT_VERSION: &str = "eliot-agent-api/v1";
+pub const CONTRACT_VERSION: &str = "eliot-agent-api/v2";
+
+/// Compatibility spelling retained as an exact alias of the canonical owner.
+pub type AttemptId = AgentAttemptId;
 
 /// A validated opaque identity used by a contract projection.
 macro_rules! id_type {
@@ -56,11 +61,9 @@ macro_rules! id_type {
 
 id_type!(TaskId);
 id_type!(LaunchRequestId);
-id_type!(AttemptId);
 id_type!(WorkUnitId);
 id_type!(SessionId);
 id_type!(WorkLeaseId);
-id_type!(AuthorityEpoch);
 id_type!(RouteFingerprintId);
 id_type!(EventId);
 id_type!(EventCursor);
@@ -102,6 +105,8 @@ pub enum ContractError {
     MissingUnknownReason,
     #[error("event sequence must be monotonic")]
     NonMonotonicEvent,
+    #[error("state fence is invalid")]
+    InvalidStateFence,
 }
 
 /// Whether an admission may expose only safe observations or material work.
@@ -337,7 +342,7 @@ pub struct AuthorityEnvelope {
     pub scope_ref: String,
     pub effect_ceiling: EffectCeiling,
     pub lease: WorkLeaseId,
-    pub state_fence: String,
+    pub state_fence: StateFence,
     pub valid_until: String,
 }
 
@@ -345,7 +350,6 @@ impl AuthorityEnvelope {
     pub fn validate(&self) -> Result<(), ContractError> {
         for (field, value) in [
             ("scope_ref", &self.scope_ref),
-            ("state_fence", &self.state_fence),
             ("valid_until", &self.valid_until),
         ] {
             if value.trim().is_empty() {
@@ -354,6 +358,12 @@ impl AuthorityEnvelope {
         }
         if self.effect_ceiling.scope_ref != self.scope_ref {
             return Err(ContractError::InsufficientAuthority);
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| ContractError::InvalidStateFence)?;
+        if self.epoch != self.state_fence.authority_epoch {
+            return Err(ContractError::InvalidStateFence);
         }
         self.effect_ceiling.validate()
     }
@@ -596,7 +606,23 @@ pub struct CancelRequest {
     pub attempt_id: AttemptId,
     pub reason: CancelReason,
     pub requested_at: String,
-    pub state_fence: String,
+    pub state_fence: StateFence,
+}
+
+impl CancelRequest {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        for (field, value) in [
+            ("attempt_id", self.attempt_id.as_str()),
+            ("requested_at", self.requested_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ContractError::EmptyField(field));
+            }
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| ContractError::InvalidStateFence)
+    }
 }
 
 /// A normalized event from a host/provider adapter.
@@ -951,7 +977,7 @@ pub struct RoutingReceipt {
     pub alternatives: Vec<String>,
     pub decision_source: String,
     pub policy_revision: String,
-    pub state_fence: String,
+    pub state_fence: StateFence,
     pub pinned_until_boundary: String,
     pub evidence_refs: Vec<String>,
 }
@@ -963,7 +989,6 @@ impl RoutingReceipt {
             ("decision_id", &self.decision_id),
             ("decision_source", &self.decision_source),
             ("policy_revision", &self.policy_revision),
-            ("state_fence", &self.state_fence),
             ("pinned_until_boundary", &self.pinned_until_boundary),
         ] {
             if value.trim().is_empty() {
@@ -973,6 +998,9 @@ impl RoutingReceipt {
         if let Some(route) = &self.selected_route {
             route.validate()?;
         }
+        self.state_fence
+            .validate()
+            .map_err(|_| ContractError::InvalidStateFence)?;
         Ok(())
     }
 }
@@ -1135,11 +1163,11 @@ mod tests {
             route: route(),
             budget: budget(),
             authority: AuthorityEnvelope {
-                epoch: AuthorityEpoch::new("epoch-1")?,
+                epoch: AuthorityEpoch::new(1)?,
                 scope_ref: "scope:test".into(),
                 effect_ceiling: ceiling(),
                 lease: WorkLeaseId::new("lease-1")?,
-                state_fence: "fence-1".into(),
+                state_fence: StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
                 valid_until: "2026-08-14T00:00:00Z".into(),
             },
             cancellation: CancellationState::NotRequested,
@@ -1147,6 +1175,217 @@ mod tests {
             continuation: None,
         };
         assert!(attempt.transition(AttemptState::Running).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_attempt_and_fence_wire_is_fail_closed() -> TestResult {
+        assert!(AttemptId::new("attempt\ncontrol").is_err());
+        let legacy = serde_json::json!({
+            "epoch": "1",
+            "scope_ref": "scope:test",
+            "effect_ceiling": {
+                "scope_ref": "scope:test",
+                "allowed": ["OBSERVE"],
+                "max_external_effects": 0
+            },
+            "lease": "lease-1",
+            "state_fence": "legacy-fence",
+            "valid_until": "later"
+        });
+        assert!(serde_json::from_value::<AuthorityEnvelope>(legacy).is_err());
+
+        let mut authority = AuthorityEnvelope {
+            epoch: AuthorityEpoch::new(1)?,
+            scope_ref: "scope:test".into(),
+            effect_ceiling: ceiling(),
+            lease: WorkLeaseId::new("lease-1")?,
+            state_fence: StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
+            valid_until: "later".into(),
+        };
+        assert!(authority.validate().is_ok());
+        authority.epoch = AuthorityEpoch::new(2)?;
+        assert_eq!(authority.validate(), Err(ContractError::InvalidStateFence));
+        Ok(())
+    }
+
+    fn authority() -> Result<AuthorityEnvelope, Box<dyn std::error::Error>> {
+        Ok(AuthorityEnvelope {
+            epoch: AuthorityEpoch::new(7)?,
+            scope_ref: "scope:test".into(),
+            effect_ceiling: ceiling(),
+            lease: WorkLeaseId::new("lease-1")?,
+            state_fence: StateFence::new(AuthorityEpoch::new(7)?, ResourceGeneration::new(3)?),
+            valid_until: "later".into(),
+        })
+    }
+
+    #[test]
+    fn api_case_01_attempt_id_is_exact_canonical_alias() -> TestResult {
+        fn accepts_canonical(_: AgentAttemptId) {}
+        let attempt: AttemptId = AttemptId::new("attempt-case-01")?;
+        accepts_canonical(attempt.clone());
+        let canonical: AgentAttemptId = attempt;
+        let _: AttemptId = canonical;
+        Ok(())
+    }
+
+    #[test]
+    fn api_case_02_canonical_attempt_json_roundtrip_rejects_blank_control() -> TestResult {
+        let attempt = AttemptId::new("attempt-case-02")?;
+        let wire = serde_json::to_string(&attempt)?;
+        assert_eq!(serde_json::from_str::<AttemptId>(&wire)?, attempt);
+        assert!(AttemptId::new(" \t").is_err());
+        assert!(AttemptId::new("attempt\ncontrol").is_err());
+        assert!(serde_json::from_str::<AttemptId>(r#"""#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn api_case_03_raw_string_is_not_an_authority_proof_without_canonical_construction()
+    -> TestResult {
+        let raw = String::from("attempt-case-03");
+        assert!(!raw.is_empty());
+        // A raw String is not implicitly authority. The accepted transition is
+        // the canonical fallible constructor/TryFrom<String> result.
+        let typed = AgentAttemptId::try_from(raw)?;
+        assert_eq!(typed.as_str(), "attempt-case-03");
+
+        // Keep this source discriminator bounded to the API surface: the
+        // compatibility spelling is an exact alias, not a local owner or an
+        // infallible reverse bridge. Build retired syntax from fragments so the
+        // discriminator cannot match its own assertion literals.
+        let source = include_str!("lib.rs");
+        assert!(source.contains("pub type AttemptId = AgentAttemptId;"));
+        let local_macro = ["id_type!", "(", "AttemptId", ")"].concat();
+        let local_struct = ["pub ", "struct ", "AttemptId"].concat();
+        let reverse_from = ["impl From<", "String> for ", "AttemptId"].concat();
+        assert!(!source.contains(&local_macro));
+        assert!(!source.contains(&local_struct));
+        assert!(!source.contains(&reverse_from));
+        Ok(())
+    }
+
+    #[test]
+    fn api_case_04_authority_numeric_epoch_and_object_fence_roundtrip() -> TestResult {
+        let original = authority()?;
+        let wire = serde_json::to_value(&original)?;
+        assert!(wire["epoch"].is_number());
+        assert!(wire["state_fence"].is_object());
+        assert_eq!(serde_json::from_value::<AuthorityEnvelope>(wire)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn api_case_05_old_string_epoch_and_fence_are_rejected() -> TestResult {
+        let mut wire = serde_json::to_value(authority()?)?;
+        wire["epoch"] = serde_json::json!("7");
+        assert!(serde_json::from_value::<AuthorityEnvelope>(wire).is_err());
+        let mut wire = serde_json::to_value(authority()?)?;
+        wire["state_fence"] = serde_json::json!("legacy-fence");
+        assert!(serde_json::from_value::<AuthorityEnvelope>(wire).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn api_case_06_epoch_and_fence_mismatch_fails_closed() -> TestResult {
+        let mut value = authority()?;
+        value.epoch = AuthorityEpoch::new(8)?;
+        assert_eq!(value.validate(), Err(ContractError::InvalidStateFence));
+        Ok(())
+    }
+
+    #[test]
+    fn api_case_07_zero_epoch_generation_and_fence_are_rejected() {
+        assert!(AuthorityEpoch::new(0).is_err());
+        assert!(ResourceGeneration::new(0).is_err());
+        let zero_fence = StateFence::new(AuthorityEpoch::default(), ResourceGeneration::default());
+        assert!(zero_fence.validate().is_err());
+        let zero = serde_json::json!({
+            "authority_epoch": 0,
+            "resource_generation": 0,
+            "task_revision": null,
+            "policy_revision": null,
+            "integration_revision": null
+        });
+        assert!(serde_json::from_value::<StateFence>(zero).is_err());
+    }
+
+    #[test]
+    fn api_case_08_cancel_and_routing_receipts_reject_legacy_and_zero_fences() -> TestResult {
+        let zero_fence = StateFence::new(AuthorityEpoch::default(), ResourceGeneration::default());
+        let typed_cancel = CancelRequest {
+            attempt_id: AttemptId::new("attempt-case-08")?,
+            reason: CancelReason::UserRequested,
+            requested_at: "later".into(),
+            state_fence: zero_fence.clone(),
+        };
+        assert!(typed_cancel.validate().is_err());
+
+        let typed_routing = RoutingReceipt {
+            decision_id: "decision-case-08-zero".into(),
+            requested_route: route(),
+            selected_route: None,
+            alternatives: Vec::new(),
+            decision_source: "test".into(),
+            policy_revision: "policy-1".into(),
+            state_fence: zero_fence,
+            pinned_until_boundary: "later".into(),
+            evidence_refs: Vec::new(),
+        };
+        assert!(typed_routing.validate().is_err());
+
+        let mut cancel = serde_json::json!({
+            "attempt_id": "attempt-case-08",
+            "reason": "user_requested",
+            "requested_at": "later",
+            "state_fence": "legacy-fence"
+        });
+        assert!(serde_json::from_value::<CancelRequest>(cancel.clone()).is_err());
+        cancel["state_fence"] = serde_json::json!({
+            "authority_epoch": 0,
+            "resource_generation": 0,
+            "task_revision": null,
+            "policy_revision": null,
+            "integration_revision": null
+        });
+        assert!(serde_json::from_value::<CancelRequest>(cancel).is_err());
+
+        let routing = RoutingReceipt {
+            decision_id: "decision-case-08".into(),
+            requested_route: route(),
+            selected_route: None,
+            alternatives: Vec::new(),
+            decision_source: "test".into(),
+            policy_revision: "policy-1".into(),
+            state_fence: StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
+            pinned_until_boundary: "later".into(),
+            evidence_refs: Vec::new(),
+        };
+        let mut routing_wire = serde_json::to_value(&routing)?;
+        routing_wire["state_fence"] = serde_json::json!("legacy-fence");
+        assert!(serde_json::from_value::<RoutingReceipt>(routing_wire).is_err());
+        let mut zero_routing = serde_json::to_value(routing)?;
+        zero_routing["state_fence"] = serde_json::json!({
+            "authority_epoch": 0,
+            "resource_generation": 0,
+            "task_revision": null,
+            "policy_revision": null,
+            "integration_revision": null
+        });
+        assert!(serde_json::from_value::<RoutingReceipt>(zero_routing).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn api_case_09_authority_schema_is_deterministic_numeric_and_object() -> TestResult {
+        let first = serde_json::to_value(schemars::schema_for!(AuthorityEnvelope))?;
+        let second = serde_json::to_value(schemars::schema_for!(AuthorityEnvelope))?;
+        assert_eq!(first, second);
+        assert_eq!(first["type"], "object");
+        assert_eq!(first["$defs"]["AuthorityEpoch"]["type"], "integer");
+        assert_eq!(first["$defs"]["StateFence"]["type"], "object");
+        assert_ne!(first["$defs"]["StateFence"]["type"], "string");
         Ok(())
     }
 }

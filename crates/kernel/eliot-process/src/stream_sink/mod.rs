@@ -14,11 +14,13 @@ pub const PROCESS_STREAM_SINK_SCHEMA_VERSION: &str = "eliot-process-stream-sink-
 const MAX_REFERENCE_BYTES: usize = 256;
 const MAX_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
 
+mod command;
 mod port;
 mod requests;
 mod terminal;
 mod types;
 
+pub use command::{ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkTerminalCommandKind};
 pub use port::{ProcessStreamSinkClient, ProcessStreamSinkFuture};
 pub use requests::{
     ProcessStreamSinkAbortReason, ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend,

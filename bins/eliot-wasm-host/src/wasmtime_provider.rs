@@ -146,10 +146,7 @@ fn epoch_driver_identity(request_digest: &Sha256Digest) -> String {
     format!("{EPOCH_DRIVER_THREAD_PREFIX}-{suffix}")
 }
 
-fn spawn_epoch_driver(
-    identity: &str,
-    task: EpochDriverTask,
-) -> io::Result<thread::JoinHandle<()>> {
+fn spawn_epoch_driver(identity: &str, task: EpochDriverTask) -> io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name(identity.to_owned())
         .spawn(move || task.run())
@@ -509,9 +506,7 @@ impl ComponentEnginePort for WasmtimeComponentEngine {
 }
 
 fn validate_epoch_policy(limits: &InvocationLimits) -> Result<(), PortError> {
-    if limits.epoch.deadline_ticks == 0
-        || limits.epoch.deadline_ticks > MAX_EPOCH_DEADLINE_TICKS
-    {
+    if limits.epoch.deadline_ticks == 0 || limits.epoch.deadline_ticks > MAX_EPOCH_DEADLINE_TICKS {
         Err(PortError::Denied)
     } else {
         Ok(())
@@ -755,7 +750,10 @@ mod tests {
             )
             .map_err(|error| error.to_string())?;
 
-        assert_eq!(observed_identity.as_deref(), Some(expected_identity.as_str()));
+        assert_eq!(
+            observed_identity.as_deref(),
+            Some(expected_identity.as_str())
+        );
         assert_eq!(
             report.termination,
             EngineTermination::Trap(TrapClass::HostContractViolation)
@@ -878,12 +876,7 @@ mod tests {
         let mut limits = test_limits(digest);
         limits.max_instances = 1;
         let report = engine
-            .invoke_component(
-                &Sha256Digest::of_bytes(b"instances"),
-                &limits,
-                b"",
-                true,
-            )
+            .invoke_component(&Sha256Digest::of_bytes(b"instances"), &limits, b"", true)
             .map_err(|error| error.to_string())?;
         assert_eq!(report.termination, EngineTermination::InstanceLimit);
         Ok(())

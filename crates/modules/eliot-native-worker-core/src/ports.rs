@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use eliot_agent_api::{
     AttemptId, AuthorityEnvelope, AuthorizedEffect, ProposedEffect, WorkLeaseId,
 };
+use eliot_contracts::{AuthorityEpoch, StateFence};
 use eliot_process::{
     FencingToken, Generation, OperationId, ProcessRequest, ProcessTreeId, ResourceLimits,
 };
@@ -352,8 +353,8 @@ pub struct AdmissionLivenessFacts {
     admission_revision: String,
     revocation_revision: u64,
     lease: WorkLeaseId,
-    authority_epoch: String,
-    state_fence: String,
+    authority_epoch: AuthorityEpoch,
+    state_fence: StateFence,
     observed_at_unix_ms: u64,
     expires_at_unix_ms: u64,
     revoked: bool,
@@ -366,8 +367,8 @@ impl AdmissionLivenessFacts {
         admission_revision: impl Into<String>,
         revocation_revision: u64,
         lease: WorkLeaseId,
-        authority_epoch: impl Into<String>,
-        state_fence: impl Into<String>,
+        authority_epoch: AuthorityEpoch,
+        state_fence: StateFence,
         observed_at_unix_ms: u64,
         expires_at_unix_ms: u64,
         revoked: bool,
@@ -377,8 +378,8 @@ impl AdmissionLivenessFacts {
             admission_revision: admission_revision.into(),
             revocation_revision,
             lease,
-            authority_epoch: authority_epoch.into(),
-            state_fence: state_fence.into(),
+            authority_epoch,
+            state_fence,
             observed_at_unix_ms,
             expires_at_unix_ms,
             revoked,
@@ -402,11 +403,11 @@ impl AdmissionLivenessFacts {
         &self.lease
     }
     #[must_use]
-    pub fn authority_epoch(&self) -> &str {
+    pub const fn authority_epoch(&self) -> &AuthorityEpoch {
         &self.authority_epoch
     }
     #[must_use]
-    pub fn state_fence(&self) -> &str {
+    pub const fn state_fence(&self) -> &StateFence {
         &self.state_fence
     }
     #[must_use]
@@ -461,8 +462,8 @@ pub struct CapabilityLivenessRequest {
     admission_revision: String,
     revocation_revision: u64,
     lease: WorkLeaseId,
-    authority_epoch: String,
-    state_fence: String,
+    authority_epoch: AuthorityEpoch,
+    state_fence: StateFence,
 }
 
 impl CapabilityLivenessRequest {
@@ -472,7 +473,7 @@ impl CapabilityLivenessRequest {
             admission_revision: grant.admission_revision().to_owned(),
             revocation_revision: grant.revocation_revision(),
             lease: grant.authority().lease.clone(),
-            authority_epoch: grant.authority().epoch.as_str().to_owned(),
+            authority_epoch: grant.authority().epoch,
             state_fence: grant.authority().state_fence.clone(),
         }
     }
@@ -494,11 +495,11 @@ impl CapabilityLivenessRequest {
         &self.lease
     }
     #[must_use]
-    pub fn authority_epoch(&self) -> &str {
+    pub const fn authority_epoch(&self) -> &AuthorityEpoch {
         &self.authority_epoch
     }
     #[must_use]
-    pub fn state_fence(&self) -> &str {
+    pub const fn state_fence(&self) -> &StateFence {
         &self.state_fence
     }
 }
@@ -513,8 +514,8 @@ pub struct EffectAdmissionRequest {
     admission_revision: String,
     revocation_revision: u64,
     lease: WorkLeaseId,
-    authority_epoch: String,
-    state_fence: String,
+    authority_epoch: AuthorityEpoch,
+    state_fence: StateFence,
 }
 
 impl EffectAdmissionRequest {
@@ -530,7 +531,7 @@ impl EffectAdmissionRequest {
             admission_revision: grant.admission_revision.clone(),
             revocation_revision: grant.revocation_revision,
             lease: grant.authority.lease.clone(),
-            authority_epoch: grant.authority.epoch.as_str().to_owned(),
+            authority_epoch: grant.authority.epoch,
             state_fence: grant.authority.state_fence.clone(),
         }
     }
@@ -566,12 +567,12 @@ impl EffectAdmissionRequest {
     }
 
     #[must_use]
-    pub fn authority_epoch(&self) -> &str {
+    pub const fn authority_epoch(&self) -> &AuthorityEpoch {
         &self.authority_epoch
     }
 
     #[must_use]
-    pub fn state_fence(&self) -> &str {
+    pub const fn state_fence(&self) -> &StateFence {
         &self.state_fence
     }
 }
@@ -582,7 +583,7 @@ impl EffectAdmissionRequest {
 pub struct EffectAdmissionFacts {
     authorized_effect: AuthorizedEffect,
     lease: WorkLeaseId,
-    state_fence: String,
+    state_fence: StateFence,
     admission_revision: String,
     revocation_revision: u64,
     observed_at_unix_ms: u64,
@@ -595,7 +596,7 @@ impl EffectAdmissionFacts {
     pub fn new(
         authorized_effect: AuthorizedEffect,
         lease: WorkLeaseId,
-        state_fence: impl Into<String>,
+        state_fence: StateFence,
         admission_revision: impl Into<String>,
         revocation_revision: u64,
         observed_at_unix_ms: u64,
@@ -605,7 +606,7 @@ impl EffectAdmissionFacts {
         Self {
             authorized_effect,
             lease,
-            state_fence: state_fence.into(),
+            state_fence,
             admission_revision: admission_revision.into(),
             revocation_revision,
             observed_at_unix_ms,
@@ -623,7 +624,7 @@ impl EffectAdmissionFacts {
         &self.lease
     }
     #[must_use]
-    pub fn state_fence(&self) -> &str {
+    pub const fn state_fence(&self) -> &StateFence {
         &self.state_fence
     }
     #[must_use]
@@ -704,8 +705,8 @@ pub struct DurableCheckpointRequest {
     request_id: String,
     stream_id: String,
     producer_generation: u64,
-    authority_epoch: String,
-    state_fence: String,
+    authority_epoch: AuthorityEpoch,
+    state_fence: StateFence,
     admission_revision: String,
     operation_id: OperationId,
     process_request_digest: String,
@@ -724,7 +725,7 @@ impl DurableCheckpointRequest {
             request_id,
             stream_id: grant.stream_id().to_owned(),
             producer_generation: grant.worker_generation(),
-            authority_epoch: grant.authority().epoch.as_str().to_owned(),
+            authority_epoch: grant.authority().epoch,
             state_fence: grant.authority().state_fence.clone(),
             admission_revision: grant.admission_revision().to_owned(),
             operation_id: process.operation_id().clone(),
@@ -749,11 +750,11 @@ impl DurableCheckpointRequest {
         self.producer_generation
     }
     #[must_use]
-    pub fn authority_epoch(&self) -> &str {
+    pub const fn authority_epoch(&self) -> &AuthorityEpoch {
         &self.authority_epoch
     }
     #[must_use]
-    pub fn state_fence(&self) -> &str {
+    pub const fn state_fence(&self) -> &StateFence {
         &self.state_fence
     }
     #[must_use]
@@ -779,8 +780,8 @@ pub struct CheckpointReceiptFacts {
     request_id: String,
     stream_id: String,
     producer_generation: u64,
-    authority_epoch: String,
-    state_fence: String,
+    authority_epoch: AuthorityEpoch,
+    state_fence: StateFence,
     admission_revision: String,
     operation_id: OperationId,
     process_request_digest: String,
@@ -795,8 +796,8 @@ impl CheckpointReceiptFacts {
         request_id: impl Into<String>,
         stream_id: impl Into<String>,
         producer_generation: u64,
-        authority_epoch: impl Into<String>,
-        state_fence: impl Into<String>,
+        authority_epoch: AuthorityEpoch,
+        state_fence: StateFence,
         admission_revision: impl Into<String>,
         operation_id: OperationId,
         process_request_digest: impl Into<String>,
@@ -808,8 +809,8 @@ impl CheckpointReceiptFacts {
             request_id: request_id.into(),
             stream_id: stream_id.into(),
             producer_generation,
-            authority_epoch: authority_epoch.into(),
-            state_fence: state_fence.into(),
+            authority_epoch,
+            state_fence,
             admission_revision: admission_revision.into(),
             operation_id,
             process_request_digest: process_request_digest.into(),
@@ -838,11 +839,11 @@ impl CheckpointReceiptFacts {
         self.producer_generation
     }
     #[must_use]
-    pub fn authority_epoch(&self) -> &str {
+    pub const fn authority_epoch(&self) -> &AuthorityEpoch {
         &self.authority_epoch
     }
     #[must_use]
-    pub fn state_fence(&self) -> &str {
+    pub const fn state_fence(&self) -> &StateFence {
         &self.state_fence
     }
     #[must_use]
