@@ -364,6 +364,24 @@ impl StoreFailure {
         Ok(())
     }
 
+    /// Constructs the provider-neutral failure for an uncertain external Store
+    /// write. Provider wording is deliberately excluded from machine semantics.
+    pub fn provider_unknown_outcome(
+        context: StoreFailureIdentityContext,
+    ) -> Result<Self, StoreFailureContractError> {
+        let mut failure = Self::base(&context);
+        if failure.operation_id.is_none() {
+            return Err(StoreFailureContractError::MissingOperationIdentity);
+        }
+        failure.disposition = StoreFailureDisposition::UnknownOutcome;
+        failure.reason_code = StoreReasonCode::new("PROVIDER_OUTCOME_UNKNOWN")?;
+        failure.mutation_disposition = StoreMutationDisposition::Unknown;
+        failure.retry_directive = StoreRetryDirective::ReconcileExactOperation;
+        failure.recovery_action = StoreRecoveryAction::ReconcileUnknownOutcome;
+        failure.validate()?;
+        Ok(failure)
+    }
+
     /// Converts the complete current `StoreError` set without wildcard collapse.
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::needless_pass_by_value)]
