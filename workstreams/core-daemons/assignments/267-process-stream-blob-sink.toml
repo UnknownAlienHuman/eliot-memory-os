@@ -1,0 +1,268 @@
+schema = "eliot.agent-work-unit.v1"
+issue = 267
+parent_issue = 85
+process_integration_owner_issue = 100
+testd_integration_owner_issue = 20
+product_pulse_issue = 11
+status = "READY_FOR_IMPLEMENTATION"
+source_base = "15d6b40d06df0eab8c2fc94a856253f36521b305"
+branch = "fix/267-process-stream-blob-sink"
+primary_owner = "process-stream-blob-adapter"
+primary_cell = "instrument.process-stream.immutable-sink"
+causal_property = "A process stdout/stderr reader can continuously drain into one bounded policy-transformed immutable Blob object and obtain typed terminal ProcessStreamEvidence; Blob latency, backpressure, failure or unknown outcome cannot block the pipe indefinitely or fabricate complete evidence."
+proof_ceiling = "ADAPTER_PACKAGE_PROOF_UNTIL_EXECUTOR_AND_REAL_BLOB_EDGE"
+
+[documentation]
+architecture_handles = ["ARCH-MOD-03", "ARCH-SEC-02", "ARCH-OBS-01", "ARCH-RES-01", "ARCH-RES-04"]
+implementation_handles = ["I1.2 BlobStore", "I2 Instrument Plane IP0-IP3", "I5.12", "I7.23", "I7.26", "I7.27", "I18"]
+required_files_read = [
+  "AGENTS.md",
+  "crates/instrument/AGENTS.md",
+  "crates/storage/AGENTS.md",
+  "crates/kernel/AGENTS.md",
+  "crates/kernel/eliot-process/Cargo.toml",
+  "crates/kernel/eliot-process/src/stream_evidence/**",
+  "crates/kernel/eliot-process/src/stream_sink/**",
+  "crates/storage/eliot-blob-api/Cargo.toml",
+  "crates/storage/eliot-blob-api/src/lib.rs",
+  "crates/storage/eliot-blob/Cargo.toml",
+  "crates/storage/eliot-blob/src/lib.rs",
+]
+routing_commands = [
+  "python scripts/docs_router.py route --path crates/instrument/eliot-process-stream-blob --topic 'BlobStore-backed immutable process stream sink with bounded pipe-drain isolation'",
+  "python scripts/docs_router.py route --path crates/storage/eliot-blob-api/src/lib.rs --topic 'existing Blob stage readback and receipt boundary consumed by process stream evidence'",
+]
+routing_receipt_status = "REQUIRED_BEFORE_FIRST_SOURCE_MUTATION"
+
+[current_state]
+contract_owner = "crates/kernel/eliot-process"
+contract_surface = [
+  "ProcessStreamEvidence and independent transport/persistence/preview/gap axes",
+  "ProcessStreamSinkClient and ProcessStreamSinkFuture",
+  "ProcessStreamSinkOpenRequest",
+  "ProcessStreamSinkAppend",
+  "ProcessStreamSinkFinalizeRequest",
+  "ProcessStreamSinkAbortRequest",
+  "ProcessStreamSinkReadback",
+  "ProcessStreamSinkSessionView",
+  "ProcessStreamSinkTerminal",
+]
+blob_owner = "crates/storage/eliot-blob-api + crates/storage/eliot-blob"
+confirmed_gap = [
+  "Repository search finds no production impl ProcessStreamSinkClient outside the provider-neutral contract/tests.",
+  "No adapter binds a stream session to BlobStageRequest/BlobReadyReceipt/readback.",
+  "WindowsProcessExecutor still owns only an in-memory prefix and synthetic locator; #268 depends on this adapter.",
+]
+old_discriminator = "Open, append and finalize a ProcessStreamSink session against current main: only fake/contract implementations exist; no real BlobStore source can be returned or read back."
+
+[crate_extraction_decision]
+disposition = "create"
+proposed_path = "crates/instrument/eliot-process-stream-blob"
+package_name = "eliot-process-stream-blob"
+layer = "C3 adapter"
+state_owner = "none; session state is operation-local and the BlobStore service remains the sole durable byte owner"
+justification = [
+  "Real first consumer is WindowsProcessExecutor in #268 and testd in #20.",
+  "The adapter has an independent fake/real BlobStore contract-test seam.",
+  "It isolates the storage dependency from provider-neutral eliot-process and avoids a C0/C1 dependency inversion.",
+  "It can be removed or replaced without changing ProcessStreamEvidence or BlobStore public contracts.",
+]
+forbidden_alternatives = [
+  "add eliot-blob or filesystem dependencies to eliot-process",
+  "make eliot-blob understand process/task/finish semantics",
+  "create a second Blob root, CAS implementation or stream database",
+  "put the adapter inside WindowsProcessExecutor so no other process consumer can use it",
+]
+workspace_rule = "Add the crate to the root workspace only in the same source commit that provides a compilable first implementation and updates Cargo.lock if required. Empty package admission is forbidden."
+
+[public_surface]
+required_types = [
+  "BlobProcessStreamSink<C: BlobStoreClient>",
+  "BlobProcessStreamSession",
+  "BlobProcessStreamSinkConfig",
+  "BlobProcessStreamSinkError",
+  "ProcessStreamBlobBinding",
+]
+required_impl = "impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobProcessStreamSink<C>"
+config_fields = [
+  "exact BlobRootLease or root-lease provider port",
+  "BlobPolicyBinding source/policy projection",
+  "bounded append queue items and bytes",
+  "bounded chunk and total bytes",
+  "bounded preview bytes",
+  "append/finalize/readback deadlines",
+  "overflow disposition",
+  "source retention/erasure identity",
+]
+binding_fields = [
+  "ProcessExecutionBinding",
+  "ProcessStreamKind",
+  "ProcessStreamSinkSessionId",
+  "ProcessStreamSinkSourceId",
+  "ProcessStreamPolicyBinding",
+  "ProcessStreamTransformationBinding",
+  "Blob operation/request/idempotency identities",
+  "Blob root/path generation and State Fence",
+]
+
+[algorithm.open]
+steps = [
+  "Validate the complete ProcessStreamSinkOpenRequest before any Blob mutation.",
+  "Resolve one exact Blob root lease, policy binding and operation/request identity from injected owner ports.",
+  "Create one operation-local session with bounded in-memory queue and digest/preview accumulators.",
+  "Return Open only after every owner needed for append/finalize/cancel is installed.",
+]
+
+[algorithm.append]
+steps = [
+  "Validate session, stream, process binding, policy, sequence, offset and replay identity.",
+  "Update full physical transport digest/count and policy-transformed admissible digest/count incrementally.",
+  "Retain only the bounded allowed preview; never retain raw pre-policy bytes in the public evidence record.",
+  "Move admissible bytes through a bounded queue that does not block the pipe reader beyond the declared append deadline.",
+  "On queue saturation, provider backpressure or persistence failure, preserve exact admitted bytes/counts and transition to a typed partial/unavailable/unknown state; never report CompleteSource.",
+  "An exact append retry is idempotent; changed bytes under the same sequence/offset are MismatchedReplay.",
+]
+
+[algorithm.finalize]
+steps = [
+  "Close append admission and drain every already accepted queue item under the bounded finalize deadline.",
+  "Stage the exact post-policy byte sequence through BlobStageRequest and obtain an owner-issued BlobReadyReceipt.",
+  "Independently read back the immutable source through BlobReadRequest under a byte ceiling.",
+  "Verify source length, source digest, Blob locator/root/path generation, ready-receipt identity and metadata digest.",
+  "Construct ProcessStreamEvidence only after terminal transport/persistence/source/preview/gap invariants agree.",
+  "Zero-byte EOF produces a real complete immutable object/receipt when policy permits.",
+]
+
+[algorithm.abort_or_unknown]
+steps = [
+  "Cancellation, read failure, redaction failure and policy prohibition preserve the exact terminal reason and all bytes already admitted.",
+  "A Blob stage/finalize response with unknown outcome keeps the exact Blob operation identity and cannot be restaged blindly.",
+  "Reopen/reconcile queries the same Blob operation/receipt before deciding complete, partial or unavailable.",
+  "Terminal session identity is immutable; changed terminal command under the same terminal ID is rejected.",
+]
+
+[backpressure]
+requirements = [
+  "No Blob call, filesystem call or unbounded allocation occurs while holding the physical pipe-reader lock.",
+  "Queue item and byte ceilings are both enforced.",
+  "Overflow disposition is explicit: partial source, source unavailable, or unknown outcome according to accepted-byte certainty.",
+  "The physical reader can continue draining/discarding under policy after durable persistence becomes unavailable, while exact evidence records the resulting gap.",
+  "No retry loop can exceed the session deadline or hide provider backpressure.",
+]
+
+[privacy]
+requirements = [
+  "The adapter consumes an owner-produced policy/transformation binding and does not choose privacy policy.",
+  "Raw pre-policy bytes never appear in preview, logs, errors, evidence refs or Blob metadata when policy prohibits them.",
+  "Transformation input/output identity is bound into the stream evidence and Blob operation receipt.",
+  "Redaction failure cannot fall back to raw persistence.",
+  "BlobStore receipt proves durable bytes only and creates no semantic, verifier, task or finish authority.",
+]
+
+[scope]
+wave_1_mutable_paths = [
+  "crates/instrument/eliot-process-stream-blob/Cargo.toml",
+  "crates/instrument/eliot-process-stream-blob/AGENTS.md",
+  "crates/instrument/eliot-process-stream-blob/src/**",
+  "crates/instrument/eliot-process-stream-blob/tests/**",
+  "Cargo.toml",
+  "Cargo.lock",
+]
+wave_2_optional_test_support_paths = [
+  "crates/test-support/**blob**",
+  "crates/test-support/**process**",
+]
+forbidden_paths = [
+  "crates/instrument/eliot-process-executor/**",
+  "crates/kernel/eliot-process/src/stream_evidence/**",
+  "crates/kernel/eliot-process/src/stream_sink/**",
+  "bins/eliot-testd/**",
+  "crates/instrument/eliot-testd-core/**",
+  "crates/kernel/eliot-ors/**",
+  "docs/architecture/**",
+  ".github/workflows/**",
+]
+non_goals = [
+  "change Windows process launch, Job Object, cancellation or operation lifecycle",
+  "change ProcessStreamEvidence contract revision",
+  "change BlobStore root ownership or receipt authority",
+  "parse/evaluate process output",
+  "migrate consumers",
+  "finish a task or promote evidence",
+  "claim live Windows proof from adapter tests",
+]
+
+[errors]
+required = [
+  "INVALID_OPEN_BINDING",
+  "SESSION_MISMATCH",
+  "STREAM_MISMATCH",
+  "POLICY_MISMATCH",
+  "SEQUENCE_GAP",
+  "OFFSET_MISMATCH",
+  "MISMATCHED_REPLAY",
+  "QUEUE_BACKPRESSURE",
+  "APPEND_DEADLINE",
+  "BLOB_UNAVAILABLE",
+  "BLOB_STAGE_UNKNOWN_OUTCOME",
+  "BLOB_RECEIPT_INVALID",
+  "BLOB_READBACK_MISMATCH",
+  "REDACTION_FAILED",
+  "POLICY_PROHIBITED",
+  "CANCELLED_BEFORE_EOF",
+  "SOURCE_PARTIAL",
+  "SOURCE_UNAVAILABLE",
+]
+rule = "Errors preserve accepted-byte certainty and exact operation/session identity; human detail does not control recovery."
+
+[fixtures]
+fake_provider = [
+  "zero_byte_complete_source",
+  "large_stream_bounded_preview_exact_full_source",
+  "exact_append_replay",
+  "mismatched_append_replay",
+  "one_stream_session_cannot_accept_another_stream",
+  "queue_item_pressure_does_not_deadlock_reader",
+  "queue_byte_pressure_does_not_deadlock_reader",
+  "append_timeout_preserves_admitted_prefix_and_gap",
+  "persistence_failure_never_reports_complete",
+  "unknown_stage_outcome_requires_exact_operation_reconciliation",
+  "cancel_during_append_preserves_exact_terminal_evidence",
+  "redaction_failure_persists_no_raw_bytes",
+  "policy_prohibited_persists_no_raw_bytes",
+]
+real_blob = [
+  "stage_finalize_readback_digest_and_length_match",
+  "ready_receipt_and_locator_binding_match_stream_source",
+  "root_generation_or_state_fence_mismatch_fails_closed",
+  "cleanup_or_session_drop_does_not_delete_cited_immutable_source",
+  "reopen_after_unknown_outcome_cannot_fabricate_success",
+]
+
+[proof]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-process-stream-blob --all-targets",
+  "cargo test --locked -p eliot-process-stream-blob --all-targets",
+  "cargo clippy --locked -p eliot-process-stream-blob --all-targets -- -D warnings",
+  "cargo tree -p eliot-process-stream-blob -e features",
+  "cargo tree -p eliot-process-stream-blob -d",
+  "git diff --check",
+]
+required_nonzero_tests = true
+real_edge_profile = "PROCESS_STREAM_BLOB_STAGE_READBACK_EDGE_01"
+product_pulse = "Deferred to #268/#20/#11: a real process emits output beyond preview, operation memory is cleaned, and the verifier expands the immutable source after restart."
+
+[stop_conditions]
+contract_challenge = [
+  "The existing ProcessStreamSinkClient cannot express the required Blob operation identity without a contract revision owned by eliot-process.",
+  "The existing BlobStore API cannot stream/stage within bounded memory and requires a separate additive Blob contract wave.",
+  "A proposed implementation would add a Blob/filesystem dependency to eliot-process or make eliot-blob own process semantics.",
+  "The adapter cannot avoid buffering the entire maximum stream and the configured bound is not operationally acceptable.",
+  "Another active PR claims the proposed adapter crate or BlobStore paths.",
+]
+
+[integration]
+merge_owner = "Process evidence integration swarm"
+merge_rule = "Merge before #268. Do not wire WindowsProcessExecutor to a fake or synthetic sink while this adapter remains unproven."
+result_schema = "issue, source_base, candidate_sha, crate_extraction_decision, changed_paths, fake_provider_matrix, real_blob_stage_readback, privacy_and_backpressure_proof, package_proof, residual_unknowns, finish"
