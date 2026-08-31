@@ -1023,6 +1023,14 @@ impl AttemptTelemetryInput {
         {
             return Err(ModelControlError::InvalidField("attempt_telemetry"));
         }
+        if self
+            .last_heartbeat_unix_ms
+            .is_some_and(|heartbeat| heartbeat > self.observed_at_unix_ms)
+        {
+            return Err(ModelControlError::InvalidField(
+                "attempt_telemetry.last_heartbeat_unix_ms",
+            ));
+        }
         self.quota.validate()
     }
 }
