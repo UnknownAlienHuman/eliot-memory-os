@@ -1,0 +1,47 @@
+name: Temporary issue 530 merge dispatcher
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/issue-530-merge-dispatch.yml
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: issue-530-traceability-merge-dispatch
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/530-normative-traceability
+          fetch-depth: 0
+
+      - name: Run bounded cleanup, verification, and publication
+        shell: pwsh
+        run: pwsh -NoProfile -File .github/temporary/run_traceability_cleanup.ps1
+
+      - name: Upload proof receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-530-traceability-proof
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            .eliot/normative-traceability-cleanup.json
+            .eliot/doc-code-conformance.json
+            .eliot/working-paths.txt
+            .eliot/prepublish-paths.txt
+            .eliot/final-paths.txt
+            .eliot/publication.json
