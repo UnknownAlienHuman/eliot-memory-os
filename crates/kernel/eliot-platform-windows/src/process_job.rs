@@ -1,18 +1,9 @@
 //! Physical Windows Job and process lifecycle only.
 //!
-//! Architecture (verified):
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A13.1.-Let-it-fail-locally`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A13.2.-Kernel-и-failure-domains`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A13.3.-Module-supervision-и-Doctor`
-//!
-//! Implementation (verified):
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.Durable-Job-execution`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.Execution-identity-boundary-on-Windows`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.A.3.-Restart-child-classes`
-//!
-//! Topology (verified):
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I2.2.-Когда-capability-становится-отдельным-crate`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I2.23.-Capability-family-topology-and-crate-extraction-decisions`
+//! Current documentation authority:
+//! - `docs/architecture/ELIOT_ARCHITECTURE.md`: `A13.1`, `A13.2`, and `A13.3`.
+//! - `docs/architecture/ELIOT_IMPLEMENTATION.md`: `I2.23`, `I6.15`, and `A.3`.
+//! - precedence: `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! This module states physical Job/process lifecycle only: creation,
 //! suspended launch, consuming validation-before-resume, assignment,
