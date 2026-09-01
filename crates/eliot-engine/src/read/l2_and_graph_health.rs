@@ -1,23 +1,18 @@
 //! Read-only L2 and graph-health boundary.
 //!
-//! Architecture anchors: `A4.5` (Evidence, relations & continuity) and `F:read`
-//! (scope + named read + consistency/cache) routed via `docs/ARCHITECTURE_CONTRACT.md`
-//! canonical pair `ELIOT_ARCHITECTURE.md` `4.5-draft` (`58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D8`)
-//! and `ELIOT_IMPLEMENTATION.md` `0.29-draft` (`C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0B`).
-//! Implementation anchors: `I5.3` (Store-neutral semantic API / named reads),
-//! `I5.8` (Canonical event and projections / `GraphRevisionFence`), `I5.9`
-//! (`SurrealDB` implementation / storage bridge), `I5.20` (Read model, consistency
-//! and cache - `Q2` exact evidence/relations, `at_least_revision` / stable-scope
-//! fence, revision-keyed cache).
+//! Current documentation authority:
+//! - `docs/architecture/ELIOT_ARCHITECTURE.md`: `A4.5` and the `F:read`
+//!   navigation family.
+//! - `docs/architecture/ELIOT_IMPLEMENTATION.md`: `I5.3`, `I5.8`, `I5.9`,
+//!   and `I5.20`.
+//! - precedence: `docs/ARCHITECTURE_CONTRACT.md`.
 //!
-//! Ownership: this child owns `ReadService` (`current_state`, `recall_l0`,
-//! `fetch_atoms_l2` with `STALE_READ_TIMEOUT` fence) and `GraphHealthService`
-//! (`new`/`health`) plus their owned read-only L0/L2/graph-health helpers
-//! (`filter_exact_l2_response`, `filter_required_exact_l2_response`,
-//! `normalized_public_handle`, `target_revision`, `revision_satisfies`,
-//! `ensure_can_wait`, and `scoped_response` test helper). Surreal read boundary
-//! stays via `eliot_store::CanonicalStore` named reads; no write/provider/process/
-//! authority, lifecycle, or unrelated helpers are moved. Public facade and
+//! This child owns `ReadService` (`current_state`, `recall_l0`, and
+//! `fetch_atoms_l2` with the `STALE_READ_TIMEOUT` fence),
+//! `GraphHealthService` (`new`/`health`), and their read-only filtering and
+//! revision helpers. The Surreal read boundary remains behind
+//! `eliot_store::CanonicalStore` named reads. No write, provider, process,
+//! authority, lifecycle, or unrelated helper is moved; the public facade and
 //! re-exports remain in `crates/eliot-engine/src/read.rs`.
 
 use crate::{EngineError, MemoryLifecycleService};
