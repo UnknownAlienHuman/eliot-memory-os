@@ -12,15 +12,22 @@ import argparse
 import copy
 import json
 import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
 INVENTORY_RELATIVE = "workstreams/core-daemons/inventory.json"
+ACTIVE_RELATIVE = "workstreams/ACTIVE.toml"
 EXPECTED_SCHEMA = "eliot.core-daemon-workstream.v4"
 EXPECTED_NORMATIVE_PAIR = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
 EXPECTED_PRODUCT_STATUS = "NOT_ACCEPTED_UNVERIFIED"
+EXPECTED_SOURCE_IDENTITY_RULE = (
+    "Resolve exact current main at work start and record base/candidate SHAs in issue/PR evidence; "
+    "this inventory never freezes a source head."
+)
+FORBIDDEN_FROZEN_IDENTITY_FIELDS = ("source_sha", "head_sha", "source_audit_base")
 EXPECTED_PROOF_CEILING = {
     "architecture_boundary_lint": "STATIC_SOURCE_BUILD_POLICY_ONLY",
     "nearest_path_guardrails": "ROUTING_CONTROL_PLANE_ONLY",
@@ -33,6 +40,77 @@ EXPECTED_PROOF_CEILING = {
     "product_pulse": "NOT_EXECUTED",
     "support": "NOT_ACCEPTED",
 }
+EXPECTED_ACTIVE_BRANCH_POLICY = {
+    "new_branch_pattern": "^(work|fix|docs|chore|refactor|test)/[0-9]+-[a-z0-9]+(?:-[a-z0-9]+)*$",
+    "standard_branch_requires_open_issue": True,
+    "requires_current_main_ancestor": True,
+    "one_issue_one_branch_one_pr": True,
+    "nonstandard_branch_requires_explicit_exception": True,
+    "merged_or_closed_branch_is_retired": True,
+    "unlisted_branch_mutation_allowed": False,
+}
+EXPECTED_ACTIVE_CORE_DAEMON_FIELDS = {
+    "id": "core-daemons",
+    "status": "active",
+    "branch_strategy": "fresh_per_issue_from_current_main",
+    "issue_refs": [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24],
+    "integration_issue_refs": [11],
+    "briefs": ["workstreams/core-daemons/AGENTS.md"],
+    "inventories": ["workstreams/core-daemons/inventory.json"],
+    "excluded_capabilities": ["dreamer"],
+}
+EXPECTED_ACTIVE_RETIRED_REFS = {
+    "status": "non_mutable_aliases_of_main",
+    "physical_delete_supported": False,
+    "rule": "Visible legacy refs may remain because the connected GitHub surface cannot delete refs. They are forced to current main and are never valid work branches.",
+    "branches": [
+        "audit/core-daemon-conformance-20260828",
+        "chore/28-repository-hygiene",
+        "chore/32-finalize-branch-state",
+        "chore/32-retire-stale-branches",
+        "chore/32-sync-cognitive-authority",
+        "chore/48-control-plane-cleanup",
+        "claude/codex-swarm-audit-p576l9",
+        "claude/eliot-search-architecture-45fdpe",
+        "claude/loving-wozniak-tw3r2s",
+        "cognitive-crates-prototypes-01",
+        "cognitive-materialize-run",
+        "cognitive-micromodules-wave-01",
+        "docs/related-repositories",
+    ],
+}
+EXPECTED_FACADES = [
+    {
+        "path": "crates/eliot-app",
+        "status": "LEGACY_MIGRATION_REGRESSION_FACADE",
+        "owner_issue": 18,
+        "rule": "No new semantic/state/effect owner; every consumer is migrated, bounded as fixture, or deleted.",
+    },
+    {
+        "path": "crates/eliot-engine",
+        "status": "LEGACY_DOMAIN_DONOR_FACADE",
+        "owner_issue": 18,
+        "rule": "Extract only a proven current causal cell; never extend as a second Governor.",
+    },
+    {
+        "path": "crates/eliot-store",
+        "status": "LEGACY_STORE_FACADE",
+        "owner_issue": 19,
+        "rule": "Cannot bypass current store API/bridge or become a second storage owner.",
+    },
+    {
+        "path": "crates/eliot-types",
+        "status": "LEGACY_TYPE_FACADE",
+        "owner_issue": 13,
+        "rule": "Do not grow an unbounded common-type owner.",
+    },
+    {
+        "path": "crates/eliot-windows-ipc",
+        "status": "LEGACY_IPC_COMPATIBILITY_FACADE",
+        "owner_issue": 15,
+        "rule": "Current IPC/process ownership remains in declared Kernel/platform/surface contracts.",
+    },
+]
 KNOWN_OWNER_ISSUES = frozenset(
     {
         10,
@@ -134,7 +212,83 @@ def _contains_excluded_capability(value: Any) -> bool:
     return False
 
 
-def verify_payload(payload: Any) -> list[Finding]:
+def _frozen_identity_findings(value: Any, path: str = "$") -> list[Finding]:
+    findings: list[Finding] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if key in FORBIDDEN_FROZEN_IDENTITY_FIELDS:
+                findings.append(
+                    _finding(
+                        "frozen_sha_mismatch",
+                        child_path,
+                        "inventory must not freeze source or candidate identity",
+                    )
+                )
+            findings.extend(_frozen_identity_findings(child, child_path))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            findings.extend(_frozen_identity_findings(child, f"{path}[{index}]"))
+    return findings
+
+
+def verify_active_registry(registry: Any) -> list[Finding]:
+    """Return deterministic findings for the current ACTIVE registry contract."""
+    findings: list[Finding] = []
+    if not isinstance(registry, dict):
+        return [_finding("active_registry_shape", "$", "ACTIVE registry root must be a TOML table")]
+
+    if registry.get("schema") != "eliot.active-workstreams.v1":
+        findings.append(_finding("active_registry_identity", "schema", "ACTIVE registry schema drifted"))
+    if registry.get("authority_branch") != "main":
+        findings.append(_finding("active_registry_identity", "authority_branch", "ACTIVE registry authority must be main"))
+
+    branch_policy = registry.get("branch_policy")
+    if branch_policy != EXPECTED_ACTIVE_BRANCH_POLICY:
+        findings.append(
+            _finding(
+                "active_registry_identity",
+                "branch_policy",
+                "ACTIVE branch policy drifted",
+            )
+        )
+
+    workstreams = registry.get("workstream")
+    if not isinstance(workstreams, list):
+        findings.append(_finding("active_registry_shape", "workstream", "ACTIVE workstream must be an array of tables"))
+        workstreams = []
+    core_daemon_matches = [
+        item for item in workstreams if isinstance(item, dict) and item.get("id") == "core-daemons"
+    ]
+    if len(core_daemon_matches) != 1:
+        detail = "core-daemons workstream is missing" if not core_daemon_matches else "core-daemons workstream is duplicated"
+        findings.append(_finding("active_registry_identity", "workstream", detail))
+    else:
+        core_daemons = core_daemon_matches[0]
+        for field, expected in EXPECTED_ACTIVE_CORE_DAEMON_FIELDS.items():
+            if core_daemons.get(field) != expected:
+                findings.append(
+                    _finding(
+                        "active_registry_identity",
+                        f"workstream[id=core-daemons].{field}",
+                        "current core-daemons registry binding drifted",
+                    )
+                )
+
+    retired_refs = registry.get("retired_refs")
+    if retired_refs != EXPECTED_ACTIVE_RETIRED_REFS:
+        findings.append(
+            _finding(
+                "active_registry_identity",
+                "retired_refs",
+                "ACTIVE retired-reference registry drifted",
+            )
+        )
+
+    return sorted(findings, key=lambda item: (item.code, item.path, item.detail))
+
+
+def verify_payload(payload: Any, active_registry: Any | None = None) -> list[Finding]:
     """Return deterministic findings for one decoded inventory payload."""
     findings: list[Finding] = []
     if not isinstance(payload, dict):
@@ -165,13 +319,14 @@ def verify_payload(payload: Any) -> list[Finding]:
                 f"expected {EXPECTED_PRODUCT_STATUS}; inventory cannot claim product support",
             )
         )
+    findings.extend(_frozen_identity_findings(payload))
     source_rule = _string(authority.get("source_identity_rule"), "authority.source_identity_rule", findings)
-    if "never freezes a source head" not in source_rule:
+    if source_rule != EXPECTED_SOURCE_IDENTITY_RULE:
         findings.append(
             _finding(
                 "frozen_sha_mismatch",
                 "authority.source_identity_rule",
-                "source identity rule must not freeze a source head",
+                "source identity rule must preserve current-main resolution without frozen identity fields",
             )
         )
 
@@ -207,6 +362,15 @@ def verify_payload(payload: Any) -> list[Finding]:
                 "proof_ceiling_drift",
                 "proof_ceiling",
                 "accepted core-daemon proof ceiling must remain unchanged",
+            )
+        )
+
+    if payload.get("retired_or_migration_facades") != EXPECTED_FACADES:
+        findings.append(
+            _finding(
+                "facade_registry_mismatch",
+                "retired_or_migration_facades",
+                "retired and migration facade registry drifted",
             )
         )
 
@@ -285,6 +449,9 @@ def verify_payload(payload: Any) -> list[Finding]:
                 )
             )
 
+    if active_registry is not None:
+        findings.extend(verify_active_registry(active_registry))
+
     return sorted(findings, key=lambda item: (item.code, item.path, item.detail))
 
 
@@ -295,19 +462,50 @@ def load_inventory(path: Path) -> Any:
         raise ValueError(f"cannot load core-daemon inventory: {error}") from error
 
 
-def verify(root: Path) -> list[Finding]:
-    path = root / INVENTORY_RELATIVE
-    if not path.is_file():
-        return [_finding("inventory_missing", INVENTORY_RELATIVE, "core-daemon inventory is missing")]
+def load_active_registry(path: Path) -> Any:
     try:
-        return verify_payload(load_inventory(path))
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(f"cannot load ACTIVE registry: {error}") from error
+
+
+def verify(root: Path) -> list[Finding]:
+    inventory_path = root / INVENTORY_RELATIVE
+    active_path = root / ACTIVE_RELATIVE
+    findings: list[Finding] = []
+    if not active_path.is_file():
+        findings.append(_finding("active_registry_missing", ACTIVE_RELATIVE, "ACTIVE registry is missing"))
+        active_registry = None
+    else:
+        try:
+            active_registry = load_active_registry(active_path)
+        except ValueError as error:
+            findings.append(_finding("active_registry_unreadable", ACTIVE_RELATIVE, str(error)))
+            active_registry = None
+
+    if not inventory_path.is_file():
+        findings.append(_finding("inventory_missing", INVENTORY_RELATIVE, "core-daemon inventory is missing"))
+        return sorted(findings, key=lambda item: (item.code, item.path, item.detail))
+    try:
+        findings.extend(verify_payload(load_inventory(inventory_path), active_registry))
     except ValueError as error:
-        return [_finding("inventory_unreadable", INVENTORY_RELATIVE, str(error))]
+        findings.append(_finding("inventory_unreadable", INVENTORY_RELATIVE, str(error)))
+    return sorted(findings, key=lambda item: (item.code, item.path, item.detail))
 
 
 def print_findings(findings: list[Finding]) -> None:
     for finding in findings:
         print(f"HARD_VIOLATION: {finding.code}: {finding.path}: {finding.detail}")
+
+
+def _valid_active_registry() -> dict[str, Any]:
+    return {
+        "schema": "eliot.active-workstreams.v1",
+        "authority_branch": "main",
+        "branch_policy": copy.deepcopy(EXPECTED_ACTIVE_BRANCH_POLICY),
+        "workstream": [copy.deepcopy(EXPECTED_ACTIVE_CORE_DAEMON_FIELDS)],
+        "retired_refs": copy.deepcopy(EXPECTED_ACTIVE_RETIRED_REFS),
+    }
 
 
 def _valid_fixture() -> dict[str, Any]:
@@ -317,7 +515,7 @@ def _valid_fixture() -> dict[str, Any]:
             "branch": "main",
             "normative_pair": EXPECTED_NORMATIVE_PAIR,
             "product_status": EXPECTED_PRODUCT_STATUS,
-            "source_identity_rule": "Resolve exact current main at work start; this inventory never freezes a source head.",
+            "source_identity_rule": EXPECTED_SOURCE_IDENTITY_RULE,
         },
         "scope": {
             "programme": "core-daemons",
@@ -343,11 +541,19 @@ def _valid_fixture() -> dict[str, Any]:
                 "proof_required": ["fixture Module Proof"],
             }
         ],
+        "retired_or_migration_facades": copy.deepcopy(EXPECTED_FACADES),
     }
 
 
 def _expect_only(payload: dict[str, Any], code: str) -> None:
     findings = verify_payload(payload)
+    codes = {finding.code for finding in findings}
+    if codes != {code}:
+        raise AssertionError(f"expected only {code}, got {sorted(codes)}: {findings}")
+
+
+def _expect_active_only(registry: dict[str, Any], code: str) -> None:
+    findings = verify_active_registry(registry)
     codes = {finding.code for finding in findings}
     if codes != {code}:
         raise AssertionError(f"expected only {code}, got {sorted(codes)}: {findings}")
@@ -360,9 +566,14 @@ def self_test() -> None:
     duplicate["units"].append(copy.deepcopy(duplicate["units"][0]))
     cases.append(("duplicate ID", "duplicate_id", duplicate))
 
-    frozen = _valid_fixture()
-    frozen["authority"]["normative_pair"] = "sha256:wrong"
-    cases.append(("frozen SHA", "frozen_sha_mismatch", frozen))
+    frozen_normative_pair = _valid_fixture()
+    frozen_normative_pair["authority"]["normative_pair"] = "sha256:wrong"
+    cases.append(("frozen normative-pair SHA", "frozen_sha_mismatch", frozen_normative_pair))
+
+    for field in FORBIDDEN_FROZEN_IDENTITY_FIELDS:
+        frozen_identity = _valid_fixture()
+        frozen_identity["authority"][field] = "deadbeef"
+        cases.append((f"forbidden {field}", "frozen_sha_mismatch", frozen_identity))
 
     missing_proof = _valid_fixture()
     missing_proof["units"][0]["proof_required"] = []
@@ -380,13 +591,27 @@ def self_test() -> None:
     cognitive_leakage["units"][0]["paths"] = ["crates/smart/cognitive-field"]
     cases.append(("cognitive leakage", "cognitive_leakage", cognitive_leakage))
 
-    clean = verify_payload(_valid_fixture())
+    facade_registry = _valid_fixture()
+    facade_registry["retired_or_migration_facades"][0]["path"] = "crates/eliot-app-tampered"
+    cases.append(("facade registry tamper", "facade_registry_mismatch", facade_registry))
+
+    clean = verify_payload(_valid_fixture(), _valid_active_registry())
     if clean:
         raise AssertionError(f"valid inventory fixture failed: {clean}")
     for case, code, payload in cases:
         _expect_only(payload, code)
         print(f"INVENTORY_FIXTURE: {case}: FAILS_AS={code}")
-    print(f"CORE_DAEMON_INVENTORY_SELF_TEST: PASS cases={len(cases)}")
+
+    active_registry = _valid_active_registry()
+    active_registry["retired_refs"]["branches"].append("tampered/branch")
+    _expect_active_only(active_registry, "active_registry_identity")
+    print("INVENTORY_FIXTURE: ACTIVE registry tamper: FAILS_AS=active_registry_identity")
+
+    duplicate_active_registry = _valid_active_registry()
+    duplicate_active_registry["workstream"].append(copy.deepcopy(duplicate_active_registry["workstream"][0]))
+    _expect_active_only(duplicate_active_registry, "active_registry_identity")
+    print("INVENTORY_FIXTURE: duplicate ACTIVE workstream: FAILS_AS=active_registry_identity")
+    print(f"CORE_DAEMON_INVENTORY_SELF_TEST: PASS cases={len(cases) + 2}")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
