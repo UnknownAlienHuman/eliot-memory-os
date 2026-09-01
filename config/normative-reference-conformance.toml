@@ -1,0 +1,59 @@
+schema_version = "eliot-normative-reference-conformance-v1"
+numeric_index = "docs/architecture/handle-index.json"
+decision_anchor_index = "docs/architecture/decision-anchor-index.json"
+decision_anchor_source = "docs/architecture/A16-01-decision-anchors.md"
+
+scan_roots = [
+  "AGENTS.md",
+  "WORKFLOW.md",
+  "README.md",
+  "apps",
+  "bins",
+  "config",
+  "crates",
+  "docs",
+  "integrations",
+  "plugin",
+  "scripts",
+  "workstreams",
+  "workspace",
+  ".github/pull_request_template.md",
+]
+
+extensions = [
+  ".rs",
+  ".md",
+  ".toml",
+  ".py",
+  ".ps1",
+  ".sh",
+  ".yml",
+  ".yaml",
+  ".json",
+  ".js",
+  ".mjs",
+  ".cs",
+  ".csproj",
+  ".manifest",
+  ".surql",
+  ".txt",
+  ".wat",
+  ".wit",
+  ".xaml",
+]
+
+# These files either implement the detector and contain deliberate negative
+# fixtures, define exact negative patterns, or preserve pre-sharding navigation
+# as non-current archaeology. Operational source and current documentation remain
+# inside the scan denominator.
+ignore_globs = [
+  "config/doc-code-conformance.toml",
+  "config/doc-traceability-retirement.toml",
+  "config/normative-reference-conformance.toml",
+  "docs/architecture/navigation-history/**",
+  "scripts/doc_code_conformance_core.py",
+  "scripts/doc_code_conformance_lib/**",
+  "scripts/docs_closure_audit.py",
+  "scripts/docs_shards_lib/**",
+  "scripts/verify-doc-code-conformance.py",
+]
