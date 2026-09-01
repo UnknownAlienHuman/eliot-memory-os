@@ -14,6 +14,9 @@ use super::{
 };
 
 #[cfg(windows)]
+use super::host_durable_persistence::{sync_dir, write_durable_file};
+
+#[cfg(windows)]
 fn store_recovery_store_dir(host_state_root: &Path) -> PathBuf {
     host_state_root.join("store-recoveries")
 }
@@ -439,10 +442,8 @@ pub(super) fn read_store_recovery_pending_identity(
 }
 
 #[cfg(windows)]
-fn sync_store_recovery_dir(dir: &Path) {
-    if let Ok(file) = std::fs::OpenOptions::new().read(true).open(dir) {
-        let _ = file.sync_all();
-    }
+fn sync_store_recovery_dir(dir: &Path) -> Result<(), HostError> {
+    sync_dir(dir)
 }
 
 #[cfg(windows)]
@@ -482,13 +483,10 @@ pub(super) fn persist_store_recovery_pending(
         Uuid::new_v4().simple()
     ));
     let publication = (|| {
-        std::fs::write(&tmp, bytes).map_err(|e| HostError::Platform(e.to_string()))?;
-        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&tmp) {
-            let _ = file.sync_all();
-        }
+        write_durable_file(&tmp, &bytes)?;
         match std::fs::hard_link(&tmp, &path) {
             Ok(()) => {
-                sync_store_recovery_dir(&dir);
+                sync_store_recovery_dir(&dir)?;
                 Ok(StoreRecoveryPendingPublication::Created)
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -510,16 +508,22 @@ pub(super) fn persist_store_recovery_pending(
         }
     })();
     let cleanup = std::fs::remove_file(&tmp);
-    sync_store_recovery_dir(&dir);
+    let sync_after_cleanup = sync_store_recovery_dir(&dir);
     match publication {
         Err(error) => Err(error),
-        Ok(value) => match cleanup {
-            Ok(()) => Ok(value),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(value),
-            Err(error) => Err(HostError::RecoveryRequired(format!(
-                "store recovery pending temporary cleanup failed: {error}"
-            ))),
-        },
+        Ok(value) => {
+            match cleanup {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(HostError::RecoveryRequired(format!(
+                        "store recovery pending temporary cleanup failed: {error}"
+                    )));
+                }
+            }
+            sync_after_cleanup?;
+            Ok(value)
+        }
     }
 }
 
@@ -595,13 +599,10 @@ pub(super) fn persist_store_recovery_termination_evidence(
         Uuid::new_v4().simple()
     ));
     let publication = (|| {
-        std::fs::write(&tmp, bytes).map_err(|error| HostError::Platform(error.to_string()))?;
-        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&tmp) {
-            let _ = file.sync_all();
-        }
+        write_durable_file(&tmp, &bytes)?;
         match std::fs::hard_link(&tmp, &path) {
             Ok(()) => {
-                sync_store_recovery_dir(&dir);
+                sync_store_recovery_dir(&dir)?;
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -627,16 +628,22 @@ pub(super) fn persist_store_recovery_termination_evidence(
         }
     })();
     let cleanup = std::fs::remove_file(&tmp);
-    sync_store_recovery_dir(&dir);
+    let sync_after_cleanup = sync_store_recovery_dir(&dir);
     match publication {
         Err(error) => Err(error),
-        Ok(()) => match cleanup {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(HostError::RecoveryRequired(format!(
-                "Store termination temporary cleanup failed: {error}"
-            ))),
-        },
+        Ok(()) => {
+            match cleanup {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(HostError::RecoveryRequired(format!(
+                        "Store termination temporary cleanup failed: {error}"
+                    )));
+                }
+            }
+            sync_after_cleanup?;
+            Ok(())
+        }
     }
 }
 
@@ -729,13 +736,10 @@ pub(super) fn persist_store_recovery_inner_binding(
         Uuid::new_v4().simple()
     ));
     let publication = (|| {
-        std::fs::write(&tmp, bytes).map_err(|error| HostError::Platform(error.to_string()))?;
-        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&tmp) {
-            let _ = file.sync_all();
-        }
+        write_durable_file(&tmp, &bytes)?;
         match std::fs::hard_link(&tmp, &path) {
             Ok(()) => {
-                sync_store_recovery_dir(&dir);
+                sync_store_recovery_dir(&dir)?;
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -760,16 +764,22 @@ pub(super) fn persist_store_recovery_inner_binding(
         }
     })();
     let cleanup = std::fs::remove_file(&tmp);
-    sync_store_recovery_dir(&dir);
+    let sync_after_cleanup = sync_store_recovery_dir(&dir);
     match publication {
         Err(error) => Err(error),
-        Ok(()) => match cleanup {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(HostError::RecoveryRequired(format!(
-                "Store recovery inner-binding temporary cleanup failed: {error}"
-            ))),
-        },
+        Ok(()) => {
+            match cleanup {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(HostError::RecoveryRequired(format!(
+                        "Store recovery inner-binding temporary cleanup failed: {error}"
+                    )));
+                }
+            }
+            sync_after_cleanup?;
+            Ok(())
+        }
     }
 }
 
@@ -816,6 +826,7 @@ pub(super) fn persist_store_recovery_receipt(
     host_state_root: &Path,
     receipt: &HostStoreRecoveryReceipt,
 ) -> Result<(), HostError> {
+    receipt.validate().map_err(HostError::RecoveryRequired)?;
     let dir = store_recovery_store_dir(host_state_root);
     std::fs::create_dir_all(&dir).map_err(|e| HostError::Platform(e.to_string()))?;
     let path = store_recovery_receipt_path(
@@ -838,55 +849,57 @@ pub(super) fn persist_store_recovery_receipt(
         receipt.external_control_mutation_digest.as_str(),
         Uuid::new_v4().simple()
     ));
-    std::fs::write(
-        &tmp,
-        serde_json::to_vec(receipt).map_err(|e| HostError::Platform(e.to_string()))?,
-    )
-    .map_err(|e| HostError::Platform(e.to_string()))?;
-    {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&tmp)
-            .map_err(|e| HostError::Platform(e.to_string()))?;
-        let _ = file.sync_all();
-    }
-    // Publish with a hard link so a concurrent writer can never replace an
-    // already durable outer receipt.  The winner is read back and must be the
-    // exact same canonical authority; a conflicting winner remains Unknown.
-    let publication = match std::fs::hard_link(&tmp, &path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let bytes =
-                read_bounded_runtime_restart_file(&path, 16 * 1024, "Store recovery receipt")?;
-            let existing =
-                serde_json::from_slice::<HostStoreRecoveryReceipt>(&bytes).map_err(|error| {
-                    HostError::RecoveryRequired(format!(
-                        "existing Store recovery receipt is malformed: {error}"
-                    ))
-                })?;
-            existing.validate().map_err(HostError::RecoveryRequired)?;
-            if existing == *receipt {
+    let bytes = serde_json::to_vec(receipt).map_err(|e| HostError::Platform(e.to_string()))?;
+    let publication = (|| {
+        write_durable_file(&tmp, &bytes)?;
+        // Publish with a hard link so a concurrent writer can never replace an
+        // already durable outer receipt.  The winner is read back and must be the
+        // exact same canonical authority; a conflicting winner remains Unknown.
+        match std::fs::hard_link(&tmp, &path) {
+            Ok(()) => {
+                sync_store_recovery_dir(&dir)?;
                 Ok(())
-            } else {
-                Err(HostError::RecoveryRequired(
-                    "existing Store recovery receipt conflicts with reconstructed authority"
-                        .to_owned(),
-                ))
             }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let bytes =
+                    read_bounded_runtime_restart_file(&path, 16 * 1024, "Store recovery receipt")?;
+                let existing = serde_json::from_slice::<HostStoreRecoveryReceipt>(&bytes).map_err(
+                    |error| {
+                        HostError::RecoveryRequired(format!(
+                            "existing Store recovery receipt is malformed: {error}"
+                        ))
+                    },
+                )?;
+                existing.validate().map_err(HostError::RecoveryRequired)?;
+                if existing == *receipt {
+                    Ok(())
+                } else {
+                    Err(HostError::RecoveryRequired(
+                        "existing Store recovery receipt conflicts with reconstructed authority"
+                            .to_owned(),
+                    ))
+                }
+            }
+            Err(error) => Err(HostError::Platform(error.to_string())),
         }
-        Err(error) => Err(HostError::Platform(error.to_string())),
-    };
+    })();
     let cleanup = std::fs::remove_file(&tmp);
-    sync_store_recovery_dir(&dir);
+    let sync_after_cleanup = sync_store_recovery_dir(&dir);
     match publication {
         Err(error) => Err(error),
-        Ok(()) => match cleanup {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(HostError::RecoveryRequired(format!(
-                "Store recovery receipt temporary cleanup failed: {error}"
-            ))),
-        },
+        Ok(()) => {
+            match cleanup {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(HostError::RecoveryRequired(format!(
+                        "Store recovery receipt temporary cleanup failed: {error}"
+                    )));
+                }
+            }
+            sync_after_cleanup?;
+            Ok(())
+        }
     }
 }
 
@@ -931,7 +944,7 @@ pub(super) fn cleanup_store_recovery_supporting_evidence_for(
             }
         }
     }
-    sync_store_recovery_dir(&dir);
+    sync_store_recovery_dir(&dir)?;
     Ok(())
 }
 
@@ -962,7 +975,7 @@ pub(super) fn cleanup_completed_store_recovery_supporting_evidence(
             }
         }
     }
-    sync_store_recovery_dir(&dir);
+    sync_store_recovery_dir(&dir)?;
     Ok(())
 }
 

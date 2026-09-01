@@ -17,6 +17,9 @@ use pending_codec::{
 };
 
 #[cfg(windows)]
+use super::host_durable_persistence::{sync_dir, write_durable_file};
+
+#[cfg(windows)]
 pub(super) fn runtime_restart_store_dir(host_state_root: &Path) -> PathBuf {
     host_state_root.join("runtime-restarts")
 }
@@ -157,10 +160,8 @@ pub(super) enum RuntimeRestartPendingPublication {
 }
 
 #[cfg(windows)]
-fn sync_runtime_restart_store_dir(dir: &Path) {
-    if let Ok(file) = std::fs::OpenOptions::new().read(true).open(dir) {
-        let _ = file.sync_all();
-    }
+fn sync_runtime_restart_store_dir(dir: &Path) -> Result<(), HostError> {
+    sync_dir(dir)
 }
 
 #[cfg(windows)]
@@ -200,15 +201,12 @@ pub(super) fn persist_runtime_restart_pending(
         Uuid::new_v4().simple()
     ));
     let publication = (|| {
-        std::fs::write(&tmp, bytes).map_err(|e| HostError::Platform(e.to_string()))?;
-        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&tmp) {
-            let _ = file.sync_all();
-        }
+        write_durable_file(&tmp, &bytes)?;
         // A hard-link publication is atomic and, unlike rename, never replaces
         // a final record that won a concurrent create race.
         match std::fs::hard_link(&tmp, &path) {
             Ok(()) => {
-                sync_runtime_restart_store_dir(&dir);
+                sync_runtime_restart_store_dir(&dir)?;
                 Ok(RuntimeRestartPendingPublication::Created)
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -230,16 +228,22 @@ pub(super) fn persist_runtime_restart_pending(
         }
     })();
     let cleanup = std::fs::remove_file(&tmp);
-    sync_runtime_restart_store_dir(&dir);
+    let sync_after_cleanup = sync_runtime_restart_store_dir(&dir);
     match publication {
-        Err(error) => Err(error),
-        Ok(value) => match cleanup {
-            Ok(()) => Ok(value),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(value),
-            Err(error) => Err(HostError::RecoveryRequired(format!(
-                "runtime restart pending temporary cleanup failed: {error}"
-            ))),
-        },
+        Err(publication_error) => Err(publication_error),
+        Ok(value) => {
+            match cleanup {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(HostError::RecoveryRequired(format!(
+                        "runtime restart pending temporary cleanup failed: {error}"
+                    )));
+                }
+            }
+            sync_after_cleanup?;
+            Ok(value)
+        }
     }
 }
 
@@ -248,28 +252,101 @@ pub(super) fn persist_runtime_restart_receipt(
     host_state_root: &Path,
     receipt: &HostKernelRestartReceipt,
 ) -> Result<(), HostError> {
+    receipt.validate().map_err(HostError::Platform)?;
     let dir = runtime_restart_store_dir(host_state_root);
     std::fs::create_dir_all(&dir).map_err(|e| HostError::Platform(e.to_string()))?;
     let path = runtime_restart_receipt_path(host_state_root, receipt.mutation_digest.as_str());
-    let tmp = dir.join(format!(".{}.receipt.tmp", receipt.mutation_digest.as_str()));
-    std::fs::write(
-        &tmp,
-        serde_json::to_vec(receipt).map_err(|e| HostError::Platform(e.to_string()))?,
-    )
-    .map_err(|e| HostError::Platform(e.to_string()))?;
-    {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&tmp)
-            .map_err(|e| HostError::Platform(e.to_string()))?;
-        let _ = file.sync_all();
+    if let Some(existing_bytes) = (|| -> Result<Option<Vec<u8>>, HostError> {
+        match std::fs::metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(HostError::RecoveryRequired(format!(
+                    "runtime restart receipt cannot be inspected: {error}"
+                )));
+            }
+        }
+        let bytes = read_bounded_runtime_restart_file(&path, 16 * 1024, "runtime restart receipt")?;
+        Ok(Some(bytes))
+    })()? {
+        let existing = serde_json::from_slice::<HostKernelRestartReceipt>(&existing_bytes)
+            .map_err(|error| {
+                HostError::RecoveryRequired(format!(
+                    "existing runtime restart receipt is malformed: {error}"
+                ))
+            })?;
+        existing.validate().map_err(HostError::RecoveryRequired)?;
+        if existing == *receipt {
+            return Ok(());
+        }
+        return Err(HostError::RecoveryRequired(
+            "existing runtime restart receipt conflicts with reconstructed authority".to_owned(),
+        ));
     }
-    std::fs::rename(&tmp, &path).map_err(|e| HostError::Platform(e.to_string()))?;
+    let tmp = dir.join(format!(
+        ".{}.receipt.{}.tmp",
+        receipt.mutation_digest.as_str(),
+        Uuid::new_v4().simple()
+    ));
+    let bytes = serde_json::to_vec(receipt).map_err(|e| HostError::Platform(e.to_string()))?;
+    let publication = (|| {
+        write_durable_file(&tmp, &bytes)?;
+        match std::fs::hard_link(&tmp, &path) {
+            Ok(()) => {
+                sync_runtime_restart_store_dir(&dir)?;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let bytes =
+                    read_bounded_runtime_restart_file(&path, 16 * 1024, "runtime restart receipt")?;
+                let existing = serde_json::from_slice::<HostKernelRestartReceipt>(&bytes).map_err(
+                    |error| {
+                        HostError::RecoveryRequired(format!(
+                            "existing runtime restart receipt is malformed: {error}"
+                        ))
+                    },
+                )?;
+                existing.validate().map_err(HostError::RecoveryRequired)?;
+                if existing == *receipt {
+                    Ok(())
+                } else {
+                    Err(HostError::RecoveryRequired(
+                        "existing runtime restart receipt conflicts with reconstructed authority"
+                            .to_owned(),
+                    ))
+                }
+            }
+            Err(error) => Err(HostError::Platform(error.to_string())),
+        }
+    })();
+    let cleanup = std::fs::remove_file(&tmp);
+    let sync_after_cleanup = sync_runtime_restart_store_dir(&dir);
+    // Publication failure is primary; cleanup cannot rename it as success.
+    let () = match publication {
+        Err(error) => return Err(error),
+        Ok(()) => match cleanup {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(HostError::RecoveryRequired(format!(
+                    "runtime restart receipt temporary cleanup failed: {error}"
+                )));
+            }
+        },
+    };
+    sync_after_cleanup?;
+    // Receipt is durable before pending removal.
     let pending = runtime_restart_pending_path(host_state_root, receipt.mutation_digest.as_str());
-    let _ = std::fs::remove_file(pending);
-    if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&dir) {
-        let _ = file.sync_all();
+    match std::fs::remove_file(&pending) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "runtime restart pending cleanup failed: {error}"
+            )));
+        }
     }
+    sync_runtime_restart_store_dir(&dir)?;
     Ok(())
 }
 

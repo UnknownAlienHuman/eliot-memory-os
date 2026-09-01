@@ -3332,6 +3332,9 @@ use host_epoch_reopen::{open_production_epoch, persist_pending_recovery};
 use host_epoch_reopen::{open_production_epoch_from_backend, reopen_existing_epoch};
 
 #[cfg(windows)]
+mod host_durable_persistence;
+
+#[cfg(windows)]
 mod runtime_restart_state;
 #[cfg(windows)]
 use runtime_restart_state::{

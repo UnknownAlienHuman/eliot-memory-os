@@ -208,10 +208,10 @@ mod tests {
     #[test]
     fn created_at_preserves_exact_unix_milliseconds() {
         let observed = UNIX_EPOCH + Duration::from_millis(42);
-        assert!(matches!(
-            runtime_restart_created_at(observed).as_deref(),
-            Ok("42")
-        ));
+        assert_eq!(
+            runtime_restart_created_at(observed).expect("created_at must succeed"),
+            "42"
+        );
     }
 
     #[test]
