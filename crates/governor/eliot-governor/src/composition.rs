@@ -1607,7 +1607,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
         match self.read_unique_agent_activation(now) {
             Ok(snapshot) => GovernorActivationOutcome::Resolved(snapshot),
-            Err(error) => classify_activation_error(error, now),
+            Err(error) => classify_activation_error(&error, now),
         }
     }
 
@@ -1755,7 +1755,7 @@ fn validate_service_observations(
     Ok(())
 }
 
-fn classify_activation_error(error: CompositionError, now: u64) -> GovernorActivationOutcome {
+fn classify_activation_error(error: &CompositionError, now: u64) -> GovernorActivationOutcome {
     let message = error.to_string();
     // NotReady is the only transient retry signal.
     if matches!(error, CompositionError::NotReady)
@@ -1766,7 +1766,7 @@ fn classify_activation_error(error: CompositionError, now: u64) -> GovernorActiv
             recovery_handle: "governor.readiness:not-ready".to_owned(),
             retry: GovernorRetryDirective::new(
                 "governor.readiness",
-                message.to_string(),
+                message.clone(),
                 now.saturating_add(1).max(1),
             ),
         };
@@ -3214,7 +3214,7 @@ mod tests {
         // Use a fresh coherent composition but verify the classification of a
         // synthetic stale error is not Resolved.
         let stale = classify_activation_error(
-            CompositionError::Recovery(
+            &CompositionError::Recovery(
                 "task revision does not match the activation fence".to_owned(),
             ),
             20,
@@ -3224,7 +3224,7 @@ mod tests {
 
         // Any FailedInternal must stay FailedInternal, never TaskSelectionRequired.
         let failed = classify_activation_error(
-            CompositionError::Recovery(
+            &CompositionError::Recovery(
                 "session lifecycle record is not an exact active activation match".to_owned(),
             ),
             20,

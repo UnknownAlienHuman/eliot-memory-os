@@ -210,18 +210,19 @@ pub fn fixture_failed_internal(reason: &str) -> GovernorActivationOutcome {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
     use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, TaskId};
 
     fn test_snapshot() -> crate::composition::GovernorActivationSnapshot {
         crate::composition::GovernorActivationSnapshot {
             state_fence: StateFence::new(
-                AuthorityEpoch::new(1).expect("epoch"),
-                ResourceGeneration::new(1).expect("gen"),
+                AuthorityEpoch::new(1).unwrap(),
+                ResourceGeneration::new(1).unwrap(),
             ),
             principal_id: "principal-1".to_owned(),
             session_id: "session-1".to_owned(),
-            task_id: TaskId::new("task-1").expect("task id"),
+            task_id: TaskId::new("task-1").unwrap(),
             work_unit_id: "work-1".to_owned(),
             work_scope_id: "scope-1".to_owned(),
             task_revision: 7,
@@ -233,7 +234,7 @@ mod tests {
     #[test]
     fn all_fixtures_produce_distinct_kinds() {
         let snapshot = test_snapshot();
-        let outcomes = vec![
+        let outcomes = [
             fixture_resolved(snapshot),
             fixture_task_selection_required(),
             fixture_scope_selection_required(Vec::new()),
@@ -242,7 +243,10 @@ mod tests {
             fixture_stale_fence(None),
             fixture_failed_internal("internal"),
         ];
-        let kinds: std::collections::BTreeSet<_> = outcomes.iter().map(|o| o.kind_str()).collect();
+        let kinds: std::collections::BTreeSet<_> = outcomes
+            .iter()
+            .map(GovernorActivationOutcome::kind_str)
+            .collect();
         assert_eq!(kinds.len(), 7);
     }
 
@@ -291,8 +295,8 @@ mod tests {
         assert!(!stale.is_resolved());
         assert_eq!(stale.kind_str(), "STALE_FENCE");
         let with_fence = fixture_stale_fence(Some(StateFence::new(
-            AuthorityEpoch::new(1).expect("epoch"),
-            ResourceGeneration::new(2).expect("gen"),
+            AuthorityEpoch::new(1).unwrap(),
+            ResourceGeneration::new(2).unwrap(),
         )));
         assert!(!with_fence.is_resolved());
     }
