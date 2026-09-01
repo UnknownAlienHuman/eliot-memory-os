@@ -21,7 +21,8 @@ A route alone is navigation, not reading evidence. The local
 
 - [Mandatory verified-reading protocol](READING_PROTOCOL.md)
 - [Task/path route matrix](ROUTES.md)
-- [Exact handle index](HANDLE_INDEX.md)
+- [Exact numeric-handle index](HANDLE_INDEX.md)
+- [Decision Anchor index](DECISION_ANCHOR_INDEX.md)
 - [Architecture bounded index](architecture/README.md)
 - [Implementation bounded index](implementation/README.md)
 - [Architecture authority](../ARCHITECTURE_CONTRACT.md)
