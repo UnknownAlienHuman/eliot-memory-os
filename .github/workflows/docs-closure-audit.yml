@@ -9,6 +9,7 @@ on:
   workflow_run:
     workflows:
       - Work 140 Codex stable wire proof
+      - Work 286 Rebased Rust Proof
     types: [completed]
   workflow_dispatch:
 
