@@ -1,22 +1,13 @@
 //! Shared file, process, and token identity observation primitives.
 //!
-//! Architecture (verified):
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A2.3`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A12.2`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A12.3`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A13.2`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-AUTH-01`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-SEC-01`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-SEC-02`
-//!
-//! Implementation (verified):
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I1.2`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I2.2`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I2.23`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I7.3`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I7.14`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I15.2`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I15.3`
+//! Current documentation authority:
+//! - `docs/architecture/ELIOT_ARCHITECTURE.md`: `A2.3`, `A12.2`, `A12.3`,
+//!   and `A13.2`.
+//! - `docs/architecture/A16-01-decision-anchors.md`: `ARCH-AUTH-01`,
+//!   `ARCH-SEC-01`, and `ARCH-SEC-02`.
+//! - `docs/architecture/ELIOT_IMPLEMENTATION.md`: `I1.2`, `I2.23`, `I7.3`,
+//!   `I7.14`, `I15.2`, and `I15.3`.
+//! - precedence: `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! This module owns shared file, process, and token identity observation
 //! primitives only. It forbids `NamedPipe` admission, job or process lifecycle,
