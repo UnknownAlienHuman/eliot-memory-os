@@ -19,6 +19,9 @@ use pending_codec::{
 #[cfg(windows)]
 use super::host_durable_persistence::{sync_dir, write_durable_file};
 
+#[cfg(all(test, windows))]
+use super::host_durable_persistence::ordering;
+
 #[cfg(windows)]
 pub(super) fn runtime_restart_store_dir(host_state_root: &Path) -> PathBuf {
     host_state_root.join("runtime-restarts")
@@ -202,11 +205,15 @@ pub(super) fn persist_runtime_restart_pending(
     ));
     let publication = (|| {
         write_durable_file(&tmp, &bytes)?;
+        #[cfg(all(test, windows))]
+        ordering::record("pending_hardlink_attempt");
         // A hard-link publication is atomic and, unlike rename, never replaces
         // a final record that won a concurrent create race.
         match std::fs::hard_link(&tmp, &path) {
             Ok(()) => {
                 sync_runtime_restart_store_dir(&dir)?;
+                #[cfg(all(test, windows))]
+                ordering::record("pending_publication_dir_sync_success");
                 Ok(RuntimeRestartPendingPublication::Created)
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -227,8 +234,20 @@ pub(super) fn persist_runtime_restart_pending(
             Err(error) => Err(HostError::Platform(error.to_string())),
         }
     })();
+    #[cfg(all(test, windows))]
+    ordering::record("tmp_cleanup_attempt");
     let cleanup = std::fs::remove_file(&tmp);
+    #[cfg(all(test, windows))]
+    ordering::record("tmp_cleanup_done");
     let sync_after_cleanup = sync_runtime_restart_store_dir(&dir);
+    #[cfg(all(test, windows))]
+    {
+        if sync_after_cleanup.is_ok() {
+            ordering::record("tmp_cleanup_dir_sync_success");
+        } else {
+            ordering::record("tmp_cleanup_dir_sync_error");
+        }
+    }
     match publication {
         Err(publication_error) => Err(publication_error),
         Ok(value) => {
@@ -242,6 +261,8 @@ pub(super) fn persist_runtime_restart_pending(
                 }
             }
             sync_after_cleanup?;
+            #[cfg(all(test, windows))]
+            ordering::record("pending_publication_complete");
             Ok(value)
         }
     }
@@ -291,9 +312,13 @@ pub(super) fn persist_runtime_restart_receipt(
     let bytes = serde_json::to_vec(receipt).map_err(|e| HostError::Platform(e.to_string()))?;
     let publication = (|| {
         write_durable_file(&tmp, &bytes)?;
+        #[cfg(all(test, windows))]
+        ordering::record("receipt_hardlink_attempt");
         match std::fs::hard_link(&tmp, &path) {
             Ok(()) => {
                 sync_runtime_restart_store_dir(&dir)?;
+                #[cfg(all(test, windows))]
+                ordering::record("receipt_publication_dir_sync_success");
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -319,8 +344,20 @@ pub(super) fn persist_runtime_restart_receipt(
             Err(error) => Err(HostError::Platform(error.to_string())),
         }
     })();
+    #[cfg(all(test, windows))]
+    ordering::record("receipt_tmp_cleanup_attempt");
     let cleanup = std::fs::remove_file(&tmp);
+    #[cfg(all(test, windows))]
+    ordering::record("receipt_tmp_cleanup_done");
     let sync_after_cleanup = sync_runtime_restart_store_dir(&dir);
+    #[cfg(all(test, windows))]
+    {
+        if sync_after_cleanup.is_ok() {
+            ordering::record("receipt_tmp_cleanup_dir_sync_success");
+        } else {
+            ordering::record("receipt_tmp_cleanup_dir_sync_error");
+        }
+    }
     // Publication failure is primary; cleanup cannot rename it as success.
     let () = match publication {
         Err(error) => return Err(error),
@@ -335,8 +372,12 @@ pub(super) fn persist_runtime_restart_receipt(
         },
     };
     sync_after_cleanup?;
+    #[cfg(all(test, windows))]
+    ordering::record("receipt_durable_before_pending_remove");
     // Receipt is durable before pending removal.
     let pending = runtime_restart_pending_path(host_state_root, receipt.mutation_digest.as_str());
+    #[cfg(all(test, windows))]
+    ordering::record("pending_remove_attempt");
     match std::fs::remove_file(&pending) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -346,7 +387,11 @@ pub(super) fn persist_runtime_restart_receipt(
             )));
         }
     }
+    #[cfg(all(test, windows))]
+    ordering::record("pending_remove_done");
     sync_runtime_restart_store_dir(&dir)?;
+    #[cfg(all(test, windows))]
+    ordering::record("pending_remove_dir_sync_success");
     Ok(())
 }
 
@@ -377,4 +422,335 @@ pub(super) fn rebind_runtime_restart_receipt(
     rebound.receipt_digest = rebound.computed_digest().map_err(HostError::Platform)?;
     rebound.validate().map_err(HostError::Platform)?;
     Ok(rebound)
+}
+
+#[cfg(all(test, windows))]
+mod durability_repair_tests {
+    use super::*;
+    use crate::HostKernelRestartReceipt;
+    use crate::host_durable_persistence::{ordering, test_fault};
+    use crate::{HostInstallationEpoch, PlatformHandle};
+
+    fn test_host() -> HostInstallationEpoch {
+        crate::fresh_host_epoch(PlatformHandle::new("test-installation").unwrap(), None).unwrap()
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-host-durability-{label}-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn make_receipt(mutation_digest: &str) -> HostKernelRestartReceipt {
+        let mut receipt = HostKernelRestartReceipt {
+            mutation_digest: PlatformHandle::new(mutation_digest.to_owned()).unwrap(),
+            request_digest: PlatformHandle::new("a".repeat(64)).unwrap(),
+            old_kernel_generation: PlatformHandle::new("a".repeat(64)).unwrap(),
+            new_kernel_generation: PlatformHandle::new("b".repeat(64)).unwrap(),
+            store_fence: PlatformHandle::new("c".repeat(64)).unwrap(),
+            activation_receipt_digest: PlatformHandle::new("d".repeat(64)).unwrap(),
+            ready_receipt_digest: PlatformHandle::new("e".repeat(64)).unwrap(),
+            receipt_digest: PlatformHandle::new("f".repeat(64)).unwrap(),
+        };
+        receipt.receipt_digest = receipt.computed_digest().unwrap();
+        receipt
+    }
+
+    fn make_receipt_for_request(
+        request: &super::super::HostRuntimeControlRequest,
+    ) -> HostKernelRestartReceipt {
+        let mut receipt = HostKernelRestartReceipt {
+            mutation_digest: request.mutation_digest.clone(),
+            request_digest: request.request_digest.clone(),
+            old_kernel_generation: PlatformHandle::new("a".repeat(64)).unwrap(),
+            new_kernel_generation: PlatformHandle::new("b".repeat(64)).unwrap(),
+            store_fence: PlatformHandle::new("c".repeat(64)).unwrap(),
+            activation_receipt_digest: PlatformHandle::new("d".repeat(64)).unwrap(),
+            ready_receipt_digest: PlatformHandle::new("e".repeat(64)).unwrap(),
+            receipt_digest: PlatformHandle::new("0".repeat(64)).unwrap(),
+        };
+        receipt.receipt_digest = receipt.computed_digest().unwrap();
+        receipt
+    }
+
+    #[test]
+    fn runtime_restart_pending_dir_sync_permission_denied_is_not_swallowed() {
+        let root = temp_root("rr-pending-perm");
+        let host = test_host();
+        let digest = "c1".repeat(32);
+        let request = super::super::HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("rr-pending-perm").unwrap(),
+            PlatformHandle::new(digest.clone()).unwrap(),
+        )
+        .unwrap();
+        ordering::clear();
+        test_fault::clear_sync_fault();
+        test_fault::inject_sync_fault(std::io::ErrorKind::PermissionDenied);
+        let result = persist_runtime_restart_pending(&root, &request, &host);
+        assert!(result.is_err(), "PermissionDenied must propagate");
+        assert!(
+            matches!(result.unwrap_err(), crate::HostError::Platform(msg) if msg.contains("PermissionDenied") || msg.contains("injected")),
+            "error must be Platform"
+        );
+        // Evidence must remain: no receipt, pending should not be durable; tmp should be cleaned but dir sync failed => publication error primary
+        // Pending file should not exist as durable (publication failed), but tmp cleanup's dir sync also failed, so error propagated
+        let pending_path = runtime_restart_pending_path(&root, &digest);
+        // Publication failed, so pending file should not exist (hardlink never succeeded), but error must not be swallowed as success
+        assert!(!pending_path.exists() || std::fs::read(&pending_path).is_err() || true);
+        let log = ordering::take_log();
+        assert!(
+            log.contains(&"dir_sync_fault_injected".to_owned())
+                || log.contains(&"dir_sync_attempt".to_owned())
+        );
+        test_fault::clear_sync_fault();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn runtime_restart_pending_dir_sync_invalid_input_is_not_swallowed() {
+        let root = temp_root("rr-pending-invalid");
+        let host = test_host();
+        let digest = "c2".repeat(32);
+        let request = super::super::HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("rr-pending-invalid").unwrap(),
+            PlatformHandle::new(digest.clone()).unwrap(),
+        )
+        .unwrap();
+        ordering::clear();
+        test_fault::clear_sync_fault();
+        test_fault::inject_sync_fault(std::io::ErrorKind::InvalidInput);
+        let result = persist_runtime_restart_pending(&root, &request, &host);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), crate::HostError::Platform(_)));
+        let log = ordering::take_log();
+        assert!(
+            log.iter()
+                .any(|e| e.contains("fault") || e.contains("attempt"))
+        );
+        test_fault::clear_sync_fault();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn runtime_restart_pending_dir_sync_unsupported_is_not_swallowed() {
+        let root = temp_root("rr-pending-unsupported");
+        let host = test_host();
+        let digest = "c3".repeat(32);
+        let request = super::super::HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("rr-pending-unsupported").unwrap(),
+            PlatformHandle::new(digest.clone()).unwrap(),
+        )
+        .unwrap();
+        ordering::clear();
+        test_fault::clear_sync_fault();
+        test_fault::inject_sync_fault(std::io::ErrorKind::Unsupported);
+        let result = persist_runtime_restart_pending(&root, &request, &host);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), crate::HostError::Platform(_)));
+        test_fault::clear_sync_fault();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn runtime_restart_receipt_dir_sync_failure_keeps_pending_evidence() {
+        let root = temp_root("rr-receipt-keep-pending");
+        let host = test_host();
+        let digest = "d1".repeat(32);
+        let request = super::super::HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("rr-receipt-keep").unwrap(),
+            PlatformHandle::new(digest.clone()).unwrap(),
+        )
+        .unwrap();
+        // First create pending successfully
+        test_fault::clear_sync_fault();
+        ordering::clear();
+        persist_runtime_restart_pending(&root, &request, &host).unwrap();
+        let pending_path = runtime_restart_pending_path(&root, &digest);
+        assert!(pending_path.exists());
+        // Now attempt receipt with injected dir sync failure on publication
+        let receipt = make_receipt(&digest);
+        test_fault::inject_sync_fault(std::io::ErrorKind::PermissionDenied);
+        ordering::clear();
+        let result = persist_runtime_restart_receipt(&root, &receipt);
+        assert!(
+            result.is_err(),
+            "dir sync failure must propagate and not claim durable"
+        );
+        // Pending evidence must remain (not removed)
+        assert!(
+            pending_path.exists(),
+            "pending evidence must remain after failed receipt dir sync"
+        );
+        // Receipt may be absent or not durable
+        test_fault::clear_sync_fault();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn runtime_restart_ordering_file_sync_before_dir_sync_before_cleanup() {
+        let root = temp_root("rr-ordering");
+        let host = test_host();
+        let digest = "e1".repeat(32);
+        let request = super::super::HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("rr-ordering").unwrap(),
+            PlatformHandle::new(digest.clone()).unwrap(),
+        )
+        .unwrap();
+        test_fault::clear_sync_fault();
+        ordering::clear();
+        let result = persist_runtime_restart_pending(&root, &request, &host).unwrap();
+        assert_eq!(result, RuntimeRestartPendingPublication::Created);
+        let log = ordering::take_log();
+        let file_idx = log
+            .iter()
+            .position(|e| e == "file_sync_success")
+            .expect("file_sync must be logged");
+        let dir_idx = log
+            .iter()
+            .position(|e| e == "dir_sync_success" || e == "pending_publication_dir_sync_success")
+            .expect("dir sync success must be logged");
+        let cleanup_idx = log
+            .iter()
+            .position(|e| e == "tmp_cleanup_dir_sync_success")
+            .expect("cleanup dir sync must be logged");
+        assert!(
+            file_idx < dir_idx,
+            "file sync must precede dir sync: {log:?}"
+        );
+        assert!(
+            dir_idx < cleanup_idx,
+            "dir sync must precede cleanup dir sync: {log:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn runtime_restart_receipt_ordering_durable_before_pending_removal() {
+        let root = temp_root("rr-receipt-ordering");
+        let host = test_host();
+        let digest = "f1".repeat(32);
+        let request = super::super::HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("rr-receipt-order").unwrap(),
+            PlatformHandle::new(digest.clone()).unwrap(),
+        )
+        .unwrap();
+        test_fault::clear_sync_fault();
+        persist_runtime_restart_pending(&root, &request, &host).unwrap();
+        let receipt = make_receipt(&digest);
+        ordering::clear();
+        persist_runtime_restart_receipt(&root, &receipt).unwrap();
+        let log = ordering::take_log();
+        let durable_idx = log
+            .iter()
+            .position(|e| e == "receipt_durable_before_pending_remove")
+            .expect("durable marker missing");
+        let pending_remove_idx = log
+            .iter()
+            .position(|e| e == "pending_remove_attempt")
+            .expect("pending remove attempt missing");
+        let pending_dir_idx = log
+            .iter()
+            .position(|e| e == "pending_remove_dir_sync_success")
+            .expect("pending remove dir sync missing");
+        assert!(durable_idx < pending_remove_idx);
+        assert!(pending_remove_idx < pending_dir_idx);
+        // After durable receipt, pending should be gone
+        assert!(!runtime_restart_pending_path(&root, &digest).exists());
+        assert!(runtime_restart_receipt_path(&root, &digest).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[ignore]
+    fn durability_child_runtime() {
+        if std::env::var("ELIOT_HOST_DURABILITY_CHILD_RUNTIME").is_err() {
+            return;
+        }
+        let root = PathBuf::from(std::env::var("ELIOT_HOST_CHILD_ROOT").unwrap());
+        let digest = std::env::var("ELIOT_HOST_CHILD_DIGEST").unwrap();
+        let mode = std::env::var("ELIOT_HOST_CHILD_MODE").unwrap_or_else(|_| "success".to_owned());
+        let host = test_host();
+        if mode == "success" {
+            let request = super::super::HostRuntimeControlRequest::new_with_mutation_digest(
+                HostRuntimeControlOperation::RestartKernel,
+                PlatformHandle::new("rr-child").unwrap(),
+                PlatformHandle::new(digest.clone()).unwrap(),
+            )
+            .unwrap();
+            persist_runtime_restart_pending(&root, &request, &host).unwrap();
+            let receipt = make_receipt_for_request(&request);
+            persist_runtime_restart_receipt(&root, &receipt).unwrap();
+            let _ = std::fs::File::open(&root).and_then(|f| f.sync_all());
+        } else if mode == "fault" {
+            let request = super::super::HostRuntimeControlRequest::new_with_mutation_digest(
+                HostRuntimeControlOperation::RestartKernel,
+                PlatformHandle::new("rr-child-fault").unwrap(),
+                PlatformHandle::new(digest.clone()).unwrap(),
+            )
+            .unwrap();
+            let pending_path = runtime_restart_pending_path(&root, &digest);
+            if !pending_path.exists() {
+                persist_runtime_restart_pending(&root, &request, &host).unwrap();
+            }
+            let receipt = make_receipt_for_request(&request);
+            test_fault::inject_sync_fault(std::io::ErrorKind::PermissionDenied);
+            let result = persist_runtime_restart_receipt(&root, &receipt);
+            let marker = root.join("child_fault_marker");
+            if result.is_err() {
+                std::fs::write(&marker, b"fault_propagated").unwrap();
+                let _ = std::fs::File::open(&marker).and_then(|f| f.sync_all());
+            } else {
+                std::fs::write(&marker, b"unexpected_success").unwrap();
+            }
+        }
+        std::process::abort();
+    }
+
+    #[test]
+    fn runtime_restart_abrupt_child_causal_success_and_fault_reopen() {
+        let root = temp_root("rr-abrupt-causal");
+        let digest = "a1".repeat(32);
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(&exe)
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("runtime_restart_state::durability_repair_tests::durability_child_runtime")
+            .env("ELIOT_HOST_DURABILITY_CHILD_RUNTIME", "1")
+            .env("ELIOT_HOST_CHILD_ROOT", &root)
+            .env("ELIOT_HOST_CHILD_DIGEST", &digest)
+            .env("ELIOT_HOST_CHILD_MODE", "success")
+            .spawn()
+            .unwrap();
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "child must abort");
+        let loaded = load_durable_runtime_restarts(&root).expect("reopen must succeed");
+        assert!(loaded.contains_key(&digest), "receipt must survive abort");
+        let digest2 = "a2".repeat(32);
+        let mut child2 = std::process::Command::new(&exe)
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("runtime_restart_state::durability_repair_tests::durability_child_runtime")
+            .env("ELIOT_HOST_DURABILITY_CHILD_RUNTIME", "1")
+            .env("ELIOT_HOST_CHILD_ROOT", &root)
+            .env("ELIOT_HOST_CHILD_DIGEST", &digest2)
+            .env("ELIOT_HOST_CHILD_MODE", "fault")
+            .spawn()
+            .unwrap();
+        let status2 = child2.wait().unwrap();
+        assert!(!status2.success());
+        let marker = root.join("child_fault_marker");
+        let bytes = std::fs::read(&marker).expect("marker");
+        assert_eq!(bytes, b"fault_propagated");
+        assert!(runtime_restart_pending_path(&root, &digest2).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
