@@ -2,7 +2,7 @@
 //!
 //! Traceability: Architecture A2.3, A12.2, A12.3, A13.2;
 //! principles ARCH-AUTH-01, ARCH-SEC-01, ARCH-SEC-02.
-//! Implementation I1.2, I7.1, I7.3, I7.5, I7.14, I15.2, I2.2, I2.23.
+//! Implementation I1.2, I7.1, I7.3, I7.5, I7.14, I15.2, I2.23.
 //!
 //! This module creates only authenticated listener instances. Peer/session
 //! validation remains in `front_door_session`; this module does not dispatch
