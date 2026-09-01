@@ -1,7 +1,7 @@
 //! Agent Bridge CLI contract — deterministic parsing and validation only.
 //! Architecture: A13.2 (Kernel and failure domains), ARCH-AUTH-01, ARCH-SEC-02, ARCH-RES-01;
 //! Agent Bridge interactive-user boundary.
-//! Implementation: I1.3 User Broker/Agent Bridge, B.1 and P.3 where applicable, I2.2 and I2.23 topology.
+//! Implementation: I1.3 User Broker/Agent Bridge, B.1 and P.3 where applicable, and I2.23 topology.
 //! Ownership: deterministic CLI profile/transport/declaration-path parsing and validation only;
 //! CLI selects declared contour but mints no authority.
 //! Non-ownership / forbids: declaration trust/decode, Kernel/activation authority, forwarding,
