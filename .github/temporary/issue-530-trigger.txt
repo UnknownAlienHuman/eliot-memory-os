@@ -1,0 +1,3 @@
+issue=530
+source_branch=fix/530-legacy-traceability-clean
+base=1fad3de311dc2add14c0f713c7c01ec55d4e4633
