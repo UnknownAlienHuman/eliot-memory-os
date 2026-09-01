@@ -1313,7 +1313,7 @@ fn retained_prefix_sink_limits_enforce_max_preview_and_omitted_range() -> TestRe
                 8,
                 1,
                 StreamTransportStatus::Complete,
-                sha256_hex(&vec![b'a'; 8]),
+                sha256_hex(&[b'a'; 8]),
                 8,
                 at_ceiling,
                 None,
