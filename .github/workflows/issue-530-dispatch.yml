@@ -1,14 +1,15 @@
 name: Temporary issue 530 dispatcher
 
 on:
-  workflow_run:
-    workflows:
-      - Work 340 OpenCode HTTP rustfmt proof
-    types: [completed]
+  pull_request:
+    types: [opened]
+    branches:
+      - main
 
 permissions:
   contents: write
   actions: read
+  pull-requests: read
 
 concurrency:
   group: issue-530-traceability-dispatch
@@ -16,7 +17,10 @@ concurrency:
 
 jobs:
   cleanup:
-    if: github.event.workflow_run.id == 33329565643
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'fix/530-normative-traceability' &&
+      github.event.pull_request.head.sha == '8a062042af2d58abf3043ee8e2c8b8f5c845faac'
     runs-on: windows-latest
     timeout-minutes: 120
 
