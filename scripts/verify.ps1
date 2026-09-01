@@ -13,6 +13,7 @@ $guardrailVerifier = Join-Path $PSScriptRoot 'verify-agent-guardrails.py'
 $runtimeHygieneAudit = Join-Path $PSScriptRoot 'audit-runtime-source-hygiene.py'
 $agentBridgeProtocolVerifier = Join-Path $PSScriptRoot 'verify-agent-bridge-protocol.py'
 $agentRouteBundleVerifier = Join-Path $PSScriptRoot 'verify-agent-route-bundles.py'
+$coreDaemonInventoryVerifier = Join-Path $PSScriptRoot 'verify-core-daemon-inventory.py'
 $docsShardVerifier = Join-Path $PSScriptRoot 'docs_shards.py'
 $docsRouter = Join-Path $PSScriptRoot 'docs_router.py'
 $docsReader = Join-Path $PSScriptRoot 'docs_read.py'
@@ -37,6 +38,14 @@ $steps = @(
     [pscustomobject]@{
         Name = 'documentation-read-self-test'
         Command = { python $docsReader self-test }
+    },
+    [pscustomobject]@{
+        Name = 'core-daemon-inventory-self-test'
+        Command = { python $coreDaemonInventoryVerifier --self-test }
+    },
+    [pscustomobject]@{
+        Name = 'core-daemon-inventory'
+        Command = { python $coreDaemonInventoryVerifier --root $repoRoot }
     },
     [pscustomobject]@{
         Name = 'normative-pair'

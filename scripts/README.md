@@ -27,6 +27,7 @@ committed as repository authority.
 | `doc_code_conformance_core.py` | Established deterministic DCC-001…DCC-007 implementation called by the public conformance front door | Internal conformance implementation |
 | `audit-architecture-boundaries.py` | Detect forbidden dependencies, SurrealDB leakage, untracked direct process launch, placeholders, and exact tracked debt | Static source/build architecture evidence only |
 | `verify-agent-guardrails.py` | Require bounded nearest-path owner/proof/stop instructions for declared source subtrees | Routing/control-plane evidence only |
+| `verify-core-daemon-inventory.py` | Verify the core-daemon inventory identity, owner references, proof requirements, exclusions, and fixed proof ceiling | Static inventory/routing evidence only |
 | `audit-runtime-source-hygiene.py` | Expose unsafe, panic/unwrap/expect, ambient configuration, unbounded-output, blocking-sleep, and source-concentration signals | Static source-quality evidence only |
 | `verify-agent-bridge-protocol.py` | Reject raw canonical Frame ingress, host-minted authority fields, validation bypass, correlation loss, and mandatory cancellation prose | Static protocol/source-policy evidence only |
 | `verify-lint-policy.ps1` | Verify the Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
