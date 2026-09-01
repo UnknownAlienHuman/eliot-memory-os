@@ -1,15 +1,15 @@
 //! The single orchestration owner for the Governor service graph.
 //!
-//! Architecture (A2, A13.2) vs Implementation (I1.10, I1.11, I2.2, I2.23):
+//! Architecture (A2, A13.2) vs Implementation (I1.10, I1.11, I2.23):
 //! - A2 (Participants, authority and modularity) and A13.2 (Kernel and failure
 //!   domains) define the intent: one Governor owns admission and lifecycle
 //!   ordering, and optional capability failure is isolated from the required
 //!   base.
 //! - I1.10 defines the shared `ServiceProcessState`/`HealthVector` vocabulary
 //!   without creating a second lifecycle enum; I1.11 defines the normative
-//!   startup order and the required-base readiness gate; I2.2 and I2.23 define
-//!   when a capability becomes a separate crate and the capability-family
-//!   topology. This crate implements those exact contracts.
+//!   startup order and the required-base readiness gate; I2.23 defines when a
+//!   capability becomes a separate crate and the capability-family topology.
+//!   This crate implements those exact contracts.
 //!
 //! Ownership / forbidden authority:
 //! - This crate is the sole owner of Governor orchestration state
