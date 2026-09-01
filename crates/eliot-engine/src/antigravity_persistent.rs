@@ -526,23 +526,33 @@ mod tests {
         );
         let bounds = AntigravityPersistentBounds::default();
         let cwd = Path::new("C:/worktree/abc");
-        let contract = svc
-            .build_contract(exe, Some(exe), cwd, &fp, bounds, &[])
-            .expect("contract");
+        let contract = match svc.build_contract(exe, Some(exe), cwd, &fp, bounds, &[]) {
+            Ok(v) => v,
+            Err(e) => panic!("build_contract failed: {e}"),
+        };
         assert!(!contract.shell);
         assert!(contract.validate().is_ok());
 
-        let runtime = FakeAntigravityRuntime::new(contract).expect("runtime");
+        let runtime = match FakeAntigravityRuntime::new(contract) {
+            Ok(v) => v,
+            Err(e) => panic!("runtime new failed: {e}"),
+        };
         let frame = AntigravityPersistentFrame {
             frame_version: ANTIGRAVITY_PERSISTENT_SCHEMA_VERSION.to_owned(),
             seq: 1,
             kind: eliot_types::antigravity_persistent::AntigravityFrameKind::Request,
             payload: serde_json::json!({"prompt":"hello"}),
         };
-        let line = runtime.emit_frame(&frame).expect("emit");
+        let line = match runtime.emit_frame(&frame) {
+            Ok(v) => v,
+            Err(e) => panic!("emit_frame failed: {e}"),
+        };
         let inbound = vec![line.clone()];
         let outbound = vec![frame.clone()];
-        let out = runtime.exchange(&inbound, &outbound).expect("exchange");
+        let out = match runtime.exchange(&inbound, &outbound) {
+            Ok(v) => v,
+            Err(e) => panic!("exchange failed: {e}"),
+        };
         assert_eq!(out.len(), 1);
     }
 
@@ -561,19 +571,26 @@ mod tests {
             "agy 1.2.3",
             help,
         );
-        let contract = svc
-            .build_contract(
-                exe,
-                Some(exe),
-                Path::new("C:/worktree/abc"),
-                &fp,
-                AntigravityPersistentBounds::default(),
-                &[],
-            )
-            .unwrap();
-        let runtime = FakeAntigravityRuntime::new(contract).unwrap();
+        let contract = match svc.build_contract(
+            exe,
+            Some(exe),
+            Path::new("C:/worktree/abc"),
+            &fp,
+            AntigravityPersistentBounds::default(),
+            &[],
+        ) {
+            Ok(v) => v,
+            Err(e) => panic!("build_contract failed: {e}"),
+        };
+        let runtime = match FakeAntigravityRuntime::new(contract) {
+            Ok(v) => v,
+            Err(e) => panic!("runtime new failed: {e}"),
+        };
         let bad_line = "{ not json".to_owned();
-        let err = runtime.validate_inbound_line(&bad_line).unwrap_err();
+        let err = match runtime.validate_inbound_line(&bad_line) {
+            Ok(v) => panic!("expected error but got ok: {v:?}"),
+            Err(e) => e,
+        };
         assert!(matches!(err, FakeRuntimeError::MalformedFrame(_)));
     }
 
@@ -592,20 +609,26 @@ mod tests {
             "agy 1.2.3",
             help,
         );
-        let mut bounds = AntigravityPersistentBounds::default();
-        bounds.max_frame_bytes = 1024;
-        bounds.max_total_bytes = 4 * 1024;
-        let contract = svc
-            .build_contract(
-                exe,
-                Some(exe),
-                Path::new("C:/worktree/abc"),
-                &fp,
-                bounds,
-                &[],
-            )
-            .unwrap();
-        let runtime = FakeAntigravityRuntime::new(contract).unwrap();
+        let bounds = AntigravityPersistentBounds {
+            max_frame_bytes: 1024,
+            max_total_bytes: 4 * 1024,
+            ..Default::default()
+        };
+        let contract = match svc.build_contract(
+            exe,
+            Some(exe),
+            Path::new("C:/worktree/abc"),
+            &fp,
+            bounds,
+            &[],
+        ) {
+            Ok(v) => v,
+            Err(e) => panic!("build_contract failed: {e}"),
+        };
+        let runtime = match FakeAntigravityRuntime::new(contract) {
+            Ok(v) => v,
+            Err(e) => panic!("runtime new failed: {e}"),
+        };
         let big_payload = "x".repeat(2000);
         let frame = AntigravityPersistentFrame {
             frame_version: ANTIGRAVITY_PERSISTENT_SCHEMA_VERSION.to_owned(),
@@ -613,7 +636,10 @@ mod tests {
             kind: eliot_types::antigravity_persistent::AntigravityFrameKind::Request,
             payload: serde_json::json!({"data": big_payload}),
         };
-        let err = runtime.emit_frame(&frame).unwrap_err();
+        let err = match runtime.emit_frame(&frame) {
+            Ok(v) => panic!("expected error but got ok: {v:?}"),
+            Err(e) => e,
+        };
         assert!(matches!(err, FakeRuntimeError::OversizedFrame(_)));
     }
 
@@ -632,24 +658,31 @@ mod tests {
             "agy 1.2.3",
             help,
         );
-        let contract = svc
-            .build_contract(
-                exe,
-                Some(exe),
-                Path::new("C:/worktree/abc"),
-                &fp,
-                AntigravityPersistentBounds::default(),
-                &[],
-            )
-            .unwrap();
-        let runtime = FakeAntigravityRuntime::new(contract).unwrap();
+        let contract = match svc.build_contract(
+            exe,
+            Some(exe),
+            Path::new("C:/worktree/abc"),
+            &fp,
+            AntigravityPersistentBounds::default(),
+            &[],
+        ) {
+            Ok(v) => v,
+            Err(e) => panic!("build_contract failed: {e}"),
+        };
+        let runtime = match FakeAntigravityRuntime::new(contract) {
+            Ok(v) => v,
+            Err(e) => panic!("runtime new failed: {e}"),
+        };
         let frame = AntigravityPersistentFrame {
             frame_version: "999".to_owned(),
             seq: 1,
             kind: eliot_types::antigravity_persistent::AntigravityFrameKind::Request,
             payload: serde_json::json!({"prompt":"hi"}),
         };
-        let err = runtime.emit_frame(&frame).unwrap_err();
+        let err = match runtime.emit_frame(&frame) {
+            Ok(v) => panic!("expected error but got ok: {v:?}"),
+            Err(e) => e,
+        };
         assert!(matches!(err, FakeRuntimeError::SchemaDrift(_)));
 
         // Also payload drift marker
@@ -659,7 +692,10 @@ mod tests {
             kind: eliot_types::antigravity_persistent::AntigravityFrameKind::Request,
             payload: serde_json::json!({"schema_drift": true}),
         };
-        let err2 = runtime.emit_frame(&frame2).unwrap_err();
+        let err2 = match runtime.emit_frame(&frame2) {
+            Ok(v) => panic!("expected error but got ok: {v:?}"),
+            Err(e) => e,
+        };
         assert!(matches!(err2, FakeRuntimeError::SchemaDrift(_)));
     }
 
@@ -678,18 +714,21 @@ mod tests {
             "agy 1.2.3",
             help,
         );
-        let mut bounds = AntigravityPersistentBounds::default();
-        bounds.timeout_ms = 999_999;
-        let err = svc
-            .build_contract(
-                exe,
-                Some(exe),
-                Path::new("C:/worktree/abc"),
-                &fp,
-                bounds,
-                &[],
-            )
-            .unwrap_err();
+        let bounds = AntigravityPersistentBounds {
+            timeout_ms: 999_999,
+            ..Default::default()
+        };
+        let err = match svc.build_contract(
+            exe,
+            Some(exe),
+            Path::new("C:/worktree/abc"),
+            &fp,
+            bounds,
+            &[],
+        ) {
+            Ok(v) => panic!("expected error but got ok: {v:?}"),
+            Err(e) => e,
+        };
         assert!(err.to_string().contains("bounds invalid"));
     }
 
@@ -709,29 +748,31 @@ mod tests {
             help,
         );
         // Secret env not in allowlist is dropped (fail-closed allowlist)
-        let contract_dropped = svc
-            .build_contract(
-                exe,
-                Some(exe),
-                Path::new("C:/worktree/abc"),
-                &fp,
-                AntigravityPersistentBounds::default(),
-                &[("API_TOKEN".to_owned(), "secret".to_owned())],
-            )
-            .expect("contract with dropped secret env");
+        let contract_dropped = match svc.build_contract(
+            exe,
+            Some(exe),
+            Path::new("C:/worktree/abc"),
+            &fp,
+            AntigravityPersistentBounds::default(),
+            &[("API_TOKEN".to_owned(), "secret".to_owned())],
+        ) {
+            Ok(v) => v,
+            Err(e) => panic!("build_contract failed: {e}"),
+        };
         assert!(contract_dropped.env.iter().all(|(k, _)| k != "API_TOKEN"));
 
         // Non-allowlisted env is dropped, not error, but contract validates allowlist
-        let contract = svc
-            .build_contract(
-                exe,
-                Some(exe),
-                Path::new("C:/worktree/abc"),
-                &fp,
-                AntigravityPersistentBounds::default(),
-                &[("PATH".to_owned(), "C:/bin".to_owned())],
-            )
-            .unwrap();
+        let contract = match svc.build_contract(
+            exe,
+            Some(exe),
+            Path::new("C:/worktree/abc"),
+            &fp,
+            AntigravityPersistentBounds::default(),
+            &[("PATH".to_owned(), "C:/bin".to_owned())],
+        ) {
+            Ok(v) => v,
+            Err(e) => panic!("build_contract failed: {e}"),
+        };
         assert!(contract.env.iter().any(|(k, _)| k == "PATH"));
         assert!(!contract.shell);
         assert!(contract.validate().is_ok());
