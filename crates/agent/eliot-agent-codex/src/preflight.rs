@@ -307,8 +307,8 @@ fn validate_binding(
 mod tests {
     use super::*;
     use crate::catalogue::{
-        CodexCatalogueContext, CodexModelWire, CodexProviderPolicy, CodexRouteTemplate,
-        compile_codex_model_catalogue, CODEX_CATALOGUE_CONTEXT_VERSION,
+        CODEX_CATALOGUE_CONTEXT_VERSION, CodexCatalogueContext, CodexModelWire,
+        CodexProviderPolicy, CodexRouteTemplate, compile_codex_model_catalogue,
     };
     use eliot_agent_api::RouteFingerprint;
     use eliot_agent_coordinator::{
@@ -476,10 +476,12 @@ mod tests {
             gate.observe(&legacy),
             Err(CodexAdapterError::StaleWire(_))
         ));
-        assert!(CodexWireMessage::parse_line(
-            br#"{"jsonrpc":"2.0","id":"1","method":"initialize","params":{}}"#
-        )
-        .is_err());
+        assert!(
+            CodexWireMessage::parse_line(
+                br#"{"jsonrpc":"2.0","id":"1","method":"initialize","params":{}}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
