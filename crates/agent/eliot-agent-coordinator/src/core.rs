@@ -192,6 +192,27 @@ impl AgentCoordinator {
             });
         }
 
+        let canonical_request = canonical(&request)?;
+        if let Some(existing_candidate) = self.plans.get(&request.candidate_id).cloned() {
+            let stored_request = self
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    CoordinatorEvent::PlanCreated { request }
+                        if request.candidate_id == existing_candidate.candidate_id =>
+                    {
+                        Some(request.as_ref())
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| CoordinatorError::Serialization("plan input missing".to_owned()))?;
+            let canonical_stored = canonical(stored_request)?;
+            if canonical_request == canonical_stored {
+                return Ok(existing_candidate);
+            }
+            return Err(CoordinatorError::IdentityConflict("candidate_id"));
+        }
+
         let ready = self
             .plans
             .iter()
