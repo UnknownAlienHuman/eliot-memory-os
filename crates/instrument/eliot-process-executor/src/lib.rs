@@ -626,41 +626,32 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 quarantine_operation(&mut guard);
                 return Err(error);
             }
-            let deadline_watcher = match spawn_deadline_watcher(Arc::clone(&operation)) {
-                Ok(watcher) => watcher,
-                Err(_) => {
-                    let mut guard = operation
-                        .lock()
-                        .map_err(|_| unavailable("operation lock poisoned"))?;
-                    if finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err() {
-                        quarantine_operation(&mut guard);
-                    }
-                    drop(guard);
-                    self.operations
-                        .lock()
-                        .map_err(|_| unavailable("operation registry lock poisoned"))?
-                        .insert(operation_id.clone(), Arc::clone(&operation));
-                    return Err(ProcessExecutionError::UnknownOutcome);
+            let Ok(deadline_watcher) = spawn_deadline_watcher(&operation) else {
+                let mut guard = operation
+                    .lock()
+                    .map_err(|_| unavailable("operation lock poisoned"))?;
+                if finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err() {
+                    quarantine_operation(&mut guard);
                 }
+                drop(guard);
+                self.operations
+                    .lock()
+                    .map_err(|_| unavailable("operation registry lock poisoned"))?
+                    .insert(operation_id.clone(), Arc::clone(&operation));
+                return Err(ProcessExecutionError::UnknownOutcome);
             };
-            let mut guard = match operation.lock() {
-                Ok(guard) => guard,
-                Err(_) => {
-                    let _ = join_deadline_watcher(deadline_watcher);
-                    return Err(ProcessExecutionError::UnknownOutcome);
-                }
+            let Ok(mut guard) = operation.lock() else {
+                let _ = join_deadline_watcher(deadline_watcher);
+                return Err(ProcessExecutionError::UnknownOutcome);
             };
             guard.deadline_watcher = Some(deadline_watcher);
             self.operations
                 .lock()
                 .map_err(|_| unavailable("operation registry lock poisoned"))?
                 .insert(operation_id, Arc::clone(&operation));
-            let receipt = match ProcessStartReceipt::new(&guard.state) {
-                Ok(receipt) => receipt,
-                Err(_) => {
-                    quarantine_operation(&mut guard);
-                    return Err(ProcessExecutionError::UnknownOutcome);
-                }
+            let Ok(receipt) = ProcessStartReceipt::new(&guard.state) else {
+                quarantine_operation(&mut guard);
+                return Err(ProcessExecutionError::UnknownOutcome);
             };
             Ok(receipt)
         }
@@ -965,7 +956,7 @@ fn quarantine_operation(operation: &mut Operation) {
 
 #[cfg(windows)]
 fn spawn_deadline_watcher(
-    operation: Arc<Mutex<Operation>>,
+    operation: &Arc<Mutex<Operation>>,
 ) -> Result<DeadlineWatcher, ProcessExecutionError> {
     #[cfg(test)]
     if FAIL_NEXT_DEADLINE_WATCHER_SPAWN.swap(false, Ordering::AcqRel) {
@@ -974,7 +965,7 @@ fn spawn_deadline_watcher(
 
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
-    let operation = Arc::downgrade(&operation);
+    let operation = Arc::downgrade(operation);
     let handle = thread::Builder::new()
         .name("eliot-p04-deadline".to_owned())
         .spawn(move || {
