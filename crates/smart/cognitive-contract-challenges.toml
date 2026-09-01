@@ -66,3 +66,16 @@ needed_by = ["future DreamCycle", "use attribution", "usefulness/harm/cost evalu
 missing_contract = "Candidate use attribution, intervention/control identity, outcome window, confounders, cost/harm/regret dimensions, rollback and promotion authority."
 forbidden_workaround = "active-generation self-modification, self-verification, benchmark-only reward or model-rated improvement"
 resolution_evidence = ["versioned attribution/experiment contracts", "counterfactual and confounder fixtures", "dimensioned evaluation", "Governor promotion gate"]
+
+[[challenge]]
+id = "CC-008"
+status = "OPEN_PROVIDER_CONFORMANCE"
+required_owner = "Governor/Memory OS canonical read owner"
+needed_by = ["eliot-memory-applicability", "eliot-context-candidates"]
+depends_on = ["eliot.foundation.evaluation-contracts::AttributedMemoryEvaluation", "eliot.evaluation.attributed-memory-use", "eliot.evaluation.memory-outcome-economics"]
+missing_contract = "Governor/store-owned bounded canonical MemoryProjectionRecord read set and ApplicableMemorySet for task-local applicability, preserving WorkScope/task/session scope, StateFence/revision, epistemic/lifecycle/freshness/provenance/influence, procedure limits, cue/negative triggers, protected roles, denominator/omissions and revalidation without storage access in Smart."
+forbidden_workaround = "Smart querying storage or treating cue hits, retrieval, delivery, similarity or model judgment as applicability, support or admission"
+resolution_evidence = ["versioned owner-neutral projection contract", "bounded provider read-set and ApplicableMemorySet fixtures", "stale/conflicted/protected/negative/precondition/truncation/missing-denominator and cue-hit-not-applicable tests", "Governor/store provider and Context consumer Edge proof"]
+proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
