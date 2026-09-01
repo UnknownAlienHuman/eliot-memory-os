@@ -18,7 +18,7 @@
 //! Architecture: P.6 canonical Store — capacity validation/projection boundary;
 //! A13.8 Integrity — content-addressed blob receipt validation; parent
 //! `canonical_store` retains the store, receipt, and transport boundary.
-//! Implementation: I2.2, I2.23 — extracted capacity module owns only its
+//! Implementation: I2.23 — extracted capacity module owns only its
 //! validation/projection cell; parent remains the sole write/receipt
 //! authority. Mechanical split from
 //! `crates/eliot-store/src/canonical_store.rs` — behavior preserved.
