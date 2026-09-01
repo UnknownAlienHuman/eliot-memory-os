@@ -7,7 +7,7 @@
 //! Architecture: A12.2 Principal, Session и visibility; A12.3 Один governed write path; A13.2 Kernel и failure domains; ARCH-AUTH-01; ARCH-SEC-02
 //! Implementation: I1.2 Обязательные процессы первого полного runtime; I7.3 Session lifecycle; I7.14 Session lifecycle; I15.2 Principal and Session binding
 //! Forbidden authority: must not accept peer-owned identity, must not widen session scope, must not accept stale daemon caller.
-//! Ordinary module: I2.2 Когда capability становится отдельным crate; I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `caller_binding` and `KernelComposition::require_current_daemon_session` plus inseparable guard-only helper with zero external users beyond the guard.
+//! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `caller_binding` and `KernelComposition::require_current_daemon_session` plus inseparable guard-only helper with zero external users beyond the guard.
 
 use super::runtime_identity::stable_owner_principal_digest;
 use super::{
