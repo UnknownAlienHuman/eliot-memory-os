@@ -1,0 +1,2 @@
+trigger=issue-530-final-verification
+workflow_source=536ddb3b0259f75b58d8e85d3aafb90bcab92295
