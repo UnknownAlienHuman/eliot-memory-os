@@ -3,7 +3,7 @@ name: Temporary issue 530 final verification
 on:
   workflow_run:
     workflows:
-      - Code scanning AI findings on PR #284
+      - Repository Policy
     types: [completed]
   workflow_dispatch:
 
@@ -25,7 +25,7 @@ env:
 
 jobs:
   verify:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.id == 33312654291
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.id == 33269926612
     runs-on: ubuntu-latest
     timeout-minutes: 240
 
