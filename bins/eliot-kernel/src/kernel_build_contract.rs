@@ -1,7 +1,7 @@
 //! Kernel build-time contract types and their exact fail-closed errors.
 //!
 //! Traceability: Architecture A13.2, A13.5, ARCH-AUTH-01, ARCH-SEC-02,
-//! ARCH-RES-01; Implementation I1.11, I14.16, P.3, I2.2, I2.23.
+//! ARCH-RES-01; Implementation I1.11, I14.16, P.3, and I2.23.
 //!
 //! This module retains typed composition inputs, protected receipt bindings,
 //! and pre-service-loop errors. It does not mint authority, hide Host binding,
