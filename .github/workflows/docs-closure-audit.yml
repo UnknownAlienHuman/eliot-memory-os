@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - docs/508-normative-index-binding
+  issues:
+    types: [opened]
   workflow_dispatch:
 
 permissions:
@@ -22,6 +24,7 @@ env:
 
 jobs:
   linux-documentation-audit:
+    if: github.event_name != 'issues' || startsWith(github.event.issue.title, '[docs-closure-audit]')
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -100,6 +103,7 @@ jobs:
           retention-days: 14
 
   windows-repository-verification:
+    if: github.event_name != 'issues' || startsWith(github.event.issue.title, '[docs-closure-audit]')
     runs-on: windows-latest
     timeout-minutes: 90
 
