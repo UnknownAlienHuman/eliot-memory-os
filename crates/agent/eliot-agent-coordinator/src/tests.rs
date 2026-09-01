@@ -1401,3 +1401,86 @@ fn coordinator_case_16_snapshot_v3_and_v4_legacy_fence_reject_before_replay() ->
     );
     Ok(())
 }
+
+#[test]
+fn plan_exact_replay_returns_existing_without_new_event_before_ready_backpressure() -> TestResult {
+    let mut coordinator = coordinator(
+        CoordinatorConfig {
+            max_ready_items: 1,
+            max_admitted_attempts: 4,
+            max_active_per_route: 4,
+            capacity_identity: "capacity-a".to_owned(),
+            capacity_revision: rev("capacity-rev-1"),
+        },
+        &[],
+    )?;
+    let spec = LaneSpec {
+        work: "work-replay",
+        role: "reader-replay",
+        route: "a",
+        scope: None,
+        write: false,
+        priority: 1,
+    };
+    let original = request("replay", std::slice::from_ref(&spec), None)?;
+    let first = coordinator.plan(original.clone())?;
+    assert_eq!(coordinator.events().len(), 1);
+    let second = coordinator.plan(original.clone())?;
+    assert_eq!(second, first);
+    assert_eq!(coordinator.events().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn plan_same_identity_changed_bytes_fails_identity_conflict_before_ready_backpressure() -> TestResult
+{
+    let mut coordinator = coordinator(
+        CoordinatorConfig {
+            max_ready_items: 1,
+            max_admitted_attempts: 4,
+            max_active_per_route: 4,
+            capacity_identity: "capacity-a".to_owned(),
+            capacity_revision: rev("capacity-rev-1"),
+        },
+        &[],
+    )?;
+    let spec = LaneSpec {
+        work: "work-conflict",
+        role: "reader-conflict",
+        route: "a",
+        scope: None,
+        write: false,
+        priority: 1,
+    };
+    let original = request("conflict", std::slice::from_ref(&spec), None)?;
+    coordinator.plan(original.clone())?;
+    assert_eq!(coordinator.events().len(), 1);
+    let mut changed = original.clone();
+    changed.task_revision = "task-rev-conflict-changed".to_owned();
+    assert_eq!(
+        coordinator.plan(changed),
+        Err(CoordinatorError::IdentityConflict("candidate_id"))
+    );
+    assert_eq!(coordinator.events().len(), 1);
+    let fresh = request(
+        "conflict-fresh",
+        &[LaneSpec {
+            work: "work-conflict-fresh",
+            role: "reader-conflict-fresh",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    assert_eq!(
+        coordinator.plan(fresh),
+        Err(CoordinatorError::Backpressure {
+            active: 1,
+            requested: 1,
+            limit: 1
+        })
+    );
+    Ok(())
+}
