@@ -3,7 +3,8 @@
 
 The complete DCC-001..007 checks remain in ``doc_code_conformance_core``. This
 front door preserves fail-closed configured-root handling and adds pipeline
-integrity checks DCC-010..013 for the documentation generator and router.
+integrity checks DCC-010..013 for the documentation generator/router and
+DCC-014 for bounded retirement of pre-sharding source traceability.
 """
 
 from __future__ import annotations
@@ -38,6 +39,123 @@ def selected_files(root: Path, roots: Sequence[str]) -> Iterable[Path]:
 
 # The base checkers resolve this name from their defining module at execution.
 _core.selected_files = selected_files
+
+
+TRACEABILITY_SCHEMA = "eliot-doc-traceability-retirement-v1"
+TRACEABILITY_DEFAULT_CONFIG = "config/doc-traceability-retirement.toml"
+TRACEABILITY_FINDING_ID = "DCC-014"
+
+
+def traceability_retirement_findings(
+    root: Path,
+    config_relative: str = TRACEABILITY_DEFAULT_CONFIG,
+) -> tuple[list[Finding], dict[str, int]]:
+    """Validate exact source headers selected for legacy-marker retirement."""
+
+    config_relative = norm(config_relative)
+    config_path = root / config_relative
+    if not config_path.is_file():
+        return (
+            [
+                Finding(
+                    TRACEABILITY_FINDING_ID,
+                    config_relative,
+                    0,
+                    "traceability retirement config is missing",
+                )
+            ],
+            {"traceability_retirement_surfaces": 0},
+        )
+
+    payload = toml(config_path)
+    if payload.get("schema_version") != TRACEABILITY_SCHEMA:
+        raise AuditError(
+            f"unsupported traceability retirement schema: {payload.get('schema_version')!r}"
+        )
+    raw_surfaces = payload.get("surface")
+    if not isinstance(raw_surfaces, list) or not raw_surfaces:
+        raise AuditError("traceability retirement config requires at least one [[surface]]")
+
+    findings: list[Finding] = []
+    seen_paths: set[str] = set()
+    for index, raw in enumerate(raw_surfaces):
+        if not isinstance(raw, dict):
+            raise AuditError(f"traceability surface[{index}] must be a table")
+        relative = norm(str(raw.get("path", "")))
+        reason = str(raw.get("reason", "")).strip()
+        if not reason:
+            raise AuditError(f"traceability surface {relative!r} has no reason")
+        if relative in seen_paths:
+            raise AuditError(f"duplicate traceability surface: {relative}")
+        seen_paths.add(relative)
+
+        forbidden_patterns = strings(
+            raw.get("forbidden_patterns"),
+            f"traceability surface {relative}.forbidden_patterns",
+        )
+        required_tokens = strings(
+            raw.get("required_tokens"),
+            f"traceability surface {relative}.required_tokens",
+        )
+        if not forbidden_patterns or not required_tokens:
+            raise AuditError(
+                f"traceability surface {relative} requires forbidden_patterns and required_tokens"
+            )
+
+        source = root / relative
+        if not source.is_file():
+            findings.append(
+                Finding(
+                    TRACEABILITY_FINDING_ID,
+                    relative,
+                    0,
+                    "traceability source is missing",
+                )
+            )
+            continue
+        if source.is_symlink():
+            findings.append(
+                Finding(
+                    TRACEABILITY_FINDING_ID,
+                    relative,
+                    0,
+                    "traceability source must not be a symlink",
+                )
+            )
+            continue
+
+        value = text(source)
+        for raw_pattern in forbidden_patterns:
+            try:
+                pattern = re.compile(raw_pattern)
+            except re.error as exc:
+                raise AuditError(
+                    f"invalid traceability regex for {relative}: {raw_pattern!r}: {exc}"
+                ) from exc
+            for match in pattern.finditer(value):
+                findings.append(
+                    Finding(
+                        TRACEABILITY_FINDING_ID,
+                        relative,
+                        line_no(value, match.start()),
+                        f"retired traceability marker remains: {match.group(0)}",
+                    )
+                )
+
+        for token in required_tokens:
+            if token not in value:
+                findings.append(
+                    Finding(
+                        TRACEABILITY_FINDING_ID,
+                        relative,
+                        1,
+                        f"current traceability token is absent: {token}",
+                    )
+                )
+
+    return sorted(set(findings)), {
+        "traceability_retirement_surfaces": len(raw_surfaces),
+    }
 
 
 def documentation_pipeline_findings(
@@ -158,6 +276,11 @@ def audit(
     pipeline_findings, pipeline_metrics = documentation_pipeline_findings(root, cfg)
     findings.extend(pipeline_findings)
     metrics.update(pipeline_metrics)
+    traceability_findings, traceability_metrics = (
+        traceability_retirement_findings(root)
+    )
+    findings.extend(traceability_findings)
+    metrics.update(traceability_metrics)
     return sorted(set(findings)), metrics
 
 
@@ -222,6 +345,66 @@ def _expect_pipeline_finding(
         )
 
 
+def traceability_retirement_self_test() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "config").mkdir()
+        (root / "src").mkdir()
+        config = root / TRACEABILITY_DEFAULT_CONFIG
+        source = root / "src/example.rs"
+        config.write_text(
+            (
+                'schema_version = "eliot-doc-traceability-retirement-v1"\n\n'
+                '[[surface]]\n'
+                'path = "src/example.rs"\n'
+                'reason = "fixture"\n'
+                "forbidden_patterns = [\"legacy-project\", '(?<![A-Za-z0-9])I2\\.2(?![0-9])']\n"
+                'required_tokens = ["docs/architecture/ELIOT_ARCHITECTURE.md", '
+                '"docs/ARCHITECTURE_CONTRACT.md"]\n'
+            ),
+            encoding="utf-8",
+        )
+        clean = (
+            "//! docs/architecture/ELIOT_ARCHITECTURE.md A2.3 I2.23\n"
+            "//! docs/ARCHITECTURE_CONTRACT.md\n"
+            "pub fn value() {}\n"
+        )
+        source.write_text(clean, encoding="utf-8")
+        findings, metrics = traceability_retirement_findings(root)
+        if findings or metrics["traceability_retirement_surfaces"] != 1:
+            raise AuditError(f"clean traceability fixture failed: {findings}")
+
+        source.write_text(clean.replace("A2.3", "legacy-project A2.3"), encoding="utf-8")
+        ids = {finding.finding_id for finding in traceability_retirement_findings(root)[0]}
+        if TRACEABILITY_FINDING_ID not in ids:
+            raise AuditError("legacy project fixture did not fail")
+
+        source.write_text(clean.replace("I2.23", "I2.2"), encoding="utf-8")
+        ids = {finding.finding_id for finding in traceability_retirement_findings(root)[0]}
+        if TRACEABILITY_FINDING_ID not in ids:
+            raise AuditError("exact invalid handle fixture did not fail")
+
+        source.write_text(clean.replace("docs/ARCHITECTURE_CONTRACT.md", ""), encoding="utf-8")
+        ids = {finding.finding_id for finding in traceability_retirement_findings(root)[0]}
+        if TRACEABILITY_FINDING_ID not in ids:
+            raise AuditError("missing current traceability token did not fail")
+
+        config.write_text(
+            config.read_text(encoding="utf-8")
+            + "\n[[surface]]\npath = \"src/example.rs\"\nreason = \"duplicate\"\n"
+            + "forbidden_patterns = [\"legacy\"]\nrequired_tokens = [\"current\"]\n",
+            encoding="utf-8",
+        )
+        try:
+            traceability_retirement_findings(root)
+        except AuditError:
+            pass
+        else:
+            raise AuditError("duplicate traceability surface did not fail closed")
+
+    print("DOC_TRACEABILITY_RETIREMENT_SELF_TEST: PASS cases=5")
+
+
 def self_test() -> None:
     _core.audit = _base_audit
     try:
@@ -284,6 +467,7 @@ def self_test() -> None:
         )
         _expect_pipeline_finding(root, cfg, "DCC-013")
 
+    traceability_retirement_self_test()
     print("DOC_CODE_CONFORMANCE_PIPELINE_SELF_TEST: PASS cases=6")
 
 

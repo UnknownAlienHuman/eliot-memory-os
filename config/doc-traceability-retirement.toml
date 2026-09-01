@@ -1,0 +1,133 @@
+schema_version = "eliot-doc-traceability-retirement-v1"
+
+# These source files still present pre-sharding graph/project identifiers,
+# nonexistent numeric handles, stale source pins, or line coordinates as current
+# verified authority. Canonical `ARCH-*` Decision Anchors from Architecture
+# A16.1 are valid and are deliberately not rejected here; issue #508 owns their
+# machine-readable validation.
+
+[[surface]]
+path = "crates/kernel/eliot-platform-windows/src/process_identity.rs"
+reason = "Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-platform-windows/src/process_job.rs"
+reason = "Replace the pre-sharding project/free-form identifiers and nonexistent I2.2 with current paths and indexed numeric handles."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+  "Durable-Job-execution",
+  "Execution-identity-boundary-on-Windows",
+  "Restart-child-classes",
+  "Когда-capability-становится-отдельным-crate",
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-platform-windows/src/kernel_front_door_expectation.rs"
+reason = "Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-platform-windows/src/named_pipe_peer_auth.rs"
+reason = "Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-platform-windows/src/kernel_front_door_server.rs"
+reason = "Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-platform-windows/src/directory_publication.rs"
+reason = "Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-platform-windows/src/named_pipe_process_admission.rs"
+reason = "Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-platform-windows/src/secret_store.rs"
+reason = "Replace nonexistent I2.2, stale documentation line coordinates, and the old CodeBase Memory source pin while preserving valid A16.1 Decision Anchors."
+forbidden_patterns = [
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+  'ELIOT_ARCHITECTURE\.md:\d+',
+  'ELIOT_IMPLEMENTATION\.md:\d+',
+  'eliot-memory-os-3c7676b-persist',
+  'crates/kernel/eliot-platform-windows/src/lib\.rs:\d+',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-platform-windows/src/tests.rs"
+reason = "Replace stale CodeBase Memory project/source pins in the test-module header with current repository authority."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  "eliot-memory-os-44e8b4b-live",
+  "2ecd3da",
+  "lines ~9212–12827",
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
