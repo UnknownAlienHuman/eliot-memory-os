@@ -250,10 +250,11 @@ impl WasmtimeComponentEngine {
             input,
             post_commit_known,
             spawn_epoch_driver,
+            |start, duration| start.checked_add(duration),
         )
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn invoke_component_with_epoch_driver<F>(
         &self,
         request_digest: &Sha256Digest,
@@ -261,15 +262,16 @@ impl WasmtimeComponentEngine {
         input: &[u8],
         post_commit_known: bool,
         spawn_driver: F,
+        deadline_calculator: impl FnOnce(Instant, Duration) -> Option<Instant>,
     ) -> Result<EngineReport, PortError>
     where
         F: FnOnce(&str, EpochDriverTask) -> io::Result<thread::JoinHandle<()>>,
     {
         validate_epoch_policy(limits)?;
         let start = Instant::now();
-        let wall_deadline = start
-            .checked_add(Duration::from_millis(limits.wall_deadline_ms))
-            .ok_or(PortError::Denied)?;
+        let wall_deadline =
+            deadline_calculator(start, Duration::from_millis(limits.wall_deadline_ms))
+                .ok_or(PortError::Denied)?;
         let (invocation_engine, component) = match limits.epoch.cancellation {
             eliot_wasm_runtime::CancellationPolicy::EpochInterruption => {
                 (&self.epoch_engine, &self.epoch_component)
@@ -747,6 +749,7 @@ mod tests {
                     observed_identity = Some(identity.to_owned());
                     Err(io::Error::other("injected epoch driver spawn failure"))
                 },
+                |start, duration| start.checked_add(duration),
             )
             .map_err(|error| error.to_string())?;
 
@@ -788,8 +791,9 @@ mod tests {
         )
         .map_err(|error| error.to_string())?;
         let mut limits = test_limits(digest);
-        limits.wall_deadline_ms = u64::MAX;
+        limits.wall_deadline_ms = 500;
         let mut driver_called = false;
+        let mut deadline_calculation_called = false;
 
         let result = engine.invoke_component_with_epoch_driver(
             &Sha256Digest::of_bytes(b"wall-deadline-overflow"),
@@ -800,9 +804,15 @@ mod tests {
                 driver_called = true;
                 Err(io::Error::other("epoch driver must not start"))
             },
+            |_start, duration| {
+                assert_eq!(duration, Duration::from_millis(500));
+                deadline_calculation_called = true;
+                None
+            },
         );
 
         assert!(matches!(result, Err(PortError::Denied)));
+        assert!(deadline_calculation_called);
         assert!(!driver_called);
         Ok(())
     }
