@@ -1,51 +1,31 @@
-//! Packet quality finalization — deterministic scoring and identity for the context packet.
+//! Packet quality finalization — deterministic scoring and identity for the
+//! context packet.
 //!
-//! This module owns the contiguous, source-proven packet-quality closure extracted
-//! from `crates/eliot-engine/src/context.rs` (canonical parent `f71070b`,
-//! `origin/main` `f71070b2455483fb102ab196566f9faab5cda1cb`):
-//! `PacketQualityService` and its `finalize` plus directly owned private helper
-//! `causal_bridge_missing_hops` in its quality/finalization block. Behavior,
-//! serialization/hash/order/errors remain identical; no compiler, proof
-//! validator, memory/provider/authority/write logic is moved.
+//! This module owns the packet-quality closure extracted from
+//! `crates/eliot-engine/src/context.rs`: `PacketQualityService::finalize` and
+//! its private `causal_bridge_missing_hops` helper. Behavior, serialization,
+//! hashing, ordering, and errors remain unchanged.
 //!
 //! # Authority separation
 //!
-//! - **This child owns:** packet quality finalization — `PacketQualityService::finalize`
-//!   deterministic packet-id hashing (`blake3` over `serde_json`), structured-bytes /
-//!   token accounting, truth-coverage, causal-bridge completeness, suppression counts,
-//!   signal density, and `PacketQualityReport` synthesis, plus helper
-//!   `causal_bridge_missing_hops`. Pure deterministic computation; no I/O, store,
-//!   provider, Dreamer, or authority decisions.
-//! - **Parent retains:** `ContextCompiler`, `UnderstandingProofValidator`, `CognitiveGate`,
-//!   `CompletionGate`, memory applicability / provider / authority / write logic, budget
-//!   rendering, gate/admission, and all tests or unrelated helpers.
-//! - **Semantic truth external:** `eliot-types` packet/report types and `EngineError`
-//!   remain external contracts (`eliot-types`, `crate::error`).
-//! - **No Dreamer / canonical-write / runtime authority:** no provider invocation,
-//!   Dreamer orchestration, canonical store write, or service lifecycle is moved here.
+//! This child owns deterministic packet identity, accounting, coverage,
+//! completeness, suppression, density, and `PacketQualityReport` synthesis.
+//! `ContextCompiler`, proof validation, gates, applicability, providers,
+//! authority, writes, rendering, admission, and tests remain with their
+//! existing owners. No provider invocation, canonical write, or service
+//! lifecycle authority is introduced.
 //!
-//! # Canonical handles (verified from local authoritative docs)
+//! # Current documentation authority
 //!
-//! Source of truth for architecture/implementation handles is the current source
-//! tree `docs/architecture/ELIOT_ARCHITECTURE.md` (`4.5-draft`) and
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (`0.29-draft`), plus
-//! `docs/architecture/INDEX.md` (`E:context-compiler`). The persistent graph
-//! `eliot-memory-os-f71070b-live` (61020 nodes / 292342 edges) and docs project
-//! `eliot-architecture-docs-*` are evidence/routing layers only and were
-//! consulted before source inspection per worktree `AGENTS.md`.
+//! - `docs/architecture/ELIOT_ARCHITECTURE.md`: `A7.1`, `A7.4`, `A7.6`, and
+//!   `A7.9`.
+//! - `docs/architecture/ELIOT_IMPLEMENTATION.md`: `I7.11`, `I7.19`, `I7.26`,
+//!   and `I12.13..I12.17`.
+//! - `docs/architecture/INDEX.md`: `E:context-compiler` navigation.
+//! - precedence: `docs/ARCHITECTURE_CONTRACT.md`.
 //!
-//! - Architecture: `A7.1` Active Understanding View, `A7.4` Context as
-//!   intervention, `A7.6` Compaction & resume, `A7.9` Context economy.
-//! - Implementation: `I7.11` Context payload profiles and Decision Safety Floor,
-//!   `I7.26` Reversible payload budget and omission handles (each compiled view
-//!   emits `PacketQualityScorecard`), `I7.19` Reactive context sequence,
-//!   `I12.13`–`I12.17` orientation/bounded context/compaction.
-//!
-//! # Import policy
-//!
-//! Exact direct imports are derived from the current `context.rs` source for
-//! this closure only; no provider, Dreamer, canonical-write, or runtime
-//! authority imports are introduced.
+//! Exact imports remain limited to this deterministic closure; no provider,
+//! Dreamer, canonical-write, or runtime-authority imports are introduced.
 
 use eliot_types::{ContextPacketL3, MaterialPacketFrame, PacketQualityReport, PacketQualityResult};
 

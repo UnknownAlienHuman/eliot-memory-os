@@ -1,21 +1,16 @@
 //! Packet-local continuity for project understanding.
 //!
-//! Architecture anchors: `A7.6` (Compaction and resume) and `ARCH-CORE-01`
-//! (Understanding continuity first, `ELIOT_ARCHITECTURE.md` 4.5-draft
-//! `58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D8`).
-//! Implementation anchors: `I12.17` (Compaction and resume) and `I7.15`
-//! (Route Continuation and transfer, `ELIOT_IMPLEMENTATION.md` 0.29-draft
-//! `C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0B`).
-//! Normative code: `crates/eliot-engine/src/project_understanding.rs`
-//! (`ProjectUnderstandingCompiler` at `project_understanding.rs:9`, continuity
-//! call sites at `context.rs:2939,2943,4552,4559`) and `crates/eliot-types`
-//! `ContextPacketL3` / `DecisionLocalitySuffix`.
+//! Current documentation authority:
+//! - `docs/architecture/ELIOT_ARCHITECTURE.md`: `A7.6`.
+//! - `docs/architecture/A16-01-decision-anchors.md`: `ARCH-CORE-01`.
+//! - `docs/architecture/ELIOT_IMPLEMENTATION.md`: `I12.17` and `I7.15`.
+//! - precedence: `docs/ARCHITECTURE_CONTRACT.md`.
 //!
-//! Ownership: `crates/eliot-engine` owns this packet-local continuity seam
-//! (restore/normalize + `union`); `crates/eliot-types` owns packet truth packet
-//! types; `crates/eliot-engine/src/context.rs` owns the `ContextCompiler`
-//! call site. This child is a pure helper with no provider, process, or
-//! canonical-write authority and does not change `ProjectUnderstandingCompiler`
+//! Source ownership remains in `ProjectUnderstandingCompiler`,
+//! `ContextPacketL3`, `DecisionLocalitySuffix`, and the parent
+//! `ContextCompiler` call sites. This child owns only pure packet-local
+//! restore/normalize/union mechanics. It has no provider, process, or
+//! canonical-write authority and does not change project-understanding
 //! semantics.
 
 use std::collections::BTreeSet;

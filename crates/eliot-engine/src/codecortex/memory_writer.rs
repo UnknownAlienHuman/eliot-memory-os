@@ -1,10 +1,20 @@
-//! Bounded `CodeCortex` memory writer — mechanical child of `crates/eliot-engine/src/codecortex.rs` (canonical base `8e1b66d267633052dc2b9eac7776dff743a6827b`, graph `eliot-memory-os-8e1b66d-live`).
+//! Bounded `CodeCortex` memory writer — mechanical child of
+//! `crates/eliot-engine/src/codecortex.rs`.
 //!
-//! Architecture anchors: `A12.3` (governed write path) and `A10.8`/`A5.5` (Instrument Plane / Verifier). Implementation anchors: `I12.10` (`CodeCortex` implementation), `I5.4`–`I5.8` + `I5.19` (canonical transition → write envelope → admission → receipt via `WriterHandle`/`WriteAdmissionService`), and `I10.8` (Instrument Plane adapters).
+//! Current documentation authority:
+//! - `docs/architecture/ELIOT_ARCHITECTURE.md`: `A5.5`, `A10.8`, and `A12.3`.
+//! - `docs/architecture/ELIOT_IMPLEMENTATION.md`: `I5.4..I5.8`, `I5.19`,
+//!   `I10.8`, and `I12.10`.
+//! - precedence: `docs/ARCHITECTURE_CONTRACT.md`.
 //!
-//! Ownership: this child owns only `CodeCortexMemoryWriter` and its `write_report` / `write_report_scoped` / `write_report_with_scope` seam that submits the already-bounded `ToolObservationRecord` (`codecortex_internal_report`, `codecortex-d1` scope, `Internal`/`LocalVerified`) via `WriteAdmissionService::admit` → `WriterHandle::submit`. All bounded payload projection (`codecortex-memory-projection-v1`, 96 KiB, evidence limit 12, truncation helpers), `codecortex_observation_command` construction, `full_report_digest` (`blake3`), and admission validation remain in the parent `codecortex` module, which retains `CodeCortexService` composition, adapter execution (`git`/`cargo`/`rg`/`sg`), diagnostics, and scope-binding authority.
+//! This child owns only `CodeCortexMemoryWriter` and its bounded report-write
+//! seam through `WriteAdmissionService` and `WriterHandle`. Payload projection,
+//! command construction, report digests, admission validation, service
+//! composition, adapter execution, diagnostics, and scope-binding authority
+//! remain in the parent `codecortex` module.
 //!
-//! Mechanical split only: no new write authority, no provider/process behavior change, no API change, no other service/helper movement. Keep `super::` seam narrow and do not widen `pub(crate)` visibility.
+//! Mechanical split only: no new write authority, provider/process behavior,
+//! API, or visibility change.
 
 use crate::{EngineError, WriteAdmissionService, WriterHandle};
 use eliot_types::{CodeCortexReport, ProjectId, SessionId, TaskId, WriteReceiptRef};

@@ -1,21 +1,22 @@
 //! OS-observed named-pipe peer process admission.
 //!
-//! Architecture anchors (eliot-architecture-docs-fa941135): A2.3, A12.2,
-//! A12.3, ARCH-AUTH-01, ARCH-SEC-01, and ARCH-SEC-02. This module owns only
-//! the sealed process/SID/session/Job evidence and the deterministic admission
-//! checks that bind a live peer to inert caller-selected expectations.
+//! Current documentation authority:
+//! - `docs/architecture/ELIOT_ARCHITECTURE.md`: `A2.3`, `A12.2`, and `A12.3`.
+//! - `docs/architecture/A16-01-decision-anchors.md`: `ARCH-AUTH-01`,
+//!   `ARCH-SEC-01`, and `ARCH-SEC-02`.
+//! - `docs/architecture/ELIOT_IMPLEMENTATION.md`: `I2.23`, `I7.5`, `I7.14`,
+//!   and `I15.2`.
+//! - precedence: `docs/ARCHITECTURE_CONTRACT.md`.
 //!
-//! Implementation anchors (eliot-architecture-docs-fa941135): I2.2, I2.23,
-//! I7.5, I7.14, and I15.2. These APIs observe live process and Job identity,
-//! preserve fail-closed mismatch behavior, and keep principal evidence
-//! separate from transport and semantic transitions.
+//! This module owns only sealed process/SID/session/Job evidence and
+//! deterministic admission checks that bind a live peer to inert,
+//! caller-selected expectations.
 //!
 //! Named-pipe listener/server creation, DACL/ACE construction, wire
-//! handshake/session state, peer-role set selection, generic process identity,
-//! service registration, and tests remain owned by their existing root or
-//! sibling modules. The Host service query below is read-only process
-//! observation for admission evidence; it does not own service authority.
-//! This module issues no authority, canonical transition, or semantic result.
+//! handshake/session state, peer-role selection, generic process identity,
+//! service registration, and tests remain with their existing owners. The
+//! Host service query below is read-only process observation; this module
+//! issues no authority, canonical transition, or semantic result.
 
 use std::path::Path;
 
