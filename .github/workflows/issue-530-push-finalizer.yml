@@ -1,14 +1,13 @@
 name: Temporary issue 530 final verification
 
 on:
-  pull_request:
-    branches: [main]
-    types: [opened, reopened, synchronize, ready_for_review]
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
 
 permissions:
   contents: write
   actions: read
-  pull-requests: read
 
 concurrency:
   group: issue-530-final-verification
@@ -16,15 +15,13 @@ concurrency:
 
 env:
   BASE_SHA: 1fad3de311dc2add14c0f713c7c01ec55d4e4633
-  SOURCE_BRANCH: fix/530-legacy-traceability-clean
-  SOURCE_SHA: 536ddb3b0259f75b58d8e85d3aafb90bcab92295
+  SOURCE_SHA: 223027fe55da2850ef6c018b2c8ad828261800ca
   CANDIDATE_BRANCH: fix/530-final-verified
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
   verify:
-    if: github.event.pull_request.head.ref == 'fix/530-legacy-traceability-clean'
     runs-on: windows-latest
     timeout-minutes: 240
 
@@ -35,7 +32,7 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          ref: 536ddb3b0259f75b58d8e85d3aafb90bcab92295
+          ref: 223027fe55da2850ef6c018b2c8ad828261800ca
           fetch-depth: 0
 
       - name: Bind exact source identity
@@ -43,25 +40,22 @@ jobs:
         run: |
           $sourceHead = (git rev-parse HEAD).Trim()
           if ($sourceHead -ne $env:SOURCE_SHA) {
-            throw "Source branch moved: expected $($env:SOURCE_SHA), observed $sourceHead"
+            throw "Source identity mismatch: expected $($env:SOURCE_SHA), observed $sourceHead"
           }
           $mergeBase = (git merge-base HEAD $env:BASE_SHA).Trim()
           if ($mergeBase -ne $env:BASE_SHA) {
-            throw "Source branch does not descend from declared base: $mergeBase"
+            throw "Source does not descend from declared base: $mergeBase"
           }
-          "source_head=$sourceHead" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "source=$sourceHead" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           "base=$mergeBase" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
       - name: Configure bounded build environment
         shell: pwsh
         run: |
-          $testTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
-          if (-not [IO.Path]::IsPathFullyQualified($testTemp) -or -not (Test-Path -LiteralPath $testTemp -PathType Container)) {
-            throw "Runner temp is not an existing absolute directory: $testTemp"
-          }
-          "TEMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "TMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "CARGO_TARGET_DIR=$testTemp\eliot-issue-530-target" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $temp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          "TEMP=$temp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TMP=$temp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_TARGET_DIR=$temp\eliot-issue-530-target" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "CARGO_INCREMENTAL=0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "CARGO_BUILD_JOBS=4" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           New-Item -ItemType Directory -Force -Path .eliot | Out-Null
@@ -73,22 +67,18 @@ jobs:
             Tee-Object -FilePath .eliot/pip-install.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Apply denominator-driven traceability cleanup
+      - name: Apply denominator-driven cleanup
         shell: pwsh
         run: |
           python .github/temporary/finalize_traceability.py *>&1 |
             Tee-Object -FilePath .eliot/issue-530-cleanup.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Remove one-shot source helper
-        shell: pwsh
-        run: |
           Remove-Item -LiteralPath .github/temporary/finalize_traceability.py -Force
           if ((Test-Path -LiteralPath .github/temporary) -and -not (Get-ChildItem -LiteralPath .github/temporary -Force)) {
             Remove-Item -LiteralPath .github/temporary -Force
           }
 
-      - name: Prove every Rust code projection is unchanged
+      - name: Prove Rust code projections unchanged
         shell: pwsh
         run: |
           @'
@@ -102,29 +92,21 @@ jobs:
 
           base = os.environ["BASE_SHA"]
           base_paths = {
-              path
-              for path in subprocess.check_output(
+              path for path in subprocess.check_output(
                   ["git", "ls-tree", "-r", "--name-only", base], text=True
-              ).splitlines()
-              if path.endswith(".rs")
+              ).splitlines() if path.endswith(".rs")
           }
           current_paths = {
-              path
-              for path in subprocess.check_output(
+              path for path in subprocess.check_output(
                   ["git", "ls-files"], text=True
-              ).splitlines()
-              if path.endswith(".rs")
+              ).splitlines() if path.endswith(".rs")
           }
           if base_paths != current_paths:
               raise SystemExit(
-                  "Rust path set changed: "
-                  f"missing={sorted(base_paths-current_paths)} "
-                  f"added={sorted(current_paths-base_paths)}"
+                  f"Rust path set changed: missing={sorted(base_paths-current_paths)} added={sorted(current_paths-base_paths)}"
               )
           for relative in sorted(base_paths):
-              before = subprocess.check_output(
-                  ["git", "show", f"{base}:{relative}"]
-              ).decode("utf-8")
+              before = subprocess.check_output(["git", "show", f"{base}:{relative}"]).decode("utf-8")
               after = Path(relative).read_text(encoding="utf-8")
               if code_projection(before) != code_projection(after):
                   raise SystemExit(f"non-comment Rust projection changed: {relative}")
@@ -132,7 +114,7 @@ jobs:
           '@ | python - *>&1 | Tee-Object -FilePath .eliot/rust-code-projection.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Enforce final mutable-path boundary
+      - name: Enforce final path boundary
         shell: pwsh
         run: |
           $allowedNonRust = @(
@@ -141,49 +123,39 @@ jobs:
             'scripts/doc_code_conformance_lib/rust_comments.py'
           )
           $paths = @(git diff --name-only $env:BASE_SHA)
-          if ($paths.Count -lt 10) {
-            throw "Expected denominator-driven cleanup; only $($paths.Count) paths changed"
-          }
+          if ($paths.Count -lt 10) { throw "Cleanup denominator unexpectedly small: $($paths.Count)" }
           $unexpected = @($paths | Where-Object {
             -not $_.EndsWith('.rs') -and $_ -notin $allowedNonRust
           })
-          if ($unexpected.Count -ne 0) {
-            throw "Unexpected final paths: $($unexpected -join ', ')"
-          }
+          if ($unexpected.Count -ne 0) { throw "Unexpected paths: $($unexpected -join ', ')" }
           foreach ($required in $allowedNonRust) {
-            if ($required -notin $paths) {
-              throw "Required final path is absent: $required"
-            }
+            if ($required -notin $paths) { throw "Required path absent: $required" }
           }
           if ($paths | Where-Object { $_ -like '.github/*' -or $_ -like 'Cargo*' }) {
-            throw 'Temporary workflow/helper or Cargo surface leaked into final diff'
+            throw 'Temporary or Cargo surface leaked into final diff'
           }
           $paths | Sort-Object | Out-File -FilePath .eliot/final-paths.txt -Encoding utf8
           "changed_paths=$($paths.Count)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
-      - name: Compile verification code
+      - name: Run documentation gates
         shell: pwsh
         run: |
           python -m py_compile scripts/verify-doc-code-conformance.py scripts/doc_code_conformance_core.py scripts/doc_code_conformance_lib/*.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Run documentation and normative-reference gates
-        shell: pwsh
-        run: |
-          $commands = @(
-            @('python', 'scripts/verify-doc-code-conformance.py', '--self-test'),
-            @('python', 'scripts/verify-doc-code-conformance.py', '--root', '.', '--json-out', '.eliot/doc-code-conformance.json'),
-            @('python', 'scripts/docs_shards.py', 'self-test'),
-            @('python', 'scripts/docs_shards.py', 'verify', '--root', '.'),
-            @('python', 'scripts/docs_router.py', 'self-test'),
-            @('python', 'scripts/docs_router.py', 'check', '--root', '.'),
-            @('python', 'scripts/docs_read.py', 'self-test')
-          )
-          foreach ($command in $commands) {
-            & $command[0] $command[1..($command.Count - 1)] *>&1 |
-              Tee-Object -FilePath .eliot/documentation-gates.log -Append
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+          python scripts/verify-doc-code-conformance.py --self-test *>&1 | Tee-Object -FilePath .eliot/doc-gates.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify-doc-code-conformance.py --root . --json-out .eliot/doc-code-conformance.json *>&1 | Tee-Object -FilePath .eliot/doc-gates.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/docs_shards.py self-test *>&1 | Tee-Object -FilePath .eliot/doc-gates.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/docs_shards.py verify --root . *>&1 | Tee-Object -FilePath .eliot/doc-gates.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/docs_router.py self-test *>&1 | Tee-Object -FilePath .eliot/doc-gates.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/docs_router.py check --root . *>&1 | Tee-Object -FilePath .eliot/doc-gates.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/docs_read.py self-test *>&1 | Tee-Object -FilePath .eliot/doc-gates.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run supported repository verification
         shell: pwsh
@@ -192,7 +164,7 @@ jobs:
             Tee-Object -FilePath .eliot/repository-verification.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Run formatting and focused tests
+      - name: Run workspace and hygiene proof
         shell: pwsh
         run: |
           cargo fmt --all -- --check *>&1 | Tee-Object -FilePath .eliot/cargo-fmt.log
@@ -204,7 +176,7 @@ jobs:
           git diff --check $env:BASE_SHA *>&1 | Tee-Object -FilePath .eliot/diff-check.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Build and publish one-parent verified candidate
+      - name: Publish one-parent verified candidate
         shell: pwsh
         run: |
           git config user.name 'github-actions[bot]'
@@ -215,7 +187,8 @@ jobs:
           $remoteMain = (git rev-parse origin/main).Trim()
           $unexpectedMain = @(git diff --name-only $env:BASE_SHA $remoteMain | Where-Object {
             $_ -ne '.github/workflows/issue-530-push-finalizer.yml' -and
-            $_ -ne '.github/temporary/issue-530-trigger.txt'
+            $_ -ne '.github/temporary/issue-530-trigger.txt' -and
+            $_ -ne '.github/temporary/archive-bootstrap.md'
           })
           if ($unexpectedMain.Count -ne 0) {
             throw "main advanced on unexpected paths: $($unexpectedMain -join ', ')"
