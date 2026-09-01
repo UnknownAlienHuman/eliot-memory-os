@@ -14,8 +14,25 @@ from .rust import module_locator
 
 
 def route_payload(root: Path, path: str, topic: str | None = None) -> dict[str, Any]:
-    registry = build_registry(root)
     path = normalize_repo_path(path)
+    root = root.resolve()
+    candidate = (root / PurePosixPath(path)).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise NavigationError(f"path escapes repository root: {path!r}") from exc
+    if not candidate.exists():
+        raise NavigationError(f"navigation path does not exist: {path}")
+
+    docs_router = load_docs_router(root)
+    docs_config = docs_router.load_config(root)
+    preliminary_topic = topic or ""
+    if not docs_router.matched_routes(docs_config, [path], preliminary_topic):
+        raise NavigationError(
+            "no non-baseline documentation route matched; add a route before mutating this scope"
+        )
+
+    registry = build_registry(root)
     package = matching_package(registry, path)
     blocks = [
         block
@@ -26,14 +43,15 @@ def route_payload(root: Path, path: str, topic: str | None = None) -> dict[str, 
         block["route_topic"] for block in blocks
     ) or "repository source ownership and change impact"
 
-    docs_router = load_docs_router(root)
-    docs_config = docs_router.load_config(root)
     routes = docs_router.matched_routes(docs_config, [path], effective_topic)
 
     module = None
     if package and path.endswith(".rs"):
         package_relative = PurePosixPath(path).relative_to(package["root_path"]).as_posix()
-        module = {"path": path, **module_locator(package["name"], package_relative)}
+        module = {
+            "path": path,
+            **module_locator(package["name"], package_relative, package["targets"]),
+        }
 
     package_view = None
     if package:

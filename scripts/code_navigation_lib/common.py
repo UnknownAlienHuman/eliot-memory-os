@@ -60,6 +60,8 @@ def sha256_file(path: Path) -> str:
 
 
 def normalize_repo_path(value: str) -> str:
+    if not isinstance(value, str):
+        raise NavigationError(f"path must be a string: {value!r}")
     value = value.strip().replace("\\", "/")
     while value.startswith("./"):
         value = value[2:]

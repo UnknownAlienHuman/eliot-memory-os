@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -14,6 +15,7 @@ from .cargo import (
     inferred_targets,
     iter_dependency_specs,
     package_metadata,
+    resolve_dependency_path,
     resolve_dependency_spec,
 )
 from .common import (
@@ -110,7 +112,11 @@ def build_registry(root: Path, blocks_relative: str = DEFAULT_BLOCKS) -> dict[st
             "contract_refs": list(metadata.get("contract_refs", []))
             if isinstance(metadata.get("contract_refs", []), list)
             else [],
-            "targets": inferred_targets(manifest_path.parent, payload),
+            "targets": inferred_targets(
+                manifest_path.parent,
+                payload,
+                strict=package_root in members,
+            ),
             "_payload": payload,
             "dependencies": [],
             "reverse_dependencies": [],
@@ -137,13 +143,17 @@ def build_registry(root: Path, blocks_relative: str = DEFAULT_BLOCKS) -> dict[st
                 workspace_dependencies,
             )
             local_root: str | None = None
+            normalized_path: str | None = None
             if raw_path is not None:
-                base = root if path_base == "workspace" else root / package_root
-                resolved = (base / raw_path).resolve()
-                try:
-                    local_root = relative_to_root(root, resolved)
-                except NavigationError:
-                    local_root = None
+                normalized_path = resolve_dependency_path(
+                    root,
+                    package_root,
+                    raw_path,
+                    path_base,
+                    f"dependency {alias!r}.path",
+                )
+                if normalized_path in package_by_root:
+                    local_root = normalized_path
             elif len(names.get(package_name, [])) == 1:
                 candidate = names[package_name][0]
                 if package_by_root[candidate]["workspace_member"]:
@@ -153,7 +163,7 @@ def build_registry(root: Path, blocks_relative: str = DEFAULT_BLOCKS) -> dict[st
                     "alias": alias,
                     "package": package_name,
                     "kind": kind,
-                    "path": raw_path,
+                    "path": normalized_path,
                     "local_package_root": local_root
                     if local_root in package_by_root
                     else None,
@@ -194,14 +204,24 @@ def build_registry(root: Path, blocks_relative: str = DEFAULT_BLOCKS) -> dict[st
         if owner is None:
             continue
         package_relative = PurePosixPath(rust_file).relative_to(owner).as_posix()
-        record = {"path": rust_file, **module_locator(package_by_root[owner]["name"], package_relative)}
+        record = {
+            "path": rust_file,
+            **module_locator(
+                package_by_root[owner]["name"],
+                package_relative,
+                package_by_root[owner]["targets"],
+            ),
+        }
         package_by_root[owner]["rust_files"].append(record)
 
     blocks = load_blocks(root, blocks_relative)
     handle_index = read_json(root / DEFAULT_HANDLE_INDEX)
+    if handle_index.get("schema_version") != "eliot-handle-index-v1":
+        raise NavigationError("unsupported documentation handle index schema")
     handles = handle_index.get("handles")
     if not isinstance(handles, dict) or not handles:
         raise NavigationError("documentation handle index is empty or invalid")
+    validate_handle_index(root, handles)
 
     for block in blocks:
         pattern_matches = {
@@ -303,6 +323,92 @@ def build_registry(root: Path, blocks_relative: str = DEFAULT_BLOCKS) -> dict[st
             "logical_blocks": len(blocks),
         },
     }
+
+
+def _markdown_anchors(text: str) -> set[str]:
+    counts: dict[str, int] = {}
+    anchors: set[str] = set()
+    fenced = False
+    for line in text.splitlines():
+        fence = re.match(r"^\s{0,3}(`{3,}|~{3,})", line)
+        if fence:
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        heading = re.match(r"^\s{0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$", line)
+        if not heading:
+            continue
+        title = heading.group(1).strip()
+        base = re.sub(r"<[^>]+>", "", title.lower())
+        base = re.sub(r"[^\w\-\s]", "", base, flags=re.UNICODE)
+        base = re.sub(r"\s", "-", base)
+        count = counts.get(base, 0)
+        anchor = base if count == 0 else f"{base}-{count}"
+        counts[base] = count + 1
+        anchors.add(anchor)
+    return anchors
+
+
+def validate_handle_index(root: Path, handles: dict[str, Any]) -> None:
+    """Verify every indexed handle remains bound to its emitted fragment."""
+    manifests: dict[str, dict[str, Any]] = {}
+    for source in ("architecture", "implementation"):
+        manifest_path = root / "docs" / "architecture" / source / "manifest.json"
+        if manifest_path.is_file():
+            manifests[source] = read_json(manifest_path)
+
+    for handle, record in handles.items():
+        if not isinstance(record, dict):
+            raise NavigationError(f"documentation handle {handle} is not an object")
+        required = ("source", "title", "path", "anchor", "source_anchor", "fragment_sha256", "fragment_bytes")
+        missing = [field for field in required if field not in record]
+        if missing:
+            raise NavigationError(f"documentation handle {handle} is missing: {', '.join(missing)}")
+        raw_path = record["path"]
+        path = normalize_repo_path(raw_path)
+        if path != raw_path:
+            raise NavigationError(f"documentation handle {handle} has non-canonical path: {raw_path!r}")
+        fragment = root / PurePosixPath(path)
+        if not fragment.is_file():
+            raise NavigationError(f"documentation handle {handle} fragment is missing: {path}")
+        raw_hash = record["fragment_sha256"]
+        if not isinstance(raw_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", raw_hash):
+            raise NavigationError(f"documentation handle {handle} has an invalid fragment hash")
+        raw_bytes = record["fragment_bytes"]
+        if isinstance(raw_bytes, bool) or not isinstance(raw_bytes, int) or raw_bytes < 0:
+            raise NavigationError(f"documentation handle {handle} has an invalid fragment byte count")
+        actual_hash = sha256_file(fragment)
+        actual_bytes = fragment.stat().st_size
+        if actual_hash != raw_hash:
+            raise NavigationError(f"documentation handle {handle} fragment hash mismatch: {path}")
+        if actual_bytes != raw_bytes:
+            raise NavigationError(f"documentation handle {handle} fragment byte mismatch: {path}")
+        anchor = record["anchor"]
+        source_anchor = record["source_anchor"]
+        if not isinstance(anchor, str) or not anchor or not isinstance(source_anchor, str) or not source_anchor:
+            raise NavigationError(f"documentation handle {handle} has invalid anchor binding")
+        text = fragment.read_text(encoding="utf-8")
+        if anchor not in _markdown_anchors(text):
+            raise NavigationError(f"documentation handle {handle} anchor is absent: {anchor}")
+
+        manifest = manifests.get(str(record["source"]))
+        expected: dict[str, Any] | None = None
+        if manifest:
+            for item in manifest.get("fragments", []):
+                if item.get("path") != path:
+                    continue
+                for heading in item.get("headings", []):
+                    if heading.get("title") == record["title"] and heading.get("source_line") == record.get("source_line"):
+                        expected = {"anchor": heading.get("fragment_anchor"), "source_anchor": heading.get("source_anchor")}
+                        break
+                if expected:
+                    break
+        if expected is not None:
+            if anchor != expected["anchor"] or source_anchor != expected["source_anchor"]:
+                raise NavigationError(f"documentation handle {handle} anchor binding mismatch")
+        elif source_anchor != anchor:
+            raise NavigationError(f"documentation handle {handle} source anchor cannot be verified")
 
 
 def matching_package(registry: dict[str, Any], path: str) -> dict[str, Any] | None:
