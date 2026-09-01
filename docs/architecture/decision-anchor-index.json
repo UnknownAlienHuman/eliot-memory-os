@@ -1,0 +1,395 @@
+{
+  "schema_version": "eliot-decision-anchor-index-v1",
+  "normative_pair_key": "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b",
+  "architecture_source_sha256": "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a",
+  "architecture_manifest_path": "docs/architecture/architecture/manifest.json",
+  "architecture_manifest_git_blob_sha1": "3714202509c5437e2569cb2487915d1257339812",
+  "source": {
+    "path": "docs/architecture/A16-01-decision-anchors.md",
+    "section_handle": "A16.1",
+    "anchor": "a161-decision-anchors",
+    "sha256": "8ecdc335274e5f9d9f67ffa9fcce535a7d3049e0b03af461a3ab9c362b89058c",
+    "git_blob_sha1": "2789eaba7cb4fe64ca01256bf1dcaf916467e2a0",
+    "bytes": 5642
+  },
+  "anchors": {
+    "ARCH-INTENT-01": {
+      "class": "Invariant",
+      "decision": "Intent outranks literal compliance",
+      "fragment_line": 7,
+      "source_line": 2709
+    },
+    "ARCH-CONCIL-01": {
+      "class": "Invariant",
+      "decision": "Dissent and falsification matter more than vote count",
+      "fragment_line": 8,
+      "source_line": 2710
+    },
+    "ARCH-DEV-01": {
+      "class": "Contract",
+      "decision": "Working vertical spine before broad hardening",
+      "fragment_line": 9,
+      "source_line": 2711
+    },
+    "ARCH-CORE-00": {
+      "class": "Invariant",
+      "decision": "Work must become cumulative",
+      "fragment_line": 10,
+      "source_line": 2712
+    },
+    "ARCH-CORE-01": {
+      "class": "Invariant",
+      "decision": "Understanding continuity first",
+      "fragment_line": 11,
+      "source_line": 2713
+    },
+    "ARCH-CORE-02": {
+      "class": "Invariant",
+      "decision": "Four planes, one governed loop",
+      "fragment_line": 12,
+      "source_line": 2714
+    },
+    "ARCH-HELP-01": {
+      "class": "Invariant",
+      "decision": "ELIOT reduces cognitive and operational load",
+      "fragment_line": 13,
+      "source_line": 2715
+    },
+    "ARCH-ROLE-01": {
+      "class": "Invariant",
+      "decision": "Observation, interpretation, authorization, and verification are separated",
+      "fragment_line": 14,
+      "source_line": 2716
+    },
+    "ARCH-ROLE-02": {
+      "class": "Invariant",
+      "decision": "Responsibility follows competence and failure type",
+      "fragment_line": 15,
+      "source_line": 2717
+    },
+    "ARCH-AUTH-01": {
+      "class": "Invariant",
+      "decision": "Authority is explicit, scoped, and fenced",
+      "fragment_line": 16,
+      "source_line": 2718
+    },
+    "ARCH-MOD-01": {
+      "class": "Invariant",
+      "decision": "Small living Kernel; local Module failure does not kill the system",
+      "fragment_line": 17,
+      "source_line": 2719
+    },
+    "ARCH-MOD-02": {
+      "class": "Contract",
+      "decision": "Depth grows through independently testable Micro-modules; physical size and form remain empirical",
+      "fragment_line": 18,
+      "source_line": 2720
+    },
+    "ARCH-MOD-03": {
+      "class": "Invariant",
+      "decision": "One causal responsibility: one owner per mutable state, one proof surface, one replacement boundary",
+      "fragment_line": 19,
+      "source_line": 2721
+    },
+    "ARCH-PORT-01": {
+      "class": "Invariant",
+      "decision": "Organs and execution contours are replaceable; public inheritance transfers, tacit strategy is requalified",
+      "fragment_line": 20,
+      "source_line": 2722
+    },
+    "ARCH-SCOPE-01": {
+      "class": "Invariant",
+      "decision": "Scope before reuse",
+      "fragment_line": 21,
+      "source_line": 2723
+    },
+    "ARCH-MEM-01": {
+      "class": "Contract",
+      "decision": "Capture first; ELIOT organizes later",
+      "fragment_line": 22,
+      "source_line": 2724
+    },
+    "ARCH-MEM-02": {
+      "class": "Invariant",
+      "decision": "Semantic fallibility is recoverable through forward revision",
+      "fragment_line": 23,
+      "source_line": 2725
+    },
+    "ARCH-MEM-03": {
+      "class": "Invariant",
+      "decision": "Derived memory preserves evidence and lineage",
+      "fragment_line": 24,
+      "source_line": 2726
+    },
+    "ARCH-MEM-04": {
+      "class": "Invariant",
+      "decision": "Retrieval is not reinforcement; forgetting is not belief revision",
+      "fragment_line": 25,
+      "source_line": 2727
+    },
+    "ARCH-LIFE-01": {
+      "class": "Invariant",
+      "decision": "No semantic teleportation among observation, interpretation, authority, and proof",
+      "fragment_line": 26,
+      "source_line": 2728
+    },
+    "ARCH-EPI-01": {
+      "class": "Invariant",
+      "decision": "Reality corrects; epistemic positions remain defeasible",
+      "fragment_line": 27,
+      "source_line": 2729
+    },
+    "ARCH-EPI-02": {
+      "class": "Contract",
+      "decision": "Theories earn and lose weight through outcomes",
+      "fragment_line": 28,
+      "source_line": 2730
+    },
+    "ARCH-EPI-03": {
+      "class": "Invariant",
+      "decision": "Exploration cannot confirm itself on the same evidence",
+      "fragment_line": 29,
+      "source_line": 2731
+    },
+    "ARCH-EPI-04": {
+      "class": "Contract",
+      "decision": "Coverage requires a declared, frozen, and recheckable denominator",
+      "fragment_line": 30,
+      "source_line": 2732
+    },
+    "ARCH-UND-01": {
+      "class": "Invariant",
+      "decision": "Load-bearing understanding has a public inspectable form",
+      "fragment_line": 31,
+      "source_line": 2733
+    },
+    "ARCH-UND-02": {
+      "class": "Contract",
+      "decision": "Causal understanding is tested by discriminative prediction and outcomes",
+      "fragment_line": 32,
+      "source_line": 2734
+    },
+    "ARCH-GROUND-01": {
+      "class": "Contract",
+      "decision": "Models remain tied to tools, graphs, artifacts, and verifiers",
+      "fragment_line": 33,
+      "source_line": 2735
+    },
+    "ARCH-SELF-01": {
+      "class": "Contract",
+      "decision": "ELIOT maintains evidence-linked self-knowledge without self-certification",
+      "fragment_line": 34,
+      "source_line": 2736
+    },
+    "ARCH-CTX-01": {
+      "class": "Contract",
+      "decision": "Decision sufficiency before context optimization",
+      "fragment_line": 35,
+      "source_line": 2737
+    },
+    "ARCH-CTX-02": {
+      "class": "Contract",
+      "decision": "Observable state drives proactive memory",
+      "fragment_line": 36,
+      "source_line": 2738
+    },
+    "ARCH-CTX-03": {
+      "class": "Contract",
+      "decision": "Decision locality is route-profiled",
+      "fragment_line": 37,
+      "source_line": 2739
+    },
+    "ARCH-CTX-04": {
+      "class": "Contract",
+      "decision": "Retrieval proposes candidates; Context Compiler admits influence",
+      "fragment_line": 38,
+      "source_line": 2740
+    },
+    "ARCH-ATTN-01": {
+      "class": "Contract",
+      "decision": "Critical Attention is state, not a message",
+      "fragment_line": 39,
+      "source_line": 2741
+    },
+    "ARCH-SKL-01": {
+      "class": "Contract",
+      "decision": "Skills are concise, intent-dense, and challengeable",
+      "fragment_line": 40,
+      "source_line": 2742
+    },
+    "ARCH-WDG-01": {
+      "class": "Contract",
+      "decision": "Independent supervision",
+      "fragment_line": 41,
+      "source_line": 2743
+    },
+    "ARCH-WDG-02": {
+      "class": "Contract",
+      "decision": "Watchdog supervises preservation of declared intent, observable outcomes, security, and recovery",
+      "fragment_line": 42,
+      "source_line": 2744
+    },
+    "ARCH-DRM-01": {
+      "class": "Invariant",
+      "decision": "Dreamer is an AI service, not an owner or authority",
+      "fragment_line": 43,
+      "source_line": 2745
+    },
+    "ARCH-DRM-02": {
+      "class": "Contract",
+      "decision": "Dreamer expands hypothesis space and orientation",
+      "fragment_line": 44,
+      "source_line": 2746
+    },
+    "ARCH-DRM-03": {
+      "class": "Contract",
+      "decision": "Dreamer agents and swarms are human-governed by budget and policy",
+      "fragment_line": 45,
+      "source_line": 2747
+    },
+    "ARCH-DRM-04": {
+      "class": "Invariant",
+      "decision": "Researcher acquires, Dreamer interprets, Governor governs",
+      "fragment_line": 46,
+      "source_line": 2748
+    },
+    "ARCH-ACT-01": {
+      "class": "Contract",
+      "decision": "Effect defines impact and authority",
+      "fragment_line": 47,
+      "source_line": 2749
+    },
+    "ARCH-SWM-01": {
+      "class": "Contract",
+      "decision": "Swarm is a bounded, context-minimal staged evidence pipeline",
+      "fragment_line": 48,
+      "source_line": 2750
+    },
+    "ARCH-SWM-02": {
+      "class": "Contract",
+      "decision": "Swarm coordination is durable, idempotent, and epoch-fenced",
+      "fragment_line": 49,
+      "source_line": 2751
+    },
+    "ARCH-LONG-01": {
+      "class": "Invariant",
+      "decision": "Long work lives in durable state",
+      "fragment_line": 50,
+      "source_line": 2752
+    },
+    "ARCH-FIN-01": {
+      "class": "Invariant",
+      "decision": "Completion is proof-bearing; other finish states remain explicit",
+      "fragment_line": 51,
+      "source_line": 2753
+    },
+    "ARCH-HUM-01": {
+      "class": "Invariant",
+      "decision": "Human retains value authority and practical control",
+      "fragment_line": 52,
+      "source_line": 2754
+    },
+    "ARCH-SEC-01": {
+      "class": "Invariant",
+      "decision": "Assume compromise; preserve control and recovery",
+      "fragment_line": 53,
+      "source_line": 2755
+    },
+    "ARCH-SEC-02": {
+      "class": "Invariant",
+      "decision": "One governed canonical transition path",
+      "fragment_line": 54,
+      "source_line": 2756
+    },
+    "ARCH-SEC-03": {
+      "class": "Invariant",
+      "decision": "Influence remains origin-bound and revocable",
+      "fragment_line": 55,
+      "source_line": 2757
+    },
+    "ARCH-SEC-04": {
+      "class": "Invariant",
+      "decision": "Model output remains a candidate until governed transition",
+      "fragment_line": 56,
+      "source_line": 2758
+    },
+    "ARCH-PRIV-01": {
+      "class": "Contract",
+      "decision": "Erasure propagates and is not undone by restore",
+      "fragment_line": 57,
+      "source_line": 2759
+    },
+    "ARCH-RES-01": {
+      "class": "Invariant",
+      "decision": "Fail locally, recover globally",
+      "fragment_line": 58,
+      "source_line": 2760
+    },
+    "ARCH-RES-02": {
+      "class": "Contract",
+      "decision": "Self-repair is bounded and verified",
+      "fragment_line": 59,
+      "source_line": 2761
+    },
+    "ARCH-RES-03": {
+      "class": "Invariant",
+      "decision": "Restore or migration cannot resurrect invalid state",
+      "fragment_line": 60,
+      "source_line": 2762
+    },
+    "ARCH-ORD-01": {
+      "class": "Invariant",
+      "decision": "Parallel where independent; ordered where causal",
+      "fragment_line": 61,
+      "source_line": 2763
+    },
+    "ARCH-OBS-01": {
+      "class": "Invariant",
+      "decision": "Logs, metrics, audit, and reports are distinct",
+      "fragment_line": 62,
+      "source_line": 2764
+    },
+    "ARCH-RES-04": {
+      "class": "Invariant",
+      "decision": "Degradation is visible and local",
+      "fragment_line": 63,
+      "source_line": 2765
+    },
+    "ARCH-RES-05": {
+      "class": "Contract",
+      "decision": "Recovery produces reusable knowledge",
+      "fragment_line": 64,
+      "source_line": 2766
+    },
+    "ARCH-LEARN-01": {
+      "class": "Invariant",
+      "decision": "Learning changes external inheritance through grounded outcomes",
+      "fragment_line": 65,
+      "source_line": 2767
+    },
+    "ARCH-LEARN-02": {
+      "class": "Contract",
+      "decision": "Learn online within a task; promote globally only under proof",
+      "fragment_line": 66,
+      "source_line": 2768
+    },
+    "ARCH-META-01": {
+      "class": "Contract",
+      "decision": "Self-improvement is advisory, isolated, evidence-driven, and falsifiable",
+      "fragment_line": 67,
+      "source_line": 2769
+    },
+    "ARCH-ECON-01": {
+      "class": "Contract",
+      "decision": "Cost is an authority boundary",
+      "fragment_line": 68,
+      "source_line": 2770
+    },
+    "ARCH-DEV-02": {
+      "class": "Contract",
+      "decision": "Depth grows through independently testable layers, Edge proofs, and Product Pulses",
+      "fragment_line": 69,
+      "source_line": 2771
+    }
+  }
+}
