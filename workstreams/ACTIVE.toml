@@ -24,7 +24,9 @@ implementation_rule = "Historical observations are regression discriminators onl
 id = "core-daemons"
 status = "active"
 branch_strategy = "fresh_per_issue_from_current_main"
-issue_refs = [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+issue_refs = [13, 14, 15, 18, 19, 20, 21, 22, 24]
+completed_baseline_issue_refs = [16, 17, 23]
+cross_cutting_follow_up_issue_refs = [100]
 integration_issue_refs = [11]
 confirmed_open_defect_refs = [63, 64, 65, 66, 67, 74, 77, 78, 79]
 merged_source_fix_refs = [59, 61, 68, 70, 72, 73, 75, 76, 120]
@@ -32,7 +34,7 @@ forbidden_active_defect_refs = [82, 83, 84]
 briefs = ["workstreams/core-daemons/AGENTS.md"]
 inventories = ["workstreams/core-daemons/inventory.json"]
 excluded_capabilities = ["dreamer"]
-implementation_rule = "Primary issues own integration. Confirmed defect issues own one causal contract or local repair. Every defect uses its own current-main branch/PR; no worker combines the epoch, request-digest, Control-Reserve, process-session and runtime-contour migrations into one patch."
+implementation_rule = "Open primary issues own current integration. Completed baseline issues remain historical boundary/proof references and are never valid writers. Issue #100 owns the shared native-process convergence follow-up. Confirmed defect issues own one causal contract or local repair. Every active issue uses its own current-main branch/PR; no worker combines the epoch, request-digest, Control-Reserve, process-session and runtime-contour migrations into one patch."
 
 [[workstream]]
 id = "cognitive-micromodules"
