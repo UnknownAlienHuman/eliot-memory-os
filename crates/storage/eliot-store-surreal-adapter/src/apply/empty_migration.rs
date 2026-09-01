@@ -1,6 +1,6 @@
 //! Empty-migration application cell for the Surreal adapter.
 //! Architecture: ARCH-MOD-01, ARCH-MOD-02, ARCH-PORT-01.
-//! Implementation: I5.1, I5.9, I5.22, I2.2, I2.23 — Surreal bridge DDL transaction, fence and schema-meta creation for the empty-database v2 baseline.
+//! Implementation: I5.1, I5.9, I5.22, I2.23 — Surreal bridge DDL transaction, fence and schema-meta creation for the empty-database v2 baseline.
 //! Responsibility: empty-database v2 baseline migration only; transactional DDL plus canonical fence and schema-meta creation/verification; forbids forward migration, genesis, atomic write, receipt/reconciliation, read-boundary, provider process/handshake, or migration-contract ownership beyond this boundary.
 
 use serde_json::{Map, Value, json};
