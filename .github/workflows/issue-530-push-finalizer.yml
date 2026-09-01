@@ -3,7 +3,7 @@ name: Temporary issue 530 final verification
 on:
   workflow_run:
     workflows:
-      - Work 286 Current Rust Proof
+      - Code scanning AI findings on PR #284
     types: [completed]
   workflow_dispatch:
 
@@ -25,8 +25,8 @@ env:
 
 jobs:
   verify:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.id == 33328474275
-    runs-on: windows-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.id == 33312654291
+    runs-on: ubuntu-latest
     timeout-minutes: 240
 
     steps:
@@ -209,7 +209,7 @@ jobs:
             'Closes #530.'
           ) -join "`n"
           $candidate = ($message | git commit-tree $tree -p $remoteMain).Trim()
-          git push --force origin "$candidate`:refs/heads/$($env:CANDIDATE_BRANCH)"
+          git push origin "$candidate`:refs/heads/$($env:CANDIDATE_BRANCH)"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "candidate=$candidate" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           "parent=$remoteMain" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
