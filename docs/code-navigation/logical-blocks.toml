@@ -1,0 +1,185 @@
+schema_version = "eliot-code-navigation-v1"
+
+[[block]]
+id = "foundation-contracts"
+title = "Foundation contracts and evidence"
+responsibility = "Shared protocols, contracts, receipts, rules, evidence, observation, security, runtime, and test-support types."
+route_topic = "foundation contracts evidence receipts protocol package ownership"
+path_globs = [
+  "crates/foundation/**",
+]
+documentation_handles = ["A2.3", "I2.8"]
+
+[[block]]
+id = "governor-semantic-control"
+title = "Governor semantic control"
+responsibility = "Semantic admission, task/workscope ownership, coordination, canonical transitions, module registry, maintenance, and finish."
+route_topic = "governor semantic admission workscope coordination canonical transition finish"
+path_globs = [
+  "crates/governor/**",
+  "bins/eliotd/**",
+]
+documentation_handles = ["I5.19"]
+
+[[block]]
+id = "host-kernel-runtime"
+title = "Host and Kernel runtime"
+responsibility = "Installation and Host journal, identity, epochs, fencing, ORS, IPC, platform, process, generation, and lifecycle control."
+route_topic = "kernel host process ipc authority epoch fencing ors installation runtime"
+path_globs = [
+  "crates/kernel/**",
+  "bins/eliot-host/**",
+  "bins/eliot-kernel/**",
+]
+documentation_handles = ["I1.8"]
+
+[[block]]
+id = "canonical-storage"
+title = "Canonical storage and blobs"
+responsibility = "Store API/adapters, Surreal generation bridge, BlobStore, backup, export, transaction, and persistence boundaries."
+route_topic = "storage surreal transaction blob backup export persistence canonical write"
+path_globs = [
+  "crates/storage/**",
+  "bins/eliot-store-surreal/**",
+]
+documentation_handles = ["I5.19"]
+
+[[block]]
+id = "agent-fabric"
+title = "Agent fabric and integrations"
+responsibility = "Agent contracts, ACP/Codex/OpenCode adapters, coordinator, swarm, stateless bridge surfaces, skills, and host integration packaging."
+route_topic = "agent fabric coordinator routing bridge skill integration codex opencode"
+path_globs = [
+  "crates/agent/**",
+  "crates/surfaces/eliot-agent-bridge-core/**",
+  "bins/eliot-agent-bridge/**",
+  "integrations/**",
+]
+documentation_handles = ["I10.15"]
+
+[[block]]
+id = "instrument-code-intelligence"
+title = "Instrumentation, verification, and code intelligence"
+responsibility = "Instrument execution, Code Cortex/Code Graph, build-test graph, diagnostics, verification, test selection, reports, and product evaluation."
+route_topic = "instrument verifier code graph code intelligence impact test selection diagnostics"
+path_globs = [
+  "crates/instrument/**",
+  "bins/eliot-testd/**",
+]
+documentation_handles = ["I10.8.17", "I18.18"]
+
+[[block]]
+id = "smart-memory-context"
+title = "Smart memory, context, and understanding"
+responsibility = "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience."
+route_topic = "memory context cue understanding dreamer learning epistemic"
+path_globs = [
+  "crates/smart/**",
+  "bins/eliot-dreamer/**",
+]
+documentation_handles = ["I12.13", "I17.11"]
+
+[[block]]
+id = "security-privacy"
+title = "Security, privacy, erasure, and influence"
+responsibility = "Source assurance, erasure, privacy/disclosure, influence, and security contract enforcement."
+route_topic = "security privacy disclosure erasure influence source assurance"
+path_globs = [
+  "crates/security/**",
+]
+documentation_handles = ["I15.9"]
+
+[[block]]
+id = "research-acquisition"
+title = "Research acquisition"
+responsibility = "Governed external-corpus acquisition, research exchange contracts, provider process, and evidence handoff."
+route_topic = "research acquisition exchange provider evidence external corpus"
+path_globs = [
+  "crates/research/**",
+  "bins/eliot-mod-research/**",
+]
+documentation_handles = ["I21.1"]
+
+[[block]]
+id = "supervision-meta"
+title = "Supervision and meta repair"
+responsibility = "Watchdog observation, Doctor repair, runtime status, improvement, independent supervision, and bounded recovery."
+route_topic = "watchdog doctor supervision repair runtime status recovery improvement"
+path_globs = [
+  "crates/supervision/**",
+  "crates/meta/**",
+  "bins/eliot-watchdog/**",
+  "bins/eliot-doctor/**",
+]
+documentation_handles = ["I8.3", "I14.25"]
+
+[[block]]
+id = "operator-surfaces"
+title = "Operator, MCP, human, and notification surfaces"
+responsibility = "Canonical CLI, MCP, ControlBoard, User Broker, notification, human UI, and surface-only orchestration."
+route_topic = "cli mcp controlboard user broker notification human surface operator"
+path_globs = [
+  "crates/surfaces/**",
+  "bins/eliot/**",
+  "bins/eliot-user-broker/**",
+  "bins/eliot-notify/**",
+  "apps/**",
+]
+documentation_handles = ["I11.1"]
+
+[[block]]
+id = "module-runtimes"
+title = "Native and WASM module runtimes"
+responsibility = "Capability-limited WASM hosting, native worker isolation, module execution boundaries, and replaceable runtime generations."
+route_topic = "module wasm native worker capability runtime isolation generation"
+path_globs = [
+  "crates/modules/**",
+  "bins/eliot-wasm-host/**",
+  "bins/eliot-native-worker/**",
+]
+documentation_handles = ["I2.10"]
+
+[[block]]
+id = "legacy-migration-facades"
+title = "Legacy migration facades"
+responsibility = "Compatibility and regression donors that may be repaired only under an explicit extraction, migration, or deletion path."
+route_topic = "legacy migration facade extraction regression retirement duplicate owner"
+path_globs = [
+  "crates/eliot-app/**",
+  "crates/eliot-engine/**",
+  "crates/eliot-store/**",
+  "crates/eliot-types/**",
+  "crates/eliot-windows-ipc/**",
+]
+documentation_handles = ["I19.14"]
+
+[[block]]
+id = "workspace-governance"
+title = "Workspace governance and verification"
+responsibility = "Workspace membership, dependency policy, scripts, tools, workstreams, repository policy, verification, and build configuration."
+route_topic = "workspace cargo package metadata dependency verification repository governance"
+path_globs = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "Justfile",
+  "rust-toolchain.toml",
+  "config/**",
+  "scripts/**",
+  "workspace/**",
+  "workstreams/**",
+  ".github/**",
+]
+documentation_handles = ["I2.8", "I18.3"]
+
+[[block]]
+id = "documentation-authority"
+title = "Documentation authority and routing"
+responsibility = "Repository instructions, normative pair identity, bounded documentation routing, operational documentation, and current project navigation."
+route_topic = "documentation architecture implementation authority route paths links handles"
+path_globs = [
+  "AGENTS.md",
+  "WORKFLOW.md",
+  "README.md",
+  "docs/**",
+]
+documentation_handles = ["I0.14", "I19.15"]

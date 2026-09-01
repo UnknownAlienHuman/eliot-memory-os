@@ -19,6 +19,7 @@ audit archive and no alternate Architecture edition.
 | Exact accepted pair identity | [`normative-pair.toml`](normative-pair.toml) |
 | Architecture / Implementation fragments and indexes | [`architecture/`](architecture/) |
 | Current repository planes and exact Cargo composition roots | [`PROJECT_MAP.md`](PROJECT_MAP.md) |
+| Crates, Rust modules, logical responsibility blocks, and Code Graph workflow | [`CODE_NAVIGATION.md`](CODE_NAVIGATION.md) |
 | Documentation/source path and inventory conformance | [`../scripts/README.md`](../scripts/README.md#repository-verification-and-documentation-pipeline) |
 | Dependency admission/removal policy | [`DEPENDENCY_POLICY.md`](DEPENDENCY_POLICY.md) |
 | Stable operational guidance | [`operations/`](operations/) |
@@ -31,6 +32,11 @@ audit archive and no alternate Architecture edition.
 the repository conformance gate. Source/build presence still does not establish
 installation, runtime health, authority correctness, Product acceptance, or
 release support.
+
+`CODE_NAVIGATION.md` and `scripts/code_navigation.py` derive package/path and
+one-hop dependency navigation from the exact checkout. Filesystem module
+locators and external Code Graph results remain derived evidence; exact source,
+compiler/build checks, and owning verifiers retain authority.
 
 Repository work rules live at the root in `AGENTS.md`, `WORKFLOW.md`, and
 `workstreams/ACTIVE.toml`.
@@ -45,10 +51,12 @@ python scripts/docs_router.py check --root .
 python scripts/docs_read.py self-test
 python scripts/verify-doc-code-conformance.py --self-test
 python scripts/verify-doc-code-conformance.py --root .
+python scripts/code_navigation.py self-test
+python scripts/code_navigation.py check --root .
 ```
 
-Generated bundles, receipts, and JSON findings are local/issue evidence and are
-not committed as documentation authority.
+Generated bundles, receipts, JSON findings, and Code Graph databases are
+local/issue evidence and are not committed as documentation authority.
 
 ## What does not belong here
 
