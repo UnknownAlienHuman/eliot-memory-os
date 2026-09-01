@@ -1,0 +1,63 @@
+name: Temporary scheduled issue 530 cleanup
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: issue-530-scheduled-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout default branch for self-removal
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Remove this one-shot scheduler from main
+        shell: pwsh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          Remove-Item -LiteralPath .github/workflows/issue-530-scheduled-dispatch.yml -Force
+          git add -A
+          git commit -m 'ci(docs): retire issue 530 scheduler'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git push origin HEAD:main
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Checkout issue branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/530-normative-traceability
+          fetch-depth: 0
+          clean: true
+
+      - name: Run bounded cleanup, verification, and publication
+        shell: pwsh
+        run: pwsh -NoProfile -File .github/temporary/run_traceability_cleanup.ps1
+
+      - name: Upload proof receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-530-traceability-proof
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            .eliot/normative-traceability-cleanup.json
+            .eliot/doc-code-conformance.json
+            .eliot/working-paths.txt
+            .eliot/prepublish-paths.txt
+            .eliot/final-paths.txt
+            .eliot/publication.json
