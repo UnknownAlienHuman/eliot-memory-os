@@ -43,8 +43,9 @@ Do not mutate the repository when:
 ## Context discipline
 
 The reader returns decision-sufficient fragments, not every related section.
-The compatibility maps, full handle index, and assembled books are navigation or
-audit surfaces. They are prohibited as default agent context.
+The compatibility maps, full handle index, Decision Anchor index, and assembled
+books are navigation or audit surfaces. They are prohibited as default agent
+context.
 
 To inspect all changed paths at once:
 
