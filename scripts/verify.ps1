@@ -17,6 +17,7 @@ $coreDaemonInventoryVerifier = Join-Path $PSScriptRoot 'verify-core-daemon-inven
 $docsShardVerifier = Join-Path $PSScriptRoot 'docs_shards.py'
 $docsRouter = Join-Path $PSScriptRoot 'docs_router.py'
 $docsReader = Join-Path $PSScriptRoot 'docs_read.py'
+$docCodeConformanceVerifier = Join-Path $PSScriptRoot 'verify-doc-code-conformance.py'
 
 $steps = @(
     [pscustomobject]@{
@@ -38,6 +39,14 @@ $steps = @(
     [pscustomobject]@{
         Name = 'documentation-read-self-test'
         Command = { python $docsReader self-test }
+    },
+    [pscustomobject]@{
+        Name = 'documentation-code-conformance-self-test'
+        Command = { python $docCodeConformanceVerifier --self-test }
+    },
+    [pscustomobject]@{
+        Name = 'documentation-code-conformance'
+        Command = { python $docCodeConformanceVerifier --root $repoRoot }
     },
     [pscustomobject]@{
         Name = 'core-daemon-inventory-self-test'
