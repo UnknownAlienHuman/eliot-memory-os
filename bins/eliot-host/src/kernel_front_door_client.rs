@@ -1,16 +1,10 @@
 //! Authenticated Kernel front-door client closure.
 //!
-//! Architecture anchors (eliot-architecture-docs-fa941135):
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A2.2`,
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A2.3`,
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-AUTH-01`,
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-SEC-02`, and
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-RES-01`.
-//! Implementation anchors (eliot-architecture-docs-fa941135):
-//! `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I1.2`,
-//! `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I1.4`,
-//! `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I2.2`, and
-//! `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I2.23`.
+//! Architecture: `docs/architecture/ELIOT_ARCHITECTURE.md` handles `A2.2`
+//! and `A2.3`, plus Decision Anchors `ARCH-AUTH-01`, `ARCH-SEC-02`, and
+//! `ARCH-RES-01`. Implementation:
+//! `docs/architecture/ELIOT_IMPLEMENTATION.md` handles `I1.2`, `I1.4`, and
+//! `I2.23`. Normative precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! Host owns physical Kernel process lifecycle and authenticated connection
 //! mechanics only. This module never owns Kernel or Governor semantic

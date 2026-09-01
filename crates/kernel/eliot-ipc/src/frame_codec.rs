@@ -5,7 +5,7 @@
 //! rejected before body allocation. Implementation `I7.3` keeps handshake
 //! fields and session binding above this byte cell.
 //!
-//! This private module follows Implementation `I2.2`: a small group used by one
+//! This private module follows Implementation `I2.23`: a small group used by one
 //! parent remains an ordinary Rust module. The control loop and identity/session
 //! visibility remain governed by Architecture `A10.1` and `A12.2`; this cell
 //! owns no pipe, process, authentication, admission, or lifecycle state.

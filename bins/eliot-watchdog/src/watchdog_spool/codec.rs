@@ -1,7 +1,7 @@
 //! Canonical watchdog spool wire codecs and validation.
 //!
 //! Architecture: ARCH-MOD-01, ARCH-MOD-02, ARCH-PORT-01, ARCH-WDG-02.
-//! Implementation: I8.1, I8.3, I8.10, I8.13, I2.2, I2.23.
+//! Implementation: I8.1, I8.3, I8.10, I8.13, I2.23.
 //! This child owns canonical watchdog spool wire DTOs, encode/decode, and bounded structural validation only; REDB persistence/recovery/retention and watchdog lifecycle/canonical authority remain in the parent/control plane.
 
 use redb::ReadableTable;

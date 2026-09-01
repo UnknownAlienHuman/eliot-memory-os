@@ -11,8 +11,8 @@
 //! Verified implementation references: `I5.1` keeps the domain on the
 //! `CanonicalStoreClient` boundary; `I5.9` keeps SDK/query details in the
 //! Store bridge; `I5.11` binds replacement to generation cutover and receipt;
-//! `B.2` names `ResolveReceipt` as the Kernel-to-Store surface; `I2.2` and
-//! `I2.23` require an executable seam with an explicit owner rather than a
+//! `B.2` names `ResolveReceipt` as the Kernel-to-Store surface; `I2.23`
+//! requires an executable seam with an explicit owner rather than a
 //! speculative crate split. Kernel is neutral and Governor-free: this module
 //! performs only route/fence and Store-owned receipt validation, never payload
 //! interpretation, authority creation, retry, cache, defaulting, or fallback.

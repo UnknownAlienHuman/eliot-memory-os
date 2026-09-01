@@ -14,9 +14,9 @@
 //!
 //! Implementation anchors: `docs/architecture/ELIOT_IMPLEMENTATION.md` §R2
 //! (canonical substrate), §I5.1 (storage boundary), §I5.9 (`SurrealDB`
-//! implementation), §I5.11 (storage replacement), §B.2 (Kernel↔Store), §I2.2
-//! (crate capability), and §I2.23 (capability-family topology) — the cell is a
-//! narrow transport boundary with no semantic synthesis.
+//! implementation), §I5.11 (storage replacement), §B.2 (Kernel↔Store), and
+//! §I2.23 (capability-family topology) — the cell is a narrow transport
+//! boundary with no semantic synthesis.
 //!
 //! This cell owns no Governor semantic types and no Store semantic ownership;
 //! those concerns remain in their owning layers.

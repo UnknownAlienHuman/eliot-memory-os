@@ -4,9 +4,9 @@
 //! Governor to restore authority-owned state without minting authority;
 //! `ARCH-RES-01`, `A13.6`, and `I1.8` bind recovery to one exact state fence;
 //! `A13.6` keeps Kernel recovery opaque while this owner performs semantic
-//! decoding. Implementation anchors are `P.3`, `I2.2`, and `I2.23`: the
-//! payload is versioned and deny-unknown, and ordinary-module extraction does
-//! not create a new provider or failure domain.
+//! decoding. Implementation anchors are `P.3` and `I2.23`: the payload is
+//! versioned and deny-unknown, and ordinary-module extraction does not create
+//! a new provider or failure domain.
 //!
 //! Forbidden boundary: this module never issues leases, mints tokens,
 //! activates effects, invents an empty replacement for non-empty durable

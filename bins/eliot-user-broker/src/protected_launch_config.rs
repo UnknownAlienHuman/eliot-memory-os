@@ -3,7 +3,7 @@
 //! Architecture anchors: A9 User Broker protected launch, A13.2 Kernel and failure domains,
 //! ARCH-AUTH-01 explicit authority, ARCH-SEC-02 SID/session binding, ARCH-RES-01 bounded startup.
 //! Implementation anchors: I1.3 optional and on-demand processes, B.8 Kernel ↔ User Broker,
-//! I2.2 capability crate boundary, I2.23 capability-family topology.
+//! and I2.23 capability-family topology.
 //!
 //! This cell owns only the protected config bytes, validation, and retained
 //! `ProtectedPathLease`. It never mints Kernel authority, never governs canonical

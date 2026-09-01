@@ -1,6 +1,6 @@
 //! Surreal store recovery application cell.
 //! Architecture: ARCH-MOD-01, ARCH-MOD-02, ARCH-PORT-01.
-//! Implementation: I5.1, I5.9, I5.22, I2.2, I2.23 — bounded coherent recovery snapshot via the Surreal bridge.
+//! Implementation: I5.1, I5.9, I5.22, I2.23 — bounded coherent recovery snapshot via the Surreal bridge.
 //! Ownership: bounded physical recovery SQL/binding and snapshot validation/ordering only; no provider lifecycle, genesis bootstrap, empty migration, schema-contract, atomic write, receipt reconciliation/read-boundary, or host-journal ownership beyond this boundary.
 //! No lifecycle/canonical authority — this cell never owns daemon lifecycle or kernel canonical state; it only renders the existing committed store state into a validated `StoreRecoverySnapshot` via the store bridge (source: `crates/storage/eliot-store-surreal-adapter/src/apply.rs:646-835`).
 

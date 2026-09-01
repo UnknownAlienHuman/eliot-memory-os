@@ -1,7 +1,7 @@
 //! Canonical package manifest and file-spec serialization for Windows staging.
 //!
 //! Architecture: A2.3, A13.8, A13.12, ARCH-MOD-01, ARCH-MOD-02.
-//! Implementation: I2.2, I2.23, I3.12, I15.8.
+//! Implementation: I2.23, I3.12, I15.8.
 //!
 //! This cell owns only `PackageFileSpec`/`PackageManifest` and their direct
 //! canonical serialization (`canonical_bytes`/`canonical_digest`) with private

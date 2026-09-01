@@ -6,7 +6,7 @@
 //! `stable_owner_principal_digest`.
 //!
 //! Architecture: A12.2 Principal, Session и visibility; A12.3 Один governed write path; A13.2 Kernel и failure domains; ARCH-AUTH-01 Kernel identity and session binding; ARCH-SEC-02 Authentication and principal binding; ARCH-RES-01 Resource governance
-//! Implementation: I1.2 Обязательные процессы первого полного runtime; I1.8 Exact ownership and call paths; I14.15 Kernel launch and recovery identity; I15.2 Principal and Session binding; I2.2 Когда capability становится отдельным crate; I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only runtime identity derivation
+//! Implementation: I1.2 Обязательные процессы первого полного runtime; I1.8 Exact ownership and call paths; I14.15 Kernel launch and recovery identity; I15.2 Principal and Session binding; I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only runtime identity derivation
 //! Forbidden authority: must not mint authority, must not own process lifecycle, must not make semantic decisions.
 //! Ownership: immutable runtime and launch identity derivation only.
 

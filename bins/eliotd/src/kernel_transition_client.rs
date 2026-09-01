@@ -5,7 +5,7 @@
 //! and exact write-receipt decoding. Store owns canonical persistence and
 //! Kernel owns route/fence admission; Governor retains semantic transition
 //! planning. Architecture: A2.3, A12.3, A13.2, ARCH-AUTH-01, ARCH-SEC-02.
-//! Implementation: I1.8, I2.2, I2.23, P.3, I14.21, I14.26.
+//! Implementation: I1.8, I2.23, P.3, I14.21, I14.26.
 //! Forbidden authority: no Store/provider SDK, canonical ownership, semantic
 //! Governor reconstruction, retry/default synthesis, or alternate transport.
 

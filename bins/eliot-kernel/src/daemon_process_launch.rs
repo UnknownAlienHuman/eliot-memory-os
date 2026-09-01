@@ -1,7 +1,7 @@
 //! Kernel approved `eliotd` launch contour.
 //!
 //! Architecture: ARCH-MOD-01, A13.2, A13.3 (Kernel and failure domains).
-//! Implementation: R1, I2.2, I2.23; extraction topology I2.2, I2.23.
+//! Implementation: R1 and I2.23 capability-family topology and crate extraction.
 //! Forbidden authority: no Store/Governor/Host semantic authority, no route/default/retry/adoption/mint.
 //! This module owns exactly `KernelComposition::launch_eliotd` and `KernelComposition::retain_eliotd_path_proof` and no additional route, default, retry, adoption, or mint authority.
 //! Keeps signatures, bodies, ordering, visibility, routes, protocol and authority unchanged; `control_plane.rs` and `daemon_runtime.rs` callers remain untouched.

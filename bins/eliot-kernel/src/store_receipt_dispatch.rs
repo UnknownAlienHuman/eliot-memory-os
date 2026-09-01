@@ -4,9 +4,9 @@
 //! `ARCH-SEC-02`, and `ARCH-RES-01` require one scoped, authenticated,
 //! fail-closed Kernel route to canonical Store evidence. Implementation
 //! anchors are `I1.8`, `I5.1`, `I5.9`, `I5.11`, `B.2`, `P.3`, `I14.21`,
-//! `I2.2`, and `I2.23`: Store owns the durable lookup, Kernel admits the
-//! exact session fence and projects the typed result, and Governor remains
-//! outside this neutral boundary.
+//! and `I2.23`: Store owns the durable lookup, Kernel admits the exact session
+//! fence and projects the typed result, and Governor remains outside this
+//! neutral boundary.
 //!
 //! Forbidden authority: no Governor interpretation, semantic authority,
 //! alternate Store client or gateway, retry, cache, default, capability,

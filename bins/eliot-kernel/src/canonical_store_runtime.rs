@@ -3,7 +3,7 @@
 //! Architecture: A12.3 One governed write path; A13.2 Kernel and failure domains; ARCH-SEC-02 Authentication and identity; ARCH-RES-01 Resource lifecycle and ownership.
 //! Implementation: I1.2 Obligatory processes; I5.1 Canonical store bootstrap; I5.9 Store client attachment; I5.11 Store gateway ownership; I15.3 Store composition binding.
 //! Forbidden authority: must not embed raw `SurrealQL`, must not handle credentials, must not claim semantic ownership, must not create a second store writer — forbidden raw `SurrealQL`, credentials, semantic ownership, second store writer.
-//! Ordinary module: I2.2 When capability becomes separate crate; I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition` canonical-store bootstrap/attachment closure plus inseparable helper with zero external users.
+//! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition` canonical-store bootstrap/attachment closure plus inseparable helper with zero external users.
 
 use super::HostStoreBootstrapRequirement;
 use super::KernelBuildError;

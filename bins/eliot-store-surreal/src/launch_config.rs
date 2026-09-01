@@ -1,19 +1,11 @@
 //! Store launch configuration and validation.
 //!
-//! Architecture (verified):
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A2.3`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A12.3`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A13.2`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-MOD-02`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-SEC-02`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-RES-01`
-//!
-//! Implementation (verified):
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I1.2`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I2.2`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I2.23`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I5.9`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I15.3`
+//! Architecture: `docs/architecture/ELIOT_ARCHITECTURE.md` handles `A2.3`,
+//! `A12.3`, and `A13.2`, plus Decision Anchors `ARCH-MOD-02`, `ARCH-SEC-02`,
+//! and `ARCH-RES-01`. Implementation:
+//! `docs/architecture/ELIOT_IMPLEMENTATION.md` handles `I1.2`, `I2.23`,
+//! `I5.9`, and `I15.3`. Normative precedence remains in
+//! `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! This module owns Store launch configuration validation, materialization,
 //! digest binding, and bounded JSON/TOML loading only. It forbids runtime

@@ -2,7 +2,7 @@
 //!
 //! Traceability: Architecture A2.3, A12.2, A12.3, A13.2;
 //! principles ARCH-AUTH-01, ARCH-SEC-01, ARCH-SEC-02.
-//! Implementation I1.2, I1.8, I7.1, I7.3, I7.5, I7.14, I15.2, P.3, I2.2, I2.23.
+//! Implementation I1.2, I1.8, I7.1, I7.3, I7.5, I7.14, I15.2, P.3, I2.23.
 //!
 //! This module owns the Windows-first transport selection and limits,
 //! authenticated peer-set construction/snapshot, and Kernel-side session

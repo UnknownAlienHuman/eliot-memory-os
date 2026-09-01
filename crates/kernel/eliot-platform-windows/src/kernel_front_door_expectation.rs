@@ -1,14 +1,16 @@
 //! Inert Kernel front-door expectation and ACL policy.
 //!
-//! Architecture anchors (eliot-architecture-docs-fa941135): A12.2 and A12.3,
-//! with ARCH-AUTH-01, ARCH-SEC-01, and ARCH-SEC-02. This module owns only
-//! caller-provided, validated expectation data; it does not create authority,
-//! perform a transition, or turn policy text into a semantic result.
+//! Architecture: `docs/architecture/ELIOT_ARCHITECTURE.md` handles `A12.2`
+//! and `A12.3`, with Decision Anchors `ARCH-AUTH-01`, `ARCH-SEC-01`, and
+//! `ARCH-SEC-02`. This module owns only caller-provided, validated expectation
+//! data; it does not create authority, perform a transition, or turn policy
+//! text into a semantic result.
 //!
-//! Implementation anchors (eliot-architecture-docs-fa941135): I2.2, I2.23,
-//! I7.5, and I7.14. The constructors preserve the existing fail-closed shape
-//! validation for SID, artifact digest, and bounded ACL-mode policy while the
-//! connected-pipe proof remains in the root runtime contour.
+//! Implementation: `docs/architecture/ELIOT_IMPLEMENTATION.md` handles
+//! `I2.23`, `I7.5`, and `I7.14`. The constructors preserve the existing
+//! fail-closed shape validation for SID, artifact digest, and bounded ACL-mode
+//! policy while the connected-pipe proof remains in the root runtime contour.
+//! Normative precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! Named-pipe listener/server creation, DACL/ACE construction and validation,
 //! handshake/session state, process admission, generic process identity, and

@@ -4,9 +4,8 @@
 //! Architecture anchors: A12.2 Principal, Session и visibility, A12.3 Один
 //! governed write path, A13.2 Kernel и failure domains (bounded A12 Security
 //! and A13 Resilience). Implementation anchors: I1.3 Optional и on-demand
-//! processes, B.1 Kernel ↔ Daemon, P.3 Kernel control boundary, I2.2 Когда
-//! capability становится отдельным crate, I2.23 Capability-family topology and
-//! crate extraction decisions.
+//! processes, B.1 Kernel ↔ Daemon, P.3 Kernel control boundary, and I2.23
+//! Capability-family topology and crate extraction decisions.
 //!
 //! This module is a thin transport: it forwards `AuthorityPort` calls over
 //! `SharedKernelClient::transact_json` and maps `KernelClientError` to

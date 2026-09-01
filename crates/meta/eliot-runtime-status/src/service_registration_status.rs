@@ -17,7 +17,7 @@
 //! coupled `ServiceRegistrationState`/`ServiceRuntimeIdentity`/helpers.
 //! Fail-closed on missing or mismatched evidence.
 //!
-//! Topology: I2.2, I2.23 — separate service-registration topology; not
+//! Topology: I2.23 — separate service-registration topology; not
 //! conflated with readiness or canonical lifecycle.
 
 #![forbid(unsafe_code)]

@@ -9,8 +9,8 @@
 //! retention authority lives here.
 //!
 //! Architecture: A4.3 Git-like history and recoverable fallibility, A12.3 One governed write path, A13.8 Integrity, ARCH-AUTH-01, ARCH-SEC-02, ARCH-RES-03 — read-only replay/integrity view topology; parent `canonical_store` retains the store, receipt, and transport boundary.
-//! Implementation: I2.2, I2.23 — extracted replay/integrity module owns only
-//! its read-only view; parent remains the sole write/receipt authority.
+//! Implementation: I2.23 — extracted replay/integrity module owns only its
+//! read-only view; parent remains the sole write/receipt authority.
 //! Forbidden: read-only replay integrity projection only, no migration execute write envelope cognitive recall blob canonical write authority — no new dependencies or broad re-exports.
 
 use super::CanonicalStore;

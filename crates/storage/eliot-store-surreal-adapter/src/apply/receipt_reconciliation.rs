@@ -1,7 +1,7 @@
 //! Physical receipt, idempotency and fence reconciliation reads for the Surreal adapter.
 //!
 //! Architecture: ARCH-MOD-01, ARCH-MOD-02, ARCH-PORT-01.
-//! Implementation: I5.1, I5.9, I5.19, I5.20, I5.3, I2.2, I2.23 — R2 storage execution, receipt/read-export and bridge named operations via the Surreal bridge.
+//! Implementation: I5.1, I5.9, I5.19, I5.20, I5.3, I2.23 — R2 storage execution, receipt/read-export and bridge named operations via the Surreal bridge.
 //! Ownership: physical receipt/idempotency/fence reconciliation reads only; no semantic policy, transition/write, authority, retry/default or Store-SDK ownership beyond the existing adapter port.
 
 use serde_json::{Map, json};

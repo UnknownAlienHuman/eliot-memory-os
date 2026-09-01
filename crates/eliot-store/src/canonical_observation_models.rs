@@ -10,9 +10,9 @@
 //! boundary; A13.2 Kernel failure domains — canonical state isolation; parent
 //! `canonical_store` retains the store, receipt, and transport boundary.
 //! Implementation: I16.1 Four surfaces — Reports/durable-audit projections
-//! generated from canonical state; I2.2, I2.23 — extracted observation-model
-//! module owns only its passive data-model cell; parent remains the sole
-//! write/receipt authority. Mechanical split from
+//! generated from canonical state; I2.23 — extracted observation-model module
+//! owns only its passive data-model cell; parent remains the sole write/receipt
+//! authority. Mechanical split from
 //! `crates/eliot-store/src/canonical_store.rs` — behavior preserved.
 //! Forbidden: passive data-model only, no cognitive/record/secret/capacity/
 //! recall/L2/replay, no provider/handshake/migration/atomic-write, no

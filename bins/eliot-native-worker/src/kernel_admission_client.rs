@@ -1,15 +1,16 @@
 //! Kernel admission client transport for native-worker startup claim.
 //!
 //! Architecture: Kernel is the governing admission authority per
-//! `ELIOT_ARCHITECTURE.md` 4.5-draft (A0.3, A2.2, A12.2, A12.3, A13.2;
-//! ARCH-AUTH-01, ARCH-SEC-01, ARCH-SEC-02). Native-worker is a thin composition
-//! boundary that must not assume or synthesize admission/authority.
+//! `docs/architecture/ELIOT_ARCHITECTURE.md` (A0.3, A2.2, A12.2, A12.3,
+//! A13.2; ARCH-AUTH-01, ARCH-SEC-01, ARCH-SEC-02). Native-worker is a thin
+//! composition boundary that must not assume or synthesize admission/authority.
 //!
 //! Implementation: Uses `eliot-cli::kernel_client::KernelClient` health probe and
-//! `native_worker.claim` transact probe per `ELIOT_IMPLEMENTATION.md` 0.29-draft
-//! (I1.2, I7.3, I7.5, I15.2, P.3, I2.2, I2.23) and `bins/eliot-native-worker` crate
-//! boundary. Fails closed until Kernel supplies a session-bound claim and preserves
-//! exact transport error mapping and handshake strings.
+//! `native_worker.claim` transact probe per
+//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (I1.2, I7.3, I7.5, I15.2,
+//! P.3, I2.23) and the `bins/eliot-native-worker` crate boundary. Fails closed
+//! until Kernel supplies a session-bound claim and preserves exact transport
+//! error mapping and handshake strings.
 //!
 //! Responsibility: Kernel admission client transport only — health handshake,
 //! claim probe, and typed `KernelAdmissionRequired` error mapping for startup.

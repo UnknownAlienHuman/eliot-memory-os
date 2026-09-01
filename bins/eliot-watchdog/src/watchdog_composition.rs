@@ -1,5 +1,5 @@
 //! Architecture: A8.1, A13.2, A13.3, ARCH-WDG-01, ARCH-RES-01, ARCH-RES-04.
-//! Implementation: I2.2, I2.23, I8.1, I8.3, I8.4, I14.10, I14.15.
+//! Implementation: I2.23, I8.1, I8.3, I8.4, I14.10, I14.15.
 //! Responsibility/Forbidden ownership: bounded Watchdog runtime composition and admitted heartbeat only; no Kernel effect, Host identity, Store canonical state, unbounded restart, default, retry, or mint authority.
 
 use std::sync::Arc;

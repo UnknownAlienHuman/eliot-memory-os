@@ -1,7 +1,7 @@
 //! Physical protected spool cell for the independent Runtime 0.17 watchdog.
 //!
 //! Architecture: ARCH-MOD-01, ARCH-MOD-02, ARCH-PORT-01, ARCH-WDG-02.
-//! Implementation: I8.1, I8.3, I8.10, I8.13, I2.2, I2.23.
+//! Implementation: I8.1, I8.3, I8.10, I8.13, I2.23.
 //! Physical protected spool only — no semantic/canonical/Kernel/Governor
 //! authority and no new default or retry; bytes/layout/recovery/high-water/fail-closed
 //! behavior is preserved verbatim from the reviewed production cell.

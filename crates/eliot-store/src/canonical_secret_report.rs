@@ -15,14 +15,13 @@
 //! Architecture: P.6 canonical Store — secret-scan report boundary; A13.2
 //! Kernel failure domains — report is a read-only projection, not canonical
 //! history/state; A13.8 Integrity — deterministic scan with bounded paging.
-//! Implementation: I2.2, I2.23 — extracted report cell owns only its
-//! projection; parent `canonical_store` retains the store, receipt, and
-//! transport boundary. Mechanical split from
-//! `crates/eliot-store/src/canonical_store.rs` — behavior preserved.
-//! This is a read-only report projection with no canonical authority; it is
-//! not canonical truth/authority and acquires no write, receipt, or
-//! transport authority. Forbidden: capacity/L2/recall/record/cognitive,
-//! write authority, provider, Dreamer/Luna/frozen/integrated cells.
+//! Implementation: I2.23 — extracted report cell owns only its projection;
+//! parent `canonical_store` retains the store, receipt, and transport boundary.
+//! Mechanical split from `crates/eliot-store/src/canonical_store.rs` — behavior
+//! preserved. This is a read-only report projection with no canonical authority;
+//! it is not canonical truth/authority and acquires no write, receipt, or
+//! transport authority. Forbidden: capacity/L2/recall/record/cognitive, write
+//! authority, provider, Dreamer/Luna/frozen/integrated cells.
 
 use crate::StoreError;
 use crate::surreal_server::{ReadySurrealServer, SurrealServerSupervisor};

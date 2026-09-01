@@ -5,7 +5,7 @@
 //! ARCH-RES-01 bounded closed dispatch.
 //! Implementation: I5.1 provider-owned store seam, I5.9 explicit receipt reconciliation,
 //! I5.11 closed Request catalogue, B.2 bounded error surface, I14.21 deterministic dispatch,
-//! I2.2 crate ownership, I2.23 seam cohesion.
+//! I2.23 capability ownership and seam cohesion.
 //!
 //! Store remains the durable owner. This module only dispatches already
 //! session-validated closed `Request`s, preserves exact operation identity and

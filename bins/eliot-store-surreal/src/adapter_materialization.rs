@@ -1,18 +1,17 @@
 //! Adapter configuration materialization cell for `eliot-store-surreal`.
 //!
-//! Architecture (verified):
-//! - `ELIOT_ARCHITECTURE.md` 4.5-draft `58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D8` R2 Canonical substrate (store API / store bridge / blob store bounded canonical substrate)
-//! - `ARCH-AUTH-01` Authority explicit, scoped and fenced
-//! - `ARCH-SEC-02` One canonical transition path
-//! - `ARCH-RES-01` Fail locally, recover globally
-//!
-//! Implementation (verified):
-//! - `ELIOT_IMPLEMENTATION.md` 0.29-draft `C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0B` `I2.2` capability-crate ownership and `I2.23` capability-family topology / crate extraction decisions
-//! - Store/provider credential boundary (`StoreLaunchConfig`/`credential_ref` via Windows Credential Manager `read_credential` vs provider `SurrealAdapterConfig`/`password` separation)
+//! Architecture: `docs/architecture/ELIOT_ARCHITECTURE.md` R2 Canonical
+//! substrate, `ARCH-AUTH-01` explicit scoped authority, `ARCH-SEC-02` one
+//! canonical transition path, and `ARCH-RES-01` local failure/global recovery.
+//! Implementation: `docs/architecture/ELIOT_IMPLEMENTATION.md:I2.23`
+//! capability-family topology and crate extraction decisions, plus the
+//! Store/provider credential boundary (`StoreLaunchConfig`/`credential_ref`
+//! through Windows Credential Manager `read_credential` versus provider
+//! `SurrealAdapterConfig`/`password` separation).
 //!
 //! This cell materializes provider configuration and credentials only; it owns no
 //! canonical/semantic authority, defaults, retries, Store writes, or readiness
-//! inference.
+//! inference. Normative precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
 
 use eliot_installation::InstallationProfile;
 use eliot_platform_windows::WindowsPlatform;

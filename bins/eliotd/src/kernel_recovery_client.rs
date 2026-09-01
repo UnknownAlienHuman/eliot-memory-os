@@ -10,7 +10,7 @@
 //!
 //! Architecture: A2.3, A12.3, A13.2, A13.6, ARCH-AUTH-01, ARCH-SEC-02,
 //! ARCH-RES-01, ARCH-RES-03.
-//! Implementation: I1.8, I2.2, I2.23, P.3, I14.21, I14.26.
+//! Implementation: I1.8, I2.23, P.3, I14.21, I14.26.
 //! Forbidden authority: no local canonical read path, owner/job default
 //! synthesis, semantic authority, lease/token minting, or success on an
 //! unknown or partially observed Store result.
