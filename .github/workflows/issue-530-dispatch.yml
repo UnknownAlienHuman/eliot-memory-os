@@ -3,7 +3,7 @@ name: Temporary issue 530 dispatcher
 on:
   workflow_run:
     workflows:
-      - Work 286 Current Rust Proof
+      - Work 340 OpenCode HTTP rustfmt proof
     types: [completed]
 
 permissions:
@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   cleanup:
-    if: github.event.workflow_run.id == 33328650908
+    if: github.event.workflow_run.id == 33329565643
     runs-on: windows-latest
     timeout-minutes: 120
 
