@@ -1,20 +1,16 @@
 //! Watchdog SCM self-admission cell — bounded timing and identity gate only.
-
 //!
-//! Architecture (verified via `codebase_memory` against `eliot-architecture-docs-fa941135` at `ELIOT_ARCHITECTURE.md`):
-//! R0 independent supervision — A0.3 Hard boundaries / A2.2 Watchdog и Doctor / A8 Watchdog /
-//! A13 Resilience, recovery и observability — SCM registration is read-only projection with
-//! fail-closed identity handles (PID + creation time + image path). No lifecycle authority.
+//! Current documentation authority:
+//! - `docs/architecture/ELIOT_ARCHITECTURE.md`: `A0.3`, `A2.2`, `A8`, and
+//!   `A13`.
+//! - `docs/architecture/ELIOT_IMPLEMENTATION.md`: `I8`, `I8.1`, `I8.2`,
+//!   `I8.3`, `I14.6`, and `I14.10`.
+//! - precedence: `docs/ARCHITECTURE_CONTRACT.md`.
 //!
-//! Implementation (verified via `codebase_memory` against `eliot-architecture-docs-fa941135` at `ELIOT_IMPLEMENTATION.md`
-//! and stale routing graph `eliot-memory-os-44e8b4b-live` verified against base `6ecf2b2217b5bd67247184928663a3e0584dedb9`):
-//! I8 Watchdog implementation contract (I8.1 Process and authority, I8.2 Independent observation routes,
-//! I8.3 Deterministic supervision loop) and I14 Queueing, backpressure and degraded behavior
-//! (I14.6 Durable work, admission and execution axes, I14.10 Supervision strategies and restart intensity)
-//! — Watchdog self-admission / bounded `SERVICE_START_PENDING` gate with wait-hint clamping.
-//!
-//! This cell explicitly forbids start/stop/registration mutation and semantic readiness authority.
-//! It owns only timing/bounded wait and same-process identity equality; it does not own
+//! SCM registration is a read-only projection with fail-closed process
+//! identity handles (PID, creation time, and image path). This cell owns only
+//! bounded wait timing and same-process identity equality. It owns no service
+//! start/stop/registration mutation, semantic readiness authority,
 //! HostObservation/HostIdentityMonitor, spool, Kernel sensor, or Host lifecycle.
 
 use std::path::Path;
