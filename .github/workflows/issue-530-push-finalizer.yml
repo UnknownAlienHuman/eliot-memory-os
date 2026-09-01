@@ -1,15 +1,14 @@
 name: Temporary issue 530 final verification
 
 on:
-  workflow_run:
-    workflows:
-      - Repository Policy
-    types: [completed]
-  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize, ready_for_review]
 
 permissions:
   contents: write
   actions: read
+  pull-requests: read
 
 concurrency:
   group: issue-530-final-verification
@@ -18,15 +17,15 @@ concurrency:
 env:
   BASE_SHA: 1fad3de311dc2add14c0f713c7c01ec55d4e4633
   SOURCE_BRANCH: fix/530-legacy-traceability-clean
-  SOURCE_SHA: 46288765cb81905818c26272ab92d6f0c8fe5ab2
+  SOURCE_SHA: 536ddb3b0259f75b58d8e85d3aafb90bcab92295
   CANDIDATE_BRANCH: fix/530-final-verified
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
   verify:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.id == 33269926612
-    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.ref == 'fix/530-legacy-traceability-clean'
+    runs-on: windows-latest
     timeout-minutes: 240
 
     steps:
@@ -36,7 +35,7 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          ref: fix/530-legacy-traceability-clean
+          ref: 536ddb3b0259f75b58d8e85d3aafb90bcab92295
           fetch-depth: 0
 
       - name: Bind exact source identity
@@ -51,11 +50,32 @@ jobs:
             throw "Source branch does not descend from declared base: $mergeBase"
           }
           "source_head=$sourceHead" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "base=$mergeBase" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Configure bounded build environment
+        shell: pwsh
+        run: |
+          $testTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          if (-not [IO.Path]::IsPathFullyQualified($testTemp) -or -not (Test-Path -LiteralPath $testTemp -PathType Container)) {
+            throw "Runner temp is not an existing absolute directory: $testTemp"
+          }
+          "TEMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_TARGET_DIR=$testTemp\eliot-issue-530-target" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_INCREMENTAL=0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_BUILD_JOBS=4" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force -Path .eliot | Out-Null
+
+      - name: Install verification dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --no-input -r scripts/requirements-verification.txt *>&1 |
+            Tee-Object -FilePath .eliot/pip-install.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Apply denominator-driven traceability cleanup
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path .eliot | Out-Null
           python .github/temporary/finalize_traceability.py *>&1 |
             Tee-Object -FilePath .eliot/issue-530-cleanup.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -68,7 +88,7 @@ jobs:
             Remove-Item -LiteralPath .github/temporary -Force
           }
 
-      - name: Prove all Rust code projections are unchanged
+      - name: Prove every Rust code projection is unchanged
         shell: pwsh
         run: |
           @'
@@ -96,22 +116,23 @@ jobs:
               if path.endswith(".rs")
           }
           if base_paths != current_paths:
-              missing = sorted(base_paths - current_paths)
-              added = sorted(current_paths - base_paths)
-              raise SystemExit(f"Rust path set changed: missing={missing} added={added}")
-
-          checked = 0
+              raise SystemExit(
+                  "Rust path set changed: "
+                  f"missing={sorted(base_paths-current_paths)} "
+                  f"added={sorted(current_paths-base_paths)}"
+              )
           for relative in sorted(base_paths):
-              before = subprocess.check_output(["git", "show", f"{base}:{relative}"]).decode("utf-8")
+              before = subprocess.check_output(
+                  ["git", "show", f"{base}:{relative}"]
+              ).decode("utf-8")
               after = Path(relative).read_text(encoding="utf-8")
               if code_projection(before) != code_projection(after):
                   raise SystemExit(f"non-comment Rust projection changed: {relative}")
-              checked += 1
-          print(f"RUST_CODE_PROJECTION: PASS files={checked}")
+          print(f"RUST_CODE_PROJECTION: PASS files={len(base_paths)}")
           '@ | python - *>&1 | Tee-Object -FilePath .eliot/rust-code-projection.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Enforce bounded final path set
+      - name: Enforce final mutable-path boundary
         shell: pwsh
         run: |
           $allowedNonRust = @(
@@ -120,6 +141,9 @@ jobs:
             'scripts/doc_code_conformance_lib/rust_comments.py'
           )
           $paths = @(git diff --name-only $env:BASE_SHA)
+          if ($paths.Count -lt 10) {
+            throw "Expected denominator-driven cleanup; only $($paths.Count) paths changed"
+          }
           $unexpected = @($paths | Where-Object {
             -not $_.EndsWith('.rs') -and $_ -notin $allowedNonRust
           })
@@ -136,13 +160,6 @@ jobs:
           }
           $paths | Sort-Object | Out-File -FilePath .eliot/final-paths.txt -Encoding utf8
           "changed_paths=$($paths.Count)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-
-      - name: Install bounded verification dependencies
-        shell: pwsh
-        run: |
-          python -m pip install --disable-pip-version-check --no-input -r scripts/requirements-verification.txt *>&1 |
-            Tee-Object -FilePath .eliot/pip-install.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Compile verification code
         shell: pwsh
@@ -168,19 +185,21 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
-      - name: Run full repository verification
+      - name: Run supported repository verification
         shell: pwsh
         run: |
           pwsh -NoProfile -File scripts/verify.ps1 *>&1 |
             Tee-Object -FilePath .eliot/repository-verification.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Run required workspace and hygiene proof
+      - name: Run formatting and focused tests
         shell: pwsh
         run: |
           cargo fmt --all -- --check *>&1 | Tee-Object -FilePath .eliot/cargo-fmt.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo check --locked --workspace --all-targets *>&1 | Tee-Object -FilePath .eliot/cargo-check.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p eliot-platform-windows --lib *>&1 | Tee-Object -FilePath .eliot/platform-windows-tests.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git diff --check $env:BASE_SHA *>&1 | Tee-Object -FilePath .eliot/diff-check.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -204,12 +223,12 @@ jobs:
           $message = @(
             'fix(docs): retire invalid source traceability',
             '',
-            'Clean the complete tracked Rust comment denominator, validate plain comment references against canonical indexes, remove satisfied exact allowances, and preserve every non-comment Rust projection.',
+            'Clean the complete tracked Rust comment denominator, validate plain Rust-comment references against canonical indexes, remove satisfied exact allowances, and preserve every non-comment Rust projection.',
             '',
             'Closes #530.'
           ) -join "`n"
           $candidate = ($message | git commit-tree $tree -p $remoteMain).Trim()
-          git push origin "$candidate`:refs/heads/$($env:CANDIDATE_BRANCH)"
+          git push --force origin "$candidate`:refs/heads/$($env:CANDIDATE_BRANCH)"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "candidate=$candidate" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           "parent=$remoteMain" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
