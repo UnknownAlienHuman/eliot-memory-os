@@ -1,13 +1,14 @@
 name: Temporary issue 530 PR dispatcher
 
 on:
-  pull_request_target:
-    types: [reopened]
+  workflow_run:
+    workflows:
+      - Code scanning AI findings on PR #300
+    types: [completed]
 
 permissions:
   contents: write
   actions: read
-  pull-requests: read
 
 concurrency:
   group: issue-530-pr-dispatcher
@@ -16,10 +17,8 @@ concurrency:
 jobs:
   cleanup:
     if: >-
-      github.event.pull_request.number == 532 &&
-      github.event.pull_request.base.ref == 'main' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.ref == 'fix/530-normative-traceability'
+      github.event.workflow_run.id == 33317647246 &&
+      github.event.workflow_run.run_attempt >= 2
     runs-on: windows-latest
     timeout-minutes: 120
 
