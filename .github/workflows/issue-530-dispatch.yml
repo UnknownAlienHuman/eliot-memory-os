@@ -1,8 +1,10 @@
 name: Temporary issue 530 dispatcher
 
 on:
-  issues:
-    types: [opened]
+  workflow_run:
+    workflows:
+      - Work 140 Codex stable wire proof
+    types: [completed]
 
 permissions:
   contents: write
@@ -17,13 +19,12 @@ env:
   ORIGINAL_BASE_SHA: 35a0c7de93c84489684adf7730dca236f8335162
   ORIGINAL_BASE_TREE: 9c79b86ea5dc050415b9b0e4079e8ffe410eb917
   BRANCH_NAME: fix/530-normative-traceability
-  TRIGGER_TITLE: "[issue-530-run] close normative traceability"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
   cleanup:
-    if: github.event.issue.title == '[issue-530-run] close normative traceability'
+    if: github.event.workflow_run.id == 33330947385
     runs-on: windows-latest
     timeout-minutes: 120
 
