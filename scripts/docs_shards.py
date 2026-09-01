@@ -2,14 +2,16 @@
 """Hardened front door for the sharded-documentation verifier and generator.
 
 The byte-preserving sharding implementation remains in ``docs_shards_core``.
-This front door owns the verified-reader text emitted into navigation surfaces,
-portable Markdown path checks, and focused negative fixtures.
+This front door owns verified-reader navigation text, portable Markdown checks,
+and the generated Decision Anchor projection derived from canonical A16.1.
 """
 
 from __future__ import annotations
 
+import argparse
 import html
 import os
+import sys
 import tempfile
 import urllib.parse
 from pathlib import Path
@@ -17,6 +19,7 @@ from typing import Any, Sequence
 
 import docs_shards_core as _core
 from docs_shards_core import *  # noqa: F403
+from docs_shards_lib import decision_anchors as _decision_anchors
 
 DOC_LINK_EXACT_CASE_V1 = "eliot-doc-link-exact-case-v1"
 LINK_SCAN_SKIP_PARTS = {
@@ -35,6 +38,8 @@ LINK_SCAN_SKIP_PARTS = {
 }
 
 _core_patch_navigation_surfaces = _core.patch_navigation_surfaces
+_core_verify_generated_surfaces = _core.verify_generated_surfaces
+_core_migrate = _core.migrate
 _core_self_test = _core.self_test
 
 
@@ -160,8 +165,9 @@ Do not mutate the repository when:
 ## Context discipline
 
 The reader returns decision-sufficient fragments, not every related section.
-The compatibility maps, full handle index, and assembled books are navigation or
-audit surfaces. They are prohibited as default agent context.
+The compatibility maps, full handle index, Decision Anchor index, and assembled
+books are navigation or audit surfaces. They are prohibited as default agent
+context.
 
 To inspect all changed paths at once:
 
@@ -205,7 +211,8 @@ A route alone is navigation, not reading evidence. The local
 
 - [Mandatory verified-reading protocol](READING_PROTOCOL.md)
 - [Task/path route matrix](ROUTES.md)
-- [Exact handle index](HANDLE_INDEX.md)
+- [Exact numeric-handle index](HANDLE_INDEX.md)
+- [Decision Anchor index](DECISION_ANCHOR_INDEX.md)
 - [Architecture bounded index](architecture/README.md)
 - [Implementation bounded index](implementation/README.md)
 - [Architecture authority](../ARCHITECTURE_CONTRACT.md)
@@ -245,7 +252,11 @@ def _case_resolution(root: Path, requested: Path) -> tuple[str, Path | None]:
         if exact is not None:
             current = exact
             continue
-        folded = [entry for name, entry in entries.items() if name.casefold() == part.casefold()]
+        folded = [
+            entry
+            for name, entry in entries.items()
+            if name.casefold() == part.casefold()
+        ]
         if folded:
             return "case_mismatch", folded[0]
         return "missing", None
@@ -300,7 +311,8 @@ def verify_markdown_links(root: Path) -> dict[str, int]:
                     else "<unknown>"
                 )
                 failures.append(
-                    f"{relative_source} -> case mismatch: {dest} (actual component: {actual})"
+                    f"{relative_source} -> case mismatch: {dest} "
+                    f"(actual component: {actual})"
                 )
                 continue
             if status == "missing" or resolved is None:
@@ -340,8 +352,28 @@ def verify_markdown_links(root: Path) -> dict[str, int]:
     return {"markdown_files": len(markdown_files), "links_checked": checked}
 
 
+def verify_generated_surfaces(
+    root: Path,
+    manifests: dict[str, dict[str, Any]],
+) -> None:
+    _core_verify_generated_surfaces(root, manifests)
+    try:
+        _decision_anchors.verify_generated(root)
+    except _decision_anchors.DecisionAnchorError as exc:
+        raise DocsError(str(exc)) from exc  # noqa: F405
+
+
+def migrate(root: Path) -> None:
+    _core_migrate(root)
+    try:
+        _decision_anchors.write_generated(root)
+    except _decision_anchors.DecisionAnchorError as exc:
+        raise DocsError(str(exc)) from exc  # noqa: F405
+
+
 def self_test() -> None:
     _core_self_test()
+    _decision_anchors.self_test()
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -360,7 +392,9 @@ def self_test() -> None:
         )
         result = verify_markdown_links(root)
         if result["markdown_files"] != 2:
-            raise DocsError("generated-directory exclusion self-test failed")  # noqa: F405
+            raise DocsError(  # noqa: F405
+                "generated-directory exclusion self-test failed"
+            )
 
         status, _ = _case_resolution(root, docs / "target.md")
         if status != "case_mismatch":
@@ -378,7 +412,33 @@ def self_test() -> None:
         else:
             raise DocsError("case-mismatch link self-test failed")  # noqa: F405
 
-    print("DOC_SHARDS_HARDENING_SELF_TEST: PASS cases=3")
+    print("DOC_SHARDS_HARDENING_SELF_TEST: PASS cases=7")
+
+
+def _refresh_indexes(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="docs_shards.py refresh-indexes",
+        description="Regenerate deterministic documentation indexes.",
+    )
+    parser.add_argument("--root", type=Path, default=Path("."))
+    parser.add_argument("--check", action="store_true")
+    args = parser.parse_args(list(argv))
+    try:
+        if args.check:
+            _decision_anchors.verify_generated(args.root)
+            action = "CHECK"
+        else:
+            _decision_anchors.write_generated(args.root)
+            _decision_anchors.verify_generated(args.root)
+            action = "WRITE"
+        print(
+            "DOC_DECISION_ANCHOR_INDEX: PASS "
+            f"action={action} schema={_decision_anchors.SCHEMA}"
+        )
+        return 0
+    except _decision_anchors.DecisionAnchorError as exc:
+        print(f"DOC_DECISION_ANCHOR_INDEX_FAIL: {exc}", file=sys.stderr)
+        return 1
 
 
 _core.routing_block = routing_block
@@ -387,8 +447,16 @@ _core.render_reading_protocol = render_reading_protocol
 _core.render_architecture_readme = render_architecture_readme
 _core.render_topic_index = render_topic_index
 _core.verify_markdown_links = verify_markdown_links
+_core.verify_generated_surfaces = verify_generated_surfaces
+_core.migrate = migrate
 _core.self_test = self_test
-main = _core.main
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "refresh-indexes":
+        return _refresh_indexes(arguments[1:])
+    return _core.main(arguments)
 
 
 if __name__ == "__main__":
