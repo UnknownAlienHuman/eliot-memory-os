@@ -1,6 +1,6 @@
 //! Host physical launch cell — approved physical path/digest/environment, suspended launch, Windows Job containment, identity-before-resume, Store-then-Kernel ordering, and liveness cleanup.
 //! Architecture `ARCH-MOD-01` Small living Kernel, `ARCH-MOD-02` Depth is additive and micro-modular, `ARCH-PORT-01` Organs and execution contours are replaceable.
-//! Implementation `I1.2` Host owns approved artifacts and `HostInstallationEpoch`, `I1.4` physical start-stop of two isolated Job branches (`Host-owned Kernel Job Object` / `Host-owned canonical-store Job Object`, `KILL_ON_JOB_CLOSE`), `I1.11` Store starts before Kernel readiness (`launch_store_then_kernel`), `I10.8.2` suspended launch plus Job assignment plus exact image identity before resume (`SuspendedJobChild::spawn_named` + `validate` + `resume`), `I2.2` / `I2.23` this module is a micro-module only (`CrateExtractionDecision`).
+//! Implementation `I1.2` Host owns approved artifacts and `HostInstallationEpoch`, `I1.4` physical start-stop of two isolated Job branches (`Host-owned Kernel Job Object` / `Host-owned canonical-store Job Object`, `KILL_ON_JOB_CLOSE`), `I1.11` Store starts before Kernel readiness (`launch_store_then_kernel`), `I10.8.2` suspended launch plus Job assignment plus exact image identity before resume (`SuspendedJobChild::spawn_named` + `validate` + `resume`), `I2.23` this module is a micro-module only (`CrateExtractionDecision`).
 //! Forbidden: no semantic, canonical, Kernel, Governor, Surreal SDK, SCM, or Watchdog authority; no default, retry, or adoption.
 
 #[cfg(windows)]
