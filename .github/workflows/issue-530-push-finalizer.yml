@@ -1,0 +1,181 @@
+name: Temporary issue 530 final verification
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: issue-530-final-verification
+  cancel-in-progress: false
+
+env:
+  BASE_SHA: 1fad3de311dc2add14c0f713c7c01ec55d4e4633
+  SOURCE_BRANCH: fix/530-legacy-traceability-clean
+  CANDIDATE_BRANCH: fix/530-final-verified
+  TRIGGER_MESSAGE: ci(docs): trigger issue 530 finalizer
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  verify:
+    if: github.event.head_commit.message == 'ci(docs): trigger issue 530 finalizer'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/530-legacy-traceability-clean
+          fetch-depth: 0
+
+      - name: Bind source and base identity
+        shell: pwsh
+        run: |
+          $sourceHead = (git rev-parse HEAD).Trim()
+          $mergeBase = (git merge-base HEAD $env:BASE_SHA).Trim()
+          if ($mergeBase -ne $env:BASE_SHA) {
+            throw "Source branch does not descend from declared base: $mergeBase"
+          }
+          "SOURCE_HEAD=$sourceHead" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "source_head=$sourceHead" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Apply deterministic finalizer
+        shell: pwsh
+        run: |
+          python .github/temporary/finalize_traceability.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Remove one-shot helper
+        shell: pwsh
+        run: |
+          Remove-Item -LiteralPath .github/temporary/finalize_traceability.py -Force
+          if ((Test-Path -LiteralPath .github/temporary) -and -not (Get-ChildItem -LiteralPath .github/temporary -Force)) {
+            Remove-Item -LiteralPath .github/temporary -Force
+          }
+
+      - name: Prove Rust executable bodies are unchanged
+        shell: pwsh
+        run: |
+          @'
+          import re
+          import subprocess
+          from pathlib import Path
+
+          base = "1fad3de311dc2add14c0f713c7c01ec55d4e4633"
+          root = Path(".")
+          leading = re.compile(r"\A(?://!.*(?:\r?\n|\Z))+" )
+
+          def body(text: str) -> str:
+              match = leading.match(text)
+              return text[match.end():] if match else text
+
+          changed = subprocess.check_output(
+              ["git", "diff", "--name-only", base], text=True
+          ).splitlines()
+          rust = sorted(path for path in changed if path.endswith(".rs"))
+          if len(rust) != 14:
+              raise SystemExit(f"expected 14 Rust files, got {len(rust)}: {rust}")
+          for relative in rust:
+              before = subprocess.check_output(
+                  ["git", "show", f"{base}:{relative}"], text=True
+              )
+              after = Path(relative).read_text(encoding="utf-8")
+              if body(before) != body(after):
+                  raise SystemExit(f"non-comment Rust body changed: {relative}")
+          print(f"RUST_COMMENT_ONLY: PASS files={len(rust)}")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Enforce exact final path set
+        shell: pwsh
+        run: |
+          $paths = @(git diff --name-only $env:BASE_SHA)
+          $rust = @($paths | Where-Object { $_.EndsWith('.rs') })
+          $other = @($paths | Where-Object { -not $_.EndsWith('.rs') })
+          if ($rust.Count -ne 14) { throw "Expected 14 Rust paths, got $($rust.Count)" }
+          if ($other.Count -ne 1 -or $other[0] -ne 'config/doc-code-conformance.toml') {
+            throw "Unexpected non-Rust paths: $($other -join ', ')"
+          }
+          $paths | Sort-Object | Out-File -FilePath .eliot/final-paths.txt -Encoding utf8
+
+      - name: Install verification dependencies
+        run: python -m pip install --disable-pip-version-check --no-input -r scripts/requirements-verification.txt
+
+      - name: Compile and execute documentation gates
+        shell: pwsh
+        run: |
+          python -m py_compile scripts/verify-doc-code-conformance.py scripts/doc_code_conformance_core.py scripts/doc_code_conformance_lib/*.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify-doc-code-conformance.py --self-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify-doc-code-conformance.py --root . --json-out .eliot/doc-code-conformance.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/docs_shards.py self-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/docs_shards.py verify --root .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/docs_router.py self-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/docs_router.py check --root .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/docs_read.py self-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run repository verification
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/verify.ps1
+
+      - name: Verify formatting and diff hygiene
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked -p eliot-platform-windows --all-targets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check $env:BASE_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build one-parent verified candidate
+        shell: pwsh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          $tree = (git write-tree).Trim()
+          git fetch --no-tags origin main
+          $remoteMain = (git rev-parse origin/main).Trim()
+          $unexpected = @(git diff --name-only $env:BASE_SHA $remoteMain | Where-Object {
+            $_ -ne '.github/workflows/issue-530-push-finalizer.yml' -and
+            $_ -ne '.github/temporary/issue-530-trigger.txt'
+          })
+          if ($unexpected.Count -ne 0) {
+            throw "main advanced on unexpected paths: $($unexpected -join ', ')"
+          }
+          $message = @(
+            'fix(docs): retire remaining legacy traceability',
+            '',
+            'Replace the remaining pre-sharding source headers with current sharded paths and canonical identifiers, remove satisfied legacy allowances, and preserve every Rust executable token.',
+            '',
+            'Closes #530.'
+          ) -join "`n"
+          $candidate = ($message | git commit-tree $tree -p $remoteMain).Trim()
+          git push --force-with-lease="refs/heads/$($env:CANDIDATE_BRANCH)" origin "$candidate`:refs/heads/$($env:CANDIDATE_BRANCH)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "candidate=$candidate" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "parent=$remoteMain" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Upload proof receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-530-final-proof
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            .eliot/issue-530-finalizer.json
+            .eliot/doc-code-conformance.json
+            .eliot/final-paths.txt
