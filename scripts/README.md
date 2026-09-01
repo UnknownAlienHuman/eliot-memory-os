@@ -23,6 +23,7 @@ committed as repository authority.
 | `docs_router.py` | Public router front door: reject unsafe paths, include deletions in changed-path routing, and emit bounded content-addressed route receipts | Documentation routing evidence only |
 | `docs_router_core.py` | Byte-preserved router implementation called by `docs_router.py`; not a separate operator entrypoint | Internal documentation implementation |
 | `docs_read.py` | Verify routed files/fragments by hash and byte count, materialize a bounded bundle, and emit a read receipt | Documentation reading evidence only |
+| `docs_closure_audit.py` | Temporary independent audit of shard reconstruction, original Git blobs, generated indexes, operational references, and workstream issue-state parity | Audit evidence for the current documentation closure only; remove after closure |
 | `code_navigation.py` | Navigate current Cargo packages, Rust files, logical blocks, local dependencies, and documentation routes | Repository navigation and static path/dependency consistency only |
 | `verify-doc-code-conformance.py` | Public conformance front door for reader instructions, workflow claims, retired/nonexistent references, script/binary maps, owner bindings, and documentation-pipeline integrity | Static repository path/inventory/instruction consistency only |
 | `doc_code_conformance_core.py` | Established deterministic DCC-001…DCC-007 implementation called by the public conformance front door | Internal conformance implementation |
@@ -52,7 +53,7 @@ python scripts/verify-doc-code-conformance.py --self-test
 python scripts/verify-doc-code-conformance.py --root . --json-out .eliot/doc-code-conformance.json
 ```
 
-Issue #291 owns the conformance gate. Its policy is
+The conformance policy introduced by issue #291 lives at
 `config/doc-code-conformance.toml`; findings fail nonzero:
 
 - `DCC-001` — verified-reader contract drift across instruction/generator surfaces;
@@ -67,10 +68,11 @@ Issue #291 owns the conformance gate. Its policy is
 - `DCC-012` — Markdown paths are not checked for exact case cross-platform;
 - `DCC-013` — drive-qualified paths are accepted as repository-relative.
 
-The conformance gate remains outside `just quick` until the complete exact
-candidate reports zero findings and the result is recorded in the owning PR.
-A clean result still proves no Architecture semantics, compilation, runtime
-behavior, authority correctness, Product acceptance, or release support.
+The conformance self-test and repository audit run from `just quick` and
+`scripts/verify.ps1`; `scripts/verify.sh` delegates to the same PowerShell-owned
+profile. Any finding fails the normal local verification path. A clean result
+still proves no Architecture semantics, compilation, runtime behavior, authority
+correctness, Product acceptance, or release support.
 
 ## Agent route, host, and model-selection utilities
 
