@@ -1809,12 +1809,12 @@ mod tests {
         assert_eq!(schema["type"], "object");
         // StateFence may be inlined or via $defs; verify it is object-typed.
         let state_fence_schema = if schema["properties"]["state_fence"]["$ref"].is_string() {
-            let def_name = schema["properties"]["state_fence"]["$ref"]
-                .as_str()
-                .unwrap()
-                .rsplit('/')
-                .next()
-                .unwrap();
+            let Some(def_ref) = schema["properties"]["state_fence"]["$ref"].as_str() else {
+                panic!("state_fence $ref must be a string");
+            };
+            let Some(def_name) = def_ref.rsplit('/').next() else {
+                panic!("state_fence $ref must contain '/'");
+            };
             schema["$defs"][def_name].clone()
         } else {
             schema["properties"]["state_fence"].clone()
@@ -1823,10 +1823,10 @@ mod tests {
         assert_eq!(state_fence_schema["type"], "object");
         assert_ne!(state_fence_schema["type"], "string");
         // Also ensure the canonical StateFence $defs is object-typed if present.
-        if let Some(defs) = schema["$defs"].as_object() {
-            if let Some(sf) = defs.get("StateFence") {
-                assert_eq!(sf["type"], "object");
-            }
+        if let Some(defs) = schema["$defs"].as_object()
+            && let Some(sf) = defs.get("StateFence")
+        {
+            assert_eq!(sf["type"], "object");
         }
         // Ensure no legacy string fallback is present.
         let s = schema.to_string();
