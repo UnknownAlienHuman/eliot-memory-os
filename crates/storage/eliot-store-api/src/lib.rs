@@ -388,7 +388,7 @@ pub fn is_genesis_fence(fence: &StateFence) -> bool {
 macro_rules! opaque_id {
     ($(#[$meta:meta])* $name:ident, $field:literal) => {
         $(#[$meta])*
-        #[derive(Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+        #[derive(Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -397,6 +397,12 @@ macro_rules! opaque_id {
             pub fn new(value: impl Into<String>) -> Result<Self, StoreError> {
                 let value = value.into();
                 validate_text(&value, $field)?;
+                if value.trim().len() != value.len() {
+                    return Err(StoreError::InvalidField {
+                        field: $field,
+                        reason: "blank or control character",
+                    });
+                }
                 Ok(Self(value))
             }
 
@@ -407,6 +413,16 @@ macro_rules! opaque_id {
         impl std::fmt::Display for $name {
             fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(&self.0)
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
             }
         }
     };
@@ -1879,6 +1895,7 @@ pub trait CanonicalStoreClient: Send + Sync {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
