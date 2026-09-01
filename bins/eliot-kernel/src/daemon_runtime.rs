@@ -2,7 +2,7 @@
 //!
 //! Owns the `eliotd` launch descriptor and runtime status transitions with bounded recovery.
 //! Architecture: A8.1, A13.2, A13.3, ARCH-WDG-01, ARCH-RES-01, ARCH-RES-04.
-//! Implementation: I1.4, I1.5, I8.1, I8.2, I8.3, I8.4, I14.10, I14.15; extraction topology I2.2, I2.23.
+//! Implementation: I1.4, I1.5, I8.1, I8.2, I8.3, I8.4, I14.10, I14.15; extraction topology I2.23.
 //! Forbidden: no semantic readiness oracle, alternate authority, unbounded restart, or fabricated launch success.
 
 use std::sync::atomic::Ordering;
