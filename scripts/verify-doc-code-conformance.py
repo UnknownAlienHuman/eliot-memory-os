@@ -3,8 +3,8 @@
 
 The complete DCC-001..007 checks remain in ``doc_code_conformance_core``. This
 front door preserves fail-closed configured-root handling, adds documentation
-pipeline checks DCC-010..013, and validates canonical numeric handles and
-Decision Anchors through DCC-015..017.
+pipeline checks DCC-010..013, retires bounded stale traceability through DCC-014,
+and validates canonical numeric handles and Decision Anchors through DCC-015..017.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Any, Iterable, Sequence
 
 import doc_code_conformance_core as _core
 from doc_code_conformance_core import *  # noqa: F403
-from doc_code_conformance_lib import normative_references
+from doc_code_conformance_lib import normative_references, traceability_retirement
 
 _base_audit = _core.audit
 _base_self_test = _core.self_test
@@ -158,10 +158,13 @@ def audit(
 ) -> tuple[list[Finding], dict[str, int]]:  # noqa: F405
     findings, metrics = _base_audit(root, cfg)
     pipeline_findings, pipeline_metrics = documentation_pipeline_findings(root, cfg)
+    traceability_findings, traceability_metrics = traceability_retirement.findings(root)
     normative_findings, normative_metrics = normative_references.reference_findings(root)
     findings.extend(pipeline_findings)
+    findings.extend(traceability_findings)
     findings.extend(normative_findings)
     metrics.update(pipeline_metrics)
+    metrics.update(traceability_metrics)
     metrics.update(normative_metrics)
     return sorted(set(findings)), metrics
 
@@ -290,13 +293,17 @@ def self_test() -> None:
         _expect_pipeline_finding(root, cfg, "DCC-013")
 
     try:
+        traceability_retirement.self_test()
         normative_references.self_test()
-    except normative_references.ReferenceAuditError as exc:
+    except (
+        traceability_retirement.TraceabilityError,
+        normative_references.ReferenceAuditError,
+    ) as exc:
         raise AuditError(  # noqa: F405
-            f"normative-reference conformance self-test failed: {exc}"
+            f"extended documentation conformance self-test failed: {exc}"
         ) from exc
 
-    print("DOC_CODE_CONFORMANCE_PIPELINE_SELF_TEST: PASS cases=14")
+    print("DOC_CODE_CONFORMANCE_PIPELINE_SELF_TEST: PASS cases=19")
 
 
 _core.audit = audit
