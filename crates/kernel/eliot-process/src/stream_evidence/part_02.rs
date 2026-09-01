@@ -203,11 +203,23 @@ impl ProcessStreamPrefixPreview {
                 limit: MAX_PREVIEW_BYTES,
             });
         }
+        if u64::try_from(self.bytes.len()).unwrap_or(u64::MAX) > MAX_PREVIEW_BYTES as u64 {
+            return Err(ProcessStreamEvidenceError::LimitExceeded {
+                field: "preview.retained_bytes",
+                limit: MAX_PREVIEW_BYTES,
+            });
+        }
         let retained_bytes = usize_to_u64("preview.retained_bytes", self.bytes.len())?;
         if self.retained_bytes != retained_bytes {
             return Err(ProcessStreamEvidenceError::Invariant {
                 field: "preview.retained_bytes",
                 reason: "retained byte count does not match inline bytes",
+            });
+        }
+        if self.retained_bytes > MAX_PREVIEW_BYTES as u64 {
+            return Err(ProcessStreamEvidenceError::LimitExceeded {
+                field: "preview.retained_bytes",
+                limit: MAX_PREVIEW_BYTES,
             });
         }
         validate_digest("preview.sha256", &self.sha256)?;
@@ -238,7 +250,27 @@ impl ProcessStreamPrefixPreview {
                 reason: "retained bytes cannot exceed represented bytes",
             });
         }
-        if self.omitted_ranges != omitted_suffix(self.retained_bytes, self.represented_bytes)? {
+        // Bounded retained-prefix must expose exactly the omitted suffix: empty when complete,
+        // single [retained, represented) when truncated. This makes truncation unambiguous.
+        let expected_omitted = omitted_suffix(self.retained_bytes, self.represented_bytes)?;
+        if self.is_truncated() {
+            if expected_omitted.len() != 1
+                || self.omitted_ranges.len() != 1
+                || self.omitted_ranges[0].start() != self.retained_bytes
+                || self.omitted_ranges[0].end_exclusive() != self.represented_bytes
+            {
+                return Err(ProcessStreamEvidenceError::Invariant {
+                    field: "preview.omitted_ranges",
+                    reason: "truncated preview must expose exactly one omitted suffix range",
+                });
+            }
+        } else if !self.omitted_ranges.is_empty() {
+            return Err(ProcessStreamEvidenceError::Invariant {
+                field: "preview.omitted_ranges",
+                reason: "complete preview cannot carry omitted ranges",
+            });
+        }
+        if self.omitted_ranges != expected_omitted {
             return Err(ProcessStreamEvidenceError::Invariant {
                 field: "preview.omitted_ranges",
                 reason: "prefix preview must expose the exact omitted suffix",

@@ -1297,6 +1297,44 @@ fn binding_stream_policy_source_and_evidence_authority_mismatches_reject() -> Te
 }
 
 #[test]
+fn retained_prefix_sink_limits_enforce_max_preview_and_omitted_range() -> TestResult {
+    // Sink limits must never exceed the kernel evidence ceiling.
+    assert!(
+        ProcessStreamSinkLimits::new(4, 16, 4, 16 * 1024 * 1024 + 1, 2, 8, 10, 20, 20).is_err()
+    );
+    let session = session("one")?;
+    // Preview at the sink ceiling is accepted, beyond is rejected via validate_preview_limit.
+    let at_ceiling = ProcessStreamPrefixPreview::from_transport_prefix(vec![b'a'; 8], 8)?;
+    assert!(
+        session
+            .validate_finalize(&ProcessStreamSinkFinalizeRequest::new(
+                session.terminal_id().clone(),
+                0,
+                8,
+                1,
+                StreamTransportStatus::Complete,
+                sha256_hex(&[b'a'; 8]),
+                8,
+                at_ceiling,
+                None,
+                Vec::new(),
+            )?)
+            .is_ok()
+    );
+
+    // Omitted-range must be exactly the suffix; truncated preview cannot hide omitted range.
+    let truncated = ProcessStreamPrefixPreview::from_transport_prefix(b"ab".to_vec(), 6)?;
+    assert!(truncated.is_truncated());
+    assert_eq!(truncated.omitted_ranges().len(), 1);
+    assert_eq!(truncated.omitted_ranges()[0].start(), 2);
+    assert_eq!(truncated.omitted_ranges()[0].end_exclusive(), 6);
+    let complete = ProcessStreamPrefixPreview::from_transport_prefix(b"abc".to_vec(), 3)?;
+    assert!(!complete.is_truncated());
+    assert!(complete.omitted_ranges().is_empty());
+    Ok(())
+}
+
+#[test]
 fn abort_reasons_are_closed_and_readback_contains_no_payload_view() -> TestResult {
     for reason in [
         ProcessStreamSinkAbortReason::Cancellation,

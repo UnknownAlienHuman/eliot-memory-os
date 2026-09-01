@@ -332,6 +332,17 @@ impl ProcessStreamEvidence {
                         reason: "complete transport preview must match observed stream identity",
                     });
                 }
+                // Truncated prefix evidence can never look equivalent to complete raw output:
+                // retained-prefix digest is scoped to retained bytes only and must not imply
+                // a full-stream digest when bytes were discarded.
+                if self.preview.is_truncated()
+                    && self.preview.sha256 == self.observed_sha256
+                {
+                    return Err(ProcessStreamEvidenceError::Invariant {
+                        field: "preview.sha256",
+                        reason: "truncated transport preview must not match complete observed digest",
+                    });
+                }
             }
             StreamPreviewRepresentation::DurableSourceBytes => {
                 let source = self
@@ -502,6 +513,14 @@ impl ProcessStreamEvidence {
                                     reason: "shorter exact source requires a persistence coverage gap",
                                 });
                             }
+                            // Exact shorter PartialSource must prove the retained prefix identity:
+                            // the transport-prefix [0, byte_length) is exactly the durable source.
+                            if source.byte_length >= self.observed_bytes {
+                                return Err(ProcessStreamEvidenceError::Invariant {
+                                    field: "source.byte_length",
+                                    reason: "shorter exact source must be strictly shorter than observed transport",
+                                });
+                            }
                             let prefix = self.transport_prefix_identity.as_ref().ok_or(
                                 ProcessStreamEvidenceError::Invariant {
                                     field: "transport_prefix_identity",
@@ -514,6 +533,12 @@ impl ProcessStreamEvidence {
                                 return Err(ProcessStreamEvidenceError::Invariant {
                                     field: "transport_prefix_identity",
                                     reason: "prefix identity must exactly match the shorter durable source",
+                                });
+                            }
+                            if prefix.byte_length >= self.observed_bytes {
+                                return Err(ProcessStreamEvidenceError::Invariant {
+                                    field: "transport_prefix_identity.byte_length",
+                                    reason: "prefix identity must be strictly shorter than observed transport",
                                 });
                             }
                         }

@@ -813,4 +813,257 @@ mod tests {
         assert!(serde_json::from_value::<ProcessStreamEvidence>(promoted).is_err());
         Ok(())
     }
+
+    #[test]
+    fn truncated_transport_preview_is_distinct_from_complete_and_requires_exact_omitted_suffix(
+    ) -> TestResult {
+        // Truncated TransportBytes: retained < observed, omitted [retained, observed), digest scoped to retained.
+        let observed = b"abcdef";
+        let retained = b"abc";
+        let preview = ProcessStreamPrefixPreview::from_transport_prefix(retained.to_vec(), 6)?;
+        assert!(preview.is_truncated());
+        assert_eq!(preview.retained_bytes(), 3);
+        assert_eq!(preview.represented_bytes(), 6);
+        assert_eq!(preview.omitted_ranges().len(), 1);
+        assert_eq!(preview.omitted_ranges()[0].start(), 3);
+        assert_eq!(preview.omitted_ranges()[0].end_exclusive(), 6);
+        // Digest is for retained prefix only, not full stream.
+        assert_eq!(preview.sha256(), sha256_hex(retained));
+        assert_ne!(preview.sha256(), sha256_hex(observed));
+
+        // Complete non-truncated preview must match observed digest.
+        let complete = ProcessStreamPrefixPreview::from_transport_prefix(observed.to_vec(), 6)?;
+        assert!(!complete.is_truncated());
+        assert!(complete.omitted_ranges().is_empty());
+        assert_eq!(complete.sha256(), sha256_hex(observed));
+
+        // Truncated preview must not be accepted as complete evidence with same observed digest.
+        let truncated_with_complete_digest = ProcessStreamEvidence::new_raw(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::SourceUnavailable,
+            sha256_hex(retained),
+            3,
+            preview.clone(),
+            None,
+            vec![StreamEvidenceGap::PersistenceUnavailable],
+        );
+        // TransportBytes truncated is allowed for unavailable source, but the preview
+        // representation already enforces represented == observed (6), so observed 3 would fail.
+        assert!(truncated_with_complete_digest.is_err());
+
+        // Proper truncated evidence keeps represented == observed (6) and is distinct from complete handle.
+        let valid_truncated = ProcessStreamEvidence::new_raw(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::CompleteSource,
+            sha256_hex(observed),
+            6,
+            preview,
+            Some(exact_source(observed)?),
+            Vec::new(),
+        )?;
+        let valid_complete = ProcessStreamEvidence::new_raw(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::CompleteSource,
+            sha256_hex(observed),
+            6,
+            complete,
+            Some(exact_source(observed)?),
+            Vec::new(),
+        )?;
+        assert_ne!(
+            valid_truncated.preview().sha256(),
+            valid_truncated.observed_sha256()
+        );
+        assert_eq!(
+            valid_complete.preview().sha256(),
+            valid_complete.observed_sha256()
+        );
+        assert_ne!(
+            valid_truncated.identity_sha256()?,
+            valid_complete.identity_sha256()?
+        );
+        // Deserialization must reject truncated preview that claims complete digest.
+        let mut wire = serde_json::to_value(&valid_truncated)?;
+        wire["preview"]["sha256"] = serde_json::json!(sha256_hex(observed));
+        assert!(serde_json::from_value::<ProcessStreamEvidence>(wire).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn complete_source_rejects_incomplete_truncated_or_gap_evidence() -> TestResult {
+        // CompleteSource requires Complete transport, no gaps, and exact source matching observed.
+        let observed = b"abc";
+        let gap = StreamEvidenceGap::PersistenceUnavailable;
+        let incomplete_transport = ProcessStreamEvidence::new_raw(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::ReadFailed,
+            StreamPersistenceStatus::CompleteSource,
+            sha256_hex(observed),
+            3,
+            ProcessStreamPrefixPreview::from_transport_prefix(observed.to_vec(), 3)?,
+            Some(exact_source(observed)?),
+            Vec::new(),
+        );
+        assert!(incomplete_transport.is_err());
+
+        let with_gap = ProcessStreamEvidence::new_raw(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::CompleteSource,
+            sha256_hex(observed),
+            3,
+            ProcessStreamPrefixPreview::from_transport_prefix(observed.to_vec(), 3)?,
+            Some(exact_source(observed)?),
+            vec![gap],
+        );
+        assert!(with_gap.is_err());
+
+        let mismatched_source = DurableProcessStreamSource::exact_transport(
+            DurableStreamLocatorKind::Blob,
+            "eliot://blob/mismatch",
+            "receipt:mismatch",
+            "d".repeat(64),
+            3,
+        )?;
+        let mismatched = ProcessStreamEvidence::new_raw(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::CompleteSource,
+            sha256_hex(observed),
+            3,
+            ProcessStreamPrefixPreview::from_transport_prefix(observed.to_vec(), 3)?,
+            Some(mismatched_source),
+            Vec::new(),
+        );
+        assert!(mismatched.is_err());
+
+        // Valid CompleteSource remains accepted.
+        assert!(ProcessStreamEvidence::new_raw(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::CompleteSource,
+            sha256_hex(observed),
+            3,
+            ProcessStreamPrefixPreview::from_transport_prefix(observed.to_vec(), 3)?,
+            Some(exact_source(observed)?),
+            Vec::new(),
+        )
+        .is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn shorter_partial_source_requires_exact_transport_prefix_identity_strictly_shorter(
+    ) -> TestResult {
+        let observed = b"abcdef";
+        let shorter = b"abc";
+        // Valid shorter partial: source < observed, prefix matches source, persistence gap present.
+        assert!(ProcessStreamEvidence::new_raw_with_transport_prefix_identity(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::PartialSource,
+            sha256_hex(observed),
+            6,
+            ProcessStreamPrefixPreview::from_transport_prefix(b"ab".to_vec(), 6)?,
+            Some(exact_source(shorter)?),
+            Some(prefix_identity(shorter)?),
+            vec![StreamEvidenceGap::PersistenceFailed],
+        )
+        .is_ok());
+
+        // Prefix must be strictly shorter than observed.
+        let equal_prefix = ProcessStreamEvidence::new_raw_with_transport_prefix_identity(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::ReadFailed,
+            StreamPersistenceStatus::PartialSource,
+            sha256_hex(observed),
+            6,
+            ProcessStreamPrefixPreview::from_transport_prefix(observed.to_vec(), 6)?,
+            Some(exact_source(observed)?),
+            Some(prefix_identity(observed)?),
+            vec![StreamEvidenceGap::TransportReadFailed],
+        );
+        assert!(equal_prefix.is_err());
+
+        // Source longer than observed is never allowed.
+        let too_long_source = exact_source_identity("a".repeat(64), 7)?;
+        assert!(ProcessStreamEvidence::new_raw_with_transport_prefix_identity(
+            binding()?,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::PartialSource,
+            sha256_hex(observed),
+            6,
+            ProcessStreamPrefixPreview::from_transport_prefix(observed.to_vec(), 6)?,
+            Some(too_long_source),
+            Some(ProcessStreamTransportPrefixIdentity::new("a".repeat(64), 7)?),
+            vec![StreamEvidenceGap::PersistenceFailed],
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn max_preview_and_omitted_range_invariants_are_fail_closed() -> TestResult {
+        // MAX_PREVIEW_BYTES enforcement.
+        let oversized = vec![b'a'; MAX_PREVIEW_BYTES + 1];
+        assert!(ProcessStreamPrefixPreview::from_transport_prefix(
+            oversized.clone(),
+            (MAX_PREVIEW_BYTES + 1) as u64
+        )
+        .is_err());
+        assert!(ProcessStreamPrefixPreview::from_source_prefix(
+            oversized,
+            (MAX_PREVIEW_BYTES + 1) as u64
+        )
+        .is_err());
+        let at_limit = vec![b'a'; MAX_PREVIEW_BYTES];
+        assert!(ProcessStreamPrefixPreview::from_transport_prefix(
+            at_limit.clone(),
+            MAX_PREVIEW_BYTES as u64
+        )
+        .is_ok());
+
+        // Omitted range must be exactly [retained, represented) when truncated.
+        let preview = ProcessStreamPrefixPreview::from_transport_prefix(b"abc".to_vec(), 6)?;
+        let mut wire = serde_json::to_value(&preview)?;
+        // Inject wrong omitted range.
+        wire["omitted_ranges"] = serde_json::json!([{"start": 2, "end_exclusive": 6}]);
+        assert!(serde_json::from_value::<ProcessStreamPrefixPreview>(wire).is_err());
+
+        // Complete preview cannot carry omitted ranges.
+        let complete = ProcessStreamPrefixPreview::from_transport_prefix(b"abc".to_vec(), 3)?;
+        let mut wire = serde_json::to_value(&complete)?;
+        wire["omitted_ranges"] = serde_json::json!([{"start": 3, "end_exclusive": 3}]);
+        assert!(serde_json::from_value::<ProcessStreamPrefixPreview>(wire).is_err());
+
+        // Truncated preview cannot have empty omitted range.
+        let mut wire = serde_json::to_value(&preview)?;
+        wire["omitted_ranges"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<ProcessStreamPrefixPreview>(wire).is_err());
+
+        Ok(())
+    }
 }
