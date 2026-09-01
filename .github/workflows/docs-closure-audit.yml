@@ -6,6 +6,10 @@ on:
       - docs/508-normative-index-binding
   issues:
     types: [opened]
+  workflow_run:
+    workflows:
+      - Work 140 Codex stable wire proof
+    types: [completed]
   workflow_dispatch:
 
 permissions:
