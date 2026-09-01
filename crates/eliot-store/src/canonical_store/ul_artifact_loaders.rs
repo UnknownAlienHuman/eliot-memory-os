@@ -20,7 +20,7 @@
 //!
 //! Architecture: P.6 canonical Store — UL artifact/dependency read boundary;
 //! parent `canonical_store` retains the store, receipt, and transport boundary.
-//! Implementation: I2.2, I2.23 — extracted loader module owns only its read-only
+//! Implementation: I2.23 — extracted loader module owns only its read-only
 //! cell; parent remains sole write/receipt authority. Mechanical split from
 //! `crates/eliot-store/src/canonical_store.rs` — behavior preserved, public
 //! facade unchanged (`CanonicalStore::load_ul_*` via parent `impl`).
