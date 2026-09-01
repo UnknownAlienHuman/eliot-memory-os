@@ -8,7 +8,7 @@ Start with the [mandatory verified-reading protocol](architecture/READING_PROTOC
 
 
 Status: current routing map for `main`, audited against
-`0c041d6ab9c33ed21fbd950cf9eb1d94254d39f7` on 2026-08-31. Navigation only;
+`0f2c94730a7e7947ec973474e3b469ce75f9469d` on 2026-08-31. Navigation only;
 product status remains `NOT_ACCEPTED / UNVERIFIED`.
 
 ## Authority and work
