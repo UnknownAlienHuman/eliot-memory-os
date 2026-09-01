@@ -8,8 +8,10 @@
 #![forbid(unsafe_code)]
 
 mod contract;
+mod procedure_projection;
 
 pub use contract::*;
+pub use procedure_projection::*;
 
 /// Stable package contract name.
 pub const CONTRACT_NAME: &str = "eliot.surface.skills";
