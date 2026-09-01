@@ -39,7 +39,8 @@ fn receipt(procedure_revision: &str, state_fence: StateFence) -> eliot_skills::R
             monotonic_ns: Some(12),
         },
     };
-    let artifact_id = ArtifactId::new("procedure-artifact").expect("artifact id");
+    let verifier_artifact_id = ArtifactId::new("verifier-artifact-1").expect("artifact id");
+    let rollback_artifact_id = ArtifactId::new("rollback-artifact-1").expect("artifact id");
     let core = ReceiptCore {
         contract: eliot_receipts::contract_identity().expect("receipt contract"),
         kind: ReceiptKind::Verification,
@@ -85,16 +86,24 @@ fn receipt(procedure_revision: &str, state_fence: StateFence) -> eliot_skills::R
             allowed_effect: EffectClass::Read,
             proof_ceiling: ProofCeiling::ScopedVerification,
         },
-        artifacts: vec![eliot_receipts::ArtifactBinding {
-            artifact_id,
-            sha256: eliot_receipts::sha256_hex(b"accepted-procedure"),
-            role: ReceiptKind::Artifact,
-            source_revision: Some(procedure_revision.to_owned()),
-        }],
+        artifacts: vec![
+            eliot_receipts::ArtifactBinding {
+                artifact_id: verifier_artifact_id.clone(),
+                sha256: eliot_receipts::sha256_hex(b"accepted-procedure"),
+                role: ReceiptKind::Artifact,
+                source_revision: Some(procedure_revision.to_owned()),
+            },
+            eliot_receipts::ArtifactBinding {
+                artifact_id: rollback_artifact_id,
+                sha256: eliot_receipts::sha256_hex(b"rollback-procedure"),
+                role: ReceiptKind::Artifact,
+                source_revision: Some(procedure_revision.to_owned()),
+            },
+        ],
         verifier: Some(VerifierBinding {
             verifier_id: ContractId::new("procedure-verifier").expect("verifier id"),
             verifier_revision: eliot_contracts::ContractVersion::new(1, 0, 0),
-            artifact_ids: vec![ArtifactId::new("procedure-artifact").expect("artifact id")],
+            artifact_ids: vec![verifier_artifact_id],
             proof_ceiling: ProofCeiling::ScopedVerification,
             state_fence,
         }),
@@ -163,8 +172,8 @@ fn procedure() -> GovernedProcedureProjection {
             rollback_artifact_ref: "rollback-artifact-1".to_owned(),
         },
         verifier: ProcedureVerifier {
-            verifier_ref: "verifier-1".to_owned(),
-            verifier_revision: "1".to_owned(),
+            verifier_ref: "procedure-verifier".to_owned(),
+            verifier_revision: "1.0.0".to_owned(),
             artifact_refs: vec!["verifier-artifact-1".to_owned()],
         },
         safety_privacy_disclosure: SafetyPrivacyDisclosure {
@@ -258,6 +267,103 @@ fn raw_non_accepted_state_is_rejected_without_candidate_fallback() {
             ProcedureState::Quarantined
         ))
     ));
+}
+
+#[test]
+fn candidate_validator_rejects_recomputed_quarantined_procedure() {
+    let mut candidate = project_governed_procedure_to_portable_skill_candidates(
+        &procedure(),
+        &[target("supported", &"1".repeat(64), true)],
+    )
+    .expect("projection")
+    .candidates
+    .pop()
+    .expect("candidate");
+    candidate.procedure.state = ProcedureState::Quarantined;
+    candidate.procedure.procedure_digest = candidate
+        .procedure
+        .expected_digest()
+        .expect("quarantined procedure digest");
+    let candidate_digest = eliot_skills::canonical_digest(&(
+        &candidate.procedure.procedure_digest,
+        &candidate.target.target_id,
+        &candidate.target.fingerprint,
+    ))
+    .expect("candidate digest");
+    candidate.candidate_id = format!("skill-candidate:{candidate_digest}");
+    assert_eq!(
+        candidate.validate(),
+        Err(eliot_skills::ProcedureProjectionError::NotAccepted(
+            ProcedureState::Quarantined
+        ))
+    );
+}
+
+fn reissue_receipt(projection: &mut GovernedProcedureProjection) {
+    let core = projection.acceptance_receipt.envelope.core.clone();
+    projection.acceptance_receipt.envelope = ReceiptEnvelope::issue(core).expect("receipt");
+    projection.procedure_digest = projection.expected_digest().expect("procedure digest");
+}
+
+#[test]
+fn receipt_verifier_identity_and_artifacts_must_match_declared_verifier() {
+    let mut projection = procedure();
+    projection
+        .acceptance_receipt
+        .envelope
+        .core
+        .verifier
+        .as_mut()
+        .expect("receipt verifier")
+        .verifier_id = ContractId::new("other-verifier").expect("verifier id");
+    reissue_receipt(&mut projection);
+    assert_eq!(
+        projection.validate(),
+        Err(
+            eliot_skills::ProcedureProjectionError::ReceiptBindingMismatch {
+                field: "acceptance_receipt.verifier.verifier_id",
+            }
+        )
+    );
+
+    let mut projection = procedure();
+    projection
+        .acceptance_receipt
+        .envelope
+        .core
+        .verifier
+        .as_mut()
+        .expect("receipt verifier")
+        .artifact_ids = vec![ArtifactId::new("rollback-artifact-1").expect("artifact id")];
+    reissue_receipt(&mut projection);
+    assert_eq!(
+        projection.validate(),
+        Err(
+            eliot_skills::ProcedureProjectionError::ReceiptBindingMismatch {
+                field: "acceptance_receipt.verifier.artifact_ids",
+            }
+        )
+    );
+}
+
+#[test]
+fn receipt_must_bind_the_declared_rollback_artifact() {
+    let mut projection = procedure();
+    projection
+        .acceptance_receipt
+        .envelope
+        .core
+        .artifacts
+        .retain(|artifact| artifact.artifact_id.as_str() != "rollback-artifact-1");
+    reissue_receipt(&mut projection);
+    assert_eq!(
+        projection.validate(),
+        Err(
+            eliot_skills::ProcedureProjectionError::ReceiptBindingMismatch {
+                field: "acceptance_receipt.rollback_artifact",
+            }
+        )
+    );
 }
 
 #[test]

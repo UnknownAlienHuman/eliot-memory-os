@@ -312,6 +312,51 @@ impl ProcedureVerifier {
         }
         Ok(())
     }
+
+    fn validate_against_receipt(
+        &self,
+        evidence: &ProcedureEvidence,
+        receipt: &ReceiptClaim,
+    ) -> Result<(), ProcedureProjectionError> {
+        self.validate(evidence)?;
+        let receipt_verifier = receipt.envelope.core.verifier.as_ref().ok_or(
+            ProcedureProjectionError::ReceiptBindingMismatch {
+                field: "acceptance_receipt.verifier",
+            },
+        )?;
+        if receipt_verifier.verifier_id.as_str() != self.verifier_ref {
+            return Err(ProcedureProjectionError::ReceiptBindingMismatch {
+                field: "acceptance_receipt.verifier.verifier_id",
+            });
+        }
+        if receipt_verifier.verifier_revision.as_string() != self.verifier_revision {
+            return Err(ProcedureProjectionError::ReceiptBindingMismatch {
+                field: "acceptance_receipt.verifier.verifier_revision",
+            });
+        }
+        let receipt_artifact_refs: Vec<String> = receipt_verifier
+            .artifact_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        if receipt_artifact_refs != self.artifact_refs {
+            return Err(ProcedureProjectionError::ReceiptBindingMismatch {
+                field: "acceptance_receipt.verifier.artifact_ids",
+            });
+        }
+        if !receipt
+            .envelope
+            .core
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_id.as_str() == evidence.rollback_artifact_ref)
+        {
+            return Err(ProcedureProjectionError::ReceiptBindingMismatch {
+                field: "acceptance_receipt.rollback_artifact",
+            });
+        }
+        Ok(())
+    }
 }
 
 /// A non-executable asset declaration. Scripts and assets are inventory only.
@@ -500,6 +545,8 @@ impl GovernedProcedureProjection {
             }
         })?;
         let core = &self.acceptance_receipt.envelope.core;
+        self.verifier
+            .validate_against_receipt(&self.evidence, &self.acceptance_receipt)?;
         if core.kind != ReceiptKind::Verification
             || !matches!(
                 &core.disposition,
@@ -609,6 +656,9 @@ impl PortableSkillPackageCandidate {
             return Err(ProcedureProjectionError::CandidateOnlyViolation {
                 field: "candidate_only/activation_applied",
             });
+        }
+        if self.procedure.state != ProcedureState::Accepted {
+            return Err(ProcedureProjectionError::NotAccepted(self.procedure.state));
         }
         self.procedure.validate()?;
         self.target.validate()?;
