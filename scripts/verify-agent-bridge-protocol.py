@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 MAIN_PATH = "bins/eliot-agent-bridge/src/main.rs"
+CORE_PATH = "crates/surfaces/eliot-agent-bridge-core/src/lib.rs"
+BRIDGE_LIB_PATH = "bins/eliot-agent-bridge/src/lib.rs"
 HOST_PATH = "crates/surfaces/eliot-mcp/src/host.rs"
 GATEWAY_PATH = "crates/surfaces/eliot-mcp/src/host_gateway.rs"
 
@@ -144,9 +146,17 @@ def require_contains(
 def verify(root: Path) -> list[Finding]:
     findings: list[Finding] = []
     main_text = read_text(root, MAIN_PATH, findings)
+    core_text = read_text(root, CORE_PATH, findings)
+    bridge_lib_text = read_text(root, BRIDGE_LIB_PATH, findings)
     host_text = read_text(root, HOST_PATH, findings)
     gateway_text = read_text(root, GATEWAY_PATH, findings)
-    if main_text is None or host_text is None or gateway_text is None:
+    if (
+        main_text is None
+        or core_text is None
+        or bridge_lib_text is None
+        or host_text is None
+        or gateway_text is None
+    ):
         return sorted(findings, key=lambda item: (item.path, item.code, item.detail))
 
     main_prod = production_prefix(main_text)
@@ -197,6 +207,53 @@ def verify(root: Path) -> list[Finding]:
                 "production public bridge source must not import or name canonical Frame",
             )
         )
+
+    core_prod = production_prefix(core_text)
+    if "forward_frame" in core_prod:
+        findings.append(
+            Finding(
+                "internal_raw_frame_forwarding_api",
+                CORE_PATH,
+                "bridge core must not expose raw Frame forwarding",
+            )
+        )
+    if re.search(r"\bFrame\b", core_prod):
+        findings.append(
+            Finding(
+                "internal_raw_frame_type_surface",
+                CORE_PATH,
+                "bridge core must not expose the canonical Frame type",
+            )
+        )
+
+    # The bridge library has cfg(test) imports before production impls, so
+    # inspect only the named production owner blocks below instead of cutting
+    # at the first test attribute.
+    bridge_lib_prod = bridge_lib_text
+    for marker, label in (
+        (
+            "impl McpForwardingPort for KernelMcpForwardingPort",
+            "KernelMcpForwardingPort",
+        ),
+        ("impl BridgeRunner", "BridgeRunner"),
+    ):
+        owner_block = extract_braced_block(bridge_lib_prod, marker)
+        if owner_block is None:
+            findings.append(
+                Finding(
+                    "internal_owner_surface_unresolved",
+                    BRIDGE_LIB_PATH,
+                    f"{label} raw-forwarding owner surface cannot be resolved",
+                )
+            )
+        elif re.search(r"\bFrame\b|\bforward_frame\b", owner_block):
+            findings.append(
+                Finding(
+                    "internal_raw_frame_forwarding_api",
+                    BRIDGE_LIB_PATH,
+                    f"{label} must not expose raw Frame forwarding",
+                )
+            )
 
     require_contains(
         findings,
@@ -448,6 +505,31 @@ mod tests {}
 '''
 
 
+def fixture_core() -> str:
+    return '''
+pub trait McpForwardingPort {
+    fn forward_hook(&mut self);
+}
+pub struct AgentBridgeCore;
+impl AgentBridgeCore {
+    pub fn forward_event(&mut self) {}
+}
+'''
+
+
+def fixture_bridge_lib() -> str:
+    return '''
+struct KernelMcpForwardingPort;
+impl McpForwardingPort for KernelMcpForwardingPort {
+    fn forward_hook(&mut self) {}
+}
+pub struct BridgeRunner;
+impl BridgeRunner {
+    pub fn forward_event(&mut self) {}
+}
+'''
+
+
 def fixture_host() -> str:
     return '''
 #[derive(Clone)]
@@ -501,6 +583,8 @@ impl HostRequestGateway {
 def write_fixtures(root: Path) -> None:
     files = {
         MAIN_PATH: fixture_main(),
+        CORE_PATH: fixture_core(),
+        BRIDGE_LIB_PATH: fixture_bridge_lib(),
         HOST_PATH: fixture_host(),
         GATEWAY_PATH: fixture_gateway(),
     }
@@ -538,6 +622,28 @@ def self_test() -> None:
         assert_finding(root, "raw_frame_ingress", "raw Frame ingress")
         write_fixtures(root)
 
+        core_path = root / CORE_PATH
+        core_path.write_text(
+            fixture_core().replace(
+                "fn forward_hook(&mut self);",
+                "fn forward_frame(&mut self, frame: &Frame);",
+            ),
+            encoding="utf-8",
+        )
+        assert_finding(root, "internal_raw_frame_forwarding_api", "core raw Frame forwarding")
+        write_fixtures(root)
+
+        bridge_lib_path = root / BRIDGE_LIB_PATH
+        bridge_lib_path.write_text(
+            fixture_bridge_lib().replace(
+                "fn forward_hook(&mut self) {}",
+                "fn forward_frame(&mut self, frame: &Frame) {}",
+            ),
+            encoding="utf-8",
+        )
+        assert_finding(root, "internal_raw_frame_forwarding_api", "wrapper raw Frame forwarding")
+        write_fixtures(root)
+
         host_path.write_text(
             fixture_host().replace(
                 "pub tool: String,", "pub tool: String,\n    pub request_identity: String,"
@@ -573,7 +679,7 @@ def self_test() -> None:
         )
         assert_finding(root, "cancellation_reason_mandatory", "mandatory cancellation prose")
 
-    print("AGENT_BRIDGE_PROTOCOL_SELF_TEST: PASS cases=6")
+    print("AGENT_BRIDGE_PROTOCOL_SELF_TEST: PASS cases=8")
 
 
 def parse_args() -> argparse.Namespace:
@@ -597,7 +703,7 @@ def main() -> int:
     if findings:
         print_findings(findings)
         return 1
-    print("AGENT_BRIDGE_PROTOCOL_VERIFY: PASS files=3")
+    print("AGENT_BRIDGE_PROTOCOL_VERIFY: PASS files=5")
     return 0
 
 

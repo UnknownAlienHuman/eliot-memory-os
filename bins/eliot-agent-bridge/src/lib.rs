@@ -16,7 +16,7 @@ use eliot_agent_bridge_core::{
 };
 use eliot_protocol::{
     AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
-    AgentBridgePeerChallenge, EventEnvelope, Frame,
+    AgentBridgePeerChallenge, EventEnvelope,
 };
 use eliot_runtime::{Runtime, RuntimeConfig};
 
@@ -59,16 +59,6 @@ struct AdmittedConnection {
 struct KernelMcpForwardingPort;
 
 impl McpForwardingPort for KernelMcpForwardingPort {
-    fn forward_frame(
-        &mut self,
-        _binding: &AttachBinding,
-        _frame: &Frame,
-    ) -> Result<(), ProviderFailure> {
-        Err(ProviderFailure::new(
-            "eliot-kernel-front-door",
-            "forwarding not admitted",
-        ))
-    }
     fn forward_hook(
         &mut self,
         _binding: &AttachBinding,
@@ -310,9 +300,6 @@ impl BridgeRunner {
     pub fn reconcile_external(&mut self) -> Result<AttachView, BridgeError> {
         self.core.reconcile_external()
     }
-    pub fn forward_frame(&mut self, frame: &Frame) -> Result<(), BridgeError> {
-        self.core.forward_frame(frame)
-    }
     pub fn forward_hook(&mut self, event: &HostEventEnvelope) -> Result<(), BridgeError> {
         self.core.forward_hook(event)
     }
@@ -361,7 +348,7 @@ mod tests {
         AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentBridgeClientDeclaration,
         AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge,
     };
-    use eliot_protocol::{EncodingProfile, FrameKind, MessageType, ProtocolPayload};
+    use eliot_protocol::{EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload};
     use eliot_protocol::{ProtocolRange, ProtocolVersion};
     use eliot_runtime_contracts::{HealthVector, ModuleGenerationState};
     use eliot_runtime_contracts::{ModuleContract, ModuleGeneration};
@@ -559,6 +546,13 @@ mod tests {
         assert!(!src.contains(&needle));
         let awr = format!("{}{}", "ActivationWire", "Response");
         assert!(!src.contains(&awr));
+    }
+
+    #[test]
+    fn raw_frame_forwarding_wrapper_is_absent() {
+        let src = include_str!("lib.rs");
+        let raw_forward = format!("{}{}", "forward_", "frame");
+        assert!(!src.contains(&raw_forward));
     }
 
     #[test]
