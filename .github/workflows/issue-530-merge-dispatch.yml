@@ -1,5 +1,6 @@
 name: Temporary issue 530 merge dispatcher
 
+# Second server-side push: the workflow already exists on the default branch.
 on:
   push:
     branches:
