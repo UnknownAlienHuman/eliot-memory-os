@@ -1,0 +1,50 @@
+name: Temporary issue 530 PR dispatcher
+
+on:
+  pull_request_target:
+    types: [ready_for_review]
+
+permissions:
+  contents: write
+  actions: read
+  pull-requests: read
+
+concurrency:
+  group: issue-530-pr-dispatcher
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    if: >-
+      github.event.pull_request.number == 532 &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'fix/530-normative-traceability'
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: UnknownAlienHuman/eliot-memory-os
+          ref: fix/530-normative-traceability
+          fetch-depth: 0
+
+      - name: Run bounded cleanup, verification, and branch publication
+        shell: pwsh
+        run: pwsh -NoProfile -File .github/temporary/run_traceability_cleanup.ps1
+
+      - name: Upload proof receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-530-traceability-proof
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            .eliot/normative-traceability-cleanup.json
+            .eliot/doc-code-conformance.json
+            .eliot/working-paths.txt
+            .eliot/prepublish-paths.txt
+            .eliot/final-paths.txt
+            .eliot/publication.json
