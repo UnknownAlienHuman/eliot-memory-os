@@ -7,9 +7,8 @@
 //! bindings with no Kernel, Governor, or Store authority.
 //!
 //! Implementation: I1 (core ELIOT substrate), I7 (EBP/transport boundary), B.1 (Kernel↔Daemon),
-//! P.3 (Kernel control boundary), I2.2 (capability crate), I2.23 (capability-family topology) —
-//! this cell is a narrow transport boundary that mints no authority and performs no semantic
-//! admission.
+//! P.3 (Kernel control boundary), and I2.23 (capability-family topology) — this cell is a narrow
+//! transport boundary that mints no authority and performs no semantic admission.
 //!
 //! Ownership: this module is the sole owner of `build_neutral_activation_request`,
 //! `activation_frame_for_request`, `decode_activation_response`, `KernelHostActivationPort` and
