@@ -1,8 +1,9 @@
 name: Temporary issue 530 merge finalizer
 
 on:
-  push:
-    branches: [main]
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -25,7 +26,7 @@ env:
 
 jobs:
   finalize:
-    if: github.event.head_commit.message == 'chore(docs): trigger issue 530 full verification'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 240
 
@@ -54,7 +55,7 @@ jobs:
           git fetch --no-tags origin main
           $remoteMain = (git rev-parse origin/main).Trim()
           if ($remoteMain -ne '${{ github.sha }}') {
-            throw "Push event/main identity mismatch: event=${{ github.sha }} remote=$remoteMain"
+            throw "Scheduled event/main identity mismatch: event=${{ github.sha }} remote=$remoteMain"
           }
           $unexpectedMain = @(git diff --name-only $env:PROOF_BASE_SHA $remoteMain | Where-Object {
             $_ -ne $env:THIS_WORKFLOW -and
