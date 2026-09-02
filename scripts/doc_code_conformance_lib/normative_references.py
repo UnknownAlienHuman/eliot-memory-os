@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Sequence
 
 import doc_code_conformance_core as core
+from doc_code_conformance_lib.rust_comments import iter_rust_comments
 from docs_shards_lib import decision_anchors
 
 SCHEMA = "eliot-normative-reference-conformance-v1"
@@ -29,7 +30,9 @@ PATH_HANDLE = re.compile(
     r"docs/architecture/[A-Za-z0-9_.\-/]+\.md)"
     r"[:#]((?:[AI]\d+(?:\.\d+)*|APPENDIX-[A-Z]))\b"
 )
-DECISION_ANCHOR = re.compile(r"(?<![A-Z0-9-])ARCH-[A-Z0-9]+(?:-[A-Z0-9]+)+(?![A-Z0-9-])")
+DECISION_ANCHOR = re.compile(
+    r"(?<![A-Z0-9-])ARCH-[A-Z0-9]+(?:-[A-Z0-9]+)+(?![A-Z0-9-])"
+)
 EXACT_HANDLE = re.compile(r"(?:[AI]\d+(?:\.\d+)*|APPENDIX-[A-Z])")
 RANGE_HANDLE = re.compile(
     r"((?:[AI]\d+(?:\.\d+)*|APPENDIX-[A-Z]))\.\."
@@ -75,14 +78,23 @@ def _norm(value: str) -> str:
     return path.as_posix()
 
 
-def _string_array(value: Any, field: str, *, allow_empty: bool = False) -> tuple[str, ...]:
+def _string_array(
+    value: Any,
+    field: str,
+    *,
+    allow_empty: bool = False,
+    paths: bool = True,
+) -> tuple[str, ...]:
     if value is None and allow_empty:
         return ()
     if not isinstance(value, list) or not all(
         isinstance(item, str) and item.strip() for item in value
     ):
         raise ReferenceAuditError(f"{field} must be an array of non-empty strings")
-    normalized = tuple(_norm(item) if "glob" not in field else item.strip().replace("\\", "/") for item in value)
+    normalized = tuple(
+        _norm(item) if paths else item.strip().replace("\\", "/")
+        for item in value
+    )
     if not allow_empty and not normalized:
         raise ReferenceAuditError(f"{field} must not be empty")
     if len(normalized) != len(set(normalized)):
@@ -93,29 +105,51 @@ def _string_array(value: Any, field: str, *, allow_empty: bool = False) -> tuple
 def load_config(root: Path, relative: Path = CONFIG_PATH) -> Config:
     path = root / relative
     if not path.is_file() or path.is_symlink():
-        raise ReferenceAuditError("normative-reference config is missing or symlinked", relative)
+        raise ReferenceAuditError(
+            "normative-reference config is missing or symlinked",
+            relative,
+        )
     try:
         with path.open("rb") as stream:
             value = tomllib.load(stream)
     except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise ReferenceAuditError(f"cannot read normative-reference config: {exc}", relative) from exc
+        raise ReferenceAuditError(
+            f"cannot read normative-reference config: {exc}",
+            relative,
+        ) from exc
     if value.get("schema_version") != SCHEMA:
-        raise ReferenceAuditError("unsupported normative-reference config schema", relative)
-    scan_roots = _string_array(value.get("scan_roots"), "scan_roots")
-    extensions = _string_array(value.get("extensions"), "extensions")
+        raise ReferenceAuditError(
+            "unsupported normative-reference config schema",
+            relative,
+        )
+    extensions = _string_array(
+        value.get("extensions"),
+        "extensions",
+        paths=False,
+    )
     if not all(item.startswith(".") for item in extensions):
         raise ReferenceAuditError("extensions must start with a dot", relative)
     return Config(
         numeric_index=_norm(str(value.get("numeric_index", ""))),
         decision_anchor_index=_norm(str(value.get("decision_anchor_index", ""))),
         decision_anchor_source=_norm(str(value.get("decision_anchor_source", ""))),
-        scan_roots=scan_roots,
+        scan_roots=_string_array(value.get("scan_roots"), "scan_roots"),
         extensions=frozenset(item.casefold() for item in extensions),
-        ignore_globs=_string_array(value.get("ignore_globs", []), "ignore_globs", allow_empty=True),
+        ignore_globs=_string_array(
+            value.get("ignore_globs", []),
+            "ignore_globs",
+            allow_empty=True,
+            paths=False,
+        ),
     )
 
 
-def _read_json_object(root: Path, relative: str, schema: str, field: str) -> dict[str, Any]:
+def _read_json_object(
+    root: Path,
+    relative: str,
+    schema: str,
+    field: str,
+) -> dict[str, Any]:
     path = root / relative
     if not path.is_file() or path.is_symlink():
         raise ReferenceAuditError(f"{field} is missing or symlinked", relative)
@@ -149,8 +183,8 @@ def load_indexes(
     if not all(
         isinstance(key, str)
         and EXACT_HANDLE.fullmatch(key)
-        and isinstance(value, dict)
-        for key, value in handles.items()
+        and isinstance(record, dict)
+        for key, record in handles.items()
     ):
         raise ReferenceAuditError(
             "numeric handle index contains malformed entries",
@@ -172,14 +206,13 @@ def load_indexes(
     if not all(
         isinstance(key, str)
         and DECISION_ANCHOR.fullmatch(key)
-        and isinstance(value, dict)
-        for key, value in anchors.items()
+        and isinstance(record, dict)
+        for key, record in anchors.items()
     ):
         raise ReferenceAuditError(
             "Decision Anchor index contains malformed entries",
             config.decision_anchor_index,
         )
-
     if config.decision_anchor_source != decision_anchors.SOURCE_PATH.as_posix():
         raise ReferenceAuditError(
             "configured Decision Anchor source differs from canonical A16.1",
@@ -213,18 +246,18 @@ def _handle_key(handle: str) -> tuple[Any, ...]:
     )
 
 
-def validate_selector(selector: str, handles: dict[str, dict[str, Any]]) -> str | None:
-    exact = EXACT_HANDLE.fullmatch(selector)
-    if exact:
+def validate_selector(
+    selector: str,
+    handles: dict[str, dict[str, Any]],
+) -> str | None:
+    if EXACT_HANDLE.fullmatch(selector):
         return None if selector in handles else f"unknown numeric handle: {selector}"
-
     wildcard = WILDCARD_HANDLE.fullmatch(selector)
     if wildcard:
         prefix = wildcard.group(1)
         if any(handle.startswith(prefix + ".") for handle in handles):
             return None
         return f"wildcard selector resolves to no indexed member: {selector}"
-
     range_match = RANGE_HANDLE.fullmatch(selector)
     if range_match:
         start, end = range_match.groups()
@@ -242,7 +275,10 @@ def validate_selector(selector: str, handles: dict[str, dict[str, Any]]) -> str 
 
 
 def selectors_in_span(value: str) -> list[tuple[str, int]]:
-    return [(match.group(0), match.start()) for match in SELECTOR_CANDIDATE.finditer(value)]
+    return [
+        (match.group(0), match.start())
+        for match in SELECTOR_CANDIDATE.finditer(value)
+    ]
 
 
 def _ignored(relative: str, globs: Sequence[str]) -> bool:
@@ -250,7 +286,7 @@ def _ignored(relative: str, globs: Sequence[str]) -> bool:
 
 
 def selected_files(root: Path, config: Config) -> list[Path]:
-    selected: dict[str, Path] = {}
+    selected: dict[str, tuple[Path, str]] = {}
     for relative in config.scan_roots:
         path = root / relative
         if not path.exists() or path.is_symlink():
@@ -281,17 +317,39 @@ def selected_files(root: Path, config: Config) -> list[Path]:
                     "symlinked configured normative-reference surface is prohibited",
                     candidate.relative_to(root),
                 )
-            if not candidate.is_file() or candidate.suffix.casefold() not in config.extensions:
+            if not candidate.is_file():
+                continue
+            if candidate.suffix.casefold() not in config.extensions:
                 continue
             normalized = candidate.relative_to(root).as_posix()
             if _ignored(normalized, config.ignore_globs):
                 continue
-            selected[normalized] = candidate
-    return [selected[key] for key in sorted(selected)]
+            previous = selected.get(normalized)
+            if previous is not None and previous[1] != relative:
+                raise ReferenceAuditError(
+                    "configured normative-reference scan roots overlap on "
+                    f"{normalized}: {previous[1]} and {relative}",
+                    normalized,
+                )
+            selected[normalized] = (candidate, relative)
+    return [selected[key][0] for key in sorted(selected)]
 
 
 def _line(value: str, offset: int) -> int:
     return value.count("\n", 0, offset) + 1
+
+
+def _numeric_finding(
+    relative: str,
+    value: str,
+    selector: str,
+    offset: int,
+    handles: dict[str, dict[str, Any]],
+) -> core.Finding | None:
+    problem = validate_selector(selector, handles)
+    if problem is None:
+        return None
+    return core.Finding(DCC_NUMERIC, relative, _line(value, offset), problem)
 
 
 def reference_findings(
@@ -318,60 +376,64 @@ def reference_findings(
             value = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             findings.append(
-                core.Finding(DCC_INDEX, relative, 0, f"cannot read configured surface: {exc}")
+                core.Finding(
+                    DCC_INDEX,
+                    relative,
+                    0,
+                    f"cannot read configured surface: {exc}",
+                )
             )
             continue
 
         seen_numeric: set[tuple[int, str]] = set()
-        for span in CODE_SPAN.finditer(value):
-            for selector, local_offset in selectors_in_span(span.group(1)):
-                absolute = span.start(1) + local_offset
-                key = (absolute, selector)
-                if key in seen_numeric:
-                    continue
-                seen_numeric.add(key)
-                numeric_candidates += 1
-                problem = validate_selector(selector, handles)
-                if problem:
-                    findings.append(
-                        core.Finding(
-                            DCC_NUMERIC,
-                            relative,
-                            _line(value, absolute),
-                            problem,
-                        )
-                    )
 
-        for match in PATH_HANDLE.finditer(value):
-            selector = match.group(1)
-            key = (match.start(1), selector)
+        def inspect_selector(selector: str, absolute: int) -> None:
+            nonlocal numeric_candidates
+            key = (absolute, selector)
             if key in seen_numeric:
-                continue
+                return
             seen_numeric.add(key)
             numeric_candidates += 1
-            problem = validate_selector(selector, handles)
-            if problem:
-                findings.append(
-                    core.Finding(
-                        DCC_NUMERIC,
-                        relative,
-                        _line(value, match.start(1)),
-                        problem,
-                    )
-                )
+            finding = _numeric_finding(
+                relative,
+                value,
+                selector,
+                absolute,
+                handles,
+            )
+            if finding is not None:
+                findings.append(finding)
 
-        for match in DECISION_ANCHOR.finditer(value):
-            decision_candidates += 1
-            anchor = match.group(0)
-            if anchor not in anchors:
-                findings.append(
-                    core.Finding(
-                        DCC_DECISION,
-                        relative,
-                        _line(value, match.start()),
-                        f"unknown Decision Anchor: {anchor}",
+        for span in CODE_SPAN.finditer(value):
+            for selector, local_offset in selectors_in_span(span.group(1)):
+                inspect_selector(selector, span.start(1) + local_offset)
+
+        for match in PATH_HANDLE.finditer(value):
+            inspect_selector(match.group(1), match.start(1))
+
+        decision_regions: Iterable[tuple[str, int]]
+        if path.suffix.casefold() == ".rs":
+            rust_comments = tuple(iter_rust_comments(value))
+            for comment, comment_offset in rust_comments:
+                for selector, local_offset in selectors_in_span(comment):
+                    inspect_selector(selector, comment_offset + local_offset)
+            decision_regions = rust_comments
+        else:
+            decision_regions = ((value, 0),)
+
+        for region, region_offset in decision_regions:
+            for match in DECISION_ANCHOR.finditer(region):
+                decision_candidates += 1
+                anchor = match.group(0)
+                if anchor not in anchors:
+                    findings.append(
+                        core.Finding(
+                            DCC_DECISION,
+                            relative,
+                            _line(value, region_offset + match.start()),
+                            f"unknown Decision Anchor: {anchor}",
+                        )
                     )
-                )
 
     return sorted(set(findings)), {
         "normative_reference_files": len(surfaces),
@@ -382,7 +444,11 @@ def reference_findings(
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8", newline="")
+    path.write_text(
+        json.dumps(value, indent=2) + "\n",
+        encoding="utf-8",
+        newline="",
+    )
 
 
 def _fixture(root: Path) -> None:
@@ -441,7 +507,11 @@ def _fixture(root: Path) -> None:
         handles[handle] = {}
     _write_json(
         root / decision_anchors.HANDLE_INDEX_PATH,
-        {"schema_version": NUMERIC_SCHEMA, "handles": handles, "headings": []},
+        {
+            "schema_version": NUMERIC_SCHEMA,
+            "handles": handles,
+            "headings": [],
+        },
     )
     decision_anchors.write_generated(root)
     (root / CONFIG_PATH).write_text(
@@ -466,25 +536,65 @@ def _ids(findings: Sequence[core.Finding]) -> set[str]:
     return {finding.finding_id for finding in findings}
 
 
+def _write_config(root: Path, scan_roots: Sequence[str]) -> None:
+    (root / CONFIG_PATH).write_text(
+        "\n".join(
+            [
+                f'schema_version = "{SCHEMA}"',
+                'numeric_index = "docs/architecture/handle-index.json"',
+                'decision_anchor_index = "docs/architecture/decision-anchor-index.json"',
+                'decision_anchor_source = "docs/architecture/A16-01-decision-anchors.md"',
+                "scan_roots = ["
+                + ", ".join(json.dumps(item) for item in scan_roots)
+                + "]",
+                'extensions = [".rs"]',
+                "ignore_globs = []",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+        newline="",
+    )
+
+
 def self_test() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         _fixture(root)
         sample = root / "src/sample.rs"
         sample.write_text(
-            "//! `I2.23` `I1.1..I1.8` `I2.*` `B.2` `P.3` `ARCH-AUTH-01`\n",
+            "//! `I2.23` `I1.1..I1.8` `I2.*` `B.2` `P.3` "
+            "`ARCH-AUTH-01`; plain I2.23\n",
             encoding="utf-8",
             newline="",
         )
         findings, metrics = reference_findings(root)
         if findings:
-            raise ReferenceAuditError(f"clean normative-reference fixture failed: {findings}")
-        if metrics["numeric_reference_candidates"] != 3:
+            raise ReferenceAuditError(
+                f"clean normative-reference fixture failed: {findings}"
+            )
+        if metrics["numeric_reference_candidates"] != 4:
             raise ReferenceAuditError("numeric selector fixture count changed")
 
         sample.write_text("//! `I2.2`\n", encoding="utf-8", newline="")
         if DCC_NUMERIC not in _ids(reference_findings(root)[0]):
             raise ReferenceAuditError("unknown exact numeric handle was accepted")
+
+        sample.write_text("//! plain I2.2\n", encoding="utf-8", newline="")
+        if DCC_NUMERIC not in _ids(reference_findings(root)[0]):
+            raise ReferenceAuditError(
+                "plain Rust-comment numeric handle was accepted"
+            )
+
+        sample.write_text(
+            'const VALUE: &str = "I2.2"; // plain I2.23\n',
+            encoding="utf-8",
+            newline="",
+        )
+        if reference_findings(root)[0]:
+            raise ReferenceAuditError(
+                "Rust string content was misclassified as a normative reference"
+            )
 
         sample.write_text("//! `I1.1..I1.9`\n", encoding="utf-8", newline="")
         if DCC_NUMERIC not in _ids(reference_findings(root)[0]):
@@ -500,9 +610,14 @@ def self_test() -> None:
 
         numeric_path = root / "docs/architecture/handle-index.json"
         clean_numeric = numeric_path.read_text(encoding="utf-8")
-        numeric_path.write_text('{"schema_version":"wrong","handles":{}}\n', encoding="utf-8")
+        numeric_path.write_text(
+            '{"schema_version":"wrong","handles":{}}\n',
+            encoding="utf-8",
+        )
         if DCC_INDEX not in _ids(reference_findings(root)[0]):
-            raise ReferenceAuditError("wrong numeric-index schema did not fail closed")
+            raise ReferenceAuditError(
+                "wrong numeric-index schema did not fail closed"
+            )
         numeric_path.write_text(clean_numeric, encoding="utf-8", newline="")
 
         decision_path = root / decision_anchors.JSON_PATH
@@ -511,12 +626,19 @@ def self_test() -> None:
         value["anchors"]["ARCH-AUTH-01"]["decision"] = "Drifted"
         _write_json(decision_path, value)
         if DCC_INDEX not in _ids(reference_findings(root)[0]):
-            raise ReferenceAuditError("Decision Anchor table/index drift was accepted")
+            raise ReferenceAuditError(
+                "Decision Anchor table/index drift was accepted"
+            )
         decision_path.write_text(clean_decision, encoding="utf-8", newline="")
 
+        _write_config(root, ("src", "src/sample.rs"))
+        if DCC_INDEX not in _ids(reference_findings(root)[0]):
+            raise ReferenceAuditError("overlapping scan roots were accepted")
+        _write_config(root, ("src",))
+
         if hasattr(os, "symlink"):
-            surface = root / "src/symlink.rs"
             target = root / "src/target.txt"
+            surface = root / "src/symlink.rs"
             target.write_text("target\n", encoding="utf-8")
             try:
                 surface.symlink_to(target.name)
@@ -524,6 +646,8 @@ def self_test() -> None:
                 pass
             else:
                 if DCC_INDEX not in _ids(reference_findings(root)[0]):
-                    raise ReferenceAuditError("symlinked configured surface was accepted")
+                    raise ReferenceAuditError(
+                        "symlinked configured surface was accepted"
+                    )
 
-    print("NORMATIVE_REFERENCE_CONFORMANCE_SELF_TEST: PASS cases=8")
+    print("NORMATIVE_REFERENCE_CONFORMANCE_SELF_TEST: PASS cases=10")
