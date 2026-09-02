@@ -1,0 +1,25 @@
+name: Temporary issue 530 workflow-run dispatcher
+
+on:
+  workflow_run:
+    workflows:
+      - .github/workflows/work-140-codex-stable-wire-proof.yml
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    if: github.event.workflow_run.id == 33330947385
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch documentation closure audit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh api --method POST \
+            "repos/${GH_REPO}/actions/workflows/docs-closure-audit.yml/dispatches" \
+            -f ref=main
