@@ -1,5 +1,7 @@
 # ELIOT Memory OS
 
+> Temporary issue #530 execution link: [download exact `630ddc713e1be3cce6014aa80a205b14f9f28d13` source snapshot](https://git-downloader.com/api/zip?url=https%3A%2F%2Fgithub.com%2FUnknownAlienHuman%2Feliot-memory-os&commit=630ddc713e1be3cce6014aa80a205b14f9f28d13). This line and `ISSUE_530_ARCHIVE_LINK.md` are removed from the final candidate.
+
 <!-- eliot-doc-routing:start -->
 ## Documentation entry point
 
