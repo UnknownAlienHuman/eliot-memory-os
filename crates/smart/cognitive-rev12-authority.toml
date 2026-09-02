@@ -1,0 +1,59 @@
+schema_version = 4
+authority_id = "eliot-cognitive-function-design-rev12"
+status = "STATIC_TOPOLOGY_AND_FIELD_CONTRACT_DESIGN_ONLY"
+issue = 94
+branch = "work/cognitive-w0-contract-freeze"
+design_base_branch = "work/94-cognitive-function-design-rev11"
+base_main_commit = "59e36385b8e81ef7a328b255ec5ff3330b58b41c"
+repository = "UnknownAlienHuman/eliot-memory-os"
+
+[normative_pair]
+architecture_revision = "4.5-draft"
+architecture_edition = "2026-08-28"
+architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
+implementation_revision = "0.29-draft"
+implementation_edition = "2026-08-28"
+implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+precedence = "Architecture defines intent and Hard Boundaries; Implementation defines target owners, contracts, defaults and failure behavior; this design is a non-normative executable projection."
+
+[scope]
+functional_cells = 86
+physical_crates = 31
+hot_path_cells = 15
+field_contract_scope = "W0_CONTRACT_EVIDENCE_PLUS_W8_CANONICAL_PROJECTIONS_PLUS_W9_META_QUALITY"
+field_contract_count = 18
+field_contract_index = "crates/smart/cognitive-rev12-all-field-contracts.toml"
+w0_agent_handoff = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+root_workspace_admission = false
+rust_implementation = false
+runtime_support = false
+product_acceptance = false
+
+[authority_rules]
+cell_source = "Exactly one [[cell]] record in the indexed catalogs is authoritative for causal responsibility and source scope."
+field_contract_source = "Each public type or function field/signature is defined once in an owner-local *.contract.toml indexed by cognitive-rev12-all-field-contracts.toml; cell catalogues and manifests reference but do not redefine it."
+base_catalog_status = "Rev11 cell catalogs 1..67 remain causal assignment projections; rev12 catalogs cover 68..86; owner-local field contracts resolve their previously incomplete field schemas."
+no_parallel_module_api_views = "Legacy module.toml, *.api.toml, centralized superseded drafts and old branches are donor evidence only, not assignment or field-contract authority."
+cell_vs_crate = "A FunctionalCapabilityCell is assigned independently; several cells share one physical crate only when lifecycle owner, dependency island, proof oracle and replacement boundary remain coherent."
+crate_creation = "A physical crate requires a contract, dependency, security, failure-containment, deployment, package-proof or replacement seam. Function count, agent count or LOC estimate is insufficient."
+loc = "Ten thousand lines is a review trigger, never a constitutional split rule."
+worker_scope = "A worker writes only the declared src/<cell>.rs and tests/<cell>.rs files. Cargo manifests, lib.rs, re-exports, owner contracts and integration belong to the integration owner."
+
+[hot_path]
+requirements = ["no model call", "no storage scan", "no provider SDK", "no blocking I/O", "bounded inputs and outputs", "deterministic ordering and tie-breaks", "explicit complexity ceiling", "visible local degradation"]
+cell_count = 15
+
+[forbidden_ownership]
+all_cells = ["canonical state", "truth or epistemic promotion", "authority grant or activation", "task finish", "DurableJob lifecycle", "scheduler or Ready Queue", "runtime lease", "provider credential or route execution", "external effect execution", "production-generation self-modification"]
+
+[field_contract_freeze]
+resolved_schema_families = ["observation classification", "Current Epistemic Position", "Dreamer common/orientation/research/curation", "cue and activation", "Context provider/compiler/view", "memory read/projection/curation/quality", "System Experience", "task-local learning/evaluation", "negative-memory extinction", "Skill/tool/Dreamer/self-quality", "Common Ground and scoped understanding"]
+remaining_challenges = ["real owner adapters", "Rust implementation", "dependency-locked package Module Proof", "real provider-consumer Edge Proof", "named Product Pulses", "root workspace/runtime admission", "product acceptance"]
+provider_request_resolution = "All Context providers use ContextProviderProjectionRequest; no provider-specific public request duplicate."
+
+[proof_model]
+module = "Package-local shape, behavior, property and adversarial proof for one implemented cell."
+edge = "Executed proof over the real provider and consumer using exact typed contracts and State Fence."
+product = "Named Product Pulse over an exact Product Identity."
+current_ceiling = "TOML parse, field-contract freeze, branch presence, commit or review cannot promote implementation, runtime, utility, understanding or product support."

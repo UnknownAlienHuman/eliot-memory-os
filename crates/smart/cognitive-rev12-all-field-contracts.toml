@@ -1,0 +1,341 @@
+schema_version = 4
+authority = "eliot-cognitive-function-design-rev12"
+status = "CONSOLIDATED_FIELD_LEVEL_CONTRACT_FREEZE_WITH_W1_W2"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+contract_count = 23
+functional_cell_reference_count = 102
+unique_functional_cell_count = 79
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+rule = "Each indexed file is the sole field-level authority for its public_type entries. Cell catalogues plus indexed correction layers define causal responsibility and source scope; Rust, runtime, Edge Proof, Product Pulse and product acceptance remain unproven."
+correction_layers = ["crates/smart/cognitive-rev12-w1-corrections.toml", "crates/smart/cognitive-rev12-w2-corrections.toml"]
+
+[[contract]]
+stage = "W0_CONTRACT_EVIDENCE"
+id = "governor.observation.classification.v1"
+path = "crates/governor/eliot-observation/classification.contract.toml"
+owner = "eliot-observation"
+primary_orders = [1]
+functional_cells = ["governor.observation.classifier"]
+
+[[contract]]
+stage = "W0_CONTRACT_EVIDENCE"
+id = "smart.epistemic.current-position.v1"
+path = "crates/smart/eliot-epistemic-contracts/current-position.contract.toml"
+owner = "eliot-epistemic-contracts"
+primary_orders = [2]
+functional_cells = ["smart.epistemic.contracts", "smart.epistemic.position", "smart.epistemic.context_projection"]
+
+[[contract]]
+stage = "W1_D3A_ORIENTATION"
+id = "smart.epistemic.resolution-input.v1"
+path = "crates/smart/eliot-epistemic-contracts/resolution.contract.toml"
+owner = "eliot-epistemic-contracts"
+primary_orders = [3]
+functional_cells = ["smart.epistemic.position"]
+
+[[contract]]
+stage = "W0_CONTRACT_EVIDENCE"
+id = "smart.dreamer.common.v1"
+path = "crates/smart/eliot-dreamer-contracts/common.contract.toml"
+owner = "eliot-dreamer-contracts"
+primary_orders = [4]
+functional_cells = ["smart.dreamer.contracts.common", "smart.dreamer.bundle", "smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+
+[[contract]]
+stage = "W0_CONTRACT_EVIDENCE"
+id = "smart.dreamer.orientation.v1"
+path = "crates/smart/eliot-dreamer-contracts/orientation.contract.toml"
+owner = "eliot-dreamer-contracts"
+primary_orders = [5]
+functional_cells = ["smart.dreamer.contracts.orientation", "smart.dreamer.rival_model", "smart.dreamer.relation_candidate", "smart.dreamer.probe_plan", "smart.dreamer.clarification", "smart.dreamer.orientation"]
+
+[[contract]]
+stage = "W0_CONTRACT_EVIDENCE"
+id = "smart.dreamer.research-synthesis.v1"
+path = "crates/smart/eliot-dreamer-contracts/research.contract.toml"
+owner = "eliot-dreamer-contracts"
+primary_orders = [6]
+functional_cells = ["smart.dreamer.contracts.research", "smart.dreamer.research_synthesis"]
+
+[[contract]]
+stage = "W0_CONTRACT_EVIDENCE"
+id = "smart.dreamer.curation-dispatch.v1"
+path = "crates/smart/eliot-dreamer-contracts/curation.contract.toml"
+owner = "eliot-dreamer-contracts"
+primary_orders = [7]
+functional_cells = ["smart.dreamer.contracts.curation", "smart.dreamer.curation_dispatch"]
+
+[[contract]]
+stage = "W1_D3A_ORIENTATION"
+id = "smart.dreamer.w1-policy.v1"
+path = "crates/smart/eliot-dreamer-contracts/w1-policy.contract.toml"
+owner = "eliot-dreamer-contracts"
+primary_orders = [10, 11, 14, 16]
+functional_cells = ["smart.dreamer.transformation_validation", "smart.dreamer.draft_admission", "smart.dreamer.probe_plan", "smart.dreamer.clarification"]
+
+[[contract]]
+stage = "W1_D3A_ORIENTATION"
+id = "smart.dreamer.self-query.v1"
+path = "crates/smart/eliot-dreamer-self-query/self-query.contract.toml"
+owner = "eliot-dreamer-self-query"
+primary_orders = [17, 18]
+functional_cells = ["smart.dreamer.architecture_brief", "smart.dreamer.implementation_brief", "smart.self_model.context_projection"]
+
+[[contract]]
+stage = "W0_CONTRACT_EVIDENCE"
+id = "smart.cue.contracts.v1"
+path = "crates/smart/eliot-cue-contracts/cue.contract.toml"
+owner = "eliot-cue-contracts"
+primary_orders = [19]
+functional_cells = ["smart.cue.contracts", "smart.cue.normalizer", "smart.cue.binding", "smart.cue.index", "smart.cue.direct_match", "smart.cue.relation_spread", "smart.cue.activation"]
+
+[[contract]]
+stage = "W2_D3B_REACTIVE_CONTEXT"
+id = "smart.cue.w2-execution.v1"
+path = "crates/smart/eliot-cue-contracts/w2-execution.contract.toml"
+owner = "eliot-cue-contracts"
+primary_orders = [20, 21, 22, 23, 24, 25]
+functional_cells = ["smart.cue.normalizer", "smart.cue.binding", "smart.cue.index", "smart.cue.direct_match", "smart.cue.relation_spread", "smart.cue.activation"]
+
+[[contract]]
+stage = "W0_CONTRACT_EVIDENCE"
+id = "smart.context.compiler-contracts.v1"
+path = "crates/smart/eliot-context-contracts/context-compiler.contract.toml"
+owner = "eliot-context-contracts"
+primary_orders = [26, 27, 28]
+functional_cells = ["smart.context.contracts.candidate", "smart.context.contracts.admission", "smart.context.contracts.view_quality", "smart.context.contribution_merge", "smart.context.admission", "smart.context.assembly", "smart.context.quality", "smart.context.decision_tail", "smart.context.reactive_delivery_plan"]
+
+[[contract]]
+stage = "W2_D3B_REACTIVE_CONTEXT"
+id = "smart.context.w2-execution.v1"
+path = "crates/smart/eliot-context-contracts/w2-execution.contract.toml"
+owner = "eliot-context-contracts"
+primary_orders = [29, 30, 31, 32, 33, 34]
+functional_cells = ["smart.context.contribution_merge", "smart.context.admission", "smart.context.assembly", "smart.context.quality", "smart.context.decision_tail", "smart.context.reactive_delivery_plan"]
+
+[[contract]]
+stage = "W0_CONTRACT_EVIDENCE"
+id = "smart.memory.curation.v1"
+path = "crates/smart/eliot-memory-curation-contracts/curation.contract.toml"
+owner = "eliot-memory-curation-contracts"
+primary_orders = [35]
+functional_cells = ["smart.memory.curation.contracts", "smart.memory.curation.screen", "smart.dreamer.classification", "smart.dreamer.episode", "smart.dreamer.concept", "smart.dreamer.procedure", "smart.dreamer.skill", "smart.dreamer.failure", "smart.dreamer.structure_repair", "smart.dreamer.reconsolidation", "smart.dreamer.accessibility", "smart.dreamer.influence_repair", "smart.dreamer.curation"]
+
+[[contract]]
+stage = "W0_CONTRACT_EVIDENCE"
+id = "smart.learning.task-local.v1"
+path = "crates/smart/eliot-learning-contracts/task-local-learning.contract.toml"
+owner = "eliot-learning-contracts"
+primary_orders = [49, 50, 51]
+functional_cells = ["smart.learning.contracts.common", "smart.learning.contracts.state_view", "smart.learning.contracts.adaptation", "smart.learning.state_view", "smart.learning.delta", "smart.learning.overlay", "smart.learning.overlay_validation"]
+
+[[contract]]
+stage = "W0_CONTRACT_EVIDENCE"
+id = "smart.learning.evaluation.v1"
+path = "crates/smart/eliot-learning-contracts/learning-evaluation.contract.toml"
+owner = "eliot-learning-contracts"
+primary_orders = [52]
+functional_cells = ["smart.learning.contracts.evaluation", "meta.learning.activation_assessment", "meta.learning.closure", "meta.learning.promotion_input"]
+
+[[contract]]
+stage = "W8_CANONICAL_PROJECTION_BRIDGES"
+id = "smart.context.provider-contribution.v1"
+path = "crates/smart/eliot-context-contracts/provider-contribution.contract.toml"
+owner = "eliot-context-contracts"
+primary_orders = [74]
+functional_cells = ["smart.context.contracts.candidate", "smart.context.contracts.admission", "smart.context.contracts.view_quality", "smart.context.provider_registry_contracts", "smart.memory.context_projection", "smart.self_model.context_projection", "smart.epistemic.context_projection"]
+
+[[contract]]
+stage = "W8_CANONICAL_PROJECTION_BRIDGES"
+id = "smart.memory.projection-contracts.v1"
+path = "crates/smart/eliot-memory-projection-contracts/projection.contract.toml"
+owner = "eliot-memory-projection-contracts"
+primary_orders = [68]
+functional_cells = ["smart.memory.projection.contracts", "smart.memory.candidate_query", "smart.memory.context_projection"]
+
+[[contract]]
+stage = "W8_CANONICAL_PROJECTION_BRIDGES"
+id = "smart.learning.system-experience.v1"
+path = "crates/smart/eliot-learning-contracts/experience.contract.toml"
+owner = "eliot-learning-contracts"
+primary_orders = [71]
+functional_cells = ["smart.learning.contracts.experience", "smart.experience.projection"]
+
+[[contract]]
+stage = "W9_META_COGNITIVE_QUALITY"
+id = "meta.memory.quality.v1"
+path = "crates/meta/eliot-memory-quality/quality.contract.toml"
+owner = "eliot-memory-quality"
+primary_orders = [76, 77]
+functional_cells = ["meta.memory.ecology_assessment", "meta.memory.gravity_assessment"]
+
+[[contract]]
+stage = "W9_META_COGNITIVE_QUALITY"
+id = "smart.dreamer.negative-memory-extinction.v1"
+path = "crates/smart/eliot-dreamer-memory-revision/negative-memory-extinction.contract.toml"
+owner = "eliot-dreamer-memory-revision"
+primary_orders = [78]
+functional_cells = ["smart.dreamer.negative_memory_extinction"]
+
+[[contract]]
+stage = "W9_META_COGNITIVE_QUALITY"
+id = "meta.cognitive.quality.v1"
+path = "crates/meta/eliot-cognitive-quality/quality.contract.toml"
+owner = "eliot-cognitive-quality"
+primary_orders = [79, 80, 81, 82, 83, 84]
+functional_cells = ["meta.skill.lifecycle_assessment", "meta.tool.surface_assessment", "meta.dreamer.job_economics", "governor.self_quality.view", "meta.self_quality.learning_bottleneck", "meta.self_quality.intervention_candidate"]
+
+[[contract]]
+stage = "W9_META_COGNITIVE_QUALITY"
+id = "meta.understanding.assessment.v1"
+path = "crates/meta/eliot-understanding-assessment/understanding.contract.toml"
+owner = "eliot-understanding-assessment"
+primary_orders = [85, 86]
+functional_cells = ["meta.common_ground.assessment", "meta.understanding.scoped_assessment"]
+
+[[dependency]]
+provider = "smart.epistemic.current-position.v1"
+consumer = "smart.epistemic.resolution-input.v1"
+reason = "Resolution input imports CurrentPositionRequest, PositionCoverage and EvidenceDependence."
+
+[[dependency]]
+provider = "smart.epistemic.current-position.v1"
+consumer = "smart.dreamer.orientation.v1"
+reason = "Orientation consumes the externally resolved Current Epistemic Position."
+
+[[dependency]]
+provider = "smart.dreamer.common.v1"
+consumer = "smart.dreamer.orientation.v1"
+reason = "Orientation imports job, grounding and admitted-draft types."
+
+[[dependency]]
+provider = "smart.dreamer.common.v1"
+consumer = "smart.dreamer.research-synthesis.v1"
+reason = "Research synthesis imports bounded Dreamer job and candidate types."
+
+[[dependency]]
+provider = "smart.dreamer.common.v1"
+consumer = "smart.dreamer.curation-dispatch.v1"
+reason = "Curation dispatch imports bounded Dreamer job and candidate types."
+
+[[dependency]]
+provider = "smart.dreamer.common.v1"
+consumer = "smart.dreamer.w1-policy.v1"
+reason = "W1 policy imports closed job/candidate/grounding/transformation types."
+
+[[dependency]]
+provider = "smart.dreamer.orientation.v1"
+consumer = "smart.dreamer.w1-policy.v1"
+reason = "Probe and clarification policies constrain orientation outputs."
+
+[[dependency]]
+provider = "smart.dreamer.self-query.v1"
+consumer = "smart.context.provider-contribution.v1"
+reason = "SelfModel provider consumes exact briefs without raising support ceiling."
+
+[[dependency]]
+provider = "smart.context.provider-contribution.v1"
+consumer = "smart.context.compiler-contracts.v1"
+reason = "Context compiler imports provider contributions."
+
+[[dependency]]
+provider = "smart.cue.contracts.v1"
+consumer = "smart.cue.w2-execution.v1"
+reason = "W2 cue execution imports the existing cue algebra and closes spread-combination policy without redefining existing cue types."
+
+[[dependency]]
+provider = "smart.cue.contracts.v1"
+consumer = "smart.memory.projection-contracts.v1"
+reason = "Memory query intent binds exact cue activation."
+
+[[dependency]]
+provider = "smart.context.provider-contribution.v1"
+consumer = "smart.context.w2-execution.v1"
+reason = "W2 Context compilation request embeds the exact ExpectedContextProviderSet."
+
+[[dependency]]
+provider = "smart.context.compiler-contracts.v1"
+consumer = "smart.context.w2-execution.v1"
+reason = "W2 execution imports the existing Context compiler algebra and adds exact request and distinct limit types."
+
+[[dependency]]
+provider = "smart.memory.projection-contracts.v1"
+consumer = "smart.memory.curation.v1"
+reason = "Curation consumes store-neutral memory projections."
+
+[[dependency]]
+provider = "smart.learning.system-experience.v1"
+consumer = "smart.learning.task-local.v1"
+reason = "Learning state consumes immutable System Experience."
+
+[[dependency]]
+provider = "smart.learning.task-local.v1"
+consumer = "smart.learning.evaluation.v1"
+reason = "Evaluation consumes task-local deltas and overlays."
+
+[[dependency]]
+provider = "smart.learning.system-experience.v1"
+consumer = "smart.learning.evaluation.v1"
+reason = "Evaluation consumes immutable outcomes."
+
+[[dependency]]
+provider = "smart.memory.projection-contracts.v1"
+consumer = "meta.memory.quality.v1"
+reason = "Memory quality consumes exact record/accessibility/influence identities."
+
+[[dependency]]
+provider = "smart.learning.system-experience.v1"
+consumer = "meta.memory.quality.v1"
+reason = "Memory quality consumes outcome attribution."
+
+[[dependency]]
+provider = "smart.learning.system-experience.v1"
+consumer = "smart.dreamer.negative-memory-extinction.v1"
+reason = "Extinction consumes failure/outcome evidence."
+
+[[dependency]]
+provider = "meta.memory.quality.v1"
+consumer = "meta.cognitive.quality.v1"
+reason = "Self-quality consumes immutable memory-quality projections."
+
+[[dependency]]
+provider = "smart.learning.system-experience.v1"
+consumer = "meta.cognitive.quality.v1"
+reason = "Cognitive quality consumes immutable attempt/outcome evidence."
+
+[[refinement]]
+id = "W1_TYPED_DREAM_CANDIDATE_KIND"
+owner = "eliot-dreamer-contracts"
+contract_ref = "crates/smart/eliot-dreamer-contracts/common.contract.toml"
+correction_ref = "crates/smart/cognitive-rev12-w1-corrections.toml"
+property = "DreamOutputContract and AdmittedDreamDraft use the closed DreamCandidateKind rather than stringly output-kind text."
+
+[[refinement]]
+id = "W2_CLOSED_RELATION_SPREAD_RULE"
+owner = "eliot-cue-contracts"
+contract_ref = "crates/smart/eliot-cue-contracts/w2-execution.contract.toml"
+correction_ref = "crates/smart/cognitive-rev12-w2-corrections.toml"
+property = "W2 spread uses only BestSingleAdmissiblePath; multiple paths cannot sum into popularity, support or authority."
+
+[[refinement]]
+id = "W2_CONTEXT_REQUEST_AND_LIMIT_SEPARATION"
+owner = "eliot-context-contracts"
+contract_ref = "crates/smart/eliot-context-contracts/w2-execution.contract.toml"
+correction_ref = "crates/smart/cognitive-rev12-w2-corrections.toml"
+property = "ContextCompilationRequest embeds the exact provider denominator and compiler bounds; DecisionTailLimits remain a distinct type."
+
+[forbidden]
+parallel_field_definition = true
+legacy_module_or_api_as_authority = true
+generic_json_or_vendor_type = true
+aggregate_confidence_utility_or_intelligence_score = true
+complete_without_recheckable_denominator = true
+candidate_as_transition_or_effect_receipt = true
+field_contract_presence_as_implementation_proof = true
+stringly_candidate_kind = true
+stringly_relation_path_combination = true
+relation_path_score_summing = true
+compiler_tail_limit_alias = true
+delivery_plan_as_receipt = true

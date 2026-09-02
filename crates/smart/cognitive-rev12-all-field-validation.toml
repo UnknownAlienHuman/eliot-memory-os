@@ -1,0 +1,191 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+status = "CONSOLIDATED_FIELD_CONTRACT_VALIDATION_NOT_IMPLEMENTATION_OR_PRODUCT_PROOF"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[expected]
+contracts = 23
+w0_contracts = 11
+w1_contracts = 3
+w2_contracts = 2
+w8_contracts = 3
+w9_contracts = 4
+w0_assignments = 15
+w1_assignments = 12
+w2_assignments = 12
+w0_orders = [1, 2, 4, 5, 6, 7, 19, 26, 27, 28, 35, 49, 50, 51, 52]
+w1_orders = [3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+w2_orders = [20, 21, 22, 23, 24, 25, 29, 30, 31, 32, 33, 34]
+all_cell_orders = "1..86"
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+field_contract_index = "crates/smart/cognitive-rev12-all-field-contracts.toml"
+type_ownership = "crates/smart/cognitive-rev12-all-type-ownership.toml"
+w0_agent_handoff = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+w1_agent_handoff = "crates/smart/cognitive-rev12-w1-agent-handoff.toml"
+w1_validation = "crates/smart/cognitive-rev12-w1-validation.toml"
+w2_agent_handoff = "crates/smart/cognitive-rev12-w2-agent-handoff.toml"
+w2_validation = "crates/smart/cognitive-rev12-w2-validation.toml"
+
+[[gate]]
+id = "CFV01_TOML_PARSE"
+requirement = "Every indexed contract, owner manifest, index, handoff, correction and validation file parses as TOML."
+
+[[gate]]
+id = "CFV02_CONTRACT_PATH_ID_OWNER"
+requirement = "Exactly twenty-three indexed contracts exist; each file contract_id and owner equal its index entry and no path/id pair is duplicated."
+
+[[gate]]
+id = "CFV03_NORMATIVE_PAIR"
+requirement = "Every field contract binds the same accepted Architecture/Implementation pair key."
+
+[[gate]]
+id = "CFV04_PUBLIC_TYPE_UNIQUENESS"
+requirement = "Every indexed [[public_type]].name has exactly one owner across all contracts; consumers use [[external_type]] rather than redefine it."
+
+[[gate]]
+id = "CFV05_EXTERNAL_TYPE_RESOLUTION"
+requirement = "Every external type resolves to an indexed owner or admitted foundation/runtime contract owner; unknown owner strings fail closed."
+
+[[gate]]
+id = "CFV06_PUBLIC_FUNCTION_COMPLETENESS"
+requirement = "Every public function has an exact Rust-oriented signature and every signature type resolves to one public or external owner."
+
+[[gate]]
+id = "CFV07_CLOSED_ENUMS"
+requirement = "Closed job, candidate kind, subtype, provider, cue, disposition, stage, relation-combination and status families are enums; free-text/generic fallback cannot extend them silently."
+
+[[gate]]
+id = "CFV08_DENOMINATOR"
+requirement = "Every Complete coverage/absence state has source revision, method, expected count and exact equality; Partial/Unavailable/Blocked name gaps or owner/reason."
+
+[[gate]]
+id = "CFV09_SCOPE_FENCE"
+requirement = "Decision-bearing requests, projections, candidates, reports and views bind exact WorkScope/task when applicable and one compatible State Fence."
+
+[[gate]]
+id = "CFV10_OWNER_SPARSE"
+requirement = "Contract cells declare no mutable state/effects; candidates/views contain no canonical writer, lifecycle, authority, scheduler, finish, provider credential or route-execution ownership."
+
+[[gate]]
+id = "CFV11_EPISTEMIC_SEPARATION"
+requirement = "Observation, support, assumption, conflict, stale/superseded and unknown remain distinct; retrieval/repetition/model agreement cannot reinforce support."
+
+[[gate]]
+id = "CFV12_DREAMER_BOUNDARY"
+requirement = "Dreamer outputs remain candidates; model draft cannot confirm evidence; Researcher acquires, Dreamer interprets, Governor governs; curation subtype dispatch has no generic fallback."
+
+[[gate]]
+id = "CFV13_TRANSFORMATION_DIMENSIONS"
+requirement = "Dreamer transformation validation contains exactly coverage, preservation, faithfulness, lineage, reversibility, source authority and dependency closure; no aggregate score masks a failure."
+
+[[gate]]
+id = "CFV14_CUE_HOT_PATH"
+requirement = "Canonical/comparison spelling is separated; exact direct firing works with zero edges; graph failure leaves direct hits; spread uses the best single admissible path without summation; activation is handles-only and not support/use."
+
+[[gate]]
+id = "CFV15_CONTEXT_COMPILER"
+requirement = "ContextCompilationRequest binds an exact provider denominator, recipe, route, scope and fence; whole units only; Safety Floor and downstream headroom precede optional provider-fair allocation; every candidate gets one disposition; omission is reversible or blocks compilation."
+
+[[gate]]
+id = "CFV16_CONTEXT_VIEW_QUALITY"
+requirement = "Assembly cannot change membership; packet quality is independent and dimensioned; DecisionLocalTail cannot invent authority/verifier; reactive plan is not delivery/prevention receipt."
+
+[[gate]]
+id = "CFV17_MEMORY_CURATION"
+requirement = "Existence/support/lifecycle/accessibility/influence/utility stay independent; low use cannot lower support; protected minority/failure evidence stays addressable; proposals are forward/reversible candidates."
+
+[[gate]]
+id = "CFV18_INFLUENCE_CLOSURE"
+requirement = "Influence repair/revocation depends on exact dependency closure, never semantic similarity; restore/reindex does not restore influence implicitly."
+
+[[gate]]
+id = "CFV19_TASK_LOCAL_LEARNING"
+requirement = "Missing owner state is not filled from transcript; hypotheses/predictions predate outcomes; equivalent retry has allowed purpose; overlay is local/reversible and preserves protected surfaces."
+
+[[gate]]
+id = "CFV20_LEARNING_EVALUATION"
+requirement = "Activation receipt owner is external; delivery/acknowledgement is not use; early adherence is not finish adherence; closure may return NoReusableDelta; promotion input is advisory and dimensioned."
+
+[[gate]]
+id = "CFV21_W9_QUALITY"
+requirement = "Activity is not quality; memory/Skill/tool/Dreamer/self-quality/understanding contracts use exact denominators, separate stages and candidates without global score or self-mutation."
+
+[[gate]]
+id = "CFV22_COMMON_GROUND_UNDERSTANDING"
+requirement = "Common Ground preserves public causal inheritance rather than summary/native state; LocallyAdequate requires rival-aware public model, prior prediction, discriminator, outcome/verifier and revision discipline."
+
+[[gate]]
+id = "CFV23_AGENT_WRITE_ISOLATION"
+requirement = "W0, W1 and W2 assignments have pairwise-disjoint source/test paths within each wave; workers cannot edit Cargo.toml/lib.rs/reexports/contracts/status or another cell."
+
+[[gate]]
+id = "CFV24_CONTRACT_REFS"
+requirement = "Every owning Cargo.toml references each owner-local field contract and retains TARGET / NOT_EXECUTED / no-workspace-admission status."
+
+[[gate]]
+id = "CFV25_PAYLOAD_HYGIENE"
+requirement = "Contract-design diff contains TOML only: no Rust, Markdown, workflow, archive, probe, .eliot, root Cargo.toml or Cargo.lock changes."
+
+[[gate]]
+id = "CFV26_PROOF_CEILING"
+requirement = "Parse, schema completeness, branch, commit, review or type count cannot claim Rust behavior, Package/Edge/Product/Release Proof, runtime support or product acceptance."
+
+[[gate]]
+id = "CFV27_NEGATIVE_TESTS"
+requirement = "Every contract contains explicit negative tests that fail old/proxy behavior and every worker implements all negative tests before package integration."
+
+[[gate]]
+id = "CFV28_CANONICAL_DIGEST"
+requirement = "Every identity-bearing collection specifies deterministic canonical ordering/digest and permutation tests where ordering is non-semantic."
+
+[[gate]]
+id = "CFV29_W1_RESOLUTION_INPUT"
+requirement = "Current-position resolver consumes an exact AdmittedEpistemicRecordSet with owner coverage and denominator; empty/unqueried state cannot become an absence claim."
+
+[[gate]]
+id = "CFV30_W1_TYPED_CANDIDATE_POLICY"
+requirement = "DreamCandidateKind is closed and used by DreamOutputContract/AdmittedDreamDraft; transformation/admission/probe/clarification policies are immutable and contain no execution authority."
+
+[[gate]]
+id = "CFV31_W1_ORIENTATION"
+requirement = "Rivals, relation candidates, probes, clarifications and packet assembly preserve evidence/synthesis separation, local conflict, noncausal proximity and candidate-only status."
+
+[[gate]]
+id = "CFV32_W1_SELF_QUERY"
+requirement = "Only exact accepted normative-pair sources produce briefs; target remains separate from current support; CurrentSystemEvidenceSnapshot is externally owned and stale evidence cannot self-certify support."
+
+[[gate]]
+id = "CFV33_W1_WRITE_ISOLATION"
+requirement = "Exactly twelve W1 briefs have twenty-four pairwise-disjoint source/test paths and no worker-owned integration file."
+
+[[gate]]
+id = "CFV34_W1_STALE_DEPENDENCY"
+requirement = "eliot-dreamer-orientation no longer depends on retired/nonexistent eliot-dreamer-candidate-validation."
+
+[[gate]]
+id = "CFV35_W1_PROOF_CEILING"
+requirement = "W1 fields/briefs/corrections remain TARGET / NOT_EXECUTED and cannot claim model, package, edge, product, runtime or release behavior."
+
+[[gate]]
+id = "CFV36_W2_FIELD_CLOSURE"
+requirement = "The two W2 owner-local refinement contracts close relation-spread combination, ContextCompilationRequest and compiler-versus-tail limit gaps without redefining existing cue/context public types."
+
+[[gate]]
+id = "CFV37_W2_WRITE_ISOLATION"
+requirement = "Exactly twelve W2 briefs have twenty-four pairwise-disjoint source/test paths and no worker-owned contract, Cargo.toml, lib.rs, re-export, status or integration file."
+
+[[gate]]
+id = "CFV38_W2_HOT_PATH"
+requirement = "All W2 cells are deterministic and request-bounded and perform no model/provider/tool call, filesystem or storage scan, blocking I/O, Context provider acquisition or host delivery."
+
+[[gate]]
+id = "CFV39_W2_SEMANTIC_BOUNDARIES"
+requirement = "Cue activation is not support/use/delivery; Context merge does not retrieve; assembly/quality do not mutate membership; reactive planning is not delivery, acknowledgement, use, outcome or prevention."
+
+[[gate]]
+id = "CFV40_COMPOSITE_COUNTS"
+requirement = "The consolidated authority contains exactly 23 indexed contracts, 102 contract-to-cell references and 79 unique FunctionalCapabilityCells."
+
+[[gate]]
+id = "CFV41_W2_PROOF_CEILING"
+requirement = "W2 fields/briefs/corrections remain TARGET / NOT_EXECUTED and cannot claim Rust behavior, Package/Edge/Product/Release Proof, host prevention, runtime support or product acceptance."

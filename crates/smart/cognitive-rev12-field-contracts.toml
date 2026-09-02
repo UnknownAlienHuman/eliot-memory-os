@@ -1,0 +1,56 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W8_FIELD_LEVEL_CONTRACT_FREEZE"
+issue = 196
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+rule = "These field contracts refine the target Implementation without changing Architecture intent. They are the only field-level source for the named W8 public types; Rust source, runtime behavior, Edge Proof and Product Pulse remain unproven."
+
+[[contract]]
+id = "smart.context.provider-contribution.v1"
+path = "crates/smart/eliot-context-contracts/provider-contribution.contract.toml"
+owner = "eliot-context-contracts"
+functional_cells = ["smart.context.contracts.candidate", "smart.context.contracts.admission", "smart.context.contracts.view_quality", "smart.context.provider_registry_contracts", "smart.memory.context_projection", "smart.self_model.context_projection", "smart.epistemic.context_projection"]
+resolves = ["CC-PROVIDER-CONTRIBUTION-SCHEMA"]
+consumers = ["eliot-context", "eliot-memory-projection", "eliot-dreamer-self-query", "eliot-epistemic"]
+
+[[contract]]
+id = "smart.memory.projection-contracts.v1"
+path = "crates/smart/eliot-memory-projection-contracts/projection.contract.toml"
+owner = "eliot-memory-projection-contracts"
+functional_cells = ["smart.memory.projection.contracts", "smart.memory.candidate_query", "smart.memory.context_projection"]
+resolves = ["CC-MEMORY-PROJECTION-SCHEMA"]
+consumers = ["eliot-memory-projection"]
+
+[[contract]]
+id = "smart.learning.system-experience.v1"
+path = "crates/smart/eliot-learning-contracts/experience.contract.toml"
+owner = "eliot-learning-contracts"
+functional_cells = ["smart.learning.contracts.experience", "smart.experience.projection"]
+resolves = ["CC-FAILURE-OBSERVATION-SCHEMA"]
+consumers = ["eliot-experience-projection", "eliot-learning-loop", "eliot-dreamer-diagnosis"]
+
+[[dependency]]
+provider = "smart.context.provider-contribution.v1"
+consumer = "smart.memory.projection-contracts.v1"
+reason = "MemoryContextProjectionRequest embeds the one generic ContextProviderProjectionRequest and returns ProviderContribution."
+
+[resolved_design_conflicts]
+provider_class_set = "Exactly GoalTask, CriticalAttention, EpistemicPosition, MemoryRecall, AuthorityAffordance, SelfModel, DecisionTail."
+provider_requirement_name = "ProviderRoleRequirement replaces ProviderRequirement."
+self_model_request = "SelfModelContextProjectionRequest is removed; self-model projection consumes ContextProviderProjectionRequest."
+context_contribution_name = "The rev10 donor ContextContribution is adapted and renamed ProviderContribution."
+complete_coverage = "Complete always requires an exact recheckable denominator and exact count equality."
+
+[still_open]
+challenges = ["CC-PROVIDER-ADAPTERS", "CC-EDGE-PROOF", "CC-PRODUCT-PULSE", "CC-WAVE0-PROOF-IDENTITY"]
+not_proven = ["Rust implementation", "package Module Proof", "real provider-consumer Edge Proof", "root workspace admission", "runtime support", "Product Pulse", "product acceptance"]
+
+[forbidden]
+generic_json_or_vendor_types = true
+provider_specific_duplicate_request = true
+aggregate_confidence_or_utility_score = true
+admission_or_authority_in_provider_contribution = true
+implicit_complete_without_denominator = true

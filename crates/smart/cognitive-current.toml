@@ -1,0 +1,60 @@
+schema_version = 6
+status = "CURRENT_COGNITIVE_DESIGN_AUTHORITY"
+authority = "crates/smart/cognitive-rev12-authority.toml"
+issue = 341
+branch = "work/341-cognitive-w2-reactive-context"
+parent_branch = "work/320-cognitive-w1-orientation-contracts"
+design_base_branch = "work/94-cognitive-function-design-rev11"
+base_main_commit = "59e36385b8e81ef7a328b255ec5ff3330b58b41c"
+proof_ceiling = "STATIC_TOPOLOGY_FIELD_CONTRACT_AND_AGENT_WORK_UNIT_DESIGN_ONLY"
+functional_cells = 86
+physical_crates = 31
+hot_path_cells = 15
+orders = "1..86"
+
+[normative_pair]
+pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
+implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+
+[assignment]
+index = "crates/smart/cognitive-rev12-cell-index.toml"
+base_catalogs = ["crates/smart/cognitive-rev11-cells-foundation.toml", "crates/smart/cognitive-rev11-cells-cues-context.toml", "crates/smart/cognitive-rev11-cells-curation-research.toml", "crates/smart/cognitive-rev11-cells-learning.toml", "crates/smart/cognitive-rev11-cells-diagnosis-planning.toml"]
+extension_catalogs = ["crates/smart/cognitive-rev12-cells-projections.toml", "crates/smart/cognitive-rev12-cells-meta-quality.toml"]
+correction_layers = ["crates/smart/cognitive-rev12-w1-corrections.toml", "crates/smart/cognitive-rev12-w2-corrections.toml"]
+new_agent_units = "crates/smart/cells-v12/README.toml"
+w0_agent_index = "crates/smart/cognitive-rev12-w0-agent-brief-index.toml"
+w0_agent_handoff = "crates/smart/cognitive-rev12-w0-agent-handoff.toml"
+w1_agent_index = "crates/smart/cognitive-rev12-w1-agent-brief-index.toml"
+w1_agent_handoff = "crates/smart/cognitive-rev12-w1-agent-handoff.toml"
+w2_agent_index = "crates/smart/cognitive-rev12-w2-agent-brief-index.toml"
+w2_agent_handoff = "crates/smart/cognitive-rev12-w2-agent-handoff.toml"
+w9_agent_handoff = "crates/smart/cognitive-rev12-w9-agent-handoff.toml"
+
+[field_contracts]
+index = "crates/smart/cognitive-rev12-all-field-contracts.toml"
+contract_count = 23
+scope = "W0 Contract/Evidence, W1 D3a Orientation, W2 D3b cue/Context execution, W8 canonical projections, W9 Meta quality and understanding"
+status = "FIELD_LEVEL_FROZEN_FOR_AGENT_IMPLEMENTATION"
+implementation_status = "TARGET_NOT_EXECUTED"
+subindexes = ["crates/smart/cognitive-rev12-w1-field-contracts.toml", "crates/smart/cognitive-rev12-w2-field-contracts.toml", "crates/smart/cognitive-rev12-field-contracts.toml", "crates/smart/cognitive-rev12-w9-field-contracts.toml"]
+
+[control]
+topology = "crates/smart/cognitive-rev12-topology.toml"
+coverage = "crates/smart/cognitive-rev12-coverage.toml"
+dispatch_coverage = "crates/smart/cognitive-rev11-coverage.toml"
+type_ownership = "crates/smart/cognitive-rev12-all-type-ownership.toml"
+contract_challenges = "crates/smart/cognitive-rev12-w0-contract-challenges.toml"
+base_edges = "crates/smart/cognitive-function-edge-map-v11.toml"
+extension_edges = "crates/smart/cognitive-rev12-edge-extension.toml"
+base_product_pulses = "crates/smart/cognitive-product-pulses-v11.toml"
+extension_product_pulses = "crates/smart/cognitive-rev12-product-pulse-extension.toml"
+waves = "crates/smart/cognitive-rev12-waves.toml"
+agent_handoff = "crates/smart/cognitive-rev12-agent-handoff.toml"
+migration = "crates/smart/cognitive-rev12-migration.toml"
+validation = "crates/smart/cognitive-rev12-all-field-validation.toml"
+w1_validation = "crates/smart/cognitive-rev12-w1-validation.toml"
+w2_validation = "crates/smart/cognitive-rev12-w2-validation.toml"
+
+[forbidden_assignment_sources]
+paths = ["legacy module.toml", "legacy *.api.toml", "superseded centralized field draft", "cognitive-crate-decisions rev7", "old cognitive branches", "retired function-only crates"]

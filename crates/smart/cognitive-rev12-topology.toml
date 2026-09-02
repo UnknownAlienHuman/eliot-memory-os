@@ -1,0 +1,258 @@
+schema_version = 2
+authority = "eliot-cognitive-function-design-rev12"
+status = "TARGET_TOPOLOGY_NOT_WORKSPACE_ADMITTED"
+physical_crate_count = 31
+functional_cell_count = 86
+rule = "Cells are assigned independently; physical crates follow owner, dependency, proof and replacement seams rather than function count."
+
+[[crate]]
+path = "crates/governor/eliot-observation"
+package = "eliot-observation"
+action = "extend_existing_crate"
+owner = "Governor Observation Owner"
+cells = ["governor.observation.classifier"]
+seam = "Governor-only deterministic capture classification."
+
+[[crate]]
+path = "crates/smart/eliot-epistemic-contracts"
+package = "eliot-epistemic-contracts"
+action = "retain_contract_crate"
+owner = "Epistemic Contract Owner"
+cells = ["smart.epistemic.contracts"]
+seam = "Provider-neutral Current Epistemic Position algebra."
+
+[[crate]]
+path = "crates/smart/eliot-epistemic"
+package = "eliot-epistemic"
+action = "refactor_existing_donor"
+owner = "Epistemic Resolver Owner"
+cells = ["smart.epistemic.position", "smart.epistemic.context_projection"]
+seam = "Hot deterministic resolver and its owner-attributed Context projection."
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-contracts"
+package = "eliot-dreamer-contracts"
+action = "retain_and_restructure_contract_crate"
+owner = "Dreamer Contract Owner"
+cells = ["smart.dreamer.contracts.common", "smart.dreamer.contracts.orientation", "smart.dreamer.contracts.research", "smart.dreamer.contracts.curation"]
+seam = "Provider-neutral candidate-only Dreamer wire family."
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-bundle"
+package = "eliot-dreamer-bundle"
+action = "retain_prototype_crate"
+owner = "Dream Input Bundle Owner"
+cells = ["smart.dreamer.bundle"]
+seam = "Disclosure, budgeting and reversible omission."
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-validation"
+package = "eliot-dreamer-validation"
+action = "create_consolidated_prototype_crate"
+owner = "Dream Transformation Validation Owner"
+cells = ["smart.dreamer.claim_grounding", "smart.dreamer.transformation_validation", "smart.dreamer.draft_admission"]
+seam = "Common post-model pipeline with independent source modules."
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-orientation"
+package = "eliot-dreamer-orientation"
+action = "retain_and_consolidate_prototype_crate"
+owner = "Orientation Candidate Owner"
+cells = ["smart.dreamer.rival_model", "smart.dreamer.relation_candidate", "smart.dreamer.probe_plan", "smart.dreamer.orientation", "smart.dreamer.clarification"]
+seam = "One bounded problem-orientation candidate family."
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-self-query"
+package = "eliot-dreamer-self-query"
+action = "create_consolidated_prototype_crate"
+owner = "Architecture Self-Query Projection Owner"
+cells = ["smart.dreamer.architecture_brief", "smart.dreamer.implementation_brief", "smart.self_model.context_projection"]
+seam = "Exact accepted-source briefs and bounded self-model projection."
+
+[[crate]]
+path = "crates/smart/eliot-cue-contracts"
+package = "eliot-cue-contracts"
+action = "retain_contract_crate"
+owner = "Cue Contract Owner"
+cells = ["smart.cue.contracts"]
+seam = "Stable cue contracts."
+
+[[crate]]
+path = "crates/smart/eliot-cues"
+package = "eliot-cues"
+action = "refactor_existing_donor"
+owner = "Cue Projection Owner"
+cells = ["smart.cue.normalizer", "smart.cue.binding", "smart.cue.index", "smart.cue.direct_match", "smart.cue.relation_spread", "smart.cue.activation"]
+seam = "One hot pure rebuildable projection dependency island."
+
+[[crate]]
+path = "crates/smart/eliot-context-contracts"
+package = "eliot-context-contracts"
+action = "retain_and_restructure_contract_crate"
+owner = "Context Contract Owner"
+cells = ["smart.context.contracts.candidate", "smart.context.contracts.admission", "smart.context.contracts.view_quality", "smart.context.provider_registry_contracts"]
+seam = "Candidate, provider, admission, view and quality contracts."
+
+[[crate]]
+path = "crates/smart/eliot-context"
+package = "eliot-context"
+action = "refactor_existing_donor"
+owner = "Context Compiler Owner"
+cells = ["smart.context.contribution_merge", "smart.context.admission", "smart.context.assembly", "smart.context.quality", "smart.context.decision_tail", "smart.context.reactive_delivery_plan"]
+seam = "One hot pure compiler/view island with independent source modules."
+
+[[crate]]
+path = "crates/smart/eliot-memory-curation-contracts"
+package = "eliot-memory-curation-contracts"
+action = "retain_contract_crate"
+owner = "Memory Curation Contract Owner"
+cells = ["smart.memory.curation.contracts"]
+seam = "Existence, support, accessibility and influence proposal contracts."
+
+[[crate]]
+path = "crates/smart/eliot-memory-curation-screen"
+package = "eliot-memory-curation-screen"
+action = "retain_prototype_crate"
+owner = "Curation Screening Owner"
+cells = ["smart.memory.curation.screen"]
+seam = "Bounded deterministic read-only screening."
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-memory-models"
+package = "eliot-dreamer-memory-models"
+action = "create_consolidated_prototype_crate"
+owner = "Semantic Memory Model Candidate Owner"
+cells = ["smart.dreamer.classification", "smart.dreamer.episode", "smart.dreamer.concept"]
+seam = "Descriptive reconstruction; chronology and causality stay distinct."
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-procedural"
+package = "eliot-dreamer-procedural"
+action = "create_consolidated_prototype_crate"
+owner = "Procedural Candidate Owner"
+cells = ["smart.dreamer.procedure", "smart.dreamer.skill", "smart.dreamer.failure"]
+seam = "Action-knowledge candidate family."
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-memory-revision"
+package = "eliot-dreamer-memory-revision"
+action = "create_consolidated_prototype_crate"
+owner = "Memory Revision Candidate Owner"
+cells = ["smart.dreamer.structure_repair", "smart.dreamer.reconsolidation", "smart.dreamer.accessibility", "smart.dreamer.influence_repair", "smart.dreamer.negative_memory_extinction"]
+seam = "Forward-only reversible semantic and activation proposals."
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-curation"
+package = "eliot-dreamer-curation"
+action = "retain_thin_dispatch_crate"
+owner = "Curation Dispatch Owner"
+cells = ["smart.dreamer.curation"]
+seam = "Typed registry and candidate-set assembly only."
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-research-synthesis"
+package = "eliot-dreamer-research-synthesis"
+action = "create_prototype_crate"
+owner = "Research Interpretation Candidate Owner"
+cells = ["smart.dreamer.research_synthesis"]
+seam = "Researcher acquires; Dreamer interprets; Governor governs."
+
+[[crate]]
+path = "crates/smart/eliot-learning-contracts"
+package = "eliot-learning-contracts"
+action = "retain_and_restructure_contract_crate"
+owner = "Learning Contract Owner"
+cells = ["smart.learning.contracts.common", "smart.learning.contracts.state_view", "smart.learning.contracts.adaptation", "smart.learning.contracts.evaluation", "smart.learning.contracts.experience"]
+seam = "Task-local learning and experience-projection contracts."
+
+[[crate]]
+path = "crates/smart/eliot-learning-loop"
+package = "eliot-learning-loop"
+action = "create_consolidated_prototype_crate"
+owner = "Task-Local Learning Candidate Owner"
+cells = ["smart.learning.state_view", "smart.learning.delta", "smart.learning.overlay", "smart.learning.overlay_validation"]
+seam = "Attempt-to-attempt reversible task-local adaptation."
+
+[[crate]]
+path = "crates/meta/eliot-learning-evaluation"
+package = "eliot-learning-evaluation"
+action = "create_consolidated_prototype_crate"
+owner = "Learning Evaluation Projection Owner"
+cells = ["meta.learning.activation_assessment", "meta.learning.closure", "meta.learning.promotion_input"]
+seam = "Outcome-linked assessment and advisory closure."
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-diagnosis"
+package = "eliot-dreamer-diagnosis"
+action = "create_consolidated_prototype_crate"
+owner = "Diagnosis Candidate Owner"
+cells = ["smart.dreamer.conflict_analysis", "smart.dreamer.development_diagnosis"]
+seam = "Rival-preserving causal diagnosis."
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-planning"
+package = "eliot-dreamer-planning"
+action = "create_consolidated_prototype_crate"
+owner = "Advisory Planning Candidate Owner"
+cells = ["smart.dreamer.maintenance_plan", "smart.dreamer.configuration_plan", "smart.dreamer.work_decomposition", "smart.dreamer.orchestration_plan"]
+seam = "Candidate-only planning; execution remains external."
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-cycle"
+package = "eliot-dreamer-cycle"
+action = "create_consolidated_prototype_crate"
+owner = "DreamCycle Candidate Owner"
+cells = ["smart.dreamer.cycle_sample", "smart.dreamer.cycle_plan"]
+seam = "One bounded maintenance cycle, no self-scheduling."
+
+[[crate]]
+path = "crates/smart/eliot-memory-projection-contracts"
+package = "eliot-memory-projection-contracts"
+action = "create_contract_crate"
+owner = "Memory Projection Contract Owner"
+cells = ["smart.memory.projection.contracts"]
+seam = "Store-neutral bounded memory read/projection contracts."
+
+[[crate]]
+path = "crates/smart/eliot-memory-projection"
+package = "eliot-memory-projection"
+action = "create_prototype_crate"
+owner = "Memory Projection Owner"
+cells = ["smart.memory.candidate_query", "smart.memory.context_projection"]
+seam = "Hot pure selection and owner-attributed Context projection."
+
+[[crate]]
+path = "crates/smart/eliot-experience-projection"
+package = "eliot-experience-projection"
+action = "create_prototype_crate"
+owner = "Experience Projection Owner"
+cells = ["smart.experience.projection"]
+seam = "Immutable outcome-linked projection, no experience store."
+
+[[crate]]
+path = "crates/meta/eliot-memory-quality"
+package = "eliot-memory-quality"
+action = "create_prototype_crate"
+owner = "Memory Quality Assessment Owner"
+cells = ["meta.memory.ecology_assessment", "meta.memory.gravity_assessment"]
+seam = "Cold dimensioned memory ecology/gravity assessments."
+
+[[crate]]
+path = "crates/meta/eliot-cognitive-quality"
+package = "eliot-cognitive-quality"
+action = "create_prototype_crate"
+owner = "Governor Diagnostic Compiler / Meta Quality Owner"
+cells = ["meta.skill.lifecycle_assessment", "meta.tool.surface_assessment", "meta.dreamer.job_economics", "governor.self_quality.view", "meta.self_quality.learning_bottleneck", "meta.self_quality.intervention_candidate"]
+seam = "Cold owner-projection analysis; no state or intervention execution."
+
+[[crate]]
+path = "crates/meta/eliot-understanding-assessment"
+package = "eliot-understanding-assessment"
+action = "create_prototype_crate"
+owner = "Understanding Assessment Owner"
+cells = ["meta.common_ground.assessment", "meta.understanding.scoped_assessment"]
+seam = "Route-transfer Common Ground and scoped understanding proof projection."
+
+[package_counter_metrics]
+reject_when = ["glue or re-export code dominates semantic code", "adjacent crates always change and prove together", "package exists only because one agent was assigned", "package has no independent replacement or failure boundary"]
+review_when = ["estimated implementation exceeds 10000 LOC", "public API exceeds one causal family", "dependencies diverge", "proof or lifecycle owner diverges"]

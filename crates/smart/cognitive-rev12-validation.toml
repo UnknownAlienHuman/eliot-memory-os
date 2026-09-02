@@ -1,0 +1,111 @@
+schema_version = 3
+authority = "eliot-cognitive-function-design-rev12"
+status = "VALIDATION_CONTRACT_NOT_PRODUCT_PROOF"
+issue = 94
+branch = "work/94-cognitive-function-design-rev11"
+expected_base_main = "59e36385b8e81ef7a328b255ec5ff3330b58b41c"
+proof_ceiling = "STATIC_TOPOLOGY_AND_W8_FIELD_CONTRACT_DESIGN_ONLY"
+
+[expected]
+functional_cells = 86
+orders = "1..86"
+physical_crates = 31
+hot_path_cells = 15
+base_typed_edges = 54
+extension_typed_edges = 14
+base_product_pulses = 9
+extension_product_pulses = 3
+field_contracts = 3
+resolved_schema_challenges = 3
+open_non_schema_challenges = 4
+normative_architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
+normative_implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+
+[[gate]]
+id = "V01_TOML_PARSE"
+requirement = "Every changed prototype and field-contract artifact parses as TOML."
+
+[[gate]]
+id = "V02_ORDER_CLOSURE"
+requirement = "Indexed orders are exactly 1..86 with no duplicate cell ID."
+
+[[gate]]
+id = "V03_SINGLE_ASSIGNMENT_VIEW"
+requirement = "One indexed cell record is the only assignment/API authority; legacy module/api files are donor evidence only."
+
+[[gate]]
+id = "V04_PUBLIC_TYPE_OWNER"
+requirement = "Every public type resolves to one physical contract owner; duplicate field-level definitions are forbidden."
+
+[[gate]]
+id = "V05_CRATE_SEAM"
+requirement = "Each of 31 crates has an owner/dependency/proof/replacement seam; agent or function count is not a seam."
+
+[[gate]]
+id = "V06_HOT_PATH"
+requirement = "Exactly 15 hot cells; all have bounded complexity, deterministic ordering, no I/O/model/provider SDK and visible degradation."
+
+[[gate]]
+id = "V07_CANDIDATE_ONLY"
+requirement = "Dreamer and Meta outputs contain no canonical transition, authority, job, effect, scheduler, finish or promotion decision."
+
+[[gate]]
+id = "V08_DIMENSIONAL_EVIDENCE"
+requirement = "Transformation, Context quality, memory ecology, Skill/tool utility, learning and understanding use dimension vectors; no aggregate confidence/intelligence score."
+
+[[gate]]
+id = "V09_MEMORY_SEPARATION"
+requirement = "Existence, support, accessibility and permitted influence are distinct; retrieval/repetition cannot reinforce."
+
+[[gate]]
+id = "V10_CAUSALITY"
+requirement = "Chronology/association/prediction/intervention support remain distinct; success alone cannot prove mechanism."
+
+[[gate]]
+id = "V11_RESEARCH_BOUNDARY"
+requirement = "Researcher acquires, Dreamer interprets, Governor governs; no provider discovery/credential/network acquisition in Dreamer cells."
+
+[[gate]]
+id = "V12_LEARNING_BOUNDARY"
+requirement = "Task-local overlay is reversible and cannot change goal, acceptance, authority, privacy, cost, evaluator or its own promotion."
+
+[[gate]]
+id = "V13_META_BOUNDARY"
+requirement = "Memory/Skill/tool/Dreamer/self-quality assessments consume owner projections and return views or candidates only."
+
+[[gate]]
+id = "V14_COMMON_GROUND"
+requirement = "Handoff checks goals, decisions, invariants, rivals, unknowns, commitments and action consequences; summary similarity is insufficient."
+
+[[gate]]
+id = "V15_SCOPED_UNDERSTANDING"
+requirement = "LOCALLY_ADEQUATE requires rival-aware public model, prediction before observation, discriminator, outcome/verifier and revision discipline."
+
+[[gate]]
+id = "V16_SOURCE_SCOPE_EXCLUSIVITY"
+requirement = "Worker source/test scopes do not overlap; Cargo/lib/reexports belong to integration owner."
+
+[[gate]]
+id = "V17_PAYLOAD_HYGIENE"
+requirement = "Design diff contains TOML only; no Rust, Markdown, workflow, archive, probe, .eliot, root Cargo.toml or Cargo.lock changes."
+
+[[gate]]
+id = "V18_PROOF_CEILING"
+requirement = "No parse, field freeze, branch, commit, test count or design review claims implementation/runtime/product support."
+
+[[gate]]
+id = "V19_FIELD_CONTRACT_INDEX"
+requirement = "Exactly three W8 field contracts are indexed; every referenced path, owner, cell and resolved challenge is unique."
+
+[[gate]]
+id = "V20_DENOMINATOR_INVARIANTS"
+requirement = "Memory, Context-provider and experience Complete states require a frozen independently recheckable exact denominator; unavailable/blocked states name the missing owner or reason."
+
+[[gate]]
+id = "V21_GENERIC_PROVIDER_REQUEST"
+requirement = "Memory, self-model and epistemic providers consume the one ContextProviderProjectionRequest; no provider-specific duplicate request type exists."
+
+[[gate]]
+id = "V22_DONOR_TRACE"
+requirement = "Every reused rev10 donor field family records exact archive and content SHA-256 plus keep/replace disposition."

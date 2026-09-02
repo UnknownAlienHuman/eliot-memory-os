@@ -1,0 +1,164 @@
+schema_version = 1
+authority = "eliot-cognitive-function-design-rev12"
+status = "W0_AGENT_HANDOFF_CONTRACT"
+field_contract_index = "crates/smart/cognitive-rev12-all-field-contracts.toml"
+orders = [1, 2, 4, 5, 6, 7, 19, 26, 27, 28, 35, 49, 50, 51, 52]
+
+[worker_rule]
+reads = ["one assignment below", "its exact field_contract", "declared Architecture/Implementation anchors", "one-hop external contracts and fixtures"]
+writes = ["only declared source_file", "only declared test_file"]
+forbidden = ["Cargo.toml", "src/lib.rs", "reexports", "another order source", "root workspace", "runtime wiring", "canonical state", "provider/model/tool calls", "proof/status files", "field-contract edits", "oracle weakening"]
+return = ["implemented selected public functions", "typed errors", "minimum and contract negative tests", "remaining ContractChallenge", "actual proof ceiling"]
+
+[[assignment]]
+order = 1
+cell = "governor.observation.classifier"
+physical_crate = "eliot-observation"
+field_contract = "crates/governor/eliot-observation/classification.contract.toml"
+public_function_selectors = ["validate_observation_classification_policy", "validate_observation_classification_input", "classify_observation", "validate_observation_classification"]
+source_file = "crates/governor/eliot-observation/src/classifier.rs"
+test_file = "crates/governor/eliot-observation/tests/classifier.rs"
+stop_condition = "Challenge rather than invent task authority, promote status, discard ambiguous capture, or write canon."
+
+[[assignment]]
+order = 2
+cell = "smart.epistemic.contracts"
+physical_crate = "eliot-epistemic-contracts"
+field_contract = "crates/smart/eliot-epistemic-contracts/current-position.contract.toml"
+public_function_selectors = ["validate_position_request", "validate_current_epistemic_position", "current_position_digest"]
+source_file = "crates/smart/eliot-epistemic-contracts/src/position.rs"
+test_file = "crates/smart/eliot-epistemic-contracts/tests/position.rs"
+stop_condition = "Challenge rather than collapse assumptions/rivals/conflicts/unknowns, count dependent evidence as independent, or create truth authority."
+
+[[assignment]]
+order = 4
+cell = "smart.dreamer.contracts.common"
+physical_crate = "eliot-dreamer-contracts"
+field_contract = "crates/smart/eliot-dreamer-contracts/common.contract.toml"
+public_function_selectors = ["validate_dream_job_envelope", "validate_reference_manifest", "validate_dream_input_bundle", "validate_model_draft", "validate_grounded_draft", "validate_transformation_report", "validate_admitted_draft"]
+source_file = "crates/smart/eliot-dreamer-contracts/src/common.rs"
+test_file = "crates/smart/eliot-dreamer-contracts/tests/common.rs"
+stop_condition = "Challenge rather than add provider SDK/store/process/model execution, generic fallback, authority, support or finish."
+
+[[assignment]]
+order = 5
+cell = "smart.dreamer.contracts.orientation"
+physical_crate = "eliot-dreamer-contracts"
+field_contract = "crates/smart/eliot-dreamer-contracts/orientation.contract.toml"
+public_function_selectors = ["validate_orientation_request", "validate_rival_model_set", "validate_relation_candidate_set", "validate_probe_plan", "validate_clarification_candidate", "validate_dream_packet"]
+source_file = "crates/smart/eliot-dreamer-contracts/src/orientation.rs"
+test_file = "crates/smart/eliot-dreamer-contracts/tests/orientation.rs"
+stop_condition = "Challenge rather than infer causality from proximity, fill resolved evidence from model text, execute probes, or admit Context."
+
+[[assignment]]
+order = 6
+cell = "smart.dreamer.contracts.research"
+physical_crate = "eliot-dreamer-contracts"
+field_contract = "crates/smart/eliot-dreamer-contracts/research.contract.toml"
+public_function_selectors = ["validate_research_synthesis_request", "validate_research_interpretation_candidate", "validate_research_synthesis_packet"]
+source_file = "crates/smart/eliot-dreamer-contracts/src/research.rs"
+test_file = "crates/smart/eliot-dreamer-contracts/tests/research.rs"
+stop_condition = "Challenge rather than acquire/expand sources, weaken citations, upgrade coverage/evidence grade, or promote project truth."
+
+[[assignment]]
+order = 7
+cell = "smart.dreamer.contracts.curation"
+physical_crate = "eliot-dreamer-contracts"
+field_contract = "crates/smart/eliot-dreamer-contracts/curation.contract.toml"
+public_function_selectors = ["validate_curation_handler_registry", "validate_curation_request", "validate_curation_candidate_set"]
+source_file = "crates/smart/eliot-dreamer-contracts/src/curation.rs"
+test_file = "crates/smart/eliot-dreamer-contracts/tests/curation.rs"
+stop_condition = "Challenge rather than infer subtype from prose, route to another subtype, add generic fallback, or emit lifecycle/write receipt."
+
+[[assignment]]
+order = 19
+cell = "smart.cue.contracts"
+physical_crate = "eliot-cue-contracts"
+field_contract = "crates/smart/eliot-cue-contracts/cue.contract.toml"
+public_function_selectors = ["validate_observed_cue", "validate_cue_comparison_profile", "validate_normalized_cue", "validate_cue_binding_candidate_set", "validate_cue_snapshot", "cue_snapshot_digest", "validate_direct_cue_match_result", "validate_relation_spread_result", "validate_cue_activation_result"]
+source_file = "crates/smart/eliot-cue-contracts/src/contracts.rs"
+test_file = "crates/smart/eliot-cue-contracts/tests/contracts.rs"
+stop_condition = "Challenge rather than lowercase canonical spelling globally, require graph edges for exact firing, fetch payloads, or claim support/use."
+
+[[assignment]]
+order = 26
+cell = "smart.context.contracts.candidate"
+physical_crate = "eliot-context-contracts"
+field_contract = "crates/smart/eliot-context-contracts/context-compiler.contract.toml"
+public_function_selectors = ["validate_context_candidate_set"]
+source_file = "crates/smart/eliot-context-contracts/src/candidate.rs"
+test_file = "crates/smart/eliot-context-contracts/tests/candidate.rs"
+stop_condition = "Challenge rather than redefine provider atoms, treat Unknown delta as zero, or hide missing-provider coverage."
+
+[[assignment]]
+order = 27
+cell = "smart.context.contracts.admission"
+physical_crate = "eliot-context-contracts"
+field_contract = "crates/smart/eliot-context-contracts/context-compiler.contract.toml"
+public_function_selectors = ["validate_context_recipe", "validate_admitted_context_set"]
+source_file = "crates/smart/eliot-context-contracts/src/admission.rs"
+test_file = "crates/smart/eliot-context-contracts/tests/admission.rs"
+stop_condition = "Challenge rather than drop Safety Floor/headroom, cut atoms mid-unit, omit without expansion, or claim delivery."
+
+[[assignment]]
+order = 28
+cell = "smart.context.contracts.view_quality"
+physical_crate = "eliot-context-contracts"
+field_contract = "crates/smart/eliot-context-contracts/context-compiler.contract.toml"
+public_function_selectors = ["validate_active_understanding_view", "validate_packet_quality", "validate_decision_local_tail", "validate_pending_context_injection_plan"]
+source_file = "crates/smart/eliot-context-contracts/src/view_quality.rs"
+test_file = "crates/smart/eliot-context-contracts/tests/view_quality.rs"
+stop_condition = "Challenge rather than mutate membership, invent action/verifier, aggregate quality, or turn a delivery plan into a receipt/prevention claim."
+
+[[assignment]]
+order = 35
+cell = "smart.memory.curation.contracts"
+physical_crate = "eliot-memory-curation-contracts"
+field_contract = "crates/smart/eliot-memory-curation-contracts/curation.contract.toml"
+public_function_selectors = ["validate_curation_snapshot", "validate_curation_screen_policy", "validate_curation_screen_result", "validate_curation_proposal"]
+source_file = "crates/smart/eliot-memory-curation-contracts/src/contracts.rs"
+test_file = "crates/smart/eliot-memory-curation-contracts/tests/contracts.rs"
+stop_condition = "Challenge rather than use scalar utility, lower support for low use, discard protected evidence, or return an applied transition."
+
+[[assignment]]
+order = 49
+cell = "smart.learning.contracts.common"
+physical_crate = "eliot-learning-contracts"
+field_contract = "crates/smart/eliot-learning-contracts/task-local-learning.contract.toml"
+public_function_selectors = ["validate_learning_identity"]
+source_file = "crates/smart/eliot-learning-contracts/src/common.rs"
+test_file = "crates/smart/eliot-learning-contracts/tests/common.rs"
+stop_condition = "Challenge rather than own task/attempt lifecycle, retry scheduling, route execution or cross-task promotion."
+
+[[assignment]]
+order = 50
+cell = "smart.learning.contracts.state_view"
+physical_crate = "eliot-learning-contracts"
+field_contract = "crates/smart/eliot-learning-contracts/task-local-learning.contract.toml"
+public_function_selectors = ["validate_learning_state_view_request", "validate_campaign_learning_state_view"]
+source_file = "crates/smart/eliot-learning-contracts/src/state_view.rs"
+test_file = "crates/smart/eliot-learning-contracts/tests/state_view.rs"
+stop_condition = "Challenge rather than fill missing/stale owner projections from transcript or create a mutable campaign aggregate."
+
+[[assignment]]
+order = 51
+cell = "smart.learning.contracts.adaptation"
+physical_crate = "eliot-learning-contracts"
+field_contract = "crates/smart/eliot-learning-contracts/task-local-learning.contract.toml"
+public_function_selectors = ["validate_learning_delta_request", "validate_attempt_learning_delta", "validate_overlay_candidate", "validate_overlay_report"]
+source_file = "crates/smart/eliot-learning-contracts/src/adaptation.rs"
+test_file = "crates/smart/eliot-learning-contracts/tests/adaptation.rs"
+stop_condition = "Challenge rather than accept post-hoc learning, equivalent blind retry, forbidden overlay surface, irreversible/global change or admission."
+
+[[assignment]]
+order = 52
+cell = "smart.learning.contracts.evaluation"
+physical_crate = "eliot-learning-contracts"
+field_contract = "crates/smart/eliot-learning-contracts/learning-evaluation.contract.toml"
+public_function_selectors = ["validate_activation_receipt_ref", "validate_activation_assessment", "validate_adherence_assessment", "validate_learning_closure", "validate_promotion_input"]
+source_file = "crates/smart/eliot-learning-contracts/src/evaluation.rs"
+test_file = "crates/smart/eliot-learning-contracts/tests/evaluation.rs"
+stop_condition = "Challenge rather than create a receipt, infer hidden activation/adherence, force reusable delta, aggregate dimensions or decide promotion."
+
+[integration_owner]
+owns = ["Cargo.toml", "src/lib.rs", "reexports", "cross-contract compatibility", "type-ownership validation", "package Module Proof", "real Edge Proof", "Product Pulse", "workspace/runtime admission"]
