@@ -3,7 +3,7 @@ name: Temporary issue 530 workflow-run dispatcher
 on:
   workflow_run:
     workflows:
-      - .github/workflows/work-140-codex-stable-wire-proof.yml
+      - Repository Policy
     types: [completed]
 
 permissions:
@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   dispatch:
-    if: github.event.workflow_run.id == 33330947385
+    if: github.event.workflow_run.id == 33268856054
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch documentation closure audit
