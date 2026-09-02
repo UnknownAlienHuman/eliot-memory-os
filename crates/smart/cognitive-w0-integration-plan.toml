@@ -1,0 +1,28 @@
+schema_version = 1
+status = "BLOCKED_WORK_UNIT"
+issue = 574
+purpose = "Expose completed W0 contract modules, admit their grouped crates to the workspace, and run the full build/test/lint gate."
+blocked_by_prs = [545, 547, 549, 551, 553, 555, 557, 559, 561, 563, 565, 567, 569, 571, 573]
+
+[exclusive_owner]
+shared_paths = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "crates/smart/eliot-epistemic-contracts/Cargo.toml",
+  "crates/smart/eliot-epistemic-contracts/src/lib.rs",
+  "crates/smart/eliot-dreamer-contracts/Cargo.toml",
+  "crates/smart/eliot-dreamer-contracts/src/lib.rs",
+  "crates/smart/eliot-cue-contracts/Cargo.toml",
+  "crates/smart/eliot-cue-contracts/src/lib.rs",
+  "crates/smart/eliot-context-contracts/Cargo.toml",
+  "crates/smart/eliot-context-contracts/src/lib.rs",
+  "crates/smart/eliot-memory-curation-contracts/Cargo.toml",
+  "crates/smart/eliot-memory-curation-contracts/src/lib.rs",
+  "crates/smart/eliot-learning-contracts/Cargo.toml",
+  "crates/smart/eliot-learning-contracts/src/lib.rs",
+]
+
+[prohibitions]
+rewrite_semantic_modules = false
+change_workflow_triggers = false
+weaken_oracles_lints_or_tests = false
