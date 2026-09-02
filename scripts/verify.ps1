@@ -18,6 +18,7 @@ $docsShardVerifier = Join-Path $PSScriptRoot 'docs_shards.py'
 $docsRouter = Join-Path $PSScriptRoot 'docs_router.py'
 $docsReader = Join-Path $PSScriptRoot 'docs_read.py'
 $docCodeConformanceVerifier = Join-Path $PSScriptRoot 'verify-doc-code-conformance.py'
+$codeNavigation = Join-Path $PSScriptRoot 'code_navigation.py'
 
 $steps = @(
     [pscustomobject]@{
@@ -47,6 +48,14 @@ $steps = @(
     [pscustomobject]@{
         Name = 'documentation-code-conformance'
         Command = { python $docCodeConformanceVerifier --root $repoRoot }
+    },
+    [pscustomobject]@{
+        Name = 'code-navigation-self-test'
+        Command = { python $codeNavigation self-test }
+    },
+    [pscustomobject]@{
+        Name = 'code-navigation'
+        Command = { python $codeNavigation check --root $repoRoot }
     },
     [pscustomobject]@{
         Name = 'core-daemon-inventory-self-test'

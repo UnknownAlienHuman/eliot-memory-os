@@ -30,10 +30,23 @@ conditional compilation, macro expansion, symbol resolution, calls, references,
 implementations, and reachability must be resolved through Code Graph and exact
 source.
 
-## Live indexes
+## Live and committed indexes
 
-The indexes are generated from the current checkout; no committed code-graph
-database or stale hand-maintained crate list is authoritative.
+The live registry is generated from the current checkout; no committed
+code-graph database or hand-maintained crate list is authoritative. Two
+deterministic projections make package-to-document navigation reviewable in
+GitHub:
+
+- [`PACKAGE_DOCS_INDEX.md`](code-navigation/PACKAGE_DOCS_INDEX.md) covers every
+  package admitted by the exact root `Cargo.toml`;
+- [`PROTOTYPE_DOCS_INDEX.md`](code-navigation/PROTOTYPE_DOCS_INDEX.md) covers
+  every discovered nonmember Cargo package and requires explicit
+  `prototype = true` plus a nonempty `workspace_admission`.
+
+Both projections bind manifests to inherited package-family `AGENTS.md`
+contracts, logical responsibility blocks, and canonical documentation handles.
+Prototype presence is not workspace admission, implementation completion,
+runtime support, or Product acceptance.
 
 ```powershell
 # Every Cargo package, with workspace/default/nonmember admission.
@@ -47,6 +60,9 @@ python scripts/code_navigation.py list --view blocks
 
 # Machine-readable full registry.
 python scripts/code_navigation.py list --view crates --format json
+
+# Rewrite both committed package-to-document projections.
+python scripts/code_navigation.py sync-index --root .
 ```
 
 The root `Cargo.toml` is the sole workspace-member/default-member input.
@@ -56,13 +72,21 @@ mistaken for admitted workspace members.
 
 The logical block map is
 [`code-navigation/logical-blocks.toml`](code-navigation/logical-blocks.toml).
-`python scripts/code_navigation.py check` fails when:
+`python scripts/code_navigation.py check --root .` fails when:
 
-- a workspace/default member resolves to no package manifest;
-- a member falls outside every logical block;
+- the workspace denominator contains a missing, duplicate, or unexpected package;
+- a workspace/default member resolves to no manifest or target front door;
+- any discovered Cargo package falls outside every logical block;
+- a package block has no governing handle or resolves no documentation route;
+- a package does not inherit the required `crates/`, `bins/`, or
+  `workspace/tools/` `AGENTS.md` contract;
+- a family contract omits the verified-reader command, reading-protocol link, or
+  required index backlink;
+- a nonmember package is not explicitly classified as a prototype or has no
+  `workspace_admission`;
+- either committed package-to-document index is missing, stale, or hand-edited;
 - a configured path escapes the repository or matches no current file;
 - a configured normative handle is absent from the generated handle index;
-- a logical block resolves no documentation route;
 - the generated registry is nondeterministic.
 
 ## Path rules
@@ -166,13 +190,19 @@ just quick
 ```
 
 The script and its configuration are owned by issue
-[#280](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/280).
+[#280](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/280), with
+complete Cargo-package ↔ documentation closure extended by issue
+[#577](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/577).
 Their proof ceiling is repository navigation and static path/dependency
 consistency. They do not prove Rust compilation, graph completeness, runtime
 behavior, storage correctness, or Product acceptance.
 
 See also:
 
+- [`code-navigation/PACKAGE_DOCS_INDEX.md`](code-navigation/PACKAGE_DOCS_INDEX.md)
+  for every admitted workspace package;
+- [`code-navigation/PROTOTYPE_DOCS_INDEX.md`](code-navigation/PROTOTYPE_DOCS_INDEX.md)
+  for every explicitly classified nonmember prototype package;
 - [`PROJECT_MAP.md`](PROJECT_MAP.md) for high-level runtime/source planes;
 - [`architecture/READING_PROTOCOL.md`](architecture/READING_PROTOCOL.md) for
   bounded normative reading;
