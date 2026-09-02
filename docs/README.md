@@ -18,6 +18,8 @@ audit archive and no alternate Architecture edition.
 | Architecture authority and precedence | [`ARCHITECTURE_CONTRACT.md`](ARCHITECTURE_CONTRACT.md) |
 | Exact accepted pair identity | [`normative-pair.toml`](normative-pair.toml) |
 | Architecture / Implementation fragments and indexes | [`architecture/`](architecture/) |
+| Admitted workspace package ↔ documentation index | [`code-navigation/PACKAGE_DOCS_INDEX.md`](code-navigation/PACKAGE_DOCS_INDEX.md) |
+| Nonmember prototype package ↔ documentation index | [`code-navigation/PROTOTYPE_DOCS_INDEX.md`](code-navigation/PROTOTYPE_DOCS_INDEX.md) |
 | Current repository planes and exact Cargo composition roots | [`PROJECT_MAP.md`](PROJECT_MAP.md) |
 | Crates, Rust modules, logical responsibility blocks, and Code Graph workflow | [`CODE_NAVIGATION.md`](CODE_NAVIGATION.md) |
 | Documentation/source path and inventory conformance | [`../scripts/README.md`](../scripts/README.md#repository-verification-and-documentation-pipeline) |
@@ -33,10 +35,16 @@ the repository conformance gate. Source/build presence still does not establish
 installation, runtime health, authority correctness, Product acceptance, or
 release support.
 
-`CODE_NAVIGATION.md` and `scripts/code_navigation.py` derive package/path and
-one-hop dependency navigation from the exact checkout. Filesystem module
-locators and external Code Graph results remain derived evidence; exact source,
-compiler/build checks, and owning verifiers retain authority.
+`CODE_NAVIGATION.md`, `code-navigation/PACKAGE_DOCS_INDEX.md`,
+`code-navigation/PROTOTYPE_DOCS_INDEX.md`, and `scripts/code_navigation.py`
+derive package/path, documentation-handle, and one-hop dependency navigation
+from the exact checkout. The workspace index is bound to the root `Cargo.toml`;
+the prototype index is bound to every discovered nonmember Cargo manifest and
+requires explicit `prototype = true` plus `workspace_admission`. Both fail
+verification when they differ from the current checkout or inherited routing
+contracts. Filesystem module locators and external Code Graph results remain
+derived evidence; exact source, compiler/build checks, and owning verifiers
+retain authority.
 
 Repository work rules live at the root in `AGENTS.md`, `WORKFLOW.md`, and
 `workstreams/ACTIVE.toml`.
@@ -56,7 +64,9 @@ python scripts/code_navigation.py check --root .
 ```
 
 Generated bundles, receipts, JSON findings, and Code Graph databases are
-local/issue evidence and are not committed as documentation authority.
+local/issue evidence and are not committed as documentation authority. The two
+Cargo-package indexes are committed navigation projections and are accepted
+only when the generator reproduces both byte-for-byte.
 
 ## What does not belong here
 

@@ -31,6 +31,14 @@ permission. See [`../docs/architecture/READING_PROTOCOL.md`](../docs/architectur
 create lifecycle, state, semantic, canonical-store, repair, provider or
 authority ownership.
 
+## Package documentation index
+
+Every admitted Cargo package below `bins/` is listed in the generated
+[workspace package ↔ documentation index](../docs/code-navigation/PACKAGE_DOCS_INDEX.md).
+The index binds the exact root `Cargo.toml` denominator to logical responsibility
+blocks and canonical documentation handles. Regenerate it with
+`python scripts/code_navigation.py sync-index --root .`; never edit it by hand.
+
 ## Mandatory rules
 
 - Start from current `main`, one open issue, one issue-numbered branch, one
