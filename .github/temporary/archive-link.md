@@ -1,1 +1,1 @@
-[Download exact main archive](https://codeload.github.com/UnknownAlienHuman/eliot-memory-os/zip/7d173c47c0209f29887d4ba1d9082433b7a44024)
+[Download exact main snapshot](https://kamalnrf--678c72faac7811f0842a0224a6c84d84.web.val.run/zip?source=https%3A%2F%2Fgithub.com%2FUnknownAlienHuman%2Feliot-memory-os%2Ftree%2F64d4dd3e6d99477dcba609a7a5ef6256360ec286)
