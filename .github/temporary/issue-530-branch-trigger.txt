@@ -1,3 +1,4 @@
 issue=530
 source=fix/530-legacy-traceability-clean
 proof_base=1fad3de311dc2add14c0f713c7c01ec55d4e4633
+retrigger=2026-09-02T06:05:00Z
