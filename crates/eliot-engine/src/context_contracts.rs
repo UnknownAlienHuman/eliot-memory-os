@@ -1,61 +1,45 @@
 //! Typed packet-context contract — input, audit, and budget values for the context compiler.
 //!
-//! This module owns the contiguous, source-proven typed packet-context contract
-//! closure extracted from the top of `crates/eliot-engine/src/context.rs`
-//! (canonical parent `121e27d`, `origin/main` `121e27dfd232f18900253e2f06a6b6b4723473c7`):
-//! `PacketBudgetPolicy` and its `impl`; `PacketRenderMode`; `PacketBudgetDecision`;
-//! `PacketCompileAudit`; `PacketCompileAuditContext`; `PacketCompileAuditReport`;
+//! This module owns the contiguous typed packet-context contract extracted from
+//! the top of `crates/eliot-engine/src/context.rs`: `PacketBudgetPolicy` and its
+//! `impl`; `PacketRenderMode`; `PacketBudgetDecision`; `PacketCompileAudit`;
+//! `PacketCompileAuditContext`; `PacketCompileAuditReport`;
 //! `PacketSourceReadAudit`; `PacketCandidateOutcome`; `PacketRenderOutcome`;
-//! `PacketCompileMode`; `PacketResolvedCues` and its `impl`; `PacketPyramidSnapshot`;
-//! `PacketPyramidSource`; `PacketExperienceSource`; `PacketTaskReceiptMetadata`;
-//! `PacketMeasurementView`; private `PacketMeasurementAssignmentStatus`; and
-//! `PacketCompilePlan`. `DEFAULT_PACKET_HARD_CEILING_TOKENS` remains defined in the
-//! parent `context` module (narrow `super::` import) to keep the single canonical
-//! ceiling definition.
+//! `PacketCompileMode`; `PacketResolvedCues` and its `impl`;
+//! `PacketPyramidSnapshot`; `PacketPyramidSource`; `PacketExperienceSource`;
+//! `PacketTaskReceiptMetadata`; `PacketMeasurementView`; private
+//! `PacketMeasurementAssignmentStatus`; and `PacketCompilePlan`.
+//! `DEFAULT_PACKET_HARD_CEILING_TOKENS` remains defined in the parent `context`
+//! module to keep one canonical ceiling definition.
 //!
 //! # Authority separation
 //!
-//! - **This child owns:** typed packet input / audit / budget contract data — the
-//!   budget policy, render mode/decision, audit counters, source-read audit,
-//!   candidate/render outcomes, compile mode, resolved cues, pyramid/experience
-//!   sources, task-receipt metadata, measurement view, and the complete
-//!   `PacketCompilePlan` value object. These are pure data types with
-//!   deterministic derives and serde shape; they carry no I/O, provider,
-//!   Dreamer, or write authority.
+//! - **This child owns:** typed packet input, audit, and budget contract data.
+//!   These are pure deterministic data types with no I/O, provider, Dreamer, or
+//!   write authority.
 //! - **Compiler remains in parent:** `context::ContextCompiler` and all
-//!   `compile_*` / `finalize_*` / budget / gate / admission functions retain
-//!   compilation, token-budget rendering, and gate/admission authority. This
-//!   module does not decide `PacketGate` / `Admission` / `Prediction` /
-//!   `CompileResult` semantics and does not own the runtime read path.
+//!   `compile_*`, `finalize_*`, budget, gate, and admission functions retain
+//!   compilation and gate/admission authority.
 //! - **Semantic truth remains external:** understanding, experience, and pyramid
-//!   semantics remain owned by `ProjectUnderstandingCompiler`, semantic-memory,
-//!   and `eliot-types` contracts; this contract only transports typed snapshots
-//!   and revision-fenced handles.
+//!   semantics remain owned by their declared compilers and contracts.
 //! - **No Dreamer / canonical-write / runtime authority:** no provider
 //!   invocation, Dreamer orchestration, canonical store write, or service
 //!   lifecycle code is moved here.
 //!
-//! # Canonical handles (verified from local authoritative docs)
+//! # Current documentation authority
 //!
-//! Source of truth for architecture/implementation handles is the current
-//! source tree `docs/architecture/ELIOT_ARCHITECTURE.md` (`4.5-draft`) and
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (`0.29-draft`), plus
-//! `docs/architecture/INDEX.md` (`E:context-compiler`). The persistent graph
-//! `eliot-memory-os-121e27d-live` (56,502 nodes / 280,736 edges) and docs
-//! project `eliot-architecture-docs-fa941135` are evidence/routing layers
-//! only and were consulted before source inspection per worktree `AGENTS.md`.
-//!
-//! - Architecture: `A7.1` Active Understanding View, `A7.4` Context as
-//!   intervention, `A7.6` Compaction & resume, `A7.9` Context economy.
-//! - Implementation: `I7.11` Context payload profiles and Decision Safety Floor,
-//!   `I7.19` Reactive context sequence, `I7.26` Reversible payload budget and
-//!   omission handles, `I12.13`–`I12.17` orientation/bounded context/compaction.
+//! - `docs/architecture/ELIOT_ARCHITECTURE.md`: `A7.1`, `A7.4`, `A7.6`, and
+//!   `A7.9`.
+//! - `docs/architecture/ELIOT_IMPLEMENTATION.md`: `I7.11`, `I7.19`, `I7.26`,
+//!   and `I12.13..I12.17`.
+//! - `docs/architecture/INDEX.md`: `E:context-compiler` navigation.
+//! - precedence: `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! # Import policy
 //!
-//! Exact direct imports are derived from the current `context.rs` source for
-//! this closure only; no provider, Dreamer, canonical-write, or runtime
-//! authority imports are introduced.
+//! Exact direct imports are derived from the current parent source for this
+//! closure only; no provider, Dreamer, canonical-write, or runtime authority
+//! imports are introduced.
 
 use std::collections::BTreeMap;
 

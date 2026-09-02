@@ -1,11 +1,10 @@
 //! Host launch-descriptor validation cell.
 //!
-//! Architecture anchors (eliot-architecture-docs-fa941135):
-//! `ELIOT_ARCHITECTURE.md` §A5.5 (scoped verifier contract) and §A13.2
-//! (Host boundary and failure domains). Implementation anchors
-//! (eliot-architecture-docs-fa941135): `ELIOT_IMPLEMENTATION.md` §I1.2
-//! (Host ownership), §I1.8 (exact ownership and call paths), §I1.11
-//! (startup validation), and §P.2 (Host state boundary).
+//! Current documentation authority:
+//! - `docs/architecture/ELIOT_ARCHITECTURE.md`: `A5.5` and `A13.2`.
+//! - `docs/architecture/ELIOT_IMPLEMENTATION.md`: `I1.2`, `I1.8`, `I1.11`,
+//!   and `P.2`.
+//! - precedence: `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! This cell performs only mechanical approved-artifact, descriptor-byte, and
 //! retained process-identity validation. It does not own Host start, stop,

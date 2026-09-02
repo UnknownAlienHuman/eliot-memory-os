@@ -1,17 +1,12 @@
 //! Authenticated readiness journal append mechanism.
 //!
-//! Architecture anchors (eliot-architecture-docs-fa941135):
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A2.2`,
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A2.3`,
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A12.3`,
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-AUTH-01`,
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-SEC-02`, and
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-RES-01`.
-//! Implementation anchors (eliot-architecture-docs-fa941135):
-//! `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I1.8`,
-//! `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I1.9`,
-//! `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I2.15`, and
-//! `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I2.23`.
+//! Current documentation authority:
+//! - `docs/architecture/ELIOT_ARCHITECTURE.md`: `A2.2`, `A2.3`, and `A12.3`.
+//! - `docs/architecture/A16-01-decision-anchors.md`: `ARCH-AUTH-01`,
+//!   `ARCH-SEC-02`, and `ARCH-RES-01`.
+//! - `docs/architecture/ELIOT_IMPLEMENTATION.md`: `I1.8`, `I1.9`, `I2.15`,
+//!   and `I2.23`.
+//! - precedence: `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! This child owns only the extracted mechanism for constructing and appending
 //! already-authorized authenticated readiness journal records. It owns no
