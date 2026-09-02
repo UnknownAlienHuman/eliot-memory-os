@@ -3,7 +3,7 @@ name: Temporary issue 530 workflow-run dispatcher
 on:
   workflow_run:
     workflows:
-      - Code scanning AI findings on PR #300
+      - One-shot documentation sharding
     types: [completed]
 
 permissions:
@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   dispatch:
-    if: github.event.workflow_run.id == 33317647246
+    if: github.event.workflow_run.id == 33308927062
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch documentation closure audit
