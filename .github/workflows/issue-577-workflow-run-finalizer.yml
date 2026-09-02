@@ -1,0 +1,427 @@
+name: Temporary issue 577 workflow-run finalizer
+
+on:
+  workflow_run:
+    workflows:
+      - Repository Policy
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: issue-577-workflow-run-finalizer
+  cancel-in-progress: false
+
+env:
+  TRIGGER_RUN_ID: '33270584752'
+  SOURCE_SHA: 71e4019eda3814ac705631ed526b71c2b7d1a45e
+  TRACE_SOURCE_BRANCH: fix/530-legacy-traceability-clean
+  CANDIDATE_BRANCH: fix/577-final-verified
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  finalize:
+    if: >-
+      github.event.workflow_run.id == 33270584752 &&
+      github.event.workflow_run.run_attempt >= 2 &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: windows-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Preserve repository line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - name: Checkout exact current main candidate parent
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          path: candidate
+          persist-credentials: true
+
+      - name: Checkout immutable staged payload
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 1
+          path: source
+          persist-credentials: false
+
+      - name: Checkout bounded issue 530 cleanup source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TRACE_SOURCE_BRANCH }}
+          fetch-depth: 1
+          path: trace-source
+          persist-credentials: false
+
+      - name: Bind trigger, payload, and current-main identities
+        shell: pwsh
+        run: |
+          if ('${{ github.event.workflow_run.id }}' -ne $env:TRIGGER_RUN_ID) {
+            throw 'Unexpected workflow-run identity.'
+          }
+          $source = (git -C source rev-parse HEAD).Trim()
+          if ($source -ne $env:SOURCE_SHA) {
+            throw "Payload source identity mismatch: $source"
+          }
+          git -C candidate fetch --no-tags origin main
+          $main = (git -C candidate rev-parse origin/main).Trim()
+          $candidateHead = (git -C candidate rev-parse HEAD).Trim()
+          if ($candidateHead -ne $main) {
+            throw "Candidate checkout is not exact current main: head=$candidateHead main=$main"
+          }
+          "PARENT_MAIN=$main" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "trigger_run=${{ github.event.workflow_run.id }}" | Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "trigger_attempt=${{ github.event.workflow_run.run_attempt }}" | Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "payload_source=$source" | Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "parent_main=$main" | Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Configure bounded build environment
+        shell: pwsh
+        run: |
+          $temp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          "TEMP=$temp" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "TMP=$temp" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_TARGET_DIR=$temp\eliot-577-target" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_INCREMENTAL=0" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_BUILD_JOBS=4" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force -Path candidate/.eliot | Out-Null
+
+      - name: Decode and materialize staged payload
+        shell: pwsh
+        env:
+          SOURCE_ROOT: ${{ github.workspace }}\source
+          CANDIDATE_ROOT: ${{ github.workspace }}\candidate
+        run: |
+          @'
+          from __future__ import annotations
+
+          import base64
+          import gzip
+          import io
+          import json
+          import os
+          import shutil
+          import subprocess
+          import tarfile
+          import zipfile
+          from pathlib import Path, PurePosixPath
+          from typing import Any
+
+          source = Path(os.environ['SOURCE_ROOT']).resolve()
+          candidate = Path(os.environ['CANDIDATE_ROOT']).resolve()
+          receipt_dir = candidate / '.eliot'
+          receipt_dir.mkdir(parents=True, exist_ok=True)
+          chunks = sorted(source.glob('.github/temporary/issue-577-payload-*.txt'))
+          if len(chunks) != 6:
+              raise SystemExit(f'expected 6 payload chunks, found {len(chunks)}')
+          encoded = ''.join(path.read_text(encoding='utf-8').strip() for path in chunks)
+          compressed = base64.b64decode(encoded, validate=True)
+          decoded = gzip.decompress(compressed)
+          (receipt_dir / 'payload.gz').write_bytes(compressed)
+          (receipt_dir / 'payload.decoded').write_bytes(decoded)
+          applied: list[str] = []
+          deleted: list[str] = []
+
+          def safe_path(raw: str) -> Path:
+              value = raw.replace('\\', '/').lstrip('./')
+              pure = PurePosixPath(value)
+              if not value or pure.is_absolute() or '..' in pure.parts or pure.parts[0] == '.git':
+                  raise SystemExit(f'unsafe payload path: {raw!r}')
+              target = (candidate / pure).resolve()
+              target.relative_to(candidate)
+              return target
+
+          def write(raw: str, data: bytes, executable: bool = False) -> None:
+              target = safe_path(raw)
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(data)
+              if executable:
+                  target.chmod(target.stat().st_mode | 0o111)
+              applied.append(target.relative_to(candidate).as_posix())
+
+          def remove(raw: str) -> None:
+              target = safe_path(raw)
+              if target.is_dir():
+                  shutil.rmtree(target)
+              elif target.exists() or target.is_symlink():
+                  target.unlink()
+              deleted.append(target.relative_to(candidate).as_posix())
+
+          def apply_json(value: Any) -> bool:
+              records: Any = None
+              removals: list[str] = []
+              if isinstance(value, dict) and 'files' in value:
+                  records = value['files']
+                  raw = value.get('delete', value.get('deletions', []))
+                  if isinstance(raw, list):
+                      removals = [str(item) for item in raw]
+              elif isinstance(value, list):
+                  records = value
+              elif isinstance(value, dict) and value and all('/' in str(key) or str(key).startswith('.') for key in value):
+                  records = [{'path': key, 'content': content} for key, content in value.items()]
+              else:
+                  return False
+              if isinstance(records, dict):
+                  records = [{'path': key, 'content': content} for key, content in records.items()]
+              if not isinstance(records, list):
+                  return False
+              for record in records:
+                  if not isinstance(record, dict) or not str(record.get('path', '')).strip():
+                      raise SystemExit('invalid payload file record')
+                  path = str(record['path'])
+                  if record.get('delete') is True or record.get('operation') == 'delete':
+                      remove(path)
+                      continue
+                  content = record.get('content', '')
+                  encoding = str(record.get('encoding', 'utf-8')).lower()
+                  if encoding in {'base64', 'b64'}:
+                      data = base64.b64decode(str(content), validate=True)
+                  elif isinstance(content, str):
+                      data = content.encode('utf-8')
+                  else:
+                      raise SystemExit(f'unsupported payload content: {path}')
+                  write(path, data, bool(record.get('executable')))
+              for path in removals:
+                  remove(path)
+              return True
+
+          kind = ''
+          try:
+              archive = tarfile.open(fileobj=io.BytesIO(compressed), mode='r:gz')
+          except tarfile.ReadError:
+              archive = None
+          if archive is not None:
+              kind = 'tar.gz'
+              members = [member for member in archive.getmembers() if member.isfile()]
+              names = [PurePosixPath(member.name.replace('\\', '/')) for member in members]
+              roots = {name.parts[0] for name in names if name.parts}
+              repository_roots = {'.github', 'apps', 'bins', 'config', 'crates', 'docs', 'integrations', 'migrations', 'plugin', 'scripts', 'tests', 'workspace', 'workstreams'}
+              strip = next(iter(roots)) if len(roots) == 1 and next(iter(roots)) not in repository_roots and all(len(name.parts) > 1 for name in names) else None
+              for member, name in zip(members, names, strict=True):
+                  parts = name.parts[1:] if strip else name.parts
+                  if not parts:
+                      continue
+                  stream = archive.extractfile(member)
+                  if stream is None:
+                      raise SystemExit(f'cannot read tar member: {member.name}')
+                  write(PurePosixPath(*parts).as_posix(), stream.read(), bool(member.mode & 0o111))
+              archive.close()
+          elif zipfile.is_zipfile(io.BytesIO(decoded)):
+              kind = 'zip'
+              with zipfile.ZipFile(io.BytesIO(decoded)) as archive:
+                  for info in archive.infolist():
+                      if not info.is_dir():
+                          write(info.filename, archive.read(info), bool((info.external_attr >> 16) & 0o111))
+          else:
+              try:
+                  text = decoded.decode('utf-8')
+              except UnicodeDecodeError:
+                  text = ''
+              value = None
+              if text:
+                  try:
+                      value = json.loads(text)
+                  except json.JSONDecodeError:
+                      pass
+              if value is not None and apply_json(value):
+                  kind = 'json'
+              elif text.startswith('diff --git ') or '\ndiff --git ' in text:
+                  kind = 'unified-diff'
+                  patch = receipt_dir / 'payload.patch'
+                  patch.write_text(text, encoding='utf-8', newline='')
+                  subprocess.run(['git', '-C', str(candidate), 'apply', '--whitespace=error-all', str(patch)], check=True)
+                  applied.extend(subprocess.check_output(['git', '-C', str(candidate), 'diff', '--name-only'], text=True).splitlines())
+              else:
+                  raise SystemExit('unrecognized payload format')
+
+          summary = {
+              'kind': kind,
+              'compressed_bytes': len(compressed),
+              'decoded_bytes': len(decoded),
+              'applied': sorted(set(applied)),
+              'deleted': sorted(set(deleted)),
+          }
+          (receipt_dir / 'payload-materialization.json').write_text(json.dumps(summary, indent=2) + '\n', encoding='utf-8', newline='')
+          print(json.dumps(summary, indent=2))
+          '@ | python - *>&1 | Tee-Object candidate/.eliot/payload-materialization.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Apply complete issue 530 comment-only cleanup
+        shell: pwsh
+        run: |
+          Copy-Item trace-source/scripts/doc_code_conformance_lib/rust_comments.py candidate/scripts/doc_code_conformance_lib/rust_comments.py -Force
+          New-Item -ItemType Directory -Force -Path candidate/.github/temporary | Out-Null
+          Copy-Item trace-source/.github/temporary/finalize_traceability.py candidate/.github/temporary/finalize_traceability.py -Force
+          Push-Location candidate
+          try {
+            python .github/temporary/finalize_traceability.py *>&1 | Tee-Object .eliot/traceability-cleanup.log
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          finally { Pop-Location }
+          Remove-Item candidate/.github/temporary/finalize_traceability.py -Force
+
+      - name: Retire all temporary automation and trigger surfaces
+        shell: pwsh
+        run: |
+          $retired = @(
+            'candidate/.github/workflows/docs-closure-audit.yml',
+            'candidate/.github/workflows/issue-530-merge-finalizer.yml',
+            'candidate/.github/workflows/issue-530-pr-finalizer.yml',
+            'candidate/.github/workflows/issue-530-push-dispatcher.yml',
+            'candidate/.github/workflows/issue-530-workflow-run-dispatcher.yml',
+            'candidate/.github/workflows/issue-577-finalizer.yml',
+            'candidate/.github/workflows/issue-577-workflow-run-finalizer.yml',
+            'candidate/.github/docs-closure-audit-trigger.txt',
+            'candidate/.github/temporary/issue-530-merge-trigger.txt',
+            'candidate/ARCHIVE_LINK.md'
+          )
+          foreach ($path in $retired) {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -Recurse }
+          }
+          if ((Test-Path candidate/.github/temporary) -and -not (Get-ChildItem candidate/.github/temporary -Force)) {
+            Remove-Item candidate/.github/temporary -Force
+          }
+
+      - name: Install bounded verification dependencies
+        shell: pwsh
+        working-directory: candidate
+        run: |
+          python -m pip install --disable-pip-version-check --no-input -r scripts/requirements-verification.txt *>&1 | Tee-Object .eliot/pip-install.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Regenerate committed package projections
+        shell: pwsh
+        working-directory: candidate
+        run: |
+          python scripts/code_navigation.py sync-index --root . *>&1 | Tee-Object .eliot/package-index-sync.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run documentation and navigation gates
+        shell: pwsh
+        working-directory: candidate
+        run: |
+          python -m py_compile scripts/*.py scripts/code_navigation_lib/*.py scripts/doc_code_conformance_lib/*.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify-doc-code-conformance.py --self-test *>&1 | Tee-Object .eliot/documentation-gates.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify-doc-code-conformance.py --root . --json-out .eliot/doc-code-conformance.json *>&1 | Tee-Object .eliot/documentation-gates.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/docs_shards.py self-test *>&1 | Tee-Object .eliot/documentation-gates.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/docs_shards.py verify --root . *>&1 | Tee-Object .eliot/documentation-gates.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/docs_router.py self-test *>&1 | Tee-Object .eliot/documentation-gates.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/docs_router.py check --root . *>&1 | Tee-Object .eliot/documentation-gates.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/docs_read.py self-test *>&1 | Tee-Object .eliot/documentation-gates.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/code_navigation.py self-test *>&1 | Tee-Object .eliot/documentation-gates.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/code_navigation.py check --root . *>&1 | Tee-Object .eliot/documentation-gates.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Prove all Rust executable projections are unchanged
+        shell: pwsh
+        working-directory: candidate
+        run: |
+          @'
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path('scripts').resolve()))
+          from doc_code_conformance_lib.rust_comments import code_projection
+          base = os.environ['PARENT_MAIN']
+          before_paths = {p for p in subprocess.check_output(['git', 'ls-tree', '-r', '--name-only', base], text=True).splitlines() if p.endswith('.rs')}
+          after_paths = {p for p in subprocess.check_output(['git', 'ls-files'], text=True).splitlines() if p.endswith('.rs')}
+          if before_paths != after_paths:
+              raise SystemExit(f'Rust path set changed: missing={sorted(before_paths-after_paths)} added={sorted(after_paths-before_paths)}')
+          changed = []
+          for relative in sorted(before_paths):
+              before = subprocess.check_output(['git', 'show', f'{base}:{relative}']).decode('utf-8')
+              after = Path(relative).read_text(encoding='utf-8')
+              if code_projection(before) != code_projection(after):
+                  changed.append(relative)
+          if changed:
+              raise SystemExit('non-comment Rust projection changed: ' + ', '.join(changed))
+          print(f'RUST_CODE_PROJECTION: PASS files={len(before_paths)}')
+          '@ | python - *>&1 | Tee-Object .eliot/rust-code-projection.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run supported repository and workspace proof
+        shell: pwsh
+        working-directory: candidate
+        run: |
+          pwsh -NoProfile -File scripts/verify.ps1 *>&1 | Tee-Object .eliot/repository-verification.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked --workspace --all-targets -- -D warnings *>&1 | Tee-Object .eliot/cargo-clippy.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p eliot-platform-windows --lib *>&1 | Tee-Object .eliot/platform-windows-tests.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check $env:PARENT_MAIN *>&1 | Tee-Object .eliot/diff-check.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Enforce clean final tree
+        shell: pwsh
+        working-directory: candidate
+        run: |
+          $forbidden = @(
+            '.github/workflows/docs-closure-audit.yml',
+            '.github/workflows/issue-530-merge-finalizer.yml',
+            '.github/workflows/issue-530-pr-finalizer.yml',
+            '.github/workflows/issue-530-push-dispatcher.yml',
+            '.github/workflows/issue-530-workflow-run-dispatcher.yml',
+            '.github/workflows/issue-577-finalizer.yml',
+            '.github/workflows/issue-577-workflow-run-finalizer.yml',
+            '.github/docs-closure-audit-trigger.txt',
+            '.github/temporary/issue-530-merge-trigger.txt',
+            'ARCHIVE_LINK.md'
+          )
+          foreach ($path in $forbidden) {
+            if (Test-Path -LiteralPath $path) { throw "Temporary surface leaked into candidate: $path" }
+          }
+          git diff --name-only $env:PARENT_MAIN | Sort-Object | Out-File .eliot/final-paths.txt -Encoding utf8
+
+      - name: Publish clean one-parent candidate
+        shell: pwsh
+        working-directory: candidate
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git reset -- .eliot
+          $tree = (git write-tree).Trim()
+          git fetch --no-tags origin main
+          $remoteMain = (git rev-parse origin/main).Trim()
+          if ($remoteMain -ne $env:PARENT_MAIN) { throw "Main moved during verification: $remoteMain" }
+          $message = @(
+            'fix(docs): complete documentation closure and traceability',
+            '',
+            'Materialize package documentation closure, retire invalid source traceability and temporary automation, regenerate deterministic indexes, and preserve all non-comment Rust projections.',
+            '',
+            'Closes #577.',
+            'Closes #530.',
+            'Closes #766.'
+          ) -join "`n"
+          $commit = ($message | git commit-tree $tree -p $remoteMain).Trim()
+          git push --force origin "$commit`:refs/heads/$($env:CANDIDATE_BRANCH)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "candidate=$commit" | Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "candidate=$commit`nparent=$remoteMain`npayload=$env:SOURCE_SHA" | Out-File .eliot/publication.txt -Encoding utf8
+
+      - name: Upload exact proof receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-577-workflow-run-proof-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: candidate/.eliot/
