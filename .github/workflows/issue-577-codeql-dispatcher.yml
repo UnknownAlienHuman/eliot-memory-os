@@ -47,13 +47,15 @@ jobs:
 
           path = Path('.github/workflows/issue-530-rerun-finalizer.yml')
           text = path.read_text(encoding='utf-8')
-          upgrade_step = """      - name: Upgrade exact package-index generators
+          upgrade_step = """      - name: Upgrade exact package indexes and specialized routes
         shell: bash
         working-directory: candidate
         run: |
           set -euo pipefail
           python scripts/code_navigation_lib/_upgrade_index_projection_v2.py 2>&1 | tee .eliot/package-index-generator-upgrade.log
+          python scripts/code_navigation_lib/_upgrade_specialized_routes.py 2>&1 | tee .eliot/specialized-route-upgrade.log
           rm -f scripts/code_navigation_lib/_upgrade_index_projection_v2.py
+          rm -f scripts/code_navigation_lib/_upgrade_specialized_routes.py
 
 """
           replacements = [
@@ -65,7 +67,7 @@ jobs:
               ("  RUN_MARKER: ELIOT_RUN_577_FINAL_20260903_0215\n", ""),
               (
                   "  DOCS_SOURCE_SHA: c87fc05982916a8dfe46bc1b0095df97ae330411\n",
-                  "  DOCS_SOURCE_SHA: 318c345ddc3a4ec69cf453698a93bb5f7b0892e9\n",
+                  "  DOCS_SOURCE_SHA: 1e4b9de8f457b880342bc981f612cadec37aa520\n",
               ),
               (
                   "  verify-and-publish:\n    if: >-\n      github.event.issue.number == 577 &&\n      github.event.comment.body == 'ELIOT_RUN_577_FINAL_20260903_0215'\n    runs-on: ubuntu-latest\n",
