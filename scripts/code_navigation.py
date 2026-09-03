@@ -20,6 +20,7 @@ from code_navigation_lib import (
     route_payload,
     self_test,
 )
+from code_navigation_lib.blocks import self_test as block_route_self_test
 from code_navigation_lib.documentation_closure import (
     check as check_documentation_closure,
     self_test as documentation_closure_self_test,
@@ -73,6 +74,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "self-test":
             self_test()
+            block_route_self_test()
             package_docs_self_test()
             prototype_docs_self_test()
             documentation_closure_self_test()
