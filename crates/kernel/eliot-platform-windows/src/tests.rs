@@ -1,8 +1,14 @@
 //! Test-oracle-only module for `eliot-platform-windows`.
 //! Architecture: Windows platform facade (P-01) — test-oracle topology mirrors production modules in `lib.rs` and siblings (`secret_store`, `protected_path`, `installer_root`, etc.).
-//! Implementation: Mechanical extraction of the `#[cfg(test)] mod tests { ... }` closure from `lib.rs` (lines ~9212–12827 at pin 2ecd3da). No production logic moved or altered.
+//! Implementation: Mechanical extraction of the `#[cfg(test)] mod tests { ... }`
+//! closure from `lib.rs`. No production logic moved or altered.
 //! Authority: Test-only. Explicitly forbids production, semantic, or authority ownership. Production truth remains in `lib.rs` and sibling modules.
-//! Verification: Topology verified via `codebase-memory-mcp` projects `eliot-memory-os-44e8b4b-live` and `eliot-architecture-docs-fa941135` (routing only, stale); exact pinned source is authoritative.
+//! Verification: Topology mirrors the production modules in this crate; the
+//! current source tree is authoritative.
+//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md`,
+//! `docs/architecture/ELIOT_ARCHITECTURE.md`,
+//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (compatibility entry points;
+//! the governing shards are named per anchor above).
 //! Policy: No wildcard imports, no new lint allows; existing test-module import/lint policy moves unchanged.
 use super::*;
 #[cfg(windows)]

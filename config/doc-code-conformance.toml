@@ -100,6 +100,8 @@ ignore_globs = [
   "scripts/doc_code_conformance_core.py",
   "scripts/verify-doc-code-conformance.py",
   "scripts/docs_shards_core.py",
+  # The closure audit defines the same retired-token list it scans for.
+  "scripts/docs_closure_audit.py",
 ]
 unstable_line_reference_regex = 'docs/(?:normative|architecture)/ELIOT_(?:ARCHITECTURE|IMPLEMENTATION)\.md:\d+'
 
@@ -227,6 +229,41 @@ reason = "The policy intentionally rejects restoration of the predecessor file."
 path = ".github/workflows/repository-policy.yml"
 token = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
 reason = "The policy intentionally rejects restoration of the predecessor file."
+
+# The three surfaces below own the retirement rule itself. A rule that forbids a
+# token must spell that token out, so each is exempt from its own prohibition.
+# Adding a token here does not weaken the check: every other path in every other
+# scan root is still rejected fail-closed.
+
+[[retired_references.allow]]
+path = "config/doc-code-conformance.toml"
+token = "docs/normative/"
+reason = "This file is the owner of the retired-token list and of these exemptions."
+
+[[retired_references.allow]]
+path = "config/doc-code-conformance.toml"
+token = "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md"
+reason = "This file is the owner of the retired-token list and of these exemptions."
+
+[[retired_references.allow]]
+path = "config/doc-code-conformance.toml"
+token = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
+reason = "This file is the owner of the retired-token list and of these exemptions."
+
+[[retired_references.allow]]
+path = "scripts/doc_code_conformance_core.py"
+token = "docs/normative/"
+reason = "The detector's default configuration and its self-test fixtures must contain the token they reject."
+
+[[retired_references.allow]]
+path = "scripts/docs_shards_core.py"
+token = "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md"
+reason = "docs_shards_core raises DocsError when this retired surface reappears; the guard names it."
+
+[[retired_references.allow]]
+path = "scripts/docs_shards_core.py"
+token = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
+reason = "docs_shards_core raises DocsError when this retired surface reappears; the guard names it."
 
 [script_inventory]
 directory = "scripts"

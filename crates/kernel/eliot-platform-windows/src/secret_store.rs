@@ -5,17 +5,44 @@
 //! Ownership: physical Windows secret persistence/DPAPI only (Credential Manager / DPAPI via `secret_store`). Explicitly forbids semantic authority, provider ownership, default/cache/retry, path ownership, or capability minting.
 //!
 //! Architecture (normative, source-backed only):
-//! - `ARCH-AUTH-01` — Authority explicit, scoped and fenced (`ELIOT_ARCHITECTURE.md:459`)
-//! - `ARCH-SEC-02` — One canonical transition path (`ELIOT_ARCHITECTURE.md:1939`)
-//! - `ARCH-RES-01` — Fail locally, recover globally (`ELIOT_ARCHITECTURE.md:2058`)
-//!   These are cited only where the source text directly supports secret isolation, least authority, and protected-storage semantics; no invented Architecture sections are claimed.
+//! - `ARCH-AUTH-01` — Authority explicit, scoped and fenced
+//!   (`docs/architecture/A02-01-complementary-fallibility.md`)
+//! - `ARCH-SEC-02` — One canonical transition path
+//!   (`docs/architecture/A12-03-one-governed-write-path.md`)
+//! - `ARCH-RES-01` — Fail locally, recover globally
+//!   (`docs/architecture/A13-01-let-it-fail-locally.md`)
+//!
+//!   These are cited only where the source text directly supports secret
+//!   isolation, least authority, and protected-storage semantics; no invented
+//!   Architecture sections are claimed.
 //!
 //! Implementation (normative):
-//! - `I15.4` Secrets — Windows Credential Manager/DPAPI-protected `SecretRef` values behind the secret-provider facade (`ELIOT_IMPLEMENTATION.md:15052`)
-//! - `I2.2` When capability becomes separate crate and `I2.23` Capability-family topology (`ELIOT_IMPLEMENTATION.md:2066`, `3530`) — single-responsibility micro-module extraction within the owning crate.
+//! - `I15.4` Secrets — Windows Credential Manager/DPAPI-protected `SecretRef`
+//!   values behind the secret-provider facade
+//!   (`docs/architecture/I15-04-secrets.md`)
+//! - `I2.1` Crate-rich extraction of a capability behind an owned contract
+//!   (`docs/architecture/I02-01-primary-decision-crate-rich-process-sparse-owner-sparse.md`)
+//!   and `I2.23` Capability-family topology
+//!   (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`)
+//!   — single-responsibility micro-module extraction within the owning crate.
 //!
-//! Non-normative source-symbol references (traceability only, not authority):
-//! - `eliot-memory-os-3c7676b-persist.crates.kernel.eliot-platform-windows.src.lib.ProtectedSecret` (`crates/kernel/eliot-platform-windows/src/lib.rs:5921`), `WindowsInstallerSecretProvider::generate_secret` (`6072`), `WindowsLocalServiceCredentialProvider::generate_secret` (`6242`), `HostCredentialMutationCapability::generate_secret` (`6326`), `WindowsPlatform::protect_secret` (`10792`), `unprotect_secret` (`10803`), `write_credential` (`10814`), `read_credential` (`10825`), `delete_credential` (`10837`), `dpapi_protect#cfg(windows)` (`14756`), `dpapi_unprotect#cfg(windows)` (`14795`), `credential_write#cfg(windows)` (`16936`), `credential_read#cfg(windows)` (`16950`), `credential_read_optional#cfg(windows)` (`16963`), `credential_delete#cfg(windows)` (`16983`), `require_exact_credential_readback` (`12405`)
+//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md`,
+//! `docs/architecture/ELIOT_ARCHITECTURE.md`,
+//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (compatibility entry points;
+//! the governing shards are named per anchor above).
+//!
+//! Non-normative source-symbol references (traceability only, not authority).
+//! Every symbol below is owned by this module; it was extracted here from the
+//! crate root, so no line coordinates are recorded:
+//! - `ProtectedSecret`, `WindowsPlatform::protect_secret`, `unprotect_secret`,
+//!   `write_credential`, `read_credential`, `delete_credential`,
+//!   `dpapi_protect`, `dpapi_unprotect`, `credential_write`, `credential_read`,
+//!   `credential_read_optional`, `credential_delete`,
+//!   `require_exact_credential_readback`
+//! - Secret generation seams remain with their providers:
+//!   `WindowsInstallerSecretProvider::generate_secret`,
+//!   `WindowsLocalServiceCredentialProvider::generate_secret`,
+//!   `HostCredentialMutationCapability::generate_secret`
 //!
 //! Secret bytes are opaque OS primitives and never become semantic authority. Only
 //! durable installation markers, HMAC proofs, and explicit reloads are authority.

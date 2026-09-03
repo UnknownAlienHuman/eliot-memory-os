@@ -2,7 +2,8 @@
 //!
 //! Architecture anchor: `A10.8` (verification and proof-bearing finish).
 //! Implementation anchors: `I18.4` (test tiers), `I18.23` (agent development
-//! test protocol), and `I18.29` (verification budget and escalation).
+//! test protocol), and `I18.20` (test-strength escalation and bounded
+//! verification cost).
 //!
 //! This child owns only `TestCostService` aggregation and its private report-ID
 //! seam. It executes no command, selects no verifier, changes no oracle, and

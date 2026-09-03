@@ -19,6 +19,7 @@ $docsRouter = Join-Path $PSScriptRoot 'docs_router.py'
 $docsReader = Join-Path $PSScriptRoot 'docs_read.py'
 $docCodeConformanceVerifier = Join-Path $PSScriptRoot 'verify-doc-code-conformance.py'
 $codeNavigation = Join-Path $PSScriptRoot 'code_navigation.py'
+$docsClosureAudit = Join-Path $PSScriptRoot 'docs_closure_audit.py'
 
 $steps = @(
     [pscustomobject]@{
@@ -56,6 +57,10 @@ $steps = @(
     [pscustomobject]@{
         Name = 'code-navigation'
         Command = { python $codeNavigation check --root $repoRoot }
+    },
+    [pscustomobject]@{
+        Name = 'documentation-closure-audit'
+        Command = { python $docsClosureAudit --root $repoRoot }
     },
     [pscustomobject]@{
         Name = 'core-daemon-inventory-self-test'

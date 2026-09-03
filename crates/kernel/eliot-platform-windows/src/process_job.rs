@@ -1,18 +1,28 @@
 //! Physical Windows Job and process lifecycle only.
 //!
 //! Architecture (verified):
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A13.1.-Let-it-fail-locally`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A13.2.-Kernel-и-failure-domains`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A13.3.-Module-supervision-и-Doctor`
+//! - `A13.1` (`docs/architecture/A13-01-let-it-fail-locally.md`)
+//! - `A13.2` (`docs/architecture/A13-02-kernel-and-failure-domains.md`)
+//! - `A13.3` (`docs/architecture/A13-03-module-supervision-and-doctor.md`)
 //!
 //! Implementation (verified):
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.Durable-Job-execution`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.Execution-identity-boundary-on-Windows`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.A.3.-Restart-child-classes`
+//! - `I14.20` runtime lifecycle vocabulary, including durable job execution
+//!   (`docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md`)
+//! - `I10.3` execution-identity boundary on Windows
+//!   (`docs/architecture/I10-03-bridge-types.md`)
+//! - Appendix A restart child classes
+//!   (`docs/architecture/APPENDIX-A-modulegeneration-lifecycle-projection.md`)
 //!
 //! Topology (verified):
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I2.2.-Когда-capability-становится-отдельным-crate`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I2.23.-Capability-family-topology-and-crate-extraction-decisions`
+//! - `I2.1` crate-rich extraction of a capability behind an owned contract
+//!   (`docs/architecture/I02-01-primary-decision-crate-rich-process-sparse-owner-sparse.md`)
+//! - `I2.23` capability-family topology and crate-extraction decisions
+//!   (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`)
+//!
+//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md`,
+//! `docs/architecture/ELIOT_ARCHITECTURE.md`,
+//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (compatibility entry points;
+//! the governing shards are named per anchor above).
 //!
 //! This module states physical Job/process lifecycle only: creation,
 //! suspended launch, consuming validation-before-resume, assignment,
