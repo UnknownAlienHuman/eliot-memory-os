@@ -69,10 +69,8 @@ jobs:
           }
           "BASE_MAIN=$main" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
           New-Item -ItemType Directory -Force -Path candidate/.eliot | Out-Null
-          "trigger_run=${{ github.event.workflow_run.id }}`nhelper=$helper`nbase=$main" |
-            Out-File candidate/.eliot/identity.txt -Encoding utf8
-          "trigger_run=${{ github.event.workflow_run.id }}" |
-            Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "trigger_run=${{ github.event.workflow_run.id }}`nhelper=$helper`nbase=$main" | Out-File candidate/.eliot/identity.txt -Encoding utf8
+          "trigger_run=${{ github.event.workflow_run.id }}" | Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           "helper=$helper" | Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           "base=$main" | Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
@@ -82,8 +80,7 @@ jobs:
           $temp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
           "TEMP=$temp" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
           "TMP=$temp" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-          "CARGO_TARGET_DIR=$temp\eliot-530-target" |
-            Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_TARGET_DIR=$temp\eliot-530-target" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
           "CARGO_INCREMENTAL=0" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
           "CARGO_BUILD_JOBS=4" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
@@ -91,41 +88,33 @@ jobs:
         shell: pwsh
         working-directory: candidate
         run: |
-          python -m pip install --disable-pip-version-check --no-input \
-            -r scripts/requirements-verification.txt *>&1 |
-            Tee-Object .eliot/pip-install.log
+          python -m pip install --disable-pip-version-check --no-input -r scripts/requirements-verification.txt *>&1 | Tee-Object .eliot/pip-install.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Apply complete tracked-Rust comment cleanup
         shell: pwsh
         run: |
-          Copy-Item helper-source/scripts/doc_code_conformance_lib/rust_comments.py \
-            candidate/scripts/doc_code_conformance_lib/rust_comments.py -Force
+          Copy-Item helper-source/scripts/doc_code_conformance_lib/rust_comments.py candidate/scripts/doc_code_conformance_lib/rust_comments.py -Force
           New-Item -ItemType Directory -Force -Path candidate/.github/temporary | Out-Null
-          Copy-Item helper-source/.github/temporary/finalize_traceability.py \
-            candidate/.github/temporary/finalize_traceability.py -Force
+          Copy-Item helper-source/.github/temporary/finalize_traceability.py candidate/.github/temporary/finalize_traceability.py -Force
           Push-Location candidate
           try {
-            python .github/temporary/finalize_traceability.py *>&1 |
-              Tee-Object .eliot/traceability-cleanup.log
+            python .github/temporary/finalize_traceability.py *>&1 | Tee-Object .eliot/traceability-cleanup.log
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-          finally { Pop-Location }
+          finally {
+            Pop-Location
+          }
 
       - name: Remove execution-only surfaces before verification
         shell: pwsh
         run: |
-          $paths = @(
-            'candidate/.github/temporary/finalize_traceability.py',
-            "candidate/$env:TEMP_WORKFLOW"
-          )
-          foreach ($path in $paths) {
+          foreach ($path in @('candidate/.github/temporary/finalize_traceability.py', "candidate/$env:TEMP_WORKFLOW")) {
             if (Test-Path -LiteralPath $path) {
               Remove-Item -LiteralPath $path -Force
             }
           }
-          if ((Test-Path candidate/.github/temporary) -and
-              -not (Get-ChildItem candidate/.github/temporary -Force)) {
+          if ((Test-Path candidate/.github/temporary) -and -not (Get-ChildItem candidate/.github/temporary -Force)) {
             Remove-Item candidate/.github/temporary -Force
           }
 
@@ -157,22 +146,18 @@ jobs:
           }
           if before_paths != after_paths:
               raise SystemExit(
-                  f'Rust path set changed: missing={sorted(before_paths-after_paths)} '
+                  f'Rust path set changed: missing={sorted(before_paths-before_paths)} '
                   f'added={sorted(after_paths-before_paths)}'
               )
           changed = []
           for relative in sorted(before_paths):
-              before = subprocess.check_output(
-                  ['git', 'show', f'{base}:{relative}']
-              ).decode('utf-8')
+              before = subprocess.check_output(['git', 'show', f'{base}:{relative}']).decode('utf-8')
               after = Path(relative).read_text(encoding='utf-8')
               if code_projection(before) != code_projection(after):
                   raise SystemExit(f'non-comment Rust projection changed: {relative}')
               if before != after:
                   changed.append(relative)
-          Path('.eliot/comment-only-rust.txt').write_text(
-              '\n'.join(changed) + '\n', encoding='utf-8'
-          )
+          Path('.eliot/comment-only-rust.txt').write_text('\n'.join(changed) + '\n', encoding='utf-8')
           print(f'RUST_CODE_PROJECTION: PASS checked={len(before_paths)} changed={len(changed)}')
           '@ | python - *>&1 | Tee-Object .eliot/rust-code-projection.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -188,9 +173,7 @@ jobs:
             '.github/workflows/issue-530-rerun-finalizer.yml'
           )
           $paths = @(git diff --name-only $env:BASE_MAIN)
-          $unexpected = @($paths | Where-Object {
-            -not $_.EndsWith('.rs') -and $_ -notin $allowedNonRust
-          })
+          $unexpected = @($paths | Where-Object { -not $_.EndsWith('.rs') -and $_ -notin $allowedNonRust })
           if ($unexpected.Count -ne 0) {
             throw "Unexpected final paths: $($unexpected -join ', ')"
           }
@@ -208,34 +191,23 @@ jobs:
         shell: pwsh
         working-directory: candidate
         run: |
-          python -m py_compile scripts/verify-doc-code-conformance.py \
-            scripts/doc_code_conformance_core.py \
-            scripts/doc_code_conformance_lib/*.py
+          python -m compileall -q scripts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python scripts/verify-doc-code-conformance.py --self-test *>&1 |
-            Tee-Object .eliot/documentation-gates.log
+          python scripts/verify-doc-code-conformance.py --self-test *>&1 | Tee-Object .eliot/documentation-gates.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python scripts/verify-doc-code-conformance.py --root . \
-            --json-out .eliot/doc-code-conformance.json *>&1 |
-            Tee-Object .eliot/documentation-gates.log -Append
+          python scripts/verify-doc-code-conformance.py --root . --json-out .eliot/doc-code-conformance.json *>&1 | Tee-Object .eliot/documentation-gates.log -Append
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python scripts/docs_shards.py self-test *>&1 |
-            Tee-Object .eliot/documentation-gates.log -Append
+          python scripts/docs_shards.py self-test *>&1 | Tee-Object .eliot/documentation-gates.log -Append
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python scripts/docs_shards.py verify --root . *>&1 |
-            Tee-Object .eliot/documentation-gates.log -Append
+          python scripts/docs_shards.py verify --root . *>&1 | Tee-Object .eliot/documentation-gates.log -Append
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python scripts/docs_router.py self-test *>&1 |
-            Tee-Object .eliot/documentation-gates.log -Append
+          python scripts/docs_router.py self-test *>&1 | Tee-Object .eliot/documentation-gates.log -Append
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python scripts/docs_router.py check --root . *>&1 |
-            Tee-Object .eliot/documentation-gates.log -Append
+          python scripts/docs_router.py check --root . *>&1 | Tee-Object .eliot/documentation-gates.log -Append
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python scripts/docs_read.py self-test *>&1 |
-            Tee-Object .eliot/documentation-gates.log -Append
+          python scripts/docs_read.py self-test *>&1 | Tee-Object .eliot/documentation-gates.log -Append
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pwsh -NoProfile -File scripts/verify.ps1 *>&1 |
-            Tee-Object .eliot/repository-verification.log
+          pwsh -NoProfile -File scripts/verify.ps1 *>&1 | Tee-Object .eliot/repository-verification.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run workspace and diff proof
@@ -244,11 +216,9 @@ jobs:
         run: |
           cargo fmt --all -- --check *>&1 | Tee-Object .eliot/cargo-fmt.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo check --locked --workspace --all-targets *>&1 |
-            Tee-Object .eliot/cargo-check.log
+          cargo check --locked --workspace --all-targets *>&1 | Tee-Object .eliot/cargo-check.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p eliot-platform-windows --lib *>&1 |
-            Tee-Object .eliot/platform-windows-tests.log
+          cargo test --locked -p eliot-platform-windows --lib *>&1 | Tee-Object .eliot/platform-windows-tests.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git diff --check $env:BASE_MAIN *>&1 | Tee-Object .eliot/diff-check.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -278,10 +248,8 @@ jobs:
           $candidate = ($message | git commit-tree $tree -p $remoteMain).Trim()
           git push --force origin "$candidate`:refs/heads/$($env:CANDIDATE_BRANCH)"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          "candidate=$candidate`nparent=$remoteMain`nhelper=$env:HELPER_SOURCE_SHA" |
-            Out-File .eliot/publication.txt -Encoding utf8
-          "candidate=$candidate" |
-            Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "candidate=$candidate`nparent=$remoteMain`nhelper=$env:HELPER_SOURCE_SHA" | Out-File .eliot/publication.txt -Encoding utf8
+          "candidate=$candidate" | Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
       - name: Upload exact proof receipts
         if: always()
