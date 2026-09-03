@@ -18,6 +18,53 @@ from .common import (
 )
 
 
+class _RouteBoundBlock(dict[str, Any]):
+    """Keep configured route IDs authoritative over sample-path projections."""
+
+    def __init__(self, values: dict[str, Any], declared_routes: list[str]) -> None:
+        super().__init__(values)
+        dict.__setitem__(self, "documentation_route_ids", declared_routes)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if key != "documentation_route_ids" or key not in self:
+            super().__setitem__(key, value)
+            return
+
+        if not isinstance(value, list):
+            raise NavigationError(
+                f"logical block {self.get('id')} produced invalid sample route IDs"
+            )
+        sample_routes = [str(item).strip() for item in value if str(item).strip()]
+        declared = list(dict.__getitem__(self, key))
+        missing = [route_id for route_id in declared if route_id not in sample_routes]
+        if missing:
+            raise NavigationError(
+                f"logical block {self.get('id')} sample path omits declared "
+                f"documentation routes: {', '.join(missing)}"
+            )
+        # The sample is only a consistency probe. Preserve the configured
+        # denominator rather than replacing it with sample-specific extras.
+
+
+def _unique_strings(
+    value: Any,
+    field: str,
+    *,
+    path_values: bool = False,
+) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise NavigationError(f"{field} must be a non-empty array")
+    normalized: list[str] = []
+    for item in value:
+        text = str(item).strip()
+        if not text:
+            raise NavigationError(f"{field} contains an empty value")
+        normalized.append(normalize_repo_path(text) if path_values else text)
+    if len(normalized) != len(set(normalized)):
+        raise NavigationError(f"{field} contains duplicate values")
+    return normalized
+
+
 def load_blocks(root: Path, relative: str = DEFAULT_BLOCKS) -> list[dict[str, Any]]:
     payload = read_toml(root / relative)
     if payload.get("schema_version") != SCHEMA:
@@ -41,25 +88,45 @@ def load_blocks(root: Path, relative: str = DEFAULT_BLOCKS) -> list[dict[str, An
         title = str(raw.get("title", "")).strip()
         responsibility = str(raw.get("responsibility", "")).strip()
         route_topic = str(raw.get("route_topic", "")).strip()
-        globs = raw.get("path_globs")
-        handles = raw.get("documentation_handles", [])
         if not title or not responsibility or not route_topic:
             raise NavigationError(f"block {block_id} has an empty required field")
-        if not isinstance(globs, list) or not globs:
-            raise NavigationError(f"block {block_id}.path_globs must be non-empty")
-        if not isinstance(handles, list):
-            raise NavigationError(f"block {block_id}.documentation_handles must be an array")
-        normalized_globs = [normalize_repo_path(str(item)) for item in globs]
-        normalized_handles = [str(item).strip() for item in handles if str(item).strip()]
+
+        globs = _unique_strings(
+            raw.get("path_globs"),
+            f"block {block_id}.path_globs",
+            path_values=True,
+        )
+        handles = _unique_strings(
+            raw.get("documentation_handles"),
+            f"block {block_id}.documentation_handles",
+        )
+        routes = _unique_strings(
+            raw.get("documentation_route_ids"),
+            f"block {block_id}.documentation_route_ids",
+        )
+        invalid_routes = [
+            route_id
+            for route_id in routes
+            if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", route_id)
+        ]
+        if invalid_routes:
+            raise NavigationError(
+                f"block {block_id} has invalid documentation route IDs: "
+                + ", ".join(invalid_routes)
+            )
+
         blocks.append(
-            {
-                "id": block_id,
-                "title": title,
-                "responsibility": responsibility,
-                "route_topic": route_topic,
-                "path_globs": normalized_globs,
-                "documentation_handles": normalized_handles,
-            }
+            _RouteBoundBlock(
+                {
+                    "id": block_id,
+                    "title": title,
+                    "responsibility": responsibility,
+                    "route_topic": route_topic,
+                    "path_globs": globs,
+                    "documentation_handles": handles,
+                },
+                routes,
+            )
         )
     return blocks
 
