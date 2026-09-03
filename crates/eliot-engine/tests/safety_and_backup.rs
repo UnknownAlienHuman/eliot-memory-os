@@ -418,6 +418,34 @@ fn maintenance_job_receipt_written() -> TestResult {
 }
 
 #[test]
+fn unreadable_incident_state_reports_error_not_absent_lockdown() -> TestResult {
+    // A caller that treats this `Err` as "no lockdown" fails open on an
+    // `A0.3` boundary. The error must be distinguishable from `Ok(false)`.
+    let root = test_root("incident-unreadable")?;
+    std::fs::create_dir_all(root.join("incidents"))?;
+    std::fs::write(root.join("incidents").join("incidents.json"), b"{ not json")?;
+
+    let service = IncidentService::new(root);
+    assert!(
+        service.lockdown_active().is_err(),
+        "a malformed incident file must not read as an absent lockdown"
+    );
+    Ok(())
+}
+
+#[test]
+fn absent_incident_state_reports_no_lockdown() -> TestResult {
+    // The other direction: a missing file is a known-empty state, not an error,
+    // so the fix above does not turn a clean install into a denial.
+    let service = IncidentService::new(test_root("incident-absent")?);
+    assert!(
+        !service.lockdown_active()?,
+        "a missing incident file is a known-empty state, not a lockdown"
+    );
+    Ok(())
+}
+
+#[test]
 fn incident_open_ack_close() -> TestResult {
     let service = IncidentService::new(test_root("incident-cycle")?);
     let opened = service.open(

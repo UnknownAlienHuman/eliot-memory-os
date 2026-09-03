@@ -99,9 +99,11 @@ pub async fn create_action_lease_artifacts(
         codecortex_reports: std::slice::from_ref(&report),
         current_git_head: current_git_head.as_deref(),
         work_lease: Some(&work_lease),
-        incident_lockdown_active: eliot_engine::IncidentService::new(root)
-            .lockdown_active()
-            .unwrap_or(false),
+        // An unreadable or malformed incident file must deny the lease, not
+        // grant it. Sixteen of the seventeen `lockdown_active` call sites in
+        // this crate already propagate; this one swallowed the error and
+        // reported "no lockdown", which is fail-open on an `A0.3` boundary.
+        incident_lockdown_active: eliot_engine::IncidentService::new(root).lockdown_active()?,
     });
     let wal = ControlWal::open(control_wal)?;
     let (handle, actor) = WriterActor::channel(wal, store, &WriterConfig::default());
