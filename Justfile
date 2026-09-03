@@ -35,6 +35,10 @@ code-navigation-sync:
 docs-closure-audit:
     python scripts/docs_closure_audit.py --root .
 
+# Completion gate for one capability cell, e.g. `just work-unit eliot-cue-contracts`.
+work-unit crate:
+    python scripts/verify-work-unit.py --crate {{crate}} --root .
+
 normative:
     pwsh -NoProfile -File scripts/verify-normative.ps1
 
