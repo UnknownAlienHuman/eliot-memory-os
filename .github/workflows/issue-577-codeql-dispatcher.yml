@@ -47,6 +47,15 @@ jobs:
 
           path = Path('.github/workflows/issue-530-rerun-finalizer.yml')
           text = path.read_text(encoding='utf-8')
+          upgrade_step = """      - name: Upgrade exact package-index generators
+        shell: bash
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          python scripts/code_navigation_lib/_upgrade_index_projection_v2.py 2>&1 | tee .eliot/package-index-generator-upgrade.log
+          rm -f scripts/code_navigation_lib/_upgrade_index_projection_v2.py
+
+"""
           replacements = [
               (
                   "on:\n  issue_comment:\n    types: [created]\n",
@@ -54,6 +63,10 @@ jobs:
               ),
               ("  issues: read\n", ""),
               ("  RUN_MARKER: ELIOT_RUN_577_FINAL_20260903_0215\n", ""),
+              (
+                  "  DOCS_SOURCE_SHA: c87fc05982916a8dfe46bc1b0095df97ae330411\n",
+                  "  DOCS_SOURCE_SHA: 318c345ddc3a4ec69cf453698a93bb5f7b0892e9\n",
+              ),
               (
                   "  verify-and-publish:\n    if: >-\n      github.event.issue.number == 577 &&\n      github.event.comment.body == 'ELIOT_RUN_577_FINAL_20260903_0215'\n    runs-on: ubuntu-latest\n",
                   "  verify-and-publish:\n    runs-on: ubuntu-latest\n",
@@ -65,6 +78,10 @@ jobs:
               (
                   "            echo \"issue=577\"\n            echo \"comment_id=${{ github.event.comment.id }}\"\n",
                   "            echo \"issue=577\"\n            echo \"trigger=workflow_dispatch\"\n",
+              ),
+              (
+                  "      - name: Apply complete tracked-Rust comment cleanup\n",
+                  upgrade_step + "      - name: Apply complete tracked-Rust comment cleanup\n",
               ),
           ]
           for old, new in replacements:
