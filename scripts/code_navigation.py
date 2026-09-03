@@ -20,6 +20,14 @@ from code_navigation_lib import (
     route_payload,
     self_test,
 )
+from code_navigation_lib.blocks import self_test as block_route_self_test
+from code_navigation_lib.documentation_closure import (
+    check as check_documentation_closure,
+    self_test as documentation_closure_self_test,
+)
+from code_navigation_lib.documentation_closure_selftest import (
+    self_test as documentation_closure_e2e_self_test,
+)
 from code_navigation_lib.package_docs import (
     check as check_package_docs,
     self_test as package_docs_self_test,
@@ -29,6 +37,10 @@ from code_navigation_lib.prototype_docs import (
     check as check_prototype_docs,
     self_test as prototype_docs_self_test,
     write_index as write_prototype_docs_index,
+)
+from code_navigation_lib.shard_limits import (
+    check as check_shard_limits,
+    self_test as shard_limits_self_test,
 )
 
 
@@ -65,17 +77,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "self-test":
             self_test()
+            block_route_self_test()
             package_docs_self_test()
             prototype_docs_self_test()
+            documentation_closure_self_test()
+            documentation_closure_e2e_self_test()
+            shard_limits_self_test()
         elif args.command == "check":
             check(root)
             check_package_docs(root)
             check_prototype_docs(root)
+            check_documentation_closure(root)
+            check_shard_limits(root)
         elif args.command == "sync-index":
             write_package_docs_index(root)
             write_prototype_docs_index(root)
             check_package_docs(root)
             check_prototype_docs(root)
+            check_documentation_closure(root)
+            check_shard_limits(root)
         elif args.command == "list":
             registry = build_registry(root)
             if args.format == "json":

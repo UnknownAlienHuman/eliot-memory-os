@@ -30,7 +30,13 @@ max_required_bytes = 393216
 [[route]]
 id = "generic-source"
 description = "Common causal-cell, ownership, edge-proof, and completion rules for any source mutation."
-path_globs = ["bins/**", "crates/**", "apps/**", "integrations/**", "plugin/**"]
+path_globs = [
+  "bins/**",
+  "crates/**",
+  "apps/**",
+  "integrations/**",
+  "plugin/**",
+]
 topic_keywords = ["source code", "implementation", "crate", "module", "binary", "refactor"]
 required_handles = ["A2.3", "A10.4", "A14.8", "I2.17", "I2.20", "I18"]
 optional_handles = ["I2.*", "I17"]
@@ -38,13 +44,40 @@ required_files = []
 optional_files = ["Cargo.toml"]
 
 [[route]]
+id = "foundation-contracts"
+description = "Shared foundation contracts, protocols, receipts, evidence, rules, and package ownership."
+path_globs = ["crates/foundation/**"]
+topic_keywords = ["foundation contract", "shared protocol", "receipt contract", "evidence contract"]
+required_handles = ["A2.3", "I2.8"]
+optional_handles = ["I2.*", "I17.*", "I18.*"]
+required_files = ["crates/AGENTS.md"]
+optional_files = []
+
+[[route]]
+id = "governor-semantic-control"
+description = "Governor semantic admission, tasks, WorkScopes, coordination, canonical transitions, maintenance, and strict finish."
+path_globs = ["crates/governor/**", "bins/eliotd/**"]
+topic_keywords = ["governor", "semantic admission", "workscope", "canonical transition", "strict finish"]
+required_handles = ["I5.19"]
+optional_handles = ["A10.*", "I5.*", "I7.*", "I14.*", "I18.*"]
+required_files = []
+optional_files = []
+max_required_bytes = 458752
+
+[[route]]
 id = "host-kernel"
 description = "Host, Kernel, authority epoch, fencing, ORS, supervision, startup, and recovery ownership."
 path_globs = ["bins/eliot-host/**", "bins/eliot-kernel/**", "crates/kernel/**"]
 topic_keywords = ["host", "kernel", "authority epoch", "fencing", "ors", "supervision", "startup"]
 required_handles = [
-  "A2.2", "A2.3", "A12.2", "A13.2",
-  "I1.1..I1.8", "I5.5", "I14.14", "I16.17",
+  "A2.2",
+  "A2.3",
+  "A12.2",
+  "A13.2",
+  "I1.1..I1.8",
+  "I5.5",
+  "I14.14",
+  "I16.17",
 ]
 optional_handles = ["I1.9..I1.13", "I5.6..I5.23", "I14.*", "I16.*", "APPENDIX-A..APPENDIX-D", "APPENDIX-P"]
 required_files = ["bins/AGENTS.md"]
@@ -64,7 +97,13 @@ optional_files = []
 [[route]]
 id = "canonical-storage"
 description = "Canonical store, BlobStore, one-write-path, transitions, backup, restore, and migration."
-path_globs = ["bins/eliot-store-surreal/**", "migrations/**", "crates/**/*store*/**", "crates/**/*blob*/**"]
+path_globs = [
+  "bins/eliot-store-surreal/**",
+  "migrations/**",
+  "crates/storage/**",
+  "crates/**/*store*/**",
+  "crates/**/*blob*/**",
+]
 topic_keywords = ["surrealdb", "canonical store", "blobstore", "transaction", "migration", "backup", "restore"]
 required_handles = ["A4", "A12.3", "A13.6..A13.9", "I5.1..I5.7", "I5.19", "I5.27"]
 optional_handles = ["A4.*", "I5.8..I5.18", "I5.20..I5.26", "I19", "I20"]
@@ -77,7 +116,17 @@ id = "module-runtime"
 description = "Replaceable process/WASM/native generations, capability boundaries, promotion, and rollback."
 path_globs = ["bins/eliot-native-worker/**", "bins/eliot-wasm-host/**", "bins/eliot-mod-*/**", "crates/modules/**"]
 topic_keywords = ["wasm", "native worker", "process generation", "hot replacement", "module promotion", "module rollback"]
-required_handles = ["A2.3", "A13.3", "A14.8", "I2.1..I2.5", "I2.10", "I6.4..I6.5", "I7.1..I7.5", "I14.14", "I18"]
+required_handles = [
+  "A2.3",
+  "A13.3",
+  "A14.8",
+  "I2.1..I2.5",
+  "I2.10",
+  "I6.4..I6.5",
+  "I7.1..I7.5",
+  "I14.14",
+  "I18",
+]
 optional_handles = ["I2.*", "I6.*", "I14.*", "I17", "APPENDIX-P"]
 required_files = []
 optional_files = []
@@ -85,11 +134,24 @@ optional_files = []
 [[route]]
 id = "agent-swarm"
 description = "Agent runtimes, provider routes, delegation, durable tasks, Concilium, swarm, and strict finish."
-path_globs = ["bins/eliot-agent-bridge/**", "crates/**/*agent*/**", "integrations/**"]
+path_globs = [
+  "bins/eliot-agent-bridge/**",
+  "crates/agent/**",
+  "crates/surfaces/eliot-agent-bridge-core/**",
+  "crates/**/*agent*/**",
+  "integrations/**",
+]
 topic_keywords = ["agent", "swarm", "codex", "claude", "opencode", "antigravity", "provider route", "concilium", "delegation"]
 required_handles = [
-  "A10.1", "A10.2", "A10.4..A10.8",
-  "I3", "I7.1..I7.9", "I10.15..I10.18", "I13", "I14", "I18.16..I18.17",
+  "A10.1",
+  "A10.2",
+  "A10.4..A10.8",
+  "I3",
+  "I7.1..I7.9",
+  "I10.15..I10.18",
+  "I13",
+  "I14",
+  "I18.16..I18.17",
 ]
 optional_handles = ["A10.*", "I7.*", "I10.*", "I13.*", "I14.*", "I16.*", "I18.*"]
 required_files = []
@@ -99,11 +161,28 @@ max_required_bytes = 458752
 [[route]]
 id = "instrument-verification"
 description = "Instrument Plane, test execution, evidence envelopes, code understanding, proof breadth, and completion evidence."
-path_globs = ["bins/eliot-testd/**", "scripts/audit-*.py", "scripts/verify-*.py", "tests/**", "crates/**/*instrument*/**", "crates/**/*verification*/**"]
+path_globs = [
+  "bins/eliot-testd/**",
+  "scripts/audit-*.py",
+  "scripts/verify-*.py",
+  "tests/**",
+  "crates/instrument/**",
+  "crates/**/*instrument*/**",
+  "crates/**/*verification*/**",
+]
 topic_keywords = ["instrument", "verification", "verifier", "evidence envelope", "proof", "test harness", "code cortex"]
 required_handles = [
-  "A5.5", "A10.8", "A14.6..A14.8",
-  "I2.17", "I2.20..I2.23", "I10.8..I10.10", "I16.17", "I17", "I18", "APPENDIX-J", "APPENDIX-P",
+  "A5.5",
+  "A10.8",
+  "A14.6..A14.8",
+  "I2.17",
+  "I2.20..I2.23",
+  "I10.8..I10.10",
+  "I16.17",
+  "I17",
+  "I18",
+  "APPENDIX-J",
+  "APPENDIX-P",
 ]
 optional_handles = ["I10.*", "I17.*", "I18.*"]
 required_files = ["scripts/verify.ps1"]
@@ -114,6 +193,8 @@ max_required_bytes = 458752
 id = "memory-context"
 description = "Memory, read reconstruction, Understanding State, graphs, Context Compiler, cues, and cognitive inheritance."
 path_globs = [
+  "crates/smart/**",
+  "bins/eliot-dreamer/**",
   "crates/eliot-engine/src/context/**",
   "crates/eliot-engine/src/read/**",
   "crates/eliot-engine/src/project_understanding/**",
@@ -121,10 +202,32 @@ path_globs = [
   "crates/**/*context*/**",
 ]
 topic_keywords = ["memory", "context compiler", "active view", "understanding", "causal graph", "code graph", "cognitive inheritance", "cue"]
-required_handles = ["A4", "A5", "A6", "A7", "A14.1..A14.4", "I12.9..I12.10", "I13", "I16"]
-optional_handles = ["A4.*", "A5.*", "A6.*", "A7.*", "I9.*", "I12.*", "I13.*", "I16.*"]
+required_handles = [
+  "A4",
+  "A5",
+  "A6",
+  "A7",
+  "A14.1..A14.4",
+  "I12.9..I12.10",
+  "I12.13",
+  "I13",
+  "I16",
+  "I17.11",
+]
+optional_handles = [
+  "A4.*",
+  "A5.*",
+  "A6.*",
+  "A7.*",
+  "I9.*",
+  "I12.*",
+  "I13.*",
+  "I16.*",
+  "I17.*",
+]
 required_files = []
 optional_files = []
+max_required_bytes = 458752
 
 [[route]]
 id = "dreamer"
@@ -139,9 +242,16 @@ optional_files = []
 [[route]]
 id = "human-surfaces"
 description = "CLI, operator UI, user broker, notifications, human control, and configuration surfaces."
-path_globs = ["apps/**", "crates/surfaces/**", "bins/eliot-user-broker/**", "bins/eliot-ui/**", "bins/eliot-notify/**"]
+path_globs = [
+  "apps/**",
+  "crates/surfaces/**",
+  "bins/eliot/**",
+  "bins/eliot-user-broker/**",
+  "bins/eliot-ui/**",
+  "bins/eliot-notify/**",
+]
 topic_keywords = ["operator ui", "dashboard", "cli", "user broker", "notification", "human control"]
-required_handles = ["A11", "I3", "I7.3..I7.8", "I11"]
+required_handles = ["A11", "I3", "I7.3..I7.8", "I11", "I11.1"]
 optional_handles = ["A11.*", "I3.*", "I7.*", "I11.*"]
 required_files = []
 optional_files = ["apps/Eliot.Operator/README.md"]
@@ -149,12 +259,41 @@ optional_files = ["apps/Eliot.Operator/README.md"]
 [[route]]
 id = "security-privacy"
 description = "Authority, credentials, provenance, influence, privacy, secret residency, and external effects."
-path_globs = ["config/**/*security*", "config/**/*privacy*", "crates/**/*auth*/**", "crates/**/*secret*/**", "crates/**/*policy*/**"]
+path_globs = [
+  "config/**/*security*",
+  "config/**/*privacy*",
+  "crates/security/**",
+  "crates/**/*auth*/**",
+  "crates/**/*secret*/**",
+  "crates/**/*policy*/**",
+]
 topic_keywords = ["security", "privacy", "secret", "credential", "provenance", "authority", "external effect", "influence"]
-required_handles = ["A0.3", "A12", "I5.26", "I6.15", "I15"]
+required_handles = ["A0.3", "A12", "I5.26", "I6.15", "I15", "I15.9"]
 optional_handles = ["A12.*", "I15.*"]
 required_files = []
 optional_files = []
+
+[[route]]
+id = "research-acquisition"
+description = "Governed external-corpus acquisition, research exchange, provider execution, and evidence handoff."
+path_globs = ["crates/research/**", "bins/eliot-mod-research/**"]
+topic_keywords = ["research acquisition", "research exchange", "external corpus", "provider evidence"]
+required_handles = ["I21.1"]
+optional_handles = ["I10.*", "I15.*", "I18.*", "I21.*"]
+required_files = []
+optional_files = []
+max_required_bytes = 458752
+
+[[route]]
+id = "supervision-meta"
+description = "Watchdog observation, Doctor repair, runtime status, Meta improvement, and bounded recovery."
+path_globs = ["crates/supervision/**", "crates/meta/**", "bins/eliot-watchdog/**", "bins/eliot-doctor/**"]
+topic_keywords = ["supervision", "runtime status", "meta repair", "bounded recovery", "improvement"]
+required_handles = ["I8.3", "I14.25"]
+optional_handles = ["A8.*", "A13.*", "I8.*", "I14.*", "I16.*"]
+required_files = []
+optional_files = []
+max_required_bytes = 458752
 
 [[route]]
 id = "doctor-operations"
@@ -168,9 +307,32 @@ optional_files = []
 max_required_bytes = 458752
 
 [[route]]
+id = "legacy-migration-facades"
+description = "Legacy compatibility and regression donors under explicit extraction, migration, or deletion ownership."
+path_globs = [
+  "crates/eliot-app/**",
+  "crates/eliot-engine/**",
+  "crates/eliot-store/**",
+  "crates/eliot-types/**",
+  "crates/eliot-windows-ipc/**",
+]
+topic_keywords = ["legacy facade", "migration donor", "compatibility extraction", "duplicate owner"]
+required_handles = ["I19.14"]
+optional_handles = ["I2.*", "I18.*", "I19.*"]
+required_files = []
+optional_files = []
+max_required_bytes = 458752
+
+[[route]]
 id = "release-migration"
 description = "Release gates, source identity, packaging, promotion, rollback, backup/restore, and cutover."
-path_globs = ["docs/release/**", ".github/workflows/**", "scripts/verify*.ps1", "scripts/**/*release*", "scripts/**/*package*"]
+path_globs = [
+  "docs/release/**",
+  ".github/workflows/**",
+  "scripts/verify*.ps1",
+  "scripts/**/*release*",
+  "scripts/**/*package*",
+]
 topic_keywords = ["release", "migration", "cutover", "deployment", "packaging", "rollback"]
 required_handles = ["A13.3", "A13.7..A13.8", "A14.8", "I0.8..I0.9", "I18", "I19", "I20"]
 optional_handles = ["I18.*", "I19.*", "I20.*", "APPENDIX-G..APPENDIX-P"]
@@ -183,7 +345,16 @@ id = "professional-workflow"
 description = "Professional or multimodal WorkScope onboarding, domain contracts, tools, and outcome verification."
 path_globs = ["crates/**/*professional*/**", "crates/**/*multimodal*/**"]
 topic_keywords = ["professional workflow", "multimodal", "media", "workscope onboarding"]
-required_handles = ["A3", "A7", "A10.1", "I4", "I10.13", "I10.20..I10.22", "I12.35", "I18.47"]
+required_handles = [
+  "A3",
+  "A7",
+  "A10.1",
+  "I4",
+  "I10.13",
+  "I10.20..I10.22",
+  "I12.35",
+  "I18.47",
+]
 optional_handles = ["A3.*", "A7.*", "I4.*", "I10.*", "I12.*", "I18.*"]
 required_files = []
 optional_files = []
@@ -191,9 +362,16 @@ optional_files = []
 [[route]]
 id = "documentation-authority"
 description = "Normative pair, architecture/implementation semantics, indexes, routes, agent instructions, and documentation integrity."
-path_globs = ["docs/**", "AGENTS.md", "**/AGENTS.md", "WORKFLOW.md", ".github/ISSUE_TEMPLATE/**", ".github/pull_request_template.md"]
+path_globs = [
+  "docs/**",
+  "AGENTS.md",
+  "**/AGENTS.md",
+  "WORKFLOW.md",
+  ".github/ISSUE_TEMPLATE/**",
+  ".github/pull_request_template.md",
+]
 topic_keywords = ["documentation", "normative", "architecture", "implementation contract", "index", "navigation", "route"]
-required_handles = ["A0.1..A0.6", "A16.3", "I0.14", "I2.17", "I18"]
+required_handles = ["A0.1..A0.6", "A16.3", "I0.14", "I2.17", "I18", "I19.15"]
 optional_handles = ["A10.4", "A14.8", "I2.20..I2.23"]
 required_files = ["docs/normative-pair.toml", "docs/architecture/route-rules.toml", "scripts/docs_shards.py", "scripts/docs_router.py"]
 optional_files = ["docs/architecture/SPLIT_REPORT.md", "docs/architecture/HANDLE_INDEX.md"]
@@ -203,11 +381,32 @@ max_required_bytes = 458752
 id = "workspace-governance"
 description = "Workspace build graph, repository policy, tests, scripts, active workstreams, and configuration changes."
 path_globs = [
-  "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml", ".typos.toml", "Justfile", "tool-versions.json", "mcpls.toml",
-  ".github/**", "scripts/**", "tests/**", "config/**", "workspace/**", "workstreams/**",
+  "Cargo.toml",
+  "Cargo.lock",
+  "rust-toolchain.toml",
+  "deny.toml",
+  ".typos.toml",
+  "Justfile",
+  "tool-versions.json",
+  "mcpls.toml",
+  ".github/**",
+  "scripts/**",
+  "tests/**",
+  "config/**",
+  "workspace/**",
+  "workstreams/**",
 ]
 topic_keywords = ["workspace", "cargo", "repository policy", "workstream", "build graph", "configuration"]
-required_handles = ["A10.4", "A14.8", "I2.17", "I2.20..I2.23", "I17", "I18"]
+required_handles = [
+  "A10.4",
+  "A14.8",
+  "I2.8",
+  "I2.17",
+  "I2.20..I2.23",
+  "I17",
+  "I18",
+  "I18.3",
+]
 optional_handles = ["I2.*", "I17.*", "I18.*"]
 required_files = ["Cargo.toml", "workstreams/ACTIVE.toml"]
 optional_files = ["Justfile"]
@@ -217,8 +416,19 @@ max_required_bytes = 458752
 id = "repository-root"
 description = "Root-level repository identity, licensing, tool pins, and contributor entry surfaces."
 path_globs = [
-  ".gitattributes", ".gitignore", "LICENSE", "README.md", "WORKFLOW.md",
-  ".typos.toml", "Cargo.toml", "Cargo.lock", "Justfile", "deny.toml", "mcpls.toml", "rust-toolchain.toml", "tool-versions.json",
+  ".gitattributes",
+  ".gitignore",
+  "LICENSE",
+  "README.md",
+  "WORKFLOW.md",
+  ".typos.toml",
+  "Cargo.toml",
+  "Cargo.lock",
+  "Justfile",
+  "deny.toml",
+  "mcpls.toml",
+  "rust-toolchain.toml",
+  "tool-versions.json",
 ]
 topic_keywords = ["repository root", "license", "toolchain pin"]
 required_handles = ["A0.4", "A14.8", "I0.14", "I2.17", "I18"]
@@ -236,7 +446,7 @@ expect_routes = ["generic-source", "host-kernel", "security-privacy"]
 [[coverage.example]]
 path = "bins/eliot-watchdog/src/runtime_loop.rs"
 topic = "Watchdog liveness"
-expect_routes = ["generic-source", "watchdog"]
+expect_routes = ["generic-source", "watchdog", "supervision-meta"]
 
 [[coverage.example]]
 path = "bins/eliot-store-surreal/src/adapter_materialization.rs"
@@ -256,7 +466,7 @@ expect_routes = ["generic-source", "instrument-verification"]
 [[coverage.example]]
 path = "crates/eliot-engine/src/context_contracts.rs"
 topic = "context compiler"
-expect_routes = ["generic-source", "memory-context"]
+expect_routes = ["generic-source", "memory-context", "legacy-migration-facades"]
 
 [[coverage.example]]
 path = "apps/Eliot.Operator/MainWindow.xaml"
@@ -282,3 +492,28 @@ expect_routes = ["documentation-authority", "doctor-operations"]
 path = "README.md"
 topic = "repository root"
 expect_routes = ["repository-root"]
+
+[[coverage.example]]
+path = "crates/foundation/eliot-contracts/Cargo.toml"
+topic = "foundation contracts"
+expect_routes = ["generic-source", "foundation-contracts"]
+
+[[coverage.example]]
+path = "crates/governor/eliot-governor/Cargo.toml"
+topic = "governor semantic control"
+expect_routes = ["generic-source", "governor-semantic-control"]
+
+[[coverage.example]]
+path = "crates/research/eliot-researcher/Cargo.toml"
+topic = "research acquisition"
+expect_routes = ["generic-source", "research-acquisition"]
+
+[[coverage.example]]
+path = "crates/meta/eliot-runtime-status/Cargo.toml"
+topic = "runtime status supervision"
+expect_routes = ["generic-source", "supervision-meta"]
+
+[[coverage.example]]
+path = "crates/eliot-types/Cargo.toml"
+topic = "legacy facade"
+expect_routes = ["generic-source", "legacy-migration-facades"]

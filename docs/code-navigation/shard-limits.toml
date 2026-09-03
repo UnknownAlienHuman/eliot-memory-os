@@ -1,0 +1,5 @@
+schema_version = "eliot-doc-shard-limits-v1"
+max_rendered_bytes = 65536
+
+# Exact, reviewed exceptions must identify one canonical shard, raise the
+# ceiling, and state a bounded reason. No current shard is exempt.

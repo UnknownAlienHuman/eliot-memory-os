@@ -83,6 +83,7 @@ def self_test() -> None:
                 route_topic = "test source"
                 path_globs = ["crates/**"]
                 documentation_handles = ["A0.1"]
+                documentation_route_ids = ["test-route"]
                 """
             ).lstrip(),
             encoding="utf-8",

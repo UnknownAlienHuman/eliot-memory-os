@@ -9,6 +9,7 @@ path_globs = [
   "crates/foundation/**",
 ]
 documentation_handles = ["A2.3", "I2.8"]
+documentation_route_ids = ["foundation-contracts"]
 
 [[block]]
 id = "governor-semantic-control"
@@ -20,6 +21,7 @@ path_globs = [
   "bins/eliotd/**",
 ]
 documentation_handles = ["I5.19"]
+documentation_route_ids = ["governor-semantic-control"]
 
 [[block]]
 id = "host-kernel-runtime"
@@ -32,6 +34,7 @@ path_globs = [
   "bins/eliot-kernel/**",
 ]
 documentation_handles = ["I1.8"]
+documentation_route_ids = ["host-kernel"]
 
 [[block]]
 id = "canonical-storage"
@@ -43,6 +46,7 @@ path_globs = [
   "bins/eliot-store-surreal/**",
 ]
 documentation_handles = ["I5.19"]
+documentation_route_ids = ["canonical-storage"]
 
 [[block]]
 id = "agent-fabric"
@@ -56,6 +60,7 @@ path_globs = [
   "integrations/**",
 ]
 documentation_handles = ["I10.15"]
+documentation_route_ids = ["agent-swarm"]
 
 [[block]]
 id = "instrument-code-intelligence"
@@ -67,6 +72,7 @@ path_globs = [
   "bins/eliot-testd/**",
 ]
 documentation_handles = ["I10.8.17", "I18.18"]
+documentation_route_ids = ["instrument-verification"]
 
 [[block]]
 id = "smart-memory-context"
@@ -78,6 +84,7 @@ path_globs = [
   "bins/eliot-dreamer/**",
 ]
 documentation_handles = ["I12.13", "I17.11"]
+documentation_route_ids = ["memory-context"]
 
 [[block]]
 id = "security-privacy"
@@ -88,6 +95,7 @@ path_globs = [
   "crates/security/**",
 ]
 documentation_handles = ["I15.9"]
+documentation_route_ids = ["security-privacy"]
 
 [[block]]
 id = "research-acquisition"
@@ -99,6 +107,7 @@ path_globs = [
   "bins/eliot-mod-research/**",
 ]
 documentation_handles = ["I21.1"]
+documentation_route_ids = ["research-acquisition"]
 
 [[block]]
 id = "supervision-meta"
@@ -112,6 +121,7 @@ path_globs = [
   "bins/eliot-doctor/**",
 ]
 documentation_handles = ["I8.3", "I14.25"]
+documentation_route_ids = ["supervision-meta"]
 
 [[block]]
 id = "operator-surfaces"
@@ -126,6 +136,7 @@ path_globs = [
   "apps/**",
 ]
 documentation_handles = ["I11.1"]
+documentation_route_ids = ["human-surfaces"]
 
 [[block]]
 id = "module-runtimes"
@@ -138,6 +149,7 @@ path_globs = [
   "bins/eliot-native-worker/**",
 ]
 documentation_handles = ["I2.10"]
+documentation_route_ids = ["module-runtime"]
 
 [[block]]
 id = "legacy-migration-facades"
@@ -152,6 +164,7 @@ path_globs = [
   "crates/eliot-windows-ipc/**",
 ]
 documentation_handles = ["I19.14"]
+documentation_route_ids = ["legacy-migration-facades"]
 
 [[block]]
 id = "workspace-governance"
@@ -170,6 +183,7 @@ path_globs = [
   ".github/**",
 ]
 documentation_handles = ["I2.8", "I18.3"]
+documentation_route_ids = ["workspace-governance"]
 
 [[block]]
 id = "documentation-authority"
@@ -183,3 +197,4 @@ path_globs = [
   "docs/**",
 ]
 documentation_handles = ["I0.14", "I19.15"]
+documentation_route_ids = ["documentation-authority"]

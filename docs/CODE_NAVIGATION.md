@@ -45,6 +45,14 @@ GitHub:
 
 Both projections bind manifests to inherited package-family `AGENTS.md`
 contracts, logical responsibility blocks, and canonical documentation handles.
+The live closure verifier additionally evaluates the package directory, manifest,
+and every declared or inferred Cargo target as separate path-only front doors.
+Each front door must inherit the family contract, match every route explicitly
+owned by its logical block, and resolve the block's governing handles to the exact
+canonical fragment path, anchor, byte count, and SHA-256. Topic keywords may
+expand an agent bundle, but are not allowed to manufacture a package's base
+routing closure.
+
 Prototype presence is not workspace admission, implementation completion,
 runtime support, or Product acceptance.
 
@@ -68,23 +76,37 @@ python scripts/code_navigation.py sync-index --root .
 The root `Cargo.toml` is the sole workspace-member/default-member input.
 Additional `Cargo.toml` files are still discovered and labelled `nonmember`; this
 prevents candidate/prototype crates from disappearing from navigation or being
-mistaken for admitted workspace members.
+mistaken for admitted workspace members. Raw member, default-member, and exclude
+selectors are evaluated before deduplication, so duplicate literals and
+intersecting globs cannot be hidden by a set projection.
 
 The logical block map is
 [`code-navigation/logical-blocks.toml`](code-navigation/logical-blocks.toml).
+Every block declares both canonical handles and explicit path-only documentation
+route IDs. The non-exempt normative-fragment ceiling and narrow exception schema
+are in [`code-navigation/shard-limits.toml`](code-navigation/shard-limits.toml).
+
 `python scripts/code_navigation.py check --root .` fails when:
 
-- the workspace denominator contains a missing, duplicate, or unexpected package;
+- raw Cargo member/default/exclude selectors are missing, duplicate, overlapping,
+  or disagree with the live package registry;
 - a workspace/default member resolves to no manifest or target front door;
 - any discovered Cargo package falls outside every logical block;
-- a package block has no governing handle or resolves no documentation route;
-- a package does not inherit the required `crates/`, `bins/`, or
-  `workspace/tools/` `AGENTS.md` contract;
+- a block has no governing handle, no explicit route, an unknown route, or a
+  matched file that does not receive its declared path-only route;
+- a package directory, manifest, or Cargo target does not inherit the required
+  `crates/`, `bins/`, or `workspace/tools/` `AGENTS.md` contract;
+- any package front door omits a declared block route or governing canonical
+  handle, or a routed fragment path/anchor/SHA differs from `handle-index.json`;
 - a family contract omits the verified-reader command, reading-protocol link, or
   required index backlink;
 - a nonmember package is not explicitly classified as a prototype or has no
   `workspace_admission`;
-- either committed package-to-document index is missing, stale, or hand-edited;
+- either committed package-to-document index is missing, stale, hand-edited, or
+  lacks the exact package backlink and block/handle chain;
+- a canonical Architecture/Implementation shard exceeds 65,536 rendered bytes
+  without an exact, larger, still-necessary, reasoned exception;
+- the canonical topic index has zero or multiple primary headings;
 - a configured path escapes the repository or matches no current file;
 - a configured normative handle is absent from the generated handle index;
 - the generated registry is nondeterministic.
@@ -182,6 +204,8 @@ selected lifecycle owner per index root.
 
 ```powershell
 python scripts/code_navigation.py self-test
+python scripts/docs_router.py sync --root .
+python scripts/code_navigation.py sync-index --root .
 python scripts/code_navigation.py check --root .
 python scripts/docs_shards.py verify --root .
 python scripts/docs_router.py check --root .
@@ -203,6 +227,8 @@ See also:
   for every admitted workspace package;
 - [`code-navigation/PROTOTYPE_DOCS_INDEX.md`](code-navigation/PROTOTYPE_DOCS_INDEX.md)
   for every explicitly classified nonmember prototype package;
+- [`code-navigation/shard-limits.toml`](code-navigation/shard-limits.toml) for
+  canonical fragment-size enforcement;
 - [`PROJECT_MAP.md`](PROJECT_MAP.md) for high-level runtime/source planes;
 - [`architecture/READING_PROTOCOL.md`](architecture/READING_PROTOCOL.md) for
   bounded normative reading;
