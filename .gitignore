@@ -72,5 +72,6 @@ __pycache__/
 
 # Excluded capability cells are standalone workspace roots (see the `exclude`
 # comment in the root Cargo.toml), so cargo writes a lock file next to each one.
-# Those locks are build artifacts of an unadmitted cell, never release inputs.
+# The same applies to any other crate that declares its own `[workspace]`.
+# Those locks are build artifacts of an unadmitted crate, never release inputs.
 crates/*/*/Cargo.lock
