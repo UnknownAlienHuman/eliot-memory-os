@@ -4,8 +4,8 @@
 This companion to `audit-architecture-boundaries.py` intentionally separates
 heuristic code-quality signals from hard architecture ownership rules. It scans
 only declared runtime-root packages and composition binaries, masks comments and
-string/character literals, and ignores the file suffix after the first
-`#[cfg(test)]` marker.
+string/character literals, and removes exactly the items annotated
+`#[cfg(test)]` — not the whole file suffix after the first such marker.
 
 A clean result is static source evidence only. It is not runtime, store or
 Product Proof, and metrics never create an owner or mandate a split by LOC.
@@ -33,14 +33,12 @@ SKIP_DIRS = {
     "target",
     "dist",
     "reports",
-    "research",
-    "swarm",
 }
 
 CFG_TEST = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
 
 PATTERNS: dict[str, re.Pattern[str]] = {
-    "unsafe": re.compile(r"\bunsafe\s*(?:\{|fn\b|impl\b|trait\b|extern\b)"),
+    "unsafe": re.compile(r"\bunsafe\s+(?:async\s+)?(?:fn\b|impl\b|trait\b|extern\b)|\bunsafe\s*\{"),
     "panic": re.compile(r"\bpanic\s*!\s*\("),
     "unwrap": re.compile(r"\.\s*unwrap\s*\(\s*\)"),
     "expect": re.compile(r"\.\s*expect\s*\("),
@@ -137,11 +135,73 @@ def owning_package(path: Path, root: Path, by_dir: dict[Path, str]) -> str | Non
         current = current.parent
 
 
-def production_prefix(content: str) -> tuple[str, bool]:
-    match = CFG_TEST.search(content)
-    if match is None:
-        return content, False
-    return content[: match.start()], True
+def _end_of_annotated_item(masked: str, start: int) -> int:
+    """Return the offset just past the item that begins at or after `start`.
+
+    An item ends at its matching closing brace (`mod tests { … }`, `fn helper()
+    { … }`) or at the first top-level semicolon (`mod tests;`, `use super::*;`).
+    Further attributes stacked on the same item are skipped first. `masked` must
+    come from `mask_non_code`, so braces inside strings, chars and comments are
+    already blanked and cannot unbalance the scan.
+    """
+    index = start
+    length = len(masked)
+    while index < length:
+        char = masked[index]
+        if char.isspace():
+            index += 1
+            continue
+        if char == "#":  # another attribute on the same item
+            depth = 0
+            while index < length:
+                if masked[index] == "[":
+                    depth += 1
+                elif masked[index] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        index += 1
+                        break
+                index += 1
+            continue
+        break
+
+    depth = 0
+    while index < length:
+        char = masked[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        elif char == ";" and depth == 0:
+            return index + 1
+        index += 1
+    return length
+
+
+def production_source(content: str) -> tuple[str, bool]:
+    """Return the source with `#[cfg(test)]` items removed, and whether any existed.
+
+    The previous implementation returned only the prefix before the first
+    `#[cfg(test)]` marker, so every later item in the file was discarded whether
+    or not it was test code. Measured on this tree that hid 183 files and
+    167 434 lines from every hygiene signal, including 588 `pub fn` and 233
+    `unsafe` blocks — 143 of them in `eliot-platform-windows/src/lib.rs` alone.
+    `forbid(unsafe_code)` was therefore only ever verified in a file's prefix.
+    """
+    masked = mask_non_code(content)
+    kept: list[str] = []
+    cursor = 0
+    found = False
+    for match in CFG_TEST.finditer(masked):
+        if match.start() < cursor:
+            continue
+        found = True
+        kept.append(content[cursor : match.start()])
+        cursor = _end_of_annotated_item(masked, match.end())
+    kept.append(content[cursor:])
+    return "".join(kept), found
 
 
 def _raw_string_start(text: str, index: int) -> tuple[int, int] | None:
@@ -307,7 +367,7 @@ def scan(root: Path, policy_path: Path) -> tuple[list[SourceMetric], list[Findin
             )
             continue
 
-        production, has_cfg_test = production_prefix(content)
+        production, has_cfg_test = production_source(content)
         code = mask_non_code(production)
         counts = count_patterns(code)
         forbids_unsafe = bool(re.search(r"#!\s*\[\s*forbid\s*\(\s*unsafe_code\s*\)\s*\]", production))
@@ -490,6 +550,56 @@ def self_test() -> None:
         assert len(metrics) == 1
         assert metrics[0].panic_count == 1
         assert metrics[0].unsafe_count == 2
+
+    # Regression fixtures for the three defects this scanner shipped with.
+    # Each one passed before the repair and fails without it.
+    with tempfile.TemporaryDirectory(prefix="eliot-runtime-hygiene-tail-") as temporary:
+        root = Path(temporary)
+        write_fixture(
+            root / "config/architecture-boundaries.toml",
+            """
+            schema = "eliot.architecture-boundaries.v1"
+            [[runtime_root]]
+            package = "tail-bin"
+            issue = 9
+            """,
+        )
+        write_fixture(
+            root / "bins/tail-bin/Cargo.toml",
+            """
+            [package]
+            name = "tail-bin"
+            version = "0.1.0"
+            edition = "2024"
+            """,
+        )
+        # Production code after a `#[cfg(test)]` item, plus `unsafe async fn`.
+        # Prefix splitting discarded everything from the marker onward, so both
+        # the trailing `unsafe` and the trailing `panic!` were invisible.
+        write_fixture(
+            root / "bins/tail-bin/src/main.rs",
+            r'''
+            fn main() { unsafe { first(); } }
+            #[cfg(test)]
+            mod tests { #[test] fn ignored() { panic!("test"); unsafe { hidden(); } } }
+            unsafe fn first() {}
+            pub unsafe async fn second() { panic!("production tail"); }
+            ''',
+        )
+        metrics, findings = scan(root, root / "config/architecture-boundaries.toml")
+        assert len(metrics) == 1, metrics
+        # `unsafe {` in main, `unsafe fn first`, `unsafe async fn second`.
+        # The `unsafe {` inside the test module is excluded.
+        assert metrics[0].unsafe_count == 3, metrics[0].unsafe_count
+        # Only the `panic!` after the test module; the one inside it is excluded.
+        assert metrics[0].panic_count == 1, metrics[0].panic_count
+        assert metrics[0].cfg_test_present is True
+
+    # `research` and `swarm` were skipped wholesale, hiding real source.
+    assert "research" not in SKIP_DIRS
+    assert "swarm" not in SKIP_DIRS
+    # `unsafe async fn` was not matched by the previous pattern.
+    assert PATTERNS["unsafe"].search("pub unsafe async fn f() {}") is not None
     print("RUNTIME_SOURCE_HYGIENE_SELF_TEST: PASS")
 
 
