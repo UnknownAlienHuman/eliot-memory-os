@@ -135,7 +135,9 @@ def load_blocks(root: Path, relative: str = DEFAULT_BLOCKS) -> list[dict[str, An
 def self_test() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        (root / DEFAULT_BLOCKS).write_text(
+        fixture = root / DEFAULT_BLOCKS
+        fixture.parent.mkdir(parents=True, exist_ok=True)
+        fixture.write_text(
             "\n".join(
                 [
                     f'schema_version = "{SCHEMA}"',
