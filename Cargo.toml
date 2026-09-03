@@ -128,6 +128,62 @@ members = [
   "workspace/tools/eliot-campaign-executor",
   "workspace/tools/eliot-live-canary",
 ]
+
+# Capability cells declared by `[package.metadata.eliot]` with `agent_order`
+# and no source yet. Excluding them keeps every per-crate cargo command
+# working while a cell is being implemented; without an entry here or in
+# `members`, cargo refuses with "current package believes it's in a
+# workspace when it's not" and the cell cannot be built or tested at all.
+#
+# A cell moves from `exclude` to `members` in its own work unit, as the last
+# commit, once its `[acceptance]` gate passes. That one-line move is the only
+# edit to this file a cell work unit may make. See I0.12 and I2.11.
+exclude = [
+  "crates/smart/eliot-dreamer-contracts",  # agent_order 3
+  "crates/smart/eliot-dreamer-bundle",  # agent_order 4
+  "crates/smart/eliot-dreamer-candidate-validation",  # agent_order 5
+  "crates/smart/eliot-dreamer-orientation",  # agent_order 6
+  "crates/smart/eliot-epistemic-contracts",  # agent_order 6
+  "crates/smart/eliot-dreamer-clarification",  # agent_order 7
+  "crates/smart/eliot-dreamer-architecture-brief",  # agent_order 8
+  "crates/smart/eliot-dreamer-implementation-brief",  # agent_order 9
+  "crates/smart/eliot-cue-contracts",  # agent_order 10
+  "crates/smart/eliot-cue-normalizer",  # agent_order 11
+  "crates/smart/eliot-cue-binding",  # agent_order 12
+  "crates/smart/eliot-cue-index",  # agent_order 13
+  "crates/smart/eliot-cue-activation",  # agent_order 14
+  "crates/smart/eliot-dreamer-claim-grounding",  # agent_order 14
+  "crates/smart/eliot-context-contracts",  # agent_order 15
+  "crates/smart/eliot-context-candidates",  # agent_order 16
+  "crates/smart/eliot-dreamer-rival-model",  # agent_order 16
+  "crates/smart/eliot-context-admission",  # agent_order 17
+  "crates/smart/eliot-dreamer-probe-plan",  # agent_order 17
+  "crates/smart/eliot-context-assembly",  # agent_order 18
+  "crates/smart/eliot-memory-curation-contracts",  # agent_order 19
+  "crates/smart/eliot-reactive-context-plan",  # agent_order 19
+  "crates/smart/eliot-memory-curation-screen",  # agent_order 20
+  "crates/smart/eliot-dreamer-classification",  # agent_order 21
+  "crates/smart/eliot-dreamer-relation",  # agent_order 22
+  "crates/smart/eliot-dreamer-episode",  # agent_order 23
+  "crates/smart/eliot-dreamer-concept",  # agent_order 24
+  "crates/smart/eliot-dreamer-procedure",  # agent_order 25
+  "crates/smart/eliot-dreamer-failure",  # agent_order 26
+  "crates/smart/eliot-dreamer-structure-repair",  # agent_order 27
+  "crates/smart/eliot-dreamer-reconsolidation",  # agent_order 28
+  "crates/smart/eliot-dreamer-accessibility",  # agent_order 29
+  "crates/smart/eliot-dreamer-memory-repair",  # agent_order 30
+  "crates/smart/eliot-dreamer-curation",  # agent_order 31
+  "crates/smart/eliot-learning-contracts",  # agent_order 32
+  "crates/smart/eliot-learning-state-view",  # agent_order 33
+  "crates/smart/eliot-learning-delta",  # agent_order 34
+  "crates/smart/eliot-learning-overlay",  # agent_order 35
+  "crates/meta/eliot-learning-activation-assessment",  # agent_order 36
+  "crates/smart/eliot-dreamer-conflict-analysis",  # agent_order 39
+  "crates/smart/eliot-dreamer-development-diagnosis",  # agent_order 40
+  "crates/smart/eliot-dreamer-maintenance-plan",  # agent_order 41
+  "crates/smart/eliot-dreamer-configuration-plan",  # agent_order 42
+  "crates/smart/eliot-dreamer-orchestration-plan",  # agent_order 43
+]
 default-members = [
   "bins/eliot",
   "bins/eliot-host",
