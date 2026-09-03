@@ -3,7 +3,7 @@
 
 The byte-preserving sharding implementation remains in ``docs_shards_core``.
 This front door owns verified-reader navigation text, portable Markdown checks,
-and the generated Decision Anchor projection derived from canonical A16.1.
+Decision Anchor generation, and idempotent topic-index rendering.
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ _core_patch_navigation_surfaces = _core.patch_navigation_surfaces
 _core_verify_generated_surfaces = _core.verify_generated_surfaces
 _core_migrate = _core.migrate
 _core_self_test = _core.self_test
+_core_render_topic_index = _core.render_topic_index
 
 
 def routing_block(
@@ -226,8 +227,31 @@ incoming file and heading links. Their canonical content has moved to fragments.
 """
 
 
+def _topic_source(old_index: str) -> str:
+    """Return only the preserved topic map, regardless of input generation."""
+
+    text = old_index.replace("\r\n", "\n")
+    marker = _core.GENERATED_MARKER
+    if text.startswith(marker):
+        separator = "\n## Preserved topic map\n\n"
+        if separator not in text:
+            raise DocsError(  # noqa: F405
+                "generated topic index has no preserved topic-map boundary"
+            )
+        text = text.split(separator, 1)[1]
+
+    lines = text.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and lines[0].strip() == "# ELIOT canonical topic index":
+        lines.pop(0)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def render_topic_index(old_index: str) -> str:
-    return _core.render_topic_index(old_index)
+    return _core_render_topic_index(_topic_source(old_index))
 
 
 def _relative_parts(root: Path, requested: Path) -> tuple[str, ...] | None:
@@ -375,6 +399,14 @@ def self_test() -> None:
     _core_self_test()
     _decision_anchors.self_test()
 
+    raw_topic = "# ELIOT canonical topic index\n\nbody\n"
+    rendered = render_topic_index(raw_topic)
+    rerendered = render_topic_index(rendered)
+    if rendered != rerendered:
+        raise DocsError("topic-index rendering is not idempotent")  # noqa: F405
+    if rendered.count("\n# ELIOT canonical topic index\n") != 1:
+        raise DocsError("topic-index primary heading is not unique")  # noqa: F405
+
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         docs = root / "docs"
@@ -412,7 +444,7 @@ def self_test() -> None:
         else:
             raise DocsError("case-mismatch link self-test failed")  # noqa: F405
 
-    print("DOC_SHARDS_HARDENING_SELF_TEST: PASS cases=7")
+    print("DOC_SHARDS_HARDENING_SELF_TEST: PASS cases=9")
 
 
 def _refresh_indexes(argv: Sequence[str]) -> int:
