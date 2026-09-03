@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -129,6 +130,41 @@ def load_blocks(root: Path, relative: str = DEFAULT_BLOCKS) -> list[dict[str, An
             )
         )
     return blocks
+
+
+def self_test() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / DEFAULT_BLOCKS).write_text(
+            "\n".join(
+                [
+                    f'schema_version = "{SCHEMA}"',
+                    "",
+                    "[[block]]",
+                    'id = "test-block"',
+                    'title = "Test"',
+                    'responsibility = "Test responsibility"',
+                    'route_topic = "test topic"',
+                    'path_globs = ["crates/test/**"]',
+                    'documentation_handles = ["I2.8"]',
+                    'documentation_route_ids = ["test-route"]',
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        block = load_blocks(root)[0]
+        block["documentation_route_ids"] = ["generic-source", "test-route"]
+        if block["documentation_route_ids"] != ["test-route"]:
+            raise NavigationError("sample routes replaced configured route IDs")
+        try:
+            block["documentation_route_ids"] = ["generic-source"]
+        except NavigationError as exc:
+            if "omits declared" not in str(exc):
+                raise
+        else:
+            raise NavigationError("sample route omission was accepted")
+    print("LOGICAL_BLOCK_ROUTE_SELF_TEST: PASS cases=2")
 
 
 def load_docs_router(root: Path) -> Any:
