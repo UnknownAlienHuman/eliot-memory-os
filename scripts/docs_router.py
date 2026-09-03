@@ -3,7 +3,7 @@
 
 The implementation remains in ``docs_router_core``. This front door owns
 portable repository-path normalization, deletion-aware changed-path discovery,
-and their executable negative fixtures.
+real-path route-payload coverage, and their executable negative fixtures.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import subprocess
 import tempfile
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from typing import Sequence
 
@@ -19,6 +20,7 @@ from docs_router_core import *  # noqa: F403
 
 DRIVE_QUALIFIED_PATH_REJECTED = "eliot-doc-router-drive-qualified-path-v1"
 _core_self_test = _core.self_test
+_core_load_config = _core.load_config
 
 
 def normalize_repo_path(value: str) -> str:
@@ -74,6 +76,44 @@ def git_changed_paths(root: Path, changed_from: str) -> list[str]:
     return sorted(set(paths))
 
 
+def _with_real_path_examples(root: Path, config: Config) -> Config:  # noqa: F405
+    """Give every live path-backed route a deterministic payload probe."""
+
+    tracked = _core.tracked_files(root)
+    examples = list(config.examples)
+    covered = {
+        str(route_id)
+        for example in examples
+        for route_id in example.get("expect_routes", ())
+    }
+    for route in config.routes:
+        if route.route_id in covered:
+            continue
+        candidate = next(
+            (
+                path
+                for path in tracked
+                if any(_core.path_matches(path, pattern) for pattern in route.path_globs)
+            ),
+            None,
+        )
+        if candidate is None:
+            continue
+        examples.append(
+            {
+                "path": candidate,
+                "topic": "",
+                "expect_routes": (route.route_id,),
+            }
+        )
+        covered.add(route.route_id)
+    return replace(config, examples=tuple(examples))
+
+
+def load_config(root: Path, relative: str = DEFAULT_CONFIG) -> Config:  # noqa: F405
+    return _with_real_path_examples(root, _core_load_config(root, relative))
+
+
 def _git(root: Path, *arguments: str) -> None:
     completed = subprocess.run(
         ["git", "-C", str(root), *arguments],
@@ -89,7 +129,13 @@ def _git(root: Path, *arguments: str) -> None:
 
 
 def self_test() -> None:
-    _core_self_test()
+    # Keep the legacy core fixture stable; the wrapper-specific route coverage
+    # is exercised independently below.
+    _core.load_config = _core_load_config
+    try:
+        _core_self_test()
+    finally:
+        _core.load_config = load_config
 
     for candidate in ("C:/repo/file.md", r"C:\repo\file.md"):
         try:
@@ -124,11 +170,47 @@ def self_test() -> None:
                 "--changed-from deletion self-test failed"
             )
 
-    print("DOC_ROUTER_HARDENING_SELF_TEST: PASS cases=3")
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        candidate = root / "crates/a/Cargo.toml"
+        candidate.parent.mkdir(parents=True)
+        candidate.write_text("[package]\nname='a'\n", encoding="utf-8")
+        rule = RouteRule(  # noqa: F405
+            route_id="live-route",
+            description="test",
+            path_globs=("crates/**",),
+            topic_keywords=(),
+            required_handles=(),
+            optional_handles=(),
+            required_files=(),
+            optional_files=(),
+            max_required_bytes=None,
+        )
+        config = Config(  # noqa: F405
+            pair_schema="",
+            baseline_handles=(),
+            baseline_files=(),
+            baseline_optional_handles=(),
+            baseline_optional_files=(),
+            max_required_bytes=1,
+            routes=(rule,),
+            examples=(),
+        )
+        augmented = _with_real_path_examples(root, config)
+        if len(augmented.examples) != 1:
+            raise RouteError("live route payload example was not synthesized")  # noqa: F405
+        example = augmented.examples[0]
+        if example["path"] != "crates/a/Cargo.toml" or example["expect_routes"] != (
+            "live-route",
+        ):
+            raise RouteError("live route payload example is nondeterministic")  # noqa: F405
+
+    print("DOC_ROUTER_HARDENING_SELF_TEST: PASS cases=4")
 
 
 _core.normalize_repo_path = normalize_repo_path
 _core.git_changed_paths = git_changed_paths
+_core.load_config = load_config
 _core.self_test = self_test
 main = _core.main
 
