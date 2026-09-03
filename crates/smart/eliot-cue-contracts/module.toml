@@ -57,3 +57,50 @@ implementation_language = "Rust 2024"
 required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
 writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
 workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+
+# Machine-checked completion gate, read by `scripts/verify-work-unit.py`.
+# `cargo fmt|test|clippy` all pass on an empty crate, so they cannot tell a
+# finished cell from an unstarted one. This table can.
+#
+# These are the floors every cell shares. The owning work unit tightens them
+# with `required_exports` and `required_tests` taken from its own brief, so a
+# reviewer decides on one exit code instead of reading prose criteria.
+
+# Machine-checked completion gate, read by `scripts/verify-work-unit.py`.
+# Worked example: every entry below is taken verbatim from the A-10 brief, so
+# the brief's numbered behaviour rules and this table cannot drift apart.
+[acceptance]
+min_source_lines = 700
+min_public_items = 28
+min_tests = 15
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = [
+  "ObservedCue", "NormalizedCue", "CanonicalCueIdentity", "ComparisonKey",
+  "MatchMode", "NormalizationProfile", "NormalizationOutcome",
+  "CueBindingCandidate", "CueSnapshot", "SnapshotMember", "RebuildIdentity",
+  "ActivationRequest", "ActivationBounds", "ActivationResult",
+  "DirectActivation", "DerivedActivation", "Completeness", "BoundKind",
+  "CueContractError",
+]
+required_tests = [
+  "observed_cue_rejects_unknown_field",
+  "canonical_identity_differs_from_comparison_key",
+  "snapshot_rebuild_digest_is_stable",
+  "snapshot_with_wrong_digest_is_rejected",
+  "direct_activation_valid_with_zero_edges",
+  "direct_and_derived_are_not_interchangeable",
+  "broken_derived_path_is_rejected",
+  "complete_result_cannot_carry_frontier",
+  "truncation_names_the_bound_it_hit",
+  "known_empty_differs_from_unavailable",
+  "every_collection_bound_is_enforced",
+  "identity_inputs_change_the_digest",
+  "cue_kind_comes_from_eliot_types",
+  "malformed_input_never_panics",
+  "consumer_fixture_compiles_standalone",
+]
+# `CueKind` has one canonical owner in `eliot-types`; a fifth copy here is the
+# defect F-CUE exists to remove.
+forbidden_patterns = ['enum\s+CueKind', 'serde_json::Value', 'unimplemented!', 'todo!']
+required_patterns = ['#\[non_exhaustive\]', 'deny_unknown_fields']

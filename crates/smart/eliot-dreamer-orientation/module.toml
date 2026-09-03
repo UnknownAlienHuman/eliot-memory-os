@@ -61,3 +61,20 @@ implementation_language = "Rust 2024"
 required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
 writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
 workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"
+
+# Machine-checked completion gate, read by `scripts/verify-work-unit.py`.
+# `cargo fmt|test|clippy` all pass on an empty crate, so they cannot tell a
+# finished cell from an unstarted one. This table can.
+#
+# These are the floors every cell shares. The owning work unit tightens them
+# with `required_exports` and `required_tests` taken from its own brief, so a
+# reviewer decides on one exit code instead of reading prose criteria.
+[acceptance]
+min_source_lines = 200
+min_public_items = 6
+min_tests = 5
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = []
+required_tests = []
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
