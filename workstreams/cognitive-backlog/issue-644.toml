@@ -1,0 +1,5 @@
+schema = "eliot.assignment-reservation.v1"
+owning_issue = 644
+status = "draft"
+source_of_truth = "GitHub issue #644 and the draft pull request body"
+remove_before_ready = true
