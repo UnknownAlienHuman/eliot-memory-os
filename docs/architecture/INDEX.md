@@ -7,8 +7,6 @@ pre-sharding topic map; each handle now resolves to a bounded fragment.
 
 ## Preserved topic map
 
-# ELIOT canonical topic index
-
 This file is a navigation projection over the accepted pair. It is not a third
 normative book. Stable references are section handles, not line numbers.
 
