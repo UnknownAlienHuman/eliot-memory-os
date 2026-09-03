@@ -38,6 +38,10 @@ docs-closure-audit:
 # Completion gate for one capability cell, e.g. `just work-unit eliot-cue-contracts`.
 work-unit crate:
     python scripts/verify-work-unit.py --crate {{crate}} --root .
+# Crates that live outside the workspace and outside `exclude`, so no other gate
+# covers them. Runs fmt, clippy and tests for each.
+standalone-crates:
+    python scripts/verify-standalone-crates.py --root .
 
 normative:
     pwsh -NoProfile -File scripts/verify-normative.ps1
@@ -109,7 +113,7 @@ claude-package:
 sync-skills:
     cargo run --quiet -p eliot-app -- host skill-sync
 
-quick: docs-shards-self-test docs-shards docs-router-self-test docs-router docs-read-self-test doc-code-conformance-self-test doc-code-conformance code-navigation-self-test code-navigation docs-closure-audit core-daemon-inventory-self-test core-daemon-inventory normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails agent-route-bundles-self-test agent-route-bundles runtime-source-hygiene-self-test runtime-source-hygiene agent-bridge-protocol-self-test agent-bridge-protocol metadata fmt-check check
+quick: docs-shards-self-test docs-shards docs-router-self-test docs-router docs-read-self-test doc-code-conformance-self-test doc-code-conformance code-navigation-self-test code-navigation docs-closure-audit standalone-crates core-daemon-inventory-self-test core-daemon-inventory normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails agent-route-bundles-self-test agent-route-bundles runtime-source-hygiene-self-test runtime-source-hygiene agent-bridge-protocol-self-test agent-bridge-protocol metadata fmt-check check
 
 verify:
     pwsh -NoProfile -File scripts/verify.ps1
