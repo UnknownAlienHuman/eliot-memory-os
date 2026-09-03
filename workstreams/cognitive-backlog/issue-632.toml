@@ -1,0 +1,8 @@
+schema = "eliot.assignment-reservation.v1"
+owning_issue = 632
+implementation_pr = 635
+branch = "work/632-dreamer-orientation-wasm"
+base_revision = "1861dbeb66914776596f2a17a920a1200906e3b0"
+status = "draft"
+source_of_truth = "GitHub issue #632 and draft pull request #635"
+remove_before_ready = true
