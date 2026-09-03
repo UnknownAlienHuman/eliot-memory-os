@@ -1,0 +1,8 @@
+schema = "eliot.assignment-reservation.v1"
+owning_issue = 640
+implementation_pr = 643
+branch = "work/640-cue-activation-wasm"
+base_revision = "1861dbeb66914776596f2a17a920a1200906e3b0"
+status = "draft"
+source_of_truth = "GitHub issue #640 and draft pull request #643"
+remove_before_ready = true
