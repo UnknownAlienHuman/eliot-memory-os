@@ -1,11 +1,11 @@
 //! OS-observed named-pipe peer process admission.
 //!
-//! Architecture anchors (eliot-architecture-docs-fa941135): A2.3, A12.2,
+//! Architecture anchors: A2.3, A12.2,
 //! A12.3, ARCH-AUTH-01, ARCH-SEC-01, and ARCH-SEC-02. This module owns only
 //! the sealed process/SID/session/Job evidence and the deterministic admission
 //! checks that bind a live peer to inert caller-selected expectations.
 //!
-//! Implementation anchors (eliot-architecture-docs-fa941135): I2.2, I2.23,
+//! Implementation anchors: I2.1, I2.23,
 //! I7.5, I7.14, and I15.2. These APIs observe live process and Job identity,
 //! preserve fail-closed mismatch behavior, and keep principal evidence
 //! separate from transport and semantic transitions.
@@ -16,6 +16,11 @@
 //! sibling modules. The Host service query below is read-only process
 //! observation for admission evidence; it does not own service authority.
 //! This module issues no authority, canonical transition, or semantic result.
+//!
+//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md`,
+//! `docs/architecture/ELIOT_ARCHITECTURE.md`,
+//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (compatibility entry points;
+//! the governing shards are named per anchor above).
 
 use std::path::Path;
 

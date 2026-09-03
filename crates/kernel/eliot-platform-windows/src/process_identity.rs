@@ -1,22 +1,26 @@
 //! Shared file, process, and token identity observation primitives.
 //!
 //! Architecture (verified):
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A2.3`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A12.2`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A12.3`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A13.2`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-AUTH-01`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-SEC-01`
-//! - `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-SEC-02`
+//! - `A2.3` (`docs/architecture/A02-03-modular-architecture.md`)
+//! - `A12.2` (`docs/architecture/A12-02-principal-session-and-visibility.md`)
+//! - `A12.3` (`docs/architecture/A12-03-one-governed-write-path.md`)
+//! - `A13.2` (`docs/architecture/A13-02-kernel-and-failure-domains.md`)
+//! - `ARCH-AUTH-01`, `ARCH-SEC-01`, `ARCH-SEC-02`
+//!   (`docs/architecture/A16-01-decision-anchors.md`)
 //!
 //! Implementation (verified):
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I1.2`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I2.2`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I2.23`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I7.3`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I7.14`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I15.2`
-//! - `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I15.3`
+//! - `I1.2` (`docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md`)
+//! - `I2.1` (`docs/architecture/I02-01-primary-decision-crate-rich-process-sparse-owner-sparse.md`)
+//! - `I2.23` (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`)
+//! - `I7.3` (`docs/architecture/I07-03-handshake.md`)
+//! - `I7.14` (`docs/architecture/I07-14-session-lifecycle.md`)
+//! - `I15.2` (`docs/architecture/I15-02-principal-and-session-binding.md`)
+//! - `I15.3` (`docs/architecture/I15-03-least-privilege-processes.md`)
+//!
+//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md`,
+//! `docs/architecture/ELIOT_ARCHITECTURE.md`,
+//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (compatibility entry points;
+//! the governing shards are named per anchor above).
 //!
 //! This module owns shared file, process, and token identity observation
 //! primitives only. It forbids `NamedPipe` admission, job or process lifecycle,

@@ -184,7 +184,7 @@ description = "Professional or multimodal WorkScope onboarding, domain contracts
 path_globs = ["crates/**/*professional*/**", "crates/**/*multimodal*/**"]
 topic_keywords = ["professional workflow", "multimodal", "media", "workscope onboarding"]
 required_handles = ["A3", "A7", "A10.1", "I4", "I10.13", "I10.20..I10.22", "I12.35", "I18.47"]
-optional_handles = ["A3.*", "A7.*", "I4.*", "I10.*", "I12.*", "I18.*"]
+optional_handles = ["A3", "A7.*", "I4.*", "I10.*", "I12.*", "I18.*"]
 required_files = []
 optional_files = []
 

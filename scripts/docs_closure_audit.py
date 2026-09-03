@@ -68,6 +68,20 @@ NEGATIVE_FIXTURE_HINTS = (
     "self-test", "self_test", "must fail", "nonexistent",
 )
 
+# Every normative shard filename in docs/architecture. Three families exist:
+#   A-PREFACE-01-…, A00-01-…   Architecture
+#   I-PREFACE-01-…, I00-01-…   Implementation
+#   APPENDIX-A-…               Implementation appendices
+# The appendix family was previously unmatched, so all fifteen appendices were
+# reported as manifest fragments absent from the inventory (issue #577).
+NORMATIVE_SHARD_NAME = re.compile(r"(?:APPENDIX-|(?:A|I)(?:-|\d)).+\.md")
+
+# Compatibility facades. They render the whole document and are deliberately
+# outside the shard inventory; they are never fragments of a manifest.
+COMPATIBILITY_FACADES = frozenset(
+    {"ELIOT_ARCHITECTURE.md", "ELIOT_IMPLEMENTATION.md"}
+)
+
 
 class AuditFailure(RuntimeError):
     pass
@@ -740,6 +754,48 @@ def validate_selector(
     return True, None
 
 
+def retired_reference_allowlist(root: Path) -> set[tuple[str, str]]:
+    """Return the `(path, token)` pairs `config/doc-code-conformance.toml` allows.
+
+    A rule that forbids a token has to spell that token out. The configuration
+    is the single owner of those exemptions; the audit reads them instead of
+    keeping a second hard-coded list, so the two can never disagree.
+    """
+    config = root / "config/doc-code-conformance.toml"
+    try:
+        data = read_toml(config)
+    except (OSError, tomllib.TOMLDecodeError, AuditFailure):
+        return set()
+    entries = data.get("retired_references", {}).get("allow", [])
+    allowed: set[tuple[str, str]] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path")
+        token = entry.get("token")
+        if isinstance(path, str) and isinstance(token, str):
+            allowed.add((path, token))
+    return allowed
+
+
+def retired_reference_is_allowed(
+    allowed: set[tuple[str, str]], relative_path: str, pattern: str
+) -> bool:
+    """Match an audit pattern against a configured exemption token.
+
+    The audit scans for the bare predecessor filename while the configuration
+    names the full repository-relative path, so an exact string comparison
+    misses. A configured token satisfies a pattern when it is that pattern or
+    ends with it as a complete path segment.
+    """
+    for allowed_path, token in allowed:
+        if allowed_path != relative_path:
+            continue
+        if token == pattern or token.endswith("/" + pattern):
+            return True
+    return False
+
+
 def likely_negative_fixture(path: Path, line: str) -> bool:
     folded = line.casefold()
     return "scripts" in path.parts and any(hint in folded for hint in NEGATIVE_FIXTURE_HINTS)
@@ -874,12 +930,21 @@ def scan_references(
                 )
                 start = offset + len(pattern)
 
+    allowed = retired_reference_allowlist(audit.root)
     for hit in legacy_hits:
         path = Path(hit["path"])
-        if path.as_posix() in {
-            ".github/workflows/repository-policy.yml",
-            "scripts/docs_closure_audit.py",
-        }:
+        relative_path = path.as_posix()
+        # `scripts/docs_closure_audit.py` names the retired tokens because this
+        # function defines them; it can never be expressed in the config it reads.
+        if relative_path == "scripts/docs_closure_audit.py":
+            continue
+        if retired_reference_is_allowed(allowed, relative_path, str(hit["pattern"])):
+            audit.info(
+                "DOC-RETIRED-REFERENCE-ALLOWED",
+                f"retired token named by its owning rule: {hit['pattern']}",
+                path=audit.root / path,
+                line=int(hit["line"]),
+            )
             continue
         audit.error(
             "DOC-RETIRED-REFERENCE",
@@ -905,8 +970,8 @@ def validate_fragment_inventory(
     tracked = {
         path.relative_to(audit.root).as_posix()
         for path in (audit.root / "docs/architecture").glob("*.md")
-        if re.fullmatch(r"(?:A|I)(?:-|\d).+\.md", path.name)
-        and path.name not in {"ELIOT_ARCHITECTURE.md", "ELIOT_IMPLEMENTATION.md"}
+        if NORMATIVE_SHARD_NAME.fullmatch(path.name)
+        and path.name not in COMPATIBILITY_FACADES
     }
     missing = sorted(expected - tracked)
     orphaned = sorted(tracked - expected)
@@ -939,13 +1004,32 @@ def validate_gate_wiring(audit: Audit) -> None:
                 f"just quick does not depend on {target}",
                 path=justfile,
             )
-    for marker in ("doc-code-conformance-self-test", "doc-code-conformance"):
-        if marker not in verify_text:
-            audit.error(
-                "DOC-GATE-POWERSHELL",
-                f"scripts/verify.ps1 does not invoke {marker}",
-                path=verify,
-            )
+    # verify.ps1 names its steps `documentation-code-conformance…`, matching the
+    # `documentation-shards` / `documentation-routes` convention it already uses.
+    # The invariant is that the gate runs the verifier in both modes, not that it
+    # copies the Justfile target names, so assert the invocations themselves.
+    verifier = "verify-doc-code-conformance.py"
+    if verifier not in verify_text:
+        audit.error(
+            "DOC-GATE-POWERSHELL",
+            f"scripts/verify.ps1 does not reference {verifier}",
+            path=verify,
+        )
+    else:
+        variable = re.search(
+            r"(?m)^\s*(\$[A-Za-z_][A-Za-z0-9_]*)\s*=\s*Join-Path\s+\$PSScriptRoot\s+'"
+            + re.escape(verifier)
+            + r"'",
+            verify_text,
+        )
+        invoker = re.escape(variable.group(1)) if variable else re.escape(verifier)
+        for mode, label in ((r"--self-test", "self-test"), (r"--root", "full")):
+            if not re.search(rf"{invoker}\s+{mode}\b", verify_text):
+                audit.error(
+                    "DOC-GATE-POWERSHELL",
+                    f"scripts/verify.ps1 does not invoke the conformance verifier in {label} mode",
+                    path=verify,
+                )
     if "verify-doc-code-conformance.py" not in readme_text:
         audit.error(
             "DOC-GATE-README",
