@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -85,6 +86,10 @@ def check(root: Path) -> None:
                     f"documentation shard record is not an object: {manifest_relative}[{index}]"
                 )
             path = normalize_repo_path(str(record.get("path", "")))
+            if path in present:
+                raise NavigationError(
+                    f"duplicate documentation shard path across manifests: {path}"
+                )
             rendered = _positive_int(
                 record.get("rendered_bytes"), f"fragment {path}.rendered_bytes"
             )
@@ -147,30 +152,43 @@ def check(root: Path) -> None:
     )
 
 
+def _write_manifest(path: Path, fragment: str, rendered_bytes: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "eliot-doc-shards-v1",
+                "fragments": [
+                    {
+                        "path": fragment,
+                        "rendered_bytes": rendered_bytes,
+                    }
+                ],
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _fixture(root: Path, *, size: int, h1_count: int = 1) -> None:
-    shard = root / "docs/architecture/implementation/I00-test.md"
-    shard.parent.mkdir(parents=True, exist_ok=True)
-    shard.write_bytes(b"x" * size)
-    architecture = root / MANIFESTS[0]
-    architecture.parent.mkdir(parents=True, exist_ok=True)
-    architecture.write_text(
-        '{"schema_version":"eliot-doc-shards-v1","fragments":['
-        '{"path":"docs/architecture/implementation/I00-test.md",'
-        f'"rendered_bytes":{size}}}'
-        ']}\n',
-        encoding="utf-8",
+    architecture_shard = root / "docs/architecture/architecture/A00-test.md"
+    architecture_shard.parent.mkdir(parents=True, exist_ok=True)
+    architecture_shard.write_bytes(b"a")
+    implementation_shard = root / "docs/architecture/implementation/I00-test.md"
+    implementation_shard.parent.mkdir(parents=True, exist_ok=True)
+    implementation_shard.write_bytes(b"x" * size)
+    _write_manifest(
+        root / MANIFESTS[0],
+        "docs/architecture/architecture/A00-test.md",
+        1,
     )
-    implementation = root / MANIFESTS[1]
-    implementation.parent.mkdir(parents=True, exist_ok=True)
-    implementation.write_text(
-        '{"schema_version":"eliot-doc-shards-v1","fragments":['
-        '{"path":"docs/architecture/implementation/I00-test.md",'
-        f'"rendered_bytes":{size}}}'
-        ']}\n',
-        encoding="utf-8",
+    _write_manifest(
+        root / MANIFESTS[1],
+        "docs/architecture/implementation/I00-test.md",
+        size,
     )
-    # The two fixture manifests intentionally reference the same byte-identical
-    # shard; production manifests have disjoint paths and are checked normally.
     topic = root / TOPIC_INDEX
     topic.parent.mkdir(parents=True, exist_ok=True)
     topic.write_text((TOPIC_H1 + "\n") * h1_count, encoding="utf-8")
@@ -205,4 +223,18 @@ def self_test() -> None:
                 raise
         else:
             raise NavigationError("duplicate topic-index H1 was accepted")
-    print("DOC_SHARD_LIMIT_SELF_TEST: PASS cases=3")
+
+        _fixture(root, size=8)
+        _write_manifest(
+            root / MANIFESTS[0],
+            "docs/architecture/implementation/I00-test.md",
+            8,
+        )
+        try:
+            check(root)
+        except NavigationError as exc:
+            if "duplicate documentation shard path" not in str(exc):
+                raise
+        else:
+            raise NavigationError("cross-manifest duplicate shard was accepted")
+    print("DOC_SHARD_LIMIT_SELF_TEST: PASS cases=4")
