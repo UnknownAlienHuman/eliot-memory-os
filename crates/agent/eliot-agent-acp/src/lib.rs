@@ -1653,10 +1653,19 @@ mod tests {
         Ok(())
     }
 
-    fn result_envelope() -> Result<AcpResultEnvelope, eliot_agent_api::ContractError> {
+    // `AttemptId::new` reports `eliot_agent_contracts::ContractError` while the
+    // sibling `RouteFingerprintId::new` reports `eliot_agent_api::ContractError`,
+    // so the two cannot share one `?`. The conversion is written out here rather
+    // than added as a cross-crate `From`, which would silently merge two
+    // unrelated error taxonomies across a public boundary.
+    fn result_envelope() -> Result<AcpResultEnvelope, AcpAdapterError> {
         Ok(AcpResultEnvelope {
             operation_id: "operation".into(),
-            attempt_id: AttemptId::new("attempt")?,
+            attempt_id: AttemptId::new("attempt").map_err(|_| {
+                AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::EmptyIdentity(
+                    "attempt_id",
+                ))
+            })?,
             session_id: Some("session".into()),
             payload: serde_json::json!({"provider":"candidate"}),
             terminal: true,
@@ -1666,14 +1675,12 @@ mod tests {
     fn project_result(
         outcome: AcpResultOutcome,
     ) -> Result<eliot_agent_api::AgentResult, AcpAdapterError> {
-        result_envelope()
-            .map_err(AcpAdapterError::ContractValidation)?
-            .into_agent_result(
-                route(),
-                RouteFingerprintId::new("route").map_err(AcpAdapterError::ContractValidation)?,
-                "started",
-                outcome,
-            )
+        result_envelope()?.into_agent_result(
+            route(),
+            RouteFingerprintId::new("route").map_err(AcpAdapterError::ContractValidation)?,
+            "started",
+            outcome,
+        )
     }
 
     #[test]
