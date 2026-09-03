@@ -25,6 +25,9 @@ from code_navigation_lib.documentation_closure import (
     check as check_documentation_closure,
     self_test as documentation_closure_self_test,
 )
+from code_navigation_lib.documentation_closure_selftest import (
+    self_test as documentation_closure_e2e_self_test,
+)
 from code_navigation_lib.package_docs import (
     check as check_package_docs,
     self_test as package_docs_self_test,
@@ -78,6 +81,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             package_docs_self_test()
             prototype_docs_self_test()
             documentation_closure_self_test()
+            documentation_closure_e2e_self_test()
             shard_limits_self_test()
         elif args.command == "check":
             check(root)
