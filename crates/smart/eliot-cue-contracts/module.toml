@@ -109,9 +109,14 @@ required_tests = [
   "known_empty_differs_from_unavailable",
   "every_collection_bound_is_enforced",
   "identity_inputs_change_the_digest",
-  "cue_kind_comes_from_eliot_types",
+  "cue_kind_covers_the_declared_vocabulary",
   "malformed_input_never_panics",
   "consumer_fixture_compiles_standalone",
 ]
-forbidden_patterns = ['enum\s+CueKind', 'serde_json::Value', 'unimplemented!', 'todo!']
-required_patterns = ['#\[non_exhaustive\]', 'deny_unknown_fields']
+# A-10 is the Level-0 cue-vocabulary owner (`depends_on = []`). The current
+# source issue requires CueKind to be defined here and pins its complete wire
+# vocabulary; F-CUE later reconciles the shipped legacy copy. Requiring an
+# `eliot-types` import or forbidding the owner definition would make the gate
+# contradict its own assignment.
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
+required_patterns = ['#\\[non_exhaustive\\]', 'deny_unknown_fields']
