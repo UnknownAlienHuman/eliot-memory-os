@@ -5,6 +5,13 @@ Implementation PR: #817
 Branch: `work/816-curation-topology`
 Base revision: `182a335beba34fc93bd910479de388717ed45ad9`
 
-Exclusive scope: the four repository-owned cognitive topology/edge/decision metadata files named in #816. This work reconciles 11 I9.6 wire kinds to ten semantic handler families, restores A-19c, separates logical readiness from Cargo linkage, and makes A-20 screening mandatory before A-31 dispatch. It must not edit a leaf crate, public schema, runtime composition, legacy DTO or implementation source.
+Exclusive scope: `crates/smart/cognitive-wave-01.toml`, `crates/smart/cognitive-edge-map.toml`, `crates/smart/cognitive-crate-decisions.toml`, exact donor/legacy-owner clarifications in `crates/smart/cognitive-donor-map.toml`, and this temporary marker.
 
-The complete English execution contract, invariants, verification evidence and proof ceiling are in issue #816. Rebase on actual current `main` before implementation and remove this marker before the pull request is marked ready.
+This single global metadata work unit reconciles both:
+
+- Curation: 11 wire kinds, ten handler families, A-19c→A-20→mandatory A-31 screen gate, A-03 registry and contract-only handler/validation edges;
+- Context: A-14a/A-06e projections→A-16a→A-17a→A-18→A-19r, with logical readiness separated from Rust linkage, A-17a as sole membership owner, A-15/F-STU measurement separation and A-19r planning without delivery ownership.
+
+Preserve A-19r and A-19c as distinct stable order-19 tracks. Forbidden: any leaf `Cargo.toml`/`module.toml`/source/test, public schema, legacy consumer migration, runtime composition, root workspace/lockfile, workflow or normative-document edit.
+
+Issue #816 plus its authoritative Context-topology extension comment are the complete execution contract. Rebase on actual current `main` before implementation and remove this marker before the pull request is marked ready.
