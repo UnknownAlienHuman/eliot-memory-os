@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Fail-closed acceptance gate for one ELIOT work unit."""
+"""Fail-closed acceptance gate for one ELIOT capability-cell work unit.
+
+The authoritative test denominator is read from the GitHub issue named by the
+crate's ``module.toml``. Package-local numbers are mirrors, never authority.
+Each numbered issue case must be bound to one real Rust test with a marker of
+this exact form immediately above its test attributes::
+
+    // WORK_UNIT_CASE: 584/1
+    #[test]
+    fn loss_policy_vocabulary_is_exact() { ... }
+
+The default mode proves a package-local leaf implementation. A leaf may be
+complete while it remains independently buildable and waits for one serialized
+workspace integration owner. ``--require-workspace-member`` proves the later
+integrated state instead.
+"""
 from __future__ import annotations
 
 import argparse
@@ -12,12 +27,17 @@ import sys
 import tomllib
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 REPOSITORY = "UnknownAlienHuman/eliot-memory-os"
 ISSUE_WEB = f"https://github.com/{REPOSITORY}/issues/"
 ISSUE_API = f"https://api.github.com/repos/{REPOSITORY}/issues/"
 MAX_ASSIGNMENT_BYTES = 2_000_000
+READY_FOR_INTEGRATION = "ready_for_wave_integration"
+ADMITTED = "admitted"
+IMPLEMENTED = "IMPLEMENTED"
 
 PUB_ITEM = re.compile(
     r"^\s*pub(?:\s*\([^)]*\))?\s+"
@@ -36,9 +56,7 @@ SERDE_DEFAULT_FIELD = re.compile(
     r"(?:///[^\n]*\n\s*)*pub\s+([a-z_0-9]+)\s*:",
     re.M,
 )
-MATRIX_HEADING = re.compile(
-    r"^##[ \t]+Required test matrix[ \t]*$", re.M | re.I
-)
+MATRIX_HEADING = re.compile(r"^##[ \t]+Required test matrix[ \t]*$", re.M | re.I)
 NEXT_H2 = re.compile(r"^##[ \t]+", re.M)
 MATRIX_ITEM = re.compile(r"^([1-9][0-9]*)\.[ \t]+\S", re.M)
 CASE_TEST = re.compile(
@@ -47,14 +65,34 @@ CASE_TEST = re.compile(
     r"\n[ \t]*(?:async[ \t]+)?fn[ \t]+([a-z_][a-z_0-9]*)",
     re.M,
 )
+SHA256 = re.compile(r"[0-9a-f]{64}")
 PROTECTED_FIELD_ROOTS = (
-    "authority", "scope", "effect", "privacy", "ordering", "receipt",
-    "grant", "permit", "revoc", "denominator", "fence", "proof",
+    "authority",
+    "scope",
+    "effect",
+    "privacy",
+    "ordering",
+    "receipt",
+    "grant",
+    "permit",
+    "revoc",
+    "denominator",
+    "fence",
+    "proof",
 )
 
 
 class AssignmentSourceError(RuntimeError):
-    pass
+    """The external assignment cannot be used as an exact denominator."""
+
+
+@dataclass(frozen=True)
+class Assignment:
+    number: int
+    title: str
+    state: str
+    case_count: int
+    body_sha256: str
 
 
 class Report:
@@ -68,40 +106,59 @@ class Report:
 
 
 def crate_dir(root: Path, crate: str) -> Path:
+    """Find exactly one Cargo package with the requested package name."""
+    matches: list[Path] = []
     for manifest_path in root.rglob("Cargo.toml"):
         if "target" in manifest_path.parts:
             continue
         try:
             manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
             continue
         if manifest.get("package", {}).get("name") == crate:
-            return manifest_path.parent
-    print(f"error: crate {crate!r} not found under {root}", file=sys.stderr)
-    raise SystemExit(2)
+            matches.append(manifest_path.parent)
+    if len(matches) != 1:
+        print(
+            f"error: expected exactly one crate named {crate!r}; "
+            f"found {len(matches)}: {matches}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return matches[0]
+
+
+def is_test_source(path: Path) -> bool:
+    """Classify conventional integration and module test files."""
+    return (
+        "tests" in path.parts
+        or path.name == "tests.rs"
+        or path.name.endswith("_tests.rs")
+    )
 
 
 def read_sources(cdir: Path) -> tuple[str, str]:
+    """Return production-source text and test-source text in stable path order."""
     source: list[str] = []
     tests: list[str] = []
     for path in sorted(cdir.rglob("*.rs")):
         if "target" in path.parts:
             continue
-        text = path.read_text(encoding="utf-8", errors="ignore")
-        (tests if "tests" in path.parts else source).append(text)
+        text = path.read_text(encoding="utf-8", errors="strict")
+        (tests if is_test_source(path) else source).append(text)
     return "\n".join(source), "\n".join(tests)
 
 
 def parse_assignment_matrix(body: str) -> tuple[int, str]:
+    """Return the contiguous case count and exact body digest."""
     headings = list(MATRIX_HEADING.finditer(body))
     if len(headings) != 1:
         raise AssignmentSourceError(
             "expected exactly one level-two 'Required test matrix' heading; "
             f"found {len(headings)}"
         )
-    remainder = body[headings[0].end():]
+    remainder = body[headings[0].end() :]
     next_heading = NEXT_H2.search(remainder)
-    section = remainder[:next_heading.start()] if next_heading else remainder
+    section = remainder[: next_heading.start()] if next_heading else remainder
     numbers = [int(match.group(1)) for match in MATRIX_ITEM.finditer(section)]
     if not numbers:
         raise AssignmentSourceError("matrix contains no numbered cases")
@@ -114,7 +171,7 @@ def parse_assignment_matrix(body: str) -> tuple[int, str]:
 
 
 def parse_case_tests(text: str) -> list[tuple[int, int, str]]:
-    """Return (issue, case, test name) bindings with an actual test attribute."""
+    """Return ``(issue, case, test_name)`` bindings attached to actual tests."""
     bindings: list[tuple[int, int, str]] = []
     for match in CASE_TEST.finditer(text):
         attrs = match.group("attrs")
@@ -131,7 +188,7 @@ def number_summary(values: list[int], limit: int = 30) -> str:
     return ",".join(map(str, shown)) + suffix
 
 
-def fetch_assignment(issue_number: int) -> tuple[int, str, str]:
+def fetch_assignment(issue_number: int) -> Assignment:
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "eliot-work-unit-verifier",
@@ -153,31 +210,194 @@ def fetch_assignment(issue_number: int) -> tuple[int, str, str]:
             f"issue #{issue_number} exceeds {MAX_ASSIGNMENT_BYTES} bytes"
         )
     try:
-        payload = json.loads(raw.decode("utf-8"))
+        payload: Any = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise AssignmentSourceError(
             f"issue #{issue_number} returned invalid JSON"
         ) from error
+    if not isinstance(payload, dict):
+        raise AssignmentSourceError(f"issue #{issue_number} returned a non-object")
+    if "pull_request" in payload:
+        raise AssignmentSourceError(
+            f"#{issue_number} is a pull request, not an authoritative issue"
+        )
     body = payload.get("body")
     title = payload.get("title")
+    state = payload.get("state")
     if not isinstance(body, str):
         raise AssignmentSourceError(f"issue #{issue_number} has no textual body")
     if not isinstance(title, str) or not title.strip():
         raise AssignmentSourceError(f"issue #{issue_number} has no title")
+    if state not in {"open", "closed"}:
+        raise AssignmentSourceError(f"issue #{issue_number} has invalid state {state!r}")
     count, digest = parse_assignment_matrix(body)
-    return count, digest, title
+    return Assignment(issue_number, title, state, count, digest)
 
 
 def normalized_unit(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
+def evaluate_workspace_lifecycle(
+    *,
+    source_status: object,
+    prototype: object,
+    module_status: object,
+    workspace_admission: object,
+    member: bool,
+    excluded: bool,
+    standalone: bool,
+    require_workspace_member: bool,
+) -> tuple[bool, str]:
+    """Validate leaf-ready versus integrated workspace lifecycle states."""
+    if source_status != IMPLEMENTED:
+        return False, f"source_status must be {IMPLEMENTED!r}; found {source_status!r}"
+    if prototype is not False:
+        return False, f"prototype must be false; found {prototype!r}"
+    if module_status != IMPLEMENTED:
+        return False, f"module status must be {IMPLEMENTED!r}; found {module_status!r}"
+    if member and excluded:
+        return False, "crate cannot be both workspace member and excluded"
+
+    if require_workspace_member:
+        if not member:
+            return False, "integration proof requires workspace membership"
+        if excluded:
+            return False, "integrated crate remains in workspace.exclude"
+        if standalone:
+            return False, "integrated crate still declares a standalone [workspace]"
+        if workspace_admission != ADMITTED:
+            return False, (
+                f"integrated crate needs workspace_admission={ADMITTED!r}; "
+                f"found {workspace_admission!r}"
+            )
+        return True, "integrated workspace state"
+
+    integrated = (
+        member
+        and not excluded
+        and not standalone
+        and workspace_admission == ADMITTED
+    )
+    leaf_ready = (
+        not member
+        and (excluded or standalone)
+        and workspace_admission == READY_FOR_INTEGRATION
+    )
+    if integrated:
+        return True, "already integrated workspace state"
+    if leaf_ready:
+        return True, "package-local proof complete; waiting for integration owner"
+    return False, (
+        "expected either an admitted workspace member or an independently "
+        f"buildable leaf with workspace_admission={READY_FOR_INTEGRATION!r}; "
+        f"member={member}, excluded={excluded}, standalone={standalone}, "
+        f"workspace_admission={workspace_admission!r}"
+    )
+
+
+def run_self_test() -> int:
+    """Exercise parser, case binding and workspace-lifecycle regressions."""
+    failures: list[str] = []
+
+    def expect(condition: bool, name: str) -> None:
+        if not condition:
+            failures.append(name)
+
+    body = "# Work\n\n## Required test matrix\n\n1. one\n2. two\n\n## Result\n"
+    count, digest = parse_assignment_matrix(body)
+    expect(count == 2, "matrix count")
+    expect(SHA256.fullmatch(digest) is not None, "matrix digest")
+
+    for malformed in (
+        "## Required test matrix\n2. gap\n",
+        "## Required test matrix\n1. one\n3. gap\n",
+        "## Required test matrix\n1. one\n## Required test matrix\n1. two\n",
+    ):
+        try:
+            parse_assignment_matrix(malformed)
+        except AssignmentSourceError:
+            pass
+        else:
+            failures.append("malformed matrix accepted")
+
+    tests = (
+        "// WORK_UNIT_CASE: 584/1\n#[test]\nfn one() {}\n"
+        "// WORK_UNIT_CASE: 584/2\n#[tokio::test]\nasync fn two() {}\n"
+        "// WORK_UNIT_CASE: 584/3\nfn not_a_test() {}\n"
+    )
+    expect(
+        parse_case_tests(tests) == [(584, 1, "one"), (584, 2, "two")],
+        "case binding parser",
+    )
+
+    common = dict(
+        source_status=IMPLEMENTED,
+        prototype=False,
+        module_status=IMPLEMENTED,
+    )
+    ok, _ = evaluate_workspace_lifecycle(
+        **common,
+        workspace_admission=READY_FOR_INTEGRATION,
+        member=False,
+        excluded=True,
+        standalone=True,
+        require_workspace_member=False,
+    )
+    expect(ok, "leaf-ready state")
+    ok, _ = evaluate_workspace_lifecycle(
+        **common,
+        workspace_admission=READY_FOR_INTEGRATION,
+        member=False,
+        excluded=True,
+        standalone=True,
+        require_workspace_member=True,
+    )
+    expect(not ok, "leaf-ready rejected by integration mode")
+    ok, _ = evaluate_workspace_lifecycle(
+        **common,
+        workspace_admission=ADMITTED,
+        member=True,
+        excluded=False,
+        standalone=False,
+        require_workspace_member=True,
+    )
+    expect(ok, "integrated state")
+    ok, _ = evaluate_workspace_lifecycle(
+        **common,
+        workspace_admission=ADMITTED,
+        member=False,
+        excluded=True,
+        standalone=True,
+        require_workspace_member=False,
+    )
+    expect(not ok, "false admitted standalone rejected")
+
+    if failures:
+        for failure in failures:
+            print(f"FAIL self-test: {failure}")
+        return 1
+    print("PASS verify-work-unit self-test")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--crate", required=True)
+    parser.add_argument("--crate")
     parser.add_argument("--root", default=".")
     parser.add_argument("--no-cargo", action="store_true")
+    parser.add_argument(
+        "--require-workspace-member",
+        action="store_true",
+        help="require the later integrated/admitted workspace state",
+    )
+    parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
+
+    if args.self_test:
+        return run_self_test()
+    if not args.crate:
+        parser.error("--crate is required unless --self-test is used")
 
     root = Path(args.root).resolve()
     cdir = crate_dir(root, args.crate)
@@ -185,7 +405,17 @@ def main() -> int:
     if not module_path.exists():
         print(f"error: {module_path} missing", file=sys.stderr)
         return 2
-    module = tomllib.loads(module_path.read_text(encoding="utf-8"))
+
+    try:
+        module = tomllib.loads(module_path.read_text(encoding="utf-8"))
+        manifest = tomllib.loads((cdir / "Cargo.toml").read_text(encoding="utf-8"))
+        workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))[
+            "workspace"
+        ]
+    except (OSError, UnicodeError, KeyError, tomllib.TOMLDecodeError) as error:
+        print(f"error: cannot load work-unit metadata: {error}", file=sys.stderr)
+        return 2
+
     acceptance = module.get("acceptance")
     if not isinstance(acceptance, dict):
         print(f"error: {module_path} has no [acceptance] table", file=sys.stderr)
@@ -215,25 +445,27 @@ def main() -> int:
     report.check(declared_cases > 0, "positive test_matrix_cases", str(declared_cases))
 
     authoritative_cases = declared_cases
+    assignment: Assignment | None = None
     if issue_number is not None:
         print(f"  unit  {unit or '?'}  assignment {ISSUE_WEB}{issue_number}")
         try:
-            live_cases, issue_digest, issue_title = fetch_assignment(issue_number)
+            assignment = fetch_assignment(issue_number)
         except AssignmentSourceError as error:
             report.check(False, "authoritative assignment available", str(error))
         else:
-            print(f"  assignment_body_sha256  {issue_digest}")
-            authoritative_cases = live_cases
+            print(f"  assignment_state        {assignment.state}")
+            print(f"  assignment_body_sha256  {assignment.body_sha256}")
+            authoritative_cases = assignment.case_count
             if isinstance(unit, str) and unit.strip():
                 report.check(
-                    normalized_unit(unit) in normalized_unit(issue_title),
+                    normalized_unit(unit) in normalized_unit(assignment.title),
                     "source_unit matches issue title",
-                    f"{unit!r} not in {issue_title!r}",
+                    f"{unit!r} not in {assignment.title!r}",
                 )
             report.check(
-                declared_cases == live_cases,
+                declared_cases == assignment.case_count,
                 "declared matrix matches authoritative issue",
-                f"declared {declared_cases}, issue has {live_cases}",
+                f"declared {declared_cases}, issue has {assignment.case_count}",
             )
 
     report.check(
@@ -241,16 +473,23 @@ def main() -> int:
         f"min_tests >= authoritative matrix ({authoritative_cases})",
         f"min_tests is {min_tests}",
     )
+
     bindings = parse_case_tests(all_text)
-    foreign = [(bound_issue, case, name) for bound_issue, case, name in bindings
-               if issue_number is None or bound_issue != issue_number]
+    foreign = [
+        (bound_issue, case, name)
+        for bound_issue, case, name in bindings
+        if issue_number is None or bound_issue != issue_number
+    ]
     report.check(
         not foreign,
         "no foreign WORK_UNIT_CASE bindings",
         ", ".join(f"{bound_issue}/{case}:{name}" for bound_issue, case, name in foreign),
     )
-    own_bindings = [(case, name) for bound_issue, case, name in bindings
-                    if bound_issue == issue_number]
+    own_bindings = [
+        (case, name)
+        for bound_issue, case, name in bindings
+        if bound_issue == issue_number
+    ]
     bound_cases = [case for case, _ in own_bindings]
     duplicate_cases = sorted(
         case for case in set(bound_cases) if bound_cases.count(case) > 1
@@ -274,12 +513,18 @@ def main() -> int:
         f"every authoritative case 1..{authoritative_cases} has one test binding",
         f"missing {number_summary(missing_cases)}",
     )
-    duplicates = sorted(
+
+    duplicate_names = sorted(
         name for name in set(required_tests) if required_tests.count(name) > 1
     )
-    report.check(not duplicates, "required test names unique", ", ".join(duplicates))
+    report.check(
+        not duplicate_names,
+        "required test names unique",
+        ", ".join(duplicate_names),
+    )
     invalid_names = sorted(
-        name for name in required_tests
+        name
+        for name in required_tests
         if not isinstance(name, str) or not re.fullmatch(r"[a-z_][a-z_0-9]*", name)
     )
     report.check(
@@ -328,8 +573,9 @@ def main() -> int:
             f"{derives} derives, {denies} deny",
         )
         offenders = [
-            field for field in SERDE_DEFAULT_FIELD.findall(source)
-            if any(root in field for root in PROTECTED_FIELD_ROOTS)
+            field
+            for field in SERDE_DEFAULT_FIELD.findall(source)
+            if any(root_name in field for root_name in PROTECTED_FIELD_ROOTS)
         ]
         report.check(
             not offenders,
@@ -345,38 +591,75 @@ def main() -> int:
         hits = len(re.findall(pattern, all_text))
         report.check(hits == 0, f"forbidden /{pattern}/ absent", f"{hits} hits")
     for pattern in acceptance.get("required_patterns", []):
-        hits = len(re.findall(pattern, all_text))
+        hits = len(re.findall(pattern, source))
         report.check(hits > 0, f"required /{pattern}/ present", "0 hits")
 
-    workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))[
-        "workspace"
-    ]
     relative = cdir.relative_to(root).as_posix()
     member = relative in set(workspace.get("members", []))
     excluded = relative in set(workspace.get("exclude", []))
     standalone = "[workspace]" in (cdir / "Cargo.toml").read_text(encoding="utf-8")
     report.check(
         member or excluded or standalone,
-        "crate is buildable by cargo",
+        "crate is independently buildable or integrated",
         relative,
     )
-    manifest = tomllib.loads((cdir / "Cargo.toml").read_text(encoding="utf-8"))
-    metadata = manifest.get("package", {}).get("metadata", {}).get("eliot", {})
-    if metadata.get("source_status") == "IMPLEMENTED":
-        report.check(member, "implemented crate is a workspace member", relative)
+
+    package_metadata = manifest.get("package", {}).get("metadata", {}).get("eliot", {})
+    source_status = package_metadata.get("source_status")
+    prototype = package_metadata.get("prototype")
+    workspace_admission = package_metadata.get("workspace_admission")
+    lifecycle_ok, lifecycle_detail = evaluate_workspace_lifecycle(
+        source_status=source_status,
+        prototype=prototype,
+        module_status=module.get("status"),
+        workspace_admission=workspace_admission,
+        member=member,
+        excluded=excluded,
+        standalone=standalone,
+        require_workspace_member=args.require_workspace_member,
+    )
+    report.check(lifecycle_ok, "completion/workspace lifecycle is valid", lifecycle_detail)
+
+    frozen_digest = acceptance.get("assignment_body_sha256")
+    digest_well_formed = (
+        isinstance(frozen_digest, str) and SHA256.fullmatch(frozen_digest) is not None
+    )
+    if source_status == IMPLEMENTED:
+        report.check(
+            digest_well_formed,
+            "implemented unit freezes authoritative assignment digest",
+            repr(frozen_digest),
+        )
+        if assignment is not None and digest_well_formed:
+            report.check(
+                frozen_digest == assignment.body_sha256,
+                "frozen assignment digest matches live issue",
+                f"frozen {frozen_digest}, live {assignment.body_sha256}",
+            )
 
     if not args.no_cargo and (member or excluded or standalone):
         process = subprocess.run(
             [
-                "cargo", "test", "--manifest-path", str(cdir / "Cargo.toml"),
-                "--all-targets", "--", "--list",
+                "cargo",
+                "test",
+                "--manifest-path",
+                str(cdir / "Cargo.toml"),
+                "--all-targets",
+                "--",
+                "--list",
             ],
+            cwd=root,
             capture_output=True,
             text=True,
+            check=False,
         )
         listed = len(re.findall(r": test$", process.stdout, re.M))
         first_error = (process.stderr or "").strip().splitlines()[:1]
-        report.check(process.returncode == 0, "cargo test --list succeeds", str(first_error))
+        report.check(
+            process.returncode == 0,
+            "cargo test --list succeeds",
+            str(first_error),
+        )
         report.check(
             listed >= max(1, min_tests),
             f"cargo lists >= {max(1, min_tests)} tests",
