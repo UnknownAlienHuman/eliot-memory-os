@@ -41,6 +41,12 @@ MATRIX_HEADING = re.compile(
 )
 NEXT_H2 = re.compile(r"^##[ \t]+", re.M)
 MATRIX_ITEM = re.compile(r"^([1-9][0-9]*)\.[ \t]+\S", re.M)
+CASE_TEST = re.compile(
+    r"^[ \t]*//[ \t]*WORK_UNIT_CASE:[ \t]*(\d+)[ \t]*/[ \t]*(\d+)[ \t]*$"
+    r"(?P<attrs>(?:\n[ \t]*#\[[^\]\n]+\][ \t]*)+)"
+    r"\n[ \t]*(?:async[ \t]+)?fn[ \t]+([a-z_][a-z_0-9]*)",
+    re.M,
+)
 PROTECTED_FIELD_ROOTS = (
     "authority", "scope", "effect", "privacy", "ordering", "receipt",
     "grant", "permit", "revoc", "denominator", "fence", "proof",
@@ -105,6 +111,24 @@ def parse_assignment_matrix(body: str) -> tuple[int, str]:
             f"matrix numbering must be contiguous from 1; found {numbers}"
         )
     return len(numbers), hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def parse_case_tests(text: str) -> list[tuple[int, int, str]]:
+    """Return (issue, case, test name) bindings with an actual test attribute."""
+    bindings: list[tuple[int, int, str]] = []
+    for match in CASE_TEST.finditer(text):
+        attrs = match.group("attrs")
+        if not re.search(r"#\[(?:tokio::)?test(?:[^\]]*)\]", attrs):
+            continue
+        bindings.append((int(match.group(1)), int(match.group(2)), match.group(4)))
+    return bindings
+
+
+def number_summary(values: list[int], limit: int = 30) -> str:
+    ordered = sorted(set(values))
+    shown = ordered[:limit]
+    suffix = "..." if len(ordered) > limit else ""
+    return ",".join(map(str, shown)) + suffix
 
 
 def fetch_assignment(issue_number: int) -> tuple[int, str, str]:
@@ -217,10 +241,38 @@ def main() -> int:
         f"min_tests >= authoritative matrix ({authoritative_cases})",
         f"min_tests is {min_tests}",
     )
+    bindings = parse_case_tests(all_text)
+    foreign = [(bound_issue, case, name) for bound_issue, case, name in bindings
+               if issue_number is None or bound_issue != issue_number]
     report.check(
-        len(required_tests) >= authoritative_cases > 0,
-        f"named tests >= authoritative matrix ({authoritative_cases})",
-        f"required_tests has {len(required_tests)} names",
+        not foreign,
+        "no foreign WORK_UNIT_CASE bindings",
+        ", ".join(f"{bound_issue}/{case}:{name}" for bound_issue, case, name in foreign),
+    )
+    own_bindings = [(case, name) for bound_issue, case, name in bindings
+                    if bound_issue == issue_number]
+    bound_cases = [case for case, _ in own_bindings]
+    duplicate_cases = sorted(
+        case for case in set(bound_cases) if bound_cases.count(case) > 1
+    )
+    out_of_range = sorted(
+        case for case in bound_cases if case < 1 or case > authoritative_cases
+    )
+    missing_cases = sorted(set(range(1, authoritative_cases + 1)) - set(bound_cases))
+    report.check(
+        not duplicate_cases,
+        "each matrix case has at most one test binding",
+        number_summary(duplicate_cases),
+    )
+    report.check(
+        not out_of_range,
+        "case bindings stay inside the authoritative denominator",
+        number_summary(out_of_range),
+    )
+    report.check(
+        not missing_cases and authoritative_cases > 0,
+        f"every authoritative case 1..{authoritative_cases} has one test binding",
+        f"missing {number_summary(missing_cases)}",
     )
     duplicates = sorted(
         name for name in set(required_tests) if required_tests.count(name) > 1
@@ -256,8 +308,10 @@ def main() -> int:
         )
 
     found_tests = set(TEST_FN.findall(all_text))
+    for _, name in own_bindings:
+        report.check(name in found_tests, f"case-bound test `{name}`", "missing")
     for name in required_tests:
-        report.check(name in found_tests, f"test `{name}`", "missing")
+        report.check(name in found_tests, f"anchor test `{name}`", "missing")
     if min_tests:
         report.check(
             len(found_tests) >= min_tests,
