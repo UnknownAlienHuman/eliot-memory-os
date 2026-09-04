@@ -100,6 +100,7 @@ members = [
   "crates/security/eliot-erasure",
   "crates/security/eliot-influence",
   "crates/smart/eliot-context",
+  "crates/smart/eliot-cue-contracts",
   "crates/smart/eliot-cues",
   "crates/smart/eliot-dreamer-core",
   "crates/smart/eliot-epistemic",
@@ -147,7 +148,6 @@ exclude = [
   "crates/smart/eliot-dreamer-clarification",  # agent_order 7
   "crates/smart/eliot-dreamer-architecture-brief",  # agent_order 8
   "crates/smart/eliot-dreamer-implementation-brief",  # agent_order 9
-  "crates/smart/eliot-cue-contracts",  # agent_order 10
   "crates/smart/eliot-cue-normalizer",  # agent_order 11
   "crates/smart/eliot-cue-binding",  # agent_order 12
   "crates/smart/eliot-cue-index",  # agent_order 13

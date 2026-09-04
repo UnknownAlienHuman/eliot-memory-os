@@ -1002,6 +1002,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-cue-contracts"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-cues"
 version = "0.1.0"
 dependencies = [

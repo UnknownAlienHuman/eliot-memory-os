@@ -15,7 +15,7 @@ python scripts/code_navigation.py check --root .
 
 ## Coverage
 
-- Workspace members: **127**.
+- Workspace members: **128**.
 - Default members: **6**.
 - Logical responsibility blocks: **15**.
 - Inherited package-family contracts: **3**.
@@ -154,6 +154,7 @@ python scripts/code_navigation.py check --root .
 | [`crates/security/eliot-influence`](../../crates/security/eliot-influence/Cargo.toml) | `workspace` | `security-privacy` |
 | [`crates/security/eliot-source-assurance`](../../crates/security/eliot-source-assurance/Cargo.toml) | `workspace` | `security-privacy` |
 | [`crates/smart/eliot-context`](../../crates/smart/eliot-context/Cargo.toml) | `workspace` | `smart-memory-context` |
+| [`crates/smart/eliot-cue-contracts`](../../crates/smart/eliot-cue-contracts/Cargo.toml) | `workspace` | `smart-memory-context` |
 | [`crates/smart/eliot-cues`](../../crates/smart/eliot-cues/Cargo.toml) | `workspace` | `smart-memory-context` |
 | [`crates/smart/eliot-dreamer-core`](../../crates/smart/eliot-dreamer-core/Cargo.toml) | `workspace` | `smart-memory-context` |
 | [`crates/smart/eliot-epistemic`](../../crates/smart/eliot-epistemic/Cargo.toml) | `workspace` | `smart-memory-context` |
