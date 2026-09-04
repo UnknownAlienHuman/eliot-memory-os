@@ -11,9 +11,9 @@ description = "Own the minimal provider-neutral cue, binding, snapshot, activati
 path = "src/lib.rs"
 
 [package.metadata.eliot]
-prototype = false
-source_status = "IMPLEMENTED"
-workspace_admission = "admitted"
+prototype = true
+source_status = "NOT_IMPLEMENTED"
+workspace_admission = "pending_agent_implementation_and_proof"
 functional_cell = "smart.cue.contracts"
 source_layer = "C1"
 runtime_layer = "R5"
@@ -21,14 +21,35 @@ runtime_bundle = "eliotd"
 agent_order = 10
 
 [dependencies]
-eliot-contracts.workspace = true
-eliot-evidence.workspace = true
-schemars.workspace = true
-serde.workspace = true
-thiserror.workspace = true
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }
+schemars = { version = "1.2.1", features = ["derive", "uuid1"] }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
 
 [dev-dependencies]
-serde_json.workspace = true
+serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 
 [lints]
 workspace = true
+
+# Standalone workspace root retained until all 50 A-10 cases pass. The later
+# serialized integration owner #829 removes this table and admits the package.
+[workspace]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "allow"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+expect_used = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+print_stderr = "warn"
+print_stdout = "warn"
+unwrap_used = "warn"
