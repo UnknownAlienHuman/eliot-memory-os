@@ -1,7 +1,7 @@
 # Assignment reservation
 
 Owning issue: #750
-Implementation PR: pending
+Implementation PR: #825
 Branch: `chore/750-manual-verification-parity`
 Base revision: `182a335beba34fc93bd910479de388717ed45ad9`
 
