@@ -1,7 +1,7 @@
 # Assignment reservation
 
 Owning issue: #844
-Implementation PR: to be assigned
+Implementation PR: #845
 Branch: `fix/844-ors-process-evidence-fixtures`
 Base revision: `182a335beba34fc93bd910479de388717ed45ad9`
 
