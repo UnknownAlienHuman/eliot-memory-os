@@ -28,6 +28,46 @@ def _combine_results(results: tuple[OverallResult, ...]) -> OverallResult:
     return OverallResult.PASS
 
 
+class WorkUnitDescriptor(_base.WorkUnitDescriptor):
+    """Current descriptor with fail-closed mapping construction.
+
+    The v2 constructor validated ordinary mappings but allowed an adversarial or
+    defective Mapping implementation to leak an incidental exception.  The
+    current facade converts every input-side mapping failure to the one closed
+    contract error family.
+    """
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "WorkUnitDescriptor":
+        try:
+            return _base.WorkUnitDescriptor.from_mapping.__func__(cls, value)
+        except ContractViolation:
+            raise
+        except Exception as error:
+            raise ContractViolation(f"invalid descriptor input: {error}") from error
+
+
+def _finding_result(findings: tuple[Finding, ...]) -> OverallResult:
+    """Derive the strongest exact result class from error findings."""
+    results: list[OverallResult] = []
+    for item in findings:
+        if item.severity is not FindingSeverity.ERROR:
+            continue
+        if item.finding_class in {
+            FindingClass.CONFIGURATION_DEFECT,
+            FindingClass.INTERNAL_DEFECT,
+        }:
+            results.append(OverallResult.CONFIGURATION_FAILURE)
+        elif item.finding_class in {
+            FindingClass.SOURCE_UNAVAILABLE,
+            FindingClass.INCOMPLETE_EVIDENCE,
+        }:
+            results.append(OverallResult.INCOMPLETE_EVIDENCE)
+        else:
+            results.append(OverallResult.CONTRACT_FAILURE)
+    return _combine_results(tuple(results) or (OverallResult.PASS,))
+
+
 def _require_assignment_descriptor(
     assignment: AssignmentSourceReceipt,
     descriptor: WorkUnitDescriptor,
@@ -106,7 +146,7 @@ class CaseAccountingReceipt:
             execution_result = OverallResult.INCOMPLETE_EVIDENCE
 
         expected = _combine_results(
-            (execution_result, _base._result_from_findings(findings))
+            (execution_result, _finding_result(findings))
         )
         _base._require_result(self.result, expected, "case-accounting")
 
@@ -132,7 +172,7 @@ class SourceShapeGateReceipt:
             if self.assignment.state is IssueState.OPEN
             else OverallResult.INCOMPLETE_EVIDENCE
         )
-        expected = _combine_results((state_result, _base._result_from_findings(findings)))
+        expected = _combine_results((state_result, _finding_result(findings)))
         _base._require_result(self.result, expected, "source-shape")
 
 
@@ -175,7 +215,7 @@ class PackageGateReceipt:
         object.__setattr__(self, "findings", findings)
         expected = _combine_results(
             (
-                _base._result_from_findings(findings),
+                _finding_result(findings),
                 self.source_shape.result,
                 self.case_accounting.result,
             )
@@ -218,7 +258,7 @@ class WorkspaceAdmissionReceipt:
             WorkspaceDisposition.CONFIGURATION_DEFECT: OverallResult.CONFIGURATION_FAILURE,
         }[self.disposition]
         expected = _combine_results(
-            (disposition_result, _base._result_from_findings(findings))
+            (disposition_result, _finding_result(findings))
         )
         _base._require_result(self.result, expected, "workspace-admission")
 
@@ -329,6 +369,12 @@ class CohortReceipt:
             if row_result is OverallResult.PASS and not exact_denominator
             else row_result
         )
+        if self.result is OverallResult.PASS and row_result is not OverallResult.PASS:
+            raise ContractViolation("passing cohort requires every row to pass")
+        if self.result is OverallResult.PASS and not exact_denominator:
+            raise ContractViolation(
+                "passing cohort requires exact denominator, arithmetic, and digest"
+            )
         _base._require_result(self.result, expected, "cohort")
 
     @property

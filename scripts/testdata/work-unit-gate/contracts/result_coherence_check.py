@@ -34,6 +34,7 @@ from scripts.work_unit_gate.contracts import (
     SourceShapeGateReceipt,
     WorkspaceAdmissionReceipt,
     WorkspaceDisposition,
+    WorkUnitDescriptor,
     cohort_digest,
 )
 
@@ -123,6 +124,29 @@ class ResultCoherenceRegressionTests(unittest.TestCase):
                 wrong_assignment, desc, desc.package, desc.module, WorkspaceDisposition.MEMBER,
                 OverallResult.PASS, (), desc.proof_ceiling,
             )
+
+    def test_mixed_contract_and_incomplete_findings_cannot_hide_contract_failure(self) -> None:
+        desc = descriptor()
+        mixed = (
+            finding(FindingClass.SOURCE_UNAVAILABLE),
+            finding(FindingClass.CONTRACT_DEFECT),
+        )
+        receipt = SourceShapeGateReceipt(
+            assignment(), desc, OverallResult.CONTRACT_FAILURE, mixed, desc.proof_ceiling
+        )
+        self.assertIs(receipt.result, OverallResult.CONTRACT_FAILURE)
+        with self.assertRaises(ContractViolation):
+            SourceShapeGateReceipt(
+                assignment(), desc, OverallResult.INCOMPLETE_EVIDENCE, mixed, desc.proof_ceiling
+            )
+
+    def test_descriptor_mapping_failures_are_closed_contract_violations(self) -> None:
+        class BrokenMapping(dict):
+            def __iter__(self):
+                raise RuntimeError("broken mapping iterator")
+
+        with self.assertRaises(ContractViolation):
+            WorkUnitDescriptor.from_mapping(BrokenMapping())
 
     def test_current_public_receipts_do_not_resolve_to_legacy_aggregators(self) -> None:
         self.assertIs(current.CaseAccountingReceipt, CaseAccountingReceipt)
