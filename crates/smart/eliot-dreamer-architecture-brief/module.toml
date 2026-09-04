@@ -62,13 +62,17 @@ workspace_admission = "forbidden until implementation, package proof, affected E
 # `cargo fmt|test|clippy` all pass on an empty crate, so they cannot tell a
 # finished cell from an unstarted one. This table can.
 #
-# These are the floors every cell shares. The owning work unit tightens them
-# with `required_exports` and `required_tests` taken from its own brief, so a
-# reviewer decides on one exit code instead of reading prose criteria.
+# `source_issue` names the assignment this gate enforces. `test_matrix_cases` is
+# the number of numbered cases in that issue's `Required test matrix` section,
+# and `min_tests` may never fall below it -- otherwise the gate certifies work
+# that ignores most of the matrix the assignment demands.
 [acceptance]
+source_issue = 649
+source_unit = "A-08"
+test_matrix_cases = 30
 min_source_lines = 200
 min_public_items = 6
-min_tests = 5
+min_tests = 30
 require_deny_unknown_fields = true
 forbid_unsafe = true
 required_exports = []
