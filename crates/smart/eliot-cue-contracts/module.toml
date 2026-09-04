@@ -58,14 +58,6 @@ required_verification = ["module/package proof at the declared proof ceiling", "
 writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
 workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
 
-# Machine-checked completion gate, read by `scripts/verify-work-unit.py`.
-# `cargo fmt|test|clippy` all pass on an empty crate, so they cannot tell a
-# finished cell from an unstarted one. This table can.
-#
-# `source_issue` names the assignment this gate enforces. `test_matrix_cases` is
-# the number of numbered cases in that issue's `Required test matrix` section,
-# and `min_tests` may never fall below it -- otherwise the gate certifies work
-# that ignores most of the matrix the assignment demands.
 [acceptance]
 source_issue = 804
 source_unit = "A-10"
@@ -76,47 +68,67 @@ min_tests = 50
 require_deny_unknown_fields = true
 forbid_unsafe = true
 required_exports = [
-  "ObservedCue",
-  "NormalizedCue",
-  "CanonicalCueIdentity",
-  "ComparisonKey",
-  "MatchMode",
-  "NormalizationProfile",
-  "NormalizationOutcome",
-  "CueBindingCandidate",
-  "CueSnapshot",
-  "SnapshotMember",
-  "RebuildIdentity",
-  "ActivationRequest",
-  "ActivationBounds",
-  "ActivationResult",
-  "DirectActivation",
-  "DerivedActivation",
-  "Completeness",
-  "BoundKind",
+  "ObservedCue", "NormalizedCue", "CanonicalCueIdentity", "ComparisonKey",
+  "MatchMode", "NormalizationProfile", "NormalizationOutcome",
+  "CueBindingCandidate", "CueSnapshot", "SnapshotMember", "RebuildIdentity",
+  "ActivationRequest", "ActivationBounds", "ActivationResult",
+  "DirectActivation", "DerivedActivation", "Completeness", "BoundKind",
   "CueContractError",
 ]
+# One stable test name per numbered case in issue #804, in the same order.
 required_tests = [
-  "observed_cue_rejects_unknown_field",
+  "cue_kind_covers_the_declared_vocabulary",
+  "cue_kind_is_defined_once_without_eliot_types_dependency",
+  "observed_cue_supports_every_current_kind",
+  "unknown_schema_field_variant_mode_and_status_are_rejected",
+  "missing_empty_and_unknown_source_identity_are_distinct",
   "canonical_identity_differs_from_comparison_key",
-  "snapshot_rebuild_digest_is_stable",
-  "snapshot_with_wrong_digest_is_rejected",
+  "identical_text_in_different_cue_kinds_remains_distinct",
+  "exact_mode_rejects_fuzzy_embedding_substring_and_semantic_matching",
+  "normalization_outcomes_cover_lossless_authorized_loss_ambiguous_and_unsupported",
+  "lossy_or_ambiguous_normalization_cannot_prove_exact_match",
+  "valid_binding_candidate_preserves_immutable_target",
+  "binding_rejects_target_source_scope_fence_and_revision_mismatch",
+  "binding_candidate_cannot_carry_canonical_action_or_status_mutation",
+  "complete_snapshot_is_rebuildable_from_exact_inputs",
+  "snapshot_denominator_arithmetic_reconciles",
+  "snapshot_digest_is_stable_under_set_like_input_order",
+  "profile_source_or_fence_change_invalidates_snapshot_identity",
+  "snapshot_states_keep_complete_partial_unavailable_stale_and_unknown_distinct",
+  "invalidation_causes_require_exact_owner_evidence",
+  "invalidation_preserves_prior_history_and_predecessor",
+  "relation_edge_requires_registry_direction_revision_digest_and_evidence",
+  "broken_reordered_and_disconnected_paths_are_rejected",
+  "depth_zero_direct_only_profile_request_and_result_are_valid",
   "direct_activation_valid_with_zero_edges",
   "direct_and_derived_are_not_interchangeable",
-  "broken_derived_path_is_rejected",
+  "one_hop_and_bounded_multi_hop_candidates_preserve_shape",
+  "every_independent_activation_bound_enforces_boundary_and_one_over",
+  "zero_unknown_and_invalid_limits_are_not_unlimited",
+  "duplicate_target_preserves_bounded_multiple_path_evidence",
+  "cycles_duplicates_paths_and_members_do_not_inflate_arithmetic",
+  "direct_complete_and_derived_partial_are_representable_together",
+  "complete_partial_truncated_blocked_unavailable_stale_and_unknown_are_distinct",
+  "truncation_preserves_frontier_omission_and_continuation",
   "complete_result_cannot_carry_frontier",
-  "truncation_names_the_bound_it_hit",
   "known_empty_differs_from_unavailable",
-  "every_collection_bound_is_enforced",
-  "identity_inputs_change_the_digest",
-  "cue_kind_covers_the_declared_vocabulary",
+  "retrieval_stage_lineage_is_exact",
+  "activation_candidate_cannot_claim_delivery_visibility_use_adherence_or_outcome",
+  "activation_candidate_cannot_mutate_support_accessibility_influence_or_lifecycle",
+  "privacy_authority_effect_and_proof_escalation_is_rejected",
+  "canonical_round_trip_and_digest_are_deterministic",
+  "semantic_path_and_transformation_order_are_preserved",
+  "legacy_payload_is_rejected_by_current_decoder",
+  "every_variable_field_enforces_its_declared_bound",
+  "sensitive_diagnostics_are_redacted",
   "malformed_input_never_panics",
+  "derived_paths_are_contiguous_bounded_and_start_from_direct_seeds",
+  "complete_denominator_member_and_frontier_arithmetic_reconciles",
+  "every_identity_bearing_mutation_changes_digest_or_is_rejected",
   "consumer_fixture_compiles_standalone",
+  "source_api_contains_no_algorithm_io_store_provider_model_mutation_authority_effect_or_finish",
 ]
-# A-10 is the Level-0 cue-vocabulary owner (`depends_on = []`). The current
-# source issue requires CueKind to be defined here and pins its complete wire
-# vocabulary; F-CUE later reconciles the shipped legacy copy. Requiring an
-# `eliot-types` import or forbidding the owner definition would make the gate
-# contradict its own assignment.
+# A-10 is the Level-0 cue-vocabulary owner (`depends_on = []`). F-CUE later
+# reconciles the shipped legacy copy; the gate pins the owner vocabulary here.
 forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
 required_patterns = ['#\\[non_exhaustive\\]', 'deny_unknown_fields']
