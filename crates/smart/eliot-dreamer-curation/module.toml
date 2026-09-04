@@ -69,10 +69,10 @@ workspace_admission = "forbidden until implementation, package proof, affected e
 [acceptance]
 source_issue = 684
 source_unit = "A-31"
-test_matrix_cases = 58
+test_matrix_cases = 60
 min_source_lines = 200
 min_public_items = 6
-min_tests = 58
+min_tests = 60
 require_deny_unknown_fields = true
 forbid_unsafe = true
 required_exports = []
