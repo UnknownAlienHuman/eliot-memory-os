@@ -59,16 +59,15 @@ writeback = "return implementation artifact, exact proof evidence, donor disposi
 workspace_admission = "admitted"
 
 # Machine-checked completion gate, read by `scripts/verify-work-unit.py`.
-# `cargo fmt|test|clippy` all pass on an empty crate, so they cannot tell a
-# finished cell from an unstarted one. This table can.
-#
-# Every entry below is taken verbatim from the A-10 brief, so the brief's
-# numbered behaviour rules and this table cannot drift apart. A reviewer
-# decides on one exit code instead of reading prose criteria.
+# The floor is bound to the 50 numbered cases in issue #804 and may not be
+# lowered to match an incomplete implementation.
 [acceptance]
+source_issue = 804
+source_unit = "A-10"
+test_matrix_cases = 50
 min_source_lines = 700
 min_public_items = 28
-min_tests = 15
+min_tests = 50
 require_deny_unknown_fields = true
 forbid_unsafe = true
 required_exports = [
@@ -96,11 +95,7 @@ required_tests = [
   "malformed_input_never_panics",
   "consumer_fixture_compiles_standalone",
 ]
-# This cell declares `depends_on = []` and links only `eliot-contracts` and
-# `eliot-evidence`, so it cannot import `CueKind` from `eliot-types` — it is the
-# Level-0 owner and defines the kind itself. Reconciling the two definitions is
-# unit F-CUE, a contract change with its own review; forbidding the definition
-# here would make this cell unsatisfiable, so the gate pins the variant set
-# through `cue_kind_covers_the_declared_vocabulary` instead.
+# A-10 is the Level-0 cue-vocabulary owner (`depends_on = []`). F-CUE later
+# reconciles the shipped legacy copy; the gate pins the owner vocabulary here.
 forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
-required_patterns = ['#\[non_exhaustive\]', 'deny_unknown_fields']
+required_patterns = ['#\\[non_exhaustive\\]', 'deny_unknown_fields']
