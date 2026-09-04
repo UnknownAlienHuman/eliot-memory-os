@@ -1,7 +1,7 @@
 # Assignment reservation
 
 Owning issue: #820
-Implementation PR: pending
+Implementation PR: #824
 Branch: `work/820-self-quality`
 Base revision: `182a335beba34fc93bd910479de388717ed45ad9`
 
