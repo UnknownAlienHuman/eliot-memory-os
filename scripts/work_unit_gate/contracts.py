@@ -29,13 +29,7 @@ def _combine_results(results: tuple[OverallResult, ...]) -> OverallResult:
 
 
 class WorkUnitDescriptor(_base.WorkUnitDescriptor):
-    """Current descriptor with fail-closed mapping construction.
-
-    The v2 constructor validated ordinary mappings but allowed an adversarial or
-    defective Mapping implementation to leak an incidental exception.  The
-    current facade converts every input-side mapping failure to the one closed
-    contract error family.
-    """
+    """Current descriptor with fail-closed mapping construction."""
 
     @classmethod
     def from_mapping(cls, value: object) -> "WorkUnitDescriptor":
@@ -43,8 +37,8 @@ class WorkUnitDescriptor(_base.WorkUnitDescriptor):
             return _base.WorkUnitDescriptor.from_mapping.__func__(cls, value)
         except ContractViolation:
             raise
-        except Exception as error:
-            raise ContractViolation(f"invalid descriptor input: {error}") from error
+        except Exception:
+            raise ContractViolation("descriptor mapping access failed") from None
 
 
 def _finding_result(findings: tuple[Finding, ...]) -> OverallResult:
@@ -145,9 +139,7 @@ class CaseAccountingReceipt:
         else:
             execution_result = OverallResult.INCOMPLETE_EVIDENCE
 
-        expected = _combine_results(
-            (execution_result, _finding_result(findings))
-        )
+        expected = _combine_results((execution_result, _finding_result(findings)))
         _base._require_result(self.result, expected, "case-accounting")
 
 
@@ -257,10 +249,26 @@ class WorkspaceAdmissionReceipt:
             WorkspaceDisposition.UNAVAILABLE: OverallResult.INCOMPLETE_EVIDENCE,
             WorkspaceDisposition.CONFIGURATION_DEFECT: OverallResult.CONFIGURATION_FAILURE,
         }[self.disposition]
-        expected = _combine_results(
-            (disposition_result, _finding_result(findings))
-        )
+        expected = _combine_results((disposition_result, _finding_result(findings)))
         _base._require_result(self.result, expected, "workspace-admission")
+
+
+@dataclass(frozen=True)
+class ComponentGateReceipt:
+    """Bounded generic summary; never a package/workspace evidence substitute."""
+
+    component: str
+    result: OverallResult
+    findings: tuple[Finding, ...]
+    proof_ceiling: ProofCeiling
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "component", _base._token(self.component, "component"))
+        _base._exact_type(self.result, OverallResult, "result")
+        _base._exact_type(self.proof_ceiling, ProofCeiling, "proof_ceiling")
+        findings = _base._normalize_findings(self.findings)
+        object.__setattr__(self, "findings", findings)
+        _base._require_result(self.result, _finding_result(findings), "component-summary")
 
 
 @dataclass(frozen=True)
