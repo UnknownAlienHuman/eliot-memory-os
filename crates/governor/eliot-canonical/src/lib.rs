@@ -585,7 +585,7 @@ pub enum RequestedFinishOutcome {
     Superseded,
 }
 
-/// ELIOT_ARCH_OWNER: ARCH-FIN-01
+/// `ELIOT_ARCH_OWNER`: `ARCH-FIN-01`
 /// The closed canonical finish decision set from I7.9.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

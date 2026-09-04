@@ -1,5 +1,10 @@
 //! Read-only activation resolution projection.
 //!
+//! The v2 chain below is complete and covered by this module's tests, but
+//! `map_resolved_snapshot_to_protocol` has no caller in the daemon path yet,
+//! so the whole chain reads as dead code. It is production code awaiting its
+//! caller, not test scaffolding, so it is not `#[cfg(test)]`.
+//!
 //! # Architecture
 //! - **A2.3 Modular architecture** — bounded pure projection cell; no new runtime/process/failure boundary.
 //! - **A13.2 Kernel and failure domains** — Kernel remains sole authority/fencing owner; this projection only reads the admitted Governor snapshot.
@@ -8,12 +13,14 @@
 //!
 //! # Implementation
 //! - **I1.11 Startup algorithm** — resolution is available only after Governor/Kernel admission; no startup authority issuance here.
-//! - **I2.2 When a capability becomes a separate crate** — pure contract/test seam justifies isolated module; no placeholder proliferation.
+//! - **I2.1 Crate-rich extraction of a capability behind an owned contract** — pure contract/test seam justifies isolated module; no placeholder proliferation.
 //! - **I2.23 Capability-family topology and crate extraction decisions** — Governor task/authority/canonical-transition family; validated via `CrateExtractionDecision`.
 //! - **Semantic-grant handle: `eliot_governor::GovernorActivationSnapshot` / `eliot_protocol::AgentActivationResolutionTicket` -> `eliot_protocol::AgentActivationResolutionDecision` via `GovernorComposition::read_unique_agent_activation`** — Kernel-issued ticket resolved against the current Governor owner set.
 //! - **Wave 2 Governor-internal outcome -> protocol v2**: `eliot_governor::GovernorActivationOutcome` -> `eliot_protocol::AgentActivationResolutionResult` is a lossless, exhaustive mapping; no resolver error is coerced to success or dropped.
 //!
 //! This is a read-only activation resolution projection and owns no authority issuance, write/effect, fence, default, retry, Kernel, Store, or lifecycle semantics.
+
+#![allow(dead_code)]
 
 use eliot_governor::{
     GovernorActivationOutcome, GovernorCandidateCoverage, GovernorRetryDirective,
@@ -207,6 +214,7 @@ pub fn map_resolved_snapshot_to_protocol(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod projection_tests {
     use super::*;
     use eliot_contracts::RequestId;
@@ -216,7 +224,7 @@ mod projection_tests {
         fixture_scope_ambiguous, fixture_scope_selection_required, fixture_stale_fence,
         fixture_task_selection_required,
     };
-    use eliot_protocol::{AgentActivationResolutionTicket, ProtocolError};
+    use eliot_protocol::AgentActivationResolutionTicket;
 
     fn test_ticket(deadline: u64) -> AgentActivationResolutionTicket {
         let mut ticket = AgentActivationResolutionTicket {

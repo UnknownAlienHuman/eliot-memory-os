@@ -1998,6 +1998,8 @@ impl ProcessExecutionRequest {
     }
 }
 
+// the large variant is the common case; boxing it would move every send to the heap
+#[allow(clippy::large_enum_variant)]
 /// Provider-neutral response projection; no child handle or permit crosses
 /// the Kernel front door.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]

@@ -60,6 +60,8 @@ struct CodexExecPlan {
     jsonl_stdout_path: PathBuf,
 }
 
+// Every field is an identity; the shared `_id` suffix is the point, not noise.
+#[allow(clippy::struct_field_names)]
 #[derive(Clone, Debug)]
 struct DogfoodCodexScope {
     project_id: ProjectId,
@@ -263,6 +265,8 @@ pub(crate) fn prepare_worktree(
     write_json(&report)
 }
 
+// Kept whole: one dogfood scenario: launch, observe, and grade a single live run.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn prepare_independent_clone(
     root: &Path,
     manifest: &DogfoodManifest,
@@ -458,6 +462,8 @@ pub(crate) async fn start(root: &Path) -> Result<()> {
     }))
 }
 
+// the call carries the full context it must not re-derive
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn run_codex(
     root: &Path,
     project_id: &str,
@@ -568,25 +574,23 @@ pub(crate) async fn run_codex(
     {
         Vec::new()
     } else {
-        match codex_event_task_action_write_ids(&process.stdout) {
-            Ok(write_ids) => write_ids,
-            Err(_) => {
-                blockers.push("codex_event_stream_invalid".to_owned());
-                Vec::new()
-            }
-        }
+        codex_event_task_action_write_ids(&process.stdout).unwrap_or_else(|_| {
+            blockers.push("codex_event_stream_invalid".to_owned());
+            Vec::new()
+        })
     };
     let model_invoked_task_action_request = !model_action_write_ids.is_empty();
     if !model_invoked_task_action_request {
         blockers.push("model_task_action_request_not_observed".to_owned());
     }
-    let final_message = match validate_codex_final_message(&launch.plan.output_last_message_path) {
-        Ok(message) => Some(message),
-        Err(_) => {
-            blockers.push("codex_final_message_invalid".to_owned());
-            None
-        }
-    };
+    let final_message = validate_codex_final_message(&launch.plan.output_last_message_path)
+        .map_or_else(
+            |_| {
+                blockers.push("codex_final_message_invalid".to_owned());
+                None
+            },
+            Some,
+        );
     if final_message
         .as_ref()
         .is_none_or(|message| message.outcome != DogfoodCodexOutcome::Completed)
@@ -711,6 +715,8 @@ pub(crate) async fn run_codex(
     Ok(())
 }
 
+// Kept whole: one dogfood scenario end to end.
+#[allow(clippy::too_many_lines)]
 async fn run_codex_provider(
     manifest: &DogfoodManifest,
     launch: &ValidatedCodexLaunch,
@@ -1036,8 +1042,7 @@ fn codex_event_task_action_write_ids(bytes: &[u8]) -> Result<Vec<WriteId>> {
             .and_then(Value::as_str);
         let exact_tool = matches!(
             tool,
-            Some("eliot_task_action_request")
-                | Some("mcp__eliot-governor__eliot_task_action_request")
+            Some("eliot_task_action_request" | "mcp__eliot-governor__eliot_task_action_request")
         );
         let exact_server = item
             .get("server")
@@ -1090,7 +1095,7 @@ fn codex_executable_identity(path: &Path) -> Result<CodexExecutableIdentity> {
     }
     let mut file = File::open(path).context("open installed Codex CLI for hashing")?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
@@ -1585,13 +1590,21 @@ fn pe_machine(bytes: &[u8]) -> Result<String> {
     if bytes.len() < 0x40 || &bytes[..2] != b"MZ" {
         bail!("SurrealDB executable is not a PE image");
     }
-    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    let pe_offset = u32::from_le_bytes(
+        bytes[0x3c..0x40]
+            .try_into()
+            .context("read the PE header offset")?,
+    ) as usize;
     if pe_offset.checked_add(6).is_none_or(|end| end > bytes.len())
         || &bytes[pe_offset..pe_offset + 4] != b"PE\0\0"
     {
         bail!("SurrealDB executable has an invalid PE header");
     }
-    let machine = u16::from_le_bytes(bytes[pe_offset + 4..pe_offset + 6].try_into().unwrap());
+    let machine = u16::from_le_bytes(
+        bytes[pe_offset + 4..pe_offset + 6]
+            .try_into()
+            .context("read the PE machine field")?,
+    );
     Ok(format!("{machine:04X}"))
 }
 
@@ -2340,6 +2353,7 @@ fn write_json(value: &Value) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

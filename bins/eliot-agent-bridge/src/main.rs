@@ -198,6 +198,9 @@ fn main() {
     }
 }
 
+// `gateway` is passed by reference for signature symmetry with the sibling
+// handlers; it is currently zero-sized but is not part of a hot path.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
     gateway: &HostRequestGateway,
     port: &mut P,
@@ -209,6 +212,7 @@ fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
     }
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn handle_cancellation<P: KernelHostRequestPort + ?Sized>(
     gateway: &HostRequestGateway,
     port: &mut P,

@@ -1323,6 +1323,8 @@ fn materialize_descriptor_bound_host_fixture(
     Ok(())
 }
 
+// kept whole: splitting this would break one scenario into fragments
+#[allow(clippy::too_many_lines)]
 #[cfg(windows)]
 #[test]
 fn production_initial_and_relaunch_reject_descriptor_generation_substitution() -> TestResult {

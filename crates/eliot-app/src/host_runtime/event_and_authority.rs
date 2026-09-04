@@ -3576,6 +3576,8 @@ fn managed_launch_observation_identity(
     })
 }
 
+// kept whole: splitting this would break one scenario into fragments
+#[allow(clippy::too_many_lines)]
 async fn grant_role_with_writer(
     root: &Path,
     store: &CanonicalStore,

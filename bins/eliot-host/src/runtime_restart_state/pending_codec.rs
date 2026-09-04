@@ -200,6 +200,7 @@ pub(super) fn read_runtime_restart_pending_identity(
 }
 
 #[cfg(all(test, windows))]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::time::Duration;
 

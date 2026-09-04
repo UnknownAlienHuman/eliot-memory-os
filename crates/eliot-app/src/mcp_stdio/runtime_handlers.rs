@@ -610,6 +610,8 @@ struct CanonicalPacketRefs {
     experience_prior_guidance: BTreeMap<String, String>,
 }
 
+// Kept whole: one runtime handler covering a single MCP call.
+#[allow(clippy::too_many_lines)]
 fn canonical_packet_refs(state: &McpState, task: &TaskContract) -> Result<CanonicalPacketRefs> {
     let authority = read_active_packet_authority(state, &task.task_id.to_string())?
         .context("active packet authority is missing for the current TaskContract")?;
@@ -973,6 +975,8 @@ async fn resolve_action_source_scope(
 
 const ACTION_MEMORY_DELIVERY_REF_SCHEMA_VERSION: &str = "eliot.action-memory-delivery-ref.v1";
 
+// Kept whole: the handler carries the full request context it must not re-derive.
+#[allow(clippy::too_many_arguments)]
 fn bind_action_memory_deliveries(
     project_id: ProjectId,
     task_id: TaskId,
@@ -1067,6 +1071,8 @@ fn action_provenance_resolver_version(
     }
 }
 
+// Kept whole: one runtime handler covering a single MCP call.
+#[allow(clippy::too_many_lines)]
 async fn resolve_action_provenance(
     state: &McpState,
     project_id: ProjectId,
@@ -1199,6 +1205,7 @@ async fn resolve_action_provenance(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod action_memory_delivery_tests {
     use super::*;
 

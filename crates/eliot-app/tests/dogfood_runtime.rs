@@ -1,3 +1,7 @@
+// Each test is one live dogfood scenario kept whole; splitting them would stop
+// proving the sequence they exist to prove.
+#![allow(clippy::too_many_lines)]
+
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -506,12 +510,8 @@ fn assert_codex_exec_plan(report: &Value, destination: &Path, runtime: &Path) ->
         report["codex_output_schema_generated_from_task_contract"],
         true
     );
-    assert!(
-        !argv
-            .iter()
-            .any(|argument| *argument == "--ask-for-approval")
-    );
-    assert!(!argv.iter().any(|argument| *argument == "--sandbox"));
+    assert!(!argv.contains(&"--ask-for-approval"));
+    assert!(!argv.contains(&"--sandbox"));
     assert_eq!(report["codex_jsonl_stdout_redirection_required"], true);
     assert_eq!(report["codex_home_relocation_required"], false);
     Ok(())
@@ -583,9 +583,10 @@ fn repo_root() -> PathBuf {
 }
 
 fn surreal_exe_arg() -> TestResult<String> {
-    let path = std::env::var_os("ELIOT_DOGFOOD_SURREAL_EXE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Tools\SurrealDB\surreal.exe"));
+    let path = std::env::var_os("ELIOT_DOGFOOD_SURREAL_EXE").map_or_else(
+        || PathBuf::from(r"C:\Tools\SurrealDB\surreal.exe"),
+        PathBuf::from,
+    );
     if !path.is_absolute() || !path.is_file() {
         return Err(format!(
             "focused dogfood test requires an operator-preseeded absolute surreal.exe; set ELIOT_DOGFOOD_SURREAL_EXE (resolved {})",

@@ -754,7 +754,7 @@ impl OnboardingResolver {
     }
 }
 
-/// ELIOT_ARCH_OWNER: ARCH-SCOPE-01
+/// `ELIOT_ARCH_OWNER`: `ARCH-SCOPE-01`
 /// Stateless mid-task scope binding guard.
 #[allow(clippy::doc_markdown)]
 #[derive(Clone, Copy, Debug, Default)]
