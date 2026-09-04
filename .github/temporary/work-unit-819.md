@@ -1,7 +1,7 @@
 # Assignment reservation
 
 Owning issue: #819
-Implementation PR: pending
+Implementation PR: #823
 Branch: `work/819-learning-closure`
 Base revision: `182a335beba34fc93bd910479de388717ed45ad9`
 
