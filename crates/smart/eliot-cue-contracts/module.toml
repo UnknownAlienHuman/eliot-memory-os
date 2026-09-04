@@ -1,7 +1,7 @@
 schema_version = 3
 module_id = "smart.cue.contracts"
 crate = "eliot-cue-contracts"
-status = "IMPLEMENTED"
+status = "PROTOTYPE"
 wave = "cognitive-micromodules-wave-01"
 agent_order = 10
 plane = "Smart"
@@ -56,7 +56,7 @@ integration_owner = "cognitive-wave-integrator"
 implementation_language = "Rust 2024"
 required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
 writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
-workspace_admission = "admitted"
+workspace_admission = "pending_agent_implementation_and_proof"
 
 [acceptance]
 source_issue = 804
