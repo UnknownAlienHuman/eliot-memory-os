@@ -1,7 +1,7 @@
 # Assignment reservation
 
 Owning issue: #846
-Implementation PR: to be assigned
+Implementation PR: #847
 Branch: `fix/846-windows-agent-bridge-staging-tests`
 Base revision: `182a335beba34fc93bd910479de388717ed45ad9`
 
