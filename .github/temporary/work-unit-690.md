@@ -1,7 +1,7 @@
 # Assignment reservation
 
 Owning issue: #690
-Implementation PR: pending
+Implementation PR: #821
 Branch: `docs/690-package-reader-closure`
 Base revision: `182a335beba34fc93bd910479de388717ed45ad9`
 
