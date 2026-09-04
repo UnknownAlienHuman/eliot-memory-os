@@ -34,6 +34,8 @@ SERDE_DEFAULT_FIELD = re.compile(
     r"#\[serde\(default[^\]]*\)\]\s*(?:#\[[^\]]*\]\s*)*(?:///[^\n]*\n\s*)*pub\s+([a-z_0-9]+)\s*:", re.M
 )
 
+ISSUE_URL = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/"
+
 PROTECTED_FIELD_ROOTS = (
     "authority", "scope", "effect", "privacy", "ordering", "receipt",
     "grant", "permit", "revoc", "denominator", "fence", "proof",
@@ -104,6 +106,25 @@ def main() -> int:
     all_text = src + "\n" + tst
     r = Report()
 
+    # ---- 0. the gate must be at least as strong as its own assignment ----
+    # These floors were once a uniform min_tests = 5 while the assignments they
+    # gate demanded 14-68 numbered test cases each. A gate weaker than the brief
+    # it enforces certifies work that ignores most of the brief, so a shortfall
+    # here is a defect in the gate, not in the crate.
+    issue = acc.get("source_issue")
+    unit = acc.get("source_unit")
+    cases = int(acc.get("test_matrix_cases", 0))
+    declared_min = int(acc.get("min_tests", 0))
+    if issue:
+        print(f"  unit  {unit or '?'}  assignment {ISSUE_URL}{issue}")
+    if cases:
+        r.check(
+            declared_min >= cases,
+            f"min_tests >= assignment matrix ({cases} cases)",
+            f"min_tests is {declared_min}; the gate would pass work that skips "
+            f"{cases - declared_min} cases the assignment requires",
+        )
+
     # ---- 1. the crate is not empty -------------------------------------
     src_lines = src.count("\n")
     floor = int(acc.get("min_source_lines", 1))
@@ -161,6 +182,20 @@ def main() -> int:
         f"{rel} is in neither workspace.members nor workspace.exclude and has no own [workspace]; "
         "cargo will refuse with 'believes it's in a workspace when it's not'",
     )
+
+    # A finished cell that still sits in workspace.exclude is not in the build:
+    # nothing in CI compiles it, and no consumer can depend on it. The promotion
+    # is part of the unit, so claiming IMPLEMENTED without it fails here rather
+    # than in a later integration nobody scheduled.
+    meta = tomllib.loads((cdir / "Cargo.toml").read_text(encoding="utf-8"))
+    declared = meta.get("package", {}).get("metadata", {}).get("eliot", {})
+    if declared.get("source_status") == "IMPLEMENTED":
+        r.check(
+            member,
+            "implemented crate is a workspace member",
+            f"{rel} is still in workspace.exclude; move it to workspace.members, drop the "
+            "standalone [workspace] table, and switch dependency pins to `workspace = true`",
+        )
 
     # ---- 6. tests actually run ------------------------------------------
     if not args.no_cargo and (member or excluded or standalone):
