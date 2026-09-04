@@ -29,16 +29,32 @@ PUB_ITEM = re.compile(
     r"([A-Za-z_][A-Za-z0-9_]*)",
     re.M,
 )
-TEST_FN = re.compile(r"#\[(?:tokio::)?test[^\]]*\]\s*(?:#\[[^\]]*\]\s*)*(?:async\s+)?fn\s+([a-z_0-9]+)", re.M)
+TEST_FN = re.compile(
+    r"#\[(?:tokio::)?test[^\]]*\]\s*"
+    r"(?:#\[[^\]]*\]\s*)*(?:async\s+)?fn\s+([a-z_0-9]+)",
+    re.M,
+)
 SERDE_DEFAULT_FIELD = re.compile(
-    r"#\[serde\(default[^\]]*\)\]\s*(?:#\[[^\]]*\]\s*)*(?:///[^\n]*\n\s*)*pub\s+([a-z_0-9]+)\s*:", re.M
+    r"#\[serde\(default[^\]]*\)\]\s*(?:#\[[^\]]*\]\s*)*"
+    r"(?:///[^\n]*\n\s*)*pub\s+([a-z_0-9]+)\s*:",
+    re.M,
 )
 
 ISSUE_URL = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/"
 
 PROTECTED_FIELD_ROOTS = (
-    "authority", "scope", "effect", "privacy", "ordering", "receipt",
-    "grant", "permit", "revoc", "denominator", "fence", "proof",
+    "authority",
+    "scope",
+    "effect",
+    "privacy",
+    "ordering",
+    "receipt",
+    "grant",
+    "permit",
+    "revoc",
+    "denominator",
+    "fence",
+    "proof",
 )
 
 
@@ -55,39 +71,44 @@ class Report:
 
 
 def crate_dir(root: Path, crate: str) -> Path:
-    for p in root.rglob("Cargo.toml"):
-        if "target" in p.parts:
+    for path in root.rglob("Cargo.toml"):
+        if "target" in path.parts:
             continue
         try:
-            d = tomllib.loads(p.read_text(encoding="utf-8"))
+            manifest = tomllib.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if d.get("package", {}).get("name") == crate:
-            return p.parent
+        if manifest.get("package", {}).get("name") == crate:
+            return path.parent
     print(f"error: crate {crate!r} not found under {root}", file=sys.stderr)
     sys.exit(2)
 
 
 def read_sources(cdir: Path) -> tuple[str, str]:
     """Return (src_text, test_text)."""
-    src, tst = [], []
-    for f in sorted(cdir.rglob("*.rs")):
-        if "target" in f.parts:
+    src: list[str] = []
+    tests: list[str] = []
+    for path in sorted(cdir.rglob("*.rs")):
+        if "target" in path.parts:
             continue
-        text = f.read_text(encoding="utf-8", errors="ignore")
-        if "tests" in f.parts:
-            tst.append(text)
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if "tests" in path.parts:
+            tests.append(text)
         else:
             src.append(text)
-    return "\n".join(src), "\n".join(tst)
+    return "\n".join(src), "\n".join(tests)
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--crate", required=True)
-    ap.add_argument("--root", default=".")
-    ap.add_argument("--no-cargo", action="store_true", help="skip cargo test --list")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--crate", required=True)
+    parser.add_argument("--root", default=".")
+    parser.add_argument(
+        "--no-cargo",
+        action="store_true",
+        help="skip cargo test --list",
+    )
+    args = parser.parse_args()
 
     root = Path(args.root).resolve()
     cdir = crate_dir(root, args.crate)
@@ -99,126 +120,235 @@ def main() -> int:
     module = tomllib.loads(mpath.read_text(encoding="utf-8"))
     acc = module.get("acceptance")
     if not acc:
-        print(f"error: {mpath} has no [acceptance] table; the unit has no machine-checkable gate", file=sys.stderr)
+        print(
+            f"error: {mpath} has no [acceptance] table; "
+            "the unit has no machine-checkable gate",
+            file=sys.stderr,
+        )
         return 2
 
     src, tst = read_sources(cdir)
     all_text = src + "\n" + tst
-    r = Report()
+    report = Report()
 
-    # ---- 0. the gate must be at least as strong as its own assignment ----
-    # These floors were once a uniform min_tests = 5 while the assignments they
-    # gate demanded 14-68 numbered test cases each. A gate weaker than the brief
-    # it enforces certifies work that ignores most of the brief, so a shortfall
-    # here is a defect in the gate, not in the crate.
+    # ---- 0. the gate must be at least as strong as its assignment -------
+    # A numeric floor alone is insufficient: an agent can satisfy it with
+    # unrelated trivial tests. Every numbered assignment case therefore needs
+    # one unique, stable test name in `required_tests`, and every such test must
+    # actually exist in source. Extra tests remain allowed.
     issue = acc.get("source_issue")
     unit = acc.get("source_unit")
     cases = int(acc.get("test_matrix_cases", 0))
     declared_min = int(acc.get("min_tests", 0))
+    required_tests = list(acc.get("required_tests", []))
+
     if issue:
         print(f"  unit  {unit or '?'}  assignment {ISSUE_URL}{issue}")
+
+    report.check(
+        bool(issue),
+        "acceptance names source issue",
+        "source_issue is missing",
+    )
+    report.check(
+        bool(unit),
+        "acceptance names stable unit",
+        "source_unit is missing",
+    )
+    report.check(
+        cases > 0,
+        "assignment matrix case count is positive",
+        f"test_matrix_cases is {cases}",
+    )
+
     if cases:
-        r.check(
+        report.check(
             declared_min >= cases,
             f"min_tests >= assignment matrix ({cases} cases)",
             f"min_tests is {declared_min}; the gate would pass work that skips "
             f"{cases - declared_min} cases the assignment requires",
         )
+        report.check(
+            len(required_tests) >= cases,
+            f"named case tests >= assignment matrix ({cases} cases)",
+            f"required_tests names {len(required_tests)} tests; "
+            f"{cases - len(required_tests)} numbered cases have no machine binding",
+        )
+
+    duplicate_required = sorted(
+        name for name in set(required_tests) if required_tests.count(name) > 1
+    )
+    report.check(
+        not duplicate_required,
+        "required test names are unique",
+        ", ".join(duplicate_required),
+    )
+
+    invalid_required = sorted(
+        name for name in required_tests if not re.fullmatch(r"[a-z_][a-z_0-9]*", name)
+    )
+    report.check(
+        not invalid_required,
+        "required test names are valid Rust identifiers",
+        ", ".join(invalid_required),
+    )
 
     # ---- 1. the crate is not empty -------------------------------------
     src_lines = src.count("\n")
     floor = int(acc.get("min_source_lines", 1))
-    r.check(src_lines >= floor, f"source floor >= {floor} lines", f"found {src_lines}")
+    report.check(
+        src_lines >= floor,
+        f"source floor >= {floor} lines",
+        f"found {src_lines}",
+    )
 
     # ---- 2. required public exports exist -------------------------------
-    found_items = {m.group(2) for m in PUB_ITEM.finditer(src)}
+    found_items = {match.group(2) for match in PUB_ITEM.finditer(src)}
     for name in acc.get("required_exports", []):
-        r.check(name in found_items, f"export `{name}`", "not declared pub in src/")
+        report.check(
+            name in found_items,
+            f"export `{name}`",
+            "not declared pub in src/",
+        )
 
     min_pub = int(acc.get("min_public_items", 0))
     if min_pub:
-        r.check(len(found_items) >= min_pub, f"public items >= {min_pub}", f"found {len(found_items)}")
+        report.check(
+            len(found_items) >= min_pub,
+            f"public items >= {min_pub}",
+            f"found {len(found_items)}",
+        )
 
-    # ---- 3. required tests exist ----------------------------------------
+    # ---- 3. every assignment-bound test exists --------------------------
     found_tests = set(TEST_FN.findall(all_text))
-    for name in acc.get("required_tests", []):
-        r.check(name in found_tests, f"test `{name}`", "no #[test] fn with this name")
+    for name in required_tests:
+        report.check(
+            name in found_tests,
+            f"test `{name}`",
+            "no #[test] fn with this name",
+        )
 
     min_tests = int(acc.get("min_tests", 0))
     if min_tests:
-        r.check(len(found_tests) >= min_tests, f"tests >= {min_tests}", f"found {len(found_tests)}")
+        report.check(
+            len(found_tests) >= min_tests,
+            f"tests >= {min_tests}",
+            f"found {len(found_tests)}",
+        )
 
     # ---- 4. wire discipline ---------------------------------------------
     if acc.get("require_deny_unknown_fields", False):
         derives = len(re.findall(r"#\[derive[^\]]*Deserialize", src))
         denies = len(re.findall(r"deny_unknown_fields", src))
-        r.check(derives == 0 or denies >= 1, "deny_unknown_fields present", f"{derives} Deserialize derives, {denies} deny")
+        report.check(
+            derives == 0 or denies >= 1,
+            "deny_unknown_fields present",
+            f"{derives} Deserialize derives, {denies} deny",
+        )
         offenders = [
-            f for f in SERDE_DEFAULT_FIELD.findall(src)
-            if any(k in f for k in PROTECTED_FIELD_ROOTS)
+            field
+            for field in SERDE_DEFAULT_FIELD.findall(src)
+            if any(root in field for root in PROTECTED_FIELD_ROOTS)
         ]
-        r.check(not offenders, "no serde(default) on protected fields", ", ".join(sorted(set(offenders))))
+        report.check(
+            not offenders,
+            "no serde(default) on protected fields",
+            ", ".join(sorted(set(offenders))),
+        )
 
     if acc.get("forbid_unsafe", True):
-        r.check("forbid(unsafe_code)" in src, "crate declares forbid(unsafe_code)")
+        report.check(
+            "forbid(unsafe_code)" in src,
+            "crate declares forbid(unsafe_code)",
+        )
 
-    for pat in acc.get("forbidden_patterns", []):
-        hits = len(re.findall(pat, all_text))
-        r.check(hits == 0, f"forbidden pattern /{pat}/ absent", f"{hits} occurrence(s)")
+    for pattern in acc.get("forbidden_patterns", []):
+        hits = len(re.findall(pattern, all_text))
+        report.check(
+            hits == 0,
+            f"forbidden pattern /{pattern}/ absent",
+            f"{hits} occurrence(s)",
+        )
 
-    for pat in acc.get("required_patterns", []):
-        hits = len(re.findall(pat, all_text))
-        r.check(hits > 0, f"required pattern /{pat}/ present", "0 occurrences")
+    for pattern in acc.get("required_patterns", []):
+        hits = len(re.findall(pattern, all_text))
+        report.check(
+            hits > 0,
+            f"required pattern /{pattern}/ present",
+            "0 occurrences",
+        )
 
     # ---- 5. workspace membership ----------------------------------------
-    wsroot = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]
+    workspace = tomllib.loads(
+        (root / "Cargo.toml").read_text(encoding="utf-8")
+    )["workspace"]
     rel = cdir.relative_to(root).as_posix()
-    member = rel in set(wsroot.get("members", []))
-    excluded = rel in set(wsroot.get("exclude", []))
-    standalone = "[workspace]" in (cdir / "Cargo.toml").read_text(encoding="utf-8")
-    r.check(
+    member = rel in set(workspace.get("members", []))
+    excluded = rel in set(workspace.get("exclude", []))
+    standalone = "[workspace]" in (cdir / "Cargo.toml").read_text(
+        encoding="utf-8"
+    )
+    report.check(
         member or excluded or standalone,
         "crate is buildable by cargo",
-        f"{rel} is in neither workspace.members nor workspace.exclude and has no own [workspace]; "
-        "cargo will refuse with 'believes it's in a workspace when it's not'",
+        f"{rel} is in neither workspace.members nor workspace.exclude and has "
+        "no own [workspace]; cargo will refuse with 'believes it is in a workspace'",
     )
 
-    # A finished cell that still sits in workspace.exclude is not in the build:
-    # nothing in CI compiles it, and no consumer can depend on it. The promotion
-    # is part of the unit, so claiming IMPLEMENTED without it fails here rather
-    # than in a later integration nobody scheduled.
-    meta = tomllib.loads((cdir / "Cargo.toml").read_text(encoding="utf-8"))
-    declared = meta.get("package", {}).get("metadata", {}).get("eliot", {})
+    manifest = tomllib.loads((cdir / "Cargo.toml").read_text(encoding="utf-8"))
+    declared = manifest.get("package", {}).get("metadata", {}).get("eliot", {})
     if declared.get("source_status") == "IMPLEMENTED":
-        r.check(
+        report.check(
             member,
             "implemented crate is a workspace member",
-            f"{rel} is still in workspace.exclude; move it to workspace.members, drop the "
-            "standalone [workspace] table, and switch dependency pins to `workspace = true`",
+            f"{rel} is still in workspace.exclude; move it to workspace.members, "
+            "drop the standalone [workspace] table, and switch dependency pins "
+            "to `workspace = true`",
         )
 
     # ---- 6. tests actually run ------------------------------------------
     if not args.no_cargo and (member or excluded or standalone):
         proc = subprocess.run(
-            ["cargo", "test", "--manifest-path", str(cdir / "Cargo.toml"), "--all-targets", "--", "--list"],
-            capture_output=True, text=True,
+            [
+                "cargo",
+                "test",
+                "--manifest-path",
+                str(cdir / "Cargo.toml"),
+                "--all-targets",
+                "--",
+                "--list",
+            ],
+            capture_output=True,
+            text=True,
         )
         listed = len(re.findall(r": test$", proc.stdout, re.M))
-        r.check(proc.returncode == 0, "cargo test --list succeeds", (proc.stderr or "").strip().splitlines()[:1])
-        r.check(listed >= max(1, min_tests), f"cargo lists >= {max(1, min_tests)} tests", f"listed {listed}")
+        first_error = (proc.stderr or "").strip().splitlines()[:1]
+        report.check(
+            proc.returncode == 0,
+            "cargo test --list succeeds",
+            str(first_error),
+        )
+        report.check(
+            listed >= max(1, min_tests),
+            f"cargo lists >= {max(1, min_tests)} tests",
+            f"listed {listed}",
+        )
 
     # ---- report ----------------------------------------------------------
     width = 72
     print("=" * width)
-    print(f"work-unit gate :: {args.crate} :: module {module.get('module_id', '?')}")
+    print(
+        f"work-unit gate :: {args.crate} :: "
+        f"module {module.get('module_id', '?')}"
+    )
     print("=" * width)
-    for label in r.ok:
+    for label in report.ok:
         print(f"  PASS  {label}")
-    for label in r.fail:
+    for label in report.fail:
         print(f"  FAIL  {label}")
     print("-" * width)
-    print(f"  {len(r.ok)} passed, {len(r.fail)} failed")
-    return 1 if r.fail else 0
+    print(f"  {len(report.ok)} passed, {len(report.fail)} failed")
+    return 1 if report.fail else 0
 
 
 if __name__ == "__main__":
