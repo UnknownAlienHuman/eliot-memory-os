@@ -5,4 +5,4 @@
 channel = "1.97.1"
 profile = "default"
 components = ["clippy", "rustfmt", "rust-analyzer", "rust-src"]
-targets = ["x86_64-pc-windows-msvc"]
+targets = ["x86_64-pc-windows-msvc", "wasm32-wasip2"]
