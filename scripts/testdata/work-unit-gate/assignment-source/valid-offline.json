@@ -1,0 +1,29 @@
+{
+  "schema": "eliot-assignment-snapshot-v1",
+  "payload": {
+    "number": 849,
+    "title": "[A-1] Bounded source fixture",
+    "body": "## Objective\nA bounded synthetic assignment.\n\n## Required test matrix\n**Declared denominator: 2 cases, exactly 1..2.**\n\n1. Accept the exact current identity.\n2. Reject a changed identity.\n\n## Verification\nNo live effects in this fixture.\n",
+    "state": "open",
+    "labels": [],
+    "updated_at": "2026-09-05T20:00:00Z",
+    "repository": "ExampleOwner/example-repo",
+    "unit": "A-1",
+    "source_use": "active-assignment",
+    "relation": null,
+    "body_sha256": "fc271d58d317415841a11d1b3e6d8b1f421f85f519dcdf8d8618c21ca74886e3",
+    "matrix_sha256": "e67377c83429511ae03dd1dcf8f73a2252ab1ffa19e726e295c02c10946e9b10",
+    "origin": "https://api.github.com",
+    "etag": "W/\"capture\"",
+    "producer": "controller",
+    "capture_receipt_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "freshness_policy_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "captured_at": 1000,
+    "expires_at": 1600,
+    "invalidated": false,
+    "complete": true,
+    "source_mode": "live-github",
+    "base_commit": null
+  },
+  "snapshot_sha256": "0fa6033d6cd8db573ec621bd27c7f966c56d69eda8803bcbc1ec9c05065433a8"
+}

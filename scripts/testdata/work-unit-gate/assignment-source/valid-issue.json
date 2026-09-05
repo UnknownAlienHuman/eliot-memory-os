@@ -1,0 +1,11 @@
+{
+  "number": 849,
+  "url": "https://api.github.com/repos/ExampleOwner/example-repo/issues/849",
+  "repository_url": "https://api.github.com/repos/ExampleOwner/example-repo",
+  "html_url": "https://github.com/ExampleOwner/example-repo/issues/849",
+  "title": "[A-1] Bounded source fixture",
+  "body": "## Objective\nA bounded synthetic assignment.\n\n## Required test matrix\n**Declared denominator: 2 cases, exactly 1..2.**\n\n1. Accept the exact current identity.\n2. Reject a changed identity.\n\n## Verification\nNo live effects in this fixture.\n",
+  "state": "open",
+  "labels": [],
+  "updated_at": "2026-09-05T20:00:00Z"
+}
