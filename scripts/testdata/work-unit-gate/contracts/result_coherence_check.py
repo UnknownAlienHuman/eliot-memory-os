@@ -1,4 +1,8 @@
-"""Focused regression checks for D-WU-C0-FIX aggregate-result coherence."""
+"""Preserved aggregate-coherence regressions, using explicit v4 evidence.
+
+The ten original regressions remain. Constructor migration supplies current
+assignment/phase bindings; legacy summaries cannot be promoted into executions.
+"""
 from __future__ import annotations
 
 import dataclasses
@@ -11,214 +15,102 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.tests.test_work_unit_gate_contracts import (
-    assignment,
-    case_receipt,
-    descriptor,
-    finding,
-    issue,
-    proof,
-    unit,
+    assignment, cases, catalogue, cohort, descriptor, evidence, finding,
+    plan, row, shape, workspace, PROOF,
 )
 from scripts.work_unit_gate import contracts as current
 from scripts.work_unit_gate import _contracts_v2 as legacy
-from scripts.work_unit_gate.contracts import (
-    CaseAccountingReceipt,
-    CohortReceipt,
-    CohortRow,
-    ComponentGateReceipt,
-    ContractViolation,
-    ExecutionDisposition,
-    FindingClass,
-    OverallResult,
-    SourceShapeGateReceipt,
-    WorkspaceAdmissionReceipt,
-    WorkspaceDisposition,
-    WorkUnitDescriptor,
-    cohort_digest,
-)
 
 
 class ResultCoherenceRegressionTests(unittest.TestCase):
-    def test_all_pass_exact_cohort_has_only_pass_result(self) -> None:
+    def test_all_pass_exact_cohort_has_only_pass_result(self):
         desc = descriptor()
-        row = CohortRow(
-            issue(), unit(), desc.mode, 1, desc.sha256, desc.identity, OverallResult.PASS
-        )
-        denominator = (desc.sha256,)
-        digest = cohort_digest((row,), 1, 1, denominator, proof())
-        CohortReceipt((row,), OverallResult.PASS, proof(), 1, 1, digest, denominator)
-        for result in (
-            OverallResult.CONTRACT_FAILURE,
-            OverallResult.CONFIGURATION_FAILURE,
-            OverallResult.INCOMPLETE_EVIDENCE,
-        ):
-            with self.subTest(result=result), self.assertRaises(ContractViolation):
-                CohortReceipt((row,), result, proof(), 1, 1, digest, denominator)
+        selected, rows = plan(desc), (evidence(desc),)
+        cohort(selected, rows)
+        for result in current.OverallResult:
+            if result is not current.OverallResult.PASS:
+                with self.subTest(result=result), self.assertRaises(current.ContractViolation):
+                    cohort(selected, rows, result)
 
-    def test_nonpass_row_class_determines_aggregate_class(self) -> None:
+    def test_nonpass_row_class_determines_aggregate_class(self):
         desc = descriptor()
-        passing = CohortRow(
-            issue(), unit(), desc.mode, 1, desc.sha256, desc.identity, OverallResult.PASS
-        )
-        expectations = {
-            OverallResult.CONTRACT_FAILURE: OverallResult.CONTRACT_FAILURE,
-            OverallResult.CONFIGURATION_FAILURE: OverallResult.CONFIGURATION_FAILURE,
-            OverallResult.INCOMPLETE_EVIDENCE: OverallResult.INCOMPLETE_EVIDENCE,
+        classes = {
+            current.OverallResult.CONTRACT_FAILURE: current.FindingClass.CONTRACT_DEFECT,
+            current.OverallResult.CONFIGURATION_FAILURE: current.FindingClass.CONFIGURATION_DEFECT,
+            current.OverallResult.INCOMPLETE_EVIDENCE: current.FindingClass.SOURCE_UNAVAILABLE,
         }
-        for row_result, aggregate in expectations.items():
-            row = dataclasses.replace(passing, result=row_result)
-            CohortReceipt((row,), aggregate, proof())
-            for invalid in OverallResult:
-                if invalid is aggregate:
-                    continue
-                with self.subTest(row=row_result, invalid=invalid), self.assertRaises(
-                    ContractViolation
-                ):
-                    CohortReceipt((row,), invalid, proof())
+        for result, kind in classes.items():
+            source = shape(desc, result=result, findings=(finding(kind),))
+            rows = (evidence(desc, source=source, package_result=result),)
+            cohort(plan(desc), rows, result)
+            for invalid in current.OverallResult:
+                if invalid is not result:
+                    with self.subTest(expected=result, supplied=invalid), self.assertRaises(current.ContractViolation):
+                        cohort(plan(desc), rows, invalid)
 
-    def test_all_pass_cohort_without_exact_denominator_is_incomplete(self) -> None:
+    def test_all_pass_cohort_without_exact_denominator_is_incomplete(self):
+        # v4 requires an explicit selected plan. Missing selected results remain
+        # incomplete even when every supplied execution passed.
+        a, b = descriptor(), descriptor(858)
+        selected, rows = plan(a, b), (evidence(a),)
+        receipt = cohort(selected, rows, current.OverallResult.INCOMPLETE_EVIDENCE)
+        self.assertEqual((1, 2), (receipt.matrix_cases, receipt.expected_matrix_cases))
+        with self.assertRaises(current.ContractViolation):
+            cohort(selected, rows)
+        with self.assertRaises(current.ContractViolation):
+            dataclasses.replace(receipt, plan=None)
+
+    def test_incomplete_finding_cannot_be_laundered_by_case_pass(self):
         desc = descriptor()
-        row = CohortRow(
-            issue(), unit(), desc.mode, 1, desc.sha256, desc.identity, OverallResult.PASS
-        )
-        CohortReceipt((row,), OverallResult.INCOMPLETE_EVIDENCE, proof())
-        with self.assertRaises(ContractViolation):
-            CohortReceipt((row,), OverallResult.PASS, proof())
+        incomplete = finding(current.FindingClass.SOURCE_UNAVAILABLE)
+        receipt = cases(desc, result=current.OverallResult.INCOMPLETE_EVIDENCE, findings=(incomplete,))
+        self.assertIs(receipt.result, current.OverallResult.INCOMPLETE_EVIDENCE)
+        with self.assertRaises(current.ContractViolation):
+            cases(desc, findings=(incomplete,))
 
-    def test_incomplete_finding_cannot_be_laundered_by_case_pass(self) -> None:
+    def test_incomplete_finding_cannot_be_laundered_by_source_or_workspace_pass(self):
         desc = descriptor()
-        incomplete = finding(FindingClass.SOURCE_UNAVAILABLE)
-        receipt = case_receipt(
-            desc,
-            (ExecutionDisposition.EXECUTED_PASS,),
-            OverallResult.INCOMPLETE_EVIDENCE,
-            findings=(incomplete,),
-        )
-        self.assertIs(receipt.result, OverallResult.INCOMPLETE_EVIDENCE)
-        with self.assertRaises(ContractViolation):
-            case_receipt(
-                desc,
-                (ExecutionDisposition.EXECUTED_PASS,),
-                OverallResult.PASS,
-                findings=(incomplete,),
-            )
+        incomplete = (finding(current.FindingClass.INCOMPLETE_EVIDENCE),)
+        for constructor in (shape, workspace):
+            constructor(desc, result=current.OverallResult.INCOMPLETE_EVIDENCE, findings=incomplete)
+            with self.assertRaises(current.ContractViolation):
+                constructor(desc, findings=incomplete)
 
-    def test_incomplete_finding_cannot_be_laundered_by_source_or_workspace_pass(
-        self,
-    ) -> None:
+    def test_assignment_descriptor_denominator_is_load_bearing_everywhere(self):
+        desc = descriptor(count=2)
+        wrong = assignment(descriptor())
+        for constructor in (shape, workspace):
+            with self.assertRaises(current.ContractViolation):
+                constructor(desc, assignment=wrong)
+
+    def test_mixed_contract_and_incomplete_findings_cannot_hide_contract_failure(self):
+        mixed = (finding(current.FindingClass.SOURCE_UNAVAILABLE), finding(current.FindingClass.CONTRACT_DEFECT))
         desc = descriptor()
-        incomplete = finding(FindingClass.INCOMPLETE_EVIDENCE)
-        SourceShapeGateReceipt(
-            assignment(),
-            desc,
-            OverallResult.INCOMPLETE_EVIDENCE,
-            (incomplete,),
-            desc.proof_ceiling,
-        )
-        WorkspaceAdmissionReceipt(
-            assignment(),
-            desc,
-            desc.package,
-            desc.module,
-            WorkspaceDisposition.MEMBER,
-            OverallResult.INCOMPLETE_EVIDENCE,
-            (incomplete,),
-            desc.proof_ceiling,
-        )
-        with self.assertRaises(ContractViolation):
-            SourceShapeGateReceipt(
-                assignment(), desc, OverallResult.PASS, (incomplete,), desc.proof_ceiling
-            )
-        with self.assertRaises(ContractViolation):
-            WorkspaceAdmissionReceipt(
-                assignment(),
-                desc,
-                desc.package,
-                desc.module,
-                WorkspaceDisposition.MEMBER,
-                OverallResult.PASS,
-                (incomplete,),
-                desc.proof_ceiling,
-            )
+        receipt = shape(desc, result=current.OverallResult.CONTRACT_FAILURE, findings=mixed)
+        self.assertIs(receipt.result, current.OverallResult.CONTRACT_FAILURE)
+        with self.assertRaises(current.ContractViolation):
+            shape(desc, result=current.OverallResult.INCOMPLETE_EVIDENCE, findings=mixed)
 
-    def test_assignment_descriptor_denominator_is_load_bearing_everywhere(
-        self,
-    ) -> None:
-        desc = descriptor(matrix_cases=2)
-        wrong_assignment = assignment(1)
-        with self.assertRaisesRegex(ContractViolation, "matrix denominator"):
-            SourceShapeGateReceipt(
-                wrong_assignment, desc, OverallResult.PASS, (), desc.proof_ceiling
-            )
-        with self.assertRaisesRegex(ContractViolation, "matrix denominator"):
-            WorkspaceAdmissionReceipt(
-                wrong_assignment,
-                desc,
-                desc.package,
-                desc.module,
-                WorkspaceDisposition.MEMBER,
-                OverallResult.PASS,
-                (),
-                desc.proof_ceiling,
-            )
+    def test_generic_component_uses_same_mixed_finding_priority(self):
+        mixed = (finding(current.FindingClass.SOURCE_UNAVAILABLE), finding(current.FindingClass.CONTRACT_DEFECT))
+        current.ComponentGateReceipt("component", current.OverallResult.CONTRACT_FAILURE, mixed, PROOF)
+        with self.assertRaises(current.ContractViolation):
+            current.ComponentGateReceipt("component", current.OverallResult.INCOMPLETE_EVIDENCE, mixed, PROOF)
 
-    def test_mixed_contract_and_incomplete_findings_cannot_hide_contract_failure(
-        self,
-    ) -> None:
-        desc = descriptor()
-        mixed = (
-            finding(FindingClass.SOURCE_UNAVAILABLE),
-            finding(FindingClass.CONTRACT_DEFECT),
-        )
-        receipt = SourceShapeGateReceipt(
-            assignment(),
-            desc,
-            OverallResult.CONTRACT_FAILURE,
-            mixed,
-            desc.proof_ceiling,
-        )
-        self.assertIs(receipt.result, OverallResult.CONTRACT_FAILURE)
-        with self.assertRaises(ContractViolation):
-            SourceShapeGateReceipt(
-                assignment(),
-                desc,
-                OverallResult.INCOMPLETE_EVIDENCE,
-                mixed,
-                desc.proof_ceiling,
-            )
-
-    def test_generic_component_uses_same_mixed_finding_priority(self) -> None:
-        mixed = (
-            finding(FindingClass.SOURCE_UNAVAILABLE),
-            finding(FindingClass.CONTRACT_DEFECT),
-        )
-        receipt = ComponentGateReceipt(
-            "component", OverallResult.CONTRACT_FAILURE, mixed, proof()
-        )
-        self.assertIs(receipt.result, OverallResult.CONTRACT_FAILURE)
-        with self.assertRaises(ContractViolation):
-            ComponentGateReceipt(
-                "component", OverallResult.INCOMPLETE_EVIDENCE, mixed, proof()
-            )
-
-    def test_descriptor_mapping_failures_are_closed_and_redacted(self) -> None:
+    def test_descriptor_mapping_failures_are_closed_and_redacted(self):
         class BrokenMapping(dict):
             def __iter__(self):
                 raise RuntimeError("SECRET_CANARY_FROM_MAPPING")
-
-        with self.assertRaises(ContractViolation) as captured:
-            WorkUnitDescriptor.from_mapping(BrokenMapping())
-        self.assertEqual("descriptor mapping access failed", str(captured.exception))
+        with self.assertRaises(current.ContractViolation) as captured:
+            current.WorkUnitDescriptor.from_mapping(BrokenMapping())
+        self.assertEqual("descriptor input must be an exact dictionary", str(captured.exception))
         self.assertIsNone(captured.exception.__cause__)
         self.assertNotIn("SECRET_CANARY", str(captured.exception))
 
-    def test_current_public_receipts_do_not_resolve_to_legacy_aggregators(self) -> None:
-        self.assertIs(current.CaseAccountingReceipt, CaseAccountingReceipt)
-        self.assertIs(current.CohortReceipt, CohortReceipt)
-        self.assertIs(current.ComponentGateReceipt, ComponentGateReceipt)
-        self.assertIsNot(current.CaseAccountingReceipt, legacy.CaseAccountingReceipt)
-        self.assertIsNot(current.CohortReceipt, legacy.CohortReceipt)
-        self.assertIsNot(current.ComponentGateReceipt, legacy.ComponentGateReceipt)
+    def test_current_public_receipts_do_not_resolve_to_legacy_aggregators(self):
+        for name in ("CaseAccountingReceipt", "CohortReceipt", "ComponentGateReceipt"):
+            self.assertIsNot(getattr(current, name), getattr(legacy, name))
+        self.assertIs(current.CohortRow, current.VerificationEvidence)
         self.assertNotIn("_contracts_v2", current.__all__)
 
 

@@ -1,0 +1,171 @@
+{
+  "schema": "eliot-work-unit-contracts-v4",
+  "descriptor_schema": "eliot-work-unit-descriptor-v2",
+  "fields": {
+    "WorkUnitDescriptor": [
+      "schema_version",
+      "identity",
+      "issue",
+      "unit",
+      "mode",
+      "source_roots",
+      "test_roots",
+      "matrix_cases",
+      "proof_ceiling",
+      "revision",
+      "body_sha256",
+      "matrix_sha256",
+      "require_workspace_member",
+      "requirements",
+      "bounds",
+      "package",
+      "module"
+    ],
+    "VerificationRequirements": [
+      "source_floor",
+      "public_floor",
+      "test_floor",
+      "required_guards"
+    ],
+    "ExecutionBounds": [
+      "wall_ms",
+      "idle_ms",
+      "output_bytes",
+      "line_bytes",
+      "discovery_tests",
+      "child_processes"
+    ],
+    "AssignmentSourceReceipt": [
+      "issue",
+      "state",
+      "unit",
+      "authority",
+      "title",
+      "body_sha256",
+      "matrix_cases",
+      "proof_ceiling",
+      "matrix_sha256",
+      "source_use",
+      "origin",
+      "live_etag",
+      "offline_capture"
+    ],
+    "OfflineCaptureBinding": [
+      "issue",
+      "unit",
+      "body_sha256",
+      "matrix_sha256",
+      "snapshot_sha256",
+      "expected_snapshot_sha256",
+      "producer",
+      "capture_receipt_sha256",
+      "expected_capture_receipt_sha256",
+      "freshness_policy_sha256",
+      "captured_at",
+      "expires_at",
+      "invalidated"
+    ],
+    "DiscoveredTestReceipt": [
+      "descriptor",
+      "descriptor_sha256",
+      "test",
+      "location",
+      "source_sha256",
+      "artifact_sha256",
+      "phase"
+    ],
+    "TestExecutionRecord": [
+      "test",
+      "disposition",
+      "discovery",
+      "detail"
+    ],
+    "CaseAccountingReceipt": [
+      "assignment",
+      "descriptor",
+      "members",
+      "result",
+      "proof_ceiling",
+      "findings"
+    ],
+    "SourceShapeGateReceipt": [
+      "assignment",
+      "descriptor",
+      "result",
+      "findings",
+      "proof_ceiling",
+      "source_sha256",
+      "source_items",
+      "public_items",
+      "test_items",
+      "guards"
+    ],
+    "PackageGateReceipt": [
+      "assignment",
+      "descriptor",
+      "package",
+      "module",
+      "source_shape",
+      "case_accounting",
+      "result",
+      "findings",
+      "proof_ceiling"
+    ],
+    "WorkspaceAdmissionReceipt": [
+      "assignment",
+      "descriptor",
+      "package",
+      "module",
+      "disposition",
+      "result",
+      "findings",
+      "proof_ceiling"
+    ],
+    "CatalogueRow": [
+      "issue",
+      "unit",
+      "body_sha256",
+      "disposition",
+      "descriptor",
+      "prerequisites"
+    ],
+    "CatalogueIntegrityReceipt": [
+      "rows",
+      "expected_issues"
+    ],
+    "VerificationSelection": [
+      "catalogue_sha256",
+      "profile_sha256",
+      "scope",
+      "issues"
+    ],
+    "PrerequisiteEvidence": [
+      "source",
+      "accepted_commit",
+      "accepted_result_sha256"
+    ],
+    "SelectedVerificationPlan": [
+      "catalogue",
+      "selection",
+      "descriptors",
+      "prerequisites"
+    ],
+    "VerificationEvidence": [
+      "source_shape",
+      "case_accounting",
+      "workspace",
+      "package"
+    ],
+    "CohortReceipt": [
+      "plan",
+      "rows",
+      "result",
+      "aggregate_sha256"
+    ]
+  },
+  "legacy": {
+    "private_blob_sha": "2efc073bc0ea0d63be12852d746ede04ad4ccbe8",
+    "baseline_facade_blob_sha": "976860b627df5e72ccd37bdc44c124ba3ba575fa",
+    "policy": "Historical v1/v2/v3 values require explicit fresh fields and cannot be promoted by defaults."
+  }
+}
