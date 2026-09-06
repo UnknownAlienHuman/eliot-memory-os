@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use eliot_contracts::StateFence;
 
 use crate::budget::BudgetLimits;
-use crate::error::ContractViolation;
+use crate::error::{ContractViolation, check_text};
 
 /// Exact wire `schema_version` admitted by [`DreamJobInput`].
 pub const DREAM_JOB_SCHEMA_VERSION: u32 = 1;
@@ -314,27 +314,6 @@ impl ImplementationBriefMarker {
 /// authority separation between brief surfaces.
 pub fn brief_kinds_distinct() -> bool {
     ARCHITECTURE_BRIEF_KIND != IMPLEMENTATION_BRIEF_KIND
-}
-
-fn check_text(value: &str, field: &'static str, max: usize) -> Result<(), ContractViolation> {
-    if value.trim().is_empty() {
-        return Err(ContractViolation::MissingField(field));
-    }
-    if value.len() > max {
-        return Err(ContractViolation::OutOfBounds {
-            field,
-            min: 1,
-            max: crate::error::len_i64(max),
-            got: crate::error::len_i64(value.len()),
-        });
-    }
-    if value.chars().any(char::is_control) {
-        return Err(ContractViolation::Malformed {
-            field,
-            reason: "must not contain control characters".to_owned(),
-        });
-    }
-    Ok(())
 }
 
 fn is_lower_hex_digest(value: &str) -> bool {

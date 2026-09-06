@@ -9,13 +9,13 @@
 
 #![allow(clippy::expect_used)]
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+use eliot_contracts::{AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, StateFence};
 use eliot_dreamer_contracts::job::{Requester, RequesterOrigin};
 use eliot_dreamer_contracts::{
     BudgetLimits, BundleCompleteness, CURATION_WIRE_KINDS, CurationFamily,
-    CurationHandlerDescriptor, CurationHandlerRegistry, CurationKind, DreamInputBundle,
-    DreamJobInput, JobClass, ModelDraft, ScreenEligibility, ScreenReference, ScreenState,
-    ValidationReceipt, family_of, parse_kind,
+    CurationHandlerDescriptor, CurationHandlerPort, CurationHandlerRegistry, CurationKind,
+    DreamInputBundle, DreamJobInput, JobClass, ModelDraft, ScreenEligibility, ScreenReference,
+    ScreenState, ValidationReceipt, family_of, parse_kind,
 };
 
 // Marker 44: consumer-shaped fixtures taking hub types by reference.
@@ -156,11 +156,15 @@ fn fixture_receipt() -> ValidationReceipt {
         output_digest: "c".repeat(64),
         terminal_disposition: "accepted".to_owned(),
         proof_ceiling: "candidate-only".to_owned(),
+        state_fence: fence(),
+        preservation_digest: "d".repeat(64),
+        budget_digest: "e".repeat(64),
     }
 }
 
-fn fixture_registry() -> CurationHandlerRegistry {
+fn fixture_registry() -> (CurationHandlerRegistry, Vec<CurationHandlerPort>) {
     let mut registry = CurationHandlerRegistry::new();
+    let mut ports = Vec::new();
     let mut seen: Vec<CurationFamily> = Vec::new();
     for spelling in CURATION_WIRE_KINDS {
         let family = family_of(parse_kind(spelling).expect("known wire kind"));
@@ -175,22 +179,27 @@ fn fixture_registry() -> CurationHandlerRegistry {
             .map(|spelling| parse_kind(spelling).expect("known wire kind"))
             .filter(|kind| family_of(*kind) == family)
             .collect();
+        let descriptor = CurationHandlerDescriptor {
+            family,
+            handler_id: std::format!("acc-{}", family.as_str()),
+            accepted_kinds: kinds,
+        };
         registry
-            .register(CurationHandlerDescriptor {
-                family,
-                handler_id: std::format!("acc-{}", family.as_str()),
-                accepted_kinds: kinds,
-            })
+            .register(descriptor.clone())
             .expect("fixture descriptor registers");
+        ports.push(CurationHandlerPort {
+            port_id: std::format!("port-{}", family.as_str()),
+            descriptor,
+        });
     }
-    registry
+    (registry, ports)
 }
 
 fn fixture_screen() -> ScreenReference {
     ScreenReference {
         screen_id: "screen-44".to_owned(),
-        request_id: "req-44".to_owned(),
-        receipt_id: "rcpt-44".to_owned(),
+        request_id: RequestId::new("req-44").expect("request id"),
+        receipt_id: ReceiptId::new("rcpt-44").expect("receipt id"),
         target_id: "target-44".to_owned(),
         result_digest: "c".repeat(64),
         item_digest: "d".repeat(64),
@@ -216,7 +225,7 @@ fn marker_44_independent_consumer_compile_fixtures() {
     assert!(draft.validate().is_ok(), "fixture draft must validate");
     let receipt = fixture_receipt();
     assert!(receipt.validate().is_ok(), "fixture receipt must validate");
-    let registry = fixture_registry();
+    let (registry, ports) = fixture_registry();
     assert!(
         registry.validate_closure().is_ok(),
         "fixture registry must close"
@@ -230,6 +239,17 @@ fn marker_44_independent_consumer_compile_fixtures() {
     replacer_shape(&registry, &screen);
     handler_shape(&job, &registry);
     consumer_shape(&bundle, &draft, &receipt, &screen);
+    assert_eq!(ports.len(), 10, "ten injected ports");
+    for spelling in CURATION_WIRE_KINDS {
+        let kind = parse_kind(spelling).expect("known wire kind");
+        let family = family_of(kind);
+        let port = ports
+            .iter()
+            .find(|p| p.descriptor.family == family && p.descriptor.accepted_kinds.contains(&kind))
+            .expect("ported family");
+        port.validate().expect("port validates");
+        assert!(registry.handlers.iter().any(|h| h == &port.descriptor));
+    }
 }
 
 // WORK_UNIT_CASE: 578/45

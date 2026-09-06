@@ -6,9 +6,9 @@
 //! request/result envelope that preserves kind, family, and common
 //! identities end to end. Owns no handler logic, dispatch, or runtime.
 
-use crate::curation::CurationKind;
-use crate::curation::CurationPayload;
-use crate::error::ContractViolation;
+use crate::candidate::CandidateDisposition;
+use crate::curation::{CurationKind, CurationPayload};
+use crate::error::{ContractViolation, check_text};
 use crate::screen::ScreenBinding;
 use eliot_contracts::StateFence;
 use schemars::JsonSchema;
@@ -130,15 +130,7 @@ pub fn family_kinds(family: CurationFamily) -> &'static [CurationKind] {
     }
 }
 
-fn non_blank(value: &str, field: &'static str) -> Result<(), ContractViolation> {
-    if value.trim().is_empty() {
-        return Err(ContractViolation::Malformed {
-            field,
-            reason: "must be non-blank".to_owned(),
-        });
-    }
-    Ok(())
-}
+const MAX_TEXT: usize = 128;
 
 fn sorted_kinds(mut kinds: Vec<CurationKind>) -> Vec<CurationKind> {
     kinds.sort_by_key(|kind| kind.as_str());
@@ -168,15 +160,7 @@ pub struct CurationHandlerDescriptor {
 impl CurationHandlerDescriptor {
     /// Validates identity bounds and exact canonical kind coverage.
     pub fn validate(&self) -> Result<(), ContractViolation> {
-        non_blank(&self.handler_id, "handler_id")?;
-        if self.handler_id.len() > 128 {
-            return Err(ContractViolation::OutOfBounds {
-                field: "handler_id",
-                min: 1,
-                max: 128,
-                got: crate::error::len_i64(self.handler_id.len()),
-            });
-        }
+        check_text(&self.handler_id, "handler_id", MAX_TEXT)?;
         if self.accepted_kinds.is_empty() {
             return Err(ContractViolation::Malformed {
                 field: "accepted_kinds",
@@ -356,7 +340,7 @@ impl TargetDenominator {
             });
         }
         for m in &self.members {
-            non_blank(m, "members")?;
+            check_text(m, "members", MAX_TEXT)?;
         }
         let mut ordered = self.members.clone();
         ordered.sort();
@@ -368,6 +352,22 @@ impl TargetDenominator {
             });
         }
         Ok(())
+    }
+}
+
+/// Injected handler port: one descriptor bound to a port identity.
+/// No discovery, no default family, no concrete handler.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurationHandlerPort {
+    pub port_id: String,
+    pub descriptor: CurationHandlerDescriptor,
+}
+
+impl CurationHandlerPort {
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        check_text(&self.port_id, "port_id", MAX_TEXT)?;
+        self.descriptor.validate()
     }
 }
 
@@ -395,10 +395,10 @@ impl TypedCurationHandlerRequest {
     ///
     /// Returns [`ContractViolation`] on drift, unscreened targets, or bad bindings.
     pub fn validate(&self) -> Result<(), ContractViolation> {
-        non_blank(&self.request_id, "request_id")?;
-        non_blank(&self.job_id, "job_id")?;
-        non_blank(&self.scope_id, "scope_id")?;
-        non_blank(&self.task_id, "task_id")?;
+        check_text(&self.request_id, "request_id", MAX_TEXT)?;
+        check_text(&self.job_id, "job_id", MAX_TEXT)?;
+        check_text(&self.scope_id, "scope_id", MAX_TEXT)?;
+        check_text(&self.task_id, "task_id", MAX_TEXT)?;
         if self.family != family_of(self.kind) {
             return Err(ContractViolation::KindPayload(format!(
                 "kind {} belongs to family {}, not {}",
@@ -459,20 +459,6 @@ impl TypedCurationHandlerRequest {
     }
 }
 
-/// Closed handler disposition for a typed curation invocation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum HandlerDisposition {
-    Candidate,
-    Duplicate,
-    Conflict,
-    Abstention,
-    Partial,
-    Blocked,
-    Unsupported,
-    InternalDefect,
-}
-
 /// Typed result envelope: preserves the request's kind, family, and common
 /// identities, and carries sha256 identity digests of request and result.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -481,7 +467,7 @@ pub struct TypedCurationHandlerResult {
     pub request_id: String,
     pub kind: CurationKind,
     pub family: CurationFamily,
-    pub disposition: HandlerDisposition,
+    pub disposition: CandidateDisposition,
     pub handler_id: String,
     pub request_digest: String,
     pub result_digest: String,
@@ -509,8 +495,8 @@ impl TypedCurationHandlerResult {
     /// agree, and malformed violations for blank identities or digests that
     /// are not lowercase sha256 hex.
     pub fn validate(&self) -> Result<(), ContractViolation> {
-        non_blank(&self.request_id, "request_id")?;
-        non_blank(&self.handler_id, "handler_id")?;
+        check_text(&self.request_id, "request_id", MAX_TEXT)?;
+        check_text(&self.handler_id, "handler_id", MAX_TEXT)?;
         if self.family != family_of(self.kind) {
             return Err(ContractViolation::KindPayload(format!(
                 "kind {} belongs to family {}, not {}",
@@ -531,7 +517,7 @@ mod tests {
     use super::*;
     use crate::curation::{CURATION_WIRE_KINDS, MergePayload, parse_kind, sample_payload};
     use crate::draft::ValidatedCurationItem;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, sha256_hex};
+    use eliot_contracts::{AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, sha256_hex};
 
     fn fence() -> StateFence {
         StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
@@ -608,8 +594,8 @@ mod tests {
         request.denominator.expected_total = 4;
         request.denominator.mode = AtomicityMode::PerMember;
         request.screen_binding = Some(ScreenBinding {
-            request_id: "req-screen".to_owned(),
-            receipt_id: "rcpt-screen".to_owned(),
+            request_id: RequestId::new("req-screen").expect("request id"),
+            receipt_id: ReceiptId::new("rcpt-screen").expect("receipt id"),
             screened_targets: targets,
             source_snapshot: "snap-1".to_owned(),
             source_revision: "rev-1".to_owned(),
@@ -711,22 +697,8 @@ mod tests {
     // WORK_UNIT_CASE: 578/29
     #[test]
     fn case_29_validated_item_preserves_receipt_source_target_ceilings() {
-        use crate::draft::ValidationReceipt;
-        let receipt = ValidationReceipt {
-            schema_version: 1,
-            validator_contract: "a05-validator".to_owned(),
-            validator_policy: "policy-7".to_owned(),
-            job_id: "job-1".to_owned(),
-            draft_digest: sha256_hex(b"draft"),
-            bundle_digest: sha256_hex(b"bundle"),
-            manifest_digest: sha256_hex(b"manifest"),
-            task_id: "task-1".to_owned(),
-            scope_id: "scope-1".to_owned(),
-            input_digest: sha256_hex(b"validator-input"),
-            output_digest: sha256_hex(b"validator-output"),
-            terminal_disposition: "accepted".to_owned(),
-            proof_ceiling: "candidate-only".to_owned(),
-        };
+        use crate::draft::valid_receipt;
+        let receipt = valid_receipt(&sha256_hex(b"draft"), fence());
         receipt.validate().expect("valid receipt");
         let item = ValidatedCurationItem {
             receipt: receipt.clone(),
@@ -737,38 +709,40 @@ mod tests {
             task_id: "task-1".to_owned(),
             scope_id: "scope-1".to_owned(),
             budget_note: "within dimension".to_owned(),
+            state_fence: fence(),
         };
         item.validate().expect("valid item");
-        let json = serde_json::to_string(&item).expect("serialize");
-        let back: ValidatedCurationItem = serde_json::from_str(&json).expect("roundtrip");
-        back.validate().expect("roundtripped item stays valid");
+        let wire = serde_json::to_string(&item).expect("serialize");
+        let back: ValidatedCurationItem = serde_json::from_str(&wire).expect("roundtrip");
+        back.validate().expect("roundtrip valid");
         assert_eq!(back, item);
-        assert_eq!(back.receipt, receipt);
-        assert_eq!(back.source_digest, sha256_hex(b"curation-source"));
-        assert_eq!(back.target_denominator, "scope-1:2-of-2");
-        assert_eq!(back.task_id, "task-1");
-        assert_eq!(back.scope_id, "scope-1");
-        assert_eq!(back.receipt.proof_ceiling, "candidate-only");
-        assert_eq!(back.receipt.terminal_disposition, "accepted");
-        let request = sample_request();
-        request.validate().expect("valid request");
-        let json = serde_json::to_string(&request).expect("serialize");
-        let back: TypedCurationHandlerRequest = serde_json::from_str(&json).expect("roundtrip");
-        back.validate().expect("roundtripped request stays valid");
-        assert_eq!(back, request);
-        assert_eq!(back.job_id, "job-1");
-        assert_eq!(back.scope_id, "scope-1");
-        assert_eq!(back.task_id, "task-1");
-        assert_eq!(back.state_fence, fence());
         assert_eq!(
-            back.payload,
-            CurationPayload::Merge(MergePayload {
-                left: "a".to_owned(),
-                right: "b".to_owned(),
-                merged: "ab".to_owned(),
-                target_evidence: crate::curation::sample_facets(),
-            })
+            back.receipt.preservation_digest,
+            sha256_hex(b"preservation")
         );
+        assert_eq!(back.receipt.budget_digest, sha256_hex(b"budget"));
+        for (from, to) in [
+            ("task-1", ""),
+            ("scope-1", ""),
+            ("\"merge\"", "\"mergeX\""),
+            ("structure_repair", "structure_repairX"),
+            ("source_digest\":\"", "source_digest\":\"zz"),
+            ("scope-1:2-of-2", ""),
+            ("within dimension", ""),
+        ] {
+            let mutated = wire.replacen(from, to, 1);
+            let parsed: ValidatedCurationItem = serde_json::from_str(&mutated).expect("parse");
+            assert!(
+                parsed.validate().is_err(),
+                "mutation {from}->{to} must fail"
+            );
+        }
+        let mut fenced = item.clone();
+        fenced.state_fence = StateFence::new(
+            AuthorityEpoch::genesis(),
+            ResourceGeneration::new(2).expect("counter"),
+        );
+        assert!(fenced.validate().is_err());
     }
 
     // WORK_UNIT_CASE: 578/30
@@ -928,7 +902,7 @@ mod tests {
             request_id: request.request_id.clone(),
             kind: request.kind,
             family: request.family,
-            disposition: HandlerDisposition::Candidate,
+            disposition: crate::candidate::CandidateDisposition::Candidate,
             handler_id: "acc-sr".to_owned(),
             request_digest: sha256_hex(request_json.as_bytes()),
             result_digest: sha256_hex(b"merge-candidate-ab"),

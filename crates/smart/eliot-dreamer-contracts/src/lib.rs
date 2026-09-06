@@ -33,15 +33,15 @@ pub use candidate::{
 };
 pub use curation::{CURATION_WIRE_KINDS, CurationKind, CurationPayload, kind_family, parse_kind};
 pub use draft::{
-    BindingExpectation, ClaimResidue, GroundedDreamDraft, ModelDraft, RawProviderOutput,
-    SupportState, ValidatedCurationItem, ValidatedDreamDraft, ValidationReceipt,
+    ClaimResidue, GroundedDreamDraft, ModelDraft, RawProviderOutput, SupportState,
+    ValidatedCurationItem, ValidatedDreamDraft, ValidationReceipt,
 };
 pub use encoding::{canonical_bytes, digest_hex};
 pub use error::ContractViolation;
 pub use job::{DreamJobInput, JobClass, RequesterOrigin, parse_job_class};
 pub use registry::{
     AtomicityMode, CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor,
-    CurationHandlerRegistry, TargetDenominator, TypedCurationHandlerRequest,
+    CurationHandlerPort, CurationHandlerRegistry, TargetDenominator, TypedCurationHandlerRequest,
     TypedCurationHandlerResult, family_of, parse_family,
 };
 pub use screen::{ScreenBinding, ScreenEligibility, ScreenReference, ScreenState};

@@ -11,6 +11,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::curation::{CurationKind, kind_family};
 use crate::error::ContractViolation;
 
 /// Independent preservation dimensions, each judged on its own.
@@ -245,17 +246,15 @@ impl CandidateDisposition {
 
 /// An inert candidate proposal.
 ///
-/// Candidate-only ceiling: the forbidden carry fields must all stay `None`.
-/// Setting any of them to `Some` claims admitted, current-state, effect,
-/// delivery, outcome, promotion, or finish evidence that a candidate must
-/// never carry, and [`CandidateResult::validate`] rejects it.
+/// Carries are unrepresentable: `deny_unknown_fields` rejects unknown
+/// injected keys at decode.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateResult {
     /// Candidate identity (non-blank).
     pub candidate_id: String,
-    /// Curation kind wire spelling (non-blank).
-    pub kind_spelling: String,
+    /// Curation kind.
+    pub kind: CurationKind,
     /// Curation family wire spelling (non-blank).
     pub family_spelling: String,
     /// Owning job identity (non-blank).
@@ -276,37 +275,18 @@ pub struct CandidateResult {
     pub rollback_note: String,
     /// Source handles backing the lineage claim (non-empty, all non-blank).
     pub source_handles: Vec<String>,
-    /// Forbidden: admitted-state evidence must never ride on a candidate.
-    pub admitted_ref: Option<String>,
-    /// Forbidden: current-state evidence must never ride on a candidate.
-    pub current_state_ref: Option<String>,
-    /// Forbidden: effect evidence must never ride on a candidate.
-    pub effect_ref: Option<String>,
-    /// Forbidden: executed-effect evidence must never ride on a candidate.
-    pub executed_ref: Option<String>,
-    /// Forbidden: delivery evidence must never ride on a candidate.
-    pub delivery_ref: Option<String>,
-    /// Forbidden: used-outcome evidence must never ride on a candidate.
-    pub use_ref: Option<String>,
-    /// Forbidden: outcome evidence must never ride on a candidate.
-    pub outcome_ref: Option<String>,
-    /// Forbidden: promotion evidence must never ride on a candidate.
-    pub promotion_ref: Option<String>,
-    /// Forbidden: finish evidence must never ride on a candidate.
-    pub finish_ref: Option<String>,
 }
 
 impl CandidateResult {
-    /// Validates lineage, preservation, notes, and the candidate-only ceiling.
+    /// Validates lineage, preservation, notes, and kind mapping.
     ///
     /// # Errors
     ///
     /// Returns [`ContractViolation`] when any required field is blank,
-    /// lineage handles are empty or blank, preservation fails, or any
-    /// forbidden carry field is `Some`.
+    /// lineage handles are empty or blank, preservation fails, or the
+    /// kind/family mapping mismatches.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         require_non_blank("candidate_id", &self.candidate_id)?;
-        require_non_blank("kind_spelling", &self.kind_spelling)?;
         require_non_blank("family_spelling", &self.family_spelling)?;
         require_non_blank("job_id", &self.job_id)?;
         require_non_blank("scope_id", &self.scope_id)?;
@@ -314,6 +294,12 @@ impl CandidateResult {
         require_non_blank("statement", &self.statement)?;
         require_non_blank("support_note", &self.support_note)?;
         require_non_blank("rollback_note", &self.rollback_note)?;
+        let kind = self.kind;
+        if kind_family(kind) != self.family_spelling.as_str() {
+            return Err(ContractViolation::KindPayload(
+                "kind and family_spelling mismatch".to_owned(),
+            ));
+        }
         if self.source_handles.is_empty() {
             return Err(ContractViolation::MissingField("source_handles"));
         }
@@ -326,15 +312,6 @@ impl CandidateResult {
             }
         }
         self.preservation.overall()?;
-        reject_carry("admitted_ref", self.admitted_ref.as_ref())?;
-        reject_carry("current_state_ref", self.current_state_ref.as_ref())?;
-        reject_carry("effect_ref", self.effect_ref.as_ref())?;
-        reject_carry("executed_ref", self.executed_ref.as_ref())?;
-        reject_carry("delivery_ref", self.delivery_ref.as_ref())?;
-        reject_carry("use_ref", self.use_ref.as_ref())?;
-        reject_carry("outcome_ref", self.outcome_ref.as_ref())?;
-        reject_carry("promotion_ref", self.promotion_ref.as_ref())?;
-        reject_carry("finish_ref", self.finish_ref.as_ref())?;
         Ok(())
     }
 }
@@ -346,19 +323,12 @@ fn require_non_blank(field: &'static str, value: &str) -> Result<(), ContractVio
     Ok(())
 }
 
-fn reject_carry(field: &'static str, value: Option<&String>) -> Result<(), ContractViolation> {
-    if value.is_some() {
-        return Err(ContractViolation::ForbiddenCarry(field.to_owned()));
-    }
-    Ok(())
-}
-
 /// Named proposal for [`propose_candidate`]; replaces 12 positional parameters.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateProposal {
     pub candidate_id: String,
-    pub kind_spelling: String,
+    pub kind: CurationKind,
     pub family_spelling: String,
     pub job_id: String,
     pub scope_id: String,
@@ -381,7 +351,7 @@ pub fn propose_candidate(
 ) -> Result<CandidateResult, ContractViolation> {
     let candidate = CandidateResult {
         candidate_id: proposal.candidate_id,
-        kind_spelling: proposal.kind_spelling,
+        kind: proposal.kind,
         family_spelling: proposal.family_spelling,
         job_id: proposal.job_id,
         scope_id: proposal.scope_id,
@@ -392,15 +362,6 @@ pub fn propose_candidate(
         support_note: proposal.support_note,
         rollback_note: proposal.rollback_note,
         source_handles: proposal.source_handles,
-        admitted_ref: None,
-        current_state_ref: None,
-        effect_ref: None,
-        executed_ref: None,
-        delivery_ref: None,
-        use_ref: None,
-        outcome_ref: None,
-        promotion_ref: None,
-        finish_ref: None,
     };
     candidate.validate()?;
     Ok(candidate)
@@ -429,8 +390,8 @@ mod tests {
     fn valid_candidate() -> CandidateResult {
         propose_candidate(CandidateProposal {
             candidate_id: "candidate-1".to_owned(),
-            kind_spelling: "dream.summary".to_owned(),
-            family_spelling: "summary".to_owned(),
+            kind: CurationKind::Classification,
+            family_spelling: "classification".to_owned(),
             job_id: "job-1".to_owned(),
             scope_id: "scope-1".to_owned(),
             task_id: "task-1".to_owned(),
@@ -441,29 +402,7 @@ mod tests {
             rollback_note: "drop candidate-1 to roll back".to_owned(),
             source_handles: vec!["source-1".to_owned()],
         })
-        .unwrap_or_else(|_| CandidateResult {
-            candidate_id: "candidate-1".to_owned(),
-            kind_spelling: "dream.summary".to_owned(),
-            family_spelling: "summary".to_owned(),
-            job_id: "job-1".to_owned(),
-            scope_id: "scope-1".to_owned(),
-            task_id: "task-1".to_owned(),
-            statement: "proposed statement".to_owned(),
-            disposition: CandidateDisposition::Candidate,
-            preservation: passing_report(),
-            support_note: "supported by source-1".to_owned(),
-            rollback_note: "drop candidate-1 to roll back".to_owned(),
-            source_handles: vec!["source-1".to_owned()],
-            admitted_ref: None,
-            current_state_ref: None,
-            effect_ref: None,
-            executed_ref: None,
-            delivery_ref: None,
-            use_ref: None,
-            outcome_ref: None,
-            promotion_ref: None,
-            finish_ref: None,
-        })
+        .expect("valid candidate")
     }
 
     // WORK_UNIT_CASE: 578/35
@@ -541,21 +480,15 @@ mod tests {
             "promotion_ref",
             "finish_ref",
         ] {
-            let injected = wire.replacen(
-                &std::format!("\"{field}\":null"),
-                &std::format!("\"{field}\":\"x\""),
-                1,
-            );
-            assert_ne!(injected, wire, "carry field {field} must exist as null");
-            let decoded: CandidateResult = serde_json::from_str(&injected).expect("decodes");
-            assert!(
-                matches!(
-                    decoded.validate(),
-                    Err(ContractViolation::ForbiddenCarry(_))
-                ),
-                "carry field {field} must be rejected"
-            );
+            let injected = wire.replacen('{', &std::format!("{{\"{field}\":\"x\","), 1);
+            assert!(serde_json::from_str::<CandidateResult>(&injected).is_err());
         }
+        let mut mismatch = valid_candidate();
+        mismatch.family_spelling = "memory_repair".to_owned();
+        assert!(matches!(
+            mismatch.validate(),
+            Err(ContractViolation::KindPayload(_))
+        ));
         assert!(valid_candidate().validate().is_ok());
     }
 }

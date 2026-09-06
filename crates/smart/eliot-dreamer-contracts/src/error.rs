@@ -18,6 +18,28 @@ pub fn len_i64(len: usize) -> i64 {
     i64::try_from(len).unwrap_or(i64::MAX)
 }
 
+/// Rejects blank, over-long, or control-character text against an exact bound.
+pub fn check_text(value: &str, field: &'static str, max: usize) -> Result<(), ContractViolation> {
+    if value.trim().is_empty() {
+        return Err(ContractViolation::MissingField(field));
+    }
+    if value.len() > max {
+        return Err(ContractViolation::OutOfBounds {
+            field,
+            min: 1,
+            max: len_i64(max),
+            got: len_i64(value.len()),
+        });
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ContractViolation::Malformed {
+            field,
+            reason: "must not contain control characters".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Closed validation failure for any Dreamer contract shape in this crate.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ContractViolation {

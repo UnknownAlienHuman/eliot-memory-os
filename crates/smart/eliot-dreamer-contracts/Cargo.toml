@@ -22,7 +22,6 @@ agent_order = 3
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
-eliot-evidence = { path = "../../foundation/eliot-evidence" }
 blake3 = "1.8.5"
 schemars = { version = "1.2.1", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }

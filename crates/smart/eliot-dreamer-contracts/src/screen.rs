@@ -8,11 +8,13 @@
 //! Generic screens contain no [`CurationKind`][crate::curation::CurationKind]:
 //! kind-specific interpretation belongs to typed handlers, never to this hub.
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{ReceiptId, RequestId, StateFence};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ContractViolation;
+use crate::error::{ContractViolation, check_text};
+
+const MAX_TEXT: usize = 256;
 
 /// Closed screen outcome state.
 ///
@@ -114,12 +116,12 @@ impl ScreenEligibility {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScreenReference {
-    /// Screen identity (non-blank).
+    /// Screen identity.
     pub screen_id: String,
-    /// A-19c screen request identity (non-blank).
-    pub request_id: String,
-    /// Screen result/receipt identity (non-blank).
-    pub receipt_id: String,
+    /// A-19c screen request identity.
+    pub request_id: RequestId,
+    /// Screen result/receipt identity.
+    pub receipt_id: ReceiptId,
     /// Screened target identity (non-blank).
     pub target_id: String,
     /// Digest of the screen result (64 lowercase hex chars).
@@ -191,16 +193,14 @@ impl ScreenReference {
 
     /// Validates identity, digest, and binding shape (not state gating).
     pub fn validate(&self) -> Result<(), ContractViolation> {
-        require_non_blank("screen_id", &self.screen_id)?;
-        require_non_blank("request_id", &self.request_id)?;
-        require_non_blank("receipt_id", &self.receipt_id)?;
-        require_non_blank("target_id", &self.target_id)?;
-        require_non_blank("profile", &self.profile)?;
-        require_non_blank("source_snapshot", &self.source_snapshot)?;
-        require_non_blank("source_revision", &self.source_revision)?;
-        require_non_blank("denominator", &self.denominator)?;
-        require_non_blank("task_id", &self.task_id)?;
-        require_non_blank("scope_id", &self.scope_id)?;
+        check_text(&self.screen_id, "screen_id", MAX_TEXT)?;
+        check_text(&self.target_id, "target_id", MAX_TEXT)?;
+        check_text(&self.profile, "profile", MAX_TEXT)?;
+        check_text(&self.source_snapshot, "source_snapshot", MAX_TEXT)?;
+        check_text(&self.source_revision, "source_revision", MAX_TEXT)?;
+        check_text(&self.denominator, "denominator", MAX_TEXT)?;
+        check_text(&self.task_id, "task_id", MAX_TEXT)?;
+        check_text(&self.scope_id, "scope_id", MAX_TEXT)?;
         require_digest("result_digest", &self.result_digest)?;
         require_digest("item_digest", &self.item_digest)?;
         check_fence(&self.state_fence)?;
@@ -212,8 +212,8 @@ impl ScreenReference {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScreenBinding {
-    pub request_id: String,
-    pub receipt_id: String,
+    pub request_id: RequestId,
+    pub receipt_id: ReceiptId,
     pub screened_targets: Vec<String>,
     pub source_snapshot: String,
     pub source_revision: String,
@@ -225,18 +225,29 @@ pub struct ScreenBinding {
 
 impl ScreenBinding {
     pub fn validate(&self) -> Result<(), ContractViolation> {
-        require_non_blank("request_id", &self.request_id)?;
-        require_non_blank("receipt_id", &self.receipt_id)?;
-        require_non_blank("source_snapshot", &self.source_snapshot)?;
-        require_non_blank("source_revision", &self.source_revision)?;
-        require_non_blank("profile", &self.profile)?;
-        require_non_blank("task_id", &self.task_id)?;
-        require_non_blank("scope_id", &self.scope_id)?;
+        check_text(&self.source_snapshot, "source_snapshot", MAX_TEXT)?;
+        check_text(&self.source_revision, "source_revision", MAX_TEXT)?;
+        check_text(&self.profile, "profile", MAX_TEXT)?;
+        check_text(&self.task_id, "task_id", MAX_TEXT)?;
+        check_text(&self.scope_id, "scope_id", MAX_TEXT)?;
+        if self.request_id.as_str() == self.receipt_id.as_str() {
+            return Err(ContractViolation::ScreenIneligible(
+                "request and receipt identities must differ".to_owned(),
+            ));
+        }
         if self.screened_targets.is_empty() {
             return Err(ContractViolation::MissingField("screened_targets"));
         }
         for target in &self.screened_targets {
-            require_non_blank("screened_targets", target)?;
+            check_text(target, "screened_targets", MAX_TEXT)?;
+        }
+        for (i, target) in self.screened_targets.iter().enumerate() {
+            if self.screened_targets[..i].contains(target) {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "screened_targets",
+                    reason: "duplicate screened target".to_owned(),
+                });
+            }
         }
         check_fence(&self.state_fence)?;
         Ok(())
@@ -249,13 +260,6 @@ fn is_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
-fn require_non_blank(field: &'static str, value: &str) -> Result<(), ContractViolation> {
-    if value.trim().is_empty() {
-        return Err(ContractViolation::MissingField(field));
-    }
-    Ok(())
 }
 
 fn check_fence(fence: &StateFence) -> Result<(), ContractViolation> {
@@ -290,8 +294,8 @@ mod tests {
     fn valid_reference() -> ScreenReference {
         ScreenReference {
             screen_id: "screen-36".to_owned(),
-            request_id: "req-36".to_owned(),
-            receipt_id: "rcpt-36".to_owned(),
+            request_id: RequestId::new("req-36").expect("id"),
+            receipt_id: ReceiptId::new("rcpt-36").expect("id"),
             target_id: "target-36".to_owned(),
             result_digest: "a".repeat(64),
             item_digest: "b".repeat(64),
@@ -316,11 +320,17 @@ mod tests {
         let decoded: ScreenReference =
             serde_json::from_slice(&bytes).expect("reference roundtrips");
         assert_eq!(decoded, reference);
-        assert_eq!(decoded.request_id, "req-36");
-        assert_eq!(decoded.receipt_id, "rcpt-36");
+        assert_eq!(decoded.request_id.as_str(), "req-36");
+        assert_eq!(decoded.receipt_id.as_str(), "rcpt-36");
         assert_eq!(decoded.target_id, "target-36");
         assert_eq!(decoded.source_revision, "rev-7");
         assert_eq!(decoded.eligibility(), ScreenEligibility::Eligible);
+        let mut oversize = valid_reference();
+        oversize.screen_id = "x".repeat(257);
+        assert!(oversize.validate().is_err());
+        let mut control = valid_reference();
+        control.profile = "a\u{7}b".to_owned();
+        assert!(control.validate().is_err());
     }
 
     // WORK_UNIT_CASE: 578/37

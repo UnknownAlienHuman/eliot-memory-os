@@ -14,6 +14,7 @@ use eliot_contracts::{StateFence, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::curation::{kind_family, parse_kind};
 use crate::error::ContractViolation;
 
 /// Exact schema version accepted by the versioned draft stages.
@@ -291,29 +292,9 @@ pub struct ValidationReceipt {
     pub terminal_disposition: String,
     /// Proof ceiling the validator attests, non-blank.
     pub proof_ceiling: String,
-}
-
-/// Expected identities a receipt binds to; replaces positional string binding.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct BindingExpectation {
-    pub job_id: String,
-    pub draft_digest: String,
-    pub bundle_digest: String,
-    pub manifest_digest: String,
-    pub fence: StateFence,
-}
-
-impl BindingExpectation {
-    pub fn for_receipt(receipt: &ValidationReceipt, fence: StateFence) -> Self {
-        Self {
-            job_id: receipt.job_id.clone(),
-            draft_digest: receipt.draft_digest.clone(),
-            bundle_digest: receipt.bundle_digest.clone(),
-            manifest_digest: receipt.manifest_digest.clone(),
-            fence,
-        }
-    }
+    pub state_fence: StateFence,
+    pub preservation_digest: String,
+    pub budget_digest: String,
 }
 
 impl ValidationReceipt {
@@ -331,6 +312,11 @@ impl ValidationReceipt {
         check_digest(&self.manifest_digest, "manifest_digest")?;
         check_digest(&self.input_digest, "input_digest")?;
         check_digest(&self.output_digest, "output_digest")?;
+        check_digest(&self.preservation_digest, "preservation_digest")?;
+        check_digest(&self.budget_digest, "budget_digest")?;
+        self.state_fence
+            .validate()
+            .map_err(|err| fence_error(&err))?;
         match self.terminal_disposition.as_str() {
             "accepted" | "rejected" | "partial" => Ok(()),
             _ => Err(ContractViolation::UnknownVariant {
@@ -340,12 +326,13 @@ impl ValidationReceipt {
         }
     }
 
-    /// Validates the receipt, then binds it to the presented expectation.
+    /// Validates both receipts, then binds self to the recorded receipt.
     ///
-    /// Any mismatch of job, draft, bundle, manifest or fence fails with
+    /// Any mismatch of job, digests, contract, ceiling or fence fails with
     /// [`ContractViolation::BindingMismatch`].
-    pub fn validate_binding(&self, expected: &BindingExpectation) -> Result<(), ContractViolation> {
+    pub fn validate_binding(&self, expected: &ValidationReceipt) -> Result<(), ContractViolation> {
         self.validate()?;
+        expected.validate()?;
         for (field, got, want) in [
             ("job_id", &self.job_id, &expected.job_id),
             ("draft_digest", &self.draft_digest, &expected.draft_digest),
@@ -359,6 +346,26 @@ impl ValidationReceipt {
                 &self.manifest_digest,
                 &expected.manifest_digest,
             ),
+            (
+                "validator_contract",
+                &self.validator_contract,
+                &expected.validator_contract,
+            ),
+            (
+                "preservation_digest",
+                &self.preservation_digest,
+                &expected.preservation_digest,
+            ),
+            (
+                "budget_digest",
+                &self.budget_digest,
+                &expected.budget_digest,
+            ),
+            (
+                "proof_ceiling",
+                &self.proof_ceiling,
+                &expected.proof_ceiling,
+            ),
         ] {
             if got != want {
                 return Err(ContractViolation::BindingMismatch {
@@ -367,7 +374,12 @@ impl ValidationReceipt {
                 });
             }
         }
-        expected.fence.validate().map_err(|err| fence_error(&err))?;
+        if self.state_fence != expected.state_fence {
+            return Err(ContractViolation::BindingMismatch {
+                field: "state_fence",
+                reason: "receipt state_fence binding mismatch".to_string(),
+            });
+        }
         Ok(())
     }
 }
@@ -433,17 +445,61 @@ pub struct ValidatedCurationItem {
     pub task_id: String,
     /// Scope the item is proposed for.
     pub scope_id: String,
+    /// State fence the item is presented under.
+    pub state_fence: StateFence,
     /// Budget note recorded by the validator.
     pub budget_note: String,
 }
 
 impl ValidatedCurationItem {
-    /// Validates the receipt plus the kind/family spellings.
+    /// Validates receipt, kind/family agreement and task/scope/fence binding.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         self.receipt.validate()?;
-        check_identity(&self.kind_spelling, "kind_spelling")?;
-        check_identity(&self.family_spelling, "family_spelling")?;
+        let kind = parse_kind(&self.kind_spelling)?;
+        if kind_family(kind) != self.family_spelling.as_str() {
+            return Err(ContractViolation::KindPayload(
+                "curation item kind/family mismatch".to_owned(),
+            ));
+        }
+        if (&self.task_id, &self.scope_id, &self.state_fence)
+            != (
+                &self.receipt.task_id,
+                &self.receipt.scope_id,
+                &self.receipt.state_fence,
+            )
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "task_scope_fence",
+                reason: "curation item task/scope/fence binding mismatch".to_string(),
+            });
+        }
+        check_digest(&self.source_digest, "source_digest")?;
+        check_identity(&self.target_denominator, "target_denominator")?;
+        check_identity(&self.budget_note, "budget_note")?;
         Ok(())
+    }
+}
+
+/// Samples a valid receipt bound to `draft_digest` for tests.
+#[cfg(test)]
+pub(crate) fn valid_receipt(draft_digest: &str, fence: StateFence) -> ValidationReceipt {
+    ValidationReceipt {
+        schema_version: 1,
+        validator_contract: "a05-validator".to_string(),
+        validator_policy: "policy-7".to_string(),
+        job_id: "job-1".to_string(),
+        draft_digest: draft_digest.to_string(),
+        bundle_digest: sha256_hex(b"bundle"),
+        manifest_digest: sha256_hex(b"manifest"),
+        task_id: "task-1".to_string(),
+        scope_id: "scope-1".to_string(),
+        input_digest: sha256_hex(b"validator-input"),
+        output_digest: sha256_hex(b"validator-output"),
+        terminal_disposition: "accepted".to_string(),
+        proof_ceiling: "candidate-only".to_string(),
+        state_fence: fence,
+        preservation_digest: sha256_hex(b"preservation"),
+        budget_digest: sha256_hex(b"budget"),
     }
 }
 
@@ -500,24 +556,6 @@ mod tests {
                 detail: "supported for warm keys only".to_string(),
             }],
             coverage_note: "covers the single model claim".to_string(),
-        }
-    }
-
-    fn valid_receipt(draft_digest: &str) -> ValidationReceipt {
-        ValidationReceipt {
-            schema_version: 1,
-            validator_contract: "a05-validator".to_string(),
-            validator_policy: "policy-7".to_string(),
-            job_id: "job-1".to_string(),
-            draft_digest: draft_digest.to_string(),
-            bundle_digest: sha256_hex(b"bundle"),
-            manifest_digest: sha256_hex(b"manifest"),
-            task_id: "task-1".to_string(),
-            scope_id: "scope-1".to_string(),
-            input_digest: sha256_hex(b"validator-input"),
-            output_digest: sha256_hex(b"validator-output"),
-            terminal_disposition: "accepted".to_string(),
-            proof_ceiling: "candidate-only".to_string(),
         }
     }
 
@@ -613,10 +651,10 @@ mod tests {
     fn valid_a05_receipt_binding_passes() {
         let model = valid_model();
         let digest = model_wire_digest(&model);
-        let receipt = valid_receipt(&digest);
+        let receipt = valid_receipt(&digest, valid_fence());
         assert!(receipt.validate().is_ok());
-        let expected = BindingExpectation::for_receipt(&receipt, valid_fence());
-        assert!(receipt.validate_binding(&expected).is_ok());
+        let recorded = receipt.clone();
+        assert!(receipt.validate_binding(&recorded).is_ok());
 
         let validated = ValidatedDreamDraft {
             receipt: receipt.clone(),
@@ -630,11 +668,12 @@ mod tests {
         let item = ValidatedCurationItem {
             receipt,
             kind_spelling: "merge".to_string(),
-            family_spelling: "state".to_string(),
+            family_spelling: "structure_repair".to_string(),
             source_digest: sha256_hex(b"curation-source"),
             target_denominator: "scope-1:2-of-2".to_string(),
             task_id: "task-1".to_string(),
             scope_id: "scope-1".to_string(),
+            state_fence: valid_fence(),
             budget_note: "within dimension".to_string(),
         };
         assert!(item.validate().is_ok());
@@ -645,36 +684,40 @@ mod tests {
     fn any_binding_mutation_invalidates_receipt() {
         let model = valid_model();
         let digest = model_wire_digest(&model);
-        let base = valid_receipt(&digest);
-        let expected = BindingExpectation::for_receipt(&base, valid_fence());
-
-        // Changed validator identity.
+        let base = valid_receipt(&digest, valid_fence());
+        let recorded = base.clone();
+        assert!(base.validate_binding(&recorded).is_ok());
+        let wire = serde_json::to_string(&base).expect("receipt serializes");
+        for field in ["job-1", "a05-validator", "candidate-only"] {
+            let mutated_wire = wire.replacen(field, "other", 1);
+            let mutated: ValidationReceipt =
+                serde_json::from_str(&mutated_wire).expect("mutated wire decodes");
+            assert!(mutated.validate_binding(&recorded).is_err());
+        }
+        let mut changed_draft = base.clone();
+        changed_draft.draft_digest = sha256_hex(b"other-draft");
+        assert!(changed_draft.validate_binding(&recorded).is_err());
+        let mut changed_bundle = base.clone();
+        changed_bundle.bundle_digest = sha256_hex(b"other-bundle");
+        assert!(changed_bundle.validate_binding(&recorded).is_err());
+        let mut changed_manifest = base.clone();
+        changed_manifest.manifest_digest = sha256_hex(b"other-manifest");
+        assert!(changed_manifest.validate_binding(&recorded).is_err());
+        let mut changed_preservation = base.clone();
+        changed_preservation.preservation_digest = sha256_hex(b"other-preservation");
+        assert!(changed_preservation.validate_binding(&recorded).is_err());
+        let mut changed_budget = base.clone();
+        changed_budget.budget_digest = sha256_hex(b"other-budget");
+        assert!(changed_budget.validate_binding(&recorded).is_err());
+        let mut changed_fence = base.clone();
+        changed_fence.state_fence = StateFence::new(
+            AuthorityEpoch::genesis(),
+            ResourceGeneration::new(2).expect("non-genesis generation"),
+        );
+        assert!(changed_fence.validate_binding(&recorded).is_err());
         let mut changed_validator = base.clone();
         changed_validator.validator_contract = "   ".to_string();
         assert!(changed_validator.validate().is_err());
-
-        // Changed job binding.
-        let mut changed_job = base.clone();
-        changed_job.job_id = "job-2".to_string();
-        assert!(changed_job.validate_binding(&expected).is_err());
-
-        // Changed draft binding (self-consistent, but no longer this draft).
-        let mut changed_draft = base.clone();
-        changed_draft.draft_digest = sha256_hex(b"other-draft");
-        assert!(changed_draft.validate().is_ok());
-        assert!(changed_draft.validate_binding(&expected).is_err());
-
-        // Changed bundle binding (expected value stays the original).
-        let mut changed_bundle = base.clone();
-        changed_bundle.bundle_digest = sha256_hex(b"other-bundle");
-        assert!(changed_bundle.validate_binding(&expected).is_err());
-
-        // Changed manifest binding (expected value stays the original).
-        let mut changed_manifest = base.clone();
-        changed_manifest.manifest_digest = sha256_hex(b"other-manifest");
-        assert!(changed_manifest.validate_binding(&expected).is_err());
-
-        // Changed digest shape.
         let mut changed_digest = base.clone();
         changed_digest.output_digest = "not-a-digest".to_string();
         assert!(changed_digest.validate().is_err());
