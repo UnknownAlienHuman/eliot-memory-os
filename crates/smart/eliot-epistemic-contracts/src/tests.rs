@@ -2350,6 +2350,12 @@ fn load_bearing_mutation_invalidates_digest() -> CaseResult {
 // WORK_UNIT_CASE: 580/44
 #[test]
 fn malformed_input_bounded_panic_free() -> CaseResult {
+    struct AlwaysFail;
+    impl Serialize for AlwaysFail {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("580/44 canonical"))
+        }
+    }
     // Bounded malformed corpus: every input fails closed on every boundary type, without panicking.
     let corpus = [
         "{\"scope\"",
@@ -2435,5 +2441,9 @@ fn malformed_input_bounded_panic_free() -> CaseResult {
     assert_eq!(failures, 11);
     let bad_lookup = OwnerLookup::new(owner, "not-a-digest").map(|_| ());
     expect_err!(bad_lookup, InvalidDigest, "absence.lookup_proof");
+    assert_eq!(
+        crate::error::canonical_bytes(&AlwaysFail),
+        Err(ContractError::Canonicalization)
+    );
     Ok(())
 }
