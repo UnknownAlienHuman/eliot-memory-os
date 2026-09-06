@@ -1,22 +1,21 @@
-//! Work-unit case coverage for the epistemic contracts boundary.
-//!
-//! One substantive test per assignment case. Fixtures build fully valid
-//! records through the public constructors; negative cases mutate exactly one
-//! load-bearing property and assert the exact closed error.
+//! Work-unit case coverage for the epistemic contracts boundary: one
+//! substantive test per assignment case, built through the public
+//! constructors, each negative mutating exactly one load-bearing property.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ContractId, OperationId, ReceiptId, ResourceGeneration, SourceId,
-    StateFence, TaskId, TaskRevision, sha256_hex,
+    ArtifactId, AuthorityEpoch, ContractId, OperationId, ProductId, RequestId, ResourceGeneration,
+    SourceId, StateFence, TaskId, TaskRevision, sha256_hex,
 };
-use eliot_evidence::{Assertability, EvidenceAuthority, EvidenceFreshness};
+use eliot_evidence::{Assertability, EvidenceAuthority, EvidenceFreshness, VerificationBinding};
+use eliot_receipts::{WorkScope, WorkScopeId};
 use serde::Serialize;
 
 use crate::absence::{AbsenceClaim, BoundedProof, OwnerLookup};
 use crate::admitted::{
-    AdmittedKind, CurrentEpistemicPosition, CurrentEpistemicPositionView, Currentness,
-    PositionState,
+    AdmittedKind, AdmittedReceipt, CurrentEpistemicPosition, CurrentEpistemicPositionView,
+    Currentness, PositionId, PositionRevision, PositionState,
 };
 use crate::assertability::PositionAssertability;
 use crate::assumption::AssumptionRecord;
@@ -37,7 +36,7 @@ use crate::identity::{
     PropositionId, SourceRevisionId, TransformedLineage, ValidityId,
 };
 use crate::investigation::{InvestigationKind, InvestigationRequirement};
-use crate::provenance::ProvenanceClosure;
+use crate::provenance::{ProvenanceClosure, SourceLineage};
 use crate::receipt::{CoverageReceipt, MemberDisposition, MemberOutcome, OmittedMember};
 use crate::request::PositionRequest;
 use crate::support::{SupportRecord, SupportResult, ValidityBounds, weakest_link};
@@ -45,7 +44,9 @@ use crate::temporal::{TemporalPrecedence, TemporalRecord, TemporalRole};
 use crate::transition::{
     EpistemicTransition, InvalidationKind, InvalidationRecord, SupportDelta, TransitionTrigger,
 };
-use crate::verifier::{DisclosureClass, RequiredVerifier, VerifierStanding};
+use crate::verifier::{
+    DisclosureClass, PrivacyHandling, RequiredVerifier, SourceAssurance, VerifierStanding,
+};
 
 type CaseResult = Result<(), ContractError>;
 
@@ -77,8 +78,51 @@ fn operation() -> Result<OperationId, ContractError> {
     OperationId::new("operation-580").map_err(|_| case_error("case.operation"))
 }
 
-fn admission() -> Result<ReceiptId, ContractError> {
-    ReceiptId::new("receipt-580").map_err(|_| case_error("case.receipt"))
+fn case_request_id() -> Result<RequestId, ContractError> {
+    RequestId::new("request-580").map_err(|_| case_error("case.request"))
+}
+
+fn case_work_scope() -> Result<WorkScope, ContractError> {
+    Ok(WorkScope {
+        scope_id: WorkScopeId::new("scope-580").map_err(|_| case_error("case.scope"))?,
+        product_id: ProductId::new("product-580").map_err(|_| case_error("case.product"))?,
+        resource_generation: ResourceGeneration::genesis(),
+        state_fence: case_fence(),
+    })
+}
+
+fn case_verification() -> Result<VerificationBinding, ContractError> {
+    let contract = ContractId::new("contract-580").map_err(|_| case_error("case.contract"))?;
+    Ok(VerificationBinding {
+        contract_id: contract,
+        run_id: artifact("run-580")?,
+        revision: "r1".to_owned(),
+    })
+}
+
+fn case_temporal() -> Result<TemporalRecord, ContractError> {
+    TemporalRecord::new(10, 11, 12, 13, 14)
+}
+
+fn owner_lookup_for(denominator_digest: &str) -> Result<OwnerLookup, ContractError> {
+    let owner = source("owner-1")?;
+    let proof = OwnerLookup::expected_proof(
+        &owner,
+        denominator_digest,
+        case_digest("proof-receipt").as_str(),
+    )?;
+    OwnerLookup::new(owner, proof)
+}
+
+fn case_lineage() -> Result<SourceLineage, ContractError> {
+    SourceLineage::new(
+        source("source-a")?,
+        "r1",
+        case_digest("content-a"),
+        Some("raw-1".to_owned()),
+        BTreeSet::new(),
+        None,
+    )
 }
 
 fn prop() -> Result<PropositionId, ContractError> {
@@ -97,49 +141,52 @@ fn wires<T: Serialize>(values: &[T]) -> Result<Vec<String>, ContractError> {
     values.iter().map(encoded).collect()
 }
 
-fn support_record(result: SupportResult) -> Result<SupportRecord, ContractError> {
-    let mut handles = BTreeSet::new();
-    let handles_required = !matches!(
-        result,
-        SupportResult::Unknown
-            | SupportResult::OutsideManifest
-            | SupportResult::JustifiedNotApplicable
-    );
-    if handles_required {
-        handles.insert(artifact("handle-1")?);
-    }
-    let reopen = if matches!(result, SupportResult::Stale | SupportResult::Superseded) {
-        Some("reopen-probe-1".to_owned())
-    } else {
-        None
-    };
+fn support_with(
+    result: SupportResult,
+    handles: BTreeSet<ArtifactId>,
+    reopen: Option<String>,
+    assurance: Option<SourceAssurance>,
+) -> Result<SupportRecord, ContractError> {
     SupportRecord::new(
         prop()?,
         result,
         handles,
         validity()?,
+        GradeAssignment::known(EvidenceGrade::Grounded),
         task()?,
         case_fence(),
+        None,
+        assurance,
         reopen,
         case_digest("proof-support"),
     )
 }
 
+fn support_record(result: SupportResult) -> Result<SupportRecord, ContractError> {
+    let mut handles = BTreeSet::new();
+    if !matches!(
+        result,
+        SupportResult::Unknown
+            | SupportResult::OutsideManifest
+            | SupportResult::JustifiedNotApplicable
+    ) {
+        handles.insert(artifact("handle-1")?);
+    }
+    let reopen = matches!(result, SupportResult::Stale | SupportResult::Superseded)
+        .then(|| "reopen-probe-1".to_owned());
+    support_with(result, handles, reopen, None)
+}
+
 fn denominator() -> Result<CoverageDenominator, ContractError> {
-    let mut members = BTreeSet::new();
-    members.insert(artifact("member-1")?);
-    members.insert(artifact("member-2")?);
-    let mut roles = BTreeSet::new();
-    roles.insert("primary".to_owned());
     CoverageDenominator::new(
         "source-record",
         "schema-1",
         "rev-1",
         "scope-580",
         case_fence(),
-        members,
-        roles,
-        None,
+        BTreeSet::from([artifact("member-1")?, artifact("member-2")?]),
+        BTreeSet::from(["primary".to_owned()]),
+        Some(QuerySpec::new("query-text", "query-rev")?),
         Some(FrontierSpec::new("frontier-1", "frontier-rev")?),
         SnapshotRef::new("snapshot-1", source("owner-1")?)?,
         Vec::new(),
@@ -149,23 +196,32 @@ fn denominator() -> Result<CoverageDenominator, ContractError> {
     )
 }
 
-fn frozen_query_digest() -> Result<String, ContractError> {
-    shape_digest(&QuerySpec::new("query-text", "query-rev")?)
-}
-
-fn receipt_for(denominator_digest: String) -> Result<CoverageReceipt, ContractError> {
-    let mut groups = BTreeSet::new();
-    groups.insert("group-1".to_owned());
+fn receipt_with(
+    denominator_digest: String,
+    size: u64,
+    members: Vec<MemberOutcome>,
+    omissions: Vec<OmittedMember>,
+) -> Result<CoverageReceipt, ContractError> {
     CoverageReceipt::new(
         QuerySpec::new("query-text", "query-rev")?,
         FrontierSpec::new("frontier-1", "frontier-rev")?,
         denominator_digest,
-        2,
+        size,
         task()?,
         "scope-580",
         case_fence(),
         "policy-1",
-        groups,
+        BTreeSet::from(["group-1".to_owned()]),
+        members,
+        omissions,
+        case_digest("proof-receipt"),
+    )
+}
+
+fn receipt_for(denominator_digest: String) -> Result<CoverageReceipt, ContractError> {
+    receipt_with(
+        denominator_digest,
+        2,
         vec![
             MemberOutcome::new(artifact("member-1")?, MemberDisposition::Observed),
             MemberOutcome::new(
@@ -174,55 +230,39 @@ fn receipt_for(denominator_digest: String) -> Result<CoverageReceipt, ContractEr
             ),
         ],
         Vec::new(),
-        case_digest("proof-receipt"),
     )
 }
 
-fn absence() -> Result<AbsenceClaim, ContractError> {
-    let frozen = denominator()?;
+fn absence_for(frozen: &CoverageDenominator) -> Result<AbsenceClaim, ContractError> {
     let frozen_digest = frozen.digest.clone();
-    let receipt = receipt_for(frozen_digest.clone())?;
     AbsenceClaim::new(
         prop()?,
-        "domain-580",
+        "source-record",
+        "schema-1",
         "scope-580",
         Some(100),
         Some(200),
         "v1",
         task()?,
         "policy-1",
-        OwnerLookup::new(source("owner-1")?, case_digest("lookup-580"))?,
-        frozen_digest,
+        owner_lookup_for(frozen_digest.as_str())?,
+        frozen_digest.clone(),
         DenominatorKind::CompleteScope,
-        frozen_query_digest()?,
+        shape_digest(&QuerySpec::new("query-text", "query-rev")?)?,
         "snapshot-1",
-        receipt,
+        receipt_for(frozen_digest)?,
         BoundedProof::new(case_digest("proof-absence"), 128)?,
     )
 }
 
 fn absence_with_denominator() -> Result<(CoverageDenominator, AbsenceClaim), ContractError> {
     let frozen = denominator()?;
-    let frozen_digest = frozen.digest.clone();
-    let receipt = receipt_for(frozen_digest.clone())?;
-    let claim = AbsenceClaim::new(
-        prop()?,
-        "domain-580",
-        "scope-580",
-        Some(100),
-        Some(200),
-        "v1",
-        task()?,
-        "policy-1",
-        OwnerLookup::new(source("owner-1")?, case_digest("lookup-580"))?,
-        frozen_digest,
-        DenominatorKind::CompleteScope,
-        frozen_query_digest()?,
-        "snapshot-1",
-        receipt,
-        BoundedProof::new(case_digest("proof-absence"), 128)?,
-    )?;
+    let claim = absence_for(&frozen)?;
     Ok((frozen, claim))
+}
+
+fn absence() -> Result<AbsenceClaim, ContractError> {
+    absence_with_denominator().map(|(_, claim)| claim)
 }
 
 fn claim_entry_with(
@@ -230,17 +270,13 @@ fn claim_entry_with(
     verdict: ClaimVerdict,
     audit: ClaimAuditOutcome,
     with_counter: bool,
+    grade: EvidenceGrade,
+    dependencies: BTreeSet<ClaimId>,
 ) -> Result<ClaimEntry, ContractError> {
     let mut counterevidence = BTreeSet::new();
     if with_counter {
         counterevidence.insert(artifact("counter-1")?);
     }
-    let mut assumptions = BTreeSet::new();
-    assumptions.insert("assumption-1".to_owned());
-    let mut discriminators = BTreeSet::new();
-    discriminators.insert("discriminator-1".to_owned());
-    let mut support = BTreeSet::new();
-    support.insert(artifact("handle-1")?);
     ClaimEntry::new(
         ClaimId::new(name)?,
         case_digest(name),
@@ -249,15 +285,17 @@ fn claim_entry_with(
         counterevidence,
         None,
         EvidenceAuthority::DeterministicRuntimeTest,
-        EvidenceGrade::Grounded,
-        BTreeSet::new(),
+        GradeAssignment::known(grade),
+        dependencies,
         validity()?,
+        None,
         case_digest("coverage-claim"),
-        support,
+        BTreeSet::from([artifact("handle-1")?]),
+        BTreeMap::new(),
         BTreeSet::new(),
-        EvidenceGrade::Grounded,
-        assumptions,
-        discriminators,
+        grade,
+        BTreeSet::from(["assumption-1".to_owned()]),
+        BTreeSet::from(["discriminator-1".to_owned()]),
     )
 }
 
@@ -267,6 +305,8 @@ fn claim_entry(name: &str) -> Result<ClaimEntry, ContractError> {
         ClaimVerdict::Accepted,
         ClaimAuditOutcome::Supported,
         false,
+        EvidenceGrade::Grounded,
+        BTreeSet::new(),
     )
 }
 
@@ -276,58 +316,82 @@ fn rejected_entry(name: &str) -> Result<ClaimEntry, ContractError> {
         ClaimVerdict::Rejected,
         ClaimAuditOutcome::Contradicted,
         false,
-    )
-}
-
-fn claim_map() -> Result<ClaimMap, ContractError> {
-    let mut admitted = BTreeSet::new();
-    admitted.insert(ClaimId::new("claim-a")?);
-    admitted.insert(ClaimId::new("claim-b")?);
-    let mut group_members = BTreeSet::new();
-    group_members.insert(ClaimId::new("claim-a")?);
-    ClaimMap::new(
-        ManifestId::new("manifest-580")?,
-        admitted,
-        vec![claim_entry("claim-a")?, rejected_entry("claim-b")?],
-        vec![DependenceGroup::new(
-            "group-1",
-            group_members,
-            "shared lineage family",
-        )?],
+        EvidenceGrade::Grounded,
         BTreeSet::new(),
     )
 }
 
-fn causal() -> Result<CausalClaim, ContractError> {
-    let mut rivals = BTreeSet::new();
-    rivals.insert("rival-1".to_owned());
-    let mut confounders = BTreeSet::new();
-    confounders.insert("confounder-1".to_owned());
-    let mut evidence_refs = BTreeSet::new();
-    evidence_refs.insert(artifact("evidence-1")?);
+fn try_map(
+    admitted: BTreeSet<ClaimId>,
+    entries: Vec<ClaimEntry>,
+    groups: Vec<DependenceGroup>,
+) -> Result<ClaimMap, ContractError> {
+    ClaimMap::new(
+        ManifestId::new("manifest-580")?,
+        admitted,
+        entries,
+        groups,
+        BTreeSet::new(),
+    )
+}
+
+fn claim_map() -> Result<ClaimMap, ContractError> {
+    try_map(
+        BTreeSet::from([ClaimId::new("claim-a")?, ClaimId::new("claim-b")?]),
+        vec![claim_entry("claim-a")?, rejected_entry("claim-b")?],
+        vec![DependenceGroup::new(
+            "group-1",
+            BTreeSet::from([ClaimId::new("claim-a")?]),
+            "shared lineage family",
+        )?],
+    )
+}
+
+fn try_causal(
+    status: CausalStatus,
+    mechanism: &str,
+    rivals: BTreeSet<String>,
+    confounders: BTreeSet<String>,
+    evidence_refs: BTreeSet<ArtifactId>,
+    ceiling: EvidenceGrade,
+) -> Result<CausalClaim, ContractError> {
     CausalClaim::new(
         prop()?,
-        CausalStatus::Mechanism,
-        "mechanism-1",
+        status,
+        mechanism,
         rivals,
         confounders,
         evidence_refs,
-        EvidenceGrade::Corroborated,
+        "outcome-delta-1",
+        "control-1",
+        source("source-a")?,
+        LineageRootId::new("lineage-1")?,
+        case_fence(),
+        case_temporal()?,
+        case_digest("proof-causal"),
+        ceiling,
         "scope-580",
     )
 }
 
+fn causal() -> Result<CausalClaim, ContractError> {
+    try_causal(
+        CausalStatus::Mechanism,
+        "mechanism-1",
+        BTreeSet::from(["rival-1".to_owned()]),
+        BTreeSet::from(["confounder-1".to_owned()]),
+        BTreeSet::from([artifact("evidence-1")?]),
+        EvidenceGrade::Corroborated,
+    )
+}
+
 fn conflict() -> Result<ConflictSet, ContractError> {
-    let mut counters = BTreeSet::new();
-    counters.insert(artifact("counter-1")?);
-    let mut first_assumptions = BTreeSet::new();
-    first_assumptions.insert("assumption-p1".to_owned());
     let positions = vec![
         ConflictPosition::new(
             source("source-a")?,
             "stance-a",
-            first_assumptions,
-            counters,
+            BTreeSet::from(["assumption-p1".to_owned()]),
+            BTreeSet::from([artifact("counter-1")?]),
             false,
         )?,
         ConflictPosition::new(
@@ -338,29 +402,18 @@ fn conflict() -> Result<ConflictSet, ContractError> {
             true,
         )?,
     ];
-    let mut evidence_refs = BTreeSet::new();
-    evidence_refs.insert(artifact("evidence-1")?);
-    let mut owners = BTreeSet::new();
-    owners.insert(source("source-a")?);
-    owners.insert(source("source-b")?);
-    let mut lineage = BTreeSet::new();
-    lineage.insert(LineageRootId::new("lineage-1")?);
-    let mut unresolved = BTreeSet::new();
-    unresolved.insert("open-question-1".to_owned());
-    let mut unresolved_owners = BTreeSet::new();
-    unresolved_owners.insert(source("source-b")?);
     ConflictSet::new(
         "conflict-1",
         ConflictKind::Epistemic,
         "scope-580",
         Some(task()?),
         positions,
-        evidence_refs,
-        owners,
-        lineage,
+        BTreeSet::from([artifact("evidence-1")?]),
+        BTreeSet::from([source("source-a")?, source("source-b")?]),
+        BTreeSet::from([LineageRootId::new("lineage-1")?]),
         BTreeSet::new(),
-        unresolved,
-        unresolved_owners,
+        BTreeSet::from(["open-question-1".to_owned()]),
+        BTreeSet::from([source("source-b")?]),
         ArgumentAcceptability::Contested,
         BTreeSet::new(),
         Some("probe-1".to_owned()),
@@ -374,11 +427,11 @@ fn conflict() -> Result<ConflictSet, ContractError> {
 fn candidate() -> Result<EpistemicPositionCandidate, ContractError> {
     let map = claim_map()?;
     let frozen = denominator()?;
-    let mut rivals = BTreeSet::new();
-    rivals.insert("rival-1".to_owned());
     EpistemicPositionCandidate::new(
         prop()?,
         TaskRevision::genesis(),
+        case_request_id()?,
+        case_work_scope()?,
         None,
         task()?,
         "attempt-580",
@@ -386,6 +439,7 @@ fn candidate() -> Result<EpistemicPositionCandidate, ContractError> {
         Some(100),
         Some(200),
         "v1",
+        "file",
         case_fence(),
         ManifestId::new("manifest-580")?,
         vec![claim_entry("claim-a")?, rejected_entry("claim-b")?],
@@ -394,25 +448,32 @@ fn candidate() -> Result<EpistemicPositionCandidate, ContractError> {
         BTreeSet::new(),
         vec![support_record(SupportResult::Supported)?],
         BTreeSet::new(),
-        EvidenceGrade::Grounded,
+        GradeAssignment::known(EvidenceGrade::Grounded),
         EvidenceAuthority::DeterministicRuntimeTest,
         DisclosureClass::Open,
+        PrivacyHandling::Unrestricted,
+        BTreeSet::new(),
         None,
         case_digest("proof-candidate"),
-        rivals,
+        BTreeSet::from(["rival-1".to_owned()]),
         PositionAssertability::HypothesisCandidate,
         None,
     )
 }
 
-fn request() -> Result<PositionRequest, ContractError> {
-    let mut records = BTreeSet::new();
-    records.insert(artifact("handle-1")?);
+fn request_with(
+    attempt: &str,
+    records: BTreeSet<ArtifactId>,
+) -> Result<PositionRequest, ContractError> {
     PositionRequest::new(
         "question-580",
+        case_request_id()?,
+        operation()?,
+        "idem-580",
+        case_work_scope()?,
         prop()?,
         task()?,
-        "attempt-580",
+        attempt,
         TaskRevision::genesis(),
         "scope-580",
         validity()?,
@@ -421,18 +482,30 @@ fn request() -> Result<PositionRequest, ContractError> {
     )
 }
 
-fn assumption() -> Result<AssumptionRecord, ContractError> {
+fn request() -> Result<PositionRequest, ContractError> {
+    request_with("attempt-580", BTreeSet::from([artifact("handle-1")?]))
+}
+
+fn assumption_with(id: &str, statement: &str) -> Result<AssumptionRecord, ContractError> {
     AssumptionRecord::new(
-        "assumption-1",
-        "the registry mirrors the snapshot",
-        "scope-580",
+        id,
+        statement,
+        "registry-snapshot",
+        "close the world for this read",
+        "a stale mirror misstates membership",
+        BTreeSet::new(),
+        validity()?,
         source("owner-1")?,
         task()?,
         case_fence(),
     )
 }
 
-fn investigation() -> Result<InvestigationRequirement, ContractError> {
+fn assumption() -> Result<AssumptionRecord, ContractError> {
+    assumption_with("assumption-1", "the registry mirrors the snapshot")
+}
+
+fn investigation_with(target: &str) -> Result<InvestigationRequirement, ContractError> {
     InvestigationRequirement::new(
         "requirement-1",
         prop()?,
@@ -440,25 +513,23 @@ fn investigation() -> Result<InvestigationRequirement, ContractError> {
         task()?,
         case_fence(),
         InvestigationKind::ObtainEvidence,
-        "open-route",
+        target,
         "no route observed the subject",
     )
 }
 
+fn investigation() -> Result<InvestigationRequirement, ContractError> {
+    investigation_with("open-route")
+}
+
 fn closure() -> Result<ProvenanceClosure, ContractError> {
-    let mut records = BTreeSet::new();
-    records.insert(artifact("handle-1")?);
-    let mut sources = BTreeSet::new();
-    sources.insert(source("source-a")?);
-    let mut raw_handles = BTreeSet::new();
-    raw_handles.insert("raw-1".to_owned());
-    let mut revisions = BTreeSet::new();
-    revisions.insert("r1".to_owned());
     ProvenanceClosure::new(
-        records,
-        sources,
-        raw_handles,
-        revisions,
+        BTreeSet::from([artifact("handle-1")?]),
+        BTreeSet::from([source("source-a")?]),
+        BTreeSet::from(["raw-1".to_owned()]),
+        BTreeSet::from(["r1".to_owned()]),
+        vec![case_lineage()?],
+        None,
         false,
         Assertability::NonAssertableUnverified,
         "scope-580",
@@ -466,63 +537,98 @@ fn closure() -> Result<ProvenanceClosure, ContractError> {
     )
 }
 
-fn competent_verifier() -> Result<RequiredVerifier, ContractError> {
+fn verifier_with(
+    revision: &str,
+    freshness: EvidenceFreshness,
+) -> Result<RequiredVerifier, ContractError> {
     let contract = ContractId::new("contract-580").map_err(|_| case_error("case.contract"))?;
     RequiredVerifier::new(
         contract,
-        "r1",
-        EvidenceFreshness::ExactCandidate,
+        revision,
+        freshness,
         VerifierStanding::Competent,
         None,
+        case_verification()?,
+        case_digest("proof-candidate"),
     )
+}
+
+fn competent_verifier() -> Result<RequiredVerifier, ContractError> {
+    verifier_with("r1", EvidenceFreshness::ExactCandidate)
 }
 
 fn admitted() -> Result<CurrentEpistemicPosition, ContractError> {
     CurrentEpistemicPosition::new(
-        prop()?,
-        TaskRevision::genesis(),
-        admission()?,
-        case_digest("admission-payload"),
-        source("owner-1")?,
+        AdmittedReceipt::new(
+            case_digest("admission-payload"),
+            source("owner-1")?,
+            "r1",
+            "scope-580",
+            case_fence(),
+            case_digest("evidence-view"),
+            case_digest("coverage-view"),
+            case_digest("conflict-view"),
+            case_digest("proof-view"),
+            PositionId::new("position-580")?,
+            PositionRevision::genesis(),
+        )?,
         Currentness::Current,
         BTreeSet::new(),
         ClaimId::new("claim-a")?,
-        "scope-580",
-        case_fence(),
-        case_digest("evidence-view"),
-        case_digest("coverage-view"),
-        case_digest("conflict-view"),
-        case_digest("proof-view"),
     )
 }
 
-fn transition() -> Result<EpistemicTransition, ContractError> {
-    let mut evidence_refs = BTreeSet::new();
-    evidence_refs.insert(artifact("evidence-1")?);
-    let mut added = BTreeSet::new();
-    added.insert(artifact("handle-2")?);
-    let mut retained = BTreeSet::new();
-    retained.insert(artifact("handle-1")?);
-    let mut reasons = BTreeSet::new();
-    reasons.insert("fresh observation".to_owned());
+fn try_transition(
+    trigger: TransitionTrigger,
+    before: SupportResult,
+    after: SupportResult,
+    before_a: PositionAssertability,
+    after_a: PositionAssertability,
+    delta: SupportDelta,
+    evidence_refs: BTreeSet<ArtifactId>,
+) -> Result<EpistemicTransition, ContractError> {
     EpistemicTransition::new(
         prop()?,
+        task()?,
+        "attempt-580",
+        case_request_id()?,
+        "idem-580",
+        case_work_scope()?,
+        case_digest("candidate-580"),
         TaskRevision::genesis(),
         case_fence(),
-        TransitionTrigger::NewEvidence,
+        trigger,
         evidence_refs,
         operation()?,
-        SupportResult::Partial,
-        SupportResult::Supported,
-        PositionAssertability::HypothesisCandidate,
-        PositionAssertability::QualifiedInference,
-        SupportDelta::new(added, BTreeSet::new(), retained, reasons)?,
+        before,
+        after,
+        before_a,
+        after_a,
+        delta,
         case_digest("coverage-delta"),
         case_digest("conflict-delta"),
+        None,
         "revert to predecessor",
         None,
         None,
         case_digest("proof-transition"),
+    )
+}
+
+fn transition() -> Result<EpistemicTransition, ContractError> {
+    try_transition(
+        TransitionTrigger::NewEvidence,
+        SupportResult::Partial,
+        SupportResult::Supported,
+        PositionAssertability::HypothesisCandidate,
+        PositionAssertability::QualifiedInference,
+        SupportDelta::new(
+            BTreeSet::from([artifact("handle-2")?]),
+            BTreeSet::new(),
+            BTreeSet::from([artifact("handle-1")?]),
+            BTreeSet::from(["fresh observation".to_owned()]),
+        )?,
+        BTreeSet::from([artifact("evidence-1")?]),
     )
 }
 
@@ -707,7 +813,7 @@ fn transformed_retains_raw_lineage() -> CaseResult {
     assert_eq!(
         restated,
         Err(ContractError::ImpossibleCombination {
-            field: "lineage.derived_revision",
+            field: "lineage.derived_revision"
         })
     );
     Ok(())
@@ -721,13 +827,13 @@ fn wrong_task_scope_fence_rejected() -> CaseResult {
     assert_eq!(
         record.validate_for(&other_task, "scope-580", &case_fence()),
         Err(ContractError::TaskMismatch {
-            field: "support.task_id",
+            field: "support.task_id"
         })
     );
     assert_eq!(
         record.validate_for(&task()?, "scope-other", &case_fence()),
         Err(ContractError::ScopeMismatch {
-            field: "support.scope",
+            field: "support.scope"
         })
     );
     let other_fence = StateFence::new(
@@ -737,37 +843,37 @@ fn wrong_task_scope_fence_rejected() -> CaseResult {
     assert_eq!(
         record.validate_for(&task()?, "scope-580", &other_fence),
         Err(ContractError::FenceMismatch {
-            field: "support.fence",
+            field: "support.fence"
         })
     );
     record.validate_for(&task()?, "scope-580", &case_fence())?;
-    // Attempt binding: a request is bound to one attempt, and retries never
-    // share it. The wrong attempt fails exactly like the wrong task.
+    // Attempt binding: a request is bound to one attempt; retries never
+    // share it.
     let inquiry = request()?;
     assert!(inquiry.applies_to(&prop()?));
     inquiry.validate_for(&task()?, "attempt-580", "scope-580", &case_fence())?;
     assert_eq!(
         inquiry.validate_for(&task()?, "attempt-other", "scope-580", &case_fence()),
         Err(ContractError::TaskMismatch {
-            field: "request.attempt_id",
+            field: "request.attempt_id"
         })
     );
     assert_eq!(
         inquiry.validate_for(&other_task, "attempt-580", "scope-580", &case_fence()),
         Err(ContractError::TaskMismatch {
-            field: "request.task_id",
+            field: "request.task_id"
         })
     );
     assert_eq!(
         inquiry.validate_for(&task()?, "attempt-580", "scope-other", &case_fence()),
         Err(ContractError::ScopeMismatch {
-            field: "request.scope",
+            field: "request.scope"
         })
     );
     assert_eq!(
         inquiry.validate_for(&task()?, "attempt-580", "scope-580", &other_fence),
         Err(ContractError::FenceMismatch {
-            field: "request.fence",
+            field: "request.fence"
         })
     );
     Ok(())
@@ -807,26 +913,12 @@ fn assert_short_bound(
 
 fn assert_statement_bound() -> CaseResult {
     let statement_max = "x".repeat(MAX_STATEMENT_TEXT);
-    AssumptionRecord::new(
-        "assumption-1",
-        statement_max.as_str(),
-        "scope-580",
-        source("owner-1")?,
-        task()?,
-        case_fence(),
-    )?;
+    assumption_with("assumption-1", statement_max.as_str())?;
     let statement_over = "x".repeat(MAX_STATEMENT_TEXT + 1);
     assert_eq!(
-        AssumptionRecord::new(
-            "assumption-1",
-            statement_over.as_str(),
-            "scope-580",
-            source("owner-1")?,
-            task()?,
-            case_fence(),
-        ),
+        assumption_with("assumption-1", statement_over.as_str()),
         Err(ContractError::TooLong {
-            field: "assumption.statement",
+            field: "assumption.statement"
         })
     );
     Ok(())
@@ -839,78 +931,29 @@ fn variable_field_boundaries_and_one_over() -> CaseResult {
         ValidityBounds::new("scope-580", None, None, "v1", value).map(|_| ())
     })?;
     assert_short_bound("request.attempt_id", &|value| {
-        let mut records = BTreeSet::new();
-        records.insert(artifact("handle-1")?);
-        PositionRequest::new(
-            "question-580",
-            prop()?,
-            task()?,
-            value,
-            TaskRevision::genesis(),
-            "scope-580",
-            validity()?,
-            case_fence(),
-            records,
-        )
-        .map(|_| ())
+        request_with(value, BTreeSet::from([artifact("handle-1")?])).map(|_| ())
     })?;
     assert_short_bound("investigation.target", &|value| {
-        InvestigationRequirement::new(
-            "requirement-1",
-            prop()?,
-            "scope-580",
-            task()?,
-            case_fence(),
-            InvestigationKind::ObtainEvidence,
-            value,
-            "reason-1",
-        )
-        .map(|_| ())
+        investigation_with(value).map(|_| ())
     })?;
     assert_short_bound("verifier.revision", &|value| {
-        let contract = ContractId::new("contract-580").map_err(|_| case_error("case.contract"))?;
-        RequiredVerifier::new(
-            contract,
-            value,
-            EvidenceFreshness::ExactCandidate,
-            VerifierStanding::Competent,
-            None,
-        )
-        .map(|_| ())
+        verifier_with(value, EvidenceFreshness::ExactCandidate).map(|_| ())
     })?;
     assert_statement_bound()?;
     let mut handles = BTreeSet::new();
     for index in 0..MAX_HANDLES {
         handles.insert(artifact(format!("handle-{index}").as_str())?);
     }
-    let full = SupportRecord::new(
-        prop()?,
-        SupportResult::Supported,
-        handles,
-        validity()?,
-        task()?,
-        case_fence(),
-        None,
-        case_digest("proof-support"),
-    )?;
+    let full = support_with(SupportResult::Supported, handles, None, None)?;
     full.validate()?;
     let mut overflow = BTreeSet::new();
     for index in 0..=MAX_HANDLES {
         overflow.insert(artifact(format!("overflow-{index}").as_str())?);
     }
     assert_eq!(
-        SupportRecord::new(
-            prop()?,
-            SupportResult::Supported,
-            overflow,
-            validity()?,
-            task()?,
-            case_fence(),
-            None,
-            case_digest("proof-support"),
-        ),
+        support_with(SupportResult::Supported, overflow, None, None),
         Err(ContractError::TooMany {
-            field: "support.handles",
+            field: "support.handles"
         })
     );
     Ok(())
@@ -924,13 +967,13 @@ fn weakest_ceiling_bounds_grade() -> CaseResult {
     assert_eq!(
         EvidenceGrade::check_ceiling(EvidenceGrade::Grounded, EvidenceGrade::Orienting),
         Err(ContractError::CeilingViolation {
-            field: "grade.ceiling",
+            field: "grade.ceiling"
         })
     );
     assert_eq!(
         EvidenceGrade::check_ceiling(EvidenceGrade::ScienceGrade, EvidenceGrade::Corroborated),
         Err(ContractError::CeilingViolation {
-            field: "grade.ceiling",
+            field: "grade.ceiling"
         })
     );
     Ok(())
@@ -944,7 +987,7 @@ fn dependents_cannot_raise_grade() -> CaseResult {
     assert_eq!(
         EvidenceGrade::check_dependent(EvidenceGrade::Grounded, EvidenceGrade::Corroborated),
         Err(ContractError::CeilingViolation {
-            field: "grade.dependent",
+            field: "grade.dependent"
         })
     );
     Ok(())
@@ -969,7 +1012,7 @@ fn unknown_grade_distinct_from_lowest_known() -> CaseResult {
     assert_eq!(
         both.validate(),
         Err(ContractError::ImpossibleCombination {
-            field: "grade.assignment",
+            field: "grade.assignment"
         })
     );
     let neither = GradeAssignment {
@@ -1033,6 +1076,31 @@ fn handles_preserved_on_support() -> CaseResult {
     assert_eq!(decoded.handles, record.handles);
     assert!(decoded.handles.contains(&artifact("handle-1")?));
     assert_eq!(encoded(&decoded)?, encoded(&record)?);
+    // Source assurance binds the proof to its source: a matching proof
+    // validates, a foreign proof fails.
+    let assured = support_with(
+        SupportResult::Supported,
+        BTreeSet::from([artifact("handle-1")?]),
+        None,
+        Some(SourceAssurance::new(
+            source("source-a")?,
+            "r1",
+            case_digest("proof-support"),
+        )?),
+    )?;
+    assured.validate()?;
+    let mut foreign = assured.clone();
+    foreign.assurance = Some(SourceAssurance::new(
+        source("source-a")?,
+        "r1",
+        case_digest("other-proof"),
+    )?);
+    assert_eq!(
+        foreign.validate(),
+        Err(ContractError::DigestMismatch {
+            field: "support.assurance"
+        })
+    );
     Ok(())
 }
 
@@ -1045,10 +1113,8 @@ fn scope_time_version_precision_mismatch_limits_support() -> CaseResult {
     assert!(!bounds.covers("scope-580", Some(50), "v1", "file"));
     assert!(!bounds.covers("scope-580", Some(250), "v1", "file"));
     assert!(!bounds.covers("scope-580", Some(150), "v2", "file"));
-    // Precision participates: a finer assertion than the support is not
-    // covered, while a coarser one is. Support at `file` precision covers
-    // `file`, `directory`, `package`, and `repository` assertions, never a
-    // `symbol` or `line` assertion.
+    // Precision participates: support at `file` covers `file` and coarser
+    // assertions, never `symbol` or `line` ones.
     assert!(!bounds.covers("scope-580", Some(150), "v1", "symbol"));
     assert!(!bounds.covers("scope-580", Some(150), "v1", "line"));
     assert!(bounds.covers("scope-580", Some(150), "v1", "directory"));
@@ -1063,7 +1129,7 @@ fn scope_time_version_precision_mismatch_limits_support() -> CaseResult {
     assert_eq!(
         record.validate_for(&task()?, "scope-other", &case_fence()),
         Err(ContractError::ScopeMismatch {
-            field: "support.scope",
+            field: "support.scope"
         })
     );
     let narrowed = ValidityBounds::new("scope-580", Some(100), Some(200), "v2", "symbol")?;
@@ -1095,7 +1161,7 @@ fn vague_denominator_rejected() -> CaseResult {
     assert_eq!(
         vague_class.validate(),
         Err(ContractError::VagueDenominator {
-            field: "coverage.class",
+            field: "coverage.class"
         })
     );
     let mut vague_scope = base.clone();
@@ -1103,35 +1169,13 @@ fn vague_denominator_rejected() -> CaseResult {
     assert_eq!(
         vague_scope.validate(),
         Err(ContractError::VagueDenominator {
-            field: "coverage.scope",
+            field: "coverage.scope"
         })
     );
-    // Known-empty is owned, exact, terminal, and bound: an empty member list
-    // with the complete marker, no query or frontier standing in, and the
-    // owner snapshot the emptiness was read from.
-    let known_empty = CoverageDenominator::new(
-        "source-record",
-        "schema-1",
-        "rev-1",
-        "scope-580",
-        case_fence(),
-        BTreeSet::new(),
-        BTreeSet::new(),
-        None,
-        None,
-        SnapshotRef::new("snapshot-1", source("owner-1")?)?,
-        Vec::new(),
-        PaginationBounds::new(0, 1, 0, false)?,
-        validity()?,
-        DenominatorKind::CompleteScope,
-    )?;
-    known_empty.validate()?;
-    assert!(known_empty.members.is_empty());
-    // Unowned empty proves nothing: sampled or unknown kinds with no members
-    // and no query standing in fail, and so does a query-fronted empty that
-    // claims completeness without enumerating it.
-    for kind in [DenominatorKind::SampledWithMethod, DenominatorKind::Unknown] {
-        let unowned = CoverageDenominator::new(
+    // Known-empty is owned, exact, and bound: complete marker plus the
+    // query, frontier, and owner snapshot the emptiness was read from.
+    let empty = |kind, query: Option<QuerySpec>, frontier: Option<FrontierSpec>, total| {
+        CoverageDenominator::new(
             "source-record",
             "schema-1",
             "rev-1",
@@ -1139,41 +1183,40 @@ fn vague_denominator_rejected() -> CaseResult {
             case_fence(),
             BTreeSet::new(),
             BTreeSet::new(),
-            None,
-            None,
+            query,
+            frontier,
             SnapshotRef::new("snapshot-1", source("owner-1")?)?,
             Vec::new(),
-            PaginationBounds::new(0, 1, 1, false)?,
+            PaginationBounds::new(0, 1, total, false)?,
             validity()?,
             kind,
-        );
+        )
+    };
+    let known_empty = empty(
+        DenominatorKind::CompleteScope,
+        Some(QuerySpec::new("query-text", "query-rev")?),
+        Some(FrontierSpec::new("frontier-1", "frontier-rev")?),
+        0,
+    )?;
+    known_empty.validate()?;
+    assert!(known_empty.members.is_empty());
+    for kind in [DenominatorKind::SampledWithMethod, DenominatorKind::Unknown] {
         assert_eq!(
-            unowned,
+            empty(kind, None, None, 1),
             Err(ContractError::IncompleteDenominator {
-                field: "coverage.members",
+                field: "coverage.members"
             })
         );
     }
-    let fronted_empty = CoverageDenominator::new(
-        "source-record",
-        "schema-1",
-        "rev-1",
-        "scope-580",
-        case_fence(),
-        BTreeSet::new(),
-        BTreeSet::new(),
-        Some(QuerySpec::new("query-text", "query-rev")?),
-        None,
-        SnapshotRef::new("snapshot-1", source("owner-1")?)?,
-        Vec::new(),
-        PaginationBounds::new(0, 1, 0, false)?,
-        validity()?,
-        DenominatorKind::CompleteScope,
-    );
     assert_eq!(
-        fronted_empty,
+        empty(
+            DenominatorKind::CompleteScope,
+            Some(QuerySpec::new("query-text", "query-rev")?),
+            None,
+            0,
+        ),
         Err(ContractError::IncompleteDenominator {
-            field: "coverage.members",
+            field: "coverage.members"
         })
     );
     // A complete scope is never truncated and its total always equals its
@@ -1183,7 +1226,7 @@ fn vague_denominator_rejected() -> CaseResult {
     assert_eq!(
         truncated.validate(),
         Err(ContractError::IncompleteDenominator {
-            field: "coverage.bounds",
+            field: "coverage.bounds"
         })
     );
     let mut short = base;
@@ -1191,7 +1234,7 @@ fn vague_denominator_rejected() -> CaseResult {
     assert_eq!(
         short.validate(),
         Err(ContractError::ArithmeticMismatch {
-            field: "coverage.bounds",
+            field: "coverage.bounds"
         })
     );
     Ok(())
@@ -1211,7 +1254,7 @@ fn one_disposition_per_member() -> CaseResult {
     assert_eq!(
         duplicated.validate(),
         Err(ContractError::Duplicate {
-            field: "receipt.members",
+            field: "receipt.members"
         })
     );
     Ok(())
@@ -1222,18 +1265,9 @@ fn one_disposition_per_member() -> CaseResult {
 fn coverage_arithmetic_validated() -> CaseResult {
     let frozen = denominator()?;
     receipt_for(frozen.digest.clone())?.validate()?;
-    let mut groups = BTreeSet::new();
-    groups.insert("group-1".to_owned());
-    let short = CoverageReceipt::new(
-        QuerySpec::new("query-text", "query-rev")?,
-        FrontierSpec::new("frontier-1", "frontier-rev")?,
+    let short = receipt_with(
         frozen.digest.clone(),
         3,
-        task()?,
-        "scope-580",
-        case_fence(),
-        "policy-1",
-        groups.clone(),
         vec![MemberOutcome::new(
             artifact("member-1")?,
             MemberDisposition::Observed,
@@ -1242,24 +1276,16 @@ fn coverage_arithmetic_validated() -> CaseResult {
             artifact("member-2")?,
             "duplicate of member-1",
         )?],
-        case_digest("proof-receipt"),
     );
     assert_eq!(
         short,
         Err(ContractError::ArithmeticMismatch {
-            field: "receipt.denominator_size",
+            field: "receipt.denominator_size"
         })
     );
-    let reconciled = CoverageReceipt::new(
-        QuerySpec::new("query-text", "query-rev")?,
-        FrontierSpec::new("frontier-1", "frontier-rev")?,
+    let reconciled = receipt_with(
         frozen.digest.clone(),
         2,
-        task()?,
-        "scope-580",
-        case_fence(),
-        "policy-1",
-        groups,
         vec![MemberOutcome::new(
             artifact("member-1")?,
             MemberDisposition::Observed,
@@ -1268,7 +1294,6 @@ fn coverage_arithmetic_validated() -> CaseResult {
             artifact("member-2")?,
             "duplicate of member-1",
         )?],
-        case_digest("proof-receipt"),
     )?;
     reconciled.validate()?;
     Ok(())
@@ -1309,24 +1334,14 @@ fn all_receipt_dispositions_distinct() -> CaseResult {
 #[test]
 fn partial_truncated_unavailable_not_complete_or_known_empty() -> CaseResult {
     let frozen = denominator()?;
-    let mut groups = BTreeSet::new();
-    groups.insert("group-1".to_owned());
-    let gapped = CoverageReceipt::new(
-        QuerySpec::new("query-text", "query-rev")?,
-        FrontierSpec::new("frontier-1", "frontier-rev")?,
+    let gapped = receipt_with(
         frozen.digest.clone(),
         2,
-        task()?,
-        "scope-580",
-        case_fence(),
-        "policy-1",
-        groups,
         vec![
             MemberOutcome::new(artifact("member-1")?, MemberDisposition::Observed),
             MemberOutcome::new(artifact("member-2")?, MemberDisposition::Unavailable),
         ],
         Vec::new(),
-        case_digest("proof-receipt"),
     )?;
     assert!(!gapped.is_terminal());
     let truncated = PaginationBounds::new(0, 1, 2, true)?;
@@ -1345,55 +1360,37 @@ fn valid_absence_claim() -> CaseResult {
     claim.check_context(
         "scope-580",
         &case_fence(),
-        frozen_query_digest()?.as_str(),
+        shape_digest(&QuerySpec::new("query-text", "query-rev")?)?.as_str(),
         "snapshot-1",
     )?;
     Ok(())
 }
 
-fn absence_receipt_with(
-    second: MemberDisposition,
-) -> Result<(CoverageDenominator, CoverageReceipt), ContractError> {
+fn absence_probe(second: MemberDisposition) -> Result<AbsenceClaim, ContractError> {
     let frozen = denominator()?;
-    let mut groups = BTreeSet::new();
-    groups.insert("group-1".to_owned());
-    let receipt = CoverageReceipt::new(
-        QuerySpec::new("query-text", "query-rev")?,
-        FrontierSpec::new("frontier-1", "frontier-rev")?,
+    let receipt = receipt_with(
         frozen.digest.clone(),
         2,
-        task()?,
-        "scope-580",
-        case_fence(),
-        "policy-1",
-        groups,
         vec![
             MemberOutcome::new(artifact("member-1")?, MemberDisposition::Observed),
             MemberOutcome::new(artifact("member-2")?, second),
         ],
         Vec::new(),
-        case_digest("proof-receipt"),
     )?;
-    Ok((frozen, receipt))
-}
-
-fn absence_attempt(
-    frozen: &CoverageDenominator,
-    receipt: CoverageReceipt,
-) -> Result<AbsenceClaim, ContractError> {
     AbsenceClaim::new(
         prop()?,
-        "domain-580",
+        "source-record",
+        "schema-1",
         "scope-580",
         Some(100),
         Some(200),
         "v1",
         task()?,
         "policy-1",
-        OwnerLookup::new(source("owner-1")?, case_digest("lookup-580"))?,
+        owner_lookup_for(frozen.digest.as_str())?,
         frozen.digest.clone(),
         DenominatorKind::CompleteScope,
-        frozen_query_digest()?,
+        shape_digest(&QuerySpec::new("query-text", "query-rev")?)?,
         "snapshot-1",
         receipt,
         BoundedProof::new(case_digest("proof-absence"), 64)?,
@@ -1406,17 +1403,18 @@ fn no_match_timeout_silence_exhaustion_not_absence() -> CaseResult {
     let frozen = denominator()?;
     let sampled = AbsenceClaim::new(
         prop()?,
-        "domain-580",
+        "source-record",
+        "schema-1",
         "scope-580",
         None,
         None,
         "v1",
         task()?,
         "policy-1",
-        OwnerLookup::new(source("owner-1")?, case_digest("lookup-580"))?,
+        owner_lookup_for(frozen.digest.as_str())?,
         frozen.digest.clone(),
         DenominatorKind::SampledWithMethod,
-        frozen_query_digest()?,
+        shape_digest(&QuerySpec::new("query-text", "query-rev")?)?,
         "snapshot-1",
         receipt_for(frozen.digest.clone())?,
         BoundedProof::new(case_digest("proof-absence"), 64)?,
@@ -1424,12 +1422,11 @@ fn no_match_timeout_silence_exhaustion_not_absence() -> CaseResult {
     assert_eq!(
         sampled,
         Err(ContractError::IncompleteDenominator {
-            field: "absence.denominator_kind",
+            field: "absence.denominator_kind"
         })
     );
-    // Every non-terminal disposition keeps the question open: no-match,
-    // timeout, silence, exhaustion, and every other unresolved outcome can
-    // never construct absence evidence.
+    // Every non-terminal disposition keeps the question open: none of them
+    // ever constructs absence evidence.
     for disposition in [
         MemberDisposition::Unavailable,
         MemberDisposition::Blocked,
@@ -1441,12 +1438,10 @@ fn no_match_timeout_silence_exhaustion_not_absence() -> CaseResult {
         MemberDisposition::DependentDuplicate,
         MemberDisposition::Unknown,
     ] {
-        let (frozen_case, receipt) = absence_receipt_with(disposition)?;
-        assert!(!receipt.is_terminal());
         assert_eq!(
-            absence_attempt(&frozen_case, receipt),
+            absence_probe(disposition),
             Err(ContractError::ImpossibleCombination {
-                field: "absence.receipt",
+                field: "absence.receipt"
             })
         );
     }
@@ -1457,7 +1452,7 @@ fn no_match_timeout_silence_exhaustion_not_absence() -> CaseResult {
 #[test]
 fn changed_query_scope_fence_snapshot_invalidates_absence() -> CaseResult {
     let claim = absence()?;
-    let live_query = frozen_query_digest()?;
+    let live_query = shape_digest(&QuerySpec::new("query-text", "query-rev")?)?;
     assert!(
         claim
             .check_context(
@@ -1500,37 +1495,21 @@ fn changed_query_scope_fence_snapshot_invalidates_absence() -> CaseResult {
             "snapshot-1"
         ),
         Err(ContractError::StaleContext {
-            field: "absence.context",
+            field: "absence.context"
         })
     );
     // Closed binding negatives: each axis fails distinctly against the exact
-    // frozen denominator, even when the claim is internally valid.
+    // frozen denominator.
     let (frozen, valid) = absence_with_denominator()?;
     let mut other = denominator()?;
     assert!(other.members.remove(&artifact("member-2")?));
     other.members.insert(artifact("member-9")?);
     other.digest = other.compute_digest()?;
-    let unrelated = AbsenceClaim::new(
-        prop()?,
-        "domain-580",
-        "scope-580",
-        Some(100),
-        Some(200),
-        "v1",
-        task()?,
-        "policy-1",
-        OwnerLookup::new(source("owner-1")?, case_digest("lookup-580"))?,
-        other.digest.clone(),
-        DenominatorKind::CompleteScope,
-        frozen_query_digest()?,
-        "snapshot-1",
-        receipt_for(other.digest.clone())?,
-        BoundedProof::new(case_digest("proof-absence"), 128)?,
-    )?;
+    let unrelated = absence_for(&other)?;
     assert_eq!(
         unrelated.validate_closed(&frozen),
         Err(ContractError::DigestMismatch {
-            field: "absence.denominator_digest",
+            field: "absence.denominator_digest"
         })
     );
     let mut swapped_query = valid.clone();
@@ -1539,7 +1518,7 @@ fn changed_query_scope_fence_snapshot_invalidates_absence() -> CaseResult {
     assert_eq!(
         swapped_query.validate_closed(&frozen),
         Err(ContractError::DigestMismatch {
-            field: "absence.query_digest",
+            field: "absence.query_digest"
         })
     );
     let mut swapped_snapshot = valid.clone();
@@ -1548,7 +1527,7 @@ fn changed_query_scope_fence_snapshot_invalidates_absence() -> CaseResult {
     assert_eq!(
         swapped_snapshot.validate_closed(&frozen),
         Err(ContractError::StaleContext {
-            field: "absence.snapshot",
+            field: "absence.snapshot"
         })
     );
     Ok(())
@@ -1562,9 +1541,7 @@ fn valid_claim_map_with_component_coverage() -> CaseResult {
     assert!(map.has_component_coverage());
     assert_eq!(map.entries.len(), 2);
     assert_eq!(map.digest, map.compute_digest()?);
-    // Accepted, rejected, countered, and unresolved handle sets validate:
-    // every admitted claim is entered exactly once, verdict sets partition
-    // the entries, assumptions are listed, and the weakest link is computed.
+    // Accepted, rejected, countered, and unresolved handle sets validate.
     assert_eq!(map.accepted_ids().len(), 1);
     assert!(map.accepted_ids().contains(&ClaimId::new("claim-a")?));
     assert_eq!(map.rejected_ids().len(), 1);
@@ -1582,36 +1559,25 @@ fn valid_claim_map_with_component_coverage() -> CaseResult {
 // WORK_UNIT_CASE: 580/26
 #[test]
 fn outside_manifest_rejected() -> CaseResult {
-    let mut admitted = BTreeSet::new();
-    admitted.insert(ClaimId::new("claim-a")?);
-    let attempt = ClaimMap::new(
-        ManifestId::new("manifest-580")?,
+    let admitted = BTreeSet::from([ClaimId::new("claim-a")?]);
+    let attempt = try_map(
         admitted,
         vec![claim_entry("claim-a")?, claim_entry("claim-outside")?],
         Vec::new(),
-        BTreeSet::new(),
     );
     assert_eq!(
         attempt,
         Err(ContractError::OutsideManifest {
-            field: "claim.entries",
+            field: "claim.entries"
         })
     );
     // An admitted claim without an entry is unrepresented, not covered.
-    let mut partial_admitted = BTreeSet::new();
-    partial_admitted.insert(ClaimId::new("claim-a")?);
-    partial_admitted.insert(ClaimId::new("claim-ghost")?);
-    let partial = ClaimMap::new(
-        ManifestId::new("manifest-580")?,
-        partial_admitted,
-        vec![claim_entry("claim-a")?],
-        Vec::new(),
-        BTreeSet::new(),
-    );
+    let partial_admitted = BTreeSet::from([ClaimId::new("claim-a")?, ClaimId::new("claim-ghost")?]);
+    let partial = try_map(partial_admitted, vec![claim_entry("claim-a")?], Vec::new());
     assert_eq!(
         partial,
         Err(ContractError::MissingReference {
-            field: "claim.entries",
+            field: "claim.entries"
         })
     );
     Ok(())
@@ -1620,23 +1586,19 @@ fn outside_manifest_rejected() -> CaseResult {
 // WORK_UNIT_CASE: 580/27
 #[test]
 fn duplicate_and_same_id_changed_rejected() -> CaseResult {
-    let mut admitted = BTreeSet::new();
-    admitted.insert(ClaimId::new("claim-a")?);
-    let duplicate = ClaimMap::new(
-        ManifestId::new("manifest-580")?,
+    let admitted = BTreeSet::from([ClaimId::new("claim-a")?]);
+    let duplicate = try_map(
         admitted.clone(),
         vec![claim_entry("claim-a")?, claim_entry("claim-a")?],
         Vec::new(),
-        BTreeSet::new(),
     );
     assert_eq!(
         duplicate,
         Err(ContractError::Duplicate {
-            field: "claim.entries",
+            field: "claim.entries"
         })
     );
-    let changed = ClaimMap::new(
-        ManifestId::new("manifest-580")?,
+    let changed = try_map(
         admitted,
         vec![
             claim_entry_with(
@@ -1644,63 +1606,47 @@ fn duplicate_and_same_id_changed_rejected() -> CaseResult {
                 ClaimVerdict::Accepted,
                 ClaimAuditOutcome::Supported,
                 false,
+                EvidenceGrade::Grounded,
+                BTreeSet::new(),
             )?,
             claim_entry_with(
                 "claim-a",
                 ClaimVerdict::Countered,
                 ClaimAuditOutcome::Contradicted,
                 true,
+                EvidenceGrade::Grounded,
+                BTreeSet::new(),
             )?,
         ],
         Vec::new(),
-        BTreeSet::new(),
     );
     assert_eq!(
         changed,
         Err(ContractError::Duplicate {
-            field: "claim.entries",
+            field: "claim.entries"
         })
     );
-    // An accepted entry with neither a supporting handle nor an explicit
-    // unresolved marker is not component coverage: digest, assumption, and
-    // discriminator presence never counts on its own.
+    // An accepted entry with neither handle nor unresolved marker is not
+    // component coverage.
     let mut bare = claim_entry("claim-a")?;
     bare.support.clear();
     assert_eq!(
         bare.validate(),
         Err(ContractError::EmptyCollection {
-            field: "claim.support",
+            field: "claim.support"
         })
     );
     Ok(())
 }
 
 fn dependent_entry(name: &str, grade: EvidenceGrade) -> Result<ClaimEntry, ContractError> {
-    let mut dependencies = BTreeSet::new();
-    dependencies.insert(ClaimId::new("claim-a")?);
-    let mut assumptions = BTreeSet::new();
-    assumptions.insert("assumption-1".to_owned());
-    let mut discriminators = BTreeSet::new();
-    discriminators.insert("discriminator-1".to_owned());
-    let mut support = BTreeSet::new();
-    support.insert(artifact("handle-1")?);
-    ClaimEntry::new(
-        ClaimId::new(name)?,
-        case_digest(name),
+    claim_entry_with(
+        name,
         ClaimVerdict::Accepted,
         ClaimAuditOutcome::Supported,
-        BTreeSet::new(),
-        None,
-        EvidenceAuthority::DeterministicRuntimeTest,
+        false,
         grade,
-        dependencies,
-        validity()?,
-        case_digest("coverage-claim"),
-        support,
-        BTreeSet::new(),
-        grade,
-        assumptions,
-        discriminators,
+        BTreeSet::from([ClaimId::new("claim-a")?]),
     )
 }
 
@@ -1711,34 +1657,21 @@ fn dependence_groups_explicit() -> CaseResult {
     assert_eq!(map.groups.len(), 1);
     assert!(map.groups[0].members.contains(&ClaimId::new("claim-a")?));
     assert!(DependenceGroup::new("empty-group", BTreeSet::new(), "no members").is_err());
-    let mut admitted = BTreeSet::new();
-    admitted.insert(ClaimId::new("claim-a")?);
-    let mut dangling = BTreeSet::new();
-    dangling.insert(ClaimId::new("claim-ghost")?);
+    let admitted = BTreeSet::from([ClaimId::new("claim-a")?]);
+    let dangling = BTreeSet::from([ClaimId::new("claim-ghost")?]);
     let mut entry = claim_entry("claim-a")?;
     entry.dependencies = dangling;
-    let attempt = ClaimMap::new(
-        ManifestId::new("manifest-580")?,
-        admitted,
-        vec![entry],
-        Vec::new(),
-        BTreeSet::new(),
-    );
+    let attempt = try_map(admitted, vec![entry], Vec::new());
     assert_eq!(
         attempt,
         Err(ContractError::MissingReference {
-            field: "claim.dependencies",
+            field: "claim.dependencies"
         })
     );
-    // Dependence groups cover dependent claims: a dependency edge with no
-    // group holding both ends together fails, even at equal grades.
-    let mut pair_admitted = BTreeSet::new();
-    pair_admitted.insert(ClaimId::new("claim-a")?);
-    pair_admitted.insert(ClaimId::new("claim-b")?);
-    let mut lone_members = BTreeSet::new();
-    lone_members.insert(ClaimId::new("claim-a")?);
-    let uncovered = ClaimMap::new(
-        ManifestId::new("manifest-580")?,
+    // Dependence groups must hold both ends of a dependency edge together.
+    let pair_admitted = BTreeSet::from([ClaimId::new("claim-a")?, ClaimId::new("claim-b")?]);
+    let lone_members = BTreeSet::from([ClaimId::new("claim-a")?]);
+    let uncovered = try_map(
         pair_admitted.clone(),
         vec![
             claim_entry("claim-a")?,
@@ -1749,21 +1682,16 @@ fn dependence_groups_explicit() -> CaseResult {
             lone_members,
             "holds only one end",
         )?],
-        BTreeSet::new(),
     );
     assert_eq!(
         uncovered,
         Err(ContractError::MissingReference {
-            field: "claim.groups",
+            field: "claim.groups"
         })
     );
-    // Quoting a claim never upgrades it: a dependent above its parent grade
-    // fails even with a covering group.
-    let mut both_members = BTreeSet::new();
-    both_members.insert(ClaimId::new("claim-a")?);
-    both_members.insert(ClaimId::new("claim-b")?);
-    let upgraded = ClaimMap::new(
-        ManifestId::new("manifest-580")?,
+    // Quoting a claim never upgrades it, even with a covering group.
+    let both_members = BTreeSet::from([ClaimId::new("claim-a")?, ClaimId::new("claim-b")?]);
+    let upgraded = try_map(
         pair_admitted,
         vec![
             claim_entry("claim-a")?,
@@ -1774,12 +1702,11 @@ fn dependence_groups_explicit() -> CaseResult {
             both_members,
             "holds both ends",
         )?],
-        BTreeSet::new(),
     );
     assert_eq!(
         upgraded,
         Err(ContractError::CeilingViolation {
-            field: "grade.dependent",
+            field: "grade.dependent"
         })
     );
     Ok(())
@@ -1796,14 +1723,8 @@ fn five_temporal_roles_distinct() -> CaseResult {
         TemporalRole::Commit,
     ];
     assert_eq!(
-        wires(&roles)?,
-        vec![
-            "\"EVENT\"",
-            "\"EFFECTIVE\"",
-            "\"OBSERVATION\"",
-            "\"INGESTION\"",
-            "\"COMMIT\""
-        ]
+        wires(&roles)?.join(","),
+        "\"EVENT\",\"EFFECTIVE\",\"OBSERVATION\",\"INGESTION\",\"COMMIT\""
     );
     let record = TemporalRecord::new(10, 11, 12, 13, 14)?;
     assert_eq!(record.role_time(TemporalRole::Event), 10);
@@ -1826,18 +1747,11 @@ fn chrono_corr_dependency_causal_no_cross_decode() -> CaseResult {
     assert!(!precedence_json.contains("mechanism"));
     assert!(!causal_json.contains("before_ms"));
     // Six-way separation: chronology, mechanism, assumption, support,
-    // investigation, and request never cross-decode in any direction.
+    // investigation, and request never cross-decode.
     let wires = [
         precedence_json,
         causal_json,
-        encoded(&AssumptionRecord::new(
-            "assumption-1",
-            "the registry mirrors the snapshot",
-            "scope-580",
-            source("owner-1")?,
-            task()?,
-            case_fence(),
-        )?)?,
+        encoded(&assumption()?)?,
         encoded(&support_record(SupportResult::Supported)?)?,
         encoded(&investigation()?)?,
         encoded(&request()?)?,
@@ -1876,49 +1790,13 @@ fn chrono_corr_dependency_causal_no_cross_decode() -> CaseResult {
     Ok(())
 }
 
-fn dependency_reading_ceiling(
-    rivals: &BTreeSet<String>,
-    confounders: &BTreeSet<String>,
-    evidence_refs: &BTreeSet<ArtifactId>,
-) -> CaseResult {
-    // A dependency reading below science grade validates; science grade never
-    // does, for any reading.
-    CausalClaim::new(
-        prop()?,
-        CausalStatus::DependencyPreconditionEnablement,
-        "enablement sketch",
-        rivals.clone(),
-        confounders.clone(),
-        evidence_refs.clone(),
-        EvidenceGrade::Corroborated,
-        "scope-580",
-    )?
-    .validate()?;
-    assert_eq!(
-        CausalClaim::new(
-            prop()?,
-            CausalStatus::DependencyPreconditionEnablement,
-            "enablement sketch",
-            rivals.clone(),
-            confounders.clone(),
-            evidence_refs.clone(),
-            EvidenceGrade::ScienceGrade,
-            "scope-580",
-        ),
-        Err(ContractError::CeilingViolation {
-            field: "causal.ceiling",
-        })
-    );
-    Ok(())
-}
-
 // WORK_UNIT_CASE: 580/31
 #[test]
 fn causal_needs_mechanism_rivals_evidence() -> CaseResult {
     let mechanism = causal()?;
     mechanism.validate()?;
-    // Causal fields survive the round-trip: mechanism sketch, rivals,
-    // confounders, evidence references, ceiling, and scope are all preserved.
+    // Causal fields survive the round-trip: mechanism, rivals, confounders,
+    // evidence, ceiling, and scope.
     let decoded: CausalClaim =
         serde_json::from_str(&encoded(&mechanism)?).map_err(|_| ContractError::Canonicalization)?;
     assert_eq!(decoded, mechanism);
@@ -1930,80 +1808,90 @@ fn causal_needs_mechanism_rivals_evidence() -> CaseResult {
         CausalStatus::DependencyPreconditionEnablement.wire_name(),
         "DEPENDENCY_PRECONDITION_ENABLEMENT",
     );
-    let mut rivals = BTreeSet::new();
-    rivals.insert("rival-1".to_owned());
-    let mut confounders = BTreeSet::new();
-    confounders.insert("confounder-1".to_owned());
-    let mut evidence_refs = BTreeSet::new();
-    evidence_refs.insert(artifact("evidence-1")?);
-    dependency_reading_ceiling(&rivals, &confounders, &evidence_refs)?;
+    let rivals = BTreeSet::from(["rival-1".to_owned()]);
+    let confounders = BTreeSet::from(["confounder-1".to_owned()]);
+    let evidence_refs = BTreeSet::from([artifact("evidence-1")?]);
+    // A dependency reading below science grade validates; science grade
+    // never does.
+    try_causal(
+        CausalStatus::DependencyPreconditionEnablement,
+        "enablement sketch",
+        rivals.clone(),
+        confounders.clone(),
+        evidence_refs.clone(),
+        EvidenceGrade::Corroborated,
+    )?
+    .validate()?;
+    assert_eq!(
+        try_causal(
+            CausalStatus::DependencyPreconditionEnablement,
+            "enablement sketch",
+            rivals.clone(),
+            confounders.clone(),
+            evidence_refs.clone(),
+            EvidenceGrade::ScienceGrade,
+        ),
+        Err(ContractError::CeilingViolation {
+            field: "causal.ceiling"
+        })
+    );
     assert!(
-        CausalClaim::new(
-            prop()?,
+        try_causal(
             CausalStatus::Mechanism,
             "mechanism-1",
             BTreeSet::new(),
             BTreeSet::new(),
             evidence_refs.clone(),
             EvidenceGrade::Corroborated,
-            "scope-580",
         )
         .is_err()
     );
     assert!(
-        CausalClaim::new(
-            prop()?,
+        try_causal(
             CausalStatus::Mechanism,
             "mechanism-1",
             rivals.clone(),
             BTreeSet::new(),
             BTreeSet::new(),
             EvidenceGrade::Corroborated,
-            "scope-580",
         )
         .is_err()
     );
     assert!(
-        CausalClaim::new(
-            prop()?,
+        try_causal(
             CausalStatus::Mechanism,
             "   ",
             rivals.clone(),
             BTreeSet::new(),
             evidence_refs.clone(),
             EvidenceGrade::Corroborated,
-            "scope-580",
         )
         .is_err()
     );
     assert_eq!(
-        CausalClaim::new(
-            prop()?,
+        try_causal(
             CausalStatus::Mechanism,
             "mechanism-1",
             rivals.clone(),
-            BTreeSet::new(),
+            confounders.clone(),
             evidence_refs.clone(),
             EvidenceGrade::ScienceGrade,
-            "scope-580",
         ),
         Err(ContractError::CeilingViolation {
-            field: "causal.ceiling",
+            field: "causal.ceiling"
         })
     );
     assert_eq!(
-        CausalClaim::new(
-            prop()?,
+        try_causal(
             CausalStatus::Association,
             "sketch",
             rivals,
             BTreeSet::new(),
             evidence_refs,
             EvidenceGrade::Corroborated,
-            "scope-580",
         ),
         Err(ContractError::CeilingViolation {
-            field: "causal.ceiling",
+            field: "causal.ceiling"
         })
     );
     Ok(())
@@ -2053,7 +1941,7 @@ fn count_recency_confidence_not_resolution() -> CaseResult {
     assert_eq!(
         resolved.validate(),
         Err(ContractError::ImpossibleCombination {
-            field: "conflict.lifecycle",
+            field: "conflict.lifecycle"
         })
     );
     assert_eq!(set.positions.len(), 2);
@@ -2074,8 +1962,7 @@ fn valid_inert_candidate() -> CaseResult {
         serde_json::from_str(&encoded(&position)?).map_err(|_| ContractError::Canonicalization)?;
     assert_eq!(decoded, position);
     // Closed identity: the candidate binds its request, denominator, receipt,
-    // map, and assumptions exactly, with no foreign, missing, or extra
-    // members anywhere in the closure.
+    // map, and assumptions exactly.
     let frozen = denominator()?;
     let receipt = receipt_for(frozen.digest.clone())?;
     position.validate_closed(
@@ -2085,10 +1972,10 @@ fn valid_inert_candidate() -> CaseResult {
         &claim_map()?,
         &[],
         &[assumption()?],
+        &[],
     )?;
-    // A strict subset of the governed claims fails closed validation: there
-    // is no scoped-claim versus covered-proposition distinction, only exact
-    // set equality between candidate claims and admitted claims.
+    // A strict subset of the governed claims fails closed validation: exact
+    // set equality only.
     let mut subset = position.clone();
     subset.claims = vec![claim_entry("claim-a")?];
     subset.digest = subset.compute_digest()?;
@@ -2101,13 +1988,13 @@ fn valid_inert_candidate() -> CaseResult {
             &claim_map()?,
             &[],
             &[assumption()?],
+            &[],
         ),
         Err(ContractError::MissingReference {
-            field: "candidate.claims",
+            field: "candidate.claims"
         })
     );
-    // Same ID with changed evidence fails: the entered shape must equal the
-    // governed shape by value.
+    // Same ID with changed evidence fails by value.
     let mut changed = position.clone();
     changed.claims[0] = rejected_entry("claim-a")?;
     changed.digest = changed.compute_digest()?;
@@ -2119,36 +2006,28 @@ fn valid_inert_candidate() -> CaseResult {
             &claim_map()?,
             &[],
             &[assumption()?],
+            &[],
         ),
         Err(ContractError::DigestMismatch {
-            field: "candidate.claims",
+            field: "candidate.claims"
         })
     );
+    // Withdrawal is mechanical: the retraction names the exact record digest.
+    let held = assumption()?;
+    let retraction = held.withdraw("mirror rotated")?;
+    retraction.validate()?;
+    assert_eq!(retraction.assumption_digest.as_str(), held.digest.as_str());
+    assert_eq!(retraction.assumption_id.as_str(), "assumption-1");
     Ok(())
 }
 
 // WORK_UNIT_CASE: 580/35
 #[test]
 fn candidate_carries_no_admission_write_effect_finish() -> CaseResult {
-    // API-level proof: walk every object key of the constructed candidate and
-    // its nested records. No admission, write, effect, allocation, apply, or
-    // finish field exists anywhere in the public shape. The traversal keeps
-    // the generic JSON type inferred, so the contract surface never depends
-    // on it.
+    // API-level proof: no admission, write, effect, allocation, apply, or
+    // finish field exists anywhere in the public shape (generic JSON type
+    // inferred, never depended on).
     let root = serde_json::to_value(&candidate()?).map_err(|_| ContractError::Canonicalization)?;
-    let mut stack = vec![&root];
-    let mut keys = Vec::new();
-    while let Some(current) = stack.pop() {
-        if let Some(map) = current.as_object() {
-            for (key, nested) in map {
-                keys.push(key.to_lowercase());
-                stack.push(nested);
-            }
-        } else if let Some(items) = current.as_array() {
-            stack.extend(items.iter());
-        }
-    }
-    assert!(!keys.is_empty());
     let forbidden = [
         "admission",
         "admission_receipt",
@@ -2161,14 +2040,24 @@ fn candidate_carries_no_admission_write_effect_finish() -> CaseResult {
         "allocation",
         "apply",
     ];
-    for key in &keys {
-        assert!(
-            !forbidden.contains(&key.as_str()),
-            "forbidden candidate field present"
-        );
+    let mut stack = vec![&root];
+    let mut seen = 0;
+    while let Some(current) = stack.pop() {
+        if let Some(map) = current.as_object() {
+            for (key, nested) in map {
+                seen += 1;
+                assert!(
+                    !forbidden.contains(&key.to_lowercase().as_str()),
+                    "forbidden candidate field present"
+                );
+                stack.push(nested);
+            }
+        } else if let Some(items) = current.as_array() {
+            stack.extend(items.iter());
+        }
     }
-    // The top-level field set is exactly the documented contract shape: no
-    // more, no fewer.
+    assert!(seen > 0);
+    // The top-level field set is exactly the documented contract shape.
     let top = root
         .as_object()
         .map(|map| {
@@ -2193,20 +2082,25 @@ fn candidate_carries_no_admission_write_effect_finish() -> CaseResult {
             "grade",
             "invalidation",
             "manifest",
+            "precision",
             "predecessor",
+            "privacy",
             "proof_digest",
             "proposed_assertability",
             "proposition",
+            "request_id",
             "revision",
             "rivals",
             "scope",
             "support",
             "task_id",
+            "temporal_digests",
             "unknowns",
             "verifier",
             "version",
             "window_end_ms",
             "window_start_ms",
+            "work_scope",
         ]
     );
     Ok(())
@@ -2218,15 +2112,22 @@ fn valid_admitted_view_with_receipt() -> CaseResult {
     let view = admitted()?;
     view.validate()?;
     assert_eq!(view.view_kind, AdmittedKind::CurrentEpistemicPosition);
-    let (receipt, digest) = view.receipt_identity();
-    assert_eq!(receipt, &admission()?);
-    assert_eq!(digest, case_digest("admission-payload").as_str());
+    assert_eq!(view.receipt_identity(), view.admission.digest.as_str());
+    assert_eq!(
+        view.admission.payload_digest.as_str(),
+        case_digest("admission-payload").as_str()
+    );
+    assert_eq!(view.admission.scope.as_str(), "scope-580");
+    assert_eq!(view.position_identity().0.as_str(), "position-580");
+    assert_eq!(view.position_identity().1, PositionRevision::genesis());
+    assert_eq!(PositionRevision::genesis().value(), 1);
+    assert!(PositionRevision::new(0).is_err());
     assert_eq!(view.currentness, Currentness::Current);
     let mut superseded = view.clone();
     superseded.currentness = Currentness::Superseded;
     assert!(superseded.validate().is_err());
-    // Alias proof: the previous name is the same type with the same serde and
-    // the same wire bytes as the canonical `CurrentEpistemicPosition`.
+    // Alias proof: the previous name is the same type with the same serde
+    // and wire bytes as `CurrentEpistemicPosition`.
     let wire = encoded(&view)?;
     assert!(wire.contains("CURRENT_EPISTEMIC_POSITION"));
     let via_alias: CurrentEpistemicPositionView =
@@ -2246,9 +2147,8 @@ fn valid_admitted_view_with_receipt() -> CaseResult {
         wires(&states)?.join(","),
         "\"OBSERVED\",\"SUPPORTED\",\"ASSUMED\",\"CONFLICTED\",\"STALE\",\"UNKNOWN\""
     );
-    // The provenance closure binds the receipt contents the view cites: every
-    // consulted record is listed, and mixed sources are derived, never
-    // asserted.
+    // The closure binds the cited receipt contents: every consulted record
+    // is listed, mixed sources derived.
     let closed = closure()?;
     closed.validate()?;
     let decoded: ProvenanceClosure =
@@ -2256,11 +2156,20 @@ fn valid_admitted_view_with_receipt() -> CaseResult {
     assert_eq!(decoded, closed);
     let mut mixed = closed.clone();
     mixed.sources.insert(source("source-b")?);
+    mixed.lineage.push(SourceLineage::new(
+        source("source-b")?,
+        "r1",
+        case_digest("content-b"),
+        Some("raw-2".to_owned()),
+        BTreeSet::new(),
+        None,
+    )?);
+    mixed.raw_handles.insert("raw-2".to_owned());
     mixed.digest = mixed.compute_digest()?;
     assert_eq!(
         mixed.validate(),
         Err(ContractError::ImpossibleCombination {
-            field: "provenance.mixed_sources",
+            field: "provenance.mixed_sources"
         })
     );
     Ok(())
@@ -2280,10 +2189,31 @@ fn candidate_admitted_no_cross_decode() -> CaseResult {
     Ok(())
 }
 
+fn closed(
+    claimed: PositionAssertability,
+    grade: EvidenceGrade,
+    support: &[SupportResult],
+    coverage_complete: bool,
+    disclosure: DisclosureClass,
+    verifier: Option<&RequiredVerifier>,
+) -> CaseResult {
+    PositionAssertability::check_closed(
+        claimed,
+        &GradeAssignment::known(grade),
+        EvidenceAuthority::DeterministicRuntimeTest,
+        support,
+        coverage_complete,
+        false,
+        true,
+        disclosure,
+        PrivacyHandling::Unrestricted,
+        verifier,
+    )
+}
+
 fn support_ceilings() -> CaseResult {
-    // Support ceilings: partial caps at qualified inference, while unknown,
-    // stale, and outside-manifest cap at hypothesis candidate — none of them
-    // yields unconditional, elevated, or material-effect assertability.
+    // Support ceilings: partial caps at qualified inference, weaker results
+    // at hypothesis candidate.
     assert_eq!(
         PositionAssertability::support_cap(&[SupportResult::Supported])?,
         PositionAssertability::MaterialEffect
@@ -2306,133 +2236,103 @@ fn support_ceilings() -> CaseResult {
         );
     }
     assert!(PositionAssertability::support_cap(&[]).is_err());
-    assert_eq!(
-        PositionAssertability::check_closed(
+    for (claimed, support) in [
+        (
             PositionAssertability::ObservedFact,
-            EvidenceGrade::Corroborated,
-            EvidenceAuthority::DeterministicRuntimeTest,
-            &[SupportResult::Partial],
-            true,
-            false,
-            true,
-            DisclosureClass::Open,
-            None,
+            &[SupportResult::Partial][..],
         ),
-        Err(ContractError::CeilingViolation {
-            field: "assertability.support",
-        })
-    );
-    assert_eq!(
-        PositionAssertability::check_closed(
+        (
             PositionAssertability::QualifiedInference,
-            EvidenceGrade::Corroborated,
-            EvidenceAuthority::DeterministicRuntimeTest,
-            &[SupportResult::Unknown],
-            true,
-            false,
-            true,
-            DisclosureClass::Open,
-            None,
+            &[SupportResult::Unknown][..],
         ),
-        Err(ContractError::CeilingViolation {
-            field: "assertability.support",
-        })
-    );
+    ] {
+        assert_eq!(
+            closed(
+                claimed,
+                EvidenceGrade::Corroborated,
+                support,
+                true,
+                DisclosureClass::Open,
+                None,
+            ),
+            Err(ContractError::CeilingViolation {
+                field: "assertability.support"
+            })
+        );
+    }
     Ok(())
 }
 
 fn disclosure_ceilings() -> CaseResult {
-    // Disclosure ceilings: restricted never rises above qualified inference,
+    // Disclosure ceilings: restricted caps at qualified inference,
     // quarantined renders only as quarantined unknown.
     assert_eq!(
-        PositionAssertability::check_closed(
+        closed(
             PositionAssertability::ObservedFact,
             EvidenceGrade::ScienceGrade,
-            EvidenceAuthority::DeterministicRuntimeTest,
             &[SupportResult::Supported],
-            true,
-            false,
             true,
             DisclosureClass::Restricted,
             Some(&competent_verifier()?),
         ),
         Err(ContractError::CeilingViolation {
-            field: "assertability.disclosure",
+            field: "assertability.disclosure"
         })
     );
     assert_eq!(
-        PositionAssertability::check_closed(
+        closed(
             PositionAssertability::HypothesisCandidate,
             EvidenceGrade::Grounded,
-            EvidenceAuthority::DeterministicRuntimeTest,
             &[SupportResult::Supported],
             false,
-            false,
-            true,
             DisclosureClass::Quarantined,
             None,
         ),
         Err(ContractError::CeilingViolation {
-            field: "assertability.disclosure",
+            field: "assertability.disclosure"
         })
     );
     Ok(())
 }
 
 fn verifier_ceilings() -> CaseResult {
-    // Verifier ceiling: a material effect requires a competent verifier over
-    // a current freshness; without one the effect is not licensed.
+    // Verifier ceiling: material effect needs a competent verifier over
+    // current freshness.
     assert_eq!(
-        PositionAssertability::check_closed(
+        closed(
             PositionAssertability::MaterialEffect,
             EvidenceGrade::ScienceGrade,
-            EvidenceAuthority::DeterministicRuntimeTest,
             &[SupportResult::Supported],
-            true,
-            false,
             true,
             DisclosureClass::Open,
             None,
         ),
         Err(ContractError::CeilingViolation {
-            field: "assertability.verifier",
+            field: "assertability.verifier"
         })
     );
-    PositionAssertability::check_closed(
+    closed(
         PositionAssertability::MaterialEffect,
         EvidenceGrade::ScienceGrade,
-        EvidenceAuthority::DeterministicRuntimeTest,
         &[SupportResult::Supported],
-        true,
-        false,
         true,
         DisclosureClass::Open,
         Some(&competent_verifier()?),
     )?;
-    let contract = ContractId::new("contract-580").map_err(|_| case_error("case.contract"))?;
-    let older = RequiredVerifier::new(
-        contract,
-        "r1",
-        EvidenceFreshness::KnownOlderSnapshot,
-        VerifierStanding::Competent,
-        None,
-    )?;
+    let older = verifier_with("r1", EvidenceFreshness::KnownOlderSnapshot)?;
     assert!(!older.is_current());
     assert!(!older.is_competent());
     assert_eq!(
-        PositionAssertability::check_closed(
+        closed(
             PositionAssertability::MaterialEffect,
             EvidenceGrade::ScienceGrade,
-            EvidenceAuthority::DeterministicRuntimeTest,
             &[SupportResult::Supported],
-            true,
-            false,
             true,
             DisclosureClass::Open,
             Some(&older),
         ),
         Err(ContractError::CeilingViolation {
-            field: "assertability.verifier",
+            field: "assertability.verifier"
         })
     );
     Ok(())
@@ -2459,7 +2359,7 @@ fn assertability_capped_by_ceilings() -> CaseResult {
             true,
         ),
         Err(ContractError::CeilingViolation {
-            field: "assertability.grade",
+            field: "assertability.grade"
         })
     );
     assert_eq!(
@@ -2472,7 +2372,7 @@ fn assertability_capped_by_ceilings() -> CaseResult {
             true,
         ),
         Err(ContractError::CeilingViolation {
-            field: "assertability.ceiling",
+            field: "assertability.ceiling"
         })
     );
     assert_eq!(
@@ -2485,7 +2385,7 @@ fn assertability_capped_by_ceilings() -> CaseResult {
             true,
         ),
         Err(ContractError::CeilingViolation {
-            field: "assertability.ceiling",
+            field: "assertability.ceiling"
         })
     );
     support_ceilings()?;
@@ -2525,7 +2425,7 @@ fn planning_grants_no_effect() -> CaseResult {
             true,
         ),
         Err(ContractError::CeilingViolation {
-            field: "assertability.grade",
+            field: "assertability.grade"
         })
     );
     Ok(())
@@ -2561,65 +2461,66 @@ fn transition_preserves_before_after_predecessor() -> CaseResult {
         Some("predecessor-1")
     );
     assert_eq!(decoded, with_history);
+    // Closed binding: the transition answers its request and candidate with
+    // real before/after records; a foreign candidate digest fails.
+    let before = vec![support_record(SupportResult::Partial)?];
+    let after = vec![support_with(
+        SupportResult::Supported,
+        BTreeSet::from([artifact("handle-1")?, artifact("handle-2")?]),
+        None,
+        None,
+    )?];
+    let mut closed_movement = transition()?;
+    assert_eq!(
+        closed_movement.validate_closed(&request()?, &candidate()?, &before, &after),
+        Err(ContractError::DigestMismatch {
+            field: "transition.candidate_digest"
+        })
+    );
+    closed_movement.candidate_digest = candidate()?.digest.clone();
+    closed_movement.evidence_refs = BTreeSet::from([artifact("handle-1")?]);
+    closed_movement.digest = closed_movement.compute_digest()?;
+    closed_movement.validate_closed(&request()?, &candidate()?, &before, &after)?;
     Ok(())
 }
 
 // WORK_UNIT_CASE: 580/41
 #[test]
 fn partial_unknown_not_unconditional_promotion() -> CaseResult {
-    let mut reasons = BTreeSet::new();
-    reasons.insert("no fresh evidence".to_owned());
-    let bare = SupportDelta::new(BTreeSet::new(), BTreeSet::new(), BTreeSet::new(), reasons)?;
-    let partial_promotion = EpistemicTransition::new(
-        prop()?,
-        TaskRevision::genesis(),
-        case_fence(),
-        TransitionTrigger::Revalidation,
+    let bare = SupportDelta::new(
         BTreeSet::new(),
-        operation()?,
+        BTreeSet::new(),
+        BTreeSet::new(),
+        BTreeSet::from(["no fresh evidence".to_owned()]),
+    )?;
+    let partial_promotion = try_transition(
+        TransitionTrigger::Revalidation,
         SupportResult::Partial,
         SupportResult::Supported,
         PositionAssertability::HypothesisCandidate,
         PositionAssertability::QualifiedInference,
         bare.clone(),
-        case_digest("coverage-delta"),
-        case_digest("conflict-delta"),
-        "revert to predecessor",
-        None,
-        None,
-        case_digest("proof-transition"),
+        BTreeSet::new(),
     );
     assert_eq!(
         partial_promotion,
         Err(ContractError::CeilingViolation {
-            field: "transition.promotion",
+            field: "transition.promotion"
         })
     );
-    let mut evidence_refs = BTreeSet::new();
-    evidence_refs.insert(artifact("evidence-1")?);
-    let unknown_promotion = EpistemicTransition::new(
-        prop()?,
-        TaskRevision::genesis(),
-        case_fence(),
+    let unknown_promotion = try_transition(
         TransitionTrigger::NewEvidence,
-        evidence_refs,
-        operation()?,
         SupportResult::Unknown,
         SupportResult::Supported,
         PositionAssertability::UnknownWithheldQuarantined,
         PositionAssertability::QualifiedInference,
         bare,
-        case_digest("coverage-delta"),
-        case_digest("conflict-delta"),
-        "revert to predecessor",
-        None,
-        None,
-        case_digest("proof-transition"),
+        BTreeSet::from([artifact("evidence-1")?]),
     );
     assert_eq!(
         unknown_promotion,
         Err(ContractError::CeilingViolation {
-            field: "transition.promotion",
+            field: "transition.promotion"
         })
     );
     transition()?.validate()?;
@@ -2629,12 +2530,14 @@ fn partial_unknown_not_unconditional_promotion() -> CaseResult {
 // WORK_UNIT_CASE: 580/42
 #[test]
 fn set_permutation_invariance() -> CaseResult {
-    let mut first_predecessors = BTreeSet::new();
-    first_predecessors.insert(PredecessorId::new("predecessor-a")?);
-    first_predecessors.insert(PredecessorId::new("predecessor-b")?);
-    let mut second_predecessors = BTreeSet::new();
-    second_predecessors.insert(PredecessorId::new("predecessor-b")?);
-    second_predecessors.insert(PredecessorId::new("predecessor-a")?);
+    let first_predecessors = BTreeSet::from([
+        PredecessorId::new("predecessor-a")?,
+        PredecessorId::new("predecessor-b")?,
+    ]);
+    let second_predecessors = BTreeSet::from([
+        PredecessorId::new("predecessor-b")?,
+        PredecessorId::new("predecessor-a")?,
+    ]);
     let shared = (
         prop()?,
         ClaimId::new("claim-580")?,
@@ -2654,16 +2557,9 @@ fn set_permutation_invariance() -> CaseResult {
         shared.6.clone(),
         first_predecessors,
     )?;
-    let second = IdentityBundle::new(
-        shared.0,
-        shared.1,
-        shared.2,
-        shared.3,
-        shared.4,
-        shared.5,
-        shared.6,
-        second_predecessors,
-    )?;
+    let mut second = first.clone();
+    second.predecessors = second_predecessors;
+    second.digest = second.compute_digest()?;
     assert_eq!(first.digest, second.digest);
     assert_eq!(first.canonical_json()?, second.canonical_json()?);
     Ok(())
@@ -2677,7 +2573,7 @@ fn load_bearing_mutation_invalidates_digest() -> CaseResult {
     assert_eq!(
         bundle.validate(),
         Err(ContractError::DigestMismatch {
-            field: "identity.digest",
+            field: "identity.digest"
         })
     );
     let mut frozen = denominator()?;
@@ -2685,7 +2581,7 @@ fn load_bearing_mutation_invalidates_digest() -> CaseResult {
     assert_eq!(
         frozen.validate(),
         Err(ContractError::DigestMismatch {
-            field: "coverage.digest",
+            field: "coverage.digest"
         })
     );
     let mut receipt = receipt_for(frozen.compute_digest()?)?;
@@ -2693,7 +2589,7 @@ fn load_bearing_mutation_invalidates_digest() -> CaseResult {
     assert_eq!(
         receipt.validate(),
         Err(ContractError::DigestMismatch {
-            field: "receipt.digest",
+            field: "receipt.digest"
         })
     );
     let mut claim = absence()?;
@@ -2701,7 +2597,7 @@ fn load_bearing_mutation_invalidates_digest() -> CaseResult {
     assert_eq!(
         claim.validate(),
         Err(ContractError::DigestMismatch {
-            field: "absence.digest",
+            field: "absence.digest"
         })
     );
     let mut map = claim_map()?;
@@ -2709,7 +2605,7 @@ fn load_bearing_mutation_invalidates_digest() -> CaseResult {
     assert_eq!(
         map.validate(),
         Err(ContractError::DigestMismatch {
-            field: "claim.digest",
+            field: "claim.digest"
         })
     );
     let mut set = conflict()?;
@@ -2717,7 +2613,7 @@ fn load_bearing_mutation_invalidates_digest() -> CaseResult {
     assert_eq!(
         set.validate(),
         Err(ContractError::DigestMismatch {
-            field: "conflict.digest",
+            field: "conflict.digest"
         })
     );
     let mut position = candidate()?;
@@ -2725,15 +2621,15 @@ fn load_bearing_mutation_invalidates_digest() -> CaseResult {
     assert_eq!(
         position.validate(),
         Err(ContractError::DigestMismatch {
-            field: "candidate.digest",
+            field: "candidate.digest"
         })
     );
     let mut view = admitted()?;
-    view.scope = "scope-changed".to_owned();
+    view.admission.scope = "scope-changed".to_owned();
     assert_eq!(
         view.validate(),
         Err(ContractError::DigestMismatch {
-            field: "admitted.digest",
+            field: "admitted.digest"
         })
     );
     let mut movement = transition()?;
@@ -2741,7 +2637,7 @@ fn load_bearing_mutation_invalidates_digest() -> CaseResult {
     assert_eq!(
         movement.validate(),
         Err(ContractError::DigestMismatch {
-            field: "transition.digest",
+            field: "transition.digest"
         })
     );
     Ok(())
@@ -2751,7 +2647,7 @@ fn load_bearing_mutation_invalidates_digest() -> CaseResult {
 #[test]
 fn malformed_input_bounded_panic_free() -> CaseResult {
     // Bounded malformed corpus: every input fails closed on every boundary
-    // type, without panicking and without reading past the corpus.
+    // type, without panicking.
     let corpus = [
         "{\"scope\"",
         "{\"scope\":\"a\u{7}b\",\"window_start_ms\":null,\"window_end_ms\":null,\"version\":\"v1\",\"precision\":\"file\"}",
@@ -2778,56 +2674,16 @@ fn malformed_input_bounded_panic_free() -> CaseResult {
         assert!(serde_json::from_str::<InvestigationRequirement>(input).is_err());
         assert!(serde_json::from_str::<RequiredVerifier>(input).is_err());
     }
+    let owner = SourceId::new("owner-1").map_err(|_| case_error("case.source"))?;
     let outcome = std::panic::catch_unwind(|| {
         let mut failures = 0;
         failures += usize::from(PaginationBounds::new(0, 0, 2, true).is_err());
         failures += usize::from(PaginationBounds::new(5, 1, 2, true).is_err());
         failures += usize::from(BoundedProof::new(case_digest("proof-absence"), u64::MAX).is_err());
-        failures += usize::from(
-            OwnerLookup::new(
-                SourceId::new("owner-1").map_err(|_| case_error("case.source"))?,
-                "not-a-digest",
-            )
-            .is_err(),
-        );
-        failures += usize::from(
-            AssumptionRecord::new(
-                "   ",
-                "statement",
-                "scope-580",
-                SourceId::new("owner-1").map_err(|_| case_error("case.source"))?,
-                TaskId::new("task-580").map_err(|_| case_error("case.task"))?,
-                StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
-            )
-            .is_err(),
-        );
-        failures += usize::from(
-            InvestigationRequirement::new(
-                "requirement-1",
-                PropositionId::new("proposition-580")?,
-                "scope-580",
-                TaskId::new("task-580").map_err(|_| case_error("case.task"))?,
-                StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
-                InvestigationKind::ObtainEvidence,
-                "   ",
-                "reason-1",
-            )
-            .is_err(),
-        );
-        failures += usize::from(
-            PositionRequest::new(
-                "question-580",
-                PropositionId::new("proposition-580")?,
-                TaskId::new("task-580").map_err(|_| case_error("case.task"))?,
-                "attempt-580",
-                TaskRevision::genesis(),
-                "scope-580",
-                ValidityBounds::new("scope-580", None, None, "v1", "file")?,
-                StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
-                BTreeSet::new(),
-            )
-            .is_err(),
-        );
+        failures += usize::from(OwnerLookup::new(owner.clone(), "not-a-digest").is_err());
+        failures += usize::from(assumption_with("   ", "statement").is_err());
+        failures += usize::from(investigation_with("   ").is_err());
+        failures += usize::from(request_with("attempt-580", BTreeSet::new()).is_err());
         Ok::<usize, ContractError>(failures)
     });
     let failures = outcome.map_err(|_| ContractError::Canonicalization)??;

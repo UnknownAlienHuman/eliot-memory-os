@@ -1,21 +1,10 @@
 //! Coverage denominator: the finite, exact, owned scope of an inquiry.
 //!
-//! A denominator declares exactly what was searched: the member class with
-//! schema and revision, the scope and fence, the members or roles (or a typed
-//! query/frontier specification standing in for explicit enumeration), the
-//! snapshot and its owner, the exclusions with reasons, the pagination bounds,
-//! and the validity window. Vague denominators such as an unbounded
-//! "all relevant" scope, and unowned empty enumerations, are rejected: an
-//! empty answer over an undeclared scope proves nothing. The one exception is
-//! the known-empty complete case — an empty member list with the complete
-//! marker, no query or frontier standing in, and the owner snapshot the
-//! emptiness was read from — which is owned, exact, terminal, and bound.
-//! Known-empty stays distinct from missing, partial, unavailable, and unknown:
-//! a complete scope is never truncated and its total always equals its
-//! enumerated member count.
-//!
-//! Only [`DenominatorKind::CompleteScope`] can ground a scoped absence claim;
-//! sampled or unknown denominators stay honest partial results.
+//! A denominator declares exactly what was searched: member class, schema, scope, fence, members or typed
+//! query/frontier, snapshot and owner, exclusions, pagination, and validity. Vague scopes and unowned empties
+//! are rejected; the one exception is the known-empty complete case (complete marker plus the query, frontier,
+//! and owner snapshot that read the emptiness). Only [`DenominatorKind::CompleteScope`] grounds absence; a
+//! complete scope is never truncated and its total equals its member count.
 
 use std::collections::BTreeSet;
 
@@ -24,8 +13,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{
-    ContractError, MAX_HANDLES, MAX_MEMBERS, MAX_SHORT_TEXT, shape_digest, validate_bounded_text,
-    validate_digest,
+    ContractError, MAX_HANDLES, MAX_MEMBERS, MAX_SHORT_TEXT, check_frozen, shape_digest,
+    validate_bounded_text,
 };
 use crate::support::ValidityBounds;
 
@@ -39,17 +28,6 @@ pub enum DenominatorKind {
     SampledWithMethod,
     /// Coverage cannot be established.
     Unknown,
-}
-
-impl DenominatorKind {
-    /// Returns the exact frozen wire name of this denominator kind.
-    pub const fn wire_name(self) -> &'static str {
-        match self {
-            Self::CompleteScope => "COMPLETE_SCOPE",
-            Self::SampledWithMethod => "SAMPLED_WITH_METHOD",
-            Self::Unknown => "UNKNOWN",
-        }
-    }
 }
 
 /// The typed query standing in for explicit member enumeration.
@@ -153,10 +131,6 @@ impl SnapshotRef {
 }
 
 /// One declared exclusion with its bounded reason, in declaration order.
-///
-/// Exclusions form a meaningful sequence: declaration order is preserved on
-/// the wire so reviewers read them as written. Order never affects the digest
-/// beyond byte identity; membership semantics come from the excluded handle.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExclusionRecord {
@@ -390,10 +364,8 @@ impl CoverageDenominator {
             validate_bounded_text(role.as_str(), "coverage.roles", MAX_SHORT_TEXT)?;
         }
         if self.kind == DenominatorKind::CompleteScope {
-            // A complete scope is arithmetically exact: never truncated, with
-            // the total equal to the enumerated member count. A truncated or
-            // short enumeration over a scope marked complete fails here, never
-            // downstream.
+            // A complete scope is arithmetically exact: never truncated, with the total equal to the
+            // enumerated member count. A truncated or short enumeration over a complete scope fails here.
             if self.bounds.truncated {
                 return Err(ContractError::IncompleteDenominator {
                     field: "coverage.bounds",
@@ -405,12 +377,10 @@ impl CoverageDenominator {
                 });
             }
             if self.members.is_empty() {
-                // Known-empty is valid only as an owned, exact, bound empty:
-                // the complete marker, no query or frontier standing in for an
-                // enumeration that never happened, and the owner snapshot the
-                // emptiness was read from. Anything else — a sampled, unknown,
-                // or query-fronted empty — proves nothing and fails below.
-                if self.query.is_some() || self.frontier.is_some() {
+                // Known-empty is valid only as an owned, exact, bound empty: the complete marker with the query
+                // and frontier that read the emptiness, plus the owner snapshot it was read from. A sampled,
+                // unknown, or query-less/frontier-less empty proves nothing and fails below.
+                if self.query.is_none() || self.frontier.is_none() {
                     return Err(ContractError::IncompleteDenominator {
                         field: "coverage.members",
                     });
@@ -449,12 +419,39 @@ impl CoverageDenominator {
     /// Validates the denominator shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
-        validate_digest(&self.digest, "coverage.digest")?;
-        if self.digest != self.compute_digest()? {
+        check_frozen(&self.digest, &self.compute_digest()?, "coverage.digest")
+    }
+}
+
+/// Binds a receipt's frozen query and frontier to the denominator by value
+/// (both present, field-equal; a `None`-versus-`Some` pairing fails closed).
+pub(crate) fn check_receipt_query_frontier(
+    denominator: &CoverageDenominator,
+    receipt: &crate::receipt::CoverageReceipt,
+    query_field: &'static str,
+    frontier_field: &'static str,
+) -> Result<(), ContractError> {
+    match &denominator.query {
+        Some(query) if *query == receipt.query => {}
+        Some(_) => {
+            return Err(ContractError::DigestMismatch { field: query_field });
+        }
+        None => {
+            return Err(ContractError::IncompleteDenominator { field: query_field });
+        }
+    }
+    match &denominator.frontier {
+        Some(frontier) if *frontier == receipt.frontier => {}
+        Some(_) => {
             return Err(ContractError::DigestMismatch {
-                field: "coverage.digest",
+                field: frontier_field,
             });
         }
-        Ok(())
+        None => {
+            return Err(ContractError::IncompleteDenominator {
+                field: frontier_field,
+            });
+        }
     }
+    Ok(())
 }

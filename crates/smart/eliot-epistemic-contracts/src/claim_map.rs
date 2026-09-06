@@ -1,23 +1,9 @@
 //! Claim map: per-claim verdicts inside one admitted manifest.
 //!
-//! A [`ClaimMap`] holds one [`ClaimEntry`] per admitted claim — exactly one:
-//! every admitted claim ID has an entry and every entry names an admitted
-//! claim, so the admitted set and the entry set coincide. Each entry carries
-//! its verdict, independent claim-audit outcome, preserved counterevidence,
-//! conflict reference, authority, grade, explicit dependencies, temporal/scope/
-//! precision bounds, component coverage, ceiling, assumptions, and
-//! discriminators. Entries form a meaningful sequence: declaration order is
-//! preserved on the wire so reviewers read the map as written, while identity
-//! semantics come from the claim IDs.
-//!
-//! Component coverage is an explicit per-component support mapping, validated
-//! rather than inferred: an accepted entry carries at least one supporting
-//! accepted handle or an explicit unresolved marker. A digest plus assumption
-//! and discriminator names never counts as coverage on its own.
-//!
-//! The map rejects two failures closed: claims outside the admitted manifest,
-//! and duplicate entries — including two entries sharing one claim ID with
-//! different statement digests.
+//! A [`ClaimMap`] holds exactly one [`ClaimEntry`] per admitted claim. Each entry carries verdict, audit outcome,
+//! counterevidence, conflict reference, authority, grade, dependencies, bounds, component coverage, ceiling,
+//! assumptions, and discriminators. Component coverage is validated, never inferred: an accepted entry carries
+//! a supporting handle or an explicit unresolved marker; outside-manifest claims and duplicates fail.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -27,12 +13,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{
-    ContractError, MAX_HANDLES, MAX_SHORT_TEXT, shape_digest, validate_bounded_text,
+    ContractError, MAX_HANDLES, MAX_SHORT_TEXT, check_frozen, shape_digest, validate_bounded_text,
     validate_digest,
 };
-use crate::grade::EvidenceGrade;
+use crate::grade::{EvidenceGrade, GradeAssignment};
 use crate::identity::{ClaimId, ManifestId};
 use crate::support::ValidityBounds;
+use crate::temporal::TemporalRecord;
 
 /// Per-claim verdict of the position author.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -46,22 +33,8 @@ pub enum ClaimVerdict {
     Countered,
 }
 
-impl ClaimVerdict {
-    /// Returns the exact frozen wire name of this verdict.
-    pub const fn wire_name(self) -> &'static str {
-        match self {
-            Self::Accepted => "ACCEPTED",
-            Self::Rejected => "REJECTED",
-            Self::Countered => "COUNTERED",
-        }
-    }
-}
-
-/// Independent claim-audit outcome per I21.8.
-///
-/// Reference verification, value verification, specification compliance, and
-/// method-artifact alignment are checked independently; uncertainty and scope
-/// limits are preserved rather than smoothed.
+/// Independent claim-audit outcome per I21.8: reference, value, specification, and method-artifact checks
+/// stay independent; uncertainty and scope limits are preserved, never smoothed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ClaimAuditOutcome {
@@ -75,19 +48,6 @@ pub enum ClaimAuditOutcome {
     Contradicted,
     /// Cannot be verified inside the declared scope.
     NotVerifiableInScope,
-}
-
-impl ClaimAuditOutcome {
-    /// Returns the exact frozen wire name of this audit outcome.
-    pub const fn wire_name(self) -> &'static str {
-        match self {
-            Self::Supported => "SUPPORTED",
-            Self::PartiallySupported => "PARTIALLY_SUPPORTED",
-            Self::Unsupported => "UNSUPPORTED",
-            Self::Contradicted => "CONTRADICTED",
-            Self::NotVerifiableInScope => "NOT_VERIFIABLE_IN_SCOPE",
-        }
-    }
 }
 
 /// One governed claim inside the map.
@@ -104,22 +64,29 @@ pub struct ClaimEntry {
     pub audit: ClaimAuditOutcome,
     /// Preserved counterevidence handles, even when the claim is accepted.
     pub counterevidence: BTreeSet<ArtifactId>,
-    /// Conflict set reference, when the claim participates in one.
-    pub conflict: Option<ArtifactId>,
+    /// Conflict digest, when the claim participates in one: it must equal the exact frozen digest of the
+    /// referenced set; any unrelated nonempty set fails the reference.
+    pub conflict: Option<String>,
     /// Authority class of the evidence behind the claim.
     pub authority: EvidenceAuthority,
-    /// Grade the claim was produced under.
-    pub grade: EvidenceGrade,
+    /// Grade assignment the claim was produced under; unknown stays unknown.
+    pub grade: GradeAssignment,
     /// Explicit claim dependencies; order carries no meaning.
     pub dependencies: BTreeSet<ClaimId>,
     /// Temporal, scope, and precision bounds of the claim.
     pub bounds: ValidityBounds,
+    /// Applicable temporal record, when the claim carries its own capture times; the five roles stay separate.
+    pub temporal: Option<TemporalRecord>,
     /// Canonical digest of the component coverage behind the claim.
     pub coverage_digest: String,
     /// Accepted supporting handles behind the component coverage; order
     /// carries no meaning. An accepted claim carries at least one handle here
     /// or an explicit marker in `unresolved_support`.
     pub support: BTreeSet<ArtifactId>,
+    /// Per-component accepted-handle mapping: each named proposition component maps to the accepted handle
+    /// covering it. Every mapped handle must be a member of `support`; a digest plus assumption and
+    /// discriminator names never counts as coverage on its own.
+    pub components: BTreeMap<String, ArtifactId>,
     /// Explicit unresolved component markers; order carries no meaning. A
     /// marker keeps the component open instead of silently uncovered.
     pub unresolved_support: BTreeSet<String>,
@@ -140,13 +107,15 @@ impl ClaimEntry {
         verdict: ClaimVerdict,
         audit: ClaimAuditOutcome,
         counterevidence: BTreeSet<ArtifactId>,
-        conflict: Option<ArtifactId>,
+        conflict: Option<String>,
         authority: EvidenceAuthority,
-        grade: EvidenceGrade,
+        grade: GradeAssignment,
         dependencies: BTreeSet<ClaimId>,
         bounds: ValidityBounds,
+        temporal: Option<TemporalRecord>,
         coverage_digest: impl Into<String>,
         support: BTreeSet<ArtifactId>,
+        components: BTreeMap<String, ArtifactId>,
         unresolved_support: BTreeSet<String>,
         ceiling: EvidenceGrade,
         assumptions: BTreeSet<String>,
@@ -163,8 +132,10 @@ impl ClaimEntry {
             grade,
             dependencies,
             bounds,
+            temporal,
             coverage_digest: coverage_digest.into(),
             support,
+            components,
             unresolved_support,
             ceiling,
             assumptions,
@@ -174,14 +145,28 @@ impl ClaimEntry {
         Ok(entry)
     }
 
-    /// Validates verdict/audit coherence, ceilings, bounds, and component
-    /// coverage: an accepted entry carries at least one supporting accepted
-    /// handle or an explicit unresolved marker.
+    /// Validates verdict/audit coherence, ceilings, bounds, and component coverage
+    /// (accepted entries carry support or an unresolved marker).
     pub fn validate(&self) -> Result<(), ContractError> {
+        self.check_entry_fields()?;
+        self.check_entry_coherence()?;
+        Ok(())
+    }
+
+    fn check_entry_fields(&self) -> Result<(), ContractError> {
         validate_digest(&self.statement_digest, "claim.statement_digest")?;
         validate_digest(&self.coverage_digest, "claim.coverage_digest")?;
         self.bounds.validate()?;
-        EvidenceGrade::check_ceiling(self.grade, self.ceiling)?;
+        self.grade.validate()?;
+        if let Some(known) = self.grade.known_grade() {
+            EvidenceGrade::check_ceiling(known, self.ceiling)?;
+        }
+        if let Some(conflict) = &self.conflict {
+            validate_digest(conflict.as_str(), "claim.conflict")?;
+        }
+        if let Some(temporal) = &self.temporal {
+            temporal.validate()?;
+        }
         if self.counterevidence.len() > MAX_HANDLES {
             return Err(ContractError::TooMany {
                 field: "claim.counterevidence",
@@ -191,6 +176,19 @@ impl ClaimEntry {
             return Err(ContractError::TooMany {
                 field: "claim.support",
             });
+        }
+        if self.components.len() > MAX_HANDLES {
+            return Err(ContractError::TooMany {
+                field: "claim.components",
+            });
+        }
+        for (component, handle) in &self.components {
+            validate_bounded_text(component.as_str(), "claim.components", MAX_SHORT_TEXT)?;
+            if !self.support.contains(handle) {
+                return Err(ContractError::MissingReference {
+                    field: "claim.components",
+                });
+            }
         }
         if self.unresolved_support.len() > MAX_HANDLES {
             return Err(ContractError::TooMany {
@@ -225,6 +223,10 @@ impl ClaimEntry {
                 MAX_SHORT_TEXT,
             )?;
         }
+        Ok(())
+    }
+
+    fn check_entry_coherence(&self) -> Result<(), ContractError> {
         if self.dependencies.contains(&self.claim) {
             return Err(ContractError::SelfReference {
                 field: "claim.dependencies",
@@ -409,20 +411,38 @@ impl ClaimMap {
             .collect()
     }
 
-    /// Returns the weakest grade across all entries: the floor no dependent
-    /// may rise above, and the grade ceiling the map as a whole can claim.
+    /// Returns the weakest known grade across all entries, or `None` when any
+    /// entry is unknown: the floor no dependent may rise above, and the grade
+    /// ceiling the map as a whole can claim. Unknown poisons the aggregate.
     pub fn weakest_grade(&self) -> Option<EvidenceGrade> {
-        self.entries
-            .iter()
-            .map(|entry| entry.grade)
-            .min_by_key(|grade| grade.rank())
+        let mut weakest: Option<EvidenceGrade> = None;
+        for entry in &self.entries {
+            let known = entry.grade.known_grade()?;
+            weakest = Some(match weakest {
+                Some(current) if current.rank() < known.rank() => current,
+                _ => known,
+            });
+        }
+        weakest
+    }
+
+    /// Returns the weakest assignment across all entries: unknown when any
+    /// entry is unknown, else the least rigorous known grade.
+    pub fn weakest_assignment(&self) -> Result<GradeAssignment, ContractError> {
+        GradeAssignment::weakest(
+            &self
+                .entries
+                .iter()
+                .map(|entry| entry.grade.clone())
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// Validates entries against the manifest, returning entered claims and
     /// their grades for the closure checks below.
     fn check_entries(
         &self,
-    ) -> Result<(BTreeSet<ClaimId>, BTreeMap<ClaimId, EvidenceGrade>), ContractError> {
+    ) -> Result<(BTreeSet<ClaimId>, BTreeMap<ClaimId, GradeAssignment>), ContractError> {
         let mut seen_claims = BTreeSet::new();
         let mut seen_digests = BTreeSet::new();
         let mut grades = BTreeMap::new();
@@ -450,7 +470,7 @@ impl ClaimMap {
                     });
                 }
             }
-            grades.insert(entry.claim.clone(), entry.grade);
+            grades.insert(entry.claim.clone(), entry.grade.clone());
         }
         Ok((seen_claims, grades))
     }
@@ -498,11 +518,9 @@ impl ClaimMap {
             });
         }
         let (seen_claims, grades) = self.check_entries()?;
-        // Exact entries: the entry set coincides with the admitted set. An
-        // admitted claim without an entry is unrepresented; an entry without
-        // admission is outside the manifest. Held-open claims keep their
-        // provisional entries, so `unresolved` is a subset of the admitted
-        // claims, never unentered claims.
+        // Exact entries: the entry set coincides with the admitted set. An admitted claim without an entry is
+        // unrepresented; an entry without admission is outside the manifest. Held-open claims keep their
+        // provisional entries, so `unresolved` is a subset of the admitted claims, never unentered claims.
         for held in &self.unresolved {
             if !self.admitted.contains(held) {
                 return Err(ContractError::OutsideManifest {
@@ -522,11 +540,22 @@ impl ClaimMap {
                 });
             }
         }
-        // Dependent grades: quoting a claim never upgrades it.
+        // Dependent grades: quoting a claim never upgrades it. An unknown parent caps every dependent: a known
+        // grade over an unknown parent is an upgrade and fails.
         for entry in &self.entries {
             for dependency in &entry.dependencies {
                 if let Some(parent) = grades.get(dependency) {
-                    EvidenceGrade::check_dependent(*parent, entry.grade)?;
+                    match (parent.known_grade(), entry.grade.known_grade()) {
+                        (Some(known_parent), Some(known_child)) => {
+                            EvidenceGrade::check_dependent(known_parent, known_child)?;
+                        }
+                        (None, Some(_)) => {
+                            return Err(ContractError::CeilingViolation {
+                                field: "grade.dependent",
+                            });
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -556,12 +585,6 @@ impl ClaimMap {
     /// Validates the map shape, manifest closure, and frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
-        validate_digest(&self.digest, "claim.digest")?;
-        if self.digest != self.compute_digest()? {
-            return Err(ContractError::DigestMismatch {
-                field: "claim.digest",
-            });
-        }
-        Ok(())
+        check_frozen(&self.digest, &self.compute_digest()?, "claim.digest")
     }
 }

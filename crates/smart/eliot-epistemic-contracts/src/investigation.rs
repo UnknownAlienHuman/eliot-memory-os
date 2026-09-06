@@ -1,26 +1,16 @@
 //! Investigation requirement: a typed inquiry outcome, never prose.
 //!
-//! An [`InvestigationRequirement`] states exactly what further inquiry a
-//! position needs: which proposition, under which scope, task, and fence, what
-//! kind of inquiry, which target it bears on, and why. Inquiry kinds are a
-//! closed vocabulary; free-text inquiry lists never cross this boundary.
-//!
-//! Donor disposition (`crates/smart/eliot-epistemic/src/lib.rs`, donor scope
-//! assumption/investigation fields): the donor `required_inquiry` and
-//! `unknowns` free-text vectors are disposed — prose cannot be validated, so
-//! it cannot be a contract. Each required inquiry becomes one typed
-//! [`InvestigationRequirement`]; each unknown becomes either a typed
-//! requirement or an explicit entry in a candidate `unknowns` set, never both
-//! silently. The donor inquiry-derivation policy (which statuses and freshness
-//! levels demand which inquiry) is explicitly not carried: deriving inquiries
-//! is resolver policy, and this crate carries no resolver.
+//! An [`InvestigationRequirement`] states what further inquiry a position needs: proposition, scope, task,
+//! fence, inquiry kind, target, and reason. Donor disposition (`crates/smart/eliot-epistemic/src/lib.rs`):
+//! donor free-text `required_inquiry`/`unknowns` vectors are disposed — prose is not a contract. Each becomes
+//! a typed requirement or an explicit candidate `unknowns` entry; inquiry-derivation policy is resolver work.
 
 use eliot_contracts::{StateFence, TaskId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{
-    ContractError, MAX_SHORT_TEXT, shape_digest, validate_bounded_text, validate_digest,
+    ContractError, MAX_SHORT_TEXT, check_frozen, shape_digest, validate_bounded_text,
 };
 use crate::identity::PropositionId;
 
@@ -38,19 +28,6 @@ pub enum InvestigationKind {
     EstablishFreshness,
     /// Reassess a rejected record.
     ReassessRejected,
-}
-
-impl InvestigationKind {
-    /// Returns the exact frozen wire name of this inquiry kind.
-    pub const fn wire_name(self) -> &'static str {
-        match self {
-            Self::Revalidate => "REVALIDATE",
-            Self::ObtainEvidence => "OBTAIN_EVIDENCE",
-            Self::DiscriminativeProbe => "DISCRIMINATIVE_PROBE",
-            Self::EstablishFreshness => "ESTABLISH_FRESHNESS",
-            Self::ReassessRejected => "REASSESS_REJECTED",
-        }
-    }
 }
 
 /// Marker proving a document is an investigation requirement, never prose.
@@ -158,12 +135,10 @@ impl InvestigationRequirement {
     /// Validates the requirement shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
-        validate_digest(&self.digest, "investigation.digest")?;
-        if self.digest != self.compute_digest()? {
-            return Err(ContractError::DigestMismatch {
-                field: "investigation.digest",
-            });
-        }
-        Ok(())
+        check_frozen(
+            &self.digest,
+            &self.compute_digest()?,
+            "investigation.digest",
+        )
     }
 }

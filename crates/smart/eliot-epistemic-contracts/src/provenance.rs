@@ -1,29 +1,10 @@
 //! Provenance closure: every handle behind a position, nothing invented.
 //!
-//! A [`ProvenanceClosure`] carries the exact record handles, typed source
-//! identities, raw handles, and revisions behind a position, whether sources
-//! are mixed, the weakest assertability across the closure, and the scope and
-//! fence it was frozen under. It is data, never authority: the closure proves
-//! which material was consulted, not what the material means.
-//!
-//! Donor disposition (`crates/smart/eliot-epistemic/src/lib.rs`, donor scope
-//! `ProvenanceView` plus assumption/investigation fields): the donor
-//! `ProvenanceView` is subsumed here and disposed — there is exactly one owner
-//! of this shape and it is this module. Field mapping, all hardened:
-//! `record_handles` ( donor `Vec`, order-significant) becomes `records`, a
-//! set, because consultation membership never depended on presentation order;
-//! `source_ids` (donor untyped `Vec<String>`) becomes typed
-//! `BTreeSet<SourceId>` so a source is an identity, not prose;
-//! `raw_handles` and `revisions` become sets for the same reason;
-//! `mixed_sources` is no longer asserted but derived and checked, so a claim
-//! of single-source over mixed material fails validation; `assertability`
-//! reuses the foundation vocabulary unchanged. `scope`, `fence`, and the
-//! frozen `digest` are added because unscoped, unfenced provenance is not
-//! closable. The donor `lowest_assertability` computation is explicitly not
-//! carried: combining assertabilities is resolver policy, and this crate
-//! carries no resolver.
+//! A [`ProvenanceClosure`] carries record handles, typed sources, raw handles, revisions, per-source
+//! [`SourceLineage`] entries (with cycle rejection), assertability, scope, and fence. The untyped sets must
+//! equal exactly the union over the lineage entries. It is data, never authority.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{ArtifactId, SourceId, StateFence};
 use eliot_evidence::Assertability;
@@ -31,9 +12,117 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{
-    ContractError, MAX_HANDLES, MAX_SHORT_TEXT, shape_digest, validate_bounded_text,
+    ContractError, MAX_HANDLES, MAX_SHORT_TEXT, check_frozen, shape_digest, validate_bounded_text,
     validate_digest,
 };
+
+/// One source's lineage inside a closure: owner, revision, content digest,
+/// raw handle, and predecessor digests within the same bundle.
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct SourceLineage {
+    /// Source that produced this slice of the closure.
+    pub owner: SourceId,
+    /// Source revision this slice was read under.
+    pub revision: String,
+    /// Digest of the frozen content this slice covers.
+    pub content_digest: String,
+    /// Raw handle the slice was derived from, when retained.
+    pub raw_handle: Option<String>,
+    /// Content digests of predecessors within the same bundle.
+    pub predecessors: BTreeSet<String>,
+    /// Raw-to-derived mapping note, when this slice transforms raw input.
+    pub derived_from_raw: Option<String>,
+}
+
+impl SourceLineage {
+    /// Constructs a source lineage entry after validation.
+    pub fn new(
+        owner: SourceId,
+        revision: impl Into<String>,
+        content_digest: impl Into<String>,
+        raw_handle: Option<String>,
+        predecessors: BTreeSet<String>,
+        derived_from_raw: Option<String>,
+    ) -> Result<Self, ContractError> {
+        let entry = Self {
+            owner,
+            revision: revision.into(),
+            content_digest: content_digest.into(),
+            raw_handle,
+            predecessors,
+            derived_from_raw,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    /// Validates revision, digests, handles, and predecessor form.
+    ///
+    /// Bundle-wide acyclicity is checked by the closure, which sees every
+    /// entry; a self-reference fails here.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_bounded_text(&self.revision, "provenance.revision", MAX_SHORT_TEXT)?;
+        validate_digest(&self.content_digest, "provenance.content_digest")?;
+        if let Some(raw) = &self.raw_handle {
+            validate_bounded_text(raw.as_str(), "provenance.raw_handle", MAX_SHORT_TEXT)?;
+        }
+        if self.predecessors.len() > MAX_HANDLES {
+            return Err(ContractError::TooMany {
+                field: "provenance.predecessors",
+            });
+        }
+        for predecessor in &self.predecessors {
+            validate_digest(predecessor.as_str(), "provenance.predecessors")?;
+        }
+        if self.predecessors.contains(&self.content_digest) {
+            return Err(ContractError::SelfReference {
+                field: "provenance.predecessors",
+            });
+        }
+        if let Some(note) = &self.derived_from_raw {
+            validate_bounded_text(note.as_str(), "provenance.derived_from_raw", MAX_SHORT_TEXT)?;
+            if self.raw_handle.is_none() {
+                return Err(ContractError::MissingReference {
+                    field: "provenance.raw_handle",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Checks that predecessor edges over content digests are acyclic.
+fn check_acyclic(entries: &[SourceLineage]) -> Result<(), ContractError> {
+    let mut edges: BTreeMap<&str, &BTreeSet<String>> = BTreeMap::new();
+    for entry in entries {
+        edges.insert(entry.content_digest.as_str(), &entry.predecessors);
+    }
+    for entry in entries {
+        let mut stack: Vec<&str> = entry.predecessors.iter().map(String::as_str).collect();
+        let mut seen = BTreeSet::new();
+        while let Some(next) = stack.pop() {
+            if next == entry.content_digest.as_str() {
+                return Err(ContractError::ImpossibleCombination {
+                    field: "provenance.predecessors",
+                });
+            }
+            if seen.insert(next) {
+                // Unknown predecessors are foreign handles, not cycles: the
+                // association check below rejects them; traversal skips them.
+                if let Some(further) = edges.get(next) {
+                    stack.extend(further.iter().map(String::as_str));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+// Donor disposition (`crates/smart/eliot-epistemic/src/lib.rs`): the donor `ProvenanceView` is subsumed here.
+// Vectors become sets (`records`, typed `sources`, `raw_handles`, `revisions`); `mixed_sources` is derived and
+// checked; `scope`, `fence`, and `digest` close the shape; `lowest_assertability` is resolver policy, not carried.
 
 /// Marker proving a document is a provenance closure and never a view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -52,12 +141,20 @@ pub struct ProvenanceClosure {
     pub closure_kind: ProvenanceClosureKind,
     /// Every record consulted; order carries no meaning.
     pub records: BTreeSet<ArtifactId>,
-    /// Every source consulted, typed; order carries no meaning.
+    /// Every source consulted, typed; order carries no meaning. Must equal
+    /// exactly the owners named by `lineage`.
     pub sources: BTreeSet<SourceId>,
-    /// Every raw handle consulted; order carries no meaning.
+    /// Every raw handle consulted; order carries no meaning. Must equal
+    /// exactly the raw handles named by `lineage`.
     pub raw_handles: BTreeSet<String>,
-    /// Every revision consulted; order carries no meaning.
+    /// Every revision consulted; order carries no meaning. Must equal exactly
+    /// the revisions named by `lineage`.
     pub revisions: BTreeSet<String>,
+    /// Per-source lineage binding every owner to its revision, content
+    /// digest, raw handle, and predecessors, in declaration order.
+    pub lineage: Vec<SourceLineage>,
+    /// Digest of the applicable temporal record, when the closure carries one.
+    pub temporal_digest: Option<String>,
     /// Whether more than one source was consulted; derived, never asserted.
     pub mixed_sources: bool,
     /// Weakest assertability across the closure, supplied by the resolver.
@@ -78,6 +175,8 @@ impl ProvenanceClosure {
         sources: BTreeSet<SourceId>,
         raw_handles: BTreeSet<String>,
         revisions: BTreeSet<String>,
+        lineage: Vec<SourceLineage>,
+        temporal_digest: Option<String>,
         mixed_sources: bool,
         assertability: Assertability,
         scope: impl Into<String>,
@@ -89,6 +188,8 @@ impl ProvenanceClosure {
             sources,
             raw_handles,
             revisions,
+            lineage,
+            temporal_digest,
             mixed_sources,
             assertability,
             scope: scope.into(),
@@ -108,6 +209,8 @@ impl ProvenanceClosure {
             &self.sources,
             &self.raw_handles,
             &self.revisions,
+            &self.lineage,
+            &self.temporal_digest,
             &self.mixed_sources,
             &self.assertability,
             &self.scope,
@@ -116,6 +219,13 @@ impl ProvenanceClosure {
     }
 
     fn validate_shape(&self) -> Result<(), ContractError> {
+        self.check_handle_bounds()?;
+        self.check_lineage()?;
+        self.check_derived()?;
+        Ok(())
+    }
+
+    fn check_handle_bounds(&self) -> Result<(), ContractError> {
         if self.closure_kind != ProvenanceClosureKind::ProvenanceClosure {
             return Err(ContractError::ImpossibleCombination {
                 field: "provenance.closure_kind",
@@ -149,6 +259,72 @@ impl ProvenanceClosure {
         for handle in self.raw_handles.iter().chain(self.revisions.iter()) {
             validate_bounded_text(handle.as_str(), "provenance.handles", MAX_SHORT_TEXT)?;
         }
+        if self.lineage.is_empty() {
+            return Err(ContractError::EmptyCollection {
+                field: "provenance.lineage",
+            });
+        }
+        if self.lineage.len() > MAX_HANDLES {
+            return Err(ContractError::TooMany {
+                field: "provenance.lineage",
+            });
+        }
+        Ok(())
+    }
+
+    fn check_lineage(&self) -> Result<(), ContractError> {
+        let mut seen_content = BTreeSet::new();
+        let mut lineage_sources = BTreeSet::new();
+        let mut lineage_raw = BTreeSet::new();
+        let mut lineage_revisions = BTreeSet::new();
+        let mut lineage_digests = BTreeSet::new();
+        for entry in &self.lineage {
+            entry.validate()?;
+            if !seen_content.insert(entry.content_digest.clone()) {
+                return Err(ContractError::Duplicate {
+                    field: "provenance.lineage",
+                });
+            }
+            lineage_sources.insert(entry.owner.clone());
+            if let Some(raw) = &entry.raw_handle {
+                lineage_raw.insert(raw.clone());
+            }
+            lineage_revisions.insert(entry.revision.clone());
+            lineage_digests.insert(entry.content_digest.clone());
+        }
+        for entry in &self.lineage {
+            for predecessor in &entry.predecessors {
+                if !lineage_digests.contains(predecessor) {
+                    return Err(ContractError::MissingReference {
+                        field: "provenance.predecessors",
+                    });
+                }
+            }
+        }
+        check_acyclic(&self.lineage)?;
+        // Exact association: the untyped sets are exactly the union over the lineage entries.
+        if lineage_sources != self.sources {
+            return Err(ContractError::OutsideManifest {
+                field: "provenance.sources",
+            });
+        }
+        if lineage_raw != self.raw_handles {
+            return Err(ContractError::OutsideManifest {
+                field: "provenance.raw_handles",
+            });
+        }
+        if lineage_revisions != self.revisions {
+            return Err(ContractError::OutsideManifest {
+                field: "provenance.revisions",
+            });
+        }
+        Ok(())
+    }
+
+    fn check_derived(&self) -> Result<(), ContractError> {
+        if let Some(temporal) = &self.temporal_digest {
+            validate_digest(temporal.as_str(), "provenance.temporal_digest")?;
+        }
         if self.mixed_sources != (self.sources.len() > 1) {
             return Err(ContractError::ImpossibleCombination {
                 field: "provenance.mixed_sources",
@@ -166,12 +342,6 @@ impl ProvenanceClosure {
     /// Validates the closure shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
-        validate_digest(&self.digest, "provenance.digest")?;
-        if self.digest != self.compute_digest()? {
-            return Err(ContractError::DigestMismatch {
-                field: "provenance.digest",
-            });
-        }
-        Ok(())
+        check_frozen(&self.digest, &self.compute_digest()?, "provenance.digest")
     }
 }

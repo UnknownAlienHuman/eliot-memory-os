@@ -1,27 +1,22 @@
 //! Consumer fixtures: Researcher, Dreamer, and Context roles using only the
 //! public contract surface, exactly as the cognitive edge-map prescribes.
-//!
-//! These fixtures prove `eliot_epistemic_contracts::CurrentEpistemicPosition`
-//! resolves from an integration consumer; that each role performs its
-//! read-only work — candidate building, inquiry drafting, projection reading —
-//! through public constructors alone; and that the public surface offers
-//! contracts with no resolver, acquisition, entailment, model, store, state,
-//! authority, effect, or finish operations.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ReceiptId, ResourceGeneration, SourceId, StateFence, TaskId,
-    TaskRevision, sha256_hex,
+    ArtifactId, AuthorityEpoch, OperationId, ProductId, RequestId, ResourceGeneration, SourceId,
+    StateFence, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_epistemic_contracts::{
-    AdmittedKind, AssumptionRecord, ClaimAuditOutcome, ClaimEntry, ClaimMap, ClaimVerdict,
-    ContractError, CurrentEpistemicPosition, Currentness, DisclosureClass,
-    EpistemicPositionCandidate, EvidenceGrade, InvestigationKind, InvestigationRequirement,
-    ManifestId, PositionAssertability, PositionRequest, PropositionId, ProvenanceClosure,
+    AdmittedKind, AdmittedReceipt, AssumptionRecord, ClaimAuditOutcome, ClaimEntry, ClaimMap,
+    ClaimVerdict, ContractError, CurrentEpistemicPosition, Currentness, DisclosureClass,
+    EpistemicPositionCandidate, EvidenceGrade, GradeAssignment, InvestigationKind,
+    InvestigationRequirement, ManifestId, PositionAssertability, PositionId, PositionRequest,
+    PositionRevision, PrivacyHandling, PropositionId, ProvenanceClosure, SourceLineage,
     SupportRecord, SupportResult, ValidityBounds,
 };
 use eliot_evidence::{Assertability, EvidenceAuthority};
+use eliot_receipts::{WorkScope, WorkScopeId};
 
 type FixtureResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -33,23 +28,19 @@ fn fence() -> StateFence {
     StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
 }
 
+fn work_scope() -> Result<WorkScope, Box<dyn std::error::Error>> {
+    Ok(WorkScope {
+        scope_id: WorkScopeId::new("scope-580")?,
+        product_id: ProductId::new("product-580")?,
+        resource_generation: ResourceGeneration::genesis(),
+        state_fence: fence(),
+    })
+}
+
 fn assert_no_hidden_ops(value: &impl serde::Serialize) -> FixtureResult {
     // Iterative key walk with the generic JSON type inferred: contract code
     // under test never depends on it.
     let root = serde_json::to_value(value)?;
-    let mut stack = vec![&root];
-    let mut keys = Vec::new();
-    while let Some(current) = stack.pop() {
-        if let Some(map) = current.as_object() {
-            for (key, nested) in map {
-                keys.push(key.to_lowercase());
-                stack.push(nested);
-            }
-        } else if let Some(items) = current.as_array() {
-            stack.extend(items.iter());
-        }
-    }
-    assert!(!keys.is_empty());
     let forbidden = [
         "write",
         "writes",
@@ -68,12 +59,23 @@ fn assert_no_hidden_ops(value: &impl serde::Serialize) -> FixtureResult {
         "model",
         "store",
     ];
-    for key in &keys {
-        assert!(
-            !forbidden.contains(&key.as_str()),
-            "hidden operation field present"
-        );
+    let mut stack = vec![&root];
+    let mut seen = 0;
+    while let Some(current) = stack.pop() {
+        if let Some(map) = current.as_object() {
+            for (key, nested) in map {
+                seen += 1;
+                assert!(
+                    !forbidden.contains(&key.to_lowercase().as_str()),
+                    "hidden operation field present"
+                );
+                stack.push(nested);
+            }
+        } else if let Some(items) = current.as_array() {
+            stack.extend(items.iter());
+        }
     }
+    assert!(seen > 0);
     Ok(())
 }
 
@@ -87,6 +89,10 @@ fn researcher_role(
     // position request plus an investigation requirement, both read-only.
     let inquiry = PositionRequest::new(
         "question-580",
+        RequestId::new("request-580")?,
+        OperationId::new("operation-580")?,
+        "idem-580",
+        work_scope()?,
         proposition.clone(),
         task.clone(),
         "attempt-580",
@@ -121,10 +127,8 @@ fn dreamer_role(
 ) -> FixtureResult {
     // Dreamer builds the inert candidate read-only: claim map, support, and
     // assumption records in, no resolver, store, or effect out.
-    let mut assumptions = BTreeSet::new();
-    assumptions.insert("assumption-1".to_owned());
-    let mut discriminators = BTreeSet::new();
-    discriminators.insert("discriminator-1".to_owned());
+    let assumptions = BTreeSet::from(["assumption-1".to_owned()]);
+    let discriminators = BTreeSet::from(["discriminator-1".to_owned()]);
     let entry = ClaimEntry::new(
         eliot_epistemic_contracts::ClaimId::new("claim-a")?,
         digest("claim-a"),
@@ -133,18 +137,19 @@ fn dreamer_role(
         BTreeSet::new(),
         None,
         EvidenceAuthority::DeterministicRuntimeTest,
-        EvidenceGrade::Grounded,
+        GradeAssignment::known(EvidenceGrade::Grounded),
         BTreeSet::new(),
         validity.clone(),
+        None,
         digest("coverage-claim"),
         handles.clone(),
+        BTreeMap::new(),
         BTreeSet::new(),
         EvidenceGrade::Grounded,
         assumptions,
         discriminators,
     )?;
-    let mut admitted = BTreeSet::new();
-    admitted.insert(eliot_epistemic_contracts::ClaimId::new("claim-a")?);
+    let admitted = BTreeSet::from([eliot_epistemic_contracts::ClaimId::new("claim-a")?]);
     let map = ClaimMap::new(
         ManifestId::new("manifest-580")?,
         admitted,
@@ -157,24 +162,32 @@ fn dreamer_role(
         SupportResult::Supported,
         handles.clone(),
         validity.clone(),
+        GradeAssignment::known(EvidenceGrade::Grounded),
         task.clone(),
         fence(),
+        None,
+        None,
         None,
         digest("proof-support"),
     )?;
     let held = AssumptionRecord::new(
         "assumption-1",
         "the registry mirrors the snapshot",
-        "scope-580",
+        "registry-snapshot",
+        "close the world for this read",
+        "a stale mirror misstates membership",
+        BTreeSet::new(),
+        validity.clone(),
         SourceId::new("owner-1")?,
         task.clone(),
         fence(),
     )?;
-    let mut rivals = BTreeSet::new();
-    rivals.insert("rival-1".to_owned());
+    let rivals = BTreeSet::from(["rival-1".to_owned()]);
     let draft = EpistemicPositionCandidate::new(
         proposition.clone(),
         TaskRevision::genesis(),
+        RequestId::new("request-580")?,
+        work_scope()?,
         None,
         task.clone(),
         "attempt-580",
@@ -182,6 +195,7 @@ fn dreamer_role(
         Some(100),
         Some(200),
         "v1",
+        "file",
         fence(),
         ManifestId::new("manifest-580")?,
         vec![entry],
@@ -190,9 +204,11 @@ fn dreamer_role(
         BTreeSet::new(),
         vec![record],
         BTreeSet::new(),
-        EvidenceGrade::Grounded,
+        GradeAssignment::known(EvidenceGrade::Grounded),
         EvidenceAuthority::DeterministicRuntimeTest,
         DisclosureClass::Open,
+        PrivacyHandling::Unrestricted,
+        BTreeSet::new(),
         None,
         digest("proof-candidate"),
         rivals,
@@ -206,44 +222,53 @@ fn dreamer_role(
 }
 
 fn context_role(
-    proposition: &PropositionId,
+    _proposition: &PropositionId,
     owner: &SourceId,
     handles: &BTreeSet<ArtifactId>,
 ) -> FixtureResult {
     // Context reads the admitted projection and its provenance closure: the
     // projection cites its external admission receipt and proves nothing
     // beyond it.
-    let view = CurrentEpistemicPosition::new(
-        proposition.clone(),
-        TaskRevision::genesis(),
-        ReceiptId::new("receipt-580")?,
+    let envelope = AdmittedReceipt::new(
         digest("admission-payload"),
         owner.clone(),
-        Currentness::Current,
-        BTreeSet::new(),
-        eliot_epistemic_contracts::ClaimId::new("claim-a")?,
+        "r1",
         "scope-580",
         fence(),
         digest("evidence-view"),
         digest("coverage-view"),
         digest("conflict-view"),
         digest("proof-view"),
+        PositionId::new("position-580")?,
+        PositionRevision::genesis(),
+    )?;
+    let view = CurrentEpistemicPosition::new(
+        envelope,
+        Currentness::Current,
+        BTreeSet::new(),
+        eliot_epistemic_contracts::ClaimId::new("claim-a")?,
     )?;
     view.validate()?;
     assert_eq!(view.view_kind, AdmittedKind::CurrentEpistemicPosition);
     let wire = serde_json::to_string(&view)?;
     assert!(wire.contains("CURRENT_EPISTEMIC_POSITION"));
-    let mut sources = BTreeSet::new();
-    sources.insert(SourceId::new("source-a")?);
-    let mut raw_handles = BTreeSet::new();
-    raw_handles.insert("raw-1".to_owned());
-    let mut revisions = BTreeSet::new();
-    revisions.insert("r1".to_owned());
+    let sources = BTreeSet::from([SourceId::new("source-a")?]);
+    let raw_handles = BTreeSet::from(["raw-1".to_owned()]);
+    let revisions = BTreeSet::from(["r1".to_owned()]);
     let stopped = ProvenanceClosure::new(
         handles.clone(),
         sources,
         raw_handles,
         revisions,
+        vec![SourceLineage::new(
+            SourceId::new("source-a")?,
+            "r1",
+            digest("content-a"),
+            Some("raw-1".to_owned()),
+            BTreeSet::new(),
+            None,
+        )?],
+        None,
         false,
         Assertability::NonAssertableUnverified,
         "scope-580",
@@ -254,7 +279,7 @@ fn context_role(
     assert!(
         view_value
             .as_object()
-            .is_some_and(|map| map.contains_key("admission_receipt"))
+            .is_some_and(|map| map.contains_key("admission"))
     );
     assert_no_hidden_ops(&stopped)?;
     Ok(())
@@ -267,8 +292,7 @@ fn consumer_roles_use_public_contracts_without_hidden_ops() -> FixtureResult {
     let task = TaskId::new("task-580")?;
     let owner = SourceId::new("owner-1")?;
     let validity = ValidityBounds::new("scope-580", Some(100), Some(200), "v1", "file")?;
-    let mut handle_set = BTreeSet::new();
-    handle_set.insert(ArtifactId::new("handle-1")?);
+    let handle_set = BTreeSet::from([ArtifactId::new("handle-1")?]);
 
     researcher_role(&proposition, &task, &validity, &handle_set)?;
 
@@ -281,9 +305,7 @@ fn consumer_roles_use_public_contracts_without_hidden_ops() -> FixtureResult {
     // beyond it.
     context_role(&proposition, &owner, &handle_set)?;
 
-    // The public surface offers contracts, not operations: no public type is
-    // a resolver, acquisition, entailment, model, store, state, authority,
-    // effect, or finish operation.
+    // The public surface offers contracts, not operations.
     let surface = [
         std::any::type_name::<PositionRequest>(),
         std::any::type_name::<InvestigationRequirement>(),

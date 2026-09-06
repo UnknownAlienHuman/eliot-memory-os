@@ -1,22 +1,10 @@
 //! Scoped absence: proving a negative over a complete denominator.
 //!
-//! An [`AbsenceClaim`] states that a proposition has no match inside an exact
-//! domain, scope, time window, and version. Absence needs a complete
-//! denominator plus a terminal receipt: every enumerated member must close as
-//! observed or authoritatively absent, with no unresolved partial, truncated,
-//! unavailable, or unknown member. A no-match probe, a timeout, silence, or
-//! an exhausted budget never decodes as absence — each is recorded with its
-//! own disposition and keeps the question open, and no constructor path turns
-//! a non-terminal receipt into absence evidence.
-//!
-//! The claim freezes its context. Shape validation ties the claim to its
-//! receipt (same denominator digest, same scope, terminal-only); closed
-//! validation ([`AbsenceClaim::validate_closed`]) binds the exact frozen
-//! [`CoverageDenominator`] object — by digest equality, never by a separately asserted [`DenominatorKind`] — plus the exact
-//! query identity, frontier identity, snapshot owner and revision, task,
-//! scope, fence, policy, denominator size, and receipt arithmetic. Any change
-//! to the query, scope, fence, or snapshot after freezing invalidates the
-//! claim via [`AbsenceClaim::check_context`].
+//! An [`AbsenceClaim`] states that a proposition has no match inside an exact domain, scope, time window, and
+//! version. Absence needs a complete denominator plus a terminal receipt; a no-match probe, timeout, silence,
+//! or exhausted budget never decodes as absence. Shape validation ties the claim to its receipt; closed
+//! validation ([`AbsenceClaim::validate_closed`]) binds the exact frozen [`CoverageDenominator`] object, and
+//! query, scope, fence, or snapshot drift invalidates the claim via [`AbsenceClaim::check_context`].
 
 use std::collections::BTreeSet;
 
@@ -24,10 +12,10 @@ use eliot_contracts::{SourceId, StateFence, TaskId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::coverage::{CoverageDenominator, DenominatorKind};
+use crate::coverage::{CoverageDenominator, DenominatorKind, check_receipt_query_frontier};
 use crate::error::{
-    ContractError, MAX_PROOF_BYTES, MAX_SHORT_TEXT, shape_digest, validate_bounded_text,
-    validate_digest,
+    ContractError, MAX_PROOF_BYTES, MAX_SHORT_TEXT, check_frozen, shape_digest,
+    validate_bounded_text, validate_digest,
 };
 use crate::identity::PropositionId;
 use crate::receipt::CoverageReceipt;
@@ -56,6 +44,33 @@ impl OwnerLookup {
     /// Validates the owner binding and lookup proof digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_digest(&self.lookup_proof, "absence.lookup_proof")?;
+        Ok(())
+    }
+
+    /// Recomputes the expected lookup proof binding the actual denominator
+    /// and receipt proofs.
+    pub fn expected_proof(
+        owner: &SourceId,
+        denominator_digest: &str,
+        receipt_proof: &str,
+    ) -> Result<String, ContractError> {
+        shape_digest(&(owner, denominator_digest, receipt_proof))
+    }
+
+    /// Validates this lookup against the actual denominator and receipt
+    /// proofs it cites.
+    pub fn validate_binding(
+        &self,
+        denominator_digest: &str,
+        receipt_proof: &str,
+    ) -> Result<(), ContractError> {
+        self.validate()?;
+        let expected = Self::expected_proof(&self.owner, denominator_digest, receipt_proof)?;
+        if self.lookup_proof != expected {
+            return Err(ContractError::DigestMismatch {
+                field: "absence.lookup_proof",
+            });
+        }
         Ok(())
     }
 }
@@ -99,8 +114,12 @@ impl BoundedProof {
 pub struct AbsenceClaim {
     /// Proposition claimed absent.
     pub proposition: PropositionId,
-    /// Exact domain the absence is claimed over.
+    /// Exact domain the absence is claimed over; must equal the frozen
+    /// denominator member class.
     pub domain: String,
+    /// Exact schema the absence is claimed under; must equal the frozen
+    /// denominator schema.
+    pub schema: String,
     /// Exact scope the absence is claimed over.
     pub scope: String,
     /// Start of the absence window in Unix milliseconds, when bounded.
@@ -132,16 +151,13 @@ pub struct AbsenceClaim {
 }
 
 impl AbsenceClaim {
-    /// Constructs an absence claim and freezes its canonical digest.
-    ///
-    /// Construction enforces shape closure only: the asserted denominator kind
-    /// must be complete and the receipt must be terminal over the asserted
-    /// digest. Binding to the exact frozen denominator object is deferred to
-    /// [`AbsenceClaim::validate_closed`], which no absence consumer may skip.
+    /// Constructs an absence claim and freezes its canonical digest (shape closure only; binding to the
+    /// frozen denominator object is deferred to [`AbsenceClaim::validate_closed`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         proposition: PropositionId,
         domain: impl Into<String>,
+        schema: impl Into<String>,
         scope: impl Into<String>,
         window_start_ms: Option<i64>,
         window_end_ms: Option<i64>,
@@ -159,6 +175,7 @@ impl AbsenceClaim {
         let mut claim = Self {
             proposition,
             domain: domain.into(),
+            schema: schema.into(),
             scope: scope.into(),
             window_start_ms,
             window_end_ms,
@@ -184,6 +201,7 @@ impl AbsenceClaim {
         shape_digest(&(
             &self.proposition,
             &self.domain,
+            &self.schema,
             &self.scope,
             &self.window_start_ms,
             &self.window_end_ms,
@@ -202,6 +220,7 @@ impl AbsenceClaim {
 
     fn validate_shape(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.domain, "absence.domain", MAX_SHORT_TEXT)?;
+        validate_bounded_text(&self.schema, "absence.schema", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.scope, "absence.scope", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.version, "absence.version", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.policy, "absence.policy", MAX_SHORT_TEXT)?;
@@ -254,33 +273,21 @@ impl AbsenceClaim {
     /// Validates the absence shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
-        validate_digest(&self.digest, "absence.digest")?;
-        if self.digest != self.compute_digest()? {
-            return Err(ContractError::DigestMismatch {
-                field: "absence.digest",
-            });
-        }
-        Ok(())
+        check_frozen(&self.digest, &self.compute_digest()?, "absence.digest")
     }
 
-    /// Closes the claim against the exact frozen denominator it cites.
-    ///
-    /// Shape validation trusts the asserted denominator digest, kind, query
-    /// digest, and snapshot identity. Closed validation binds each of them to
-    /// the frozen object: the digest must equal the denominator digest, the
-    /// asserted kind must equal the frozen kind, the query digest must equal
-    /// the digest of the receipt query (never a separately asserted string),
-    /// the receipt frontier must equal the frozen frontier, the snapshot
-    /// identity and owner must equal the frozen snapshot, the claim window and
-    /// version must equal the frozen validity, the scope/task/fence/policy
-    /// must reconcile across claim, denominator, and receipt, and the receipt
-    /// must account for exactly the frozen members — one terminal disposition
-    /// per member, no omissions, no foreign or missing members. An unrelated
-    /// digest paired with an unrelated receipt fails here even when each is
-    /// internally valid.
+    /// Closes the claim against the exact frozen denominator it cites (denominator,
+    /// snapshot/scope, and member-arithmetic checks below).
     pub fn validate_closed(&self, denominator: &CoverageDenominator) -> Result<(), ContractError> {
         self.validate()?;
         denominator.validate()?;
+        self.check_denominator(denominator)?;
+        self.check_scope(denominator)?;
+        self.check_members(denominator)?;
+        Ok(())
+    }
+
+    fn check_denominator(&self, denominator: &CoverageDenominator) -> Result<(), ContractError> {
         if self.denominator_digest != denominator.digest {
             return Err(ContractError::DigestMismatch {
                 field: "absence.denominator_digest",
@@ -291,19 +298,31 @@ impl AbsenceClaim {
                 field: "absence.denominator_kind",
             });
         }
+        check_receipt_query_frontier(
+            denominator,
+            &self.receipt,
+            "absence.query_digest",
+            "absence.frontier",
+        )?;
         let frozen_query = shape_digest(&self.receipt.query)?;
         if self.query_digest != frozen_query {
             return Err(ContractError::DigestMismatch {
                 field: "absence.query_digest",
             });
         }
-        match &denominator.frontier {
-            Some(frontier) if *frontier == self.receipt.frontier => {}
-            _ => {
-                return Err(ContractError::IncompleteDenominator {
-                    field: "absence.frontier",
-                });
-            }
+        Ok(())
+    }
+
+    fn check_scope(&self, denominator: &CoverageDenominator) -> Result<(), ContractError> {
+        if self.domain != denominator.class {
+            return Err(ContractError::ScopeMismatch {
+                field: "absence.domain",
+            });
+        }
+        if self.schema != denominator.schema {
+            return Err(ContractError::ScopeMismatch {
+                field: "absence.schema",
+            });
         }
         if self.snapshot_id != denominator.snapshot.snapshot_id {
             return Err(ContractError::StaleContext {
@@ -315,6 +334,10 @@ impl AbsenceClaim {
                 field: "absence.owner_lookup",
             });
         }
+        self.owner_lookup.validate_binding(
+            denominator.digest.as_str(),
+            self.receipt.proof_digest.as_str(),
+        )?;
         if self.scope != denominator.scope || self.scope != denominator.validity.scope {
             return Err(ContractError::ScopeMismatch {
                 field: "absence.scope",
@@ -342,6 +365,10 @@ impl AbsenceClaim {
                 field: "absence.fence",
             });
         }
+        Ok(())
+    }
+
+    fn check_members(&self, denominator: &CoverageDenominator) -> Result<(), ContractError> {
         if self.receipt.denominator_size != denominator.members.len() as u64 {
             return Err(ContractError::ArithmeticMismatch {
                 field: "absence.denominator_size",
@@ -372,11 +399,8 @@ impl AbsenceClaim {
         Ok(())
     }
 
-    /// Checks the claim against live context; any drift invalidates it.
-    ///
-    /// A changed query digest, scope, fence, or snapshot identity yields
-    /// [`ContractError::StaleContext`]: the claim stays well-formed history
-    /// but no longer grounds the negative.
+    /// Checks the claim against live context; any drift invalidates it
+    /// ([`ContractError::StaleContext`]).
     pub fn check_context(
         &self,
         scope: &str,

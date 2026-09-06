@@ -1,14 +1,8 @@
 //! Position identity: stable IDs plus canonical digests.
 //!
-//! Identity answers "which proposition, claim, evidence set, manifest, source
-//! revision, lineage root, validity window, and predecessors are addressed".
-//! The canonical digest answers "exact bytes were frozen". A digest is never
-//! an identity: two revisions of one proposition share the proposition ID and
-//! carry different digests, and equal digests never manufacture shared lineage.
-//!
-//! Transformed records retain their raw lineage: a derivation names the raw
-//! lineage root and raw source revision it was built from, and a derivation
-//! that merely restates its raw input is rejected.
+//! Identity answers which proposition, claim, evidence set, manifest, source revision, lineage root, validity,
+//! and predecessors are addressed; the digest answers which exact bytes were frozen. A digest is never an
+//! identity, and derivations that merely restate raw input are rejected.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -18,9 +12,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::error::{
-    ContractError, MAX_SHORT_TEXT, shape_digest, validate_bounded_text, validate_digest,
+    ContractError, MAX_SHORT_TEXT, check_frozen, shape_digest, validate_bounded_text,
 };
 
+#[macro_export]
 macro_rules! position_id {
     ($(#[$meta:meta])* $name:ident, $label:literal) => {
         $(#[$meta])*
@@ -105,11 +100,8 @@ position_id!(
     "predecessor_id"
 );
 
-/// The complete identity closure of one epistemic position.
-///
-/// Predecessors form a set: presentation order carries no meaning and the
-/// canonical bytes sort them. `digest` is the SHA-256 of the canonical bytes
-/// of every field except `digest` itself.
+/// The complete identity closure of one epistemic position: predecessors
+/// form a set, and `digest` covers every field except itself.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityBundle {
@@ -226,20 +218,12 @@ impl IdentityBundle {
                 MAX_SHORT_TEXT,
             )?;
         }
-        validate_digest(&self.digest, "identity.digest")?;
-        if self.digest != self.compute_digest()? {
-            return Err(ContractError::DigestMismatch {
-                field: "identity.digest",
-            });
-        }
-        Ok(())
+        check_frozen(&self.digest, &self.compute_digest()?, "identity.digest")
     }
 }
 
-/// A derivation that retains the exact raw lineage it was built from.
-///
-/// `derived_revision` must differ from `raw_source_revision`: a transform
-/// that restates its input byte-for-byte is not a transformation.
+/// A derivation retaining the exact raw lineage it was built from: `derived_revision` must differ from
+/// `raw_source_revision`; a transform restating its input byte-for-byte is not a transformation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TransformedLineage {

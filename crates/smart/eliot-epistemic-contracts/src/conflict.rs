@@ -1,16 +1,9 @@
 //! Conflict set: every position preserved, no winner by arithmetic.
 //!
-//! A [`ConflictSet`] references the canonical owner shapes — task, source,
-//! fence, and lineage identities come from the foundation and identity crates
-//! and are never duplicated here — while preserving every local position with
-//! its source, stance, assumptions, counters, and minority flag, plus the
-//! common lineage, unresolved residue and owners, discriminative probe, and
-//! receipt digest. Positions form a meaningful sequence: declaration order is
-//! preserved on the wire so reviewers read the debate as recorded.
-//!
-//! Count, recency, and scalar confidence never resolve a conflict. There is
-//! deliberately no resolution constructor: a set closes only when its
-//! unresolved residue is empty and its lifecycle says so.
+//! A [`ConflictSet`] preserves every local position with source, stance, assumptions, counters, and minority
+//! flag, plus common lineage, unresolved residue and owners, probe, and receipt digest. Count, recency, and
+//! scalar confidence never resolve a conflict: a set closes only when its residue is empty and its lifecycle
+//! says so.
 
 use std::collections::BTreeSet;
 
@@ -19,8 +12,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{
-    ContractError, MAX_HANDLES, MAX_POSITIONS, MAX_SHORT_TEXT, MAX_STATEMENT_TEXT, shape_digest,
-    validate_bounded_text, validate_digest,
+    ContractError, MAX_HANDLES, MAX_POSITIONS, MAX_SHORT_TEXT, MAX_STATEMENT_TEXT, check_frozen,
+    shape_digest, validate_bounded_text, validate_digest,
 };
 use crate::identity::LineageRootId;
 
@@ -46,25 +39,7 @@ pub enum ConflictKind {
     Architecture,
 }
 
-impl ConflictKind {
-    /// Returns the exact frozen wire name of this conflict kind.
-    pub const fn wire_name(self) -> &'static str {
-        match self {
-            Self::Epistemic => "EPISTEMIC",
-            Self::State => "STATE",
-            Self::Plan => "PLAN",
-            Self::Authority => "AUTHORITY",
-            Self::Artifact => "ARTIFACT",
-            Self::Instruction => "INSTRUCTION",
-            Self::Resource => "RESOURCE",
-            Self::Architecture => "ARCHITECTURE",
-        }
-    }
-}
-
-/// Claim acceptability inside one conflict set, per I13.2.
-///
-/// This axis describes support and attack relations inside the set. It is
+/// Claim acceptability inside one conflict set, per I13.2: support and attack relations inside the set,
 /// orthogonal to epistemic status and to the set lifecycle below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -81,19 +56,6 @@ pub enum ArgumentAcceptability {
     Undecided,
 }
 
-impl ArgumentAcceptability {
-    /// Returns the exact frozen wire name of this acceptability.
-    pub const fn wire_name(self) -> &'static str {
-        match self {
-            Self::Grounded => "GROUNDED",
-            Self::Contested => "CONTESTED",
-            Self::Defeated => "DEFEATED",
-            Self::AssumptionDependent => "ASSUMPTION_DEPENDENT",
-            Self::Undecided => "UNDECIDED",
-        }
-    }
-}
-
 /// Lifecycle of the conflict set itself; conflict is localized state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -108,19 +70,6 @@ pub enum ConflictLifecycle {
     Superseded,
     /// Closed with empty unresolved residue.
     Resolved,
-}
-
-impl ConflictLifecycle {
-    /// Returns the exact frozen wire name of this lifecycle state.
-    pub const fn wire_name(self) -> &'static str {
-        match self {
-            Self::Open => "OPEN",
-            Self::Investigating => "INVESTIGATING",
-            Self::Decided => "DECIDED",
-            Self::Superseded => "SUPERSEDED",
-            Self::Resolved => "RESOLVED",
-        }
-    }
 }
 
 /// One preserved position inside a conflict set.
@@ -385,12 +334,6 @@ impl ConflictSet {
     /// Validates the set shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
-        validate_digest(&self.digest, "conflict.digest")?;
-        if self.digest != self.compute_digest()? {
-            return Err(ContractError::DigestMismatch {
-                field: "conflict.digest",
-            });
-        }
-        Ok(())
+        check_frozen(&self.digest, &self.compute_digest()?, "conflict.digest")
     }
 }

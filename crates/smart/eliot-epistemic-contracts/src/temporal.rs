@@ -1,16 +1,8 @@
 //! Temporal roles: five distinct times that must never merge.
 //!
-//! Event, effective, observation, ingestion, and commit times answer different
-//! questions — when something happened, when the proposition holds, when it
-//! was observed, when it entered the pipeline, and when it was committed.
-//! A [`TemporalRecord`] keeps all five as separate fields. Pipeline order is
-//! enforced where it is load-bearing (observation before ingestion before
-//! commit); the event/effective pair stays unordered because backdated and
-//! predictive propositions are legitimate.
-//!
-//! [`TemporalPrecedence`] records bare chronological order. Chronology never
-//! decodes as causation: there is deliberately no conversion into a causal
-//! claim.
+//! Event, effective, observation, ingestion, and commit times stay separate fields; pipeline order
+//! (observation, ingestion, commit) is enforced while event/effective stay unordered. [`TemporalPrecedence`]
+//! records bare chronology, which never decodes as causation.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -31,19 +23,6 @@ pub enum TemporalRole {
     Ingestion,
     /// When the record was committed.
     Commit,
-}
-
-impl TemporalRole {
-    /// Returns the exact frozen wire name of this role.
-    pub const fn wire_name(self) -> &'static str {
-        match self {
-            Self::Event => "EVENT",
-            Self::Effective => "EFFECTIVE",
-            Self::Observation => "OBSERVATION",
-            Self::Ingestion => "INGESTION",
-            Self::Commit => "COMMIT",
-        }
-    }
 }
 
 /// Five distinct times of one record, in Unix milliseconds.
@@ -104,11 +83,8 @@ impl TemporalRecord {
     }
 }
 
-/// Bare chronological precedence between two instants.
-///
-/// Precedence is navigation evidence only. It carries a bounded basis note and
-/// no mechanism, rivals, or causal status, so it cannot be promoted into a
-/// causal claim by retyping.
+/// Bare chronological precedence between two instants: navigation evidence
+/// only, never promotable into a causal claim by retyping.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TemporalPrecedence {

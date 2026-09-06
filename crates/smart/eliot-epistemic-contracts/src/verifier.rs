@@ -1,28 +1,18 @@
-//! Verifier competence and disclosure: who may vouch, and how widely a
-//! position may travel.
+//! Verifier competence and disclosure: who may vouch, and how widely a position may travel.
 //!
-//! A [`RequiredVerifier`] names the exact evaluation contract and revision
-//! required to vouch for a position, the [`EvidenceFreshness`] of the run it
-//! vouched for, and its standing. Only a [`VerifierStanding::Competent`]
-//! verifier over a current freshness
-//! ([`EvidenceFreshness::ExactCandidate`],
-//! [`EvidenceFreshness::ExactCommit`], or
-//! [`EvidenceFreshness::ExactQuiescedWorktree`]) licenses the strongest
-//! renderings; anything else quarantines the position instead of promoting it.
-//! Freshness vocabulary is reused from `eliot-evidence` and never redefined.
-//!
-//! [`DisclosureClass`] bounds how widely a position may travel: open material
-//! renders under its ceilings, restricted material never rises above qualified
-//! inference, and quarantined material renders only as quarantined unknown.
-//! Disclosure is a ceiling, never evidence: it can only lower assertability.
+//! A [`RequiredVerifier`] names the evaluation contract, revision, run freshness, and standing required to
+//! vouch. Only a competent verifier over a current freshness licenses the strongest renderings.
+//! [`DisclosureClass`] bounds travel (open, restricted, quarantined) as a ceiling, never evidence. Freshness
+//! vocabulary is reused from `eliot-evidence`.
 
-use eliot_contracts::ContractId;
-use eliot_evidence::EvidenceFreshness;
+use eliot_contracts::{ContractId, SourceId};
+use eliot_evidence::{EvidenceFreshness, VerificationBinding};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{
-    ContractError, MAX_SHORT_TEXT, shape_digest, validate_bounded_text, validate_digest,
+    ContractError, MAX_SHORT_TEXT, check_frozen, shape_digest, validate_bounded_text,
+    validate_digest,
 };
 
 /// Standing of a required verifier.
@@ -37,17 +27,6 @@ pub enum VerifierStanding {
     Quarantined,
 }
 
-impl VerifierStanding {
-    /// Returns the exact frozen wire name of this standing.
-    pub const fn wire_name(self) -> &'static str {
-        match self {
-            Self::Competent => "COMPETENT",
-            Self::Unknown => "UNKNOWN",
-            Self::Quarantined => "QUARANTINED",
-        }
-    }
-}
-
 /// How widely a position may travel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -60,14 +39,72 @@ pub enum DisclosureClass {
     Quarantined,
 }
 
-impl DisclosureClass {
-    /// Returns the exact frozen wire name of this disclosure class.
-    pub const fn wire_name(self) -> &'static str {
-        match self {
-            Self::Open => "OPEN",
-            Self::Restricted => "RESTRICTED",
-            Self::Quarantined => "QUARANTINED",
+/// Independent privacy handling of a position: what survived redaction.
+/// Purged caps at hypothesis candidate no matter the disclosure class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PrivacyHandling {
+    /// No load-bearing material was redacted.
+    Unrestricted,
+    /// Some material is need-to-know; the position renders qualified at best.
+    RestrictedHandling,
+    /// A load-bearing handle was purged; the position holds as candidate only.
+    Purged,
+}
+
+/// Source assurance binding one proof digest to its actual source, with a
+/// derived (never asserted) integrity digest.
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct SourceAssurance {
+    /// Source that produced the proof payload.
+    pub source: SourceId,
+    /// Source revision the proof was captured under.
+    pub revision: String,
+    /// Digest of the proof payload this assurance covers.
+    pub proof_digest: String,
+    /// Derived integrity digest over source, revision, and proof digest.
+    pub integrity_digest: String,
+}
+
+impl SourceAssurance {
+    /// Constructs source assurance and freezes its derived integrity digest.
+    pub fn new(
+        source: SourceId,
+        revision: impl Into<String>,
+        proof_digest: impl Into<String>,
+    ) -> Result<Self, ContractError> {
+        let mut assurance = Self {
+            source,
+            revision: revision.into(),
+            proof_digest: proof_digest.into(),
+            integrity_digest: String::new(),
+        };
+        validate_digest(&assurance.proof_digest, "assurance.proof_digest")?;
+        validate_bounded_text(&assurance.revision, "assurance.revision", MAX_SHORT_TEXT)?;
+        assurance.integrity_digest = assurance.compute_integrity()?;
+        Ok(assurance)
+    }
+
+    /// Recomputes the derived integrity digest.
+    pub fn compute_integrity(&self) -> Result<String, ContractError> {
+        shape_digest(&(&self.source, &self.revision, &self.proof_digest))
+    }
+
+    /// Validates the binding: the integrity digest must cover exactly this
+    /// source, revision, and proof digest.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_digest(&self.proof_digest, "assurance.proof_digest")?;
+        validate_bounded_text(&self.revision, "assurance.revision", MAX_SHORT_TEXT)?;
+        validate_digest(&self.integrity_digest, "assurance.integrity_digest")?;
+        if self.integrity_digest != self.compute_integrity()? {
+            return Err(ContractError::DigestMismatch {
+                field: "assurance.integrity_digest",
+            });
         }
+        Ok(())
     }
 }
 
@@ -85,18 +122,27 @@ pub struct RequiredVerifier {
     pub standing: VerifierStanding,
     /// Bounded quarantine reason; required exactly when quarantined.
     pub quarantine_reason: Option<String>,
+    /// Current run binding reused from `eliot-evidence`: the contract run
+    /// that vouched, with its revision. Standing alone never proves a run.
+    pub verification: VerificationBinding,
+    /// Digest of the exact candidate or receipt the run verified. Results
+    /// bind to this digest; a run over another digest vouches nothing here.
+    pub verified_digest: String,
     /// Canonical digest of the verifier shape, excluding this field.
     pub digest: String,
 }
 
 impl RequiredVerifier {
     /// Constructs a required verifier and freezes its canonical digest.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         contract: ContractId,
         revision: impl Into<String>,
         freshness: EvidenceFreshness,
         standing: VerifierStanding,
         quarantine_reason: Option<String>,
+        verification: VerificationBinding,
+        verified_digest: impl Into<String>,
     ) -> Result<Self, ContractError> {
         let mut verifier = Self {
             contract,
@@ -104,6 +150,8 @@ impl RequiredVerifier {
             freshness,
             standing,
             quarantine_reason,
+            verification,
+            verified_digest: verified_digest.into(),
             digest: String::new(),
         };
         verifier.validate_shape()?;
@@ -119,14 +167,13 @@ impl RequiredVerifier {
             &self.freshness,
             &self.standing,
             &self.quarantine_reason,
+            &self.verification,
+            &self.verified_digest,
         ))
     }
 
-    /// Returns whether the vouched run is current.
-    ///
-    /// Only the exact candidate, the exact commit, or a quiesced exact
-    /// worktree counts as current; older snapshots, stale runs, and unknown
-    /// freshness never do.
+    /// Returns whether the vouched run is current (exact candidate, commit,
+    /// or quiesced worktree only).
     pub const fn is_current(&self) -> bool {
         matches!(
             self.freshness,
@@ -143,6 +190,12 @@ impl RequiredVerifier {
 
     fn validate_shape(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.revision, "verifier.revision", MAX_SHORT_TEXT)?;
+        self.verification
+            .validate()
+            .map_err(|_| ContractError::ImpossibleCombination {
+                field: "verifier.verification",
+            })?;
+        validate_digest(&self.verified_digest, "verifier.verified_digest")?;
         match (&self.standing, &self.quarantine_reason) {
             (VerifierStanding::Quarantined, Some(reason)) => {
                 validate_bounded_text(
@@ -166,15 +219,21 @@ impl RequiredVerifier {
         Ok(())
     }
 
-    /// Validates the verifier shape and its frozen digest.
-    pub fn validate(&self) -> Result<(), ContractError> {
-        self.validate_shape()?;
-        validate_digest(&self.digest, "verifier.digest")?;
-        if self.digest != self.compute_digest()? {
+    /// Validates that this verifier vouched for the given candidate or
+    /// receipt digest. A competent run over another digest vouches nothing.
+    pub fn validate_for(&self, verified_digest: &str) -> Result<(), ContractError> {
+        self.validate()?;
+        if self.verified_digest != verified_digest {
             return Err(ContractError::DigestMismatch {
-                field: "verifier.digest",
+                field: "verifier.verified_digest",
             });
         }
         Ok(())
+    }
+
+    /// Validates the verifier shape and its frozen digest.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        self.validate_shape()?;
+        check_frozen(&self.digest, &self.compute_digest()?, "verifier.digest")
     }
 }

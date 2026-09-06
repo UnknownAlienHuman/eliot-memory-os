@@ -1,13 +1,8 @@
 //! Coverage receipt: exactly one disposition per enumerated member.
 //!
-//! A [`CoverageReceipt`] binds the query, frontier, denominator, task, scope,
-//! fence, policy, dependence groups, omissions, digest, and proof of one
-//! frozen enumeration. Every enumerated member carries exactly one
-//! [`MemberDisposition`]: the disposition is a field of the member outcome,
-//! and duplicate members are rejected, so silence can never masquerade as a
-//! second outcome. Member order is declaration order on the wire; receipt
-//! arithmetic — members plus omissions equal the denominator size — is
-//! validated, never assumed.
+//! A [`CoverageReceipt`] binds query, frontier, denominator, task, scope, fence, policy, groups, omissions,
+//! and proof of one frozen enumeration. Duplicate members are rejected and member-plus-omission arithmetic
+//! must equal the denominator size.
 
 use std::collections::BTreeSet;
 
@@ -18,13 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::coverage::{FrontierSpec, QuerySpec};
 use crate::error::{
-    ContractError, MAX_HANDLES, MAX_MEMBERS, MAX_SHORT_TEXT, shape_digest, validate_bounded_text,
-    validate_digest,
+    ContractError, MAX_HANDLES, MAX_MEMBERS, MAX_SHORT_TEXT, check_frozen, shape_digest,
+    validate_bounded_text, validate_digest,
 };
 
-/// What the enumeration observed for one member.
-///
-/// Variants are mutually exclusive outcomes, not a ladder: `EXHAUSTION`
+/// What the enumeration observed for one member: mutually exclusive outcomes, not a ladder. `EXHAUSTION`
 /// records that a budget ended the route, and never decodes as completeness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -71,10 +64,8 @@ impl MemberDisposition {
         }
     }
 
-    /// Returns whether this disposition is terminal for absence reasoning.
-    ///
-    /// Only observed presence and authoritative absence close a member;
-    /// every other disposition keeps the member unresolved.
+    /// Returns whether this disposition is terminal for absence reasoning: only observed presence and
+    /// authoritative absence close a member; every other disposition keeps the member unresolved.
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Observed | Self::AuthoritativeAbsence)
     }
@@ -215,14 +206,6 @@ impl CoverageReceipt {
         ))
     }
 
-    /// Counts members carrying the given disposition.
-    pub fn count_with(&self, disposition: MemberDisposition) -> usize {
-        self.members
-            .iter()
-            .filter(|outcome| outcome.disposition == disposition)
-            .count()
-    }
-
     /// Returns whether every member outcome is terminal.
     pub fn is_terminal(&self) -> bool {
         self.omissions.is_empty()
@@ -295,12 +278,6 @@ impl CoverageReceipt {
     /// Validates the receipt shape, arithmetic, and frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
-        validate_digest(&self.digest, "receipt.digest")?;
-        if self.digest != self.compute_digest()? {
-            return Err(ContractError::DigestMismatch {
-                field: "receipt.digest",
-            });
-        }
-        Ok(())
+        check_frozen(&self.digest, &self.compute_digest()?, "receipt.digest")
     }
 }

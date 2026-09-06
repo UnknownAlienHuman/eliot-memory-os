@@ -1,8 +1,7 @@
 //! Closed validation errors and shared bounded-text helpers.
 //!
-//! Every failure in this crate is a member of [`ContractError`]. The enum is
-//! closed: there is no catch-all variant, and validation never panics. Bounds
-//! for variable-length fields live here so every module enforces one ceiling.
+//! Every failure in this crate is a member of [`ContractError`]. The enum is closed: no catch-all variant,
+//! and validation never panics. Bounds for variable-length fields live here so every module enforces one ceiling.
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use serde::Serialize;
@@ -127,6 +126,19 @@ pub(crate) fn validate_digest(value: &str, field: &'static str) -> Result<(), Co
             .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
     {
         return Err(ContractError::InvalidDigest { field });
+    }
+    Ok(())
+}
+
+/// Validates a frozen shape digest against its recomputed canonical bytes.
+pub(crate) fn check_frozen(
+    digest: &str,
+    computed: &str,
+    field: &'static str,
+) -> Result<(), ContractError> {
+    validate_digest(digest, field)?;
+    if digest != computed {
+        return Err(ContractError::DigestMismatch { field });
     }
     Ok(())
 }

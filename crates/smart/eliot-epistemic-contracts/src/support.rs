@@ -1,14 +1,8 @@
 //! Per-proposition support: results, validity bounds, and weakest-link.
 //!
-//! A [`SupportRecord`] states what one inquiry route observed for one
-//! proposition inside explicit scope, time, version, and precision bounds,
-//! with every evidence handle preserved. Handles are a set: order carries no
-//! meaning. An unsupported-but-valid record is data, not an error —
-//! `data insufficient` remains a valid outcome and reopen stays possible via
-//! [`SupportRecord::reopen_reason`].
-//!
-//! Aggregation across routes uses [`weakest_link`]: the least supportive
-//! result bounds the whole, so one strong route never silences a rival.
+//! A [`SupportRecord`] states what one inquiry route observed for one proposition inside explicit scope, time,
+//! version, and precision bounds, with every evidence handle preserved. An unsupported-but-valid record is data,
+//! not an error. Aggregation uses [`weakest_link`].
 
 use std::collections::BTreeSet;
 
@@ -20,12 +14,13 @@ use serde::{Deserialize, Serialize};
 use crate::error::{
     ContractError, MAX_HANDLES, MAX_SHORT_TEXT, validate_bounded_text, validate_digest,
 };
+use crate::grade::GradeAssignment;
 use crate::identity::PropositionId;
+use crate::temporal::TemporalRecord;
+use crate::verifier::SourceAssurance;
 
-/// What one inquiry route observed for one proposition.
-///
-/// `Supported` and `Partial` are the only results that license downstream
-/// reliance; every other result preserves the unknown instead of smoothing it.
+/// What one inquiry route observed for one proposition: `Supported` and `Partial` are the only results that
+/// license downstream reliance; every other result preserves the unknown instead of smoothing it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SupportResult {
@@ -50,21 +45,6 @@ pub enum SupportResult {
 }
 
 impl SupportResult {
-    /// Returns the exact frozen wire name of this result.
-    pub const fn wire_name(self) -> &'static str {
-        match self {
-            Self::Supported => "SUPPORTED",
-            Self::Partial => "PARTIAL",
-            Self::Contradicted => "CONTRADICTED",
-            Self::Unsupported => "UNSUPPORTED",
-            Self::Unknown => "UNKNOWN",
-            Self::OutsideManifest => "OUTSIDE_MANIFEST",
-            Self::Stale => "STALE",
-            Self::Superseded => "SUPERSEDED",
-            Self::JustifiedNotApplicable => "JUSTIFIED_NOT_APPLICABLE",
-        }
-    }
-
     /// Weakest-link rank: lower bounds any aggregate it participates in.
     pub(crate) const fn link_rank(self) -> u8 {
         match self {
@@ -79,11 +59,7 @@ impl SupportResult {
     }
 }
 
-/// Returns the weakest of the supplied results.
-///
-/// The least supportive result bounds the whole: a `CONTRADICTED` route is
-/// never outvoted by additional `SUPPORTED` routes. An empty input is an
-/// error, never a silent success.
+/// Returns the weakest of the supplied results (empty input is an error).
 pub fn weakest_link(results: &[SupportResult]) -> Result<SupportResult, ContractError> {
     let mut iter = results.iter();
     let first = iter.next().ok_or(ContractError::EmptyCollection {
@@ -98,10 +74,8 @@ pub fn weakest_link(results: &[SupportResult]) -> Result<SupportResult, Contract
     Ok(weakest)
 }
 
-/// Scope, time, version, and precision bounds of one support observation.
-///
-/// A mismatch between these bounds and the question asked limits support
-/// instead of failing: the record stays valid data about a narrower question.
+/// Scope, time, version, and precision bounds of one support observation: a mismatch with the question asked
+/// limits support instead of failing; the record stays valid data about a narrower question.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ValidityBounds {
@@ -117,9 +91,8 @@ pub struct ValidityBounds {
     pub precision: String,
 }
 
-/// Precision lattice, coarsest-first: a coarser assertion is covered by finer
-/// support, never the reverse. Spellings outside this lattice cover only exact
-/// equality, so novel precision vocabulary stays reviewable data elsewhere.
+/// Precision lattice, coarsest-first: coarser support covers finer assertions,
+/// never the reverse; off-lattice spellings cover only exact equality.
 const PRECISION_LATTICE: [&str; 6] = [
     "repository",
     "package",
@@ -133,6 +106,41 @@ fn precision_rank(precision: &str) -> Option<usize> {
     PRECISION_LATTICE
         .iter()
         .position(|known| *known == precision.trim().to_lowercase())
+}
+
+/// Returns whether `supported` precision covers an `asserted` precision.
+pub(crate) fn precision_covers(supported: &str, asserted: &str) -> bool {
+    match (precision_rank(supported), precision_rank(asserted)) {
+        (Some(known), Some(wanted)) => wanted <= known,
+        _ => supported == asserted,
+    }
+}
+
+/// Returns whether the outer window contains the inner window (unbounded
+/// sides are unbounded; a bounded outer side never contains an unbounded
+/// inner side).
+pub(crate) fn window_contains(
+    outer: (Option<i64>, Option<i64>),
+    inner: (Option<i64>, Option<i64>),
+) -> bool {
+    match (outer.0, inner.0) {
+        (Some(lo), Some(inner_lo)) if inner_lo < lo => return false,
+        _ => {}
+    }
+    match (outer.1, inner.1) {
+        (Some(hi), Some(inner_hi)) if inner_hi > hi => return false,
+        _ => {}
+    }
+    // A bounded outer window never contains an unbounded inner window on
+    // the bounded side: answering "any time" from "this week" is a partial
+    // answer, never a covered one.
+    if outer.0.is_some() && inner.0.is_none() {
+        return false;
+    }
+    if outer.1.is_some() && inner.1.is_none() {
+        return false;
+    }
+    true
 }
 
 impl ValidityBounds {
@@ -171,18 +179,7 @@ impl ValidityBounds {
     }
 
     /// Returns whether these bounds cover the requested scope, instant,
-    /// version, and precision.
-    ///
-    /// All four axes participate: scope must match exactly, the instant must
-    /// fall inside the validity window, the version must match exactly, and
-    /// the asserted precision must be no finer than the supported precision on
-    /// the documented lattice (`repository` < `package` < `directory` <
-    /// `file` < `symbol` < `line`). Version compatibility is deliberately
-    /// exact: any looser compatibility rule must be stated, versioned, and
-    /// reviewed as its own contract change, never inferred here. Precision
-    /// spellings outside the lattice cover only exact equality. The bounds are
-    /// never rewritten: a mismatch limits support instead of failing, and the
-    /// record stays valid data about the narrower question it does cover.
+    /// version, and precision. A mismatch limits support instead of failing.
     pub fn covers(
         &self,
         scope: &str,
@@ -201,10 +198,26 @@ impl ValidityBounds {
         if self.version != version {
             return false;
         }
-        match (precision_rank(&self.precision), precision_rank(precision)) {
-            (Some(supported), Some(asserted)) => asserted <= supported,
-            _ => self.precision == precision,
+        precision_covers(&self.precision, precision)
+    }
+
+    /// Returns whether these bounds cover a candidate window, version, and
+    /// precision: same scope and version, containing window, covering
+    /// precision.
+    pub fn covers_candidate(
+        &self,
+        scope: &str,
+        window: (Option<i64>, Option<i64>),
+        version: &str,
+        precision: &str,
+    ) -> bool {
+        if self.scope != scope || self.version != version {
+            return false;
         }
+        if !window_contains((self.window_start_ms, self.window_end_ms), window) {
+            return false;
+        }
+        precision_covers(&self.precision, precision)
     }
 }
 
@@ -220,10 +233,17 @@ pub struct SupportRecord {
     pub handles: BTreeSet<ArtifactId>,
     /// Scope, time, version, and precision bounds of the observation.
     pub validity: ValidityBounds,
+    /// Grade assignment of the observation; unknown stays unknown and caps.
+    pub grade: GradeAssignment,
     /// Task binding of the inquiry that produced the observation.
     pub task_id: TaskId,
     /// Fence under which the observation was captured.
     pub fence: StateFence,
+    /// Applicable temporal record, when the route timestamped its capture.
+    /// The five roles stay separate; no role is merged into the window.
+    pub temporal: Option<TemporalRecord>,
+    /// Source assurance binding this record's proof to its actual source.
+    pub assurance: Option<SourceAssurance>,
     /// Bounded reason that reopens inquiry, required for stale/superseded.
     pub reopen_reason: Option<String>,
     /// Digest of the bounded proof payload behind this record.
@@ -238,8 +258,11 @@ impl SupportRecord {
         result: SupportResult,
         handles: BTreeSet<ArtifactId>,
         validity: ValidityBounds,
+        grade: GradeAssignment,
         task_id: TaskId,
         fence: StateFence,
+        temporal: Option<TemporalRecord>,
+        assurance: Option<SourceAssurance>,
         reopen_reason: Option<String>,
         proof_digest: impl Into<String>,
     ) -> Result<Self, ContractError> {
@@ -248,8 +271,11 @@ impl SupportRecord {
             result,
             handles,
             validity,
+            grade,
             task_id,
             fence,
+            temporal,
+            assurance,
             reopen_reason,
             proof_digest: proof_digest.into(),
         };
@@ -262,11 +288,23 @@ impl SupportRecord {
     /// `Unsupported` with valid handles and bounds is valid data and passes.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validity.validate()?;
+        self.grade.validate()?;
         self.fence
             .validate()
             .map_err(|_| ContractError::FenceMismatch {
                 field: "support.fence",
             })?;
+        if let Some(temporal) = &self.temporal {
+            temporal.validate()?;
+        }
+        if let Some(assurance) = &self.assurance {
+            assurance.validate()?;
+            if assurance.proof_digest != self.proof_digest {
+                return Err(ContractError::DigestMismatch {
+                    field: "support.assurance",
+                });
+            }
+        }
         if self.handles.len() > MAX_HANDLES {
             return Err(ContractError::TooMany {
                 field: "support.handles",

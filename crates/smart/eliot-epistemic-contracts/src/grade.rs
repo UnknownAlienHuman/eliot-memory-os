@@ -1,16 +1,9 @@
 //! Evidence grade: the frozen I21.2 rigour ladder.
 //!
-//! Grade states how much rigour was **required**, following I21.2 exactly:
-//! `ORIENTING`, `GROUNDED`, `CORROBORATED`, `SCIENCE_GRADE`, in that order.
-//! Grade is orthogonal to evidence authority, per-claim support, and
-//! assertability: no axis can be inferred from another or collapsed into one
-//! scalar. This module performs intrinsic ceiling checks only — it validates
-//! supplied ceilings against each other and never grades evidence itself.
-//!
-//! A claim carries the grade it was produced under; quoting a claim never
-//! upgrades it, dependents of a claim cannot claim a higher grade than the
-//! claim they depend on, and an unknown grade is distinct from the lowest
-//! known grade.
+//! Grade states how much rigour was **required**: `ORIENTING`, `GROUNDED`, `CORROBORATED`, `SCIENCE_GRADE`,
+//! weakest-first, orthogonal to authority, support, and assertability. This module only checks supplied
+//! ceilings — it never grades evidence. Quoting never upgrades; dependents never exceed their parent; unknown
+//! stays distinct from the lowest known grade.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -90,10 +83,9 @@ impl EvidenceGrade {
         Ok(())
     }
 
-    /// Validates that a dependent claim does not raise its parent's grade.
+    /// Quoting a claim never upgrades its parent's grade.
     ///
-    /// A later reader may not upgrade a claim by quoting it; raising the
-    /// requirement is prospective and never retroactive.
+    /// Raising the requirement is prospective and never retroactive.
     pub fn check_dependent(parent: Self, dependent: Self) -> Result<(), ContractError> {
         if dependent.rank() > parent.rank() {
             return Err(ContractError::CeilingViolation {
@@ -104,11 +96,8 @@ impl EvidenceGrade {
     }
 }
 
-/// A supplied grade that keeps "unknown" distinct from the lowest known grade.
-///
-/// Exactly one side is present: either a frozen grade or a bounded reason why
-/// the grade cannot be established. An unknown grade never decodes as
-/// `ORIENTING` and never satisfies a grade ceiling on its own.
+/// A supplied grade keeping "unknown" distinct from the lowest known grade:
+/// exactly one side is present, and unknown never satisfies a ceiling alone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GradeAssignment {
@@ -153,6 +142,47 @@ impl GradeAssignment {
             _ => Err(ContractError::ImpossibleCombination {
                 field: "grade.assignment",
             }),
+        }
+    }
+
+    /// Returns the known grade, or `None` when the grade is unknown.
+    pub fn known_grade(&self) -> Option<EvidenceGrade> {
+        self.grade
+    }
+
+    /// Returns the weakest of the supplied assignments: any unknown poisons
+    /// the aggregate, otherwise the least rigorous known grade wins. Empty
+    /// input errors.
+    pub fn weakest(assignments: &[GradeAssignment]) -> Result<GradeAssignment, ContractError> {
+        let mut iter = assignments.iter();
+        let first = iter.next().ok_or(ContractError::EmptyCollection {
+            field: "grade.assignment",
+        })?;
+        first.validate()?;
+        let mut weakest = first.grade;
+        let mut unknown = first.is_unknown();
+        for assignment in iter {
+            assignment.validate()?;
+            if assignment.is_unknown() {
+                unknown = true;
+            } else if let Some(grade) = assignment.grade {
+                weakest = Some(match weakest {
+                    Some(current) if current.rank() < grade.rank() => current,
+                    _ => grade,
+                });
+            }
+        }
+        if unknown {
+            Ok(GradeAssignment {
+                grade: None,
+                unknown_reason: Some("weakest-link: grade unknown".to_owned()),
+            })
+        } else if let Some(grade) = weakest {
+            Ok(GradeAssignment::known(grade))
+        } else {
+            Err(ContractError::EmptyCollection {
+                field: "grade.assignment",
+            })
         }
     }
 }

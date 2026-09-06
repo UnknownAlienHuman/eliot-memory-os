@@ -1,30 +1,21 @@
 //! Owner-neutral position request: what is asked, under which bindings.
 //!
-//! A [`PositionRequest`] carries the question, the proposition it bears on,
-//! the task and attempt it is bound to, the task-plan revision, the scope with
-//! its time/version/precision validity, the fence, and the admitted record
-//! handles it may draw on. It resolves nothing, acquires nothing, ranks
-//! nothing, and writes nothing: resolution, acquisition, ranking, and
-//! canonical writes belong to their owning boundaries.
-//!
-//! Donor disposition (`crates/smart/eliot-epistemic/src/lib.rs`, donor scope
-//! `PositionRequest`): the donor `question`, `scope`, `state_fence`, and
-//! `records` are preserved — records as admitted handle sets rather than
-//! embedded envelopes, so the request cannot smuggle unadmitted evidence. The
-//! donor had no task, attempt, revision, or proposition binding; those are
-//! added here because an unbound question is not answerable: `task_id`,
-//! `attempt_id`, `revision`, `proposition`, and `validity` close the request.
-//! The donor `resolve` algorithm is explicitly not carried.
+//! A [`PositionRequest`] carries the question, proposition, task, attempt, revision, scope with validity,
+//! fence, and admitted record handles. It resolves, acquires, ranks, and writes nothing. Donor disposition
+//! (`crates/smart/eliot-epistemic/src/lib.rs`, donor scope `PositionRequest`): `question`, `scope`,
+//! `state_fence`, and `records` are preserved (records as handle sets, never embedded envelopes); task,
+//! attempt, revision, proposition, and validity close the request; the donor `resolve` algorithm is not carried.
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::{ArtifactId, StateFence, TaskId, TaskRevision};
+use eliot_contracts::{ArtifactId, OperationId, RequestId, StateFence, TaskId, TaskRevision};
+use eliot_receipts::WorkScope;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{
-    ContractError, MAX_HANDLES, MAX_SHORT_TEXT, MAX_STATEMENT_TEXT, shape_digest,
-    validate_bounded_text, validate_digest,
+    ContractError, MAX_HANDLES, MAX_SHORT_TEXT, MAX_STATEMENT_TEXT, check_frozen, shape_digest,
+    validate_bounded_text,
 };
 use crate::identity::PropositionId;
 use crate::support::ValidityBounds;
@@ -46,6 +37,15 @@ pub struct PositionRequest {
     pub request_kind: RequestKind,
     /// Bounded question the position must bear on.
     pub question: String,
+    /// Caller request identity: retries share it, distinct asks never do.
+    pub request_id: RequestId,
+    /// Operation identity the position is proposed under.
+    pub operation_id: OperationId,
+    /// Idempotency key binding retries of this exact ask.
+    pub idempotency_key: String,
+    /// Canonical work scope the inquiry runs in, reused from `eliot-receipts`
+    /// and never redefined here: there is exactly one `WorkScope` owner.
+    pub work_scope: WorkScope,
     /// Proposition the question bears on; applicability is explicit.
     pub proposition: PropositionId,
     /// Task binding of the inquiry.
@@ -71,6 +71,10 @@ impl PositionRequest {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         question: impl Into<String>,
+        request_id: RequestId,
+        operation_id: OperationId,
+        idempotency_key: impl Into<String>,
+        work_scope: WorkScope,
         proposition: PropositionId,
         task_id: TaskId,
         attempt_id: impl Into<String>,
@@ -83,6 +87,10 @@ impl PositionRequest {
         let mut request = Self {
             request_kind: RequestKind::PositionRequest,
             question: question.into(),
+            request_id,
+            operation_id,
+            idempotency_key: idempotency_key.into(),
+            work_scope,
             proposition,
             task_id,
             attempt_id: attempt_id.into(),
@@ -103,6 +111,10 @@ impl PositionRequest {
         shape_digest(&(
             &self.request_kind,
             &self.question,
+            &self.request_id,
+            &self.operation_id,
+            &self.idempotency_key,
+            &self.work_scope,
             &self.proposition,
             &self.task_id,
             &self.attempt_id,
@@ -126,8 +138,36 @@ impl PositionRequest {
             });
         }
         validate_bounded_text(&self.question, "request.question", MAX_STATEMENT_TEXT)?;
+        validate_bounded_text(
+            &self.idempotency_key,
+            "request.idempotency_key",
+            MAX_SHORT_TEXT,
+        )?;
         validate_bounded_text(&self.attempt_id, "request.attempt_id", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.scope, "request.scope", MAX_SHORT_TEXT)?;
+        self.work_scope
+            .state_fence
+            .validate()
+            .map_err(|_| ContractError::FenceMismatch {
+                field: "request.work_scope",
+            })?;
+        if self.work_scope.resource_generation != self.work_scope.state_fence.resource_generation {
+            return Err(ContractError::FenceMismatch {
+                field: "request.work_scope",
+            });
+        }
+        if self.work_scope.scope_id.as_str() != self.scope {
+            return Err(ContractError::ScopeMismatch {
+                field: "request.work_scope",
+            });
+        }
+        if !self.work_scope.state_fence.is_compatible_with(&self.fence)
+            || !self.fence.is_compatible_with(&self.work_scope.state_fence)
+        {
+            return Err(ContractError::FenceMismatch {
+                field: "request.work_scope",
+            });
+        }
         self.validity.validate()?;
         if self.validity.scope != self.scope {
             return Err(ContractError::ScopeMismatch {
@@ -155,13 +195,7 @@ impl PositionRequest {
     /// Validates the request shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
-        validate_digest(&self.digest, "request.digest")?;
-        if self.digest != self.compute_digest()? {
-            return Err(ContractError::DigestMismatch {
-                field: "request.digest",
-            });
-        }
-        Ok(())
+        check_frozen(&self.digest, &self.compute_digest()?, "request.digest")
     }
 
     /// Validates this request against the live task, attempt, scope, and fence.

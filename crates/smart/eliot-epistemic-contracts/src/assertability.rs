@@ -1,33 +1,19 @@
 //! Position assertability: what a position may be rendered as.
 //!
-//! Assertability is capped by grade, authority, support results, coverage,
-//! conflict, proof, verifier competence, and disclosure together: the ceilings
-//! intersect and the lowest one wins. The seven levels are distinct renderings
-//! — observed fact, qualified inference, hypothesis candidate, conflict
-//! qualification, quarantined unknown, planning-only, and material effect —
-//! and planning-only material never grants a material effect, no matter how
-//! useful the plan is.
-//!
-//! Support results participate directly: partial support caps at qualified
-//! inference, and unknown, stale, outside-manifest, contradicted,
-//! unsupported, or superseded support caps at hypothesis candidate, so none of
-//! them can yield unconditional, elevated, or material-effect assertability.
-//! Coverage completeness is never inferred from merely-empty unknowns or
-//! conflicts: callers derive it from a terminal receipt over a complete
-//! denominator (see [`EpistemicPositionCandidate::validate_closed`](crate::candidate::EpistemicPositionCandidate::validate_closed)).
-//! Disclosure can only lower: restricted material never rises above qualified
-//! inference and quarantined material renders only as quarantined unknown. A
-//! material effect additionally requires a competent verifier over a current
-//! freshness; without one the effect is not licensed.
+//! Assertability is capped by grade, authority, support results, coverage, conflict, proof, verifier competence,
+//! disclosure, and privacy together: the ceilings intersect and the lowest one wins. Support results participate
+//! directly (partial caps at qualified inference; unknown, stale, contradicted, and friends cap at hypothesis
+//! candidate); coverage completeness is never inferred from empty unknowns or conflicts; disclosure and privacy
+//! can only lower; a material effect additionally requires a competent verifier over a current freshness.
 
 use eliot_evidence::EvidenceAuthority;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ContractError;
-use crate::grade::EvidenceGrade;
+use crate::grade::{EvidenceGrade, GradeAssignment};
 use crate::support::SupportResult;
-use crate::verifier::{DisclosureClass, RequiredVerifier};
+use crate::verifier::{DisclosureClass, PrivacyHandling, RequiredVerifier};
 
 /// What a position may be rendered as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -50,19 +36,6 @@ pub enum PositionAssertability {
 }
 
 impl PositionAssertability {
-    /// Returns the exact frozen wire name of this assertability.
-    pub const fn wire_name(self) -> &'static str {
-        match self {
-            Self::ObservedFact => "OBSERVED_FACT",
-            Self::QualifiedInference => "QUALIFIED_INFERENCE",
-            Self::HypothesisCandidate => "HYPOTHESIS_CANDIDATE",
-            Self::ConflictQualificationRequired => "CONFLICT_QUALIFICATION_REQUIRED",
-            Self::UnknownWithheldQuarantined => "UNKNOWN_WITHHELD_QUARANTINED",
-            Self::PlanningOnly => "PLANNING_ONLY",
-            Self::MaterialEffect => "MATERIAL_EFFECT",
-        }
-    }
-
     /// Strength rank: higher licenses stronger rendering.
     const fn strength(self) -> u8 {
         match self {
@@ -76,6 +49,12 @@ impl PositionAssertability {
         }
     }
 
+    /// Strength rank for cross-module ceiling checks: higher licenses
+    /// stronger rendering.
+    pub(crate) const fn strength_rank(self) -> u8 {
+        self.strength()
+    }
+
     /// Maximum assertability admitted by one evidence grade.
     pub const fn grade_cap(grade: EvidenceGrade) -> Self {
         match grade {
@@ -86,10 +65,8 @@ impl PositionAssertability {
         }
     }
 
-    /// Maximum assertability admitted by one evidence authority class.
-    ///
-    /// Heuristic and model-produced readings stay qualified no matter how
-    /// complete the surrounding coverage is.
+    /// Maximum assertability admitted by one evidence authority class: heuristic and model-produced readings
+    /// stay qualified no matter how complete the surrounding coverage is.
     pub const fn authority_cap(authority: EvidenceAuthority) -> Self {
         match authority {
             EvidenceAuthority::HeuristicStatic | EvidenceAuthority::ModelInterpretation => {
@@ -102,10 +79,8 @@ impl PositionAssertability {
         }
     }
 
-    /// Intersects every ceiling into the strongest renderable assertability.
-    ///
-    /// Incomplete coverage, an open conflict, and missing proof can only
-    /// lower the grade and authority caps; they never raise them.
+    /// Intersects every ceiling into the strongest renderable assertability: incomplete coverage, an open
+    /// conflict, and missing proof can only lower the grade and authority caps; they never raise them.
     pub fn ceiling_for(
         grade: EvidenceGrade,
         authority: EvidenceAuthority,
@@ -153,10 +128,9 @@ impl PositionAssertability {
         }
     }
 
-    /// Validates that a claimed assertability sits at or below its ceilings.
+    /// A claimed assertability sits at or below its ceilings.
     ///
-    /// Planning-only input can never validate a material-effect claim:
-    /// planning grants no effect.
+    /// Planning-only input can never validate a material-effect claim; planning grants no effect.
     pub fn check(
         claimed: Self,
         grade: EvidenceGrade,
@@ -185,13 +159,9 @@ impl PositionAssertability {
         Ok(())
     }
 
-    /// Maximum assertability admitted by one support-results slice.
-    ///
-    /// All-supported support licenses the full ceilings below; partial (or
-    /// justified-not-applicable) support caps at qualified inference; any
-    /// contradicted, unsupported, unknown, outside-manifest, stale, or
-    /// superseded result caps at hypothesis candidate. An empty slice is an
-    /// error, never a silent success.
+    /// Maximum assertability admitted by one support-results slice: partial
+    /// caps at qualified inference, any weaker result at hypothesis
+    /// candidate, empty input errors.
     pub fn support_cap(support: &[SupportResult]) -> Result<Self, ContractError> {
         let mut partial_only = false;
         for result in support {
@@ -222,11 +192,8 @@ impl PositionAssertability {
         }
     }
 
-    /// Maximum assertability admitted by one disclosure class.
-    ///
-    /// Disclosure is a ceiling, never evidence: restricted material never
-    /// rises above qualified inference, quarantined material renders only as
-    /// quarantined unknown, and open material is unbounded by disclosure.
+    /// Maximum assertability admitted by one disclosure class (a ceiling,
+    /// never evidence).
     pub const fn disclosure_cap(disclosure: DisclosureClass) -> Self {
         match disclosure {
             DisclosureClass::Open => Self::MaterialEffect,
@@ -235,34 +202,37 @@ impl PositionAssertability {
         }
     }
 
-    /// Intersects every ceiling — grade, authority, support results, coverage,
-    /// conflict, proof, disclosure, and verifier competence — into the
-    /// strongest renderable assertability.
-    ///
-    /// `coverage_complete` must be derived from a terminal receipt over a
-    /// complete denominator, never from merely-empty unknowns or conflicts.
-    /// A material-effect claim additionally requires a competent verifier over
-    /// a current freshness; planning-only input still grants no effect.
+    /// Intersects every ceiling — grade, authority, support, coverage,
+    /// conflict, proof, disclosure, privacy, verifier — into the strongest
+    /// renderable assertability.
     #[allow(clippy::too_many_arguments)]
     pub fn check_closed(
         claimed: Self,
-        grade: EvidenceGrade,
+        grade: &GradeAssignment,
         authority: EvidenceAuthority,
         support: &[SupportResult],
         coverage_complete: bool,
         conflict_open: bool,
         proof_bound: bool,
         disclosure: DisclosureClass,
+        privacy: PrivacyHandling,
         verifier: Option<&RequiredVerifier>,
     ) -> Result<(), ContractError> {
-        Self::check(
-            claimed,
-            grade,
-            authority,
-            coverage_complete,
-            conflict_open,
-            proof_bound,
-        )?;
+        grade.validate()?;
+        if let Some(known) = grade.known_grade() {
+            Self::check(
+                claimed,
+                known,
+                authority,
+                coverage_complete,
+                conflict_open,
+                proof_bound,
+            )?;
+        } else if claimed.strength() > Self::HypothesisCandidate.strength() {
+            return Err(ContractError::CeilingViolation {
+                field: "grade.unknown",
+            });
+        }
         let support_ceiling = Self::support_cap(support)?;
         if claimed.strength() > support_ceiling.strength() {
             return Err(ContractError::CeilingViolation {
@@ -273,6 +243,16 @@ impl PositionAssertability {
         if claimed.strength() > disclosure_ceiling.strength() {
             return Err(ContractError::CeilingViolation {
                 field: "assertability.disclosure",
+            });
+        }
+        let privacy_ceiling = match privacy {
+            PrivacyHandling::Unrestricted => Self::MaterialEffect,
+            PrivacyHandling::RestrictedHandling => Self::QualifiedInference,
+            PrivacyHandling::Purged => Self::HypothesisCandidate,
+        };
+        if claimed.strength() > privacy_ceiling.strength() {
+            return Err(ContractError::CeilingViolation {
+                field: "assertability.privacy",
             });
         }
         if claimed == Self::MaterialEffect {
