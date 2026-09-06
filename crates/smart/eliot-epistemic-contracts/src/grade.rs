@@ -4,7 +4,6 @@
 //! weakest-first, orthogonal to authority, support, and assertability. This module only checks supplied
 //! ceilings — it never grades evidence. Quoting never upgrades; dependents never exceed their parent; unknown
 //! stays distinct from the lowest known grade.
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +39,6 @@ pub enum EvidenceGrade {
     /// confirmatory, evidence freeze, claim-level audit, explicit debts.
     ScienceGrade,
 }
-
 impl EvidenceGrade {
     /// Returns the rigour rank, weakest-first starting at zero.
     pub const fn rank(self) -> u8 {
@@ -106,7 +104,6 @@ pub struct GradeAssignment {
     /// Bounded reason why the grade is unknown, when the grade is absent.
     pub unknown_reason: Option<String>,
 }
-
 impl GradeAssignment {
     /// Assigns a known frozen grade.
     pub fn known(grade: EvidenceGrade) -> Self {

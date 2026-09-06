@@ -3,7 +3,6 @@
 //! A [`SupportRecord`] states what one inquiry route observed for one proposition inside explicit scope, time,
 //! version, and precision bounds, with every evidence handle preserved. An unsupported-but-valid record is data,
 //! not an error. Aggregation uses [`weakest_link`].
-
 use std::collections::BTreeSet;
 
 use eliot_contracts::ArtifactId;
@@ -43,7 +42,6 @@ pub enum SupportResult {
     /// Support does not apply here for a recorded, bounded reason.
     JustifiedNotApplicable,
 }
-
 impl SupportResult {
     /// Weakest-link rank: lower bounds any aggregate it participates in.
     pub(crate) const fn link_rank(self) -> u8 {
@@ -101,7 +99,6 @@ const PRECISION_LATTICE: [&str; 6] = [
     "symbol",
     "line",
 ];
-
 fn precision_rank(precision: &str) -> Option<usize> {
     PRECISION_LATTICE
         .iter()
@@ -142,7 +139,6 @@ pub(crate) fn window_contains(
     }
     true
 }
-
 impl ValidityBounds {
     /// Constructs validity bounds, rejecting inverted windows.
     pub fn new(
@@ -249,7 +245,6 @@ pub struct SupportRecord {
     /// Digest of the bounded proof payload behind this record.
     pub proof_digest: String,
 }
-
 impl SupportRecord {
     /// Constructs a support record after validating every bound.
     #[allow(clippy::too_many_arguments)]

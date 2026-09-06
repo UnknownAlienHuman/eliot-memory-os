@@ -4,7 +4,6 @@
 //! vouch. Only a competent verifier over a current freshness licenses the strongest renderings.
 //! [`DisclosureClass`] bounds travel (open, restricted, quarantined) as a ceiling, never evidence. Freshness
 //! vocabulary is reused from `eliot-evidence`.
-
 use eliot_contracts::{ContractId, SourceId};
 use eliot_evidence::{EvidenceFreshness, VerificationBinding};
 use schemars::JsonSchema;
@@ -68,7 +67,6 @@ pub struct SourceAssurance {
     /// Derived integrity digest over source, revision, and proof digest.
     pub integrity_digest: String,
 }
-
 impl SourceAssurance {
     /// Constructs source assurance and freezes its derived integrity digest.
     pub fn new(
@@ -131,7 +129,6 @@ pub struct RequiredVerifier {
     /// Canonical digest of the verifier shape, excluding this field.
     pub digest: String,
 }
-
 impl RequiredVerifier {
     /// Constructs a required verifier and freezes its canonical digest.
     #[allow(clippy::too_many_arguments)]
@@ -187,7 +184,6 @@ impl RequiredVerifier {
     pub const fn is_competent(&self) -> bool {
         matches!(self.standing, VerifierStanding::Competent) && self.is_current()
     }
-
     fn validate_shape(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.revision, "verifier.revision", MAX_SHORT_TEXT)?;
         self.verification

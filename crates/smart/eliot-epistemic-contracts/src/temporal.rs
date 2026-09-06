@@ -3,7 +3,6 @@
 //! Event, effective, observation, ingestion, and commit times stay separate fields; pipeline order
 //! (observation, ingestion, commit) is enforced while event/effective stay unordered. [`TemporalPrecedence`]
 //! records bare chronology, which never decodes as causation.
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +39,6 @@ pub struct TemporalRecord {
     /// Commit time: when the record was committed.
     pub commit_ms: i64,
 }
-
 impl TemporalRecord {
     /// Constructs a temporal record after validation.
     pub fn new(
@@ -95,7 +93,6 @@ pub struct TemporalPrecedence {
     /// Bounded basis note for the ordering evidence.
     pub basis: String,
 }
-
 impl TemporalPrecedence {
     /// Constructs a precedence record after validation.
     pub fn new(

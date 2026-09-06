@@ -4,7 +4,6 @@
 //! that never cross-decode. A [`CausalClaim`] earns the mechanism reading only with a named mechanism, rivals,
 //! confounders, outcome and control observations, source, lineage, fence, temporal record, and proof binding —
 //! and even then never reaches science grade alone.
-
 use std::collections::BTreeSet;
 
 use eliot_contracts::{ArtifactId, SourceId, StateFence};
@@ -12,11 +11,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{
-    ContractError, MAX_HANDLES, MAX_SHORT_TEXT, validate_bounded_text, validate_digest,
+    ContractError, MAX_HANDLES, MAX_SHORT_TEXT, check_frozen, validate_bounded_text,
+    validate_digest,
 };
 use crate::grade::EvidenceGrade;
 use crate::identity::{LineageRootId, PropositionId};
+use crate::provenance::SourceLineage;
 use crate::temporal::TemporalRecord;
+use crate::verifier::SourceAssurance;
 
 /// Separate causal readings; declaration order is not a ladder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -43,7 +45,6 @@ pub enum CausalStatus {
     /// Known confounders defeat the causal reading.
     Confounded,
 }
-
 impl CausalStatus {
     /// Returns the exact frozen wire name of this status.
     pub const fn wire_name(self) -> &'static str {
@@ -87,6 +88,11 @@ pub struct CausalClaim {
     pub control: String,
     /// Source owning the reading.
     pub source: SourceId,
+    /// Frozen lineage entry binding the canonical source identity, revision, and content digest
+    /// (reuses [`SourceLineage`]; no parallel source type is carried).
+    pub source_lineage: SourceLineage,
+    /// Assurance binding the proof digest to its source and lineage revision.
+    pub assurance: SourceAssurance,
     /// Lineage root the reading traces back to.
     pub lineage: LineageRootId,
     /// Fence the reading was captured under.
@@ -100,8 +106,9 @@ pub struct CausalClaim {
     pub ceiling: EvidenceGrade,
     /// Scope the reading applies to.
     pub scope: String,
+    /// Canonical digest of the causal shape, excluding this field.
+    pub digest: String,
 }
-
 impl CausalClaim {
     /// Constructs a causal claim after validation.
     #[allow(clippy::too_many_arguments)]
@@ -115,6 +122,8 @@ impl CausalClaim {
         outcome: impl Into<String>,
         control: impl Into<String>,
         source: SourceId,
+        source_lineage: SourceLineage,
+        assurance: SourceAssurance,
         lineage: LineageRootId,
         fence: StateFence,
         temporal: TemporalRecord,
@@ -122,7 +131,7 @@ impl CausalClaim {
         ceiling: EvidenceGrade,
         scope: impl Into<String>,
     ) -> Result<Self, ContractError> {
-        let claim = Self {
+        let mut claim = Self {
             subject,
             status,
             mechanism: mechanism.into(),
@@ -132,24 +141,73 @@ impl CausalClaim {
             outcome: outcome.into(),
             control: control.into(),
             source,
+            source_lineage,
+            assurance,
             lineage,
             fence,
             temporal,
             proof_digest: proof_digest.into(),
             ceiling,
             scope: scope.into(),
+            digest: String::new(),
         };
-        claim.validate()?;
+        claim.validate_shape()?;
+        claim.digest = claim.compute_digest()?;
         Ok(claim)
+    }
+
+    /// Recomputes the canonical digest of the causal shape (nested tuples keep every arity at or
+    /// below the sixteen-element serde bound without dropping a load-bearing field).
+    pub fn compute_digest(&self) -> Result<String, ContractError> {
+        crate::error::shape_digest(&(
+            (
+                &self.subject,
+                &self.status,
+                &self.mechanism,
+                &self.rivals,
+                &self.confounders,
+                &self.evidence_refs,
+                &self.outcome,
+                &self.control,
+            ),
+            (
+                &self.source,
+                &self.source_lineage,
+                &self.assurance,
+                &self.lineage,
+                &self.fence,
+                &self.temporal,
+                &self.proof_digest,
+                &self.ceiling,
+                &self.scope,
+            ),
+        ))
     }
 
     /// Validates mechanism, rivals, confounders, evidence, outcome, control,
     /// source, lineage, fence, temporal roles, proof binding, and the ceiling.
-    pub fn validate(&self) -> Result<(), ContractError> {
+    fn validate_shape(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.mechanism, "causal.mechanism", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.scope, "causal.scope", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.outcome, "causal.outcome", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.control, "causal.control", MAX_SHORT_TEXT)?;
+        // Frozen source provenance: the lineage entry names this source, and the assurance pins the
+        // same source, lineage revision, and proof digest, so mutating revision or content under the
+        // same source ID breaks the binding even with a recomputed shape digest.
+        self.source_lineage.validate()?;
+        self.assurance.validate()?;
+        if self.source_lineage.owner != self.source || self.assurance.source != self.source {
+            let field = "causal.source";
+            return Err(ContractError::OutsideManifest { field });
+        }
+        if self.source_lineage.revision != self.assurance.revision {
+            let field = "causal.assurance";
+            return Err(ContractError::StaleContext { field });
+        }
+        if self.assurance.proof_digest != self.proof_digest {
+            let field = "causal.assurance";
+            return Err(ContractError::DigestMismatch { field });
+        }
         self.fence
             .validate()
             .map_err(|_| ContractError::FenceMismatch {
@@ -221,5 +279,11 @@ impl CausalClaim {
             });
         }
         Ok(())
+    }
+
+    /// Validates the causal shape and its frozen digest.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        self.validate_shape()?;
+        check_frozen(&self.digest, &self.compute_digest()?, "causal.digest")
     }
 }

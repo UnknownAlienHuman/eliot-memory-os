@@ -5,7 +5,6 @@
 //! assertability, added/removed/retained handles with reasons, coverage and conflict deltas, and rollback,
 //! repair, invalidation, and proof references. Transitions are inert data: this crate applies nothing and
 //! allocates nothing. Promotion out of unknown or partial support without fresh evidence is rejected.
-
 use std::collections::BTreeSet;
 
 use eliot_contracts::ArtifactId;
@@ -50,7 +49,6 @@ pub struct InvalidationRecord {
     /// Predecessor retained as history.
     pub predecessor: PredecessorId,
 }
-
 impl InvalidationRecord {
     /// Constructs an invalidation record after validation.
     pub fn new(
@@ -108,7 +106,6 @@ pub struct SupportDelta {
     /// Bounded reasons for the changes; order carries no meaning.
     pub reasons: BTreeSet<String>,
 }
-
 impl SupportDelta {
     /// Constructs a support delta after validation.
     pub fn new(
@@ -243,7 +240,6 @@ struct TransitionDigestShape<'a> {
     invalidation: &'a Option<InvalidationRecord>,
     proof_digest: &'a str,
 }
-
 impl EpistemicTransition {
     /// Constructs a transition and freezes its canonical digest.
     #[allow(clippy::too_many_arguments)]
@@ -335,46 +331,35 @@ impl EpistemicTransition {
         })
     }
 
-    /// Support-delta reconciliation: added handles are after-handles,
-    /// removed are before-handles, retained are in both.
+    /// Support-delta reconciliation: the delta is the exact partition of the before/after handle sets —
+    /// added is after-minus-before, removed is before-minus-after, retained is the intersection, so an
+    /// omitted, duplicated, extra, or misclassified handle fails.
     pub fn reconcile_delta(
         delta: &SupportDelta,
         before: &[SupportRecord],
         after: &[SupportRecord],
     ) -> Result<(), ContractError> {
         delta.validate()?;
-        let before_handles: BTreeSet<_> = before
+        let before_handles: BTreeSet<ArtifactId> = before
             .iter()
-            .flat_map(|record| record.handles.iter())
+            .flat_map(|record| record.handles.iter().cloned())
             .collect();
-        let after_handles: BTreeSet<_> = after
+        let after_handles: BTreeSet<ArtifactId> = after
             .iter()
-            .flat_map(|record| record.handles.iter())
+            .flat_map(|record| record.handles.iter().cloned())
             .collect();
-        for handle in &delta.added {
-            if !after_handles.contains(&handle) {
-                return Err(ContractError::OutsideManifest {
-                    field: "transition.delta",
-                });
-            }
+        let field = "transition.delta";
+        if delta.added != &after_handles - &before_handles {
+            return Err(ContractError::ArithmeticMismatch { field });
         }
-        for handle in &delta.removed {
-            if !before_handles.contains(&handle) {
-                return Err(ContractError::MissingReference {
-                    field: "transition.delta",
-                });
-            }
+        if delta.removed != &before_handles - &after_handles {
+            return Err(ContractError::ArithmeticMismatch { field });
         }
-        for handle in &delta.retained {
-            if !before_handles.contains(&handle) || !after_handles.contains(&handle) {
-                return Err(ContractError::MissingReference {
-                    field: "transition.delta",
-                });
-            }
+        if delta.retained != &before_handles & &after_handles {
+            return Err(ContractError::ArithmeticMismatch { field });
         }
         Ok(())
     }
-
     fn validate_shape(&self) -> Result<(), ContractError> {
         self.expected_fence
             .validate()
@@ -469,8 +454,18 @@ impl EpistemicTransition {
         self.validate()?;
         request.validate()?;
         candidate.validate()?;
+        // Before/after records bind to the expected task, scope, fence, and proposition by value:
+        // structural validity alone never places a record in this transition.
         for record in before.iter().chain(after.iter()) {
-            record.validate()?;
+            record.validate_for(
+                &self.task_id,
+                self.work_scope.scope_id.as_str(),
+                &self.expected_fence,
+            )?;
+            if record.proposition != self.position {
+                let field = "transition.records";
+                return Err(ContractError::ScopeMismatch { field });
+            }
         }
         self.check_request_binding(request)?;
         self.check_candidate_binding(candidate, before, after)?;
@@ -478,7 +473,6 @@ impl EpistemicTransition {
         self.check_terminality(candidate, before)?;
         Ok(())
     }
-
     fn check_request_binding(&self, request: &PositionRequest) -> Result<(), ContractError> {
         if request.task_id != self.task_id {
             return Err(ContractError::TaskMismatch {
@@ -524,7 +518,6 @@ impl EpistemicTransition {
         }
         Ok(())
     }
-
     fn check_candidate_binding(
         &self,
         candidate: &EpistemicPositionCandidate,
@@ -551,6 +544,27 @@ impl EpistemicTransition {
                 field: "transition.position",
             });
         }
+        // The candidate must stand on the expected revision under the expected fence: a candidate from
+        // another revision or fence answers another transition.
+        if candidate.revision != self.expected_revision {
+            let field = "transition.candidate_revision";
+            return Err(ContractError::StaleContext { field });
+        }
+        if !candidate.fence.is_compatible_with(&self.expected_fence)
+            || !self.expected_fence.is_compatible_with(&candidate.fence)
+        {
+            let field = "transition.candidate_fence";
+            return Err(ContractError::FenceMismatch { field });
+        }
+        // The transition temporal must be owned by the candidate digest set: a valid but unrelated
+        // temporal proves nothing here.
+        let digests = &candidate.temporal_digests;
+        if let Some(temporal) = &self.temporal
+            && !digests.contains(&shape_digest(temporal)?)
+        {
+            let field = "transition.temporal";
+            return Err(ContractError::MissingReference { field });
+        }
         Self::reconcile_delta(&self.delta, before, after)?;
         let real: BTreeSet<_> = before
             .iter()
@@ -566,7 +580,6 @@ impl EpistemicTransition {
         }
         Ok(())
     }
-
     fn check_arithmetic(
         &self,
         before: &[SupportRecord],
@@ -585,6 +598,11 @@ impl EpistemicTransition {
                 field: "transition.after_support",
             });
         }
+        let before_ceiling = PositionAssertability::support_cap(&before_results)?;
+        if self.before_assertability.strength_rank() > before_ceiling.strength_rank() {
+            let field = "transition.before_assertability";
+            return Err(ContractError::CeilingViolation { field });
+        }
         let after_ceiling = PositionAssertability::support_cap(&after_results)?;
         if self.after_assertability.strength_rank() > after_ceiling.strength_rank() {
             return Err(ContractError::CeilingViolation {
@@ -600,7 +618,6 @@ impl EpistemicTransition {
         }
         Ok(())
     }
-
     fn check_terminality(
         &self,
         candidate: &EpistemicPositionCandidate,

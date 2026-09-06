@@ -3,7 +3,6 @@
 //! A [`CoverageReceipt`] binds query, frontier, denominator, task, scope, fence, policy, groups, omissions,
 //! and proof of one frozen enumeration. Duplicate members are rejected and member-plus-omission arithmetic
 //! must equal the denominator size.
-
 use std::collections::BTreeSet;
 
 use eliot_contracts::ArtifactId;
@@ -11,7 +10,7 @@ use eliot_contracts::{StateFence, TaskId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::coverage::{FrontierSpec, QuerySpec};
+use crate::coverage::{CoverageDenominator, FrontierSpec, QuerySpec};
 use crate::error::{
     ContractError, MAX_HANDLES, MAX_MEMBERS, MAX_SHORT_TEXT, check_frozen, shape_digest,
     validate_bounded_text, validate_digest,
@@ -45,7 +44,6 @@ pub enum MemberDisposition {
     /// The member outcome cannot be established.
     Unknown,
 }
-
 impl MemberDisposition {
     /// Returns the exact frozen wire name of this disposition.
     pub const fn wire_name(self) -> &'static str {
@@ -71,23 +69,36 @@ impl MemberDisposition {
     }
 }
 
-/// Exactly one disposition for one enumerated member.
+/// Exactly one disposition for one enumerated member under one admitted role.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MemberOutcome {
-    /// Enumerated member identity.
+    /// Enumerated member identity (same `ArtifactId` as the denominator members, no parallel owner).
     pub member: ArtifactId,
-    /// The single disposition recorded for this member.
+    /// Role the member was enumerated under (same role-name spelling as the denominator roles).
+    pub role: String,
+    /// The single disposition recorded for this member under this role.
     pub disposition: MemberDisposition,
 }
-
 impl MemberOutcome {
-    /// Constructs a member outcome.
-    pub fn new(member: ArtifactId, disposition: MemberDisposition) -> Self {
-        Self {
+    /// Constructs a member outcome after validating its role binding.
+    pub fn new(
+        member: ArtifactId,
+        role: impl Into<String>,
+        disposition: MemberDisposition,
+    ) -> Result<Self, ContractError> {
+        let outcome = Self {
             member,
+            role: role.into(),
             disposition,
-        }
+        };
+        outcome.validate()?;
+        Ok(outcome)
+    }
+
+    /// Validates the role binding; the disposition vocabulary is closed by type.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_bounded_text(&self.role, "receipt.role", MAX_SHORT_TEXT)
     }
 }
 
@@ -100,7 +111,6 @@ pub struct OmittedMember {
     /// Bounded reason the omission is permitted.
     pub reason: String,
 }
-
 impl OmittedMember {
     /// Constructs an omission record after validation.
     pub fn new(member: ArtifactId, reason: impl Into<String>) -> Result<Self, ContractError> {
@@ -150,7 +160,6 @@ pub struct CoverageReceipt {
     /// Canonical digest of the receipt shape, excluding this field.
     pub digest: String,
 }
-
 impl CoverageReceipt {
     /// Constructs a receipt and freezes its canonical digest.
     #[allow(clippy::too_many_arguments)]
@@ -214,7 +223,6 @@ impl CoverageReceipt {
                 .iter()
                 .all(|outcome| outcome.disposition.is_terminal())
     }
-
     fn validate_shape(&self) -> Result<(), ContractError> {
         self.query.validate()?;
         self.frontier.validate()?;
@@ -249,17 +257,20 @@ impl CoverageReceipt {
                 field: "receipt.omissions",
             });
         }
-        let mut seen = BTreeSet::new();
+        let mut seen_pairs = BTreeSet::new();
+        let mut seen_members = BTreeSet::new();
         for outcome in &self.members {
-            if !seen.insert(outcome.member.clone()) {
+            outcome.validate()?;
+            if !seen_pairs.insert((outcome.member.clone(), outcome.role.clone())) {
                 return Err(ContractError::Duplicate {
                     field: "receipt.members",
                 });
             }
+            seen_members.insert(outcome.member.clone());
         }
         for omission in &self.omissions {
             omission.validate()?;
-            if !seen.insert(omission.member.clone()) {
+            if !seen_members.insert(omission.member.clone()) {
                 return Err(ContractError::Duplicate {
                     field: "receipt.omissions",
                 });
@@ -280,4 +291,39 @@ impl CoverageReceipt {
         self.validate_shape()?;
         check_frozen(&self.digest, &self.compute_digest()?, "receipt.digest")
     }
+}
+
+/// Reconciles receipt member roles against the denominator product: every outcome names an admitted
+/// (member, role) pair (a foreign member or role fails) and every required pair is present (gaps fail);
+/// exact duplicate pairs fail in shape. A shared member under two roles is allowed only when both pairs
+/// are required.
+pub(crate) fn check_member_roles(
+    receipt: &CoverageReceipt,
+    denominator: &CoverageDenominator,
+    field: &'static str,
+) -> Result<(), ContractError> {
+    let mut seen = BTreeSet::new();
+    for outcome in &receipt.members {
+        if !denominator.members.contains(&outcome.member) {
+            return Err(ContractError::OutsideManifest { field });
+        }
+        if !denominator.roles.contains(&outcome.role) {
+            return Err(ContractError::OutsideManifest { field });
+        }
+        if !seen.insert((outcome.member.clone(), outcome.role.clone())) {
+            return Err(ContractError::Duplicate { field });
+        }
+    }
+    for member in &denominator.members {
+        for role in &denominator.roles {
+            if !receipt
+                .members
+                .iter()
+                .any(|outcome| &outcome.member == member && &outcome.role == role)
+            {
+                return Err(ContractError::MissingReference { field });
+            }
+        }
+    }
+    Ok(())
 }

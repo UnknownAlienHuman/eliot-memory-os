@@ -1,33 +1,29 @@
 //! Consumer fixtures: Researcher, Dreamer, and Context roles using only the
 //! public contract surface, exactly as the cognitive edge-map prescribes.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, OperationId, ProductId, RequestId, ResourceGeneration, SourceId,
-    StateFence, TaskId, TaskRevision, sha256_hex,
+    ArtifactId, AuthorityEpoch, OperationId, ProductId, ReceiptId, RequestId, ResourceGeneration,
+    SourceId, StateFence, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_epistemic_contracts::{
     AdmittedKind, AdmittedReceipt, AssumptionRecord, ClaimAuditOutcome, ClaimEntry, ClaimMap,
     ClaimVerdict, ContractError, CurrentEpistemicPosition, Currentness, DisclosureClass,
     EpistemicPositionCandidate, EvidenceGrade, GradeAssignment, InvestigationKind,
-    InvestigationRequirement, ManifestId, PositionAssertability, PositionId, PositionRequest,
-    PositionRevision, PrivacyHandling, PropositionId, ProvenanceClosure, SourceLineage,
-    SupportRecord, SupportResult, ValidityBounds,
+    InvestigationRequirement, ManifestId, MemberDisposition, MemberOutcome, PositionAssertability,
+    PositionId, PositionRequest, PositionRevision, PrivacyHandling, PropositionId,
+    ProvenanceClosure, SourceLineage, SupportDelta, SupportRecord, SupportResult, TemporalRecord,
+    TemporalRole, ValidityBounds,
 };
 use eliot_evidence::{Assertability, EvidenceAuthority};
 use eliot_receipts::{WorkScope, WorkScopeId};
-
 type FixtureResult = Result<(), Box<dyn std::error::Error>>;
-
 fn digest(seed: &str) -> String {
     sha256_hex(seed.as_bytes())
 }
-
 fn fence() -> StateFence {
     StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
 }
-
 fn work_scope() -> Result<WorkScope, Box<dyn std::error::Error>> {
     Ok(WorkScope {
         scope_id: WorkScopeId::new("scope-580")?,
@@ -36,7 +32,6 @@ fn work_scope() -> Result<WorkScope, Box<dyn std::error::Error>> {
         state_fence: fence(),
     })
 }
-
 fn assert_no_hidden_ops(value: &impl serde::Serialize) -> FixtureResult {
     // Iterative key walk with the generic JSON type inferred: contract code
     // under test never depends on it.
@@ -78,7 +73,6 @@ fn assert_no_hidden_ops(value: &impl serde::Serialize) -> FixtureResult {
     assert!(seen > 0);
     Ok(())
 }
-
 fn researcher_role(
     proposition: &PropositionId,
     task: &TaskId,
@@ -103,6 +97,8 @@ fn researcher_role(
         handles.clone(),
     )?;
     inquiry.validate()?;
+    assert_eq!(inquiry.operation_id.as_str(), "operation-580");
+    assert_eq!(inquiry.idempotency_key.as_str(), "idem-580");
     let follow_up = InvestigationRequirement::new(
         "requirement-1",
         proposition.clone(),
@@ -118,7 +114,6 @@ fn researcher_role(
     assert_no_hidden_ops(&follow_up)?;
     Ok(())
 }
-
 fn dreamer_role(
     proposition: &PropositionId,
     task: &TaskId,
@@ -187,6 +182,8 @@ fn dreamer_role(
         proposition.clone(),
         TaskRevision::genesis(),
         RequestId::new("request-580")?,
+        OperationId::new("operation-580")?,
+        "idem-580",
         work_scope()?,
         None,
         task.clone(),
@@ -216,11 +213,12 @@ fn dreamer_role(
         None,
     )?;
     draft.validate()?;
+    assert_eq!(draft.operation_id, OperationId::new("operation-580")?);
+    assert_eq!(draft.idempotency_key.as_str(), "idem-580");
     assert_no_hidden_ops(&draft)?;
     assert_no_hidden_ops(&held)?;
     Ok(())
 }
-
 fn context_role(
     _proposition: &PropositionId,
     owner: &SourceId,
@@ -230,6 +228,7 @@ fn context_role(
     // projection cites its external admission receipt and proves nothing
     // beyond it.
     let envelope = AdmittedReceipt::new(
+        ReceiptId::new("receipt-580")?,
         digest("admission-payload"),
         owner.clone(),
         "r1",
@@ -250,6 +249,9 @@ fn context_role(
     )?;
     view.validate()?;
     assert_eq!(view.view_kind, AdmittedKind::CurrentEpistemicPosition);
+    assert_eq!(view.admission.receipt_id.as_str(), "receipt-580");
+    let challenge = view.admission.existence_challenge()?;
+    assert_eq!(challenge.sub_item.as_str(), "admitted.existence");
     let wire = serde_json::to_string(&view)?;
     assert!(wire.contains("CURRENT_EPISTEMIC_POSITION"));
     let sources = BTreeSet::from([SourceId::new("source-a")?]);
@@ -268,6 +270,7 @@ fn context_role(
             BTreeSet::new(),
             None,
         )?],
+        BTreeMap::from([(ArtifactId::new("handle-1")?, digest("content-a"))]),
         None,
         false,
         Assertability::NonAssertableUnverified,
@@ -275,6 +278,23 @@ fn context_role(
         fence(),
     )?;
     stopped.validate()?;
+    // New closure surface through the public API only: role-bound outcomes, exact support deltas,
+    // and temporal roles travel with the same read-only fixtures.
+    let outcome = MemberOutcome::new(
+        ArtifactId::new("handle-1")?,
+        "primary",
+        MemberDisposition::Observed,
+    )?;
+    assert_eq!(outcome.role.as_str(), "primary");
+    let delta = SupportDelta::new(
+        BTreeSet::from([ArtifactId::new("handle-2")?]),
+        BTreeSet::new(),
+        handles.clone(),
+        BTreeSet::from(["fresh read".to_owned()]),
+    )?;
+    delta.validate()?;
+    let staged = TemporalRecord::new(10, 11, 12, 13, 14)?;
+    assert_eq!(staged.role_time(TemporalRole::Event), 10);
     let view_value = serde_json::to_value(&view)?;
     assert!(
         view_value
@@ -284,7 +304,6 @@ fn context_role(
     assert_no_hidden_ops(&stopped)?;
     Ok(())
 }
-
 // WORK_UNIT_CASE: 580/45
 #[test]
 fn consumer_roles_use_public_contracts_without_hidden_ops() -> FixtureResult {
@@ -293,18 +312,14 @@ fn consumer_roles_use_public_contracts_without_hidden_ops() -> FixtureResult {
     let owner = SourceId::new("owner-1")?;
     let validity = ValidityBounds::new("scope-580", Some(100), Some(200), "v1", "file")?;
     let handle_set = BTreeSet::from([ArtifactId::new("handle-1")?]);
-
     researcher_role(&proposition, &task, &validity, &handle_set)?;
-
     // Dreamer builds the inert candidate read-only: claim map, support, and
     // assumption records in, no resolver, store, or effect out.
     dreamer_role(&proposition, &task, &validity, &handle_set)?;
-
     // Context reads the admitted projection and its provenance closure: the
     // projection cites its external admission receipt and proves nothing
     // beyond it.
     context_role(&proposition, &owner, &handle_set)?;
-
     // The public surface offers contracts, not operations.
     let surface = [
         std::any::type_name::<PositionRequest>(),

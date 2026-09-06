@@ -5,7 +5,6 @@
 //! or exhausted budget never decodes as absence. Shape validation ties the claim to its receipt; closed
 //! validation ([`AbsenceClaim::validate_closed`]) binds the exact frozen [`CoverageDenominator`] object, and
 //! query, scope, fence, or snapshot drift invalidates the claim via [`AbsenceClaim::check_context`].
-
 use std::collections::BTreeSet;
 
 use eliot_contracts::{SourceId, StateFence, TaskId};
@@ -29,7 +28,6 @@ pub struct OwnerLookup {
     /// Digest of the bounded lookup proof.
     pub lookup_proof: String,
 }
-
 impl OwnerLookup {
     /// Constructs an owner lookup after validation.
     pub fn new(owner: SourceId, lookup_proof: impl Into<String>) -> Result<Self, ContractError> {
@@ -84,7 +82,6 @@ pub struct BoundedProof {
     /// Length of the proof payload in bytes.
     pub byte_len: u64,
 }
-
 impl BoundedProof {
     /// Constructs a bounded proof reference after validation.
     pub fn new(digest: impl Into<String>, byte_len: u64) -> Result<Self, ContractError> {
@@ -149,7 +146,6 @@ pub struct AbsenceClaim {
     /// Canonical digest of the absence shape, excluding this field.
     pub digest: String,
 }
-
 impl AbsenceClaim {
     /// Constructs an absence claim and freezes its canonical digest (shape closure only; binding to the
     /// frozen denominator object is deferred to [`AbsenceClaim::validate_closed`]).
@@ -217,7 +213,6 @@ impl AbsenceClaim {
             &self.proof,
         ))
     }
-
     fn validate_shape(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.domain, "absence.domain", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.schema, "absence.schema", MAX_SHORT_TEXT)?;
@@ -286,7 +281,6 @@ impl AbsenceClaim {
         self.check_members(denominator)?;
         Ok(())
     }
-
     fn check_denominator(&self, denominator: &CoverageDenominator) -> Result<(), ContractError> {
         if self.denominator_digest != denominator.digest {
             return Err(ContractError::DigestMismatch {
@@ -312,7 +306,6 @@ impl AbsenceClaim {
         }
         Ok(())
     }
-
     fn check_scope(&self, denominator: &CoverageDenominator) -> Result<(), ContractError> {
         if self.domain != denominator.class {
             return Err(ContractError::ScopeMismatch {
@@ -367,7 +360,6 @@ impl AbsenceClaim {
         }
         Ok(())
     }
-
     fn check_members(&self, denominator: &CoverageDenominator) -> Result<(), ContractError> {
         if self.receipt.denominator_size != denominator.members.len() as u64 {
             return Err(ContractError::ArithmeticMismatch {

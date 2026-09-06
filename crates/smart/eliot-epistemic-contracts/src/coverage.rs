@@ -5,7 +5,6 @@
 //! are rejected; the one exception is the known-empty complete case (complete marker plus the query, frontier,
 //! and owner snapshot that read the emptiness). Only [`DenominatorKind::CompleteScope`] grounds absence; a
 //! complete scope is never truncated and its total equals its member count.
-
 use std::collections::BTreeSet;
 
 use eliot_contracts::{ArtifactId, SourceId, StateFence};
@@ -39,7 +38,6 @@ pub struct QuerySpec {
     /// Revision of the query definition.
     pub query_revision: String,
 }
-
 impl QuerySpec {
     /// Constructs a query specification after validation.
     pub fn new(
@@ -75,7 +73,6 @@ pub struct FrontierSpec {
     /// Revision of the frozen retrieval frontier.
     pub frontier_revision: String,
 }
-
 impl FrontierSpec {
     /// Constructs a frontier specification after validation.
     pub fn new(
@@ -111,7 +108,6 @@ pub struct SnapshotRef {
     /// Owner that admits the snapshot revision.
     pub owner: SourceId,
 }
-
 impl SnapshotRef {
     /// Constructs a snapshot reference after validation.
     pub fn new(snapshot_id: impl Into<String>, owner: SourceId) -> Result<Self, ContractError> {
@@ -139,7 +135,6 @@ pub struct ExclusionRecord {
     /// Bounded reason for the exclusion.
     pub reason: String,
 }
-
 impl ExclusionRecord {
     /// Constructs an exclusion record after validation.
     pub fn new(
@@ -175,7 +170,6 @@ pub struct PaginationBounds {
     /// Whether the enumeration was truncated before the total.
     pub truncated: bool,
 }
-
 impl PaginationBounds {
     /// Constructs pagination bounds after validation.
     pub fn new(
@@ -232,7 +226,6 @@ const VAGUE_DENOMINATOR_TEXTS: [&str; 7] = [
     "relevant",
     "unknown",
 ];
-
 fn reject_vague(value: &str, field: &'static str) -> Result<(), ContractError> {
     let normalized = value.trim().to_lowercase();
     if VAGUE_DENOMINATOR_TEXTS.contains(&normalized.as_str()) {
@@ -276,7 +269,6 @@ pub struct CoverageDenominator {
     /// Canonical digest of the denominator shape, excluding this field.
     pub digest: String,
 }
-
 impl CoverageDenominator {
     /// Constructs a denominator and freezes its canonical digest.
     #[allow(clippy::too_many_arguments)]
@@ -337,7 +329,6 @@ impl CoverageDenominator {
             &self.kind,
         ))
     }
-
     fn validate_shape(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.class, "coverage.class", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.schema, "coverage.schema", MAX_SHORT_TEXT)?;

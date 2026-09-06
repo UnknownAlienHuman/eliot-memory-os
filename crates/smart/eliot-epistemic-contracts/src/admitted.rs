@@ -4,12 +4,11 @@
 //! [`AdmittedReceipt`] envelope it was read from, bound by value rather than by receipt id. The view proves
 //! nothing beyond the envelope; a distinct marker keeps candidates and views undecodable as each other.
 //! [`CurrentEpistemicPositionView`] is a documented alias of the same type, kept only for migrating readers.
-
 use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
-use eliot_contracts::{ArtifactId, SourceId, StateFence};
+use eliot_contracts::{ArtifactId, ReceiptId, SourceId, StateFence};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
@@ -27,7 +26,6 @@ pub enum AdmittedKind {
     #[schemars(rename = "CURRENT_EPISTEMIC_POSITION")]
     CurrentEpistemicPosition,
 }
-
 crate::position_id!(
     /// Dedicated identity of one admitted epistemic position: the proposition
     /// names what the position bears on, while the position id names the
@@ -55,7 +53,6 @@ crate::position_id!(
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct PositionRevision(u64);
-
 impl PositionRevision {
     /// Creates a position revision, rejecting zero as the absent value.
     pub const fn new(value: u64) -> Result<Self, ContractError> {
@@ -84,6 +81,9 @@ impl PositionRevision {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdmittedReceipt {
+    /// Canonical external receipt identity, reused from `eliot-contracts`: a payload digest alone never
+    /// validates, and every envelope binds this receipt id plus its owner at minimum.
+    pub receipt_id: ReceiptId,
     /// Digest of the externally admitted payload.
     pub payload_digest: String,
     /// Source owning the admitted position.
@@ -109,11 +109,11 @@ pub struct AdmittedReceipt {
     /// Canonical digest of the envelope shape, excluding this field.
     pub digest: String,
 }
-
 impl AdmittedReceipt {
     /// Constructs an admitted envelope and freezes its canonical digest.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        receipt_id: ReceiptId,
         payload_digest: impl Into<String>,
         owner: SourceId,
         revision: impl Into<String>,
@@ -127,6 +127,7 @@ impl AdmittedReceipt {
         position_revision: PositionRevision,
     ) -> Result<Self, ContractError> {
         let mut receipt = Self {
+            receipt_id,
             payload_digest: payload_digest.into(),
             owner,
             revision: revision.into(),
@@ -148,6 +149,7 @@ impl AdmittedReceipt {
     /// Recomputes the canonical digest of the envelope shape.
     pub fn compute_digest(&self) -> Result<String, ContractError> {
         shape_digest(&(
+            &self.receipt_id,
             &self.payload_digest,
             &self.owner,
             &self.revision,
@@ -161,7 +163,6 @@ impl AdmittedReceipt {
             &self.position_revision,
         ))
     }
-
     fn validate_shape(&self) -> Result<(), ContractError> {
         validate_digest(&self.payload_digest, "admitted.payload_digest")?;
         validate_bounded_text(&self.revision, "admitted.revision", MAX_SHORT_TEXT)?;
@@ -182,6 +183,69 @@ impl AdmittedReceipt {
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
         check_frozen(&self.digest, &self.compute_digest()?, "admitted.digest")
+    }
+
+    /// Returns the exact challenge for external existence: receipt-id plus owner bind locally, while the
+    /// store read proving existence belongs to a future admission-owner work unit, never to this crate.
+    pub fn existence_challenge(&self) -> Result<ContractChallenge, ContractError> {
+        ContractChallenge::new(
+            "admitted.existence",
+            self.owner.to_string(),
+            "admission-store receipt read (no I/O in this crate)",
+            "external receipt existence",
+            "future admission-owner PR",
+        )
+    }
+}
+
+/// Exact challenge for a sub-item this crate cannot close itself: external receipt existence would need I/O
+/// against an owner outside this crate, so identity binds locally and existence is challenged, never claimed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContractChallenge {
+    /// Sub-item whose closure is challenged.
+    pub sub_item: String,
+    /// Owner that must attest the sub-item.
+    pub missing_owner: String,
+    /// Read API that would prove the sub-item; none is invoked here.
+    pub missing_api: String,
+    /// Invariant no local check can establish.
+    pub missing_invariant: String,
+    /// Future work unit or PR that will close the sub-item.
+    pub future_work: String,
+}
+impl ContractChallenge {
+    /// Constructs a challenge after validation.
+    pub fn new(
+        sub_item: impl Into<String>,
+        missing_owner: impl Into<String>,
+        missing_api: impl Into<String>,
+        missing_invariant: impl Into<String>,
+        future_work: impl Into<String>,
+    ) -> Result<Self, ContractError> {
+        let challenge = Self {
+            sub_item: sub_item.into(),
+            missing_owner: missing_owner.into(),
+            missing_api: missing_api.into(),
+            missing_invariant: missing_invariant.into(),
+            future_work: future_work.into(),
+        };
+        challenge.validate()?;
+        Ok(challenge)
+    }
+
+    /// Validates the challenge shape.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_bounded_text(&self.sub_item, "challenge.sub_item", MAX_SHORT_TEXT)?;
+        let field = "challenge.missing_owner";
+        validate_bounded_text(&self.missing_owner, field, MAX_SHORT_TEXT)?;
+        validate_bounded_text(&self.missing_api, "challenge.missing_api", MAX_SHORT_TEXT)?;
+        validate_bounded_text(
+            &self.missing_invariant,
+            "challenge.missing_invariant",
+            MAX_SHORT_TEXT,
+        )?;
+        validate_bounded_text(&self.future_work, "challenge.future_work", MAX_SHORT_TEXT)
     }
 }
 
@@ -239,7 +303,6 @@ pub struct CurrentEpistemicPosition {
 /// serde, the same wire bytes. New code uses the canonical name; this alias
 /// exists only so existing readers keep compiling while they migrate.
 pub type CurrentEpistemicPositionView = CurrentEpistemicPosition;
-
 impl CurrentEpistemicPosition {
     /// Constructs an admitted view and freezes its canonical digest.
     pub fn new(
@@ -283,7 +346,6 @@ impl CurrentEpistemicPosition {
     pub fn receipt_identity(&self) -> &str {
         self.admission.digest.as_str()
     }
-
     fn validate_shape(&self) -> Result<(), ContractError> {
         if self.view_kind != AdmittedKind::CurrentEpistemicPosition {
             return Err(ContractError::ImpossibleCombination {

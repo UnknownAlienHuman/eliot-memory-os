@@ -5,7 +5,6 @@
 //! directly (partial caps at qualified inference; unknown, stale, contradicted, and friends cap at hypothesis
 //! candidate); coverage completeness is never inferred from empty unknowns or conflicts; disclosure and privacy
 //! can only lower; a material effect additionally requires a competent verifier over a current freshness.
-
 use eliot_evidence::EvidenceAuthority;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -34,7 +33,6 @@ pub enum PositionAssertability {
     /// May ground a material effect under full ceilings.
     MaterialEffect,
 }
-
 impl PositionAssertability {
     /// Strength rank: higher licenses stronger rendering.
     const fn strength(self) -> u8 {
@@ -115,7 +113,6 @@ impl PositionAssertability {
         }
         Self::from_strength(strongest)
     }
-
     const fn from_strength(strength: u8) -> Self {
         match strength {
             0 => Self::UnknownWithheldQuarantined,

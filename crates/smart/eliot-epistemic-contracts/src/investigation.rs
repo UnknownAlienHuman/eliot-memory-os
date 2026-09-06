@@ -4,7 +4,6 @@
 //! fence, inquiry kind, target, and reason. Donor disposition (`crates/smart/eliot-epistemic/src/lib.rs`):
 //! donor free-text `required_inquiry`/`unknowns` vectors are disposed — prose is not a contract. Each becomes
 //! a typed requirement or an explicit candidate `unknowns` entry; inquiry-derivation policy is resolver work.
-
 use eliot_contracts::{StateFence, TaskId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -64,7 +63,6 @@ pub struct InvestigationRequirement {
     /// Canonical digest of the requirement shape, excluding this field.
     pub digest: String,
 }
-
 impl InvestigationRequirement {
     /// Constructs an investigation requirement and freezes its digest.
     #[allow(clippy::too_many_arguments)]
@@ -109,7 +107,6 @@ impl InvestigationRequirement {
             &self.reason,
         ))
     }
-
     fn validate_shape(&self) -> Result<(), ContractError> {
         if self.requirement_kind != RequirementKind::InvestigationRequirement {
             return Err(ContractError::ImpossibleCombination {

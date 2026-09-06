@@ -5,7 +5,6 @@
 //! (`crates/smart/eliot-epistemic/src/lib.rs`, donor scope `PositionRequest`): `question`, `scope`,
 //! `state_fence`, and `records` are preserved (records as handle sets, never embedded envelopes); task,
 //! attempt, revision, proposition, and validity close the request; the donor `resolve` algorithm is not carried.
-
 use std::collections::BTreeSet;
 
 use eliot_contracts::{ArtifactId, OperationId, RequestId, StateFence, TaskId, TaskRevision};
@@ -65,7 +64,6 @@ pub struct PositionRequest {
     /// Canonical digest of the request shape, excluding this field.
     pub digest: String,
 }
-
 impl PositionRequest {
     /// Constructs a request and freezes its canonical digest.
     #[allow(clippy::too_many_arguments)]
@@ -130,7 +128,6 @@ impl PositionRequest {
     pub fn applies_to(&self, proposition: &PropositionId) -> bool {
         &self.proposition == proposition
     }
-
     fn validate_shape(&self) -> Result<(), ContractError> {
         if self.request_kind != RequestKind::PositionRequest {
             return Err(ContractError::ImpossibleCombination {

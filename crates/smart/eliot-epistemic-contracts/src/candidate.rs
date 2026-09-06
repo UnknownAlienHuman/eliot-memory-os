@@ -9,10 +9,9 @@
 //! and support binds by proposition, task, attempt, scope, and fence rather than claim ID. Coverage completeness
 //! is never inferred from empty unknowns or conflicts; only [`EpistemicPositionCandidate::validate_closed`]
 //! derives it from a terminal receipt over a complete denominator.
-
 use std::collections::BTreeSet;
 
-use eliot_contracts::{ArtifactId, RequestId, StateFence, TaskId, TaskRevision};
+use eliot_contracts::{ArtifactId, OperationId, RequestId, StateFence, TaskId, TaskRevision};
 use eliot_evidence::EvidenceAuthority;
 use eliot_receipts::WorkScope;
 use schemars::JsonSchema;
@@ -29,7 +28,7 @@ use crate::error::{
 };
 use crate::grade::GradeAssignment;
 use crate::identity::{ManifestId, PredecessorId, PropositionId};
-use crate::receipt::CoverageReceipt;
+use crate::receipt::{CoverageReceipt, check_member_roles};
 use crate::request::PositionRequest;
 use crate::support::{SupportRecord, SupportResult};
 use crate::temporal::TemporalRecord;
@@ -55,11 +54,13 @@ pub struct EpistemicPositionCandidate {
     pub proposition: PropositionId,
     /// Task-plan revision the candidate was built under.
     pub revision: TaskRevision,
-    /// Caller request identity this candidate answers; must equal the
-    /// governing request's identity.
+    /// Caller request identity this candidate answers; must equal the governing request's identity.
     pub request_id: RequestId,
-    /// Canonical work scope the candidate was built in; must equal the
-    /// governing request's scope.
+    /// Operation identity the candidate is proposed under; must equal the governing request's operation.
+    pub operation_id: OperationId,
+    /// Idempotency key binding retries of this exact ask; must equal the governing request's key.
+    pub idempotency_key: String,
+    /// Canonical work scope the candidate was built in; must equal the governing request's scope.
     pub work_scope: WorkScope,
     /// Predecessor retained as history, when one exists.
     pub predecessor: Option<PredecessorId>,
@@ -139,6 +140,8 @@ struct CandidateDigestShape<'a> {
     proposition: &'a PropositionId,
     revision: &'a TaskRevision,
     request_id: &'a RequestId,
+    operation_id: &'a OperationId,
+    idempotency_key: &'a str,
     work_scope: &'a WorkScope,
     predecessor: &'a Option<PredecessorId>,
     task_id: &'a TaskId,
@@ -166,7 +169,6 @@ struct CandidateDigestShape<'a> {
     proposed_assertability: &'a PositionAssertability,
     invalidation: &'a Option<InvalidationRecord>,
 }
-
 impl EpistemicPositionCandidate {
     /// Constructs a candidate and freezes its canonical digest (shape closure
     /// only; the closed ceiling needs
@@ -176,6 +178,8 @@ impl EpistemicPositionCandidate {
         proposition: PropositionId,
         revision: TaskRevision,
         request_id: RequestId,
+        operation_id: OperationId,
+        idempotency_key: impl Into<String>,
         work_scope: WorkScope,
         predecessor: Option<PredecessorId>,
         task_id: TaskId,
@@ -220,6 +224,8 @@ impl EpistemicPositionCandidate {
             proposition,
             revision,
             request_id,
+            operation_id,
+            idempotency_key: idempotency_key.into(),
             work_scope,
             predecessor,
             task_id,
@@ -261,6 +267,8 @@ impl EpistemicPositionCandidate {
             proposition: &self.proposition,
             revision: &self.revision,
             request_id: &self.request_id,
+            operation_id: &self.operation_id,
+            idempotency_key: self.idempotency_key.as_str(),
             work_scope: &self.work_scope,
             predecessor: &self.predecessor,
             task_id: &self.task_id,
@@ -335,7 +343,6 @@ impl EpistemicPositionCandidate {
         }
         Ok(())
     }
-
     fn validate_shape(&self) -> Result<(), ContractError> {
         self.check_claims_shape()?;
         let (_, support_results, _) = self.bound_support()?;
@@ -343,7 +350,6 @@ impl EpistemicPositionCandidate {
         self.check_history()?;
         Ok(())
     }
-
     fn check_claims_shape(&self) -> Result<(), ContractError> {
         if self.candidate_kind != CandidateKind::EpistemicPositionCandidate {
             return Err(ContractError::ImpossibleCombination {
@@ -351,6 +357,8 @@ impl EpistemicPositionCandidate {
             });
         }
         validate_bounded_text(&self.attempt_id, "candidate.attempt_id", MAX_SHORT_TEXT)?;
+        let field = "candidate.idempotency_key";
+        validate_bounded_text(&self.idempotency_key, field, MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.scope, "candidate.scope", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.version, "candidate.version", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.precision, "candidate.precision", MAX_SHORT_TEXT)?;
@@ -409,7 +417,6 @@ impl EpistemicPositionCandidate {
         }
         Ok(())
     }
-
     fn check_ceiling_shape(&self, support_results: &[SupportResult]) -> Result<(), ContractError> {
         if self.unknowns.len() > MAX_HANDLES {
             return Err(ContractError::TooMany {
@@ -527,6 +534,14 @@ impl EpistemicPositionCandidate {
                 field: "candidate.request_id",
             });
         }
+        if request.operation_id != self.operation_id {
+            let field = "candidate.operation";
+            return Err(ContractError::OutsideManifest { field });
+        }
+        if request.idempotency_key != self.idempotency_key {
+            let field = "candidate.idempotency_key";
+            return Err(ContractError::TaskMismatch { field });
+        }
         if request.work_scope != self.work_scope {
             return Err(ContractError::ScopeMismatch {
                 field: "candidate.work_scope",
@@ -631,6 +646,7 @@ impl EpistemicPositionCandidate {
                 field: "candidate.coverage",
             });
         }
+        check_member_roles(receipt, denominator, "candidate.coverage")?;
         if denominator.kind != DenominatorKind::CompleteScope {
             return Ok(false);
         }
@@ -829,6 +845,34 @@ impl EpistemicPositionCandidate {
         Ok(())
     }
 
+    /// Caps one entered claim by the weakest grade over its referenced support records: the ceiling is
+    /// per-claim from that claim's handles, never the map-wide aggregate.
+    fn check_claim_grade(&self, entry: &ClaimEntry) -> Result<(), ContractError> {
+        let referenced: Vec<GradeAssignment> = self
+            .support
+            .iter()
+            .filter(|record| {
+                let handles = &record.handles;
+                handles.iter().any(|handle| entry.support.contains(handle))
+            })
+            .map(|record| record.grade.clone())
+            .collect();
+        if referenced.is_empty() {
+            return Ok(());
+        }
+        let floor = GradeAssignment::weakest(&referenced)?;
+        let over = match (floor.known_grade(), entry.grade.known_grade()) {
+            (Some(floor), Some(claimed)) => claimed.rank() > floor.rank(),
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if over {
+            let field = "candidate.grade";
+            return Err(ContractError::CeilingViolation { field });
+        }
+        Ok(())
+    }
+
     /// Resolves one entered claim against its governed shape.
     fn check_claim_entry(
         &self,
@@ -873,6 +917,14 @@ impl EpistemicPositionCandidate {
                 });
             }
         }
+        // Counterevidence closure: every preserved counter handle resolves against the supplied closed
+        // support set; a countered claim over a foreign handle fails even when its verdict is coherent.
+        for handle in &entry.counterevidence {
+            if !support_handles.contains(handle) {
+                let field = "candidate.counterevidence";
+                return Err(ContractError::MissingReference { field });
+            }
+        }
         for marker in &entry.unresolved_support {
             if !self.unknowns.contains(marker) {
                 return Err(ContractError::MissingReference {
@@ -892,7 +944,19 @@ impl EpistemicPositionCandidate {
             // Exact closure: the named record must hold in this task, scope,
             // and fence. Same name under another context is foreign.
             record.validate_for(&self.task_id, self.scope.as_str(), &self.fence)?;
+            // Assumption closure: the record bounds must cover the candidate window, version, and
+            // precision; a narrower, coarser, or version-drifted assumption never enters here.
+            if !record.bounds.covers_candidate(
+                self.scope.as_str(),
+                self.candidate_window(),
+                self.version.as_str(),
+                self.precision.as_str(),
+            ) {
+                let field = "candidate.assumptions";
+                return Err(ContractError::StaleContext { field });
+            }
         }
+        self.check_claim_grade(entry)?;
         if let Some(conflict) = &entry.conflict
             && !conflicts
                 .iter()

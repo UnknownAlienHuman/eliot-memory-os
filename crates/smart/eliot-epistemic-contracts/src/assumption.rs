@@ -4,7 +4,6 @@
 //! (load-bearing per I12.4, not prose), plus statement, bounds, holder, task, and fence. Withdrawal is
 //! mechanical via [`AssumptionRecord::withdraw`]; the record carries no support result, handles, or verdict —
 //! nothing a reader could mistake for observed support.
-
 use std::collections::BTreeSet;
 
 use eliot_contracts::{SourceId, StateFence, TaskId};
@@ -57,7 +56,6 @@ pub struct AssumptionRecord {
     /// Canonical digest of the assumption shape, excluding this field.
     pub digest: String,
 }
-
 impl AssumptionRecord {
     /// Constructs an assumption record and freezes its canonical digest.
     #[allow(clippy::too_many_arguments)]
@@ -128,7 +126,6 @@ impl AssumptionRecord {
             self.task_id.clone(),
         )
     }
-
     fn validate_shape(&self) -> Result<(), ContractError> {
         if self.assumption_kind != AssumptionKind::AssumptionRecord {
             return Err(ContractError::ImpossibleCombination {
@@ -228,7 +225,6 @@ pub struct AssumptionRetraction {
     /// Canonical digest of the retraction shape, excluding this field.
     pub digest: String,
 }
-
 impl AssumptionRetraction {
     /// Constructs a retraction and freezes its canonical digest.
     pub fn new(
@@ -261,7 +257,6 @@ impl AssumptionRetraction {
             &self.task_id,
         ))
     }
-
     fn validate_shape(&self) -> Result<(), ContractError> {
         validate_digest(&self.assumption_digest, "assumption.retraction")?;
         validate_bounded_text(

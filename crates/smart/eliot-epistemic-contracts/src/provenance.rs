@@ -3,7 +3,6 @@
 //! A [`ProvenanceClosure`] carries record handles, typed sources, raw handles, revisions, per-source
 //! [`SourceLineage`] entries (with cycle rejection), assertability, scope, and fence. The untyped sets must
 //! equal exactly the union over the lineage entries. It is data, never authority.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{ArtifactId, SourceId, StateFence};
@@ -36,7 +35,6 @@ pub struct SourceLineage {
     /// Raw-to-derived mapping note, when this slice transforms raw input.
     pub derived_from_raw: Option<String>,
 }
-
 impl SourceLineage {
     /// Constructs a source lineage entry after validation.
     pub fn new(
@@ -139,7 +137,7 @@ pub enum ProvenanceClosureKind {
 pub struct ProvenanceClosure {
     /// Marker binding this document to the closure decoding.
     pub closure_kind: ProvenanceClosureKind,
-    /// Every record consulted; order carries no meaning.
+    /// Every record consulted; order carries no meaning. Each maps to its lineage entry below.
     pub records: BTreeSet<ArtifactId>,
     /// Every source consulted, typed; order carries no meaning. Must equal
     /// exactly the owners named by `lineage`.
@@ -153,6 +151,9 @@ pub struct ProvenanceClosure {
     /// Per-source lineage binding every owner to its revision, content
     /// digest, raw handle, and predecessors, in declaration order.
     pub lineage: Vec<SourceLineage>,
+    /// Relational closure: every record handle maps to the content digest of its concrete lineage entry.
+    /// Set unions matching is insufficient; a foreign handle fails here even when the unions match.
+    pub record_origin: BTreeMap<ArtifactId, String>,
     /// Digest of the applicable temporal record, when the closure carries one.
     pub temporal_digest: Option<String>,
     /// Whether more than one source was consulted; derived, never asserted.
@@ -166,7 +167,6 @@ pub struct ProvenanceClosure {
     /// Canonical digest of the closure shape, excluding this field.
     pub digest: String,
 }
-
 impl ProvenanceClosure {
     /// Constructs a closure and freezes its canonical digest.
     #[allow(clippy::too_many_arguments)]
@@ -176,6 +176,7 @@ impl ProvenanceClosure {
         raw_handles: BTreeSet<String>,
         revisions: BTreeSet<String>,
         lineage: Vec<SourceLineage>,
+        record_origin: BTreeMap<ArtifactId, String>,
         temporal_digest: Option<String>,
         mixed_sources: bool,
         assertability: Assertability,
@@ -189,6 +190,7 @@ impl ProvenanceClosure {
             raw_handles,
             revisions,
             lineage,
+            record_origin,
             temporal_digest,
             mixed_sources,
             assertability,
@@ -210,6 +212,7 @@ impl ProvenanceClosure {
             &self.raw_handles,
             &self.revisions,
             &self.lineage,
+            &self.record_origin,
             &self.temporal_digest,
             &self.mixed_sources,
             &self.assertability,
@@ -217,14 +220,12 @@ impl ProvenanceClosure {
             &self.fence,
         ))
     }
-
     fn validate_shape(&self) -> Result<(), ContractError> {
         self.check_handle_bounds()?;
         self.check_lineage()?;
         self.check_derived()?;
         Ok(())
     }
-
     fn check_handle_bounds(&self) -> Result<(), ContractError> {
         if self.closure_kind != ProvenanceClosureKind::ProvenanceClosure {
             return Err(ContractError::ImpossibleCombination {
@@ -271,7 +272,6 @@ impl ProvenanceClosure {
         }
         Ok(())
     }
-
     fn check_lineage(&self) -> Result<(), ContractError> {
         let mut seen_content = BTreeSet::new();
         let mut lineage_sources = BTreeSet::new();
@@ -318,9 +318,23 @@ impl ProvenanceClosure {
                 field: "provenance.revisions",
             });
         }
+        // Relational closure: every record maps to a concrete lineage entry, and nothing else does.
+        let field = "provenance.record_origin";
+        for (handle, digest) in &self.record_origin {
+            if !self.records.contains(handle) {
+                return Err(ContractError::OutsideManifest { field });
+            }
+            if !lineage_digests.contains(digest) {
+                return Err(ContractError::MissingReference { field });
+            }
+        }
+        for handle in &self.records {
+            if !self.record_origin.contains_key(handle) {
+                return Err(ContractError::MissingReference { field });
+            }
+        }
         Ok(())
     }
-
     fn check_derived(&self) -> Result<(), ContractError> {
         if let Some(temporal) = &self.temporal_digest {
             validate_digest(temporal.as_str(), "provenance.temporal_digest")?;

@@ -4,7 +4,6 @@
 //! flag, plus common lineage, unresolved residue and owners, probe, and receipt digest. Count, recency, and
 //! scalar confidence never resolve a conflict: a set closes only when its residue is empty and its lifecycle
 //! says so.
-
 use std::collections::BTreeSet;
 
 use eliot_contracts::{ArtifactId, SourceId, TaskId};
@@ -87,7 +86,6 @@ pub struct ConflictPosition {
     /// Whether this position is a recorded minority.
     pub minority: bool,
 }
-
 impl ConflictPosition {
     /// Constructs a conflict position after validation.
     pub fn new(
@@ -194,7 +192,6 @@ struct ConflictDigestShape<'a> {
     lifecycle: &'a ConflictLifecycle,
     receipt_digest: &'a str,
 }
-
 impl ConflictSet {
     /// Constructs a conflict set and freezes its canonical digest.
     #[allow(clippy::too_many_arguments)]
@@ -274,7 +271,6 @@ impl ConflictSet {
             && self.unresolved.is_empty()
             && self.unresolved_owners.is_empty()
     }
-
     fn validate_shape(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.conflict_id, "conflict.conflict_id", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.scope, "conflict.scope", MAX_SHORT_TEXT)?;

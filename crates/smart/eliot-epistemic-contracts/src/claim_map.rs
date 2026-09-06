@@ -4,7 +4,6 @@
 //! counterevidence, conflict reference, authority, grade, dependencies, bounds, component coverage, ceiling,
 //! assumptions, and discriminators. Component coverage is validated, never inferred: an accepted entry carries
 //! a supporting handle or an explicit unresolved marker; outside-manifest claims and duplicates fail.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::ArtifactId;
@@ -97,7 +96,6 @@ pub struct ClaimEntry {
     /// Discriminators separating this claim from its rivals.
     pub discriminators: BTreeSet<String>,
 }
-
 impl ClaimEntry {
     /// Constructs a claim entry after validation.
     #[allow(clippy::too_many_arguments)]
@@ -152,7 +150,6 @@ impl ClaimEntry {
         self.check_entry_coherence()?;
         Ok(())
     }
-
     fn check_entry_fields(&self) -> Result<(), ContractError> {
         validate_digest(&self.statement_digest, "claim.statement_digest")?;
         validate_digest(&self.coverage_digest, "claim.coverage_digest")?;
@@ -225,7 +222,6 @@ impl ClaimEntry {
         }
         Ok(())
     }
-
     fn check_entry_coherence(&self) -> Result<(), ContractError> {
         if self.dependencies.contains(&self.claim) {
             return Err(ContractError::SelfReference {
@@ -275,7 +271,6 @@ pub struct DependenceGroup {
     /// Bounded rationale for grouping these members.
     pub rationale: String,
 }
-
 impl DependenceGroup {
     /// Constructs a dependence group after validation.
     pub fn new(
@@ -332,7 +327,6 @@ pub struct ClaimMap {
     /// Canonical digest of the map shape, excluding this field.
     pub digest: String,
 }
-
 impl ClaimMap {
     /// Constructs a claim map and freezes its canonical digest.
     pub fn new(
@@ -495,7 +489,6 @@ impl ClaimMap {
         }
         Ok(())
     }
-
     fn validate_shape(&self) -> Result<(), ContractError> {
         if self.entries.is_empty() {
             return Err(ContractError::EmptyCollection {

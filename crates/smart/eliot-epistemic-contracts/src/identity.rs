@@ -3,7 +3,6 @@
 //! Identity answers which proposition, claim, evidence set, manifest, source revision, lineage root, validity,
 //! and predecessors are addressed; the digest answers which exact bytes were frozen. A digest is never an
 //! identity, and derivations that merely restate raw input are rejected.
-
 use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
@@ -14,7 +13,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use crate::error::{
     ContractError, MAX_SHORT_TEXT, check_frozen, shape_digest, validate_bounded_text,
 };
-
 #[macro_export]
 macro_rules! position_id {
     ($(#[$meta:meta])* $name:ident, $label:literal) => {
@@ -22,7 +20,6 @@ macro_rules! position_id {
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, JsonSchema)]
         #[schemars(transparent)]
         pub struct $name(String);
-
         impl $name {
             /// Constructs a validated identifier.
             pub fn new(value: impl Into<String>) -> Result<Self, ContractError> {
@@ -34,21 +31,17 @@ macro_rules! position_id {
             /// Returns the canonical identifier text.
             pub fn as_str(&self) -> &str { &self.0 }
         }
-
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.0) }
         }
-
         impl FromStr for $name {
             type Err = ContractError;
             fn from_str(value: &str) -> Result<Self, Self::Err> { Self::new(value) }
         }
-
         impl Serialize for $name {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where S: Serializer { serializer.serialize_str(&self.0) }
         }
-
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where D: Deserializer<'de> {
@@ -58,7 +51,6 @@ macro_rules! position_id {
         }
     };
 }
-
 position_id!(
     /// Identity of one proposition addressed by an epistemic position.
     PropositionId,
@@ -124,7 +116,6 @@ pub struct IdentityBundle {
     /// Canonical digest of the identity shape, excluding this field.
     pub digest: String,
 }
-
 impl IdentityBundle {
     /// Constructs a bundle and freezes its canonical digest.
     #[allow(clippy::too_many_arguments)]
@@ -236,7 +227,6 @@ pub struct TransformedLineage {
     /// Source revision of the derived output.
     pub derived_revision: SourceRevisionId,
 }
-
 impl TransformedLineage {
     /// Constructs a transformation record retaining raw lineage.
     pub fn new(

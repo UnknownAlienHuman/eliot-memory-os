@@ -9,9 +9,7 @@
 //! `ProvenanceView`), and assumption/investigation fields harden the donor scope of
 //! `crates/smart/eliot-epistemic/src/lib.rs`; donor `resolve`, `provenance_for`, and `lowest_assertability`
 //! are resolver policy, not carried.
-
 #![forbid(unsafe_code)]
-
 pub mod absence;
 pub mod admitted;
 pub mod assertability;
@@ -35,11 +33,10 @@ pub mod verifier;
 
 #[cfg(test)]
 mod tests;
-
 pub use absence::{AbsenceClaim, BoundedProof, OwnerLookup};
 pub use admitted::{
-    AdmittedKind, AdmittedReceipt, CurrentEpistemicPosition, CurrentEpistemicPositionView,
-    Currentness, PositionId, PositionRevision, PositionState,
+    AdmittedKind, AdmittedReceipt, ContractChallenge, CurrentEpistemicPosition,
+    CurrentEpistemicPositionView, Currentness, PositionId, PositionRevision, PositionState,
 };
 pub use assertability::PositionAssertability;
 pub use assumption::{AssumptionKind, AssumptionRecord, AssumptionRetraction};

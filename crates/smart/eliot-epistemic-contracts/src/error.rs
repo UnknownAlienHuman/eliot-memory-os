@@ -2,7 +2,6 @@
 //!
 //! Every failure in this crate is a member of [`ContractError`]. The enum is closed: no catch-all variant,
 //! and validation never panics. Bounds for variable-length fields live here so every module enforces one ceiling.
-
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use serde::Serialize;
 use thiserror::Error;
