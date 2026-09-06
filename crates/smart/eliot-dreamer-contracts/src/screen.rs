@@ -12,7 +12,7 @@ use eliot_contracts::{ReceiptId, RequestId, StateFence};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{ContractViolation, check_text};
+use crate::error::{ContractViolation, check_fence, check_text, is_hex64_lower};
 
 const MAX_TEXT: usize = 256;
 
@@ -88,6 +88,22 @@ impl ScreenState {
     pub const fn is_eligible(self) -> bool {
         matches!(self, Self::Eligible)
     }
+
+    /// Exact fail-closed reason for every state; only `Eligible` enables dispatch.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Eligible => "eligible",
+            Self::Protected => "screen state is protected",
+            Self::ProtectionUnknown => "screen protection is unknown",
+            Self::Malformed => "screen state is malformed",
+            Self::Stale => "screen state is stale",
+            Self::Unavailable => "screen state is unavailable",
+            Self::Partial => "screen state is partial",
+            Self::Truncated => "screen state is truncated",
+            Self::Unprocessed => "screen state is unprocessed",
+        }
+    }
 }
 
 /// Dispatch eligibility derived from a [`ScreenReference`].
@@ -151,44 +167,19 @@ impl ScreenReference {
     /// with well-formed digests, else `Ineligible` with the exact reason.
     #[must_use]
     pub fn eligibility(&self) -> ScreenEligibility {
-        match self.state {
-            ScreenState::Eligible => {
-                for (label, digest) in
-                    [("result", &self.result_digest), ("item", &self.item_digest)]
-                {
-                    if !is_digest(digest) {
-                        return ScreenEligibility::Ineligible {
-                            reason: std::format!("screen {label} digest is not 64 lowercase hex"),
-                        };
-                    }
-                }
-                ScreenEligibility::Eligible
-            }
-            ScreenState::Protected => ScreenEligibility::Ineligible {
-                reason: "screen state is protected".to_owned(),
-            },
-            ScreenState::ProtectionUnknown => ScreenEligibility::Ineligible {
-                reason: "screen protection is unknown".to_owned(),
-            },
-            ScreenState::Malformed => ScreenEligibility::Ineligible {
-                reason: "screen state is malformed".to_owned(),
-            },
-            ScreenState::Stale => ScreenEligibility::Ineligible {
-                reason: "screen state is stale".to_owned(),
-            },
-            ScreenState::Unavailable => ScreenEligibility::Ineligible {
-                reason: "screen state is unavailable".to_owned(),
-            },
-            ScreenState::Partial => ScreenEligibility::Ineligible {
-                reason: "screen state is partial".to_owned(),
-            },
-            ScreenState::Truncated => ScreenEligibility::Ineligible {
-                reason: "screen state is truncated".to_owned(),
-            },
-            ScreenState::Unprocessed => ScreenEligibility::Ineligible {
-                reason: "screen state is unprocessed".to_owned(),
-            },
+        if self.state != ScreenState::Eligible {
+            return ScreenEligibility::Ineligible {
+                reason: self.state.reason().to_owned(),
+            };
         }
+        for (label, digest) in [("result", &self.result_digest), ("item", &self.item_digest)] {
+            if !is_hex64_lower(digest) {
+                return ScreenEligibility::Ineligible {
+                    reason: std::format!("screen {label} digest is not 64 lowercase hex"),
+                };
+            }
+        }
+        ScreenEligibility::Eligible
     }
 
     /// Validates identity, digest, and binding shape (not state gating).
@@ -221,10 +212,21 @@ pub struct ScreenBinding {
     pub task_id: String,
     pub scope_id: String,
     pub state_fence: StateFence,
+    pub state: ScreenState,
+    pub result_digest: String,
+    pub item_digest: String,
 }
 
 impl ScreenBinding {
     pub fn validate(&self) -> Result<(), ContractViolation> {
+        if self.state != ScreenState::Eligible
+            || !is_hex64_lower(&self.result_digest)
+            || !is_hex64_lower(&self.item_digest)
+        {
+            return Err(ContractViolation::ScreenIneligible(
+                "screen binding is not eligible".to_owned(),
+            ));
+        }
         check_text(&self.source_snapshot, "source_snapshot", MAX_TEXT)?;
         check_text(&self.source_revision, "source_revision", MAX_TEXT)?;
         check_text(&self.profile, "profile", MAX_TEXT)?;
@@ -238,41 +240,25 @@ impl ScreenBinding {
         if self.screened_targets.is_empty() {
             return Err(ContractViolation::MissingField("screened_targets"));
         }
-        for target in &self.screened_targets {
+        let mut ordered = self.screened_targets.clone();
+        ordered.sort();
+        for target in &ordered {
             check_text(target, "screened_targets", MAX_TEXT)?;
         }
-        for (i, target) in self.screened_targets.iter().enumerate() {
-            if self.screened_targets[..i].contains(target) {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "screened_targets",
-                    reason: "duplicate screened target".to_owned(),
-                });
-            }
+        ordered.dedup();
+        if ordered.len() != self.screened_targets.len() {
+            return Err(ContractViolation::BindingMismatch {
+                field: "screened_targets",
+                reason: "duplicate screened target".to_owned(),
+            });
         }
         check_fence(&self.state_fence)?;
         Ok(())
     }
 }
 
-/// Returns true when `value` is 64 lowercase hex chars.
-fn is_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
-fn check_fence(fence: &StateFence) -> Result<(), ContractViolation> {
-    fence
-        .validate()
-        .map_err(|_| ContractViolation::BindingMismatch {
-            field: "state_fence",
-            reason: "screen state fence is empty".to_owned(),
-        })
-}
-
 fn require_digest(field: &'static str, value: &str) -> Result<(), ContractViolation> {
-    if !is_digest(value) {
+    if !is_hex64_lower(value) {
         return Err(ContractViolation::Malformed {
             field,
             reason: "expected 64 lowercase hex chars".to_owned(),
@@ -351,16 +337,8 @@ mod tests {
             let mut reference = valid_reference();
             reference.state = state;
             let eligibility = reference.eligibility();
-            assert!(
-                !eligibility.is_eligible(),
-                "state {} must not enable dispatch",
-                state.as_str()
-            );
-            assert!(
-                matches!(eligibility, ScreenEligibility::Ineligible { .. }),
-                "state {} must report Ineligible",
-                state.as_str()
-            );
+            assert!(!eligibility.is_eligible());
+            assert!(matches!(eligibility, ScreenEligibility::Ineligible { .. }));
         }
     }
 }

@@ -8,7 +8,7 @@
 
 use crate::candidate::CandidateDisposition;
 use crate::curation::{CurationKind, CurationPayload};
-use crate::error::{ContractViolation, check_text};
+use crate::error::{ContractViolation, check_fence, check_text, check_vec_bound, is_hex64_lower};
 use crate::screen::ScreenBinding;
 use eliot_contracts::StateFence;
 use schemars::JsonSchema;
@@ -138,15 +138,6 @@ fn sorted_kinds(mut kinds: Vec<CurationKind>) -> Vec<CurationKind> {
     kinds
 }
 
-fn check_fence(fence: &StateFence) -> Result<(), ContractViolation> {
-    fence
-        .validate()
-        .map_err(|err| ContractViolation::BindingMismatch {
-            field: "state_fence",
-            reason: err.to_string(),
-        })
-}
-
 /// Rejects a screen-owned value that drifts from the typed request.
 fn bind_screen(field: &'static str, got: &str, want: &str) -> Result<(), ContractViolation> {
     if got != want {
@@ -183,12 +174,10 @@ impl CurationHandlerDescriptor {
         if actual != expected || actual.len() != self.accepted_kinds.len() {
             let want: Vec<&str> = expected.iter().map(|k| k.as_str()).collect();
             let got: Vec<&str> = self.accepted_kinds.iter().map(|k| k.as_str()).collect();
+            let family = self.family.as_str();
             return Err(ContractViolation::BindingMismatch {
                 field: "accepted_kinds",
-                reason: format!(
-                    "family {} requires exactly {want:?}, got {got:?}",
-                    self.family.as_str()
-                ),
+                reason: format!("family {family} requires exactly {want:?}, got {got:?}"),
             });
         }
         Ok(())
@@ -223,9 +212,11 @@ impl CurationHandlerRegistry {
         &mut self,
         descriptor: CurationHandlerDescriptor,
     ) -> Result<(), ContractViolation> {
-        descriptor
-            .validate()
-            .map_err(|err| ContractViolation::Registry(format!("invalid descriptor: {err}")))?;
+        if let Err(err) = descriptor.validate() {
+            return Err(ContractViolation::Registry(format!(
+                "invalid descriptor: {err}"
+            )));
+        }
         if let Some(existing) = self
             .handlers
             .iter()
@@ -262,9 +253,11 @@ impl CurationHandlerRegistry {
     /// Validates exact closure: descriptors valid, eleven kinds covered once.
     pub fn validate_closure(&self) -> Result<(), ContractViolation> {
         for descriptor in &self.handlers {
-            descriptor
-                .validate()
-                .map_err(|err| ContractViolation::Registry(format!("invalid descriptor: {err}")))?;
+            if let Err(err) = descriptor.validate() {
+                return Err(ContractViolation::Registry(format!(
+                    "invalid descriptor: {err}"
+                )));
+            }
         }
         let mut covered: Vec<CurationKind> = Vec::new();
         for descriptor in &self.handlers {
@@ -280,19 +273,10 @@ impl CurationHandlerRegistry {
         }
         let covered = sorted_kinds(covered);
         let mut all = Vec::new();
-        for family in [
-            CurationFamily::Classification,
-            CurationFamily::Relation,
-            CurationFamily::Episode,
-            CurationFamily::Concept,
-            CurationFamily::Procedure,
-            CurationFamily::Failure,
-            CurationFamily::StructureRepair,
-            CurationFamily::Reconsolidation,
-            CurationFamily::Accessibility,
-            CurationFamily::MemoryRepair,
-        ] {
-            all.extend_from_slice(family_kinds(family));
+        for spelling in CURATION_FAMILIES {
+            if let Ok(family) = parse_family(spelling) {
+                all.extend_from_slice(family_kinds(family));
+            }
         }
         let all = sorted_kinds(all);
         if covered != all {
@@ -311,11 +295,10 @@ impl CurationHandlerRegistry {
     /// Returns the sha256 hex digest over sorted `family:handler_id` lines.
     #[must_use]
     pub fn digest(&self) -> String {
-        let mut lines: Vec<String> = self
-            .handlers
-            .iter()
-            .map(|h| format!("{}:{}", h.family.as_str(), h.handler_id))
-            .collect();
+        let mut lines: Vec<String> = Vec::new();
+        for h in &self.handlers {
+            lines.push(format!("{}:{}", h.family.as_str(), h.handler_id));
+        }
         lines.sort();
         format!("{:x}", Sha256::digest(lines.join("\n").as_bytes()))
     }
@@ -337,6 +320,9 @@ pub struct TargetDenominator {
     pub expected_total: u32,
 }
 
+/// Max members admitted in any target denominator.
+const MAX_DENOMINATOR_MEMBERS: usize = 1_024;
+
 impl TargetDenominator {
     /// Validates exact member coverage against `expected_total`.
     ///
@@ -344,6 +330,8 @@ impl TargetDenominator {
     ///
     /// Returns a [`ContractViolation`] on length, blank, or duplicate members.
     pub fn validate(&self) -> Result<(), ContractViolation> {
+        let total = self.expected_total as usize;
+        check_vec_bound(total, MAX_DENOMINATOR_MEMBERS, "expected_total")?;
         if self.members.len() != self.expected_total as usize {
             return Err(ContractViolation::BindingMismatch {
                 field: "members",
@@ -444,48 +432,45 @@ impl TypedCurationHandlerRequest {
             });
         }
         if self.denominator.mode == AtomicityMode::AllOrNothing
-            && targets.len() != self.denominator.members.len()
+            && !crate::error::sorted_set_eq(targets, &self.denominator.members)
         {
             return Err(ContractViolation::BindingMismatch {
                 field: "targets",
                 reason: "all-or-nothing targets must equal the denominator".to_owned(),
             });
         }
-        if let Some(binding) = &self.screen_binding {
-            binding.validate()?;
-            if !self
-                .payload
-                .facets()
-                .targets
-                .iter()
-                .all(|t| binding.screened_targets.contains(t))
-            {
-                return Err(ContractViolation::ScreenIneligible(
-                    "payload adds unscreened target".to_owned(),
-                ));
-            }
-            bind_screen("request_id", &self.request_id, binding.request_id.as_str())?;
-            bind_screen("receipt_id", &self.receipt_id, binding.receipt_id.as_str())?;
-            bind_screen(
-                "source_snapshot",
-                &self.source_snapshot,
-                &binding.source_snapshot,
-            )?;
-            bind_screen(
-                "source_revision",
-                &self.source_revision,
-                &binding.source_revision,
-            )?;
-            bind_screen("profile", &self.profile, &binding.profile)?;
-            if binding.task_id != self.task_id
-                || binding.scope_id != self.scope_id
-                || binding.state_fence != self.state_fence
-            {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "screen_binding",
-                    reason: "screen binding task/scope/fence must match request".to_owned(),
-                });
-            }
+        let Some(binding) = &self.screen_binding else {
+            return Err(ContractViolation::ScreenIneligible(
+                "typed dispatch requires an eligible screen binding".to_owned(),
+            ));
+        };
+        binding.validate()?;
+        if !self
+            .payload
+            .facets()
+            .targets
+            .iter()
+            .all(|t| binding.screened_targets.contains(t))
+        {
+            return Err(ContractViolation::ScreenIneligible(
+                "payload adds unscreened target".to_owned(),
+            ));
+        }
+        bind_screen("request_id", &self.request_id, binding.request_id.as_str())?;
+        bind_screen("receipt_id", &self.receipt_id, binding.receipt_id.as_str())?;
+        let snap = (&self.source_snapshot, &binding.source_snapshot);
+        let rev = (&self.source_revision, &binding.source_revision);
+        bind_screen("source_snapshot", snap.0, snap.1)?;
+        bind_screen("source_revision", rev.0, rev.1)?;
+        bind_screen("profile", &self.profile, &binding.profile)?;
+        if binding.task_id != self.task_id
+            || binding.scope_id != self.scope_id
+            || binding.state_fence != self.state_fence
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "screen_binding",
+                reason: "screen binding task/scope/fence must match request".to_owned(),
+            });
         }
         Ok(())
     }
@@ -506,10 +491,7 @@ pub struct TypedCurationHandlerResult {
 }
 
 fn check_digest(value: &str, field: &'static str) -> Result<(), ContractViolation> {
-    if value.len() != 64
-        || !value.bytes().all(|b| b.is_ascii_hexdigit())
-        || value.bytes().any(|b| b.is_ascii_uppercase())
-    {
+    if !is_hex64_lower(value) {
         return Err(ContractViolation::Malformed {
             field,
             reason: "must be 64-character lowercase hex sha256".to_owned(),
@@ -547,12 +529,17 @@ impl TypedCurationHandlerResult {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::curation::{CURATION_WIRE_KINDS, MergePayload, parse_kind, sample_payload};
+    use crate::curation::{CURATION_WIRE_KINDS, parse_kind, sample_payload};
     use crate::draft::ValidatedCurationItem;
     use eliot_contracts::{AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, sha256_hex};
 
     fn fence() -> StateFence {
         StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    }
+
+    fn bumped_fence() -> StateFence {
+        let gen2 = ResourceGeneration::new(2).expect("counter");
+        StateFence::new(AuthorityEpoch::genesis(), gen2)
     }
 
     fn descriptor(
@@ -581,11 +568,27 @@ mod tests {
             (CurationFamily::Accessibility, "acc-a11y"),
             (CurationFamily::MemoryRepair, "acc-mr"),
         ] {
-            registry
-                .register(descriptor(family, id, family_kinds(family).to_vec()))
-                .expect("fixture descriptor");
+            let desc = descriptor(family, id, family_kinds(family).to_vec());
+            registry.register(desc).expect("fixture descriptor");
         }
         registry
+    }
+
+    fn sample_binding() -> ScreenBinding {
+        ScreenBinding {
+            request_id: RequestId::new("req-1").expect("request id"),
+            receipt_id: ReceiptId::new("rcpt-1").expect("receipt id"),
+            screened_targets: vec!["a".to_owned(), "b".to_owned(), "ab".to_owned()],
+            source_snapshot: "snap-1".to_owned(),
+            source_revision: "rev-1".to_owned(),
+            profile: "default".to_owned(),
+            task_id: "task-1".to_owned(),
+            scope_id: "scope-1".to_owned(),
+            state_fence: fence(),
+            state: crate::screen::ScreenState::Eligible,
+            result_digest: "a".repeat(64),
+            item_digest: "b".repeat(64),
+        }
     }
 
     fn sample_request() -> TypedCurationHandlerRequest {
@@ -601,18 +604,13 @@ mod tests {
             scope_id: "scope-1".to_owned(),
             task_id: "task-1".to_owned(),
             state_fence: fence(),
-            payload: CurationPayload::Merge(MergePayload {
-                left: "a".to_owned(),
-                right: "b".to_owned(),
-                merged: "ab".to_owned(),
-                target_evidence: crate::curation::sample_facets(),
-            }),
+            payload: sample_payload(CurationKind::Merge),
             denominator: TargetDenominator {
                 mode: AtomicityMode::AllOrNothing,
                 members: vec!["a".to_owned(), "b".to_owned(), "ab".to_owned()],
                 expected_total: 3,
             },
-            screen_binding: None,
+            screen_binding: Some(sample_binding()),
         }
     }
 
@@ -630,40 +628,21 @@ mod tests {
         request.denominator.expected_total = 4;
         request.denominator.mode = AtomicityMode::PerMember;
         request.receipt_id = "rcpt-screen".to_owned();
-        request.source_snapshot = "snap-1".to_owned();
-        request.source_revision = "rev-1".to_owned();
-        request.profile = "default".to_owned();
-        request.screen_binding = Some(ScreenBinding {
-            request_id: RequestId::new(wire).expect("request id"),
-            receipt_id: ReceiptId::new("rcpt-screen").expect("receipt id"),
-            screened_targets: targets,
-            source_snapshot: "snap-1".to_owned(),
-            source_revision: "rev-1".to_owned(),
-            profile: "default".to_owned(),
-            task_id: "task-1".to_owned(),
-            scope_id: "scope-1".to_owned(),
-            state_fence: fence(),
-        });
+        let mut binding = sample_binding();
+        binding.request_id = RequestId::new(wire).expect("request id");
+        binding.receipt_id = ReceiptId::new("rcpt-screen").expect("receipt id");
+        binding.screened_targets = targets;
+        request.screen_binding = Some(binding);
         request
     }
 
     // WORK_UNIT_CASE: 578/22
     #[test]
     fn case_22_ten_families_exact_order_and_roundtrip() {
+        let got = CURATION_FAMILIES.join(",");
         assert_eq!(
-            CURATION_FAMILIES,
-            &[
-                "classification",
-                "relation",
-                "episode",
-                "concept",
-                "procedure",
-                "failure",
-                "structure_repair",
-                "reconsolidation",
-                "accessibility",
-                "memory_repair",
-            ]
+            got,
+            "classification,relation,episode,concept,procedure,failure,structure_repair,reconsolidation,accessibility,memory_repair"
         );
         assert_eq!(CURATION_FAMILIES.len(), 10);
         for spelling in CURATION_FAMILIES {
@@ -677,61 +656,38 @@ mod tests {
         // Wire-only spellings are never families.
         for spelling in ["merge", "split", "repair", "other"] {
             let err = parse_family(spelling).expect_err("must reject");
-            assert_eq!(
-                err,
-                ContractViolation::UnknownVariant {
-                    field: "family",
-                    value: spelling.to_owned(),
-                }
-            );
+            let want = ContractViolation::UnknownVariant {
+                field: "family",
+                value: spelling.into(),
+            };
+            assert_eq!(err, want);
         }
     }
 
     // WORK_UNIT_CASE: 578/23
     #[test]
     fn case_23_eleven_kinds_map_to_ten_families() {
-        let kinds = [
-            CurationKind::Classification,
-            CurationKind::Relation,
-            CurationKind::Episode,
-            CurationKind::Concept,
-            CurationKind::Procedure,
-            CurationKind::Failure,
-            CurationKind::Merge,
-            CurationKind::Split,
-            CurationKind::Reconsolidation,
-            CurationKind::Accessibility,
-            CurationKind::Repair,
-        ];
-        assert_eq!(kinds.len(), 11);
-        let mut families: Vec<CurationFamily> = kinds.iter().map(|k| family_of(*k)).collect();
+        assert_eq!(CURATION_WIRE_KINDS.len(), 11);
+        let mut families: Vec<CurationFamily> = CURATION_WIRE_KINDS
+            .iter()
+            .map(|w| family_of(parse_kind(w).expect("known wire kind")))
+            .collect();
         families.sort_by_key(|f| f.as_str());
         families.dedup();
         assert_eq!(families.len(), 10);
         for spelling in CURATION_FAMILIES {
             let family = parse_family(spelling).expect("known family");
-            assert!(
-                families.contains(&family),
-                "family {spelling} has no kind mapping to it"
-            );
+            let found = families.contains(&family);
+            assert!(found, "family {spelling} has no kind mapping to it");
         }
-        // Spot-check the collapsing arms of the mapping.
-        assert_eq!(
-            family_of(CurationKind::Merge),
-            family_of(CurationKind::Split)
-        );
-        assert_eq!(
-            family_of(CurationKind::Merge),
-            CurationFamily::StructureRepair
-        );
-        assert_eq!(
-            family_of(CurationKind::Repair),
-            CurationFamily::MemoryRepair
-        );
-        assert_eq!(
-            family_of(CurationKind::Classification),
-            CurationFamily::Classification
-        );
+        let merge = family_of(CurationKind::Merge);
+        let split = family_of(CurationKind::Split);
+        assert_eq!(merge, split);
+        assert_eq!(merge, CurationFamily::StructureRepair);
+        let repair = family_of(CurationKind::Repair);
+        assert_eq!(repair, CurationFamily::MemoryRepair);
+        let classification = family_of(CurationKind::Classification);
+        assert_eq!(classification, CurationFamily::Classification);
     }
 
     // WORK_UNIT_CASE: 578/29
@@ -744,22 +700,25 @@ mod tests {
             receipt: receipt.clone(),
             kind_spelling: "merge".to_owned(),
             family_spelling: "structure_repair".to_owned(),
+            payload: crate::curation::sample_payload(CurationKind::Merge),
+            denominator: TargetDenominator {
+                mode: AtomicityMode::AllOrNothing,
+                members: vec!["a".to_owned(), "b".to_owned(), "ab".to_owned()],
+                expected_total: 3,
+            },
             source_digest: sha256_hex(b"curation-source"),
-            target_denominator: "scope-1:2-of-2".to_owned(),
             task_id: "task-1".to_owned(),
             scope_id: "scope-1".to_owned(),
-            budget_note: "within dimension".to_owned(),
             state_fence: fence(),
+            budget_note: "within dimension".to_owned(),
         };
         item.validate().expect("valid item");
         let wire = serde_json::to_string(&item).expect("serialize");
         let back: ValidatedCurationItem = serde_json::from_str(&wire).expect("roundtrip");
         back.validate().expect("roundtrip valid");
         assert_eq!(back, item);
-        assert_eq!(
-            back.receipt.preservation_digest,
-            sha256_hex(b"preservation")
-        );
+        let preservation = sha256_hex(b"preservation");
+        assert_eq!(back.receipt.preservation_digest, preservation);
         assert_eq!(back.receipt.budget_digest, sha256_hex(b"budget"));
         for (from, to) in [
             ("task-1", ""),
@@ -767,21 +726,19 @@ mod tests {
             ("\"merge\"", "\"mergeX\""),
             ("structure_repair", "structure_repairX"),
             ("source_digest\":\"", "source_digest\":\"zz"),
-            ("scope-1:2-of-2", ""),
+            (
+                "\"members\":[\"a\",\"b\",\"ab\"]",
+                "\"members\":[\"a\",\"b\",\"x\"]",
+            ),
             ("within dimension", ""),
         ] {
             let mutated = wire.replacen(from, to, 1);
             let parsed: ValidatedCurationItem = serde_json::from_str(&mutated).expect("parse");
-            assert!(
-                parsed.validate().is_err(),
-                "mutation {from}->{to} must fail"
-            );
+            let ok = parsed.validate().is_ok();
+            assert!(!ok, "mutation {from}->{to} must fail");
         }
         let mut fenced = item.clone();
-        fenced.state_fence = StateFence::new(
-            AuthorityEpoch::genesis(),
-            ResourceGeneration::new(2).expect("counter"),
-        );
+        fenced.state_fence = bumped_fence();
         assert!(fenced.validate().is_err());
     }
 
@@ -791,28 +748,22 @@ mod tests {
         let registry = full_registry();
         assert_eq!(registry.handlers.len(), 10);
         registry.validate_closure().expect("full coverage");
-        // A structure_repair handler accepts exactly merge plus split.
         let sr = registry
             .handlers
             .iter()
             .find(|h| h.family == CurationFamily::StructureRepair)
             .expect("structure_repair handler");
-        assert_eq!(
-            sorted_kinds(sr.accepted_kinds.clone()),
-            sorted_kinds(vec![CurationKind::Merge, CurationKind::Split])
-        );
-        // Every other family accepts exactly its single kind.
+        let got = sorted_kinds(sr.accepted_kinds.clone());
+        let want = sorted_kinds(vec![CurationKind::Merge, CurationKind::Split]);
+        assert_eq!(got, want);
         for handler in &registry.handlers {
             if handler.family == CurationFamily::StructureRepair {
                 continue;
             }
-            assert_eq!(
-                handler.accepted_kinds,
-                family_kinds(handler.family).to_vec()
-            );
+            let want = family_kinds(handler.family).to_vec();
+            assert_eq!(handler.accepted_kinds, want);
             assert_eq!(handler.accepted_kinds.len(), 1);
         }
-        // Explicit-discriminant routing per wire kind; all-or-nothing rejects subsets.
         for wire in CURATION_WIRE_KINDS {
             let kind = parse_kind(wire).expect("known wire kind");
             let request = kind_request(kind, wire);
@@ -820,9 +771,17 @@ mod tests {
             assert_eq!(request.family, family_of(kind));
             let mut strict = request.clone();
             strict.denominator.mode = AtomicityMode::AllOrNothing;
-            let err = strict
-                .validate()
-                .expect_err("all-or-nothing rejects subsets");
+            let res = strict.validate();
+            let err = res.expect_err("all-or-nothing rejects subsets");
+            assert!(matches!(err, ContractViolation::BindingMismatch { .. }));
+            let mut dup = sample_request();
+            dup.payload = sample_payload(CurationKind::Merge);
+            if let CurationPayload::Merge(inner) = &mut dup.payload {
+                inner.target_evidence.targets = vec!["a".to_owned(), "a".to_owned()];
+            }
+            dup.denominator.members = vec!["a".to_owned(), "b".to_owned()];
+            dup.denominator.expected_total = 2;
+            let err = dup.validate().expect_err("duplicate targets must fail");
             assert!(matches!(err, ContractViolation::BindingMismatch { .. }));
         }
     }
@@ -830,82 +789,49 @@ mod tests {
     // WORK_UNIT_CASE: 578/31
     #[test]
     fn case_31_missing_duplicate_overlap_rejected() {
-        // Missing: empty registry cannot close.
         let empty = CurationHandlerRegistry::new();
-        assert!(matches!(
-            empty.validate_closure(),
-            Err(ContractViolation::Registry(_))
-        ));
-        // Partial registry cannot close either.
+        let err = empty.validate_closure().expect_err("empty must fail");
+        assert!(matches!(err, ContractViolation::Registry(_)));
         let mut partial = CurationHandlerRegistry::new();
+        let kinds = vec![CurationKind::Classification];
         partial
-            .register(descriptor(
-                CurationFamily::Classification,
-                "h-cls",
-                vec![CurationKind::Classification],
-            ))
+            .register(descriptor(CurationFamily::Classification, "h-cls", kinds))
             .expect("first registration");
-        assert!(matches!(
-            partial.validate_closure(),
-            Err(ContractViolation::Registry(_))
-        ));
-        // Duplicate: identical descriptor under the same id.
+        let res = partial.validate_closure();
+        assert!(matches!(res, Err(ContractViolation::Registry(_))));
         let mut registry = CurationHandlerRegistry::new();
-        let first = descriptor(
-            CurationFamily::Relation,
-            "h-rel",
-            vec![CurationKind::Relation],
-        );
-        registry
-            .register(first.clone())
-            .expect("first registration");
-        let err = registry.register(first).expect_err("duplicate must fail");
-        assert!(
-            matches!(err, ContractViolation::Registry(_)),
-            "unexpected: {err:?}"
-        );
-        // Overlap: a second handler covering an already-covered kind.
-        let overlap = descriptor(
-            CurationFamily::Classification,
-            "h-cls-2",
-            vec![CurationKind::Classification],
-        );
+        let kinds = vec![CurationKind::Relation];
+        let first = descriptor(CurationFamily::Relation, "h-rel", kinds);
+        let dup = first.clone();
+        registry.register(first).expect("first registration");
+        let err = registry.register(dup).expect_err("duplicate must fail");
+        assert!(matches!(err, ContractViolation::Registry(_)));
+        let kinds = vec![CurationKind::Classification];
+        let overlap = descriptor(CurationFamily::Classification, "h-cls-2", kinds);
         let mut registry = CurationHandlerRegistry::new();
+        let kinds = vec![CurationKind::Classification];
         registry
-            .register(descriptor(
-                CurationFamily::Classification,
-                "h-cls-1",
-                vec![CurationKind::Classification],
-            ))
+            .register(descriptor(CurationFamily::Classification, "h-cls-1", kinds))
             .expect("first registration");
-        // `h-cls-2` is intrinsically valid but overlaps `h-cls-1`.
         overlap.validate().expect("overlap fixture is valid alone");
         let err = registry.register(overlap).expect_err("overlap must fail");
-        assert!(
-            matches!(err, ContractViolation::Registry(_)),
-            "unexpected: {err:?}"
-        );
+        assert!(matches!(err, ContractViolation::Registry(_)));
     }
 
     // WORK_UNIT_CASE: 578/32
     #[test]
     fn case_32_changed_same_id_descriptor_conflicts() {
         let mut registry = CurationHandlerRegistry::new();
+        let kinds = vec![CurationKind::Episode];
         registry
-            .register(descriptor(
-                CurationFamily::Episode,
-                "h-ep",
-                vec![CurationKind::Episode],
-            ))
+            .register(descriptor(CurationFamily::Episode, "h-ep", kinds))
             .expect("first registration");
         let changed = descriptor(CurationFamily::Concept, "h-ep", vec![CurationKind::Concept]);
         changed.validate().expect("changed fixture is valid alone");
-        let err = registry.register(changed).expect_err("changed must fail");
-        assert!(
-            matches!(err, ContractViolation::Registry(ref msg) if msg.contains("changed")),
-            "unexpected: {err:?}"
-        );
-        // The original descriptor is untouched by the failed registration.
+        assert!(matches!(
+            registry.register(changed),
+            Err(ContractViolation::Registry(ref msg)) if msg.contains("changed")
+        ));
         assert_eq!(registry.handlers.len(), 1);
         assert_eq!(registry.handlers[0].family, CurationFamily::Episode);
     }
@@ -922,7 +848,6 @@ mod tests {
         }
         assert_eq!(first.digest(), reversed.digest());
         assert_eq!(first.digest().len(), 64);
-        // Different content digests differently.
         let mut other = first.clone();
         other.handlers[0].handler_id = "acc-cls-renamed".to_owned();
         assert_ne!(first.digest(), other.digest());
@@ -951,14 +876,12 @@ mod tests {
         let result_json = serde_json::to_string(&result).expect("serialize result");
         let result_back: TypedCurationHandlerResult =
             serde_json::from_str(&result_json).expect("roundtrip result");
-        result_back
-            .validate()
-            .expect("roundtripped result stays valid");
+        let res = result_back.validate();
+        res.expect("roundtripped result stays valid");
         assert_eq!(result_back, result);
         assert_eq!(result_back.request_id, request_back.request_id);
         assert_eq!(result_back.kind, request_back.kind);
         assert_eq!(result_back.family, request_back.family);
-        // Candidate results encode no targets and no application.
         for key in ["targets", "screen_binding", "denominator"] {
             assert!(!result_json.contains(key), "result must not encode {key}");
         }
@@ -967,21 +890,15 @@ mod tests {
             kind: CurationKind::Repair,
             ..result.clone()
         };
-        assert!(matches!(
-            drifted.validate(),
-            Err(ContractViolation::KindPayload(_))
-        ));
-        // Uppercase or truncated digests are malformed, not digests.
+        let err = drifted.validate().expect_err("kind drift must fail");
+        assert!(matches!(err, ContractViolation::KindPayload(_)));
         let bad_digest = TypedCurationHandlerResult {
             result_digest: "AB".to_owned(),
             ..result
         };
-        assert!(matches!(
-            bad_digest.validate(),
-            Err(ContractViolation::Malformed { .. })
-        ));
+        let err = bad_digest.validate().expect_err("bad digest must fail");
+        assert!(matches!(err, ContractViolation::Malformed { .. }));
 
-        // Denominator exactness: wrong total, dupes, and outside targets fail.
         let mut wrong_total = sample_request();
         wrong_total.denominator.expected_total = 99;
         let err = wrong_total.validate().expect_err("wrong total must fail");
@@ -1000,46 +917,78 @@ mod tests {
         outside.denominator.members = vec!["x".to_owned()];
         outside.denominator.expected_total = 1;
         assert!(outside.validate().is_err());
+        let mut huge = sample_request();
+        huge.denominator.expected_total = 1_025;
+        let err = huge.validate().expect_err("huge total must fail");
+        assert!(matches!(
+            err,
+            ContractViolation::OutOfBounds {
+                field: "expected_total",
+                ..
+            }
+        ));
+        let mut max = sample_request();
+        max.job_id = "j".repeat(128);
+        max.validate().expect("128-char identity is the bound");
+        let mut over = sample_request();
+        over.job_id = "j".repeat(129);
+        let err = over.validate().expect_err("overlong identity must fail");
+        assert!(matches!(err, ContractViolation::OutOfBounds { .. }));
+        let mut control = sample_request();
+        control.job_id = "a\u{0}b".to_owned();
+        let err = control.validate().expect_err("control identity must fail");
+        assert!(matches!(err, ContractViolation::Malformed { .. }));
         assert_screened_dispatch_fails();
     }
 
     fn assert_screened_dispatch_fails() {
-        // Screened dispatch: unscreened targets and foreign task/scope/fence fail.
         let screened = kind_request(CurationKind::Merge, "req-screened");
         screened.validate().expect("screened request");
         let mut unscreened = screened.clone();
-        if let Some(binding) = unscreened.screen_binding.as_mut() {
-            binding.screened_targets.retain(|t| t != "ab");
-        }
-        let err = unscreened
-            .validate()
-            .expect_err("unscreened target must fail");
+        let binding = unscreened.screen_binding.as_mut().expect("binding");
+        binding.screened_targets.retain(|t| t != "ab");
+        let res = unscreened.validate();
+        let err = res.expect_err("unscreened target must fail");
         assert!(matches!(err, ContractViolation::ScreenIneligible(_)));
-        let mut foreign_task = screened.clone();
-        if let Some(binding) = foreign_task.screen_binding.as_mut() {
-            binding.task_id = "task-9".to_owned();
+        for which in ["task", "scope", "fence"] {
+            let mut bad = screened.clone();
+            let binding = bad.screen_binding.as_mut().expect("binding");
+            match which {
+                "task" => binding.task_id = "task-9".to_owned(),
+                "scope" => binding.scope_id = "scope-9".to_owned(),
+                _ => binding.state_fence = bumped_fence(),
+            }
+            let err = bad.validate().expect_err("foreign binding must fail");
+            assert!(matches!(err, ContractViolation::BindingMismatch { .. }));
         }
-        let err = foreign_task.validate().expect_err("foreign task must fail");
-        assert!(matches!(err, ContractViolation::BindingMismatch { .. }));
-        let mut foreign_scope = screened.clone();
-        if let Some(binding) = foreign_scope.screen_binding.as_mut() {
-            binding.scope_id = "scope-9".to_owned();
-        }
-        let err = foreign_scope
-            .validate()
-            .expect_err("foreign scope must fail");
-        assert!(matches!(err, ContractViolation::BindingMismatch { .. }));
-        let mut foreign_fence = screened.clone();
-        if let Some(binding) = foreign_fence.screen_binding.as_mut() {
-            binding.state_fence = StateFence::new(
-                AuthorityEpoch::genesis(),
-                ResourceGeneration::new(2).expect("counter"),
-            );
-        }
-        let err = foreign_fence
-            .validate()
-            .expect_err("foreign fence must fail");
-        assert!(matches!(err, ContractViolation::BindingMismatch { .. }));
+        let mut missing = screened.clone();
+        missing.screen_binding = None;
+        let err = missing.validate().expect_err("missing binding must fail");
+        assert!(matches!(err, ContractViolation::ScreenIneligible(_)));
+        let mut protected = screened.clone();
+        let binding = protected.screen_binding.as_mut().expect("binding");
+        binding.state = crate::screen::ScreenState::Protected;
+        let err = protected.validate().expect_err("protected must fail");
+        assert!(matches!(err, ContractViolation::ScreenIneligible(_)));
+        let mut truncated = screened.clone();
+        let binding = truncated.screen_binding.as_mut().expect("binding");
+        binding.result_digest.truncate(63);
+        let err = truncated.validate().expect_err("truncated must fail");
+        assert!(matches!(err, ContractViolation::ScreenIneligible(_)));
+        let mut max_target = screened.clone();
+        let binding = max_target.screen_binding.as_mut().expect("binding");
+        binding.screened_targets.push("t".repeat(256));
+        assert!(max_target.validate().is_ok());
+        let mut over_target = screened.clone();
+        let binding = over_target.screen_binding.as_mut().expect("binding");
+        binding.screened_targets.push("t".repeat(257));
+        let err = over_target.validate().expect_err("oversize must fail");
+        assert!(matches!(err, ContractViolation::OutOfBounds { .. }));
+        let mut control_target = screened.clone();
+        let binding = control_target.screen_binding.as_mut().expect("binding");
+        binding.screened_targets.push("a\u{0}b".to_owned());
+        let err = control_target.validate().expect_err("control must fail");
+        assert!(matches!(err, ContractViolation::Malformed { .. }));
         for f in [
             "request_id",
             "receipt_id",
@@ -1055,9 +1004,8 @@ mod tests {
                 "source_revision" => bad.source_revision = "rev-x".to_owned(),
                 _ => bad.profile = "other".to_owned(),
             }
-            let err = bad
-                .validate()
-                .expect_err("binding field mismatch must fail");
+            let res = bad.validate();
+            let err = res.expect_err("binding field mismatch must fail");
             assert!(
                 matches!(err, ContractViolation::BindingMismatch { field, .. } if field == f),
                 "field {f} must fail closed"

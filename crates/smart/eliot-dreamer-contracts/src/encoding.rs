@@ -1,5 +1,4 @@
 //! Canonical encoding and identity-visible digests.
-//!
 //! Cell `smart.dreamer.contracts` (Level-0, candidate-only, fail-closed).
 //! Canonical bytes sort object keys so wire order never changes identity.
 //! [`SemanticSequence`] keeps item order identity-visible: order changes the
@@ -33,9 +32,7 @@ pub fn digest_hex(bytes: &[u8]) -> String {
 
 /// Validates bounded, printable text.
 ///
-/// Rejects empty input only when the caller requires non-empty text via
-/// `require_non_empty`; always rejects input longer than
-/// [`MAX_ITEM_BYTES`] bytes and input containing control characters.
+/// Rejects blank-if-required, oversize, or control-char input.
 ///
 /// # Errors
 ///
@@ -69,8 +66,7 @@ pub fn validate_text(
 
 /// An order-sensitive semantic sequence with an identity-visible digest.
 ///
-/// The digest is computed over items in order: reordering items changes the
-/// digest. For the order-invariant set view use
+/// Reordering items changes the digest; for the order-invariant set view use
 /// [`canonical_digest_sorted`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -84,7 +80,7 @@ pub struct SemanticSequence {
 impl SemanticSequence {
     /// Builds a sequence, computing the digest over items in order.
     #[must_use]
-    pub fn new(items: Vec<String>) -> Self {
+    fn new(items: Vec<String>) -> Self {
         let digest = digest_join(&items);
         Self { items, digest }
     }
@@ -93,8 +89,7 @@ impl SemanticSequence {
     ///
     /// # Errors
     ///
-    /// Returns [`ContractViolation::Malformed`] when any item is oversize or
-    /// contains control characters.
+    /// Returns [`ContractViolation::Malformed`] for oversize or control-char items.
     pub fn try_new(items: Vec<String>) -> Result<Self, ContractViolation> {
         for item in &items {
             validate_text("sequence_item", item, false)?;
@@ -110,29 +105,28 @@ impl SemanticSequence {
     }
 }
 
-/// Returns the digest over items in the given order (order matters).
 fn digest_join(items: &[String]) -> String {
     digest_hex(items.join(JOIN_SEPARATOR).as_bytes())
 }
 
 /// Returns the digest over items in sorted order (order-invariant set view).
-///
-/// Insertion order never changes the result: the same set of items always
-/// yields the same digest.
-#[must_use]
+#[deprecated(note = "unchecked input bypasses item bounds; use try_canonical_digest_sorted")]
 pub fn canonical_digest_sorted(items: &[String]) -> String {
-    let mut sorted: Vec<&String> = items.iter().collect();
+    let mut sorted = items.to_vec();
     sorted.sort();
-    let joined: String = sorted
-        .iter()
-        .map(|item| item.as_str())
-        .collect::<Vec<&str>>()
-        .join(JOIN_SEPARATOR);
-    digest_hex(joined.as_bytes())
+    digest_join(&sorted)
+}
+
+#[allow(deprecated)]
+pub fn try_canonical_digest_sorted(items: &[String]) -> Result<String, ContractViolation> {
+    for item in items {
+        validate_text("sequence_item", item, false)?;
+    }
+    Ok(canonical_digest_sorted(items))
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, deprecated)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -147,10 +141,9 @@ mod tests {
         second.insert("a".to_owned(), "1".to_owned());
         second.insert("b".to_owned(), "2".to_owned());
         assert_eq!(canonical_bytes(&first), canonical_bytes(&second));
-        assert_eq!(
-            digest_hex(&canonical_bytes(&first).expect("fixture serializes")),
-            digest_hex(&canonical_bytes(&second).expect("fixture serializes"))
-        );
+        let first_digest = digest_hex(&canonical_bytes(&first).expect("fixture serializes"));
+        let second_digest = digest_hex(&canonical_bytes(&second).expect("fixture serializes"));
+        assert_eq!(first_digest, second_digest);
 
         let one = vec!["x".to_owned(), "y".to_owned()];
         let two = vec!["y".to_owned(), "x".to_owned()];
@@ -160,8 +153,8 @@ mod tests {
     // WORK_UNIT_CASE: 578/42
     #[test]
     fn marker_42_semantic_sequence_order_is_identity_visible() {
-        let first = SemanticSequence::new(vec!["a".to_owned(), "b".to_owned()]);
-        let second = SemanticSequence::new(vec!["b".to_owned(), "a".to_owned()]);
+        let first = SemanticSequence::try_new(vec!["a".to_owned(), "b".to_owned()]).expect("ok");
+        let second = SemanticSequence::try_new(vec!["b".to_owned(), "a".to_owned()]).expect("ok");
         assert_ne!(first.digest, second.digest);
         assert_eq!(first.items, vec!["a".to_owned(), "b".to_owned()]);
     }
@@ -182,8 +175,7 @@ mod tests {
         for input in &hostile {
             let bytes = canonical_bytes(&input).expect("hostile input still serializes");
             assert!(!bytes.is_empty() || input.is_empty());
-            let digest = digest_hex(input.as_bytes());
-            assert_eq!(digest.len(), 64);
+            assert_eq!(digest_hex(input.as_bytes()).len(), 64);
             let text = validate_text("hostile", input, false);
             if input.len() > MAX_ITEM_BYTES || input.chars().any(char::is_control) {
                 assert!(
@@ -213,5 +205,7 @@ mod tests {
             ),
             "non-string map keys must fail closed, never empty vec"
         );
+        let hostile_items = vec!["\u{0}".to_owned(), "x".repeat(MAX_ITEM_BYTES + 1)];
+        assert!(try_canonical_digest_sorted(&hostile_items).is_err());
     }
 }

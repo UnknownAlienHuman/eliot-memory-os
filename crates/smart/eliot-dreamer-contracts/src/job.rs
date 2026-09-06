@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use eliot_contracts::StateFence;
 
 use crate::budget::BudgetLimits;
-use crate::error::{ContractViolation, check_text};
+use crate::error::{ContractViolation, check_fence, check_text, is_hex64_lower};
 
 /// Exact wire `schema_version` admitted by [`DreamJobInput`].
 pub const DREAM_JOB_SCHEMA_VERSION: u32 = 1;
@@ -208,8 +208,7 @@ impl DreamJobInput {
             return Err(ContractViolation::BindingMismatch {
                 field: "schema_version",
                 reason: std::format!(
-                    "expected schema_version {}, got {}",
-                    DREAM_JOB_SCHEMA_VERSION,
+                    "expected schema_version {DREAM_JOB_SCHEMA_VERSION}, got {}",
                     self.schema_version
                 ),
             });
@@ -221,35 +220,26 @@ impl DreamJobInput {
         check_text(&self.scope_id, "scope_id", 256)?;
         check_text(&self.contract_ref, "contract_ref", 512)?;
         check_text(&self.policy_ref, "policy_ref", 512)?;
-        match self.privacy_profile.as_str() {
-            PRIVACY_LOCAL_ONLY | PRIVACY_GOVERNED_EXTERNAL => {}
-            _ => {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "privacy_profile",
-                    reason: std::format!(
-                        "must be one of {:?} or {:?}, got {:?}",
-                        PRIVACY_LOCAL_ONLY,
-                        PRIVACY_GOVERNED_EXTERNAL,
-                        self.privacy_profile
-                    ),
-                });
-            }
+        let profile = self.privacy_profile.as_str();
+        if profile != PRIVACY_LOCAL_ONLY && profile != PRIVACY_GOVERNED_EXTERNAL {
+            return Err(ContractViolation::BindingMismatch {
+                field: "privacy_profile",
+                reason: std::format!(
+                    "must be one of {PRIVACY_LOCAL_ONLY:?} or {PRIVACY_GOVERNED_EXTERNAL:?}, got {:?}",
+                    self.privacy_profile
+                ),
+            });
         }
         if self.frozen_manifest_digest.is_empty() {
             return Err(ContractViolation::MissingField("frozen_manifest_digest"));
         }
-        if !is_lower_hex_digest(&self.frozen_manifest_digest) {
+        if !is_hex64_lower(&self.frozen_manifest_digest) {
             return Err(ContractViolation::BindingMismatch {
                 field: "frozen_manifest_digest",
                 reason: "must be 64 lowercase hex chars".to_owned(),
             });
         }
-        self.state_fence
-            .validate()
-            .map_err(|err| ContractViolation::BindingMismatch {
-                field: "state_fence",
-                reason: err.to_string(),
-            })?;
+        check_fence(&self.state_fence)?;
         self.budget.validate()?;
         Ok(())
     }
@@ -314,13 +304,6 @@ impl ImplementationBriefMarker {
 /// authority separation between brief surfaces.
 pub fn brief_kinds_distinct() -> bool {
     ARCHITECTURE_BRIEF_KIND != IMPLEMENTATION_BRIEF_KIND
-}
-
-fn is_lower_hex_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[cfg(test)]
@@ -456,10 +439,8 @@ mod tests {
         ];
         for class in others {
             job.job_class = class;
-            assert!(
-                !orientation_is_self_contained(&job),
-                "{class:?} must require downstream work"
-            );
+            let alone = orientation_is_self_contained(&job);
+            assert!(!alone, "{class:?} must require downstream work");
         }
     }
 
@@ -473,10 +454,8 @@ mod tests {
         ];
         for (origin, spelling) in cases {
             assert_eq!(origin.as_str(), spelling);
-            assert_eq!(
-                parse_requester_origin(spelling).expect("known origin"),
-                origin
-            );
+            let parsed = parse_requester_origin(spelling).expect("known origin");
+            assert_eq!(parsed, origin);
             let requester = Requester {
                 origin,
                 principal: "alice@example".to_owned(),
@@ -519,10 +498,8 @@ mod tests {
         assert_ne!(without_class, wire);
         let err = serde_json::from_str::<DreamJobInput>(&without_class)
             .expect_err("missing job_class must fail");
-        assert!(
-            err.to_string().contains("job_class"),
-            "unexpected serde error: {err}"
-        );
+        let msg = err.to_string();
+        assert!(msg.contains("job_class"), "unexpected serde error: {err}");
         let mut defaulted = sample_job();
         defaulted.schema_version = 0;
         let err = defaulted.validate().expect_err("version 0 must fail");
@@ -549,19 +526,25 @@ mod tests {
         assert_eq!(back.scope_id, "scope-1");
         assert_eq!(back.operation_id, "op-1");
         assert_eq!(back.idempotency_key, "idem-1");
+        let back_fence = &back.state_fence;
+        let job_fence = &job.state_fence;
+        assert_eq!(back_fence.authority_epoch, job_fence.authority_epoch);
         assert_eq!(
-            back.state_fence.authority_epoch,
-            job.state_fence.authority_epoch
-        );
-        assert_eq!(
-            back.state_fence.resource_generation,
-            job.state_fence.resource_generation
+            back_fence.resource_generation,
+            job_fence.resource_generation
         );
         assert_eq!(back.state_fence.authority_epoch.value(), 1);
         assert_eq!(back.state_fence.resource_generation.value(), 1);
         assert!(back.validate().is_ok());
         assert_eq!(back.canonical_id(), job.canonical_id());
         assert_eq!(back.canonical_id().len(), 64);
+        let mut bound_job = sample_job();
+        bound_job.operation_id = "o".repeat(128);
+        assert!(bound_job.validate().is_ok());
+        bound_job.operation_id = "o".repeat(129);
+        assert!(bound_job.validate().is_err());
+        bound_job.operation_id = "bad\u{0}id".to_owned();
+        assert!(bound_job.validate().is_err());
     }
 
     // WORK_UNIT_CASE: 578/9
@@ -575,26 +558,22 @@ mod tests {
         );
         let err =
             serde_json::from_str::<DreamJobInput>(&with_extra).expect_err("extra key must fail");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("unknown field"),
+            msg.contains("unknown field"),
             "unexpected serde error: {err}"
         );
-        let zeroed = wire.replace(
-            &std::format!("\"schema_version\":{DREAM_JOB_SCHEMA_VERSION}"),
-            "\"schema_version\":0",
-        );
+        let needle = std::format!("\"schema_version\":{DREAM_JOB_SCHEMA_VERSION}");
+        let zeroed = wire.replace(&needle, "\"schema_version\":0");
         assert_ne!(zeroed, wire);
-        let decoded: DreamJobInput =
-            serde_json::from_str(&zeroed).expect("zero version still decodes");
-        let err = decoded
-            .validate()
-            .expect_err("zero version must not validate");
+        let decoded: DreamJobInput = serde_json::from_str(&zeroed).expect("decodes");
+        let valid = decoded.validate();
+        let err = valid.expect_err("zero version must not validate");
         assert_eq!(err, ContractViolation::ImplicitDefault("schema_version"));
         let mut blank_digest = sample_job();
         blank_digest.frozen_manifest_digest.clear();
-        assert_eq!(
-            blank_digest.validate().expect_err("empty digest must fail"),
-            ContractViolation::MissingField("frozen_manifest_digest")
-        );
+        let err = blank_digest.validate().expect_err("empty digest must fail");
+        let want = ContractViolation::MissingField("frozen_manifest_digest");
+        assert_eq!(err, want);
     }
 }

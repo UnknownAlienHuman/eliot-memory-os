@@ -14,8 +14,10 @@ use eliot_contracts::{StateFence, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::curation::{kind_family, parse_kind};
-use crate::error::{ContractViolation, check_text};
+use crate::curation::{CurationPayload, kind_family, parse_kind};
+use crate::error::ContractViolation;
+use crate::error::{check_fence, check_text, check_vec_bound, is_hex64_lower, sorted_set_eq};
+use crate::registry::TargetDenominator;
 
 /// Exact schema version accepted by the versioned draft stages.
 const DRAFT_SCHEMA_VERSION: u32 = 1;
@@ -25,24 +27,6 @@ const MAX_ROUTE_CHARS: usize = 128;
 const MAX_RAW_BYTES: usize = 1_048_576;
 /// Maximum model statement length, measured in bytes (`check_text` bound).
 const MAX_STATEMENT_CHARS: usize = 16384;
-
-/// Returns true when `value` is exactly 64 hex digits.
-fn is_hex64(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-/// Rejects blank/over-long/control identity text (256-byte `check_text` bound).
-fn check_identity(value: &str, field: &'static str) -> Result<(), ContractViolation> {
-    check_text(value, field, 256)
-}
-
-/// Maps a fence validation failure onto the closed contract error.
-fn fence_error(err: &eliot_contracts::ContractError) -> ContractViolation {
-    ContractViolation::BindingMismatch {
-        field: "state_fence",
-        reason: err.to_string(),
-    }
-}
 
 /// Rejects a receipt-owned value that drifts from the recorded receipt.
 fn bind_eq(field: &'static str, got: &str, want: &str) -> Result<(), ContractViolation> {
@@ -54,13 +38,23 @@ fn bind_eq(field: &'static str, got: &str, want: &str) -> Result<(), ContractVio
     }
     Ok(())
 }
-/// Rejects a digest that is not exactly 64 hex characters.
+/// Rejects a digest that is not exactly 64 lowercase hex characters.
 fn check_digest(value: &str, field: &'static str) -> Result<(), ContractViolation> {
-    if !is_hex64(value) {
+    if !is_hex64_lower(value) {
         return Err(ContractViolation::BindingMismatch {
             field,
             reason: "digest must be 64 hex characters".to_string(),
         });
+    }
+    Ok(())
+}
+
+/// Rejects over-count/over-bytes vectors plus bad elements via shared bounds.
+fn check_str_vec(v: &[String], field: &'static str, max: usize) -> Result<(), ContractViolation> {
+    check_vec_bound(v.len(), 1024, field)?;
+    check_vec_bound(v.iter().map(String::len).sum(), 1_048_576, field)?;
+    for item in v {
+        check_text(item, field, max)?;
     }
     Ok(())
 }
@@ -98,16 +92,9 @@ impl RawProviderOutput {
     /// Validates intrinsic bounds plus digest isolation of the raw payload.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         check_schema_version(self.schema_version)?;
-        check_identity(&self.job_id, "job_id")?;
+        check_text(&self.job_id, "job_id", 256)?;
         check_text(&self.provider_route, "provider_route", MAX_ROUTE_CHARS)?;
-        if self.raw_bytes.len() > MAX_RAW_BYTES {
-            return Err(ContractViolation::OutOfBounds {
-                field: "raw_bytes",
-                min: 0,
-                max: crate::error::len_i64(MAX_RAW_BYTES),
-                got: crate::error::len_i64(self.raw_bytes.len()),
-            });
-        }
+        check_vec_bound(self.raw_bytes.len(), MAX_RAW_BYTES, "raw_bytes")?;
         if self.output_digest != sha256_hex(&self.raw_bytes) {
             return Err(ContractViolation::BindingMismatch {
                 field: "output_digest",
@@ -151,29 +138,21 @@ impl ModelDraft {
     /// Validates intrinsic bounds and the no-confirmed-evidence rule.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         check_schema_version(self.schema_version)?;
-        check_identity(&self.job_id, "job_id")?;
+        check_text(&self.job_id, "job_id", 256)?;
         check_text(&self.statement, "statement", MAX_STATEMENT_CHARS)?;
         if self.source_handles.is_empty() {
             return Err(ContractViolation::MissingField("source_handles"));
         }
-        for handle in &self.source_handles {
-            check_text(handle, "source_handles", MAX_ROUTE_CHARS)?;
-        }
-        for entry in &self.counterevidence {
-            check_text(entry, "counterevidence", 1024)?;
-        }
+        check_str_vec(&self.source_handles, "source_handles", MAX_ROUTE_CHARS)?;
+        check_str_vec(&self.counterevidence, "counterevidence", 1024)?;
         check_text(&self.uncertainty, "uncertainty", 1024)?;
         check_text(&self.expected_benefit, "expected_benefit", 1024)?;
-        for probe in &self.recommended_probes {
-            check_text(probe, "recommended_probes", 1024)?;
-        }
-        for cond in &self.invalidation_conditions {
-            check_text(cond, "invalidation_conditions", 1024)?;
-        }
+        check_str_vec(&self.recommended_probes, "recommended_probes", 1024)?;
+        let conds = &self.invalidation_conditions;
+        check_str_vec(conds, "invalidation_conditions", 1024)?;
+        let no_confirmed = "model draft must not declare confirmed evidence handles".to_string();
         if !self.declared_confirmed_handles.is_empty() {
-            return Err(ContractViolation::ForbiddenCarry(
-                "model draft must not declare confirmed evidence handles".to_string(),
-            ));
+            return Err(ContractViolation::ForbiddenCarry(no_confirmed));
         }
         Ok(())
     }
@@ -236,14 +215,19 @@ impl GroundedDreamDraft {
     /// Validates the draft binding plus full residue accounting.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         check_schema_version(self.schema_version)?;
-        check_identity(&self.job_id, "job_id")?;
+        check_text(&self.job_id, "job_id", 256)?;
         check_digest(&self.draft_digest, "draft_digest")?;
+        check_vec_bound(self.residues.len(), 1024, "residues")?;
+        let bytes: usize = self
+            .residues
+            .iter()
+            .map(|r| r.claim.len() + r.detail.len())
+            .sum();
+        check_vec_bound(bytes, 1_048_576, "residues")?;
         if self.residues.is_empty() {
             return Err(ContractViolation::MissingField("residues"));
         }
-        for residue in &self.residues {
-            residue.validate()?;
-        }
+        self.residues.iter().try_for_each(ClaimResidue::validate)?;
         check_text(&self.coverage_note, "coverage_note", 1024)?;
         Ok(())
     }
@@ -288,12 +272,12 @@ impl ValidationReceipt {
     /// Validates intrinsic bounds, digest shapes and the closed disposition.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         check_schema_version(self.schema_version)?;
-        check_identity(&self.validator_contract, "validator_contract")?;
-        check_identity(&self.validator_policy, "validator_policy")?;
-        check_identity(&self.job_id, "job_id")?;
-        check_identity(&self.task_id, "task_id")?;
-        check_identity(&self.scope_id, "scope_id")?;
-        check_identity(&self.proof_ceiling, "proof_ceiling")?;
+        check_text(&self.validator_contract, "validator_contract", 256)?;
+        check_text(&self.validator_policy, "validator_policy", 256)?;
+        check_text(&self.job_id, "job_id", 256)?;
+        check_text(&self.task_id, "task_id", 256)?;
+        check_text(&self.scope_id, "scope_id", 256)?;
+        check_text(&self.proof_ceiling, "proof_ceiling", 256)?;
         check_digest(&self.draft_digest, "draft_digest")?;
         check_digest(&self.bundle_digest, "bundle_digest")?;
         check_digest(&self.manifest_digest, "manifest_digest")?;
@@ -301,9 +285,7 @@ impl ValidationReceipt {
         check_digest(&self.output_digest, "output_digest")?;
         check_digest(&self.preservation_digest, "preservation_digest")?;
         check_digest(&self.budget_digest, "budget_digest")?;
-        self.state_fence
-            .validate()
-            .map_err(|err| fence_error(&err))?;
+        check_fence(&self.state_fence)?;
         match self.terminal_disposition.as_str() {
             "accepted" | "rejected" | "partial" => Ok(()),
             _ => Err(ContractViolation::UnknownVariant {
@@ -320,56 +302,25 @@ impl ValidationReceipt {
     pub fn validate_binding(&self, expected: &ValidationReceipt) -> Result<(), ContractViolation> {
         self.validate()?;
         expected.validate()?;
-        bind_eq("job_id", &self.job_id, &expected.job_id)?;
-        bind_eq("task_id", &self.task_id, &expected.task_id)?;
-        bind_eq("scope_id", &self.scope_id, &expected.scope_id)?;
-        bind_eq("draft_digest", &self.draft_digest, &expected.draft_digest)?;
-        bind_eq(
-            "bundle_digest",
-            &self.bundle_digest,
-            &expected.bundle_digest,
-        )?;
-        bind_eq(
-            "manifest_digest",
-            &self.manifest_digest,
-            &expected.manifest_digest,
-        )?;
-        bind_eq("input_digest", &self.input_digest, &expected.input_digest)?;
-        bind_eq(
-            "output_digest",
-            &self.output_digest,
-            &expected.output_digest,
-        )?;
-        bind_eq(
-            "validator_contract",
-            &self.validator_contract,
-            &expected.validator_contract,
-        )?;
-        bind_eq(
-            "validator_policy",
-            &self.validator_policy,
-            &expected.validator_policy,
-        )?;
-        bind_eq(
-            "terminal_disposition",
-            &self.terminal_disposition,
-            &expected.terminal_disposition,
-        )?;
-        bind_eq(
-            "proof_ceiling",
-            &self.proof_ceiling,
-            &expected.proof_ceiling,
-        )?;
-        bind_eq(
-            "preservation_digest",
-            &self.preservation_digest,
-            &expected.preservation_digest,
-        )?;
-        bind_eq(
-            "budget_digest",
-            &self.budget_digest,
-            &expected.budget_digest,
-        )?;
+        let (a, b) = (self, expected);
+        bind_eq("job_id", &a.job_id, &b.job_id)?;
+        bind_eq("task_id", &a.task_id, &b.task_id)?;
+        bind_eq("scope_id", &a.scope_id, &b.scope_id)?;
+        bind_eq("draft_digest", &a.draft_digest, &b.draft_digest)?;
+        bind_eq("bundle_digest", &a.bundle_digest, &b.bundle_digest)?;
+        bind_eq("manifest_digest", &a.manifest_digest, &b.manifest_digest)?;
+        bind_eq("input_digest", &a.input_digest, &b.input_digest)?;
+        bind_eq("output_digest", &a.output_digest, &b.output_digest)?;
+        bind_eq("proof_ceiling", &a.proof_ceiling, &b.proof_ceiling)?;
+        bind_eq("budget_digest", &a.budget_digest, &b.budget_digest)?;
+        let vc = (&a.validator_contract, &b.validator_contract);
+        let vp = (&a.validator_policy, &b.validator_policy);
+        let td = (&a.terminal_disposition, &b.terminal_disposition);
+        let pd = (&a.preservation_digest, &b.preservation_digest);
+        bind_eq("validator_contract", vc.0, vc.1)?;
+        bind_eq("validator_policy", vp.0, vp.1)?;
+        bind_eq("terminal_disposition", td.0, td.1)?;
+        bind_eq("preservation_digest", pd.0, pd.1)?;
         if self.state_fence != expected.state_fence {
             return Err(ContractViolation::BindingMismatch {
                 field: "state_fence",
@@ -400,14 +351,11 @@ impl ValidatedDreamDraft {
     /// Validates the receipt plus the draft/scope/task/fence binding.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         self.receipt.validate()?;
+        let r = &self.receipt;
         for (field, got, want) in [
-            (
-                "draft_digest",
-                &self.draft_digest,
-                &self.receipt.draft_digest,
-            ),
-            ("scope_id", &self.scope_id, &self.receipt.scope_id),
-            ("task_id", &self.task_id, &self.receipt.task_id),
+            ("draft_digest", &self.draft_digest, &r.draft_digest),
+            ("scope_id", &self.scope_id, &r.scope_id),
+            ("task_id", &self.task_id, &r.task_id),
         ] {
             if got != want {
                 return Err(ContractViolation::BindingMismatch {
@@ -416,9 +364,7 @@ impl ValidatedDreamDraft {
                 });
             }
         }
-        self.state_fence
-            .validate()
-            .map_err(|err| fence_error(&err))?;
+        check_fence(&self.state_fence)?;
         Ok(())
     }
 }
@@ -433,10 +379,12 @@ pub struct ValidatedCurationItem {
     pub kind_spelling: String,
     /// Curation family wire spelling, non-blank.
     pub family_spelling: String,
+    /// Typed curation payload carrying its own kind.
+    pub payload: CurationPayload,
+    /// Declared/frozen denominator carried by the item.
+    pub denominator: TargetDenominator,
     /// Digest of the curation source.
     pub source_digest: String,
-    /// Target denominator the curation applies to.
-    pub target_denominator: String,
     /// Task the item is proposed for.
     pub task_id: String,
     /// Scope the item is proposed for.
@@ -448,29 +396,36 @@ pub struct ValidatedCurationItem {
 }
 
 impl ValidatedCurationItem {
-    /// Validates receipt, kind/family agreement and task/scope/fence binding.
+    /// Validates receipt, payload, denominator, kind agreement and binding.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         self.receipt.validate()?;
+        self.payload.validate()?;
+        self.denominator.validate()?;
         let kind = parse_kind(&self.kind_spelling)?;
-        if kind_family(kind) != self.family_spelling.as_str() {
-            return Err(ContractViolation::KindPayload(
-                "curation item kind/family mismatch".to_owned(),
-            ));
+        let drift = "curation item payload kind drift".to_owned();
+        let mismatch = "curation item kind/family mismatch".to_owned();
+        if kind != self.payload.kind() {
+            return Err(ContractViolation::KindPayload(drift));
         }
-        if (&self.task_id, &self.scope_id, &self.state_fence)
-            != (
-                &self.receipt.task_id,
-                &self.receipt.scope_id,
-                &self.receipt.state_fence,
-            )
-        {
+        if kind_family(kind) != self.family_spelling.as_str() {
+            return Err(ContractViolation::KindPayload(mismatch));
+        }
+        if !sorted_set_eq(&self.payload.facets().targets, &self.denominator.members) {
+            return Err(ContractViolation::BindingMismatch {
+                field: "targets",
+                reason: "payload targets must equal denominator set".to_string(),
+            });
+        }
+        let r = &self.receipt;
+        let (t, s, f) = (&self.task_id, &self.scope_id, &self.state_fence);
+        let (et, es, ef) = (&r.task_id, &r.scope_id, &r.state_fence);
+        if (t, s, f) != (et, es, ef) {
             return Err(ContractViolation::BindingMismatch {
                 field: "task_scope_fence",
                 reason: "curation item task/scope/fence binding mismatch".to_string(),
             });
         }
         check_digest(&self.source_digest, "source_digest")?;
-        check_identity(&self.target_denominator, "target_denominator")?;
         check_text(&self.budget_note, "budget_note", 1024)?;
         Ok(())
     }
@@ -555,12 +510,26 @@ mod tests {
         }
     }
 
+    fn model_with(f: impl FnOnce(&mut ModelDraft)) -> ModelDraft {
+        let mut m = valid_model();
+        f(&mut m);
+        m
+    }
+    fn assert_oob(r: &Result<(), ContractViolation>) {
+        assert!(matches!(r, Err(ContractViolation::OutOfBounds { .. })));
+    }
+    fn assert_malformed(r: &Result<(), ContractViolation>) {
+        assert!(matches!(r, Err(ContractViolation::Malformed { .. })));
+    }
+    fn assert_binding(r: &Result<(), ContractViolation>) {
+        assert!(matches!(r, Err(ContractViolation::BindingMismatch { .. })));
+    }
+
     // WORK_UNIT_CASE: 578/17
     #[test]
     fn stages_cannot_cross_decode() {
-        let raw = valid_raw();
-        assert!(raw.validate().is_ok());
-        let raw_json = serde_json::to_string(&raw).expect("raw serializes");
+        assert!(valid_raw().validate().is_ok());
+        let raw_json = serde_json::to_string(&valid_raw()).expect("raw serializes");
         assert!(serde_json::from_str::<GroundedDreamDraft>(&raw_json).is_err());
         assert!(serde_json::from_str::<ValidatedDreamDraft>(&raw_json).is_err());
 
@@ -577,31 +546,27 @@ mod tests {
         assert!(serde_json::from_str::<RawProviderOutput>(&grounded_json).is_err());
         assert!(serde_json::from_str::<ModelDraft>(&grounded_json).is_err());
 
-        // Digest isolation: a well-shaped payload with a foreign digest fails.
         let mut tampered = valid_raw();
         tampered.output_digest = sha256_hex(b"something-else");
         assert!(tampered.validate().is_err());
 
-        // Closed world: an injected unknown field fails even on valid bytes.
         let with_extra = raw_json.trim_end_matches('}').to_string() + r#","injected":1}"#;
         assert!(serde_json::from_str::<RawProviderOutput>(&with_extra).is_err());
 
         // Model text can never carry confirmed evidence handles.
-        let mut carrying = valid_model();
-        carrying.declared_confirmed_handles = vec!["source-a".to_string()];
+        let carrying = model_with(|m| m.declared_confirmed_handles = vec!["source-a".to_string()]);
         assert!(matches!(
             carrying.validate(),
             Err(ContractViolation::ForbiddenCarry(_))
         ));
-        let mut max_stmt = valid_model();
-        max_stmt.statement = "s".repeat(16384);
+        let max_stmt = model_with(|m| m.statement = "s".repeat(16384));
         assert!(max_stmt.validate().is_ok());
-        let mut over_stmt = valid_model();
-        over_stmt.statement = "s".repeat(16385);
-        assert!(over_stmt.validate().is_err());
-        let mut ctrl_handle = valid_model();
-        ctrl_handle.source_handles = vec!["a\0b".to_string()];
-        assert!(ctrl_handle.validate().is_err());
+        assert_oob(&model_with(|m| m.statement = "s".repeat(16385)).validate());
+        assert_malformed(&model_with(|m| m.source_handles = vec!["a\0b".to_string()]).validate());
+        let max_vec = model_with(|m| m.source_handles = vec!["s".to_string(); 1024]);
+        assert!(max_vec.validate().is_ok());
+        assert_oob(&model_with(|m| m.source_handles = vec!["s".to_string(); 1025]).validate());
+        assert_oob(&model_with(|m| m.counterevidence = vec!["c".repeat(1025); 1024]).validate());
     }
 
     // WORK_UNIT_CASE: 578/18
@@ -614,22 +579,16 @@ mod tests {
             SupportState::OutsideManifest,
             SupportState::UnsupportedPrecision,
         ];
-        let residues: Vec<ClaimResidue> = states
+        let mut draft = valid_grounded(&sha256_hex(b"model"));
+        draft.coverage_note = "covers claims 0-4".to_string();
+        draft.residues = states
             .iter()
-            .enumerate()
-            .map(|(index, state)| ClaimResidue {
-                claim: format!("claim-{index}"),
+            .map(|state| ClaimResidue {
+                claim: format!("{state:?}"),
                 state: *state,
-                detail: format!("residue detail for claim-{index}"),
+                detail: format!("{state:?} detail"),
             })
             .collect();
-        let draft = GroundedDreamDraft {
-            schema_version: 1,
-            job_id: "job-1".to_string(),
-            draft_digest: sha256_hex(b"model"),
-            residues,
-            coverage_note: "covers claims 0-4".to_string(),
-        };
         assert!(draft.validate().is_ok());
         let wire = serde_json::to_string(&draft).expect("grounded serializes");
         let back: GroundedDreamDraft = serde_json::from_str(&wire).expect("grounded deserializes");
@@ -654,16 +613,13 @@ mod tests {
     // WORK_UNIT_CASE: 578/19
     #[test]
     fn valid_a05_receipt_binding_passes() {
-        let model = valid_model();
-        let digest = model_wire_digest(&model);
-        let receipt = valid_receipt(&digest, valid_fence());
+        let receipt = valid_receipt(&model_wire_digest(&valid_model()), valid_fence());
         assert!(receipt.validate().is_ok());
-        let recorded = receipt.clone();
-        assert!(receipt.validate_binding(&recorded).is_ok());
+        assert!(receipt.validate_binding(&receipt.clone()).is_ok());
 
         let validated = ValidatedDreamDraft {
             receipt: receipt.clone(),
-            draft_digest: digest,
+            draft_digest: model_wire_digest(&valid_model()),
             scope_id: "scope-1".to_string(),
             task_id: "task-1".to_string(),
             state_fence: valid_fence(),
@@ -674,22 +630,42 @@ mod tests {
             receipt,
             kind_spelling: "merge".to_string(),
             family_spelling: "structure_repair".to_string(),
+            payload: CurationPayload::Merge(crate::curation::MergePayload {
+                left: "a".to_string(),
+                right: "b".to_string(),
+                merged: "ab".to_string(),
+                target_evidence: crate::curation::TargetEvidence {
+                    targets: vec!["a".to_string(), "b".to_string(), "ab".to_string()],
+                    evidence_refs: vec!["e-1".to_string()],
+                },
+            }),
+            denominator: TargetDenominator {
+                mode: crate::registry::AtomicityMode::AllOrNothing,
+                members: vec!["a".to_string(), "b".to_string(), "ab".to_string()],
+                expected_total: 3,
+            },
             source_digest: sha256_hex(b"curation-source"),
-            target_denominator: "scope-1:2-of-2".to_string(),
             task_id: "task-1".to_string(),
             scope_id: "scope-1".to_string(),
             state_fence: valid_fence(),
             budget_note: "within dimension".to_string(),
         };
         assert!(item.validate().is_ok());
+        let mut drifted = item.clone();
+        drifted.kind_spelling = "split".to_string();
+        assert!(matches!(
+            drifted.validate(),
+            Err(ContractViolation::KindPayload(_))
+        ));
+        let mut swapped = item.clone();
+        swapped.denominator.members = vec!["a".to_string(), "b".to_string(), "x".to_string()];
+        assert_binding(&swapped.validate());
     }
 
     // WORK_UNIT_CASE: 578/20
     #[test]
     fn any_binding_mutation_invalidates_receipt() {
-        let model = valid_model();
-        let digest = model_wire_digest(&model);
-        let base = valid_receipt(&digest, valid_fence());
+        let base = valid_receipt(&model_wire_digest(&valid_model()), valid_fence());
         let recorded = base.clone();
         assert!(base.validate_binding(&recorded).is_ok());
         let wire = serde_json::to_string(&base).expect("receipt serializes");
@@ -706,47 +682,48 @@ mod tests {
                 serde_json::from_str(&mutated_wire).expect("mutated wire decodes");
             assert!(mutated.validate_binding(&recorded).is_err());
         }
-        let mut changed_draft = base.clone();
-        changed_draft.draft_digest = sha256_hex(b"other-draft");
-        assert!(changed_draft.validate_binding(&recorded).is_err());
-        let mut changed_bundle = base.clone();
-        changed_bundle.bundle_digest = sha256_hex(b"other-bundle");
-        assert!(changed_bundle.validate_binding(&recorded).is_err());
-        let mut changed_manifest = base.clone();
-        changed_manifest.manifest_digest = sha256_hex(b"other-manifest");
-        assert!(changed_manifest.validate_binding(&recorded).is_err());
-        let mut changed_preservation = base.clone();
-        changed_preservation.preservation_digest = sha256_hex(b"other-preservation");
-        assert!(changed_preservation.validate_binding(&recorded).is_err());
-        let mut changed_budget = base.clone();
-        changed_budget.budget_digest = sha256_hex(b"other-budget");
-        assert!(changed_budget.validate_binding(&recorded).is_err());
+        for (field, other) in [
+            ("draft_digest", sha256_hex(b"other-draft")),
+            ("bundle_digest", sha256_hex(b"other-bundle")),
+            ("manifest_digest", sha256_hex(b"other-manifest")),
+            ("preservation_digest", sha256_hex(b"other-preservation")),
+            ("budget_digest", sha256_hex(b"other-budget")),
+            ("input_digest", sha256_hex(b"other-input")),
+            ("output_digest", sha256_hex(b"other-output")),
+        ] {
+            let mut changed = base.clone();
+            match field {
+                "draft_digest" => changed.draft_digest = other,
+                "bundle_digest" => changed.bundle_digest = other,
+                "manifest_digest" => changed.manifest_digest = other,
+                "preservation_digest" => changed.preservation_digest = other,
+                "budget_digest" => changed.budget_digest = other,
+                "input_digest" => changed.input_digest = other,
+                _ => changed.output_digest = other,
+            }
+            assert_binding(&changed.validate_binding(&recorded));
+        }
         let mut changed_disp = base.clone();
         changed_disp.terminal_disposition = "rejected".to_string();
-        assert!(changed_disp.validate_binding(&recorded).is_err());
-        let mut changed_input = base.clone();
-        changed_input.input_digest = sha256_hex(b"other-input");
-        assert!(changed_input.validate_binding(&recorded).is_err());
-        let mut changed_output = base.clone();
-        changed_output.output_digest = sha256_hex(b"other-output");
-        assert!(changed_output.validate_binding(&recorded).is_err());
+        assert_binding(&changed_disp.validate_binding(&recorded));
         let mut over_id = base.clone();
         over_id.job_id = "x".repeat(257);
-        assert!(over_id.validate().is_err());
+        assert_oob(&over_id.validate());
         let mut ctrl_id = base.clone();
         ctrl_id.task_id = "a\tb".to_string();
-        assert!(ctrl_id.validate().is_err());
+        assert_malformed(&ctrl_id.validate());
+        let next_gen = ResourceGeneration::new(2).expect("non-genesis generation");
         let mut changed_fence = base.clone();
-        changed_fence.state_fence = StateFence::new(
-            AuthorityEpoch::genesis(),
-            ResourceGeneration::new(2).expect("non-genesis generation"),
-        );
-        assert!(changed_fence.validate_binding(&recorded).is_err());
-        let mut changed_validator = base.clone();
-        changed_validator.validator_contract = "   ".to_string();
-        assert!(changed_validator.validate().is_err());
-        let mut changed_digest = base.clone();
-        changed_digest.output_digest = "not-a-digest".to_string();
-        assert!(changed_digest.validate().is_err());
+        changed_fence.state_fence = StateFence::new(AuthorityEpoch::genesis(), next_gen);
+        assert_binding(&changed_fence.validate_binding(&recorded));
+        let mut bad_validator = base.clone();
+        bad_validator.validator_contract = "   ".to_string();
+        assert!(matches!(
+            bad_validator.validate(),
+            Err(ContractViolation::MissingField(_))
+        ));
+        let mut bad_digest = base.clone();
+        bad_digest.output_digest = "not-a-digest".to_string();
+        assert_binding(&bad_digest.validate());
     }
 }

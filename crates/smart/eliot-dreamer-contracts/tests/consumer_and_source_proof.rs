@@ -1,11 +1,6 @@
 //! Consumer-compile and source-proof integration tests.
-//!
-//! Marker 44 proves independent consumers (shaped like the A-04 assembler,
-//! A-05 validator, A-14b replacer, a typed handler, and the A-31 consumer)
-//! compile against the hub without reverse imports: no handler, algorithm,
-//! provider, or runtime crate is imported here. Marker 45 proves the hub
-//! sources contain no algorithm, provider, I/O, or escape-hatch surface by
-//! scanning the sources with `include_str!`.
+//! Markers 44/45: hub consumers compile without reverse imports; hub sources
+//! contain no algorithm, provider, I/O, or escape-hatch surface (`include_str!`).
 
 #![allow(clippy::expect_used)]
 
@@ -21,41 +16,24 @@ use eliot_dreamer_contracts::{
 };
 
 // Marker 44: consumer-shaped fixtures taking hub types by reference.
-
+fn assert_stable(check: impl Fn() -> bool, ctx: &str) {
+    assert_eq!(check(), check(), "{ctx} must be stable");
+}
 fn assembler_shape(job: &DreamJobInput, bundle: &DreamInputBundle) {
-    let first = job.validate().is_ok();
-    let second = job.validate().is_ok();
-    assert_eq!(first, second, "assembler view of job must be stable");
-    let first = bundle.validate().is_ok();
-    let second = bundle.validate().is_ok();
-    assert_eq!(first, second, "assembler view of bundle must be stable");
+    assert_stable(|| job.validate().is_ok(), "assembler job");
+    assert_stable(|| bundle.validate().is_ok(), "assembler bundle");
 }
-
 fn validator_shape(draft: &ModelDraft, receipt: &ValidationReceipt) {
-    let first = draft.validate().is_ok();
-    let second = draft.validate().is_ok();
-    assert_eq!(first, second, "validator view of draft must be stable");
-    let first = receipt.validate().is_ok();
-    let second = receipt.validate().is_ok();
-    assert_eq!(first, second, "validator view of receipt must be stable");
+    assert_stable(|| draft.validate().is_ok(), "validator draft");
+    assert_stable(|| receipt.validate().is_ok(), "validator receipt");
 }
-
 fn replacer_shape(registry: &CurationHandlerRegistry, screen: &ScreenReference) {
-    let first = registry.validate_closure().is_ok();
-    let second = registry.validate_closure().is_ok();
-    assert_eq!(first, second, "replacer view of registry must be stable");
-    let first = screen.validate().is_ok();
-    let second = screen.validate().is_ok();
-    assert_eq!(first, second, "replacer view of screen must be stable");
+    assert_stable(|| registry.validate_closure().is_ok(), "replacer registry");
+    assert_stable(|| screen.validate().is_ok(), "replacer screen");
 }
-
 fn handler_shape(job: &DreamJobInput, registry: &CurationHandlerRegistry) {
-    let first = job.validate().is_ok();
-    let second = job.validate().is_ok();
-    assert_eq!(first, second, "handler view of job must be stable");
-    let first = registry.validate_closure().is_ok();
-    let second = registry.validate_closure().is_ok();
-    assert_eq!(first, second, "handler view of registry must be stable");
+    assert_stable(|| job.validate().is_ok(), "handler job");
+    assert_stable(|| registry.validate_closure().is_ok(), "handler registry");
 }
 
 fn consumer_shape(
@@ -64,14 +42,10 @@ fn consumer_shape(
     receipt: &ValidationReceipt,
     screen: &ScreenReference,
 ) {
-    for stable in [
-        bundle.validate().is_ok() == bundle.validate().is_ok(),
-        draft.validate().is_ok() == draft.validate().is_ok(),
-        receipt.validate().is_ok() == receipt.validate().is_ok(),
-        screen.validate().is_ok() == screen.validate().is_ok(),
-    ] {
-        assert!(stable, "consumer view of hub types must be stable");
-    }
+    assert_stable(|| bundle.validate().is_ok(), "consumer bundle");
+    assert_stable(|| draft.validate().is_ok(), "consumer draft");
+    assert_stable(|| receipt.validate().is_ok(), "consumer receipt");
+    assert_stable(|| screen.validate().is_ok(), "consumer screen");
 }
 
 fn fence() -> StateFence {
@@ -216,8 +190,6 @@ fn fixture_screen() -> ScreenReference {
     }
 }
 
-// Explicit discriminant-routed wire JSON per kind: the tag names the kind up
-// front, so `route_payload` decodes it in one attempt with no trial decoding.
 fn typed_wire(kind: CurationKind) -> String {
     let body = match kind {
         CurationKind::Classification => r#""label":"memory","confidence_bps":9000"#,
@@ -239,47 +211,36 @@ fn typed_wire(kind: CurationKind) -> String {
 }
 
 fn assert_typed_dispatch(registry: &CurationHandlerRegistry, ports: &[CurationHandlerPort]) {
+    let screened = vec!["a".to_owned(), "b".to_owned(), "ab".to_owned()];
     let binding = ScreenBinding {
         request_id: RequestId::new("req-44").expect("request id"),
         receipt_id: ReceiptId::new("rcpt-44").expect("receipt id"),
-        screened_targets: vec!["a".to_owned(), "b".to_owned(), "ab".to_owned()],
+        screened_targets: screened.clone(),
         source_snapshot: "snapshot-1".to_owned(),
         source_revision: "rev-7".to_owned(),
         profile: "default".to_owned(),
         task_id: "task-1".to_owned(),
         scope_id: "scope-1".to_owned(),
         state_fence: fence(),
+        state: ScreenState::Eligible,
+        result_digest: "a".repeat(64),
+        item_digest: "b".repeat(64),
     };
-    assert!(binding.validate().is_ok(), "fixture binding must validate");
     let denominator = TargetDenominator {
         mode: AtomicityMode::PerMember,
-        members: vec![
-            "a".to_owned(),
-            "b".to_owned(),
-            "ab".to_owned(),
-            "extra".to_owned(),
-        ],
+        members: [screened, vec!["extra".to_owned()]].concat(),
         expected_total: 4,
     };
-    assert!(
-        denominator.validate().is_ok(),
-        "fixture denominator must validate"
-    );
     for spelling in CURATION_WIRE_KINDS {
         let kind = parse_kind(spelling).expect("known wire kind");
         let family = family_of(kind);
-        let port = ports
-            .iter()
-            .find(|p| p.descriptor.family == family && p.descriptor.accepted_kinds.contains(&kind))
-            .expect("ported family");
+        let port = ports.iter().find(|p| p.descriptor.family == family);
+        let port = port.expect("ported family");
+        assert!(port.descriptor.accepted_kinds.contains(&kind));
         port.validate().expect("port validates");
         assert!(registry.handlers.iter().any(|h| h == &port.descriptor));
         let payload = route_payload(kind, &typed_wire(kind)).expect("typed payload routes");
-        assert_eq!(
-            payload.kind(),
-            kind,
-            "explicit discriminant routing, no trial decode"
-        );
+        assert_eq!(payload.kind(), kind, "discriminant routing");
         let request = TypedCurationHandlerRequest {
             request_id: "req-44".to_owned(),
             receipt_id: "rcpt-44".to_owned(),
@@ -297,10 +258,7 @@ fn assert_typed_dispatch(registry: &CurationHandlerRegistry, ports: &[CurationHa
             screen_binding: Some(binding.clone()),
         };
         request.validate().expect("typed request validates");
-        assert_eq!(
-            request.family, port.descriptor.family,
-            "typed seam dispatches to ported family"
-        );
+        assert_eq!(request.family, port.descriptor.family);
     }
 }
 
@@ -318,10 +276,8 @@ fn assert_target_evidence_roles() {
         confidence_bps: 9_000,
         target_evidence: overlap,
     });
-    assert!(matches!(
-        bad.validate(),
-        Err(ContractViolation::KindPayload(_))
-    ));
+    let bad_err = bad.validate().expect_err("bad payload must fail");
+    assert!(matches!(bad_err, ContractViolation::KindPayload(_)));
     let empty = TargetEvidence {
         targets: Vec::new(),
         evidence_refs: vec!["e-1".into()],
@@ -344,10 +300,7 @@ fn marker_44_independent_consumer_compile_fixtures() {
     let receipt = fixture_receipt();
     assert!(receipt.validate().is_ok(), "fixture receipt must validate");
     let (registry, ports) = fixture_registry();
-    assert!(
-        registry.validate_closure().is_ok(),
-        "fixture registry must close"
-    );
+    assert!(registry.validate_closure().is_ok(), "registry must close");
     let screen = fixture_screen();
     assert!(screen.validate().is_ok());
     assert_eq!(screen.eligibility(), ScreenEligibility::Eligible);
@@ -396,15 +349,9 @@ fn marker_45_source_proof_of_no_algorithms() {
         "execute_effect",
     ];
     for (name, source) in SOURCES {
-        assert!(
-            !source.is_empty(),
-            "hub source {name} must exist and be non-empty"
-        );
+        assert!(!source.is_empty(), "hub source {name} must be non-empty");
         for token in FORBIDDEN {
-            assert!(
-                !source.contains(token),
-                "hub source {name} must not contain forbidden token {token}"
-            );
+            assert!(!source.contains(token), "{name} must not contain {token}");
         }
     }
 }

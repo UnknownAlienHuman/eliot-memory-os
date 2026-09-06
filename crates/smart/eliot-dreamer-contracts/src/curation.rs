@@ -1,11 +1,9 @@
 //! Closed curation-kind and payload contracts.
-//!
 //! Cell `smart.dreamer.contracts` (Level-0, candidate-only, fail-closed).
-//! Owns the exact 11 wire kinds of `I9.6 CurationCandidate`, one closed
-//! payload schema per kind, and the wire-kind to handler-family spelling map.
-//! No handler, screening, runtime, or provider behavior lives here.
+//! Owns the exact 11 wire kinds of `I9.6 CurationCandidate`, one closed payload
+//! schema per kind, and the wire-kind to handler-family spelling map.
 
-use crate::error::{ContractViolation, check_text};
+use crate::error::{ContractViolation, check_text, check_vec_bound};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -69,9 +67,8 @@ impl CurationKind {
 ///
 /// # Errors
 ///
-/// Returns [`ContractViolation::UnknownVariant`] with `field == "wire_kind"`
-/// for family spellings (`structure_repair`, `memory_repair`), architecture
-/// subtype spellings, and every other unknown value.
+/// Returns [`ContractViolation::UnknownVariant`] with `field == "wire_kind"` for
+/// family spellings, architecture subtypes, and every other unknown value.
 pub fn parse_kind(value: &str) -> Result<CurationKind, ContractViolation> {
     match value {
         "classification" => Ok(CurationKind::Classification),
@@ -87,7 +84,7 @@ pub fn parse_kind(value: &str) -> Result<CurationKind, ContractViolation> {
         "repair" => Ok(CurationKind::Repair),
         _ => Err(ContractViolation::UnknownVariant {
             field: "wire_kind",
-            value: value.to_owned(),
+            value: value.into(),
         }),
     }
 }
@@ -104,18 +101,27 @@ impl TargetEvidence {
         if self.targets.is_empty() {
             return Err(ContractViolation::MissingField("targets"));
         }
+        check_vec_bound(self.targets.len(), MAX_TARGETS, "targets")?;
+        check_vec_bound(self.evidence_refs.len(), MAX_EVIDENCE_REFS, "evidence_refs")?;
         for h in &self.targets {
             check_text(h, "targets", MAX_TEXT)?;
         }
         for h in &self.evidence_refs {
             check_text(h, "evidence_refs", MAX_TEXT)?;
         }
-        for h in &self.targets {
-            if self.evidence_refs.iter().any(|e| e == h) {
-                return Err(ContractViolation::KindPayload(std::format!(
-                    "{kind_spelling} target {h} must not appear in immutable evidence"
-                )));
-            }
+        let mut ordered = self.targets.clone();
+        ordered.sort();
+        ordered.dedup();
+        if ordered.len() != self.targets.len() {
+            return Err(ContractViolation::BindingMismatch {
+                field: "targets",
+                reason: "duplicate target".to_owned(),
+            });
+        }
+        if let Some(h) = self.targets.iter().find(|h| self.evidence_refs.contains(h)) {
+            return Err(ContractViolation::KindPayload(std::format!(
+                "{kind_spelling} target {h} must not appear in immutable evidence"
+            )));
         }
         Ok(())
     }
@@ -242,39 +248,48 @@ pub enum CurationPayload {
 
 /// Max bytes admitted for any curation text field.
 const MAX_TEXT: usize = 256;
+/// Max targets admitted in any target/evidence set.
+const MAX_TARGETS: usize = 1_024;
+/// Max evidence refs admitted in any target/evidence set.
+const MAX_EVIDENCE_REFS: usize = 1_024;
+/// Max bytes admitted for any routed payload envelope.
+const MAX_PAYLOAD_JSON: usize = 1_048_576;
 
 fn check_subjects(
     subjects: &[&String],
     facets: &TargetEvidence,
     kind: &'static str,
 ) -> Result<(), ContractViolation> {
-    for subject in subjects {
-        if !facets.targets.contains(subject) {
-            return Err(ContractViolation::KindPayload(std::format!(
-                "{kind} subject {subject} must be a declared target"
-            )));
-        }
+    facets.validate(kind)?;
+    if let Some(subject) = subjects.iter().find(|s| !facets.targets.contains(s)) {
+        return Err(ContractViolation::KindPayload(std::format!(
+            "{kind} subject {subject} must be a declared target"
+        )));
     }
     Ok(())
 }
 
 impl CurationPayload {
+    fn parts(&self) -> (CurationKind, &TargetEvidence) {
+        match self {
+            Self::Classification(p) => (CurationKind::Classification, &p.target_evidence),
+            Self::Relation(p) => (CurationKind::Relation, &p.target_evidence),
+            Self::Episode(p) => (CurationKind::Episode, &p.target_evidence),
+            Self::Concept(p) => (CurationKind::Concept, &p.target_evidence),
+            Self::Procedure(p) => (CurationKind::Procedure, &p.target_evidence),
+            Self::Failure(p) => (CurationKind::Failure, &p.target_evidence),
+            Self::Merge(p) => (CurationKind::Merge, &p.target_evidence),
+            Self::Split(p) => (CurationKind::Split, &p.target_evidence),
+            Self::Reconsolidation(p) => (CurationKind::Reconsolidation, &p.target_evidence),
+            Self::Accessibility(p) => (CurationKind::Accessibility, &p.target_evidence),
+            Self::Repair(p) => (CurationKind::Repair, &p.target_evidence),
+        }
+    }
+
     /// Returns the wire kind carried by this payload.
     #[must_use]
     pub fn kind(&self) -> CurationKind {
-        match self {
-            Self::Classification(_) => CurationKind::Classification,
-            Self::Relation(_) => CurationKind::Relation,
-            Self::Episode(_) => CurationKind::Episode,
-            Self::Concept(_) => CurationKind::Concept,
-            Self::Procedure(_) => CurationKind::Procedure,
-            Self::Failure(_) => CurationKind::Failure,
-            Self::Merge(_) => CurationKind::Merge,
-            Self::Split(_) => CurationKind::Split,
-            Self::Reconsolidation(_) => CurationKind::Reconsolidation,
-            Self::Accessibility(_) => CurationKind::Accessibility,
-            Self::Repair(_) => CurationKind::Repair,
-        }
+        self.parts().0
     }
 
     /// Validates intrinsic bounds plus the target/evidence split.
@@ -296,12 +311,8 @@ impl CurationPayload {
                 check_text(&p.from_handle, "from_handle", MAX_TEXT)?;
                 check_text(&p.to_handle, "to_handle", MAX_TEXT)?;
                 check_text(&p.relation, "relation", MAX_TEXT)?;
-                p.target_evidence.validate("relation")?;
-                check_subjects(
-                    &[&p.from_handle, &p.to_handle],
-                    &p.target_evidence,
-                    "relation",
-                )?;
+                let facets = &p.target_evidence;
+                check_subjects(&[&p.from_handle, &p.to_handle], facets, "relation")?;
             }
             Self::Episode(p) => {
                 check_text(&p.episode, "episode", MAX_TEXT)?;
@@ -325,36 +336,28 @@ impl CurationPayload {
                 check_text(&p.left, "left", MAX_TEXT)?;
                 check_text(&p.right, "right", MAX_TEXT)?;
                 check_text(&p.merged, "merged", MAX_TEXT)?;
-                p.target_evidence.validate("merge")?;
                 check_subjects(&[&p.left, &p.right, &p.merged], &p.target_evidence, "merge")?;
             }
             Self::Split(p) => {
                 check_text(&p.whole, "whole", MAX_TEXT)?;
                 check_text(&p.first, "first", MAX_TEXT)?;
                 check_text(&p.second, "second", MAX_TEXT)?;
-                p.target_evidence.validate("split")?;
-                check_subjects(
-                    &[&p.whole, &p.first, &p.second],
-                    &p.target_evidence,
-                    "split",
-                )?;
+                let facets = &p.target_evidence;
+                check_subjects(&[&p.whole, &p.first, &p.second], facets, "split")?;
             }
             Self::Reconsolidation(p) => {
                 check_text(&p.target, "target", MAX_TEXT)?;
                 check_text(&p.update, "update", MAX_TEXT)?;
-                p.target_evidence.validate("reconsolidation")?;
                 check_subjects(&[&p.target], &p.target_evidence, "reconsolidation")?;
             }
             Self::Accessibility(p) => {
                 check_text(&p.handle, "handle", MAX_TEXT)?;
                 check_text(&p.note, "note", MAX_TEXT)?;
-                p.target_evidence.validate("accessibility")?;
                 check_subjects(&[&p.handle], &p.target_evidence, "accessibility")?;
             }
             Self::Repair(p) => {
                 check_text(&p.target, "target", MAX_TEXT)?;
                 check_text(&p.repair, "repair", MAX_TEXT)?;
-                p.target_evidence.validate("repair")?;
                 check_subjects(&[&p.target], &p.target_evidence, "repair")?;
             }
         }
@@ -363,25 +366,12 @@ impl CurationPayload {
 
     #[must_use]
     pub fn facets(&self) -> &TargetEvidence {
-        match self {
-            Self::Classification(p) => &p.target_evidence,
-            Self::Relation(p) => &p.target_evidence,
-            Self::Episode(p) => &p.target_evidence,
-            Self::Concept(p) => &p.target_evidence,
-            Self::Procedure(p) => &p.target_evidence,
-            Self::Failure(p) => &p.target_evidence,
-            Self::Merge(p) => &p.target_evidence,
-            Self::Split(p) => &p.target_evidence,
-            Self::Reconsolidation(p) => &p.target_evidence,
-            Self::Accessibility(p) => &p.target_evidence,
-            Self::Repair(p) => &p.target_evidence,
-        }
+        self.parts().1
     }
 }
 
-/// Routes raw JSON to the payload named by `kind`: tag peeked, decoded,
-/// validated; wrong/invalid kind/payload fails before routing with no
-/// caller-side `validate` needed.
+/// Routes raw JSON to the payload named by `kind`: tag peeked, decoded, validated;
+/// wrong/invalid kind/payload fails before routing (no caller-side `validate` needed).
 ///
 /// # Errors
 ///
@@ -390,6 +380,12 @@ pub fn route_payload(kind: CurationKind, json: &str) -> Result<CurationPayload, 
     #[derive(Deserialize)]
     struct KindTag {
         kind: CurationKind,
+    }
+    if json.len() > MAX_PAYLOAD_JSON {
+        return Err(ContractViolation::Malformed {
+            field: "curation_payload",
+            reason: "payload envelope exceeds byte bound".to_owned(),
+        });
     }
     let tag: KindTag = serde_json::from_str(json).map_err(|err| ContractViolation::Malformed {
         field: "curation_payload",
@@ -411,22 +407,10 @@ pub fn route_payload(kind: CurationKind, json: &str) -> Result<CurationPayload, 
     Ok(payload)
 }
 
-/// Maps a wire kind to its handler-family spelling (`merge`/`split` collapse
-/// to `structure_repair`; see [`crate::registry::CurationFamily`]).
+/// Maps a wire kind to its handler-family spelling (see [`crate::registry::CurationFamily`]).
 #[must_use]
 pub const fn kind_family(kind: CurationKind) -> &'static str {
-    match kind {
-        CurationKind::Classification => "classification",
-        CurationKind::Relation => "relation",
-        CurationKind::Episode => "episode",
-        CurationKind::Concept => "concept",
-        CurationKind::Procedure => "procedure",
-        CurationKind::Failure => "failure",
-        CurationKind::Merge | CurationKind::Split => "structure_repair",
-        CurationKind::Reconsolidation => "reconsolidation",
-        CurationKind::Accessibility => "accessibility",
-        CurationKind::Repair => "memory_repair",
-    }
+    crate::registry::family_of(kind).as_str()
 }
 
 /// Samples distinct targets and evidence for tests.
@@ -587,13 +571,13 @@ mod tests {
             assert!(json.contains(&format!("\"kind\":\"{spelling}\"")));
             let routed = route_payload(kind, &json).expect("route");
             assert_eq!(routed, payload);
-            assert!(!payload.facets().targets.is_empty());
+            let facets = payload.facets();
+            assert!(!facets.targets.is_empty());
             assert!(
-                payload
-                    .facets()
+                facets
                     .targets
                     .iter()
-                    .all(|t| !payload.facets().evidence_refs.contains(t))
+                    .all(|t| !facets.evidence_refs.contains(t))
             );
             assert_eq!(routed.facets(), payload.facets());
             let direct: CurationPayload = serde_json::from_str(&json).expect("direct decode");
@@ -607,55 +591,25 @@ mod tests {
         let kind = CurationKind::Classification;
         let json = serde_json::to_string(&sample_payload(kind)).expect("serialize");
         let err = route_payload(CurationKind::Relation, &json).expect_err("tag mismatch must fail");
-        assert!(
-            matches!(err, ContractViolation::KindPayload(_)),
-            "unexpected: {err:?}"
-        );
-        // Internally-tagged decode keeps the true variant: no silent coercion.
+        assert!(matches!(err, ContractViolation::KindPayload(_)));
         let direct: CurationPayload = serde_json::from_str(&json).expect("direct decode");
         assert_eq!(direct.kind(), CurationKind::Classification);
         assert_ne!(direct.kind(), CurationKind::Relation);
-        // Malformed input is malformed, not a kind/payload mismatch.
         let malformed = route_payload(kind, "{not json").expect_err("malformed must fail");
-        assert!(
-            matches!(
-                malformed,
-                ContractViolation::Malformed {
-                    field: "curation_payload",
-                    ..
-                }
-            ),
-            "unexpected: {malformed:?}"
-        );
-        // Unknown tag spelling is an unknown wire kind, surfaced as malformed
-        // JSON for the payload envelope (serde rejects the tag first).
-        let unknown_tag =
-            route_payload(kind, r#"{"kind":"other"}"#).expect_err("unknown tag must fail");
-        assert!(
-            matches!(unknown_tag, ContractViolation::Malformed { .. }),
-            "unexpected: {unknown_tag:?}"
-        );
+        assert!(matches!(malformed, ContractViolation::Malformed { .. }));
+        let unknown_tag = route_payload(kind, r#"{"kind":"other"}"#).expect_err("tag must fail");
+        assert!(matches!(unknown_tag, ContractViolation::Malformed { .. }));
         let blank_rt = sample_wire(kind).replace("memory", "  ");
-        assert!(matches!(
-            route_payload(kind, &blank_rt),
-            Err(ContractViolation::MissingField(_))
-        ));
+        let err = route_payload(kind, &blank_rt).expect_err("blank must fail");
+        assert!(matches!(err, ContractViolation::MissingField(_)));
         let long_rt = sample_wire(kind).replace("memory", &"a".repeat(257));
-        assert!(matches!(
-            route_payload(kind, &long_rt),
-            Err(ContractViolation::OutOfBounds { .. })
-        ));
+        let err = route_payload(kind, &long_rt).expect_err("overlong must fail");
+        assert!(matches!(err, ContractViolation::OutOfBounds { .. }));
         let ctrl_rt = sample_wire(kind).replace("memory", "a\u{0}b");
-        assert!(matches!(
-            route_payload(kind, &ctrl_rt),
-            Err(ContractViolation::Malformed { .. })
-        ));
-        // Blank fields and out-of-range confidence fail intrinsic validation.
-        let blank = CurationPayload::Classification(ClassificationPayload {
-            label: "  ".to_owned(),
-            confidence_bps: 9_000,
-            target_evidence: sample_facets(),
-        });
+        let err = route_payload(kind, &ctrl_rt).expect_err("control must fail");
+        assert!(matches!(err, ContractViolation::Malformed { .. }));
+        let json = sample_wire(kind).replace("memory", "  ");
+        let blank: CurationPayload = serde_json::from_str(&json).expect("decodes");
         assert!(blank.validate().is_err());
         let overconfident = CurationPayload::Classification(ClassificationPayload {
             label: "memory".to_owned(),
@@ -671,43 +625,66 @@ mod tests {
                 got: 10_001,
             }
         );
-        // A target reused as immutable evidence breaks the target/evidence split.
         let json = sample_wire(CurationKind::Merge)
             .replace("\"evidence_refs\":[\"e-1\"]", "\"evidence_refs\":[\"a\"]");
         let payload: CurationPayload = serde_json::from_str(&json).expect("decodes");
+        let err = payload.validate().expect_err("overlap must fail");
+        assert!(matches!(err, ContractViolation::KindPayload(_)));
+        let json = sample_wire(kind).replace("[\"a\",\"b\",\"ab\"]", "[\"a\",\"a\"]");
+        let payload: CurationPayload = serde_json::from_str(&json).expect("decodes");
         assert!(matches!(
             payload.validate(),
-            Err(ContractViolation::KindPayload(_))
+            Err(ContractViolation::BindingMismatch {
+                field: "targets",
+                ..
+            })
         ));
-        // Foreign subjects fail per bound variant; value-only kinds pass opaquely.
+        let oversize = "x".repeat(MAX_PAYLOAD_JSON + 1);
+        let err = route_payload(kind, &oversize).expect_err("oversize must fail");
+        assert!(matches!(err, ContractViolation::Malformed { .. }));
+        let flooded = TargetEvidence {
+            targets: vec!["a".to_owned(); MAX_TARGETS + 1],
+            evidence_refs: Vec::new(),
+        };
+        assert!(matches!(
+            flooded.validate("classification"),
+            Err(ContractViolation::OutOfBounds {
+                field: "targets",
+                ..
+            })
+        ));
+        let flooded_evidence = TargetEvidence {
+            targets: vec!["a".to_owned()],
+            evidence_refs: vec!["e".to_owned(); MAX_EVIDENCE_REFS + 1],
+        };
+        assert!(matches!(
+            flooded_evidence.validate("classification"),
+            Err(ContractViolation::OutOfBounds {
+                field: "evidence_refs",
+                ..
+            })
+        ));
         for wire in CURATION_WIRE_KINDS {
             let kind = parse_kind(wire).expect("known kind");
             let json = sample_wire(kind).replace("[\"a\",\"b\",\"ab\"]", "[\"zzz\"]");
             let payload: CurationPayload = serde_json::from_str(&json).expect("decodes");
-            let bound = matches!(
+            if matches!(
                 kind,
-                CurationKind::Relation
-                    | CurationKind::Merge
-                    | CurationKind::Split
-                    | CurationKind::Reconsolidation
-                    | CurationKind::Accessibility
-                    | CurationKind::Repair
-            );
-            if bound {
-                assert!(matches!(
-                    payload.validate(),
-                    Err(ContractViolation::KindPayload(_))
-                ));
-            } else {
+                CurationKind::Classification
+                    | CurationKind::Episode
+                    | CurationKind::Concept
+                    | CurationKind::Procedure
+                    | CurationKind::Failure
+            ) {
                 assert!(payload.validate().is_ok());
+            } else {
+                let err = payload.validate().expect_err("foreign subject must fail");
+                assert!(matches!(err, ContractViolation::KindPayload(_)));
             }
         }
-        // An empty target set authorizes nothing.
         let json = sample_wire(CurationKind::Merge).replace("[\"a\",\"b\",\"ab\"]", "[]");
         let payload: CurationPayload = serde_json::from_str(&json).expect("decodes");
-        assert!(matches!(
-            payload.validate(),
-            Err(ContractViolation::MissingField("targets"))
-        ));
+        let err = payload.validate().expect_err("empty targets must fail");
+        assert!(matches!(err, ContractViolation::MissingField("targets")));
     }
 }

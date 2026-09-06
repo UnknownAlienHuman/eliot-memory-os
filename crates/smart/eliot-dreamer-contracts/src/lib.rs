@@ -37,7 +37,7 @@ pub use draft::{
     ValidatedCurationItem, ValidatedDreamDraft, ValidationReceipt,
 };
 pub use encoding::{canonical_bytes, digest_hex};
-pub use error::ContractViolation;
+pub use error::{ContractViolation, check_fence, check_vec_bound, is_hex64_lower};
 pub use job::{DreamJobInput, JobClass, RequesterOrigin, parse_job_class};
 pub use registry::{
     AtomicityMode, CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor,

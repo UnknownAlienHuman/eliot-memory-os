@@ -142,6 +142,20 @@ pub const DEX_BUDGET_DIMENSIONS: &[&str] = &[
     "report_bytes",
 ];
 
+/// Every independent budget dimension as typed values, in canonical order.
+pub(crate) const ALL_BUDGET_DIMENSIONS: [BudgetDimension; 10] = [
+    BudgetDimension::InputBytes,
+    BudgetDimension::OutputBytes,
+    BudgetDimension::SourceWidth,
+    BudgetDimension::ReferenceWidth,
+    BudgetDimension::ModelCalls,
+    BudgetDimension::Attempts,
+    BudgetDimension::Candidates,
+    BudgetDimension::WallMs,
+    BudgetDimension::WorkFanOut,
+    BudgetDimension::ReportBytes,
+];
+
 /// Independent per-dimension budget limits. `None` means the limit is
 /// unknown at rest; unknown-as-unlimited is forbidden at authorization time,
 /// so [`BudgetLimits::require_exact`] rejects any `None` before usage can be
@@ -180,42 +194,26 @@ impl BudgetLimits {
     /// of zero authorizes nothing and would silently disable the job; byte,
     /// width, time, and STU limits may be zero.
     pub fn validate(&self) -> Result<(), ContractViolation> {
-        check_limit(self.input_bytes, "input_bytes", INPUT_BYTES_CEILING, true)?;
-        check_limit(
-            self.output_bytes,
-            "output_bytes",
-            OUTPUT_BYTES_CEILING,
-            true,
-        )?;
-        check_limit(
-            self.source_width,
-            "source_width",
-            SOURCE_WIDTH_CEILING,
-            true,
-        )?;
-        check_limit(
-            self.reference_width,
-            "reference_width",
-            REFERENCE_WIDTH_CEILING,
-            true,
-        )?;
-        check_limit(self.model_calls, "model_calls", MODEL_CALLS_CEILING, false)?;
-        check_limit(self.attempts, "attempts", ATTEMPTS_CEILING, false)?;
-        check_limit(self.candidates, "candidates", CANDIDATES_CEILING, false)?;
-        check_limit(self.wall_ms, "wall_ms", WALL_MS_CEILING, true)?;
-        check_limit(
-            self.work_fan_out,
-            "work_fan_out",
-            WORK_FAN_OUT_CEILING,
-            true,
-        )?;
-        check_limit(
-            self.report_bytes,
-            "report_bytes",
-            REPORT_BYTES_CEILING,
-            true,
-        )?;
-        check_limit(self.max_stu, "max_stu", STU_CEILING, true)?;
+        let output_bytes = self.output_bytes;
+        let source_width = self.source_width;
+        let reference = self.reference_width;
+        let work_fan_out = self.work_fan_out;
+        let report_bytes = self.report_bytes;
+        for (value, dim, ceiling, allow_zero) in [
+            (self.input_bytes, "input_bytes", INPUT_BYTES_CEILING, true),
+            (output_bytes, "output_bytes", OUTPUT_BYTES_CEILING, true),
+            (source_width, "source_width", SOURCE_WIDTH_CEILING, true),
+            (reference, "reference_width", REFERENCE_WIDTH_CEILING, true),
+            (self.model_calls, "model_calls", MODEL_CALLS_CEILING, false),
+            (self.attempts, "attempts", ATTEMPTS_CEILING, false),
+            (self.candidates, "candidates", CANDIDATES_CEILING, false),
+            (self.wall_ms, "wall_ms", WALL_MS_CEILING, true),
+            (work_fan_out, "work_fan_out", WORK_FAN_OUT_CEILING, true),
+            (report_bytes, "report_bytes", REPORT_BYTES_CEILING, true),
+            (self.max_stu, "max_stu", STU_CEILING, true),
+        ] {
+            check_limit(value, dim, ceiling, allow_zero)?;
+        }
         Ok(())
     }
 
@@ -223,17 +221,21 @@ impl BudgetLimits {
     /// unknown-as-unlimited cannot authorize usage. Present values are then
     /// validated against their class ceilings.
     pub fn require_exact(&self) -> Result<(), ContractViolation> {
-        require_known(self.input_bytes, "input_bytes")?;
-        require_known(self.output_bytes, "output_bytes")?;
-        require_known(self.source_width, "source_width")?;
-        require_known(self.reference_width, "reference_width")?;
-        require_known(self.model_calls, "model_calls")?;
-        require_known(self.attempts, "attempts")?;
-        require_known(self.candidates, "candidates")?;
-        require_known(self.wall_ms, "wall_ms")?;
-        require_known(self.work_fan_out, "work_fan_out")?;
-        require_known(self.report_bytes, "report_bytes")?;
-        require_known(self.max_stu, "max_stu")?;
+        for (value, dim) in [
+            (self.input_bytes, "input_bytes"),
+            (self.output_bytes, "output_bytes"),
+            (self.source_width, "source_width"),
+            (self.reference_width, "reference_width"),
+            (self.model_calls, "model_calls"),
+            (self.attempts, "attempts"),
+            (self.candidates, "candidates"),
+            (self.wall_ms, "wall_ms"),
+            (self.work_fan_out, "work_fan_out"),
+            (self.report_bytes, "report_bytes"),
+            (self.max_stu, "max_stu"),
+        ] {
+            require_known(value, dim)?;
+        }
         self.validate()
     }
 }
@@ -292,11 +294,7 @@ impl BudgetUsage {
     }
 }
 
-/// Checks usage against limits with no compensation across dimensions: each
-/// dimension is authorized independently, so under-use in one dimension can
-/// never cover over-use in another. Semantically the same gate as
-/// [`BudgetUsage::fits`], with error reasons that state the independence
-/// rule explicitly.
+/// Checks usage against limits with no compensation across dimensions.
 pub fn check_no_cross_subsidy(
     usage: &BudgetUsage,
     limits: &BudgetLimits,
@@ -353,79 +351,62 @@ fn limit_of(limits: &BudgetLimits, dimension: BudgetDimension) -> Option<u64> {
     }
 }
 
+fn unknown_reason(cross: bool) -> String {
+    if cross {
+        "unknown limit cannot authorize usage; no compensation across dimensions".to_owned()
+    } else {
+        "unknown limit cannot authorize usage".to_owned()
+    }
+}
+
+fn over_reason(cross: bool, used: u64, cap: u64, label: &str) -> String {
+    if cross {
+        std::format!(
+            "usage {used} exceeds limit {cap} on {label}; under-use elsewhere cannot compensate"
+        )
+    } else {
+        std::format!("usage {used} exceeds limit {cap}")
+    }
+}
+
 fn check_usage(
     usage: &BudgetUsage,
     limits: &BudgetLimits,
     cross_subsidy_spelling: bool,
 ) -> Result<(), ContractViolation> {
-    const DIMENSIONS: [BudgetDimension; 10] = [
-        BudgetDimension::InputBytes,
-        BudgetDimension::OutputBytes,
-        BudgetDimension::SourceWidth,
-        BudgetDimension::ReferenceWidth,
-        BudgetDimension::ModelCalls,
-        BudgetDimension::Attempts,
-        BudgetDimension::Candidates,
-        BudgetDimension::WallMs,
-        BudgetDimension::WorkFanOut,
-        BudgetDimension::ReportBytes,
-    ];
-    for dimension in DIMENSIONS {
+    for dimension in ALL_BUDGET_DIMENSIONS {
         let used = usage.of(dimension);
-        match limit_of(limits, dimension) {
-            None => {
-                return Err(ContractViolation::Budget {
-                    dimension: dimension.as_str(),
-                    reason: if cross_subsidy_spelling {
-                        "unknown limit cannot authorize usage; no compensation across dimensions"
-                            .to_owned()
-                    } else {
-                        "unknown limit cannot authorize usage".to_owned()
-                    },
-                });
-            }
-            Some(cap) => {
-                if used > cap {
-                    return Err(ContractViolation::Budget {
-                        dimension: dimension.as_str(),
-                        reason: if cross_subsidy_spelling {
-                            std::format!(
-                                "usage {used} exceeds limit {cap} on {dimension:?}; under-use elsewhere cannot compensate (no cross-subsidy)"
-                            )
-                        } else {
-                            std::format!("usage {used} exceeds limit {cap}")
-                        },
-                    });
-                }
-            }
+        let Some(cap) = limit_of(limits, dimension) else {
+            return Err(ContractViolation::Budget {
+                dimension: dimension.as_str(),
+                reason: unknown_reason(cross_subsidy_spelling),
+            });
+        };
+        if used > cap {
+            return Err(ContractViolation::Budget {
+                dimension: dimension.as_str(),
+                reason: over_reason(
+                    cross_subsidy_spelling,
+                    used,
+                    cap,
+                    &std::format!("{dimension:?}"),
+                ),
+            });
         }
     }
-    match limits.max_stu {
-        None => Err(ContractViolation::Budget {
+    let Some(cap) = limits.max_stu else {
+        return Err(ContractViolation::Budget {
             dimension: "max_stu",
-            reason: if cross_subsidy_spelling {
-                "unknown limit cannot authorize usage; no compensation across dimensions".to_owned()
-            } else {
-                "unknown limit cannot authorize usage".to_owned()
-            },
-        }),
-        Some(cap) => {
-            if usage.stu_used > cap {
-                return Err(ContractViolation::Budget {
-                    dimension: "max_stu",
-                    reason: if cross_subsidy_spelling {
-                        std::format!(
-                            "usage {} exceeds limit {cap} on STU; under-use elsewhere cannot compensate (no cross-subsidy)",
-                            usage.stu_used
-                        )
-                    } else {
-                        std::format!("usage {} exceeds limit {cap}", usage.stu_used)
-                    },
-                });
-            }
-            Ok(())
-        }
+            reason: unknown_reason(cross_subsidy_spelling),
+        });
+    };
+    if usage.stu_used > cap {
+        return Err(ContractViolation::Budget {
+            dimension: "max_stu",
+            reason: over_reason(cross_subsidy_spelling, usage.stu_used, cap, "STU"),
+        });
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -433,18 +414,7 @@ fn check_usage(
 mod tests {
     use super::*;
 
-    const DIMENSIONS: [BudgetDimension; 10] = [
-        BudgetDimension::InputBytes,
-        BudgetDimension::OutputBytes,
-        BudgetDimension::SourceWidth,
-        BudgetDimension::ReferenceWidth,
-        BudgetDimension::ModelCalls,
-        BudgetDimension::Attempts,
-        BudgetDimension::Candidates,
-        BudgetDimension::WallMs,
-        BudgetDimension::WorkFanOut,
-        BudgetDimension::ReportBytes,
-    ];
+    use super::ALL_BUDGET_DIMENSIONS as DIMENSIONS;
 
     fn ceiling_limits() -> BudgetLimits {
         BudgetLimits {
@@ -514,19 +484,15 @@ mod tests {
         assert_eq!(DEX_BUDGET_DIMENSIONS.len(), 10);
         for (index, dimension) in DIMENSIONS.iter().enumerate() {
             assert_eq!(DEX_BUDGET_DIMENSIONS[index], dimension.as_str());
-            assert_eq!(
-                parse_budget_dimension(dimension.as_str()).expect("known dimension"),
-                *dimension
-            );
-            assert_eq!(
-                dimension.ceiling(),
-                limit_of(&ceiling_limits(), *dimension).expect("ceiling set")
-            );
+            let parsed = parse_budget_dimension(dimension.as_str()).expect("known dimension");
+            assert_eq!(parsed, *dimension);
             let ceiling = dimension.ceiling();
+            let limit = limit_of(&ceiling_limits(), *dimension).expect("ceiling set");
+            assert_eq!(ceiling, limit);
             assert!(limits_at(*dimension, ceiling).validate().is_ok());
             let over = limits_at(*dimension, ceiling + 1)
                 .validate()
-                .expect_err("ceiling+1 must fail");
+                .expect_err("ceiling+1");
             match over {
                 ContractViolation::Budget {
                     dimension: dim,
@@ -541,7 +507,7 @@ mod tests {
             assert!(usage_at(*dimension, ceiling).fits(&limits).is_ok());
             let err = usage_at(*dimension, ceiling + 1)
                 .fits(&limits)
-                .expect_err("usage ceiling+1 must fail");
+                .expect_err("usage+1");
             match err {
                 ContractViolation::Budget { dimension: dim, .. } => {
                     assert_eq!(dim, dimension.as_str());
@@ -549,18 +515,12 @@ mod tests {
                 other => panic!("wrong violation for {dimension:?}: {other:?}"),
             }
         }
-        assert!(ceiling_limits().validate().is_ok());
-        assert!(ceiling_limits().require_exact().is_ok());
-        let stu_over = BudgetUsage {
-            stu_used: STU_CEILING + 1,
-            ..usage_at(BudgetDimension::InputBytes, 0)
-        };
-        assert!(stu_over.fits(&ceiling_limits()).is_err());
-        let stu_exact = BudgetUsage {
-            stu_used: STU_CEILING,
-            ..usage_at(BudgetDimension::InputBytes, 0)
-        };
-        assert!(stu_exact.fits(&ceiling_limits()).is_ok());
+        assert!(ceiling_limits().validate().is_ok() && ceiling_limits().require_exact().is_ok());
+        let mut stu = usage_at(BudgetDimension::InputBytes, 0);
+        stu.stu_used = STU_CEILING + 1;
+        assert!(stu.fits(&ceiling_limits()).is_err());
+        stu.stu_used = STU_CEILING;
+        assert!(stu.fits(&ceiling_limits()).is_ok());
     }
 
     // WORK_UNIT_CASE: 578/11
@@ -571,9 +531,7 @@ mod tests {
             BudgetDimension::Attempts,
             BudgetDimension::Candidates,
         ] {
-            let err = limits_at(dimension, 0)
-                .validate()
-                .expect_err("zero count bound must fail");
+            let err = limits_at(dimension, 0).validate().expect_err("zero bound");
             match err {
                 ContractViolation::Budget { dimension: dim, .. } => {
                     assert_eq!(dim, dimension.as_str());
@@ -601,10 +559,8 @@ mod tests {
         }
         let mut above = ceiling_limits();
         above.attempts = Some(ATTEMPTS_CEILING + 1);
-        assert!(above.validate().is_err());
-        assert!(above.require_exact().is_err());
-        assert!(parse_budget_dimension("other").is_err());
-        assert!(parse_budget_dimension("").is_err());
+        assert!(above.validate().is_err() && above.require_exact().is_err());
+        assert!(parse_budget_dimension("other").is_err() && parse_budget_dimension("").is_err());
     }
 
     // WORK_UNIT_CASE: 578/12
@@ -643,8 +599,7 @@ mod tests {
             }
             other => panic!("wrong violation for skewed usage: {other:?}"),
         }
-        let err =
-            check_no_cross_subsidy(&skewed, &limits).expect_err("cross-subsidy check must fail");
+        let err = check_no_cross_subsidy(&skewed, &limits).expect_err("cross-subsidy");
         match err {
             ContractViolation::Budget { dimension, reason } => {
                 assert_eq!(dimension, "output_bytes");
@@ -655,11 +610,20 @@ mod tests {
             }
             other => panic!("wrong violation for cross-subsidy: {other:?}"),
         }
-        let within = BudgetUsage {
-            output_bytes: 100,
-            ..skewed
-        };
-        assert!(within.fits(&limits).is_ok());
-        assert!(check_no_cross_subsidy(&within, &limits).is_ok());
+        let mut within = skewed;
+        within.output_bytes = 100;
+        assert!(within.fits(&limits).is_ok() && check_no_cross_subsidy(&within, &limits).is_ok());
+        assert_eq!(DEX_BUDGET_DIMENSIONS.len(), 10);
+        let mut ceilings: Vec<u64> = DIMENSIONS.iter().map(|d| d.ceiling()).collect();
+        ceilings.push(STU_CEILING);
+        assert_eq!(ceilings.len(), 11);
+        let total: u128 = ceilings.iter().map(|c| u128::from(*c)).sum();
+        assert!(total < u128::from(u64::MAX) && total > 0);
+        let mut seen: Vec<&str> = DEX_BUDGET_DIMENSIONS.to_vec();
+        seen.push("max_stu");
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 11);
+        assert!(ceiling_limits().require_exact().is_ok());
     }
 }

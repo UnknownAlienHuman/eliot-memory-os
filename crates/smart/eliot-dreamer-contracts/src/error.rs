@@ -1,5 +1,4 @@
 //! Shared closed-world error for the provider-neutral Dreamer contract hub.
-//!
 //! Cell `smart.dreamer.contracts`. Every validation failure in this crate maps
 //! to this single error so handler/status bridges can switch on a closed set
 //! without string matching. No I/O, no state, no provider surface.
@@ -8,11 +7,7 @@
 
 use thiserror::Error;
 
-/// Converts a measured length into the `i64` bound space used by
-/// [`ContractViolation::OutOfBounds`].
-///
-/// Saturates at [`i64::MAX`] instead of wrapping, so hostile oversized
-/// inputs stay representable without panics or silent truncation.
+/// Saturates hostile lengths at [`i64::MAX`] for [`ContractViolation::OutOfBounds`].
 #[must_use]
 pub fn len_i64(len: usize) -> i64 {
     i64::try_from(len).unwrap_or(i64::MAX)
@@ -38,6 +33,48 @@ pub fn check_text(value: &str, field: &'static str, max: usize) -> Result<(), Co
         });
     }
     Ok(())
+}
+
+pub fn is_hex64_lower(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+pub fn check_vec_bound(
+    len: usize,
+    cap: usize,
+    field: &'static str,
+) -> Result<(), ContractViolation> {
+    if len > cap {
+        return Err(ContractViolation::OutOfBounds {
+            field,
+            min: 0,
+            max: len_i64(cap),
+            got: len_i64(len),
+        });
+    }
+    Ok(())
+}
+
+pub fn check_fence(fence: &eliot_contracts::StateFence) -> Result<(), ContractViolation> {
+    fence
+        .validate()
+        .map_err(|err| ContractViolation::BindingMismatch {
+            field: "state_fence",
+            reason: err.to_string(),
+        })
+}
+
+/// Compares string sets order-insensitively (callers reject duplicates at ingress).
+#[must_use]
+pub fn sorted_set_eq(left: &[String], right: &[String]) -> bool {
+    let mut ordered_left = left.to_vec();
+    ordered_left.sort();
+    let mut ordered_right = right.to_vec();
+    ordered_right.sort();
+    ordered_left == ordered_right
 }
 
 /// Closed validation failure for any Dreamer contract shape in this crate.

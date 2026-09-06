@@ -14,7 +14,7 @@ use eliot_contracts::StateFence;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{ContractViolation, check_text};
+use crate::error::{ContractViolation, check_fence, check_text, check_vec_bound, is_hex64_lower};
 
 /// Exact bundle schema version accepted by [`DreamInputBundle::validate`].
 const BUNDLE_SCHEMA_VERSION: u32 = 1;
@@ -22,23 +22,18 @@ const BUNDLE_SCHEMA_VERSION: u32 = 1;
 const MAX_HANDLE_CHARS: usize = 128;
 /// Maximum materials accepted in one bundle.
 const MAX_MATERIALS: usize = 1024;
+/// Maximum omissions accepted in one bundle (G3 collection bound).
+const MAX_OMISSIONS: usize = 1024;
 
-/// Returns true when `value` is exactly 64 lowercase-or-uppercase hex digits.
-fn is_hex64(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-/// Rejects blank/over-long/control handles (128-byte `check_text` bound).
-fn check_handle(handle: &str) -> Result<(), ContractViolation> {
-    check_text(handle, "handle", MAX_HANDLE_CHARS)
-}
-
-/// Maps a fence validation failure onto the closed contract error.
-fn fence_error(err: &eliot_contracts::ContractError) -> ContractViolation {
-    ContractViolation::BindingMismatch {
-        field: "state_fence",
-        reason: err.to_string(),
+/// Rejects a digest that is not exactly 64 lowercase hex characters.
+fn check_digest(value: &str, field: &'static str) -> Result<(), ContractViolation> {
+    if !is_hex64_lower(value) {
+        return Err(ContractViolation::BindingMismatch {
+            field,
+            reason: "digest must be 64 hex characters".to_string(),
+        });
     }
+    Ok(())
 }
 
 /// Disposition of one bundle source on the closed wire spelling.
@@ -92,13 +87,8 @@ pub struct BundleMaterial {
 impl BundleMaterial {
     /// Validates intrinsic handle and digest bounds.
     pub fn validate(&self) -> Result<(), ContractViolation> {
-        check_handle(&self.handle)?;
-        if !is_hex64(&self.digest) {
-            return Err(ContractViolation::BindingMismatch {
-                field: "material_digest",
-                reason: "material digest must be 64 hex characters".to_string(),
-            });
-        }
+        check_text(&self.handle, "handle", MAX_HANDLE_CHARS)?;
+        check_digest(&self.digest, "material_digest")?;
         Ok(())
     }
 }
@@ -128,13 +118,13 @@ pub struct OmissionHandle {
 }
 
 impl OmissionHandle {
-    /// Validates intrinsic bounds (identities 256B, reason/digest 1024B/256B) plus reversible-or-explicit rule.
+    /// Validates intrinsic bounds plus reversible-or-explicit rule.
     pub fn validate(&self) -> Result<(), ContractViolation> {
-        check_handle(&self.handle)?;
+        check_text(&self.handle, "handle", MAX_HANDLE_CHARS)?;
         check_text(&self.reason, "reason", 1024)?;
         check_text(&self.scope_id, "scope_id", 256)?;
         check_text(&self.task_id, "task_id", 256)?;
-        check_text(&self.digest, "digest", 1024)?;
+        check_digest(&self.digest, "digest")?;
         if let Some(reason) = &self.nonrecoverable_reason {
             check_text(reason, "nonrecoverable_reason", 1024)?;
         }
@@ -207,23 +197,10 @@ impl DreamInputBundle {
         check_text(&self.job_id, "job_id", 256)?;
         check_text(&self.scope_id, "scope_id", 256)?;
         check_text(&self.task_id, "task_id", 256)?;
-        self.state_fence
-            .validate()
-            .map_err(|err| fence_error(&err))?;
-        if !is_hex64(&self.manifest_digest) {
-            return Err(ContractViolation::BindingMismatch {
-                field: "manifest_digest",
-                reason: "manifest digest must be 64 hex characters".to_string(),
-            });
-        }
-        if self.materials.len() > MAX_MATERIALS {
-            return Err(ContractViolation::OutOfBounds {
-                field: "materials",
-                min: 0,
-                max: crate::error::len_i64(MAX_MATERIALS),
-                got: crate::error::len_i64(self.materials.len()),
-            });
-        }
+        check_fence(&self.state_fence)?;
+        check_digest(&self.manifest_digest, "manifest_digest")?;
+        check_vec_bound(self.materials.len(), MAX_MATERIALS, "materials")?;
+        check_vec_bound(self.omissions.len(), MAX_OMISSIONS, "omissions")?;
         for material in &self.materials {
             material.validate()?;
         }
@@ -242,33 +219,24 @@ impl DreamInputBundle {
                 });
             }
         }
-        let mut seen: Vec<&str> = Vec::new();
-        for handle in self
-            .materials
-            .iter()
-            .map(|material| material.handle.as_str())
-            .chain(
-                self.omissions
-                    .iter()
-                    .map(|omission| omission.handle.as_str()),
-            )
-        {
-            if seen.contains(&handle) {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "handle",
-                    reason: "duplicate bundle handle".to_string(),
-                });
-            }
-            seen.push(handle);
+        let mut handles: Vec<&str> = Vec::new();
+        handles.extend(self.materials.iter().map(|m| m.handle.as_str()));
+        handles.extend(self.omissions.iter().map(|o| o.handle.as_str()));
+        handles.sort_unstable();
+        let total = handles.len();
+        handles.dedup();
+        if handles.len() != total {
+            return Err(ContractViolation::BindingMismatch {
+                field: "handle",
+                reason: "duplicate bundle handle".to_string(),
+            });
         }
         match self.completeness {
             BundleCompleteness::CompleteForScope | BundleCompleteness::KnownEmpty => {
-                match &self.authoritative_denominator {
-                    Some(d) => check_text(d, "authoritative_denominator", 256)?,
-                    None => {
-                        return Err(ContractViolation::MissingField("authoritative_denominator"));
-                    }
-                }
+                let Some(d) = &self.authoritative_denominator else {
+                    return Err(ContractViolation::MissingField("authoritative_denominator"));
+                };
+                check_text(d, "authoritative_denominator", 256)?;
             }
             BundleCompleteness::PartialForScope | BundleCompleteness::Unknown => {
                 if let Some(d) = &self.authoritative_denominator {
@@ -341,7 +309,6 @@ mod tests {
     // WORK_UNIT_CASE: 578/8
     #[test]
     fn bundle_rejects_bad_manifest_tampered_scope_and_invalid_fence() {
-        // Wrong manifest: non-hex digest is rejected.
         let mut bad_manifest = valid_bundle();
         bad_manifest.manifest_digest = "not-a-digest".to_string();
         assert!(matches!(
@@ -349,37 +316,29 @@ mod tests {
             Err(ContractViolation::BindingMismatch { .. })
         ));
 
-        // Tampered scope: bundle scope no longer matches the omission binding.
         let mut tampered_scope = valid_bundle();
         tampered_scope.scope_id = "scope-2".to_string();
         assert!(tampered_scope.validate().is_err());
 
-        // Tampered task: same binding rule guards the task identity.
         let mut tampered_task = valid_bundle();
         tampered_task.task_id = "task-2".to_string();
         assert!(tampered_task.validate().is_err());
 
-        // Wrong source: blank material handle is rejected.
         let mut blank_handle = valid_bundle();
         blank_handle.materials[0].handle = "   ".to_string();
         assert!(blank_handle.validate().is_err());
 
-        // Wrong source: corrupt material digest is rejected.
         let mut corrupt_digest = valid_bundle();
         corrupt_digest.materials[0].digest = "z".repeat(64);
         assert!(corrupt_digest.validate().is_err());
 
-        // Duplicate handles across materials and omissions are rejected.
         let mut duplicate = valid_bundle();
         duplicate.omissions[0].handle = "source-a".to_string();
         assert!(duplicate.validate().is_err());
 
-        // Invalid fence: epoch zero cannot cross the deserialization boundary,
-        // so no bundle carrying it can ever validate.
         let fence_json = r#"{"authority_epoch":0,"resource_generation":1}"#;
         assert!(serde_json::from_str::<StateFence>(fence_json).is_err());
 
-        // Same rejection holds at the full-bundle boundary.
         let wire = serde_json::to_string(&valid_bundle()).expect("fixture serializes");
         assert!(wire.contains("\"authority_epoch\":1"));
         let tampered = wire.replace("\"authority_epoch\":1", "\"authority_epoch\":0");
@@ -387,13 +346,20 @@ mod tests {
         assert!(serde_json::from_str::<DreamInputBundle>(&tampered).is_err());
         let mut over_handle = valid_bundle();
         over_handle.materials[0].handle = "h".repeat(129);
-        assert!(over_handle.validate().is_err());
+        let r = over_handle.validate();
+        assert!(matches!(r, Err(ContractViolation::OutOfBounds { .. })));
         let mut ctrl_handle = valid_bundle();
         ctrl_handle.materials[0].handle = "a\tb".to_string();
-        assert!(ctrl_handle.validate().is_err());
+        let r = ctrl_handle.validate();
+        assert!(matches!(r, Err(ContractViolation::Malformed { .. })));
         let mut over_id = valid_bundle();
         over_id.job_id = "j".repeat(257);
-        assert!(over_id.validate().is_err());
+        let r = over_id.validate();
+        assert!(matches!(r, Err(ContractViolation::OutOfBounds { .. })));
+        let mut over_omissions = valid_bundle();
+        over_omissions.omissions = vec![valid_omission(); 1025];
+        let r = over_omissions.validate();
+        assert!(matches!(r, Err(ContractViolation::OutOfBounds { .. })));
     }
 
     // WORK_UNIT_CASE: 578/13
@@ -498,14 +464,22 @@ mod tests {
         missing_reason.nonrecoverable_reason = Some("  ".to_string());
         assert!(missing_reason.validate().is_err());
 
-        // The lookup helper resolves a recorded omission and fails otherwise.
+        let mut bad_digest = valid_omission();
+        bad_digest.digest = "not-a-digest".to_string();
+        assert!(matches!(
+            bad_digest.validate(),
+            Err(ContractViolation::BindingMismatch { .. })
+        ));
+        let mut upper_digest = valid_omission();
+        upper_digest.digest = "A".repeat(64);
+        assert!(matches!(
+            upper_digest.validate(),
+            Err(ContractViolation::BindingMismatch { .. })
+        ));
+
         let bundle = valid_bundle();
-        assert_eq!(
-            omit_handle(&bundle, "source-b")
-                .expect("omission present")
-                .handle,
-            "source-b"
-        );
+        let omission = omit_handle(&bundle, "source-b").expect("omission present");
+        assert_eq!(omission.handle, "source-b");
         assert!(omit_handle(&bundle, "source-a").is_err());
         assert!(omit_handle(&bundle, "no-such-source").is_err());
     }

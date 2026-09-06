@@ -12,7 +12,20 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::curation::{CurationKind, kind_family};
-use crate::error::{ContractViolation, check_text};
+use crate::error::{ContractViolation, check_text, check_vec_bound};
+
+fn pres(dimension: &str, detail: &str) -> ContractViolation {
+    ContractViolation::Preservation(format!("dimension {dimension} {detail}"))
+}
+
+fn unknown_variant(field: &'static str, value: &str) -> ContractViolation {
+    let value = value.to_owned();
+    ContractViolation::UnknownVariant { field, value }
+}
+
+fn dup_or_missing(kind: &str, dimension: &str) -> ContractViolation {
+    ContractViolation::Preservation(format!("{kind} verdict for dimension {dimension}"))
+}
 
 /// Independent preservation dimensions, each judged on its own.
 ///
@@ -66,10 +79,7 @@ impl PreservationDimension {
             "authority_ceiling" => Ok(Self::AuthorityCeiling),
             "dependency_closure" => Ok(Self::DependencyClosure),
             "provenance_retention" => Ok(Self::ProvenanceRetention),
-            other => Err(ContractViolation::UnknownVariant {
-                field: "preservation_dimension",
-                value: other.to_owned(),
-            }),
+            other => Err(unknown_variant("preservation_dimension", other)),
         }
     }
 }
@@ -119,41 +129,29 @@ impl PreservationReport {
     /// Returns [`ContractViolation::Preservation`] when the verdict count is
     /// not seven, any dimension repeats or is missing, or any note is blank.
     pub fn validate(&self) -> Result<(), ContractViolation> {
-        if self.verdicts.len() != PRESERVATION_DIMENSIONS.len() {
+        let (want, got) = (PRESERVATION_DIMENSIONS.len(), self.verdicts.len());
+        if got != want {
             return Err(ContractViolation::Preservation(format!(
-                "expected {} dimension verdicts, got {}",
-                PRESERVATION_DIMENSIONS.len(),
-                self.verdicts.len()
+                "expected {want} dimension verdicts, got {got}"
             )));
         }
         let mut seen: Vec<PreservationDimension> = Vec::with_capacity(7);
         for verdict in &self.verdicts {
+            let d = verdict.dimension.as_str();
             if verdict.note.trim().is_empty() {
-                return Err(ContractViolation::Preservation(format!(
-                    "dimension {} has a blank note",
-                    verdict.dimension.as_str()
-                )));
+                return Err(pres(d, "has a blank note"));
             }
             if verdict.note.len() > 1024 || verdict.note.chars().any(char::is_control) {
-                return Err(ContractViolation::Preservation(std::format!(
-                    "dimension {} note exceeds 1024 bytes or has control chars",
-                    verdict.dimension.as_str()
-                )));
+                return Err(pres(d, "note exceeds 1024 bytes or has control chars"));
             }
             if seen.contains(&verdict.dimension) {
-                return Err(ContractViolation::Preservation(format!(
-                    "duplicate verdict for dimension {}",
-                    verdict.dimension.as_str()
-                )));
+                return Err(dup_or_missing("duplicate", d));
             }
             seen.push(verdict.dimension);
         }
         for spelling in PRESERVATION_DIMENSIONS {
-            let dimension = PreservationDimension::parse(spelling)?;
-            if !seen.contains(&dimension) {
-                return Err(ContractViolation::Preservation(format!(
-                    "missing verdict for dimension {spelling}"
-                )));
+            if !seen.contains(&PreservationDimension::parse(spelling)?) {
+                return Err(dup_or_missing("missing", spelling));
             }
         }
         Ok(())
@@ -173,16 +171,10 @@ impl PreservationReport {
         self.validate()?;
         for verdict in &self.verdicts {
             if !verdict.known {
-                return Err(ContractViolation::Preservation(format!(
-                    "dimension {} is unknown",
-                    verdict.dimension.as_str()
-                )));
+                return Err(pres(verdict.dimension.as_str(), "is unknown"));
             }
             if !verdict.passed {
-                return Err(ContractViolation::Preservation(format!(
-                    "dimension {} failed",
-                    verdict.dimension.as_str()
-                )));
+                return Err(pres(verdict.dimension.as_str(), "failed"));
             }
         }
         Ok(())
@@ -242,10 +234,7 @@ impl CandidateDisposition {
             "blocked" => Ok(Self::Blocked),
             "unsupported" => Ok(Self::Unsupported),
             "internal_defect" => Ok(Self::InternalDefect),
-            other => Err(ContractViolation::UnknownVariant {
-                field: "candidate_disposition",
-                value: other.to_owned(),
-            }),
+            other => Err(unknown_variant("candidate_disposition", other)),
         }
     }
 }
@@ -292,34 +281,28 @@ impl CandidateResult {
     /// lineage handles are empty or blank, preservation fails, or the
     /// kind/family mapping mismatches.
     pub fn validate(&self) -> Result<(), ContractViolation> {
-        require_non_blank("candidate_id", &self.candidate_id)?;
-        require_non_blank("family_spelling", &self.family_spelling)?;
-        require_non_blank("job_id", &self.job_id)?;
-        require_non_blank("scope_id", &self.scope_id)?;
-        require_non_blank("task_id", &self.task_id)?;
-        require_non_blank("statement", &self.statement)?;
-        require_non_blank("support_note", &self.support_note)?;
-        require_non_blank("rollback_note", &self.rollback_note)?;
-        let kind = self.kind;
-        if kind_family(kind) != self.family_spelling.as_str() {
-            return Err(ContractViolation::KindPayload(
-                "kind and family_spelling mismatch".to_owned(),
-            ));
+        check_text(&self.candidate_id, "candidate_id", 256)?;
+        check_text(&self.family_spelling, "family_spelling", 256)?;
+        check_text(&self.job_id, "job_id", 256)?;
+        check_text(&self.scope_id, "scope_id", 256)?;
+        check_text(&self.task_id, "task_id", 256)?;
+        check_text(&self.statement, "statement", 256)?;
+        check_text(&self.support_note, "support_note", 256)?;
+        check_text(&self.rollback_note, "rollback_note", 256)?;
+        let reason = "kind and family_spelling mismatch".to_owned();
+        if kind_family(self.kind) != self.family_spelling.as_str() {
+            return Err(ContractViolation::KindPayload(reason));
         }
         if self.source_handles.is_empty() {
             return Err(ContractViolation::MissingField("source_handles"));
         }
+        check_vec_bound(self.source_handles.len(), 1024, "source_handles")?;
         for handle in &self.source_handles {
             check_text(handle, "source_handles", 128)?;
         }
         self.preservation.overall()?;
         Ok(())
     }
-}
-
-/// Rejects blank/over-long/control candidate text (256-byte `check_text` bound).
-fn require_non_blank(field: &'static str, value: &str) -> Result<(), ContractViolation> {
-    check_text(value, field, 256)
 }
 
 /// Named proposal for [`propose_candidate`]; replaces 12 positional parameters.
@@ -345,22 +328,20 @@ pub struct CandidateProposal {
 /// # Errors
 ///
 /// Returns [`ContractViolation`] on blank fields, bad lineage, or failed preservation.
-pub fn propose_candidate(
-    proposal: CandidateProposal,
-) -> Result<CandidateResult, ContractViolation> {
+pub fn propose_candidate(p: CandidateProposal) -> Result<CandidateResult, ContractViolation> {
     let candidate = CandidateResult {
-        candidate_id: proposal.candidate_id,
-        kind: proposal.kind,
-        family_spelling: proposal.family_spelling,
-        job_id: proposal.job_id,
-        scope_id: proposal.scope_id,
-        task_id: proposal.task_id,
-        statement: proposal.statement,
-        disposition: proposal.disposition,
-        preservation: proposal.preservation,
-        support_note: proposal.support_note,
-        rollback_note: proposal.rollback_note,
-        source_handles: proposal.source_handles,
+        candidate_id: p.candidate_id,
+        kind: p.kind,
+        family_spelling: p.family_spelling,
+        job_id: p.job_id,
+        scope_id: p.scope_id,
+        task_id: p.task_id,
+        statement: p.statement,
+        disposition: p.disposition,
+        preservation: p.preservation,
+        support_note: p.support_note,
+        rollback_note: p.rollback_note,
+        source_handles: p.source_handles,
     };
     candidate.validate()?;
     Ok(candidate)
@@ -372,17 +353,14 @@ mod tests {
     use super::*;
 
     fn passing_report() -> PreservationReport {
+        let verdicts = PRESERVATION_DIMENSIONS.iter().map(|s| DimensionVerdict {
+            dimension: PreservationDimension::parse(s).unwrap_or(PreservationDimension::Coverage),
+            passed: true,
+            known: true,
+            note: format!("{s} holds"),
+        });
         PreservationReport {
-            verdicts: PRESERVATION_DIMENSIONS
-                .iter()
-                .map(|spelling| DimensionVerdict {
-                    dimension: PreservationDimension::parse(spelling)
-                        .unwrap_or(PreservationDimension::Coverage),
-                    passed: true,
-                    known: true,
-                    note: format!("{spelling} holds"),
-                })
-                .collect(),
+            verdicts: verdicts.collect(),
         }
     }
 
@@ -423,11 +401,9 @@ mod tests {
         spellings.dedup();
         assert_eq!(spellings.len(), 8, "all dispositions must differ");
         for state in states {
-            let parsed = CandidateDisposition::parse(state.as_str());
-            assert_eq!(parsed, Ok(state));
+            assert_eq!(CandidateDisposition::parse(state.as_str()), Ok(state));
             let bytes = serde_json::to_vec(&state).expect("disposition serializes");
-            let decoded: CandidateDisposition =
-                serde_json::from_slice(&bytes).expect("disposition roundtrips");
+            let decoded: CandidateDisposition = serde_json::from_slice(&bytes).expect("roundtrips");
             assert_eq!(decoded, state);
         }
     }
@@ -437,13 +413,12 @@ mod tests {
     fn marker_38_seven_preservation_dimensions_independent() {
         assert_eq!(PRESERVATION_DIMENSIONS.len(), 7);
         let report = passing_report();
-        assert!(report.validate().is_ok());
-        assert!(report.overall().is_ok());
+        assert!(report.validate().is_ok() && report.overall().is_ok());
         for spelling in PRESERVATION_DIMENSIONS {
             let addressed: Vec<&DimensionVerdict> = report
                 .verdicts
                 .iter()
-                .filter(|verdict| verdict.dimension.as_str() == *spelling)
+                .filter(|v| v.dimension.as_str() == *spelling)
                 .collect();
             assert_eq!(addressed.len(), 1, "dimension {spelling} must appear once");
             assert!(addressed[0].passed && addressed[0].known);
@@ -455,13 +430,11 @@ mod tests {
     fn marker_39_failed_or_unknown_dimension_fails_overall() {
         let mut failed = passing_report();
         failed.verdicts[0].passed = false;
-        assert!(failed.validate().is_ok());
-        assert!(failed.overall().is_err());
+        assert!(failed.validate().is_ok() && failed.overall().is_err());
 
         let mut unknown = passing_report();
         unknown.verdicts[3].known = false;
-        assert!(unknown.validate().is_ok());
-        assert!(unknown.overall().is_err());
+        assert!(unknown.validate().is_ok() && unknown.overall().is_err());
     }
 
     // WORK_UNIT_CASE: 578/40
@@ -484,19 +457,37 @@ mod tests {
         }
         let mut mismatch = valid_candidate();
         mismatch.family_spelling = "memory_repair".to_owned();
-        assert!(matches!(
-            mismatch.validate(),
-            Err(ContractViolation::KindPayload(_))
-        ));
+        let r = mismatch.validate();
+        assert!(matches!(r, Err(ContractViolation::KindPayload(_))));
         assert!(valid_candidate().validate().is_ok());
         let mut maxed = valid_candidate();
         maxed.candidate_id = "c".repeat(256);
         assert!(maxed.validate().is_ok());
         let mut over = valid_candidate();
         over.candidate_id = "c".repeat(257);
-        assert!(over.validate().is_err());
+        let r = over.validate();
+        assert!(matches!(r, Err(ContractViolation::OutOfBounds { .. })));
         let mut ctrl = valid_candidate();
         ctrl.source_handles = vec!["a\nb".to_owned()];
-        assert!(ctrl.validate().is_err());
+        let r = ctrl.validate();
+        assert!(matches!(r, Err(ContractViolation::Malformed { .. })));
+        let mut max_handles = valid_candidate();
+        max_handles.source_handles = vec!["s".to_owned(); 1024];
+        assert!(max_handles.validate().is_ok());
+        let mut over_handles = valid_candidate();
+        over_handles.source_handles = vec!["s".to_owned(); 1025];
+        let r = over_handles.validate();
+        assert!(matches!(r, Err(ContractViolation::OutOfBounds { .. })));
+        let mut max_note = passing_report();
+        max_note.verdicts[0].note = "n".repeat(1024);
+        assert!(max_note.validate().is_ok());
+        let mut over_note = passing_report();
+        over_note.verdicts[0].note = "n".repeat(1025);
+        let r = over_note.validate();
+        assert!(matches!(r, Err(ContractViolation::Preservation(_))));
+        let mut ctrl_note = passing_report();
+        ctrl_note.verdicts[0].note = "a\nb".to_owned();
+        let r = ctrl_note.validate();
+        assert!(matches!(r, Err(ContractViolation::Preservation(_))));
     }
 }
