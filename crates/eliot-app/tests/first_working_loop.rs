@@ -858,7 +858,7 @@ fn first_working_loop_end_to_end() -> TestResult {
         allowed_action
             .pointer("/action_lease/memory_delivery_refs")
             .and_then(Value::as_array)
-            .is_some_and(|refs| refs.is_empty()),
+            .is_some_and(std::vec::Vec::is_empty),
         "the bounded core loop must not claim an undelivered memory influence"
     );
     worktree.append_and_commit(&artifact_path)?;

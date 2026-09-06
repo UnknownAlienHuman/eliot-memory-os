@@ -20,7 +20,7 @@ pub const HOST_REQUEST_GATEWAY_CONTRACT_REVISION: &str = "1.0.0";
 /// Trusted Kernel/Governor boundary for inert host invocation and cancellation.
 ///
 /// The implementation owns authentication, application Session/task binding,
-/// RequestIdentity issuance, absolute deadline, idempotency, authority/fence
+/// `RequestIdentity` issuance, absolute deadline, idempotency, authority/fence
 /// validation, semantic dispatch, cancellation targeting, and reconciliation.
 /// This crate only validates and correlates the host-facing contract.
 pub trait KernelHostRequestPort {

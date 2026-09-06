@@ -178,6 +178,10 @@ async fn t02_memory_grant_offer_is_scoped_and_immutable() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// One durable scenario: redeem, observe atomicity, then prove single use.
+// Splitting it would need a shared store fixture and would stop proving that
+// the three phases hold against the same live grant.
+#[allow(clippy::too_many_lines)]
 async fn t02_memory_grant_redemption_is_atomic_durable_and_single_use() -> TestResult {
     if rerun_with_isolated_credential_backend(
         "t02_memory_grant_redemption_is_atomic_durable_and_single_use",

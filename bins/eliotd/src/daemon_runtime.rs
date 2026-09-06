@@ -86,8 +86,7 @@ pub(super) fn run() -> Result<(), String> {
     let shutdown_result = composition.shutdown().map_err(|error| error.to_string());
     match (loop_result, shutdown_result) {
         (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(report_terminal_failure(&kernel, error)),
-        (Ok(()), Err(error)) => Err(report_terminal_failure(&kernel, error)),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(report_terminal_failure(&kernel, error)),
         (Err(error), Err(shutdown_error)) => Err(report_terminal_failure(
             &kernel,
             format!("{error}; shutdown: {shutdown_error}"),
@@ -272,6 +271,7 @@ fn write_json_to(output: &mut impl Write, message: &ReadyMessage) -> Result<(), 
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

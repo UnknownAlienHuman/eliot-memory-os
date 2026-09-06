@@ -424,7 +424,7 @@ pub struct CoordinationEventReceipt {
     pub event: CoordinationEvent,
 }
 
-/// ELIOT_ARCH_OWNER: ARCH-SWM-02
+/// `ELIOT_ARCH_OWNER`: `ARCH-SWM-02`
 /// An in-memory canonical owner suitable for a store adapter or daemon cell.
 #[allow(clippy::doc_markdown)]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

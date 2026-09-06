@@ -9,6 +9,9 @@
 
 use super::*;
 
+// Kept whole: one task dispatch path; the fence and the derivations that depend
+// on it are the completion semantics and stay together.
+#[allow(clippy::too_many_lines)]
 pub(super) async fn dispatch_task_action_request(
     state: &McpState,
     context: AuthenticatedRequestContext,
@@ -1272,6 +1275,8 @@ pub(super) fn task_input(
 mod replay_tests {
     use super::*;
 
+    // kept whole: splitting this would break one scenario into fragments
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn exact_memory_grant_action_replay_is_idempotent_and_substitution_fails() -> Result<()> {
         let project_id = ProjectId::from_uuid(uuid::Uuid::from_u128(1));

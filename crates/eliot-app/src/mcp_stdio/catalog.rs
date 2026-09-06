@@ -1045,6 +1045,8 @@ pub(super) fn metrics_tool_definitions() -> Vec<Value> {
     ]
 }
 
+// Kept whole: one catalogue projection built in a single pass.
+#[allow(clippy::too_many_lines)]
 pub(super) fn task_tool_definitions() -> Vec<Value> {
     vec![
         tool(

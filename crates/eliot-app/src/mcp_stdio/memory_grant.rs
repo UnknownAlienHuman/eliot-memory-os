@@ -3,7 +3,7 @@
 //! An offer is durably committed before it is returned. That is not a
 //! delivery claim. The same authenticated task session returning the signed
 //! token in `eliot_task_action_request` is the acknowledgement. Redemption is
-//! appended to the TaskContract in the same revision-CAS transaction as the
+//! appended to the `TaskContract` in the same revision-CAS transaction as the
 //! consuming action, so a failed transition cannot burn a token.
 
 use super::*;
@@ -285,7 +285,7 @@ pub(super) async fn resolve_memory_grant_ref(
     anyhow::ensure!(
         constant_time_text_eq(
             &offer.token_hash,
-            &blake3::hash(token.as_bytes()).to_hex().to_string()
+            blake3::hash(token.as_bytes()).to_hex().as_str()
         ),
         "memory grant token hash is invalid"
     );
@@ -394,6 +394,7 @@ pub(super) fn append_memory_grant_redemptions(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

@@ -2057,6 +2057,8 @@ impl McpDaemon {
         .transpose()?)
     }
 
+    // the call carries the full context it must not re-derive
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn authoritative_host_scope(
         &self,
         profile: &str,

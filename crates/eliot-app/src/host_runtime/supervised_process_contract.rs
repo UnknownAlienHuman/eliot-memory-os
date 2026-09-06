@@ -13,7 +13,7 @@
 //! `ProcessRestartPolicy`, `SupervisedProcessSpec`, and
 //! `SupervisedProcessOutput`. It records policy values, restart bounds, and
 //! bounded output/receipt facts; it does not implement process launch, SCM,
-//! lifecycle, canonical/semantic/write, provider authority, or SurrealDB.
+//! lifecycle, canonical/semantic/write, provider authority, or `SurrealDB`.
 //! Those concerns remain in the parent `supervised_process` worker/runner,
 //! `eliot-installation`/SCM, canonical store, and provider/authority surfaces.
 

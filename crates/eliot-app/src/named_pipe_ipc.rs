@@ -1196,6 +1196,8 @@ fn allowed_ipc_profile(profile: &str) -> bool {
     )
 }
 
+// each flag is an independent admission decision
+#[allow(clippy::fn_params_excessive_bools)]
 fn valid_normal_scope_shape(
     has_session: bool,
     has_project: bool,

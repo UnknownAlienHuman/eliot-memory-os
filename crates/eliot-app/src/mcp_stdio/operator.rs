@@ -127,6 +127,8 @@ pub(super) fn load_or_create_operator_cursor_signing_key(
     )
 }
 
+// Kept whole: one operator surface projection.
+#[allow(clippy::too_many_lines)]
 pub(super) fn dispatch_operator_contract() -> Result<Value> {
     Ok(json!({
         "schema_version": OPERATOR_SCHEMA_VERSION,
@@ -724,6 +726,8 @@ pub(super) async fn dispatch_operator_snapshot(
     .map_err(Into::into)
 }
 
+// kept whole: splitting this would break one scenario into fragments
+#[allow(clippy::too_many_lines)]
 pub(super) async fn dispatch_operator_query(
     state: &McpState,
     context: AuthenticatedRequestContext,

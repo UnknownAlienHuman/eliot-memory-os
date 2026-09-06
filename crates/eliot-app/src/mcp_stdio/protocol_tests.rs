@@ -1,3 +1,7 @@
+// Assertions in a test use `expect`/`unwrap` deliberately; the workspace
+// lints target production paths.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use super::catalog::{memory_lifecycle_tool_definitions, replay_tool_definitions};
 use super::*;
 
@@ -111,6 +115,8 @@ fn governor_bound_scope_defaults_ids_and_rejects_scope_spoofing() -> Result<()> 
     Ok(())
 }
 
+// kept whole: splitting this would break one scenario into fragments
+#[allow(clippy::too_many_lines)]
 #[test]
 fn scoped_request_authority_refresh_rejects_revocation_and_stale_fences() -> Result<()> {
     let project_id = ProjectId::new_v7();
