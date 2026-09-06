@@ -353,44 +353,45 @@ fn reject_carry(field: &'static str, value: Option<&String>) -> Result<(), Contr
     Ok(())
 }
 
-/// Proposes an inert candidate.
-///
-/// The constructor keeps every forbidden carry field at `None`, requires
-/// non-blank lineage via `source_handles`, and enforces preservation with
-/// no averaging.
+/// Named proposal for [`propose_candidate`]; replaces 12 positional parameters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateProposal {
+    pub candidate_id: String,
+    pub kind_spelling: String,
+    pub family_spelling: String,
+    pub job_id: String,
+    pub scope_id: String,
+    pub task_id: String,
+    pub statement: String,
+    pub disposition: CandidateDisposition,
+    pub preservation: PreservationReport,
+    pub support_note: String,
+    pub rollback_note: String,
+    pub source_handles: Vec<String>,
+}
+
+/// Proposes an inert candidate with all forbidden carry fields `None`.
 ///
 /// # Errors
 ///
-/// Returns [`ContractViolation`] when any required field is blank, lineage
-/// handles are empty or blank, or preservation fails.
-#[allow(clippy::too_many_arguments)]
+/// Returns [`ContractViolation`] on blank fields, bad lineage, or failed preservation.
 pub fn propose_candidate(
-    candidate_id: String,
-    kind_spelling: String,
-    family_spelling: String,
-    job_id: String,
-    scope_id: String,
-    task_id: String,
-    statement: String,
-    disposition: CandidateDisposition,
-    preservation: PreservationReport,
-    support_note: String,
-    rollback_note: String,
-    source_handles: Vec<String>,
+    proposal: CandidateProposal,
 ) -> Result<CandidateResult, ContractViolation> {
     let candidate = CandidateResult {
-        candidate_id,
-        kind_spelling,
-        family_spelling,
-        job_id,
-        scope_id,
-        task_id,
-        statement,
-        disposition,
-        preservation,
-        support_note,
-        rollback_note,
-        source_handles,
+        candidate_id: proposal.candidate_id,
+        kind_spelling: proposal.kind_spelling,
+        family_spelling: proposal.family_spelling,
+        job_id: proposal.job_id,
+        scope_id: proposal.scope_id,
+        task_id: proposal.task_id,
+        statement: proposal.statement,
+        disposition: proposal.disposition,
+        preservation: proposal.preservation,
+        support_note: proposal.support_note,
+        rollback_note: proposal.rollback_note,
+        source_handles: proposal.source_handles,
         admitted_ref: None,
         current_state_ref: None,
         effect_ref: None,
@@ -426,20 +427,20 @@ mod tests {
     }
 
     fn valid_candidate() -> CandidateResult {
-        propose_candidate(
-            "candidate-1".to_owned(),
-            "dream.summary".to_owned(),
-            "summary".to_owned(),
-            "job-1".to_owned(),
-            "scope-1".to_owned(),
-            "task-1".to_owned(),
-            "proposed statement".to_owned(),
-            CandidateDisposition::Candidate,
-            passing_report(),
-            "supported by source-1".to_owned(),
-            "drop candidate-1 to roll back".to_owned(),
-            vec!["source-1".to_owned()],
-        )
+        propose_candidate(CandidateProposal {
+            candidate_id: "candidate-1".to_owned(),
+            kind_spelling: "dream.summary".to_owned(),
+            family_spelling: "summary".to_owned(),
+            job_id: "job-1".to_owned(),
+            scope_id: "scope-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            statement: "proposed statement".to_owned(),
+            disposition: CandidateDisposition::Candidate,
+            preservation: passing_report(),
+            support_note: "supported by source-1".to_owned(),
+            rollback_note: "drop candidate-1 to roll back".to_owned(),
+            source_handles: vec!["source-1".to_owned()],
+        })
         .unwrap_or_else(|_| CandidateResult {
             candidate_id: "candidate-1".to_owned(),
             kind_spelling: "dream.summary".to_owned(),
@@ -528,72 +529,33 @@ mod tests {
     // WORK_UNIT_CASE: 578/40
     #[test]
     fn marker_40_candidate_cannot_carry_terminal_evidence() {
-        let mut candidate = valid_candidate();
-        assert!(candidate.validate().is_ok());
-
-        candidate.admitted_ref = Some("admitted-1".to_owned());
-        assert!(matches!(
-            candidate.validate(),
-            Err(ContractViolation::ForbiddenCarry(_))
-        ));
-        candidate.admitted_ref = None;
-
-        candidate.current_state_ref = Some("current-1".to_owned());
-        assert!(matches!(
-            candidate.validate(),
-            Err(ContractViolation::ForbiddenCarry(_))
-        ));
-        candidate.current_state_ref = None;
-
-        candidate.effect_ref = Some("effect-1".to_owned());
-        assert!(matches!(
-            candidate.validate(),
-            Err(ContractViolation::ForbiddenCarry(_))
-        ));
-        candidate.effect_ref = None;
-
-        candidate.executed_ref = Some("executed-1".to_owned());
-        assert!(matches!(
-            candidate.validate(),
-            Err(ContractViolation::ForbiddenCarry(_))
-        ));
-        candidate.executed_ref = None;
-
-        candidate.delivery_ref = Some("delivery-1".to_owned());
-        assert!(matches!(
-            candidate.validate(),
-            Err(ContractViolation::ForbiddenCarry(_))
-        ));
-        candidate.delivery_ref = None;
-
-        candidate.use_ref = Some("used-1".to_owned());
-        assert!(matches!(
-            candidate.validate(),
-            Err(ContractViolation::ForbiddenCarry(_))
-        ));
-        candidate.use_ref = None;
-
-        candidate.outcome_ref = Some("outcome-1".to_owned());
-        assert!(matches!(
-            candidate.validate(),
-            Err(ContractViolation::ForbiddenCarry(_))
-        ));
-        candidate.outcome_ref = None;
-
-        candidate.promotion_ref = Some("promotion-1".to_owned());
-        assert!(matches!(
-            candidate.validate(),
-            Err(ContractViolation::ForbiddenCarry(_))
-        ));
-        candidate.promotion_ref = None;
-
-        candidate.finish_ref = Some("finish-1".to_owned());
-        assert!(matches!(
-            candidate.validate(),
-            Err(ContractViolation::ForbiddenCarry(_))
-        ));
-        candidate.finish_ref = None;
-
-        assert!(candidate.validate().is_ok());
+        let wire = serde_json::to_string(&valid_candidate()).expect("candidate serializes");
+        for field in [
+            "admitted_ref",
+            "current_state_ref",
+            "effect_ref",
+            "executed_ref",
+            "delivery_ref",
+            "use_ref",
+            "outcome_ref",
+            "promotion_ref",
+            "finish_ref",
+        ] {
+            let injected = wire.replacen(
+                &std::format!("\"{field}\":null"),
+                &std::format!("\"{field}\":\"x\""),
+                1,
+            );
+            assert_ne!(injected, wire, "carry field {field} must exist as null");
+            let decoded: CandidateResult = serde_json::from_str(&injected).expect("decodes");
+            assert!(
+                matches!(
+                    decoded.validate(),
+                    Err(ContractViolation::ForbiddenCarry(_))
+                ),
+                "carry field {field} must be rejected"
+            );
+        }
+        assert!(valid_candidate().validate().is_ok());
     }
 }

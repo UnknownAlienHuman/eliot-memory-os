@@ -18,12 +18,12 @@ pub const MAX_ITEM_BYTES: usize = 1024 * 1024;
 /// Separator used when joining sequence items before hashing.
 const JOIN_SEPARATOR: &str = "\u{1f}";
 
-/// Returns deterministic JSON bytes with object keys sorted recursively.
-///
-/// Falls back to an empty vector when serialization fails, so encoding is
-/// total and never panics.
-pub fn canonical_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
-    eliot_contracts::canonical_json_bytes(value).unwrap_or_default()
+/// Returns deterministic canonical JSON bytes, failing closed on serialization errors.
+pub fn canonical_bytes<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ContractViolation> {
+    eliot_contracts::canonical_json_bytes(value).map_err(|err| ContractViolation::Malformed {
+        field: "canonical_bytes",
+        reason: err.to_string(),
+    })
 }
 
 /// Returns the lowercase hex SHA-256 digest of `bytes`.
@@ -148,8 +148,8 @@ mod tests {
         second.insert("b".to_owned(), "2".to_owned());
         assert_eq!(canonical_bytes(&first), canonical_bytes(&second));
         assert_eq!(
-            digest_hex(&canonical_bytes(&first)),
-            digest_hex(&canonical_bytes(&second))
+            digest_hex(&canonical_bytes(&first).expect("fixture serializes")),
+            digest_hex(&canonical_bytes(&second).expect("fixture serializes"))
         );
 
         let one = vec!["x".to_owned(), "y".to_owned()];
@@ -180,7 +180,7 @@ mod tests {
             "emoji 🦀 ok".to_owned(),
         ];
         for input in &hostile {
-            let bytes = canonical_bytes(&input);
+            let bytes = canonical_bytes(&input).expect("hostile input still serializes");
             assert!(!bytes.is_empty() || input.is_empty());
             let digest = digest_hex(input.as_bytes());
             assert_eq!(digest.len(), 64);
@@ -205,5 +205,13 @@ mod tests {
             SemanticSequence::try_new(oversize),
             Err(ContractViolation::Malformed { .. })
         ));
+        let bad_key: HashMap<Vec<u8>, u8> = HashMap::from([(vec![1_u8], 2_u8)]);
+        assert!(
+            matches!(
+                canonical_bytes(&bad_key),
+                Err(ContractViolation::Malformed { .. })
+            ),
+            "non-string map keys must fail closed, never empty vec"
+        );
     }
 }

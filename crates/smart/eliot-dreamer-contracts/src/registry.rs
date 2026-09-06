@@ -9,6 +9,7 @@
 use crate::curation::CurationKind;
 use crate::curation::CurationPayload;
 use crate::error::ContractViolation;
+use crate::screen::ScreenBinding;
 use eliot_contracts::StateFence;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -113,9 +114,6 @@ pub const fn family_of(kind: CurationKind) -> CurationFamily {
 }
 
 /// Returns exactly the canonical wire-kind set a family handler must accept.
-///
-/// Single-kind families accept exactly their kind; `StructureRepair` accepts
-/// exactly `[Merge, Split]`.
 #[must_use]
 pub fn family_kinds(family: CurationFamily) -> &'static [CurationKind] {
     match family {
@@ -169,13 +167,6 @@ pub struct CurationHandlerDescriptor {
 
 impl CurationHandlerDescriptor {
     /// Validates identity bounds and exact canonical kind coverage.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ContractViolation`] when `handler_id` is blank or longer
-    /// than 128 bytes, when `accepted_kinds` is empty, or when it differs
-    /// from exactly [`family_kinds`] of `family` (in particular, a
-    /// `structure_repair` handler must accept exactly merge plus split).
     pub fn validate(&self) -> Result<(), ContractViolation> {
         non_blank(&self.handler_id, "handler_id")?;
         if self.handler_id.len() > 128 {
@@ -273,13 +264,7 @@ impl CurationHandlerRegistry {
         Ok(())
     }
 
-    /// Validates exact closure: every descriptor is intrinsically valid and
-    /// the eleven wire kinds are covered exactly once, with no gaps.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContractViolation::Registry`] naming the first missing,
-    /// duplicated, or overlapped kind.
+    /// Validates exact closure: descriptors valid, eleven kinds covered once.
     pub fn validate_closure(&self) -> Result<(), ContractViolation> {
         for descriptor in &self.handlers {
             descriptor
@@ -298,25 +283,23 @@ impl CurationHandlerRegistry {
                 covered.push(*kind);
             }
         }
-        let mut covered = sorted_kinds(covered);
-        covered.sort_by_key(|kind| kind.as_str());
-        let mut all = sorted_kinds(
-            [
-                CurationKind::Classification,
-                CurationKind::Relation,
-                CurationKind::Episode,
-                CurationKind::Concept,
-                CurationKind::Procedure,
-                CurationKind::Failure,
-                CurationKind::Merge,
-                CurationKind::Split,
-                CurationKind::Reconsolidation,
-                CurationKind::Accessibility,
-                CurationKind::Repair,
-            ]
-            .to_vec(),
-        );
-        all.sort_by_key(|kind| kind.as_str());
+        let covered = sorted_kinds(covered);
+        let mut all = Vec::new();
+        for family in [
+            CurationFamily::Classification,
+            CurationFamily::Relation,
+            CurationFamily::Episode,
+            CurationFamily::Concept,
+            CurationFamily::Procedure,
+            CurationFamily::Failure,
+            CurationFamily::StructureRepair,
+            CurationFamily::Reconsolidation,
+            CurationFamily::Accessibility,
+            CurationFamily::MemoryRepair,
+        ] {
+            all.extend_from_slice(family_kinds(family));
+        }
+        let all = sorted_kinds(all);
         if covered != all {
             let missing: Vec<&str> = all
                 .iter()
@@ -331,9 +314,6 @@ impl CurationHandlerRegistry {
     }
 
     /// Returns the sha256 hex digest over sorted `family:handler_id` lines.
-    ///
-    /// Insertion-order independent: two registries with the same descriptors
-    /// in different orders share one digest.
     #[must_use]
     pub fn digest(&self) -> String {
         let mut lines: Vec<String> = self
@@ -346,12 +326,53 @@ impl CurationHandlerRegistry {
     }
 }
 
-/// Typed invocation envelope: one kind, its family, explicit job identities,
-/// a valid fence, and exactly the payload of that kind.
-///
-/// The identity triple mirrors [`crate::job::DreamJobInput`] (`job_id`,
-/// `scope_id`, `task_id`) as explicit strings; the job itself never crosses
-/// the handler boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AtomicityMode {
+    AllOrNothing,
+    PerMember,
+}
+
+/// Complete target/member denominator under one atomicity mode.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TargetDenominator {
+    pub mode: AtomicityMode,
+    pub members: Vec<String>,
+    pub expected_total: u32,
+}
+
+impl TargetDenominator {
+    /// Validates exact member coverage against `expected_total`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ContractViolation`] on length, blank, or duplicate members.
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        if self.members.len() != self.expected_total as usize {
+            return Err(ContractViolation::BindingMismatch {
+                field: "members",
+                reason: "denominator members must exactly cover expected_total".to_owned(),
+            });
+        }
+        for m in &self.members {
+            non_blank(m, "members")?;
+        }
+        let mut ordered = self.members.clone();
+        ordered.sort();
+        ordered.dedup();
+        if ordered.len() != self.members.len() {
+            return Err(ContractViolation::BindingMismatch {
+                field: "members",
+                reason: "duplicate denominator member".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Typed invocation envelope for the A-31 seam: kind, family, job identities,
+/// fence, payload, denominator, and optional screen binding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TypedCurationHandlerRequest {
@@ -363,16 +384,16 @@ pub struct TypedCurationHandlerRequest {
     pub task_id: String,
     pub state_fence: StateFence,
     pub payload: CurationPayload,
+    pub denominator: TargetDenominator,
+    pub screen_binding: Option<ScreenBinding>,
 }
 
 impl TypedCurationHandlerRequest {
-    /// Validates identities, kind/family/payload agreement, and the fence.
+    /// Validates identities, agreement, fence, denominator, and screen binding.
     ///
     /// # Errors
     ///
-    /// Returns [`ContractViolation::KindPayload`] when `family` differs from
-    /// [`family_of`] of `kind` or the payload carries another kind, and a
-    /// binding or malformed violation for blank identities or a bad fence.
+    /// Returns [`ContractViolation`] on drift, unscreened targets, or bad bindings.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         non_blank(&self.request_id, "request_id")?;
         non_blank(&self.job_id, "job_id")?;
@@ -395,6 +416,45 @@ impl TypedCurationHandlerRequest {
         }
         check_fence(&self.state_fence)?;
         self.payload.validate()?;
+        self.denominator.validate()?;
+        let targets = &self.payload.facets().targets;
+        if !targets.iter().all(|t| self.denominator.members.contains(t)) {
+            return Err(ContractViolation::BindingMismatch {
+                field: "targets",
+                reason: "payload targets outside complete denominator".to_owned(),
+            });
+        }
+        if self.denominator.mode == AtomicityMode::AllOrNothing
+            && targets.len() != self.denominator.members.len()
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "targets",
+                reason: "all-or-nothing targets must equal the denominator".to_owned(),
+            });
+        }
+        if let Some(binding) = &self.screen_binding {
+            binding.validate()?;
+            if !self
+                .payload
+                .facets()
+                .targets
+                .iter()
+                .all(|t| binding.screened_targets.contains(t))
+            {
+                return Err(ContractViolation::ScreenIneligible(
+                    "payload adds unscreened target".to_owned(),
+                ));
+            }
+            if binding.task_id != self.task_id
+                || binding.scope_id != self.scope_id
+                || binding.state_fence != self.state_fence
+            {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "screen_binding",
+                    reason: "screen binding task/scope/fence must match request".to_owned(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -469,12 +529,9 @@ impl TypedCurationHandlerResult {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::curation::{
-        AccessibilityPayload, ConceptPayload, EpisodePayload, FailurePayload, MergePayload,
-        ProcedurePayload, ReconsolidationPayload, RelationPayload, RepairPayload, SplitPayload,
-    };
+    use crate::curation::{CURATION_WIRE_KINDS, MergePayload, parse_kind, sample_payload};
     use crate::draft::ValidatedCurationItem;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, sha256_hex};
 
     fn fence() -> StateFence {
         StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
@@ -526,12 +583,42 @@ mod tests {
                 left: "a".to_owned(),
                 right: "b".to_owned(),
                 merged: "ab".to_owned(),
+                target_evidence: crate::curation::sample_facets(),
             }),
+            denominator: TargetDenominator {
+                mode: AtomicityMode::AllOrNothing,
+                members: vec!["a".to_owned(), "b".to_owned(), "ab".to_owned()],
+                expected_total: 3,
+            },
+            screen_binding: None,
         }
     }
 
-    fn hex64(seed: &str) -> String {
-        format!("{:x}", Sha256::digest(seed.as_bytes()))
+    fn kind_request(kind: CurationKind, wire: &str) -> TypedCurationHandlerRequest {
+        let payload = sample_payload(kind);
+        let targets = payload.facets().targets.clone();
+        let mut members = targets.clone();
+        members.push("extra".to_owned());
+        let mut request = sample_request();
+        request.request_id = wire.to_owned();
+        request.kind = kind;
+        request.family = family_of(kind);
+        request.payload = payload;
+        request.denominator.members = members;
+        request.denominator.expected_total = 4;
+        request.denominator.mode = AtomicityMode::PerMember;
+        request.screen_binding = Some(ScreenBinding {
+            request_id: "req-screen".to_owned(),
+            receipt_id: "rcpt-screen".to_owned(),
+            screened_targets: targets,
+            source_snapshot: "snap-1".to_owned(),
+            source_revision: "rev-1".to_owned(),
+            profile: "default".to_owned(),
+            task_id: "task-1".to_owned(),
+            scope_id: "scope-1".to_owned(),
+            state_fence: fence(),
+        });
+        request
     }
 
     // WORK_UNIT_CASE: 578/22
@@ -630,13 +717,13 @@ mod tests {
             validator_contract: "a05-validator".to_owned(),
             validator_policy: "policy-7".to_owned(),
             job_id: "job-1".to_owned(),
-            draft_digest: hex64("draft"),
-            bundle_digest: hex64("bundle"),
-            manifest_digest: hex64("manifest"),
+            draft_digest: sha256_hex(b"draft"),
+            bundle_digest: sha256_hex(b"bundle"),
+            manifest_digest: sha256_hex(b"manifest"),
             task_id: "task-1".to_owned(),
             scope_id: "scope-1".to_owned(),
-            input_digest: hex64("validator-input"),
-            output_digest: hex64("validator-output"),
+            input_digest: sha256_hex(b"validator-input"),
+            output_digest: sha256_hex(b"validator-output"),
             terminal_disposition: "accepted".to_owned(),
             proof_ceiling: "candidate-only".to_owned(),
         };
@@ -645,7 +732,7 @@ mod tests {
             receipt: receipt.clone(),
             kind_spelling: "merge".to_owned(),
             family_spelling: "structure_repair".to_owned(),
-            source_digest: hex64("curation-source"),
+            source_digest: sha256_hex(b"curation-source"),
             target_denominator: "scope-1:2-of-2".to_owned(),
             task_id: "task-1".to_owned(),
             scope_id: "scope-1".to_owned(),
@@ -657,7 +744,7 @@ mod tests {
         back.validate().expect("roundtripped item stays valid");
         assert_eq!(back, item);
         assert_eq!(back.receipt, receipt);
-        assert_eq!(back.source_digest, hex64("curation-source"));
+        assert_eq!(back.source_digest, sha256_hex(b"curation-source"));
         assert_eq!(back.target_denominator, "scope-1:2-of-2");
         assert_eq!(back.task_id, "task-1");
         assert_eq!(back.scope_id, "scope-1");
@@ -679,6 +766,7 @@ mod tests {
                 left: "a".to_owned(),
                 right: "b".to_owned(),
                 merged: "ab".to_owned(),
+                target_evidence: crate::curation::sample_facets(),
             })
         );
     }
@@ -709,6 +797,19 @@ mod tests {
                 family_kinds(handler.family).to_vec()
             );
             assert_eq!(handler.accepted_kinds.len(), 1);
+        }
+        // Explicit-discriminant routing per wire kind; all-or-nothing rejects subsets.
+        for wire in CURATION_WIRE_KINDS {
+            let kind = parse_kind(wire).expect("known wire kind");
+            let request = kind_request(kind, wire);
+            request.validate().expect("kind request");
+            assert_eq!(request.family, family_of(kind));
+            let mut strict = request.clone();
+            strict.denominator.mode = AtomicityMode::AllOrNothing;
+            let err = strict
+                .validate()
+                .expect_err("all-or-nothing rejects subsets");
+            assert!(matches!(err, ContractViolation::BindingMismatch { .. }));
         }
     }
 
@@ -829,8 +930,8 @@ mod tests {
             family: request.family,
             disposition: HandlerDisposition::Candidate,
             handler_id: "acc-sr".to_owned(),
-            request_digest: hex64(&request_json),
-            result_digest: hex64("merge-candidate-ab"),
+            request_digest: sha256_hex(request_json.as_bytes()),
+            result_digest: sha256_hex(b"merge-candidate-ab"),
         };
         result.validate().expect("valid result");
         let result_json = serde_json::to_string(&result).expect("serialize result");
@@ -840,12 +941,14 @@ mod tests {
             .validate()
             .expect("roundtripped result stays valid");
         assert_eq!(result_back, result);
-        // Common identities are preserved across the envelope pair.
         assert_eq!(result_back.request_id, request_back.request_id);
         assert_eq!(result_back.kind, request_back.kind);
         assert_eq!(result_back.family, request_back.family);
+        // Candidate results encode no targets and no application.
+        for key in ["targets", "screen_binding", "denominator"] {
+            assert!(!result_json.contains(key), "result must not encode {key}");
+        }
 
-        // A result that drifts kind/family no longer validates.
         let drifted = TypedCurationHandlerResult {
             kind: CurationKind::Repair,
             ..result.clone()
@@ -864,45 +967,60 @@ mod tests {
             Err(ContractViolation::Malformed { .. })
         ));
 
-        // Payload constructors referenced across all families decode cleanly,
-        // keeping every payload struct linked into this protocol's proof.
-        let _ = CurationPayload::Relation(RelationPayload {
-            from_handle: "a".to_owned(),
-            to_handle: "b".to_owned(),
-            relation: "refines".to_owned(),
-        });
-        let _ = CurationPayload::Episode(EpisodePayload {
-            episode: "ep".to_owned(),
-            observed_at_ms: 1,
-        });
-        let _ = CurationPayload::Concept(ConceptPayload {
-            concept: "c".to_owned(),
-            definition: "d".to_owned(),
-        });
-        let _ = CurationPayload::Procedure(ProcedurePayload {
-            procedure: "p".to_owned(),
-            steps: 1,
-        });
-        let _ = CurationPayload::Failure(FailurePayload {
-            fingerprint: "f".to_owned(),
-            signature: "s".to_owned(),
-        });
-        let _ = CurationPayload::Split(SplitPayload {
-            whole: "w".to_owned(),
-            first: "f".to_owned(),
-            second: "s".to_owned(),
-        });
-        let _ = CurationPayload::Reconsolidation(ReconsolidationPayload {
-            target: "t".to_owned(),
-            update: "u".to_owned(),
-        });
-        let _ = CurationPayload::Accessibility(AccessibilityPayload {
-            handle: "h".to_owned(),
-            note: "n".to_owned(),
-        });
-        let _ = CurationPayload::Repair(RepairPayload {
-            target: "t".to_owned(),
-            repair: "r".to_owned(),
-        });
+        // Denominator exactness: wrong total, dupes, and outside targets fail.
+        let mut wrong_total = sample_request();
+        wrong_total.denominator.expected_total = 99;
+        let err = wrong_total.validate().expect_err("wrong total must fail");
+        assert!(matches!(err, ContractViolation::BindingMismatch { .. }));
+        let mut dupe = sample_request();
+        dupe.denominator.members = vec!["a".to_owned(), "a".to_owned(), "b".to_owned()];
+        let err = dupe.validate().expect_err("duplicate member must fail");
+        assert!(matches!(
+            err,
+            ContractViolation::BindingMismatch {
+                field: "members",
+                ..
+            }
+        ));
+        let mut outside = sample_request();
+        outside.denominator.members = vec!["x".to_owned()];
+        outside.denominator.expected_total = 1;
+        assert!(outside.validate().is_err());
+        // Screened dispatch: unscreened targets and foreign task/scope/fence fail.
+        let screened = kind_request(CurationKind::Merge, "req-screened");
+        screened.validate().expect("screened request");
+        let mut unscreened = screened.clone();
+        if let Some(binding) = unscreened.screen_binding.as_mut() {
+            binding.screened_targets.retain(|t| t != "ab");
+        }
+        let err = unscreened
+            .validate()
+            .expect_err("unscreened target must fail");
+        assert!(matches!(err, ContractViolation::ScreenIneligible(_)));
+        let mut foreign_task = screened.clone();
+        if let Some(binding) = foreign_task.screen_binding.as_mut() {
+            binding.task_id = "task-9".to_owned();
+        }
+        let err = foreign_task.validate().expect_err("foreign task must fail");
+        assert!(matches!(err, ContractViolation::BindingMismatch { .. }));
+        let mut foreign_scope = screened.clone();
+        if let Some(binding) = foreign_scope.screen_binding.as_mut() {
+            binding.scope_id = "scope-9".to_owned();
+        }
+        let err = foreign_scope
+            .validate()
+            .expect_err("foreign scope must fail");
+        assert!(matches!(err, ContractViolation::BindingMismatch { .. }));
+        let mut foreign_fence = screened.clone();
+        if let Some(binding) = foreign_fence.screen_binding.as_mut() {
+            binding.state_fence = StateFence::new(
+                AuthorityEpoch::genesis(),
+                ResourceGeneration::new(2).expect("counter"),
+            );
+        }
+        let err = foreign_fence
+            .validate()
+            .expect_err("foreign fence must fail");
+        assert!(matches!(err, ContractViolation::BindingMismatch { .. }));
     }
 }

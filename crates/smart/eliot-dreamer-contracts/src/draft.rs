@@ -293,6 +293,29 @@ pub struct ValidationReceipt {
     pub proof_ceiling: String,
 }
 
+/// Expected identities a receipt binds to; replaces positional string binding.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BindingExpectation {
+    pub job_id: String,
+    pub draft_digest: String,
+    pub bundle_digest: String,
+    pub manifest_digest: String,
+    pub fence: StateFence,
+}
+
+impl BindingExpectation {
+    pub fn for_receipt(receipt: &ValidationReceipt, fence: StateFence) -> Self {
+        Self {
+            job_id: receipt.job_id.clone(),
+            draft_digest: receipt.draft_digest.clone(),
+            bundle_digest: receipt.bundle_digest.clone(),
+            manifest_digest: receipt.manifest_digest.clone(),
+            fence,
+        }
+    }
+}
+
 impl ValidationReceipt {
     /// Validates intrinsic bounds, digest shapes and the closed disposition.
     pub fn validate(&self) -> Result<(), ContractViolation> {
@@ -317,44 +340,34 @@ impl ValidationReceipt {
         }
     }
 
-    /// Validates the receipt, then binds it to the presented identities.
+    /// Validates the receipt, then binds it to the presented expectation.
     ///
     /// Any mismatch of job, draft, bundle, manifest or fence fails with
     /// [`ContractViolation::BindingMismatch`].
-    pub fn validate_binding(
-        &self,
-        job_id: &str,
-        draft_digest: &str,
-        bundle_digest: &str,
-        manifest_digest: &str,
-        fence: &StateFence,
-    ) -> Result<(), ContractViolation> {
+    pub fn validate_binding(&self, expected: &BindingExpectation) -> Result<(), ContractViolation> {
         self.validate()?;
-        if self.job_id != job_id {
-            return Err(ContractViolation::BindingMismatch {
-                field: "job_id",
-                reason: "receipt job binding mismatch".to_string(),
-            });
+        for (field, got, want) in [
+            ("job_id", &self.job_id, &expected.job_id),
+            ("draft_digest", &self.draft_digest, &expected.draft_digest),
+            (
+                "bundle_digest",
+                &self.bundle_digest,
+                &expected.bundle_digest,
+            ),
+            (
+                "manifest_digest",
+                &self.manifest_digest,
+                &expected.manifest_digest,
+            ),
+        ] {
+            if got != want {
+                return Err(ContractViolation::BindingMismatch {
+                    field,
+                    reason: std::format!("receipt {field} binding mismatch"),
+                });
+            }
         }
-        if self.draft_digest != draft_digest {
-            return Err(ContractViolation::BindingMismatch {
-                field: "draft_digest",
-                reason: "receipt draft binding mismatch".to_string(),
-            });
-        }
-        if self.bundle_digest != bundle_digest {
-            return Err(ContractViolation::BindingMismatch {
-                field: "bundle_digest",
-                reason: "receipt bundle binding mismatch".to_string(),
-            });
-        }
-        if self.manifest_digest != manifest_digest {
-            return Err(ContractViolation::BindingMismatch {
-                field: "manifest_digest",
-                reason: "receipt manifest binding mismatch".to_string(),
-            });
-        }
-        fence.validate().map_err(|err| fence_error(&err))?;
+        expected.fence.validate().map_err(|err| fence_error(&err))?;
         Ok(())
     }
 }
@@ -379,23 +392,21 @@ impl ValidatedDreamDraft {
     /// Validates the receipt plus the draft/scope/task/fence binding.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         self.receipt.validate()?;
-        if self.draft_digest != self.receipt.draft_digest {
-            return Err(ContractViolation::BindingMismatch {
-                field: "draft_digest",
-                reason: "validated draft digest binding mismatch".to_string(),
-            });
-        }
-        if self.scope_id != self.receipt.scope_id {
-            return Err(ContractViolation::BindingMismatch {
-                field: "scope_id",
-                reason: "validated draft scope binding mismatch".to_string(),
-            });
-        }
-        if self.task_id != self.receipt.task_id {
-            return Err(ContractViolation::BindingMismatch {
-                field: "task_id",
-                reason: "validated draft task binding mismatch".to_string(),
-            });
+        for (field, got, want) in [
+            (
+                "draft_digest",
+                &self.draft_digest,
+                &self.receipt.draft_digest,
+            ),
+            ("scope_id", &self.scope_id, &self.receipt.scope_id),
+            ("task_id", &self.task_id, &self.receipt.task_id),
+        ] {
+            if got != want {
+                return Err(ContractViolation::BindingMismatch {
+                    field,
+                    reason: std::format!("validated draft {field} binding mismatch"),
+                });
+            }
         }
         self.state_fence
             .validate()
@@ -604,17 +615,8 @@ mod tests {
         let digest = model_wire_digest(&model);
         let receipt = valid_receipt(&digest);
         assert!(receipt.validate().is_ok());
-        assert!(
-            receipt
-                .validate_binding(
-                    "job-1",
-                    &digest,
-                    &receipt.bundle_digest.clone(),
-                    &receipt.manifest_digest.clone(),
-                    &valid_fence(),
-                )
-                .is_ok()
-        );
+        let expected = BindingExpectation::for_receipt(&receipt, valid_fence());
+        assert!(receipt.validate_binding(&expected).is_ok());
 
         let validated = ValidatedDreamDraft {
             receipt: receipt.clone(),
@@ -644,6 +646,7 @@ mod tests {
         let model = valid_model();
         let digest = model_wire_digest(&model);
         let base = valid_receipt(&digest);
+        let expected = BindingExpectation::for_receipt(&base, valid_fence());
 
         // Changed validator identity.
         let mut changed_validator = base.clone();
@@ -653,55 +656,23 @@ mod tests {
         // Changed job binding.
         let mut changed_job = base.clone();
         changed_job.job_id = "job-2".to_string();
-        let bundle = changed_job.bundle_digest.clone();
-        let manifest = changed_job.manifest_digest.clone();
-        assert!(
-            changed_job
-                .validate_binding("job-1", &digest, &bundle, &manifest, &valid_fence())
-                .is_err()
-        );
+        assert!(changed_job.validate_binding(&expected).is_err());
 
         // Changed draft binding (self-consistent, but no longer this draft).
         let mut changed_draft = base.clone();
         changed_draft.draft_digest = sha256_hex(b"other-draft");
         assert!(changed_draft.validate().is_ok());
-        let bundle = changed_draft.bundle_digest.clone();
-        let manifest = changed_draft.manifest_digest.clone();
-        assert!(
-            changed_draft
-                .validate_binding("job-1", &digest, &bundle, &manifest, &valid_fence())
-                .is_err()
-        );
+        assert!(changed_draft.validate_binding(&expected).is_err());
 
         // Changed bundle binding (expected value stays the original).
         let mut changed_bundle = base.clone();
         changed_bundle.bundle_digest = sha256_hex(b"other-bundle");
-        assert!(
-            changed_bundle
-                .validate_binding(
-                    "job-1",
-                    &digest,
-                    &base.bundle_digest,
-                    &base.manifest_digest,
-                    &valid_fence(),
-                )
-                .is_err()
-        );
+        assert!(changed_bundle.validate_binding(&expected).is_err());
 
         // Changed manifest binding (expected value stays the original).
         let mut changed_manifest = base.clone();
         changed_manifest.manifest_digest = sha256_hex(b"other-manifest");
-        assert!(
-            changed_manifest
-                .validate_binding(
-                    "job-1",
-                    &digest,
-                    &base.bundle_digest,
-                    &base.manifest_digest,
-                    &valid_fence(),
-                )
-                .is_err()
-        );
+        assert!(changed_manifest.validate_binding(&expected).is_err());
 
         // Changed digest shape.
         let mut changed_digest = base.clone();

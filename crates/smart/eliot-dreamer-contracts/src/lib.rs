@@ -28,22 +28,23 @@ pub use bundle::{
     SourceDisposition, omit_handle,
 };
 pub use candidate::{
-    CandidateDisposition, CandidateResult, PRESERVATION_DIMENSIONS, PreservationDimension,
-    PreservationReport, propose_candidate,
+    CandidateDisposition, CandidateProposal, CandidateResult, PRESERVATION_DIMENSIONS,
+    PreservationDimension, PreservationReport, propose_candidate,
 };
 pub use curation::{CURATION_WIRE_KINDS, CurationKind, CurationPayload, kind_family, parse_kind};
 pub use draft::{
-    ClaimResidue, GroundedDreamDraft, ModelDraft, RawProviderOutput, SupportState,
-    ValidatedCurationItem, ValidatedDreamDraft, ValidationReceipt,
+    BindingExpectation, ClaimResidue, GroundedDreamDraft, ModelDraft, RawProviderOutput,
+    SupportState, ValidatedCurationItem, ValidatedDreamDraft, ValidationReceipt,
 };
 pub use encoding::{canonical_bytes, digest_hex};
 pub use error::ContractViolation;
 pub use job::{DreamJobInput, JobClass, RequesterOrigin, parse_job_class};
 pub use registry::{
-    CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor, CurationHandlerRegistry,
-    TypedCurationHandlerRequest, TypedCurationHandlerResult, family_of, parse_family,
+    AtomicityMode, CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor,
+    CurationHandlerRegistry, TargetDenominator, TypedCurationHandlerRequest,
+    TypedCurationHandlerResult, family_of, parse_family,
 };
-pub use screen::{ScreenEligibility, ScreenReference, ScreenState};
+pub use screen::{ScreenBinding, ScreenEligibility, ScreenReference, ScreenState};
 
 /// Contract hub identity (`name@version`).
 pub const CONTRACT_NAME: &str = "eliot.smart.dreamer.contracts";

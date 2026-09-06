@@ -109,16 +109,19 @@ impl ScreenEligibility {
     }
 }
 
-/// Opaque, owner-neutral pointer to a screening outcome.
-///
-/// Carries digests and a fence so dispatch can confirm that a screen ran.
-/// Carries no curation kind: generic screens contain no kind, and
-/// kind-specific interpretation belongs to typed handlers.
+/// Opaque, owner-neutral pointer to a screening outcome: digests and a fence
+/// confirm a screen ran; no curation kind is carried.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScreenReference {
     /// Screen identity (non-blank).
     pub screen_id: String,
+    /// A-19c screen request identity (non-blank).
+    pub request_id: String,
+    /// Screen result/receipt identity (non-blank).
+    pub receipt_id: String,
+    /// Screened target identity (non-blank).
+    pub target_id: String,
     /// Digest of the screen result (64 lowercase hex chars).
     pub result_digest: String,
     /// Digest of the screened item (64 lowercase hex chars).
@@ -127,6 +130,8 @@ pub struct ScreenReference {
     pub profile: String,
     /// Source snapshot the screen ran against (non-blank).
     pub source_snapshot: String,
+    /// Source snapshot revision (non-blank).
+    pub source_revision: String,
     /// Population denominator the screen ran against (non-blank).
     pub denominator: String,
     /// Owning task identity (non-blank).
@@ -140,25 +145,20 @@ pub struct ScreenReference {
 }
 
 impl ScreenReference {
-    /// Derives dispatch eligibility.
-    ///
-    /// Returns [`ScreenEligibility::Eligible`] only when the state is
-    /// [`ScreenState::Eligible`] and both digests are well-formed. Every
-    /// other state maps to [`ScreenEligibility::Ineligible`] with an exact
-    /// reason, so no non-eligible state can enable dispatch.
+    /// Derives dispatch eligibility: `Eligible` only for an eligible state
+    /// with well-formed digests, else `Ineligible` with the exact reason.
     #[must_use]
     pub fn eligibility(&self) -> ScreenEligibility {
         match self.state {
             ScreenState::Eligible => {
-                if !is_digest(&self.result_digest) {
-                    return ScreenEligibility::Ineligible {
-                        reason: "screen result digest is not 64 lowercase hex".to_owned(),
-                    };
-                }
-                if !is_digest(&self.item_digest) {
-                    return ScreenEligibility::Ineligible {
-                        reason: "screen item digest is not 64 lowercase hex".to_owned(),
-                    };
+                for (label, digest) in
+                    [("result", &self.result_digest), ("item", &self.item_digest)]
+                {
+                    if !is_digest(digest) {
+                        return ScreenEligibility::Ineligible {
+                            reason: std::format!("screen {label} digest is not 64 lowercase hex"),
+                        };
+                    }
                 }
                 ScreenEligibility::Eligible
             }
@@ -189,30 +189,56 @@ impl ScreenReference {
         }
     }
 
-    /// Validates identity, digest, and binding shape.
-    ///
-    /// Checks digest formats and non-blank fields plus the state fence.
-    /// State gating itself belongs to [`ScreenReference::eligibility`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContractViolation`] when any field is blank, any digest is
-    /// not 64 lowercase hex chars, or the fence is empty.
+    /// Validates identity, digest, and binding shape (not state gating).
     pub fn validate(&self) -> Result<(), ContractViolation> {
         require_non_blank("screen_id", &self.screen_id)?;
+        require_non_blank("request_id", &self.request_id)?;
+        require_non_blank("receipt_id", &self.receipt_id)?;
+        require_non_blank("target_id", &self.target_id)?;
         require_non_blank("profile", &self.profile)?;
         require_non_blank("source_snapshot", &self.source_snapshot)?;
+        require_non_blank("source_revision", &self.source_revision)?;
         require_non_blank("denominator", &self.denominator)?;
         require_non_blank("task_id", &self.task_id)?;
         require_non_blank("scope_id", &self.scope_id)?;
         require_digest("result_digest", &self.result_digest)?;
         require_digest("item_digest", &self.item_digest)?;
-        self.state_fence
-            .validate()
-            .map_err(|_| ContractViolation::BindingMismatch {
-                field: "state_fence",
-                reason: "screen state fence is empty".to_owned(),
-            })?;
+        check_fence(&self.state_fence)?;
+        Ok(())
+    }
+}
+
+/// Owner-neutral A-19c screen handle for the A-31 seam.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenBinding {
+    pub request_id: String,
+    pub receipt_id: String,
+    pub screened_targets: Vec<String>,
+    pub source_snapshot: String,
+    pub source_revision: String,
+    pub profile: String,
+    pub task_id: String,
+    pub scope_id: String,
+    pub state_fence: StateFence,
+}
+
+impl ScreenBinding {
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        require_non_blank("request_id", &self.request_id)?;
+        require_non_blank("receipt_id", &self.receipt_id)?;
+        require_non_blank("source_snapshot", &self.source_snapshot)?;
+        require_non_blank("source_revision", &self.source_revision)?;
+        require_non_blank("profile", &self.profile)?;
+        require_non_blank("task_id", &self.task_id)?;
+        require_non_blank("scope_id", &self.scope_id)?;
+        if self.screened_targets.is_empty() {
+            return Err(ContractViolation::MissingField("screened_targets"));
+        }
+        for target in &self.screened_targets {
+            require_non_blank("screened_targets", target)?;
+        }
+        check_fence(&self.state_fence)?;
         Ok(())
     }
 }
@@ -230,6 +256,15 @@ fn require_non_blank(field: &'static str, value: &str) -> Result<(), ContractVio
         return Err(ContractViolation::MissingField(field));
     }
     Ok(())
+}
+
+fn check_fence(fence: &StateFence) -> Result<(), ContractViolation> {
+    fence
+        .validate()
+        .map_err(|_| ContractViolation::BindingMismatch {
+            field: "state_fence",
+            reason: "screen state fence is empty".to_owned(),
+        })
 }
 
 fn require_digest(field: &'static str, value: &str) -> Result<(), ContractViolation> {
@@ -255,10 +290,14 @@ mod tests {
     fn valid_reference() -> ScreenReference {
         ScreenReference {
             screen_id: "screen-36".to_owned(),
+            request_id: "req-36".to_owned(),
+            receipt_id: "rcpt-36".to_owned(),
+            target_id: "target-36".to_owned(),
             result_digest: "a".repeat(64),
             item_digest: "b".repeat(64),
             profile: "default".to_owned(),
             source_snapshot: "snapshot-1".to_owned(),
+            source_revision: "rev-7".to_owned(),
             denominator: "population".to_owned(),
             task_id: "task-1".to_owned(),
             scope_id: "scope-1".to_owned(),
@@ -277,6 +316,10 @@ mod tests {
         let decoded: ScreenReference =
             serde_json::from_slice(&bytes).expect("reference roundtrips");
         assert_eq!(decoded, reference);
+        assert_eq!(decoded.request_id, "req-36");
+        assert_eq!(decoded.receipt_id, "rcpt-36");
+        assert_eq!(decoded.target_id, "target-36");
+        assert_eq!(decoded.source_revision, "rev-7");
         assert_eq!(decoded.eligibility(), ScreenEligibility::Eligible);
     }
 

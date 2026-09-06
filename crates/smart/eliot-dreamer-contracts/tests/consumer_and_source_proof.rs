@@ -189,10 +189,14 @@ fn fixture_registry() -> CurationHandlerRegistry {
 fn fixture_screen() -> ScreenReference {
     ScreenReference {
         screen_id: "screen-44".to_owned(),
+        request_id: "req-44".to_owned(),
+        receipt_id: "rcpt-44".to_owned(),
+        target_id: "target-44".to_owned(),
         result_digest: "c".repeat(64),
         item_digest: "d".repeat(64),
         profile: "default".to_owned(),
         source_snapshot: "snapshot-1".to_owned(),
+        source_revision: "rev-7".to_owned(),
         denominator: "population".to_owned(),
         task_id: "task-1".to_owned(),
         scope_id: "scope-1".to_owned(),
