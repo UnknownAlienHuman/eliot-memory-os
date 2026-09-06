@@ -569,5 +569,177 @@ class BoundaryRegressionTests(unittest.TestCase):
                 self.assertEqual('text', receiver.id)
 
 
+class HeadingCompatibilityTests(unittest.TestCase):
+    """#818's finite heading table at the actual #849 acquisition boundary.
+
+    Additional regressions preserve all original 36 primary case bindings.
+    Captured matrix text is data, never a trusted offline authority receipt.
+    """
+    reject = SourceTests.reject
+    parse = SourceTests.parse
+    ALIASES = ('Required test matrix', 'Deterministic acceptance matrix',
+               'Repair and acceptance contract')
+
+    def test_finite_alias_table_has_exactly_the_three_accepted_names(self):
+        self.assertEqual(frozenset(name.lower() for name in self.ALIASES), s.MATRIX_HEADING_ALIASES)
+        self.assertEqual('eliot-assignment-matrix-headings-v2', s.MATRIX_HEADING_POLICY)
+        self.assertEqual('eliot-assignment-matrix-v1', s.MATRIX_SCHEMA)
+        with self.assertRaises(TypeError):
+            s.parse_matrix(BODY, ISSUE, heading_aliases=('arbitrary acceptance',))
+
+    def test_each_alias_works_through_the_real_acquisition_path(self):
+        expected = self.parse(BODY)
+        for alias in self.ALIASES:
+            with self.subTest(alias=alias):
+                body = BODY.replace('Required test matrix', alias)
+                result = acquire(LIVE | {'body': body})
+                self.assertEqual([1, 2], [case.identity.number for case in result.matrix.cases])
+                self.assertEqual(expected.matrix_sha256, result.receipt.matrix_sha256)
+                self.assertEqual(hashlib.sha256(body.encode()).hexdigest(), result.receipt.body_sha256)
+                self.assertEqual(body, result.body)
+
+    def test_case_horizontal_whitespace_and_balanced_outer_decoration(self):
+        expected = self.parse(BODY)
+        for alias in self.ALIASES:
+            for wrapper in ('', '*', '**', '_', '__'):
+                for closing in ('', ' ###'):
+                    heading = '##\t' + wrapper + alias.upper().replace(' ', ' \t ') + wrapper + closing + '  '
+                    with self.subTest(heading=heading):
+                        body = BODY.replace('## Required test matrix', heading)
+                        result = self.parse(body)
+                        self.assertEqual(expected.matrix_sha256, result.matrix_sha256)
+                        self.assertEqual(hashlib.sha256(body.encode()).hexdigest(), result.body_sha256)
+
+    def test_near_matches_and_inline_code_are_not_matrix_authority(self):
+        for title in ('Acceptance criteria', 'Required result', 'Verification and acceptance',
+                      'Examples of required test matrix', 'Required test matrix examples',
+                      'Required test matrix:', '`Required test matrix`',
+                      '[Required test matrix](https://example.invalid)',
+                      '**Required test matrix', 'Required **test** matrix',
+                      '***Required test matrix***', 'Required\u00a0test matrix'):
+            with self.subTest(title=title):
+                self.reject(s.SourceProblem.MATRIX_MISSING, self.parse,
+                            BODY.replace('Required test matrix', title))
+
+    def test_mixed_duplicate_aliases_fail_even_after_verification_section(self):
+        for first in self.ALIASES:
+            for second in self.ALIASES:
+                with self.subTest(first=first, second=second):
+                    body = BODY.replace('Required test matrix', first)
+                    body += '\n## **' + second.upper() + '**\n1. Ambiguous second matrix.\n'
+                    self.reject(s.SourceProblem.MATRIX_MULTIPLE, self.parse, body)
+
+    def test_every_alias_at_wrong_heading_level_fails(self):
+        for alias in self.ALIASES:
+            for level in (1, 3, 4, 5, 6):
+                with self.subTest(alias=alias, level=level):
+                    self.reject(s.SourceProblem.MATRIX_HEADING, self.parse,
+                                BODY.replace('## Required test matrix', '#' * level + ' ' + alias))
+
+    def test_hidden_aliases_do_not_supply_or_duplicate_a_matrix(self):
+        for alias in self.ALIASES:
+            heading = '## **' + alias + '**'
+            hidden = ('```\n' + heading + '\n1. Example.\n```\n',
+                      '> ' + heading + '\n> 1. Example.\n',
+                      '    ' + heading + '\n    1. Example.\n',
+                      '\t' + heading + '\n\t1. Example.\n')
+            for block in hidden:
+                with self.subTest(alias=alias, block=block[:8]):
+                    self.assertEqual(2, len(self.parse(block + BODY).cases))
+                    self.reject(s.SourceProblem.MATRIX_MISSING, self.parse, block)
+
+    def test_indented_heading_is_not_promoted_from_nested_content(self):
+        for spaces in (1, 2, 3):
+            self.reject(s.SourceProblem.MATRIX_MISSING, self.parse,
+                        BODY.replace('## Required test matrix', ' ' * spaces + '## Required test matrix'))
+
+    def test_declared_count_and_numbering_guards_apply_to_every_alias(self):
+        for alias in self.ALIASES:
+            base = BODY.replace('Required test matrix', alias)
+            for body in (base.replace('2 cases', '1 cases'), base.replace('1..2', '1..3')):
+                self.reject(s.SourceProblem.MATRIX_DENOMINATOR, self.parse, body)
+            for body in (base.replace('1. Accept', '0. Accept'), base.replace('2. Reject', '1. Reject'),
+                         base.replace('2. Reject', '3. Reject')):
+                self.reject(s.SourceProblem.MATRIX_NUMBERING, self.parse, body)
+
+    def test_alias_does_not_replace_missing_count_or_empty_case_sequence(self):
+        for alias in self.ALIASES:
+            self.reject(s.SourceProblem.MATRIX_DENOMINATOR, self.parse,
+                        '## ' + alias + '\n1. Real obligation.\n')
+            self.reject(s.SourceProblem.MATRIX_EMPTY, self.parse,
+                        '## ' + alias + '\nDeclared denominator: 1 case.\n')
+
+    def test_exact_crlf_unicode_case_spans_are_not_normalized(self):
+        for alias in self.ALIASES:
+            body = BODY.replace('Required test matrix', alias).replace('current identity.',
+                    'точную идентичность café.').replace('\n', '\r\n')
+            parsed = self.parse(body)
+            for case in parsed.cases:
+                self.assertEqual(case.text.encode(), body.encode()[case.start_byte:case.end_byte])
+                self.assertIn('\r\n', case.text)
+            self.assertEqual(hashlib.sha256(body.encode()).hexdigest(), parsed.body_sha256)
+
+    def test_heading_only_change_keeps_matrix_but_invalidates_body_bound_descriptor(self):
+        first = acquire()
+        changed = acquire(LIVE | {'body': BODY.replace('Required test matrix', 'Repair and acceptance contract')})
+        self.assertEqual(first.receipt.matrix_sha256, changed.receipt.matrix_sha256)
+        self.assertNotEqual(first.receipt.body_sha256, changed.receipt.body_sha256)
+        descriptor = c.WorkUnitDescriptor(c.WORK_UNIT_DESCRIPTOR_SCHEMA, c.DescriptorIdentity('849-source'), ISSUE,
+            REQUEST.unit, c.RunnerMode.PYTHON_UNITTEST, (c.RepositoryPath('scripts/work_unit_gate/assignment_source.py'),),
+            (c.RepositoryPath('scripts/tests/test_work_unit_assignment_source.py'),), 2, c.ProofCeiling('source-only'),
+            1, first.receipt.body_sha256, first.receipt.matrix_sha256, False,
+            c.VerificationRequirements(1, 0, 2, ()), c.ExecutionBounds(20000, 5000, 65536, 4096, 100, 1))
+        with self.assertRaises(c.ContractViolation):
+            c.SourceShapeGateReceipt(changed.receipt, descriptor, c.OverallResult.PASS, (), descriptor.proof_ceiling,
+                                     'a'*64, 1, 0, 2, ())
+
+    def test_actual_840_section_retains_all_ten_original_obligations(self):
+        fixture = json.loads((FIXTURES / 'heading-compatibility.json').read_text(encoding='utf-8'))
+        body = fixture['excerpt']
+        issue = c.IssueIdentity(c.RepositoryIdentity('UnknownAlienHuman', 'eliot-memory-os'), 840)
+        parsed = s.parse_matrix(body, issue)
+        self.assertEqual(list(range(1, 11)), fixture['expected_cases'])
+        self.assertEqual(fixture['expected_cases'], [case.identity.number for case in parsed.cases])
+        self.assertEqual(fixture['excerpt_sha256'], hashlib.sha256(body.encode()).hexdigest())
+        self.assertTrue(parsed.cases[0].text.startswith('1. baseline failure is the obsolete literal'))
+        self.assertTrue(parsed.cases[9].text.startswith('10. product diff is solely the stale assertion removal'))
+        self.assertNotIn('## Verification', parsed.cases[9].text)
+        for case in parsed.cases:
+            self.assertEqual(issue, case.identity.issue)
+            self.assertEqual(case.text.encode(), body.encode()[case.start_byte:case.end_byte])
+        # An excerpt is not an offline source receipt and cannot admit itself.
+        self.reject(s.SourceProblem.UNTRUSTED_CAPTURE, s.AssignmentSource(REQUEST).read, OFFLINE_MODE)
+
+    def test_real_840_shape_is_acquired_without_renaming_its_heading(self):
+        fixture = json.loads((FIXTURES / 'heading-compatibility.json').read_text(encoding='utf-8'))
+        issue = c.IssueIdentity(c.RepositoryIdentity('UnknownAlienHuman', 'eliot-memory-os'), 840)
+        request = s.SourceRequest(issue, c.WorkUnitIdentity('D-TEST-CLI-CONTRACT'), c.AssignmentSourceUse.ACTIVE_ASSIGNMENT)
+        # This finite transport fixture exercises the real production decoder;
+        # it is not evidence that the module made a live GitHub HTTPS request.
+        payload = LIVE | {'number': 840, 'title': '[D-TEST-CLI-CONTRACT] Remove the stale duplicated MCP version assertion',
+            'url': request.endpoint, 'repository_url': 'https://api.github.com/repos/UnknownAlienHuman/eliot-memory-os',
+            'html_url': fixture['source_url'], 'body': fixture['excerpt'], 'updated_at': fixture['source_updated_at']}
+        result = acquire(payload, request=request, observed=response(payload=payload, url=request.endpoint))
+        self.assertEqual(10, result.receipt.matrix_cases)
+        self.assertEqual(request.unit, result.receipt.unit)
+        self.assertEqual('assignment-source-only', result.receipt.proof_ceiling.value)
+
+    def test_empty_major_heading_ends_matrix_before_unrelated_numbering(self):
+        for separator in ('#', '##', '##  ', '# ###'):
+            body = BODY.replace('## Verification', separator) + '99. Outside the matrix.\n'
+            parsed = self.parse(body)
+            self.assertEqual(2, len(parsed.cases))
+            self.assertNotIn('99. Outside', parsed.cases[-1].text)
+            self.assertNotIn('No live effects', parsed.cases[-1].text)
+
+    def test_subheading_group_preserves_numbering_and_case_boundaries(self):
+        for alias in self.ALIASES:
+            body = BODY.replace('Required test matrix', alias).replace('2. Reject', '### **Second group** ###\n2. Reject')
+            parsed = self.parse(body)
+            self.assertEqual([1, 2], [case.identity.number for case in parsed.cases])
+            self.assertNotIn('Second group', parsed.cases[0].text)
+            self.assertTrue(parsed.cases[1].text.startswith('2. Reject'))
+
+
 if __name__ == '__main__':
     unittest.main()

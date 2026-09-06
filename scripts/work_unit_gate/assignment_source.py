@@ -5,8 +5,10 @@ capture expectation through a separate configuration channel. Nothing in an
 issue, snapshot or worker descriptor can create that expectation. Receipts use
 contracts v4; parsed spans are source data, not another authority schema.
 
-Markdown grammar v1: one unquoted/unfenced H2 `Required test matrix`, column-zero
-ordered cases 1..N, H3 groups, and an explicit numeric denominator. Fenced,
+Markdown matrix v1 with heading policy v2: one unquoted/unfenced column-zero
+H2 from the finite #818 compatibility table, column-zero cases 1..N, H3 groups,
+and an explicit numeric denominator. Only heading recognition is normalized;
+case/body bytes and their existing v1 digest format are unchanged. Fenced,
 indented, quoted and nested examples do not add cases. Unsupported HTML blocks
 and unterminated fences fail closed. Hashes preserve UTF-8, CRLF and whitespace.
 
@@ -38,6 +40,14 @@ from . import contracts as c
 API_ORIGIN = "https://api.github.com"
 API_VERSION = "2026-03-10"
 MATRIX_SCHEMA = "eliot-assignment-matrix-v1"
+MATRIX_HEADING_POLICY = "eliot-assignment-matrix-headings-v2"
+# Exact aliases agreed by #818. This is the sole matrix-title recognition table;
+# callers must not add fuzzy acceptance/verification substring heuristics.
+MATRIX_HEADING_ALIASES = frozenset({
+    "required test matrix",
+    "deterministic acceptance matrix",
+    "repair and acceptance contract",
+})
 SNAPSHOT_SCHEMA = "eliot-assignment-snapshot-v1"
 _TOKEN_ENV = frozenset({"GITHUB_TOKEN", "GH_TOKEN"})
 
@@ -279,6 +289,26 @@ def _visible_lines(body: str, limits: SourceLimits) -> tuple[list[str], list[boo
     return lines, visible, offsets
 
 
+def _atx_heading(raw: str) -> tuple[int, str] | None:
+    """Recognize column-zero ATX headings without rewriting the source body.
+
+    Preserve the established structural grammar. Normalize only horizontal
+    whitespace, case, an optional closing hash sequence and one balanced outer
+    emphasis/strong wrapper. Backticks, links, punctuation and extra words are
+    not erased: they cannot turn a different heading into a trusted matrix.
+    Visibility (code/quotes) is decided before calling this helper.
+    """
+    heading = re.fullmatch(r"(#{1,6})(?:[ \t]+(.*))?", raw.rstrip("\r\n"))
+    if heading is None:
+        return None
+    text = re.sub(r"[ \t]+#+[ \t]*$", "", heading[2] or "").strip(" \t")
+    for marker in ("**", "__", "*", "_"):
+        if len(text) > 2 * len(marker) and text.startswith(marker) and text.endswith(marker):
+            text = text[len(marker):-len(marker)].strip(" \t")
+            break
+    return len(heading[1]), re.sub(r"[ \t]+", " ", text).lower()
+
+
 def parse_matrix(body: str, issue: c.IssueIdentity, limits: SourceLimits = SourceLimits()) -> ParsedMatrix:
     """Parse exact case spans; this alone establishes no source authority."""
     _require(type(issue) is c.IssueIdentity and type(limits) is SourceLimits, SourceProblem.CONFIGURATION)
@@ -287,15 +317,16 @@ def parse_matrix(body: str, issue: c.IssueIdentity, limits: SourceLimits = Sourc
     for index, raw in enumerate(lines):
         if not visible[index]:
             continue
-        heading = re.fullmatch(r"(#{1,6})[ \t]+Required test matrix[ \t]*(?:[ \t]+#+)?", raw.rstrip("\r\n"))
-        if heading:
-            _require(len(heading[1]) == 2, SourceProblem.MATRIX_HEADING)
+        heading = _atx_heading(raw)
+        if heading is not None and heading[1] in MATRIX_HEADING_ALIASES:
+            _require(heading[0] == 2, SourceProblem.MATRIX_HEADING)
             headings.append(index)
     _require(len(headings) > 0, SourceProblem.MATRIX_MISSING)
     _require(len(headings) == 1, SourceProblem.MATRIX_MULTIPLE)
     start, end = headings[0] + 1, len(lines)
     for index in range(start, len(lines)):
-        if visible[index] and re.match(r"#{1,2}[ \t]+", lines[index]):
+        heading = _atx_heading(lines[index]) if visible[index] else None
+        if heading is not None and heading[0] <= 2:
             end = index
             break
     starts, stops, declarations = [], [], []
@@ -319,7 +350,8 @@ def parse_matrix(body: str, issue: c.IssueIdentity, limits: SourceLimits = Sourc
             _require(declaration_seen, SourceProblem.MATRIX_DENOMINATOR)
         if text and text[0].isdecimal() and not text[0].isascii():
             raise SourceError(SourceProblem.MATRIX_NUMBERING)
-        if re.match(r"#{3,6}[ \t]+", text):
+        heading = _atx_heading(text)
+        if heading is not None and heading[0] >= 3:
             if current is not None:
                 stops.append(index)
                 current = None

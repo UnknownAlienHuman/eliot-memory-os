@@ -1,0 +1,19 @@
+{
+  "fixture_kind": "bounded-matrix-section-regression-not-authority-snapshot",
+  "source_url": "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/840",
+  "source_updated_at": "2026-09-05T13:19:50Z",
+  "excerpt_sha256": "c09125302da6e76e0e94566bd90f20461b12b7dbecb440b93d33f667ad012ca1",
+  "expected_cases": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "excerpt": "## Repair and acceptance contract\n\nReproduce the old failure through its actual test on the assigned source; keep the output. Do not require the corrected test to fail. Delete the stale assertion, not its whole containing function or its valid four-provider checks. Retain the production alias to the canonical MCP owner without copying its current revision literal into another assertion. No added MCP provider row or version mutation.\n\nThe ten Python tests exercise the following distinct source/run predicates. A shared setup may execute the actual fixed Rust suite once per current candidate and retain its validated result for assertions; no historical, caller-authored passed JSON or marker-only evidence. Source checks use the current parsed item/diff and the frozen counterpart, not global substring matching that counts comments or fixture strings. Negative fixtures demonstrate that an invented provider row, removed valid assertion or changed production token is rejected.\n\n**Declared denominator: 10 cases, exactly 1..10.** One real Python unittest per `# WORK_UNIT_CASE: 840/<case>` immediately above its method. All ten passing checks and independent diff review are required; a green Cargo result alone is insufficient.\n\n1. baseline failure is the obsolete literal, or a reviewed already-correct disposition has exact equivalent evidence;\n2. production MCP constant still delegates to the canonical owner;\n3. no second current MCP version literal remains in this test;\n4. catalogue and retained test still require exactly four actual providers;\n5. every provider's nonempty version assertion remains effective;\n6. every provider's 64-character shape-digest assertion remains effective;\n7. no MCP provider row is invented;\n8. the exact original Rust test is discovered, selected once and actually passes;\n9. actual current CLI package tests pass; a separate failure remains non-green rather than being ignored;\n10. product diff is solely the stale assertion removal; the only additional paths are this named test-only acceptance wrapper and reservation removal.\n\nThe slight scope extension in case 10 is solely for executable acceptance, not a new product feature or weakened original one-line repair. Clippy and git diff checks remain additional required evidence. The ten checks must fail on their relevant source/run mutation, not merely assert constants about the assignment.\n\n## Verification\n"
+}
