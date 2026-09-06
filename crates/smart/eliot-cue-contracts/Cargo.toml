@@ -23,19 +23,20 @@ agent_order = 10
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
 eliot-evidence = { path = "../../foundation/eliot-evidence" }
+schemars = { version = "1.2.1", features = ["derive", "uuid1"] }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+
+[dev-dependencies]
+serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 
 [lints]
 workspace = true
 
-# Standalone workspace root. Without this, cargo walks above the repository
-# and can bind this package to an unrelated ancestor manifest, so every
-# per-crate `cargo check|test|clippy` fails before it starts. Remove this
-# table when the cell is promoted into the root workspace `members`.
+# Standalone workspace root retained until all 50 A-10 cases pass. The later
+# serialized integration owner #829 removes this table and admits the package.
 [workspace]
 
-# Mirrors the root `[workspace.lints]` verbatim so an excluded cell is linted
-# exactly like an admitted one. Keep in sync; the promotion commit drops this
-# whole `[workspace]` table and restores plain inheritance.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "allow"
