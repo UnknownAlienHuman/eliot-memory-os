@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Mechanical acceptance gate for one ELIOT work unit.
+"""Legacy source-shape diagnostics, NOT work-unit completion evidence.
 
-Reads `[acceptance]` from a crate's module.toml and proves the crate is
-actually implemented. Unlike `cargo test`, this FAILS on an empty crate.
+The former checker counted declarations and `cargo test -- --list` output.
+Neither proves test execution or assignment-case coverage. Until #837 composes
+#849/#850/#851/#852, this compatibility entrypoint must fail closed for an
+acceptance request, even when every source-shape hint matches. It runs no Cargo
+command and cannot approve a work unit. Use the independently reviewed,
+assignment-specific bootstrap checks; do not interpret these hints as proof.
 
 Usage:
     python scripts/verify-work-unit.py --crate <name> [--root .] [--no-cargo]
 
 Exit codes:
-    0  every acceptance rule satisfied
-    1  one or more rules violated (each printed)
+    0  help only; no work unit is accepted by this legacy entrypoint
+    1  execution evidence incomplete, with source-shape findings when available
     2  usage / configuration error
 """
 
@@ -17,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -81,10 +84,10 @@ def read_sources(cdir: Path) -> tuple[str, str]:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--crate", required=True)
     ap.add_argument("--root", default=".")
-    ap.add_argument("--no-cargo", action="store_true", help="skip cargo test --list")
+    ap.add_argument("--no-cargo", action="store_true", help="legacy diagnostic flag; does not authorize skipping execution proof")
     args = ap.parse_args()
 
     root = Path(args.root).resolve()
@@ -162,28 +165,27 @@ def main() -> int:
         "cargo will refuse with 'believes it's in a workspace when it's not'",
     )
 
-    # ---- 6. tests actually run ------------------------------------------
-    if not args.no_cargo and (member or excluded or standalone):
-        proc = subprocess.run(
-            ["cargo", "test", "--manifest-path", str(cdir / "Cargo.toml"), "--all-targets", "--", "--list"],
-            capture_output=True, text=True,
-        )
-        listed = len(re.findall(r": test$", proc.stdout, re.M))
-        r.check(proc.returncode == 0, "cargo test --list succeeds", (proc.stderr or "").strip().splitlines()[:1])
-        r.check(listed >= max(1, min_tests), f"cargo lists >= {max(1, min_tests)} tests", f"listed {listed}")
+    # A successful build/list exit or --no-cargo supplies no execution proof.
+    # Do not run the old unbounded discovery subprocess and then promote its
+    # output to acceptance. The fixed runner and binding owners are #850/#851;
+    # #837 replaces this compatibility path with their actual orchestration.
 
     # ---- report ----------------------------------------------------------
     width = 72
     print("=" * width)
-    print(f"work-unit gate :: {args.crate} :: module {module.get('module_id', '?')}")
+    print(f"legacy work-unit diagnostics :: {args.crate} :: module {module.get('module_id', '?')}")
     print("=" * width)
     for label in r.ok:
-        print(f"  PASS  {label}")
+        print(f"  MATCH  {label}")
     for label in r.fail:
         print(f"  FAIL  {label}")
     print("-" * width)
-    print(f"  {len(r.ok)} passed, {len(r.fail)} failed")
-    return 1 if r.fail else 0
+    print(f"  {len(r.ok)} source-shape hints matched, {len(r.fail)} findings")
+    print("INCOMPLETE: proof=legacy-source-shape-only; execution=NOT_RUN; "
+          "case-binding=NOT_CHECKED; completion=NOT_VERIFIED")
+    print("The accepted runner/bindings/catalogue orchestration (#850/#851/#852/#837) "
+          "is not integrated into this entrypoint. No work unit is accepted.")
+    return 1
 
 
 if __name__ == "__main__":
