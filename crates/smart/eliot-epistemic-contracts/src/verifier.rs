@@ -13,6 +13,7 @@ use crate::error::{
     ContractError, MAX_SHORT_TEXT, check_frozen, shape_digest, validate_bounded_text,
     validate_digest,
 };
+use crate::identity::SourceRevisionId;
 
 /// Standing of a required verifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -68,15 +69,14 @@ pub struct SourceAssurance {
     pub integrity_digest: String,
 }
 impl SourceAssurance {
-    /// Constructs source assurance and freezes its derived integrity digest.
     pub fn new(
         source: SourceId,
-        revision: impl Into<String>,
+        revision: SourceRevisionId,
         proof_digest: impl Into<String>,
     ) -> Result<Self, ContractError> {
         let mut assurance = Self {
             source,
-            revision: revision.into(),
+            revision: revision.into_string(),
             proof_digest: proof_digest.into(),
             integrity_digest: String::new(),
         };
@@ -85,12 +85,9 @@ impl SourceAssurance {
         assurance.integrity_digest = assurance.compute_integrity()?;
         Ok(assurance)
     }
-
-    /// Recomputes the derived integrity digest.
     pub fn compute_integrity(&self) -> Result<String, ContractError> {
         shape_digest(&(&self.source, &self.revision, &self.proof_digest))
     }
-
     /// Validates the binding: the integrity digest must cover exactly this
     /// source, revision, and proof digest.
     pub fn validate(&self) -> Result<(), ContractError> {
@@ -130,8 +127,6 @@ pub struct RequiredVerifier {
     pub digest: String,
 }
 impl RequiredVerifier {
-    /// Constructs a required verifier and freezes its canonical digest.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         contract: ContractId,
         revision: impl Into<String>,
@@ -155,8 +150,6 @@ impl RequiredVerifier {
         verifier.digest = verifier.compute_digest()?;
         Ok(verifier)
     }
-
-    /// Recomputes the canonical digest of the verifier shape.
     pub fn compute_digest(&self) -> Result<String, ContractError> {
         shape_digest(&(
             &self.contract,
@@ -168,7 +161,6 @@ impl RequiredVerifier {
             &self.verified_digest,
         ))
     }
-
     /// Returns whether the vouched run is current (exact candidate, commit,
     /// or quiesced worktree only).
     pub const fn is_current(&self) -> bool {
@@ -179,7 +171,6 @@ impl RequiredVerifier {
                 | EvidenceFreshness::ExactQuiescedWorktree
         )
     }
-
     /// Returns whether this verifier licenses the strongest renderings.
     pub const fn is_competent(&self) -> bool {
         matches!(self.standing, VerifierStanding::Competent) && self.is_current()
@@ -214,9 +205,7 @@ impl RequiredVerifier {
         }
         Ok(())
     }
-
-    /// Validates that this verifier vouched for the given candidate or
-    /// receipt digest. A competent run over another digest vouches nothing.
+    /// Validates that this verifier vouched for the given candidate or receipt digest.
     pub fn validate_for(&self, verified_digest: &str) -> Result<(), ContractError> {
         self.validate()?;
         if self.verified_digest != verified_digest {
@@ -226,8 +215,6 @@ impl RequiredVerifier {
         }
         Ok(())
     }
-
-    /// Validates the verifier shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
         check_frozen(&self.digest, &self.compute_digest()?, "verifier.digest")

@@ -46,7 +46,6 @@ pub enum CausalStatus {
     Confounded,
 }
 impl CausalStatus {
-    /// Returns the exact frozen wire name of this status.
     pub const fn wire_name(self) -> &'static str {
         match self {
             Self::Association => "ASSOCIATION",
@@ -109,53 +108,54 @@ pub struct CausalClaim {
     /// Canonical digest of the causal shape, excluding this field.
     pub digest: String,
 }
+/// Named constructor arguments for [`CausalClaim::new`].
+/// Named fields block transposition; text uses concrete [`String`].
+#[derive(Clone, Debug)]
+pub struct CausalClaimParams {
+    pub subject: PropositionId,
+    pub status: CausalStatus,
+    pub mechanism: String,
+    pub rivals: BTreeSet<String>,
+    pub confounders: BTreeSet<String>,
+    pub evidence_refs: BTreeSet<ArtifactId>,
+    pub outcome: String,
+    pub control: String,
+    pub source: SourceId,
+    pub source_lineage: SourceLineage,
+    pub assurance: SourceAssurance,
+    pub lineage: LineageRootId,
+    pub fence: StateFence,
+    pub temporal: TemporalRecord,
+    pub proof_digest: String,
+    pub ceiling: EvidenceGrade,
+    pub scope: String,
+}
 impl CausalClaim {
-    /// Constructs a causal claim after validation.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        subject: PropositionId,
-        status: CausalStatus,
-        mechanism: impl Into<String>,
-        rivals: BTreeSet<String>,
-        confounders: BTreeSet<String>,
-        evidence_refs: BTreeSet<ArtifactId>,
-        outcome: impl Into<String>,
-        control: impl Into<String>,
-        source: SourceId,
-        source_lineage: SourceLineage,
-        assurance: SourceAssurance,
-        lineage: LineageRootId,
-        fence: StateFence,
-        temporal: TemporalRecord,
-        proof_digest: impl Into<String>,
-        ceiling: EvidenceGrade,
-        scope: impl Into<String>,
-    ) -> Result<Self, ContractError> {
+    pub fn new(params: CausalClaimParams) -> Result<Self, ContractError> {
         let mut claim = Self {
-            subject,
-            status,
-            mechanism: mechanism.into(),
-            rivals,
-            confounders,
-            evidence_refs,
-            outcome: outcome.into(),
-            control: control.into(),
-            source,
-            source_lineage,
-            assurance,
-            lineage,
-            fence,
-            temporal,
-            proof_digest: proof_digest.into(),
-            ceiling,
-            scope: scope.into(),
+            subject: params.subject,
+            status: params.status,
+            mechanism: params.mechanism,
+            rivals: params.rivals,
+            confounders: params.confounders,
+            evidence_refs: params.evidence_refs,
+            outcome: params.outcome,
+            control: params.control,
+            source: params.source,
+            source_lineage: params.source_lineage,
+            assurance: params.assurance,
+            lineage: params.lineage,
+            fence: params.fence,
+            temporal: params.temporal,
+            proof_digest: params.proof_digest,
+            ceiling: params.ceiling,
+            scope: params.scope,
             digest: String::new(),
         };
         claim.validate_shape()?;
         claim.digest = claim.compute_digest()?;
         Ok(claim)
     }
-
     /// Recomputes the canonical digest of the causal shape (nested tuples keep every arity at or
     /// below the sixteen-element serde bound without dropping a load-bearing field).
     pub fn compute_digest(&self) -> Result<String, ContractError> {
@@ -183,7 +183,6 @@ impl CausalClaim {
             ),
         ))
     }
-
     /// Validates mechanism, rivals, confounders, evidence, outcome, control,
     /// source, lineage, fence, temporal roles, proof binding, and the ceiling.
     fn validate_shape(&self) -> Result<(), ContractError> {
@@ -191,9 +190,7 @@ impl CausalClaim {
         validate_bounded_text(&self.scope, "causal.scope", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.outcome, "causal.outcome", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.control, "causal.control", MAX_SHORT_TEXT)?;
-        // Frozen source provenance: the lineage entry names this source, and the assurance pins the
-        // same source, lineage revision, and proof digest, so mutating revision or content under the
-        // same source ID breaks the binding even with a recomputed shape digest.
+        // Frozen source provenance: the assurance pins source, lineage revision, and proof digest.
         self.source_lineage.validate()?;
         self.assurance.validate()?;
         if self.source_lineage.owner != self.source || self.assurance.source != self.source {
@@ -236,8 +233,7 @@ impl CausalClaim {
         for confounder in &self.confounders {
             validate_bounded_text(confounder.as_str(), "causal.confounders", MAX_SHORT_TEXT)?;
         }
-        // Mechanism and intervention readings without confounders are
-        // mechanism-plus-identifiers alone, which never suffice.
+        // Mechanism and intervention readings without confounders never suffice.
         if matches!(
             self.status,
             CausalStatus::Mechanism
@@ -280,8 +276,6 @@ impl CausalClaim {
         }
         Ok(())
     }
-
-    /// Validates the causal shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
         check_frozen(&self.digest, &self.compute_digest()?, "causal.digest")

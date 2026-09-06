@@ -45,7 +45,6 @@ pub enum MemberDisposition {
     Unknown,
 }
 impl MemberDisposition {
-    /// Returns the exact frozen wire name of this disposition.
     pub const fn wire_name(self) -> &'static str {
         match self {
             Self::Observed => "OBSERVED",
@@ -61,9 +60,7 @@ impl MemberDisposition {
             Self::Unknown => "UNKNOWN",
         }
     }
-
-    /// Returns whether this disposition is terminal for absence reasoning: only observed presence and
-    /// authoritative absence close a member; every other disposition keeps the member unresolved.
+    /// Returns whether this disposition is terminal: only observed presence and authoritative absence close.
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Observed | Self::AuthoritativeAbsence)
     }
@@ -95,7 +92,6 @@ impl MemberOutcome {
         outcome.validate()?;
         Ok(outcome)
     }
-
     /// Validates the role binding; the disposition vocabulary is closed by type.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.role, "receipt.role", MAX_SHORT_TEXT)
@@ -112,7 +108,6 @@ pub struct OmittedMember {
     pub reason: String,
 }
 impl OmittedMember {
-    /// Constructs an omission record after validation.
     pub fn new(member: ArtifactId, reason: impl Into<String>) -> Result<Self, ContractError> {
         let omission = Self {
             member,
@@ -121,8 +116,6 @@ impl OmittedMember {
         omission.validate()?;
         Ok(omission)
     }
-
-    /// Validates the omission reason.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.reason, "receipt.omission_reason", MAX_SHORT_TEXT)?;
         Ok(())
@@ -160,44 +153,44 @@ pub struct CoverageReceipt {
     /// Canonical digest of the receipt shape, excluding this field.
     pub digest: String,
 }
+/// Named constructor arguments for [`CoverageReceipt::new`].
+/// Named fields block transposition; text uses concrete [`String`].
+#[derive(Clone, Debug)]
+pub struct CoverageReceiptParams {
+    pub query: QuerySpec,
+    pub frontier: FrontierSpec,
+    pub denominator: String,
+    pub denominator_size: u64,
+    pub task_id: TaskId,
+    pub scope: String,
+    pub fence: StateFence,
+    pub policy: String,
+    pub groups: BTreeSet<String>,
+    pub members: Vec<MemberOutcome>,
+    pub omissions: Vec<OmittedMember>,
+    pub proof_digest: String,
+}
 impl CoverageReceipt {
-    /// Constructs a receipt and freezes its canonical digest.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        query: QuerySpec,
-        frontier: FrontierSpec,
-        denominator: impl Into<String>,
-        denominator_size: u64,
-        task_id: TaskId,
-        scope: impl Into<String>,
-        fence: StateFence,
-        policy: impl Into<String>,
-        groups: BTreeSet<String>,
-        members: Vec<MemberOutcome>,
-        omissions: Vec<OmittedMember>,
-        proof_digest: impl Into<String>,
-    ) -> Result<Self, ContractError> {
+    pub fn new(params: CoverageReceiptParams) -> Result<Self, ContractError> {
         let mut receipt = Self {
-            query,
-            frontier,
-            denominator: denominator.into(),
-            denominator_size,
-            task_id,
-            scope: scope.into(),
-            fence,
-            policy: policy.into(),
-            groups,
-            members,
-            omissions,
-            proof_digest: proof_digest.into(),
+            query: params.query,
+            frontier: params.frontier,
+            denominator: params.denominator,
+            denominator_size: params.denominator_size,
+            task_id: params.task_id,
+            scope: params.scope,
+            fence: params.fence,
+            policy: params.policy,
+            groups: params.groups,
+            members: params.members,
+            omissions: params.omissions,
+            proof_digest: params.proof_digest,
             digest: String::new(),
         };
         receipt.validate_shape()?;
         receipt.digest = receipt.compute_digest()?;
         Ok(receipt)
     }
-
-    /// Recomputes the canonical digest of the receipt shape.
     pub fn compute_digest(&self) -> Result<String, ContractError> {
         shape_digest(&(
             &self.query,
@@ -214,7 +207,6 @@ impl CoverageReceipt {
             &self.proof_digest,
         ))
     }
-
     /// Returns whether every member outcome is terminal.
     pub fn is_terminal(&self) -> bool {
         self.omissions.is_empty()
@@ -285,18 +277,14 @@ impl CoverageReceipt {
         validate_digest(&self.proof_digest, "receipt.proof_digest")?;
         Ok(())
     }
-
-    /// Validates the receipt shape, arithmetic, and frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
         check_frozen(&self.digest, &self.compute_digest()?, "receipt.digest")
     }
 }
 
-/// Reconciles receipt member roles against the denominator product: every outcome names an admitted
-/// (member, role) pair (a foreign member or role fails) and every required pair is present (gaps fail);
-/// exact duplicate pairs fail in shape. A shared member under two roles is allowed only when both pairs
-/// are required.
+/// Reconciles member roles against the denominator product: every outcome names an admitted pair,
+/// every required pair is present, duplicates fail in shape, and shared members need both pairs.
 pub(crate) fn check_member_roles(
     receipt: &CoverageReceipt,
     denominator: &CoverageDenominator,

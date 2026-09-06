@@ -87,7 +87,6 @@ pub struct ConflictPosition {
     pub minority: bool,
 }
 impl ConflictPosition {
-    /// Constructs a conflict position after validation.
     pub fn new(
         source: SourceId,
         stance: impl Into<String>,
@@ -105,7 +104,6 @@ impl ConflictPosition {
         position.validate()?;
         Ok(position)
     }
-
     /// Validates stance, assumptions, and counters.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.stance, "conflict.stance", MAX_STATEMENT_TEXT)?;
@@ -192,56 +190,56 @@ struct ConflictDigestShape<'a> {
     lifecycle: &'a ConflictLifecycle,
     receipt_digest: &'a str,
 }
+/// Named constructor arguments for [`ConflictSet::new`].
+/// Named fields block transposition; text uses concrete [`String`].
+#[derive(Clone, Debug)]
+pub struct ConflictSetParams {
+    pub conflict_id: String,
+    pub kind: ConflictKind,
+    pub scope: String,
+    pub task_id: Option<TaskId>,
+    pub positions: Vec<ConflictPosition>,
+    pub evidence_refs: BTreeSet<ArtifactId>,
+    pub owners: BTreeSet<SourceId>,
+    pub common_lineage: BTreeSet<LineageRootId>,
+    pub resolved_parts: BTreeSet<String>,
+    pub unresolved: BTreeSet<String>,
+    pub unresolved_owners: BTreeSet<SourceId>,
+    pub acceptability: ArgumentAcceptability,
+    pub defeated_refs: BTreeSet<ArtifactId>,
+    pub probe: Option<String>,
+    pub decision_owner: SourceId,
+    pub affected_actions: Vec<String>,
+    pub lifecycle: ConflictLifecycle,
+    pub receipt_digest: String,
+}
 impl ConflictSet {
-    /// Constructs a conflict set and freezes its canonical digest.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        conflict_id: impl Into<String>,
-        kind: ConflictKind,
-        scope: impl Into<String>,
-        task_id: Option<TaskId>,
-        positions: Vec<ConflictPosition>,
-        evidence_refs: BTreeSet<ArtifactId>,
-        owners: BTreeSet<SourceId>,
-        common_lineage: BTreeSet<LineageRootId>,
-        resolved_parts: BTreeSet<String>,
-        unresolved: BTreeSet<String>,
-        unresolved_owners: BTreeSet<SourceId>,
-        acceptability: ArgumentAcceptability,
-        defeated_refs: BTreeSet<ArtifactId>,
-        probe: Option<String>,
-        decision_owner: SourceId,
-        affected_actions: Vec<String>,
-        lifecycle: ConflictLifecycle,
-        receipt_digest: impl Into<String>,
-    ) -> Result<Self, ContractError> {
+    pub fn new(params: ConflictSetParams) -> Result<Self, ContractError> {
         let mut set = Self {
-            conflict_id: conflict_id.into(),
-            kind,
-            scope: scope.into(),
-            task_id,
-            positions,
-            evidence_refs,
-            owners,
-            common_lineage,
-            resolved_parts,
-            unresolved,
-            unresolved_owners,
-            acceptability,
-            defeated_refs,
-            probe,
-            decision_owner,
-            affected_actions,
-            lifecycle,
-            receipt_digest: receipt_digest.into(),
+            conflict_id: params.conflict_id,
+            kind: params.kind,
+            scope: params.scope,
+            task_id: params.task_id,
+            positions: params.positions,
+            evidence_refs: params.evidence_refs,
+            owners: params.owners,
+            common_lineage: params.common_lineage,
+            resolved_parts: params.resolved_parts,
+            unresolved: params.unresolved,
+            unresolved_owners: params.unresolved_owners,
+            acceptability: params.acceptability,
+            defeated_refs: params.defeated_refs,
+            probe: params.probe,
+            decision_owner: params.decision_owner,
+            affected_actions: params.affected_actions,
+            lifecycle: params.lifecycle,
+            receipt_digest: params.receipt_digest,
             digest: String::new(),
         };
         set.validate_shape()?;
         set.digest = set.compute_digest()?;
         Ok(set)
     }
-
-    /// Recomputes the canonical digest of the set shape.
     pub fn compute_digest(&self) -> Result<String, ContractError> {
         shape_digest(&ConflictDigestShape {
             conflict_id: self.conflict_id.as_str(),
@@ -264,7 +262,6 @@ impl ConflictSet {
             receipt_digest: self.receipt_digest.as_str(),
         })
     }
-
     /// Returns whether the set is closed with empty residue.
     pub fn is_closed(&self) -> bool {
         self.lifecycle == ConflictLifecycle::Resolved
@@ -326,8 +323,6 @@ impl ConflictSet {
         validate_digest(&self.receipt_digest, "conflict.receipt_digest")?;
         Ok(())
     }
-
-    /// Validates the set shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
         check_frozen(&self.digest, &self.compute_digest()?, "conflict.digest")

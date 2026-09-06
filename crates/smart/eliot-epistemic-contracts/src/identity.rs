@@ -21,15 +21,15 @@ macro_rules! position_id {
         #[schemars(transparent)]
         pub struct $name(String);
         impl $name {
-            /// Constructs a validated identifier.
             pub fn new(value: impl Into<String>) -> Result<Self, ContractError> {
                 let value = value.into();
                 validate_bounded_text(&value, $label, MAX_SHORT_TEXT)?;
                 Ok(Self(value))
             }
-
-            /// Returns the canonical identifier text.
             pub fn as_str(&self) -> &str { &self.0 }
+
+            /// Consumes this identifier and returns its text.
+            pub fn into_string(self) -> String { self.0 }
         }
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.0) }
@@ -92,8 +92,7 @@ position_id!(
     "predecessor_id"
 );
 
-/// The complete identity closure of one epistemic position: predecessors
-/// form a set, and `digest` covers every field except itself.
+/// The complete identity closure: predecessors form a set; `digest` covers every field but itself.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityBundle {
@@ -116,40 +115,40 @@ pub struct IdentityBundle {
     /// Canonical digest of the identity shape, excluding this field.
     pub digest: String,
 }
+/// Named constructor arguments for [`IdentityBundle::new`].
+/// Named fields block transposition; all members are typed ids.
+#[derive(Clone, Debug)]
+pub struct IdentityBundleParams {
+    pub proposition: PropositionId,
+    pub claim: ClaimId,
+    pub evidence_set: EvidenceSetId,
+    pub manifest: ManifestId,
+    pub source_revision: SourceRevisionId,
+    pub lineage_root: LineageRootId,
+    pub validity: ValidityId,
+    pub predecessors: BTreeSet<PredecessorId>,
+}
 impl IdentityBundle {
-    /// Constructs a bundle and freezes its canonical digest.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        proposition: PropositionId,
-        claim: ClaimId,
-        evidence_set: EvidenceSetId,
-        manifest: ManifestId,
-        source_revision: SourceRevisionId,
-        lineage_root: LineageRootId,
-        validity: ValidityId,
-        predecessors: BTreeSet<PredecessorId>,
-    ) -> Result<Self, ContractError> {
-        if predecessors.len() > crate::error::MAX_HANDLES {
+    pub fn new(params: IdentityBundleParams) -> Result<Self, ContractError> {
+        if params.predecessors.len() > crate::error::MAX_HANDLES {
             return Err(ContractError::TooMany {
                 field: "identity.predecessors",
             });
         }
         let mut bundle = Self {
-            proposition,
-            claim,
-            evidence_set,
-            manifest,
-            source_revision,
-            lineage_root,
-            validity,
-            predecessors,
+            proposition: params.proposition,
+            claim: params.claim,
+            evidence_set: params.evidence_set,
+            manifest: params.manifest,
+            source_revision: params.source_revision,
+            lineage_root: params.lineage_root,
+            validity: params.validity,
+            predecessors: params.predecessors,
             digest: String::new(),
         };
         bundle.digest = bundle.compute_digest()?;
         Ok(bundle)
     }
-
-    /// Recomputes the canonical digest of the identity shape.
     pub fn compute_digest(&self) -> Result<String, ContractError> {
         shape_digest(&(
             &self.proposition,
@@ -162,7 +161,6 @@ impl IdentityBundle {
             &self.predecessors,
         ))
     }
-
     /// Returns the deterministic canonical JSON bytes of the identity shape.
     pub fn canonical_json(&self) -> Result<Vec<u8>, ContractError> {
         crate::error::canonical_bytes(&(
@@ -176,7 +174,6 @@ impl IdentityBundle {
             &self.predecessors,
         ))
     }
-
     /// Validates every identifier and the frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_bounded_text(
@@ -213,8 +210,7 @@ impl IdentityBundle {
     }
 }
 
-/// A derivation retaining the exact raw lineage it was built from: `derived_revision` must differ from
-/// `raw_source_revision`; a transform restating its input byte-for-byte is not a transformation.
+/// A derivation retaining its exact raw lineage: `derived_revision` must differ from `raw_source_revision`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TransformedLineage {
@@ -244,7 +240,6 @@ impl TransformedLineage {
         record.validate()?;
         Ok(record)
     }
-
     /// Validates raw lineage retention and the bounded transform description.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_bounded_text(

@@ -96,55 +96,55 @@ pub struct ClaimEntry {
     /// Discriminators separating this claim from its rivals.
     pub discriminators: BTreeSet<String>,
 }
+/// Named constructor arguments for [`ClaimEntry::new`].
+/// Named fields block transposition; text uses concrete [`String`].
+#[derive(Clone, Debug)]
+pub struct ClaimEntryParams {
+    pub claim: ClaimId,
+    pub statement_digest: String,
+    pub verdict: ClaimVerdict,
+    pub audit: ClaimAuditOutcome,
+    pub counterevidence: BTreeSet<ArtifactId>,
+    pub conflict: Option<String>,
+    pub authority: EvidenceAuthority,
+    pub grade: GradeAssignment,
+    pub dependencies: BTreeSet<ClaimId>,
+    pub bounds: ValidityBounds,
+    pub temporal: Option<TemporalRecord>,
+    pub coverage_digest: String,
+    pub support: BTreeSet<ArtifactId>,
+    pub components: BTreeMap<String, ArtifactId>,
+    pub unresolved_support: BTreeSet<String>,
+    pub ceiling: EvidenceGrade,
+    pub assumptions: BTreeSet<String>,
+    pub discriminators: BTreeSet<String>,
+}
 impl ClaimEntry {
-    /// Constructs a claim entry after validation.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        claim: ClaimId,
-        statement_digest: impl Into<String>,
-        verdict: ClaimVerdict,
-        audit: ClaimAuditOutcome,
-        counterevidence: BTreeSet<ArtifactId>,
-        conflict: Option<String>,
-        authority: EvidenceAuthority,
-        grade: GradeAssignment,
-        dependencies: BTreeSet<ClaimId>,
-        bounds: ValidityBounds,
-        temporal: Option<TemporalRecord>,
-        coverage_digest: impl Into<String>,
-        support: BTreeSet<ArtifactId>,
-        components: BTreeMap<String, ArtifactId>,
-        unresolved_support: BTreeSet<String>,
-        ceiling: EvidenceGrade,
-        assumptions: BTreeSet<String>,
-        discriminators: BTreeSet<String>,
-    ) -> Result<Self, ContractError> {
+    pub fn new(params: ClaimEntryParams) -> Result<Self, ContractError> {
         let entry = Self {
-            claim,
-            statement_digest: statement_digest.into(),
-            verdict,
-            audit,
-            counterevidence,
-            conflict,
-            authority,
-            grade,
-            dependencies,
-            bounds,
-            temporal,
-            coverage_digest: coverage_digest.into(),
-            support,
-            components,
-            unresolved_support,
-            ceiling,
-            assumptions,
-            discriminators,
+            claim: params.claim,
+            statement_digest: params.statement_digest,
+            verdict: params.verdict,
+            audit: params.audit,
+            counterevidence: params.counterevidence,
+            conflict: params.conflict,
+            authority: params.authority,
+            grade: params.grade,
+            dependencies: params.dependencies,
+            bounds: params.bounds,
+            temporal: params.temporal,
+            coverage_digest: params.coverage_digest,
+            support: params.support,
+            components: params.components,
+            unresolved_support: params.unresolved_support,
+            ceiling: params.ceiling,
+            assumptions: params.assumptions,
+            discriminators: params.discriminators,
         };
         entry.validate()?;
         Ok(entry)
     }
-
-    /// Validates verdict/audit coherence, ceilings, bounds, and component coverage
-    /// (accepted entries carry support or an unresolved marker).
+    /// Validates verdict/audit coherence, ceilings, bounds, and component coverage.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.check_entry_fields()?;
         self.check_entry_coherence()?;
@@ -272,7 +272,6 @@ pub struct DependenceGroup {
     pub rationale: String,
 }
 impl DependenceGroup {
-    /// Constructs a dependence group after validation.
     pub fn new(
         group_id: impl Into<String>,
         members: BTreeSet<ClaimId>,
@@ -286,7 +285,6 @@ impl DependenceGroup {
         group.validate()?;
         Ok(group)
     }
-
     /// Validates group identity, non-empty membership, and rationale.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.group_id, "claim.group_id", MAX_SHORT_TEXT)?;
@@ -311,24 +309,19 @@ impl DependenceGroup {
 pub struct ClaimMap {
     /// Allowed-reference manifest admitting every entry.
     pub manifest: ManifestId,
-    /// Claims admitted by the manifest; order carries no meaning. The entry
-    /// set coincides with this set exactly: an admitted claim without an entry
-    /// is unrepresented, and an entry without admission is outside the
-    /// manifest.
+    /// Claims admitted by the manifest; order carries no meaning. The entry set coincides exactly:
+    /// unentered admission is unrepresented, unadmitted entry is outside the manifest.
     pub admitted: BTreeSet<ClaimId>,
     /// Per-claim entries in declaration order.
     pub entries: Vec<ClaimEntry>,
     /// Explicit dependence groups in declaration order.
     pub groups: Vec<DependenceGroup>,
-    /// Admitted claims held open for further inquiry; order carries no
-    /// meaning. Held-open claims keep their provisional entries: `unresolved`
-    /// is a subset of the entered claims, never unentered claims.
+    /// Admitted claims held open for further inquiry; `unresolved` is a subset of entered claims.
     pub unresolved: BTreeSet<ClaimId>,
     /// Canonical digest of the map shape, excluding this field.
     pub digest: String,
 }
 impl ClaimMap {
-    /// Constructs a claim map and freezes its canonical digest.
     pub fn new(
         manifest: ManifestId,
         admitted: BTreeSet<ClaimId>,
@@ -348,8 +341,6 @@ impl ClaimMap {
         map.digest = map.compute_digest()?;
         Ok(map)
     }
-
-    /// Recomputes the canonical digest of the map shape.
     pub fn compute_digest(&self) -> Result<String, ContractError> {
         shape_digest(&(
             &self.manifest,
@@ -359,9 +350,7 @@ impl ClaimMap {
             &self.unresolved,
         ))
     }
-
-    /// Returns whether every accepted entry carries component coverage: at
-    /// least one supporting accepted handle or an explicit unresolved marker.
+    /// Returns whether every accepted entry carries component coverage.
     pub fn has_component_coverage(&self) -> bool {
         self.entries.iter().all(|entry| {
             !matches!(entry.verdict, ClaimVerdict::Accepted)
@@ -369,8 +358,6 @@ impl ClaimMap {
                 || !entry.unresolved_support.is_empty()
         })
     }
-
-    /// Returns the admitted claims accepted by verdict.
     pub fn accepted_ids(&self) -> BTreeSet<ClaimId> {
         self.entries
             .iter()
@@ -378,8 +365,6 @@ impl ClaimMap {
             .map(|entry| entry.claim.clone())
             .collect()
     }
-
-    /// Returns the admitted claims rejected by verdict.
     pub fn rejected_ids(&self) -> BTreeSet<ClaimId> {
         self.entries
             .iter()
@@ -387,8 +372,6 @@ impl ClaimMap {
             .map(|entry| entry.claim.clone())
             .collect()
     }
-
-    /// Returns the admitted claims held open by preserved counterevidence.
     pub fn countered_ids(&self) -> BTreeSet<ClaimId> {
         self.entries
             .iter()
@@ -396,18 +379,13 @@ impl ClaimMap {
             .map(|entry| entry.claim.clone())
             .collect()
     }
-
-    /// Returns every named assumption set across all entries.
     pub fn assumption_names(&self) -> BTreeSet<String> {
         self.entries
             .iter()
             .flat_map(|entry| entry.assumptions.iter().cloned())
             .collect()
     }
-
-    /// Returns the weakest known grade across all entries, or `None` when any
-    /// entry is unknown: the floor no dependent may rise above, and the grade
-    /// ceiling the map as a whole can claim. Unknown poisons the aggregate.
+    /// Returns the weakest known grade across entries, or `None` when any entry is unknown.
     pub fn weakest_grade(&self) -> Option<EvidenceGrade> {
         let mut weakest: Option<EvidenceGrade> = None;
         for entry in &self.entries {
@@ -419,9 +397,7 @@ impl ClaimMap {
         }
         weakest
     }
-
-    /// Returns the weakest assignment across all entries: unknown when any
-    /// entry is unknown, else the least rigorous known grade.
+    /// Returns the weakest assignment: unknown when any entry is unknown.
     pub fn weakest_assignment(&self) -> Result<GradeAssignment, ContractError> {
         GradeAssignment::weakest(
             &self
@@ -431,9 +407,7 @@ impl ClaimMap {
                 .collect::<Vec<_>>(),
         )
     }
-
-    /// Validates entries against the manifest, returning entered claims and
-    /// their grades for the closure checks below.
+    /// Validates entries against the manifest, returning entered claims and grades.
     fn check_entries(
         &self,
     ) -> Result<(BTreeSet<ClaimId>, BTreeMap<ClaimId, GradeAssignment>), ContractError> {
@@ -468,8 +442,6 @@ impl ClaimMap {
         }
         Ok((seen_claims, grades))
     }
-
-    /// Validates dependence groups against the manifest.
     fn check_groups(&self) -> Result<(), ContractError> {
         let mut seen_groups = BTreeSet::new();
         for group in &self.groups {
@@ -511,9 +483,8 @@ impl ClaimMap {
             });
         }
         let (seen_claims, grades) = self.check_entries()?;
-        // Exact entries: the entry set coincides with the admitted set. An admitted claim without an entry is
-        // unrepresented; an entry without admission is outside the manifest. Held-open claims keep their
-        // provisional entries, so `unresolved` is a subset of the admitted claims, never unentered claims.
+        // Exact entries: the entry set coincides with the admitted set; `unresolved` stays a subset
+        // of the admitted claims, never unentered claims.
         for held in &self.unresolved {
             if !self.admitted.contains(held) {
                 return Err(ContractError::OutsideManifest {
@@ -533,8 +504,7 @@ impl ClaimMap {
                 });
             }
         }
-        // Dependent grades: quoting a claim never upgrades it. An unknown parent caps every dependent: a known
-        // grade over an unknown parent is an upgrade and fails.
+        // Dependent grades: quoting never upgrades; a known grade over an unknown parent fails.
         for entry in &self.entries {
             for dependency in &entry.dependencies {
                 if let Some(parent) = grades.get(dependency) {
@@ -553,8 +523,7 @@ impl ClaimMap {
             }
         }
         self.check_groups()?;
-        // Dependence groups cover dependent claims: every dependency edge of
-        // an entry resolves inside a group holding both ends together.
+        // Dependence groups hold both ends of every dependency edge together.
         for entry in &self.entries {
             for dependency in &entry.dependencies {
                 let covered = self.groups.iter().any(|group| {
@@ -574,8 +543,6 @@ impl ClaimMap {
         }
         Ok(())
     }
-
-    /// Validates the map shape, manifest closure, and frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
         check_frozen(&self.digest, &self.compute_digest()?, "claim.digest")

@@ -40,7 +40,6 @@ pub struct TemporalRecord {
     pub commit_ms: i64,
 }
 impl TemporalRecord {
-    /// Constructs a temporal record after validation.
     pub fn new(
         event_ms: i64,
         effective_ms: i64,
@@ -58,8 +57,6 @@ impl TemporalRecord {
         record.validate()?;
         Ok(record)
     }
-
-    /// Returns the instant attached to one role.
     pub const fn role_time(&self, role: TemporalRole) -> i64 {
         match role {
             TemporalRole::Event => self.event_ms,
@@ -69,7 +66,6 @@ impl TemporalRecord {
             TemporalRole::Commit => self.commit_ms,
         }
     }
-
     /// Validates pipeline order: observation, ingestion, then commit.
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.ingestion_ms < self.observation_ms || self.commit_ms < self.ingestion_ms {
@@ -94,7 +90,6 @@ pub struct TemporalPrecedence {
     pub basis: String,
 }
 impl TemporalPrecedence {
-    /// Constructs a precedence record after validation.
     pub fn new(
         before_ms: i64,
         after_ms: i64,
@@ -108,7 +103,6 @@ impl TemporalPrecedence {
         record.validate()?;
         Ok(record)
     }
-
     /// Validates chronological order and the bounded basis note.
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.after_ms < self.before_ms {

@@ -1,6 +1,5 @@
-//! Work-unit case coverage for the epistemic contracts boundary: one
-//! substantive test per assignment case, built through the public
-//! constructors, each negative mutating exactly one load-bearing property.
+//! Work-unit case coverage for the epistemic contracts boundary: one substantive test per
+//! assignment case through the public constructors; each negative mutates one load-bearing property.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,37 +12,54 @@ use eliot_receipts::{WorkScope, WorkScopeId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::absence::AbsenceClaimParams;
 use crate::absence::{AbsenceClaim, BoundedProof, OwnerLookup};
 use crate::admitted::{
-    AdmittedKind, AdmittedReceipt, ContractChallenge, CurrentEpistemicPosition,
-    CurrentEpistemicPositionView, Currentness, PositionId, PositionRevision, PositionState,
+    AdmittedKind, AdmittedReceipt, AdmittedReceiptParams, ChallengeInvariant, ContractChallenge,
+    CurrentEpistemicPosition, CurrentEpistemicPositionView, Currentness, PositionId,
+    PositionRevision, PositionState,
 };
 use crate::assertability::PositionAssertability;
-use crate::assumption::{AssumptionKind, AssumptionRecord, AssumptionRetraction};
+use crate::assumption::{
+    AssumptionKind, AssumptionRecord, AssumptionRecordParams, AssumptionRetraction,
+};
+use crate::candidate::EpistemicPositionCandidateParams;
 use crate::candidate::{CandidateKind, EpistemicPositionCandidate};
+use crate::causal::CausalClaimParams;
 use crate::causal::{CausalClaim, CausalStatus};
+use crate::claim_map::ClaimEntryParams;
 use crate::claim_map::{ClaimAuditOutcome, ClaimEntry, ClaimMap, ClaimVerdict, DependenceGroup};
+use crate::conflict::ConflictSetParams;
 use crate::conflict::{
     ArgumentAcceptability, ConflictKind, ConflictLifecycle, ConflictPosition, ConflictSet,
 };
 use crate::coverage::{
-    CoverageDenominator, DenominatorKind, ExclusionRecord, FrontierSpec, PaginationBounds,
-    QuerySpec, SnapshotRef,
+    CoverageDenominator, CoverageDenominatorParams, DenominatorKind, ExclusionReason,
+    ExclusionRecord, FrontierRevision, FrontierSpec, PaginationBounds, QueryRevision, QuerySpec,
+    SnapshotRef,
 };
 use crate::error::{ContractError, MAX_HANDLES, MAX_SHORT_TEXT, MAX_STATEMENT_TEXT, shape_digest};
 use crate::grade::{EvidenceGrade, GRADE_ORDER, GradeAssignment};
 use crate::identity::{
-    ClaimId, EvidenceSetId, IdentityBundle, LineageRootId, ManifestId, PredecessorId,
-    PropositionId, SourceRevisionId, TransformedLineage, ValidityId,
+    ClaimId, EvidenceSetId, IdentityBundle, IdentityBundleParams, LineageRootId, ManifestId,
+    PredecessorId, PropositionId, SourceRevisionId, TransformedLineage, ValidityId,
 };
-use crate::investigation::{InvestigationKind, InvestigationRequirement, RequirementKind};
-use crate::provenance::{ProvenanceClosure, ProvenanceClosureKind, SourceLineage};
+use crate::investigation::{
+    InvestigationKind, InvestigationRequirement, InvestigationRequirementParams, RequirementKind,
+};
+use crate::provenance::{
+    ProvenanceClosure, ProvenanceClosureKind, ProvenanceClosureParams, SourceLineage,
+};
 use crate::receipt::{
-    CoverageReceipt, MemberDisposition, MemberOutcome, OmittedMember, check_member_roles,
+    CoverageReceipt, CoverageReceiptParams, MemberDisposition, MemberOutcome, OmittedMember,
+    check_member_roles,
 };
-use crate::request::{PositionRequest, RequestKind};
-use crate::support::{SupportRecord, SupportResult, ValidityBounds, weakest_link};
+use crate::request::{PositionRequest, PositionRequestParams, RequestKind};
+use crate::support::{
+    Precision, SupportRecord, SupportRecordParams, SupportResult, ValidityBounds, weakest_link,
+};
 use crate::temporal::{TemporalPrecedence, TemporalRecord, TemporalRole};
+use crate::transition::EpistemicTransitionParams;
 use crate::transition::{
     EpistemicTransition, InvalidationKind, InvalidationRecord, SupportDelta, TransitionTrigger,
 };
@@ -58,12 +74,11 @@ use EvidenceGrade as Grade;
 use EvidenceGrade::{Corroborated, Grounded, Orienting, ScienceGrade};
 use PositionAssertability::{HypothesisCandidate, MaterialEffect, ObservedFact};
 use PositionAssertability::{PlanningOnly, QualifiedInference};
-use SupportResult::{Contradicted, Partial, Supported};
+use SupportResult::{Contradicted, Partial, Supported, Unsupported};
 
 type CaseResult = Result<(), ContractError>;
 
-// Asserts exact variant-plus-field equality. The struct literal lives inside
-// the macro so call sites stay on one line; expansion is the same assert_eq!.
+// Asserts exact variant-plus-field equality in one line via `assert_eq!`.
 macro_rules! expect_err {
     ($result:expr, $variant:ident, $field:expr) => {
         assert_eq!($result, Err(ContractError::$variant { field: $field }))
@@ -96,6 +111,17 @@ fn source(value: &str) -> Result<SourceId, ContractError> {
 fn task() -> Result<TaskId, ContractError> {
     TaskId::new("task-580").map_err(|_| case_error("case.task"))
 }
+fn case_bounds(
+    scope: &str,
+    window: (Option<i64>, Option<i64>),
+    version: &str,
+    prec: &str,
+) -> Result<ValidityBounds, ContractError> {
+    ValidityBounds::new(scope, window.0, window.1, version, Precision(prec.into()))
+}
+fn case_frontier() -> Result<FrontierSpec, ContractError> {
+    FrontierSpec::new("frontier-1", FrontierRevision("frontier-rev".to_owned()))
+}
 fn case_work_scope() -> Result<WorkScope, ContractError> {
     Ok(WorkScope {
         scope_id: WorkScopeId::new("scope-580").map_err(|_| case_error("case.scope"))?,
@@ -104,20 +130,19 @@ fn case_work_scope() -> Result<WorkScope, ContractError> {
         state_fence: case_fence(),
     })
 }
-fn owner_lookup_for(denominator_digest: &str) -> Result<OwnerLookup, ContractError> {
-    let owner = source("owner-1")?;
-    let proof = OwnerLookup::expected_proof(
-        &owner,
-        denominator_digest,
-        sha256_hex("proof-receipt".as_bytes()).as_str(),
-    )?;
-    OwnerLookup::new(owner, proof)
-}
 fn encoded<T: Serialize>(value: &T) -> Result<String, ContractError> {
     serde_json::to_string(value).map_err(|_| ContractError::Canonicalization)
 }
 fn wires<T: Serialize>(values: &[T]) -> Result<Vec<String>, ContractError> {
     values.iter().map(encoded).collect()
+}
+// Asserts the exact frozen wire spellings of one vocabulary in join order.
+fn assert_wires<T: Serialize>(values: &[T], expected: &str) -> CaseResult {
+    assert_eq!(wires(values)?.join(","), expected);
+    Ok(())
+}
+fn case_assurance(proof: String) -> Result<SourceAssurance, ContractError> {
+    SourceAssurance::new(source("source-a")?, SourceRevisionId::new("r1")?, proof)
 }
 fn support_with(
     result: SupportResult,
@@ -125,51 +150,43 @@ fn support_with(
     reopen: Option<String>,
     assurance: Option<SourceAssurance>,
 ) -> Result<SupportRecord, ContractError> {
-    SupportRecord::new(
-        PropositionId::new("proposition-580")?,
+    SupportRecord::new(SupportRecordParams {
+        proposition: PropositionId::new("proposition-580")?,
         result,
         handles,
-        ValidityBounds::new("scope-580", Some(100), Some(200), "v1", "file")?,
-        GradeAssignment::known(EvidenceGrade::Grounded),
-        task()?,
-        case_fence(),
-        None,
+        validity: case_bounds("scope-580", (Some(100), Some(200)), "v1", "file")?,
+        grade: GradeAssignment::known(EvidenceGrade::Grounded),
+        task_id: task()?,
+        fence: case_fence(),
+        temporal: None,
         assurance,
-        reopen,
-        sha256_hex("proof-support".as_bytes()),
-    )
+        reopen_reason: reopen,
+        proof_digest: sha256_hex("proof-support".as_bytes()),
+    })
 }
-fn support_record(result: SupportResult) -> Result<SupportRecord, ContractError> {
-    let mut handles = BTreeSet::new();
-    if !matches!(
-        result,
-        SupportResult::Unknown
-            | SupportResult::OutsideManifest
-            | SupportResult::JustifiedNotApplicable
-    ) {
-        handles.insert(artifact("handle-1")?);
-    }
-    let reopen = matches!(result, SupportResult::Stale | SupportResult::Superseded)
-        .then(|| "reopen-probe-1".to_owned());
-    support_with(result, handles, reopen, None)
+fn denominator_params() -> Result<CoverageDenominatorParams, ContractError> {
+    Ok(CoverageDenominatorParams {
+        class: "source-record".to_owned(),
+        schema: "schema-1".to_owned(),
+        revision: "rev-1".to_owned(),
+        scope: "scope-580".to_owned(),
+        fence: case_fence(),
+        members: BTreeSet::from([artifact("member-1")?, artifact("member-2")?]),
+        roles: BTreeSet::from(["primary".to_owned()]),
+        query: Some(QuerySpec::new(
+            "query-text",
+            QueryRevision("query-rev".to_owned()),
+        )?),
+        frontier: Some(case_frontier()?),
+        snapshot: SnapshotRef::new("snapshot-1", source("owner-1")?)?,
+        exclusions: Vec::new(),
+        bounds: PaginationBounds::new(0, 2, 2, false)?,
+        validity: case_bounds("scope-580", (Some(100), Some(200)), "v1", "file")?,
+        kind: DenominatorKind::CompleteScope,
+    })
 }
 fn denominator() -> Result<CoverageDenominator, ContractError> {
-    CoverageDenominator::new(
-        "source-record",
-        "schema-1",
-        "rev-1",
-        "scope-580",
-        case_fence(),
-        BTreeSet::from([artifact("member-1")?, artifact("member-2")?]),
-        BTreeSet::from(["primary".to_owned()]),
-        Some(QuerySpec::new("query-text", "query-rev")?),
-        Some(FrontierSpec::new("frontier-1", "frontier-rev")?),
-        SnapshotRef::new("snapshot-1", source("owner-1")?)?,
-        Vec::new(),
-        PaginationBounds::new(0, 2, 2, false)?,
-        ValidityBounds::new("scope-580", Some(100), Some(200), "v1", "file")?,
-        DenominatorKind::CompleteScope,
-    )
+    CoverageDenominator::new(denominator_params()?)
 }
 fn receipt_with(
     denominator_digest: String,
@@ -177,52 +194,64 @@ fn receipt_with(
     members: Option<Vec<MemberOutcome>>,
     omissions: Option<Vec<OmittedMember>>,
 ) -> Result<CoverageReceipt, ContractError> {
-    // One param-defaults form: an omitted size follows the standard observed
-    // pair, omitted members are that pair, omitted omissions are empty.
-    CoverageReceipt::new(
-        QuerySpec::new("query-text", "query-rev")?,
-        FrontierSpec::new("frontier-1", "frontier-rev")?,
-        denominator_digest,
-        size.unwrap_or(2),
-        task()?,
-        "scope-580",
-        case_fence(),
-        "policy-1",
-        BTreeSet::from(["group-1".to_owned()]),
-        members.unwrap_or(vec![
+    // One param-defaults form: omitted size/members/omissions follow the standard observed pair.
+    CoverageReceipt::new(CoverageReceiptParams {
+        query: QuerySpec::new("query-text", QueryRevision("query-rev".to_owned()))?,
+        frontier: FrontierSpec::new("frontier-1", FrontierRevision("frontier-rev".to_owned()))?,
+        denominator: denominator_digest,
+        denominator_size: size.unwrap_or(2),
+        task_id: task()?,
+        scope: "scope-580".to_owned(),
+        fence: case_fence(),
+        policy: "policy-1".to_owned(),
+        groups: BTreeSet::from(["group-1".to_owned()]),
+        members: members.unwrap_or(vec![
             member_outcome("member-1", MemberDisposition::Observed)?,
             member_outcome("member-2", MemberDisposition::AuthoritativeAbsence)?,
         ]),
-        omissions.unwrap_or_default(),
-        sha256_hex("proof-receipt".as_bytes()),
-    )
+        omissions: omissions.unwrap_or_default(),
+        proof_digest: sha256_hex("proof-receipt".as_bytes()),
+    })
+}
+fn absence_params(frozen_digest: String) -> Result<AbsenceClaimParams, ContractError> {
+    let query = QuerySpec::new("query-text", QueryRevision("query-rev".to_owned()))?;
+    let owner = source("owner-1")?;
+    let lookup_proof = OwnerLookup::expected_proof(
+        &owner,
+        frozen_digest.as_str(),
+        sha256_hex("proof-receipt".as_bytes()).as_str(),
+    )?;
+    Ok(AbsenceClaimParams {
+        proposition: PropositionId::new("proposition-580")?,
+        domain: "source-record".to_owned(),
+        schema: "schema-1".to_owned(),
+        scope: "scope-580".to_owned(),
+        window_start_ms: Some(100),
+        window_end_ms: Some(200),
+        version: "v1".to_owned(),
+        task_id: task()?,
+        policy: "policy-1".to_owned(),
+        owner_lookup: OwnerLookup::new(owner, lookup_proof)?,
+        denominator_digest: frozen_digest.clone(),
+        denominator_kind: DenominatorKind::CompleteScope,
+        query_digest: shape_digest(&query)?,
+        snapshot_id: "snapshot-1".to_owned(),
+        receipt: receipt_with(frozen_digest, None, None, None)?,
+        proof: BoundedProof::new(sha256_hex("proof-absence".as_bytes()), 64)?,
+    })
 }
 fn absence_with(
     frozen_digest: String,
     receipt: Option<CoverageReceipt>,
     proof_len: u64,
 ) -> Result<AbsenceClaim, ContractError> {
-    // One param-defaults form: an omitted receipt follows the standard
-    // observed pair; only the proof length varies otherwise.
-    let receipt = receipt.unwrap_or(receipt_with(frozen_digest.clone(), None, None, None)?);
-    AbsenceClaim::new(
-        PropositionId::new("proposition-580")?,
-        "source-record",
-        "schema-1",
-        "scope-580",
-        Some(100),
-        Some(200),
-        "v1",
-        task()?,
-        "policy-1",
-        owner_lookup_for(frozen_digest.as_str())?,
-        frozen_digest,
-        DenominatorKind::CompleteScope,
-        shape_digest(&QuerySpec::new("query-text", "query-rev")?)?,
-        "snapshot-1",
-        receipt,
-        BoundedProof::new(sha256_hex("proof-absence".as_bytes()), proof_len)?,
-    )
+    // One param-defaults form: an omitted receipt follows the standard observed pair.
+    let mut params = absence_params(frozen_digest)?;
+    if let Some(receipt) = receipt {
+        params.receipt = receipt;
+    }
+    params.proof = BoundedProof::new(sha256_hex("proof-absence".as_bytes()), proof_len)?;
+    AbsenceClaim::new(params)
 }
 fn claim_entry(
     name: &str,
@@ -231,8 +260,7 @@ fn claim_entry(
     grade: Option<EvidenceGrade>,
     dependencies: BTreeSet<ClaimId>,
 ) -> Result<ClaimEntry, ContractError> {
-    // One param-defaults form: an omitted verdict and grade follow the
-    // accepted, grounded shape, and the audit follows the verdict.
+    // One param-defaults form: omitted verdict/grade follow the accepted, grounded shape.
     let verdict = verdict.unwrap_or(ClaimVerdict::Accepted);
     let audit = match verdict {
         ClaimVerdict::Accepted => ClaimAuditOutcome::Supported,
@@ -242,26 +270,26 @@ fn claim_entry(
     if with_counter {
         counterevidence.insert(artifact("counter-1")?);
     }
-    ClaimEntry::new(
-        ClaimId::new(name)?,
-        sha256_hex(name.as_bytes()),
+    ClaimEntry::new(ClaimEntryParams {
+        claim: ClaimId::new(name)?,
+        statement_digest: sha256_hex(name.as_bytes()),
         verdict,
         audit,
         counterevidence,
-        None,
-        EvidenceAuthority::DeterministicRuntimeTest,
-        GradeAssignment::known(grade.unwrap_or(EvidenceGrade::Grounded)),
+        conflict: None,
+        authority: EvidenceAuthority::DeterministicRuntimeTest,
+        grade: GradeAssignment::known(grade.unwrap_or(EvidenceGrade::Grounded)),
         dependencies,
-        ValidityBounds::new("scope-580", Some(100), Some(200), "v1", "file")?,
-        None,
-        sha256_hex("coverage-claim".as_bytes()),
-        BTreeSet::from([artifact("handle-1")?]),
-        BTreeMap::new(),
-        BTreeSet::new(),
-        grade.unwrap_or(EvidenceGrade::Grounded),
-        BTreeSet::from(["assumption-1".to_owned()]),
-        BTreeSet::from(["discriminator-1".to_owned()]),
-    )
+        bounds: case_bounds("scope-580", (Some(100), Some(200)), "v1", "file")?,
+        temporal: None,
+        coverage_digest: sha256_hex("coverage-claim".as_bytes()),
+        support: BTreeSet::from([artifact("handle-1")?]),
+        components: BTreeMap::new(),
+        unresolved_support: BTreeSet::new(),
+        ceiling: grade.unwrap_or(EvidenceGrade::Grounded),
+        assumptions: BTreeSet::from(["assumption-1".to_owned()]),
+        discriminators: BTreeSet::from(["discriminator-1".to_owned()]),
+    })
 }
 fn try_map(
     admitted: BTreeSet<ClaimId>,
@@ -290,51 +318,40 @@ fn claim_map() -> Result<ClaimMap, ContractError> {
         )?],
     )
 }
-fn try_causal(
-    status: CausalStatus,
-    mechanism: &str,
-    rivals: BTreeSet<String>,
-    confounders: BTreeSet<String>,
-    evidence_refs: BTreeSet<ArtifactId>,
-    ceiling: EvidenceGrade,
-) -> Result<CausalClaim, ContractError> {
+fn causal_with(mutate: impl FnOnce(&mut CausalClaimParams)) -> Result<CausalClaim, ContractError> {
+    // One fixture helper: every other causal argument is fixed; call sites name one axis.
     let proof = sha256_hex("proof-causal".as_bytes());
-    CausalClaim::new(
-        PropositionId::new("proposition-580")?,
-        status,
-        mechanism,
-        rivals,
-        confounders,
-        evidence_refs,
-        "outcome-delta-1",
-        "control-1",
-        source("source-a")?,
-        SourceLineage::new(
+    let mut params = CausalClaimParams {
+        subject: PropositionId::new("proposition-580")?,
+        status: CausalStatus::Mechanism,
+        mechanism: "mechanism-1".to_owned(),
+        rivals: BTreeSet::from(["rival-1".to_owned()]),
+        confounders: BTreeSet::from(["confounder-1".to_owned()]),
+        evidence_refs: BTreeSet::from([artifact("evidence-1")?]),
+        outcome: "outcome-delta-1".to_owned(),
+        control: "control-1".to_owned(),
+        source: source("source-a")?,
+        source_lineage: SourceLineage::new(
             source("source-a")?,
-            "r1",
+            SourceRevisionId::new("r1")?,
             sha256_hex("content-causal".as_bytes()),
             Some("raw-causal".to_owned()),
             BTreeSet::new(),
             None,
         )?,
-        SourceAssurance::new(source("source-a")?, "r1", proof.clone())?,
-        LineageRootId::new("lineage-1")?,
-        case_fence(),
-        TemporalRecord::new(10, 11, 12, 13, 14)?,
-        proof,
-        ceiling,
-        "scope-580",
-    )
+        assurance: case_assurance(proof.clone())?,
+        lineage: LineageRootId::new("lineage-1")?,
+        fence: case_fence(),
+        temporal: TemporalRecord::new(10, 11, 12, 13, 14)?,
+        proof_digest: proof,
+        ceiling: EvidenceGrade::Corroborated,
+        scope: "scope-580".to_owned(),
+    };
+    mutate(&mut params);
+    CausalClaim::new(params)
 }
 fn causal() -> Result<CausalClaim, ContractError> {
-    try_causal(
-        CausalStatus::Mechanism,
-        "mechanism-1",
-        BTreeSet::from(["rival-1".to_owned()]),
-        BTreeSet::from(["confounder-1".to_owned()]),
-        BTreeSet::from([artifact("evidence-1")?]),
-        EvidenceGrade::Corroborated,
-    )
+    causal_with(|_| {})
 }
 fn conflict() -> Result<ConflictSet, ContractError> {
     let positions = vec![
@@ -353,68 +370,74 @@ fn conflict() -> Result<ConflictSet, ContractError> {
             true,
         )?,
     ];
-    ConflictSet::new(
-        "conflict-1",
-        ConflictKind::Epistemic,
-        "scope-580",
-        Some(task()?),
+    ConflictSet::new(ConflictSetParams {
+        conflict_id: "conflict-1".to_owned(),
+        kind: ConflictKind::Epistemic,
+        scope: "scope-580".to_owned(),
+        task_id: Some(task()?),
         positions,
-        BTreeSet::from([artifact("evidence-1")?]),
-        BTreeSet::from([source("source-a")?, source("source-b")?]),
-        BTreeSet::from([LineageRootId::new("lineage-1")?]),
-        BTreeSet::new(),
-        BTreeSet::from(["open-question-1".to_owned()]),
-        BTreeSet::from([source("source-b")?]),
-        ArgumentAcceptability::Contested,
-        BTreeSet::new(),
-        Some("probe-1".to_owned()),
-        source("source-a")?,
-        vec!["action-1".to_owned()],
-        ConflictLifecycle::Open,
-        sha256_hex("receipt-conflict".as_bytes()),
-    )
+        evidence_refs: BTreeSet::from([artifact("evidence-1")?]),
+        owners: BTreeSet::from([source("source-a")?, source("source-b")?]),
+        common_lineage: BTreeSet::from([LineageRootId::new("lineage-1")?]),
+        resolved_parts: BTreeSet::new(),
+        unresolved: BTreeSet::from(["open-question-1".to_owned()]),
+        unresolved_owners: BTreeSet::from([source("source-b")?]),
+        acceptability: ArgumentAcceptability::Contested,
+        defeated_refs: BTreeSet::new(),
+        probe: Some("probe-1".to_owned()),
+        decision_owner: source("source-a")?,
+        affected_actions: vec!["action-1".to_owned()],
+        lifecycle: ConflictLifecycle::Open,
+        receipt_digest: sha256_hex("receipt-conflict".as_bytes()),
+    })
 }
 fn candidate_with(
     claims: Vec<ClaimEntry>,
     map: &ClaimMap,
     digest: String,
 ) -> Result<EpistemicPositionCandidate, ContractError> {
-    // One test-only params helper: every other candidate argument is fixed,
-    // so the public constructor keeps its full signature untouched.
-    EpistemicPositionCandidate::new(
-        PropositionId::new("proposition-580")?,
-        TaskRevision::genesis(),
-        RequestId::new("request-580").map_err(|_| case_error("case.request"))?,
-        OperationId::new("operation-580").map_err(|_| case_error("case.operation"))?,
-        "idem-580",
-        case_work_scope()?,
+    // One fixture helper: every other candidate argument is fixed; call sites name one axis.
+    let support = support_with(
+        Supported,
+        BTreeSet::from([artifact("handle-1")?]),
         None,
-        task()?,
-        "attempt-580",
-        "scope-580",
-        Some(100),
-        Some(200),
-        "v1",
-        "file",
-        case_fence(),
-        ManifestId::new("manifest-580")?,
+        None,
+    )?;
+    EpistemicPositionCandidate::new(EpistemicPositionCandidateParams {
+        proposition: PropositionId::new("proposition-580")?,
+        revision: TaskRevision::genesis(),
+        request_id: RequestId::new("request-580").map_err(|_| case_error("case.request"))?,
+        operation_id: OperationId::new("operation-580")
+            .map_err(|_| case_error("case.operation"))?,
+        idempotency_key: "idem-580".to_owned(),
+        work_scope: case_work_scope()?,
+        predecessor: None,
+        task_id: task()?,
+        attempt_id: "attempt-580".to_owned(),
+        scope: "scope-580".to_owned(),
+        window_start_ms: Some(100),
+        window_end_ms: Some(200),
+        version: "v1".to_owned(),
+        precision: "file".to_owned(),
+        fence: case_fence(),
+        manifest: ManifestId::new("manifest-580")?,
         claims,
-        Some(map),
-        digest,
-        BTreeSet::new(),
-        vec![support_record(SupportResult::Supported)?],
-        BTreeSet::new(),
-        GradeAssignment::known(EvidenceGrade::Grounded),
-        EvidenceAuthority::DeterministicRuntimeTest,
-        DisclosureClass::Open,
-        PrivacyHandling::Unrestricted,
-        BTreeSet::new(),
-        None,
-        sha256_hex("proof-candidate".as_bytes()),
-        BTreeSet::from(["rival-1".to_owned()]),
-        PositionAssertability::HypothesisCandidate,
-        None,
-    )
+        claim_map: Some(map.clone()),
+        coverage_digest: digest,
+        conflict_digests: BTreeSet::new(),
+        support: vec![support],
+        unknowns: BTreeSet::new(),
+        grade: GradeAssignment::known(EvidenceGrade::Grounded),
+        authority: EvidenceAuthority::DeterministicRuntimeTest,
+        disclosure: DisclosureClass::Open,
+        privacy: PrivacyHandling::Unrestricted,
+        temporal_digests: BTreeSet::new(),
+        verifier: None,
+        proof_digest: sha256_hex("proof-candidate".as_bytes()),
+        rivals: BTreeSet::from(["rival-1".to_owned()]),
+        proposed_assertability: PositionAssertability::HypothesisCandidate,
+        invalidation: None,
+    })
 }
 fn candidate() -> Result<EpistemicPositionCandidate, ContractError> {
     candidate_with(
@@ -430,64 +453,65 @@ fn request_with(
     attempt: &str,
     records: BTreeSet<ArtifactId>,
 ) -> Result<PositionRequest, ContractError> {
-    PositionRequest::new(
-        "question-580",
-        RequestId::new("request-580").map_err(|_| case_error("case.request"))?,
-        OperationId::new("operation-580").map_err(|_| case_error("case.operation"))?,
-        "idem-580",
-        case_work_scope()?,
-        PropositionId::new("proposition-580")?,
-        task()?,
-        attempt,
-        TaskRevision::genesis(),
-        "scope-580",
-        ValidityBounds::new("scope-580", Some(100), Some(200), "v1", "file")?,
-        case_fence(),
+    PositionRequest::new(PositionRequestParams {
+        question: "question-580".to_owned(),
+        request_id: RequestId::new("request-580").map_err(|_| case_error("case.request"))?,
+        operation_id: OperationId::new("operation-580")
+            .map_err(|_| case_error("case.operation"))?,
+        idempotency_key: "idem-580".to_owned(),
+        work_scope: case_work_scope()?,
+        proposition: PropositionId::new("proposition-580")?,
+        task_id: task()?,
+        attempt_id: attempt.to_owned(),
+        revision: TaskRevision::genesis(),
+        scope: "scope-580".to_owned(),
+        validity: case_bounds("scope-580", (Some(100), Some(200)), "v1", "file")?,
+        fence: case_fence(),
         records,
-    )
+    })
 }
 fn request() -> Result<PositionRequest, ContractError> {
     request_with("attempt-580", BTreeSet::from([artifact("handle-1")?]))
 }
 fn assumption_with(id: &str, statement: &str) -> Result<AssumptionRecord, ContractError> {
-    AssumptionRecord::new(
-        id,
-        statement,
-        "registry-snapshot",
-        "close the world for this read",
-        "a stale mirror misstates membership",
-        BTreeSet::new(),
-        ValidityBounds::new("scope-580", Some(100), Some(200), "v1", "file")?,
-        source("owner-1")?,
-        task()?,
-        case_fence(),
-    )
+    AssumptionRecord::new(AssumptionRecordParams {
+        assumption_id: id.to_owned(),
+        statement: statement.to_owned(),
+        origin: "registry-snapshot".to_owned(),
+        necessity: "close the world for this read".to_owned(),
+        failure_mode: "a stale mirror misstates membership".to_owned(),
+        dependents: BTreeSet::new(),
+        bounds: case_bounds("scope-580", (Some(100), Some(200)), "v1", "file")?,
+        holder: source("owner-1")?,
+        task_id: task()?,
+        fence: case_fence(),
+    })
 }
 fn assumption() -> Result<AssumptionRecord, ContractError> {
     assumption_with("assumption-1", "the registry mirrors the snapshot")
 }
 fn investigation_with(target: &str) -> Result<InvestigationRequirement, ContractError> {
-    InvestigationRequirement::new(
-        "requirement-1",
-        PropositionId::new("proposition-580")?,
-        "scope-580",
-        task()?,
-        case_fence(),
-        InvestigationKind::ObtainEvidence,
-        target,
-        "no route observed the subject",
-    )
+    InvestigationRequirement::new(InvestigationRequirementParams {
+        requirement_id: "requirement-1".to_owned(),
+        proposition: PropositionId::new("proposition-580")?,
+        scope: "scope-580".to_owned(),
+        task_id: task()?,
+        fence: case_fence(),
+        inquiry: InvestigationKind::ObtainEvidence,
+        target: target.to_owned(),
+        reason: "no route observed the subject".to_owned(),
+    })
 }
 fn closure() -> Result<ProvenanceClosure, ContractError> {
-    ProvenanceClosure::new(
-        BTreeSet::from([artifact("handle-1")?, artifact("handle-2")?]),
-        BTreeSet::from([source("source-a")?]),
-        BTreeSet::from(["raw-1".to_owned(), "raw-2".to_owned()]),
-        BTreeSet::from(["r1".to_owned()]),
-        vec![
+    ProvenanceClosure::new(ProvenanceClosureParams {
+        records: BTreeSet::from([artifact("handle-1")?, artifact("handle-2")?]),
+        sources: BTreeSet::from([source("source-a")?]),
+        raw_handles: BTreeSet::from(["raw-1".to_owned(), "raw-2".to_owned()]),
+        revisions: BTreeSet::from(["r1".to_owned()]),
+        lineage: vec![
             SourceLineage::new(
                 source("source-a")?,
-                "r1",
+                SourceRevisionId::new("r1")?,
                 sha256_hex("content-a".as_bytes()),
                 Some("raw-1".to_owned()),
                 BTreeSet::new(),
@@ -495,23 +519,23 @@ fn closure() -> Result<ProvenanceClosure, ContractError> {
             )?,
             SourceLineage::new(
                 source("source-a")?,
-                "r1",
+                SourceRevisionId::new("r1")?,
                 sha256_hex("content-b".as_bytes()),
                 Some("raw-2".to_owned()),
                 BTreeSet::from([sha256_hex("content-a".as_bytes())]),
                 None,
             )?,
         ],
-        BTreeMap::from([
+        record_origin: BTreeMap::from([
             (artifact("handle-1")?, sha256_hex("content-a".as_bytes())),
             (artifact("handle-2")?, sha256_hex("content-b".as_bytes())),
         ]),
-        None,
-        false,
-        Assertability::NonAssertableUnverified,
-        "scope-580",
-        case_fence(),
-    )
+        temporal_digest: None,
+        mixed_sources: false,
+        assertability: Assertability::NonAssertableUnverified,
+        scope: "scope-580".to_owned(),
+        fence: case_fence(),
+    })
 }
 fn verifier_with(
     revision: &str,
@@ -535,88 +559,77 @@ fn verifier_with(
 }
 fn admitted() -> Result<CurrentEpistemicPosition, ContractError> {
     CurrentEpistemicPosition::new(
-        AdmittedReceipt::new(
-            ReceiptId::new("receipt-580").map_err(|_| case_error("case.receipt"))?,
-            sha256_hex("admission-payload".as_bytes()),
-            source("owner-1")?,
-            "r1",
-            "scope-580",
-            case_fence(),
-            sha256_hex("evidence-view".as_bytes()),
-            sha256_hex("coverage-view".as_bytes()),
-            sha256_hex("conflict-view".as_bytes()),
-            sha256_hex("proof-view".as_bytes()),
-            PositionId::new("position-580")?,
-            PositionRevision::genesis(),
-        )?,
+        AdmittedReceipt::new(AdmittedReceiptParams {
+            receipt_id: ReceiptId::new("receipt-580").map_err(|_| case_error("case.receipt"))?,
+            payload_digest: sha256_hex("admission-payload".as_bytes()),
+            owner: source("owner-1")?,
+            revision: "r1".to_owned(),
+            scope: "scope-580".to_owned(),
+            fence: case_fence(),
+            evidence_digest: sha256_hex("evidence-view".as_bytes()),
+            coverage_digest: sha256_hex("coverage-view".as_bytes()),
+            conflict_digest: sha256_hex("conflict-view".as_bytes()),
+            proof_digest: sha256_hex("proof-view".as_bytes()),
+            position: PositionId::new("position-580")?,
+            position_revision: PositionRevision::genesis(),
+        })?,
         Currentness::Current,
         BTreeSet::new(),
         ClaimId::new("claim-a")?,
     )
 }
-fn try_transition(
-    trigger: TransitionTrigger,
-    before: SupportResult,
-    after: SupportResult,
-    before_a: PositionAssertability,
-    after_a: PositionAssertability,
-    delta: SupportDelta,
-    evidence_refs: BTreeSet<ArtifactId>,
+fn transition_with(
+    mutate: impl FnOnce(&mut EpistemicTransitionParams),
 ) -> Result<EpistemicTransition, ContractError> {
-    EpistemicTransition::new(
-        PropositionId::new("proposition-580")?,
-        task()?,
-        "attempt-580",
-        RequestId::new("request-580").map_err(|_| case_error("case.request"))?,
-        "idem-580",
-        case_work_scope()?,
-        sha256_hex("candidate-580".as_bytes()),
-        TaskRevision::genesis(),
-        case_fence(),
-        trigger,
-        evidence_refs,
-        OperationId::new("operation-580").map_err(|_| case_error("case.operation"))?,
-        before,
-        after,
-        before_a,
-        after_a,
-        delta,
-        sha256_hex("coverage-delta".as_bytes()),
-        sha256_hex("conflict-delta".as_bytes()),
-        None,
-        "revert to predecessor",
-        None,
-        None,
-        sha256_hex("proof-transition".as_bytes()),
-    )
-}
-fn transition() -> Result<EpistemicTransition, ContractError> {
-    try_transition(
-        TransitionTrigger::NewEvidence,
-        SupportResult::Partial,
-        SupportResult::Supported,
-        PositionAssertability::HypothesisCandidate,
-        PositionAssertability::QualifiedInference,
-        SupportDelta::new(
+    // One fixture helper: every other transition argument is fixed; call sites name one axis.
+    let mut params = EpistemicTransitionParams {
+        position: PropositionId::new("proposition-580")?,
+        task_id: task()?,
+        attempt_id: "attempt-580".to_owned(),
+        request_id: RequestId::new("request-580").map_err(|_| case_error("case.request"))?,
+        idempotency_key: "idem-580".to_owned(),
+        work_scope: case_work_scope()?,
+        candidate_digest: sha256_hex("candidate-580".as_bytes()),
+        expected_revision: TaskRevision::genesis(),
+        expected_fence: case_fence(),
+        trigger: TransitionTrigger::NewEvidence,
+        evidence_refs: BTreeSet::from([artifact("evidence-1")?]),
+        operation: OperationId::new("operation-580").map_err(|_| case_error("case.operation"))?,
+        before_support: SupportResult::Partial,
+        after_support: SupportResult::Supported,
+        before_assertability: PositionAssertability::HypothesisCandidate,
+        after_assertability: PositionAssertability::QualifiedInference,
+        delta: SupportDelta::new(
             BTreeSet::from([artifact("handle-2")?]),
             BTreeSet::new(),
             BTreeSet::from([artifact("handle-1")?]),
             BTreeSet::from(["fresh observation".to_owned()]),
         )?,
-        BTreeSet::from([artifact("evidence-1")?]),
-    )
+        coverage_delta_digest: sha256_hex("coverage-delta".as_bytes()),
+        conflict_delta_digest: sha256_hex("conflict-delta".as_bytes()),
+        temporal: None,
+        rollback: "revert to predecessor".to_owned(),
+        repair: None,
+        invalidation: None,
+        proof_digest: sha256_hex("proof-transition".as_bytes()),
+    };
+    mutate(&mut params);
+    EpistemicTransition::new(params)
+}
+fn transition() -> Result<EpistemicTransition, ContractError> {
+    transition_with(|_| {})
 }
 fn identity_bundle() -> Result<IdentityBundle, ContractError> {
-    IdentityBundle::new(
-        PropositionId::new("proposition-580")?,
-        ClaimId::new("claim-580")?,
-        EvidenceSetId::new("evidence-set-580")?,
-        ManifestId::new("manifest-580")?,
-        SourceRevisionId::new("revision-580")?,
-        LineageRootId::new("lineage-580")?,
-        ValidityId::new("validity-580")?,
-        BTreeSet::new(),
-    )
+    IdentityBundle::new(IdentityBundleParams {
+        proposition: PropositionId::new("proposition-580")?,
+        claim: ClaimId::new("claim-580")?,
+        evidence_set: EvidenceSetId::new("evidence-set-580")?,
+        manifest: ManifestId::new("manifest-580")?,
+        source_revision: SourceRevisionId::new("revision-580")?,
+        lineage_root: LineageRootId::new("lineage-580")?,
+        validity: ValidityId::new("validity-580")?,
+        predecessors: BTreeSet::new(),
+    })
 }
 // WORK_UNIT_CASE: 580/1
 #[test]
@@ -641,70 +654,69 @@ fn golden_grade_names_and_order() {
 // WORK_UNIT_CASE: 580/2
 #[test]
 fn support_coverage_completeness_assertability_invalidation_vocabs() -> CaseResult {
-    let grades = wires(&GRADE_ORDER)?.join(",");
-    let expected_grades = "\"ORIENTING\",\"GROUNDED\",\"CORROBORATED\",\"SCIENCE_GRADE\"";
-    assert_eq!(grades, expected_grades);
-    let support = [
-        SupportResult::Supported,
-        SupportResult::Partial,
-        SupportResult::Contradicted,
-        SupportResult::Unsupported,
-        SupportResult::Unknown,
-        SupportResult::OutsideManifest,
-        SupportResult::Stale,
-        SupportResult::Superseded,
-        SupportResult::JustifiedNotApplicable,
-    ];
-    assert_eq!(
-        wires(&support)?.join(","),
-        "\"SUPPORTED\",\"PARTIAL\",\"CONTRADICTED\",\"UNSUPPORTED\",\"UNKNOWN\",\"OUTSIDE_MANIFEST\",\"STALE\",\"SUPERSEDED\",\"JUSTIFIED_NOT_APPLICABLE\""
-    );
-    let kinds = [
-        DenominatorKind::CompleteScope,
-        DenominatorKind::SampledWithMethod,
-        DenominatorKind::Unknown,
-    ];
-    let kinds_wire = "\"COMPLETE_SCOPE\",\"SAMPLED_WITH_METHOD\",\"UNKNOWN\"";
-    assert_eq!(wires(&kinds)?.join(","), kinds_wire);
-    let dispositions = [
-        MemberDisposition::Observed,
-        MemberDisposition::AuthoritativeAbsence,
-        MemberDisposition::Unavailable,
-        MemberDisposition::Blocked,
-        MemberDisposition::Stale,
-        MemberDisposition::Malformed,
-        MemberDisposition::OutOfScope,
-        MemberDisposition::PermittedOmission,
-        MemberDisposition::Exhaustion,
-        MemberDisposition::DependentDuplicate,
-        MemberDisposition::Unknown,
-    ];
-    assert_eq!(
-        wires(&dispositions)?.join(","),
-        "\"OBSERVED\",\"AUTHORITATIVE_ABSENCE\",\"UNAVAILABLE\",\"BLOCKED\",\"STALE\",\"MALFORMED\",\"OUT_OF_SCOPE\",\"PERMITTED_OMISSION\",\"EXHAUSTION\",\"DEPENDENT_DUPLICATE\",\"UNKNOWN\""
-    );
-    let assertability = [
-        PositionAssertability::ObservedFact,
-        PositionAssertability::QualifiedInference,
-        PositionAssertability::HypothesisCandidate,
-        PositionAssertability::ConflictQualificationRequired,
-        PositionAssertability::UnknownWithheldQuarantined,
-        PositionAssertability::PlanningOnly,
-        PositionAssertability::MaterialEffect,
-    ];
-    assert_eq!(
-        wires(&assertability)?.join(","),
-        "\"OBSERVED_FACT\",\"QUALIFIED_INFERENCE\",\"HYPOTHESIS_CANDIDATE\",\"CONFLICT_QUALIFICATION_REQUIRED\",\"UNKNOWN_WITHHELD_QUARANTINED\",\"PLANNING_ONLY\",\"MATERIAL_EFFECT\""
-    );
-    let invalidations = [
-        InvalidationKind::Superseded,
-        InvalidationKind::Withdrawn,
-        InvalidationKind::Reopened,
-        InvalidationKind::Repaired,
-    ];
-    let repaired = wires(&invalidations)?.join(",");
-    let expected_repairs = "\"SUPERSEDED\",\"WITHDRAWN\",\"REOPENED\",\"REPAIRED\"";
-    assert_eq!(repaired, expected_repairs);
+    use MemberDisposition as D;
+    use PositionAssertability as A;
+    let grades = "\"ORIENTING\",\"GROUNDED\",\"CORROBORATED\",\"SCIENCE_GRADE\"";
+    assert_wires(&GRADE_ORDER, grades)?;
+    assert_wires(
+        &[
+            Supported,
+            Partial,
+            Contradicted,
+            Unsupported,
+            SupportResult::Unknown,
+            SupportResult::OutsideManifest,
+            SupportResult::Stale,
+            SupportResult::Superseded,
+            SupportResult::JustifiedNotApplicable,
+        ],
+        "\"SUPPORTED\",\"PARTIAL\",\"CONTRADICTED\",\"UNSUPPORTED\",\"UNKNOWN\",\"OUTSIDE_MANIFEST\",\"STALE\",\"SUPERSEDED\",\"JUSTIFIED_NOT_APPLICABLE\"",
+    )?;
+    assert_wires(
+        &[
+            DenominatorKind::CompleteScope,
+            DenominatorKind::SampledWithMethod,
+            DenominatorKind::Unknown,
+        ],
+        "\"COMPLETE_SCOPE\",\"SAMPLED_WITH_METHOD\",\"UNKNOWN\"",
+    )?;
+    assert_wires(
+        &[
+            D::Observed,
+            D::AuthoritativeAbsence,
+            D::Unavailable,
+            D::Blocked,
+            D::Stale,
+            D::Malformed,
+            D::OutOfScope,
+            D::PermittedOmission,
+            D::Exhaustion,
+            D::DependentDuplicate,
+            D::Unknown,
+        ],
+        "\"OBSERVED\",\"AUTHORITATIVE_ABSENCE\",\"UNAVAILABLE\",\"BLOCKED\",\"STALE\",\"MALFORMED\",\"OUT_OF_SCOPE\",\"PERMITTED_OMISSION\",\"EXHAUSTION\",\"DEPENDENT_DUPLICATE\",\"UNKNOWN\"",
+    )?;
+    assert_wires(
+        &[
+            A::ObservedFact,
+            A::QualifiedInference,
+            A::HypothesisCandidate,
+            A::ConflictQualificationRequired,
+            A::UnknownWithheldQuarantined,
+            A::PlanningOnly,
+            A::MaterialEffect,
+        ],
+        "\"OBSERVED_FACT\",\"QUALIFIED_INFERENCE\",\"HYPOTHESIS_CANDIDATE\",\"CONFLICT_QUALIFICATION_REQUIRED\",\"UNKNOWN_WITHHELD_QUARANTINED\",\"PLANNING_ONLY\",\"MATERIAL_EFFECT\"",
+    )?;
+    assert_wires(
+        &[
+            InvalidationKind::Superseded,
+            InvalidationKind::Withdrawn,
+            InvalidationKind::Reopened,
+            InvalidationKind::Repaired,
+        ],
+        "\"SUPERSEDED\",\"WITHDRAWN\",\"REOPENED\",\"REPAIRED\"",
+    )?;
     Ok(())
 }
 // WORK_UNIT_CASE: 580/3
@@ -729,8 +741,7 @@ fn digest_differs_from_source_identity_and_authority() -> CaseResult {
     assert_ne!(bundle.digest, bundle.source_revision.as_str());
     assert_ne!(bundle.digest, bundle.lineage_root.as_str());
     assert_ne!(bundle.digest, bundle.evidence_set.as_str());
-    // Authority is a class of reading, never an identity and never a digest:
-    // the authority wire names the reading while the digest covers bytes.
+    // Authority is a reading, never an identity or digest.
     let authority_wire = encoded(&EvidenceAuthority::DeterministicRuntimeTest)?;
     assert_eq!(authority_wire, "\"DETERMINISTIC_RUNTIME_TEST\"");
     assert_ne!(authority_wire.as_str(), bundle.digest.as_str());
@@ -776,7 +787,12 @@ fn transformed_retains_raw_lineage() -> CaseResult {
 // WORK_UNIT_CASE: 580/6
 #[test]
 fn wrong_task_scope_fence_rejected() -> CaseResult {
-    let record = support_record(SupportResult::Supported)?;
+    let record = support_with(
+        Supported,
+        BTreeSet::from([artifact("handle-1")?]),
+        None,
+        None,
+    )?;
     let other_task = TaskId::new("task-other").map_err(|_| case_error("case.task"))?;
     let epoch9 = AuthorityEpoch::new(9).map_err(|_| case_error("case.epoch"))?;
     let task_probe = record.validate_for(&other_task, "scope-580", &case_fence());
@@ -843,7 +859,7 @@ fn assert_statement_bound() -> CaseResult {
 #[test]
 fn variable_field_boundaries_and_one_over() -> CaseResult {
     assert_short_bound("support.precision", &|value| {
-        ValidityBounds::new("scope-580", None, None, "v1", value).map(|_| ())
+        case_bounds("scope-580", (None, None), "v1", value).map(|_| ())
     })?;
     assert_short_bound("request.attempt_id", &|value| {
         request_with(value, BTreeSet::from([artifact("handle-1")?])).map(|_| ())
@@ -859,14 +875,18 @@ fn variable_field_boundaries_and_one_over() -> CaseResult {
     for index in 0..MAX_HANDLES {
         handles.insert(artifact(format!("handle-{index}").as_str())?);
     }
-    let full = support_with(SupportResult::Supported, handles, None, None)?;
+    let full = support_with(Supported, handles, None, None)?;
     full.validate()?;
     let mut overflow = BTreeSet::new();
     for index in 0..=MAX_HANDLES {
         overflow.insert(artifact(format!("overflow-{index}").as_str())?);
     }
-    let overflowed = support_with(SupportResult::Supported, overflow, None, None);
+    let overflowed = support_with(Supported, overflow, None, None);
     expect_err!(overflowed, TooMany, "support.handles");
+    let empty_bounds = PaginationBounds::new(0, 0, 2, false).map(|_| ());
+    expect_err!(empty_bounds, OutOfRange, "coverage.limit");
+    let control = assumption_with("assumption-1", "a\u{7}b").map(|_| ());
+    expect_err!(control, ControlCharacter, "assumption.statement");
     Ok(())
 }
 // WORK_UNIT_CASE: 580/9
@@ -940,67 +960,81 @@ fn all_support_results_decode() -> CaseResult {
 // WORK_UNIT_CASE: 580/13
 #[test]
 fn unsupported_valid_is_not_error() -> CaseResult {
-    support_record(SupportResult::Unsupported)?.validate()?;
-    support_record(SupportResult::Contradicted)?.validate()?;
-    support_record(SupportResult::Unknown)?.validate()
+    support_with(
+        Unsupported,
+        BTreeSet::from([artifact("handle-1")?]),
+        None,
+        None,
+    )?
+    .validate()?;
+    support_with(
+        Contradicted,
+        BTreeSet::from([artifact("handle-1")?]),
+        None,
+        None,
+    )?
+    .validate()?;
+    support_with(SupportResult::Unknown, BTreeSet::new(), None, None)?.validate()
 }
 // WORK_UNIT_CASE: 580/14
 #[test]
 fn handles_preserved_on_support() -> CaseResult {
-    let record = support_record(SupportResult::Supported)?;
+    let record = support_with(
+        Supported,
+        BTreeSet::from([artifact("handle-1")?]),
+        None,
+        None,
+    )?;
     let decoded: SupportRecord = parse(&encoded(&record)?)?;
     assert_eq!(decoded.handles, record.handles);
     assert!(decoded.handles.contains(&artifact("handle-1")?));
     assert_eq!(encoded(&decoded)?, encoded(&record)?);
-    // Source assurance binds the proof to its source: a matching proof
-    // validates, a foreign proof fails.
+    // Source assurance binds the proof to its source.
     let assured = support_with(
-        SupportResult::Supported,
+        Supported,
         BTreeSet::from([artifact("handle-1")?]),
         None,
-        Some(SourceAssurance::new(
-            source("source-a")?,
-            "r1",
-            sha256_hex("proof-support".as_bytes()),
-        )?),
+        Some(case_assurance(sha256_hex("proof-support".as_bytes()))?),
     )?;
     assured.validate()?;
     let mut foreign = assured.clone();
-    foreign.assurance = Some(SourceAssurance::new(
-        source("source-a")?,
-        "r1",
-        sha256_hex("other-proof".as_bytes()),
-    )?);
+    foreign.assurance = Some(case_assurance(sha256_hex("other-proof".as_bytes()))?);
     expect_err!(foreign.validate(), DigestMismatch, "support.assurance");
     Ok(())
 }
 // WORK_UNIT_CASE: 580/15
 #[test]
 fn scope_time_version_precision_mismatch_limits_support() -> CaseResult {
-    let bounds = ValidityBounds::new("scope-580", Some(100), Some(200), "v1", "file")?;
+    let bounds = case_bounds("scope-580", (Some(100), Some(200)), "v1", "file")?;
     assert!(bounds.covers("scope-580", Some(150), "v1", "file"));
     assert!(!bounds.covers("scope-other", Some(150), "v1", "file"));
     assert!(!bounds.covers("scope-580", Some(50), "v1", "file"));
     assert!(!bounds.covers("scope-580", Some(250), "v1", "file"));
     assert!(!bounds.covers("scope-580", Some(150), "v2", "file"));
-    // Precision participates: support at `file` covers `file` and coarser
-    // assertions, never `symbol` or `line` ones.
+    // Precision participates: `file` covers `file` and coarser, never `symbol`/`line`.
     assert!(!bounds.covers("scope-580", Some(150), "v1", "symbol"));
     assert!(!bounds.covers("scope-580", Some(150), "v1", "line"));
     assert!(bounds.covers("scope-580", Some(150), "v1", "directory"));
     assert!(bounds.covers("scope-580", Some(150), "v1", "package"));
     assert!(bounds.covers("scope-580", Some(150), "v1", "repository"));
     // Unknown precision spellings cover only exact equality.
-    let custom = ValidityBounds::new("scope-580", None, None, "v1", "rack-unit")?;
+    let custom = case_bounds("scope-580", (None, None), "v1", "rack-unit")?;
     assert!(custom.covers("scope-580", None, "v1", "rack-unit"));
     assert!(!custom.covers("scope-580", None, "v1", "file"));
     assert!(!bounds.covers("scope-580", None, "v1", "rack-unit"));
-    let record = support_record(SupportResult::Supported)?;
+    let record = support_with(
+        Supported,
+        BTreeSet::from([artifact("handle-1")?]),
+        None,
+        None,
+    )?;
     let scope_probe = record.validate_for(&task()?, "scope-other", &case_fence());
     expect_err!(scope_probe, ScopeMismatch, "support.scope");
-    let narrowed = ValidityBounds::new("scope-580", Some(100), Some(200), "v2", "symbol")?;
+    let narrowed = case_bounds("scope-580", (Some(100), Some(200)), "v2", "symbol")?;
     assert_ne!(narrowed.version, bounds.version);
     assert_ne!(narrowed.precision, bounds.precision);
+    let inverted = case_bounds("scope-580", (Some(200), Some(100)), "v1", "file").map(|_| ());
+    expect_err!(inverted, InvertedInterval, "support.window");
     Ok(())
 }
 // WORK_UNIT_CASE: 580/16
@@ -1011,9 +1045,10 @@ fn valid_finite_denominator() -> CaseResult {
     assert_eq!(frozen.members.len(), 2);
     assert_eq!(frozen.kind, DenominatorKind::CompleteScope);
     assert_eq!(frozen.digest, frozen.compute_digest()?);
-    let exclusion = ExclusionRecord::new("member-9", "out of scope class")?;
+    let exclusion =
+        ExclusionRecord::new("member-9", ExclusionReason("out of scope class".to_owned()))?;
     exclusion.validate()?;
-    assert!(ExclusionRecord::new("member-9", "   ").is_err());
+    assert!(ExclusionRecord::new("member-9", ExclusionReason("   ".to_owned())).is_err());
     Ok(())
 }
 // WORK_UNIT_CASE: 580/17
@@ -1027,30 +1062,24 @@ fn vague_denominator_rejected() -> CaseResult {
     let mut vague_scope = base.clone();
     vague_scope.scope = "*".to_owned();
     expect_err!(vague_scope.validate(), VagueDenominator, "coverage.scope");
-    // Known-empty is owned, exact, and bound: complete marker plus the
-    // query, frontier, and owner snapshot the emptiness was read from.
-    let empty = |kind, query: Option<QuerySpec>, frontier: Option<FrontierSpec>, total| {
-        CoverageDenominator::new(
-            "source-record",
-            "schema-1",
-            "rev-1",
-            "scope-580",
-            case_fence(),
-            BTreeSet::new(),
-            BTreeSet::new(),
-            query,
-            frontier,
-            SnapshotRef::new("snapshot-1", source("owner-1")?)?,
-            Vec::new(),
-            PaginationBounds::new(0, 1, total, false)?,
-            ValidityBounds::new("scope-580", Some(100), Some(200), "v1", "file")?,
-            kind,
-        )
+    // Known-empty is owned, exact, and bound to its query, frontier, and snapshot.
+    let empty = |kind, query, frontier, total| {
+        let mut params = denominator_params()?;
+        params.kind = kind;
+        params.query = query;
+        params.frontier = frontier;
+        params.members = BTreeSet::new();
+        params.roles = BTreeSet::new();
+        params.bounds = PaginationBounds::new(0, 1, total, false)?;
+        CoverageDenominator::new(params)
     };
     let known_empty = empty(
         DenominatorKind::CompleteScope,
-        Some(QuerySpec::new("query-text", "query-rev")?),
-        Some(FrontierSpec::new("frontier-1", "frontier-rev")?),
+        Some(QuerySpec::new(
+            "query-text",
+            QueryRevision("query-rev".to_owned()),
+        )?),
+        Some(case_frontier()?),
         0,
     )?;
     known_empty.validate()?;
@@ -1059,7 +1088,7 @@ fn vague_denominator_rejected() -> CaseResult {
         let empty_members = empty(kind, None, None, 1);
         expect_err!(empty_members, IncompleteDenominator, "coverage.members");
     }
-    let query = QuerySpec::new("query-text", "query-rev")?;
+    let query = QuerySpec::new("query-text", QueryRevision("query-rev".to_owned()))?;
     let incomplete = empty(CompleteScope, Some(query), None, 0);
     expect_err!(incomplete, IncompleteDenominator, "coverage.members");
     // A complete scope is never truncated and its total always equals its enumerated member count.
@@ -1097,10 +1126,8 @@ fn one_disposition_per_member() -> CaseResult {
     let omitted = receipt_with(frozen.digest.clone(), None, None, None)?;
     let roles = check_member_roles(&omitted, &role_omitted, "receipt.role");
     expect_err!(roles, MissingReference, "receipt.role");
-    // Exact (member, role) pairs: a shared member under a second, unrequired role passes shape (distinct
-    // pairs) but fails reconciliation; diagonal and swapped-diagonal receipts over a two-role denominator
-    // keep member and role counts yet miss required pairs; exact duplicate pairs fail in shape, while the
-    // full product reconciles.
+    // Exact (member, role) pairs: a shared member under an unrequired role passes shape but fails
+    // reconciliation; diagonal receipts keep counts yet miss pairs; duplicate pairs fail in shape.
     let mut shared_member = receipt_with(frozen.digest.clone(), None, None, None)?;
     shared_member.members[1].member = artifact("member-1")?;
     shared_member.members[1].role = "secondary".to_owned();
@@ -1215,7 +1242,8 @@ fn valid_absence_claim() -> CaseResult {
     claim.validate()?;
     assert!(claim.receipt.is_terminal());
     claim.validate_closed(&frozen)?;
-    let query = shape_digest(&QuerySpec::new("query-text", "query-rev")?)?;
+    let spec = QuerySpec::new("query-text", QueryRevision("query-rev".to_owned()))?;
+    let query = shape_digest(&spec)?;
     claim.check_context("scope-580", &case_fence(), query.as_str(), "snapshot-1")
 }
 fn absence_probe(second: MemberDisposition) -> Result<AbsenceClaim, ContractError> {
@@ -1235,27 +1263,13 @@ fn absence_probe(second: MemberDisposition) -> Result<AbsenceClaim, ContractErro
 #[test]
 fn no_match_timeout_silence_exhaustion_not_absence() -> CaseResult {
     let frozen = denominator()?;
-    let sampled = AbsenceClaim::new(
-        PropositionId::new("proposition-580")?,
-        "source-record",
-        "schema-1",
-        "scope-580",
-        None,
-        None,
-        "v1",
-        task()?,
-        "policy-1",
-        owner_lookup_for(frozen.digest.as_str())?,
-        frozen.digest.clone(),
-        DenominatorKind::SampledWithMethod,
-        shape_digest(&QuerySpec::new("query-text", "query-rev")?)?,
-        "snapshot-1",
-        receipt_with(frozen.digest.clone(), None, None, None)?,
-        BoundedProof::new(sha256_hex("proof-absence".as_bytes()), 64)?,
-    );
+    let mut sampled_params = absence_params(frozen.digest.clone())?;
+    sampled_params.window_start_ms = None;
+    sampled_params.window_end_ms = None;
+    sampled_params.denominator_kind = DenominatorKind::SampledWithMethod;
+    let sampled = AbsenceClaim::new(sampled_params);
     expect_err!(sampled, IncompleteDenominator, "absence.denominator_kind");
-    // Every non-terminal disposition keeps the question open: none of them
-    // ever constructs absence evidence.
+    // Every non-terminal disposition keeps the question open.
     for disposition in [
         MemberDisposition::Unavailable,
         MemberDisposition::Blocked,
@@ -1276,7 +1290,8 @@ fn no_match_timeout_silence_exhaustion_not_absence() -> CaseResult {
 #[test]
 fn changed_query_scope_fence_snapshot_invalidates_absence() -> CaseResult {
     let claim = absence_with(denominator()?.digest.clone(), None, 128)?;
-    let live_query = shape_digest(&QuerySpec::new("query-text", "query-rev")?)?;
+    let live_spec = QuerySpec::new("query-text", QueryRevision("query-rev".to_owned()))?;
+    let live_query = shape_digest(&live_spec)?;
     let other_query = sha256_hex("other-query".as_bytes());
     let genesis = case_fence();
     let epoch7 = AuthorityEpoch::new(7).map_err(|_| case_error("case.epoch"))?;
@@ -1350,7 +1365,6 @@ fn outside_manifest_rejected() -> CaseResult {
     let ghost_entries = vec![claim_entry("claim-a", None, false, None, BTreeSet::new())?];
     let partial = try_map(partial_admitted, ghost_entries, Vec::new());
     expect_err!(partial, MissingReference, "claim.entries");
-    expect_err!(partial, MissingReference, "claim.entries");
     Ok(())
 }
 // WORK_UNIT_CASE: 580/27
@@ -1412,6 +1426,10 @@ fn dependence_groups_explicit() -> CaseResult {
     entry.dependencies = dangling;
     let attempt = try_map(admitted, vec![entry], Vec::new());
     expect_err!(attempt, MissingReference, "claim.dependencies");
+    // A claim depending on itself names the self-reference, not a missing link.
+    let own = BTreeSet::from([ClaimId::new("claim-a")?]);
+    let self_dependent = claim_entry("claim-a", None, false, None, own);
+    expect_err!(self_dependent, SelfReference, "claim.dependencies");
     // Dependence groups must hold both ends of a dependency edge together.
     let pair_admitted = BTreeSet::from([ClaimId::new("claim-a")?, ClaimId::new("claim-b")?]);
     let lone_members = BTreeSet::from([ClaimId::new("claim-a")?]);
@@ -1472,13 +1490,17 @@ fn chrono_corr_dependency_causal_no_cross_decode() -> CaseResult {
     assert!(serde_json::from_str::<TemporalPrecedence>(&causal_json).is_err());
     assert!(!precedence_json.contains("mechanism"));
     assert!(!causal_json.contains("before_ms"));
-    // Six-way separation: chronology, mechanism, assumption, support,
-    // investigation, and request never cross-decode.
+    // Six-way separation: the six shapes never cross-decode.
     let wires = [
         precedence_json,
         causal_json,
         encoded(&assumption()?)?,
-        encoded(&support_record(SupportResult::Supported)?)?,
+        encoded(&support_with(
+            Supported,
+            BTreeSet::from([artifact("handle-1")?]),
+            None,
+            None,
+        )?)?,
         encoded(&investigation_with("open-route")?)?,
         encoded(&request()?)?,
     ];
@@ -1522,8 +1544,7 @@ fn causal_needs_mechanism_rivals_evidence() -> CaseResult {
     const NO_CONF: (bool, bool, bool) = (true, false, true);
     let mechanism = causal()?;
     mechanism.validate()?;
-    // Causal fields survive the round-trip: mechanism, rivals, confounders,
-    // evidence, ceiling, and scope.
+    // Causal fields survive the round-trip.
     let decoded: CausalClaim = parse(&encoded(&mechanism)?)?;
     assert_eq!(decoded, mechanism);
     assert!(decoded.confounders.contains("confounder-1"));
@@ -1536,14 +1557,10 @@ fn causal_needs_mechanism_rivals_evidence() -> CaseResult {
     let confounders = BTreeSet::from(["confounder-1".to_owned()]);
     let evidence_refs = BTreeSet::from([artifact("evidence-1")?]);
     // A dependency reading below science grade validates; science grade never does.
-    try_causal(
-        CausalStatus::DependencyPreconditionEnablement,
-        "enablement sketch",
-        rivals.clone(),
-        confounders.clone(),
-        evidence_refs.clone(),
-        EvidenceGrade::Corroborated,
-    )?
+    causal_with(|params| {
+        params.status = CausalStatus::DependencyPreconditionEnablement;
+        params.mechanism = "enablement sketch".to_owned();
+    })?
     .validate()?;
     // One axis per row: rivals, confounders, refs, mechanism, ceiling each fail distinctly.
     let enable = CausalStatus::DependencyPreconditionEnablement;
@@ -1556,16 +1573,15 @@ fn causal_needs_mechanism_rivals_evidence() -> CaseResult {
         (Mech, "mechanism-1", ALL, Sci, "causal.ceiling"),
         (Assoc, "sketch", NO_CONF, Corr, "causal.ceiling"),
     ] {
-        let attempt = try_causal(
-            status,
-            mechanism,
-            pick_set(flags.0, rivals.clone(), no_names.clone()),
-            pick_set(flags.1, confounders.clone(), no_names.clone()),
-            pick_set(flags.2, evidence_refs.clone(), no_refs.clone()),
-            ceiling,
-        );
-        // The ceiling rows name the ceiling; both empty-set rows name
-        // their missing collection instead.
+        let attempt = causal_with(|params| {
+            params.status = status;
+            params.mechanism = mechanism.to_owned();
+            params.rivals = pick_set(flags.0, rivals.clone(), no_names.clone());
+            params.confounders = pick_set(flags.1, confounders.clone(), no_names.clone());
+            params.evidence_refs = pick_set(flags.2, evidence_refs.clone(), no_refs.clone());
+            params.ceiling = ceiling;
+        });
+        // Ceiling rows name the ceiling; empty-set rows name their collection.
         let expected = if field == "causal.ceiling" {
             ContractError::CeilingViolation { field }
         } else {
@@ -1573,11 +1589,12 @@ fn causal_needs_mechanism_rivals_evidence() -> CaseResult {
         };
         assert_eq!(attempt.map(|_| ()), Err(expected));
     }
-    let blank_sets = (rivals.clone(), no_names.clone(), evidence_refs.clone());
-    let blank = try_causal(Mech, "   ", blank_sets.0, blank_sets.1, blank_sets.2, Corr);
+    let blank = causal_with(|params| {
+        params.mechanism = "   ".to_owned();
+        params.confounders = no_names.clone();
+    });
     assert!(blank.is_err());
-    // Frozen source provenance: the same source ID with a mutated revision breaks the assurance pin even
-    // with a recomputed shape digest; mutated content breaks the frozen digest; a foreign owner breaks it.
+    // Frozen source provenance: mutated revision, content, or owner each fail distinctly.
     let mut drifted = causal()?;
     drifted.source_lineage.revision = "r2".to_owned();
     drifted.digest = drifted.compute_digest()?;
@@ -1636,12 +1653,18 @@ fn valid_inert_candidate() -> CaseResult {
     assert_eq!(position.candidate_kind, expected_kind);
     let decoded: EpistemicPositionCandidate = parse(&encoded(&position)?)?;
     assert_eq!(decoded, position);
+    // Checked deserialization: `from_str` yields `serde_json::Error`, so pair wire rejection and named `validate` failure.
+    let bad_wire = encoded(&position)?.replace("attempt-580", "   ");
+    assert!(serde_json::from_str::<EpistemicPositionCandidate>(&bad_wire).is_err());
+    let mut blank = position.clone();
+    blank.attempt_id = "   ".to_owned();
+    expect_err!(blank.validate(), Blank, "candidate.attempt_id");
     // Closed identity: the candidate binds its request, denominator, receipt, map, and assumptions exactly.
     let frozen = denominator()?;
     let receipt = receipt_with(frozen.digest.clone(), None, None, None)?;
     let check =
         |candidate: &EpistemicPositionCandidate, map: &ClaimMap, held: &[AssumptionRecord]| {
-            candidate.validate_closed(&request()?, &frozen, &receipt, map, &[], held, &[])
+            candidate.validate_closed((&request()?, &frozen, &receipt, map), (&[], held, &[]))
         };
     check(&position, &claim_map()?, &[assumption()?])?;
     // A strict subset of the governed claims fails closed validation: exact set equality only.
@@ -1674,7 +1697,7 @@ fn valid_inert_candidate() -> CaseResult {
         let admitted = BTreeSet::from([entry.claim.clone()]);
         let map = try_map(admitted, vec![entry.clone()], Vec::new())?;
         let single = candidate_with(vec![entry], &map, frozen.digest.clone())?;
-        single.validate_closed(&request()?, &frozen, &receipt, &map, &[], held, &[])
+        single.validate_closed((&request()?, &frozen, &receipt, &map), (&[], held, &[]))
     };
     // Counterevidence closure: a countered claim over a foreign handle fails against the closed support set.
     let entry =
@@ -1690,16 +1713,16 @@ fn valid_inert_candidate() -> CaseResult {
     let plain = claim_entry("claim-a", None, false, None, BTreeSet::new())?;
     let mut narrowed = assumption()?;
     for bounds in [
-        ValidityBounds::new("scope-580", Some(120), Some(180), "v1", "file")?,
-        ValidityBounds::new("scope-580", Some(100), Some(200), "v2", "file")?,
-        ValidityBounds::new("scope-580", Some(100), Some(200), "v1", "directory")?,
+        case_bounds("scope-580", (Some(120), Some(180)), "v1", "file")?,
+        case_bounds("scope-580", (Some(100), Some(200)), "v2", "file")?,
+        case_bounds("scope-580", (Some(100), Some(200)), "v1", "directory")?,
     ] {
         narrowed.bounds = bounds;
         narrowed.digest = narrowed.compute_digest()?;
         let closed_check = closed_single(plain.clone(), &[narrowed.clone()]);
         expect_err!(closed_check, StaleContext, "candidate.assumptions");
     }
-    narrowed.bounds = ValidityBounds::new("scope-other", Some(100), Some(200), "v1", "file")?;
+    narrowed.bounds = case_bounds("scope-other", (Some(100), Some(200)), "v1", "file")?;
     narrowed.digest = narrowed.compute_digest()?;
     let closed_check = closed_single(plain.clone(), &[narrowed.clone()]);
     expect_err!(closed_check, ScopeMismatch, "assumption.scope");
@@ -1724,9 +1747,8 @@ fn valid_inert_candidate() -> CaseResult {
 // WORK_UNIT_CASE: 580/35
 #[test]
 fn candidate_carries_no_admission_write_effect_finish() -> CaseResult {
-    // API-level proof: no admission, write, effect, allocation, apply, resolve, acquire, rank,
-    // persist, store, or finish field exists anywhere in the public shape (generic JSON type inferred,
-    // never depended on).
+    // API-level proof: no admission/write/effect/alloc/apply/resolve/acquire/rank/persist/store/finish/model
+    // field exists in the public shape (generic JSON type inferred, never depended on).
     let root = serde_json::to_value(&candidate()?).map_err(|_| ContractError::Canonicalization)?;
     let forbidden = [
         "admission",
@@ -1810,8 +1832,7 @@ fn candidate_carries_no_admission_write_effect_finish() -> CaseResult {
             "work_scope",
         ]
     );
-    // Real-API proof beyond the key walk: the candidate decodes as no admitted view, carries no
-    // admission envelope, and answers exactly the request it mirrors (operation and idempotency bound).
+    // Real-API proof: no admitted-view decode, no envelope, exact request binding.
     let wire = encoded(&candidate()?)?;
     assert!(serde_json::from_str::<CurrentEpistemicPosition>(&wire).is_err());
     let (inquiry, position) = (request()?, candidate()?);
@@ -1839,13 +1860,19 @@ fn valid_admitted_view_with_receipt() -> CaseResult {
     let mut superseded = view.clone();
     superseded.currentness = Currentness::Superseded;
     assert!(superseded.validate().is_err());
-    // Alias proof: the previous name is the same type with the same serde
-    // and wire bytes as `CurrentEpistemicPosition`.
+    // Alias proof: the previous name is the same type, serde, and wire bytes.
     let wire = encoded(&view)?;
     assert!(wire.contains("CURRENT_EPISTEMIC_POSITION"));
     let via_alias: CurrentEpistemicPositionView = parse(&wire)?;
     assert_eq!(via_alias, view);
     assert_eq!(encoded(&via_alias)?, wire);
+    // Checked deserialization: `from_str` yields `serde_json::Error`, so pair wire rejection and named `validate` failure.
+    let other = sha256_hex("other".as_bytes());
+    let bad_wire = wire.replacen(view.digest.as_str(), other.as_str(), 1);
+    assert!(serde_json::from_str::<CurrentEpistemicPosition>(&bad_wire).is_err());
+    let mut bad_view = view.clone();
+    bad_view.digest = sha256_hex("other".as_bytes());
+    expect_err!(bad_view.validate(), DigestMismatch, "admitted.digest");
     // Donor-compatible position states round-trip with exact wire names.
     let states = [
         PositionState::Observed,
@@ -1855,12 +1882,9 @@ fn valid_admitted_view_with_receipt() -> CaseResult {
         PositionState::Stale,
         PositionState::Unknown,
     ];
-    assert_eq!(
-        wires(&states)?.join(","),
-        "\"OBSERVED\",\"SUPPORTED\",\"ASSUMED\",\"CONFLICTED\",\"STALE\",\"UNKNOWN\""
-    );
-    // The closure binds the cited receipt contents: every consulted record
-    // is listed, mixed sources derived.
+    let states_wire = "\"OBSERVED\",\"SUPPORTED\",\"ASSUMED\",\"CONFLICTED\",\"STALE\",\"UNKNOWN\"";
+    assert_wires(&states, states_wire)?;
+    // The closure binds the cited receipt contents exactly.
     let closed = closure()?;
     closed.validate()?;
     let decoded: ProvenanceClosure = parse(&encoded(&closed)?)?;
@@ -1869,7 +1893,7 @@ fn valid_admitted_view_with_receipt() -> CaseResult {
     mixed.sources.insert(source("source-b")?);
     mixed.lineage.push(SourceLineage::new(
         source("source-b")?,
-        "r1",
+        SourceRevisionId::new("r1")?,
         sha256_hex("content-c".as_bytes()),
         Some("raw-3".to_owned()),
         BTreeSet::new(),
@@ -1879,8 +1903,7 @@ fn valid_admitted_view_with_receipt() -> CaseResult {
     mixed.digest = mixed.compute_digest()?;
     let check = mixed.validate();
     expect_err!(check, ImpossibleCombination, "provenance.mixed_sources");
-    // Relational closure: a foreign handle fails even when the source/raw/revision unions still match,
-    // and so does an unmapped record or a digest naming no lineage entry.
+    // Relational closure: foreign, unmapped, and dangling references each fail.
     let mut foreign = closed.clone();
     let content_a = sha256_hex("content-a".as_bytes());
     let record_map = &mut foreign.record_origin;
@@ -1900,8 +1923,7 @@ fn valid_admitted_view_with_receipt() -> CaseResult {
     dangling.digest = dangling.compute_digest()?;
     let dangling_check = dangling.validate();
     expect_err!(dangling_check, MissingReference, "provenance.record_origin");
-    // Receipt identity: the envelope binds receipt-id plus owner; a payload digest alone never validates,
-    // and external existence is an exact challenge, never a local claim.
+    // Receipt identity binds receipt-id plus owner; existence is challenged, never claimed.
     assert_eq!(view.admission.receipt_id.as_str(), "receipt-580");
     let missing_id =
         serde_json::to_value(&view.admission).map_err(|_| ContractError::Canonicalization)?;
@@ -1941,21 +1963,20 @@ fn closed_full(
     // Short form for the common all-supported, complete-coverage ceiling probe.
     PositionAssertability::check_closed(
         claimed,
-        &GradeAssignment::known(grade),
-        EvidenceAuthority::DeterministicRuntimeTest,
+        (
+            &GradeAssignment::known(grade),
+            EvidenceAuthority::DeterministicRuntimeTest,
+        ),
         &[SupportResult::Supported],
         true,
         false,
         true,
-        disclosure,
-        PrivacyHandling::Unrestricted,
-        verifier,
+        (disclosure, PrivacyHandling::Unrestricted, verifier),
     )
 }
 fn support_ceilings() -> CaseResult {
     let cap = |support: &[SupportResult]| PositionAssertability::support_cap(support);
-    // Support ceilings: partial caps at qualified inference, weaker results
-    // at hypothesis candidate.
+    // Support ceilings: partial caps at qualified inference, weaker results at hypothesis candidate.
     assert_eq!(cap(&[Supported])?, PositionAssertability::MaterialEffect);
     assert_eq!(cap(&[Supported, Partial])?, QualifiedInference);
     for result in [
@@ -1975,37 +1996,36 @@ fn support_ceilings() -> CaseResult {
     ] {
         let probe = PositionAssertability::check_closed(
             claimed,
-            &GradeAssignment::known(Corroborated),
-            EvidenceAuthority::DeterministicRuntimeTest,
+            (
+                &GradeAssignment::known(Corroborated),
+                EvidenceAuthority::DeterministicRuntimeTest,
+            ),
             support,
             true,
             false,
             true,
-            Open,
-            PrivacyHandling::Unrestricted,
-            None,
+            (Open, PrivacyHandling::Unrestricted, None),
         );
         expect_err!(probe, CeilingViolation, "assertability.support");
     }
     Ok(())
 }
 fn disclosure_ceilings() -> CaseResult {
-    // Disclosure ceilings: restricted caps at qualified inference,
-    // quarantined renders only as quarantined unknown.
+    // Disclosure ceilings: restricted caps at qualified inference; quarantined renders only quarantined unknown.
     let verifier = verifier_with("r1", EvidenceFreshness::ExactCandidate)?;
     let probe = closed_full(ObservedFact, ScienceGrade, Restricted, Some(&verifier));
     expect_err!(probe, CeilingViolation, "assertability.disclosure");
     let probe = PositionAssertability::check_closed(
         HypothesisCandidate,
-        &GradeAssignment::known(Grounded),
-        EvidenceAuthority::DeterministicRuntimeTest,
+        (
+            &GradeAssignment::known(Grounded),
+            EvidenceAuthority::DeterministicRuntimeTest,
+        ),
         &[Supported],
         false,
         false,
         true,
-        Quarantined,
-        PrivacyHandling::Unrestricted,
-        None,
+        (Quarantined, PrivacyHandling::Unrestricted, None),
     );
     expect_err!(probe, CeilingViolation, "assertability.disclosure");
     Ok(())
@@ -2077,11 +2097,21 @@ fn transition_preserves_before_after_predecessor() -> CaseResult {
         .map(|record| record.predecessor.as_str());
     assert_eq!(predecessor, Some("predecessor-1"));
     assert_eq!(decoded, with_history);
-    // Closed binding: the transition answers its request and candidate with
-    // real before/after records; a foreign candidate digest fails.
-    let before = vec![support_record(SupportResult::Partial)?];
+    // Checked deserialization pairs a wire rejection with the constructor failing named below.
+    let bad_wire = encoded(&movement)?.replace("attempt-580", "   ");
+    assert!(serde_json::from_str::<EpistemicTransition>(&bad_wire).is_err());
+    let mut blank = movement.clone();
+    blank.attempt_id = "   ".to_owned();
+    expect_err!(blank.validate(), Blank, "transition.attempt_id");
+    // Closed binding answers request and candidate with real before/after records.
+    let before = vec![support_with(
+        Partial,
+        BTreeSet::from([artifact("handle-1")?]),
+        None,
+        None,
+    )?];
     let both = BTreeSet::from([artifact("handle-1")?, artifact("handle-2")?]);
-    let after = vec![support_with(SupportResult::Supported, both, None, None)?];
+    let after = vec![support_with(Supported, both, None, None)?];
     let mut closed_movement = transition()?;
     let digest_check = closed_movement.validate_closed(&request()?, &candidate()?, &before, &after);
     expect_err!(digest_check, DigestMismatch, "transition.candidate_digest");
@@ -2103,18 +2133,14 @@ fn transition_preserves_before_after_predecessor() -> CaseResult {
     drifted_rev.digest = drifted_rev.compute_digest()?;
     let rev_check = drifted_rev.validate_closed(&inquiry, &drifted_candidate, &before, &after);
     expect_err!(rev_check, StaleContext, "transition.candidate_revision");
-    // Fence drift is rejected at close through the shared work-scope equality chain (the direct
-    // candidate/expected fence split stays a backstop behind the shape checks).
+    // Fence drift fails at close through the shared work-scope equality chain.
     let epoch9 = AuthorityEpoch::new(9).map_err(|_| case_error("case.epoch"))?;
     let mut drifted_fence = closed_movement.clone();
     drifted_fence.expected_fence = StateFence::new(epoch9, ResourceGeneration::genesis());
     drifted_fence.digest = drifted_fence.compute_digest()?;
     let fence_check = drifted_fence.validate_closed(&inquiry, &current, &before, &after);
     expect_err!(fence_check, FenceMismatch, "transition.work_scope");
-    // Candidate fence drift is pinned by the candidate shape check first: the
-    // request and expected fences agree, so the work-scope chain passes, and
-    // the drifted candidate fence fails its own work-scope pin before the
-    // transition.candidate_fence backstop behind it.
+    // Candidate fence drift fails the candidate work-scope pin first.
     let mut fenced_candidate = candidate()?;
     fenced_candidate.fence = StateFence::new(epoch9, ResourceGeneration::genesis());
     fenced_candidate.digest = fenced_candidate.compute_digest()?;
@@ -2124,14 +2150,12 @@ fn transition_preserves_before_after_predecessor() -> CaseResult {
     let candidate_fence =
         fence_drifted.validate_closed(&inquiry, &fenced_candidate, &before, &after);
     expect_err!(candidate_fence, FenceMismatch, "candidate.work_scope");
-    // Before/after context: a foreign-context record reusing the same handles fails, as does a
-    // before-side assertability above the before support ceiling and an unowned temporal.
+    // Before/after context: foreign records, heady assertability, and unowned temporals fail.
     let mut foreign_task = before.clone();
     foreign_task[0].task_id = TaskId::new("task-other").map_err(|_| case_error("case.task"))?;
     let task_check = closed_movement.validate_closed(&inquiry, &current, &foreign_task, &after);
     expect_err!(task_check, TaskMismatch, "support.task_id");
-    // Scope, fence, and proposition axes: a foreign-context record reusing the same handles is
-    // structurally valid data about another context, never evidence for this transition.
+    // Scope, fence, and proposition axes: foreign-context records are never evidence here.
     let mut foreign_scope = before.clone();
     foreign_scope[0].validity.scope = "scope-other".to_owned();
     foreign_scope[0].validate()?;
@@ -2150,11 +2174,8 @@ fn transition_preserves_before_after_predecessor() -> CaseResult {
     let mut heady_before = closed_movement.clone();
     heady_before.before_assertability = PositionAssertability::MaterialEffect;
     heady_before.digest = heady_before.compute_digest()?;
-    expect_err!(
-        heady_before.validate_closed(&inquiry, &current, &before, &after),
-        CeilingViolation,
-        "transition.before_assertability"
-    );
+    let heady = heady_before.validate_closed(&inquiry, &current, &before, &after);
+    expect_err!(heady, CeilingViolation, "transition.before_assertability");
     let mut foreign_time = closed_movement.clone();
     foreign_time.temporal = Some(TemporalRecord::new(10, 11, 12, 13, 14)?);
     foreign_time.digest = foreign_time.compute_digest()?;
@@ -2171,29 +2192,20 @@ fn partial_unknown_not_unconditional_promotion() -> CaseResult {
         BTreeSet::new(),
         BTreeSet::from(["no fresh evidence".to_owned()]),
     )?;
-    let partial_promotion = try_transition(
-        TransitionTrigger::Revalidation,
-        SupportResult::Partial,
-        SupportResult::Supported,
-        PositionAssertability::HypothesisCandidate,
-        PositionAssertability::QualifiedInference,
-        bare.clone(),
-        BTreeSet::new(),
-    );
+    let partial_promotion = transition_with(|params| {
+        params.trigger = TransitionTrigger::Revalidation;
+        params.delta = bare.clone();
+        params.evidence_refs = BTreeSet::new();
+    });
     expect_err!(partial_promotion, CeilingViolation, "transition.promotion");
-    let unknown_promotion = try_transition(
-        TransitionTrigger::NewEvidence,
-        SupportResult::Unknown,
-        SupportResult::Supported,
-        PositionAssertability::UnknownWithheldQuarantined,
-        PositionAssertability::QualifiedInference,
-        bare,
-        BTreeSet::from([artifact("evidence-1")?]),
-    );
+    let unknown_promotion = transition_with(|params| {
+        params.before_support = SupportResult::Unknown;
+        params.before_assertability = PositionAssertability::UnknownWithheldQuarantined;
+        params.delta = bare;
+    });
     expect_err!(unknown_promotion, CeilingViolation, "transition.promotion");
     transition()?.validate()?;
-    // Exact partition: added is after-minus-before, removed is before-minus-after, retained is the
-    // intersection; misclassified, omitted, and extra handles fail.
+    // Exact partition: misclassified, omitted, and extra handles fail.
     let h1 = BTreeSet::from([artifact("handle-1")?]);
     let h2 = BTreeSet::from([artifact("handle-2")?]);
     let h2b = h2.clone();
@@ -2201,8 +2213,8 @@ fn partial_unknown_not_unconditional_promotion() -> CaseResult {
     let reasons = |note: &str| BTreeSet::from([note.to_owned()]);
     let empty: BTreeSet<ArtifactId> = BTreeSet::new();
     let retained = h1.clone();
-    let before_rec = support_with(SupportResult::Partial, h1.clone(), None, None)?;
-    let after_rec = support_with(SupportResult::Supported, both.clone(), None, None)?;
+    let before_rec = support_with(Partial, h1.clone(), None, None)?;
+    let after_rec = support_with(Supported, both.clone(), None, None)?;
     let exact = SupportDelta::new(h2b, BTreeSet::new(), retained, reasons("fresh observation"))?;
     let before = std::slice::from_ref(&before_rec);
     let after = std::slice::from_ref(&after_rec);
@@ -2217,8 +2229,8 @@ fn partial_unknown_not_unconditional_promotion() -> CaseResult {
         expect_err!(partition, ArithmeticMismatch, "transition.delta");
     }
     // After-side ceiling: assertability above the after-support cap fails even with all digests recomputed.
-    let capped_before = vec![support_with(SupportResult::Partial, h1, None, None)?];
-    let capped_after = vec![support_with(SupportResult::Partial, both, None, None)?];
+    let capped_before = vec![support_with(Partial, h1, None, None)?];
+    let capped_after = vec![support_with(Partial, both, None, None)?];
     let mut capped_movement = transition()?;
     capped_movement.after_support = SupportResult::Partial;
     capped_movement.after_assertability = PositionAssertability::MaterialEffect;
@@ -2243,32 +2255,15 @@ fn set_permutation_invariance() -> CaseResult {
         PredecessorId::new("predecessor-b")?,
         PredecessorId::new("predecessor-a")?,
     ]);
-    let shared = (
-        PropositionId::new("proposition-580")?,
-        ClaimId::new("claim-580")?,
-        EvidenceSetId::new("evidence-set-580")?,
-        ManifestId::new("manifest-580")?,
-        SourceRevisionId::new("revision-580")?,
-        LineageRootId::new("lineage-580")?,
-        ValidityId::new("validity-580")?,
-    );
-    let first = IdentityBundle::new(
-        shared.0.clone(),
-        shared.1.clone(),
-        shared.2.clone(),
-        shared.3.clone(),
-        shared.4.clone(),
-        shared.5.clone(),
-        shared.6.clone(),
-        first_predecessors,
-    )?;
+    let mut first = identity_bundle()?;
+    first.predecessors = first_predecessors;
+    first.digest = first.compute_digest()?;
     let mut second = first.clone();
     second.predecessors = second_predecessors;
     second.digest = second.compute_digest()?;
     assert_eq!(first.digest, second.digest);
     assert_eq!(first.canonical_json()?, second.canonical_json()?);
-    // Repaired relations permute order-freely: record-origin insertion order never moves the frozen
-    // digest, while lineage declaration order never blocks validation.
+    // Order-free relations: insertion order never moves the digest; declaration order never blocks.
     let mut reordered = closure()?;
     reordered.record_origin = BTreeMap::from([
         (artifact("handle-2")?, sha256_hex("content-b".as_bytes())),
@@ -2326,9 +2321,7 @@ fn load_bearing_mutation_invalidates_digest() -> CaseResult {
     let mut movement = transition()?;
     movement.rollback = "changed rollback".to_owned();
     expect_err!(movement.validate(), DigestMismatch, "transition.digest");
-    // Nested relational mutations attribute to the relation, not the top-level digest: an unmapped
-    // record-origin value, a drifted causal revision (assurance pin), a foreign component handle, a
-    // rebound receipt role, a drifted admitted receipt id, and a rebound denominator role each fail.
+    // Nested relational mutations attribute to the relation, never the top-level digest.
     let mut origin = closure()?;
     let content_nine = sha256_hex("content-9".as_bytes());
     let record_map = &mut origin.record_origin;
@@ -2384,8 +2377,7 @@ fn malformed_input_bounded_panic_free() -> CaseResult {
         assert!(serde_json::from_str::<InvestigationRequirement>(input).is_err());
         assert!(serde_json::from_str::<RequiredVerifier>(input).is_err());
     }
-    // Full contract matrix: every enum and struct rejects null, arrays, and unknown-only objects
-    // without panicking; groups below attribute one invariant family each.
+    // Full contract matrix: every shape rejects null, arrays, and unknown-only objects.
     macro_rules! malformed {
         ($wire:expr, $($ty:ty),+) => {{ $(assert!(serde_json::from_str::<$ty>($wire).is_err());)+ }};
     }
@@ -2426,11 +2418,22 @@ fn malformed_input_bounded_panic_free() -> CaseResult {
         failures += usize::from(request_with("attempt-580", BTreeSet::new()).is_err());
         failures += usize::from(TemporalRecord::new(10, 11, 13, 12, 14).is_err());
         failures += usize::from(GradeAssignment::unknown("   ").is_err());
-        failures += usize::from(ValidityBounds::new("   ", None, None, "v1", "file").is_err());
-        failures += usize::from(ContractChallenge::new("a", "b", "c", "d", "   ").is_err());
+        failures += usize::from(case_bounds("   ", (None, None), "v1", "file").is_err());
+        failures += usize::from(
+            ContractChallenge::new(
+                "a",
+                source("b")?,
+                "c",
+                ChallengeInvariant("d".to_owned()),
+                "   ",
+            )
+            .is_err(),
+        );
         Ok::<usize, ContractError>(failures)
     });
     let failures = outcome.map_err(|_| ContractError::Canonicalization)??;
     assert_eq!(failures, 11);
+    let bad_lookup = OwnerLookup::new(owner, "not-a-digest").map(|_| ());
+    expect_err!(bad_lookup, InvalidDigest, "absence.lookup_proof");
     Ok(())
 }

@@ -56,43 +56,47 @@ pub struct AssumptionRecord {
     /// Canonical digest of the assumption shape, excluding this field.
     pub digest: String,
 }
+/// Assumption digest role (no canonical owner covers digest strings).
+pub struct AssumptionDigest(pub String);
+/// Retraction reason role (same rationale as [`AssumptionDigest`]).
+pub struct RetractionReason(pub String);
+/// Named constructor arguments for [`AssumptionRecord::new`].
+/// Named fields block transposition; text uses concrete [`String`].
+#[derive(Clone, Debug)]
+pub struct AssumptionRecordParams {
+    pub assumption_id: String,
+    pub statement: String,
+    pub origin: String,
+    pub necessity: String,
+    pub failure_mode: String,
+    pub dependents: BTreeSet<String>,
+    pub bounds: ValidityBounds,
+    pub holder: SourceId,
+    pub task_id: TaskId,
+    pub fence: StateFence,
+}
 impl AssumptionRecord {
-    /// Constructs an assumption record and freezes its canonical digest.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        assumption_id: impl Into<String>,
-        statement: impl Into<String>,
-        origin: impl Into<String>,
-        necessity: impl Into<String>,
-        failure_mode: impl Into<String>,
-        dependents: BTreeSet<String>,
-        bounds: ValidityBounds,
-        holder: SourceId,
-        task_id: TaskId,
-        fence: StateFence,
-    ) -> Result<Self, ContractError> {
-        let scope = bounds.scope.clone();
+    pub fn new(params: AssumptionRecordParams) -> Result<Self, ContractError> {
+        let scope = params.bounds.scope.clone();
         let mut record = Self {
             assumption_kind: AssumptionKind::AssumptionRecord,
-            assumption_id: assumption_id.into(),
-            statement: statement.into(),
-            origin: origin.into(),
-            necessity: necessity.into(),
-            failure_mode: failure_mode.into(),
-            dependents,
-            bounds,
+            assumption_id: params.assumption_id,
+            statement: params.statement,
+            origin: params.origin,
+            necessity: params.necessity,
+            failure_mode: params.failure_mode,
+            dependents: params.dependents,
+            bounds: params.bounds,
             scope,
-            holder,
-            task_id,
-            fence,
+            holder: params.holder,
+            task_id: params.task_id,
+            fence: params.fence,
             digest: String::new(),
         };
         record.validate_shape()?;
         record.digest = record.compute_digest()?;
         Ok(record)
     }
-
-    /// Recomputes the canonical digest of the assumption shape.
     pub fn compute_digest(&self) -> Result<String, ContractError> {
         shape_digest(&(
             &self.assumption_kind,
@@ -109,19 +113,16 @@ impl AssumptionRecord {
             &self.fence,
         ))
     }
-
-    /// Mechanically withdraws this assumption: derives a retraction naming
-    /// the exact record digest plus the withdrawal context. Dependents fall
-    /// by this record, never by rewriting history.
+    /// Mechanically withdraws this assumption; dependents fall by this record, never by rewriting history.
     pub fn withdraw(
         &self,
         reason: impl Into<String>,
     ) -> Result<AssumptionRetraction, ContractError> {
         self.validate()?;
         AssumptionRetraction::new(
-            self.digest.clone(),
+            AssumptionDigest(self.digest.clone()),
             self.assumption_id.clone(),
-            reason,
+            RetractionReason(reason.into()),
             self.scope.clone(),
             self.task_id.clone(),
         )
@@ -172,13 +173,10 @@ impl AssumptionRecord {
             })?;
         Ok(())
     }
-
-    /// Validates the assumption shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
         check_frozen(&self.digest, &self.compute_digest()?, "assumption.digest")
     }
-
     /// Validates this record against the claiming task, scope, and fence: the same name under another task,
     /// scope, or fence is another context that closed candidate validation rejects.
     pub fn validate_for(
@@ -207,8 +205,7 @@ impl AssumptionRecord {
     }
 }
 
-/// A mechanical withdrawal of one assumption record: it names the exact record digest withdrawn plus the
-/// withdrawal context, and carries no replacement content.
+/// A mechanical withdrawal naming the exact record digest, carrying no replacement content.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AssumptionRetraction {
@@ -226,18 +223,17 @@ pub struct AssumptionRetraction {
     pub digest: String,
 }
 impl AssumptionRetraction {
-    /// Constructs a retraction and freezes its canonical digest.
     pub fn new(
-        assumption_digest: impl Into<String>,
+        assumption_digest: AssumptionDigest,
         assumption_id: impl Into<String>,
-        reason: impl Into<String>,
+        reason: RetractionReason,
         scope: impl Into<String>,
         task_id: TaskId,
     ) -> Result<Self, ContractError> {
         let mut retraction = Self {
-            assumption_digest: assumption_digest.into(),
+            assumption_digest: assumption_digest.0,
             assumption_id: assumption_id.into(),
-            reason: reason.into(),
+            reason: reason.0,
             scope: scope.into(),
             task_id,
             digest: String::new(),
@@ -246,8 +242,6 @@ impl AssumptionRetraction {
         retraction.digest = retraction.compute_digest()?;
         Ok(retraction)
     }
-
-    /// Recomputes the canonical digest of the retraction shape.
     pub fn compute_digest(&self) -> Result<String, ContractError> {
         shape_digest(&(
             &self.assumption_digest,
@@ -268,8 +262,6 @@ impl AssumptionRetraction {
         validate_bounded_text(&self.scope, "assumption.retraction_scope", MAX_SHORT_TEXT)?;
         Ok(())
     }
-
-    /// Validates the retraction shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
         check_frozen(

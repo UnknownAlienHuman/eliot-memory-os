@@ -29,7 +29,6 @@ pub struct OwnerLookup {
     pub lookup_proof: String,
 }
 impl OwnerLookup {
-    /// Constructs an owner lookup after validation.
     pub fn new(owner: SourceId, lookup_proof: impl Into<String>) -> Result<Self, ContractError> {
         let lookup = Self {
             owner,
@@ -38,15 +37,12 @@ impl OwnerLookup {
         lookup.validate()?;
         Ok(lookup)
     }
-
     /// Validates the owner binding and lookup proof digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_digest(&self.lookup_proof, "absence.lookup_proof")?;
         Ok(())
     }
-
-    /// Recomputes the expected lookup proof binding the actual denominator
-    /// and receipt proofs.
+    /// Recomputes the expected lookup proof from denominator and receipt proofs.
     pub fn expected_proof(
         owner: &SourceId,
         denominator_digest: &str,
@@ -54,9 +50,7 @@ impl OwnerLookup {
     ) -> Result<String, ContractError> {
         shape_digest(&(owner, denominator_digest, receipt_proof))
     }
-
-    /// Validates this lookup against the actual denominator and receipt
-    /// proofs it cites.
+    /// Validates this lookup against the cited denominator and receipt proofs.
     pub fn validate_binding(
         &self,
         denominator_digest: &str,
@@ -83,7 +77,6 @@ pub struct BoundedProof {
     pub byte_len: u64,
 }
 impl BoundedProof {
-    /// Constructs a bounded proof reference after validation.
     pub fn new(digest: impl Into<String>, byte_len: u64) -> Result<Self, ContractError> {
         let proof = Self {
             digest: digest.into(),
@@ -92,7 +85,6 @@ impl BoundedProof {
         proof.validate()?;
         Ok(proof)
     }
-
     /// Validates the digest form and the byte length ceiling.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_digest(&self.digest, "absence.proof_digest")?;
@@ -146,52 +138,54 @@ pub struct AbsenceClaim {
     /// Canonical digest of the absence shape, excluding this field.
     pub digest: String,
 }
+/// Named constructor arguments for [`AbsenceClaim::new`].
+/// Named fields block transposition; text uses concrete [`String`].
+#[derive(Clone, Debug)]
+pub struct AbsenceClaimParams {
+    pub proposition: PropositionId,
+    pub domain: String,
+    pub schema: String,
+    pub scope: String,
+    pub window_start_ms: Option<i64>,
+    pub window_end_ms: Option<i64>,
+    pub version: String,
+    pub task_id: TaskId,
+    pub policy: String,
+    pub owner_lookup: OwnerLookup,
+    pub denominator_digest: String,
+    pub denominator_kind: DenominatorKind,
+    pub query_digest: String,
+    pub snapshot_id: String,
+    pub receipt: CoverageReceipt,
+    pub proof: BoundedProof,
+}
 impl AbsenceClaim {
     /// Constructs an absence claim and freezes its canonical digest (shape closure only; binding to the
     /// frozen denominator object is deferred to [`AbsenceClaim::validate_closed`]).
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        proposition: PropositionId,
-        domain: impl Into<String>,
-        schema: impl Into<String>,
-        scope: impl Into<String>,
-        window_start_ms: Option<i64>,
-        window_end_ms: Option<i64>,
-        version: impl Into<String>,
-        task_id: TaskId,
-        policy: impl Into<String>,
-        owner_lookup: OwnerLookup,
-        denominator_digest: impl Into<String>,
-        denominator_kind: DenominatorKind,
-        query_digest: impl Into<String>,
-        snapshot_id: impl Into<String>,
-        receipt: CoverageReceipt,
-        proof: BoundedProof,
-    ) -> Result<Self, ContractError> {
+    pub fn new(params: AbsenceClaimParams) -> Result<Self, ContractError> {
         let mut claim = Self {
-            proposition,
-            domain: domain.into(),
-            schema: schema.into(),
-            scope: scope.into(),
-            window_start_ms,
-            window_end_ms,
-            version: version.into(),
-            task_id,
-            policy: policy.into(),
-            owner_lookup,
-            denominator_digest: denominator_digest.into(),
-            denominator_kind,
-            query_digest: query_digest.into(),
-            snapshot_id: snapshot_id.into(),
-            receipt,
-            proof,
+            proposition: params.proposition,
+            domain: params.domain,
+            schema: params.schema,
+            scope: params.scope,
+            window_start_ms: params.window_start_ms,
+            window_end_ms: params.window_end_ms,
+            version: params.version,
+            task_id: params.task_id,
+            policy: params.policy,
+            owner_lookup: params.owner_lookup,
+            denominator_digest: params.denominator_digest,
+            denominator_kind: params.denominator_kind,
+            query_digest: params.query_digest,
+            snapshot_id: params.snapshot_id,
+            receipt: params.receipt,
+            proof: params.proof,
             digest: String::new(),
         };
         claim.validate_shape()?;
         claim.digest = claim.compute_digest()?;
         Ok(claim)
     }
-
     /// Recomputes the canonical digest of the absence shape.
     pub fn compute_digest(&self) -> Result<String, ContractError> {
         shape_digest(&(
@@ -264,15 +258,12 @@ impl AbsenceClaim {
         self.proof.validate()?;
         Ok(())
     }
-
     /// Validates the absence shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
         check_frozen(&self.digest, &self.compute_digest()?, "absence.digest")
     }
-
-    /// Closes the claim against the exact frozen denominator it cites (denominator,
-    /// snapshot/scope, and member-arithmetic checks below).
+    /// Closes the claim against the exact frozen denominator it cites.
     pub fn validate_closed(&self, denominator: &CoverageDenominator) -> Result<(), ContractError> {
         self.validate()?;
         denominator.validate()?;
@@ -390,9 +381,7 @@ impl AbsenceClaim {
         }
         Ok(())
     }
-
-    /// Checks the claim against live context; any drift invalidates it
-    /// ([`ContractError::StaleContext`]).
+    /// Checks the claim against live context ([`ContractError::StaleContext`] on drift).
     pub fn check_context(
         &self,
         scope: &str,

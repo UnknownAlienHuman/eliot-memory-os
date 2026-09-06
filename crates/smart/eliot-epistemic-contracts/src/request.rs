@@ -64,47 +64,47 @@ pub struct PositionRequest {
     /// Canonical digest of the request shape, excluding this field.
     pub digest: String,
 }
+/// Named constructor arguments for [`PositionRequest::new`].
+/// Named fields block transposition; text uses concrete [`String`].
+#[derive(Clone, Debug)]
+pub struct PositionRequestParams {
+    pub question: String,
+    pub request_id: RequestId,
+    pub operation_id: OperationId,
+    pub idempotency_key: String,
+    pub work_scope: WorkScope,
+    pub proposition: PropositionId,
+    pub task_id: TaskId,
+    pub attempt_id: String,
+    pub revision: TaskRevision,
+    pub scope: String,
+    pub validity: ValidityBounds,
+    pub fence: StateFence,
+    pub records: BTreeSet<ArtifactId>,
+}
 impl PositionRequest {
-    /// Constructs a request and freezes its canonical digest.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        question: impl Into<String>,
-        request_id: RequestId,
-        operation_id: OperationId,
-        idempotency_key: impl Into<String>,
-        work_scope: WorkScope,
-        proposition: PropositionId,
-        task_id: TaskId,
-        attempt_id: impl Into<String>,
-        revision: TaskRevision,
-        scope: impl Into<String>,
-        validity: ValidityBounds,
-        fence: StateFence,
-        records: BTreeSet<ArtifactId>,
-    ) -> Result<Self, ContractError> {
+    pub fn new(params: PositionRequestParams) -> Result<Self, ContractError> {
         let mut request = Self {
             request_kind: RequestKind::PositionRequest,
-            question: question.into(),
-            request_id,
-            operation_id,
-            idempotency_key: idempotency_key.into(),
-            work_scope,
-            proposition,
-            task_id,
-            attempt_id: attempt_id.into(),
-            revision,
-            scope: scope.into(),
-            validity,
-            fence,
-            records,
+            question: params.question,
+            request_id: params.request_id,
+            operation_id: params.operation_id,
+            idempotency_key: params.idempotency_key,
+            work_scope: params.work_scope,
+            proposition: params.proposition,
+            task_id: params.task_id,
+            attempt_id: params.attempt_id,
+            revision: params.revision,
+            scope: params.scope,
+            validity: params.validity,
+            fence: params.fence,
+            records: params.records,
             digest: String::new(),
         };
         request.validate_shape()?;
         request.digest = request.compute_digest()?;
         Ok(request)
     }
-
-    /// Recomputes the canonical digest of the request shape.
     pub fn compute_digest(&self) -> Result<String, ContractError> {
         shape_digest(&(
             &self.request_kind,
@@ -123,8 +123,6 @@ impl PositionRequest {
             &self.records,
         ))
     }
-
-    /// Returns whether this request applies to the given proposition.
     pub fn applies_to(&self, proposition: &PropositionId) -> bool {
         &self.proposition == proposition
     }
@@ -188,13 +186,10 @@ impl PositionRequest {
         }
         Ok(())
     }
-
-    /// Validates the request shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
         check_frozen(&self.digest, &self.compute_digest()?, "request.digest")
     }
-
     /// Validates this request against the live task, attempt, scope, and fence.
     pub fn validate_for(
         &self,

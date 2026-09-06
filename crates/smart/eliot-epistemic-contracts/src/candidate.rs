@@ -7,8 +7,7 @@
 //!
 //! Identity closure is exact: candidate claim IDs, claim-map admitted set, and claim-map entry set coincide,
 //! and support binds by proposition, task, attempt, scope, and fence rather than claim ID. Coverage completeness
-//! is never inferred from empty unknowns or conflicts; only [`EpistemicPositionCandidate::validate_closed`]
-//! derives it from a terminal receipt over a complete denominator.
+//! is never inferred from empty unknowns or conflicts.
 use std::collections::BTreeSet;
 
 use eliot_contracts::{ArtifactId, OperationId, RequestId, StateFence, TaskId, TaskRevision};
@@ -46,7 +45,7 @@ pub enum CandidateKind {
 
 /// An inert candidate position awaiting admission elsewhere.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, try_from = "EpistemicPositionCandidateWire")]
 pub struct EpistemicPositionCandidate {
     /// Marker binding this document to the candidate decoding.
     pub candidate_kind: CandidateKind,
@@ -83,8 +82,7 @@ pub struct EpistemicPositionCandidate {
     pub fence: StateFence,
     /// Allowed-reference manifest bounding the candidate.
     pub manifest: ManifestId,
-    /// Per-claim entries in declaration order. The entry IDs coincide exactly
-    /// with the claim-map admitted set; see `validate_closed`.
+    /// Per-claim entries in declaration order, coinciding exactly with the claim-map admitted set.
     pub claims: Vec<ClaimEntry>,
     /// Canonical digest of the governing claim map.
     pub claim_map_digest: String,
@@ -102,12 +100,9 @@ pub struct EpistemicPositionCandidate {
     pub authority: EvidenceAuthority,
     /// How widely the candidate may travel; a ceiling, never evidence.
     pub disclosure: DisclosureClass,
-    /// Independent privacy handling; purged material caps the candidate no
-    /// matter how open its disclosure class is.
+    /// Independent privacy handling; purged material caps the candidate regardless of disclosure.
     pub privacy: PrivacyHandling,
-    /// Digests of the governing temporal records. Support and claim temporal
-    /// values bind here by digest at closed validation; a temporal value no
-    /// digest names is foreign.
+    /// Digests of the governing temporal records; support and claim temporals bind here by digest.
     pub temporal_digests: BTreeSet<String>,
     /// Verifier required to vouch for elevated renderings, when one is bound.
     pub verifier: Option<RequiredVerifier>,
@@ -131,9 +126,8 @@ type BoundSupport = (
 );
 
 /// Canonical digest shape of a candidate, excluding the frozen digest field
-/// and the verifier: the verifier vouches for the frozen bytes it is
-/// excluded from, like a signature over the claim, so binding a run never
-/// rewrites the digest it vouches for.
+/// and the verifier: the verifier vouches for the frozen bytes, so binding
+/// a run never rewrites the digest it vouches for.
 #[derive(Serialize)]
 struct CandidateDigestShape<'a> {
     candidate_kind: &'a CandidateKind,
@@ -169,46 +163,132 @@ struct CandidateDigestShape<'a> {
     proposed_assertability: &'a PositionAssertability,
     invalidation: &'a Option<InvalidationRecord>,
 }
+/// Named constructor arguments for [`EpistemicPositionCandidate::new`].
+/// Named fields block transposition; text uses concrete [`String`].
+#[derive(Clone, Debug)]
+pub struct EpistemicPositionCandidateParams {
+    pub proposition: PropositionId,
+    pub revision: TaskRevision,
+    pub request_id: RequestId,
+    pub operation_id: OperationId,
+    pub idempotency_key: String,
+    pub work_scope: WorkScope,
+    pub predecessor: Option<PredecessorId>,
+    pub task_id: TaskId,
+    pub attempt_id: String,
+    pub scope: String,
+    pub window_start_ms: Option<i64>,
+    pub window_end_ms: Option<i64>,
+    pub version: String,
+    pub precision: String,
+    pub fence: StateFence,
+    pub manifest: ManifestId,
+    pub claims: Vec<ClaimEntry>,
+    pub claim_map: Option<ClaimMap>,
+    pub coverage_digest: String,
+    pub conflict_digests: BTreeSet<String>,
+    pub support: Vec<SupportRecord>,
+    pub unknowns: BTreeSet<String>,
+    pub grade: GradeAssignment,
+    pub authority: EvidenceAuthority,
+    pub disclosure: DisclosureClass,
+    pub privacy: PrivacyHandling,
+    pub temporal_digests: BTreeSet<String>,
+    pub verifier: Option<RequiredVerifier>,
+    pub proof_digest: String,
+    pub rivals: BTreeSet<String>,
+    pub proposed_assertability: PositionAssertability,
+    pub invalidation: Option<InvalidationRecord>,
+}
+/// Checked wire mirror of [`EpistemicPositionCandidate`]: deserialization validates the full shape.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct EpistemicPositionCandidateWire {
+    candidate_kind: CandidateKind,
+    proposition: PropositionId,
+    revision: TaskRevision,
+    request_id: RequestId,
+    operation_id: OperationId,
+    idempotency_key: String,
+    work_scope: WorkScope,
+    predecessor: Option<PredecessorId>,
+    task_id: TaskId,
+    attempt_id: String,
+    scope: String,
+    window_start_ms: Option<i64>,
+    window_end_ms: Option<i64>,
+    version: String,
+    precision: String,
+    fence: StateFence,
+    manifest: ManifestId,
+    claims: Vec<ClaimEntry>,
+    claim_map_digest: String,
+    coverage_digest: String,
+    conflict_digests: BTreeSet<String>,
+    support: Vec<SupportRecord>,
+    unknowns: BTreeSet<String>,
+    grade: GradeAssignment,
+    authority: EvidenceAuthority,
+    disclosure: DisclosureClass,
+    privacy: PrivacyHandling,
+    temporal_digests: BTreeSet<String>,
+    verifier: Option<RequiredVerifier>,
+    proof_digest: String,
+    rivals: BTreeSet<String>,
+    proposed_assertability: PositionAssertability,
+    invalidation: Option<InvalidationRecord>,
+    digest: String,
+}
+impl TryFrom<EpistemicPositionCandidateWire> for EpistemicPositionCandidate {
+    type Error = ContractError;
+    // `new` needs the governing map object, so the wire builds the record and runs `validate` directly.
+    fn try_from(wire: EpistemicPositionCandidateWire) -> Result<Self, ContractError> {
+        let candidate = Self {
+            candidate_kind: wire.candidate_kind,
+            proposition: wire.proposition,
+            revision: wire.revision,
+            request_id: wire.request_id,
+            operation_id: wire.operation_id,
+            idempotency_key: wire.idempotency_key,
+            work_scope: wire.work_scope,
+            predecessor: wire.predecessor,
+            task_id: wire.task_id,
+            attempt_id: wire.attempt_id,
+            scope: wire.scope,
+            window_start_ms: wire.window_start_ms,
+            window_end_ms: wire.window_end_ms,
+            version: wire.version,
+            precision: wire.precision,
+            fence: wire.fence,
+            manifest: wire.manifest,
+            claims: wire.claims,
+            claim_map_digest: wire.claim_map_digest,
+            coverage_digest: wire.coverage_digest,
+            conflict_digests: wire.conflict_digests,
+            support: wire.support,
+            unknowns: wire.unknowns,
+            grade: wire.grade,
+            authority: wire.authority,
+            disclosure: wire.disclosure,
+            privacy: wire.privacy,
+            temporal_digests: wire.temporal_digests,
+            verifier: wire.verifier,
+            proof_digest: wire.proof_digest,
+            rivals: wire.rivals,
+            proposed_assertability: wire.proposed_assertability,
+            invalidation: wire.invalidation,
+            digest: wire.digest,
+        };
+        candidate.validate()?;
+        Ok(candidate)
+    }
+}
 impl EpistemicPositionCandidate {
     /// Constructs a candidate and freezes its canonical digest (shape closure
     /// only; the closed ceiling needs
     /// [`EpistemicPositionCandidate::validate_closed`]).
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        proposition: PropositionId,
-        revision: TaskRevision,
-        request_id: RequestId,
-        operation_id: OperationId,
-        idempotency_key: impl Into<String>,
-        work_scope: WorkScope,
-        predecessor: Option<PredecessorId>,
-        task_id: TaskId,
-        attempt_id: impl Into<String>,
-        scope: impl Into<String>,
-        window_start_ms: Option<i64>,
-        window_end_ms: Option<i64>,
-        version: impl Into<String>,
-        precision: impl Into<String>,
-        fence: StateFence,
-        manifest: ManifestId,
-        claims: Vec<ClaimEntry>,
-        claim_map: Option<&ClaimMap>,
-        coverage_digest: impl Into<String>,
-        conflict_digests: BTreeSet<String>,
-        support: Vec<SupportRecord>,
-        unknowns: BTreeSet<String>,
-        grade: GradeAssignment,
-        authority: EvidenceAuthority,
-        disclosure: DisclosureClass,
-        privacy: PrivacyHandling,
-        temporal_digests: BTreeSet<String>,
-        verifier: Option<RequiredVerifier>,
-        proof_digest: impl Into<String>,
-        rivals: BTreeSet<String>,
-        proposed_assertability: PositionAssertability,
-        invalidation: Option<InvalidationRecord>,
-    ) -> Result<Self, ContractError> {
-        let claim_map_digest = match &claim_map {
+    pub fn new(params: EpistemicPositionCandidateParams) -> Result<Self, ContractError> {
+        let claim_map_digest = match &params.claim_map {
             Some(map) => {
                 map.validate()?;
                 map.digest.clone()
@@ -221,46 +301,44 @@ impl EpistemicPositionCandidate {
         };
         let mut candidate = Self {
             candidate_kind: CandidateKind::EpistemicPositionCandidate,
-            proposition,
-            revision,
-            request_id,
-            operation_id,
-            idempotency_key: idempotency_key.into(),
-            work_scope,
-            predecessor,
-            task_id,
-            attempt_id: attempt_id.into(),
-            scope: scope.into(),
-            window_start_ms,
-            window_end_ms,
-            version: version.into(),
-            precision: precision.into(),
-            fence,
-            manifest,
-            claims,
+            proposition: params.proposition,
+            revision: params.revision,
+            request_id: params.request_id,
+            operation_id: params.operation_id,
+            idempotency_key: params.idempotency_key,
+            work_scope: params.work_scope,
+            predecessor: params.predecessor,
+            task_id: params.task_id,
+            attempt_id: params.attempt_id,
+            scope: params.scope,
+            window_start_ms: params.window_start_ms,
+            window_end_ms: params.window_end_ms,
+            version: params.version,
+            precision: params.precision,
+            fence: params.fence,
+            manifest: params.manifest,
+            claims: params.claims,
             claim_map_digest,
-            coverage_digest: coverage_digest.into(),
-            conflict_digests,
-            support,
-            unknowns,
-            grade,
-            authority,
-            disclosure,
-            privacy,
-            temporal_digests,
-            verifier,
-            proof_digest: proof_digest.into(),
-            rivals,
-            proposed_assertability,
-            invalidation,
+            coverage_digest: params.coverage_digest,
+            conflict_digests: params.conflict_digests,
+            support: params.support,
+            unknowns: params.unknowns,
+            grade: params.grade,
+            authority: params.authority,
+            disclosure: params.disclosure,
+            privacy: params.privacy,
+            temporal_digests: params.temporal_digests,
+            verifier: params.verifier,
+            proof_digest: params.proof_digest,
+            rivals: params.rivals,
+            proposed_assertability: params.proposed_assertability,
+            invalidation: params.invalidation,
             digest: String::new(),
         };
         candidate.validate_shape()?;
         candidate.digest = candidate.compute_digest()?;
         Ok(candidate)
     }
-
-    /// Recomputes the canonical digest of the candidate shape.
     pub fn compute_digest(&self) -> Result<String, ContractError> {
         shape_digest(&CandidateDigestShape {
             candidate_kind: &self.candidate_kind,
@@ -297,9 +375,7 @@ impl EpistemicPositionCandidate {
             invalidation: &self.invalidation,
         })
     }
-
-    /// Collects support handles, results, and grades after task/scope/fence
-    /// binding (by proposition, never by claim ID).
+    /// Collects support handles, results, and grades bound by proposition, never claim ID.
     fn bound_support(&self) -> Result<BoundSupport, ContractError> {
         if self.support.is_empty() {
             return Err(ContractError::EmptyCollection {
@@ -327,9 +403,7 @@ impl EpistemicPositionCandidate {
         }
         Ok((handles, results, grades))
     }
-
-    /// Validates the predecessor/invalidation history chain (an invalidation
-    /// names the retained predecessor, never a rewritten chain).
+    /// Validates the predecessor/invalidation history chain.
     fn check_history(&self) -> Result<(), ContractError> {
         if let Some(invalidation) = &self.invalidation {
             invalidation.validate()?;
@@ -446,47 +520,37 @@ impl EpistemicPositionCandidate {
         for rival in &self.rivals {
             validate_bounded_text(rival.as_str(), "candidate.rivals", MAX_SHORT_TEXT)?;
         }
-        // Open assertability treats coverage as incomplete: only `validate_closed`
-        // derives completeness from a terminal receipt over a complete denominator.
+        // Open assertability treats coverage as incomplete.
         PositionAssertability::check_closed(
             self.proposed_assertability,
-            &self.grade,
-            self.authority,
+            (&self.grade, self.authority),
             support_results,
             false,
             !self.conflict_digests.is_empty(),
             true,
-            self.disclosure,
-            self.privacy,
-            self.verifier.as_ref(),
+            (self.disclosure, self.privacy, self.verifier.as_ref()),
         )?;
         Ok(())
     }
-
-    /// Validates the candidate shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
         check_frozen(&self.digest, &self.compute_digest()?, "candidate.digest")
     }
-
-    /// Closes the candidate against request, denominator, receipt, map, conflicts,
-    /// assumptions, and temporals (exact binding plus a re-derived closed ceiling).
-    #[allow(clippy::too_many_arguments)]
+    /// Closes the candidate against request, denominator, receipt, map, and slices.
     pub fn validate_closed(
         &self,
-        request: &PositionRequest,
-        denominator: &CoverageDenominator,
-        receipt: &CoverageReceipt,
-        map: &ClaimMap,
-        conflicts: &[ConflictSet],
-        assumptions: &[AssumptionRecord],
-        temporals: &[TemporalRecord],
+        inputs: (
+            &PositionRequest,
+            &CoverageDenominator,
+            &CoverageReceipt,
+            &ClaimMap,
+        ),
+        slices: (&[ConflictSet], &[AssumptionRecord], &[TemporalRecord]),
     ) -> Result<(), ContractError> {
+        let (request, denominator, receipt, map) = inputs;
+        let (conflicts, assumptions, temporals) = slices;
         self.validate()?;
-        request.validate()?;
-        denominator.validate()?;
-        receipt.validate()?;
-        map.validate()?;
+        Self::validate_closed_inputs(request, denominator, receipt, map)?;
         for conflict in conflicts {
             conflict.validate()?;
         }
@@ -509,19 +573,26 @@ impl EpistemicPositionCandidate {
         }
         PositionAssertability::check_closed(
             self.proposed_assertability,
-            &self.grade,
-            self.authority,
+            (&self.grade, self.authority),
             &support_results,
             coverage_complete,
             conflict_open,
             true,
-            self.disclosure,
-            self.privacy,
-            self.verifier.as_ref(),
+            (self.disclosure, self.privacy, self.verifier.as_ref()),
         )?;
         Ok(())
     }
-
+    fn validate_closed_inputs(
+        request: &PositionRequest,
+        denominator: &CoverageDenominator,
+        receipt: &CoverageReceipt,
+        map: &ClaimMap,
+    ) -> Result<(), ContractError> {
+        request.validate()?;
+        denominator.validate()?;
+        receipt.validate()?;
+        map.validate()
+    }
     /// Binds request identity, work scope, task, attempt, scope, proposition,
     /// revision, validity, and fence; every support handle is request-admitted.
     fn check_request_binding(
@@ -588,9 +659,7 @@ impl EpistemicPositionCandidate {
         }
         Ok(())
     }
-
-    /// Derives closed completeness from a complete denominator plus an
-    /// all-terminal receipt with exact member arithmetic.
+    /// Derives closed completeness from a complete denominator plus an all-terminal receipt.
     fn check_coverage_binding(
         &self,
         denominator: &CoverageDenominator,
@@ -668,12 +737,10 @@ impl EpistemicPositionCandidate {
         }
         Ok(receipt.omissions.is_empty() && receipt.is_terminal())
     }
-
     /// Candidate window, version, and precision shared by every validity check.
     fn candidate_window(&self) -> (Option<i64>, Option<i64>) {
         (self.window_start_ms, self.window_end_ms)
     }
-
     /// Binds validity across request, denominator, and every support record
     /// (same scope/version, containing window, no finer precision).
     fn check_validity_binding(
@@ -716,9 +783,7 @@ impl EpistemicPositionCandidate {
         }
         Ok(())
     }
-
-    /// Binds every support and claim temporal value to a governing digest
-    /// (exact set equality: no foreign, missing, or extra records).
+    /// Binds every support and claim temporal value to a governing digest by exact set equality.
     fn check_temporal_binding(&self, temporals: &[TemporalRecord]) -> Result<(), ContractError> {
         let mut provided = BTreeSet::new();
         for temporal in temporals {
@@ -754,9 +819,7 @@ impl EpistemicPositionCandidate {
         }
         Ok(())
     }
-
-    /// Caps the candidate grade by the map weakest assignment and every
-    /// support assignment.
+    /// Caps the candidate grade by the map weakest and every support assignment.
     fn check_grade_binding(
         &self,
         map: &ClaimMap,
@@ -781,9 +844,7 @@ impl EpistemicPositionCandidate {
         }
         Ok(())
     }
-
-    /// Binds the governing claim map: same digest and manifest, exact claim-ID
-    /// coincidence, by-value entries, and resolved handles/markers/names.
+    /// Binds the governing claim map: same digest and manifest, exact ID coincidence, by-value entries.
     fn check_map_binding(
         &self,
         map: &ClaimMap,
@@ -828,8 +889,7 @@ impl EpistemicPositionCandidate {
         for entry in &self.claims {
             self.check_claim_entry(map, entry, support_handles, assumptions, conflicts)?;
         }
-        // No extra records: every provided assumption is named by at least
-        // one entered claim. An unnamed record rides along otherwise.
+        // No extra records: every provided assumption is named by an entered claim.
         let named: BTreeSet<&str> = self
             .claims
             .iter()
@@ -844,7 +904,6 @@ impl EpistemicPositionCandidate {
         }
         Ok(())
     }
-
     /// Caps one entered claim by the weakest grade over its referenced support records: the ceiling is
     /// per-claim from that claim's handles, never the map-wide aggregate.
     fn check_claim_grade(&self, entry: &ClaimEntry) -> Result<(), ContractError> {
@@ -872,7 +931,6 @@ impl EpistemicPositionCandidate {
         }
         Ok(())
     }
-
     /// Resolves one entered claim against its governed shape.
     fn check_claim_entry(
         &self,
@@ -891,15 +949,13 @@ impl EpistemicPositionCandidate {
                 field: "candidate.claims",
             });
         };
-        // Same ID with changed evidence is a different claim, not an update:
-        // the entered shape must equal the governed shape by value.
+        // Same ID with changed evidence is a different claim: shapes must equal by value.
         if governed != entry {
             return Err(ContractError::DigestMismatch {
                 field: "candidate.claims",
             });
         }
         // Bounds closure: entered bounds must cover the candidate window, version, and precision.
-        // A claim about another version or a finer precision never enters this candidate.
         if !entry.bounds.covers_candidate(
             self.scope.as_str(),
             self.candidate_window(),
@@ -917,8 +973,7 @@ impl EpistemicPositionCandidate {
                 });
             }
         }
-        // Counterevidence closure: every preserved counter handle resolves against the supplied closed
-        // support set; a countered claim over a foreign handle fails even when its verdict is coherent.
+        // Counterevidence closure: every preserved counter handle resolves against the closed support set.
         for handle in &entry.counterevidence {
             if !support_handles.contains(handle) {
                 let field = "candidate.counterevidence";
@@ -941,11 +996,9 @@ impl EpistemicPositionCandidate {
                     field: "candidate.assumptions",
                 });
             };
-            // Exact closure: the named record must hold in this task, scope,
-            // and fence. Same name under another context is foreign.
+            // Exact closure: the named record must hold in this task, scope, and fence.
             record.validate_for(&self.task_id, self.scope.as_str(), &self.fence)?;
-            // Assumption closure: the record bounds must cover the candidate window, version, and
-            // precision; a narrower, coarser, or version-drifted assumption never enters here.
+            // Assumption closure: record bounds must cover the candidate window, version, precision.
             if !record.bounds.covers_candidate(
                 self.scope.as_str(),
                 self.candidate_window(),
@@ -968,9 +1021,7 @@ impl EpistemicPositionCandidate {
         }
         Ok(())
     }
-
-    /// Binds claimed conflicts exactly to the provided sets and reports
-    /// whether any conflict stays open (openness from lifecycle and residue).
+    /// Binds claimed conflicts exactly to the provided sets and reports openness.
     fn check_conflict_binding(&self, conflicts: &[ConflictSet]) -> Result<bool, ContractError> {
         let provided: BTreeSet<_> = conflicts
             .iter()

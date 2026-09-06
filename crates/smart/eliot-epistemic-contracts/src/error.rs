@@ -142,12 +142,10 @@ pub(crate) fn check_frozen(
     Ok(())
 }
 
-/// Returns deterministic canonical JSON bytes for any serializable shape.
 pub(crate) fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, ContractError> {
     canonical_json_bytes(value).map_err(|_| ContractError::Canonicalization)
 }
 
-/// Returns the SHA-256 hex digest of the canonical JSON bytes of a shape.
 pub(crate) fn shape_digest<T: Serialize>(value: &T) -> Result<String, ContractError> {
     let bytes = canonical_bytes(value)?;
     Ok(sha256_hex(&bytes))

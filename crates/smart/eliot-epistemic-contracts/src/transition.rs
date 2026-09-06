@@ -3,8 +3,8 @@
 //! An [`EpistemicTransition`] records a proposed move from a before position to an after position: the expected
 //! revision and fence, the trigger with its evidence and operation identity, before/after support and
 //! assertability, added/removed/retained handles with reasons, coverage and conflict deltas, and rollback,
-//! repair, invalidation, and proof references. Transitions are inert data: this crate applies nothing and
-//! allocates nothing. Promotion out of unknown or partial support without fresh evidence is rejected.
+//! repair, invalidation, and proof references. Transitions allocate nothing and apply nothing.
+//! Promotion out of unknown or partial support without fresh evidence is rejected.
 use std::collections::BTreeSet;
 
 use eliot_contracts::ArtifactId;
@@ -50,7 +50,6 @@ pub struct InvalidationRecord {
     pub predecessor: PredecessorId,
 }
 impl InvalidationRecord {
-    /// Constructs an invalidation record after validation.
     pub fn new(
         kind: InvalidationKind,
         reason: impl Into<String>,
@@ -64,8 +63,6 @@ impl InvalidationRecord {
         record.validate()?;
         Ok(record)
     }
-
-    /// Validates the invalidation reason.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_bounded_text(
             &self.reason,
@@ -107,7 +104,6 @@ pub struct SupportDelta {
     pub reasons: BTreeSet<String>,
 }
 impl SupportDelta {
-    /// Constructs a support delta after validation.
     pub fn new(
         added: BTreeSet<ArtifactId>,
         removed: BTreeSet<ArtifactId>,
@@ -123,7 +119,6 @@ impl SupportDelta {
         delta.validate()?;
         Ok(delta)
     }
-
     /// Validates disjointness, bounds, and non-empty reasons.
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.added.len() > MAX_HANDLES
@@ -156,7 +151,7 @@ impl SupportDelta {
 
 /// An inert, fully described position transition.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, try_from = "EpistemicTransitionWire")]
 pub struct EpistemicTransition {
     /// Position the transition bears on.
     pub position: PropositionId,
@@ -240,68 +235,131 @@ struct TransitionDigestShape<'a> {
     invalidation: &'a Option<InvalidationRecord>,
     proof_digest: &'a str,
 }
+/// Named constructor arguments for [`EpistemicTransition::new`].
+/// Named fields block transposition; text uses concrete [`String`].
+#[derive(Clone, Debug)]
+pub struct EpistemicTransitionParams {
+    pub position: PropositionId,
+    pub task_id: TaskId,
+    pub attempt_id: String,
+    pub request_id: RequestId,
+    pub idempotency_key: String,
+    pub work_scope: WorkScope,
+    pub candidate_digest: String,
+    pub expected_revision: TaskRevision,
+    pub expected_fence: StateFence,
+    pub trigger: TransitionTrigger,
+    pub evidence_refs: BTreeSet<ArtifactId>,
+    pub operation: OperationId,
+    pub before_support: SupportResult,
+    pub after_support: SupportResult,
+    pub before_assertability: PositionAssertability,
+    pub after_assertability: PositionAssertability,
+    pub delta: SupportDelta,
+    pub coverage_delta_digest: String,
+    pub conflict_delta_digest: String,
+    pub temporal: Option<TemporalRecord>,
+    pub rollback: String,
+    pub repair: Option<String>,
+    pub invalidation: Option<InvalidationRecord>,
+    pub proof_digest: String,
+}
+/// Checked wire mirror of [`EpistemicTransition`]: deserialization validates via `new`.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct EpistemicTransitionWire {
+    position: PropositionId,
+    task_id: TaskId,
+    attempt_id: String,
+    request_id: RequestId,
+    idempotency_key: String,
+    work_scope: WorkScope,
+    candidate_digest: String,
+    expected_revision: TaskRevision,
+    expected_fence: StateFence,
+    trigger: TransitionTrigger,
+    evidence_refs: BTreeSet<ArtifactId>,
+    operation: OperationId,
+    before_support: SupportResult,
+    after_support: SupportResult,
+    before_assertability: PositionAssertability,
+    after_assertability: PositionAssertability,
+    delta: SupportDelta,
+    coverage_delta_digest: String,
+    conflict_delta_digest: String,
+    temporal: Option<TemporalRecord>,
+    rollback: String,
+    repair: Option<String>,
+    invalidation: Option<InvalidationRecord>,
+    proof_digest: String,
+    digest: String,
+}
+impl TryFrom<EpistemicTransitionWire> for EpistemicTransition {
+    type Error = ContractError;
+    fn try_from(wire: EpistemicTransitionWire) -> Result<Self, ContractError> {
+        let transition = Self::new(EpistemicTransitionParams {
+            position: wire.position,
+            task_id: wire.task_id,
+            attempt_id: wire.attempt_id,
+            request_id: wire.request_id,
+            idempotency_key: wire.idempotency_key,
+            work_scope: wire.work_scope,
+            candidate_digest: wire.candidate_digest,
+            expected_revision: wire.expected_revision,
+            expected_fence: wire.expected_fence,
+            trigger: wire.trigger,
+            evidence_refs: wire.evidence_refs,
+            operation: wire.operation,
+            before_support: wire.before_support,
+            after_support: wire.after_support,
+            before_assertability: wire.before_assertability,
+            after_assertability: wire.after_assertability,
+            delta: wire.delta,
+            coverage_delta_digest: wire.coverage_delta_digest,
+            conflict_delta_digest: wire.conflict_delta_digest,
+            temporal: wire.temporal,
+            rollback: wire.rollback,
+            repair: wire.repair,
+            invalidation: wire.invalidation,
+            proof_digest: wire.proof_digest,
+        })?;
+        check_frozen(&wire.digest, &transition.digest, "transition.digest")?;
+        Ok(transition)
+    }
+}
 impl EpistemicTransition {
-    /// Constructs a transition and freezes its canonical digest.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        position: PropositionId,
-        task_id: TaskId,
-        attempt_id: impl Into<String>,
-        request_id: RequestId,
-        idempotency_key: impl Into<String>,
-        work_scope: WorkScope,
-        candidate_digest: impl Into<String>,
-        expected_revision: TaskRevision,
-        expected_fence: StateFence,
-        trigger: TransitionTrigger,
-        evidence_refs: BTreeSet<ArtifactId>,
-        operation: OperationId,
-        before_support: SupportResult,
-        after_support: SupportResult,
-        before_assertability: PositionAssertability,
-        after_assertability: PositionAssertability,
-        delta: SupportDelta,
-        coverage_delta_digest: impl Into<String>,
-        conflict_delta_digest: impl Into<String>,
-        temporal: Option<TemporalRecord>,
-        rollback: impl Into<String>,
-        repair: Option<String>,
-        invalidation: Option<InvalidationRecord>,
-        proof_digest: impl Into<String>,
-    ) -> Result<Self, ContractError> {
+    pub fn new(params: EpistemicTransitionParams) -> Result<Self, ContractError> {
         let mut transition = Self {
-            position,
-            task_id,
-            attempt_id: attempt_id.into(),
-            request_id,
-            idempotency_key: idempotency_key.into(),
-            work_scope,
-            candidate_digest: candidate_digest.into(),
-            expected_revision,
-            expected_fence,
-            trigger,
-            evidence_refs,
-            operation,
-            before_support,
-            after_support,
-            before_assertability,
-            after_assertability,
-            delta,
-            coverage_delta_digest: coverage_delta_digest.into(),
-            conflict_delta_digest: conflict_delta_digest.into(),
-            temporal,
-            rollback: rollback.into(),
-            repair,
-            invalidation,
-            proof_digest: proof_digest.into(),
+            position: params.position,
+            task_id: params.task_id,
+            attempt_id: params.attempt_id,
+            request_id: params.request_id,
+            idempotency_key: params.idempotency_key,
+            work_scope: params.work_scope,
+            candidate_digest: params.candidate_digest,
+            expected_revision: params.expected_revision,
+            expected_fence: params.expected_fence,
+            trigger: params.trigger,
+            evidence_refs: params.evidence_refs,
+            operation: params.operation,
+            before_support: params.before_support,
+            after_support: params.after_support,
+            before_assertability: params.before_assertability,
+            after_assertability: params.after_assertability,
+            delta: params.delta,
+            coverage_delta_digest: params.coverage_delta_digest,
+            conflict_delta_digest: params.conflict_delta_digest,
+            temporal: params.temporal,
+            rollback: params.rollback,
+            repair: params.repair,
+            invalidation: params.invalidation,
+            proof_digest: params.proof_digest,
             digest: String::new(),
         };
         transition.validate_shape()?;
         transition.digest = transition.compute_digest()?;
         Ok(transition)
     }
-
-    /// Recomputes the canonical digest of the transition shape.
     pub fn compute_digest(&self) -> Result<String, ContractError> {
         shape_digest(&TransitionDigestShape {
             position: &self.position,
@@ -330,9 +388,7 @@ impl EpistemicTransition {
             proof_digest: self.proof_digest.as_str(),
         })
     }
-
-    /// Support-delta reconciliation: the delta is the exact partition of the before/after handle sets —
-    /// added is after-minus-before, removed is before-minus-after, retained is the intersection, so an
+    /// Support-delta reconciliation: the delta exactly partitions before/after handles; any
     /// omitted, duplicated, extra, or misclassified handle fails.
     pub fn reconcile_delta(
         delta: &SupportDelta,
@@ -435,15 +491,11 @@ impl EpistemicTransition {
         }
         Ok(())
     }
-
-    /// Validates the transition shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
         check_frozen(&self.digest, &self.compute_digest()?, "transition.digest")
     }
-
-    /// Closes the transition against its governing request, candidate, and real
-    /// before/after support records (binding, arithmetic, and terminality below).
+    /// Closes the transition against governing request, candidate, and real before/after records.
     pub fn validate_closed(
         &self,
         request: &PositionRequest,
@@ -544,8 +596,7 @@ impl EpistemicTransition {
                 field: "transition.position",
             });
         }
-        // The candidate must stand on the expected revision under the expected fence: a candidate from
-        // another revision or fence answers another transition.
+        // The candidate must stand on the expected revision under the expected fence.
         if candidate.revision != self.expected_revision {
             let field = "transition.candidate_revision";
             return Err(ContractError::StaleContext { field });
@@ -556,8 +607,7 @@ impl EpistemicTransition {
             let field = "transition.candidate_fence";
             return Err(ContractError::FenceMismatch { field });
         }
-        // The transition temporal must be owned by the candidate digest set: a valid but unrelated
-        // temporal proves nothing here.
+        // The transition temporal must be owned by the candidate digest set.
         let digests = &candidate.temporal_digests;
         if let Some(temporal) = &self.temporal
             && !digests.contains(&shape_digest(temporal)?)

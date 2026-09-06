@@ -2,8 +2,7 @@
 //!
 //! An [`InvestigationRequirement`] states what further inquiry a position needs: proposition, scope, task,
 //! fence, inquiry kind, target, and reason. Donor disposition (`crates/smart/eliot-epistemic/src/lib.rs`):
-//! donor free-text `required_inquiry`/`unknowns` vectors are disposed — prose is not a contract. Each becomes
-//! a typed requirement or an explicit candidate `unknowns` entry; inquiry-derivation policy is resolver work.
+//! free-text vectors are disposed; each becomes a typed requirement or an explicit `unknowns` entry.
 use eliot_contracts::{StateFence, TaskId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -63,37 +62,37 @@ pub struct InvestigationRequirement {
     /// Canonical digest of the requirement shape, excluding this field.
     pub digest: String,
 }
+/// Named constructor arguments for [`InvestigationRequirement::new`].
+/// Named fields block transposition; text uses concrete [`String`].
+#[derive(Clone, Debug)]
+pub struct InvestigationRequirementParams {
+    pub requirement_id: String,
+    pub proposition: PropositionId,
+    pub scope: String,
+    pub task_id: TaskId,
+    pub fence: StateFence,
+    pub inquiry: InvestigationKind,
+    pub target: String,
+    pub reason: String,
+}
 impl InvestigationRequirement {
-    /// Constructs an investigation requirement and freezes its digest.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        requirement_id: impl Into<String>,
-        proposition: PropositionId,
-        scope: impl Into<String>,
-        task_id: TaskId,
-        fence: StateFence,
-        inquiry: InvestigationKind,
-        target: impl Into<String>,
-        reason: impl Into<String>,
-    ) -> Result<Self, ContractError> {
+    pub fn new(params: InvestigationRequirementParams) -> Result<Self, ContractError> {
         let mut requirement = Self {
             requirement_kind: RequirementKind::InvestigationRequirement,
-            requirement_id: requirement_id.into(),
-            proposition,
-            scope: scope.into(),
-            task_id,
-            fence,
-            inquiry,
-            target: target.into(),
-            reason: reason.into(),
+            requirement_id: params.requirement_id,
+            proposition: params.proposition,
+            scope: params.scope,
+            task_id: params.task_id,
+            fence: params.fence,
+            inquiry: params.inquiry,
+            target: params.target,
+            reason: params.reason,
             digest: String::new(),
         };
         requirement.validate_shape()?;
         requirement.digest = requirement.compute_digest()?;
         Ok(requirement)
     }
-
-    /// Recomputes the canonical digest of the requirement shape.
     pub fn compute_digest(&self) -> Result<String, ContractError> {
         shape_digest(&(
             &self.requirement_kind,
@@ -128,8 +127,6 @@ impl InvestigationRequirement {
         validate_bounded_text(&self.reason, "investigation.reason", MAX_SHORT_TEXT)?;
         Ok(())
     }
-
-    /// Validates the requirement shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
         check_frozen(

@@ -9,9 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ContractError, validate_bounded_text};
 
-/// Frozen I21.2 evidence grade names in canonical order.
-///
-/// The order is load-bearing: [`EvidenceGrade::rank`] increases with rigour.
+/// Frozen I21.2 evidence grade names in canonical order; the order is load-bearing for `rank`.
 pub const GRADE_ORDER: [EvidenceGrade; 4] = [
     EvidenceGrade::Orienting,
     EvidenceGrade::Grounded,
@@ -19,9 +17,7 @@ pub const GRADE_ORDER: [EvidenceGrade; 4] = [
     EvidenceGrade::ScienceGrade,
 ];
 
-/// Exact I21.2 evidence grade.
-///
-/// Variants are listed weakest-first; declaration order is the rigour order.
+/// Exact I21.2 evidence grade, weakest-first; declaration order is the rigour order.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]
@@ -49,8 +45,6 @@ impl EvidenceGrade {
             Self::ScienceGrade => 3,
         }
     }
-
-    /// Returns the exact frozen wire name of this grade.
     pub const fn wire_name(self) -> &'static str {
         match self {
             Self::Orienting => "ORIENTING",
@@ -59,7 +53,6 @@ impl EvidenceGrade {
             Self::ScienceGrade => "SCIENCE_GRADE",
         }
     }
-
     /// Returns the frozen grade names in canonical weakest-first order.
     pub fn ordered_names() -> [&'static str; 4] {
         [
@@ -69,9 +62,7 @@ impl EvidenceGrade {
             EvidenceGrade::ScienceGrade.wire_name(),
         ]
     }
-
-    /// Validates a supplied ceiling intrinsically: the claimed grade must not
-    /// exceed the ceiling it was produced under. No grading is performed.
+    /// Validates a supplied ceiling: the claimed grade must not exceed it.
     pub fn check_ceiling(claimed: Self, ceiling: Self) -> Result<(), ContractError> {
         if claimed.rank() > ceiling.rank() {
             return Err(ContractError::CeilingViolation {
@@ -80,7 +71,6 @@ impl EvidenceGrade {
         }
         Ok(())
     }
-
     /// Quoting a claim never upgrades its parent's grade.
     ///
     /// Raising the requirement is prospective and never retroactive.
@@ -94,8 +84,7 @@ impl EvidenceGrade {
     }
 }
 
-/// A supplied grade keeping "unknown" distinct from the lowest known grade:
-/// exactly one side is present, and unknown never satisfies a ceiling alone.
+/// A supplied grade with exactly one side present; unknown never satisfies a ceiling alone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GradeAssignment {
@@ -112,7 +101,6 @@ impl GradeAssignment {
             unknown_reason: None,
         }
     }
-
     /// Records an unknown grade with its bounded reason.
     pub fn unknown(reason: impl Into<String>) -> Result<Self, ContractError> {
         let assignment = Self {
@@ -122,12 +110,9 @@ impl GradeAssignment {
         assignment.validate()?;
         Ok(assignment)
     }
-
-    /// Returns whether the grade is unknown.
     pub fn is_unknown(&self) -> bool {
         self.grade.is_none()
     }
-
     /// Validates that exactly one side is present.
     pub fn validate(&self) -> Result<(), ContractError> {
         match (&self.grade, &self.unknown_reason) {
@@ -141,15 +126,11 @@ impl GradeAssignment {
             }),
         }
     }
-
     /// Returns the known grade, or `None` when the grade is unknown.
     pub fn known_grade(&self) -> Option<EvidenceGrade> {
         self.grade
     }
-
-    /// Returns the weakest of the supplied assignments: any unknown poisons
-    /// the aggregate, otherwise the least rigorous known grade wins. Empty
-    /// input errors.
+    /// Returns the weakest of the supplied assignments (unknown poisons; empty input errors).
     pub fn weakest(assignments: &[GradeAssignment]) -> Result<GradeAssignment, ContractError> {
         let mut iter = assignments.iter();
         let first = iter.next().ok_or(ContractError::EmptyCollection {

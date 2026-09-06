@@ -18,8 +18,7 @@ use crate::identity::PropositionId;
 use crate::temporal::TemporalRecord;
 use crate::verifier::SourceAssurance;
 
-/// What one inquiry route observed for one proposition: `Supported` and `Partial` are the only results that
-/// license downstream reliance; every other result preserves the unknown instead of smoothing it.
+/// What one route observed: `Supported` and `Partial` license reliance; others preserve the unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SupportResult {
@@ -89,8 +88,7 @@ pub struct ValidityBounds {
     pub precision: String,
 }
 
-/// Precision lattice, coarsest-first: coarser support covers finer assertions,
-/// never the reverse; off-lattice spellings cover only exact equality.
+/// Precision lattice, coarsest-first: coarser covers finer; off-lattice covers exact equality.
 const PRECISION_LATTICE: [&str; 6] = [
     "repository",
     "package",
@@ -113,9 +111,7 @@ pub(crate) fn precision_covers(supported: &str, asserted: &str) -> bool {
     }
 }
 
-/// Returns whether the outer window contains the inner window (unbounded
-/// sides are unbounded; a bounded outer side never contains an unbounded
-/// inner side).
+/// Returns whether the outer window contains the inner window (unbounded sides stay unbounded).
 pub(crate) fn window_contains(
     outer: (Option<i64>, Option<i64>),
     inner: (Option<i64>, Option<i64>),
@@ -128,9 +124,8 @@ pub(crate) fn window_contains(
         (Some(hi), Some(inner_hi)) if inner_hi > hi => return false,
         _ => {}
     }
-    // A bounded outer window never contains an unbounded inner window on
-    // the bounded side: answering "any time" from "this week" is a partial
-    // answer, never a covered one.
+    // A bounded outer window never contains an unbounded inner window: "any time" from "this week"
+    // is a partial answer, never a covered one.
     if outer.0.is_some() && inner.0.is_none() {
         return false;
     }
@@ -139,6 +134,8 @@ pub(crate) fn window_contains(
     }
     true
 }
+/// Precision role (no canonical owner covers precision spellings).
+pub struct Precision(pub String);
 impl ValidityBounds {
     /// Constructs validity bounds, rejecting inverted windows.
     pub fn new(
@@ -146,19 +143,18 @@ impl ValidityBounds {
         window_start_ms: Option<i64>,
         window_end_ms: Option<i64>,
         version: impl Into<String>,
-        precision: impl Into<String>,
+        precision: Precision,
     ) -> Result<Self, ContractError> {
         let bounds = Self {
             scope: scope.into(),
             window_start_ms,
             window_end_ms,
             version: version.into(),
-            precision: precision.into(),
+            precision: precision.0,
         };
         bounds.validate()?;
         Ok(bounds)
     }
-
     /// Validates scope, version, precision, and window order.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.scope, "support.scope", MAX_SHORT_TEXT)?;
@@ -173,7 +169,6 @@ impl ValidityBounds {
         }
         Ok(())
     }
-
     /// Returns whether these bounds cover the requested scope, instant,
     /// version, and precision. A mismatch limits support instead of failing.
     pub fn covers(
@@ -196,7 +191,6 @@ impl ValidityBounds {
         }
         precision_covers(&self.precision, precision)
     }
-
     /// Returns whether these bounds cover a candidate window, version, and
     /// precision: same scope and version, containing window, covering
     /// precision.
@@ -245,39 +239,41 @@ pub struct SupportRecord {
     /// Digest of the bounded proof payload behind this record.
     pub proof_digest: String,
 }
+/// Named constructor arguments for [`SupportRecord::new`].
+/// Named fields block transposition; text uses concrete [`String`].
+#[derive(Clone, Debug)]
+pub struct SupportRecordParams {
+    pub proposition: PropositionId,
+    pub result: SupportResult,
+    pub handles: BTreeSet<ArtifactId>,
+    pub validity: ValidityBounds,
+    pub grade: GradeAssignment,
+    pub task_id: TaskId,
+    pub fence: StateFence,
+    pub temporal: Option<TemporalRecord>,
+    pub assurance: Option<SourceAssurance>,
+    pub reopen_reason: Option<String>,
+    pub proof_digest: String,
+}
 impl SupportRecord {
     /// Constructs a support record after validating every bound.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        proposition: PropositionId,
-        result: SupportResult,
-        handles: BTreeSet<ArtifactId>,
-        validity: ValidityBounds,
-        grade: GradeAssignment,
-        task_id: TaskId,
-        fence: StateFence,
-        temporal: Option<TemporalRecord>,
-        assurance: Option<SourceAssurance>,
-        reopen_reason: Option<String>,
-        proof_digest: impl Into<String>,
-    ) -> Result<Self, ContractError> {
+    pub fn new(params: SupportRecordParams) -> Result<Self, ContractError> {
         let record = Self {
-            proposition,
-            result,
-            handles,
-            validity,
-            grade,
-            task_id,
-            fence,
-            temporal,
-            assurance,
-            reopen_reason,
-            proof_digest: proof_digest.into(),
+            proposition: params.proposition,
+            result: params.result,
+            handles: params.handles,
+            validity: params.validity,
+            grade: params.grade,
+            task_id: params.task_id,
+            fence: params.fence,
+            temporal: params.temporal,
+            assurance: params.assurance,
+            reopen_reason: params.reopen_reason,
+            proof_digest: params.proof_digest,
         };
         record.validate()?;
         Ok(record)
     }
-
     /// Validates bounds, handles, reopen discipline, and digests.
     ///
     /// `Unsupported` with valid handles and bounds is valid data and passes.
@@ -339,7 +335,6 @@ impl SupportRecord {
         validate_digest(&self.proof_digest, "support.proof_digest")?;
         Ok(())
     }
-
     /// Validates this record against the requesting task, scope, and fence.
     pub fn validate_for(
         &self,

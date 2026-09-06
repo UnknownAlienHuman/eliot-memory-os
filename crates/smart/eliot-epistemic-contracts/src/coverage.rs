@@ -38,21 +38,20 @@ pub struct QuerySpec {
     /// Revision of the query definition.
     pub query_revision: String,
 }
+/// Query revision role (no canonical owner covers query revisions).
+pub struct QueryRevision(pub String);
 impl QuerySpec {
-    /// Constructs a query specification after validation.
     pub fn new(
         query_text: impl Into<String>,
-        query_revision: impl Into<String>,
+        query_revision: QueryRevision,
     ) -> Result<Self, ContractError> {
         let spec = Self {
             query_text: query_text.into(),
-            query_revision: query_revision.into(),
+            query_revision: query_revision.0,
         };
         spec.validate()?;
         Ok(spec)
     }
-
-    /// Validates the query text and revision.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.query_text, "coverage.query_text", MAX_SHORT_TEXT)?;
         validate_bounded_text(
@@ -73,21 +72,20 @@ pub struct FrontierSpec {
     /// Revision of the frozen retrieval frontier.
     pub frontier_revision: String,
 }
+/// Frontier revision role (same rationale as [`QueryRevision`]).
+pub struct FrontierRevision(pub String);
 impl FrontierSpec {
-    /// Constructs a frontier specification after validation.
     pub fn new(
         frontier_id: impl Into<String>,
-        frontier_revision: impl Into<String>,
+        frontier_revision: FrontierRevision,
     ) -> Result<Self, ContractError> {
         let spec = Self {
             frontier_id: frontier_id.into(),
-            frontier_revision: frontier_revision.into(),
+            frontier_revision: frontier_revision.0,
         };
         spec.validate()?;
         Ok(spec)
     }
-
-    /// Validates the frontier identity and revision.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.frontier_id, "coverage.frontier_id", MAX_SHORT_TEXT)?;
         validate_bounded_text(
@@ -109,7 +107,6 @@ pub struct SnapshotRef {
     pub owner: SourceId,
 }
 impl SnapshotRef {
-    /// Constructs a snapshot reference after validation.
     pub fn new(snapshot_id: impl Into<String>, owner: SourceId) -> Result<Self, ContractError> {
         let snapshot = Self {
             snapshot_id: snapshot_id.into(),
@@ -118,7 +115,6 @@ impl SnapshotRef {
         snapshot.validate()?;
         Ok(snapshot)
     }
-
     /// Validates the snapshot identity; ownership is structural and explicit.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.snapshot_id, "coverage.snapshot_id", MAX_SHORT_TEXT)?;
@@ -135,21 +131,20 @@ pub struct ExclusionRecord {
     /// Bounded reason for the exclusion.
     pub reason: String,
 }
+/// Exclusion reason role (no canonical owner covers exclusion prose).
+pub struct ExclusionReason(pub String);
 impl ExclusionRecord {
-    /// Constructs an exclusion record after validation.
     pub fn new(
         excluded: impl Into<String>,
-        reason: impl Into<String>,
+        reason: ExclusionReason,
     ) -> Result<Self, ContractError> {
         let record = Self {
             excluded: excluded.into(),
-            reason: reason.into(),
+            reason: reason.0,
         };
         record.validate()?;
         Ok(record)
     }
-
-    /// Validates the excluded coordinate and its reason.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.excluded, "coverage.excluded", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.reason, "coverage.exclusion_reason", MAX_SHORT_TEXT)?;
@@ -171,7 +166,6 @@ pub struct PaginationBounds {
     pub truncated: bool,
 }
 impl PaginationBounds {
-    /// Constructs pagination bounds after validation.
     pub fn new(
         offset: u64,
         limit: u64,
@@ -187,7 +181,6 @@ impl PaginationBounds {
         bounds.validate()?;
         Ok(bounds)
     }
-
     /// Validates that offset and limit reconcile with the total.
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.limit == 0 {
@@ -269,48 +262,48 @@ pub struct CoverageDenominator {
     /// Canonical digest of the denominator shape, excluding this field.
     pub digest: String,
 }
+/// Named constructor arguments for [`CoverageDenominator::new`].
+/// Named fields block transposition; text uses concrete [`String`].
+#[derive(Clone, Debug)]
+pub struct CoverageDenominatorParams {
+    pub class: String,
+    pub schema: String,
+    pub revision: String,
+    pub scope: String,
+    pub fence: StateFence,
+    pub members: BTreeSet<ArtifactId>,
+    pub roles: BTreeSet<String>,
+    pub query: Option<QuerySpec>,
+    pub frontier: Option<FrontierSpec>,
+    pub snapshot: SnapshotRef,
+    pub exclusions: Vec<ExclusionRecord>,
+    pub bounds: PaginationBounds,
+    pub validity: ValidityBounds,
+    pub kind: DenominatorKind,
+}
 impl CoverageDenominator {
-    /// Constructs a denominator and freezes its canonical digest.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        class: impl Into<String>,
-        schema: impl Into<String>,
-        revision: impl Into<String>,
-        scope: impl Into<String>,
-        fence: StateFence,
-        members: BTreeSet<ArtifactId>,
-        roles: BTreeSet<String>,
-        query: Option<QuerySpec>,
-        frontier: Option<FrontierSpec>,
-        snapshot: SnapshotRef,
-        exclusions: Vec<ExclusionRecord>,
-        bounds: PaginationBounds,
-        validity: ValidityBounds,
-        kind: DenominatorKind,
-    ) -> Result<Self, ContractError> {
+    pub fn new(params: CoverageDenominatorParams) -> Result<Self, ContractError> {
         let mut denominator = Self {
-            class: class.into(),
-            schema: schema.into(),
-            revision: revision.into(),
-            scope: scope.into(),
-            fence,
-            members,
-            roles,
-            query,
-            frontier,
-            snapshot,
-            exclusions,
-            bounds,
-            validity,
-            kind,
+            class: params.class,
+            schema: params.schema,
+            revision: params.revision,
+            scope: params.scope,
+            fence: params.fence,
+            members: params.members,
+            roles: params.roles,
+            query: params.query,
+            frontier: params.frontier,
+            snapshot: params.snapshot,
+            exclusions: params.exclusions,
+            bounds: params.bounds,
+            validity: params.validity,
+            kind: params.kind,
             digest: String::new(),
         };
         denominator.validate_shape()?;
         denominator.digest = denominator.compute_digest()?;
         Ok(denominator)
     }
-
-    /// Recomputes the canonical digest of the denominator shape.
     pub fn compute_digest(&self) -> Result<String, ContractError> {
         shape_digest(&(
             &self.class,
@@ -355,8 +348,7 @@ impl CoverageDenominator {
             validate_bounded_text(role.as_str(), "coverage.roles", MAX_SHORT_TEXT)?;
         }
         if self.kind == DenominatorKind::CompleteScope {
-            // A complete scope is arithmetically exact: never truncated, with the total equal to the
-            // enumerated member count. A truncated or short enumeration over a complete scope fails here.
+            // A complete scope is arithmetically exact: never truncated, total equals member count.
             if self.bounds.truncated {
                 return Err(ContractError::IncompleteDenominator {
                     field: "coverage.bounds",
@@ -368,9 +360,8 @@ impl CoverageDenominator {
                 });
             }
             if self.members.is_empty() {
-                // Known-empty is valid only as an owned, exact, bound empty: the complete marker with the query
-                // and frontier that read the emptiness, plus the owner snapshot it was read from. A sampled,
-                // unknown, or query-less/frontier-less empty proves nothing and fails below.
+                // Known-empty is valid only as an owned, exact, bound empty: complete marker with the
+                // query, frontier, and owner snapshot that read the emptiness.
                 if self.query.is_none() || self.frontier.is_none() {
                     return Err(ContractError::IncompleteDenominator {
                         field: "coverage.members",
@@ -406,8 +397,6 @@ impl CoverageDenominator {
         }
         Ok(())
     }
-
-    /// Validates the denominator shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
         check_frozen(&self.digest, &self.compute_digest()?, "coverage.digest")

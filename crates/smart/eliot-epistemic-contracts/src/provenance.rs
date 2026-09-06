@@ -2,7 +2,7 @@
 //!
 //! A [`ProvenanceClosure`] carries record handles, typed sources, raw handles, revisions, per-source
 //! [`SourceLineage`] entries (with cycle rejection), assertability, scope, and fence. The untyped sets must
-//! equal exactly the union over the lineage entries. It is data, never authority.
+//! equal exactly the union over the lineage entries.
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{ArtifactId, SourceId, StateFence};
@@ -14,6 +14,7 @@ use crate::error::{
     ContractError, MAX_HANDLES, MAX_SHORT_TEXT, check_frozen, shape_digest, validate_bounded_text,
     validate_digest,
 };
+use crate::identity::SourceRevisionId;
 
 /// One source's lineage inside a closure: owner, revision, content digest,
 /// raw handle, and predecessor digests within the same bundle.
@@ -36,10 +37,9 @@ pub struct SourceLineage {
     pub derived_from_raw: Option<String>,
 }
 impl SourceLineage {
-    /// Constructs a source lineage entry after validation.
     pub fn new(
         owner: SourceId,
-        revision: impl Into<String>,
+        revision: SourceRevisionId,
         content_digest: impl Into<String>,
         raw_handle: Option<String>,
         predecessors: BTreeSet<String>,
@@ -47,7 +47,7 @@ impl SourceLineage {
     ) -> Result<Self, ContractError> {
         let entry = Self {
             owner,
-            revision: revision.into(),
+            revision: revision.into_string(),
             content_digest: content_digest.into(),
             raw_handle,
             predecessors,
@@ -56,11 +56,7 @@ impl SourceLineage {
         entry.validate()?;
         Ok(entry)
     }
-
-    /// Validates revision, digests, handles, and predecessor form.
-    ///
-    /// Bundle-wide acyclicity is checked by the closure, which sees every
-    /// entry; a self-reference fails here.
+    /// Validates revision, digests, handles, and predecessor form (acyclicity lives in the closure).
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.revision, "provenance.revision", MAX_SHORT_TEXT)?;
         validate_digest(&self.content_digest, "provenance.content_digest")?;
@@ -167,43 +163,43 @@ pub struct ProvenanceClosure {
     /// Canonical digest of the closure shape, excluding this field.
     pub digest: String,
 }
+/// Named constructor arguments for [`ProvenanceClosure::new`].
+/// Named fields block transposition; text uses concrete [`String`].
+#[derive(Clone, Debug)]
+pub struct ProvenanceClosureParams {
+    pub records: BTreeSet<ArtifactId>,
+    pub sources: BTreeSet<SourceId>,
+    pub raw_handles: BTreeSet<String>,
+    pub revisions: BTreeSet<String>,
+    pub lineage: Vec<SourceLineage>,
+    pub record_origin: BTreeMap<ArtifactId, String>,
+    pub temporal_digest: Option<String>,
+    pub mixed_sources: bool,
+    pub assertability: Assertability,
+    pub scope: String,
+    pub fence: StateFence,
+}
 impl ProvenanceClosure {
-    /// Constructs a closure and freezes its canonical digest.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        records: BTreeSet<ArtifactId>,
-        sources: BTreeSet<SourceId>,
-        raw_handles: BTreeSet<String>,
-        revisions: BTreeSet<String>,
-        lineage: Vec<SourceLineage>,
-        record_origin: BTreeMap<ArtifactId, String>,
-        temporal_digest: Option<String>,
-        mixed_sources: bool,
-        assertability: Assertability,
-        scope: impl Into<String>,
-        fence: StateFence,
-    ) -> Result<Self, ContractError> {
+    pub fn new(params: ProvenanceClosureParams) -> Result<Self, ContractError> {
         let mut closure = Self {
             closure_kind: ProvenanceClosureKind::ProvenanceClosure,
-            records,
-            sources,
-            raw_handles,
-            revisions,
-            lineage,
-            record_origin,
-            temporal_digest,
-            mixed_sources,
-            assertability,
-            scope: scope.into(),
-            fence,
+            records: params.records,
+            sources: params.sources,
+            raw_handles: params.raw_handles,
+            revisions: params.revisions,
+            lineage: params.lineage,
+            record_origin: params.record_origin,
+            temporal_digest: params.temporal_digest,
+            mixed_sources: params.mixed_sources,
+            assertability: params.assertability,
+            scope: params.scope,
+            fence: params.fence,
             digest: String::new(),
         };
         closure.validate_shape()?;
         closure.digest = closure.compute_digest()?;
         Ok(closure)
     }
-
-    /// Recomputes the canonical digest of the closure shape.
     pub fn compute_digest(&self) -> Result<String, ContractError> {
         shape_digest(&(
             &self.closure_kind,
@@ -352,8 +348,6 @@ impl ProvenanceClosure {
             })?;
         Ok(())
     }
-
-    /// Validates the closure shape and its frozen digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_shape()?;
         check_frozen(&self.digest, &self.compute_digest()?, "provenance.digest")
