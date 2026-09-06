@@ -1,0 +1,95 @@
+//! Shared closed-world error for the provider-neutral Dreamer contract hub.
+//!
+//! Cell `smart.dreamer.contracts`. Every validation failure in this crate maps
+//! to this single error so handler/status bridges can switch on a closed set
+//! without string matching. No I/O, no state, no provider surface.
+
+#![forbid(unsafe_code)]
+
+use thiserror::Error;
+
+/// Converts a measured length into the `i64` bound space used by
+/// [`ContractViolation::OutOfBounds`].
+///
+/// Saturates at [`i64::MAX`] instead of wrapping, so hostile oversized
+/// inputs stay representable without panics or silent truncation.
+#[must_use]
+pub fn len_i64(len: usize) -> i64 {
+    i64::try_from(len).unwrap_or(i64::MAX)
+}
+
+/// Closed validation failure for any Dreamer contract shape in this crate.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ContractViolation {
+    /// A closed enum received an unknown wire spelling.
+    #[error("unknown variant for {field}: {value}")]
+    UnknownVariant {
+        /// Closed field name (e.g. `job_class`, `wire_kind`, `family`).
+        field: &'static str,
+        /// Rejected wire spelling.
+        value: String,
+    },
+    /// A required field is missing.
+    #[error("missing required field: {0}")]
+    MissingField(&'static str),
+    /// A value is outside its exact permitted bound.
+    #[error("{field} out of bounds: got {got}, permitted {min}..={max}")]
+    OutOfBounds {
+        /// Field name.
+        field: &'static str,
+        /// Inclusive lower bound.
+        min: i64,
+        /// Inclusive upper bound.
+        max: i64,
+        /// Observed value.
+        got: i64,
+    },
+    /// A protected identity/ordering/receipt/completeness/terminal field used
+    /// an implicit default instead of an explicit value.
+    #[error("protected field must be explicit, not defaulted: {0}")]
+    ImplicitDefault(&'static str),
+    /// Wrapper/identity/binding mismatch (source, manifest, scope, fence,
+    /// receipt digest, validator, job, draft, bundle).
+    #[error("binding mismatch on {field}: {reason}")]
+    BindingMismatch {
+        /// Binding name.
+        field: &'static str,
+        /// Exact reason.
+        reason: String,
+    },
+    /// Budget exhausted, unknown-as-unlimited, cross-subsidy, or
+    /// class-ceiling violation.
+    #[error("budget violation on {dimension}: {reason}")]
+    Budget {
+        /// Independent budget dimension.
+        dimension: &'static str,
+        /// Exact reason.
+        reason: String,
+    },
+    /// Cross-stage decode attempt (raw/structured/grounded/validated/candidate).
+    #[error("cross-stage decode rejected: {0}")]
+    CrossStage(&'static str),
+    /// Wrong curation kind/payload pairing or trial-decoding routing attempt.
+    #[error("kind/payload mismatch: {0}")]
+    KindPayload(String),
+    /// Registry registration conflict (duplicate, overlap, changed descriptor).
+    #[error("registry conflict: {0}")]
+    Registry(String),
+    /// Screen reference cannot enable dispatch.
+    #[error("screen ineligible: {0}")]
+    ScreenIneligible(String),
+    /// Preservation dimension failed/unknown and cannot be averaged away.
+    #[error("preservation failure: {0}")]
+    Preservation(String),
+    /// Candidate carries admitted/current/effect/delivery/use/outcome/promotion/Finish evidence.
+    #[error("forbidden candidate carry: {0}")]
+    ForbiddenCarry(String),
+    /// Malformed or hostile input rejected with a bound (never panics).
+    #[error("malformed input for {field}: {reason}")]
+    Malformed {
+        /// Field name.
+        field: &'static str,
+        /// Exact reason.
+        reason: String,
+    },
+}
