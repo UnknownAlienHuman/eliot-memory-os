@@ -429,6 +429,13 @@ pub(crate) fn sample_payload(kind: CurationKind) -> CurationPayload {
     route_payload(kind, sample_wire(kind)).expect("sample wire decodes")
 }
 
+/// Asserts a receipt binding mismatch on `field` for tests.
+#[cfg(test)]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn assert_probe(r: Result<(), ContractViolation>, field: &str) {
+    assert!(matches!(r, Err(ContractViolation::BindingMismatch { field: g, .. }) if g == field));
+}
+
 #[cfg(test)]
 fn sample_wire(kind: CurationKind) -> &'static str {
     match kind {
@@ -588,7 +595,9 @@ mod tests {
     // WORK_UNIT_CASE: 578/28
     #[test]
     fn case_28_wrong_kind_payload_pairing_rejected() {
-        let kind = CurationKind::Classification;
+        use ContractViolation::*;
+        use CurationKind::*;
+        let kind = Classification;
         let json = serde_json::to_string(&sample_payload(kind)).expect("serialize");
         let err = route_payload(CurationKind::Relation, &json).expect_err("tag mismatch must fail");
         assert!(matches!(err, ContractViolation::KindPayload(_)));
@@ -632,13 +641,8 @@ mod tests {
         assert!(matches!(err, ContractViolation::KindPayload(_)));
         let json = sample_wire(kind).replace("[\"a\",\"b\",\"ab\"]", "[\"a\",\"a\"]");
         let payload: CurationPayload = serde_json::from_str(&json).expect("decodes");
-        assert!(matches!(
-            payload.validate(),
-            Err(ContractViolation::BindingMismatch {
-                field: "targets",
-                ..
-            })
-        ));
+        let r = payload.validate();
+        assert!(matches!(r, Err(BindingMismatch { field: g, .. }) if g == "targets"));
         let oversize = "x".repeat(MAX_PAYLOAD_JSON + 1);
         let err = route_payload(kind, &oversize).expect_err("oversize must fail");
         assert!(matches!(err, ContractViolation::Malformed { .. }));
@@ -646,35 +650,21 @@ mod tests {
             targets: vec!["a".to_owned(); MAX_TARGETS + 1],
             evidence_refs: Vec::new(),
         };
-        assert!(matches!(
-            flooded.validate("classification"),
-            Err(ContractViolation::OutOfBounds {
-                field: "targets",
-                ..
-            })
-        ));
+        let r = flooded.validate("classification");
+        assert!(matches!(r, Err(OutOfBounds { field: g, .. }) if g == "targets"));
         let flooded_evidence = TargetEvidence {
             targets: vec!["a".to_owned()],
             evidence_refs: vec!["e".to_owned(); MAX_EVIDENCE_REFS + 1],
         };
-        assert!(matches!(
-            flooded_evidence.validate("classification"),
-            Err(ContractViolation::OutOfBounds {
-                field: "evidence_refs",
-                ..
-            })
-        ));
+        let r = flooded_evidence.validate("classification");
+        assert!(matches!(r, Err(OutOfBounds { field: g, .. }) if g == "evidence_refs"));
         for wire in CURATION_WIRE_KINDS {
             let kind = parse_kind(wire).expect("known kind");
             let json = sample_wire(kind).replace("[\"a\",\"b\",\"ab\"]", "[\"zzz\"]");
             let payload: CurationPayload = serde_json::from_str(&json).expect("decodes");
             if matches!(
                 kind,
-                CurationKind::Classification
-                    | CurationKind::Episode
-                    | CurationKind::Concept
-                    | CurationKind::Procedure
-                    | CurationKind::Failure
+                Classification | Episode | Concept | Procedure | Failure
             ) {
                 assert!(payload.validate().is_ok());
             } else {

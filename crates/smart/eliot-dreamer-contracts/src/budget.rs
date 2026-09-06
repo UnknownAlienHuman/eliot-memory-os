@@ -241,7 +241,7 @@ impl BudgetLimits {
 }
 
 /// Observed per-dimension budget consumption plus synthetic throttle units.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetUsage {
     /// Consumed input bytes.
@@ -414,8 +414,6 @@ fn check_usage(
 mod tests {
     use super::*;
 
-    use super::ALL_BUDGET_DIMENSIONS as DIMENSIONS;
-
     fn ceiling_limits() -> BudgetLimits {
         BudgetLimits {
             input_bytes: Some(INPUT_BYTES_CEILING),
@@ -433,19 +431,7 @@ mod tests {
     }
 
     fn usage_at(dimension: BudgetDimension, value: u64) -> BudgetUsage {
-        let mut usage = BudgetUsage {
-            input_bytes: 0,
-            output_bytes: 0,
-            source_width: 0,
-            reference_width: 0,
-            model_calls: 0,
-            attempts: 0,
-            candidates: 0,
-            wall_ms: 0,
-            work_fan_out: 0,
-            report_bytes: 0,
-            stu_used: 0,
-        };
+        let mut usage = BudgetUsage::default();
         match dimension {
             BudgetDimension::InputBytes => usage.input_bytes = value,
             BudgetDimension::OutputBytes => usage.output_bytes = value,
@@ -482,7 +468,7 @@ mod tests {
     #[test]
     fn every_dimension_exact_bound_ceiling_accepted_ceiling_plus_one_rejected() {
         assert_eq!(DEX_BUDGET_DIMENSIONS.len(), 10);
-        for (index, dimension) in DIMENSIONS.iter().enumerate() {
+        for (index, dimension) in ALL_BUDGET_DIMENSIONS.iter().enumerate() {
             assert_eq!(DEX_BUDGET_DIMENSIONS[index], dimension.as_str());
             let parsed = parse_budget_dimension(dimension.as_str()).expect("known dimension");
             assert_eq!(parsed, *dimension);
@@ -566,31 +552,13 @@ mod tests {
     // WORK_UNIT_CASE: 578/12
     #[test]
     fn under_use_cannot_cover_over_use_in_another_dimension() {
-        let limits = BudgetLimits {
-            input_bytes: Some(1000),
-            output_bytes: Some(100),
-            source_width: Some(SOURCE_WIDTH_CEILING),
-            reference_width: Some(REFERENCE_WIDTH_CEILING),
-            model_calls: Some(MODEL_CALLS_CEILING),
-            attempts: Some(ATTEMPTS_CEILING),
-            candidates: Some(CANDIDATES_CEILING),
-            wall_ms: Some(WALL_MS_CEILING),
-            work_fan_out: Some(WORK_FAN_OUT_CEILING),
-            report_bytes: Some(REPORT_BYTES_CEILING),
-            max_stu: Some(STU_CEILING),
-        };
+        let mut limits = ceiling_limits();
+        limits.input_bytes = Some(1000);
+        limits.output_bytes = Some(100);
         let skewed = BudgetUsage {
             input_bytes: 10,
             output_bytes: 101,
-            source_width: 0,
-            reference_width: 0,
-            model_calls: 0,
-            attempts: 0,
-            candidates: 0,
-            wall_ms: 0,
-            work_fan_out: 0,
-            report_bytes: 0,
-            stu_used: 0,
+            ..BudgetUsage::default()
         };
         let err = skewed.fits(&limits).expect_err("over-use must fail");
         match err {
@@ -614,7 +582,7 @@ mod tests {
         within.output_bytes = 100;
         assert!(within.fits(&limits).is_ok() && check_no_cross_subsidy(&within, &limits).is_ok());
         assert_eq!(DEX_BUDGET_DIMENSIONS.len(), 10);
-        let mut ceilings: Vec<u64> = DIMENSIONS.iter().map(|d| d.ceiling()).collect();
+        let mut ceilings: Vec<u64> = ALL_BUDGET_DIMENSIONS.iter().map(|d| d.ceiling()).collect();
         ceilings.push(STU_CEILING);
         assert_eq!(ceilings.len(), 11);
         let total: u128 = ceilings.iter().map(|c| u128::from(*c)).sum();

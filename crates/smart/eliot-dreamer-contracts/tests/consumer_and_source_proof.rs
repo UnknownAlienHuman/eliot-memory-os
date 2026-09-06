@@ -15,7 +15,6 @@ use eliot_dreamer_contracts::{
     TypedCurationHandlerRequest, ValidationReceipt, family_of, parse_kind,
 };
 
-// Marker 44: consumer-shaped fixtures taking hub types by reference.
 fn assert_stable(check: impl Fn() -> bool, ctx: &str) {
     assert_eq!(check(), check(), "{ctx} must be stable");
 }
@@ -302,8 +301,7 @@ fn marker_44_independent_consumer_compile_fixtures() {
     let (registry, ports) = fixture_registry();
     assert!(registry.validate_closure().is_ok(), "registry must close");
     let screen = fixture_screen();
-    assert!(screen.validate().is_ok());
-    assert_eq!(screen.eligibility(), ScreenEligibility::Eligible);
+    assert!(screen.validate().is_ok() && screen.eligibility() == ScreenEligibility::Eligible);
 
     assembler_shape(&job, &bundle);
     validator_shape(&draft, &receipt);
@@ -331,9 +329,6 @@ fn marker_45_source_proof_of_no_algorithms() {
         ("registry.rs", include_str!("../src/registry.rs")),
         ("screen.rs", include_str!("../src/screen.rs")),
     ];
-    // Tokens are assembled with `concat!` so this test's own denylist does
-    // not self-match naive source scanners; the runtime strings are identical
-    // and still detect any real occurrence in the scanned hub sources above.
     const FORBIDDEN: &[&str] = &[
         concat!("serde_json::", "Value"),
         concat!("unimplemented", "!"),

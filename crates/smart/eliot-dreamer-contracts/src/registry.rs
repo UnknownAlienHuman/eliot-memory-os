@@ -195,9 +195,7 @@ impl CurationHandlerRegistry {
     /// Creates an empty registry (covers nothing until handlers register).
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            handlers: Vec::new(),
-        }
+        Self::default()
     }
 
     /// Registers one descriptor after intrinsic and cross-handler checks.
@@ -208,32 +206,25 @@ impl CurationHandlerRegistry {
     /// invalid, when `handler_id` is already registered (a changed
     /// descriptor under the same id is a conflict, an identical one a
     /// duplicate), or when any accepted kind is already covered.
-    pub fn register(
-        &mut self,
-        descriptor: CurationHandlerDescriptor,
-    ) -> Result<(), ContractViolation> {
-        if let Err(err) = descriptor.validate() {
+    pub fn register(&mut self, d: CurationHandlerDescriptor) -> Result<(), ContractViolation> {
+        if let Err(err) = d.validate() {
             return Err(ContractViolation::Registry(format!(
                 "invalid descriptor: {err}"
             )));
         }
-        if let Some(existing) = self
-            .handlers
-            .iter()
-            .find(|h| h.handler_id == descriptor.handler_id)
-        {
-            if *existing == descriptor {
+        if let Some(existing) = self.handlers.iter().find(|h| h.handler_id == d.handler_id) {
+            if *existing == d {
                 return Err(ContractViolation::Registry(format!(
                     "duplicate handler_id: {}",
-                    descriptor.handler_id
+                    d.handler_id
                 )));
             }
             return Err(ContractViolation::Registry(format!(
                 "changed descriptor for handler_id: {}",
-                descriptor.handler_id
+                d.handler_id
             )));
         }
-        for kind in &descriptor.accepted_kinds {
+        for kind in &d.accepted_kinds {
             if let Some(owner) = self
                 .handlers
                 .iter()
@@ -246,7 +237,7 @@ impl CurationHandlerRegistry {
                 )));
             }
         }
-        self.handlers.push(descriptor);
+        self.handlers.push(d);
         Ok(())
     }
 
@@ -530,30 +521,31 @@ impl TypedCurationHandlerResult {
 mod tests {
     use super::*;
     use crate::curation::{CURATION_WIRE_KINDS, parse_kind, sample_payload};
-    use crate::draft::ValidatedCurationItem;
+    use crate::draft::{ValidatedCurationItem, valid_receipt};
     use eliot_contracts::{AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, sha256_hex};
 
     fn fence() -> StateFence {
         StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
     }
-
     fn bumped_fence() -> StateFence {
         let gen2 = ResourceGeneration::new(2).expect("counter");
         StateFence::new(AuthorityEpoch::genesis(), gen2)
     }
-
-    fn descriptor(
-        family: CurationFamily,
-        id: &str,
-        kinds: Vec<CurationKind>,
-    ) -> CurationHandlerDescriptor {
+    fn descriptor(f: CurationFamily, id: &str, k: Vec<CurationKind>) -> CurationHandlerDescriptor {
         CurationHandlerDescriptor {
-            family,
+            family: f,
             handler_id: id.to_owned(),
-            accepted_kinds: kinds,
+            accepted_kinds: k,
         }
     }
 
+    fn denom_all() -> TargetDenominator {
+        TargetDenominator {
+            mode: AtomicityMode::AllOrNothing,
+            members: vec!["a".to_owned(), "b".to_owned(), "ab".to_owned()],
+            expected_total: 3,
+        }
+    }
     fn full_registry() -> CurationHandlerRegistry {
         let mut registry = CurationHandlerRegistry::new();
         for (family, id) in [
@@ -605,26 +597,31 @@ mod tests {
             task_id: "task-1".to_owned(),
             state_fence: fence(),
             payload: sample_payload(CurationKind::Merge),
-            denominator: TargetDenominator {
-                mode: AtomicityMode::AllOrNothing,
-                members: vec!["a".to_owned(), "b".to_owned(), "ab".to_owned()],
-                expected_total: 3,
-            },
+            denominator: denom_all(),
             screen_binding: Some(sample_binding()),
         }
     }
 
+    fn binding_of(r: &mut TypedCurationHandlerRequest) -> &mut ScreenBinding {
+        r.screen_binding.as_mut().expect("binding")
+    }
+    fn screened_with(
+        b: &TypedCurationHandlerRequest,
+        f: impl FnOnce(&mut ScreenBinding),
+    ) -> TypedCurationHandlerRequest {
+        let mut r = b.clone();
+        f(binding_of(&mut r));
+        r
+    }
     fn kind_request(kind: CurationKind, wire: &str) -> TypedCurationHandlerRequest {
         let payload = sample_payload(kind);
         let targets = payload.facets().targets.clone();
-        let mut members = targets.clone();
-        members.push("extra".to_owned());
         let mut request = sample_request();
         request.request_id = wire.to_owned();
         request.kind = kind;
         request.family = family_of(kind);
         request.payload = payload;
-        request.denominator.members = members;
+        request.denominator.members = [targets.clone(), vec!["extra".to_owned()]].concat();
         request.denominator.expected_total = 4;
         request.denominator.mode = AtomicityMode::PerMember;
         request.receipt_id = "rcpt-screen".to_owned();
@@ -640,20 +637,16 @@ mod tests {
     #[test]
     fn case_22_ten_families_exact_order_and_roundtrip() {
         let got = CURATION_FAMILIES.join(",");
-        assert_eq!(
-            got,
-            "classification,relation,episode,concept,procedure,failure,structure_repair,reconsolidation,accessibility,memory_repair"
-        );
+        let want = "classification,relation,episode,concept,procedure,failure,structure_repair,reconsolidation,accessibility,memory_repair";
+        assert_eq!(got, want);
         assert_eq!(CURATION_FAMILIES.len(), 10);
         for spelling in CURATION_FAMILIES {
             let family = parse_family(spelling).expect("known family");
-            assert_eq!(family.as_str(), *spelling);
             let json = serde_json::to_string(&family).expect("serialize");
-            assert_eq!(json, format!("\"{spelling}\""));
             let back: CurationFamily = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(back, family);
+            assert!(family.as_str() == *spelling && back == family);
+            assert_eq!(json, format!("\"{spelling}\""));
         }
-        // Wire-only spellings are never families.
         for spelling in ["merge", "split", "repair", "other"] {
             let err = parse_family(spelling).expect_err("must reject");
             let want = ContractViolation::UnknownVariant {
@@ -693,7 +686,6 @@ mod tests {
     // WORK_UNIT_CASE: 578/29
     #[test]
     fn case_29_validated_item_preserves_receipt_source_target_ceilings() {
-        use crate::draft::valid_receipt;
         let receipt = valid_receipt(&sha256_hex(b"draft"), fence());
         receipt.validate().expect("valid receipt");
         let item = ValidatedCurationItem {
@@ -701,11 +693,7 @@ mod tests {
             kind_spelling: "merge".to_owned(),
             family_spelling: "structure_repair".to_owned(),
             payload: crate::curation::sample_payload(CurationKind::Merge),
-            denominator: TargetDenominator {
-                mode: AtomicityMode::AllOrNothing,
-                members: vec!["a".to_owned(), "b".to_owned(), "ab".to_owned()],
-                expected_total: 3,
-            },
+            denominator: denom_all(),
             source_digest: sha256_hex(b"curation-source"),
             task_id: "task-1".to_owned(),
             scope_id: "scope-1".to_owned(),
@@ -716,9 +704,7 @@ mod tests {
         let wire = serde_json::to_string(&item).expect("serialize");
         let back: ValidatedCurationItem = serde_json::from_str(&wire).expect("roundtrip");
         back.validate().expect("roundtrip valid");
-        assert_eq!(back, item);
-        let preservation = sha256_hex(b"preservation");
-        assert_eq!(back.receipt.preservation_digest, preservation);
+        assert!(back == item && back.receipt.preservation_digest == sha256_hex(b"preservation"));
         assert_eq!(back.receipt.budget_digest, sha256_hex(b"budget"));
         for (from, to) in [
             ("task-1", ""),
@@ -761,8 +747,7 @@ mod tests {
                 continue;
             }
             let want = family_kinds(handler.family).to_vec();
-            assert_eq!(handler.accepted_kinds, want);
-            assert_eq!(handler.accepted_kinds.len(), 1);
+            assert!(handler.accepted_kinds == want && handler.accepted_kinds.len() == 1);
         }
         for wire in CURATION_WIRE_KINDS {
             let kind = parse_kind(wire).expect("known wire kind");
@@ -828,10 +813,8 @@ mod tests {
             .expect("first registration");
         let changed = descriptor(CurationFamily::Concept, "h-ep", vec![CurationKind::Concept]);
         changed.validate().expect("changed fixture is valid alone");
-        assert!(matches!(
-            registry.register(changed),
-            Err(ContractViolation::Registry(ref msg)) if msg.contains("changed")
-        ));
+        let r = registry.register(changed);
+        assert!(matches!(r, Err(ContractViolation::Registry(ref m)) if m.contains("changed")));
         assert_eq!(registry.handlers.len(), 1);
         assert_eq!(registry.handlers[0].family, CurationFamily::Episode);
     }
@@ -846,8 +829,7 @@ mod tests {
         for handler in handlers {
             reversed.register(handler).expect("fixture descriptor");
         }
-        assert_eq!(first.digest(), reversed.digest());
-        assert_eq!(first.digest().len(), 64);
+        assert!(first.digest() == reversed.digest() && first.digest().len() == 64);
         let mut other = first.clone();
         other.handlers[0].handler_id = "acc-cls-renamed".to_owned();
         assert_ne!(first.digest(), other.digest());
@@ -878,10 +860,8 @@ mod tests {
             serde_json::from_str(&result_json).expect("roundtrip result");
         let res = result_back.validate();
         res.expect("roundtripped result stays valid");
-        assert_eq!(result_back, result);
-        assert_eq!(result_back.request_id, request_back.request_id);
-        assert_eq!(result_back.kind, request_back.kind);
-        assert_eq!(result_back.family, request_back.family);
+        assert!(result_back == result && result_back.request_id == request_back.request_id);
+        assert!(result_back.kind == request_back.kind && result_back.family == request_back.family);
         for key in ["targets", "screen_binding", "denominator"] {
             assert!(!result_json.contains(key), "result must not encode {key}");
         }
@@ -944,19 +924,16 @@ mod tests {
     fn assert_screened_dispatch_fails() {
         let screened = kind_request(CurationKind::Merge, "req-screened");
         screened.validate().expect("screened request");
-        let mut unscreened = screened.clone();
-        let binding = unscreened.screen_binding.as_mut().expect("binding");
-        binding.screened_targets.retain(|t| t != "ab");
+        let unscreened = screened_with(&screened, |b| b.screened_targets.retain(|t| t != "ab"));
         let res = unscreened.validate();
         let err = res.expect_err("unscreened target must fail");
         assert!(matches!(err, ContractViolation::ScreenIneligible(_)));
         for which in ["task", "scope", "fence"] {
             let mut bad = screened.clone();
-            let binding = bad.screen_binding.as_mut().expect("binding");
             match which {
-                "task" => binding.task_id = "task-9".to_owned(),
-                "scope" => binding.scope_id = "scope-9".to_owned(),
-                _ => binding.state_fence = bumped_fence(),
+                "task" => binding_of(&mut bad).task_id = "task-9".to_owned(),
+                "scope" => binding_of(&mut bad).scope_id = "scope-9".to_owned(),
+                _ => binding_of(&mut bad).state_fence = bumped_fence(),
             }
             let err = bad.validate().expect_err("foreign binding must fail");
             assert!(matches!(err, ContractViolation::BindingMismatch { .. }));
@@ -966,29 +943,45 @@ mod tests {
         let err = missing.validate().expect_err("missing binding must fail");
         assert!(matches!(err, ContractViolation::ScreenIneligible(_)));
         let mut protected = screened.clone();
-        let binding = protected.screen_binding.as_mut().expect("binding");
-        binding.state = crate::screen::ScreenState::Protected;
+        binding_of(&mut protected).state = crate::screen::ScreenState::Protected;
         let err = protected.validate().expect_err("protected must fail");
         assert!(matches!(err, ContractViolation::ScreenIneligible(_)));
-        let mut truncated = screened.clone();
-        let binding = truncated.screen_binding.as_mut().expect("binding");
-        binding.result_digest.truncate(63);
+        let truncated = screened_with(&screened, |b| b.result_digest.truncate(63));
         let err = truncated.validate().expect_err("truncated must fail");
         assert!(matches!(err, ContractViolation::ScreenIneligible(_)));
-        let mut max_target = screened.clone();
-        let binding = max_target.screen_binding.as_mut().expect("binding");
-        binding.screened_targets.push("t".repeat(256));
+        let max_target = screened_with(&screened, |b| b.screened_targets.push("t".repeat(256)));
         assert!(max_target.validate().is_ok());
-        let mut over_target = screened.clone();
-        let binding = over_target.screen_binding.as_mut().expect("binding");
-        binding.screened_targets.push("t".repeat(257));
+        let over_target = screened_with(&screened, |b| b.screened_targets.push("t".repeat(257)));
         let err = over_target.validate().expect_err("oversize must fail");
         assert!(matches!(err, ContractViolation::OutOfBounds { .. }));
-        let mut control_target = screened.clone();
-        let binding = control_target.screen_binding.as_mut().expect("binding");
-        binding.screened_targets.push("a\u{0}b".to_owned());
+        let control_target =
+            screened_with(&screened, |b| b.screened_targets.push("a\u{0}b".to_owned()));
         let err = control_target.validate().expect_err("control must fail");
         assert!(matches!(err, ContractViolation::Malformed { .. }));
+        let mut capped = screened.clone();
+        let binding = capped.screen_binding.as_mut().expect("binding");
+        binding
+            .screened_targets
+            .extend((0..1021).map(|i| format!("t-{i:04}")));
+        assert!(capped.validate().is_ok());
+        let mut over = screened.clone();
+        binding_of(&mut over).screened_targets = vec!["s".to_owned(); 1025];
+        let err = over.validate().expect_err("1025 targets must fail");
+        assert!(matches!(err, ContractViolation::OutOfBounds { .. }));
+        let mut kilo = screened.clone();
+        binding_of(&mut kilo).screened_targets = vec!["y".repeat(1024); 1024];
+        let err = kilo.validate().expect_err("1KiB items fail per-item");
+        assert!(matches!(
+            err,
+            ContractViolation::OutOfBounds { max: 256, .. }
+        ));
+        let mut over_bytes = kilo.clone();
+        binding_of(&mut over_bytes).screened_targets[0] = "y".repeat(1025);
+        let err = over_bytes.validate().expect_err("cap plus one must fail");
+        assert!(matches!(
+            err,
+            ContractViolation::OutOfBounds { max: 1_048_576, .. }
+        ));
         for f in [
             "request_id",
             "receipt_id",

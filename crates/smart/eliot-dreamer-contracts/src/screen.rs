@@ -12,7 +12,7 @@ use eliot_contracts::{ReceiptId, RequestId, StateFence};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{ContractViolation, check_fence, check_text, is_hex64_lower};
+use crate::error::{ContractViolation, check_fence, check_text, check_vec_bound, is_hex64_lower};
 
 const MAX_TEXT: usize = 256;
 
@@ -240,6 +240,9 @@ impl ScreenBinding {
         if self.screened_targets.is_empty() {
             return Err(ContractViolation::MissingField("screened_targets"));
         }
+        check_vec_bound(self.screened_targets.len(), 1024, "screened_targets")?;
+        let aggregate: usize = self.screened_targets.iter().map(String::len).sum();
+        check_vec_bound(aggregate, 1_048_576, "screened_targets")?;
         let mut ordered = self.screened_targets.clone();
         ordered.sort();
         for target in &ordered {

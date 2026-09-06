@@ -2,14 +2,14 @@
 //! Cell `smart.dreamer.contracts` (Level-0, candidate-only, fail-closed).
 //! Canonical bytes sort object keys so wire order never changes identity.
 //! [`SemanticSequence`] keeps item order identity-visible: order changes the
-//! digest. [`canonical_digest_sorted`] offers the order-invariant set view.
+//! digest. [`try_canonical_digest_sorted`] offers the order-invariant set view.
 //! Hostile inputs are bounded and panic-free: oversize or control-char text
 //! is rejected with [`ContractViolation::Malformed`].
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ContractViolation;
+use crate::error::{ContractViolation, check_vec_bound};
 
 /// Maximum accepted text length for a single validated item (1 MiB).
 pub const MAX_ITEM_BYTES: usize = 1024 * 1024;
@@ -67,14 +67,14 @@ pub fn validate_text(
 /// An order-sensitive semantic sequence with an identity-visible digest.
 ///
 /// Reordering items changes the digest; for the order-invariant set view use
-/// [`canonical_digest_sorted`].
+/// [`try_canonical_digest_sorted`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, try_from = "RawSequence")]
 pub struct SemanticSequence {
     /// Sequence items in identity order.
-    pub items: Vec<String>,
+    items: Vec<String>,
     /// Hex digest over the ordered items.
-    pub digest: String,
+    digest: String,
 }
 
 impl SemanticSequence {
@@ -89,19 +89,61 @@ impl SemanticSequence {
     ///
     /// # Errors
     ///
-    /// Returns [`ContractViolation::Malformed`] for oversize or control-char items.
+    /// Returns [`ContractViolation::Malformed`] or [`ContractViolation::OutOfBounds`].
     pub fn try_new(items: Vec<String>) -> Result<Self, ContractViolation> {
-        for item in &items {
-            validate_text("sequence_item", item, false)?;
-        }
-        let total: usize = items.iter().map(String::len).sum();
-        if total > MAX_ITEM_BYTES {
-            return Err(ContractViolation::Malformed {
-                field: "sequence_items",
-                reason: format!("sequence exceeds {MAX_ITEM_BYTES} bytes"),
-            });
-        }
+        check_sequence_bounds(&items)?;
         Ok(Self::new(items))
+    }
+
+    /// Validates item bounds, join budget, and digest agreement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContractViolation::Malformed`] or [`ContractViolation::OutOfBounds`].
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        check_sequence_bounds(&self.items)?;
+        if self.digest == digest_join(&self.items) {
+            return Ok(());
+        }
+        Err(ContractViolation::Malformed {
+            field: "sequence_digest",
+            reason: "digest does not match items".to_owned(),
+        })
+    }
+}
+
+fn check_sequence_bounds(items: &[String]) -> Result<(), ContractViolation> {
+    let mut joined = items.len().saturating_sub(1);
+    for item in items {
+        validate_text("sequence_item", item, false)?;
+        joined = joined.saturating_add(item.len());
+    }
+    check_vec_bound(items.len(), 1024, "sequence_items")?;
+    if joined > MAX_ITEM_BYTES {
+        return Err(ContractViolation::Malformed {
+            field: "sequence_items",
+            reason: format!("sequence exceeds {MAX_ITEM_BYTES} bytes"),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RawSequence {
+    items: Vec<String>,
+    digest: String,
+}
+
+impl TryFrom<RawSequence> for SemanticSequence {
+    type Error = ContractViolation;
+    fn try_from(raw: RawSequence) -> Result<Self, Self::Error> {
+        let sequence = Self {
+            items: raw.items,
+            digest: raw.digest,
+        };
+        sequence.validate()?;
+        Ok(sequence)
     }
 }
 
@@ -110,23 +152,15 @@ fn digest_join(items: &[String]) -> String {
 }
 
 /// Returns the digest over items in sorted order (order-invariant set view).
-#[deprecated(note = "unchecked input bypasses item bounds; use try_canonical_digest_sorted")]
-pub fn canonical_digest_sorted(items: &[String]) -> String {
+pub fn try_canonical_digest_sorted(items: &[String]) -> Result<String, ContractViolation> {
+    check_sequence_bounds(items)?;
     let mut sorted = items.to_vec();
     sorted.sort();
-    digest_join(&sorted)
-}
-
-#[allow(deprecated)]
-pub fn try_canonical_digest_sorted(items: &[String]) -> Result<String, ContractViolation> {
-    for item in items {
-        validate_text("sequence_item", item, false)?;
-    }
-    Ok(canonical_digest_sorted(items))
+    Ok(digest_join(&sorted))
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, deprecated)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -147,7 +181,23 @@ mod tests {
 
         let one = vec!["x".to_owned(), "y".to_owned()];
         let two = vec!["y".to_owned(), "x".to_owned()];
-        assert_eq!(canonical_digest_sorted(&one), canonical_digest_sorted(&two));
+        let sorted_one = try_canonical_digest_sorted(&one).expect("bounded");
+        let sorted_two = try_canonical_digest_sorted(&two).expect("bounded");
+        assert_eq!(sorted_one, sorted_two);
+        assert!(try_canonical_digest_sorted(&vec!["a".to_owned(); 1024]).is_ok());
+        assert!(matches!(
+            try_canonical_digest_sorted(&vec!["a".to_owned(); 1025]),
+            Err(ContractViolation::OutOfBounds { .. })
+        ));
+        let wide = vec!["a".repeat(1024); 1024];
+        assert!(matches!(
+            try_canonical_digest_sorted(&wide),
+            Err(ContractViolation::Malformed { .. })
+        ));
+        assert!(matches!(
+            SemanticSequence::try_new(wide),
+            Err(ContractViolation::Malformed { .. })
+        ));
     }
 
     // WORK_UNIT_CASE: 578/42
@@ -157,6 +207,12 @@ mod tests {
         let second = SemanticSequence::try_new(vec!["b".to_owned(), "a".to_owned()]).expect("ok");
         assert_ne!(first.digest, second.digest);
         assert_eq!(first.items, vec!["a".to_owned(), "b".to_owned()]);
+        assert!(SemanticSequence::try_new(Vec::new()).is_ok());
+        assert!(SemanticSequence::try_new(vec!["a".to_owned(); 1024]).is_ok());
+        assert!(matches!(
+            SemanticSequence::try_new(vec!["a".to_owned(); 1025]),
+            Err(ContractViolation::OutOfBounds { .. })
+        ));
     }
 
     // WORK_UNIT_CASE: 578/43
@@ -176,21 +232,13 @@ mod tests {
             let bytes = canonical_bytes(&input).expect("hostile input still serializes");
             assert!(!bytes.is_empty() || input.is_empty());
             assert_eq!(digest_hex(input.as_bytes()).len(), 64);
+            let bad = input.len() > MAX_ITEM_BYTES || input.chars().any(char::is_control);
             let text = validate_text("hostile", input, false);
-            if input.len() > MAX_ITEM_BYTES || input.chars().any(char::is_control) {
-                assert!(
-                    matches!(text, Err(ContractViolation::Malformed { .. })),
-                    "hostile input must be rejected"
-                );
-            } else {
-                assert!(text.is_ok());
-            }
-            let sequence = SemanticSequence::try_new(vec![input.clone()]);
-            if input.len() > MAX_ITEM_BYTES || input.chars().any(char::is_control) {
-                assert!(sequence.is_err(), "hostile item must be rejected");
-            } else {
-                assert!(sequence.is_ok());
-            }
+            assert_eq!(
+                bad,
+                matches!(text, Err(ContractViolation::Malformed { .. }))
+            );
+            assert_eq!(bad, SemanticSequence::try_new(vec![input.clone()]).is_err());
         }
         let oversize = vec!["q".repeat(MAX_ITEM_BYTES + 1)];
         assert!(matches!(
@@ -207,5 +255,31 @@ mod tests {
         );
         let hostile_items = vec!["\u{0}".to_owned(), "x".repeat(MAX_ITEM_BYTES + 1)];
         assert!(try_canonical_digest_sorted(&hostile_items).is_err());
+        let big = vec!["b".repeat(600 * 1024); 2];
+        let built = SemanticSequence::try_new(big.clone());
+        assert!(matches!(built, Err(ContractViolation::Malformed { .. })));
+        let sorted = try_canonical_digest_sorted(&big);
+        assert!(matches!(sorted, Err(ContractViolation::Malformed { .. })));
+        let mixed = vec!["ok".to_owned(), "bad\u{0}".to_owned()];
+        assert!(try_canonical_digest_sorted(&mixed).is_err());
+        assert!(matches!(
+            SemanticSequence::try_new(mixed),
+            Err(ContractViolation::Malformed { .. })
+        ));
+        let many = vec!["c".to_owned(); 1025];
+        assert!(matches!(
+            try_canonical_digest_sorted(&many),
+            Err(ContractViolation::OutOfBounds { .. })
+        ));
+        let good = SemanticSequence::try_new(vec!["a".to_owned()]).expect("ok");
+        let json = serde_json::to_string(&good).expect("serializes");
+        assert_eq!(
+            serde_json::from_str::<SemanticSequence>(&json).expect("roundtrip"),
+            good
+        );
+        let tampered = json.replace(&good.digest, &"0".repeat(64));
+        assert!(serde_json::from_str::<SemanticSequence>(&tampered).is_err());
+        let extra = json.replace('}', r#","extra":1}"#);
+        assert!(serde_json::from_str::<SemanticSequence>(&extra).is_err());
     }
 }

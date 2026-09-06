@@ -429,6 +429,10 @@ impl ValidatedCurationItem {
         check_text(&self.budget_note, "budget_note", 1024)?;
         Ok(())
     }
+    pub fn validate_against(&self, expected: &ValidationReceipt) -> Result<(), ContractViolation> {
+        self.validate()?;
+        self.receipt.validate_binding(expected)
+    }
 }
 
 /// Samples a valid receipt bound to `draft_digest` for tests.
@@ -553,18 +557,14 @@ mod tests {
         let with_extra = raw_json.trim_end_matches('}').to_string() + r#","injected":1}"#;
         assert!(serde_json::from_str::<RawProviderOutput>(&with_extra).is_err());
 
-        // Model text can never carry confirmed evidence handles.
         let carrying = model_with(|m| m.declared_confirmed_handles = vec!["source-a".to_string()]);
-        assert!(matches!(
-            carrying.validate(),
-            Err(ContractViolation::ForbiddenCarry(_))
-        ));
+        let r = carrying.validate();
+        assert!(matches!(r, Err(ContractViolation::ForbiddenCarry(_))));
         let max_stmt = model_with(|m| m.statement = "s".repeat(16384));
-        assert!(max_stmt.validate().is_ok());
+        let max_vec = model_with(|m| m.source_handles = vec!["s".to_string(); 1024]);
+        assert!(max_stmt.validate().is_ok() && max_vec.validate().is_ok());
         assert_oob(&model_with(|m| m.statement = "s".repeat(16385)).validate());
         assert_malformed(&model_with(|m| m.source_handles = vec!["a\0b".to_string()]).validate());
-        let max_vec = model_with(|m| m.source_handles = vec!["s".to_string(); 1024]);
-        assert!(max_vec.validate().is_ok());
         assert_oob(&model_with(|m| m.source_handles = vec!["s".to_string(); 1025]).validate());
         assert_oob(&model_with(|m| m.counterevidence = vec!["c".repeat(1025); 1024]).validate());
     }
@@ -593,17 +593,16 @@ mod tests {
         let wire = serde_json::to_string(&draft).expect("grounded serializes");
         let back: GroundedDreamDraft = serde_json::from_str(&wire).expect("grounded deserializes");
         assert_eq!(back, draft);
-        for state in states {
-            assert!(
-                back.residues
-                    .iter()
-                    .any(|residue| residue.state == state && !residue.detail.trim().is_empty()),
-                "state {state:?} must roundtrip with detail preserved"
-            );
+        for s in states {
+            let hit = back
+                .residues
+                .iter()
+                .any(|r| r.state == s && !r.detail.trim().is_empty());
+            assert!(hit, "state {s:?} must roundtrip with detail preserved");
         }
         let mut wires: Vec<String> = states
             .iter()
-            .map(|state| serde_json::to_string(state).expect("state serializes"))
+            .map(|s| serde_json::to_string(s).expect("state serializes"))
             .collect();
         wires.sort();
         wires.dedup();
@@ -614,8 +613,7 @@ mod tests {
     #[test]
     fn valid_a05_receipt_binding_passes() {
         let receipt = valid_receipt(&model_wire_digest(&valid_model()), valid_fence());
-        assert!(receipt.validate().is_ok());
-        assert!(receipt.validate_binding(&receipt.clone()).is_ok());
+        assert!(receipt.validate().is_ok() && receipt.validate_binding(&receipt.clone()).is_ok());
 
         let validated = ValidatedDreamDraft {
             receipt: receipt.clone(),
@@ -624,21 +622,12 @@ mod tests {
             task_id: "task-1".to_string(),
             state_fence: valid_fence(),
         };
-        assert!(validated.validate().is_ok());
 
-        let item = ValidatedCurationItem {
+        let mut item = ValidatedCurationItem {
             receipt,
             kind_spelling: "merge".to_string(),
             family_spelling: "structure_repair".to_string(),
-            payload: CurationPayload::Merge(crate::curation::MergePayload {
-                left: "a".to_string(),
-                right: "b".to_string(),
-                merged: "ab".to_string(),
-                target_evidence: crate::curation::TargetEvidence {
-                    targets: vec!["a".to_string(), "b".to_string(), "ab".to_string()],
-                    evidence_refs: vec!["e-1".to_string()],
-                },
-            }),
+            payload: crate::curation::sample_payload(crate::curation::CurationKind::Merge),
             denominator: TargetDenominator {
                 mode: crate::registry::AtomicityMode::AllOrNothing,
                 members: vec!["a".to_string(), "b".to_string(), "ab".to_string()],
@@ -650,16 +639,33 @@ mod tests {
             state_fence: valid_fence(),
             budget_note: "within dimension".to_string(),
         };
-        assert!(item.validate().is_ok());
+        assert!(validated.validate().is_ok() && item.validate().is_ok());
         let mut drifted = item.clone();
         drifted.kind_spelling = "split".to_string();
-        assert!(matches!(
-            drifted.validate(),
-            Err(ContractViolation::KindPayload(_))
-        ));
+        let r = drifted.validate();
+        assert!(matches!(r, Err(ContractViolation::KindPayload(_))));
         let mut swapped = item.clone();
         swapped.denominator.members = vec!["a".to_string(), "b".to_string(), "x".to_string()];
         assert_binding(&swapped.validate());
+        item.budget_note = "other".into();
+        assert!(item.validate_against(&item.receipt).is_ok());
+        let mut p = item.clone();
+        p.receipt.bundle_digest = sha256_hex(b"1");
+        assert!(p.validate().is_ok());
+        crate::curation::assert_probe(p.validate_against(&item.receipt), "bundle_digest");
+        let mut p = item.clone();
+        p.receipt.validator_contract = "other".into();
+        assert!(p.validate().is_ok());
+        crate::curation::assert_probe(p.validate_against(&item.receipt), "validator_contract");
+        let mut p = item.clone();
+        p.receipt.terminal_disposition = "rejected".into();
+        assert!(p.validate().is_ok());
+        crate::curation::assert_probe(p.validate_against(&item.receipt), "terminal_disposition");
+        let mut p = item.clone();
+        p.receipt.state_fence.resource_generation = ResourceGeneration::new(2).expect("g");
+        p.state_fence = p.receipt.state_fence.clone();
+        assert!(p.validate().is_ok());
+        crate::curation::assert_probe(p.validate_against(&item.receipt), "state_fence");
     }
 
     // WORK_UNIT_CASE: 578/20
@@ -677,10 +683,9 @@ mod tests {
             "task-1",
             "scope-1",
         ] {
-            let mutated_wire = wire.replacen(field, "other", 1);
-            let mutated: ValidationReceipt =
-                serde_json::from_str(&mutated_wire).expect("mutated wire decodes");
-            assert!(mutated.validate_binding(&recorded).is_err());
+            let w = wire.replacen(field, "other", 1);
+            let m: ValidationReceipt = serde_json::from_str(&w).expect("mutated wire decodes");
+            assert!(m.validate_binding(&recorded).is_err());
         }
         for (field, other) in [
             ("draft_digest", sha256_hex(b"other-draft")),
@@ -718,10 +723,8 @@ mod tests {
         assert_binding(&changed_fence.validate_binding(&recorded));
         let mut bad_validator = base.clone();
         bad_validator.validator_contract = "   ".to_string();
-        assert!(matches!(
-            bad_validator.validate(),
-            Err(ContractViolation::MissingField(_))
-        ));
+        let r = bad_validator.validate();
+        assert!(matches!(r, Err(ContractViolation::MissingField(_))));
         let mut bad_digest = base.clone();
         bad_digest.output_digest = "not-a-digest".to_string();
         assert_binding(&bad_digest.validate());
