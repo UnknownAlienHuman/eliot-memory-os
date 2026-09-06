@@ -15,15 +15,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::curation::{kind_family, parse_kind};
-use crate::error::ContractViolation;
+use crate::error::{ContractViolation, check_text};
 
 /// Exact schema version accepted by the versioned draft stages.
 const DRAFT_SCHEMA_VERSION: u32 = 1;
-/// Maximum provider-route length, measured in Unicode scalar values.
+/// Maximum provider-route/handle length, measured in bytes (`check_text` bound).
 const MAX_ROUTE_CHARS: usize = 128;
 /// Maximum raw provider payload accepted in one output.
 const MAX_RAW_BYTES: usize = 1_048_576;
-/// Maximum model statement length, measured in Unicode scalar values.
+/// Maximum model statement length, measured in bytes (`check_text` bound).
 const MAX_STATEMENT_CHARS: usize = 16384;
 
 /// Returns true when `value` is exactly 64 hex digits.
@@ -31,9 +31,9 @@ fn is_hex64(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Returns true when `value` is empty or consists only of whitespace.
-fn is_blank(value: &str) -> bool {
-    value.trim().is_empty()
+/// Rejects blank/over-long/control identity text (256-byte `check_text` bound).
+fn check_identity(value: &str, field: &'static str) -> Result<(), ContractViolation> {
+    check_text(value, field, 256)
 }
 
 /// Maps a fence validation failure onto the closed contract error.
@@ -44,14 +44,16 @@ fn fence_error(err: &eliot_contracts::ContractError) -> ContractViolation {
     }
 }
 
-/// Rejects a blank identity field shared by the draft stages.
-fn check_identity(value: &str, field: &'static str) -> Result<(), ContractViolation> {
-    if is_blank(value) {
-        return Err(ContractViolation::MissingField(field));
+/// Rejects a receipt-owned value that drifts from the recorded receipt.
+fn bind_eq(field: &'static str, got: &str, want: &str) -> Result<(), ContractViolation> {
+    if got != want {
+        return Err(ContractViolation::BindingMismatch {
+            field,
+            reason: std::format!("receipt {field} binding mismatch"),
+        });
     }
     Ok(())
 }
-
 /// Rejects a digest that is not exactly 64 hex characters.
 fn check_digest(value: &str, field: &'static str) -> Result<(), ContractViolation> {
     if !is_hex64(value) {
@@ -97,15 +99,7 @@ impl RawProviderOutput {
     pub fn validate(&self) -> Result<(), ContractViolation> {
         check_schema_version(self.schema_version)?;
         check_identity(&self.job_id, "job_id")?;
-        check_identity(&self.provider_route, "provider_route")?;
-        if self.provider_route.chars().count() > MAX_ROUTE_CHARS {
-            return Err(ContractViolation::OutOfBounds {
-                field: "provider_route",
-                min: 1,
-                max: crate::error::len_i64(MAX_ROUTE_CHARS),
-                got: crate::error::len_i64(self.provider_route.chars().count()),
-            });
-        }
+        check_text(&self.provider_route, "provider_route", MAX_ROUTE_CHARS)?;
         if self.raw_bytes.len() > MAX_RAW_BYTES {
             return Err(ContractViolation::OutOfBounds {
                 field: "raw_bytes",
@@ -158,27 +152,23 @@ impl ModelDraft {
     pub fn validate(&self) -> Result<(), ContractViolation> {
         check_schema_version(self.schema_version)?;
         check_identity(&self.job_id, "job_id")?;
-        if is_blank(&self.statement) {
-            return Err(ContractViolation::MissingField("statement"));
-        }
-        if self.statement.chars().count() > MAX_STATEMENT_CHARS {
-            return Err(ContractViolation::OutOfBounds {
-                field: "statement",
-                min: 1,
-                max: crate::error::len_i64(MAX_STATEMENT_CHARS),
-                got: crate::error::len_i64(self.statement.chars().count()),
-            });
-        }
+        check_text(&self.statement, "statement", MAX_STATEMENT_CHARS)?;
         if self.source_handles.is_empty() {
             return Err(ContractViolation::MissingField("source_handles"));
         }
         for handle in &self.source_handles {
-            if is_blank(handle) {
-                return Err(ContractViolation::MissingField("source_handles"));
-            }
+            check_text(handle, "source_handles", MAX_ROUTE_CHARS)?;
         }
-        if is_blank(&self.expected_benefit) {
-            return Err(ContractViolation::MissingField("expected_benefit"));
+        for entry in &self.counterevidence {
+            check_text(entry, "counterevidence", 1024)?;
+        }
+        check_text(&self.uncertainty, "uncertainty", 1024)?;
+        check_text(&self.expected_benefit, "expected_benefit", 1024)?;
+        for probe in &self.recommended_probes {
+            check_text(probe, "recommended_probes", 1024)?;
+        }
+        for cond in &self.invalidation_conditions {
+            check_text(cond, "invalidation_conditions", 1024)?;
         }
         if !self.declared_confirmed_handles.is_empty() {
             return Err(ContractViolation::ForbiddenCarry(
@@ -218,14 +208,10 @@ pub struct ClaimResidue {
 }
 
 impl ClaimResidue {
-    /// Validates that claim and detail are both present.
+    /// Validates claim/detail bounds (1024-byte `check_text` each).
     pub fn validate(&self) -> Result<(), ContractViolation> {
-        if is_blank(&self.claim) {
-            return Err(ContractViolation::MissingField("claim"));
-        }
-        if is_blank(&self.detail) {
-            return Err(ContractViolation::MissingField("detail"));
-        }
+        check_text(&self.claim, "claim", 1024)?;
+        check_text(&self.detail, "detail", 1024)?;
         Ok(())
     }
 }
@@ -258,6 +244,7 @@ impl GroundedDreamDraft {
         for residue in &self.residues {
             residue.validate()?;
         }
+        check_text(&self.coverage_note, "coverage_note", 1024)?;
         Ok(())
     }
 }
@@ -328,52 +315,61 @@ impl ValidationReceipt {
 
     /// Validates both receipts, then binds self to the recorded receipt.
     ///
-    /// Any mismatch of job, digests, contract, ceiling or fence fails with
-    /// [`ContractViolation::BindingMismatch`].
+    /// Binds job/draft/bundle/manifest/input/output/preservation/budget digests plus
+    /// contract/policy/disposition/ceiling/task/scope/fence; any mismatch fails.
     pub fn validate_binding(&self, expected: &ValidationReceipt) -> Result<(), ContractViolation> {
         self.validate()?;
         expected.validate()?;
-        for (field, got, want) in [
-            ("job_id", &self.job_id, &expected.job_id),
-            ("draft_digest", &self.draft_digest, &expected.draft_digest),
-            (
-                "bundle_digest",
-                &self.bundle_digest,
-                &expected.bundle_digest,
-            ),
-            (
-                "manifest_digest",
-                &self.manifest_digest,
-                &expected.manifest_digest,
-            ),
-            (
-                "validator_contract",
-                &self.validator_contract,
-                &expected.validator_contract,
-            ),
-            (
-                "preservation_digest",
-                &self.preservation_digest,
-                &expected.preservation_digest,
-            ),
-            (
-                "budget_digest",
-                &self.budget_digest,
-                &expected.budget_digest,
-            ),
-            (
-                "proof_ceiling",
-                &self.proof_ceiling,
-                &expected.proof_ceiling,
-            ),
-        ] {
-            if got != want {
-                return Err(ContractViolation::BindingMismatch {
-                    field,
-                    reason: std::format!("receipt {field} binding mismatch"),
-                });
-            }
-        }
+        bind_eq("job_id", &self.job_id, &expected.job_id)?;
+        bind_eq("task_id", &self.task_id, &expected.task_id)?;
+        bind_eq("scope_id", &self.scope_id, &expected.scope_id)?;
+        bind_eq("draft_digest", &self.draft_digest, &expected.draft_digest)?;
+        bind_eq(
+            "bundle_digest",
+            &self.bundle_digest,
+            &expected.bundle_digest,
+        )?;
+        bind_eq(
+            "manifest_digest",
+            &self.manifest_digest,
+            &expected.manifest_digest,
+        )?;
+        bind_eq("input_digest", &self.input_digest, &expected.input_digest)?;
+        bind_eq(
+            "output_digest",
+            &self.output_digest,
+            &expected.output_digest,
+        )?;
+        bind_eq(
+            "validator_contract",
+            &self.validator_contract,
+            &expected.validator_contract,
+        )?;
+        bind_eq(
+            "validator_policy",
+            &self.validator_policy,
+            &expected.validator_policy,
+        )?;
+        bind_eq(
+            "terminal_disposition",
+            &self.terminal_disposition,
+            &expected.terminal_disposition,
+        )?;
+        bind_eq(
+            "proof_ceiling",
+            &self.proof_ceiling,
+            &expected.proof_ceiling,
+        )?;
+        bind_eq(
+            "preservation_digest",
+            &self.preservation_digest,
+            &expected.preservation_digest,
+        )?;
+        bind_eq(
+            "budget_digest",
+            &self.budget_digest,
+            &expected.budget_digest,
+        )?;
         if self.state_fence != expected.state_fence {
             return Err(ContractViolation::BindingMismatch {
                 field: "state_fence",
@@ -475,7 +471,7 @@ impl ValidatedCurationItem {
         }
         check_digest(&self.source_digest, "source_digest")?;
         check_identity(&self.target_denominator, "target_denominator")?;
-        check_identity(&self.budget_note, "budget_note")?;
+        check_text(&self.budget_note, "budget_note", 1024)?;
         Ok(())
     }
 }
@@ -597,6 +593,15 @@ mod tests {
             carrying.validate(),
             Err(ContractViolation::ForbiddenCarry(_))
         ));
+        let mut max_stmt = valid_model();
+        max_stmt.statement = "s".repeat(16384);
+        assert!(max_stmt.validate().is_ok());
+        let mut over_stmt = valid_model();
+        over_stmt.statement = "s".repeat(16385);
+        assert!(over_stmt.validate().is_err());
+        let mut ctrl_handle = valid_model();
+        ctrl_handle.source_handles = vec!["a\0b".to_string()];
+        assert!(ctrl_handle.validate().is_err());
     }
 
     // WORK_UNIT_CASE: 578/18
@@ -688,7 +693,14 @@ mod tests {
         let recorded = base.clone();
         assert!(base.validate_binding(&recorded).is_ok());
         let wire = serde_json::to_string(&base).expect("receipt serializes");
-        for field in ["job-1", "a05-validator", "candidate-only"] {
+        for field in [
+            "job-1",
+            "a05-validator",
+            "candidate-only",
+            "policy-7",
+            "task-1",
+            "scope-1",
+        ] {
             let mutated_wire = wire.replacen(field, "other", 1);
             let mutated: ValidationReceipt =
                 serde_json::from_str(&mutated_wire).expect("mutated wire decodes");
@@ -709,6 +721,21 @@ mod tests {
         let mut changed_budget = base.clone();
         changed_budget.budget_digest = sha256_hex(b"other-budget");
         assert!(changed_budget.validate_binding(&recorded).is_err());
+        let mut changed_disp = base.clone();
+        changed_disp.terminal_disposition = "rejected".to_string();
+        assert!(changed_disp.validate_binding(&recorded).is_err());
+        let mut changed_input = base.clone();
+        changed_input.input_digest = sha256_hex(b"other-input");
+        assert!(changed_input.validate_binding(&recorded).is_err());
+        let mut changed_output = base.clone();
+        changed_output.output_digest = sha256_hex(b"other-output");
+        assert!(changed_output.validate_binding(&recorded).is_err());
+        let mut over_id = base.clone();
+        over_id.job_id = "x".repeat(257);
+        assert!(over_id.validate().is_err());
+        let mut ctrl_id = base.clone();
+        ctrl_id.task_id = "a\tb".to_string();
+        assert!(ctrl_id.validate().is_err());
         let mut changed_fence = base.clone();
         changed_fence.state_fence = StateFence::new(
             AuthorityEpoch::genesis(),

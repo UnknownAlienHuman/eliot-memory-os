@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::curation::{CurationKind, kind_family};
-use crate::error::ContractViolation;
+use crate::error::{ContractViolation, check_text};
 
 /// Independent preservation dimensions, each judged on its own.
 ///
@@ -131,6 +131,12 @@ impl PreservationReport {
             if verdict.note.trim().is_empty() {
                 return Err(ContractViolation::Preservation(format!(
                     "dimension {} has a blank note",
+                    verdict.dimension.as_str()
+                )));
+            }
+            if verdict.note.len() > 1024 || verdict.note.chars().any(char::is_control) {
+                return Err(ContractViolation::Preservation(std::format!(
+                    "dimension {} note exceeds 1024 bytes or has control chars",
                     verdict.dimension.as_str()
                 )));
             }
@@ -304,23 +310,16 @@ impl CandidateResult {
             return Err(ContractViolation::MissingField("source_handles"));
         }
         for handle in &self.source_handles {
-            if handle.trim().is_empty() {
-                return Err(ContractViolation::Malformed {
-                    field: "source_handles",
-                    reason: "source handle must be non-blank".to_owned(),
-                });
-            }
+            check_text(handle, "source_handles", 128)?;
         }
         self.preservation.overall()?;
         Ok(())
     }
 }
 
+/// Rejects blank/over-long/control candidate text (256-byte `check_text` bound).
 fn require_non_blank(field: &'static str, value: &str) -> Result<(), ContractViolation> {
-    if value.trim().is_empty() {
-        return Err(ContractViolation::MissingField(field));
-    }
-    Ok(())
+    check_text(value, field, 256)
 }
 
 /// Named proposal for [`propose_candidate`]; replaces 12 positional parameters.
@@ -490,5 +489,14 @@ mod tests {
             Err(ContractViolation::KindPayload(_))
         ));
         assert!(valid_candidate().validate().is_ok());
+        let mut maxed = valid_candidate();
+        maxed.candidate_id = "c".repeat(256);
+        assert!(maxed.validate().is_ok());
+        let mut over = valid_candidate();
+        over.candidate_id = "c".repeat(257);
+        assert!(over.validate().is_err());
+        let mut ctrl = valid_candidate();
+        ctrl.source_handles = vec!["a\nb".to_owned()];
+        assert!(ctrl.validate().is_err());
     }
 }

@@ -147,6 +147,17 @@ fn check_fence(fence: &StateFence) -> Result<(), ContractViolation> {
         })
 }
 
+/// Rejects a screen-owned value that drifts from the typed request.
+fn bind_screen(field: &'static str, got: &str, want: &str) -> Result<(), ContractViolation> {
+    if got != want {
+        return Err(ContractViolation::BindingMismatch {
+            field,
+            reason: "screen binding field must match request".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// A single typed handler descriptor: one family, one handler identity, and
 /// exactly that family's canonical kind set.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -377,6 +388,10 @@ impl CurationHandlerPort {
 #[serde(deny_unknown_fields)]
 pub struct TypedCurationHandlerRequest {
     pub request_id: String,
+    pub receipt_id: String,
+    pub source_snapshot: String,
+    pub source_revision: String,
+    pub profile: String,
     pub kind: CurationKind,
     pub family: CurationFamily,
     pub job_id: String,
@@ -396,9 +411,13 @@ impl TypedCurationHandlerRequest {
     /// Returns [`ContractViolation`] on drift, unscreened targets, or bad bindings.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         check_text(&self.request_id, "request_id", MAX_TEXT)?;
+        check_text(&self.receipt_id, "receipt_id", MAX_TEXT)?;
         check_text(&self.job_id, "job_id", MAX_TEXT)?;
+        check_text(&self.source_snapshot, "source_snapshot", MAX_TEXT)?;
         check_text(&self.scope_id, "scope_id", MAX_TEXT)?;
+        check_text(&self.source_revision, "source_revision", MAX_TEXT)?;
         check_text(&self.task_id, "task_id", MAX_TEXT)?;
+        check_text(&self.profile, "profile", MAX_TEXT)?;
         if self.family != family_of(self.kind) {
             return Err(ContractViolation::KindPayload(format!(
                 "kind {} belongs to family {}, not {}",
@@ -445,6 +464,19 @@ impl TypedCurationHandlerRequest {
                     "payload adds unscreened target".to_owned(),
                 ));
             }
+            bind_screen("request_id", &self.request_id, binding.request_id.as_str())?;
+            bind_screen("receipt_id", &self.receipt_id, binding.receipt_id.as_str())?;
+            bind_screen(
+                "source_snapshot",
+                &self.source_snapshot,
+                &binding.source_snapshot,
+            )?;
+            bind_screen(
+                "source_revision",
+                &self.source_revision,
+                &binding.source_revision,
+            )?;
+            bind_screen("profile", &self.profile, &binding.profile)?;
             if binding.task_id != self.task_id
                 || binding.scope_id != self.scope_id
                 || binding.state_fence != self.state_fence
@@ -559,6 +591,10 @@ mod tests {
     fn sample_request() -> TypedCurationHandlerRequest {
         TypedCurationHandlerRequest {
             request_id: "req-1".to_owned(),
+            receipt_id: "rcpt-1".to_owned(),
+            source_snapshot: "snap-1".to_owned(),
+            source_revision: "rev-1".to_owned(),
+            profile: "default".to_owned(),
             kind: CurationKind::Merge,
             family: CurationFamily::StructureRepair,
             job_id: "job-1".to_owned(),
@@ -593,8 +629,12 @@ mod tests {
         request.denominator.members = members;
         request.denominator.expected_total = 4;
         request.denominator.mode = AtomicityMode::PerMember;
+        request.receipt_id = "rcpt-screen".to_owned();
+        request.source_snapshot = "snap-1".to_owned();
+        request.source_revision = "rev-1".to_owned();
+        request.profile = "default".to_owned();
         request.screen_binding = Some(ScreenBinding {
-            request_id: RequestId::new("req-screen").expect("request id"),
+            request_id: RequestId::new(wire).expect("request id"),
             receipt_id: ReceiptId::new("rcpt-screen").expect("receipt id"),
             screened_targets: targets,
             source_snapshot: "snap-1".to_owned(),
@@ -960,6 +1000,10 @@ mod tests {
         outside.denominator.members = vec!["x".to_owned()];
         outside.denominator.expected_total = 1;
         assert!(outside.validate().is_err());
+        assert_screened_dispatch_fails();
+    }
+
+    fn assert_screened_dispatch_fails() {
         // Screened dispatch: unscreened targets and foreign task/scope/fence fail.
         let screened = kind_request(CurationKind::Merge, "req-screened");
         screened.validate().expect("screened request");
@@ -996,5 +1040,28 @@ mod tests {
             .validate()
             .expect_err("foreign fence must fail");
         assert!(matches!(err, ContractViolation::BindingMismatch { .. }));
+        for f in [
+            "request_id",
+            "receipt_id",
+            "source_snapshot",
+            "source_revision",
+            "profile",
+        ] {
+            let mut bad = screened.clone();
+            match f {
+                "request_id" => bad.request_id = "req-x".to_owned(),
+                "receipt_id" => bad.receipt_id = "rcpt-x".to_owned(),
+                "source_snapshot" => bad.source_snapshot = "snap-x".to_owned(),
+                "source_revision" => bad.source_revision = "rev-x".to_owned(),
+                _ => bad.profile = "other".to_owned(),
+            }
+            let err = bad
+                .validate()
+                .expect_err("binding field mismatch must fail");
+            assert!(
+                matches!(err, ContractViolation::BindingMismatch { field, .. } if field == f),
+                "field {f} must fail closed"
+            );
+        }
     }
 }

@@ -10,12 +10,14 @@
 #![allow(clippy::expect_used)]
 
 use eliot_contracts::{AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, StateFence};
+use eliot_dreamer_contracts::curation::{ClassificationPayload, TargetEvidence, route_payload};
 use eliot_dreamer_contracts::job::{Requester, RequesterOrigin};
 use eliot_dreamer_contracts::{
-    BudgetLimits, BundleCompleteness, CURATION_WIRE_KINDS, CurationFamily,
-    CurationHandlerDescriptor, CurationHandlerPort, CurationHandlerRegistry, CurationKind,
-    DreamInputBundle, DreamJobInput, JobClass, ModelDraft, ScreenEligibility, ScreenReference,
-    ScreenState, ValidationReceipt, family_of, parse_kind,
+    AtomicityMode, BudgetLimits, BundleCompleteness, CURATION_WIRE_KINDS, ContractViolation,
+    CurationFamily, CurationHandlerDescriptor, CurationHandlerPort, CurationHandlerRegistry,
+    CurationKind, CurationPayload, DreamInputBundle, DreamJobInput, JobClass, ModelDraft,
+    ScreenBinding, ScreenEligibility, ScreenReference, ScreenState, TargetDenominator,
+    TypedCurationHandlerRequest, ValidationReceipt, family_of, parse_kind,
 };
 
 // Marker 44: consumer-shaped fixtures taking hub types by reference.
@@ -214,6 +216,122 @@ fn fixture_screen() -> ScreenReference {
     }
 }
 
+// Explicit discriminant-routed wire JSON per kind: the tag names the kind up
+// front, so `route_payload` decodes it in one attempt with no trial decoding.
+fn typed_wire(kind: CurationKind) -> String {
+    let body = match kind {
+        CurationKind::Classification => r#""label":"memory","confidence_bps":9000"#,
+        CurationKind::Relation => r#""from_handle":"a","to_handle":"b","relation":"refines""#,
+        CurationKind::Episode => r#""episode":"ep-7","observed_at_ms":1700000000000"#,
+        CurationKind::Concept => r#""concept":"fence","definition":"state dependency""#,
+        CurationKind::Procedure => r#""procedure":"rotate","steps":3"#,
+        CurationKind::Failure => r#""fingerprint":"fp-1","signature":"sig-1""#,
+        CurationKind::Merge => r#""left":"a","right":"b","merged":"ab""#,
+        CurationKind::Split => r#""whole":"ab","first":"a","second":"b""#,
+        CurationKind::Reconsolidation => r#""target":"a","update":"refresh""#,
+        CurationKind::Accessibility => r#""handle":"a","note":"captioned""#,
+        CurationKind::Repair => r#""target":"a","repair":"relink""#,
+    };
+    std::format!(
+        r#"{{"kind":"{kind_tag}",{body},"target_evidence":{{"targets":["a","b","ab"],"evidence_refs":["e-1"]}}}}"#,
+        kind_tag = kind.as_str()
+    )
+}
+
+fn assert_typed_dispatch(registry: &CurationHandlerRegistry, ports: &[CurationHandlerPort]) {
+    let binding = ScreenBinding {
+        request_id: RequestId::new("req-44").expect("request id"),
+        receipt_id: ReceiptId::new("rcpt-44").expect("receipt id"),
+        screened_targets: vec!["a".to_owned(), "b".to_owned(), "ab".to_owned()],
+        source_snapshot: "snapshot-1".to_owned(),
+        source_revision: "rev-7".to_owned(),
+        profile: "default".to_owned(),
+        task_id: "task-1".to_owned(),
+        scope_id: "scope-1".to_owned(),
+        state_fence: fence(),
+    };
+    assert!(binding.validate().is_ok(), "fixture binding must validate");
+    let denominator = TargetDenominator {
+        mode: AtomicityMode::PerMember,
+        members: vec![
+            "a".to_owned(),
+            "b".to_owned(),
+            "ab".to_owned(),
+            "extra".to_owned(),
+        ],
+        expected_total: 4,
+    };
+    assert!(
+        denominator.validate().is_ok(),
+        "fixture denominator must validate"
+    );
+    for spelling in CURATION_WIRE_KINDS {
+        let kind = parse_kind(spelling).expect("known wire kind");
+        let family = family_of(kind);
+        let port = ports
+            .iter()
+            .find(|p| p.descriptor.family == family && p.descriptor.accepted_kinds.contains(&kind))
+            .expect("ported family");
+        port.validate().expect("port validates");
+        assert!(registry.handlers.iter().any(|h| h == &port.descriptor));
+        let payload = route_payload(kind, &typed_wire(kind)).expect("typed payload routes");
+        assert_eq!(
+            payload.kind(),
+            kind,
+            "explicit discriminant routing, no trial decode"
+        );
+        let request = TypedCurationHandlerRequest {
+            request_id: "req-44".to_owned(),
+            receipt_id: "rcpt-44".to_owned(),
+            source_snapshot: "snapshot-1".to_owned(),
+            source_revision: "rev-7".to_owned(),
+            profile: "default".to_owned(),
+            kind,
+            family,
+            job_id: "job-44".to_owned(),
+            scope_id: "scope-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            state_fence: fence(),
+            payload,
+            denominator: denominator.clone(),
+            screen_binding: Some(binding.clone()),
+        };
+        request.validate().expect("typed request validates");
+        assert_eq!(
+            request.family, port.descriptor.family,
+            "typed seam dispatches to ported family"
+        );
+    }
+}
+
+fn assert_target_evidence_roles() {
+    let overlap = TargetEvidence {
+        targets: vec!["a".into()],
+        evidence_refs: vec!["a".into()],
+    };
+    assert!(matches!(
+        overlap.validate("classification"),
+        Err(ContractViolation::KindPayload(_))
+    ));
+    let bad = CurationPayload::Classification(ClassificationPayload {
+        label: "m".into(),
+        confidence_bps: 9_000,
+        target_evidence: overlap,
+    });
+    assert!(matches!(
+        bad.validate(),
+        Err(ContractViolation::KindPayload(_))
+    ));
+    let empty = TargetEvidence {
+        targets: Vec::new(),
+        evidence_refs: vec!["e-1".into()],
+    };
+    assert!(matches!(
+        empty.validate("classification"),
+        Err(ContractViolation::MissingField("targets"))
+    ));
+}
+
 // WORK_UNIT_CASE: 578/44
 #[test]
 fn marker_44_independent_consumer_compile_fixtures() {
@@ -240,16 +358,8 @@ fn marker_44_independent_consumer_compile_fixtures() {
     handler_shape(&job, &registry);
     consumer_shape(&bundle, &draft, &receipt, &screen);
     assert_eq!(ports.len(), 10, "ten injected ports");
-    for spelling in CURATION_WIRE_KINDS {
-        let kind = parse_kind(spelling).expect("known wire kind");
-        let family = family_of(kind);
-        let port = ports
-            .iter()
-            .find(|p| p.descriptor.family == family && p.descriptor.accepted_kinds.contains(&kind))
-            .expect("ported family");
-        port.validate().expect("port validates");
-        assert!(registry.handlers.iter().any(|h| h == &port.descriptor));
-    }
+    assert_typed_dispatch(&registry, &ports);
+    assert_target_evidence_roles();
 }
 
 // WORK_UNIT_CASE: 578/45

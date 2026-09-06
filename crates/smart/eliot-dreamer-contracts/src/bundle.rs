@@ -14,11 +14,11 @@ use eliot_contracts::StateFence;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ContractViolation;
+use crate::error::{ContractViolation, check_text};
 
 /// Exact bundle schema version accepted by [`DreamInputBundle::validate`].
 const BUNDLE_SCHEMA_VERSION: u32 = 1;
-/// Maximum handle length, measured in Unicode scalar values.
+/// Maximum handle length, measured in bytes (`check_text` bound).
 const MAX_HANDLE_CHARS: usize = 128;
 /// Maximum materials accepted in one bundle.
 const MAX_MATERIALS: usize = 1024;
@@ -28,26 +28,9 @@ fn is_hex64(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Returns true when `value` is empty or consists only of whitespace.
-fn is_blank(value: &str) -> bool {
-    value.trim().is_empty()
-}
-
-/// Rejects blank or over-long handles shared by materials and omissions.
+/// Rejects blank/over-long/control handles (128-byte `check_text` bound).
 fn check_handle(handle: &str) -> Result<(), ContractViolation> {
-    if is_blank(handle) {
-        return Err(ContractViolation::MissingField("handle"));
-    }
-    let len = handle.chars().count();
-    if len > MAX_HANDLE_CHARS {
-        return Err(ContractViolation::OutOfBounds {
-            field: "handle",
-            min: 1,
-            max: crate::error::len_i64(MAX_HANDLE_CHARS),
-            got: crate::error::len_i64(len),
-        });
-    }
-    Ok(())
+    check_text(handle, "handle", MAX_HANDLE_CHARS)
 }
 
 /// Maps a fence validation failure onto the closed contract error.
@@ -145,25 +128,20 @@ pub struct OmissionHandle {
 }
 
 impl OmissionHandle {
-    /// Validates intrinsic bounds plus the reversible-or-explicit rule.
+    /// Validates intrinsic bounds (identities 256B, reason/digest 1024B/256B) plus reversible-or-explicit rule.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         check_handle(&self.handle)?;
-        if is_blank(&self.reason) {
-            return Err(ContractViolation::MissingField("reason"));
-        }
-        if is_blank(&self.scope_id) {
-            return Err(ContractViolation::MissingField("scope_id"));
-        }
-        if is_blank(&self.task_id) {
-            return Err(ContractViolation::MissingField("task_id"));
-        }
-        if is_blank(&self.digest) {
-            return Err(ContractViolation::MissingField("digest"));
+        check_text(&self.reason, "reason", 1024)?;
+        check_text(&self.scope_id, "scope_id", 256)?;
+        check_text(&self.task_id, "task_id", 256)?;
+        check_text(&self.digest, "digest", 1024)?;
+        if let Some(reason) = &self.nonrecoverable_reason {
+            check_text(reason, "nonrecoverable_reason", 1024)?;
         }
         let reason_ok = self
             .nonrecoverable_reason
             .as_ref()
-            .is_some_and(|reason| !is_blank(reason));
+            .is_some_and(|reason| !reason.trim().is_empty());
         if !self.reversible && !reason_ok {
             return Err(ContractViolation::BindingMismatch {
                 field: "nonrecoverable_reason",
@@ -226,15 +204,9 @@ impl DreamInputBundle {
                 got: i64::from(self.schema_version),
             });
         }
-        if is_blank(&self.job_id) {
-            return Err(ContractViolation::MissingField("job_id"));
-        }
-        if is_blank(&self.scope_id) {
-            return Err(ContractViolation::MissingField("scope_id"));
-        }
-        if is_blank(&self.task_id) {
-            return Err(ContractViolation::MissingField("task_id"));
-        }
+        check_text(&self.job_id, "job_id", 256)?;
+        check_text(&self.scope_id, "scope_id", 256)?;
+        check_text(&self.task_id, "task_id", 256)?;
         self.state_fence
             .validate()
             .map_err(|err| fence_error(&err))?;
@@ -291,15 +263,18 @@ impl DreamInputBundle {
         }
         match self.completeness {
             BundleCompleteness::CompleteForScope | BundleCompleteness::KnownEmpty => {
-                let denominator_ok = self
-                    .authoritative_denominator
-                    .as_ref()
-                    .is_some_and(|denominator| !is_blank(denominator));
-                if !denominator_ok {
-                    return Err(ContractViolation::MissingField("authoritative_denominator"));
+                match &self.authoritative_denominator {
+                    Some(d) => check_text(d, "authoritative_denominator", 256)?,
+                    None => {
+                        return Err(ContractViolation::MissingField("authoritative_denominator"));
+                    }
                 }
             }
-            BundleCompleteness::PartialForScope | BundleCompleteness::Unknown => {}
+            BundleCompleteness::PartialForScope | BundleCompleteness::Unknown => {
+                if let Some(d) = &self.authoritative_denominator {
+                    check_text(d, "authoritative_denominator", 256)?;
+                }
+            }
         }
         Ok(())
     }
@@ -410,6 +385,15 @@ mod tests {
         let tampered = wire.replace("\"authority_epoch\":1", "\"authority_epoch\":0");
         assert!(tampered.contains("\"authority_epoch\":0"));
         assert!(serde_json::from_str::<DreamInputBundle>(&tampered).is_err());
+        let mut over_handle = valid_bundle();
+        over_handle.materials[0].handle = "h".repeat(129);
+        assert!(over_handle.validate().is_err());
+        let mut ctrl_handle = valid_bundle();
+        ctrl_handle.materials[0].handle = "a\tb".to_string();
+        assert!(ctrl_handle.validate().is_err());
+        let mut over_id = valid_bundle();
+        over_id.job_id = "j".repeat(257);
+        assert!(over_id.validate().is_err());
     }
 
     // WORK_UNIT_CASE: 578/13
@@ -428,6 +412,11 @@ mod tests {
             back.authoritative_denominator.as_deref(),
             Some("scope-1:2-of-2")
         );
+        let mut maxed = valid_bundle();
+        maxed.materials[0].handle = "h".repeat(128);
+        maxed.authoritative_denominator = Some("d".repeat(256));
+        maxed.completeness = BundleCompleteness::CompleteForScope;
+        assert!(maxed.validate().is_ok());
     }
 
     // WORK_UNIT_CASE: 578/14
