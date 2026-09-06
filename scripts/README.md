@@ -35,6 +35,7 @@ committed as repository authority.
 | `audit-runtime-source-hygiene.py` | Expose unsafe, panic/unwrap/expect, ambient configuration, unbounded-output, blocking-sleep, and source-concentration signals | Static source-quality evidence only |
 | `verify-agent-bridge-protocol.py` | Reject raw canonical Frame ingress, host-minted authority fields, validation bypass, correlation loss, and mandatory cancellation prose | Static protocol/source-policy evidence only |
 | `verify-lint-policy.ps1` | Verify the Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
+| `verify-wasm-toolchain.py` | Check the declared WASI component target without installing anything | Declaration/toolchain check only |
 | `requirements-verification.txt` | Python dependency manifest for repository verification scripts | Verification dependency manifest |
 
 The three public documentation entrypoints are intentionally small front doors.
