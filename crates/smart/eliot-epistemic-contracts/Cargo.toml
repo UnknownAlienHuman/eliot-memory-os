@@ -15,8 +15,10 @@ eliot-contracts = { path = "../../foundation/eliot-contracts" }
 eliot-evidence = { path = "../../foundation/eliot-evidence" }
 schemars = { version = "1.2.1", features = ["derive", "uuid1"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.149" }
 thiserror = "2.0.18"
+
+[dev-dependencies]
+serde_json = { version = "1.0.149" }
 
 [package.metadata.eliot]
 prototype = true

@@ -6,7 +6,13 @@
 //! snapshot and its owner, the exclusions with reasons, the pagination bounds,
 //! and the validity window. Vague denominators such as an unbounded
 //! "all relevant" scope, and unowned empty enumerations, are rejected: an
-//! empty answer over an undeclared scope proves nothing.
+//! empty answer over an undeclared scope proves nothing. The one exception is
+//! the known-empty complete case — an empty member list with the complete
+//! marker, no query or frontier standing in, and the owner snapshot the
+//! emptiness was read from — which is owned, exact, terminal, and bound.
+//! Known-empty stays distinct from missing, partial, unavailable, and unknown:
+//! a complete scope is never truncated and its total always equals its
+//! enumerated member count.
 //!
 //! Only [`DenominatorKind::CompleteScope`] can ground a scoped absence claim;
 //! sampled or unknown denominators stay honest partial results.
@@ -383,7 +389,34 @@ impl CoverageDenominator {
         for role in &self.roles {
             validate_bounded_text(role.as_str(), "coverage.roles", MAX_SHORT_TEXT)?;
         }
-        if self.members.is_empty() && self.query.is_none() {
+        if self.kind == DenominatorKind::CompleteScope {
+            // A complete scope is arithmetically exact: never truncated, with
+            // the total equal to the enumerated member count. A truncated or
+            // short enumeration over a scope marked complete fails here, never
+            // downstream.
+            if self.bounds.truncated {
+                return Err(ContractError::IncompleteDenominator {
+                    field: "coverage.bounds",
+                });
+            }
+            if self.bounds.total != self.members.len() as u64 {
+                return Err(ContractError::ArithmeticMismatch {
+                    field: "coverage.bounds",
+                });
+            }
+            if self.members.is_empty() {
+                // Known-empty is valid only as an owned, exact, bound empty:
+                // the complete marker, no query or frontier standing in for an
+                // enumeration that never happened, and the owner snapshot the
+                // emptiness was read from. Anything else — a sampled, unknown,
+                // or query-fronted empty — proves nothing and fails below.
+                if self.query.is_some() || self.frontier.is_some() {
+                    return Err(ContractError::IncompleteDenominator {
+                        field: "coverage.members",
+                    });
+                }
+            }
+        } else if self.members.is_empty() && self.query.is_none() {
             return Err(ContractError::IncompleteDenominator {
                 field: "coverage.members",
             });

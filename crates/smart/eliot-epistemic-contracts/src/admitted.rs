@@ -1,12 +1,19 @@
 //! Admitted view: a read of an external admission, proving nothing itself.
 //!
-//! A [`CurrentEpistemicPositionView`] carries the exact position identity and
+//! A [`CurrentEpistemicPosition`] carries the exact position identity and
 //! revision, the external admission receipt it was read from, the owning
 //! source with currentness and supersession links, the claim with its scope
 //! and fence, and evidence, coverage, conflict, and proof references. The
 //! view is a read: it proves nothing beyond the receipt it cites, and it
 //! carries a distinct marker so a candidate document can never decode as an
 //! admitted view nor the reverse.
+//!
+//! The canonical admitted read-view type is named exactly
+//! [`CurrentEpistemicPosition`], satisfying the cognitive edge-map contract
+//! `eliot-epistemic-contracts::CurrentEpistemicPosition`.
+//! [`CurrentEpistemicPositionView`] is a documented alias of the same type —
+//! same definition, same serde, same wire bytes — kept only so existing
+//! readers keep compiling while they migrate to the canonical name.
 
 use std::collections::BTreeSet;
 
@@ -24,9 +31,51 @@ use crate::identity::{ClaimId, PropositionId};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum AdmittedKind {
     /// The single admitted spelling of an admitted position view.
-    #[serde(rename = "CURRENT_EPISTEMIC_POSITION_VIEW")]
-    #[schemars(rename = "CURRENT_EPISTEMIC_POSITION_VIEW")]
-    CurrentEpistemicPositionView,
+    #[serde(rename = "CURRENT_EPISTEMIC_POSITION")]
+    #[schemars(rename = "CURRENT_EPISTEMIC_POSITION")]
+    CurrentEpistemicPosition,
+}
+
+/// Owner-neutral rendering of the donor position algebra, for record
+/// compatibility.
+///
+/// Donor disposition (`crates/smart/eliot-epistemic/src/lib.rs`, donor scope
+/// `PositionState`): the six donor states are preserved exactly, including
+/// `Assumed`, which stays a position state rather than a promotion of the
+/// underlying evidence vocabulary. An admitted view itself carries
+/// [`Currentness`] plus its external receipt instead of a resolver state; this
+/// enum exists so donor records and migrated fixtures keep a shared,
+/// owner-neutral spelling. The donor `resolve` transition into these states is
+/// explicitly not carried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PositionState {
+    /// Directly captured observation, not yet support for a claim.
+    Observed,
+    /// Currently supported within its declared scope.
+    Supported,
+    /// Held under an explicit assumption; never decoded as support.
+    Assumed,
+    /// Competing positions remain unresolved.
+    Conflicted,
+    /// Once useful material whose freshness boundary has passed.
+    Stale,
+    /// The available material cannot establish a position.
+    Unknown,
+}
+
+impl PositionState {
+    /// Returns the exact frozen wire name of this position state.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Observed => "OBSERVED",
+            Self::Supported => "SUPPORTED",
+            Self::Assumed => "ASSUMED",
+            Self::Conflicted => "CONFLICTED",
+            Self::Stale => "STALE",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
 }
 
 /// Currentness of the admitted position under its owner.
@@ -52,7 +101,7 @@ impl Currentness {
 /// A read view of an externally admitted epistemic position.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct CurrentEpistemicPositionView {
+pub struct CurrentEpistemicPosition {
     /// Marker binding this document to the admitted-view decoding.
     pub view_kind: AdmittedKind,
     /// Exact position identity admitted elsewhere.
@@ -87,7 +136,12 @@ pub struct CurrentEpistemicPositionView {
     pub digest: String,
 }
 
-impl CurrentEpistemicPositionView {
+/// Previous name of [`CurrentEpistemicPosition`]: the same type, the same
+/// serde, the same wire bytes. New code uses the canonical name; this alias
+/// exists only so existing readers keep compiling while they migrate.
+pub type CurrentEpistemicPositionView = CurrentEpistemicPosition;
+
+impl CurrentEpistemicPosition {
     /// Constructs an admitted view and freezes its canonical digest.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -107,7 +161,7 @@ impl CurrentEpistemicPositionView {
         proof_digest: impl Into<String>,
     ) -> Result<Self, ContractError> {
         let mut view = Self {
-            view_kind: AdmittedKind::CurrentEpistemicPositionView,
+            view_kind: AdmittedKind::CurrentEpistemicPosition,
             position,
             revision,
             admission_receipt,
@@ -158,7 +212,7 @@ impl CurrentEpistemicPositionView {
     }
 
     fn validate_shape(&self) -> Result<(), ContractError> {
-        if self.view_kind != AdmittedKind::CurrentEpistemicPositionView {
+        if self.view_kind != AdmittedKind::CurrentEpistemicPosition {
             return Err(ContractError::ImpossibleCombination {
                 field: "admitted.view_kind",
             });

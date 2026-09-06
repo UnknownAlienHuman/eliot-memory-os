@@ -1,18 +1,25 @@
 //! Claim map: per-claim verdicts inside one admitted manifest.
 //!
-//! A [`ClaimMap`] holds one [`ClaimEntry`] per admitted claim. Each entry
-//! carries its verdict, independent claim-audit outcome, preserved
-//! counterevidence, conflict reference, authority, grade, explicit
-//! dependencies, temporal/scope/precision bounds, coverage digest, ceiling,
-//! assumptions, and discriminators. Entries form a meaningful sequence:
-//! declaration order is preserved on the wire so reviewers read the map as
-//! written, while identity semantics come from the claim IDs.
+//! A [`ClaimMap`] holds one [`ClaimEntry`] per admitted claim — exactly one:
+//! every admitted claim ID has an entry and every entry names an admitted
+//! claim, so the admitted set and the entry set coincide. Each entry carries
+//! its verdict, independent claim-audit outcome, preserved counterevidence,
+//! conflict reference, authority, grade, explicit dependencies, temporal/scope/
+//! precision bounds, component coverage, ceiling, assumptions, and
+//! discriminators. Entries form a meaningful sequence: declaration order is
+//! preserved on the wire so reviewers read the map as written, while identity
+//! semantics come from the claim IDs.
+//!
+//! Component coverage is an explicit per-component support mapping, validated
+//! rather than inferred: an accepted entry carries at least one supporting
+//! accepted handle or an explicit unresolved marker. A digest plus assumption
+//! and discriminator names never counts as coverage on its own.
 //!
 //! The map rejects two failures closed: claims outside the admitted manifest,
 //! and duplicate entries — including two entries sharing one claim ID with
 //! different statement digests.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::ArtifactId;
 use eliot_evidence::EvidenceAuthority;
@@ -109,6 +116,13 @@ pub struct ClaimEntry {
     pub bounds: ValidityBounds,
     /// Canonical digest of the component coverage behind the claim.
     pub coverage_digest: String,
+    /// Accepted supporting handles behind the component coverage; order
+    /// carries no meaning. An accepted claim carries at least one handle here
+    /// or an explicit marker in `unresolved_support`.
+    pub support: BTreeSet<ArtifactId>,
+    /// Explicit unresolved component markers; order carries no meaning. A
+    /// marker keeps the component open instead of silently uncovered.
+    pub unresolved_support: BTreeSet<String>,
     /// Grade ceiling the claim must not exceed.
     pub ceiling: EvidenceGrade,
     /// Named assumption sets the claim depends on; order carries no meaning.
@@ -132,6 +146,8 @@ impl ClaimEntry {
         dependencies: BTreeSet<ClaimId>,
         bounds: ValidityBounds,
         coverage_digest: impl Into<String>,
+        support: BTreeSet<ArtifactId>,
+        unresolved_support: BTreeSet<String>,
         ceiling: EvidenceGrade,
         assumptions: BTreeSet<String>,
         discriminators: BTreeSet<String>,
@@ -148,6 +164,8 @@ impl ClaimEntry {
             dependencies,
             bounds,
             coverage_digest: coverage_digest.into(),
+            support,
+            unresolved_support,
             ceiling,
             assumptions,
             discriminators,
@@ -156,7 +174,9 @@ impl ClaimEntry {
         Ok(entry)
     }
 
-    /// Validates verdict/audit coherence, ceilings, and bounds.
+    /// Validates verdict/audit coherence, ceilings, bounds, and component
+    /// coverage: an accepted entry carries at least one supporting accepted
+    /// handle or an explicit unresolved marker.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_digest(&self.statement_digest, "claim.statement_digest")?;
         validate_digest(&self.coverage_digest, "claim.coverage_digest")?;
@@ -166,6 +186,19 @@ impl ClaimEntry {
             return Err(ContractError::TooMany {
                 field: "claim.counterevidence",
             });
+        }
+        if self.support.len() > MAX_HANDLES {
+            return Err(ContractError::TooMany {
+                field: "claim.support",
+            });
+        }
+        if self.unresolved_support.len() > MAX_HANDLES {
+            return Err(ContractError::TooMany {
+                field: "claim.unresolved_support",
+            });
+        }
+        for marker in &self.unresolved_support {
+            validate_bounded_text(marker.as_str(), "claim.unresolved_support", MAX_SHORT_TEXT)?;
         }
         if self.dependencies.len() > MAX_HANDLES {
             return Err(ContractError::TooMany {
@@ -195,6 +228,14 @@ impl ClaimEntry {
         if self.dependencies.contains(&self.claim) {
             return Err(ContractError::SelfReference {
                 field: "claim.dependencies",
+            });
+        }
+        if matches!(self.verdict, ClaimVerdict::Accepted)
+            && self.support.is_empty()
+            && self.unresolved_support.is_empty()
+        {
+            return Err(ContractError::EmptyCollection {
+                field: "claim.support",
             });
         }
         match (self.verdict, self.audit) {
@@ -273,12 +314,19 @@ impl DependenceGroup {
 pub struct ClaimMap {
     /// Allowed-reference manifest admitting every entry.
     pub manifest: ManifestId,
-    /// Claims admitted by the manifest; order carries no meaning.
+    /// Claims admitted by the manifest; order carries no meaning. The entry
+    /// set coincides with this set exactly: an admitted claim without an entry
+    /// is unrepresented, and an entry without admission is outside the
+    /// manifest.
     pub admitted: BTreeSet<ClaimId>,
     /// Per-claim entries in declaration order.
     pub entries: Vec<ClaimEntry>,
     /// Explicit dependence groups in declaration order.
     pub groups: Vec<DependenceGroup>,
+    /// Admitted claims held open for further inquiry; order carries no
+    /// meaning. Held-open claims keep their provisional entries: `unresolved`
+    /// is a subset of the entered claims, never unentered claims.
+    pub unresolved: BTreeSet<ClaimId>,
     /// Canonical digest of the map shape, excluding this field.
     pub digest: String,
 }
@@ -290,12 +338,14 @@ impl ClaimMap {
         admitted: BTreeSet<ClaimId>,
         entries: Vec<ClaimEntry>,
         groups: Vec<DependenceGroup>,
+        unresolved: BTreeSet<ClaimId>,
     ) -> Result<Self, ContractError> {
         let mut map = Self {
             manifest,
             admitted,
             entries,
             groups,
+            unresolved,
             digest: String::new(),
         };
         map.validate_shape()?;
@@ -305,36 +355,77 @@ impl ClaimMap {
 
     /// Recomputes the canonical digest of the map shape.
     pub fn compute_digest(&self) -> Result<String, ContractError> {
-        shape_digest(&(&self.manifest, &self.admitted, &self.entries, &self.groups))
+        shape_digest(&(
+            &self.manifest,
+            &self.admitted,
+            &self.entries,
+            &self.groups,
+            &self.unresolved,
+        ))
     }
 
-    /// Returns whether every entry carries component coverage.
+    /// Returns whether every accepted entry carries component coverage: at
+    /// least one supporting accepted handle or an explicit unresolved marker.
     pub fn has_component_coverage(&self) -> bool {
         self.entries.iter().all(|entry| {
-            entry.coverage_digest.len() == 64
-                && !entry.assumptions.is_empty()
-                && !entry.discriminators.is_empty()
+            !matches!(entry.verdict, ClaimVerdict::Accepted)
+                || !entry.support.is_empty()
+                || !entry.unresolved_support.is_empty()
         })
     }
 
-    fn validate_shape(&self) -> Result<(), ContractError> {
-        if self.entries.is_empty() {
-            return Err(ContractError::EmptyCollection {
-                field: "claim.entries",
-            });
-        }
-        if self.entries.len() > MAX_HANDLES {
-            return Err(ContractError::TooMany {
-                field: "claim.entries",
-            });
-        }
-        if self.groups.len() > MAX_HANDLES {
-            return Err(ContractError::TooMany {
-                field: "claim.groups",
-            });
-        }
+    /// Returns the admitted claims accepted by verdict.
+    pub fn accepted_ids(&self) -> BTreeSet<ClaimId> {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(entry.verdict, ClaimVerdict::Accepted))
+            .map(|entry| entry.claim.clone())
+            .collect()
+    }
+
+    /// Returns the admitted claims rejected by verdict.
+    pub fn rejected_ids(&self) -> BTreeSet<ClaimId> {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(entry.verdict, ClaimVerdict::Rejected))
+            .map(|entry| entry.claim.clone())
+            .collect()
+    }
+
+    /// Returns the admitted claims held open by preserved counterevidence.
+    pub fn countered_ids(&self) -> BTreeSet<ClaimId> {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(entry.verdict, ClaimVerdict::Countered))
+            .map(|entry| entry.claim.clone())
+            .collect()
+    }
+
+    /// Returns every named assumption set across all entries.
+    pub fn assumption_names(&self) -> BTreeSet<String> {
+        self.entries
+            .iter()
+            .flat_map(|entry| entry.assumptions.iter().cloned())
+            .collect()
+    }
+
+    /// Returns the weakest grade across all entries: the floor no dependent
+    /// may rise above, and the grade ceiling the map as a whole can claim.
+    pub fn weakest_grade(&self) -> Option<EvidenceGrade> {
+        self.entries
+            .iter()
+            .map(|entry| entry.grade)
+            .min_by_key(|grade| grade.rank())
+    }
+
+    /// Validates entries against the manifest, returning entered claims and
+    /// their grades for the closure checks below.
+    fn check_entries(
+        &self,
+    ) -> Result<(BTreeSet<ClaimId>, BTreeMap<ClaimId, EvidenceGrade>), ContractError> {
         let mut seen_claims = BTreeSet::new();
         let mut seen_digests = BTreeSet::new();
+        let mut grades = BTreeMap::new();
         for entry in &self.entries {
             entry.validate()?;
             if !self.admitted.contains(&entry.claim) {
@@ -359,7 +450,13 @@ impl ClaimMap {
                     });
                 }
             }
+            grades.insert(entry.claim.clone(), entry.grade);
         }
+        Ok((seen_claims, grades))
+    }
+
+    /// Validates dependence groups against the manifest.
+    fn check_groups(&self) -> Result<(), ContractError> {
         let mut seen_groups = BTreeSet::new();
         for group in &self.groups {
             group.validate()?;
@@ -375,6 +472,83 @@ impl ClaimMap {
                     });
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn validate_shape(&self) -> Result<(), ContractError> {
+        if self.entries.is_empty() {
+            return Err(ContractError::EmptyCollection {
+                field: "claim.entries",
+            });
+        }
+        if self.entries.len() > MAX_HANDLES {
+            return Err(ContractError::TooMany {
+                field: "claim.entries",
+            });
+        }
+        if self.groups.len() > MAX_HANDLES {
+            return Err(ContractError::TooMany {
+                field: "claim.groups",
+            });
+        }
+        if self.unresolved.len() > MAX_HANDLES {
+            return Err(ContractError::TooMany {
+                field: "claim.unresolved",
+            });
+        }
+        let (seen_claims, grades) = self.check_entries()?;
+        // Exact entries: the entry set coincides with the admitted set. An
+        // admitted claim without an entry is unrepresented; an entry without
+        // admission is outside the manifest. Held-open claims keep their
+        // provisional entries, so `unresolved` is a subset of the admitted
+        // claims, never unentered claims.
+        for held in &self.unresolved {
+            if !self.admitted.contains(held) {
+                return Err(ContractError::OutsideManifest {
+                    field: "claim.unresolved",
+                });
+            }
+            if !seen_claims.contains(held) {
+                return Err(ContractError::MissingReference {
+                    field: "claim.unresolved",
+                });
+            }
+        }
+        for admitted in &self.admitted {
+            if !seen_claims.contains(admitted) {
+                return Err(ContractError::MissingReference {
+                    field: "claim.entries",
+                });
+            }
+        }
+        // Dependent grades: quoting a claim never upgrades it.
+        for entry in &self.entries {
+            for dependency in &entry.dependencies {
+                if let Some(parent) = grades.get(dependency) {
+                    EvidenceGrade::check_dependent(*parent, entry.grade)?;
+                }
+            }
+        }
+        self.check_groups()?;
+        // Dependence groups cover dependent claims: every dependency edge of
+        // an entry resolves inside a group holding both ends together.
+        for entry in &self.entries {
+            for dependency in &entry.dependencies {
+                let covered = self.groups.iter().any(|group| {
+                    group.members.contains(&entry.claim) && group.members.contains(dependency)
+                });
+                if !covered {
+                    return Err(ContractError::MissingReference {
+                        field: "claim.groups",
+                    });
+                }
+            }
+        }
+        if !self.has_component_coverage() {
+            return Err(ContractError::EmptyCollection {
+                field: "claim.support",
+            });
         }
         Ok(())
     }

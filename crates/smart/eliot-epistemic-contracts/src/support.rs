@@ -66,7 +66,7 @@ impl SupportResult {
     }
 
     /// Weakest-link rank: lower bounds any aggregate it participates in.
-    const fn link_rank(self) -> u8 {
+    pub(crate) const fn link_rank(self) -> u8 {
         match self {
             Self::Contradicted => 0,
             Self::Unsupported => 1,
@@ -117,6 +117,24 @@ pub struct ValidityBounds {
     pub precision: String,
 }
 
+/// Precision lattice, coarsest-first: a coarser assertion is covered by finer
+/// support, never the reverse. Spellings outside this lattice cover only exact
+/// equality, so novel precision vocabulary stays reviewable data elsewhere.
+const PRECISION_LATTICE: [&str; 6] = [
+    "repository",
+    "package",
+    "directory",
+    "file",
+    "symbol",
+    "line",
+];
+
+fn precision_rank(precision: &str) -> Option<usize> {
+    PRECISION_LATTICE
+        .iter()
+        .position(|known| *known == precision.trim().to_lowercase())
+}
+
 impl ValidityBounds {
     /// Constructs validity bounds, rejecting inverted windows.
     pub fn new(
@@ -152,15 +170,40 @@ impl ValidityBounds {
         Ok(())
     }
 
-    /// Returns whether these bounds cover the requested scope and instant.
-    pub fn covers(&self, scope: &str, instant_ms: Option<i64>) -> bool {
+    /// Returns whether these bounds cover the requested scope, instant,
+    /// version, and precision.
+    ///
+    /// All four axes participate: scope must match exactly, the instant must
+    /// fall inside the validity window, the version must match exactly, and
+    /// the asserted precision must be no finer than the supported precision on
+    /// the documented lattice (`repository` < `package` < `directory` <
+    /// `file` < `symbol` < `line`). Version compatibility is deliberately
+    /// exact: any looser compatibility rule must be stated, versioned, and
+    /// reviewed as its own contract change, never inferred here. Precision
+    /// spellings outside the lattice cover only exact equality. The bounds are
+    /// never rewritten: a mismatch limits support instead of failing, and the
+    /// record stays valid data about the narrower question it does cover.
+    pub fn covers(
+        &self,
+        scope: &str,
+        instant_ms: Option<i64>,
+        version: &str,
+        precision: &str,
+    ) -> bool {
         if self.scope != scope {
             return false;
         }
         match (self.window_start_ms, self.window_end_ms, instant_ms) {
-            (Some(start), _, Some(instant)) if instant < start => false,
-            (_, Some(end), Some(instant)) if instant > end => false,
-            _ => true,
+            (Some(start), _, Some(instant)) if instant < start => return false,
+            (_, Some(end), Some(instant)) if instant > end => return false,
+            _ => {}
+        }
+        if self.version != version {
+            return false;
+        }
+        match (precision_rank(&self.precision), precision_rank(precision)) {
+            (Some(supported), Some(asserted)) => asserted <= supported,
+            _ => self.precision == precision,
         }
     }
 }
