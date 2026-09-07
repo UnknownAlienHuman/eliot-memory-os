@@ -138,6 +138,24 @@ fn supplied_ack_binds_generic_receipt_and_replay_keeps_maximum_phase() -> TestRe
         ReactiveContextAckDisposition::DuplicateHistorical
     );
 
+    let mut contextual_duplicate = durable.clone();
+    contextual_duplicate.receipt.disposition = EventDisposition::Duplicate;
+    contextual_duplicate.disposition = ReactiveContextAckDisposition::DuplicateHistorical;
+    assert_eq!(
+        ledger.record(&contextual_duplicate, &payload)?,
+        ReactiveContextAckDisposition::DuplicateHistorical
+    );
+    assert_eq!(ledger.maximum_phase, Some(AckPhase::Applied));
+    let history_len = ledger.receipt_digests.len();
+    let mut unmatched_duplicate = contextual_duplicate;
+    unmatched_duplicate.proof_sha256 = "f".repeat(64);
+    assert!(matches!(
+        ledger.record(&unmatched_duplicate, &payload),
+        Err(eliot_protocol::reactive_context::ReactiveContextError::ReplayConflict)
+    ));
+    assert_eq!(ledger.receipt_digests.len(), history_len);
+    assert_eq!(ledger.maximum_phase, Some(AckPhase::Applied));
+
     let mut changed = durable.clone();
     changed.proof_sha256 = "f".repeat(64);
     assert!(matches!(

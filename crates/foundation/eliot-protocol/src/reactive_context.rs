@@ -992,26 +992,18 @@ impl ReactiveContextAckEvidence {
         {
             return Err(ReactiveContextError::NotCurrent);
         }
-        let expected_disposition = match self.observed_phase {
-            AckPhase::Rejected => EventDisposition::Rejected,
-            AckPhase::Unknown => EventDisposition::Accepted,
-            AckPhase::Received | AckPhase::Durable | AckPhase::Normalized | AckPhase::Applied => {
-                EventDisposition::Accepted
-            }
-        };
-        let generic_disposition_valid = self.receipt.disposition == expected_disposition;
+        let expected_disposition = expected_event_disposition(self.observed_phase);
+        let contextual_duplicate = self.receipt.disposition == EventDisposition::Duplicate
+            && self.disposition == ReactiveContextAckDisposition::DuplicateHistorical;
+        let generic_disposition_valid =
+            self.receipt.disposition == expected_disposition || contextual_duplicate;
         if !generic_disposition_valid {
             return Err(ReactiveContextError::Mismatch {
                 field: "receipt.disposition",
             });
         }
-        let evidence_disposition_valid = match self.observed_phase {
-            AckPhase::Rejected => self.disposition == ReactiveContextAckDisposition::Rejected,
-            AckPhase::Unknown => self.disposition == ReactiveContextAckDisposition::Unknown,
-            AckPhase::Received | AckPhase::Durable | AckPhase::Normalized | AckPhase::Applied => {
-                self.disposition == ReactiveContextAckDisposition::Accepted
-            }
-        };
+        let evidence_disposition_valid = contextual_duplicate
+            || self.disposition == expected_ack_disposition(self.observed_phase);
         if !evidence_disposition_valid {
             return Err(ReactiveContextError::Mismatch {
                 field: "disposition",
@@ -1087,6 +1079,7 @@ impl ReactiveContextAckLedger {
         {
             return Err(ReactiveContextError::ReplayConflict);
         }
+        let duplicate_requested = evidence.receipt.disposition == EventDisposition::Duplicate;
         let receipt_bytes = canonical_json_bytes(&evidence.receipt)
             .map_err(|error| ReactiveContextError::Serialization(error.to_string()))?;
         let receipt_digest = sha256_hex(&receipt_bytes);
@@ -1099,6 +1092,19 @@ impl ReactiveContextAckLedger {
             .position(|seen| seen == &receipt_digest)
         {
             if self.evidence_digests.get(index) == Some(&evidence_digest) {
+                return Ok(ReactiveContextAckDisposition::DuplicateHistorical);
+            }
+            return Err(ReactiveContextError::ReplayConflict);
+        }
+        if duplicate_requested {
+            let (normalized_receipt_digest, normalized_evidence_digest) =
+                normalized_history_digests(evidence)?;
+            if let Some(index) = self
+                .receipt_digests
+                .iter()
+                .position(|seen| seen == &normalized_receipt_digest)
+                && self.evidence_digests.get(index) == Some(&normalized_evidence_digest)
+            {
                 return Ok(ReactiveContextAckDisposition::DuplicateHistorical);
             }
             return Err(ReactiveContextError::ReplayConflict);
@@ -1132,6 +1138,43 @@ impl ReactiveContextAckLedger {
         self.evidence_digests.push(evidence_digest);
         Ok(evidence.disposition)
     }
+}
+
+fn expected_event_disposition(phase: AckPhase) -> EventDisposition {
+    match phase {
+        AckPhase::Rejected => EventDisposition::Rejected,
+        AckPhase::Received | AckPhase::Durable | AckPhase::Normalized | AckPhase::Applied => {
+            EventDisposition::Accepted
+        }
+        AckPhase::Unknown => EventDisposition::Accepted,
+    }
+}
+
+fn expected_ack_disposition(phase: AckPhase) -> ReactiveContextAckDisposition {
+    match phase {
+        AckPhase::Rejected => ReactiveContextAckDisposition::Rejected,
+        AckPhase::Unknown => ReactiveContextAckDisposition::Unknown,
+        AckPhase::Received | AckPhase::Durable | AckPhase::Normalized | AckPhase::Applied => {
+            ReactiveContextAckDisposition::Accepted
+        }
+    }
+}
+
+fn normalized_history_digests(
+    evidence: &ReactiveContextAckEvidence,
+) -> Result<(String, String), ReactiveContextError> {
+    let mut normalized_receipt = evidence.receipt.clone();
+    normalized_receipt.disposition = expected_event_disposition(evidence.observed_phase);
+    let receipt_bytes = canonical_json_bytes(&normalized_receipt)
+        .map_err(|error| ReactiveContextError::Serialization(error.to_string()))?;
+    let receipt_digest = sha256_hex(&receipt_bytes);
+
+    let mut normalized_evidence = evidence.clone();
+    normalized_evidence.receipt = normalized_receipt;
+    normalized_evidence.disposition = expected_ack_disposition(evidence.observed_phase);
+    let evidence_bytes = canonical_json_bytes(&normalized_evidence)
+        .map_err(|error| ReactiveContextError::Serialization(error.to_string()))?;
+    Ok((receipt_digest, sha256_hex(&evidence_bytes)))
 }
 
 fn phase_advances(from: AckPhase, to: AckPhase) -> bool {
