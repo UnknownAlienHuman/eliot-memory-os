@@ -131,7 +131,8 @@ pub fn admit_context(input: &AdmissionInput) -> Result<AdmissionResult, ContextE
     }
 
     let mut optional_cost = 0_u64;
-    let mut omissions = Vec::new();
+    let mut failure_causes: BTreeMap<eliot_contracts::ArtifactId, (OmissionReason, String)> =
+        BTreeMap::new();
     let mut optional_ids: Vec<_> = candidates
         .keys()
         .filter(|id| !floor_ids.contains(*id))
@@ -153,15 +154,14 @@ pub fn admit_context(input: &AdmissionInput) -> Result<AdmissionResult, ContextE
         .checked_sub(fixed)
         .and_then(|value| value.checked_sub(required_cost))
         .ok_or(ContextError::Overflow)?;
-    let mut handled = BTreeSet::new();
     for atom_id in optional_ids {
-        if handled.contains(&atom_id) {
+        if admitted.contains_key(&atom_id) {
             continue;
         }
         let candidate = candidates
             .get(&atom_id)
             .ok_or(ContextError::DenominatorMismatch)?;
-        let closure = optional_closure(&atom_id, &floor_ids, &candidates, &mut handled)?;
+        let closure = optional_closure(&atom_id, &floor_ids, &candidates)?;
         let closure_candidates = closure
             .iter()
             .filter_map(|id| candidates.get(id).copied())
@@ -214,12 +214,32 @@ pub fn admit_context(input: &AdmissionInput) -> Result<AdmissionResult, ContextE
                 .checked_add(value)
                 .ok_or(ContextError::Overflow)?;
         } else {
-            let failure = optional_failure_cause(input, &closure_candidates, closure_missing)?;
-            for item in closure_candidates {
-                let item_cost = exact_cost(input, item).ok();
-                omissions.push(make_omission(input, item, &supplied, item_cost, failure)?);
-            }
+            let failure = optional_failure_cause(
+                input,
+                &closure,
+                &candidates,
+                &closure_candidates,
+                closure_missing,
+            )?;
+            failure_causes.insert(
+                atom_id,
+                failure.unwrap_or((
+                    OmissionReason::Capacity,
+                    "optional allocation exceeds remaining capacity".to_owned(),
+                )),
+            );
         }
+    }
+    let mut omissions = Vec::new();
+    for (atom_id, candidate) in &candidates {
+        if floor_ids.contains(atom_id) || admitted.contains_key(atom_id) {
+            continue;
+        }
+        let item_cost = exact_cost(input, candidate).ok();
+        let failure = failure_causes.get(atom_id).cloned();
+        omissions.push(make_omission(
+            input, candidate, &supplied, item_cost, failure,
+        )?);
     }
     omissions.sort_by(|left, right| left.atom_id.cmp(&right.atom_id));
 
@@ -488,7 +508,6 @@ fn optional_closure(
     root: &eliot_contracts::ArtifactId,
     floor_ids: &BTreeSet<eliot_contracts::ArtifactId>,
     candidates: &BTreeMap<eliot_contracts::ArtifactId, &eliot_context_contracts::ContextCandidate>,
-    handled: &mut BTreeSet<eliot_contracts::ArtifactId>,
 ) -> Result<BTreeSet<eliot_contracts::ArtifactId>, ContextError> {
     let mut queue = VecDeque::from([root.clone()]);
     let mut closure = BTreeSet::new();
@@ -496,11 +515,10 @@ fn optional_closure(
         if floor_ids.contains(&atom_id) || !closure.insert(atom_id.clone()) {
             continue;
         }
-        handled.insert(atom_id.clone());
         if let Some(candidate) = candidates.get(&atom_id) {
             queue.extend(candidate.dependencies.iter().cloned());
         }
-        if closure.len() >= 4096 {
+        if closure.len() > 4096 {
             return Err(ContextError::Bounds {
                 field: "optional.closure",
             });
@@ -553,13 +571,20 @@ fn exact_cost(
 
 fn optional_failure_cause(
     input: &AdmissionInput,
+    closure: &BTreeSet<eliot_contracts::ArtifactId>,
+    candidates: &BTreeMap<eliot_contracts::ArtifactId, &eliot_context_contracts::ContextCandidate>,
     closure_candidates: &[&eliot_context_contracts::ContextCandidate],
     closure_missing: bool,
-) -> Result<Option<(OmissionReason, &'static str)>, ContextError> {
+) -> Result<Option<(OmissionReason, String)>, ContextError> {
     if closure_missing {
+        let missing = closure
+            .iter()
+            .find(|atom_id| !candidates.contains_key(*atom_id))
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "unknown".to_owned());
         return Ok(Some((
-            OmissionReason::Unavailable,
-            "required dependency is missing from the candidate closure",
+            OmissionReason::Blocked,
+            format!("required dependency closure is missing atom {missing}"),
         )));
     }
     for candidate in closure_candidates {
@@ -573,34 +598,49 @@ fn optional_failure_cause(
                     Some(match measurement.cost {
                         AdmissionMeasuredCost::Unavailable => (
                             OmissionReason::MeasurementUnavailable,
-                            "measurement owner could not provide an exact contribution",
+                            format!("measurement {} is unavailable", measurement.measurement_id),
                         ),
                         AdmissionMeasuredCost::Unknown => (
                             OmissionReason::UnknownMeasurement,
-                            "exact UTF-8 contribution is unknown",
+                            format!(
+                                "measurement {} has unknown exact UTF-8 contribution",
+                                measurement.measurement_id
+                            ),
                         ),
                         _ => return Err(ContextError::UnknownMeasurement),
                     })
                 }
                 Err(error) => return Err(error),
             },
-            AtomAvailability::Stale => Some((OmissionReason::Stale, "candidate is stale")),
-            AtomAvailability::Blocked => Some((OmissionReason::Blocked, "candidate is blocked")),
+            AtomAvailability::Stale => Some((
+                OmissionReason::Stale,
+                format!("candidate {} is stale", candidate.atom_id),
+            )),
+            AtomAvailability::Blocked => Some((
+                OmissionReason::Blocked,
+                format!("candidate {} is blocked", candidate.atom_id),
+            )),
             AtomAvailability::Unavailable
             | AtomAvailability::Missing
             | AtomAvailability::KnownEmpty
             | AtomAvailability::Partial
             | AtomAvailability::Exhausted => Some((
-                OmissionReason::Unavailable,
-                "dependency provider cannot supply a current candidate",
+                OmissionReason::Blocked,
+                format!(
+                    "required dependency {} is {:?}",
+                    candidate.atom_id, candidate.availability
+                ),
             )),
             AtomAvailability::Unknown => Some((
                 OmissionReason::UnknownMeasurement,
-                "candidate state is unknown",
+                format!("candidate {} state is unknown", candidate.atom_id),
             )),
             AtomAvailability::Omitted => Some((
                 OmissionReason::Policy,
-                "candidate was already omitted by policy",
+                format!(
+                    "candidate {} was already omitted by policy",
+                    candidate.atom_id
+                ),
             )),
         };
         if cause.is_some() {
@@ -673,32 +713,42 @@ fn make_omission(
         &eliot_context_contracts::SuppliedOmissionBinding,
     >,
     cost: Option<u64>,
-    cause: Option<(OmissionReason, &'static str)>,
+    cause: Option<(OmissionReason, String)>,
 ) -> Result<OmissionRecord, ContextError> {
     let binding = supplied
         .get(&candidate.atom_id)
         .ok_or(ContextError::OmissionHandleInvalid)?;
     let (reason, constraint) = cause.unwrap_or_else(|| match candidate.availability {
-        AtomAvailability::Stale => (OmissionReason::Stale, "candidate is stale"),
-        AtomAvailability::Blocked => (OmissionReason::Blocked, "candidate is blocked"),
-        AtomAvailability::Unavailable => (OmissionReason::Unavailable, "provider unavailable"),
-        AtomAvailability::Missing => (OmissionReason::Unavailable, "candidate is missing"),
+        AtomAvailability::Stale => (OmissionReason::Stale, "candidate is stale".to_owned()),
+        AtomAvailability::Blocked => (OmissionReason::Blocked, "candidate is blocked".to_owned()),
+        AtomAvailability::Unavailable => (
+            OmissionReason::Unavailable,
+            "provider unavailable".to_owned(),
+        ),
+        AtomAvailability::Missing => (
+            OmissionReason::Unavailable,
+            "candidate is missing".to_owned(),
+        ),
         AtomAvailability::Unknown => (
             OmissionReason::UnknownMeasurement,
-            "candidate state is unknown",
+            "candidate state is unknown".to_owned(),
         ),
         AtomAvailability::KnownEmpty => (
             OmissionReason::Unavailable,
-            "provider has authoritative empty coverage",
+            "provider has authoritative empty coverage".to_owned(),
         ),
-        AtomAvailability::Partial => (OmissionReason::Unavailable, "provider coverage is partial"),
+        AtomAvailability::Partial => (
+            OmissionReason::Unavailable,
+            "provider coverage is partial".to_owned(),
+        ),
         AtomAvailability::Omitted => (
             OmissionReason::Policy,
-            "candidate was already omitted by policy",
+            "candidate was already omitted by policy".to_owned(),
         ),
-        AtomAvailability::Exhausted => {
-            (OmissionReason::Unavailable, "provider source is exhausted")
-        }
+        AtomAvailability::Exhausted => (
+            OmissionReason::Unavailable,
+            "provider source is exhausted".to_owned(),
+        ),
         AtomAvailability::PresentCurrent if cost.is_none() => {
             let unavailable = input
                 .measurement(&candidate.atom_id, candidate.representation.kind())
@@ -708,18 +758,18 @@ fn make_omission(
             if unavailable {
                 (
                     OmissionReason::MeasurementUnavailable,
-                    "measurement owner could not provide an exact contribution",
+                    "measurement owner could not provide an exact contribution".to_owned(),
                 )
             } else {
                 (
                     OmissionReason::UnknownMeasurement,
-                    "exact UTF-8 contribution is unknown",
+                    "exact UTF-8 contribution is unknown".to_owned(),
                 )
             }
         }
         AtomAvailability::PresentCurrent => (
             OmissionReason::Capacity,
-            "optional allocation exceeds remaining capacity",
+            "optional allocation exceeds remaining capacity".to_owned(),
         ),
     });
     let task_revision = input
@@ -735,7 +785,7 @@ fn make_omission(
         decision: input.recipe.decision.clone(),
         task_revision,
         reason,
-        competing_constraint: constraint.to_owned(),
+        competing_constraint: constraint,
         measured_cost: cost,
         allowed_representation: binding.policy,
         expansion: binding.expansion.clone(),

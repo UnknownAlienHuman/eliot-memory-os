@@ -96,6 +96,84 @@ fn candidate(
     }
 }
 
+fn measurement(
+    context: &ContextBinding,
+    candidate: &ContextCandidate,
+    measurement_id: &str,
+    cost: AdmissionMeasuredCost,
+) -> AdmissionMeasurement {
+    AdmissionMeasurement {
+        measurement_id: id(measurement_id),
+        atom_id: candidate.atom_id.clone(),
+        representation: candidate.representation.kind(),
+        unit: MeasurementUnit::Utf8Bytes,
+        binding: AdmissionMeasurementBinding {
+            context: context.clone(),
+            schema_version: CONTEXT_CONTRACT_VERSION,
+            subject_digest: canonical_digest(candidate).expect("candidate subject"),
+            input_digest: candidate.measurement.digest.clone(),
+            output_digest: digest(b'e'),
+            serializer_id: "json-v1".to_owned(),
+            serializer_version: "1".to_owned(),
+            serializer_options_digest: digest(b'f'),
+            route_id: "route".to_owned(),
+            model_id: "model".to_owned(),
+        },
+        cost,
+        observation: None,
+    }
+}
+
+fn expansion(
+    context: &ContextBinding,
+    candidate: &ContextCandidate,
+    policy: LossPolicy,
+) -> ExpansionHandle {
+    ExpansionHandle {
+        handle_id: id(&format!("handle-{}", candidate.atom_id)),
+        atom_id: candidate.atom_id.clone(),
+        source_id: id(candidate.source.source_id.as_str()),
+        source_revision: candidate.source.revision.clone(),
+        context: context.clone(),
+        decision: decision(context),
+        policy,
+        provider_role: candidate.provider_role.clone(),
+        handle_digest: digest(b'g'),
+        expires: None,
+        invalidation: None,
+    }
+}
+
+fn make_handle_optional(input: &mut AdmissionInput) {
+    let context = input.binding.clone();
+    let candidate = &mut input.candidates.candidates[1];
+    let handle = id(&format!("handle-{}", candidate.atom_id));
+    candidate.representation = AtomRepresentation::Handle { handle };
+    candidate.loss_policy = LossPolicy::HandleOnly;
+    let policy = input
+        .recipe
+        .role_policies
+        .iter_mut()
+        .find(|policy| policy.role == SemanticRole::Optional)
+        .expect("optional policy");
+    policy.loss_policy = LossPolicy::HandleOnly;
+    policy.allowed_representations = vec![RepresentationKind::Handle];
+    input.supplied_omissions[0].policy = LossPolicy::HandleOnly;
+    input.supplied_omissions[0].expansion =
+        Some(expansion(&context, candidate, LossPolicy::HandleOnly));
+    input.supplied_omissions[0].non_recoverable_reason = None;
+    input.measurements[1] = measurement(
+        &context,
+        candidate,
+        "optional-measurement",
+        input.measurements[1].cost.clone(),
+    );
+    input.recipe.recipe_sha256 = input
+        .recipe
+        .canonical_policy_digest()
+        .expect("recipe digest");
+}
+
 fn input_with_optional(optional_cost: AdmissionMeasuredCost) -> AdmissionInput {
     let context = binding();
     let required_role = role("required-provider", SemanticRole::Goal);
@@ -188,33 +266,6 @@ fn input_with_optional(optional_cost: AdmissionMeasuredCost) -> AdmissionInput {
         rule_evidence: id("floor-rule"),
         capacity,
     };
-    let subject = canonical_digest(&required).expect("required subject");
-    let optional_subject = canonical_digest(&optional).expect("optional subject");
-    let measurement =
-        |candidate: &ContextCandidate, measurement_id: &str, cost| AdmissionMeasurement {
-            measurement_id: id(measurement_id),
-            atom_id: candidate.atom_id.clone(),
-            representation: candidate.representation.kind(),
-            unit: MeasurementUnit::Utf8Bytes,
-            binding: AdmissionMeasurementBinding {
-                context: context.clone(),
-                schema_version: CONTEXT_CONTRACT_VERSION,
-                subject_digest: if candidate.atom_id == required.atom_id {
-                    subject.clone()
-                } else {
-                    optional_subject.clone()
-                },
-                input_digest: candidate.measurement.digest.clone(),
-                output_digest: digest(b'e'),
-                serializer_id: "json-v1".to_owned(),
-                serializer_version: "1".to_owned(),
-                serializer_options_digest: digest(b'f'),
-                route_id: "route".to_owned(),
-                model_id: "model".to_owned(),
-            },
-            cost,
-            observation: None,
-        };
     AdmissionInput {
         schema_version: CONTEXT_CONTRACT_VERSION,
         binding: context.clone(),
@@ -276,23 +327,38 @@ fn input_with_optional(optional_cost: AdmissionMeasuredCost) -> AdmissionInput {
         }],
         measurements: vec![
             measurement(
+                &context,
                 &required,
                 "required-measurement",
                 AdmissionMeasuredCost::ExactUtf8Bytes { value: 20 },
             ),
-            measurement(&optional, "optional-measurement", optional_cost),
+            measurement(&context, &optional, "optional-measurement", optional_cost),
         ],
     }
 }
 
 #[test]
 fn required_floor_is_admitted_before_fitting_optional_material() {
-    let input = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 20 });
+    let mut input = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 20 });
+    let dependency = input.candidates.candidates[1].atom_id.clone();
+    input.candidates.candidates[0]
+        .dependencies
+        .push(dependency.clone());
+    input.floor.floor.members[0]
+        .required_dependencies
+        .push(dependency);
+    make_handle_optional(&mut input);
     let result = admit_context(&input).expect("valid admission");
     let ContextOutcome::Complete(ref admitted) = result.outcome else {
         panic!("floor should fit");
     };
     assert_eq!(admitted.records.len(), 2);
+    assert!(
+        admitted
+            .records
+            .iter()
+            .any(|record| record.disposition == AdmissionDisposition::HandleOnly)
+    );
     assert_eq!(admitted.economy.allocations.admitted_required, 20);
     assert_eq!(admitted.economy.allocations.admitted_optional, 20);
     result.validate_for(&input).expect("result conservation");
@@ -333,6 +399,31 @@ fn required_missing_stale_unknown_and_oversized_are_exact_gaps() {
     assert_eq!(gap.missing, vec![id("required")]);
     assert_eq!(gap.provider_gaps.len(), 1);
 
+    let mut stale_unavailable = input_with_optional(AdmissionMeasuredCost::Unavailable);
+    stale_unavailable.candidates.candidates[0].availability = AtomAvailability::Stale;
+    stale_unavailable.candidates.denominator.dispositions[0].state = AtomAvailability::Stale;
+    stale_unavailable.recipe.denominator.dispositions[0].state = AtomAvailability::Stale;
+    stale_unavailable.floor.floor.members[0].availability = AtomAvailability::Stale;
+    stale_unavailable.floor.floor.providers.dispositions[0].state = AtomAvailability::Stale;
+    let unavailable_id = stale_unavailable.candidates.candidates[1].atom_id.clone();
+    stale_unavailable.candidates.candidates[0]
+        .dependencies
+        .push(unavailable_id.clone());
+    stale_unavailable.floor.floor.members[0]
+        .required_dependencies
+        .push(unavailable_id);
+    stale_unavailable.recipe.recipe_sha256 = stale_unavailable
+        .recipe
+        .canonical_policy_digest()
+        .expect("recipe digest");
+    let result = admit_context(&stale_unavailable).expect("combined floor gaps");
+    let ContextOutcome::Incomplete(gap) = result.outcome else {
+        panic!("expected combined gap");
+    };
+    assert_eq!(gap.stale, vec![id("required")]);
+    assert_eq!(gap.unavailable, vec![id("optional")]);
+    assert!(gap.measurements.contains(&id("optional-measurement")));
+
     let mut unknown = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     unknown.measurements[0].cost = AdmissionMeasuredCost::Unknown;
     let result = admit_context(&unknown).expect("unknown is explicit");
@@ -356,7 +447,8 @@ fn required_missing_stale_unknown_and_oversized_are_exact_gaps() {
 
 #[test]
 fn exact_optional_overbudget_is_reversible_omission() {
-    let input = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 80 });
+    let mut input = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 80 });
+    make_handle_optional(&mut input);
     let result = admit_context(&input).expect("optional omission is valid");
     let ContextOutcome::Complete(admitted) = result.outcome else {
         panic!("floor fits");
@@ -369,7 +461,7 @@ fn exact_optional_overbudget_is_reversible_omission() {
         .expect("omission evidence");
     assert_eq!(omission.measured_cost, Some(80));
     assert_eq!(omission.reason, OmissionReason::Capacity);
-    assert!(omission.non_recoverable_reason.is_some());
+    assert!(omission.expansion.is_some());
 }
 
 #[test]
@@ -384,7 +476,90 @@ fn unknown_optional_is_visible_without_inventing_zero_cost() {
 
 #[test]
 fn candidate_permutation_keeps_membership_and_priority_stable() {
-    let first = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 20 });
+    let mut first = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
+    first.recipe.capacity.route_capacity = 55;
+    first.floor.floor.capacity = first.recipe.capacity;
+    first.measurement_profile.capacity = first.recipe.capacity;
+    first.recipe.recipe_sha256 = first
+        .recipe
+        .canonical_policy_digest()
+        .expect("recipe digest");
+    let context = first.binding.clone();
+    let role = first.candidates.candidates[1].provider_role.clone();
+    let mut a = candidate(
+        &context,
+        "a",
+        role.clone(),
+        "aaaaaaaaaa",
+        LossPolicy::Summarizable,
+        false,
+    );
+    let mut b = candidate(
+        &context,
+        "b",
+        role.clone(),
+        "b",
+        LossPolicy::Summarizable,
+        false,
+    );
+    let d = first.candidates.candidates[1].clone();
+    a.dependencies.push(d.atom_id.clone());
+    b.dependencies.push(d.atom_id.clone());
+    first.candidates.candidates.push(a.clone());
+    first.candidates.candidates.push(b.clone());
+    first.measurements.push(measurement(
+        &context,
+        &a,
+        "a-measurement",
+        AdmissionMeasuredCost::ExactUtf8Bytes { value: 10 },
+    ));
+    first.measurements.push(measurement(
+        &context,
+        &b,
+        "b-measurement",
+        AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 },
+    ));
+    first.priority.priorities[1] = CandidatePriority {
+        atom_id: d.atom_id.clone(),
+        class: AdmissionPriorityClass::Low,
+        ordinal: 2,
+    };
+    first.priority.priorities.push(CandidatePriority {
+        atom_id: a.atom_id.clone(),
+        class: AdmissionPriorityClass::High,
+        ordinal: 0,
+    });
+    first.priority.priorities.push(CandidatePriority {
+        atom_id: b.atom_id.clone(),
+        class: AdmissionPriorityClass::Normal,
+        ordinal: 1,
+    });
+    first.supplied_omissions.push(SuppliedOmissionBinding {
+        atom_id: a.atom_id.clone(),
+        policy: LossPolicy::Summarizable,
+        expansion: None,
+        non_recoverable_reason: Some(NonRecoverableReason::SourceUnavailable),
+        authorization_requirement: "owner".to_owned(),
+        privacy_requirement: "scoped".to_owned(),
+        proof_requirement: "observation".to_owned(),
+        expires: None,
+        invalidation: None,
+    });
+    first.supplied_omissions.push(SuppliedOmissionBinding {
+        atom_id: b.atom_id.clone(),
+        policy: LossPolicy::Summarizable,
+        expansion: None,
+        non_recoverable_reason: Some(NonRecoverableReason::SourceUnavailable),
+        authorization_requirement: "owner".to_owned(),
+        privacy_requirement: "scoped".to_owned(),
+        proof_requirement: "observation".to_owned(),
+        expires: None,
+        invalidation: None,
+    });
+    first.recipe.recipe_sha256 = first
+        .recipe
+        .canonical_policy_digest()
+        .expect("recipe digest");
     let mut second = first.clone();
     second.candidates.candidates.reverse();
     second.measurements.reverse();
@@ -393,11 +568,17 @@ fn candidate_permutation_keeps_membership_and_priority_stable() {
     let one = admit_context(&first).expect("first order");
     let two = admit_context(&second).expect("permuted order");
     assert_eq!(one, two);
-    assert_eq!(one.evidence.decisions.len(), 2);
-    assert!(
-        one.evidence
-            .decisions
-            .iter()
-            .all(|decision| { matches!(decision.disposition, AdmissionDisposition::Include) })
-    );
+    assert_eq!(one.evidence.decisions.len(), 4);
+    assert_eq!(one.evidence.omissions.len(), 1);
+    assert_eq!(one.evidence.omissions[0].atom_id, id("a"));
+    assert_eq!(one.evidence.omissions[0].measured_cost, Some(10));
+    let ContextOutcome::Complete(admitted) = one.outcome else {
+        panic!("shared dependency route should fit");
+    };
+    let admitted_ids = admitted
+        .records
+        .iter()
+        .map(|record| record.candidate.atom_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(admitted_ids, vec![id("b"), id("optional"), id("required")]);
 }
