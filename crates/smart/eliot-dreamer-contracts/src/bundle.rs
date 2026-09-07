@@ -128,11 +128,13 @@ impl OmissionHandle {
         if let Some(reason) = &self.nonrecoverable_reason {
             check_text(reason, "nonrecoverable_reason", 1024)?;
         }
-        let reason_ok = self
+        let no_reason = self
             .nonrecoverable_reason
-            .as_ref()
-            .is_some_and(|reason| !reason.trim().is_empty());
-        if !self.reversible && !reason_ok {
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty();
+        if !self.reversible && no_reason {
             return Err(ContractViolation::BindingMismatch {
                 field: "nonrecoverable_reason",
                 reason: "irreversible omission requires an explicit nonrecoverable reason"
@@ -186,14 +188,7 @@ pub struct DreamInputBundle {
 impl DreamInputBundle {
     /// Validates intrinsic bounds, bindings and completeness rules.
     pub fn validate(&self) -> Result<(), ContractViolation> {
-        if self.schema_version != BUNDLE_SCHEMA_VERSION {
-            return Err(ContractViolation::OutOfBounds {
-                field: "schema_version",
-                min: 1,
-                max: 1,
-                got: i64::from(self.schema_version),
-            });
-        }
+        crate::error::check_schema_version(self.schema_version, BUNDLE_SCHEMA_VERSION)?;
         check_text(&self.job_id, "job_id", 256)?;
         check_text(&self.scope_id, "scope_id", 256)?;
         check_text(&self.task_id, "task_id", 256)?;
@@ -265,46 +260,51 @@ pub fn omit_handle(
 }
 
 #[cfg(test)]
+use eliot_contracts::{AuthorityEpoch, ResourceGeneration, sha256_hex};
+
+#[cfg(test)]
+pub(crate) fn valid_fence() -> StateFence {
+    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+}
+
+#[cfg(test)]
+pub(crate) fn valid_omission() -> OmissionHandle {
+    OmissionHandle {
+        handle: "source-b".to_string(),
+        reason: "upstream unavailable".to_string(),
+        reversible: true,
+        scope_id: "scope-1".to_string(),
+        task_id: "task-1".to_string(),
+        digest: sha256_hex(b"omission-b"),
+        nonrecoverable_reason: None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn valid_bundle() -> DreamInputBundle {
+    DreamInputBundle {
+        schema_version: 1,
+        job_id: "job-1".to_string(),
+        scope_id: "scope-1".to_string(),
+        task_id: "task-1".to_string(),
+        state_fence: valid_fence(),
+        manifest_digest: sha256_hex(b"manifest"),
+        materials: vec![BundleMaterial {
+            handle: "source-a".to_string(),
+            disposition: SourceDisposition::Required,
+            bytes: 12,
+            digest: sha256_hex(b"source-a"),
+        }],
+        omissions: vec![valid_omission()],
+        completeness: BundleCompleteness::PartialForScope,
+        authoritative_denominator: None,
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, sha256_hex};
-
-    fn valid_fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
-    }
-
-    fn valid_omission() -> OmissionHandle {
-        OmissionHandle {
-            handle: "source-b".to_string(),
-            reason: "upstream unavailable".to_string(),
-            reversible: true,
-            scope_id: "scope-1".to_string(),
-            task_id: "task-1".to_string(),
-            digest: sha256_hex(b"omission-b"),
-            nonrecoverable_reason: None,
-        }
-    }
-
-    fn valid_bundle() -> DreamInputBundle {
-        DreamInputBundle {
-            schema_version: 1,
-            job_id: "job-1".to_string(),
-            scope_id: "scope-1".to_string(),
-            task_id: "task-1".to_string(),
-            state_fence: valid_fence(),
-            manifest_digest: sha256_hex(b"manifest"),
-            materials: vec![BundleMaterial {
-                handle: "source-a".to_string(),
-                disposition: SourceDisposition::Required,
-                bytes: 12,
-                digest: sha256_hex(b"source-a"),
-            }],
-            omissions: vec![valid_omission()],
-            completeness: BundleCompleteness::PartialForScope,
-            authoritative_denominator: None,
-        }
-    }
 
     // WORK_UNIT_CASE: 578/8
     #[test]
@@ -374,10 +374,8 @@ mod tests {
         let back: DreamInputBundle = serde_json::from_str(&wire).expect("fixture deserializes");
         assert!(back.validate().is_ok());
         assert_eq!(back, bundle);
-        assert_eq!(
-            back.authoritative_denominator.as_deref(),
-            Some("scope-1:2-of-2")
-        );
+        let denom = back.authoritative_denominator.as_deref();
+        assert_eq!(denom, Some("scope-1:2-of-2"));
         let mut maxed = valid_bundle();
         maxed.materials[0].handle = "h".repeat(128);
         maxed.authoritative_denominator = Some("d".repeat(256));

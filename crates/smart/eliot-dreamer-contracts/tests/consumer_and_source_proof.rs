@@ -8,11 +8,13 @@ use eliot_contracts::{AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, 
 use eliot_dreamer_contracts::curation::{ClassificationPayload, TargetEvidence, route_payload};
 use eliot_dreamer_contracts::job::{Requester, RequesterOrigin};
 use eliot_dreamer_contracts::{
-    AtomicityMode, BudgetLimits, BundleCompleteness, CURATION_WIRE_KINDS, ContractViolation,
-    CurationFamily, CurationHandlerDescriptor, CurationHandlerPort, CurationHandlerRegistry,
-    CurationKind, CurationPayload, DreamInputBundle, DreamJobInput, JobClass, ModelDraft,
-    ScreenBinding, ScreenEligibility, ScreenReference, ScreenState, TargetDenominator,
-    TypedCurationHandlerRequest, ValidationReceipt, family_of, parse_kind,
+    AtomicityMode, BudgetLimits, BudgetUsage, BundleCompleteness, BundleMaterial,
+    CURATION_WIRE_KINDS, ClaimResidue, ContractViolation, CurationAcceptanceCtx, CurationFamily,
+    CurationHandlerDescriptor, CurationHandlerPort, CurationHandlerRegistry, CurationKind,
+    CurationPayload, DreamInputBundle, DreamJobInput, GroundedDreamDraft, JobClass, ModelDraft,
+    OmissionHandle, ScreenBinding, ScreenEligibility, ScreenReference, ScreenState,
+    SourceDisposition, SupportState, TargetDenominator, TypedCurationHandlerRequest,
+    ValidatedCurationItem, ValidationReceipt, canonical_bytes, digest_hex, family_of, parse_kind,
 };
 
 fn assert_stable(check: impl Fn() -> bool, ctx: &str) {
@@ -82,7 +84,7 @@ fn fixture_job() -> DreamJobInput {
             max_stu: Some(10),
         },
         deadline_ms: None,
-        frozen_manifest_digest: "e".repeat(64),
+        frozen_manifest_digest: "f".repeat(64),
     }
 }
 
@@ -94,8 +96,35 @@ fn fixture_bundle() -> DreamInputBundle {
         task_id: "task-1".to_owned(),
         state_fence: fence(),
         manifest_digest: "f".repeat(64),
-        materials: Vec::new(),
-        omissions: Vec::new(),
+        materials: vec![
+            BundleMaterial {
+                handle: "a".to_owned(),
+                disposition: SourceDisposition::Required,
+                bytes: 12,
+                digest: "a".repeat(64),
+            },
+            BundleMaterial {
+                handle: "b".to_owned(),
+                disposition: SourceDisposition::Required,
+                bytes: 12,
+                digest: "b".repeat(64),
+            },
+            BundleMaterial {
+                handle: "ab".to_owned(),
+                disposition: SourceDisposition::Required,
+                bytes: 12,
+                digest: "ab".repeat(32),
+            },
+        ],
+        omissions: vec![OmissionHandle {
+            handle: "e-1".to_owned(),
+            reason: "upstream unavailable".to_owned(),
+            reversible: true,
+            scope_id: "scope-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            digest: "e".repeat(64),
+            nonrecoverable_reason: None,
+        }],
         completeness: BundleCompleteness::PartialForScope,
         authoritative_denominator: None,
     }
@@ -134,6 +163,20 @@ fn fixture_receipt() -> ValidationReceipt {
         state_fence: fence(),
         preservation_digest: "d".repeat(64),
         budget_digest: "e".repeat(64),
+    }
+}
+
+fn fixture_grounded() -> GroundedDreamDraft {
+    GroundedDreamDraft {
+        schema_version: 1,
+        job_id: "job-44".to_owned(),
+        draft_digest: "a".repeat(64),
+        residues: vec![ClaimResidue {
+            claim: "cache helps".to_owned(),
+            state: SupportState::Supported,
+            detail: "manifest covers it".to_owned(),
+        }],
+        coverage_note: "covered".to_owned(),
     }
 }
 
@@ -261,6 +304,207 @@ fn assert_typed_dispatch(registry: &CurationHandlerRegistry, ports: &[CurationHa
     }
 }
 
+fn seam_fixtures(
+    job: &DreamJobInput,
+) -> (
+    GroundedDreamDraft,
+    BudgetUsage,
+    String,
+    Vec<String>,
+    TargetDenominator,
+) {
+    let grounded = fixture_grounded();
+    grounded.validate().expect("grounded validates");
+    let usage = BudgetUsage::default();
+    let job_digest = digest_hex(&canonical_bytes(job).expect("canonical job"));
+    let screened = vec!["a".to_owned(), "b".to_owned(), "ab".to_owned()];
+    let denominator = TargetDenominator {
+        mode: AtomicityMode::AllOrNothing,
+        members: screened.clone(),
+        expected_total: 3,
+    };
+    (grounded, usage, job_digest, screened, denominator)
+}
+
+fn seam_item(
+    kind: CurationKind,
+    family: CurationFamily,
+    payload: CurationPayload,
+    receipt: &ValidationReceipt,
+    denominator: &TargetDenominator,
+    job_digest: &str,
+) -> ValidatedCurationItem {
+    ValidatedCurationItem {
+        receipt: receipt.clone(),
+        kind_spelling: kind.as_str().to_owned(),
+        family_spelling: family.as_str().to_owned(),
+        payload,
+        denominator: denominator.clone(),
+        source_digest: "a".repeat(64),
+        task_id: "task-1".to_owned(),
+        scope_id: "scope-1".to_owned(),
+        state_fence: fence(),
+        budget_note: "within limits".to_owned(),
+        job_digest: job_digest.to_owned(),
+        requester: Requester {
+            origin: RequesterOrigin::Human,
+            principal: "alice".to_owned(),
+            session: None,
+        },
+    }
+}
+
+fn seam_screen(item_digest: &str) -> ScreenBinding {
+    ScreenBinding {
+        request_id: RequestId::new("req-44").expect("request id"),
+        receipt_id: ReceiptId::new("rcpt-44").expect("receipt id"),
+        screened_targets: vec!["a".to_owned(), "b".to_owned(), "ab".to_owned()],
+        source_snapshot: "snapshot-1".to_owned(),
+        source_revision: "rev-7".to_owned(),
+        profile: "default".to_owned(),
+        task_id: "task-1".to_owned(),
+        scope_id: "scope-1".to_owned(),
+        state_fence: fence(),
+        state: ScreenState::Eligible,
+        result_digest: "a".repeat(64),
+        item_digest: item_digest.to_owned(),
+    }
+}
+
+fn seam_request(
+    kind: CurationKind,
+    family: CurationFamily,
+    payload: CurationPayload,
+    denominator: &TargetDenominator,
+    screen: &ScreenBinding,
+) -> TypedCurationHandlerRequest {
+    TypedCurationHandlerRequest {
+        request_id: "req-44".to_owned(),
+        receipt_id: "rcpt-44".to_owned(),
+        source_snapshot: "snapshot-1".to_owned(),
+        source_revision: "rev-7".to_owned(),
+        profile: "default".to_owned(),
+        kind,
+        family,
+        job_id: "job-44".to_owned(),
+        scope_id: "scope-1".to_owned(),
+        task_id: "task-1".to_owned(),
+        state_fence: fence(),
+        payload,
+        denominator: denominator.clone(),
+        screen_binding: Some(screen.clone()),
+    }
+}
+
+fn seam_ctx<'a>(
+    parts: (
+        &'a DreamJobInput,
+        &'a DreamInputBundle,
+        &'a ValidationReceipt,
+        &'a GroundedDreamDraft,
+        &'a BudgetUsage,
+    ),
+    screen: &'a ScreenBinding,
+    request: &'a TypedCurationHandlerRequest,
+) -> CurationAcceptanceCtx<'a> {
+    let (job, bundle, receipt, grounded, usage) = parts;
+    CurationAcceptanceCtx {
+        job,
+        bundle,
+        receipt,
+        screen,
+        grounded,
+        usage,
+        request,
+    }
+}
+
+fn assert_item_accept_seam(
+    job: &DreamJobInput,
+    bundle: &DreamInputBundle,
+    receipt: &ValidationReceipt,
+) {
+    let (grounded, usage, job_digest, _screened, denominator) = seam_fixtures(job);
+    let parts = (job, bundle, receipt, &grounded, &usage);
+    for spelling in CURATION_WIRE_KINDS {
+        let kind = parse_kind(spelling).expect("known wire kind");
+        let family = family_of(kind);
+        let payload = route_payload(kind, &typed_wire(kind)).expect("typed payload routes");
+        assert_eq!(payload.kind(), kind, "discriminant routing");
+        let item = seam_item(
+            kind,
+            family,
+            payload.clone(),
+            receipt,
+            &denominator,
+            &job_digest,
+        );
+        item.validate().expect("item validates");
+        let digest = item.item_digest(&grounded).expect("item digest");
+        assert_eq!(digest.len(), 64, "item digest is sha256 hex");
+        let mut probe = item.clone();
+        probe.task_id = "task-9".into();
+        assert_ne!(
+            probe.item_digest(&grounded).expect("digest"),
+            digest,
+            "digest tracks task identity"
+        );
+        let screen = seam_screen(&digest);
+        let request = seam_request(kind, family, payload, &denominator, &screen);
+        request.validate().expect("seam request validates");
+        let ctx = seam_ctx(parts, &screen, &request);
+        item.accept(&ctx).expect("accept ok");
+        assert_eq!(item.family_spelling, family.as_str());
+    }
+}
+
+fn assert_item_accept_negatives(
+    job: &DreamJobInput,
+    bundle: &DreamInputBundle,
+    receipt: &ValidationReceipt,
+) {
+    let (grounded, usage, job_digest, screened, denominator) = seam_fixtures(job);
+    let parts = (job, bundle, receipt, &grounded, &usage);
+    let kind = parse_kind(CURATION_WIRE_KINDS[0]).expect("known wire kind");
+    let family = family_of(kind);
+    let payload = route_payload(kind, &typed_wire(kind)).expect("typed payload routes");
+    let item = seam_item(
+        kind,
+        family,
+        payload.clone(),
+        receipt,
+        &denominator,
+        &job_digest,
+    );
+    let digest = item.item_digest(&grounded).expect("item digest");
+    let screen = seam_screen(&digest);
+    let request = seam_request(kind, family, payload, &denominator, &screen);
+    let mut wrong_screen = screen.clone();
+    wrong_screen.item_digest = "c".repeat(64);
+    let ctx = seam_ctx(parts, &wrong_screen, &request);
+    assert!(item.accept(&ctx).is_err(), "wrong screen digest must fail");
+    let mut loose = item.clone();
+    loose.denominator = TargetDenominator {
+        mode: AtomicityMode::PerMember,
+        members: [screened, vec!["extra".to_owned()]].concat(),
+        expected_total: 4,
+    };
+    let mut loose_screen = screen.clone();
+    loose_screen.item_digest = loose.item_digest(&grounded).expect("digest");
+    let mut loose_request = request.clone();
+    loose_request.denominator = loose.denominator.clone();
+    let ctx = seam_ctx(parts, &loose_screen, &loose_request);
+    loose.accept(&ctx).expect("per-member subset accepts");
+    loose.denominator.mode = AtomicityMode::AllOrNothing;
+    let mut strict_screen = screen.clone();
+    strict_screen.item_digest = loose.item_digest(&grounded).expect("digest");
+    let ctx = seam_ctx(parts, &strict_screen, &request);
+    assert!(
+        loose.accept(&ctx).is_err(),
+        "all-or-nothing subset must fail"
+    );
+}
+
 fn assert_target_evidence_roles() {
     let overlap = TargetEvidence {
         targets: vec!["a".into()],
@@ -310,6 +554,8 @@ fn marker_44_independent_consumer_compile_fixtures() {
     consumer_shape(&bundle, &draft, &receipt, &screen);
     assert_eq!(ports.len(), 10, "ten injected ports");
     assert_typed_dispatch(&registry, &ports);
+    assert_item_accept_seam(&job, &bundle, &receipt);
+    assert_item_accept_negatives(&job, &bundle, &receipt);
     assert_target_evidence_roles();
 }
 

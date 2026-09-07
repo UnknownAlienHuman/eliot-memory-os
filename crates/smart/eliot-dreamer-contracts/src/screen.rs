@@ -12,7 +12,9 @@ use eliot_contracts::{ReceiptId, RequestId, StateFence};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{ContractViolation, check_fence, check_text, check_vec_bound, is_hex64_lower};
+use crate::error::{
+    ContractViolation, check_fence, check_text, check_vec_bound, closed_wire_enum, is_hex64_lower,
+};
 
 const MAX_TEXT: usize = 256;
 
@@ -43,46 +45,19 @@ pub enum ScreenState {
     Unprocessed,
 }
 
+closed_wire_enum!(assoc ScreenState, field = "screen_state", [
+    Eligible => "eligible",
+    Protected => "protected",
+    ProtectionUnknown => "protection_unknown",
+    Malformed => "malformed",
+    Stale => "stale",
+    Unavailable => "unavailable",
+    Partial => "partial",
+    Truncated => "truncated",
+    Unprocessed => "unprocessed",
+]);
+
 impl ScreenState {
-    /// Returns the canonical wire spelling.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Eligible => "eligible",
-            Self::Protected => "protected",
-            Self::ProtectionUnknown => "protection_unknown",
-            Self::Malformed => "malformed",
-            Self::Stale => "stale",
-            Self::Unavailable => "unavailable",
-            Self::Partial => "partial",
-            Self::Truncated => "truncated",
-            Self::Unprocessed => "unprocessed",
-        }
-    }
-
-    /// Parses a wire spelling into a [`ScreenState`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContractViolation::UnknownVariant`] for any unknown spelling.
-    pub fn parse(value: &str) -> Result<Self, ContractViolation> {
-        match value {
-            "eligible" => Ok(Self::Eligible),
-            "protected" => Ok(Self::Protected),
-            "protection_unknown" => Ok(Self::ProtectionUnknown),
-            "malformed" => Ok(Self::Malformed),
-            "stale" => Ok(Self::Stale),
-            "unavailable" => Ok(Self::Unavailable),
-            "partial" => Ok(Self::Partial),
-            "truncated" => Ok(Self::Truncated),
-            "unprocessed" => Ok(Self::Unprocessed),
-            other => Err(ContractViolation::UnknownVariant {
-                field: "screen_state",
-                value: other.to_owned(),
-            }),
-        }
-    }
-
     /// Returns true only for [`ScreenState::Eligible`].
     #[must_use]
     pub const fn is_eligible(self) -> bool {
@@ -241,7 +216,11 @@ impl ScreenBinding {
             return Err(ContractViolation::MissingField("screened_targets"));
         }
         check_vec_bound(self.screened_targets.len(), 1024, "screened_targets")?;
-        let aggregate: usize = self.screened_targets.iter().map(String::len).sum();
+        let aggregate: usize = self
+            .screened_targets
+            .iter()
+            .map(String::len)
+            .fold(0usize, usize::saturating_add);
         check_vec_bound(aggregate, 1_048_576, "screened_targets")?;
         let mut ordered = self.screened_targets.clone();
         ordered.sort();

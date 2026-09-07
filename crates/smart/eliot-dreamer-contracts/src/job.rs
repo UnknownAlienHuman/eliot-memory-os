@@ -12,9 +12,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use eliot_contracts::StateFence;
+#[cfg(test)]
+use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
 
 use crate::budget::BudgetLimits;
-use crate::error::{ContractViolation, check_fence, check_text, is_hex64_lower};
+use crate::error::{ContractViolation, check_fence, check_text, closed_wire_enum, is_hex64_lower};
 
 /// Exact wire `schema_version` admitted by [`DreamJobInput`].
 pub const DREAM_JOB_SCHEMA_VERSION: u32 = 1;
@@ -62,42 +64,17 @@ pub enum JobClass {
     ConfigurationAssistance,
 }
 
-impl JobClass {
-    /// Returns the exact wire spelling of this class.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Orientation => "orientation",
-            Self::Curation => "curation",
-            Self::Clarification => "clarification",
-            Self::ResearchSynthesis => "research_synthesis",
-            Self::ArchitectureSelfQuery => "architecture_self_query",
-            Self::DevelopmentDiagnosis => "development_diagnosis",
-            Self::Maintenance => "maintenance",
-            Self::OrchestrationPlanning => "orchestration_planning",
-            Self::ConfigurationAssistance => "configuration_assistance",
-        }
-    }
-}
-
-/// Parses an exact wire spelling into a [`JobClass`], rejecting anything
-/// else (including `"other"`, `"Other"`, and `""`) as fail-closed.
-pub fn parse_job_class(value: &str) -> Result<JobClass, ContractViolation> {
-    match value {
-        "orientation" => Ok(JobClass::Orientation),
-        "curation" => Ok(JobClass::Curation),
-        "clarification" => Ok(JobClass::Clarification),
-        "research_synthesis" => Ok(JobClass::ResearchSynthesis),
-        "architecture_self_query" => Ok(JobClass::ArchitectureSelfQuery),
-        "development_diagnosis" => Ok(JobClass::DevelopmentDiagnosis),
-        "maintenance" => Ok(JobClass::Maintenance),
-        "orchestration_planning" => Ok(JobClass::OrchestrationPlanning),
-        "configuration_assistance" => Ok(JobClass::ConfigurationAssistance),
-        _ => Err(ContractViolation::UnknownVariant {
-            field: "job_class",
-            value: value.to_owned(),
-        }),
-    }
-}
+closed_wire_enum!(free JobClass, parse_job_class, field = "job_class", [
+    Orientation => "orientation",
+    Curation => "curation",
+    Clarification => "clarification",
+    ResearchSynthesis => "research_synthesis",
+    ArchitectureSelfQuery => "architecture_self_query",
+    DevelopmentDiagnosis => "development_diagnosis",
+    Maintenance => "maintenance",
+    OrchestrationPlanning => "orchestration_planning",
+    ConfigurationAssistance => "configuration_assistance",
+]);
 
 /// Closed requester origin. Model text can never rewrite this value: it is
 /// bound at intake and carried verbatim through the candidate pipeline.
@@ -114,30 +91,11 @@ pub enum RequesterOrigin {
     SchedulePolicy,
 }
 
-impl RequesterOrigin {
-    /// Returns the exact wire spelling of this origin.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Human => "human",
-            Self::AdmittedAgent => "admitted_agent",
-            Self::SchedulePolicy => "schedule_policy",
-        }
-    }
-}
-
-/// Parses an exact wire spelling into a [`RequesterOrigin`], rejecting
-/// anything else as fail-closed.
-pub fn parse_requester_origin(value: &str) -> Result<RequesterOrigin, ContractViolation> {
-    match value {
-        "human" => Ok(RequesterOrigin::Human),
-        "admitted_agent" => Ok(RequesterOrigin::AdmittedAgent),
-        "schedule_policy" => Ok(RequesterOrigin::SchedulePolicy),
-        _ => Err(ContractViolation::UnknownVariant {
-            field: "requester_origin",
-            value: value.to_owned(),
-        }),
-    }
-}
+closed_wire_enum!(free RequesterOrigin, parse_requester_origin, field = "requester_origin", [
+    Human => "human",
+    AdmittedAgent => "admitted_agent",
+    SchedulePolicy => "schedule_policy",
+]);
 
 /// Authenticated requester binding carried with every dream job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -261,16 +219,15 @@ impl DreamJobInput {
             scope_id: &self.scope_id,
         };
         if let Ok(bytes) = eliot_contracts::canonical_json_bytes(&parts) {
-            eliot_contracts::sha256_hex(&bytes)
-        } else {
-            let fallback = std::format!(
-                "{}|{}|{}",
-                self.job_class.as_str(),
-                self.operation_id,
-                self.scope_id
-            );
-            eliot_contracts::sha256_hex(fallback.as_bytes())
+            return eliot_contracts::sha256_hex(&bytes);
         }
+        let fallback = std::format!(
+            "{}|{}|{}",
+            self.job_class.as_str(),
+            self.operation_id,
+            self.scope_id
+        );
+        eliot_contracts::sha256_hex(fallback.as_bytes())
     }
 }
 
@@ -307,45 +264,45 @@ pub fn brief_kinds_distinct() -> bool {
 }
 
 #[cfg(test)]
+pub(crate) fn sample_job() -> DreamJobInput {
+    DreamJobInput {
+        schema_version: DREAM_JOB_SCHEMA_VERSION,
+        job_class: JobClass::Orientation,
+        requester: Requester {
+            origin: RequesterOrigin::Human,
+            principal: "alice".to_owned(),
+            session: None,
+        },
+        operation_id: "op-1".to_owned(),
+        idempotency_key: "idem-1".to_owned(),
+        task_id: "task-1".to_owned(),
+        scope_id: "scope-1".to_owned(),
+        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        privacy_profile: PRIVACY_LOCAL_ONLY.to_owned(),
+        contract_ref: "contract-1".to_owned(),
+        policy_ref: "policy-1".to_owned(),
+        budget: BudgetLimits {
+            input_bytes: Some(1024),
+            output_bytes: Some(1024),
+            source_width: Some(8),
+            reference_width: Some(8),
+            model_calls: Some(4),
+            attempts: Some(2),
+            candidates: Some(2),
+            wall_ms: Some(1000),
+            work_fan_out: Some(2),
+            report_bytes: Some(1024),
+            max_stu: Some(10),
+        },
+        deadline_ms: None,
+        frozen_manifest_digest: "0123456789abcdef".repeat(4),
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
-
-    fn sample_job() -> DreamJobInput {
-        DreamJobInput {
-            schema_version: DREAM_JOB_SCHEMA_VERSION,
-            job_class: JobClass::Orientation,
-            requester: Requester {
-                origin: RequesterOrigin::Human,
-                principal: "alice".to_owned(),
-                session: None,
-            },
-            operation_id: "op-1".to_owned(),
-            idempotency_key: "idem-1".to_owned(),
-            task_id: "task-1".to_owned(),
-            scope_id: "scope-1".to_owned(),
-            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
-            privacy_profile: PRIVACY_LOCAL_ONLY.to_owned(),
-            contract_ref: "contract-1".to_owned(),
-            policy_ref: "policy-1".to_owned(),
-            budget: BudgetLimits {
-                input_bytes: Some(1024),
-                output_bytes: Some(1024),
-                source_width: Some(8),
-                reference_width: Some(8),
-                model_calls: Some(4),
-                attempts: Some(2),
-                candidates: Some(2),
-                wall_ms: Some(1000),
-                work_fan_out: Some(2),
-                report_bytes: Some(1024),
-                max_stu: Some(10),
-            },
-            deadline_ms: None,
-            frozen_manifest_digest: "0123456789abcdef".repeat(4),
-        }
-    }
 
     // WORK_UNIT_CASE: 578/1
     #[test]
@@ -409,14 +366,10 @@ mod tests {
     // WORK_UNIT_CASE: 578/3
     #[test]
     fn brief_kinds_are_distinct() {
-        assert_ne!(ARCHITECTURE_BRIEF_KIND, IMPLEMENTATION_BRIEF_KIND);
+        assert!(ARCHITECTURE_BRIEF_KIND != IMPLEMENTATION_BRIEF_KIND && brief_kinds_distinct());
         assert_eq!(ARCHITECTURE_BRIEF_KIND, "architecture_brief");
         assert_eq!(IMPLEMENTATION_BRIEF_KIND, "implementation_brief");
-        assert!(brief_kinds_distinct());
-        assert_ne!(
-            ArchitectureBriefMarker::KIND,
-            ImplementationBriefMarker::KIND
-        );
+        assert!(ArchitectureBriefMarker::KIND != ImplementationBriefMarker::KIND);
         assert_eq!(ArchitectureBriefMarker::KIND, ARCHITECTURE_BRIEF_KIND);
         assert_eq!(ImplementationBriefMarker::KIND, IMPLEMENTATION_BRIEF_KIND);
     }

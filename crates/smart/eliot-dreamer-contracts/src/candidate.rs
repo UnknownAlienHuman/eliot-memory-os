@@ -12,15 +12,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::curation::{CurationKind, kind_family};
-use crate::error::{ContractViolation, check_text, check_vec_bound};
+use crate::error::{ContractViolation, check_text, check_vec_bound, closed_wire_enum};
 
 fn pres(dimension: &str, detail: &str) -> ContractViolation {
     ContractViolation::Preservation(format!("dimension {dimension} {detail}"))
-}
-
-fn unknown_variant(field: &'static str, value: &str) -> ContractViolation {
-    let value = value.to_owned();
-    ContractViolation::UnknownVariant { field, value }
 }
 
 fn dup_or_missing(kind: &str, dimension: &str) -> ContractViolation {
@@ -50,39 +45,15 @@ pub enum PreservationDimension {
     ProvenanceRetention,
 }
 
-impl PreservationDimension {
-    /// Returns the canonical wire spelling.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Coverage => "coverage",
-            Self::Faithfulness => "faithfulness",
-            Self::Lineage => "lineage",
-            Self::Reversibility => "reversibility",
-            Self::AuthorityCeiling => "authority_ceiling",
-            Self::DependencyClosure => "dependency_closure",
-            Self::ProvenanceRetention => "provenance_retention",
-        }
-    }
-
-    /// Parses a wire spelling into a [`PreservationDimension`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContractViolation::UnknownVariant`] for any unknown spelling.
-    pub fn parse(value: &str) -> Result<Self, ContractViolation> {
-        match value {
-            "coverage" => Ok(Self::Coverage),
-            "faithfulness" => Ok(Self::Faithfulness),
-            "lineage" => Ok(Self::Lineage),
-            "reversibility" => Ok(Self::Reversibility),
-            "authority_ceiling" => Ok(Self::AuthorityCeiling),
-            "dependency_closure" => Ok(Self::DependencyClosure),
-            "provenance_retention" => Ok(Self::ProvenanceRetention),
-            other => Err(unknown_variant("preservation_dimension", other)),
-        }
-    }
-}
+closed_wire_enum!(assoc PreservationDimension, field = "preservation_dimension", [
+    Coverage => "coverage",
+    Faithfulness => "faithfulness",
+    Lineage => "lineage",
+    Reversibility => "reversibility",
+    AuthorityCeiling => "authority_ceiling",
+    DependencyClosure => "dependency_closure",
+    ProvenanceRetention => "provenance_retention",
+]);
 
 /// Canonical spellings of the seven preservation dimensions.
 pub const PRESERVATION_DIMENSIONS: &[&str] = &[
@@ -203,41 +174,16 @@ pub enum CandidateDisposition {
     InternalDefect,
 }
 
-impl CandidateDisposition {
-    /// Returns the canonical wire spelling.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Candidate => "candidate",
-            Self::Duplicate => "duplicate",
-            Self::Conflict => "conflict",
-            Self::Abstention => "abstention",
-            Self::Partial => "partial",
-            Self::Blocked => "blocked",
-            Self::Unsupported => "unsupported",
-            Self::InternalDefect => "internal_defect",
-        }
-    }
-
-    /// Parses a wire spelling into a [`CandidateDisposition`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContractViolation::UnknownVariant`] for any unknown spelling.
-    pub fn parse(value: &str) -> Result<Self, ContractViolation> {
-        match value {
-            "candidate" => Ok(Self::Candidate),
-            "duplicate" => Ok(Self::Duplicate),
-            "conflict" => Ok(Self::Conflict),
-            "abstention" => Ok(Self::Abstention),
-            "partial" => Ok(Self::Partial),
-            "blocked" => Ok(Self::Blocked),
-            "unsupported" => Ok(Self::Unsupported),
-            "internal_defect" => Ok(Self::InternalDefect),
-            other => Err(unknown_variant("candidate_disposition", other)),
-        }
-    }
-}
+closed_wire_enum!(assoc CandidateDisposition, field = "candidate_disposition", [
+    Candidate => "candidate",
+    Duplicate => "duplicate",
+    Conflict => "conflict",
+    Abstention => "abstention",
+    Partial => "partial",
+    Blocked => "blocked",
+    Unsupported => "unsupported",
+    InternalDefect => "internal_defect",
+]);
 
 /// An inert candidate proposal.
 ///
@@ -297,6 +243,12 @@ impl CandidateResult {
             return Err(ContractViolation::MissingField("source_handles"));
         }
         check_vec_bound(self.source_handles.len(), 1024, "source_handles")?;
+        let handles = &self.source_handles;
+        let mut agg = 0usize;
+        for handle in handles {
+            agg = agg.saturating_add(handle.len());
+        }
+        check_vec_bound(agg, 1024 * 1024, "source_handles")?;
         for handle in &self.source_handles {
             check_text(handle, "source_handles", 128)?;
         }
@@ -352,15 +304,19 @@ pub fn propose_candidate(p: CandidateProposal) -> Result<CandidateResult, Contra
 mod tests {
     use super::*;
 
-    fn passing_report() -> PreservationReport {
-        let verdicts = PRESERVATION_DIMENSIONS.iter().map(|s| DimensionVerdict {
-            dimension: PreservationDimension::parse(s).unwrap_or(PreservationDimension::Coverage),
+    fn verdict(s: &str) -> DimensionVerdict {
+        let dimension = PreservationDimension::parse(s).unwrap_or(PreservationDimension::Coverage);
+        DimensionVerdict {
+            dimension,
             passed: true,
             known: true,
             note: format!("{s} holds"),
-        });
+        }
+    }
+
+    fn passing_report() -> PreservationReport {
         PreservationReport {
-            verdicts: verdicts.collect(),
+            verdicts: PRESERVATION_DIMENSIONS.iter().map(|s| verdict(s)).collect(),
         }
     }
 
@@ -401,18 +357,17 @@ mod tests {
         spellings.dedup();
         assert_eq!(spellings.len(), 8, "all dispositions must differ");
         for state in states {
-            assert_eq!(CandidateDisposition::parse(state.as_str()), Ok(state));
             let bytes = serde_json::to_vec(&state).expect("disposition serializes");
             let decoded: CandidateDisposition = serde_json::from_slice(&bytes).expect("roundtrips");
-            assert_eq!(decoded, state);
+            assert!(CandidateDisposition::parse(state.as_str()) == Ok(state) && decoded == state);
         }
     }
 
     // WORK_UNIT_CASE: 578/38
     #[test]
     fn marker_38_seven_preservation_dimensions_independent() {
-        assert_eq!(PRESERVATION_DIMENSIONS.len(), 7);
         let report = passing_report();
+        assert_eq!(PRESERVATION_DIMENSIONS.len(), 7);
         assert!(report.validate().is_ok() && report.overall().is_ok());
         for spelling in PRESERVATION_DIMENSIONS {
             let addressed: Vec<&DimensionVerdict> = report
@@ -477,6 +432,10 @@ mod tests {
         let mut over_handles = valid_candidate();
         over_handles.source_handles = vec!["s".to_owned(); 1025];
         let r = over_handles.validate();
+        assert!(matches!(r, Err(ContractViolation::OutOfBounds { .. })));
+        let mut agg_over = valid_candidate();
+        agg_over.source_handles = vec!["s".repeat(2048); 600];
+        let r = agg_over.validate();
         assert!(matches!(r, Err(ContractViolation::OutOfBounds { .. })));
         let mut max_note = passing_report();
         max_note.verdicts[0].note = "n".repeat(1024);

@@ -67,12 +67,24 @@ pub fn check_fence(fence: &eliot_contracts::StateFence) -> Result<(), ContractVi
         })
 }
 
+/// Rejects a schema version other than the exact accepted one.
+pub fn check_schema_version(version: u32, expected: u32) -> Result<(), ContractViolation> {
+    if version == expected {
+        return Ok(());
+    }
+    Err(ContractViolation::OutOfBounds {
+        field: "schema_version",
+        min: i64::from(expected),
+        max: i64::from(expected),
+        got: i64::from(version),
+    })
+}
+
 /// Compares string sets order-insensitively (callers reject duplicates at ingress).
 #[must_use]
 pub fn sorted_set_eq(left: &[String], right: &[String]) -> bool {
-    let mut ordered_left = left.to_vec();
+    let (mut ordered_left, mut ordered_right) = (left.to_vec(), right.to_vec());
     ordered_left.sort();
-    let mut ordered_right = right.to_vec();
     ordered_right.sort();
     ordered_left == ordered_right
 }
@@ -152,3 +164,79 @@ pub enum ContractViolation {
         reason: String,
     },
 }
+
+/// Generates `as_str` + `parse` for a closed wire enum from one spelling table.
+/// `assoc` emits `Enum::parse`; `free` a free `parse_*` fn; `family_map` emits
+/// `family_of` + `family_kinds`. Spellings/fields come only from each row list.
+macro_rules! closed_wire_enum {
+    (assoc $Enum:ident, field = $field:literal, [$($Variant:ident => $spelling:literal),* $(,)?]) => {
+        impl $Enum {
+            /// Returns the canonical wire spelling.
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$Variant => $spelling,)*
+                }
+            }
+            /// Parses a wire spelling into its closed value.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`crate::error::ContractViolation::UnknownVariant`] for any unknown spelling.
+            pub fn parse(value: &str) -> Result<Self, crate::error::ContractViolation> {
+                match value {
+                    $($spelling => Ok(Self::$Variant),)*
+                    other => Err(crate::error::ContractViolation::UnknownVariant {
+                        field: $field,
+                        value: other.to_owned(),
+                    }),
+                }
+            }
+        }
+    };
+    (free $Enum:ident, $parse_fn:ident, field = $field:literal, [$($Variant:ident => $spelling:literal),* $(,)?]) => {
+        impl $Enum {
+            /// Returns the canonical wire spelling.
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$Variant => $spelling,)*
+                }
+            }
+        }
+        /// Parses a wire spelling into its closed value.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`crate::error::ContractViolation::UnknownVariant`] for any unknown spelling.
+        pub fn $parse_fn(value: &str) -> Result<$Enum, crate::error::ContractViolation> {
+            match value {
+                $($spelling => Ok($Enum::$Variant),)*
+                other => Err(crate::error::ContractViolation::UnknownVariant {
+                    field: $field,
+                    value: other.to_owned(),
+                }),
+            }
+        }
+    };
+    (family_map $Kind:ident => $Family:ident, [$($FVariant:ident => [$($KVariant:ident),* $(,)?]),* $(,)?]) => {
+        /// Maps a wire kind to its handler family.
+        ///
+        /// Identity for the first six kinds plus reconsolidation and accessibility;
+        /// `Merge | Split` collapse to `StructureRepair`, `Repair` to `MemoryRepair`.
+        #[must_use]
+        pub const fn family_of(kind: $Kind) -> $Family {
+            match kind {
+                $($( $Kind::$KVariant => $Family::$FVariant, )*)*
+            }
+        }
+        /// Returns exactly the canonical wire-kind set a family handler must accept.
+        #[must_use]
+        pub fn family_kinds(family: $Family) -> &'static [$Kind] {
+            match family {
+                $($Family::$FVariant => &[$($Kind::$KVariant),*],)*
+            }
+        }
+    };
+}
+pub(crate) use closed_wire_enum;

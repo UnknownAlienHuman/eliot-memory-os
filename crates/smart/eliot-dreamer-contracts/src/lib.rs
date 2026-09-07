@@ -33,12 +33,12 @@ pub use candidate::{
 };
 pub use curation::{CURATION_WIRE_KINDS, CurationKind, CurationPayload, kind_family, parse_kind};
 pub use draft::{
-    ClaimResidue, GroundedDreamDraft, ModelDraft, RawProviderOutput, SupportState,
-    ValidatedCurationItem, ValidatedDreamDraft, ValidationReceipt,
+    ClaimResidue, CurationAcceptanceCtx, GroundedDreamDraft, ModelDraft, RawProviderOutput,
+    SupportState, ValidatedCurationItem, ValidatedDreamDraft, ValidationReceipt,
 };
 pub use encoding::{canonical_bytes, digest_hex};
 pub use error::{ContractViolation, check_fence, check_vec_bound, is_hex64_lower};
-pub use job::{DreamJobInput, JobClass, RequesterOrigin, parse_job_class};
+pub use job::{DreamJobInput, JobClass, Requester, RequesterOrigin, parse_job_class};
 pub use registry::{
     AtomicityMode, CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor,
     CurationHandlerPort, CurationHandlerRegistry, TargetDenominator, TypedCurationHandlerRequest,

@@ -3,7 +3,7 @@
 //! Owns the exact 11 wire kinds of `I9.6 CurationCandidate`, one closed payload
 //! schema per kind, and the wire-kind to handler-family spelling map.
 
-use crate::error::{ContractViolation, check_text, check_vec_bound};
+use crate::error::{ContractViolation, check_text, check_vec_bound, closed_wire_enum};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -43,51 +43,19 @@ pub enum CurationKind {
     Repair,
 }
 
-impl CurationKind {
-    /// Returns the canonical wire spelling of this kind.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Classification => "classification",
-            Self::Relation => "relation",
-            Self::Episode => "episode",
-            Self::Concept => "concept",
-            Self::Procedure => "procedure",
-            Self::Failure => "failure",
-            Self::Merge => "merge",
-            Self::Split => "split",
-            Self::Reconsolidation => "reconsolidation",
-            Self::Accessibility => "accessibility",
-            Self::Repair => "repair",
-        }
-    }
-}
-
-/// Parses a wire spelling into its closed kind.
-///
-/// # Errors
-///
-/// Returns [`ContractViolation::UnknownVariant`] with `field == "wire_kind"` for
-/// family spellings, architecture subtypes, and every other unknown value.
-pub fn parse_kind(value: &str) -> Result<CurationKind, ContractViolation> {
-    match value {
-        "classification" => Ok(CurationKind::Classification),
-        "relation" => Ok(CurationKind::Relation),
-        "episode" => Ok(CurationKind::Episode),
-        "concept" => Ok(CurationKind::Concept),
-        "procedure" => Ok(CurationKind::Procedure),
-        "failure" => Ok(CurationKind::Failure),
-        "merge" => Ok(CurationKind::Merge),
-        "split" => Ok(CurationKind::Split),
-        "reconsolidation" => Ok(CurationKind::Reconsolidation),
-        "accessibility" => Ok(CurationKind::Accessibility),
-        "repair" => Ok(CurationKind::Repair),
-        _ => Err(ContractViolation::UnknownVariant {
-            field: "wire_kind",
-            value: value.into(),
-        }),
-    }
-}
+closed_wire_enum!(free CurationKind, parse_kind, field = "wire_kind", [
+    Classification => "classification",
+    Relation => "relation",
+    Episode => "episode",
+    Concept => "concept",
+    Procedure => "procedure",
+    Failure => "failure",
+    Merge => "merge",
+    Split => "split",
+    Reconsolidation => "reconsolidation",
+    Accessibility => "accessibility",
+    Repair => "repair",
+]);
 
 /// Exact mutation/semantic target set plus the distinct immutable evidence/reference set.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -116,6 +84,15 @@ impl TargetEvidence {
             return Err(ContractViolation::BindingMismatch {
                 field: "targets",
                 reason: "duplicate target".to_owned(),
+            });
+        }
+        let mut ordered_evidence = self.evidence_refs.clone();
+        ordered_evidence.sort();
+        ordered_evidence.dedup();
+        if ordered_evidence.len() != self.evidence_refs.len() {
+            return Err(ContractViolation::BindingMismatch {
+                field: "evidence_refs",
+                reason: "duplicate evidence ref".to_owned(),
             });
         }
         if let Some(h) = self.targets.iter().find(|h| self.evidence_refs.contains(h)) {
@@ -387,10 +364,11 @@ pub fn route_payload(kind: CurationKind, json: &str) -> Result<CurationPayload, 
             reason: "payload envelope exceeds byte bound".to_owned(),
         });
     }
-    let tag: KindTag = serde_json::from_str(json).map_err(|err| ContractViolation::Malformed {
+    let malformed = |err: serde_json::Error| ContractViolation::Malformed {
         field: "curation_payload",
         reason: err.to_string(),
-    })?;
+    };
+    let tag: KindTag = serde_json::from_str(json).map_err(&malformed)?;
     if tag.kind != kind {
         return Err(ContractViolation::KindPayload(format!(
             "expected payload for {}, found {}",
@@ -398,11 +376,7 @@ pub fn route_payload(kind: CurationKind, json: &str) -> Result<CurationPayload, 
             tag.kind.as_str()
         )));
     }
-    let payload: CurationPayload =
-        serde_json::from_str(json).map_err(|err| ContractViolation::Malformed {
-            field: "curation_payload",
-            reason: err.to_string(),
-        })?;
+    let payload: CurationPayload = serde_json::from_str(json).map_err(malformed)?;
     payload.validate()?;
     Ok(payload)
 }
@@ -426,53 +400,28 @@ pub(crate) fn sample_facets() -> TargetEvidence {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 pub(crate) fn sample_payload(kind: CurationKind) -> CurationPayload {
-    route_payload(kind, sample_wire(kind)).expect("sample wire decodes")
-}
-
-/// Asserts a receipt binding mismatch on `field` for tests.
-#[cfg(test)]
-#[allow(clippy::needless_pass_by_value)]
-pub(crate) fn assert_probe(r: Result<(), ContractViolation>, field: &str) {
-    assert!(matches!(r, Err(ContractViolation::BindingMismatch { field: g, .. }) if g == field));
+    route_payload(kind, &sample_wire(kind)).expect("sample wire decodes")
 }
 
 #[cfg(test)]
-fn sample_wire(kind: CurationKind) -> &'static str {
-    match kind {
-        CurationKind::Classification => {
-            r#"{"kind":"classification","label":"memory","confidence_bps":9000,"target_evidence":{"targets":["a","b","ab"],"evidence_refs":["e-1"]}}"#
-        }
-        CurationKind::Relation => {
-            r#"{"kind":"relation","from_handle":"a","to_handle":"b","relation":"refines","target_evidence":{"targets":["a","b","ab"],"evidence_refs":["e-1"]}}"#
-        }
-        CurationKind::Episode => {
-            r#"{"kind":"episode","episode":"ep-7","observed_at_ms":1700000000000,"target_evidence":{"targets":["a","b","ab"],"evidence_refs":["e-1"]}}"#
-        }
-        CurationKind::Concept => {
-            r#"{"kind":"concept","concept":"fence","definition":"state dependency","target_evidence":{"targets":["a","b","ab"],"evidence_refs":["e-1"]}}"#
-        }
-        CurationKind::Procedure => {
-            r#"{"kind":"procedure","procedure":"rotate","steps":3,"target_evidence":{"targets":["a","b","ab"],"evidence_refs":["e-1"]}}"#
-        }
-        CurationKind::Failure => {
-            r#"{"kind":"failure","fingerprint":"fp-1","signature":"sig-1","target_evidence":{"targets":["a","b","ab"],"evidence_refs":["e-1"]}}"#
-        }
-        CurationKind::Merge => {
-            r#"{"kind":"merge","left":"a","right":"b","merged":"ab","target_evidence":{"targets":["a","b","ab"],"evidence_refs":["e-1"]}}"#
-        }
-        CurationKind::Split => {
-            r#"{"kind":"split","whole":"ab","first":"a","second":"b","target_evidence":{"targets":["a","b","ab"],"evidence_refs":["e-1"]}}"#
-        }
-        CurationKind::Reconsolidation => {
-            r#"{"kind":"reconsolidation","target":"a","update":"refresh","target_evidence":{"targets":["a","b","ab"],"evidence_refs":["e-1"]}}"#
-        }
-        CurationKind::Accessibility => {
-            r#"{"kind":"accessibility","handle":"a","note":"captioned","target_evidence":{"targets":["a","b","ab"],"evidence_refs":["e-1"]}}"#
-        }
-        CurationKind::Repair => {
-            r#"{"kind":"repair","target":"a","repair":"relink","target_evidence":{"targets":["a","b","ab"],"evidence_refs":["e-1"]}}"#
-        }
-    }
+fn sample_wire(kind: CurationKind) -> String {
+    let body = match kind {
+        CurationKind::Classification => r#""label":"memory","confidence_bps":9000"#,
+        CurationKind::Relation => r#""from_handle":"a","to_handle":"b","relation":"refines""#,
+        CurationKind::Episode => r#""episode":"ep-7","observed_at_ms":1700000000000"#,
+        CurationKind::Concept => r#""concept":"fence","definition":"state dependency""#,
+        CurationKind::Procedure => r#""procedure":"rotate","steps":3"#,
+        CurationKind::Failure => r#""fingerprint":"fp-1","signature":"sig-1""#,
+        CurationKind::Merge => r#""left":"a","right":"b","merged":"ab""#,
+        CurationKind::Split => r#""whole":"ab","first":"a","second":"b""#,
+        CurationKind::Reconsolidation => r#""target":"a","update":"refresh""#,
+        CurationKind::Accessibility => r#""handle":"a","note":"captioned""#,
+        CurationKind::Repair => r#""target":"a","repair":"relink""#,
+    };
+    std::format!(
+        r#"{{"kind":"{kind_tag}",{body},"target_evidence":{{"targets":["a","b","ab"],"evidence_refs":["e-1"]}}}}"#,
+        kind_tag = kind.as_str()
+    )
 }
 
 #[cfg(test)]
@@ -643,6 +592,10 @@ mod tests {
         let payload: CurationPayload = serde_json::from_str(&json).expect("decodes");
         let r = payload.validate();
         assert!(matches!(r, Err(BindingMismatch { field: g, .. }) if g == "targets"));
+        let json = sample_wire(kind).replace("[\"e-1\"]", "[\"e-1\",\"e-1\"]");
+        let payload: CurationPayload = serde_json::from_str(&json).expect("decodes");
+        let r = payload.validate();
+        assert!(matches!(r, Err(BindingMismatch { field: g, .. }) if g == "evidence_refs"));
         let oversize = "x".repeat(MAX_PAYLOAD_JSON + 1);
         let err = route_payload(kind, &oversize).expect_err("oversize must fail");
         assert!(matches!(err, ContractViolation::Malformed { .. }));

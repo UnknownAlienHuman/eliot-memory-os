@@ -11,7 +11,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ContractViolation;
+use crate::error::{ContractViolation, closed_wire_enum};
 
 /// Class ceiling for `input_bytes`.
 pub const INPUT_BYTES_CEILING: u64 = 1_048_576;
@@ -73,23 +73,20 @@ pub enum BudgetDimension {
     ReportBytes,
 }
 
-impl BudgetDimension {
-    /// Returns the exact wire spelling of this dimension.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::InputBytes => "input_bytes",
-            Self::OutputBytes => "output_bytes",
-            Self::SourceWidth => "source_width",
-            Self::ReferenceWidth => "reference_width",
-            Self::ModelCalls => "model_calls",
-            Self::Attempts => "attempts",
-            Self::Candidates => "candidates",
-            Self::WallMs => "wall_ms",
-            Self::WorkFanOut => "work_fan_out",
-            Self::ReportBytes => "report_bytes",
-        }
-    }
+closed_wire_enum!(free BudgetDimension, parse_budget_dimension, field = "budget_dimension", [
+    InputBytes => "input_bytes",
+    OutputBytes => "output_bytes",
+    SourceWidth => "source_width",
+    ReferenceWidth => "reference_width",
+    ModelCalls => "model_calls",
+    Attempts => "attempts",
+    Candidates => "candidates",
+    WallMs => "wall_ms",
+    WorkFanOut => "work_fan_out",
+    ReportBytes => "report_bytes",
+]);
 
+impl BudgetDimension {
     /// Returns the class ceiling for this dimension.
     pub const fn ceiling(self) -> u64 {
         match self {
@@ -104,27 +101,6 @@ impl BudgetDimension {
             Self::WorkFanOut => WORK_FAN_OUT_CEILING,
             Self::ReportBytes => REPORT_BYTES_CEILING,
         }
-    }
-}
-
-/// Parses an exact wire spelling into a [`BudgetDimension`], rejecting
-/// anything else as fail-closed.
-pub fn parse_budget_dimension(value: &str) -> Result<BudgetDimension, ContractViolation> {
-    match value {
-        "input_bytes" => Ok(BudgetDimension::InputBytes),
-        "output_bytes" => Ok(BudgetDimension::OutputBytes),
-        "source_width" => Ok(BudgetDimension::SourceWidth),
-        "reference_width" => Ok(BudgetDimension::ReferenceWidth),
-        "model_calls" => Ok(BudgetDimension::ModelCalls),
-        "attempts" => Ok(BudgetDimension::Attempts),
-        "candidates" => Ok(BudgetDimension::Candidates),
-        "wall_ms" => Ok(BudgetDimension::WallMs),
-        "work_fan_out" => Ok(BudgetDimension::WorkFanOut),
-        "report_bytes" => Ok(BudgetDimension::ReportBytes),
-        _ => Err(ContractViolation::UnknownVariant {
-            field: "budget_dimension",
-            value: value.to_owned(),
-        }),
     }
 }
 
@@ -194,22 +170,22 @@ impl BudgetLimits {
     /// of zero authorizes nothing and would silently disable the job; byte,
     /// width, time, and STU limits may be zero.
     pub fn validate(&self) -> Result<(), ContractViolation> {
-        let output_bytes = self.output_bytes;
-        let source_width = self.source_width;
-        let reference = self.reference_width;
-        let work_fan_out = self.work_fan_out;
-        let report_bytes = self.report_bytes;
+        let ob = OUTPUT_BYTES_CEILING;
+        let sw = SOURCE_WIDTH_CEILING;
+        let rw = REFERENCE_WIDTH_CEILING;
+        let wf = WORK_FAN_OUT_CEILING;
+        let rb = REPORT_BYTES_CEILING;
         for (value, dim, ceiling, allow_zero) in [
             (self.input_bytes, "input_bytes", INPUT_BYTES_CEILING, true),
-            (output_bytes, "output_bytes", OUTPUT_BYTES_CEILING, true),
-            (source_width, "source_width", SOURCE_WIDTH_CEILING, true),
-            (reference, "reference_width", REFERENCE_WIDTH_CEILING, true),
+            (self.output_bytes, "output_bytes", ob, true),
+            (self.source_width, "source_width", sw, true),
+            (self.reference_width, "reference_width", rw, true),
             (self.model_calls, "model_calls", MODEL_CALLS_CEILING, false),
             (self.attempts, "attempts", ATTEMPTS_CEILING, false),
             (self.candidates, "candidates", CANDIDATES_CEILING, false),
             (self.wall_ms, "wall_ms", WALL_MS_CEILING, true),
-            (work_fan_out, "work_fan_out", WORK_FAN_OUT_CEILING, true),
-            (report_bytes, "report_bytes", REPORT_BYTES_CEILING, true),
+            (self.work_fan_out, "work_fan_out", wf, true),
+            (self.report_bytes, "report_bytes", rb, true),
             (self.max_stu, "max_stu", STU_CEILING, true),
         ] {
             check_limit(value, dim, ceiling, allow_zero)?;
@@ -351,60 +327,35 @@ fn limit_of(limits: &BudgetLimits, dimension: BudgetDimension) -> Option<u64> {
     }
 }
 
-fn unknown_reason(cross: bool) -> String {
-    if cross {
-        "unknown limit cannot authorize usage; no compensation across dimensions".to_owned()
-    } else {
-        "unknown limit cannot authorize usage".to_owned()
-    }
-}
-
-fn over_reason(cross: bool, used: u64, cap: u64, label: &str) -> String {
-    if cross {
-        std::format!(
-            "usage {used} exceeds limit {cap} on {label}; under-use elsewhere cannot compensate"
-        )
-    } else {
-        std::format!("usage {used} exceeds limit {cap}")
-    }
-}
-
 fn check_usage(
     usage: &BudgetUsage,
     limits: &BudgetLimits,
     cross_subsidy_spelling: bool,
 ) -> Result<(), ContractViolation> {
-    for dimension in ALL_BUDGET_DIMENSIONS {
-        let used = usage.of(dimension);
-        let Some(cap) = limit_of(limits, dimension) else {
-            return Err(ContractViolation::Budget {
-                dimension: dimension.as_str(),
-                reason: unknown_reason(cross_subsidy_spelling),
-            });
+    let mut rows: Vec<(&str, u64, Option<u64>)> = ALL_BUDGET_DIMENSIONS
+        .iter()
+        .map(|d| (d.as_str(), usage.of(*d), limit_of(limits, *d)))
+        .collect();
+    rows.push(("max_stu", usage.stu_used, limits.max_stu));
+    for (dimension, used, cap) in rows {
+        let Some(cap) = cap else {
+            let reason = if cross_subsidy_spelling {
+                "unknown limit cannot authorize usage; no compensation across dimensions".to_owned()
+            } else {
+                "unknown limit cannot authorize usage".to_owned()
+            };
+            return Err(ContractViolation::Budget { dimension, reason });
         };
         if used > cap {
-            return Err(ContractViolation::Budget {
-                dimension: dimension.as_str(),
-                reason: over_reason(
-                    cross_subsidy_spelling,
-                    used,
-                    cap,
-                    &std::format!("{dimension:?}"),
-                ),
-            });
+            let reason = if cross_subsidy_spelling {
+                std::format!(
+                    "usage {used} exceeds limit {cap} on {dimension}; under-use elsewhere cannot compensate"
+                )
+            } else {
+                std::format!("usage {used} exceeds limit {cap}")
+            };
+            return Err(ContractViolation::Budget { dimension, reason });
         }
-    }
-    let Some(cap) = limits.max_stu else {
-        return Err(ContractViolation::Budget {
-            dimension: "max_stu",
-            reason: unknown_reason(cross_subsidy_spelling),
-        });
-    };
-    if usage.stu_used > cap {
-        return Err(ContractViolation::Budget {
-            dimension: "max_stu",
-            reason: over_reason(cross_subsidy_spelling, usage.stu_used, cap, "STU"),
-        });
     }
     Ok(())
 }
@@ -430,37 +381,32 @@ mod tests {
         }
     }
 
+    macro_rules! set_dim {
+        ($t:expr, $d:expr, $v:expr) => {
+            match $d {
+                BudgetDimension::InputBytes => $t.input_bytes = $v,
+                BudgetDimension::OutputBytes => $t.output_bytes = $v,
+                BudgetDimension::SourceWidth => $t.source_width = $v,
+                BudgetDimension::ReferenceWidth => $t.reference_width = $v,
+                BudgetDimension::ModelCalls => $t.model_calls = $v,
+                BudgetDimension::Attempts => $t.attempts = $v,
+                BudgetDimension::Candidates => $t.candidates = $v,
+                BudgetDimension::WallMs => $t.wall_ms = $v,
+                BudgetDimension::WorkFanOut => $t.work_fan_out = $v,
+                BudgetDimension::ReportBytes => $t.report_bytes = $v,
+            }
+        };
+    }
+
     fn usage_at(dimension: BudgetDimension, value: u64) -> BudgetUsage {
         let mut usage = BudgetUsage::default();
-        match dimension {
-            BudgetDimension::InputBytes => usage.input_bytes = value,
-            BudgetDimension::OutputBytes => usage.output_bytes = value,
-            BudgetDimension::SourceWidth => usage.source_width = value,
-            BudgetDimension::ReferenceWidth => usage.reference_width = value,
-            BudgetDimension::ModelCalls => usage.model_calls = value,
-            BudgetDimension::Attempts => usage.attempts = value,
-            BudgetDimension::Candidates => usage.candidates = value,
-            BudgetDimension::WallMs => usage.wall_ms = value,
-            BudgetDimension::WorkFanOut => usage.work_fan_out = value,
-            BudgetDimension::ReportBytes => usage.report_bytes = value,
-        }
+        set_dim!(usage, dimension, value);
         usage
     }
 
     fn limits_at(dimension: BudgetDimension, value: u64) -> BudgetLimits {
         let mut limits = ceiling_limits();
-        match dimension {
-            BudgetDimension::InputBytes => limits.input_bytes = Some(value),
-            BudgetDimension::OutputBytes => limits.output_bytes = Some(value),
-            BudgetDimension::SourceWidth => limits.source_width = Some(value),
-            BudgetDimension::ReferenceWidth => limits.reference_width = Some(value),
-            BudgetDimension::ModelCalls => limits.model_calls = Some(value),
-            BudgetDimension::Attempts => limits.attempts = Some(value),
-            BudgetDimension::Candidates => limits.candidates = Some(value),
-            BudgetDimension::WallMs => limits.wall_ms = Some(value),
-            BudgetDimension::WorkFanOut => limits.work_fan_out = Some(value),
-            BudgetDimension::ReportBytes => limits.report_bytes = Some(value),
-        }
+        set_dim!(limits, dimension, Some(value));
         limits
     }
 
