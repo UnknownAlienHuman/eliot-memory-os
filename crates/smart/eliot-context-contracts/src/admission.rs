@@ -226,13 +226,15 @@ pub struct ContextCandidateSet {
 }
 
 impl ContextCandidateSet {
-    /// Validate candidate identities and exact provider coverage.
-    pub fn validate(&self) -> Result<(), ContextError> {
+    /// Validate the candidate identities supplied to admission.
+    ///
+    /// Admission can receive an empty candidate set when the denominator was
+    /// requested but no candidate could be supplied yet.  Dependencies may
+    /// likewise refer to atoms that are absent from this partial set; the
+    /// admission owner reports those gaps as an incomplete outcome.
+    pub fn validate_for_admission(&self) -> Result<(), ContextError> {
         self.binding.validate()?;
         self.denominator.validate()?;
-        if self.candidates.is_empty() {
-            return Err(ContextError::MissingField("candidates"));
-        }
         let mut ids = BTreeSet::new();
         for candidate in &self.candidates {
             candidate.validate()?;
@@ -261,6 +263,20 @@ impl ContextCandidateSet {
                 return Err(ContextError::Duplicate("candidates.atom_id"));
             }
         }
+        Ok(())
+    }
+
+    /// Validate candidate identities and exact provider coverage.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        self.validate_for_admission()?;
+        if self.candidates.is_empty() {
+            return Err(ContextError::MissingField("candidates"));
+        }
+        let ids: BTreeSet<_> = self
+            .candidates
+            .iter()
+            .map(|candidate| candidate.atom_id.clone())
+            .collect();
         for candidate in &self.candidates {
             if !candidate
                 .dependencies

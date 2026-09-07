@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod admission;
+mod admission_input;
 mod atom;
 mod economy;
 mod error;
@@ -20,6 +21,12 @@ mod view;
 pub use admission::{
     AdmissionRecord, AdmittedContextSet, ContextCandidateSet, DecisionSafetyFloor,
     SafetyFloorMember,
+};
+pub use admission_input::{
+    AdmissionDecisionEvidence, AdmissionInput, AdmissionMeasuredCost, AdmissionMeasurement,
+    AdmissionMeasurementBinding, AdmissionPriorityClass, AdmissionResult, AdmissionRuleIdentity,
+    CandidatePriority, MeasurementAggregationMode, MeasurementCompositionProfile, MeasurementUnit,
+    PriorityPolicyIdentity, SafetyFloorIdentity, SuppliedOmissionBinding,
 };
 pub use atom::{
     AdmissionDisposition, AdmittedAtom, AtomAvailability, AtomRepresentation, AuthorityClass,
