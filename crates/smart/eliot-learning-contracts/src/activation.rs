@@ -88,7 +88,7 @@ impl LifecycleStage {
     /// Return the only compatible predecessor for this stage.
     pub const fn required_predecessor(self) -> Option<Self> {
         match self {
-            Self::CandidateProduced => None,
+            Self::CandidateProduced | Self::Closure => None,
             Self::AdmittedForEvaluation => Some(Self::CandidateProduced),
             Self::ActivationRequested => Some(Self::AdmittedForEvaluation),
             Self::Retrieved => Some(Self::ActivationRequested),
@@ -106,7 +106,6 @@ impl LifecycleStage {
             }
             Self::CausalAssessment => Some(Self::Benefit),
             Self::ExternalPromotion => Some(Self::CausalAssessment),
-            Self::Closure => Some(Self::ExternalPromotion),
         }
     }
 }

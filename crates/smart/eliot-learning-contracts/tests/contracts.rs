@@ -279,6 +279,15 @@ fn lifecycle_stages_require_owner_receipts_and_predecessors()
         skipped.validate(),
         Err(LearningContractError::IncompatiblePredecessor)
     ));
+    let closure = StageObservation {
+        stage: LifecycleStage::Closure,
+        disposition: StageDisposition::Observed,
+        predecessor: None,
+        owner_receipt: Some(aid("closure-stage-receipt")?),
+        evidence: vec![aid("closure-stage-evidence")?],
+        denominator,
+    };
+    closure.validate()?;
     Ok(())
 }
 
