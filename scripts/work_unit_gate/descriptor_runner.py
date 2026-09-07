@@ -6,6 +6,12 @@ snapshot and toolchain evidence. This module neither spawns a process nor
 claims containment. A parsed child record is not a trusted execution receipt.
 The v4 shared contracts remain the descriptor owner; only parse_descriptor
 constructs that public type. No legacy promotion or descriptor command field.
+
+Fixed argv constructors below build command vectors only; they never start a
+child. The controller owns interpreter/toolchain resolution, working
+directories, owned process-tree containment, timeouts and cleanup. Environment
+filtering passes names only, never secret values. This module is not a sandbox
+against hostile test code.
 """
 from __future__ import annotations
 
@@ -38,6 +44,43 @@ _IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}\Z")
 _PY_MODULE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
 _RUST_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*\Z")
 _STATUSES = frozenset(("pass", "failure", "error", "skip", "expected-failure", "unexpected-success"))
+_SAFE_COMMAND_ARG = re.compile(r"[A-Za-z0-9_./:=-]+\Z")
+# Package-mode cargo invocations must never carry one of these. Constructors
+# are structurally incapable of emitting them; assert_no_workspace_wide
+# rechecks every argv at runtime.
+WORKSPACE_WIDE_FLAGS = frozenset(("--workspace", "--all"))
+# Caller-supplied cargo metadata classification. Strings are preserved verbatim
+# in the returned binding; this module never edits membership.
+MEMBER_KINDS = frozenset(("member", "excluded", "standalone", "unavailable"))
+# Minimal nonsecret child environment. Exact names only, no prefix wildcards:
+# build-scoped CARGO_*/RUST_* passthrough stays controller-owned policy, never
+# an implicit passthrough here. Entries naming a blocked marker are dropped
+# even when explicitly allowed.
+ALLOWED_ENV_NAMES = frozenset((
+    "PATH", "SYSTEMROOT", "TEMP", "TMP",
+    "PYTHONDONTWRITEBYTECODE", "PYTHONIOENCODING",
+))
+BLOCKED_ENV_MARKERS = frozenset(("TOKEN", "SECRET", "CREDENTIAL", "PASSWORD", "KEY"))
+# Suffixes that mark a metadata value as a generator/mutation/network spelling
+# rather than a dotted registered-suite identity.
+_METADATA_FORBIDDEN_SUFFIXES = (".py", ".pyw", ".pyc", ".pyd", ".ps1", ".psm1",
+                                ".psd1", ".sh", ".exe", ".bat", ".dll", ".so", ".dylib")
+# Phase x outcome verdicts. Only a complete discovery and an exact terminal
+# pass record are green. Skip and expected-failure are valid observations but
+# cannot satisfy a selected identity, so they stay non-green here.
+PHASE_TRUTH_TABLE = {
+    ("discover", "complete"): "green",
+    ("discover", "empty"): "non-green",
+    ("discover", "malformed"): "non-green",
+    ("execute", "pass"): "green",
+    ("execute", "failure"): "non-green",
+    ("execute", "error"): "non-green",
+    ("execute", "skip"): "non-green",
+    ("execute", "expected-failure"): "non-green",
+    ("execute", "unexpected-success"): "non-green",
+    ("execute", "missing"): "non-green",
+    ("execute", "timeout"): "non-green",
+}
 
 
 class RunnerInputError(ValueError):
@@ -142,6 +185,14 @@ def _relative_path(value):
 
 
 def _safe_path(root: Path, relative: str):
+    """Resolve a repository-relative path with link/reparse checks.
+
+    Detection, not prevention: lstat checks and the later open/read are
+    separate steps, so a concurrently executing admitted test could swap an
+    entry between check and use (TOCTOU). Callers must treat this as they
+    treat snapshot comparison -- invalidation evidence, not a barrier -- and
+    never run unadmitted source under it.
+    """
     relative = _relative_path(relative)
     try:
         root = root.resolve(strict=True)
@@ -279,6 +330,8 @@ def parse_rust_discovery(raw: bytes, maximum: int):
         _reject("OUTPUT_UTF8")
     names = []
     for line in text.splitlines():
+        if len(line) > 1024:
+            _reject("DISCOVERY_LINE_BOUND")
         if not line.endswith(": test") or not _RUST_NAME.fullmatch(line[:-6]):
             _reject("UNSUPPORTED_DISCOVERY_GRAMMAR")
         names.append(line[:-6])
@@ -304,8 +357,10 @@ def parse_rust_exact(raw: bytes, selected: str, returncode: int, discovered_coun
     anchored grammar can describe success, and its code/count/name must match.
     Caller additionally binds binary bytes, owned execution and captured stream.
     No supported Rust toolchain is certified by these grammar checks alone.
+    The selected identity is length-capped before matching so an untrusted
+    megabyte-scale name cannot drive pathological matching cost in the parent.
     """
-    if type(selected) is not str or not _RUST_NAME.fullmatch(selected):
+    if type(selected) is not str or len(selected) > 256 or not _RUST_NAME.fullmatch(selected):
         _reject("RUST_IDENTITY_SYNTAX")
     _integer(discovered_count, MAX_TESTS, 1)
     if type(returncode) is not int:
@@ -376,6 +431,253 @@ def parse_python_protocol(raw: bytes, *, request_sha256: str, expected_module: s
     return data
 
 
+def assert_no_workspace_wide(argv):
+    """Structural guard: reject any workspace-wide selection flag.
+
+    Returns the argv as a tuple when clean. Package-mode constructors call
+    this at runtime; they are additionally incapable of emitting such flags
+    by construction.
+    """
+    if type(argv) not in (list, tuple):
+        _reject("COMMAND_SHAPE")
+    for item in argv:
+        if type(item) is not str:
+            _reject("COMMAND_TEXT_REQUIRED")
+        if item in WORKSPACE_WIDE_FLAGS:
+            _reject("WORKSPACE_WIDE_FORBIDDEN")
+    return tuple(argv)
+
+
+def build_cargo_discovery_command(*, manifest_rel: str, target_dir_rel: str, package: str):
+    """Fixed package-mode discovery argv. Verified on cargo 1.97.1:
+
+    cargo test --manifest-path <m> --target-dir <t> -p <pkg> -- --list --format terse
+    emits `<name>: test` lines accepted by parse_rust_discovery.
+    """
+    manifest = _relative_path(manifest_rel)
+    target = _relative_path(target_dir_rel)
+    name = _text(package, 128)
+    return assert_no_workspace_wide(
+        ("cargo", "test", "--manifest-path", manifest, "--target-dir", target,
+         "-p", name, "--", "--list", "--format", "terse"))
+
+
+def build_cargo_test_command(*, manifest_rel: str, target_dir_rel: str, package: str, test_id: str):
+    """Fixed single-test argv. Verified on cargo 1.97.1:
+
+    cargo test --manifest-path <m> --target-dir <t> -p <pkg> -- --exact <id>
+    runs exactly one test; its pretty transcript matches parse_rust_exact.
+    An ignored identity prints `... ignored` and a filtered-out identity
+    prints `running 0 tests`, both rejected by the exact-result grammar.
+    """
+    manifest = _relative_path(manifest_rel)
+    target = _relative_path(target_dir_rel)
+    name = _text(package, 128)
+    if type(test_id) is not str or len(test_id) > 256 or not _RUST_NAME.fullmatch(test_id):
+        _reject("RUST_IDENTITY_SYNTAX")
+    return assert_no_workspace_wide(
+        ("cargo", "test", "--manifest-path", manifest, "--target-dir", target,
+         "-p", name, "--", "--exact", test_id))
+
+
+def build_cargo_build_command(*, manifest_rel: str, target_dir_rel: str, package: str):
+    """Fixed package-mode build argv. Verified on cargo 1.97.1:
+
+    cargo build --manifest-path <m> --target-dir <t> -p <pkg>
+    --message-format json-render-diagnostics
+    emits structured JSON lines (`compiler-artifact`, `build-finished`).
+    """
+    manifest = _relative_path(manifest_rel)
+    target = _relative_path(target_dir_rel)
+    name = _text(package, 128)
+    return assert_no_workspace_wide(
+        ("cargo", "build", "--manifest-path", manifest, "--target-dir", target,
+         "-p", name, "--message-format", "json-render-diagnostics"))
+
+
+def resolve_package_manifest(*, package_name: str, metadata_packages: list,
+                             require_workspace_member: bool = False):
+    """Bind one exact package against caller-supplied cargo metadata.
+
+    Pure classification: no cargo invocation, no membership edits. Each entry
+    must hold exactly {name, manifest_rel, member_kind}; member_kind stays one
+    of member/excluded/standalone/unavailable and is preserved verbatim in the
+    returned binding. Exactly one name match is required. Package-only callers
+    pass through buildable excluded/standalone entries; unavailable entries
+    and unknown names fail, and membership-required callers fail on non-member.
+    """
+    name = _text(package_name, 128)
+    if type(require_workspace_member) is not bool:
+        _reject("MEMBERSHIP_BOOL_REQUIRED")
+    if type(metadata_packages) is not list:
+        _reject("METADATA_SHAPE")
+    matches = []
+    for entry in metadata_packages:
+        item = _keys(entry, ("name", "manifest_rel", "member_kind"))
+        entry_name = _text(item["name"], 128)
+        manifest = _relative_path(item["manifest_rel"])
+        kind = item["member_kind"]
+        if type(kind) is not str or kind not in MEMBER_KINDS:
+            _reject("UNKNOWN_MEMBER_KIND")
+        if entry_name == name:
+            matches.append({"name": entry_name, "manifest_rel": manifest, "member_kind": kind})
+    if not matches:
+        _reject("PACKAGE_NOT_FOUND")
+    if len(matches) > 1:
+        _reject("DUPLICATE_PACKAGE_IDENTITY")
+    binding = matches[0]
+    if binding["member_kind"] == "unavailable":
+        _reject("PACKAGE_UNAVAILABLE")
+    if require_workspace_member and binding["member_kind"] != "member":
+        _reject("WORKSPACE_MEMBER_REQUIRED")
+    return binding
+
+
+def build_python_child_command(*, script_rel: str, fd: int):
+    """Fixed Python child argv. The `<python>` slot is a placeholder: the
+    controller substitutes its policy-resolved interpreter (the equivalent of
+    its own sys.executable) so this module never resolves host paths and stays
+    deterministic across hosts. fd names the pre-opened protocol channel and
+    must leave 0/1/2 alone. No descriptor-controlled parts, no shell.
+    """
+    script = _relative_path(script_rel)
+    if type(fd) is not int or not 3 <= fd <= 1048575:
+        _reject("CHILD_FD_BOUND")
+    return ("<python>", "-I", "-B", script, "--_python-child", str(fd))
+
+
+def minimal_child_env(env: dict, *, allowed: frozenset = ALLOWED_ENV_NAMES):
+    """Filter a controller-supplied environment down to allowed nonsecret names.
+
+    Keeps only entries whose name is explicitly allowed and carries no blocked
+    marker (TOKEN/SECRET/CREDENTIAL/PASSWORD/KEY, case-insensitive), even when
+    allowed. Returns a filtered copy; values never appear in diagnostics, only
+    codes are raised.
+    """
+    if type(env) is not dict:
+        _reject("ENV_OBJECT_REQUIRED")
+    try:
+        allowlist = frozenset(allowed)
+    except TypeError:
+        _reject("ENV_ALLOWLIST_SHAPE")
+    filtered = {}
+    for key, value in env.items():
+        if type(key) is not str or type(value) is not str:
+            _reject("ENV_TEXT_REQUIRED")
+        if key not in allowlist:
+            continue
+        upper = key.upper()
+        if any(marker in upper for marker in BLOCKED_ENV_MARKERS):
+            continue
+        filtered[key] = value
+    return filtered
+
+
+def resolve_metadata_entrypoint(*, module: str, test_roots):
+    """Resolve one fixed registered Python suite identity.
+
+    Registered suites are dotted module identities only. Generator, mutation
+    and network spellings (anything carrying :, /, backslash, !, @,
+    whitespace, or a script/binary suffix) are rejected as NOT_A_REGISTERED_SUITE.
+    A well-formed module whose file is outside every supplied test root is
+    rejected as FOREIGN_TEST_IDENTITY. Library imports used by test code are
+    unaffected; only the entrypoint identity is checked.
+    """
+    if type(module) is not str or not module:
+        _reject("NOT_A_REGISTERED_SUITE")
+    lowered = module.lower()
+    if (any(mark in module for mark in (":", "/", "\\", "!", "@"))
+            or any(char.isspace() for char in module)
+            or any(lowered.endswith(suffix) for suffix in _METADATA_FORBIDDEN_SUFFIXES)
+            or not _PY_MODULE.fullmatch(module)):
+        _reject("NOT_A_REGISTERED_SUITE")
+    if type(test_roots) not in (list, tuple):
+        _reject("ROOT_DENOMINATOR")
+    roots = [_relative_path(root) for root in test_roots]
+    candidate = module.replace(".", "/") + ".py"
+    if not any(candidate == root or candidate.startswith(root + "/") for root in roots):
+        _reject("FOREIGN_TEST_IDENTITY")
+    return module
+
+
+def snapshot_protected(root: Path, rels: list):
+    """Record sha256 digests of protected inputs. Detection only.
+
+    Reads through _safe_path and _file_digest, so unowned or missing paths are
+    rejected. Never writes, never resets; the controller compares the returned
+    mapping with compare_snapshots and preserves the diff on mismatch.
+    """
+    if not isinstance(root, Path):
+        _reject("SNAPSHOT_ROOT_REQUIRED")
+    if type(rels) not in (list, tuple):
+        _reject("SNAPSHOT_SHAPE")
+    snapshot = {}
+    for rel in rels:
+        key = _relative_path(rel)
+        snapshot[key] = _file_digest(_safe_path(root, key))
+    return snapshot
+
+
+def compare_snapshots(before: dict, after: dict):
+    """Diff two protected-input snapshots. Empty lists mean clean.
+
+    Pure mapping comparison; no filesystem access, no writes, no auto-reset.
+    """
+    if type(before) is not dict or type(after) is not dict:
+        _reject("SNAPSHOT_SHAPE")
+    for snapshot in (before, after):
+        for key, value in snapshot.items():
+            if type(key) is not str or type(value) is not str:
+                _reject("SNAPSHOT_SHAPE")
+    keys_before = set(before)
+    keys_after = set(after)
+    return {
+        "mutated": sorted(key for key in keys_before & keys_after if before[key] != after[key]),
+        "added": sorted(keys_after - keys_before),
+        "removed": sorted(keys_before - keys_after),
+    }
+
+
+def canonical_command(argv):
+    """Deterministic rendering of a constructed argv.
+
+    Space-joined; an argument passes through verbatim only when it matches
+    [A-Za-z0-9_./:=-]+, otherwise it is wrapped in double quotes with
+    backslash and double-quote characters escaped. Wall durations and other
+    observations never enter this rendering, so equal semantic inputs give
+    identical strings. The argv is count- and byte-bounded so an untrusted
+    caller cannot force unbounded allocation in the parent.
+    """
+    if type(argv) not in (list, tuple) or not argv:
+        _reject("EMPTY_COMMAND")
+    if len(argv) > 4096:
+        _reject("COMMAND_BOUND")
+    parts = []
+    total = 0
+    for item in argv:
+        if type(item) is not str or not item:
+            _reject("COMMAND_TEXT_REQUIRED")
+        total += len(item.encode("utf-8")) + 3
+        if total > MAX_PROTOCOL_BYTES:
+            _reject("COMMAND_BOUND")
+        if _SAFE_COMMAND_ARG.fullmatch(item):
+            parts.append(item)
+        else:
+            parts.append('"' + item.replace("\\", "\\\\").replace('"', '\\"') + '"')
+    return " ".join(parts)
+
+
+def phase_verdict(phase: str, outcome: str):
+    """Look up the phase x outcome verdict: "green" or "non-green".
+
+    Unknown pairs fail closed. See PHASE_TRUTH_TABLE.
+    """
+    try:
+        return PHASE_TRUTH_TABLE[(phase, outcome)]
+    except (KeyError, TypeError):
+        _reject("UNKNOWN_PHASE_OUTCOME")
+
+
 def _file_digest(path):
     try:
         with path.open("rb") as handle:
@@ -430,6 +732,9 @@ def _python_child(raw: bytes, channel):
             digest = hashlib.sha256(content).hexdigest()
             if checked == source and digest != before:
                 _reject("SOURCE_IDENTITY_MISMATCH")
+            previous = loaded_sources.get(checked)
+            if previous is not None and previous != digest:
+                _reject("IMPORTED_SOURCE_MUTATED")
             loaded_sources[checked] = digest
             return self.source_to_code(content, str(checked))
 
@@ -450,7 +755,7 @@ def _python_child(raw: bytes, channel):
                 return spec
             if origin.suffix == ".pyc":
                 _reject("SOURCELESS_REPOSITORY_MODULE")
-            return None
+            _reject("NATIVE_REPOSITORY_MODULE")
 
     if module in sys.modules:
         _reject("TEST_MODULE_ALREADY_LOADED")

@@ -1,0 +1,17 @@
+schema_version = "eliot-work-unit-descriptor-v2"
+identity = {value = "work-unit-850"}
+issue = {repository = {owner = "UnknownAlienHuman", name = "eliot-memory-os"}, number = 850}
+unit = {value = "D-WU-RUNNERS"}
+mode = "rust-package"
+source_roots = [{value = "scripts/work_unit_gate/descriptor_runner.py"}]
+test_roots = [{value = "scripts/tests/test_work_unit_descriptor_runner.py"}]
+matrix_cases = 44
+proof_ceiling = {value = "package-local"}
+revision = 1
+body_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+matrix_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+require_workspace_member = false
+package = {name = "runner"}
+module = {value = "scripts.tests.test_work_unit_descriptor_runner"}
+requirements = {source_floor = 1, public_floor = 1, test_floor = 44, required_guards = [{value = "bounded"}]}
+bounds = {wall_ms = 10000, idle_ms = 5000, output_bytes = 65536, line_bytes = 4096, discovery_tests = 1000, child_processes = 4}
