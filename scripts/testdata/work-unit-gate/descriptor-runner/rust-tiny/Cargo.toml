@@ -1,0 +1,10 @@
+[package]
+name = "wu850_tiny"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+# Detach from the enclosing repository workspace so the fixture resolves as a
+# standalone package (offline, zero-dep) and `cargo -p wu850_tiny` works.
+[workspace]

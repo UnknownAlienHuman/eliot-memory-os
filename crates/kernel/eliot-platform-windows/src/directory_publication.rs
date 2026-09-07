@@ -1,13 +1,13 @@
 //! Handle-bound create-new directory publication for the Windows platform contour.
 //!
-//! Architecture anchors (eliot-architecture-docs-fa941135): A2.3,
+//! Architecture anchors: `A2.3`,
 //! ARCH-MOD-02, A12.1, ARCH-SEC-01, A13.1, ARCH-RES-01, A13.6, A13.9,
 //! and ARCH-ORD-01. This module owns one independently understandable
 //! physical publication capability: retained no-follow parent handles,
 //! create-new staging, identity fences, handle-relative no-replace rename,
 //! and typed post-commit reconciliation.
 //!
-//! Implementation anchors (eliot-architecture-docs-fa941135): I2.2, I2.15,
+//! Implementation anchors: `I2.1`, `I2.15`,
 //! I2.23, I3.15, and I5.23. The implementation remains a normal Rust module
 //! because its public contract is part of this crate and its native contour
 //! is tightly coupled to shared platform identity/path primitives.
@@ -20,6 +20,11 @@
 //! package-staging authority here. Unknown post-commit outcomes remain typed
 //! and reconcilable rather than being converted into success or pre-commit
 //! errors.
+//!
+//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md`,
+//! `docs/architecture/ELIOT_ARCHITECTURE.md`,
+//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (compatibility entry points;
+//! the governing shards are named per anchor above).
 
 use std::path::{Path, PathBuf};
 
