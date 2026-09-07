@@ -1193,11 +1193,40 @@ class PackageManifestCases(unittest.TestCase):
             (troot / 'Cargo.toml').write_text('[package]\nname = "runner"\nversion = "0.1.0"\n', newline='\n')
             parent = r._safe_path(troot, 'Cargo.toml').parent.as_posix()
             pid = f"path+file://{parent}#runner@0.1.0"
-            meta = {'packages': [{'name': 'runner', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [pid], 'excluded': []}
+            verbatim = parent + '/Cargo.toml'
+            meta = {'packages': [{'name': 'runner', 'manifest_path': verbatim, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [pid], 'excluded': []}
             obs = r.bind_package_observation(descriptor=desc, metadata=meta, root=troot, manifest_rel='Cargo.toml')
             self.assertEqual('runner', obs['name'])
             self.assertEqual('member', obs['member_kind'])
             self.assertTrue(obs['manifest_path'].endswith('/Cargo.toml'))
+            self.assertEqual(verbatim, obs['manifest_path'])
+            self.assertEqual(pid, obs['id'])
+        with tempfile.TemporaryDirectory() as directory:
+            import urllib.parse
+            wroot = Path(directory)
+            (wroot / 'Cargo.toml').write_text('[package]\nname = "runner"\nversion = "0.1.0"\n', newline='\n')
+            wparent_posix = r._safe_path(wroot, 'Cargo.toml').parent.as_posix()
+            wparent_native = wparent_posix.replace('/', '\\')
+            wmanifest_native = wparent_native + '\\Cargo.toml'
+            encoded = urllib.parse.quote(wparent_posix, safe='/:')
+            if encoded.startswith('/'):
+                wid = f"path+file://{encoded}#runner@0.1.0"
+            else:
+                wid = f"path+file:///{encoded}#runner@0.1.0"
+            wmeta = {'packages': [{'name': 'runner', 'manifest_path': wmanifest_native, 'id': wid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [wid], 'excluded': []}
+            wobs = r.bind_package_observation(descriptor=desc, metadata=wmeta, root=wroot, manifest_rel='Cargo.toml')
+            self.assertEqual(wmanifest_native, wobs['manifest_path'])
+            self.assertEqual(wid, wobs['id'])
+            self.assertEqual('0.1.0', wobs['version'])
+            self.assertTrue(wobs['manifest_path'].replace('\\', '/').endswith('/Cargo.toml'))
+            wart = {'package': 'runner', 'package_id': wid, 'package_version': '0.1.0', 'manifest_rel': 'Cargo.toml', 'target_name': 'runner', 'target_kind': 'lib', 'profile_test': True, 'filenames': ('/tmp/wu850-win-bin.exe',), 'fresh': False}
+            wbound = r.bind_test_binary(artifact=wart, binary_name='wu850-win-bin.exe', binary_sha256='b' * 64)
+            self.assertEqual(wid, wbound['package_id'])
+            wcombined = r.bind_execution_observations(package=wobs, binary=wbound)
+            self.assertEqual('runner', wcombined['name'])
+            self.assertEqual(wid, wcombined['id'])
+            self.assertEqual(wmanifest_native, wcombined['manifest_path'])
+            self.assertEqual('Cargo.toml', wcombined['manifest_rel'])
 
     # WORK_UNIT_CASE: 850/15
     def test_missing_duplicate_package_identity(self):
@@ -1246,7 +1275,9 @@ class PackageManifestCases(unittest.TestCase):
             (troot / 'Cargo.toml').write_text('[package]\nname = "runner"\nversion = "0.1.0"\n', newline='\n')
             parent = r._safe_path(troot, 'Cargo.toml').parent.as_posix()
             pid = f"path+file://{parent}#runner@0.1.0"
-            cases = (('member', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [pid], 'excluded': []}, True), ('excluded', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': ['runner']}, True), ('standalone', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}, True), ('unavailable', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': False}], 'workspace_members': [], 'excluded': []}, False))
+            # Anchor: verbatim manifest_path dir == decoded id dir == filesystem parent.
+            verbatim = parent + '/Cargo.toml'
+            cases = (('member', {'packages': [{'name': 'runner', 'manifest_path': verbatim, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [pid], 'excluded': []}, True), ('excluded', {'packages': [{'name': 'runner', 'manifest_path': verbatim, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': ['runner']}, True), ('standalone', {'packages': [{'name': 'runner', 'manifest_path': verbatim, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}, True), ('unavailable', {'packages': [{'name': 'runner', 'manifest_path': verbatim, 'id': pid, 'version': '0.1.0', 'buildable': False}], 'workspace_members': [], 'excluded': []}, False))
             for kind, meta, ok in cases:
                 with self.subTest(kind=kind):
                     if ok:
@@ -1276,7 +1307,9 @@ class PackageManifestCases(unittest.TestCase):
             (troot / 'Cargo.toml').write_text('[package]\nname = "runner"\nversion = "0.1.0"\n', newline='\n')
             parent = r._safe_path(troot, 'Cargo.toml').parent.as_posix()
             pid = f"path+file://{parent}#runner@0.1.0"
-            excluded_meta = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': ['runner']}
+            # Anchor: verbatim manifest_path dir == decoded id dir == filesystem parent.
+            verbatim = parent + '/Cargo.toml'
+            excluded_meta = {'packages': [{'name': 'runner', 'manifest_path': verbatim, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': ['runner']}
             self.assertEqual('excluded', r.bind_package_observation(descriptor=local, metadata=excluded_meta, root=troot, manifest_rel='Cargo.toml')['member_kind'])
             with self.assertRaisesRegex(r.RunnerInputError, 'WORKSPACE_MEMBER_REQUIRED'):
                 r.bind_package_observation(descriptor=integrated, metadata=excluded_meta, root=troot, manifest_rel='Cargo.toml')
@@ -2152,11 +2185,13 @@ class BoundedCompletionCases(unittest.TestCase):
         with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_NOT_PRODUCED'):
             r.bind_test_binary(artifact=art, binary_name='other-bin.exe', binary_sha256='a' * 64)
         pkg_meta = {'packages': [{'name': 'wu850_tiny',
-                                  'manifest_path': 'C:/repo/' + art['manifest_rel'],
+                                  'manifest_path': real_parent + '/Cargo.toml',
                                   'id': art['package_id'], 'version': art['package_version'],
                                   'buildable': True}],
                     'workspace_members': [art['package_id']], 'excluded': []}
         pkg_obs = r.bind_package_observation(descriptor=desc, metadata=pkg_meta, root=ROOT, manifest_rel=tiny_rel)
+        self.assertEqual(real_parent + '/Cargo.toml', pkg_obs['manifest_path'])
+        self.assertEqual(real_pid, pkg_obs['id'])
         evil_version_id = f"path+file://{real_parent}#wu850_tiny@99.9.9"
         evil_version_meta = {'packages': [{'name': 'wu850_tiny', 'manifest_path': 'C:/forged/elsewhere/Cargo.toml',
                                            'id': evil_version_id, 'version': '99.9.9', 'buildable': True}],
@@ -2169,6 +2204,16 @@ class BoundedCompletionCases(unittest.TestCase):
                          'workspace_members': [evil_dir_id], 'excluded': []}
         with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_ID_DIR_MISMATCH'):
             r.bind_package_observation(descriptor=desc, metadata=evil_dir_meta, root=ROOT, manifest_rel=tiny_rel)
+        forged_prefix_path = 'C:/forged-prefix/' + tiny_rel
+        forged_prefix_meta = {'packages': [{'name': 'wu850_tiny', 'manifest_path': forged_prefix_path,
+                                            'id': real_pid, 'version': '0.1.0', 'buildable': True}],
+                              'workspace_members': [real_pid], 'excluded': []}
+        with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_PATH_DIR_MISMATCH'):
+            r.bind_package_observation(descriptor=desc, metadata=forged_prefix_meta, root=ROOT, manifest_rel=tiny_rel)
+        with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_PATH_DIR_MISMATCH'):
+            forged_obs = r.bind_package_observation(descriptor=desc, metadata=forged_prefix_meta, root=ROOT, manifest_rel=tiny_rel)
+            r.bind_execution_observations(package=forged_obs, binary=bound)
+            r.compose_discovery_receipt(descriptor=desc, binary=bound, test_name='tiny_ok_a', kind='rust', package=forged_obs)
         registry_id = 'registry+https://github.com/rust-lang/crates.io-index#wu850_tiny@0.1.0'
         registry_meta = {'packages': [{'name': 'wu850_tiny', 'manifest_path': 'C:/repo/' + tiny_rel,
                                        'id': registry_id, 'version': '0.1.0', 'buildable': True}],
@@ -2405,10 +2450,10 @@ class ResidualBindingNegatives(unittest.TestCase):
                     bad = {'packages': [{'name': 'runner', 'manifest_path': bad_manifest, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
                     with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_PATH_SHAPE'):
                         r.bind_package_observation(descriptor=desc, metadata=bad, root=troot, manifest_rel='Cargo.toml')
-            forward = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
+            forward = {'packages': [{'name': 'runner', 'manifest_path': parent + '/Cargo.toml', 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
             forward_obs = r.bind_package_observation(descriptor=desc, metadata=forward, root=troot, manifest_rel='Cargo.toml')
-            self.assertEqual(rel, forward_obs['manifest_path'])
-            bad_bool = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': 'yes'}], 'workspace_members': [], 'excluded': []}
+            self.assertEqual(parent + '/Cargo.toml', forward_obs['manifest_path'])
+            bad_bool = {'packages': [{'name': 'runner', 'manifest_path': parent + '/Cargo.toml', 'id': pid, 'version': '0.1.0', 'buildable': 'yes'}], 'workspace_members': [], 'excluded': []}
             with self.assertRaisesRegex(r.RunnerInputError, 'BUILDABLE_BOOL_REQUIRED'):
                 r.bind_package_observation(descriptor=desc, metadata=bad_bool, root=troot, manifest_rel='Cargo.toml')
 
@@ -2466,7 +2511,7 @@ class ResidualBindingNegatives(unittest.TestCase):
         parent = r._safe_path(ROOT, rel).parent.as_posix()
         pid = f"path+file://{parent}#wu850_tiny@0.1.0"
         pkg_obs = r.bind_package_observation(descriptor=desc, metadata={
-            'packages': [{'name': 'wu850_tiny', 'manifest_path': 'C:/repo/' + rel,
+            'packages': [{'name': 'wu850_tiny', 'manifest_path': parent + '/Cargo.toml',
                           'id': pid, 'version': '0.1.0', 'buildable': True}],
             'workspace_members': [pid], 'excluded': []}, root=ROOT, manifest_rel=rel)
 
@@ -2522,7 +2567,7 @@ class ResidualBindingNegatives(unittest.TestCase):
         parent = r._safe_path(ROOT, rel).parent.as_posix()
         pid = f"path+file://{parent}#wu850_tiny@0.1.0"
         pkg = r.bind_package_observation(descriptor=desc, metadata={
-            'packages': [{'name': 'wu850_tiny', 'manifest_path': 'C:/repo/' + rel,
+            'packages': [{'name': 'wu850_tiny', 'manifest_path': parent + '/Cargo.toml',
                           'id': pid, 'version': '0.1.0', 'buildable': True}],
             'workspace_members': [pid], 'excluded': []}, root=ROOT, manifest_rel=rel)
         art = {'package': 'wu850_tiny', 'package_id': pid, 'package_version': '0.1.0',
@@ -2555,7 +2600,7 @@ class ResidualBindingNegatives(unittest.TestCase):
             r.bind_execution_observations(package=dict(pkg, manifest_path='C:/forged/elsewhere/Cargo.toml'), binary=binary)
         with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_IDENTITY_INCONSISTENT'):
             r.bind_package_observation(descriptor=desc, metadata={
-                'packages': [{'name': 'wu850_tiny', 'manifest_path': 'C:/repo/' + rel,
+                'packages': [{'name': 'wu850_tiny', 'manifest_path': parent + '/Cargo.toml',
                               'id': 'path+file:///x#other@0.1.0', 'version': '0.1.0', 'buildable': True}],
                 'workspace_members': [], 'excluded': []}, root=ROOT, manifest_rel=rel)
 

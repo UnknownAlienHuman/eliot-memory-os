@@ -944,6 +944,22 @@ def bind_package_observation(*, descriptor, metadata, root, manifest_rel):
     # manifest content check above stays authoritative.
     if decoded_dir != expected_dir and decoded_dir.casefold() != expected_dir.casefold():
         _reject("PACKAGE_ID_DIR_MISMATCH")
+    # Anchor the verbatim manifest_path to the same file that was read above.
+    # decoded_dir == expected_dir is already enforced, so requiring the
+    # observed manifest_path directory to equal decoded_dir makes all three
+    # coincide; a forged prefix (real id dir, prefixed manifest_path) fails
+    # closed here and never reaches bind_execution_observations. The stored
+    # binding keeps the verbatim manifest_path (no rewrite).
+    observed_manifest_norm = found["manifest_path"].replace("\\", "/")
+    observed_manifest_dir = observed_manifest_norm.rsplit("/", 1)[0]
+    if (len(observed_manifest_dir) >= 3 and observed_manifest_dir[0] == "/"
+            and observed_manifest_dir[1].isalpha() and observed_manifest_dir[2] == ":"):
+        observed_manifest_dir_cmp = observed_manifest_dir[1:]
+    else:
+        observed_manifest_dir_cmp = observed_manifest_dir
+    if (observed_manifest_dir_cmp != decoded_dir
+            and observed_manifest_dir_cmp.casefold() != decoded_dir.casefold()):
+        _reject("MANIFEST_PATH_DIR_MISMATCH")
     member_ids = set(members)
     if found["id"] in member_ids:
         kind = "member"
