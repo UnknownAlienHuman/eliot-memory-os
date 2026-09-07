@@ -1,11 +1,11 @@
 //! Kernel front-door server proof and authentication.
 //!
-//! Architecture anchors (eliot-architecture-docs-fa941135): A12.2 and A12.3,
+//! Architecture anchors: A12.2 and A12.3,
 //! with ARCH-AUTH-01, ARCH-SEC-01, and ARCH-SEC-02. This module owns only the
 //! OS-observed front-door proof and fail-closed authentication mechanics; it
 //! does not create semantic, Store, Governor, or transition authority.
 //!
-//! Implementation anchors (eliot-architecture-docs-fa941135): I2.2, I2.23,
+//! Implementation anchors: I2.1, I2.23,
 //! I7.5, and I7.14. The proof binds the live process, executable object,
 //! artifact digest, and narrow front-door DACL observation to the connected
 //! pipe while preserving the existing cfg and unknown/failure behavior.
@@ -15,6 +15,11 @@
 //! orchestration, and tests remain owned by existing root or sibling modules.
 //! This module observes and proves transport identity; it does not issue a
 //! semantic result or Store/Governor authority.
+//!
+//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md`,
+//! `docs/architecture/ELIOT_ARCHITECTURE.md`,
+//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (compatibility entry points;
+//! the governing shards are named per anchor above).
 
 use crate::{
     KernelFrontDoorAclMode, KernelFrontDoorServerExpectation, PEER_SET_GENERIC_ALL_MAPPED,

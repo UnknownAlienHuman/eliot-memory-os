@@ -105,7 +105,10 @@ impl EventRange {
         match (self.first_sequence, self.last_sequence, self.count) {
             (None, None, 0) => Ok(()),
             (Some(first), Some(last), count)
-                if first <= last && count > 0 && count <= last - first + 1 =>
+                if last
+                    .checked_sub(first)
+                    .and_then(|width| width.checked_add(1))
+                    == Some(count) =>
             {
                 Ok(())
             }
