@@ -227,6 +227,25 @@ fn whole_unit_and_loss_policy_are_closed_and_coherent() {
     let encoded = serde_json::to_string(&LossPolicy::NonDroppable).expect("wire encoding");
     assert_eq!(encoded, "\"NON_DROPPABLE\"");
     assert!(serde_json::from_str::<LossPolicy>("\"OTHER\"").is_err());
+
+    let incompatible_rule = RoleLossRule {
+        role: SemanticRole::Goal,
+        loss_policy: LossPolicy::NonDroppable,
+        required: true,
+        allowed_representations: vec![RepresentationKind::Whole, RepresentationKind::Summary],
+    };
+    assert_eq!(
+        incompatible_rule.validate(),
+        Err(ContextError::WholeUnitRequired)
+    );
+    let duplicate_rule = RoleLossRule {
+        allowed_representations: vec![RepresentationKind::Whole, RepresentationKind::Whole],
+        ..incompatible_rule
+    };
+    assert_eq!(
+        duplicate_rule.validate(),
+        Err(ContextError::WholeUnitRequired)
+    );
 }
 
 #[test]
@@ -262,15 +281,19 @@ fn denominator_and_floor_preserve_incomplete_observability() {
         .expect("valid incomplete floor")
         .expect("missing floor");
     assert_eq!(incomplete.code, ContextErrorCode::DecisionContextIncomplete);
+    assert_eq!(incomplete.missing, vec![id("atom")]);
     assert_eq!(
-        incomplete.missing,
-        vec![id("atom"), id("provider:fixture-provider")]
+        incomplete.provider_gaps,
+        vec![ProviderRoleGap {
+            slot: provider_role(),
+            state: AtomAvailability::Missing,
+        }]
     );
     incomplete
         .validate()
         .expect("incomplete result remains explicit");
 
-    let mut unknown_floor = floor;
+    let mut unknown_floor = floor.clone();
     unknown_floor.providers.dispositions[0].state = AtomAvailability::Unknown;
     unknown_floor.members[0].availability = AtomAvailability::Unknown;
     let unknown = unknown_floor
@@ -278,6 +301,35 @@ fn denominator_and_floor_preserve_incomplete_observability() {
         .expect("unknown floor remains representable")
         .expect("unknown instrumentation cannot become complete");
     assert_eq!(unknown.code, ContextErrorCode::DecisionContextIncomplete);
+    assert_eq!(unknown.unknown, vec![id("atom")]);
+    assert_eq!(
+        unknown.provider_gaps,
+        vec![ProviderRoleGap {
+            slot: provider_role(),
+            state: AtomAvailability::Unknown,
+        }]
+    );
+
+    let mut known_empty_floor = unknown_floor;
+    known_empty_floor.providers.dispositions[0].state = AtomAvailability::KnownEmpty;
+    known_empty_floor.members[0].availability = AtomAvailability::KnownEmpty;
+    let known_empty = known_empty_floor
+        .incomplete()
+        .expect("known-empty floor remains explicit")
+        .expect("known-empty cannot become complete");
+    assert_eq!(known_empty.known_empty, vec![id("atom")]);
+
+    let mut invalid_dependency = floor;
+    invalid_dependency.members[0].required_dependencies = vec![id("atom")];
+    assert_eq!(
+        invalid_dependency.validate(),
+        Err(ContextError::Duplicate("floor.required_dependencies"))
+    );
+    invalid_dependency.members[0].required_dependencies = vec![id("other"), id("other")];
+    assert_eq!(
+        invalid_dependency.validate(),
+        Err(ContextError::Duplicate("floor.required_dependencies"))
+    );
 }
 
 #[test]
@@ -350,20 +402,52 @@ fn admitted_view_preserves_protected_fields_and_rejects_injected_content() {
     let admitted = admitted_set(candidate());
     admitted.validate().expect("admitted set");
     let context = admitted.binding.clone();
-    let output_digest = digest();
+    let recipe_digest = digest();
+    let fence_digest = "b".repeat(64);
+    let rendered = vec![RenderedAtom::from_admitted(&admitted.records[0])];
+    let output_digest = ActiveUnderstandingView::canonical_output_digest(
+        &context,
+        &recipe_digest,
+        &fence_digest,
+        &rendered,
+    )
+    .expect("canonical rendered payload digest");
+    let rendered_bytes = ActiveUnderstandingView::canonical_output_utf8_bytes(
+        &context,
+        &recipe_digest,
+        &fence_digest,
+        &rendered,
+    )
+    .expect("canonical rendered payload bytes");
+    let mut measurement = exact_measurement(&context);
+    measurement.envelope_digest = output_digest.clone();
+    measurement.rendered_utf8_bytes = rendered_bytes;
     let mut view = ActiveUnderstandingView::assemble(
         &admitted,
         quality(&context),
-        exact_measurement(&context),
+        measurement,
         output_digest.clone(),
-        digest(),
-        digest(),
+        recipe_digest,
+        fence_digest,
     )
     .expect("view projection");
     assert!(view.rendered[0].protected);
     assert_eq!(view.selection.output_digest, output_digest);
     view.validate_against(&admitted)
         .expect("exact admitted projection");
+
+    let mut stale = admitted_set(candidate());
+    stale.floor.members[0].availability = AtomAvailability::Stale;
+    stale.floor.providers.dispositions[0].state = AtomAvailability::Stale;
+    stale.records[0].candidate.availability = AtomAvailability::Stale;
+    assert!(matches!(
+        stale.outcome().expect("stale admitted set validates"),
+        ContextOutcome::Incomplete(_)
+    ));
+    let mut mismatched = admitted_set(candidate());
+    mismatched.floor.members[0].availability = AtomAvailability::Stale;
+    mismatched.floor.providers.dispositions[0].state = AtomAvailability::Stale;
+    assert_eq!(mismatched.validate(), Err(ContextError::IdentityConflict));
 
     let mut injected = view.clone();
     let mut extra = injected.rendered[0].clone();
@@ -374,7 +458,7 @@ fn admitted_view_preserves_protected_fields_and_rejects_injected_content() {
         Err(ContextError::SelectionIntegrityMismatch)
     );
 
-    view.rendered[0].authority = AuthorityClass::Governing;
+    view.rendered[0].source_revision = "r2".to_owned();
     assert_eq!(
         view.validate_against(&admitted),
         Err(ContextError::SelectionIntegrityMismatch)

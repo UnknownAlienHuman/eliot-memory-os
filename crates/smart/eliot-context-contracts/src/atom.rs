@@ -239,6 +239,11 @@ impl ContextRecipe {
         if self.mandatory_roles.is_empty() || self.mandatory_roles.len() > 64 {
             return Err(ContextError::MissingField("recipe.mandatory_roles"));
         }
+        let mandatory_roles: std::collections::BTreeSet<_> =
+            self.mandatory_roles.iter().copied().collect();
+        if mandatory_roles.len() != self.mandatory_roles.len() {
+            return Err(ContextError::Duplicate("recipe.mandatory_roles"));
+        }
         for role in &self.mandatory_roles {
             if !self.role_policies.iter().any(|rule| rule.role == *role) {
                 return Err(ContextError::MissingField("recipe.role_policies"));
@@ -255,6 +260,15 @@ impl ContextRecipe {
                 return Err(ContextError::Duplicate("recipe.role_policies.role"));
             }
             rule.validate()?;
+        }
+        let required_roles: std::collections::BTreeSet<_> = self
+            .role_policies
+            .iter()
+            .filter(|rule| rule.required)
+            .map(|rule| rule.role)
+            .collect();
+        if required_roles != mandatory_roles {
+            return Err(ContextError::DenominatorMismatch);
         }
         self.capacity.validate()
     }

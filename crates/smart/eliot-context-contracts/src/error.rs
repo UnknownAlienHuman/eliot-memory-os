@@ -6,6 +6,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::{AtomAvailability, ProviderRole};
+
 /// Machine-readable Context failure code. The incomplete wire spelling is
 /// deliberately different from generic failure.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -95,6 +97,24 @@ pub enum ContextError {
     InvalidDigest(&'static str),
 }
 
+/// A provider/role-specific floor gap retaining its canonical slot identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRoleGap {
+    pub slot: ProviderRole,
+    pub state: AtomAvailability,
+}
+
+impl ProviderRoleGap {
+    fn validate(&self) -> Result<(), ContextError> {
+        self.slot.validate()?;
+        if self.state == AtomAvailability::PresentCurrent {
+            return Err(ContextError::InvalidField("provider_gap.state"));
+        }
+        Ok(())
+    }
+}
+
 /// First-class incomplete outcome with exact floor gap identities.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -115,6 +135,12 @@ pub struct DecisionContextIncomplete {
     pub exhausted: Vec<ArtifactId>,
     /// Mandatory material whose state is not known.
     pub unknown: Vec<ArtifactId>,
+    /// Mandatory material whose authoritative source is known empty.
+    pub known_empty: Vec<ArtifactId>,
+    /// Mandatory material with only partial authoritative coverage.
+    pub partial: Vec<ArtifactId>,
+    /// Provider/role gaps retain the slot instead of manufacturing an atom ID.
+    pub provider_gaps: Vec<ProviderRoleGap>,
     /// Oversized identities/allocations.
     pub oversized: Vec<ArtifactId>,
     /// Failed floor rule identity.
@@ -139,6 +165,9 @@ impl DecisionContextIncomplete {
             omitted: Vec::new(),
             exhausted: Vec::new(),
             unknown: Vec::new(),
+            known_empty: Vec::new(),
+            partial: Vec::new(),
+            provider_gaps: Vec::new(),
             oversized: Vec::new(),
             failed_floor_rule,
             measurements: Vec::new(),
@@ -160,6 +189,9 @@ impl DecisionContextIncomplete {
             && self.omitted.is_empty()
             && self.exhausted.is_empty()
             && self.unknown.is_empty()
+            && self.known_empty.is_empty()
+            && self.partial.is_empty()
+            && self.provider_gaps.is_empty()
         {
             return Err(ContextError::MissingFloor);
         }
@@ -171,6 +203,9 @@ impl DecisionContextIncomplete {
             ("incomplete.omitted", self.omitted.len()),
             ("incomplete.exhausted", self.exhausted.len()),
             ("incomplete.unknown", self.unknown.len()),
+            ("incomplete.known_empty", self.known_empty.len()),
+            ("incomplete.partial", self.partial.len()),
+            ("incomplete.provider_gaps", self.provider_gaps.len()),
             ("incomplete.oversized", self.oversized.len()),
             ("incomplete.measurements", self.measurements.len()),
         ] {
@@ -189,9 +224,18 @@ impl DecisionContextIncomplete {
             .chain(self.omitted.iter())
             .chain(self.exhausted.iter())
             .chain(self.unknown.iter())
+            .chain(self.known_empty.iter())
+            .chain(self.partial.iter())
         {
             if !all.insert(id.clone()) {
                 return Err(ContextError::Duplicate("incomplete.gap_ids"));
+            }
+        }
+        let mut provider_gaps = std::collections::BTreeSet::new();
+        for gap in &self.provider_gaps {
+            gap.validate()?;
+            if !provider_gaps.insert((gap.slot.clone(), gap.state)) {
+                return Err(ContextError::Duplicate("incomplete.provider_gaps"));
             }
         }
         if self.reopening_requirements.len() > 64 {

@@ -45,6 +45,11 @@ impl DecisionSafetyFloor {
         if self.mandatory_atoms.is_empty() || self.members.is_empty() {
             return Err(ContextError::MissingFloor);
         }
+        if self.mandatory_atoms.len() > 256 || self.members.len() > 256 {
+            return Err(ContextError::Bounds {
+                field: "floor.members",
+            });
+        }
         let expected: BTreeSet<_> = self.mandatory_atoms.iter().cloned().collect();
         if expected.len() != self.mandatory_atoms.len() {
             return Err(ContextError::Duplicate("floor.mandatory_atoms"));
@@ -74,6 +79,17 @@ impl DecisionSafetyFloor {
             .iter()
             .map(|member| member.atom_id.clone())
             .collect();
+        if self.interpretation_dependencies.len() > 256 {
+            return Err(ContextError::Bounds {
+                field: "floor.interpretation_dependencies",
+            });
+        }
+        let mut interpretation_dependencies = BTreeSet::new();
+        for dependency in &self.interpretation_dependencies {
+            if !interpretation_dependencies.insert(dependency.clone()) {
+                return Err(ContextError::Duplicate("floor.interpretation_dependencies"));
+            }
+        }
         if !self
             .interpretation_dependencies
             .iter()
@@ -82,6 +98,19 @@ impl DecisionSafetyFloor {
             return Err(ContextError::MissingFloor);
         }
         for member in &self.members {
+            if member.required_dependencies.len() > 256 {
+                return Err(ContextError::Bounds {
+                    field: "floor.required_dependencies",
+                });
+            }
+            let mut dependencies = BTreeSet::new();
+            if member
+                .required_dependencies
+                .iter()
+                .any(|id| !dependencies.insert(id.clone()) || *id == member.atom_id)
+            {
+                return Err(ContextError::Duplicate("floor.required_dependencies"));
+            }
             if !member
                 .required_dependencies
                 .iter()
@@ -122,36 +151,18 @@ impl DecisionSafetyFloor {
                 AtomAvailability::Unavailable => result.unavailable.push(member.atom_id.clone()),
                 AtomAvailability::Omitted => result.omitted.push(member.atom_id.clone()),
                 AtomAvailability::Exhausted => result.exhausted.push(member.atom_id.clone()),
-                AtomAvailability::Unknown
-                | AtomAvailability::Partial
-                | AtomAvailability::KnownEmpty => result.unknown.push(member.atom_id.clone()),
+                AtomAvailability::Unknown => result.unknown.push(member.atom_id.clone()),
+                AtomAvailability::Partial => result.partial.push(member.atom_id.clone()),
+                AtomAvailability::KnownEmpty => result.known_empty.push(member.atom_id.clone()),
                 AtomAvailability::PresentCurrent => {}
             }
         }
         for disposition in &self.providers.dispositions {
-            let id = ArtifactId::new(format!("provider:{}", disposition.slot.provider.as_str()))
-                .map_err(|_| ContextError::InvalidField("provider"))?;
-            match disposition.state {
-                AtomAvailability::Stale => result.stale.push(id),
-                AtomAvailability::Blocked => {
-                    result.blocked.push(id);
-                }
-                AtomAvailability::Unavailable => result.unavailable.push(id),
-                AtomAvailability::Omitted => result.omitted.push(id),
-                AtomAvailability::Exhausted => result.exhausted.push(id),
-                AtomAvailability::Unknown
-                | AtomAvailability::Partial
-                | AtomAvailability::KnownEmpty => result.unknown.push(id),
-                AtomAvailability::PresentCurrent => {}
-                AtomAvailability::Missing => result.missing.push(id),
-            }
-        }
-        for dependency in &self.interpretation_dependencies {
-            if !self.members.iter().any(|member| {
-                member.atom_id == *dependency
-                    && member.availability == AtomAvailability::PresentCurrent
-            }) {
-                result.missing.push(dependency.clone());
+            if disposition.state != AtomAvailability::PresentCurrent {
+                result.provider_gaps.push(crate::ProviderRoleGap {
+                    slot: disposition.slot.clone(),
+                    state: disposition.state,
+                });
             }
         }
         result.missing.sort();
@@ -160,6 +171,18 @@ impl DecisionSafetyFloor {
         result.stale.dedup();
         result.blocked.sort();
         result.blocked.dedup();
+        result.unavailable.sort();
+        result.unavailable.dedup();
+        result.omitted.sort();
+        result.omitted.dedup();
+        result.exhausted.sort();
+        result.exhausted.dedup();
+        result.unknown.sort();
+        result.unknown.dedup();
+        result.known_empty.sort();
+        result.known_empty.dedup();
+        result.partial.sort();
+        result.partial.dedup();
         if result.missing.is_empty()
             && result.stale.is_empty()
             && result.blocked.is_empty()
@@ -168,6 +191,9 @@ impl DecisionSafetyFloor {
             && result.omitted.is_empty()
             && result.exhausted.is_empty()
             && result.unknown.is_empty()
+            && result.known_empty.is_empty()
+            && result.partial.is_empty()
+            && result.provider_gaps.is_empty()
         {
             Ok(None)
         } else {
@@ -218,6 +244,16 @@ impl ContextCandidateSet {
             {
                 return Err(ContextError::DenominatorMismatch);
             }
+            let provider_state = self
+                .denominator
+                .dispositions
+                .iter()
+                .find(|disposition| disposition.slot == candidate.provider_role)
+                .ok_or(ContextError::DenominatorMismatch)?
+                .state;
+            if candidate.availability != provider_state {
+                return Err(ContextError::IdentityConflict);
+            }
             if !ids.insert(candidate.atom_id.clone()) {
                 return Err(ContextError::Duplicate("candidates.atom_id"));
             }
@@ -262,6 +298,39 @@ impl AdmittedContextSet {
             {
                 return Err(ContextError::Duplicate("admitted.atom_id"));
             }
+            let floor_member = self
+                .floor
+                .members
+                .iter()
+                .find(|member| member.atom_id == record.candidate.atom_id)
+                .ok_or(ContextError::DenominatorMismatch)?;
+            if record.candidate.provider_role.role != floor_member.role
+                || record.candidate.availability != floor_member.availability
+            {
+                return Err(ContextError::IdentityConflict);
+            }
+            if let Some(measurement) = &floor_member.measurement
+                && record.candidate.measurement != *measurement
+            {
+                return Err(ContextError::IdentityConflict);
+            }
+            let provider = self
+                .floor
+                .providers
+                .dispositions
+                .iter()
+                .find(|disposition| disposition.slot == record.candidate.provider_role)
+                .ok_or(ContextError::DenominatorMismatch)?;
+            if record.candidate.availability != provider.state {
+                return Err(ContextError::IdentityConflict);
+            }
+            let candidate_dependencies: BTreeSet<_> =
+                record.candidate.dependencies.iter().cloned().collect();
+            let floor_dependencies: BTreeSet<_> =
+                floor_member.required_dependencies.iter().cloned().collect();
+            if candidate_dependencies != floor_dependencies {
+                return Err(ContextError::IdentityConflict);
+            }
             if !matches!(
                 record.disposition,
                 AdmissionDisposition::Include | AdmissionDisposition::HandleOnly
@@ -287,10 +356,22 @@ impl AdmittedContextSet {
                 return Err(ContextError::IdentityConflict);
             }
         }
+        for member in &self.floor.members {
+            if member.availability == crate::AtomAvailability::PresentCurrent
+                && !ids.contains(&member.atom_id)
+            {
+                return Err(ContextError::MissingFloor);
+            }
+        }
         if admitted_ids != ids {
             return Err(ContextError::DenominatorMismatch);
         }
-        self.economy.validate()
+        self.economy.validate()?;
+        let economy_admitted: BTreeSet<_> = self.economy.admitted.iter().cloned().collect();
+        if economy_admitted != ids {
+            return Err(ContextError::EconomyMismatch);
+        }
+        Ok(())
     }
 
     /// Return a complete result only if the floor is complete.

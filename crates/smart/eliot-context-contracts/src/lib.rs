@@ -27,7 +27,9 @@ pub use atom::{
     ProviderDisposition, ProviderRoleDenominator, RepresentationKind, RoleLossRule,
 };
 pub use economy::{ContextEconomyReceipt, EconomyAllocations};
-pub use error::{ContextError, ContextErrorCode, ContextOutcome, DecisionContextIncomplete};
+pub use error::{
+    ContextError, ContextErrorCode, ContextOutcome, DecisionContextIncomplete, ProviderRoleGap,
+};
 pub use identity::{
     CONTEXT_CONTRACT_NAME, CONTEXT_CONTRACT_VERSION, ContextBinding, DecisionRevision,
     ProofBinding, ProviderId, ProviderRole, SemanticRole, SourceSnapshot,
