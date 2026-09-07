@@ -9,6 +9,7 @@ description = "Provider-neutral ACP v1 stdio compatibility adapter"
 [dependencies]
 blake3.workspace = true
 eliot-agent-api.workspace = true
+eliot-contracts.workspace = true
 eliot-process.workspace = true
 eliot-source-assurance.workspace = true
 schemars.workspace = true

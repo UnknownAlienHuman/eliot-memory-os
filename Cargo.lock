@@ -609,6 +609,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "eliot-agent-api",
+ "eliot-contracts",
  "eliot-process",
  "eliot-source-assurance",
  "schemars",
