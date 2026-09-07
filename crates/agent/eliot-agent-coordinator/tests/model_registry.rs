@@ -4,10 +4,10 @@ use std::error::Error;
 use eliot_agent_api::{AuthorityEpoch, ResourceGeneration, RouteFingerprint, StateFence};
 use eliot_agent_coordinator::{
     BillingClass, BillingEvidence, CapabilityObservation, CapabilityStatus, CheckDisposition,
-    ModelAvailability, ModelCatalogueEntry, ModelCatalogueSnapshot, ModelRegistrySnapshot,
-    ModelRole, QuotaDisposition, QuotaObservation, RankingDimension, RankingDisposition,
-    RankingPolicy, RouteAdmissionStatus, RouteHealthStatus, RouteRequirements,
-    compile_model_selection, find_models,
+    CoverageState, ModelAvailability, ModelCatalogueEntry, ModelCatalogueSnapshot,
+    ModelRegistryError, ModelRegistrySnapshot, ModelRole, QuotaDisposition, QuotaObservation,
+    RankingDimension, RankingDisposition, RankingPolicy, RouteAdmissionStatus, RouteHealthStatus,
+    RouteRequirements, compile_model_selection, find_models,
 };
 
 const NOW: u64 = 10_000;
@@ -121,6 +121,58 @@ fn denominator_retains_missing_expected_route() -> Result<(), Box<dyn Error>> {
             .explanations
             .iter()
             .any(|explanation| explanation.entry_id.is_none())
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_empty_denominator_is_unknown_until_explicitly_declared() -> Result<(), Box<dyn Error>> {
+    let empty = catalogue(Vec::new());
+    let legacy = ModelRegistrySnapshot::from_catalogue(&empty)?;
+    assert_eq!(legacy.coverage, CoverageState::Unknown);
+    assert!(!legacy.complete());
+
+    let explicit = ModelRegistrySnapshot::with_expected_routes(&empty, Vec::new())?;
+    assert_eq!(explicit.coverage, CoverageState::Complete);
+    assert!(explicit.complete());
+
+    let mut requirements = requirements()?;
+    requirements.require_complete_coverage = true;
+    let result = find_models(
+        &legacy,
+        &requirements,
+        RankingPolicy::new("r1", vec![RankingDimension::RouteIdentity]),
+    )?;
+    assert!(result.eligible.is_empty());
+    assert_eq!(result.coverage, CoverageState::Unknown);
+    assert!(
+        result
+            .unresolved_facts
+            .iter()
+            .any(|fact| fact == "registry:coverage")
+    );
+    Ok(())
+}
+
+#[test]
+fn source_evidence_cannot_be_declared_not_applicable() -> Result<(), Box<dyn Error>> {
+    let mut snapshot = ModelRegistrySnapshot::from_catalogue(&catalogue(vec![entry(
+        "present",
+        "provider-a",
+        "model-a",
+        1,
+    )]))?;
+    snapshot.source_evidence.state = eliot_agent_coordinator::EvidenceState::NotApplicable;
+    let Err(error) = find_models(
+        &snapshot,
+        &requirements()?,
+        RankingPolicy::new("r1", vec![RankingDimension::RouteIdentity]),
+    ) else {
+        return Err("source evidence unexpectedly accepted".into());
+    };
+    assert_eq!(
+        error,
+        ModelRegistryError::InvalidField("registry.source_evidence")
     );
     Ok(())
 }

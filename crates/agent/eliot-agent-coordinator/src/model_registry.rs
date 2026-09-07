@@ -69,13 +69,18 @@ pub struct RegistryEvidence {
 }
 
 impl RegistryEvidence {
-    pub fn known(source: impl Into<String>, receipt_ref: impl Into<String>) -> Self {
+    pub fn known(
+        source: impl Into<String>,
+        receipt_ref: impl Into<String>,
+        observed_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    ) -> Self {
         Self {
             state: EvidenceState::Known,
             source: Some(source.into()),
             receipt_ref: Some(receipt_ref.into()),
-            observed_at_unix_ms: None,
-            expires_at_unix_ms: None,
+            observed_at_unix_ms: Some(observed_at_unix_ms),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
         }
     }
 
@@ -198,11 +203,7 @@ impl ModelRegistrySnapshot {
             .map(|entry| entry.route.clone())
             .collect();
         let mut snapshot = Self::with_expected_routes(catalogue, expected)?;
-        snapshot.coverage = if catalogue.entries.is_empty() {
-            CoverageState::Complete
-        } else {
-            CoverageState::Unknown
-        };
+        snapshot.coverage = CoverageState::Unknown;
         snapshot.canonical_digest = snapshot_digest(&snapshot)?;
         Ok(snapshot)
     }
@@ -288,6 +289,9 @@ impl ModelRegistrySnapshot {
             || self.expected_route_count != self.routes.len()
         {
             return Err(ModelRegistryError::InvalidField("registry.identity"));
+        }
+        if self.source_evidence.state == EvidenceState::NotApplicable {
+            return Err(ModelRegistryError::InvalidField("registry.source_evidence"));
         }
         self.source_evidence.validate("registry.source_evidence")?;
         self.probe_evidence.validate("registry.probe_evidence")?;
