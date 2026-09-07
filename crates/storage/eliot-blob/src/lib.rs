@@ -892,6 +892,7 @@ struct TombstoneCas {
 #[serde(deny_unknown_fields)]
 struct Tombstone {
     operation_id: String,
+    parent_idempotency_key: String,
     revision: u64,
     intent_revision: u64,
     proof_id: BlobId,
@@ -910,6 +911,10 @@ struct Tombstone {
 impl Tombstone {
     fn validate_base(&self) -> Result<(), BlobError> {
         valid_operation_text(&self.operation_id, "tombstone.operation_id")?;
+        valid_operation_text(
+            &self.parent_idempotency_key,
+            "tombstone.parent_idempotency_key",
+        )?;
         if self.revision == 0 || self.intent_revision == 0 || self.intent_revision > self.revision {
             return Err(BlobError::PlanGap(
                 "GC tombstone revision is missing".to_owned(),
@@ -1049,6 +1054,35 @@ fn cas_failure_is_bound(failure: &BlobCasFailure, request: &BlobCasRequest) -> b
     candidate.context.operation.operation_id == request.context.operation.operation_id
         && candidate.context.operation.idempotency_key == request.context.operation.idempotency_key
         && candidate_commitment == request_commitment
+}
+
+fn validate_retained_cas_status(
+    request: &BlobCasRequest,
+    status: &BlobCasProviderResult,
+) -> Result<(), BlobError> {
+    let expected_success = if request.expected.sha256() == Some(request.replacement_sha256.as_str())
+    {
+        BlobCasSuccessKind::NoOp
+    } else {
+        BlobCasSuccessKind::Applied
+    };
+    if status.operation_id != request.context.operation.operation_id.to_string()
+        || status.request_commitment_sha256 != request.request_commitment_sha256()?
+        || status.observed != request.expected
+        || status.replacement_sha256 != request.replacement_sha256
+        || status.replacement_length != request.replacement_length
+        || status.backend_generation != request.expected_backend_generation
+        || status.observed_durability != BlobCasDurability::Confirmed
+        || status.success != expected_success
+    {
+        return Err(cas_unknown(
+            request,
+            Some(status.observed.clone()),
+            Some(status.backend_generation),
+            status.observed_durability,
+        ));
+    }
+    Ok(())
 }
 
 fn cas_durability_unconfirmed(
@@ -1686,36 +1720,21 @@ where
         &self,
         path: &WorkScopePath,
         tombstone: &Tombstone,
-        expected_revision: Option<u64>,
-    ) -> Result<(), BlobError> {
+        expected_revision: Option<(u64, BlobCasState)>,
+    ) -> Result<BlobCasState, BlobError> {
         tombstone.validate_base()?;
         self.contained(path)?;
-        let (expected_state, observed_state, conflict_observed) = if let Some(expected) =
-            expected_revision
-        {
-            let current_bytes = self.read_bounded_file(path, MAX_JOURNAL_BYTES)?;
-            let current = decode_tombstone(&current_bytes)?;
-            current.validate()?;
-            let observed = BlobCasState::Digest(sha256_hex(&current_bytes));
-            let conflict = current.revision != expected;
-            let attempted = if conflict {
-                tombstone
-                    .cas
-                    .as_ref()
-                    .ok_or_else(|| {
-                        BlobError::PlanGap(
-                            "new GC tombstone is missing owner-issued CAS step context".to_owned(),
-                        )
-                    })?
-                    .expected
-                    .clone()
+        let (expected_state, observed_state, conflict_observed) =
+            if let Some((expected, frozen)) = expected_revision {
+                let current_bytes = self.read_bounded_file(path, MAX_JOURNAL_BYTES)?;
+                let current = decode_tombstone(&current_bytes)?;
+                current.validate()?;
+                let observed = BlobCasState::Digest(sha256_hex(&current_bytes));
+                let conflict = current.revision != expected || frozen != observed;
+                (frozen, observed, conflict)
             } else {
-                observed.clone()
+                (BlobCasState::Missing, BlobCasState::Missing, false)
             };
-            (attempted, observed, conflict)
-        } else {
-            (BlobCasState::Missing, BlobCasState::Missing, false)
-        };
         let backend_generation = self.platform_backend_generation()?;
         if backend_generation == 0 {
             return Err(BlobError::PlanGap(
@@ -1775,7 +1794,8 @@ where
                 }),
             });
         }
-        self.platform_compare_and_replace(&request, &bytes)
+        self.platform_compare_and_replace(&request, &bytes)?;
+        Ok(BlobCasState::Digest(sha256_hex(&bytes)))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1948,28 +1968,8 @@ where
                 BlobCasDurability::Unconfirmed,
             ));
         };
-        let expected_success =
-            if request.expected.sha256() == Some(request.replacement_sha256.as_str()) {
-                BlobCasSuccessKind::NoOp
-            } else {
-                BlobCasSuccessKind::Applied
-            };
-        if status.operation_id != request.context.operation.operation_id.to_string()
-            || status.request_commitment_sha256 != request.request_commitment_sha256()?
-            || status.observed != request.expected
-            || status.replacement_sha256 != request.replacement_sha256
-            || status.replacement_length != request.replacement_length
-            || status.backend_generation != request.expected_backend_generation
-            || status.observed_durability != BlobCasDurability::Confirmed
-            || status.success != expected_success
-        {
-            return Err(cas_unknown(
-                &request,
-                Some(status.observed),
-                Some(status.backend_generation),
-                status.observed_durability,
-            ));
-        }
+        validate_retained_cas_status(&request, &status)?;
+        let mut frozen_cas_state = BlobCasState::Digest(sha256_hex(&bytes));
         if let Some(receipt) = &tombstone.receipt {
             validate_deletion_receipt(receipt, &tombstone)?;
             return Ok(ConditionalDeleteOutcome::Deleted);
@@ -1986,7 +1986,11 @@ where
                 .ok_or_else(|| BlobError::PlanGap("GC tombstone revision overflow".to_owned()))?;
             tombstone.intent_revision = tombstone.revision;
             tombstone.state = GcState::LiveSetRevalidated;
-            self.persist_tombstone(path, &tombstone, Some(previous_revision))?;
+            frozen_cas_state = self.persist_tombstone(
+                path,
+                &tombstone,
+                Some((previous_revision, frozen_cas_state.clone())),
+            )?;
         }
 
         let payload = tombstone.payload.clone();
@@ -2009,7 +2013,11 @@ where
                             BlobError::PlanGap("GC tombstone revision overflow".to_owned())
                         })?;
                         tombstone.state = state;
-                        self.persist_tombstone(path, &tombstone, Some(previous_revision))?;
+                        frozen_cas_state = self.persist_tombstone(
+                            path,
+                            &tombstone,
+                            Some((previous_revision, frozen_cas_state.clone())),
+                        )?;
                         self.platform_remove(target)
                             .map_err(|_| BlobError::UnknownGcOutcome {
                                 operation_id: operation_id.clone(),
@@ -2077,7 +2085,11 @@ where
             .ok_or_else(|| BlobError::PlanGap("GC tombstone revision overflow".to_owned()))?;
         tombstone.state = GcState::TombstoneCleaned;
         tombstone.receipt = Some(applied);
-        self.persist_tombstone(path, &tombstone, Some(previous_revision))?;
+        let _ = self.persist_tombstone(
+            path,
+            &tombstone,
+            Some((previous_revision, frozen_cas_state)),
+        )?;
         Ok(ConditionalDeleteOutcome::Deleted)
     }
 
@@ -2589,6 +2601,9 @@ where
                         "GC tombstone identity does not match the exact request".to_owned(),
                     ));
                 }
+                if tombstone.parent_idempotency_key != request.context.operation.idempotency_key {
+                    return Err(BlobError::IdempotencyConflict);
+                }
                 match self.reconcile_tombstone_path(&tombstone_path)? {
                     ConditionalDeleteOutcome::Deleted => deleted.push(locator.clone()),
                     ConditionalDeleteOutcome::RetainedLive => retained.push(locator.clone()),
@@ -2633,6 +2648,7 @@ where
             Self::validate_revalidation(&request, &current)?;
             let tombstone = Tombstone {
                 operation_id: request.context.operation.operation_id.to_string(),
+                parent_idempotency_key: request.context.operation.idempotency_key.clone(),
                 revision: 1,
                 intent_revision: 1,
                 proof_id: request.live_set.proof_id.clone(),
@@ -2737,6 +2753,18 @@ where
                 if cas.root_lease != self.owner.lease {
                     return Err(BlobError::StaleFence);
                 }
+                let request = Self::tombstone_cas_request(&tombstone, &bytes)?;
+                let Ok(Some(status)) = self.platform_read().and_then(|platform| {
+                    platform.cas_status(request.context.operation.operation_id.as_str())
+                }) else {
+                    return Err(cas_unknown(
+                        &request,
+                        None,
+                        None,
+                        BlobCasDurability::Unconfirmed,
+                    ));
+                };
+                validate_retained_cas_status(&request, &status)?;
                 if !matches!(tombstone.state, GcState::TombstoneCleaned)
                     || tombstone.receipt.is_none()
                 {
@@ -3751,6 +3779,12 @@ mod tests {
         let health = block_on(store.health()).expect("health");
         assert!(health.ready);
         assert!(health.recovery_clean);
+        let mut changed_parent = request.clone();
+        changed_parent.context.operation.idempotency_key = "gc-operation-changed".to_owned();
+        assert_eq!(
+            block_on(store.gc(changed_parent)),
+            Err(BlobError::IdempotencyConflict)
+        );
         let replay = block_on(store.gc(request)).expect("exact gc replay");
         assert_eq!(replay, receipt);
     }
@@ -3808,6 +3842,49 @@ mod tests {
         assert!(matches!(
             block_on(store.gc(request.clone())),
             Err(BlobError::UnknownGcOutcome { .. })
+        ));
+        let tombstones = WorkScopePath::new("tombstones").expect("tombstones path");
+        let tombstone_path = store
+            .core
+            .platform
+            .read()
+            .expect("platform lock")
+            .list(&tombstones)
+            .expect("tombstone list")
+            .into_iter()
+            .next()
+            .expect("durable tombstone");
+        let current_bytes = store
+            .core
+            .platform
+            .read()
+            .expect("platform lock")
+            .read_bounded(&tombstone_path, MAX_JOURNAL_BYTES)
+            .expect("tombstone bytes");
+        let current = decode_tombstone(&current_bytes).expect("tombstone");
+        let revision_one_id =
+            tombstone_cas_step_identity(&current.operation_id, &tombstone_path, 1);
+        let revision_one_status = store
+            .core
+            .platform
+            .read()
+            .expect("platform lock")
+            .cas_status(&revision_one_id)
+            .expect("retained status")
+            .expect("revision one status");
+        let revision_one_expected = revision_one_status.replacement_sha256.clone();
+        let mut stale = current.clone();
+        stale.revision = current.revision.saturating_add(1);
+        let stale_error = store.core.persist_tombstone(
+            &tombstone_path,
+            &stale,
+            Some((1, BlobCasState::Digest(revision_one_expected.clone()))),
+        );
+        assert!(matches!(
+            stale_error,
+                Err(BlobError::CasFailure { failure })
+                    if matches!(&*failure, BlobCasFailure::ExpectedStateConflict { request, .. }
+                    if request.expected == BlobCasState::Digest(revision_one_expected.clone()))
         ));
         assert!(block_on(store.read(read_request(&orphan, "unknown-read"))).is_ok());
         let health = block_on(store.health()).expect("health");
