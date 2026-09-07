@@ -489,6 +489,15 @@ fn admitted_view_preserves_protected_fields_and_rejects_injected_content() {
         .expect("exact admitted projection");
 
     let mut qualified = exact_measurement(&context);
+    qualified.status = MeasurementStatus::ExactTokenizer;
+    qualified.tokenizer = Some(TokenizerObservation {
+        tokenizer_id: "fixture-tokenizer".to_owned(),
+        tokenizer_version: "1".to_owned(),
+        tokenizer_hash: digest(),
+        tokens: admitted
+            .canonical_payload_utf8_bytes()
+            .expect("admitted payload token fixture"),
+    });
     qualified.envelope_digest = admitted
         .canonical_payload_digest()
         .expect("admitted payload digest");

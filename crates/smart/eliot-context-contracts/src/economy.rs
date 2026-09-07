@@ -85,9 +85,7 @@ impl ContextEconomyReceipt {
             return Err(ContextError::EconomyMismatch);
         }
         if !displaced.is_empty()
-            && (self.requested.is_empty()
-                || self.admitted.is_empty()
-                || self.applied_rule.as_str().is_empty())
+            && (self.requested.is_empty() || self.applied_rule.as_str().is_empty())
         {
             return Err(ContextError::EconomyMismatch);
         }

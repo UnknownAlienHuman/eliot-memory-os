@@ -317,6 +317,68 @@ impl AdmittedContextSet {
         u64::try_from(bytes.len()).map_err(|_| ContextError::Overflow)
     }
 
+    fn validate_admitted_record(
+        &self,
+        record: &AdmittedAtom,
+        ids: &mut BTreeSet<ArtifactId>,
+    ) -> Result<(), ContextError> {
+        record.candidate.validate()?;
+        if record.candidate.binding != self.binding || !ids.insert(record.candidate.atom_id.clone())
+        {
+            return Err(ContextError::Duplicate("admitted.atom_id"));
+        }
+        if let Some(floor_member) = self
+            .floor
+            .members
+            .iter()
+            .find(|member| member.atom_id == record.candidate.atom_id)
+        {
+            if record.candidate.provider_role.role != floor_member.role
+                || record.candidate.availability != floor_member.availability
+            {
+                return Err(ContextError::IdentityConflict);
+            }
+            if let Some(measurement) = &floor_member.measurement
+                && record.candidate.measurement != *measurement
+            {
+                return Err(ContextError::IdentityConflict);
+            }
+            let candidate_dependencies: BTreeSet<_> =
+                record.candidate.dependencies.iter().cloned().collect();
+            let floor_dependencies: BTreeSet<_> =
+                floor_member.required_dependencies.iter().cloned().collect();
+            if candidate_dependencies != floor_dependencies {
+                return Err(ContextError::IdentityConflict);
+            }
+            if !self
+                .floor
+                .providers
+                .dispositions
+                .iter()
+                .any(|disposition| disposition.slot == record.candidate.provider_role)
+            {
+                return Err(ContextError::DenominatorMismatch);
+            }
+        }
+        if let Some(provider) = self
+            .floor
+            .providers
+            .dispositions
+            .iter()
+            .find(|disposition| disposition.slot == record.candidate.provider_role)
+            && record.candidate.availability != provider.state
+        {
+            return Err(ContextError::IdentityConflict);
+        }
+        if !matches!(
+            record.disposition,
+            AdmissionDisposition::Include | AdmissionDisposition::HandleOnly
+        ) {
+            return Err(ContextError::DenominatorMismatch);
+        }
+        Ok(())
+    }
+
     /// Validate candidate/admitted identity conservation and floor outcome.
     pub fn validate(&self) -> Result<(), ContextError> {
         self.binding.validate()?;
@@ -326,52 +388,7 @@ impl AdmittedContextSet {
         }
         let mut ids = BTreeSet::new();
         for record in &self.records {
-            record.candidate.validate()?;
-            if record.candidate.binding != self.binding
-                || !ids.insert(record.candidate.atom_id.clone())
-            {
-                return Err(ContextError::Duplicate("admitted.atom_id"));
-            }
-            if let Some(floor_member) = self
-                .floor
-                .members
-                .iter()
-                .find(|member| member.atom_id == record.candidate.atom_id)
-            {
-                if record.candidate.provider_role.role != floor_member.role
-                    || record.candidate.availability != floor_member.availability
-                {
-                    return Err(ContextError::IdentityConflict);
-                }
-                if let Some(measurement) = &floor_member.measurement
-                    && record.candidate.measurement != *measurement
-                {
-                    return Err(ContextError::IdentityConflict);
-                }
-                let candidate_dependencies: BTreeSet<_> =
-                    record.candidate.dependencies.iter().cloned().collect();
-                let floor_dependencies: BTreeSet<_> =
-                    floor_member.required_dependencies.iter().cloned().collect();
-                if candidate_dependencies != floor_dependencies {
-                    return Err(ContextError::IdentityConflict);
-                }
-            }
-            if let Some(provider) = self
-                .floor
-                .providers
-                .dispositions
-                .iter()
-                .find(|disposition| disposition.slot == record.candidate.provider_role)
-                && record.candidate.availability != provider.state
-            {
-                return Err(ContextError::IdentityConflict);
-            }
-            if !matches!(
-                record.disposition,
-                AdmissionDisposition::Include | AdmissionDisposition::HandleOnly
-            ) {
-                return Err(ContextError::DenominatorMismatch);
-            }
+            self.validate_admitted_record(record, &mut ids)?;
         }
         let mut admitted_ids = BTreeSet::new();
         for admission in &self.admissions {
@@ -395,6 +412,20 @@ impl AdmittedContextSet {
             if member.availability == crate::AtomAvailability::PresentCurrent
                 && !ids.contains(&member.atom_id)
             {
+                return Err(ContextError::MissingFloor);
+            }
+        }
+        for provider in self
+            .floor
+            .providers
+            .dispositions
+            .iter()
+            .filter(|provider| provider.state == crate::AtomAvailability::PresentCurrent)
+        {
+            if !self.records.iter().any(|record| {
+                record.candidate.provider_role == provider.slot
+                    && record.candidate.availability == crate::AtomAvailability::PresentCurrent
+            }) {
                 return Err(ContextError::MissingFloor);
             }
         }
@@ -422,6 +453,21 @@ impl AdmittedContextSet {
             if measurement.context != self.binding {
                 return Err(ContextError::InvalidFence);
             }
+            let measured_cost = match measurement.status {
+                crate::MeasurementStatus::ExactUtf8 => measurement.rendered_utf8_bytes,
+                crate::MeasurementStatus::ExactTokenizer => {
+                    measurement
+                        .tokenizer
+                        .as_ref()
+                        .ok_or(ContextError::UnknownMeasurement)?
+                        .tokens
+                }
+                crate::MeasurementStatus::ConservativeStu
+                | crate::MeasurementStatus::Unknown
+                | crate::MeasurementStatus::Unavailable => {
+                    return Err(ContextError::UnknownMeasurement);
+                }
+            };
             if measurement.envelope_digest != self.canonical_payload_digest()?
                 || measurement.rendered_utf8_bytes != self.canonical_payload_utf8_bytes()?
             {
@@ -448,7 +494,7 @@ impl AdmittedContextSet {
                 .admitted_required
                 .checked_add(allocations.admitted_optional)
                 .ok_or(ContextError::Overflow)?;
-            if measurement.rendered_utf8_bytes != admitted_cost {
+            if measured_cost != admitted_cost {
                 return Err(ContextError::EconomyMismatch);
             }
             if !measurement.proves_fit(capacity.route_capacity)? {
