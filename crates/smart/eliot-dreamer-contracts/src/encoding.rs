@@ -281,10 +281,10 @@ mod tests {
         assert!(serde_json::from_str::<SemanticSequence>(&tampered).is_err());
         let extra = json.replace('}', r#","extra":1}"#);
         assert!(serde_json::from_str::<SemanticSequence>(&extra).is_err());
+        digest_flood_probe();
     }
 
-    #[test]
-    fn item_digest_combined_flood_fails_fast_on_targets() {
+    fn digest_flood_probe() {
         let fence = crate::registry::fence();
         let hex = eliot_contracts::sha256_hex(b"model");
         let receipt = crate::draft::valid_receipt(&hex, fence.clone());
