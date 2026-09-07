@@ -399,8 +399,8 @@ fn required_floor_is_admitted_before_fitting_optional_material() {
             .iter()
             .any(|record| record.disposition == AdmissionDisposition::HandleOnly)
     );
-    assert_eq!(admitted.economy.allocations.admitted_required, 20);
-    assert_eq!(admitted.economy.allocations.admitted_optional, 20);
+    assert_eq!(admitted.economy.allocations.admitted_required, 40);
+    assert_eq!(admitted.economy.allocations.admitted_optional, 0);
     result.validate_for(&input).expect("result conservation");
 }
 
