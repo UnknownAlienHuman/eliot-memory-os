@@ -227,6 +227,15 @@ fn request(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    let root_effects = if specs.iter().any(|spec| spec.write) {
+        BTreeSet::from([
+            EffectKind::Observe,
+            EffectKind::ReadWorkspace,
+            EffectKind::WriteCandidate,
+        ])
+    } else {
+        BTreeSet::from([EffectKind::Observe, EffectKind::ReadWorkspace])
+    };
     Ok(StaffingPlanRequest {
         candidate_id: CandidateId::new(format!("candidate-{tag}"))?,
         launch: AgentLaunchRequest {
@@ -243,7 +252,7 @@ fn request(
             privacy_profile: "PRIVATE".to_owned(),
             effect_ceiling: EffectCeiling {
                 scope_ref: "task-scope".to_owned(),
-                allowed: BTreeSet::from([EffectKind::WriteCandidate]),
+                allowed: root_effects,
                 max_external_effects: 0,
             },
             max_depth: 3,
