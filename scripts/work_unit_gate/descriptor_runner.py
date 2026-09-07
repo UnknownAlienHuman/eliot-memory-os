@@ -330,7 +330,7 @@ def parse_descriptor(raw: bytes, filename: str, assignment):
         descriptor = c.WorkUnitDescriptor.from_mapping(converted)
     except c.ContractViolation:
         _reject("SHARED_DESCRIPTOR_REJECTED")
-    for key in ("issue", "unit", "matrix_cases", "body_sha256", "matrix_sha256"):
+    for key in ("issue", "unit", "matrix_cases", "body_sha256", "matrix_sha256", "proof_ceiling"):
         if getattr(descriptor, key) != getattr(assignment, key):
             _reject("STALE_ASSIGNMENT_BINDING")
     return descriptor
@@ -481,6 +481,9 @@ def compose_discovery_receipt(*, descriptor, binary, test_name, kind, line=1):
             _reject("PYTHON_MODULE_SYNTAX")
     _integer(line, 2**31 - 1, 1)
     if binary is None:
+        if kind == "rust":
+            _reject("BINARY_REQUIRED")
+        # python has no binary concept; suite-set binding.
         rel = descriptor.test_roots[0].value
         artifact_digest = descriptor.matrix_sha256
     else:
@@ -488,6 +491,11 @@ def compose_discovery_receipt(*, descriptor, binary, test_name, kind, line=1):
             _reject("BINARY_BINDING_REQUIRED")
         if descriptor.package is not None and binary.get("package") != descriptor.package.name:
             _reject("PACKAGE_BINARY_MISMATCH")
+        if kind == "rust":
+            if binary.get("profile_test") is not True:
+                _reject("BINARY_NOT_TEST_PROFILE")
+            if binary.get("target_kind") not in ("lib", "bin", "test"):
+                _reject("UNSUPPORTED_TARGET_KIND")
         rel = _relative_path(binary["manifest_rel"])
         candidate = binary.get("binary_sha256")
         if type(candidate) is not str or not _HEX.fullmatch(candidate):
@@ -602,6 +610,11 @@ def _parse_build_artifact(data: dict, package: str, manifest_rel: str):
     fragments = package_id.split("#")
     if len(fragments) != 2 or not fragments[1].startswith(f"{package}@"):
         _reject("PACKAGE_ID_MISMATCH")
+    version = fragments[1][len(package) + 1:]
+    if (not version or len(version.encode("utf-8")) > 128 or "#" in version
+            or "@" in version or any(ch.isspace() for ch in version)):
+        _reject("PACKAGE_VERSION_SHAPE")
+    _text(package_id, 1024)
     target = data.get("target")
     if type(target) is not dict:
         _reject("TARGET_SHAPE")
@@ -630,7 +643,8 @@ def _parse_build_artifact(data: dict, package: str, manifest_rel: str):
     fresh = data.get("fresh")
     if type(fresh) is not bool:
         _reject("FRESH_BOOL_REQUIRED")
-    return {"package": package, "manifest_rel": manifest_rel, "target_name": target_name,
+    return {"package": package, "package_id": package_id, "package_version": version,
+            "version": version, "manifest_rel": manifest_rel, "target_name": target_name,
             "target_kind": kinds[0], "profile_test": profile["test"],
             "filenames": tuple(clean), "fresh": fresh}
 
@@ -731,11 +745,23 @@ def bind_test_binary(*, artifact, binary_name, binary_sha256, target=None, cfgs=
     """
     if type(artifact) is not dict:
         _reject("ARTIFACT_SHAPE")
-    for key in ("package", "manifest_rel", "filenames"):
+    for key in ("package", "manifest_rel", "filenames", "package_id"):
         if key not in artifact:
             _reject("ARTIFACT_SHAPE")
+    if "package_version" not in artifact and "version" not in artifact:
+        _reject("ARTIFACT_SHAPE")
     package = _text(artifact["package"], 128)
     manifest = _relative_path(artifact["manifest_rel"])
+    raw_version = artifact.get("package_version", artifact.get("version"))
+    if (type(raw_version) is not str or not raw_version
+            or len(raw_version.encode("utf-8")) > 128 or "#" in raw_version
+            or "@" in raw_version or any(ch.isspace() for ch in raw_version)):
+        _reject("PACKAGE_VERSION_SHAPE")
+    version = raw_version
+    try:
+        package_id = _text(artifact["package_id"], 1024)
+    except RunnerInputError:
+        raise
     filenames = artifact["filenames"]
     if type(filenames) not in (list, tuple) or not filenames:
         _reject("ARTIFACT_SHAPE")
@@ -757,9 +783,10 @@ def bind_test_binary(*, artifact, binary_name, binary_sha256, target=None, cfgs=
     profile = artifact.get("profile_test", False)
     if type(profile) is not bool:
         _reject("PROFILE_SHAPE")
-    return {"package": package, "manifest_rel": manifest, "binary_name": name,
+    return {"package": package, "package_id": package_id, "package_version": version,
+            "version": version, "manifest_rel": manifest, "binary_name": name,
             "binary_sha256": digest, "target": target, "cfgs": codes,
-            "profile_test": profile}
+            "target_kind": artifact.get("target_kind"), "profile_test": profile}
 
 
 def bind_package_observation(*, descriptor, metadata):
@@ -790,17 +817,31 @@ def bind_package_observation(*, descriptor, metadata):
     wanted = descriptor.package.name
     matches = []
     for entry in packages:
-        item = _keys(entry, ("name", "manifest_path", "id", "buildable"))
+        item = _keys(entry, ("name", "manifest_path", "id", "buildable", "version"))
         entry_name = _text(item["name"], 128)
-        manifest_path = _text(item["manifest_path"], 1024)
-        if not manifest_path.endswith("/Cargo.toml"):
+        raw_manifest_path = item["manifest_path"]
+        if type(raw_manifest_path) is not str:
+            _text(raw_manifest_path, 1024)
+        # cargo emits platform-native separators; comparison is separator-insensitive.
+        normalized = raw_manifest_path.replace("\\", "/")
+        if (not normalized.endswith("/Cargo.toml") or "//" in raw_manifest_path
+                or "\\\\" in raw_manifest_path or ".." in normalized.split("/")
+                or any(ord(c) < 32 or ord(c) == 127 for c in raw_manifest_path)):
             _reject("MANIFEST_PATH_SHAPE")
-        entry_id = _text(item["id"], 1024)
+        manifest_path = _text(raw_manifest_path, 1024)
+        try:
+            entry_id = _text(item["id"], 512)
+        except RunnerInputError:
+            _reject("METADATA_ID_SHAPE")
+        raw_ver = item["version"]
+        if (type(raw_ver) is not str or not raw_ver or len(raw_ver.encode("utf-8")) > 128
+                or "#" in raw_ver or "@" in raw_ver or any(ch.isspace() for ch in raw_ver)):
+            _reject("METADATA_VERSION_SHAPE")
         if type(item["buildable"]) is not bool:
             _reject("BUILDABLE_BOOL_REQUIRED")
         if entry_name == wanted:
             matches.append({"name": entry_name, "manifest_path": manifest_path,
-                            "id": entry_id, "buildable": item["buildable"]})
+                            "id": entry_id, "version": raw_ver, "buildable": item["buildable"]})
     if not matches:
         _reject("PACKAGE_NOT_FOUND")
     if len(matches) > 1:
@@ -820,7 +861,7 @@ def bind_package_observation(*, descriptor, metadata):
     if descriptor.require_workspace_member and kind != "member":
         _reject("WORKSPACE_MEMBER_REQUIRED")
     return {"name": found["name"], "manifest_path": found["manifest_path"],
-            "member_kind": kind}
+            "member_kind": kind, "version": found["version"], "id": found["id"]}
 
 
 def build_python_child_command(*, script_rel: str, fd: int):
@@ -990,7 +1031,7 @@ def compare_snapshots(before: dict, after: dict):
     }
 
 
-def bind_protected_snapshot(*, descriptor, assignment, snapshot: dict):
+def bind_protected_snapshot(*, descriptor, assignment, snapshot: dict, descriptor_rel: str, manifest_rel):
     """Bind a controller-observed protected-input snapshot to the descriptor.
 
     The adapter consumes the controller's observed digest mapping and emits an
@@ -998,7 +1039,9 @@ def bind_protected_snapshot(*, descriptor, assignment, snapshot: dict):
     assignment must be an ACTIVE_ASSIGNMENT+OPEN receipt bound to the same
     issue/unit/matrix/body as the descriptor. Required keys are the sorted
     source+test root values plus the module file when the descriptor carries
-    one; the digest is sha256 over the canonical JSON of the sorted items.
+    one, plus the descriptor file itself, plus the package manifest when the
+    descriptor carries a package; the digest is sha256 over the canonical
+    JSON of the sorted items.
     """
     from . import contracts as c
     if type(descriptor) is not c.WorkUnitDescriptor:
@@ -1010,9 +1053,25 @@ def bind_protected_snapshot(*, descriptor, assignment, snapshot: dict):
     for key in ("issue", "unit", "matrix_cases", "body_sha256", "matrix_sha256"):
         if getattr(descriptor, key) != getattr(assignment, key):
             _reject("STALE_ASSIGNMENT_BINDING")
+    try:
+        drel = _relative_path(descriptor_rel)
+    except RunnerInputError:
+        _reject("DESCRIPTOR_REL_SHAPE")
+    if descriptor.package is not None:
+        if type(manifest_rel) is not str:
+            _reject("MANIFEST_REL_SHAPE")
+        try:
+            mrel = _relative_path(manifest_rel)
+        except RunnerInputError:
+            _reject("MANIFEST_REL_SHAPE")
+    else:
+        if manifest_rel is not None:
+            _reject("MANIFEST_REL_SHAPE")
+        mrel = None
     required = sorted({path.value for path in descriptor.source_roots + descriptor.test_roots}
                       | ({descriptor.module.value.replace(".", "/") + ".py"}
-                         if descriptor.module is not None else set()))
+                         if descriptor.module is not None else set())
+                      | {drel} | ({mrel} if mrel is not None else set()))
     if not required:
         _reject("EMPTY_SNAPSHOT")
     if type(snapshot) is not dict:
@@ -1027,6 +1086,55 @@ def bind_protected_snapshot(*, descriptor, assignment, snapshot: dict):
     canonical = json.dumps({key: snapshot[key] for key in required},
                            sort_keys=True, separators=(",", ":")).encode("utf-8")
     return {"digest": hashlib.sha256(canonical).hexdigest(), "keys": required}
+
+
+def compose_mutation_finding(*, descriptor, diff: dict, snapshot_digest: str):
+    """Emit a typed protected-input invalidation finding, or None when clean.
+
+    Pure shape binding over a controller-observed snapshot diff
+    {mutated, added, removed} of sorted string lists; no filesystem access.
+    All three empty means clean (None). Otherwise an ERROR/SOURCE_UNAVAILABLE
+    finding owned by the descriptor unit carrying only codes/paths.
+    """
+    from . import contracts as c
+    if type(descriptor) is not c.WorkUnitDescriptor:
+        _reject("DESCRIPTOR_TYPE_REQUIRED")
+    _sha(snapshot_digest)
+    try:
+        checked = _keys(diff, ("mutated", "added", "removed"))
+    except RunnerInputError:
+        _reject("MUTATION_DIFF_SHAPE")
+    parts = {}
+    for key in ("mutated", "added", "removed"):
+        value = checked[key]
+        if type(value) is not list:
+            _reject("MUTATION_DIFF_SHAPE")
+        for item in value:
+            if type(item) is not str:
+                _reject("MUTATION_DIFF_SHAPE")
+            try:
+                _text(item, 1024)
+            except RunnerInputError:
+                _reject("MUTATION_DIFF_SHAPE")
+        if list(value) != sorted(value) or len(set(value)) != len(value):
+            _reject("MUTATION_DIFF_SHAPE")
+        parts[key] = list(value)
+    if not parts["mutated"] and not parts["added"] and not parts["removed"]:
+        return None
+    combined = sorted(parts["mutated"] + parts["added"] + parts["removed"])
+    message = "protected-input-invalidated:" + ",".join(combined)
+    try:
+        _text(message, 1024)
+    except RunnerInputError:
+        _reject("MUTATION_DIFF_SHAPE")
+    try:
+        return c.Finding(severity=c.FindingSeverity.ERROR,
+                         finding_class=c.FindingClass.SOURCE_UNAVAILABLE,
+                         owner=descriptor.unit,
+                         remediation=c.RemediationCode("REPROVISION_PROTECTED_INPUTS"),
+                         message=message)
+    except c.ContractViolation:
+        _reject("MUTATION_FINDING_REJECTED")
 
 
 def canonical_command(argv):

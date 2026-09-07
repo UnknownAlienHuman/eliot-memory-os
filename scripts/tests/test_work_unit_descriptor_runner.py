@@ -878,7 +878,7 @@ class DescriptorBindingTests(unittest.TestCase):
         value = c.AssignmentSourceReceipt(
             issue=issue, state=c.IssueState.OPEN, unit=c.WorkUnitIdentity("D-WU-RUNNERS"),
             authority=c.SourceAuthority.LIVE_GITHUB, title="fixture, not a live authorization",
-            body_sha256="a" * 64, matrix_cases=44, proof_ceiling=c.ProofCeiling("assignment-source-only"),
+            body_sha256="a" * 64, matrix_cases=44, proof_ceiling=c.ProofCeiling("package-local"),
             matrix_sha256="b" * 64, source_use=c.AssignmentSourceUse.ACTIVE_ASSIGNMENT,
             origin="https://api.github.com")
         return dataclasses.replace(value, **changes)
@@ -1022,7 +1022,7 @@ def _b1_assignment(**changes):
     value = c.AssignmentSourceReceipt(
         issue=issue, state=c.IssueState.OPEN, unit=c.WorkUnitIdentity("D-WU-RUNNERS"),
         authority=c.SourceAuthority.LIVE_GITHUB, title="fixture, not a live authorization",
-        body_sha256="a" * 64, matrix_cases=44, proof_ceiling=c.ProofCeiling("assignment-source-only"),
+        body_sha256="a" * 64, matrix_cases=44, proof_ceiling=c.ProofCeiling("package-local"),
         matrix_sha256="b" * 64, source_use=c.AssignmentSourceUse.ACTIVE_ASSIGNMENT,
         origin="https://api.github.com")
     return dataclasses.replace(value, **changes)
@@ -1188,7 +1188,7 @@ class PackageManifestCases(unittest.TestCase):
         self.assertEqual('wu850_tiny', binding['name'])
         self.assertEqual('member', binding['member_kind'])
         desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
-        meta = {'packages': [{'name': 'runner', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': 'path+file:///repo#runner@0.1.0', 'buildable': True}], 'workspace_members': ['path+file:///repo#runner@0.1.0'], 'excluded': []}
+        meta = {'packages': [{'name': 'runner', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': 'path+file:///repo#runner@0.1.0', 'version': '0.1.0', 'buildable': True}], 'workspace_members': ['path+file:///repo#runner@0.1.0'], 'excluded': []}
         obs = r.bind_package_observation(descriptor=desc, metadata=meta)
         self.assertEqual('runner', obs['name'])
         self.assertEqual('member', obs['member_kind'])
@@ -1205,10 +1205,10 @@ class PackageManifestCases(unittest.TestCase):
         with self.assertRaises(r.RunnerInputError):
             r.resolve_package_manifest(package_name='wu850_tiny', metadata_packages=dup)
         desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
-        missing_meta = {'packages': [{'name': 'other', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': 'path+file:///repo#other@0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
+        missing_meta = {'packages': [{'name': 'other', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': 'path+file:///repo#other@0.1.0', 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
         with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_NOT_FOUND'):
             r.bind_package_observation(descriptor=desc, metadata=missing_meta)
-        dup_meta = {'packages': [{'name': 'runner', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': 'path+file:///repo#runner@0.1.0', 'buildable': True}, {'name': 'runner', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': 'path+file:///repo#runner@0.1.1', 'buildable': True}], 'workspace_members': [], 'excluded': []}
+        dup_meta = {'packages': [{'name': 'runner', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': 'path+file:///repo#runner@0.1.0', 'version': '0.1.0', 'buildable': True}, {'name': 'runner', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': 'path+file:///repo#runner@0.1.1', 'version': '0.1.1', 'buildable': True}], 'workspace_members': [], 'excluded': []}
         with self.assertRaisesRegex(r.RunnerInputError, 'DUPLICATE_PACKAGE_IDENTITY'):
             r.bind_package_observation(descriptor=desc, metadata=dup_meta)
 
@@ -1231,7 +1231,7 @@ class PackageManifestCases(unittest.TestCase):
             r.resolve_package_manifest(package_name='p', metadata_packages=[{'name': 'p', 'manifest_rel': rel, 'member_kind': 'excluded'}], require_workspace_member=True)
         desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
         pid = 'path+file:///repo#runner@0.1.0'
-        cases = (('member', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'buildable': True}], 'workspace_members': [pid], 'excluded': []}, True), ('excluded', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'buildable': True}], 'workspace_members': [], 'excluded': ['runner']}, True), ('standalone', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'buildable': True}], 'workspace_members': [], 'excluded': []}, True), ('unavailable', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'buildable': False}], 'workspace_members': [], 'excluded': []}, False))
+        cases = (('member', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [pid], 'excluded': []}, True), ('excluded', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': ['runner']}, True), ('standalone', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}, True), ('unavailable', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': False}], 'workspace_members': [], 'excluded': []}, False))
         for kind, meta, ok in cases:
             with self.subTest(kind=kind):
                 if ok:
@@ -1257,13 +1257,13 @@ class PackageManifestCases(unittest.TestCase):
         self.assertNotEqual(local.sha256, integrated.sha256)
         self.assertIs(local.phase, c.VerificationPhase.PACKAGE_LOCAL)
         pid = 'path+file:///repo#runner@0.1.0'
-        excluded_meta = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'buildable': True}], 'workspace_members': [], 'excluded': ['runner']}
+        excluded_meta = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': ['runner']}
         self.assertEqual('excluded', r.bind_package_observation(descriptor=local, metadata=excluded_meta)['member_kind'])
         with self.assertRaisesRegex(r.RunnerInputError, 'WORKSPACE_MEMBER_REQUIRED'):
             r.bind_package_observation(descriptor=integrated, metadata=excluded_meta)
         stale = _b1_assignment(body_sha256='c' * 64)
         with self.assertRaisesRegex(r.RunnerInputError, 'STALE_ASSIGNMENT_BINDING'):
-            r.bind_protected_snapshot(descriptor=local, assignment=stale, snapshot={k: 'a' * 64 for k in ['scripts/tests/test_work_unit_descriptor_runner.py', 'scripts/work_unit_gate/descriptor_runner.py']})
+            r.bind_protected_snapshot(descriptor=local, assignment=stale, snapshot={k: 'a' * 64 for k in ['scripts/tests/test_work_unit_descriptor_runner.py', 'scripts/work_unit_gate/descriptor_runner.py']}, descriptor_rel=FILENAME, manifest_rel='scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml')
 
 
 class RustRealRunnerCases(unittest.TestCase):
@@ -1406,6 +1406,35 @@ class RustRealRunnerCases(unittest.TestCase):
         self.assertIs(type(record), c.TestExecutionRecord)
         self.assertIs(record.disposition, c.ExecutionDisposition.EXECUTED_PASS)
         self.assertEqual(receipt.test, record.test)
+        meta_argv = ['cargo', 'metadata', '--format-version', '1', '--offline',
+                     '--manifest-path', self._manifest_abs, '--no-deps']
+        self.assertEqual(tuple(meta_argv), r.assert_no_workspace_wide(meta_argv))
+        mdisp = self.launcher.run(meta_argv, cwd=str(ROOT), env=self.cargo_env,
+                                  bounds=_r2_descriptor_bounds('minimal-rust-package.toml'))
+        self.assertEqual(0, mdisp['returncode'], mdisp['stderr'][-2000:])
+        self.assertTrue(mdisp['cleanup_ok'], mdisp)
+        self.assertFalse(mdisp['truncated'], mdisp)
+        observed_meta = json.loads(mdisp['stdout'].decode('utf-8'))
+        observed_pkgs = [p for p in observed_meta['packages'] if p['name'] == 'wu850_tiny']
+        self.assertEqual(1, len(observed_pkgs))
+        observed_pkg = observed_pkgs[0]
+        self.assertEqual(art['package_id'], observed_pkg['id'])
+        self.assertEqual(art['package_version'], observed_pkg['version'])
+        self.assertEqual('0.1.0', observed_pkg['version'])
+        self.assertIn(observed_pkg['id'], observed_meta['workspace_members'])
+        self.assertNotEqual('path+file:///forged#wu850_tiny@99.9.9', observed_pkg['id'])
+        self.assertNotEqual('99.9.9', observed_pkg['version'])
+        raw_manifest = observed_pkg['manifest_path']
+        self.assertIn('\\', raw_manifest)
+        self.assertIn('Cargo.toml', raw_manifest)
+        raw_entry = {'name': observed_pkg['name'], 'manifest_path': raw_manifest, 'id': observed_pkg['id'], 'version': observed_pkg['version'], 'buildable': True}
+        raw_meta = {'packages': [raw_entry], 'workspace_members': list(observed_meta['workspace_members']), 'excluded': []}
+        rust_desc = r.parse_descriptor((DESCRIPTOR_DIR / 'minimal-rust-package.toml').read_bytes(), FILENAME, _b1_assignment())
+        raw_obs = r.bind_package_observation(descriptor=rust_desc, metadata=raw_meta)
+        self.assertEqual(raw_manifest, raw_obs['manifest_path'])
+        self.assertTrue(raw_obs['manifest_path'].replace('\\', '/').endswith('scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'))
+        self.assertEqual(art['package_id'], raw_obs['id'])
+        self.assertEqual(art['package_version'], raw_obs['version'])
 
     # WORK_UNIT_CASE: 850/21
     def test_ignored_filtered_cfg_disabled_never_pass(self):
@@ -1952,20 +1981,30 @@ class BoundedCompletionCases(unittest.TestCase):
             self.assertEqual(0, observed.returncode, observed.stderr)
         desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
         assign = _b1_assignment()
-        required = sorted({p.value for p in desc.source_roots + desc.test_roots} | ({desc.module.value.replace('.', '/') + '.py'} if desc.module is not None else set()))
-        self.assertEqual(['scripts/tests/test_work_unit_descriptor_runner.py', 'scripts/work_unit_gate/descriptor_runner.py'], required)
+        manifest = 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'
+        required = sorted({p.value for p in desc.source_roots + desc.test_roots} | ({desc.module.value.replace('.', '/') + '.py'} if desc.module is not None else set()) | {FILENAME, manifest})
+        self.assertEqual(['.github/work-units/850.toml', 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'scripts/tests/test_work_unit_descriptor_runner.py', 'scripts/work_unit_gate/descriptor_runner.py'], required)
         good = {k: 'a' * 64 for k in required}
-        bound = r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot=dict(good))
+        bound = r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot=dict(good), descriptor_rel=FILENAME, manifest_rel=manifest)
         self.assertEqual(required, bound['keys'])
         self.assertEqual(64, len(bound['digest']))
         with self.assertRaisesRegex(r.RunnerInputError, 'MISSING_SNAPSHOT_KEY'):
-            r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot={k: 'a' * 64 for k in required[:-1]})
+            r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot={k: 'a' * 64 for k in required[:-1]}, descriptor_rel=FILENAME, manifest_rel=manifest)
         with self.assertRaisesRegex(r.RunnerInputError, 'FOREIGN_SNAPSHOT_KEY'):
-            r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot=dict(good, **{'extra/key.py': 'a' * 64}))
+            r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot=dict(good, **{'extra/key.py': 'a' * 64}), descriptor_rel=FILENAME, manifest_rel=manifest)
         with self.assertRaisesRegex(r.RunnerInputError, 'SNAPSHOT_DIGEST_SYNTAX|SNAPSHOT_SHAPE|MISSING_SNAPSHOT_KEY'):
-            r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot={})
+            r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot={}, descriptor_rel=FILENAME, manifest_rel=manifest)
         with self.assertRaisesRegex(r.RunnerInputError, 'SNAPSHOT_DIGEST_SYNTAX'):
-            r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot={k: 'not-hex' for k in required})
+            r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot={k: 'not-hex' for k in required}, descriptor_rel=FILENAME, manifest_rel=manifest)
+        finding = r.compose_mutation_finding(descriptor=desc, diff=diff, snapshot_digest=bound['digest'])
+        self.assertIsNotNone(finding)
+        self.assertIs(finding.severity, c.FindingSeverity.ERROR)
+        self.assertIs(finding.finding_class, c.FindingClass.SOURCE_UNAVAILABLE)
+        self.assertEqual(desc.unit, finding.owner)
+        self.assertIn('tests/seed.txt', finding.message)
+        self.assertTrue(finding.message.startswith('protected-input-invalidated:'))
+        clean = r.compose_mutation_finding(descriptor=desc, diff={'mutated': [], 'added': [], 'removed': []}, snapshot_digest=bound['digest'])
+        self.assertIsNone(clean)
 
     # WORK_UNIT_CASE: 850/43
     def test_stale_assignment_rejected(self):
@@ -2015,14 +2054,16 @@ class BoundedCompletionCases(unittest.TestCase):
             with self.assertRaises(r.RunnerInputError):
                 r.parse_python_protocol(json.dumps(bad_outcome).encode(), **kwargs)
         desc = r.parse_descriptor((DESCRIPTOR_DIR / 'minimal-rust-package.toml').read_bytes(), FILENAME, _b1_assignment())
-        art = {'package': 'wu850_tiny', 'manifest_rel': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'target_name': 'wu850_tiny', 'target_kind': 'lib', 'profile_test': False, 'filenames': ('/tmp/real-test-bin.exe',), 'fresh': False}
+        art = {'package': 'wu850_tiny', 'package_id': 'path+file:///x#wu850_tiny@0.1.0', 'package_version': '0.1.0', 'manifest_rel': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'target_name': 'wu850_tiny', 'target_kind': 'lib', 'profile_test': True, 'filenames': ('/tmp/real-test-bin.exe',), 'fresh': False}
         bound = r.bind_test_binary(artifact=art, binary_name='real-test-bin.exe', binary_sha256='a' * 64)
+        self.assertEqual('0.1.0', bound['package_version'])
+        self.assertEqual('path+file:///x#wu850_tiny@0.1.0', bound['package_id'])
         with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_NOT_PRODUCED'):
             r.bind_test_binary(artifact=art, binary_name='other-bin.exe', binary_sha256='a' * 64)
         with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_DIGEST_REQUIRED'):
-            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'wu850_tiny', 'manifest_rel': art['manifest_rel'], 'binary_sha256': 'not-hex'}, test_name='tiny_ok_a', kind='rust')
+            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'wu850_tiny', 'manifest_rel': art['manifest_rel'], 'profile_test': True, 'target_kind': 'lib', 'binary_sha256': 'not-hex'}, test_name='tiny_ok_a', kind='rust')
         with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_DIGEST_REQUIRED'):
-            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'wu850_tiny', 'manifest_rel': art['manifest_rel']}, test_name='tiny_ok_a', kind='rust')
+            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'wu850_tiny', 'manifest_rel': art['manifest_rel'], 'profile_test': True, 'target_kind': 'lib'}, test_name='tiny_ok_a', kind='rust')
         with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_BINARY_MISMATCH'):
             r.compose_discovery_receipt(descriptor=desc, binary={'package': 'other_pkg', 'manifest_rel': art['manifest_rel'], 'binary_sha256': 'a' * 64}, test_name='tiny_ok_a', kind='rust')
         with self.assertRaisesRegex(r.RunnerInputError, 'KIND_MODE_MISMATCH'):
@@ -2208,7 +2249,7 @@ class ResidualBindingNegatives(unittest.TestCase):
             r.parse_cargo_build_stream(b'x' * (r.MAX_PROTOCOL_BYTES + 1), package='wu850_tiny', manifest_rel=rel)
 
     def test_test_binary_shapes(self):
-        art = {'package': 'wu850_tiny', 'manifest_rel': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'target_name': 'wu850_tiny', 'target_kind': 'lib', 'profile_test': False, 'filenames': ('/tmp/bin.exe',), 'fresh': False}
+        art = {'package': 'wu850_tiny', 'package_id': 'path+file:///x#wu850_tiny@0.1.0', 'package_version': '0.1.0', 'manifest_rel': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'target_name': 'wu850_tiny', 'target_kind': 'lib', 'profile_test': False, 'filenames': ('/tmp/bin.exe',), 'fresh': False}
         with self.assertRaisesRegex(r.RunnerInputError, 'ARTIFACT_SHAPE'):
             r.bind_test_binary(artifact={'package': 'wu850_tiny'}, binary_name='bin.exe', binary_sha256='a' * 64)
         with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_NAME_SHAPE'):
@@ -2228,23 +2269,32 @@ class ResidualBindingNegatives(unittest.TestCase):
             r.bind_package_observation(descriptor={'package': 'x'}, metadata={'packages': [], 'workspace_members': [], 'excluded': []})
         with self.assertRaisesRegex(r.RunnerInputError, 'METADATA_SHAPE'):
             r.bind_package_observation(descriptor=desc, metadata={'packages': [], 'workspace_members': [], 'excluded': 'x'})
-        bad_path = {'packages': [{'name': 'runner', 'manifest_path': 'bad/path.txt', 'id': pid, 'buildable': True}], 'workspace_members': [], 'excluded': []}
+        bad_path = {'packages': [{'name': 'runner', 'manifest_path': 'bad/path.txt', 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
         with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_PATH_SHAPE'):
             r.bind_package_observation(descriptor=desc, metadata=bad_path)
-        bad_bool = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'buildable': 'yes'}], 'workspace_members': [], 'excluded': []}
+        for bad_manifest in (rel.replace('/Cargo.toml', '//Cargo.toml'), 'C:\\repo\\\\Cargo.toml', 'scripts/testdata/../escape/Cargo.toml', 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml.bak', 'scripts/testdata/\x01gate/descriptor-runner/rust-tiny/Cargo.toml', 'scripts/testdata/\x7fgate/descriptor-runner/rust-tiny/Cargo.toml'):
+            with self.subTest(bad_manifest=repr(bad_manifest)):
+                bad = {'packages': [{'name': 'runner', 'manifest_path': bad_manifest, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
+                with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_PATH_SHAPE'):
+                    r.bind_package_observation(descriptor=desc, metadata=bad)
+        forward = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
+        forward_obs = r.bind_package_observation(descriptor=desc, metadata=forward)
+        self.assertEqual(rel, forward_obs['manifest_path'])
+        bad_bool = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': 'yes'}], 'workspace_members': [], 'excluded': []}
         with self.assertRaisesRegex(r.RunnerInputError, 'BUILDABLE_BOOL_REQUIRED'):
             r.bind_package_observation(descriptor=desc, metadata=bad_bool)
 
     def test_snapshot_and_enforcement_shapes(self):
         desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
         good = {k: 'a' * 64 for k in ['scripts/tests/test_work_unit_descriptor_runner.py', 'scripts/work_unit_gate/descriptor_runner.py']}
+        manifest = 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'
         with self.assertRaisesRegex(r.RunnerInputError, 'DESCRIPTOR_TYPE_REQUIRED'):
-            r.bind_protected_snapshot(descriptor={}, assignment=_b1_assignment(), snapshot=dict(good))
+            r.bind_protected_snapshot(descriptor={}, assignment=_b1_assignment(), snapshot=dict(good), descriptor_rel=FILENAME, manifest_rel=manifest)
         with self.assertRaisesRegex(r.RunnerInputError, 'ASSIGNMENT_RECEIPT_REQUIRED'):
-            r.bind_protected_snapshot(descriptor=desc, assignment=None, snapshot=dict(good))
+            r.bind_protected_snapshot(descriptor=desc, assignment=None, snapshot=dict(good), descriptor_rel=FILENAME, manifest_rel=manifest)
         closed = _b1_assignment(state=c.IssueState.CLOSED, source_use=c.AssignmentSourceUse.PREREQUISITE_EVIDENCE)
         with self.assertRaisesRegex(r.RunnerInputError, 'INACTIVE_ASSIGNMENT'):
-            r.bind_protected_snapshot(descriptor=desc, assignment=closed, snapshot=dict(good))
+            r.bind_protected_snapshot(descriptor=desc, assignment=closed, snapshot=dict(good), descriptor_rel=FILENAME, manifest_rel=manifest)
         bounds = r.decode_descriptor((DESCRIPTOR_DIR / 'minimal-python-unittest.toml').read_bytes(), FILENAME)['bounds']
         plan = r.enforcement_plan(bounds=bounds)
         self.assertEqual({'wall_s', 'idle_s', 'output_bytes', 'line_bytes', 'max_tests', 'max_processes'}, set(plan))
@@ -2271,6 +2321,58 @@ class ResidualBindingNegatives(unittest.TestCase):
         self.assertEqual(desc.matrix_sha256, receipt.artifact_sha256)
         with self.assertRaisesRegex(r.RunnerInputError, 'DISCOVERY_RECEIPT_REQUIRED'):
             r.compose_execution_record(discovery={}, disposition='executed-pass')
+
+    def test_rust_binary_gates(self):
+        desc = r.parse_descriptor((DESCRIPTOR_DIR / 'minimal-rust-package.toml').read_bytes(), FILENAME, _b1_assignment())
+        rel = 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'
+        with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_REQUIRED'):
+            r.compose_discovery_receipt(descriptor=desc, binary=None, test_name='tiny_ok_a', kind='rust')
+        with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_NOT_TEST_PROFILE'):
+            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'wu850_tiny', 'manifest_rel': rel, 'profile_test': False, 'target_kind': 'lib', 'binary_sha256': 'a' * 64}, test_name='tiny_ok_a', kind='rust')
+        with self.assertRaisesRegex(r.RunnerInputError, 'UNSUPPORTED_TARGET_KIND'):
+            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'wu850_tiny', 'manifest_rel': rel, 'profile_test': True, 'target_kind': 'rlib', 'binary_sha256': 'a' * 64}, test_name='tiny_ok_a', kind='rust')
+        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_BINARY_MISMATCH'):
+            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'other_pkg', 'manifest_rel': rel, 'profile_test': True, 'target_kind': 'lib', 'binary_sha256': 'a' * 64}, test_name='tiny_ok_a', kind='rust')
+        with self.assertRaisesRegex(r.RunnerInputError, 'KIND_MODE_MISMATCH'):
+            r.compose_discovery_receipt(descriptor=desc, binary=None, test_name='a.B.test_x', kind='python')
+
+    def test_artifact_and_metadata_id_version_shapes(self):
+        rel = 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'
+        base = {'package': 'wu850_tiny', 'manifest_rel': rel, 'target_name': 'wu850_tiny', 'target_kind': 'lib', 'profile_test': True, 'filenames': ('/tmp/bin.exe',), 'fresh': False}
+        forged = dict(base, package_id='path+file:///x#wu850_tiny@99.9.9', package_version='99.9.9 forged')
+        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_VERSION_SHAPE'):
+            r.bind_test_binary(artifact=forged, binary_name='bin.exe', binary_sha256='a' * 64)
+        with self.assertRaisesRegex(r.RunnerInputError, 'ARTIFACT_SHAPE'):
+            r.bind_test_binary(artifact=dict(base), binary_name='bin.exe', binary_sha256='a' * 64)
+        desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
+        pid = 'path+file:///repo#runner@0.1.0'
+        bad_version = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': 'not a version', 'buildable': True}], 'workspace_members': [], 'excluded': []}
+        with self.assertRaisesRegex(r.RunnerInputError, 'METADATA_VERSION_SHAPE'):
+            r.bind_package_observation(descriptor=desc, metadata=bad_version)
+        bad_id = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': 7, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
+        with self.assertRaisesRegex(r.RunnerInputError, 'METADATA_ID_SHAPE'):
+            r.bind_package_observation(descriptor=desc, metadata=bad_id)
+        missing_version = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'buildable': True}], 'workspace_members': [], 'excluded': []}
+        with self.assertRaisesRegex(r.RunnerInputError, 'CLOSED_FIELDS'):
+            r.bind_package_observation(descriptor=desc, metadata=missing_version)
+
+    def test_snapshot_rel_and_mutation_shapes(self):
+        desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
+        good = {k: 'a' * 64 for k in ['scripts/tests/test_work_unit_descriptor_runner.py', 'scripts/work_unit_gate/descriptor_runner.py']}
+        manifest = 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'
+        with self.assertRaisesRegex(r.RunnerInputError, 'DESCRIPTOR_REL_SHAPE'):
+            r.bind_protected_snapshot(descriptor=desc, assignment=_b1_assignment(), snapshot=dict(good), descriptor_rel='/abs/path.toml', manifest_rel=manifest)
+        with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_REL_SHAPE'):
+            r.bind_protected_snapshot(descriptor=desc, assignment=_b1_assignment(), snapshot=dict(good), descriptor_rel=FILENAME, manifest_rel=None)
+        with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_REL_SHAPE'):
+            r.bind_protected_snapshot(descriptor=desc, assignment=_b1_assignment(), snapshot=dict(good), descriptor_rel=FILENAME, manifest_rel=7)
+        with self.assertRaisesRegex(r.RunnerInputError, 'SHA256_REQUIRED'):
+            r.compose_mutation_finding(descriptor=desc, diff={'mutated': [], 'added': [], 'removed': []}, snapshot_digest='not-hex')
+        for bad in ({'mutated': [], 'added': []}, {'mutated': 'x', 'added': [], 'removed': []}, {'mutated': ['b', 'a'], 'added': [], 'removed': []}):
+            with self.assertRaisesRegex(r.RunnerInputError, 'MUTATION_DIFF_SHAPE'):
+                r.compose_mutation_finding(descriptor=desc, diff=bad, snapshot_digest='a' * 64)
+        with self.assertRaisesRegex(r.RunnerInputError, 'DESCRIPTOR_TYPE_REQUIRED'):
+            r.compose_mutation_finding(descriptor={}, diff={'mutated': [], 'added': [], 'removed': []}, snapshot_digest='a' * 64)
 
 
 if __name__ == '__main__':
