@@ -99,6 +99,17 @@ impl AtomRepresentation {
     pub const fn is_whole(&self) -> bool {
         matches!(self, Self::Whole { .. })
     }
+
+    /// Return the closed representation kind used by loss-policy checks.
+    #[must_use]
+    pub const fn kind(&self) -> RepresentationKind {
+        match self {
+            Self::Whole { .. } => RepresentationKind::Whole,
+            Self::Handle { .. } => RepresentationKind::Handle,
+            Self::Extractive { .. } => RepresentationKind::Extractive,
+            Self::Summary { .. } => RepresentationKind::Summary,
+        }
+    }
 }
 
 /// Atom-specific privacy and disclosure boundary.
@@ -192,6 +203,21 @@ impl ContextRecipe {
     pub fn canonical_policy_digest(&self) -> Result<String, ContextError> {
         let mut canonical = self.clone();
         canonical.recipe_sha256 = "0".repeat(64);
+
+        // These fields are sets on the wire even though Serde represents them
+        // as bounded arrays.  Normalize their order for the policy digest;
+        // `canonical_digest` itself intentionally preserves array order for
+        // values where ordering carries meaning.
+        canonical.mandatory_roles.sort();
+        canonical.denominator.requested.sort();
+        canonical
+            .denominator
+            .dispositions
+            .sort_by(|left, right| left.slot.cmp(&right.slot));
+        for rule in &mut canonical.role_policies {
+            rule.allowed_representations.sort();
+        }
+        canonical.role_policies.sort_by_key(|rule| rule.role);
         crate::canonical_digest(&canonical)
     }
 
@@ -262,7 +288,15 @@ impl RoleLossRule {
             LossPolicy::Extractive => RepresentationKind::Extractive,
             LossPolicy::Summarizable => RepresentationKind::Summary,
         };
-        if !self.allowed_representations.contains(&required) {
+        let mut seen = std::collections::BTreeSet::new();
+        if self
+            .allowed_representations
+            .iter()
+            .any(|kind| !seen.insert(*kind) || !self.loss_policy.allows(*kind))
+        {
+            return Err(ContextError::WholeUnitRequired);
+        }
+        if !seen.contains(&required) {
             return Err(ContextError::WholeUnitRequired);
         }
         Ok(())
@@ -270,13 +304,35 @@ impl RoleLossRule {
 }
 
 /// Closed representation kinds declared by a recipe.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RepresentationKind {
     Whole,
     Handle,
     Extractive,
     Summary,
+}
+
+impl LossPolicy {
+    /// Whether a representation is exact or no more lossy than this policy.
+    const fn allows(self, representation: RepresentationKind) -> bool {
+        match self {
+            Self::NonDroppable => matches!(representation, RepresentationKind::Whole),
+            Self::HandleOnly => matches!(representation, RepresentationKind::Handle),
+            Self::Extractive => matches!(
+                representation,
+                RepresentationKind::Whole | RepresentationKind::Extractive
+            ),
+            Self::Summarizable => matches!(
+                representation,
+                RepresentationKind::Whole
+                    | RepresentationKind::Extractive
+                    | RepresentationKind::Summary
+            ),
+        }
+    }
 }
 
 /// Exact requested provider/role denominator and provider dispositions.
@@ -406,17 +462,7 @@ impl ContextCandidate {
                 field: "candidate.dependencies",
             });
         }
-        let allowed = matches!(
-            (&self.loss_policy, &self.representation),
-            (LossPolicy::NonDroppable, AtomRepresentation::Whole { .. })
-                | (LossPolicy::HandleOnly, AtomRepresentation::Handle { .. })
-                | (
-                    LossPolicy::Extractive,
-                    AtomRepresentation::Extractive { .. }
-                )
-                | (LossPolicy::Summarizable, AtomRepresentation::Summary { .. })
-        );
-        if !allowed {
+        if !self.loss_policy.allows(self.representation.kind()) {
             return Err(ContextError::WholeUnitRequired);
         }
         if matches!(

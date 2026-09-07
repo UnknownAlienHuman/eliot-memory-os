@@ -74,7 +74,7 @@ pub enum SemanticRole {
 }
 
 /// Provider/semantic-role slot in the exact requested denominator.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderRole {
     /// Provider that owns the projection.
