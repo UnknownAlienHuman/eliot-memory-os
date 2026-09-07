@@ -1018,7 +1018,7 @@ impl AcpResultEnvelope {
     ) -> Result<AgentResult, AcpAdapterError> {
         let (disposition, unknown_reason) = match outcome {
             AcpResultOutcome::Completed => (ResultDisposition::DegradedNoProof, None),
-            AcpResultOutcome::Cancelled => (ResultDisposition::Cancelled, None),
+            AcpResultOutcome::Cancelled => (ResultDisposition::CancelledObserved, None),
             AcpResultOutcome::Failed { reason } => {
                 (ResultDisposition::FailedVerification, Some(reason))
             }
@@ -1038,7 +1038,6 @@ impl AcpResultEnvelope {
             artifacts: Vec::new(),
             evidence_refs: Vec::new(),
             proposed_effects: Vec::new(),
-            effect_receipts: Vec::new(),
             unresolved_questions: Vec::new(),
             usage: usage.clone(),
             actual_route: ActualRouteReceipt {
@@ -1081,12 +1080,25 @@ pub struct AcpCancelRequest {
     pub session_id: String,
     /// A-01 cancellation reason.
     pub reason: eliot_agent_api::CancelReason,
-    /// State fence from the caller-owned authority/attempt projection.
-    pub state_fence: String,
+    /// Canonical typed fence from the caller-owned authority projection.
+    pub state_fence: eliot_contracts::StateFence,
 }
 
 /// Short cancel alias.
 pub type AcpCancel = AcpCancelRequest;
+
+impl AcpCancelRequest {
+    /// Validates that the cancel carries a typed, non-zero fence and non-blank identifiers.
+    pub fn validate(&self) -> Result<(), AcpAdapterError> {
+        if self.operation_id.trim().is_empty() || self.session_id.trim().is_empty() {
+            return Err(AcpAdapterError::InvalidInput("operation_id/session_id"));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| AcpAdapterError::InvalidInput("state_fence"))?;
+        Ok(())
+    }
+}
 
 /// Reconnect projection.  Reconnect never creates a new attempt implicitly.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -1653,10 +1665,19 @@ mod tests {
         Ok(())
     }
 
-    fn result_envelope() -> Result<AcpResultEnvelope, eliot_agent_api::ContractError> {
+    // `AttemptId::new` reports `eliot_agent_contracts::ContractError` while the
+    // sibling `RouteFingerprintId::new` reports `eliot_agent_api::ContractError`,
+    // so the two cannot share one `?`. The conversion is written out here rather
+    // than added as a cross-crate `From`, which would silently merge two
+    // unrelated error taxonomies across a public boundary.
+    fn result_envelope() -> Result<AcpResultEnvelope, AcpAdapterError> {
         Ok(AcpResultEnvelope {
             operation_id: "operation".into(),
-            attempt_id: AttemptId::new("attempt")?,
+            attempt_id: AttemptId::new("attempt").map_err(|_| {
+                AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::EmptyIdentity(
+                    "attempt_id",
+                ))
+            })?,
             session_id: Some("session".into()),
             payload: serde_json::json!({"provider":"candidate"}),
             terminal: true,
@@ -1666,14 +1687,12 @@ mod tests {
     fn project_result(
         outcome: AcpResultOutcome,
     ) -> Result<eliot_agent_api::AgentResult, AcpAdapterError> {
-        result_envelope()
-            .map_err(AcpAdapterError::ContractValidation)?
-            .into_agent_result(
-                route(),
-                RouteFingerprintId::new("route").map_err(AcpAdapterError::ContractValidation)?,
-                "started",
-                outcome,
-            )
+        result_envelope()?.into_agent_result(
+            route(),
+            RouteFingerprintId::new("route").map_err(AcpAdapterError::ContractValidation)?,
+            "started",
+            outcome,
+        )
     }
 
     #[test]
@@ -1683,7 +1702,6 @@ mod tests {
         assert_eq!(result.disposition, ResultDisposition::DegradedNoProof);
         assert!(result.evidence_refs.is_empty());
         assert!(result.proposed_effects.is_empty());
-        assert!(result.effect_receipts.is_empty());
         assert!(result.actual_route.observed.is_none());
         assert_eq!(result.actual_route.usage.quota, QuotaKnowledge::Unknown);
         assert!(result.actual_route.usage.input_tokens.is_none());
@@ -1697,7 +1715,7 @@ mod tests {
     fn result_projection_preserves_cancelled_disposition() -> Result<(), Box<dyn std::error::Error>>
     {
         let result = project_result(AcpResultOutcome::Cancelled)?;
-        assert_eq!(result.disposition, ResultDisposition::Cancelled);
+        assert_eq!(result.disposition, ResultDisposition::CancelledObserved);
         assert!(result.unknown_reason.is_none());
         Ok(())
     }
@@ -1719,6 +1737,98 @@ mod tests {
         })?;
         assert_eq!(unknown.disposition, ResultDisposition::UnknownOutcome);
         assert_eq!(unknown.unknown_reason.as_deref(), Some("transport closed"));
+        Ok(())
+    }
+
+    #[test]
+    fn acp_cancel_carries_typed_state_fence_and_rejects_legacy_string()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let typed = AcpCancelRequest {
+            operation_id: "op-cancel-01".into(),
+            attempt_id: AttemptId::new("attempt-cancel-01")?,
+            session_id: "session-cancel-01".into(),
+            reason: eliot_agent_api::CancelReason::UserRequested,
+            state_fence: eliot_contracts::StateFence::new(
+                eliot_contracts::AuthorityEpoch::new(3)?,
+                eliot_contracts::ResourceGeneration::new(5)?,
+            ),
+        };
+        assert!(typed.validate().is_ok());
+        let wire = serde_json::to_value(&typed)?;
+        assert!(wire["state_fence"].is_object());
+        assert_eq!(wire["state_fence"]["authority_epoch"], 3);
+        assert_eq!(
+            serde_json::from_value::<AcpCancelRequest>(wire.clone())?,
+            typed
+        );
+
+        // Legacy string fence must not deserialize as typed fence.
+        let legacy = serde_json::json!({
+            "operation_id": "op-cancel-01",
+            "attempt_id": "attempt-cancel-01",
+            "session_id": "session-cancel-01",
+            "reason": "user_requested",
+            "state_fence": "legacy-fence-string"
+        });
+        assert!(serde_json::from_value::<AcpCancelRequest>(legacy).is_err());
+
+        // Zero fence must fail closed via validate.
+        let zero = AcpCancelRequest {
+            operation_id: "op-cancel-01".into(),
+            attempt_id: AttemptId::new("attempt-cancel-01")?,
+            session_id: "session-cancel-01".into(),
+            reason: eliot_agent_api::CancelReason::UserRequested,
+            state_fence: eliot_contracts::StateFence::new(
+                eliot_contracts::AuthorityEpoch::default(),
+                eliot_contracts::ResourceGeneration::default(),
+            ),
+        };
+        assert!(zero.validate().is_err());
+        let zero_wire = serde_json::json!({
+            "operation_id": "op-cancel-01",
+            "attempt_id": "attempt-cancel-01",
+            "session_id": "session-cancel-01",
+            "reason": "user_requested",
+            "state_fence": {
+                "authority_epoch": 0,
+                "resource_generation": 0,
+                "task_revision": null,
+                "policy_revision": null,
+                "integration_revision": null
+            }
+        });
+        assert!(serde_json::from_value::<AcpCancelRequest>(zero_wire).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn acp_cancel_schema_is_object_fence_not_string() -> Result<(), Box<dyn std::error::Error>> {
+        let schema = serde_json::to_value(schemars::schema_for!(AcpCancelRequest))?;
+        assert_eq!(schema["type"], "object");
+        // StateFence may be inlined or via $defs; verify it is object-typed.
+        let state_fence_schema = if schema["properties"]["state_fence"]["$ref"].is_string() {
+            let Some(def_ref) = schema["properties"]["state_fence"]["$ref"].as_str() else {
+                panic!("state_fence $ref must be a string");
+            };
+            let Some(def_name) = def_ref.rsplit('/').next() else {
+                panic!("state_fence $ref must contain '/'");
+            };
+            schema["$defs"][def_name].clone()
+        } else {
+            schema["properties"]["state_fence"].clone()
+        };
+        // The resolved StateFence schema must be an object, never a string.
+        assert_eq!(state_fence_schema["type"], "object");
+        assert_ne!(state_fence_schema["type"], "string");
+        // Also ensure the canonical StateFence $defs is object-typed if present.
+        if let Some(defs) = schema["$defs"].as_object()
+            && let Some(sf) = defs.get("StateFence")
+        {
+            assert_eq!(sf["type"], "object");
+        }
+        // Ensure no legacy string fallback is present.
+        let s = schema.to_string();
+        assert!(!s.contains("\"legacy-fence\""));
         Ok(())
     }
 }

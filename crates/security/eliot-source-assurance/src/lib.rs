@@ -18,6 +18,8 @@ pub const SOURCE_ASSURANCE_SCHEMA_VERSION: &str = "eliot-source-assurance-v1";
 
 /// A stable, non-authoritative digest algorithm used by this cell.
 pub const SOURCE_ASSURANCE_DIGEST_ALGORITHM: &str = "blake3";
+/// Exact policy revision whose field semantics are implemented by this crate.
+pub const SOURCE_ASSURANCE_POLICY_VERSION: &str = "source-policy-v1";
 
 /// A governing source identity authenticated by its exact bytes and origin.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -283,6 +285,43 @@ pub struct AdmissionExpectation {
     pub scope: ScopeBindingProof,
 }
 
+/// Versioned policy supplied by the owner of the assurance boundary.
+///
+/// The policy is deliberately separate from caller security labels.  It
+/// describes the one permitted epistemic use, effect ceiling and verifier
+/// requirement for the exact source snapshot under evaluation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceAssurancePolicy {
+    pub policy_version: String,
+    pub expected_source_state_fence: String,
+    pub expectation: AdmissionExpectation,
+    pub allowed_use: AdmissibleUse,
+    pub privacy_class: PrivacyClass,
+    pub effect_ceiling: EffectCeiling,
+    pub required_verifier: Option<String>,
+}
+
+/// Owner-authenticated evidence injected independently of an application
+/// request.  A caller cannot construct trusted evidence by adding fields to
+/// its request payload or security labels.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerSourceEvidence {
+    pub owner_principal_ref: String,
+    pub evidence_ref: String,
+    pub request_id: String,
+    pub original_request_sha256: String,
+    pub idempotency_key: String,
+    pub cancellation_id: String,
+    pub session_id: String,
+    pub state_fence_digest: String,
+    pub canonical_request_sha256: String,
+    pub verifier_ref: Option<String>,
+    pub assurance: SourceAssurance,
+    pub policy: SourceAssurancePolicy,
+}
+
 /// Typed source-assurance findings; no generic string authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -295,9 +334,33 @@ pub enum AssuranceFinding {
     WrongScope,
     AmbiguousScope,
     Quarantined,
+    QuarantineIncomplete,
     UnknownTrust,
     InstructionTainted,
     InvalidIntegrity,
+    UseNotAllowed,
+    EffectCeilingExceeded,
+    VerifierMismatch,
+    OwnerAuthenticationFailed,
+    AxisFailed { axis: TrustAxis },
+    AxisUnknown { axis: TrustAxis },
+    PrivacyMismatch,
+    SourceFenceMismatch,
+}
+
+/// Profile axis name used when an assessment is independently unavailable or
+/// fails. The enum prevents collapsing the eight assessments into a score.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TrustAxis {
+    Integrity,
+    Freshness,
+    Competence,
+    Incentives,
+    Independence,
+    Privacy,
+    InstructionTaint,
+    Threat,
 }
 
 /// Typed admission outcome. Every non-admitted state preserves the reason.
@@ -388,22 +451,24 @@ impl SourceAssurance {
         if self.governing_sources.members.is_empty() {
             findings.push(AssuranceFinding::MissingSource);
         }
-        if self.trust.integrity != AxisStatus::Verified {
-            findings.push(AssuranceFinding::InvalidIntegrity);
+        append_axis_finding(&mut findings, TrustAxis::Integrity, &self.trust.integrity);
+        append_axis_finding(&mut findings, TrustAxis::Freshness, &self.trust.freshness);
+        append_axis_finding(&mut findings, TrustAxis::Competence, &self.trust.competence);
+        append_axis_finding(&mut findings, TrustAxis::Incentives, &self.trust.incentives);
+        append_axis_finding(
+            &mut findings,
+            TrustAxis::Independence,
+            &self.trust.independence,
+        );
+        if matches!(self.trust.instruction_taint, InstructionTaint::Unknown) {
+            findings.push(AssuranceFinding::AxisUnknown {
+                axis: TrustAxis::InstructionTaint,
+            });
         }
-        if self.trust.freshness != AxisStatus::Verified {
-            findings.push(AssuranceFinding::StaleSnapshot);
-        }
-        if self.trust.competence == AxisStatus::Unknown
-            || self.trust.independence == AxisStatus::Unknown
-        {
-            findings.push(AssuranceFinding::UnknownTrust);
-        }
-        if !matches!(
-            self.trust.instruction_taint,
-            InstructionTaint::InstructionChannel
-        ) {
-            findings.push(AssuranceFinding::InstructionTainted);
+        if matches!(self.trust.threat, ThreatStatus::Unknown) {
+            findings.push(AssuranceFinding::AxisUnknown {
+                axis: TrustAxis::Threat,
+            });
         }
         if matches!(
             self.trust.threat,
@@ -413,42 +478,51 @@ impl SourceAssurance {
         }
         match &self.quarantine {
             QuarantineStatus::Clear => {}
-            QuarantineStatus::Quarantined { .. } | QuarantineStatus::Unknown { .. } => {
-                findings.push(AssuranceFinding::Quarantined);
+            QuarantineStatus::Quarantined { .. } => findings.push(AssuranceFinding::Quarantined),
+            QuarantineStatus::Unknown { .. } => {
+                findings.push(AssuranceFinding::QuarantineIncomplete);
             }
         }
         findings.sort_by_key(finding_key);
         findings.dedup();
+        Ok(classify_findings(findings, digest))
+    }
+
+    /// Evaluate this immutable owner evidence against the exact supplied
+    /// policy.  Data remains data: permitted epistemic use is independent of
+    /// instruction-channel authority.
+    pub fn admit_with_policy(
+        &self,
+        policy: &SourceAssurancePolicy,
+    ) -> Result<AdmissionOutcome, SourceAssuranceError> {
+        policy.validate()?;
+        let outcome = self.admit(&policy.expectation)?;
+        let mut findings = match &outcome {
+            AdmissionOutcome::Admitted { .. } => Vec::new(),
+            AdmissionOutcome::NeedsRevalidation { findings }
+            | AdmissionOutcome::Missing { findings }
+            | AdmissionOutcome::Conflicted { findings }
+            | AdmissionOutcome::WrongScope { findings }
+            | AdmissionOutcome::Quarantined { findings } => findings.clone(),
+        };
+        if self.requested_use != policy.allowed_use {
+            findings.push(AssuranceFinding::UseNotAllowed);
+        }
+        if effect_rank(&self.effect_ceiling) > effect_rank(&policy.effect_ceiling) {
+            findings.push(AssuranceFinding::EffectCeilingExceeded);
+        }
+        if self.trust.privacy != policy.privacy_class {
+            findings.push(AssuranceFinding::PrivacyMismatch);
+        }
+        if self.snapshot.state_fence != policy.expected_source_state_fence {
+            findings.push(AssuranceFinding::SourceFenceMismatch);
+        }
+        findings.sort_by_key(finding_key);
+        findings.dedup();
         if findings.is_empty() {
-            Ok(AdmissionOutcome::Admitted {
-                assurance_digest: digest,
-            })
-        } else if findings
-            .iter()
-            .any(|finding| matches!(finding, AssuranceFinding::WrongScope))
-        {
-            Ok(AdmissionOutcome::WrongScope { findings })
-        } else if findings
-            .iter()
-            .any(|finding| matches!(finding, AssuranceFinding::ConflictingSources))
-        {
-            Ok(AdmissionOutcome::Conflicted { findings })
-        } else if findings.iter().any(|finding| {
-            matches!(
-                finding,
-                AssuranceFinding::MissingSource | AssuranceFinding::MissingFrontier
-            )
-        }) {
-            Ok(AdmissionOutcome::Missing { findings })
-        } else if findings.iter().any(|finding| {
-            matches!(
-                finding,
-                AssuranceFinding::Quarantined | AssuranceFinding::InvalidIntegrity
-            )
-        }) {
-            Ok(AdmissionOutcome::Quarantined { findings })
+            Ok(outcome)
         } else {
-            Ok(AdmissionOutcome::NeedsRevalidation { findings })
+            Ok(classify_findings(findings, self.validate()?))
         }
     }
 
@@ -479,6 +553,12 @@ pub fn source_assurance_schema() -> schemars::Schema {
     schemars::schema_for!(SourceAssurance)
 }
 
+/// Compute the canonical source-assurance digest for a serializable value.
+/// This keeps edge fixtures on the same digest algorithm as the owner.
+pub fn canonical_digest<T: Serialize>(value: &T) -> Result<String, SourceAssuranceError> {
+    digest_json(value)
+}
+
 #[derive(Serialize)]
 struct SourceSetDigestMaterial<'a> {
     set_id: &'a str,
@@ -492,6 +572,45 @@ impl AdmissionExpectation {
         require_field("expectation.source_set_revision", &self.source_set_revision)?;
         validate_frontier(&self.frontier)?;
         validate_scope(&self.scope)
+    }
+}
+
+impl SourceAssurancePolicy {
+    fn validate(&self) -> Result<(), SourceAssuranceError> {
+        if self.policy_version != SOURCE_ASSURANCE_POLICY_VERSION {
+            return Err(SourceAssuranceError::UnsupportedSchema(
+                self.policy_version.clone(),
+            ));
+        }
+        require_field(
+            "policy.expected_source_state_fence",
+            &self.expected_source_state_fence,
+        )?;
+        self.expectation.validate()?;
+        if let Some(verifier) = &self.required_verifier {
+            require_field("policy.required_verifier", verifier)?;
+        }
+        Ok(())
+    }
+}
+
+impl OwnerSourceEvidence {
+    /// Validate owner evidence before it is compared with the active binding.
+    pub fn validate(&self) -> Result<(), SourceAssuranceError> {
+        require_field("owner_principal_ref", &self.owner_principal_ref)?;
+        require_field("evidence_ref", &self.evidence_ref)?;
+        require_field("request_id", &self.request_id)?;
+        require_digest("original_request_sha256", &self.original_request_sha256)?;
+        require_field("idempotency_key", &self.idempotency_key)?;
+        require_field("cancellation_id", &self.cancellation_id)?;
+        require_field("session_id", &self.session_id)?;
+        require_digest("state_fence_digest", &self.state_fence_digest)?;
+        require_digest("canonical_request_sha256", &self.canonical_request_sha256)?;
+        if let Some(verifier) = &self.verifier_ref {
+            require_field("verifier_ref", verifier)?;
+        }
+        self.assurance.validate()?;
+        self.policy.validate()
     }
 }
 
@@ -591,9 +710,69 @@ fn finding_key(finding: &AssuranceFinding) -> &'static str {
         AssuranceFinding::WrongScope => "wrong_scope",
         AssuranceFinding::AmbiguousScope => "ambiguous_scope",
         AssuranceFinding::Quarantined => "quarantined",
+        AssuranceFinding::QuarantineIncomplete => "quarantine_incomplete",
         AssuranceFinding::UnknownTrust => "unknown_trust",
         AssuranceFinding::InstructionTainted => "instruction_tainted",
         AssuranceFinding::InvalidIntegrity => "invalid_integrity",
+        AssuranceFinding::UseNotAllowed => "use_not_allowed",
+        AssuranceFinding::EffectCeilingExceeded => "effect_ceiling_exceeded",
+        AssuranceFinding::VerifierMismatch => "verifier_mismatch",
+        AssuranceFinding::OwnerAuthenticationFailed => "owner_authentication_failed",
+        AssuranceFinding::AxisFailed { .. } => "axis_failed",
+        AssuranceFinding::AxisUnknown { .. } => "axis_unknown",
+        AssuranceFinding::PrivacyMismatch => "privacy_mismatch",
+        AssuranceFinding::SourceFenceMismatch => "source_fence_mismatch",
+    }
+}
+
+fn classify_findings(findings: Vec<AssuranceFinding>, digest: String) -> AdmissionOutcome {
+    if findings.is_empty() {
+        AdmissionOutcome::Admitted {
+            assurance_digest: digest,
+        }
+    } else if findings
+        .iter()
+        .any(|finding| matches!(finding, AssuranceFinding::WrongScope))
+    {
+        AdmissionOutcome::WrongScope { findings }
+    } else if findings
+        .iter()
+        .any(|finding| matches!(finding, AssuranceFinding::ConflictingSources))
+    {
+        AdmissionOutcome::Conflicted { findings }
+    } else if findings.iter().any(|finding| {
+        matches!(
+            finding,
+            AssuranceFinding::MissingSource | AssuranceFinding::MissingFrontier
+        )
+    }) {
+        AdmissionOutcome::Missing { findings }
+    } else if findings.iter().any(|finding| {
+        matches!(
+            finding,
+            AssuranceFinding::Quarantined
+                | AssuranceFinding::InvalidIntegrity
+                | AssuranceFinding::AxisFailed { .. }
+        )
+    }) {
+        AdmissionOutcome::Quarantined { findings }
+    } else {
+        AdmissionOutcome::NeedsRevalidation { findings }
+    }
+}
+
+fn append_axis_finding(findings: &mut Vec<AssuranceFinding>, axis: TrustAxis, status: &AxisStatus) {
+    match status {
+        AxisStatus::Verified => {}
+        AxisStatus::Failed => findings.push(AssuranceFinding::AxisFailed { axis }),
+        AxisStatus::Unknown => findings.push(AssuranceFinding::AxisUnknown { axis }),
+    }
+}
+
+fn effect_rank(effect: &EffectCeiling) -> u8 {
+    match effect {
+        EffectCeiling::NoEffect => 0,
+        EffectCeiling::ReadOnlyCandidate => 1,
     }
 }
 

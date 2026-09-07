@@ -1,15 +1,20 @@
 //! Named-pipe peer authentication and validation mechanics.
 //!
-//! Architecture anchors (eliot-architecture-docs-fa941135): A2.3, A12.2,
+//! Architecture anchors: `A2.3`, `A12.2`,
 //! A12.3, ARCH-AUTH-01, ARCH-SEC-01, and ARCH-SEC-02. This private cell owns
 //! only physical peer identity/authentication evidence; it does not own
 //! semantic readiness, session lifecycle, canonical transitions, or authority.
 //!
-//! Implementation anchors (eliot-architecture-docs-fa941135): I2.2, I2.23,
+//! Implementation anchors: `I2.1`, `I2.23`,
 //! I7.5, I7.14, and I15.2. Pipe ACLs, live process/token observations,
 //! impersonation boundaries, and bounded peer-set validation remain here;
 //! peer models/process observation and role selection remain in their existing
 //! sibling modules.
+//!
+//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md`,
+//! `docs/architecture/ELIOT_ARCHITECTURE.md`,
+//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (compatibility entry points;
+//! the governing shards are named per anchor above).
 
 use crate::named_pipe_process_admission::{NamedPipePeerExpectation, NamedPipePeerJobBinding};
 use crate::{ProcessIdentity, WindowsAdapterError, same_process_identity};

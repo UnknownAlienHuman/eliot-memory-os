@@ -69,3 +69,9 @@ __pycache__/
 *.temp
 *.bak
 *.swp
+
+# Excluded capability cells are standalone workspace roots (see the `exclude`
+# comment in the root Cargo.toml), so cargo writes a lock file next to each one.
+# The same applies to any other crate that declares its own `[workspace]`.
+# Those locks are build artifacts of an unadmitted crate, never release inputs.
+crates/*/*/Cargo.lock

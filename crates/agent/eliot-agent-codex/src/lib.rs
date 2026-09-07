@@ -887,7 +887,7 @@ pub fn translate_result(
         evidence_refs.push("codex-event:completed".into());
     }
     let (disposition, unknown_reason) = if input.cancelled {
-        (ResultDisposition::Cancelled, input.unknown_reason)
+        (ResultDisposition::CancelledObserved, input.unknown_reason)
     } else if !input.completed_event_seen {
         (
             ResultDisposition::UnknownOutcome,
@@ -906,7 +906,6 @@ pub fn translate_result(
         artifacts: Vec::new(),
         evidence_refs,
         proposed_effects: input.proposed_effects,
-        effect_receipts: Vec::new(),
         unresolved_questions: Vec::new(),
         usage: input.usage.clone(),
         actual_route: ActualRouteReceipt {
@@ -1601,13 +1600,13 @@ mod tests {
             &a.authority.effect_ceiling,
         )?;
         assert_eq!(success.disposition, ResultDisposition::Partial);
-        assert_ne!(success.disposition, ResultDisposition::VerifiedComplete);
+        assert_ne!(success.disposition, ResultDisposition::CandidateSucceeded);
 
         let cancelled = translate_result(
             result_input(&a, Some("provider output"), true, true, None)?,
             &a.authority.effect_ceiling,
         )?;
-        assert_eq!(cancelled.disposition, ResultDisposition::Cancelled);
+        assert_eq!(cancelled.disposition, ResultDisposition::CancelledObserved);
 
         let unknown = translate_result(
             result_input(&a, None, false, false, None)?,
