@@ -455,6 +455,55 @@ fn assert_item_accept_seam(
         let ctx = seam_ctx(parts, &screen, &request);
         item.accept(&ctx).expect("accept ok");
         assert_eq!(item.family_spelling, family.as_str());
+        let mut drifted = request.clone();
+        match &mut drifted.payload {
+            CurationPayload::Classification(p) => p.confidence_bps = 8999,
+            CurationPayload::Relation(p) => p.relation = "contradicts".into(),
+            CurationPayload::Episode(p) => p.observed_at_ms += 1,
+            CurationPayload::Concept(p) => p.definition.push_str(" v2"),
+            CurationPayload::Procedure(p) => p.steps = 4,
+            CurationPayload::Failure(p) => p.signature = "sig-2".into(),
+            CurationPayload::Merge(p) => {
+                p.left = "b".into();
+                p.right = "a".into();
+            }
+            CurationPayload::Split(p) => {
+                p.first = "b".into();
+                p.second = "a".into();
+            }
+            CurationPayload::Reconsolidation(p) => p.update = "refresh-2".into(),
+            CurationPayload::Accessibility(p) => p.note = "captioned-2".into(),
+            CurationPayload::Repair(p) => p.repair = "relink-2".into(),
+        }
+        drifted.validate().expect("drifted request stays valid");
+        let drift_ctx = seam_ctx(parts, &screen, &drifted);
+        assert!(matches!(
+            item.accept(&drift_ctx),
+            Err(ContractViolation::BindingMismatch { field, .. })
+            if field == "payload"
+        ));
+        let mut evidenced = request.clone();
+        let facets = match &mut evidenced.payload {
+            CurationPayload::Classification(p) => &mut p.target_evidence,
+            CurationPayload::Relation(p) => &mut p.target_evidence,
+            CurationPayload::Episode(p) => &mut p.target_evidence,
+            CurationPayload::Concept(p) => &mut p.target_evidence,
+            CurationPayload::Procedure(p) => &mut p.target_evidence,
+            CurationPayload::Failure(p) => &mut p.target_evidence,
+            CurationPayload::Merge(p) => &mut p.target_evidence,
+            CurationPayload::Split(p) => &mut p.target_evidence,
+            CurationPayload::Reconsolidation(p) => &mut p.target_evidence,
+            CurationPayload::Accessibility(p) => &mut p.target_evidence,
+            CurationPayload::Repair(p) => &mut p.target_evidence,
+        };
+        facets.evidence_refs = vec!["e-9".to_owned()];
+        evidenced.validate().expect("evidence drift stays valid");
+        let evidence_ctx = seam_ctx(parts, &screen, &evidenced);
+        assert!(matches!(
+            item.accept(&evidence_ctx),
+            Err(ContractViolation::BindingMismatch { field, .. })
+            if field == "payload"
+        ));
     }
 }
 

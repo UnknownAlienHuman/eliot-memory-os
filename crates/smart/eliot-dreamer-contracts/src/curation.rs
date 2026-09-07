@@ -345,6 +345,113 @@ impl CurationPayload {
     pub fn facets(&self) -> &TargetEvidence {
         self.parts().1
     }
+
+    fn facets_eq(a: &TargetEvidence, b: &TargetEvidence) -> bool {
+        crate::error::sorted_set_eq(&a.targets, &b.targets)
+            && crate::error::sorted_set_eq(&a.evidence_refs, &b.evidence_refs)
+    }
+
+    /// Compares full semantic equality across kind, scalars, and facets.
+    ///
+    /// Fail-closed on enum growth: every outer arm is explicit, so adding a
+    /// variant breaks compilation until it is compared here. The inner
+    /// wildcard rejects cross-kind pairs behind the kind check.
+    #[must_use]
+    pub(crate) fn semantic_eq(&self, other: &Self) -> bool {
+        match self {
+            Self::Classification(a) => match other {
+                Self::Classification(b) => {
+                    a.label == b.label
+                        && a.confidence_bps == b.confidence_bps
+                        && Self::facets_eq(&a.target_evidence, &b.target_evidence)
+                }
+                _ => false,
+            },
+            Self::Relation(a) => match other {
+                Self::Relation(b) => {
+                    a.from_handle == b.from_handle
+                        && a.to_handle == b.to_handle
+                        && a.relation == b.relation
+                        && Self::facets_eq(&a.target_evidence, &b.target_evidence)
+                }
+                _ => false,
+            },
+            Self::Episode(a) => match other {
+                Self::Episode(b) => {
+                    a.episode == b.episode
+                        && a.observed_at_ms == b.observed_at_ms
+                        && Self::facets_eq(&a.target_evidence, &b.target_evidence)
+                }
+                _ => false,
+            },
+            Self::Concept(a) => match other {
+                Self::Concept(b) => {
+                    a.concept == b.concept
+                        && a.definition == b.definition
+                        && Self::facets_eq(&a.target_evidence, &b.target_evidence)
+                }
+                _ => false,
+            },
+            Self::Procedure(a) => match other {
+                Self::Procedure(b) => {
+                    a.procedure == b.procedure
+                        && a.steps == b.steps
+                        && Self::facets_eq(&a.target_evidence, &b.target_evidence)
+                }
+                _ => false,
+            },
+            Self::Failure(a) => match other {
+                Self::Failure(b) => {
+                    a.fingerprint == b.fingerprint
+                        && a.signature == b.signature
+                        && Self::facets_eq(&a.target_evidence, &b.target_evidence)
+                }
+                _ => false,
+            },
+            Self::Merge(a) => match other {
+                Self::Merge(b) => {
+                    a.left == b.left
+                        && a.right == b.right
+                        && a.merged == b.merged
+                        && Self::facets_eq(&a.target_evidence, &b.target_evidence)
+                }
+                _ => false,
+            },
+            Self::Split(a) => match other {
+                Self::Split(b) => {
+                    a.whole == b.whole
+                        && a.first == b.first
+                        && a.second == b.second
+                        && Self::facets_eq(&a.target_evidence, &b.target_evidence)
+                }
+                _ => false,
+            },
+            Self::Reconsolidation(a) => match other {
+                Self::Reconsolidation(b) => {
+                    a.target == b.target
+                        && a.update == b.update
+                        && Self::facets_eq(&a.target_evidence, &b.target_evidence)
+                }
+                _ => false,
+            },
+            Self::Accessibility(a) => match other {
+                Self::Accessibility(b) => {
+                    a.handle == b.handle
+                        && a.note == b.note
+                        && Self::facets_eq(&a.target_evidence, &b.target_evidence)
+                }
+                _ => false,
+            },
+            Self::Repair(a) => match other {
+                Self::Repair(b) => {
+                    a.target == b.target
+                        && a.repair == b.repair
+                        && Self::facets_eq(&a.target_evidence, &b.target_evidence)
+                }
+                _ => false,
+            },
+        }
+    }
 }
 
 /// Routes raw JSON to the payload named by `kind`: tag peeked, decoded, validated;

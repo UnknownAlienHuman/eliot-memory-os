@@ -183,6 +183,12 @@ pub(crate) fn check_curation_request_compat(
             reason: "curation item denominator must equal handler request denominator".to_owned(),
         });
     }
+    if !payload.semantic_eq(&request.payload) {
+        return Err(ContractViolation::BindingMismatch {
+            field: "payload",
+            reason: "curation item payload must equal handler request payload".to_owned(),
+        });
+    }
     Ok(())
 }
 

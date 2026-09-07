@@ -1122,6 +1122,27 @@ mod tests {
         let mut nolim = job.clone();
         nolim.budget.output_bytes = None;
         assert_budget(&run(item, &nolim, rc, sc, gr, rq, us), "output_bytes");
+        let mut rq_swap = request.clone();
+        if let crate::curation::CurationPayload::Merge(inner) = &mut rq_swap.payload {
+            inner.left = "b".to_owned();
+            inner.right = "a".to_owned();
+        }
+        rq_swap.validate().expect("swapped request stays valid");
+        assert_field(&run(item, jb, rc, sc, gr, &rq_swap, us), "payload");
+        let mut rq_evidence = request.clone();
+        if let crate::curation::CurationPayload::Merge(inner) = &mut rq_evidence.payload {
+            inner.target_evidence.evidence_refs = vec!["e-9".to_owned()];
+        }
+        rq_evidence.validate().expect("evidence drift stays valid");
+        assert_field(&run(item, jb, rc, sc, gr, &rq_evidence, us), "payload");
+        let mut rq_permuted = request.clone();
+        if let crate::curation::CurationPayload::Merge(inner) = &mut rq_permuted.payload {
+            inner.target_evidence.targets = vec!["ab".to_owned(), "a".to_owned(), "b".to_owned()];
+        }
+        rq_permuted
+            .validate()
+            .expect("permuted request stays valid");
+        assert!(run(item, jb, rc, sc, gr, &rq_permuted, us).is_ok());
     }
 
     // WORK_UNIT_CASE: 578/20
