@@ -5,7 +5,6 @@
 //! adapters supply immutable observations; A-02 compiles candidate selections
 //! and read-only operator projections from those observations.
 
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
@@ -80,7 +79,7 @@ fn validate_unique_texts(
     Ok(())
 }
 
-fn canonical_digest<T: Serialize>(value: &T) -> Result<String, ModelControlError> {
+pub(crate) fn canonical_digest<T: Serialize>(value: &T) -> Result<String, ModelControlError> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| ModelControlError::Serialization(error.to_string()))?;
     Ok(format!("sha256:{}", eliot_receipts::sha256_hex(&bytes)))
@@ -100,7 +99,9 @@ fn validate_canonical_digest(value: &str, field: &'static str) -> Result<(), Mod
     Ok(())
 }
 
-fn catalogue_digest(snapshot: &ModelCatalogueSnapshot) -> Result<String, ModelControlError> {
+pub(crate) fn catalogue_digest(
+    snapshot: &ModelCatalogueSnapshot,
+) -> Result<String, ModelControlError> {
     let mut normalized = snapshot.clone();
     normalized
         .entries
@@ -130,17 +131,6 @@ pub enum BillingClass {
     Unknown,
 }
 
-impl BillingClass {
-    const fn rank(self) -> u8 {
-        match self {
-            Self::Free => 0,
-            Self::SubscriptionIncluded => 1,
-            Self::Paid => 2,
-            Self::Unknown => 3,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RouteAdmissionStatus {
@@ -159,17 +149,6 @@ pub enum RouteHealthStatus {
     Unknown,
 }
 
-impl RouteHealthStatus {
-    const fn rank(self) -> u8 {
-        match self {
-            Self::Healthy => 0,
-            Self::Degraded => 1,
-            Self::Unavailable => 2,
-            Self::Unknown => 3,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ModelAvailability {
@@ -177,17 +156,6 @@ pub enum ModelAvailability {
     Degraded,
     Unavailable,
     Unknown,
-}
-
-impl ModelAvailability {
-    const fn rank(self) -> u8 {
-        match self {
-            Self::Available => 0,
-            Self::Degraded => 1,
-            Self::Unavailable => 2,
-            Self::Unknown => 3,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -198,18 +166,6 @@ pub enum QuotaDisposition {
     Exhausted,
     Unknown,
     NotExposed,
-}
-
-impl QuotaDisposition {
-    const fn rank(self) -> u8 {
-        match self {
-            Self::Available => 0,
-            Self::Low => 1,
-            Self::Exhausted => 2,
-            Self::Unknown => 3,
-            Self::NotExposed => 4,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -233,7 +189,7 @@ impl BillingEvidence {
         )
     }
 
-    const fn is_current(&self, now_unix_ms: u64) -> bool {
+    pub(crate) const fn is_current(&self, now_unix_ms: u64) -> bool {
         now_unix_ms >= self.observed_at_unix_ms && now_unix_ms <= self.expires_at_unix_ms
     }
 }
@@ -268,7 +224,7 @@ impl QuotaObservation {
         Ok(())
     }
 
-    const fn is_current(&self, now_unix_ms: u64) -> bool {
+    pub(crate) const fn is_current(&self, now_unix_ms: u64) -> bool {
         now_unix_ms >= self.observed_at_unix_ms && now_unix_ms <= self.expires_at_unix_ms
     }
 }
@@ -320,7 +276,7 @@ pub struct ModelCatalogueEntry {
 }
 
 impl ModelCatalogueEntry {
-    fn validate(&self, account_scope: &str) -> Result<(), ModelControlError> {
+    pub(crate) fn validate(&self, account_scope: &str) -> Result<(), ModelControlError> {
         for (value, field) in [
             (self.entry_id.as_str(), "entry.entry_id"),
             (self.account_scope.as_str(), "entry.account_scope"),
@@ -354,7 +310,7 @@ impl ModelCatalogueEntry {
         validate_unique_texts(&self.evidence_refs, "entry.evidence_refs", false)
     }
 
-    fn deterministic_key(&self) -> (&str, &str, &str, &str, &str) {
+    pub(crate) fn deterministic_key(&self) -> (&str, &str, &str, &str, &str) {
         (
             self.host_family.as_str(),
             self.provider_id.as_str(),
@@ -429,7 +385,7 @@ pub struct ModelQuery {
 }
 
 impl ModelQuery {
-    fn validate(&self) -> Result<(), ModelControlError> {
+    pub(crate) fn validate(&self) -> Result<(), ModelControlError> {
         validate_text(&self.query_id, "query.query_id")?;
         if let Some(text) = self.text.as_deref() {
             validate_text(text, "query.text")?;
@@ -471,7 +427,7 @@ pub enum DispatchBlocker {
     CapabilityUnknown(String),
 }
 
-fn dispatch_blockers(
+pub(crate) fn dispatch_blockers(
     snapshot: &ModelCatalogueSnapshot,
     entry: &ModelCatalogueEntry,
     required_capabilities: &BTreeSet<String>,
@@ -588,7 +544,7 @@ pub struct ModelQueryReceipt {
     pub execution: ZeroModelExecutionCounters,
 }
 
-fn text_matches(entry: &ModelCatalogueEntry, query: Option<&str>) -> bool {
+pub(crate) fn text_matches(entry: &ModelCatalogueEntry, query: Option<&str>) -> bool {
     let Some(query) = query else {
         return true;
     };
@@ -603,7 +559,7 @@ fn text_matches(entry: &ModelCatalogueEntry, query: Option<&str>) -> bool {
     .any(|value| value.to_lowercase().contains(&needle))
 }
 
-fn free_filter_matches(
+pub(crate) fn free_filter_matches(
     entry: &ModelCatalogueEntry,
     include_subscription_included: bool,
     now_unix_ms: u64,
@@ -621,50 +577,7 @@ pub fn query_model_catalogue(
     query: &ModelQuery,
     now_unix_ms: u64,
 ) -> Result<ModelQueryReceipt, ModelControlError> {
-    snapshot.validate()?;
-    query.validate()?;
-    let mut hits = snapshot
-        .entries
-        .iter()
-        .filter(|entry| {
-            (query.host_families.is_empty() || query.host_families.contains(&entry.host_family))
-                && (query.provider_ids.is_empty()
-                    || query.provider_ids.contains(&entry.provider_id))
-                && text_matches(entry, query.text.as_deref())
-                && (!query.free_only
-                    || free_filter_matches(entry, query.include_subscription_included, now_unix_ms))
-        })
-        .filter_map(|entry| {
-            let blockers = dispatch_blockers(
-                snapshot,
-                entry,
-                &query.required_capabilities,
-                query.minimum_context_window,
-                false,
-                now_unix_ms,
-            );
-            let dispatchable = blockers.is_empty();
-            (!query.dispatchable_only || dispatchable).then(|| ModelQueryHit {
-                entry: entry.clone(),
-                dispatchable,
-                blockers,
-            })
-        })
-        .collect::<Vec<_>>();
-    hits.sort_by(|left, right| {
-        left.entry
-            .deterministic_key()
-            .cmp(&right.entry.deterministic_key())
-    });
-    hits.truncate(query.limit);
-    Ok(ModelQueryReceipt {
-        schema_version: MODEL_QUERY_RECEIPT_VERSION.to_owned(),
-        query_id: query.query_id.clone(),
-        catalogue_snapshot_id: snapshot.snapshot_id.clone(),
-        catalogue_digest: catalogue_digest(snapshot)?,
-        hits,
-        execution: ZeroModelExecutionCounters::zero(),
-    })
+    crate::model_registry::query_model_catalogue(snapshot, query, now_unix_ms)
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -677,7 +590,7 @@ pub struct ModelSelector {
 }
 
 impl ModelSelector {
-    fn validate(&self) -> Result<(), ModelControlError> {
+    pub(crate) fn validate(&self) -> Result<(), ModelControlError> {
         let values = [
             self.host_family.as_deref(),
             self.provider_id.as_deref(),
@@ -693,7 +606,7 @@ impl ModelSelector {
         Ok(())
     }
 
-    fn matches(&self, entry: &ModelCatalogueEntry) -> bool {
+    pub(crate) fn matches(&self, entry: &ModelCatalogueEntry) -> bool {
         self.host_family
             .as_deref()
             .is_none_or(|value| value == entry.host_family)
@@ -776,16 +689,9 @@ impl HumanModelPreferencePolicy {
         }
         Ok(())
     }
-
-    fn role(&self, role: ModelRole) -> Result<&RoleModelPreference, ModelControlError> {
-        self.roles
-            .iter()
-            .find(|preference| preference.role == role)
-            .ok_or(ModelControlError::MissingRolePolicy(role))
-    }
 }
 
-fn preference_policy_digest(
+pub(crate) fn preference_policy_digest(
     policy: &HumanModelPreferencePolicy,
 ) -> Result<String, ModelControlError> {
     let mut normalized = policy.clone();
@@ -817,37 +723,6 @@ pub struct RejectedModelCandidate {
     pub provider_id: String,
     pub model_id: String,
     pub reasons: Vec<SelectionRejection>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RankedCandidate<'a> {
-    entry: &'a ModelCatalogueEntry,
-    preference_rank: usize,
-}
-
-impl RankedCandidate<'_> {
-    fn compare(&self, other: &Self) -> Ordering {
-        (
-            self.preference_rank,
-            self.entry.billing.class.rank(),
-            self.entry.route_health.rank(),
-            self.entry.availability.rank(),
-            self.entry.quota.disposition.rank(),
-            self.entry.cost_class,
-            self.entry.latency_class,
-            self.entry.deterministic_key(),
-        )
-            .cmp(&(
-                other.preference_rank,
-                other.entry.billing.class.rank(),
-                other.entry.route_health.rank(),
-                other.entry.availability.rank(),
-                other.entry.quota.disposition.rank(),
-                other.entry.cost_class,
-                other.entry.latency_class,
-                other.entry.deterministic_key(),
-            ))
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1030,28 +905,13 @@ impl ModelSelectionReceipt {
     }
 }
 
-fn preference_rank(entry: &ModelCatalogueEntry, selectors: &[ModelSelector]) -> usize {
-    selectors
-        .iter()
-        .position(|selector| selector.matches(entry))
-        .unwrap_or(usize::MAX)
-}
-
-fn selection_rejections(
-    snapshot: &ModelCatalogueSnapshot,
+pub(crate) fn selection_rejections_with_blockers(
     entry: &ModelCatalogueEntry,
     preference: &RoleModelPreference,
-    now_unix_ms: u64,
+    blockers: Vec<DispatchBlocker>,
 ) -> Vec<SelectionRejection> {
     let mut reasons = BTreeSet::new();
-    for blocker in dispatch_blockers(
-        snapshot,
-        entry,
-        &preference.required_capabilities,
-        preference.minimum_context_window,
-        preference.allow_degraded_routes,
-        now_unix_ms,
-    ) {
+    for blocker in blockers {
         reasons.insert(SelectionRejection::Dispatch(blocker));
     }
     if !entry.role_eligibility.contains(&preference.role) {
@@ -1086,87 +946,14 @@ pub fn compile_model_selection(
     selection_id: &str,
     now_unix_ms: u64,
 ) -> Result<ModelSelectionReceipt, ModelControlError> {
-    snapshot.validate()?;
-    policy.validate()?;
     validate_text(selection_id, "selection_id")?;
-    if snapshot.account_scope != policy.account_scope {
-        return Err(ModelControlError::InvalidField("selection.account_scope"));
-    }
-    if !snapshot.is_current(now_unix_ms) {
-        return Err(ModelControlError::StaleCatalogue);
-    }
-    let preference = policy.role(role)?;
-    let mut eligible = Vec::new();
-    let mut rejected = Vec::new();
-    for entry in &snapshot.entries {
-        let reasons = selection_rejections(snapshot, entry, preference, now_unix_ms);
-        if reasons.is_empty() {
-            eligible.push(RankedCandidate {
-                entry,
-                preference_rank: preference_rank(entry, &preference.preferred),
-            });
-        } else {
-            rejected.push(RejectedModelCandidate {
-                entry_id: entry.entry_id.clone(),
-                host_family: entry.host_family.clone(),
-                provider_id: entry.provider_id.clone(),
-                model_id: entry.model_id.clone(),
-                reasons,
-            });
-        }
-    }
-    eligible.sort_by(RankedCandidate::compare);
-    rejected.sort_by(|left, right| {
-        (
-            left.host_family.as_str(),
-            left.provider_id.as_str(),
-            left.model_id.as_str(),
-            left.entry_id.as_str(),
-        )
-            .cmp(&(
-                right.host_family.as_str(),
-                right.provider_id.as_str(),
-                right.model_id.as_str(),
-                right.entry_id.as_str(),
-            ))
-    });
-    let selected = eligible
-        .first()
-        .ok_or(ModelControlError::NoDispatchableRoute(role))?
-        .entry
-        .clone();
-    let catalogue_digest = catalogue_digest(snapshot)?;
-    let preference_policy_digest = preference_policy_digest(policy)?;
-    let selection_digest = canonical_digest(&(
-        MODEL_SELECTION_RECEIPT_VERSION,
+    crate::model_registry::compile_model_selection(
+        snapshot,
+        policy,
+        role,
         selection_id,
-        role,
-        snapshot.snapshot_id.as_str(),
-        catalogue_digest.as_str(),
-        policy.policy_id.as_str(),
-        policy.revision.as_str(),
-        preference_policy_digest.as_str(),
-        selected.entry_id.as_str(),
-    ))?;
-    let receipt = ModelSelectionReceipt {
-        schema_version: MODEL_SELECTION_RECEIPT_VERSION.to_owned(),
-        selection_id: selection_id.to_owned(),
-        selection_digest,
-        role,
-        account_scope: snapshot.account_scope.clone(),
-        catalogue_snapshot_id: snapshot.snapshot_id.clone(),
-        catalogue_digest,
-        preference_policy_id: policy.policy_id.clone(),
-        preference_revision: policy.revision.clone(),
-        preference_policy_digest,
-        selected,
-        rejected,
-        execution: ZeroModelExecutionCounters::zero(),
-        candidate_only: true,
-        dispatch_authority: false,
-    };
-    receipt.validate()?;
-    Ok(receipt)
+        now_unix_ms,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
