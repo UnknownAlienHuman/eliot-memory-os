@@ -1,304 +1,279 @@
-"""Closed, immutable value contracts for the ELIOT work-unit gate.
+"""Phase-aware immutable contracts for the work-unit verification gate.
 
-This module deliberately contains no filesystem, network, subprocess, clock,
-environment, or repository mutation logic. It is the neutral vocabulary used
-by separately owned assignment-source, runner, case-binding, cohort, and CLI
-components.
+v4 deliberately rejects legacy receipts missing assignment, source or phase
+bindings. The preserved v2 module is historical, never silently upgraded.
+All validation here is intrinsic: constructing a value cannot establish source
+acquisition authority, current workspace state, execution, or accepted merge.
 """
-
 from __future__ import annotations
 
 import dataclasses
 import hashlib
-import json
 import re
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import PurePosixPath
-from typing import Any, Mapping
 
-MAX_TOKEN_BYTES = 128
-MAX_TITLE_BYTES = 512
-MAX_DIAGNOSTIC_BYTES = 1_024
-MAX_DIAGNOSTIC_FIELDS = 32
-MAX_MATRIX_CASES = 100_000
-MAX_COHORT_ROWS = 10_000
+from . import _contracts_v2 as _base
+from ._contracts_v2 import *  # noqa: F401,F403
 
-_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]*$")
-_GITHUB_SLUG = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})$")
-_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_REMEDIATION_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
-_TEST_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:<>/-]{0,511}$")
+CONTRACT_SCHEMA_REVISION = "eliot-work-unit-contracts-v4"
+WORK_UNIT_DESCRIPTOR_SCHEMA = "eliot-work-unit-descriptor-v2"
+LegacyWorkUnitDescriptorV1 = _base.WorkUnitDescriptor
+LegacyAssignmentSourceReceiptV2 = _base.AssignmentSourceReceipt
+LegacyCohortRowV2 = _base.CohortRow
 
 
-class ContractViolation(ValueError):
-    """A supplied value cannot represent a valid current gate contract."""
+def canonical_bytes(value: object) -> bytes:
+    """Preserve canonicalization rules, contain malformed extension behavior."""
+    try:
+        return _base.canonical_bytes(value)
+    except Exception:
+        # Legacy canonicalization can include a hostile Mapping exception in
+        # its message. Preserve rejection, never echo that untrusted message.
+        raise ContractViolation("canonical value rejected") from None
 
 
-class SourceAuthority(str, Enum):
-    LIVE_GITHUB = "live-github"
-    EXPLICIT_OFFLINE_SNAPSHOT = "explicit-offline-snapshot"
+def canonical_sha256(value: object) -> str:
+    return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
-class IssueState(str, Enum):
-    OPEN = "open"
-    CLOSED = "closed"
-    SUPERSEDED = "superseded"
+def _digest(value: object, field: str) -> str:
+    _base._exact_type(value, str, field)
+    return _base._sha256(value, field)
 
 
-class RelationRole(str, Enum):
-    IMPLEMENTS = "implements"
-    VERIFIED_BY = "verified-by"
-    INTEGRATED_BY = "integrated-by"
-    BLOCKED_BY = "blocked-by"
-    SUPERSEDES = "supersedes"
+def _count(value: object, field: str, maximum: int, *, minimum: int = 0) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ContractViolation(f"{field} is outside its integer bounds")
+    return value
 
 
-class RunnerMode(str, Enum):
-    RUST_PACKAGE = "rust-package"
-    PYTHON_UNITTEST = "python-unittest"
-    METADATA_PYTHON = "metadata-python"
+def _text(value: object, field: str, limit: int = MAX_TOKEN_BYTES) -> str:
+    _base._exact_type(value, str, field)
+    try:
+        return _base._bounded_text(value, field, limit)
+    except (UnicodeError, RecursionError):
+        raise ContractViolation(f"{field} is not bounded UTF-8 text") from None
 
 
-class ExecutionDisposition(str, Enum):
-    DISCOVERED = "discovered"
-    EXECUTED_PASS = "executed-pass"
-    EXECUTED_FAIL = "executed-fail"
-    SKIPPED = "skipped"
-    IGNORED = "ignored"
-    CFG_DISABLED = "cfg-disabled"
-    TIMED_OUT = "timed-out"
+def _tuple(values: object, kind: type, field: str, maximum: int = MAX_COHORT_ROWS,
+           *, nonempty: bool = False) -> tuple:
+    return _base._tuple_of_exact(values, kind, field, maximum=maximum, nonempty=nonempty)
+
+
+def _unique(values: tuple, field: str) -> None:
+    if len(set(values)) != len(values):
+        raise ContractViolation(f"duplicate {field}")
+
+
+def _combine_results(results: tuple[OverallResult, ...]) -> OverallResult:
+    if not results:
+        raise ContractViolation("result evidence cannot be empty")
+    for result in results:
+        _base._exact_type(result, OverallResult, "result evidence")
+    for result in (OverallResult.CONFIGURATION_FAILURE, OverallResult.CONTRACT_FAILURE,
+                   OverallResult.INCOMPLETE_EVIDENCE):
+        if result in results:
+            return result
+    return OverallResult.PASS
+
+
+def _finding_result(findings: tuple[Finding, ...]) -> OverallResult:
+    results = []
+    for item in findings:
+        if item.severity is not FindingSeverity.ERROR:
+            continue
+        if item.finding_class in (FindingClass.CONFIGURATION_DEFECT, FindingClass.INTERNAL_DEFECT):
+            results.append(OverallResult.CONFIGURATION_FAILURE)
+        elif item.finding_class in (FindingClass.SOURCE_UNAVAILABLE, FindingClass.INCOMPLETE_EVIDENCE):
+            results.append(OverallResult.INCOMPLETE_EVIDENCE)
+        else:
+            results.append(OverallResult.CONTRACT_FAILURE)
+    return _combine_results(tuple(results) or (OverallResult.PASS,))
+
+
+class _ClosedEnum(str, Enum):
+    @classmethod
+    def _missing_(cls, value: object) -> None:
+        # Do not call an untrusted value's repr or echo secrets into diagnostics.
+        raise ContractViolation(f"unsupported {cls.__name__} value")
+
+
+class AssignmentSourceUse(_ClosedEnum):
+    ACTIVE_ASSIGNMENT = "active-assignment"
+    PREREQUISITE_EVIDENCE = "prerequisite-evidence"
+
+
+class VerificationPhase(_ClosedEnum):
+    PACKAGE_LOCAL = "package-local"
+    WORKSPACE_INTEGRATION = "workspace-integration"
+
+
+class WorkspaceDisposition(_ClosedEnum):
+    MEMBER = "member"
+    EXCLUDED = "excluded"
+    STANDALONE = "standalone"
     UNAVAILABLE = "unavailable"
-
-
-class OverallResult(str, Enum):
-    PASS = "pass"
-    CONTRACT_FAILURE = "contract-failure"
-    CONFIGURATION_FAILURE = "configuration-failure"
-    INCOMPLETE_EVIDENCE = "incomplete-evidence"
-
-
-class FindingSeverity(str, Enum):
-    ERROR = "error"
-    WARNING = "warning"
-    OBSERVATION = "observation"
-
-
-class FindingClass(str, Enum):
-    INVALID_IDENTITY = "invalid-identity"
-    INVALID_DENOMINATOR = "invalid-denominator"
-    SOURCE_UNAVAILABLE = "source-unavailable"
-    DISCOVERY_MISMATCH = "discovery-mismatch"
-    EXECUTION_MISMATCH = "execution-mismatch"
     CONFIGURATION_DEFECT = "configuration-defect"
-    INCOMPLETE_EVIDENCE = "incomplete-evidence"
-    INTERNAL_DEFECT = "internal-defect"
+    NOT_APPLICABLE = "not-applicable"
 
 
-def _utf8_len(value: str) -> int:
-    return len(value.encode("utf-8"))
-
-
-def _bounded_text(value: str, field: str, limit: int) -> str:
-    if not isinstance(value, str):
-        raise ContractViolation(f"{field} must be text")
-    if not value.strip():
-        raise ContractViolation(f"{field} must be non-blank")
-    if _utf8_len(value) > limit:
-        raise ContractViolation(f"{field} exceeds {limit} UTF-8 bytes")
-    if any(ord(char) < 32 and char not in "\t\n\r" for char in value):
-        raise ContractViolation(f"{field} contains a control character")
-    return value
-
-
-def _token(value: str, field: str, *, pattern: re.Pattern[str] = _TOKEN) -> str:
-    value = _bounded_text(value, field, MAX_TOKEN_BYTES)
-    if pattern.fullmatch(value) is None:
-        raise ContractViolation(f"{field} has invalid token syntax")
-    return value
-
-
-def _positive(value: int, field: str, *, maximum: int | None = None) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ContractViolation(f"{field} must be a positive integer")
-    if maximum is not None and value > maximum:
-        raise ContractViolation(f"{field} exceeds {maximum}")
-    return value
-
-
-def _sha256(value: str, field: str) -> str:
-    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
-        raise ContractViolation(f"{field} must be lowercase SHA-256 hex")
-    return value
-
-
-def _exact_type(value: object, expected: type[Any], field: str) -> None:
-    if type(value) is not expected:
-        raise ContractViolation(f"{field} must be exactly {expected.__name__}")
-
-
-@dataclass(frozen=True, order=True)
-class RepositoryIdentity:
-    owner: str
-    name: str
+@dataclass(frozen=True)
+class VerificationRequirements:
+    source_floor: int
+    public_floor: int
+    test_floor: int
+    required_guards: tuple[WorkUnitIdentity, ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "owner", _token(self.owner, "owner", pattern=_GITHUB_SLUG))
-        object.__setattr__(self, "name", _token(self.name, "name", pattern=_GITHUB_SLUG))
+        for name in ("source_floor", "public_floor", "test_floor"):
+            _count(getattr(self, name), name, MAX_CANONICAL_ITEMS)
+        guards = _tuple(self.required_guards, WorkUnitIdentity, "required_guards", 64)
+        _unique(guards, "required guard")
+        object.__setattr__(self, "required_guards", tuple(sorted(guards)))
+
+
+@dataclass(frozen=True)
+class ExecutionBounds:
+    wall_ms: int
+    idle_ms: int
+    output_bytes: int
+    line_bytes: int
+    discovery_tests: int
+    child_processes: int
+
+    def __post_init__(self) -> None:
+        limits = (("wall_ms", 86_400_000), ("idle_ms", 86_400_000),
+                  ("output_bytes", 67_108_864), ("line_bytes", 1_048_576),
+                  ("discovery_tests", MAX_MATRIX_CASES), ("child_processes", 64))
+        for name, limit in limits:
+            _count(getattr(self, name), name, limit, minimum=1)
+        if self.idle_ms > self.wall_ms or self.line_bytes > self.output_bytes:
+            raise ContractViolation("execution bounds are inconsistent")
+
+
+@dataclass(frozen=True)
+class WorkUnitDescriptor:
+    schema_version: str
+    identity: DescriptorIdentity
+    issue: IssueIdentity
+    unit: WorkUnitIdentity
+    mode: RunnerMode
+    source_roots: tuple[RepositoryPath, ...]
+    test_roots: tuple[RepositoryPath, ...]
+    matrix_cases: int
+    proof_ceiling: ProofCeiling
+    revision: int
+    body_sha256: str
+    matrix_sha256: str
+    require_workspace_member: bool
+    requirements: VerificationRequirements
+    bounds: ExecutionBounds
+    package: PackageIdentity | None = None
+    module: ModuleIdentity | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not str or self.schema_version != WORK_UNIT_DESCRIPTOR_SCHEMA:
+            raise ContractViolation("unsupported descriptor schema; explicit migration required")
+        # Reuse the proven v1 identity/path checks with an explicit historical
+        # constructor, never a changed global schema or a subclass type bypass.
+        old = _base.WorkUnitDescriptor(
+            _base.WORK_UNIT_DESCRIPTOR_SCHEMA, self.identity, self.issue, self.unit,
+            self.mode, self.source_roots, self.test_roots, self.matrix_cases,
+            self.proof_ceiling, self.package, self.module)
+        for name in ("source_roots", "test_roots", "matrix_cases"):
+            object.__setattr__(self, name, getattr(old, name))
+        for path in self.source_roots + self.test_roots:
+            if any(char in path.value for char in "*?[]"):
+                raise ContractViolation("descriptor roots cannot grant wildcard authority")
+        _count(self.revision, "revision", MAX_CANONICAL_INTEGER_ABS, minimum=1)
+        _digest(self.body_sha256, "body_sha256")
+        _digest(self.matrix_sha256, "matrix_sha256")
+        _base._exact_type(self.require_workspace_member, bool, "require_workspace_member")
+        _base._exact_type(self.requirements, VerificationRequirements, "requirements")
+        _base._exact_type(self.bounds, ExecutionBounds, "bounds")
+        if (self.mode is RunnerMode.RUST_PACKAGE or self.require_workspace_member) and self.package is None:
+            raise ContractViolation("this descriptor requires an exact package")
+        if self.requirements.test_floor < self.matrix_cases or self.bounds.discovery_tests < self.matrix_cases:
+            raise ContractViolation("test floor or discovery bound cannot omit matrix cases")
+
+    @classmethod
+    def from_mapping(cls, value: object) -> WorkUnitDescriptor:
+        # Mapping construction consumes already typed values; TOML/JSON decoding
+        # belongs to #850. Missing v2 fields are never supplied by defaults.
+        try:
+            if type(value) is not dict:
+                raise ContractViolation("descriptor input must be an exact dictionary")
+            fields = {field.name: field for field in dataclasses.fields(cls)}
+            if len(value) > len(fields):
+                raise ContractViolation("descriptor contains unknown fields")
+            copied = {}
+            for key, item in value.items():
+                if type(key) is not str or key not in fields:
+                    raise ContractViolation("descriptor contains unknown or non-string fields")
+                if key in copied:
+                    raise ContractViolation("duplicate descriptor field")
+                copied[key] = item
+            required = {name for name, field in fields.items() if field.default is dataclasses.MISSING}
+            if not required.issubset(copied):
+                raise ContractViolation("descriptor is missing required fields")
+            return cls(**copied)
+        except ContractViolation:
+            raise
+        except Exception:
+            raise ContractViolation("descriptor mapping access failed") from None
 
     @property
-    def full_name(self) -> str:
-        return f"{self.owner}/{self.name}"
+    def phase(self) -> VerificationPhase:
+        return (VerificationPhase.WORKSPACE_INTEGRATION if self.require_workspace_member
+                else VerificationPhase.PACKAGE_LOCAL)
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256(self)
 
 
-@dataclass(frozen=True, order=True)
-class IssueIdentity:
-    repository: RepositoryIdentity
-    number: int
+@dataclass(frozen=True)
+class OfflineCaptureBinding:
+    """Intrinsic expected/observed capture binding, not authority verification.
 
-    def __post_init__(self) -> None:
-        _exact_type(self.repository, RepositoryIdentity, "repository")
-        object.__setattr__(self, "number", _positive(self.number, "issue number"))
-
-
-@dataclass(frozen=True, order=True)
-class PullRequestIdentity:
-    repository: RepositoryIdentity
-    number: int
-
-    def __post_init__(self) -> None:
-        _exact_type(self.repository, RepositoryIdentity, "repository")
-        object.__setattr__(self, "number", _positive(self.number, "pull request number"))
-
-
-@dataclass(frozen=True, order=True)
-class PackageIdentity:
-    name: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "name", _token(self.name, "package name"))
-
-
-@dataclass(frozen=True, order=True)
-class ModuleIdentity:
-    value: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "value", _token(self.value, "module identity"))
-
-
-@dataclass(frozen=True, order=True)
-class WorkUnitIdentity:
-    value: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "value", _token(self.value, "work-unit identity"))
-
-
-@dataclass(frozen=True, order=True)
-class ProofCeiling:
-    value: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "value", _token(self.value, "proof ceiling"))
-
-
-@dataclass(frozen=True, order=True)
-class AssignmentRelation:
-    source_issue: IssueIdentity
-    role: RelationRole
-    target_issue: IssueIdentity
-
-    def __post_init__(self) -> None:
-        _exact_type(self.source_issue, IssueIdentity, "source_issue")
-        _exact_type(self.target_issue, IssueIdentity, "target_issue")
-        _exact_type(self.role, RelationRole, "role")
-
-
-@dataclass(frozen=True, order=True)
-class CaseIdentity:
+    #849 must acquire the expected values independently and validate the actual
+    controller authority and policy clock. Equal caller-provided hashes alone
+    never establish trust, freshness or accepted merge.
+    """
     issue: IssueIdentity
-    number: int
+    unit: WorkUnitIdentity
+    body_sha256: str
+    matrix_sha256: str
+    snapshot_sha256: str
+    expected_snapshot_sha256: str
+    producer: WorkUnitIdentity
+    capture_receipt_sha256: str
+    expected_capture_receipt_sha256: str
+    freshness_policy_sha256: str
+    captured_at: int
+    expires_at: int
+    invalidated: bool
 
     def __post_init__(self) -> None:
-        _exact_type(self.issue, IssueIdentity, "issue")
-        object.__setattr__(self, "number", _positive(self.number, "case number", maximum=MAX_MATRIX_CASES))
-
-    def require_within(self, denominator: int) -> None:
-        denominator = _positive(denominator, "matrix denominator", maximum=MAX_MATRIX_CASES)
-        if self.number > denominator:
-            raise ContractViolation(f"case {self.number} exceeds matrix denominator {denominator}")
-
-
-@dataclass(frozen=True, order=True)
-class RepositoryPath:
-    value: str
-
-    def __post_init__(self) -> None:
-        value = _bounded_text(self.value, "repository path", 1_024)
-        if "\\" in value:
-            raise ContractViolation("repository path must use forward slashes")
-        path = PurePosixPath(value)
-        if path.is_absolute() or value.startswith("//"):
-            raise ContractViolation("repository path must be relative")
-        if not path.parts or any(part in {"", ".", ".."} for part in path.parts):
-            raise ContractViolation("repository path contains an invalid segment")
-        if ":" in path.parts[0]:
-            raise ContractViolation("repository path cannot contain a drive prefix")
-        object.__setattr__(self, "value", path.as_posix())
+        _base._exact_type(self.issue, IssueIdentity, "issue")
+        _base._exact_type(self.unit, WorkUnitIdentity, "unit")
+        _base._exact_type(self.producer, WorkUnitIdentity, "producer")
+        for name in ("body_sha256", "matrix_sha256", "snapshot_sha256", "expected_snapshot_sha256", "capture_receipt_sha256",
+                     "expected_capture_receipt_sha256", "freshness_policy_sha256"):
+            _digest(getattr(self, name), name)
+        for name in ("captured_at", "expires_at"):
+            _count(getattr(self, name), name, (1 << 63) - 1)
+        _base._exact_type(self.invalidated, bool, "invalidated")
+        if self.invalidated or self.expires_at <= self.captured_at:
+            raise ContractViolation("offline capture is invalidated or has invalid expiry")
+        if self.snapshot_sha256 != self.expected_snapshot_sha256:
+            raise ContractViolation("offline expected snapshot mismatch")
+        if self.capture_receipt_sha256 != self.expected_capture_receipt_sha256:
+            raise ContractViolation("offline expected capture receipt mismatch")
 
 
-@dataclass(frozen=True, order=True)
-class SourceLocation:
-    path: RepositoryPath
-    line: int
-    column: int = 1
-
-    def __post_init__(self) -> None:
-        _exact_type(self.path, RepositoryPath, "path")
-        object.__setattr__(self, "line", _positive(self.line, "line"))
-        object.__setattr__(self, "column", _positive(self.column, "column"))
-
-
-@dataclass(frozen=True, order=True)
-class TestIdentity:
-    mode: RunnerMode
-    qualified_name: str
-
-    def __post_init__(self) -> None:
-        _exact_type(self.mode, RunnerMode, "mode")
-        name = _bounded_text(self.qualified_name, "qualified test identity", 512)
-        if _TEST_ID.fullmatch(name) is None:
-            raise ContractViolation("qualified test identity has invalid syntax")
-        object.__setattr__(self, "qualified_name", name)
-
-
-@dataclass(frozen=True, order=True)
-class CaseMarker:
-    case: CaseIdentity
-    test: TestIdentity
-    location: SourceLocation
-
-    def __post_init__(self) -> None:
-        _exact_type(self.case, CaseIdentity, "case")
-        _exact_type(self.test, TestIdentity, "test")
-        _exact_type(self.location, SourceLocation, "location")
-
-
-@dataclass(frozen=True, order=True)
-class TestExecutionRecord:
-    test: TestIdentity
-    disposition: ExecutionDisposition
-    detail: str | None = None
-
-    def __post_init__(self) -> None:
-        _exact_type(self.test, TestIdentity, "test")
-        _exact_type(self.disposition, ExecutionDisposition, "disposition")
-        if self.detail is not None:
-            object.__setattr__(self, "detail", _bounded_text(self.detail, "execution detail", MAX_DIAGNOSTIC_BYTES))
-
-
-@dataclass(frozen=True, order=True)
+@dataclass(frozen=True)
 class AssignmentSourceReceipt:
     issue: IssueIdentity
     state: IssueState
@@ -308,263 +283,552 @@ class AssignmentSourceReceipt:
     body_sha256: str
     matrix_cases: int
     proof_ceiling: ProofCeiling
+    matrix_sha256: str
+    source_use: AssignmentSourceUse
+    origin: str
     live_etag: str | None = None
-    snapshot_sha256: str | None = None
+    offline_capture: OfflineCaptureBinding | None = None
 
     def __post_init__(self) -> None:
-        _exact_type(self.issue, IssueIdentity, "issue")
-        _exact_type(self.state, IssueState, "state")
-        _exact_type(self.unit, WorkUnitIdentity, "unit")
-        _exact_type(self.authority, SourceAuthority, "authority")
-        _exact_type(self.proof_ceiling, ProofCeiling, "proof_ceiling")
-        object.__setattr__(self, "title", _bounded_text(self.title, "title", MAX_TITLE_BYTES))
-        object.__setattr__(self, "body_sha256", _sha256(self.body_sha256, "body_sha256"))
-        object.__setattr__(self, "matrix_cases", _positive(self.matrix_cases, "matrix_cases", maximum=MAX_MATRIX_CASES))
-        if self.live_etag is not None:
-            object.__setattr__(self, "live_etag", _bounded_text(self.live_etag, "live_etag", MAX_TOKEN_BYTES))
-        if self.snapshot_sha256 is not None:
-            object.__setattr__(self, "snapshot_sha256", _sha256(self.snapshot_sha256, "snapshot_sha256"))
+        for name, kind in (("issue", IssueIdentity), ("state", IssueState),
+                           ("unit", WorkUnitIdentity), ("authority", SourceAuthority),
+                           ("proof_ceiling", ProofCeiling), ("source_use", AssignmentSourceUse)):
+            _base._exact_type(getattr(self, name), kind, name)
+        _text(self.title, "title", MAX_TITLE_BYTES)
+        _digest(self.body_sha256, "body_sha256")
+        _digest(self.matrix_sha256, "matrix_sha256")
+        _count(self.matrix_cases, "matrix_cases", MAX_MATRIX_CASES, minimum=1)
+        if type(self.origin) is not str or self.origin != "https://api.github.com":
+            raise ContractViolation("assignment origin is not the fixed GitHub API")
+        if self.source_use is AssignmentSourceUse.ACTIVE_ASSIGNMENT and self.state is not IssueState.OPEN:
+            raise ContractViolation("active assignment requires open nonsuperseded ownership")
         if self.authority is SourceAuthority.LIVE_GITHUB:
-            if self.snapshot_sha256 is not None:
-                raise ContractViolation("live source cannot carry an offline snapshot digest")
-        elif self.authority is SourceAuthority.EXPLICIT_OFFLINE_SNAPSHOT:
-            if self.snapshot_sha256 is None:
-                raise ContractViolation("offline source requires snapshot_sha256")
+            if self.offline_capture is not None:
+                raise ContractViolation("live source cannot carry offline capture")
             if self.live_etag is not None:
-                raise ContractViolation("offline source cannot carry a live ETag")
+                _text(self.live_etag, "live_etag")
+        else:
+            if self.live_etag is not None:
+                raise ContractViolation("offline source cannot carry live ETag")
+            _base._exact_type(self.offline_capture, OfflineCaptureBinding, "offline_capture")
+            for name in ("issue", "unit", "body_sha256", "matrix_sha256"):
+                if getattr(self.offline_capture, name) != getattr(self, name):
+                    raise ContractViolation("offline capture assignment identity mismatch")
 
 
-@dataclass(frozen=True, order=True)
+def _binding(assignment: AssignmentSourceReceipt, descriptor: WorkUnitDescriptor) -> None:
+    _base._exact_type(assignment, AssignmentSourceReceipt, "assignment")
+    _base._exact_type(descriptor, WorkUnitDescriptor, "descriptor")
+    for field in ("issue", "unit", "matrix_cases", "body_sha256", "matrix_sha256"):
+        if getattr(assignment, field) != getattr(descriptor, field):
+            raise ContractViolation(f"assignment {field} does not match descriptor")
+
+
+def _active(assignment: AssignmentSourceReceipt) -> OverallResult:
+    return (OverallResult.PASS if assignment.source_use is AssignmentSourceUse.ACTIVE_ASSIGNMENT
+            and assignment.state is IssueState.OPEN else OverallResult.INCOMPLETE_EVIDENCE)
+
+
+@dataclass(frozen=True)
+class DiscoveredTestReceipt:
+    descriptor: DescriptorIdentity
+    descriptor_sha256: str
+    test: TestIdentity
+    location: SourceLocation
+    source_sha256: str
+    artifact_sha256: str
+    phase: VerificationPhase
+
+    def __post_init__(self) -> None:
+        for name, kind in (("descriptor", DescriptorIdentity), ("test", TestIdentity),
+                           ("location", SourceLocation), ("phase", VerificationPhase)):
+            _base._exact_type(getattr(self, name), kind, name)
+        for name in ("descriptor_sha256", "source_sha256", "artifact_sha256"):
+            _digest(getattr(self, name), name)
+
+
+@dataclass(frozen=True)
+class TestExecutionRecord:
+    test: TestIdentity
+    disposition: ExecutionDisposition
+    discovery: DiscoveredTestReceipt
+    detail: str | None = None
+
+    def __post_init__(self) -> None:
+        _base._exact_type(self.test, TestIdentity, "test")
+        _base._exact_type(self.disposition, ExecutionDisposition, "disposition")
+        _base._exact_type(self.discovery, DiscoveredTestReceipt, "discovery")
+        if self.test != self.discovery.test:
+            raise ContractViolation("execution test does not match discovery test")
+        if self.detail is not None:
+            _text(self.detail, "execution detail", MAX_DIAGNOSTIC_BYTES)
+
+
+TestExecutionReceipt = TestExecutionRecord
+
+
+@dataclass(frozen=True)
 class CaseAccountingMember:
     case: CaseIdentity
     marker: CaseMarker
     execution: TestExecutionRecord
 
     def __post_init__(self) -> None:
-        _exact_type(self.case, CaseIdentity, "case")
-        _exact_type(self.marker, CaseMarker, "marker")
-        _exact_type(self.execution, TestExecutionRecord, "execution")
-        if self.marker.case != self.case:
-            raise ContractViolation("marker case does not match member case")
-        if self.marker.test != self.execution.test:
-            raise ContractViolation("marker test does not match execution test")
+        for name, kind in (("case", CaseIdentity), ("marker", CaseMarker), ("execution", TestExecutionRecord)):
+            _base._exact_type(getattr(self, name), kind, name)
+        if self.case != self.marker.case or self.marker.test != self.execution.test:
+            raise ContractViolation("case marker does not match execution")
+        if self.marker.location != self.execution.discovery.location:
+            raise ContractViolation("discovery location does not match marker location")
 
 
 @dataclass(frozen=True)
 class CaseAccountingReceipt:
     assignment: AssignmentSourceReceipt
+    descriptor: WorkUnitDescriptor
     members: tuple[CaseAccountingMember, ...]
     result: OverallResult
     proof_ceiling: ProofCeiling
+    findings: tuple[Finding, ...] = ()
 
     def __post_init__(self) -> None:
-        _exact_type(self.assignment, AssignmentSourceReceipt, "assignment")
-        _exact_type(self.result, OverallResult, "result")
-        _exact_type(self.proof_ceiling, ProofCeiling, "proof_ceiling")
-        if len(self.members) > MAX_MATRIX_CASES:
-            raise ContractViolation("case-accounting member count exceeds policy")
-        for member in self.members:
-            _exact_type(member, CaseAccountingMember, "member")
-            if member.case.issue != self.assignment.issue:
-                raise ContractViolation("member issue does not match assignment issue")
-            member.case.require_within(self.assignment.matrix_cases)
-        ordered = tuple(sorted(self.members, key=lambda item: item.case.number))
+        _binding(self.assignment, self.descriptor)
+        _proof(self.proof_ceiling, self.descriptor)
+        members = _tuple(self.members, CaseAccountingMember, "members", MAX_MATRIX_CASES)
+        ordered = tuple(sorted(members, key=lambda item: item.case.number))
         object.__setattr__(self, "members", ordered)
-        numbers = [item.case.number for item in ordered]
-        tests = [item.execution.test for item in ordered]
-        if len(numbers) != len(set(numbers)):
-            raise ContractViolation("duplicate case-accounting member")
-        if len(tests) != len(set(tests)):
-            raise ContractViolation("one test identity cannot cover multiple cases")
-        if self.result is OverallResult.PASS:
-            expected = list(range(1, self.assignment.matrix_cases + 1))
-            if numbers != expected:
-                raise ContractViolation("pass requires complete exact case denominator")
-            if any(item.execution.disposition is not ExecutionDisposition.EXECUTED_PASS for item in ordered):
-                raise ContractViolation("pass requires every case test to execute successfully")
+        findings = _base._normalize_findings(self.findings)
+        object.__setattr__(self, "findings", findings)
+        _unique(tuple(item.case for item in ordered), "case-accounting member")
+        _unique(tuple(item.execution.test for item in ordered), "test covering multiple cases")
+        for item in ordered:
+            item.case.require_within(self.descriptor.matrix_cases)
+            found = item.execution.discovery
+            if (item.case.issue != self.descriptor.issue or found.descriptor != self.descriptor.identity
+                    or found.descriptor_sha256 != self.descriptor.sha256
+                    or found.test.mode is not self.descriptor.mode or found.phase is not self.descriptor.phase):
+                raise ContractViolation("case/discovery descriptor identity, mode or phase mismatch")
+            path = found.location.path.value
+            if not any(path == root.value or path.startswith(root.value + "/")
+                       for root in self.descriptor.test_roots):
+                raise ContractViolation("discovered test is outside registered test roots")
+        dispositions = tuple(item.execution.disposition for item in ordered)
+        if ExecutionDisposition.EXECUTED_FAIL in dispositions:
+            execution = OverallResult.CONTRACT_FAILURE
+        elif (tuple(item.case.number for item in ordered) == tuple(range(1, self.descriptor.matrix_cases + 1))
+              and all(item is ExecutionDisposition.EXECUTED_PASS for item in dispositions)):
+            execution = OverallResult.PASS
+        else:
+            execution = OverallResult.INCOMPLETE_EVIDENCE
+        expected = _combine_results((execution, _active(self.assignment), _finding_result(findings)))
+        _base._require_result(self.result, expected, "case-accounting")
 
 
-@dataclass(frozen=True, order=True)
-class RemediationCode:
-    value: str
+def _proof(value: ProofCeiling, descriptor: WorkUnitDescriptor) -> None:
+    _base._exact_type(value, ProofCeiling, "proof_ceiling")
+    if value != descriptor.proof_ceiling:
+        raise ContractViolation("proof ceiling does not match descriptor")
+
+
+@dataclass(frozen=True)
+class GuardResult:
+    identity: WorkUnitIdentity
+    result: OverallResult
 
     def __post_init__(self) -> None:
-        value = _bounded_text(self.value, "remediation code", 64)
-        if _REMEDIATION_CODE.fullmatch(value) is None:
-            raise ContractViolation("remediation code must be stable uppercase syntax")
-        object.__setattr__(self, "value", value)
+        _base._exact_type(self.identity, WorkUnitIdentity, "guard identity")
+        _base._exact_type(self.result, OverallResult, "guard result")
 
 
-@dataclass(frozen=True, order=True)
-class Finding:
-    severity: FindingSeverity
-    finding_class: FindingClass
-    owner: WorkUnitIdentity
-    remediation: RemediationCode
-    message: str
+@dataclass(frozen=True)
+class SourceShapeGateReceipt:
+    assignment: AssignmentSourceReceipt
+    descriptor: WorkUnitDescriptor
+    result: OverallResult
+    findings: tuple[Finding, ...]
+    proof_ceiling: ProofCeiling
+    source_sha256: str
+    source_items: int
+    public_items: int
+    test_items: int
+    guards: tuple[GuardResult, ...]
 
     def __post_init__(self) -> None:
-        _exact_type(self.severity, FindingSeverity, "severity")
-        _exact_type(self.finding_class, FindingClass, "finding_class")
-        _exact_type(self.owner, WorkUnitIdentity, "owner")
-        _exact_type(self.remediation, RemediationCode, "remediation")
-        object.__setattr__(self, "message", _bounded_text(self.message, "finding message", MAX_DIAGNOSTIC_BYTES))
+        _binding(self.assignment, self.descriptor)
+        _proof(self.proof_ceiling, self.descriptor)
+        _digest(self.source_sha256, "source_sha256")
+        findings = _base._normalize_findings(self.findings)
+        object.__setattr__(self, "findings", findings)
+        guards = _tuple(self.guards, GuardResult, "guards", 64)
+        _unique(tuple(item.identity for item in guards), "guard observation")
+        object.__setattr__(self, "guards", tuple(sorted(guards, key=lambda item: item.identity)))
+        actual = tuple(sorted(item.identity for item in guards))
+        required = self.descriptor.requirements.required_guards
+        if not set(actual).issubset(required):
+            raise ContractViolation("unregistered source guard")
+        floor_results = []
+        for observation, floor in (("source_items", "source_floor"), ("public_items", "public_floor"),
+                                   ("test_items", "test_floor")):
+            count = _count(getattr(self, observation), observation, MAX_CANONICAL_ITEMS)
+            floor_results.append(OverallResult.PASS if count >= getattr(self.descriptor.requirements, floor)
+                                 else OverallResult.CONTRACT_FAILURE)
+        coverage = OverallResult.PASS if actual == required else OverallResult.INCOMPLETE_EVIDENCE
+        expected = _combine_results(tuple(floor_results) + tuple(item.result for item in guards)
+                                    + (coverage, _active(self.assignment), _finding_result(findings)))
+        _base._require_result(self.result, expected, "source-shape")
+
+
+@dataclass(frozen=True)
+class PackageGateReceipt:
+    assignment: AssignmentSourceReceipt
+    descriptor: WorkUnitDescriptor
+    package: PackageIdentity
+    module: ModuleIdentity | None
+    source_shape: SourceShapeGateReceipt
+    case_accounting: CaseAccountingReceipt
+    result: OverallResult
+    findings: tuple[Finding, ...]
+    proof_ceiling: ProofCeiling
+
+    def __post_init__(self) -> None:
+        _binding(self.assignment, self.descriptor)
+        _proof(self.proof_ceiling, self.descriptor)
+        _base._exact_type(self.package, PackageIdentity, "package")
+        if self.module is not None:
+            _base._exact_type(self.module, ModuleIdentity, "module")
+        if self.package != self.descriptor.package or self.module != self.descriptor.module:
+            raise ContractViolation("package/module does not match descriptor")
+        _children(self.assignment, self.descriptor, self.source_shape, self.case_accounting)
+        findings = _base._normalize_findings(self.findings)
+        object.__setattr__(self, "findings", findings)
+        expected = _combine_results((self.source_shape.result, self.case_accounting.result, _finding_result(findings)))
+        _base._require_result(self.result, expected, "package")
+
+
+def _children(assignment: AssignmentSourceReceipt, descriptor: WorkUnitDescriptor,
+              source: SourceShapeGateReceipt, cases: CaseAccountingReceipt) -> None:
+    _base._exact_type(source, SourceShapeGateReceipt, "source_shape")
+    _base._exact_type(cases, CaseAccountingReceipt, "case_accounting")
+    for child in (source, cases):
+        if child.assignment != assignment or child.descriptor != descriptor:
+            raise ContractViolation("child assignment/descriptor mismatch")
+    if any(member.execution.discovery.source_sha256 != source.source_sha256 for member in cases.members):
+        raise ContractViolation("case execution source does not match inspected source")
+
+
+@dataclass(frozen=True)
+class WorkspaceAdmissionReceipt:
+    assignment: AssignmentSourceReceipt
+    descriptor: WorkUnitDescriptor
+    package: PackageIdentity | None
+    module: ModuleIdentity | None
+    disposition: WorkspaceDisposition
+    result: OverallResult
+    findings: tuple[Finding, ...]
+    proof_ceiling: ProofCeiling
+
+    def __post_init__(self) -> None:
+        _binding(self.assignment, self.descriptor)
+        _proof(self.proof_ceiling, self.descriptor)
+        _base._exact_type(self.disposition, WorkspaceDisposition, "disposition")
+        if self.package is not None:
+            _base._exact_type(self.package, PackageIdentity, "package")
+        if self.module is not None:
+            _base._exact_type(self.module, ModuleIdentity, "module")
+        if self.package != self.descriptor.package or self.module != self.descriptor.module:
+            raise ContractViolation("workspace package/module mismatch")
+        findings = _base._normalize_findings(self.findings)
+        object.__setattr__(self, "findings", findings)
+        if self.disposition is WorkspaceDisposition.NOT_APPLICABLE:
+            if self.descriptor.mode is RunnerMode.RUST_PACKAGE or self.descriptor.require_workspace_member:
+                raise ContractViolation("workspace not-applicable contradicts descriptor")
+            observed = OverallResult.PASS
+        elif self.disposition is WorkspaceDisposition.CONFIGURATION_DEFECT:
+            observed = OverallResult.CONFIGURATION_FAILURE
+        elif self.disposition is WorkspaceDisposition.UNAVAILABLE:
+            observed = OverallResult.INCOMPLETE_EVIDENCE
+        elif self.disposition is WorkspaceDisposition.MEMBER or not self.descriptor.require_workspace_member:
+            observed = OverallResult.PASS
+        else:
+            observed = OverallResult.INCOMPLETE_EVIDENCE
+        _base._require_result(self.result, _combine_results((observed, _active(self.assignment),
+                                                           _finding_result(findings))), "workspace")
 
 
 @dataclass(frozen=True)
 class ComponentGateReceipt:
+    """Generic summary; not an authoritative source/workspace/execution result."""
     component: str
     result: OverallResult
     findings: tuple[Finding, ...]
     proof_ceiling: ProofCeiling
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "component", _token(self.component, "component"))
-        _exact_type(self.result, OverallResult, "result")
-        _exact_type(self.proof_ceiling, ProofCeiling, "proof_ceiling")
-        if len(self.findings) > MAX_DIAGNOSTIC_FIELDS:
-            raise ContractViolation("too many component findings")
-        for finding in self.findings:
-            _exact_type(finding, Finding, "finding")
-        object.__setattr__(self, "findings", tuple(sorted(self.findings)))
-        if self.result is OverallResult.PASS and any(finding.severity is FindingSeverity.ERROR for finding in self.findings):
-            raise ContractViolation("passing component receipt cannot contain errors")
+        _base._token(self.component, "component")
+        _base._exact_type(self.proof_ceiling, ProofCeiling, "proof_ceiling")
+        findings = _base._normalize_findings(self.findings)
+        object.__setattr__(self, "findings", findings)
+        _base._require_result(self.result, _finding_result(findings), "component-summary")
 
 
-@dataclass(frozen=True, order=True)
-class CohortRow:
+class CatalogueDisposition(_ClosedEnum):
+    ASSIGNED = "assigned"
+    PLANNED = "planned"
+    BLOCKED = "blocked"
+    NONEXECUTABLE = "nonexecutable"
+    SUPERSEDED = "superseded"
+    ACCEPTED_HISTORICAL = "accepted-historical"
+
+
+class CatalogueResult(_ClosedEnum):
+    INTEGRITY_VALID = "integrity-valid"
+
+
+class SelectionScope(_ClosedEnum):
+    SELECTED = "selected"
+    FULL_PROJECT = "full-project"
+
+
+@dataclass(frozen=True)
+class CatalogueRow:
     issue: IssueIdentity
     unit: WorkUnitIdentity
-    mode: RunnerMode
-    matrix_cases: int
-    descriptor_sha256: str
+    body_sha256: str
+    disposition: CatalogueDisposition
+    descriptor: WorkUnitDescriptor | None
+    prerequisites: tuple[IssueIdentity, ...] = ()
 
     def __post_init__(self) -> None:
-        _exact_type(self.issue, IssueIdentity, "issue")
-        _exact_type(self.unit, WorkUnitIdentity, "unit")
-        _exact_type(self.mode, RunnerMode, "mode")
-        object.__setattr__(self, "matrix_cases", _positive(self.matrix_cases, "matrix_cases", maximum=MAX_MATRIX_CASES))
-        object.__setattr__(self, "descriptor_sha256", _sha256(self.descriptor_sha256, "descriptor_sha256"))
+        _base._exact_type(self.issue, IssueIdentity, "issue")
+        _base._exact_type(self.unit, WorkUnitIdentity, "unit")
+        _base._exact_type(self.disposition, CatalogueDisposition, "disposition")
+        _digest(self.body_sha256, "body_sha256")
+        deps = _tuple(self.prerequisites, IssueIdentity, "prerequisites", 256)
+        _unique(deps, "prerequisite")
+        if self.issue in deps or any(dep.repository != self.issue.repository for dep in deps):
+            raise ContractViolation("self or foreign-repository prerequisite")
+        object.__setattr__(self, "prerequisites", tuple(sorted(deps)))
+        if self.descriptor is not None:
+            _base._exact_type(self.descriptor, WorkUnitDescriptor, "descriptor")
+            if (self.descriptor.issue != self.issue or self.descriptor.unit != self.unit
+                    or self.descriptor.body_sha256 != self.body_sha256):
+                raise ContractViolation("catalogue descriptor binding mismatch")
+        elif self.disposition is CatalogueDisposition.ASSIGNED:
+            raise ContractViolation("assigned catalogue row requires a descriptor")
+
+
+@dataclass(frozen=True)
+class CatalogueIntegrityReceipt:
+    """Well-formed complete accounting; neither ready nor executed work."""
+    rows: tuple[CatalogueRow, ...]
+    expected_issues: tuple[IssueIdentity, ...]
+
+    def __post_init__(self) -> None:
+        rows = _tuple(self.rows, CatalogueRow, "catalogue rows", nonempty=True)
+        expected = _tuple(self.expected_issues, IssueIdentity, "expected issues", nonempty=True)
+        _unique(tuple(row.issue for row in rows), "catalogue issue")
+        _unique(tuple(row.unit for row in rows), "catalogue unit")
+        descriptors = tuple(row.descriptor.identity for row in rows if row.descriptor is not None)
+        _unique(descriptors, "catalogue descriptor")
+        _unique(expected, "expected issue")
+        if set(expected) != {row.issue for row in rows}:
+            raise ContractViolation("catalogue issue denominator mismatch")
+        if len({identity.repository for identity in expected}) != 1:
+            raise ContractViolation("catalogue contains multiple repositories")
+        known = set(expected)
+        if any(not set(row.prerequisites).issubset(known) for row in rows):
+            raise ContractViolation("catalogue prerequisite is missing")
+        object.__setattr__(self, "rows", tuple(sorted(rows, key=lambda row: row.issue)))
+        object.__setattr__(self, "expected_issues", tuple(sorted(expected)))
+
+    @property
+    def result(self) -> CatalogueResult:
+        return CatalogueResult.INTEGRITY_VALID
+
+    @property
+    def proof_ceiling(self) -> ProofCeiling:
+        return ProofCeiling("catalogue-integrity-only")
+
+    @property
+    def matrix_cases(self) -> int:
+        return sum(row.descriptor.matrix_cases for row in self.rows if row.descriptor is not None)
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256({"schema": CONTRACT_SCHEMA_REVISION, "kind": "catalogue", "payload": self})
+
+
+@dataclass(frozen=True)
+class VerificationSelection:
+    """Producer-issued requested denominator, not a CLI permission override."""
+    catalogue_sha256: str
+    profile_sha256: str
+    scope: SelectionScope
+    issues: tuple[IssueIdentity, ...]
+
+    def __post_init__(self) -> None:
+        _digest(self.catalogue_sha256, "catalogue_sha256")
+        _digest(self.profile_sha256, "profile_sha256")
+        _base._exact_type(self.scope, SelectionScope, "scope")
+        issues = _tuple(self.issues, IssueIdentity, "selected issues", nonempty=True)
+        _unique(issues, "selected issue")
+        object.__setattr__(self, "issues", tuple(sorted(issues)))
+
+
+@dataclass(frozen=True)
+class PrerequisiteEvidence:
+    """Reference to separately accepted proof; a source read is insufficient."""
+    source: AssignmentSourceReceipt
+    accepted_commit: str
+    accepted_result_sha256: str
+
+    def __post_init__(self) -> None:
+        _base._exact_type(self.source, AssignmentSourceReceipt, "source")
+        if self.source.source_use is not AssignmentSourceUse.PREREQUISITE_EVIDENCE:
+            raise ContractViolation("prerequisite evidence requires its distinct source use")
+        if type(self.accepted_commit) is not str or not re.fullmatch(r"[0-9a-f]{40}", self.accepted_commit):
+            raise ContractViolation("accepted commit must be an exact observed Git object ID")
+        _digest(self.accepted_result_sha256, "accepted_result_sha256")
+
+
+@dataclass(frozen=True)
+class SelectedVerificationPlan:
+    catalogue: CatalogueIntegrityReceipt
+    selection: VerificationSelection
+    descriptors: tuple[WorkUnitDescriptor, ...]
+    prerequisites: tuple[PrerequisiteEvidence, ...]
+
+    def __post_init__(self) -> None:
+        _base._exact_type(self.catalogue, CatalogueIntegrityReceipt, "catalogue")
+        _base._exact_type(self.selection, VerificationSelection, "selection")
+        if self.selection.catalogue_sha256 != self.catalogue.sha256:
+            raise ContractViolation("selection catalogue identity mismatch")
+        descriptors = _tuple(self.descriptors, WorkUnitDescriptor, "selected descriptors", nonempty=True)
+        _unique(tuple(item.issue for item in descriptors), "selected descriptor issue")
+        if set(self.selection.issues) != {item.issue for item in descriptors}:
+            raise ContractViolation("selected descriptor denominator mismatch")
+        rows = {row.issue: row for row in self.catalogue.rows}
+        active = {row.issue for row in rows.values() if row.disposition in
+                  (CatalogueDisposition.ASSIGNED, CatalogueDisposition.BLOCKED, CatalogueDisposition.PLANNED)}
+        if self.selection.scope is SelectionScope.FULL_PROJECT and set(self.selection.issues) != active:
+            raise ContractViolation("subset cannot claim full-project selection")
+        required = set()
+        for desc in descriptors:
+            row = rows.get(desc.issue)
+            if row is None or row.descriptor != desc or row.disposition is not CatalogueDisposition.ASSIGNED:
+                raise ContractViolation("selected row is not an assigned matching descriptor")
+            required.update(row.prerequisites)
+        evidence = _tuple(self.prerequisites, PrerequisiteEvidence, "prerequisite evidence")
+        _unique(tuple(item.source.issue for item in evidence), "prerequisite evidence")
+        if {item.source.issue for item in evidence} != required:
+            raise ContractViolation("selected prerequisite denominator mismatch")
+        for item in evidence:
+            row = rows[item.source.issue]
+            if (row.disposition is not CatalogueDisposition.ACCEPTED_HISTORICAL
+                    or item.source.body_sha256 != row.body_sha256 or item.source.unit != row.unit):
+                raise ContractViolation("prerequisite is not matching accepted historical evidence")
+            if row.descriptor is not None:
+                _binding(item.source, row.descriptor)
+        object.__setattr__(self, "descriptors", tuple(sorted(descriptors, key=lambda desc: desc.issue)))
+        object.__setattr__(self, "prerequisites", tuple(sorted(evidence, key=lambda item: item.source.issue)))
+
+    @property
+    def matrix_cases(self) -> int:
+        return sum(desc.matrix_cases for desc in self.descriptors)
+
+    @property
+    def sha256(self) -> str:
+        # No self-digest field or future integration commit is hashed here.
+        return canonical_sha256({"schema": CONTRACT_SCHEMA_REVISION, "kind": "selection", "payload": self})
+
+
+@dataclass(frozen=True)
+class VerificationEvidence:
+    source_shape: SourceShapeGateReceipt
+    case_accounting: CaseAccountingReceipt
+    workspace: WorkspaceAdmissionReceipt
+    package: PackageGateReceipt | None
+
+    def __post_init__(self) -> None:
+        _base._exact_type(self.source_shape, SourceShapeGateReceipt, "source_shape")
+        _base._exact_type(self.workspace, WorkspaceAdmissionReceipt, "workspace")
+        assignment, descriptor = self.source_shape.assignment, self.source_shape.descriptor
+        _children(assignment, descriptor, self.source_shape, self.case_accounting)
+        if self.workspace.assignment != assignment or self.workspace.descriptor != descriptor:
+            raise ContractViolation("workspace evidence binding mismatch")
+        if descriptor.package is None:
+            if self.package is not None:
+                raise ContractViolation("nonpackage descriptor cannot carry package evidence")
+        else:
+            _base._exact_type(self.package, PackageGateReceipt, "package")
+            if (self.package.source_shape != self.source_shape or self.package.case_accounting != self.case_accounting
+                    or self.package.assignment != assignment or self.package.descriptor != descriptor):
+                raise ContractViolation("package evidence binding mismatch")
+
+    @property
+    def descriptor(self) -> WorkUnitDescriptor:
+        return self.source_shape.descriptor
+
+    @property
+    def result(self) -> OverallResult:
+        results = (self.source_shape.result, self.case_accounting.result, self.workspace.result)
+        if self.package is not None:
+            results += (self.package.result,)
+        return _combine_results(results)
+
+
+def cohort_digest(plan: SelectedVerificationPlan, rows: tuple[VerificationEvidence, ...]) -> str:
+    _base._exact_type(plan, SelectedVerificationPlan, "plan")
+    rows = _tuple(rows, VerificationEvidence, "execution rows")
+    return canonical_sha256({"schema": CONTRACT_SCHEMA_REVISION, "kind": "execution-cohort",
+                             "plan_sha256": plan.sha256,
+                             "rows": tuple(sorted(rows, key=lambda row: row.descriptor.issue))})
 
 
 @dataclass(frozen=True)
 class CohortReceipt:
-    rows: tuple[CohortRow, ...]
+    plan: SelectedVerificationPlan
+    rows: tuple[VerificationEvidence, ...]
     result: OverallResult
-    proof_ceiling: ProofCeiling
+    aggregate_sha256: str
 
     def __post_init__(self) -> None:
-        _exact_type(self.result, OverallResult, "result")
-        _exact_type(self.proof_ceiling, ProofCeiling, "proof_ceiling")
-        if not self.rows:
-            raise ContractViolation("cohort denominator cannot be empty")
-        if len(self.rows) > MAX_COHORT_ROWS:
-            raise ContractViolation("cohort row count exceeds policy")
-        for row in self.rows:
-            _exact_type(row, CohortRow, "row")
-        ordered = tuple(sorted(self.rows, key=lambda row: (row.issue.number, row.unit.value)))
+        _base._exact_type(self.plan, SelectedVerificationPlan, "plan")
+        rows = _tuple(self.rows, VerificationEvidence, "execution rows")
+        _unique(tuple(row.descriptor.issue for row in rows), "cohort issue")
+        expected = {desc.issue: desc for desc in self.plan.descriptors}
+        for row in rows:
+            if expected.get(row.descriptor.issue) != row.descriptor:
+                raise ContractViolation("foreign or substituted execution descriptor")
+        ordered = tuple(sorted(rows, key=lambda row: row.descriptor.issue))
         object.__setattr__(self, "rows", ordered)
-        if len({row.issue for row in ordered}) != len(ordered):
-            raise ContractViolation("duplicate cohort issue identity")
-        if len({row.unit for row in ordered}) != len(ordered):
-            raise ContractViolation("duplicate cohort work-unit identity")
+        coverage = OverallResult.PASS if len(rows) == len(expected) else OverallResult.INCOMPLETE_EVIDENCE
+        actual = _combine_results(tuple(row.result for row in rows) + (coverage,))
+        _base._require_result(self.result, actual, "execution-cohort")
+        _digest(self.aggregate_sha256, "aggregate_sha256")
+        if self.aggregate_sha256 != cohort_digest(self.plan, ordered):
+            raise ContractViolation("cohort aggregate digest mismatch")
 
     @property
     def matrix_cases(self) -> int:
-        return sum(row.matrix_cases for row in self.rows)
+        return sum(row.descriptor.matrix_cases for row in self.rows)
+
+    @property
+    def expected_matrix_cases(self) -> int:
+        return self.plan.matrix_cases
+
+    @property
+    def proof_ceiling(self) -> ProofCeiling:
+        return ProofCeiling("selected-verification-only")
 
 
-@dataclass(frozen=True)
-class BoundedDiagnostic:
-    summary: str
-    fields: tuple[tuple[str, str], ...] = ()
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "summary", _bounded_text(self.summary, "diagnostic summary", MAX_DIAGNOSTIC_BYTES))
-        if len(self.fields) > MAX_DIAGNOSTIC_FIELDS:
-            raise ContractViolation("too many diagnostic fields")
-        normalized: list[tuple[str, str]] = []
-        for key, value in self.fields:
-            normalized.append((_token(key, "diagnostic field key"), _bounded_text(value, "diagnostic field value", MAX_DIAGNOSTIC_BYTES)))
-        if len({key for key, _ in normalized}) != len(normalized):
-            raise ContractViolation("duplicate diagnostic field")
-        object.__setattr__(self, "fields", tuple(sorted(normalized)))
-
-
-def _canonical_value(value: Any) -> Any:
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {field.name: _canonical_value(getattr(value, field.name)) for field in dataclasses.fields(value)}
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, Mapping):
-        return {str(key): _canonical_value(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
-    if isinstance(value, (set, frozenset)):
-        normalized = [_canonical_value(item) for item in value]
-        return sorted(normalized, key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
-    if isinstance(value, (tuple, list)):
-        return [_canonical_value(item) for item in value]
-    if value is None or isinstance(value, (str, int, bool)):
-        return value
-    raise ContractViolation(f"unsupported canonical value type: {type(value).__name__}")
-
-
-def canonical_bytes(value: Any) -> bytes:
-    """Return deterministic UTF-8 JSON bytes for a contract value."""
-
-    return json.dumps(
-        _canonical_value(value),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-
-
-def canonical_sha256(value: Any) -> str:
-    """Return the SHA-256 of :func:`canonical_bytes`."""
-
-    return hashlib.sha256(canonical_bytes(value)).hexdigest()
-
-
-__all__ = [
-    "AssignmentRelation",
-    "AssignmentSourceReceipt",
-    "BoundedDiagnostic",
-    "CaseAccountingMember",
-    "CaseAccountingReceipt",
-    "CaseIdentity",
-    "CaseMarker",
-    "CohortReceipt",
-    "CohortRow",
-    "ComponentGateReceipt",
-    "ContractViolation",
-    "ExecutionDisposition",
-    "Finding",
-    "FindingClass",
-    "FindingSeverity",
-    "IssueIdentity",
-    "IssueState",
-    "MAX_COHORT_ROWS",
-    "MAX_DIAGNOSTIC_BYTES",
-    "MAX_DIAGNOSTIC_FIELDS",
-    "MAX_MATRIX_CASES",
-    "MAX_TITLE_BYTES",
-    "MAX_TOKEN_BYTES",
-    "ModuleIdentity",
-    "OverallResult",
-    "PackageIdentity",
-    "ProofCeiling",
-    "PullRequestIdentity",
-    "RelationRole",
-    "RemediationCode",
-    "RepositoryIdentity",
-    "RepositoryPath",
-    "RunnerMode",
-    "SourceAuthority",
-    "SourceLocation",
-    "TestExecutionRecord",
-    "TestIdentity",
-    "WorkUnitIdentity",
-    "canonical_bytes",
-    "canonical_sha256",
-]
+# One current row owner; the old summary is available only by its explicit
+# versioned name and cannot enter a current cohort.
+CohortRow = VerificationEvidence
+__all__ = tuple(_base.__all__) + (
+    "AssignmentSourceUse", "VerificationPhase", "VerificationRequirements", "ExecutionBounds",
+    "OfflineCaptureBinding", "GuardResult", "CatalogueDisposition", "CatalogueResult", "CatalogueRow",
+    "CatalogueIntegrityReceipt", "SelectionScope", "VerificationSelection", "PrerequisiteEvidence",
+    "SelectedVerificationPlan", "VerificationEvidence", "LegacyWorkUnitDescriptorV1",
+    "LegacyAssignmentSourceReceiptV2", "LegacyCohortRowV2",
+)
