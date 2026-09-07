@@ -2,12 +2,19 @@
 
 use eliot_contracts::{ArtifactId, TaskRevision};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     ContextBinding, ContextError, DecisionRevision, LossPolicy, ProviderRole, validate_digest,
     validate_text,
 };
+
+fn required_optional_cost<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<u64>::deserialize(deserializer)
+}
 
 /// Why an atom was omitted, including the competing constraint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -17,6 +24,8 @@ pub enum OmissionReason {
     ProtectedReserve,
     Stale,
     Blocked,
+    UnknownMeasurement,
+    MeasurementUnavailable,
     Privacy,
     Authority,
     Unavailable,
@@ -73,7 +82,9 @@ pub struct OmissionRecord {
     pub task_revision: TaskRevision,
     pub reason: OmissionReason,
     pub competing_constraint: String,
-    pub measured_cost: u64,
+    /// Exact known cost; `None` is an explicit unknown observation.
+    #[serde(deserialize_with = "required_optional_cost")]
+    pub measured_cost: Option<u64>,
     pub allowed_representation: LossPolicy,
     pub expansion: Option<ExpansionHandle>,
     pub non_recoverable_reason: Option<NonRecoverableReason>,
@@ -88,9 +99,6 @@ pub struct OmissionRecord {
 impl OmissionRecord {
     /// Enforce reversible versus explicitly non-recoverable semantics.
     pub fn validate(&self, context: &ContextBinding) -> Result<(), ContextError> {
-        if self.measured_cost == 0 {
-            return Err(ContextError::InvalidField("omission.measured_cost"));
-        }
         validate_text(&self.competing_constraint, "omission.competing_constraint")?;
         validate_text(
             &self.authorization_requirement,
