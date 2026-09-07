@@ -216,6 +216,7 @@ pub fn admit_context(input: &AdmissionInput) -> Result<AdmissionResult, ContextE
         } else {
             let failure = optional_failure_cause(
                 input,
+                &atom_id,
                 &closure,
                 &candidates,
                 &closure_candidates,
@@ -571,6 +572,7 @@ fn exact_cost(
 
 fn optional_failure_cause(
     input: &AdmissionInput,
+    root: &eliot_contracts::ArtifactId,
     closure: &BTreeSet<eliot_contracts::ArtifactId>,
     candidates: &BTreeMap<eliot_contracts::ArtifactId, &eliot_context_contracts::ContextCandidate>,
     closure_candidates: &[&eliot_context_contracts::ContextCandidate],
@@ -580,8 +582,7 @@ fn optional_failure_cause(
         let missing = closure
             .iter()
             .find(|atom_id| !candidates.contains_key(*atom_id))
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "unknown".to_owned());
+            .map_or_else(|| "unknown".to_owned(), ToString::to_string);
         return Ok(Some((
             OmissionReason::Blocked,
             format!("required dependency closure is missing atom {missing}"),
@@ -625,14 +626,29 @@ fn optional_failure_cause(
             | AtomAvailability::KnownEmpty
             | AtomAvailability::Partial
             | AtomAvailability::Exhausted => Some((
-                OmissionReason::Blocked,
-                format!(
-                    "required dependency {} is {:?}",
-                    candidate.atom_id, candidate.availability
-                ),
+                if candidate.atom_id == *root {
+                    OmissionReason::Unavailable
+                } else {
+                    OmissionReason::Blocked
+                },
+                if candidate.atom_id == *root {
+                    format!(
+                        "candidate {} is {:?}",
+                        candidate.atom_id, candidate.availability
+                    )
+                } else {
+                    format!(
+                        "required dependency {} is {:?}",
+                        candidate.atom_id, candidate.availability
+                    )
+                },
             )),
             AtomAvailability::Unknown => Some((
-                OmissionReason::UnknownMeasurement,
+                if candidate.atom_id == *root {
+                    OmissionReason::Unavailable
+                } else {
+                    OmissionReason::Blocked
+                },
                 format!("candidate {} state is unknown", candidate.atom_id),
             )),
             AtomAvailability::Omitted => Some((

@@ -138,7 +138,7 @@ fn expansion(
         decision: decision(context),
         policy,
         provider_role: candidate.provider_role.clone(),
-        handle_digest: digest(b'g'),
+        handle_digest: digest(b'a'),
         expires: None,
         invalidation: None,
     }
@@ -341,12 +341,52 @@ fn input_with_optional(optional_cost: AdmissionMeasuredCost) -> AdmissionInput {
 fn required_floor_is_admitted_before_fitting_optional_material() {
     let mut input = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 20 });
     let dependency = input.candidates.candidates[1].atom_id.clone();
+    let dependency_role = input.candidates.candidates[1].provider_role.clone();
     input.candidates.candidates[0]
         .dependencies
         .push(dependency.clone());
+    input.measurements[0].binding.subject_digest =
+        canonical_digest(&input.candidates.candidates[0]).expect("required subject");
     input.floor.floor.members[0]
         .required_dependencies
-        .push(dependency);
+        .push(dependency.clone());
+    input.floor.floor.mandatory_atoms.push(dependency.clone());
+    input
+        .floor
+        .floor
+        .mandatory_roles
+        .push(SemanticRole::Optional);
+    input.floor.floor.members.push(SafetyFloorMember {
+        atom_id: dependency,
+        role: SemanticRole::Optional,
+        availability: AtomAvailability::PresentCurrent,
+        measurement: Some(input.candidates.candidates[1].measurement.clone()),
+        required_dependencies: Vec::new(),
+    });
+    input
+        .floor
+        .floor
+        .providers
+        .requested
+        .push(dependency_role.clone());
+    input
+        .floor
+        .floor
+        .providers
+        .dispositions
+        .push(ProviderDisposition {
+            slot: dependency_role,
+            state: AtomAvailability::PresentCurrent,
+            evidence: None,
+        });
+    input.recipe.mandatory_roles.push(SemanticRole::Optional);
+    input
+        .recipe
+        .role_policies
+        .iter_mut()
+        .find(|policy| policy.role == SemanticRole::Optional)
+        .expect("optional policy")
+        .required = true;
     make_handle_optional(&mut input);
     let result = admit_context(&input).expect("valid admission");
     let ContextOutcome::Complete(ref admitted) = result.outcome else {
@@ -399,13 +439,70 @@ fn required_missing_stale_unknown_and_oversized_are_exact_gaps() {
     assert_eq!(gap.missing, vec![id("required")]);
     assert_eq!(gap.provider_gaps.len(), 1);
 
-    let mut stale_unavailable = input_with_optional(AdmissionMeasuredCost::Unavailable);
+    let mut stale_unavailable =
+        input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     stale_unavailable.candidates.candidates[0].availability = AtomAvailability::Stale;
     stale_unavailable.candidates.denominator.dispositions[0].state = AtomAvailability::Stale;
     stale_unavailable.recipe.denominator.dispositions[0].state = AtomAvailability::Stale;
     stale_unavailable.floor.floor.members[0].availability = AtomAvailability::Stale;
     stale_unavailable.floor.floor.providers.dispositions[0].state = AtomAvailability::Stale;
     let unavailable_id = stale_unavailable.candidates.candidates[1].atom_id.clone();
+    stale_unavailable.candidates.candidates[1].availability = AtomAvailability::Unavailable;
+    stale_unavailable.candidates.denominator.dispositions[1].state = AtomAvailability::Unavailable;
+    stale_unavailable.recipe.denominator.dispositions[1].state = AtomAvailability::Unavailable;
+    stale_unavailable
+        .floor
+        .floor
+        .members
+        .push(SafetyFloorMember {
+            atom_id: unavailable_id.clone(),
+            role: SemanticRole::Optional,
+            availability: AtomAvailability::Unavailable,
+            measurement: Some(
+                stale_unavailable.candidates.candidates[1]
+                    .measurement
+                    .clone(),
+            ),
+            required_dependencies: Vec::new(),
+        });
+    stale_unavailable
+        .floor
+        .floor
+        .mandatory_atoms
+        .push(unavailable_id.clone());
+    stale_unavailable
+        .floor
+        .floor
+        .mandatory_roles
+        .push(SemanticRole::Optional);
+    stale_unavailable
+        .recipe
+        .mandatory_roles
+        .push(SemanticRole::Optional);
+    stale_unavailable
+        .recipe
+        .role_policies
+        .iter_mut()
+        .find(|policy| policy.role == SemanticRole::Optional)
+        .expect("optional policy")
+        .required = true;
+    stale_unavailable.floor.floor.providers.requested.push(
+        stale_unavailable.candidates.candidates[1]
+            .provider_role
+            .clone(),
+    );
+    stale_unavailable
+        .floor
+        .floor
+        .providers
+        .dispositions
+        .push(ProviderDisposition {
+            slot: stale_unavailable.candidates.candidates[1]
+                .provider_role
+                .clone(),
+            state: AtomAvailability::Unavailable,
+            evidence: None,
+        });
     stale_unavailable.candidates.candidates[0]
         .dependencies
         .push(unavailable_id.clone());
@@ -416,6 +513,10 @@ fn required_missing_stale_unknown_and_oversized_are_exact_gaps() {
         .recipe
         .canonical_policy_digest()
         .expect("recipe digest");
+    stale_unavailable.measurements[0].binding.subject_digest =
+        canonical_digest(&stale_unavailable.candidates.candidates[0]).expect("stale subject");
+    stale_unavailable.measurements[1].binding.subject_digest =
+        canonical_digest(&stale_unavailable.candidates.candidates[1]).expect("unavailable subject");
     let result = admit_context(&stale_unavailable).expect("combined floor gaps");
     let ContextOutcome::Incomplete(gap) = result.outcome else {
         panic!("expected combined gap");
@@ -472,6 +573,25 @@ fn unknown_optional_is_visible_without_inventing_zero_cost() {
     let omission = result.evidence.omissions.first().expect("unknown omission");
     assert_eq!(omission.measured_cost, None);
     assert_eq!(omission.reason, OmissionReason::UnknownMeasurement);
+
+    let mut unavailable = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
+    unavailable.candidates.candidates[1].availability = AtomAvailability::Unavailable;
+    unavailable.candidates.denominator.dispositions[1].state = AtomAvailability::Unavailable;
+    unavailable.recipe.denominator.dispositions[1].state = AtomAvailability::Unavailable;
+    unavailable.recipe.recipe_sha256 = unavailable
+        .recipe
+        .canonical_policy_digest()
+        .expect("recipe digest");
+    unavailable.measurements[1].binding.subject_digest =
+        canonical_digest(&unavailable.candidates.candidates[1]).expect("unavailable subject");
+    let result = admit_context(&unavailable).expect("unavailable optional is explicit");
+    let omission = result
+        .evidence
+        .omissions
+        .first()
+        .expect("unavailable omission");
+    assert_eq!(omission.measured_cost, Some(1));
+    assert_eq!(omission.reason, OmissionReason::Unavailable);
 }
 
 #[test]
