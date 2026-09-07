@@ -1,0 +1,4 @@
+tiny_fail: test
+tiny_ignored: test
+tiny_ok_a: test
+tiny_ok_b: test
