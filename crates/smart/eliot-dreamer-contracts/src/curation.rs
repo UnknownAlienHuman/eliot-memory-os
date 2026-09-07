@@ -351,6 +351,92 @@ impl CurationPayload {
             && crate::error::sorted_set_eq(&a.evidence_refs, &b.evidence_refs)
     }
 
+    /// Returns a digest-normalized clone with sorted target/evidence sets.
+    ///
+    /// Clone-then-sort only: the caller payload is never mutated, so `accept`
+    /// can reuse `facets()` after the digest is computed. Duplicates are never
+    /// removed here; they still fail at ingress in `validate()`, and sorting
+    /// alone makes order-only permutations digest-identical while scalar or
+    /// set drift stays digest-visible. All scalar and sequence fields stay
+    /// byte-identical, so `Merge` left/right and `Split` whole/first/second
+    /// order remains visible. Bounds are already enforced by `validate()`
+    /// (`MAX_TEXT`, `MAX_TARGETS`, `MAX_EVIDENCE_REFS`), so the at most
+    /// 1024-element clones plus sorts add no new checks. Every outer arm is
+    /// explicit with no wildcard, mirroring `parts()`, `validate()`, and
+    /// `semantic_eq()`: a twelfth variant breaks compilation until it is
+    /// normalized here.
+    #[must_use]
+    pub(crate) fn normalized_for_digest(&self) -> Self {
+        match self {
+            Self::Classification(p) => {
+                let mut inner = p.clone();
+                inner.target_evidence.targets.sort();
+                inner.target_evidence.evidence_refs.sort();
+                Self::Classification(inner)
+            }
+            Self::Relation(p) => {
+                let mut inner = p.clone();
+                inner.target_evidence.targets.sort();
+                inner.target_evidence.evidence_refs.sort();
+                Self::Relation(inner)
+            }
+            Self::Episode(p) => {
+                let mut inner = p.clone();
+                inner.target_evidence.targets.sort();
+                inner.target_evidence.evidence_refs.sort();
+                Self::Episode(inner)
+            }
+            Self::Concept(p) => {
+                let mut inner = p.clone();
+                inner.target_evidence.targets.sort();
+                inner.target_evidence.evidence_refs.sort();
+                Self::Concept(inner)
+            }
+            Self::Procedure(p) => {
+                let mut inner = p.clone();
+                inner.target_evidence.targets.sort();
+                inner.target_evidence.evidence_refs.sort();
+                Self::Procedure(inner)
+            }
+            Self::Failure(p) => {
+                let mut inner = p.clone();
+                inner.target_evidence.targets.sort();
+                inner.target_evidence.evidence_refs.sort();
+                Self::Failure(inner)
+            }
+            Self::Merge(p) => {
+                let mut inner = p.clone();
+                inner.target_evidence.targets.sort();
+                inner.target_evidence.evidence_refs.sort();
+                Self::Merge(inner)
+            }
+            Self::Split(p) => {
+                let mut inner = p.clone();
+                inner.target_evidence.targets.sort();
+                inner.target_evidence.evidence_refs.sort();
+                Self::Split(inner)
+            }
+            Self::Reconsolidation(p) => {
+                let mut inner = p.clone();
+                inner.target_evidence.targets.sort();
+                inner.target_evidence.evidence_refs.sort();
+                Self::Reconsolidation(inner)
+            }
+            Self::Accessibility(p) => {
+                let mut inner = p.clone();
+                inner.target_evidence.targets.sort();
+                inner.target_evidence.evidence_refs.sort();
+                Self::Accessibility(inner)
+            }
+            Self::Repair(p) => {
+                let mut inner = p.clone();
+                inner.target_evidence.targets.sort();
+                inner.target_evidence.evidence_refs.sort();
+                Self::Repair(inner)
+            }
+        }
+    }
+
     /// Compares full semantic equality across kind, scalars, and facets.
     ///
     /// Fail-closed on enum growth: every outer arm is explicit, so adding a

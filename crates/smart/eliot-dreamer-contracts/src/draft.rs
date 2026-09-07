@@ -507,8 +507,11 @@ impl ValidatedCurationItem {
     /// fence. `budget_note` stays out: it is a free-text annotation, so a
     /// reword must not break item identity. Screen digests stay out by the
     /// recursion lemma: the screen attests *to* this digest, so hashing one
-    /// back would demand a fixed point.
+    /// back would demand a fixed point. The payload is hashed in
+    /// digest-normalized form: order-only target/evidence permutations share
+    /// one digest, while scalar, sequence, or set drift stays visible.
     pub fn item_digest(&self, grounded: &GroundedDreamDraft) -> Result<String, ContractViolation> {
+        let normalized = self.payload.normalized_for_digest();
         let receipt = ItemDigestReceipt {
             validator_contract: &self.receipt.validator_contract,
             validator_policy: &self.receipt.validator_policy,
@@ -529,7 +532,7 @@ impl ValidatedCurationItem {
         let preimage = ItemDigestPreimage {
             kind_spelling: &self.kind_spelling,
             family_spelling: &self.family_spelling,
-            payload: &self.payload,
+            payload: &normalized,
             denominator: &self.denominator,
             source_digest: &self.source_digest,
             task_id: &self.task_id,
@@ -942,12 +945,15 @@ mod tests {
         probe.budget_note = "reworded note".to_string();
         assert!(probe.validate().is_ok());
         assert_eq!(probe.item_digest(&grounded).expect("digest"), base);
+        digest_permutation_probes(&item, &base, &grounded);
         item.source_digest = sha256_hex(b"source-a");
         if let crate::curation::CurationPayload::Merge(p) = &mut item.payload {
             p.target_evidence.evidence_refs = vec!["source-b".to_string()];
         }
         let mut bundle = crate::bundle::valid_bundle();
-        bundle.materials.extend([mat("a"), mat("b"), mat("ab")]);
+        bundle
+            .materials
+            .extend([mat("a"), mat("b"), mat("ab"), mat("e-1"), mat("e-2")]);
         let digest = item.item_digest(&grounded).expect("congruent digest");
         let mut screen = crate::registry::sample_binding();
         screen.item_digest = digest;
@@ -955,6 +961,69 @@ mod tests {
         let usage = BudgetUsage::default();
         accept_probes(&item, &job, &bundle, &screen, &grounded, &request, &usage);
         accept_probes_request(&item, &job, &bundle, &screen, &grounded, &request, &usage);
+        accept_probes_permuted_evidence(&item, &job, &bundle, &screen, &grounded, &usage);
+    }
+    fn digest_permutation_probes(
+        item: &ValidatedCurationItem,
+        base: &str,
+        grounded: &GroundedDreamDraft,
+    ) {
+        let mut probe = item.clone();
+        if let crate::curation::CurationPayload::Merge(q) = &mut probe.payload {
+            q.target_evidence.targets = vec!["ab".to_owned(), "a".to_owned(), "b".to_owned()];
+        }
+        assert!(probe.validate().is_ok());
+        assert_eq!(probe.item_digest(grounded).expect("digest"), base);
+        probe = item.clone();
+        if let crate::curation::CurationPayload::Merge(q) = &mut probe.payload {
+            q.target_evidence.evidence_refs = vec!["source-b".to_owned(), "e-1".to_owned()];
+        }
+        assert!(probe.validate().is_ok());
+        let permuted = probe.item_digest(grounded).expect("digest");
+        assert_ne!(permuted, base);
+        probe = item.clone();
+        if let crate::curation::CurationPayload::Merge(q) = &mut probe.payload {
+            q.target_evidence.evidence_refs = vec!["e-1".to_owned(), "source-b".to_owned()];
+        }
+        assert!(probe.validate().is_ok());
+        assert_eq!(probe.item_digest(grounded).expect("digest"), permuted);
+    }
+    fn accept_probes_permuted_evidence(
+        item: &ValidatedCurationItem,
+        job: &DreamJobInput,
+        bundle: &DreamInputBundle,
+        screen: &ScreenBinding,
+        grounded: &GroundedDreamDraft,
+        usage: &BudgetUsage,
+    ) {
+        let mut permuted = item.clone();
+        if let crate::curation::CurationPayload::Merge(q) = &mut permuted.payload {
+            q.target_evidence.evidence_refs = vec!["e-2".to_owned(), "e-1".to_owned()];
+        }
+        assert!(permuted.validate().is_ok());
+        let digest = permuted.item_digest(grounded).expect("digest");
+        let mut same_order = permuted.clone();
+        if let crate::curation::CurationPayload::Merge(q) = &mut same_order.payload {
+            q.target_evidence.evidence_refs = vec!["e-1".to_owned(), "e-2".to_owned()];
+        }
+        assert_eq!(same_order.item_digest(grounded).expect("digest"), digest);
+        let mut permuted_screen = screen.clone();
+        permuted_screen.item_digest = digest;
+        let mut request = accept_request(&permuted, &permuted_screen);
+        if let crate::curation::CurationPayload::Merge(inner) = &mut request.payload {
+            inner.target_evidence.evidence_refs = vec!["e-1".to_owned(), "e-2".to_owned()];
+        }
+        request.validate().expect("permuted request stays valid");
+        let ctx = ctx_of(
+            job,
+            bundle,
+            &permuted.receipt,
+            &permuted_screen,
+            grounded,
+            &request,
+            usage,
+        );
+        assert!(permuted.accept(&ctx).is_ok());
     }
     fn accept_probes(
         item: &ValidatedCurationItem,

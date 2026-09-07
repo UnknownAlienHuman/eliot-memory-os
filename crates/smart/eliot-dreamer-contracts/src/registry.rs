@@ -141,13 +141,17 @@ pub(crate) fn check_screen_compat(
     Ok(())
 }
 
-/// Cross-envelope item/request agreement: kind, target subset,
-/// all-or-nothing equality, and whole-denominator equality.
+/// Cross-envelope item/request agreement, compared in order: kind, target
+/// subset, all-or-nothing target equality, whole-denominator equality, and
+/// full-payload semantic agreement.
 ///
 /// Family is skipped by transitivity: item and request validation each
 /// enforce kind↔family, so kind equality implies family agreement.
-/// Evidence is skipped: each side enforces target∩evidence disjointness
-/// plus bundle membership, leaving no principled cross direction.
+/// Evidence is compared as sorted sets inside `payload.semantic_eq`: an
+/// order-only permutation of targets or evidence compares equal, while
+/// scalar drift or added/removed evidence handles fail as payload.
+/// No bundle check runs on the request side: the request carries no bundle,
+/// so source/evidence/target bundle binds stay item-side in `accept()`.
 pub(crate) fn check_curation_request_compat(
     kind: CurationKind,
     payload: &CurationPayload,
