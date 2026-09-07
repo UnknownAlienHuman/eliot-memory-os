@@ -11,7 +11,7 @@ revision = 1
 body_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 matrix_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 require_workspace_member = false
-package = {name = "runner"}
+package = {name = "wu850_tiny"}
 module = {value = "scripts.tests.test_work_unit_descriptor_runner"}
 requirements = {source_floor = 1, public_floor = 1, test_floor = 44, required_guards = [{value = "bounded"}]}
 bounds = {wall_ms = 10000, idle_ms = 5000, output_bytes = 65536, line_bytes = 4096, discovery_tests = 1000, child_processes = 4}

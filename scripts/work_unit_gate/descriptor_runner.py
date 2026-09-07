@@ -12,6 +12,11 @@ child. The controller owns interpreter/toolchain resolution, working
 directories, owned process-tree containment, timeouts and cleanup. Environment
 filtering passes names only, never secret values. This module is not a sandbox
 against hostile test code.
+
+Adapter role: this module consumes controller-owned observations (admitted
+descriptors, captured cargo/python transcripts, metadata, snapshots,
+environments) and emits authoritative typed bindings; execution and
+containment stay controller-owned.
 """
 from __future__ import annotations
 
@@ -61,10 +66,22 @@ ALLOWED_ENV_NAMES = frozenset((
     "PYTHONDONTWRITEBYTECODE", "PYTHONIOENCODING",
 ))
 BLOCKED_ENV_MARKERS = frozenset(("TOKEN", "SECRET", "CREDENTIAL", "PASSWORD", "KEY"))
+# Bounded child-environment byte caps (UTF-8 byte lengths, not characters).
+ENV_VALUE_CAP = 4096
+ENV_TOTAL_CAP = 65536
+# Proven cargo/rustc toolchain names. Sufficiency was proven with one scratch
+# zero-dep build+test under toolchain_child_env in %TEMP% (direct rustc
+# 1.97.1, RUSTC_WRAPPER forced empty); see toolchain_child_env. The fixed set
+# below plus the build-scoped CARGO_*/RUST_* prefix rule is the whole policy.
+TOOLCHAIN_ENV_NAMES = frozenset((
+    "PATH", "SYSTEMROOT", "SYSTEMDRIVE", "PROGRAMDATA", "TEMP", "TMP",
+    "PATHEXT", "OS", "USERPROFILE", "COMSPEC", "WINDIR", "LOCALAPPDATA",
+))
 # Suffixes that mark a metadata value as a generator/mutation/network spelling
 # rather than a dotted registered-suite identity.
 _METADATA_FORBIDDEN_SUFFIXES = (".py", ".pyw", ".pyc", ".pyd", ".ps1", ".psm1",
-                                ".psd1", ".sh", ".exe", ".bat", ".dll", ".so", ".dylib")
+                                ".psd1", ".sh", ".exe", ".bat", ".dll", ".so", ".dylib",
+                                ".js", ".com", ".cmd", ".vbs")
 # Phase x outcome verdicts. Only a complete discovery and an exact terminal
 # pass record are green. Skip and expected-failure are valid observations but
 # cannot satisfy a selected identity, so they stay non-green here.
@@ -431,6 +448,89 @@ def parse_python_protocol(raw: bytes, *, request_sha256: str, expected_module: s
     return data
 
 
+def compose_discovery_receipt(*, descriptor, binary, test_name, kind, line=1):
+    """Emit an authoritative typed discovery binding from controller observations.
+
+    The adapter consumes the admitted descriptor, an observed binary binding
+    (or None) and the selected test identity, and emits the shared typed
+    receipt bound to descriptor.identity and descriptor.sha256. The test name
+    grammar follows kind ("rust" or "python"), which must match the descriptor
+    mode (rust with rust-package, python with python-unittest/metadata-python);
+    the location is the binary manifest_rel when a binary is bound, else the
+    first descriptor test root. The receipt carries the descriptor source
+    digest and the descriptor phase. With no binary the artifact digest falls
+    back to the descriptor matrix digest; a bound binary must carry its own
+    valid digest and, when the descriptor names a package, the same package.
+    Execution and containment stay controller-owned.
+    """
+    from . import contracts as c
+    if type(descriptor) is not c.WorkUnitDescriptor:
+        _reject("DESCRIPTOR_TYPE_REQUIRED")
+    if type(kind) is not str or kind not in ("rust", "python"):
+        _reject("DISCOVERY_KIND_REQUIRED")
+    if kind == "rust":
+        if descriptor.mode is not c.RunnerMode.RUST_PACKAGE:
+            _reject("KIND_MODE_MISMATCH")
+        if type(test_name) is not str or len(test_name) > 256 or not _RUST_NAME.fullmatch(test_name):
+            _reject("RUST_IDENTITY_SYNTAX")
+    else:
+        if (descriptor.mode is not c.RunnerMode.PYTHON_UNITTEST
+                and descriptor.mode is not c.RunnerMode.METADATA_PYTHON):
+            _reject("KIND_MODE_MISMATCH")
+        if type(test_name) is not str or len(test_name) > 512 or not _PY_MODULE.fullmatch(test_name):
+            _reject("PYTHON_MODULE_SYNTAX")
+    _integer(line, 2**31 - 1, 1)
+    if binary is None:
+        rel = descriptor.test_roots[0].value
+        artifact_digest = descriptor.matrix_sha256
+    else:
+        if type(binary) is not dict or "manifest_rel" not in binary:
+            _reject("BINARY_BINDING_REQUIRED")
+        if descriptor.package is not None and binary.get("package") != descriptor.package.name:
+            _reject("PACKAGE_BINARY_MISMATCH")
+        rel = _relative_path(binary["manifest_rel"])
+        candidate = binary.get("binary_sha256")
+        if type(candidate) is not str or not _HEX.fullmatch(candidate):
+            _reject("BINARY_DIGEST_REQUIRED")
+        artifact_digest = candidate
+    try:
+        identity = c.TestIdentity(mode=descriptor.mode, qualified_name=test_name)
+        location = c.SourceLocation(c.RepositoryPath(rel), line)
+        return c.DiscoveredTestReceipt(
+            descriptor=descriptor.identity,
+            descriptor_sha256=descriptor.sha256,
+            test=identity,
+            location=location,
+            source_sha256=descriptor.body_sha256,
+            artifact_sha256=artifact_digest,
+            phase=descriptor.phase)
+    except c.ContractViolation:
+        _reject("DISCOVERY_RECEIPT_REJECTED")
+
+
+def compose_execution_record(*, discovery, disposition, detail=None):
+    """Emit an authoritative typed execution binding for a discovered test.
+
+    The disposition is decoded through the shared ExecutionDisposition enum;
+    unknown values fail closed. Detail carries stable codes only, never
+    values; it is shape-checked and preserved verbatim.
+    """
+    from . import contracts as c
+    if type(discovery) is not c.DiscoveredTestReceipt:
+        _reject("DISCOVERY_RECEIPT_REQUIRED")
+    try:
+        confirmed = c.ExecutionDisposition(disposition)
+    except (c.ContractViolation, TypeError):
+        _reject("UNKNOWN_DISPOSITION")
+    if detail is not None:
+        _text(detail, 1024)
+    try:
+        return c.TestExecutionRecord(test=discovery.test, disposition=confirmed,
+                                      discovery=discovery, detail=detail)
+    except c.ContractViolation:
+        _reject("EXECUTION_RECORD_REJECTED")
+
+
 def assert_no_workspace_wide(argv):
     """Structural guard: reject any workspace-wide selection flag.
 
@@ -495,6 +595,95 @@ def build_cargo_build_command(*, manifest_rel: str, target_dir_rel: str, package
          "-p", name, "--message-format", "json-render-diagnostics"))
 
 
+def _parse_build_artifact(data: dict, package: str, manifest_rel: str):
+    package_id = data.get("package_id")
+    if type(package_id) is not str:
+        _reject("PACKAGE_ID_MISMATCH")
+    fragments = package_id.split("#")
+    if len(fragments) != 2 or not fragments[1].startswith(f"{package}@"):
+        _reject("PACKAGE_ID_MISMATCH")
+    target = data.get("target")
+    if type(target) is not dict:
+        _reject("TARGET_SHAPE")
+    target_name = target.get("name")
+    if type(target_name) is not str or not target_name or len(target_name.encode("utf-8")) > 128:
+        _reject("TARGET_SHAPE")
+    kind = target.get("kind")
+    if type(kind) is str:
+        kinds = [kind]
+    elif type(kind) is list and kind and all(type(item) is str for item in kind):
+        kinds = list(kind)
+    else:
+        _reject("TARGET_SHAPE")
+    for item in kinds:
+        if not item or len(item.encode("utf-8")) > 128:
+            _reject("TARGET_SHAPE")
+    if len(kinds) != 1:
+        _reject("TARGET_SHAPE")
+    profile = data.get("profile")
+    if type(profile) is not dict or type(profile.get("test")) is not bool:
+        _reject("PROFILE_SHAPE")
+    filenames = data.get("filenames")
+    if type(filenames) is not list or not filenames:
+        _reject("FILENAMES_REQUIRED")
+    clean = [_text(path, 1024) for path in filenames]
+    fresh = data.get("fresh")
+    if type(fresh) is not bool:
+        _reject("FRESH_BOOL_REQUIRED")
+    return {"package": package, "manifest_rel": manifest_rel, "target_name": target_name,
+            "target_kind": kinds[0], "profile_test": profile["test"],
+            "filenames": tuple(clean), "fresh": fresh}
+
+
+def parse_cargo_build_stream(raw: bytes, *, package: str, manifest_rel: str):
+    """Parse pinned `cargo build --message-format=json-render-diagnostics` stdout.
+
+    The controller owns cargo resolution, the working directory, the owned
+    process tree, timeouts and capture; this function only decodes captured
+    stdout bytes (MAX_PROTOCOL_BYTES, UTF-8, per-line _bounded_json). Every
+    nonempty line must carry a reason of exactly compiler-artifact or
+    build-finished; any other reason fails closed. Each compiler-artifact must
+    belong to the selected package (package_id splits on "#" into exactly two
+    parts whose tail starts with `<package>@`) and
+    carry a well-formed target, profile, filenames and fresh flag. The stream
+    must terminate in exactly one successful build-finished event, otherwise
+    BUILD_NOT_SUCCESSFUL. Returns one binding per compiler-artifact.
+    """
+    name = _text(package, 128)
+    manifest = _relative_path(manifest_rel)
+    if type(raw) is not bytes or len(raw) > MAX_PROTOCOL_BYTES:
+        _reject("OUTPUT_BYTE_BOUND")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError:
+        _reject("OUTPUT_UTF8")
+    artifacts = []
+    finished = 0
+    last_reason = None
+    last_success = False
+    for line in text.splitlines():
+        if not line:
+            continue
+        data = _bounded_json(line.encode("utf-8"))
+        if type(data) is not dict or type(data.get("reason")) is not str:
+            _reject("UNSUPPORTED_BUILD_EVENT")
+        reason = data["reason"]
+        last_reason = reason
+        if reason == "compiler-artifact":
+            artifacts.append(_parse_build_artifact(data, name, manifest))
+        elif reason == "build-finished":
+            finished += 1
+            success = data.get("success")
+            if type(success) is not bool:
+                _reject("BUILD_NOT_SUCCESSFUL")
+            last_success = success
+        else:
+            _reject("UNSUPPORTED_BUILD_EVENT")
+    if finished != 1 or last_reason != "build-finished" or last_success is not True:
+        _reject("BUILD_NOT_SUCCESSFUL")
+    return tuple(artifacts)
+
+
 def resolve_package_manifest(*, package_name: str, metadata_packages: list,
                              require_workspace_member: bool = False):
     """Bind one exact package against caller-supplied cargo metadata.
@@ -533,6 +722,107 @@ def resolve_package_manifest(*, package_name: str, metadata_packages: list,
     return binding
 
 
+def bind_test_binary(*, artifact, binary_name, binary_sha256, target=None, cfgs=()):
+    """Bind one observed test binary to a parsed build artifact.
+
+    Pure basename match against the artifact filenames (both separators are
+    honored); the controller owns binary-byte acquisition, hashing and owned
+    execution. cfgs are opaque short codes validated for shape only.
+    """
+    if type(artifact) is not dict:
+        _reject("ARTIFACT_SHAPE")
+    for key in ("package", "manifest_rel", "filenames"):
+        if key not in artifact:
+            _reject("ARTIFACT_SHAPE")
+    package = _text(artifact["package"], 128)
+    manifest = _relative_path(artifact["manifest_rel"])
+    filenames = artifact["filenames"]
+    if type(filenames) not in (list, tuple) or not filenames:
+        _reject("ARTIFACT_SHAPE")
+    for path in filenames:
+        _text(path, 1024)
+    name = _text(binary_name, 1024)
+    if "/" in name or "\\" in name:
+        _reject("BINARY_NAME_SHAPE")
+    if not any(path.replace("\\", "/").rsplit("/", 1)[-1] == name for path in filenames):
+        _reject("BINARY_NOT_PRODUCED")
+    digest = _sha(binary_sha256)
+    if target is not None:
+        _text(target, 128)
+        if artifact.get("target_name") != target:
+            _reject("TARGET_MISMATCH")
+    if type(cfgs) not in (list, tuple):
+        _reject("CFGS_SHAPE")
+    codes = tuple(_text(item, 128) for item in cfgs)
+    profile = artifact.get("profile_test", False)
+    if type(profile) is not bool:
+        _reject("PROFILE_SHAPE")
+    return {"package": package, "manifest_rel": manifest, "binary_name": name,
+            "binary_sha256": digest, "target": target, "cfgs": codes,
+            "profile_test": profile}
+
+
+def bind_package_observation(*, descriptor, metadata):
+    """Classify one observed cargo-metadata package against the descriptor.
+
+    The controller owns cargo invocation and metadata acquisition; this
+    function only decodes the closed observation shape {"packages": [{name,
+    manifest_path, id, buildable}], "workspace_members": [id], "excluded":
+    [name]} and binds the single entry whose name equals the descriptor
+    package name. Membership is derived verbatim from workspace_members,
+    excluded and buildable, never edited here.
+    """
+    from . import contracts as c
+    if type(descriptor) is not c.WorkUnitDescriptor:
+        _reject("DESCRIPTOR_TYPE_REQUIRED")
+    if descriptor.package is None:
+        _reject("PACKAGE_REQUIRED")
+    _keys(metadata, ("packages", "workspace_members", "excluded"))
+    packages = metadata["packages"]
+    members = metadata["workspace_members"]
+    excluded = metadata["excluded"]
+    if type(packages) is not list or type(members) is not list or type(excluded) is not list:
+        _reject("METADATA_SHAPE")
+    for value in members:
+        _text(value, 1024)
+    for value in excluded:
+        _text(value, 128)
+    wanted = descriptor.package.name
+    matches = []
+    for entry in packages:
+        item = _keys(entry, ("name", "manifest_path", "id", "buildable"))
+        entry_name = _text(item["name"], 128)
+        manifest_path = _text(item["manifest_path"], 1024)
+        if not manifest_path.endswith("/Cargo.toml"):
+            _reject("MANIFEST_PATH_SHAPE")
+        entry_id = _text(item["id"], 1024)
+        if type(item["buildable"]) is not bool:
+            _reject("BUILDABLE_BOOL_REQUIRED")
+        if entry_name == wanted:
+            matches.append({"name": entry_name, "manifest_path": manifest_path,
+                            "id": entry_id, "buildable": item["buildable"]})
+    if not matches:
+        _reject("PACKAGE_NOT_FOUND")
+    if len(matches) > 1:
+        _reject("DUPLICATE_PACKAGE_IDENTITY")
+    found = matches[0]
+    member_ids = set(members)
+    if found["id"] in member_ids:
+        kind = "member"
+    elif found["name"] in set(excluded):
+        kind = "excluded"
+    elif found["buildable"]:
+        kind = "standalone"
+    else:
+        kind = "unavailable"
+    if kind == "unavailable":
+        _reject("PACKAGE_UNAVAILABLE")
+    if descriptor.require_workspace_member and kind != "member":
+        _reject("WORKSPACE_MEMBER_REQUIRED")
+    return {"name": found["name"], "manifest_path": found["manifest_path"],
+            "member_kind": kind}
+
+
 def build_python_child_command(*, script_rel: str, fd: int):
     """Fixed Python child argv. The `<python>` slot is a placeholder: the
     controller substitutes its policy-resolved interpreter (the equivalent of
@@ -546,30 +836,70 @@ def build_python_child_command(*, script_rel: str, fd: int):
     return ("<python>", "-I", "-B", script, "--_python-child", str(fd))
 
 
-def minimal_child_env(env: dict, *, allowed: frozenset = ALLOWED_ENV_NAMES):
+def minimal_child_env(env: dict):
     """Filter a controller-supplied environment down to allowed nonsecret names.
 
-    Keeps only entries whose name is explicitly allowed and carries no blocked
-    marker (TOKEN/SECRET/CREDENTIAL/PASSWORD/KEY, case-insensitive), even when
-    allowed. Returns a filtered copy; values never appear in diagnostics, only
-    codes are raised.
+    Keeps only entries whose name is exactly in fixed ALLOWED_ENV_NAMES and
+    carries no blocked marker (TOKEN/SECRET/CREDENTIAL/PASSWORD/KEY,
+    case-insensitive), even when allowed. Per-value UTF-8 bytes are capped at
+    4096 and the kept total at 65536; over-cap values fail closed. Returns a
+    filtered copy; values never appear in diagnostics, only codes are raised.
     """
     if type(env) is not dict:
         _reject("ENV_OBJECT_REQUIRED")
-    try:
-        allowlist = frozenset(allowed)
-    except TypeError:
-        _reject("ENV_ALLOWLIST_SHAPE")
     filtered = {}
+    total = 0
     for key, value in env.items():
         if type(key) is not str or type(value) is not str:
             _reject("ENV_TEXT_REQUIRED")
-        if key not in allowlist:
+        if key not in ALLOWED_ENV_NAMES:
             continue
         upper = key.upper()
         if any(marker in upper for marker in BLOCKED_ENV_MARKERS):
             continue
+        size = len(value.encode("utf-8"))
+        if size > ENV_VALUE_CAP:
+            _reject("ENV_VALUE_BOUND")
+        total += size
+        if total > ENV_TOTAL_CAP:
+            _reject("ENV_TOTAL_BOUND")
         filtered[key] = value
+    return filtered
+
+
+def toolchain_child_env(env: dict):
+    """Filter a controller-supplied environment down to the proven toolchain set.
+
+    Keeps only fixed TOOLCHAIN_ENV_NAMES plus the build-scoped CARGO_*/RUST_*
+    prefix rule; blocked secret markers still drop, and the same byte caps as
+    minimal_child_env apply. Always emits RUSTC_WRAPPER="" AFTER filtering so
+    no ambient wrapper value can leak in: pinned policy is no wrapper, direct
+    rustc 1.97.1; ambient sccache config must not interpose. Returns a filtered
+    copy; values never appear in diagnostics, only codes are raised.
+    """
+    if type(env) is not dict:
+        _reject("ENV_OBJECT_REQUIRED")
+    filtered = {}
+    total = 0
+    for key, value in env.items():
+        if type(key) is not str or type(value) is not str:
+            _reject("ENV_TEXT_REQUIRED")
+        if key == "RUSTC_WRAPPER":
+            continue
+        upper = key.upper()
+        if not (key in TOOLCHAIN_ENV_NAMES or upper.startswith("CARGO_")
+                or upper.startswith("RUST_")):
+            continue
+        if any(marker in upper for marker in BLOCKED_ENV_MARKERS):
+            continue
+        size = len(value.encode("utf-8"))
+        if size > ENV_VALUE_CAP:
+            _reject("ENV_VALUE_BOUND")
+        total += size
+        if total > ENV_TOTAL_CAP:
+            _reject("ENV_TOTAL_BOUND")
+        filtered[key] = value
+    filtered["RUSTC_WRAPPER"] = ""
     return filtered
 
 
@@ -598,6 +928,28 @@ def resolve_metadata_entrypoint(*, module: str, test_roots):
     if not any(candidate == root or candidate.startswith(root + "/") for root in roots):
         _reject("FOREIGN_TEST_IDENTITY")
     return module
+
+
+def bind_python_suite(*, root: Path, module: str, test_roots):
+    """Bind one registered Python suite to its repository-relative source file.
+
+    Lexical registration checks come from resolve_metadata_entrypoint;
+    physical authority comes from _safe_path. The resolved entry must be an
+    existing file whose repository-relative form equals the module-derived
+    candidate, otherwise FOREIGN_TEST_SOURCE. Returns the candidate rel.
+    """
+    if not isinstance(root, Path):
+        _reject("SNAPSHOT_ROOT_REQUIRED")
+    resolve_metadata_entrypoint(module=module, test_roots=test_roots)
+    candidate = module.replace(".", "/") + ".py"
+    resolved = _safe_path(root, candidate)
+    try:
+        rel = resolved.relative_to(root.resolve()).as_posix()
+    except ValueError:
+        _reject("FOREIGN_TEST_SOURCE")
+    if rel != candidate or not resolved.is_file():
+        _reject("FOREIGN_TEST_SOURCE")
+    return candidate
 
 
 def snapshot_protected(root: Path, rels: list):
@@ -638,6 +990,45 @@ def compare_snapshots(before: dict, after: dict):
     }
 
 
+def bind_protected_snapshot(*, descriptor, assignment, snapshot: dict):
+    """Bind a controller-observed protected-input snapshot to the descriptor.
+
+    The adapter consumes the controller's observed digest mapping and emits an
+    authoritative binding; no filesystem access, no writes, no reset. The
+    assignment must be an ACTIVE_ASSIGNMENT+OPEN receipt bound to the same
+    issue/unit/matrix/body as the descriptor. Required keys are the sorted
+    source+test root values plus the module file when the descriptor carries
+    one; the digest is sha256 over the canonical JSON of the sorted items.
+    """
+    from . import contracts as c
+    if type(descriptor) is not c.WorkUnitDescriptor:
+        _reject("DESCRIPTOR_TYPE_REQUIRED")
+    if type(assignment) is not c.AssignmentSourceReceipt:
+        _reject("ASSIGNMENT_RECEIPT_REQUIRED")
+    if assignment.source_use is not c.AssignmentSourceUse.ACTIVE_ASSIGNMENT or assignment.state is not c.IssueState.OPEN:
+        _reject("INACTIVE_ASSIGNMENT")
+    for key in ("issue", "unit", "matrix_cases", "body_sha256", "matrix_sha256"):
+        if getattr(descriptor, key) != getattr(assignment, key):
+            _reject("STALE_ASSIGNMENT_BINDING")
+    required = sorted({path.value for path in descriptor.source_roots + descriptor.test_roots}
+                      | ({descriptor.module.value.replace(".", "/") + ".py"}
+                         if descriptor.module is not None else set()))
+    if not required:
+        _reject("EMPTY_SNAPSHOT")
+    if type(snapshot) is not dict:
+        _reject("SNAPSHOT_SHAPE")
+    if any(key not in snapshot for key in required):
+        _reject("MISSING_SNAPSHOT_KEY")
+    if any(key not in required for key in snapshot):
+        _reject("FOREIGN_SNAPSHOT_KEY")
+    for value in snapshot.values():
+        if type(value) is not str or not _HEX.fullmatch(value):
+            _reject("SNAPSHOT_DIGEST_SYNTAX")
+    canonical = json.dumps({key: snapshot[key] for key in required},
+                           sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {"digest": hashlib.sha256(canonical).hexdigest(), "keys": required}
+
+
 def canonical_command(argv):
     """Deterministic rendering of a constructed argv.
 
@@ -676,6 +1067,46 @@ def phase_verdict(phase: str, outcome: str):
         return PHASE_TRUTH_TABLE[(phase, outcome)]
     except (KeyError, TypeError):
         _reject("UNKNOWN_PHASE_OUTCOME")
+
+
+def cleanup_verdict(*, cleanup: str, active_processes: int, truncated: bool):
+    """Reconcile one owned-tree cleanup observation to green or non-green.
+
+    Covers cleanup reconciliation only: green requires a clean or
+    timeout-reaped tree with zero active processes and no truncation. Wall and
+    idle causes and the timeout cause itself are separate observations owned
+    elsewhere; every other cleanup string or shape stays non-green, so an
+    unknown cleanup can never read as green.
+    """
+    if (type(cleanup) is not str or type(active_processes) is not int
+            or type(truncated) is not bool or active_processes < 0):
+        _reject("CLEANUP_SHAPE")
+    if cleanup in ("clean", "timeout-reaped") and active_processes == 0 and truncated is False:
+        return "green"
+    return "non-green"
+
+
+def enforcement_plan(*, bounds: dict):
+    """Normalize descriptor execution bounds to owned-transport parameters.
+
+    Consumes a closed ExecutionBounds-shaped mapping and emits transport
+    parameters {wall_s, idle_s, output_bytes, line_bytes, max_tests,
+    max_processes}. Transports take THESE values, never looser substitutes:
+    callers must not widen, default, or reinterpret any dimension; tighter
+    test-provisioning subsets stay within the emitted ceiling.
+    """
+    data = _keys(bounds, ("wall_ms", "idle_ms", "output_bytes", "line_bytes",
+                          "discovery_tests", "child_processes"))
+    wall = _integer(data["wall_ms"], 86400000, 1)
+    idle = _integer(data["idle_ms"], 86400000, 1)
+    output = _integer(data["output_bytes"], 67108864, 1)
+    line = _integer(data["line_bytes"], 1048576, 1)
+    tests = _integer(data["discovery_tests"], MAX_TESTS, 1)
+    procs = _integer(data["child_processes"], 64, 1)
+    if idle > wall or line > output:
+        _reject("INCONSISTENT_BOUNDS")
+    return {"wall_s": wall / 1000, "idle_s": idle / 1000, "output_bytes": output,
+            "line_bytes": line, "max_tests": tests, "max_processes": procs}
 
 
 def _file_digest(path):

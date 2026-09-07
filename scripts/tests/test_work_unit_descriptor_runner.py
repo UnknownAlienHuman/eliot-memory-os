@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -37,45 +38,77 @@ RUST_TINY_MANIFEST = RUST_TINY_DIR / 'Cargo.toml'
 PYTHON_TINY_DIR = FIXTURE_ROOT / 'python-tiny'
 
 
+# Lane-C production policy: cargo provisioning uses runner-owned
+# r.toolchain_child_env (fixed 12 TOOLCHAIN_ENV_NAMES + CARGO_*/RUST_* prefix,
+# blocked secret markers, byte caps, emits RUSTC_WRAPPER='' after filtering).
+# (local toolchain copies removed; see r.TOOLCHAIN_ENV_NAMES / r.toolchain_child_env).
+# Sufficiency re-proven GREEN under the real owned job at max_active=4 with the
+# direct rustc 1.97.1 chain, target dir under %TEMP%, RUSTC_WRAPPER='' emitted.
+
+
+def _r2_descriptor_bounds(name='minimal-python-unittest.toml'):
+    """Decode frozen descriptor fixture bounds via runner enforcement_plan."""
+    data = r.decode_descriptor((DESCRIPTOR_DIR / name).read_bytes(), FILENAME)
+    return r.enforcement_plan(bounds=data['bounds'])
+
+
 class WindowsOwnedTree:
     """Test-owned bounded owned-tree launcher (TEST FILE ONLY, never production).
 
-    B2 reuse interface:
-      launcher = WindowsOwnedTree(output_bytes=65536, line_bytes=4096)
-      disp = launcher.run(argv, *, input_bytes=None, timeout=..., cwd=..., env=...)
+    Windows-only. Job Object with KILL_ON_JOB_CLOSE plus an ActiveProcessLimit,
+    suspended-create with assign-before-first-instruction, streaming pump
+    capture, wall/idle bounds, and TerminateJobObject reap. POSIX is explicitly
+    unsupported: _run_posix raises RuntimeError before spawn -- there is no
+    accepted owned-tree equivalent there, and a process-group/killpg branch is
+    NOT an owned tree, so it is refused rather than simulated.
+
+    R2 reuse interface:
+      launcher = WindowsOwnedTree()
+      bounds = _r2_descriptor_bounds('minimal-python-unittest.toml')
+      disp = launcher.run(argv, *, input_bytes=None, timeout=None, cwd=..., env=...,
+                          bounds=bounds, idle_s=None)
+    bounds is REQUIRED and fail-closed (BOUNDS_REQUIRED when omitted or
+    malformed): a mapping {wall_s, idle_s, output_bytes, line_bytes,
+    max_processes} decoded from the frozen descriptor fixtures. Explicit
+    timeout/idle_s overrides are accepted as test provisioning; the
+    output/line/max dimensions always come from bounds. The constructor
+    output_bytes/line_bytes are retained for call compatibility only and are
+    ignored whenever bounds is present (bounds is always present).
+
     disp keys: argv, returncode, stdout (bytes), stderr (bytes), timed_out (bool),
-      truncated (bool), truncate_reason (str), active_processes (int),
-      total_processes (int), cleanup (str), cleanup_ok (bool).
+      idle_timeout (bool), truncated (bool), truncate_reason (str),
+      dropped_bytes (int), active_processes (int), total_processes (int),
+      max_active (int, peak ActiveProcesses polled each 100ms during the run),
+      cleanup (str), cleanup_ok (bool).
 
-    Windows: Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, Popen spawn,
-    immediate AssignProcessToJobObject, timeout wait via communicate(),
-    TerminateJobObject cleanup on timeout, zero-active-process verification via
-    JobObjectBasicAccountingInformation (class 1). No kill-by-name, no PID reuse:
-    only the owned Job handle is terminated/queried.
-    POSIX: process-group leader + killpg + empty-group verification; same dict shape.
+    Streaming capture is genuinely bounded: pump threads read stdout/stderr in
+    64KiB chunks and enforce output_bytes (total per stream) and line_bytes
+    (per line) incrementally, carrying partial-line state (including CR/LF
+    split across chunks) between reads. On exceed the owned tree is terminated
+    immediately via TerminateJobObject on the owned Job handle, truncated=True
+    plus a reason is recorded, pumps stop, and the job is reaped. Parent-side
+    kept bytes are capped at output_bytes + one chunk slack per stream; beyond
+    that bytes are discarded and only counted (dropped_bytes; the reason carries
+    the code plus counts, never child content).
 
-    Bounded capture is fail-closed: when stdout/stderr exceeds output_bytes or
-    any line exceeds line_bytes, truncated=True and the caller must reject the
-    output as proof (returncode is preserved for diagnostics only).
+    Idle: when no new bytes arrive on either stream for idle_s seconds the tree
+    is terminated as timed_out=True + idle_timeout=True with cleanup
+    timeout-reaped after zero-active verification.
 
-    Windows: the child is created SUSPENDED (CREATE_SUSPENDED), assigned to the
-    Job before its first instruction runs, then its threads are resumed via a
-    Toolhelp snapshot; breakaway is denied (the BREAKAWAY_OK limit is absent)
-    so descendants cannot leave, and nested descendants inherit membership.
-    Timeout/cancellation uses TerminateJobObject on the owned handle, then
-    accounting must show zero active processes or cleanup is reported failed.
-    POSIX: the child starts as a process-group leader (start_new_session) and
-    timeout uses killpg + ESRCH verification of an empty group. Not a sandbox:
-    only controller-admitted test source runs here, and a descendant that
-    calls setsid(2) on POSIX would leave the owned group undetected -- the
-    verdict covers the owned group/tree only.
+    Descendant limit: ActiveProcessLimit is set from max_processes with
+    LimitFlags KILL_ON_JOB_CLOSE|JOB_OBJECT_LIMIT_ACTIVE_PROCESS(0x8), so
+    over-limit spawns are denied by the OS while the owned job still reaps
+    cleanly.
 
     Residual honesty: unknown cleanup (failed queries, surviving members) is
     reported as cleanup-failed/cleanup_ok=False and never passes.
     """
 
     KILL_ON_JOB_CLOSE = 0x2000
+    _JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x8
     _CREATE_SUSPENDED = 0x00000004
+    _CHUNK = 65536
+    _POLL_S = 0.1
     _TH32CS_SNAPTHREAD = 0x00000004
     _THREAD_SUSPEND_RESUME = 0x0002
     _JOB_EXTENDED = 9
@@ -127,55 +160,45 @@ class WindowsOwnedTree:
             kernel32.CloseHandle(snap)
 
     def __init__(self, *, output_bytes=65536, line_bytes=4096):
+        # Retained for call compatibility only; run(bounds=...) always governs.
         self.output_bytes = int(output_bytes)
         self.line_bytes = int(line_bytes)
 
-    def _check_bounds(self, stdout: bytes, stderr: bytes):
-        if len(stdout) > self.output_bytes or len(stderr) > self.output_bytes:
-            return True, 'OUTPUT_BYTE_BOUND'
-        for chunk in (stdout, stderr):
-            for line in chunk.splitlines():
-                if len(line) > self.line_bytes:
-                    return True, 'LINE_BYTE_BOUND'
-        return False, ''
-
-    def _run_posix(self, argv, *, input_bytes, timeout, cwd, env):
-        proc = subprocess.Popen(list(argv), stdin=subprocess.PIPE if input_bytes is not None else None,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=env,
-                                start_new_session=True)
-        timed_out = False
+    def _coerce_bounds(self, bounds, timeout, idle_s, provisioned=False):
+        """Fail closed: bounds mapping required, no looser defaults."""
+        if bounds is None:
+            raise RuntimeError('BOUNDS_REQUIRED: launcher.run requires descriptor-decoded bounds '
+                               '{wall_s,idle_s,output_bytes,line_bytes,max_processes}')
         try:
-            out, err = proc.communicate(input=input_bytes, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-            try:
-                out, err = proc.communicate(timeout=5)
-            except Exception:
-                out, err = b'', b''
-            timed_out = True
-        # Verify the owned process GROUP is empty (direct kill is not proof).
-        active = -1
-        cleanup = 'cleanup-failed'
-        for _ in range(20):
-            try:
-                os.killpg(proc.pid, 0)
-            except ProcessLookupError:
-                active = 0
-                cleanup = 'timeout-reaped' if timed_out else 'clean'
-                break
-            except (PermissionError, OSError):
-                break
-            time.sleep(0.1)
-        truncated, reason = self._check_bounds(out or b'', err or b'')
-        return {'argv': tuple(argv), 'returncode': proc.returncode, 'stdout': out or b'',
-                'stderr': err or b'', 'timed_out': timed_out, 'truncated': truncated,
-                'truncate_reason': reason, 'active_processes': active, 'total_processes': 1,
-                'cleanup': cleanup, 'cleanup_ok': active == 0}
+            wall_b = float(bounds['wall_s'])
+            idle_b = float(bounds['idle_s'])
+            out_b = int(bounds['output_bytes'])
+            line_b = int(bounds['line_bytes'])
+            max_p = int(bounds['max_processes'])
+        except Exception:
+            raise RuntimeError('BOUNDS_REQUIRED: malformed bounds mapping')
+        if isinstance(bounds.get('wall_s'), bool) or isinstance(bounds.get('idle_s'), bool):
+            raise RuntimeError('BOUNDS_REQUIRED: malformed bounds mapping')
+        if not (wall_b > 0 and idle_b > 0 and out_b >= 1 and line_b >= 1 and max_p >= 1):
+            raise RuntimeError('BOUNDS_REQUIRED: non-positive bound')
+        if not (idle_b <= wall_b and line_b <= out_b and max_p <= 64):
+            raise RuntimeError('BOUNDS_REQUIRED: inconsistent bounds')
+        wall = float(timeout) if timeout is not None else wall_b
+        idle = float(idle_s) if idle_s is not None else idle_b
+        if isinstance(timeout, bool) or isinstance(idle_s, bool) or not (wall > 0 and idle > 0):
+            raise RuntimeError('BOUNDS_REQUIRED: bad timeout/idle override')
+        if not provisioned:
+            if timeout is not None and wall > wall_b:
+                raise RuntimeError('BOUNDS_REQUIRED: timeout override exceeds decoded ceiling')
+            if idle_s is not None and idle > idle_b:
+                raise RuntimeError('BOUNDS_REQUIRED: idle override exceeds decoded ceiling')
+        return wall, idle, out_b, line_b, max_p
 
-    def _run_windows(self, argv, *, input_bytes, timeout, cwd, env):
+    def _run_posix(self, argv, *, input_bytes, timeout, cwd, env, bounds=None, idle_s=None, provisioned=False):
+        raise RuntimeError('unsupported containment on POSIX: no accepted owned-tree equivalent; '
+                           'Windows Job Object required')
+
+    def _run_windows(self, argv, *, input_bytes, timeout, cwd, env, bounds, idle_s, provisioned=False):
         kernel32 = ctypes.windll.kernel32
         try:
             kernel32.CreateJobObjectW.restype = ctypes.c_void_p
@@ -194,6 +217,9 @@ class WindowsOwnedTree:
                         ('WriteTransferCount', ctypes.c_uint64), ('OtherTransferCount', ctypes.c_uint64)]
 
         class _BASIC(ctypes.Structure):
+            # NOTE: the ActiveProcessCount slot carries ActiveProcessLimit when
+            # setting limits (same DWORD offset/size); accounting reads below
+            # use the separate _ACC.ActiveProcesses field, never this slot.
             _fields_ = [('PerProcessUserTimeLimit', ctypes.c_int64), ('PerJobUserTimeLimit', ctypes.c_int64),
                         ('LimitFlags', ctypes.c_uint32), ('MinimumWorkingSetSize', ctypes.c_size_t),
                         ('MaximumWorkingSetSize', ctypes.c_size_t), ('ActiveProcessCount', ctypes.c_uint32),
@@ -211,14 +237,18 @@ class WindowsOwnedTree:
                         ('TotalPageFaultCount', ctypes.c_uint32), ('TotalProcesses', ctypes.c_uint32),
                         ('ActiveProcesses', ctypes.c_uint32), ('TotalTerminatedProcesses', ctypes.c_uint32)]
 
+        wall_s, idle_eff, out_bound, line_bound, max_proc = self._coerce_bounds(bounds, timeout, idle_s, provisioned=provisioned)
+        keep_cap = out_bound + self._CHUNK
+
         job = kernel32.CreateJobObjectW(None, None)
         if not job:
             raise RuntimeError('CreateJobObjectW failed')
         try:
             ext = _EXT()
-            ext.BasicLimitInformation.LimitFlags = self.KILL_ON_JOB_CLOSE
+            ext.BasicLimitInformation.LimitFlags = (self.KILL_ON_JOB_CLOSE | self._JOB_OBJECT_LIMIT_ACTIVE_PROCESS)
+            ext.BasicLimitInformation.ActiveProcessCount = int(max_proc)
             if not kernel32.SetInformationJobObject(job, self._JOB_EXTENDED, ctypes.byref(ext), ctypes.sizeof(ext)):
-                raise RuntimeError('SetInformationJobObject KILL_ON_JOB_CLOSE failed')
+                raise RuntimeError('SetInformationJobObject limits failed')
             proc = subprocess.Popen(list(argv), stdin=subprocess.PIPE if input_bytes is not None else None,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=env,
                                     creationflags=self._CREATE_SUSPENDED)
@@ -236,45 +266,234 @@ class WindowsOwnedTree:
                     except Exception:
                         pass
                     raise
-                try:
-                    out, err = proc.communicate(input=input_bytes, timeout=timeout)
-                    timed_out = False
-                    cleanup = 'clean'
-                except subprocess.TimeoutExpired:
-                    kernel32.TerminateJobObject(job, 1)
+
+                lock = threading.Lock()
+                stop = threading.Event()
+                shared = {'truncated': False, 'reason_code': '', 'timed_out': False,
+                          'idle_timeout': False, 'last_data': time.monotonic()}
+
+                def new_slot():
+                    return {'kept': bytearray(), 'total': 0, 'dropped': 0, 'line': 0, 'cr': False}
+
+                slots = {'out': new_slot(), 'err': new_slot()}
+
+                def terminate_tree():
                     try:
-                        out, err = proc.communicate(timeout=10)
+                        kernel32.TerminateJobObject(job, 1)
                     except Exception:
-                        out, err = b'', b''
-                    timed_out = True
-                    cleanup = 'timeout-reaped'
-                out = out or b''
-                err = err or b''
-                truncated, reason = self._check_bounds(out, err)
-                acc = _ACC()
-                length = ctypes.c_uint32(0)
-                active = total = -1
-                if kernel32.QueryInformationJobObject(job, self._JOB_BASIC_ACCOUNTING_INFORMATION,
-                                                      ctypes.byref(acc), ctypes.sizeof(acc), ctypes.byref(length)):
-                    active, total = int(acc.ActiveProcesses), int(acc.TotalProcesses)
-                else:
-                    cleanup = 'cleanup-failed'
+                        pass
+                    stop.set()
+
+                def feed(slot, chunk):
+                    """Account one chunk; returns 'OUTPUT'/'LINE' on bound hit, else None."""
+                    slot['total'] += len(chunk)
+                    room = keep_cap - len(slot['kept'])
+                    if room > 0:
+                        take = len(chunk) if len(chunk) < room else room
+                        slot['kept'] += chunk[:take]
+                        slot['dropped'] += len(chunk) - take
+                    else:
+                        slot['dropped'] += len(chunk)
+                    if slot['total'] > out_bound:
+                        return 'OUTPUT'
+                    cur = slot['line']
+                    cr = slot['cr']
+                    for byte in chunk:
+                        if byte == 0x0A:
+                            eff = cur - (1 if cr else 0)
+                            if eff > line_bound:
+                                slot['line'] = 0
+                                slot['cr'] = False
+                                return 'LINE'
+                            cur = 0
+                            cr = False
+                        elif byte == 0x0D:
+                            cur += 1
+                            cr = True
+                        else:
+                            if cr:
+                                if cur - 1 > line_bound:
+                                    slot['line'] = cur
+                                    slot['cr'] = False
+                                    return 'LINE'
+                                cur = 0
+                                cr = False
+                            cur += 1
+                            if cur > line_bound:
+                                slot['line'] = cur
+                                slot['cr'] = cr
+                                return 'LINE'
+                    slot['line'] = cur
+                    slot['cr'] = cr
+                    return None
+
+                def pump(pipe, slot):
+                    try:
+                        while not stop.is_set():
+                            try:
+                                chunk = pipe.read(self._CHUNK)
+                            except Exception:
+                                break
+                            if not chunk:
+                                break
+                            with lock:
+                                shared['last_data'] = time.monotonic()
+                                if shared['truncated']:
+                                    slot['total'] += len(chunk)
+                                    slot['dropped'] += len(chunk)
+                                    continue
+                                hit = feed(slot, chunk)
+                                if hit is not None and not shared['truncated']:
+                                    shared['truncated'] = True
+                                    shared['reason_code'] = ('OUTPUT_BYTE_BOUND' if hit == 'OUTPUT'
+                                                             else 'LINE_BYTE_BOUND')
+                                    terminate_tree()
+                    finally:
+                        pass
+
+                def query():
+                    acc = _ACC()
+                    length = ctypes.c_uint32(0)
+                    try:
+                        ok = kernel32.QueryInformationJobObject(job, self._JOB_BASIC_ACCOUNTING_INFORMATION,
+                                                               ctypes.byref(acc), ctypes.sizeof(acc),
+                                                               ctypes.byref(length))
+                    except Exception:
+                        return None, None
+                    if ok:
+                        return int(acc.ActiveProcesses), int(acc.TotalProcesses)
+                    return None, None
+
+                if input_bytes is not None:
+                    try:
+                        proc.stdin.write(input_bytes)
+                    except Exception:
+                        pass
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
+                t_out = threading.Thread(target=pump, args=(proc.stdout, slots['out']), daemon=True)
+                t_err = threading.Thread(target=pump, args=(proc.stderr, slots['err']), daemon=True)
+                t_out.start()
+                t_err.start()
+                start = time.monotonic()
+                deadline = start + wall_s
+                active, total = query()
+                max_active = active if active is not None else 0
+                if active is None:
+                    active = -1
+                if total is None:
+                    total = -1
+                try:
+                    while True:
+                        time.sleep(self._POLL_S)
+                        now = time.monotonic()
+                        with lock:
+                            trunc = shared['truncated']
+                            last = shared['last_data']
+                        rc = proc.poll()
+                        seen_active, seen_total = query()
+                        if seen_active is not None:
+                            active = seen_active
+                            if seen_active > max_active:
+                                max_active = seen_active
+                        if seen_total is not None:
+                            total = seen_total
+                        if rc is None:
+                            if trunc:
+                                pass  # TerminateJobObject already requested; await exit.
+                            elif now >= deadline:
+                                with lock:
+                                    shared['timed_out'] = True
+                                terminate_tree()
+                            elif now - last >= idle_eff:
+                                with lock:
+                                    shared['timed_out'] = True
+                                    shared['idle_timeout'] = True
+                                terminate_tree()
+                            if (now - start) > wall_s + 60:
+                                with lock:
+                                    shared['timed_out'] = True
+                                terminate_tree()
+                        else:
+                            if (not t_out.is_alive()) and (not t_err.is_alive()):
+                                break
+                            if (now - start) > wall_s + 60:
+                                with lock:
+                                    shared['timed_out'] = True
+                                terminate_tree()
+                                break
+                finally:
+                    pass
+                with lock:
+                    trunc = shared['truncated']
+                    code = shared['reason_code']
+                    timed_out = shared['timed_out']
+                    idle_flag = shared['idle_timeout']
+                if timed_out or trunc:
+                    for _ in range(100):
+                        seen_active, seen_total = query()
+                        if seen_active is not None:
+                            active = seen_active
+                            if seen_active > max_active:
+                                max_active = seen_active
+                        if seen_total is not None:
+                            total = seen_total
+                        if active == 0:
+                            break
+                        time.sleep(0.1)
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    pass
+                for thread in (t_out, t_err):
+                    thread.join(timeout=10)
+                for pipe in (proc.stdout, proc.stderr):
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
+                for thread in (t_out, t_err):
+                    if thread.is_alive():
+                        thread.join(timeout=5)
+                seen_active, seen_total = query()
+                if seen_active is not None:
+                    active = seen_active
+                    if seen_active > max_active:
+                        max_active = seen_active
+                if seen_total is not None:
+                    total = seen_total
+                out = bytes(slots['out']['kept'])
+                err = bytes(slots['err']['kept'])
+                dropped = int(slots['out']['dropped'] + slots['err']['dropped'])
+                if not trunc:
+                    for slot in (slots['out'], slots['err']):
+                        eff = slot['line'] - (1 if slot['cr'] else 0)
+                        if eff > line_bound:
+                            trunc = True
+                            code = 'LINE_BYTE_BOUND'
+                            break
+                if not trunc and (slots['out']['total'] > out_bound or slots['err']['total'] > out_bound):
+                    trunc = True
+                    code = 'OUTPUT_BYTE_BOUND'
+                reason = (code + ' dropped_bytes=%d' % dropped) if trunc else ''
                 if active != 0:
-                    time.sleep(0.5)
-                    if kernel32.QueryInformationJobObject(job, self._JOB_BASIC_ACCOUNTING_INFORMATION,
-                                                          ctypes.byref(acc), ctypes.sizeof(acc), ctypes.byref(length)):
-                        active, total = int(acc.ActiveProcesses), int(acc.TotalProcesses)
-                    if active != 0:
-                        cleanup = 'cleanup-failed'
-                if timed_out and cleanup == 'clean':
+                    cleanup = 'cleanup-failed'
+                elif timed_out:
                     cleanup = 'timeout-reaped'
+                elif trunc:
+                    cleanup = 'truncated-reaped'
+                else:
+                    cleanup = 'clean'
                 cleanup_ok = (active == 0)
                 if not cleanup_ok:
                     cleanup = 'cleanup-failed'
                 return {'argv': tuple(argv), 'returncode': proc.returncode, 'stdout': out, 'stderr': err,
-                        'timed_out': timed_out, 'truncated': truncated, 'truncate_reason': reason,
-                        'active_processes': active, 'total_processes': total,
-                        'cleanup': cleanup, 'cleanup_ok': cleanup_ok}
+                        'timed_out': bool(timed_out), 'idle_timeout': bool(idle_flag),
+                        'truncated': bool(trunc), 'truncate_reason': reason,
+                        'dropped_bytes': dropped, 'active_processes': active, 'total_processes': total,
+                        'max_active': int(max_active), 'cleanup': cleanup, 'cleanup_ok': bool(cleanup_ok)}
             finally:
                 try:
                     if proc.poll() is None:
@@ -288,10 +507,15 @@ class WindowsOwnedTree:
             except Exception:
                 pass
 
-    def run(self, argv, *, input_bytes=None, timeout, cwd, env):
+    def run(self, argv, *, input_bytes=None, timeout=None, cwd, env, bounds=None, idle_s=None, provisioned=False):
+        if bounds is None:
+            raise RuntimeError('BOUNDS_REQUIRED: pass descriptor-decoded bounds '
+                               '{wall_s,idle_s,output_bytes,line_bytes,max_processes}; no defaults')
         if os.name == 'nt':
-            return self._run_windows(argv, input_bytes=input_bytes, timeout=timeout, cwd=cwd, env=env)
-        return self._run_posix(argv, input_bytes=input_bytes, timeout=timeout, cwd=cwd, env=env)
+            return self._run_windows(argv, input_bytes=input_bytes, timeout=timeout, cwd=cwd, env=env,
+                                     bounds=bounds, idle_s=idle_s, provisioned=provisioned)
+        return self._run_posix(argv, input_bytes=input_bytes, timeout=timeout, cwd=cwd, env=env,
+                               bounds=bounds, idle_s=idle_s, provisioned=provisioned)
 
 
 VALID = '''schema_version = "eliot-work-unit-descriptor-v2"
@@ -484,11 +708,18 @@ class PythonProtocolTests(unittest.TestCase):
             env = {'PATH': os.environ.get('PATH', os.defpath), 'SYSTEMROOT': os.environ.get('SYSTEMROOT', r'C:\Windows'),
                    'TEMP': tempfile.gettempdir(), 'TMP': tempfile.gettempdir(),
                    'PYTHONDONTWRITEBYTECODE': '1', 'PYTHONIOENCODING': 'utf-8'}
-            disp = launcher.run(argv, input_bytes=raw, timeout=15, cwd=str(root), env=env)
+            # R2: wall/idle/output/line/max all come from the frozen descriptor
+            # (wall 10s is ample for the small python child; no override).
+            bounds = _r2_descriptor_bounds('minimal-python-unittest.toml')
+            disp = launcher.run(argv, input_bytes=raw, cwd=str(root), env=env, bounds=bounds)
             self.assertFalse(disp['truncated'], disp['truncate_reason'])
             self.assertTrue(disp['cleanup_ok'], disp)
             observed = subprocess.CompletedProcess(argv, disp['returncode'], disp['stdout'], disp['stderr'])
-            body = proto.read_bytes() if proto.exists() else b''
+            if proto.exists():
+                with proto.open('rb') as _pf:
+                    body = _pf.read(r.MAX_PROTOCOL_BYTES + 2)
+            else:
+                body = b''
             if len(body) > r.MAX_PROTOCOL_BYTES + 1:
                 body = body[:r.MAX_PROTOCOL_BYTES + 1]
             data = r.parse_python_protocol(body, request_sha256=hashlib.sha256(raw).hexdigest(), expected_module=req["module"], expected_source_sha256=req["source_sha256"], expected_phase=phase, expected_discovery=req["expected"] if phase == "execute" else None) if body else None
@@ -956,6 +1187,12 @@ class PackageManifestCases(unittest.TestCase):
                                              require_workspace_member=False)
         self.assertEqual('wu850_tiny', binding['name'])
         self.assertEqual('member', binding['member_kind'])
+        desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
+        meta = {'packages': [{'name': 'runner', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': 'path+file:///repo#runner@0.1.0', 'buildable': True}], 'workspace_members': ['path+file:///repo#runner@0.1.0'], 'excluded': []}
+        obs = r.bind_package_observation(descriptor=desc, metadata=meta)
+        self.assertEqual('runner', obs['name'])
+        self.assertEqual('member', obs['member_kind'])
+        self.assertTrue(obs['manifest_path'].endswith('/Cargo.toml'))
 
     # WORK_UNIT_CASE: 850/15
     def test_missing_duplicate_package_identity(self):
@@ -967,6 +1204,13 @@ class PackageManifestCases(unittest.TestCase):
                {'name': 'wu850_tiny', 'manifest_rel': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'member_kind': 'member'}]
         with self.assertRaises(r.RunnerInputError):
             r.resolve_package_manifest(package_name='wu850_tiny', metadata_packages=dup)
+        desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
+        missing_meta = {'packages': [{'name': 'other', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': 'path+file:///repo#other@0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
+        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_NOT_FOUND'):
+            r.bind_package_observation(descriptor=desc, metadata=missing_meta)
+        dup_meta = {'packages': [{'name': 'runner', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': 'path+file:///repo#runner@0.1.0', 'buildable': True}, {'name': 'runner', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': 'path+file:///repo#runner@0.1.1', 'buildable': True}], 'workspace_members': [], 'excluded': []}
+        with self.assertRaisesRegex(r.RunnerInputError, 'DUPLICATE_PACKAGE_IDENTITY'):
+            r.bind_package_observation(descriptor=desc, metadata=dup_meta)
 
     # WORK_UNIT_CASE: 850/16
     def test_four_member_kinds_distinct(self):
@@ -985,6 +1229,17 @@ class PackageManifestCases(unittest.TestCase):
         self.assertEqual('member', member['member_kind'])
         with self.assertRaises(r.RunnerInputError):
             r.resolve_package_manifest(package_name='p', metadata_packages=[{'name': 'p', 'manifest_rel': rel, 'member_kind': 'excluded'}], require_workspace_member=True)
+        desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
+        pid = 'path+file:///repo#runner@0.1.0'
+        cases = (('member', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'buildable': True}], 'workspace_members': [pid], 'excluded': []}, True), ('excluded', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'buildable': True}], 'workspace_members': [], 'excluded': ['runner']}, True), ('standalone', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'buildable': True}], 'workspace_members': [], 'excluded': []}, True), ('unavailable', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'buildable': False}], 'workspace_members': [], 'excluded': []}, False))
+        for kind, meta, ok in cases:
+            with self.subTest(kind=kind):
+                if ok:
+                    obs = r.bind_package_observation(descriptor=desc, metadata=meta)
+                    self.assertEqual(kind, obs['member_kind'])
+                else:
+                    with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_UNAVAILABLE'):
+                        r.bind_package_observation(descriptor=desc, metadata=meta)
 
     # WORK_UNIT_CASE: 850/17
     def test_package_only_vs_membership_required(self):
@@ -1001,6 +1256,14 @@ class PackageManifestCases(unittest.TestCase):
         integrated = r.parse_descriptor(VALID.replace(b'require_workspace_member = false', b'require_workspace_member = true'), FILENAME, _b1_assignment())
         self.assertNotEqual(local.sha256, integrated.sha256)
         self.assertIs(local.phase, c.VerificationPhase.PACKAGE_LOCAL)
+        pid = 'path+file:///repo#runner@0.1.0'
+        excluded_meta = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'buildable': True}], 'workspace_members': [], 'excluded': ['runner']}
+        self.assertEqual('excluded', r.bind_package_observation(descriptor=local, metadata=excluded_meta)['member_kind'])
+        with self.assertRaisesRegex(r.RunnerInputError, 'WORKSPACE_MEMBER_REQUIRED'):
+            r.bind_package_observation(descriptor=integrated, metadata=excluded_meta)
+        stale = _b1_assignment(body_sha256='c' * 64)
+        with self.assertRaisesRegex(r.RunnerInputError, 'STALE_ASSIGNMENT_BINDING'):
+            r.bind_protected_snapshot(descriptor=local, assignment=stale, snapshot={k: 'a' * 64 for k in ['scripts/tests/test_work_unit_descriptor_runner.py', 'scripts/work_unit_gate/descriptor_runner.py']})
 
 
 class RustRealRunnerCases(unittest.TestCase):
@@ -1012,17 +1275,23 @@ class RustRealRunnerCases(unittest.TestCase):
         cls._manifest_abs = str(RUST_TINY_MANIFEST.resolve())
         cls._target_abs = str(cls._target.resolve())
         cls.launcher = WindowsOwnedTree()
-        # Deviation disclosed: cargo runs use the full host env minus
-        # secret-marked names (MSVC link.exe requires inherited INCLUDE/LIB/
-        # SystemRoot and the Cargo/Rust toolchain vars), NOT the 6-name
-        # minimal_child_env used for the python child. Secret names carrying
-        # TOKEN/SECRET/CREDENTIAL/PASSWORD/KEY are still filtered by name, and
-        # values never enter diagnostics.
-        blocked = ('TOKEN', 'SECRET', 'CREDENTIAL', 'PASSWORD', 'KEY')
-        cls.cargo_env = {k: v for k, v in os.environ.items() if not any(m in k.upper() for m in blocked)}
+        # Lane-C production policy: cargo runs use runner-owned
+        # r.toolchain_child_env (emits RUSTC_WRAPPER='' after filtering, so no
+        # ambient sccache wrapper leaks in; direct rustc 1.97.1 chain peaks at
+        # max_active=4 under the frozen descriptor bound). NOT the 6-name
+        # minimal_child_env and NOT the full host env. Target dir stays under
+        # %TEMP% (scratch below). Secret values never enter diagnostics.
+        cls.cargo_env = r.toolchain_child_env(dict(os.environ))
+        self_assert_wrapper = cls.cargo_env.get('RUSTC_WRAPPER')
+        assert self_assert_wrapper == '', repr(self_assert_wrapper)
         argv = ['cargo', 'test', '--manifest-path', cls._manifest_abs, '--target-dir', cls._target_abs,
                 '-p', 'wu850_tiny', '--', '--list', '--format', 'terse']
-        disp = cls.launcher.run(argv, timeout=180, cwd=str(ROOT), env=cls.cargo_env)
+        # R2: output/line/idle/max are descriptor-bound; the cold build uses the
+        # explicit provisioned=True escape (180s wall) because the tiny offline
+        # build needs headroom on cold cache. Matrix proof cases (25/26/36/41)
+        # never use it; they run at or under the decoded ceiling.
+        disp = cls.launcher.run(argv, timeout=180, cwd=str(ROOT), env=cls.cargo_env,
+                                bounds=_r2_descriptor_bounds('minimal-rust-package.toml'), provisioned=True)
         assert disp['returncode'] == 0, disp['stderr'][:2000]
         assert disp['cleanup_ok'], disp
         assert not disp['truncated'], disp
@@ -1033,10 +1302,11 @@ class RustRealRunnerCases(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(str(cls._scratch), ignore_errors=True)
 
-    def _exact_stdout(self, test_id, timeout=120):
+    def _exact_stdout(self, test_id, timeout=None):
         argv = ['cargo', 'test', '--manifest-path', self._manifest_abs, '--target-dir', self._target_abs,
                 '-p', 'wu850_tiny', '--', '--exact', test_id]
-        disp = self.launcher.run(argv, timeout=timeout, cwd=str(ROOT), env=self.cargo_env)
+        disp = self.launcher.run(argv, timeout=timeout, cwd=str(ROOT), env=self.cargo_env,
+                                 bounds=_r2_descriptor_bounds('minimal-rust-package.toml'))
         return disp
 
     def _libtest_section(self, stdout):
@@ -1082,6 +1352,60 @@ class RustRealRunnerCases(unittest.TestCase):
         parsed = r.parse_rust_exact(section, 'tiny_ok_a', 0, 4)
         self.assertEqual('pass', parsed.outcome)
         self.assertEqual(3, parsed.filtered)
+        build_argv = ['cargo', 'build', '--manifest-path', self._manifest_abs, '--target-dir', self._target_abs, '-p', 'wu850_tiny', '--message-format', 'json-render-diagnostics']
+        self.assertEqual(tuple(build_argv), r.assert_no_workspace_wide(build_argv))
+        shape = r.build_cargo_build_command(manifest_rel='scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', target_dir_rel='target/wu850-tiny', package='wu850_tiny')
+        self.assertIn('--message-format', shape)
+        bdisp = self.launcher.run(build_argv, cwd=str(ROOT), env=self.cargo_env, bounds=_r2_descriptor_bounds('minimal-rust-package.toml'))
+        self.assertEqual(0, bdisp['returncode'], bdisp['stderr'][-2000:])
+        self.assertTrue(bdisp['cleanup_ok'], bdisp)
+        self.assertFalse(bdisp['truncated'], bdisp)
+        plain_arts = r.parse_cargo_build_stream(bdisp['stdout'], package='wu850_tiny', manifest_rel='scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml')
+        self.assertGreaterEqual(len(plain_arts), 1)
+        self.assertTrue(any(a['profile_test'] is False for a in plain_arts))
+        norun_argv = ['cargo', 'test', '--no-run', '--message-format', 'json-render-diagnostics', '--manifest-path', self._manifest_abs, '--target-dir', self._target_abs, '-p', 'wu850_tiny']
+        self.assertEqual(tuple(norun_argv), r.assert_no_workspace_wide(norun_argv))
+        ndisp = self.launcher.run(norun_argv, cwd=str(ROOT), env=self.cargo_env, bounds=_r2_descriptor_bounds('minimal-rust-package.toml'))
+        self.assertEqual(0, ndisp['returncode'], ndisp['stderr'][-2000:])
+        self.assertTrue(ndisp['cleanup_ok'], ndisp)
+        self.assertFalse(ndisp['truncated'], ndisp)
+        arts = r.parse_cargo_build_stream(ndisp['stdout'], package='wu850_tiny', manifest_rel='scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml')
+        test_arts = sorted((a for a in arts if a['profile_test'] is True), key=lambda a: a['target_name'])
+        self.assertEqual(1, len(test_arts))
+        art = test_arts[0]
+        self.assertEqual('wu850_tiny', art['package'])
+        self.assertEqual('scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', art['manifest_rel'])
+        self.assertEqual('wu850_tiny', art['target_name'])
+        self.assertEqual('lib', art['target_kind'])
+        self.assertIs(art['profile_test'], True)
+        self.assertGreaterEqual(len(art['filenames']), 1)
+        self.assertIs(type(art['fresh']), bool)
+        exe_candidates = sorted(fn for fn in art['filenames'] if fn.lower().endswith('.exe') and Path(fn).exists())
+        self.assertEqual(1, len(exe_candidates))
+        real_file = exe_candidates[0]
+        self.assertTrue(Path(real_file).name.startswith('wu850_tiny-'))
+        digest = hashlib.sha256(Path(real_file).read_bytes()).hexdigest()
+        bound = r.bind_test_binary(artifact=art, binary_name=Path(real_file).name, binary_sha256=digest)
+        self.assertEqual(Path(real_file).name, bound['binary_name'])
+        self.assertEqual(digest, bound['binary_sha256'])
+        self.assertIs(bound['profile_test'], True)
+        desc = r.parse_descriptor((DESCRIPTOR_DIR / 'minimal-rust-package.toml').read_bytes(), FILENAME, _b1_assignment())
+        self.assertIs(type(desc), c.WorkUnitDescriptor)
+        receipt = r.compose_discovery_receipt(descriptor=desc, binary=bound, test_name='tiny_ok_a', kind='rust')
+        self.assertIs(type(receipt), c.DiscoveredTestReceipt)
+        self.assertIs(type(receipt.test), c.TestIdentity)
+        self.assertEqual('tiny_ok_a', receipt.test.qualified_name)
+        self.assertEqual(desc.mode, receipt.test.mode)
+        self.assertEqual(desc.identity, receipt.descriptor)
+        self.assertEqual(desc.sha256, receipt.descriptor_sha256)
+        self.assertEqual(desc.body_sha256, receipt.source_sha256)
+        self.assertEqual(digest, receipt.artifact_sha256)
+        self.assertIs(receipt.phase, desc.phase)
+        self.assertEqual(bound['manifest_rel'], receipt.location.path.value)
+        record = r.compose_execution_record(discovery=receipt, disposition='executed-pass', detail='tiny_ok_a-pass')
+        self.assertIs(type(record), c.TestExecutionRecord)
+        self.assertIs(record.disposition, c.ExecutionDisposition.EXECUTED_PASS)
+        self.assertEqual(receipt.test, record.test)
 
     # WORK_UNIT_CASE: 850/21
     def test_ignored_filtered_cfg_disabled_never_pass(self):
@@ -1117,6 +1441,19 @@ class RustRealRunnerCases(unittest.TestCase):
         for output in (b'', grammar + b'forged', grammar.replace(b'1 passed', b'2 passed')):
             with self.assertRaises(r.RunnerInputError):
                 r.parse_rust_exact(output, 'tiny_ok_a', 0, 4)
+        rel = 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'
+        good_art = b'{"reason":"compiler-artifact","package_id":"path+file:///x#wu850_tiny@0.1.0","target":{"name":"wu850_tiny","kind":["lib"]},"profile":{"test":false},"filenames":["/tmp/a.rlib"],"fresh":false}\n'
+        good_fin = b'{"reason":"build-finished","success":true}\n'
+        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_ID_MISMATCH'):
+            r.parse_cargo_build_stream(good_art.replace(b'#wu850_tiny@', b'#other@') + good_fin, package='wu850_tiny', manifest_rel=rel)
+        with self.assertRaisesRegex(r.RunnerInputError, 'BUILD_NOT_SUCCESSFUL'):
+            r.parse_cargo_build_stream(good_art, package='wu850_tiny', manifest_rel=rel)
+        with self.assertRaisesRegex(r.RunnerInputError, 'BUILD_NOT_SUCCESSFUL'):
+            r.parse_cargo_build_stream(good_art + b'{"reason":"build-finished","success":false}\n', package='wu850_tiny', manifest_rel=rel)
+        with self.assertRaisesRegex(r.RunnerInputError, 'UNSUPPORTED_BUILD_EVENT'):
+            r.parse_cargo_build_stream(b'{"reason":"compiler-message","message":"x"}\n' + good_art + good_fin, package='wu850_tiny', manifest_rel=rel)
+        with self.assertRaisesRegex(r.RunnerInputError, 'BUILD_NOT_SUCCESSFUL'):
+            r.parse_cargo_build_stream(b'', package='wu850_tiny', manifest_rel=rel)
 
     # WORK_UNIT_CASE: 850/24
     def test_package_mode_never_workspace_wide(self):
@@ -1140,9 +1477,14 @@ class BoundedCompletionCases(unittest.TestCase):
     child = PythonProtocolTests.child
     discover_execute = PythonProtocolTests.discover_execute
 
-    def _short_child(self, root, phase, expected, timeout, max_tests=100):
+    def _short_child(self, root, phase, expected, timeout, max_tests=100, bounds=None):
         # Test-only bounded driver run (mirrors PythonProtocolTests.child but
         # with a caller-chosen wall timeout). Returns (disp, body, req).
+        # R2: bounds required; defaults to the frozen python-unittest descriptor.
+        # Callers pass tighter-or-equal timeouts (3s/5s <= 10s descriptor wall).
+        if bounds is None:
+            bounds = _r2_descriptor_bounds('minimal-python-unittest.toml')
+        self.assertLessEqual(timeout, bounds['wall_s'])
         source = root / 'tests/suite.py'
         req = dict(schema=r.PYTHON_PROTOCOL, phase=phase, root=str(root), module='tests.suite',
                    source='tests/suite.py',
@@ -1159,8 +1501,13 @@ class BoundedCompletionCases(unittest.TestCase):
             env = {'PATH': os.environ.get('PATH', os.defpath), 'SYSTEMROOT': os.environ.get('SYSTEMROOT', r'C:\Windows'),
                    'TEMP': tempfile.gettempdir(), 'TMP': tempfile.gettempdir(),
                    'PYTHONDONTWRITEBYTECODE': '1', 'PYTHONIOENCODING': 'utf-8'}
-            disp = launcher.run(argv, input_bytes=raw, timeout=timeout, cwd=str(root), env=env)
-            body = proto.read_bytes() if proto.exists() else b''
+            disp = launcher.run(argv, input_bytes=raw, timeout=timeout, cwd=str(root), env=env,
+                                bounds=bounds)
+            if proto.exists():
+                with proto.open('rb') as _pf:
+                    body = _pf.read(r.MAX_PROTOCOL_BYTES + 2)
+            else:
+                body = b''
             return disp, body, req
 
     def _minimal_env(self):
@@ -1172,15 +1519,29 @@ class BoundedCompletionCases(unittest.TestCase):
     def test_real_bounded_child_tree_timeout_cleanup(self):
         import inspect
         launcher = WindowsOwnedTree()
+        # R2: bounds decoded from the frozen descriptor; the 3s wall override
+        # is tighter than the 10s descriptor ceiling.
+        desc = r.decode_descriptor((DESCRIPTOR_DIR / 'minimal-python-unittest.toml').read_bytes(), FILENAME)
+        bounds = _r2_descriptor_bounds('minimal-python-unittest.toml')
+        self.assertEqual(r.enforcement_plan(bounds=desc['bounds']), bounds)
+        self.assertEqual(desc['bounds']['child_processes'], bounds['max_processes'])
+        self.assertEqual(desc['bounds']['output_bytes'], bounds['output_bytes'])
+        self.assertEqual(desc['bounds']['wall_ms'] / 1000, bounds['wall_s'])
+        self.assertEqual(desc['bounds']['idle_ms'] / 1000, bounds['idle_s'])
+        self.assertEqual(desc['bounds']['line_bytes'], bounds['line_bytes'])
+        self.assertEqual(desc['bounds']['discovery_tests'], bounds['max_tests'])
         code = ('import subprocess, sys, time; '
                 'subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]); '
                 'time.sleep(60)')
-        disp = launcher.run([sys.executable, '-c', code], timeout=3, cwd=str(ROOT), env=self._minimal_env())
+        disp = launcher.run([sys.executable, '-c', code], timeout=3, cwd=str(ROOT), env=self._minimal_env(),
+                            bounds=bounds)
         self.assertTrue(disp['timed_out'], disp)
         self.assertEqual('timeout-reaped', disp['cleanup'], disp)
         self.assertTrue(disp['cleanup_ok'], disp)
         self.assertEqual(0, disp['active_processes'], disp)
-        self.assertGreaterEqual(disp['total_processes'], 1, disp)
+        self.assertGreaterEqual(disp['total_processes'], 2, disp)
+        self.assertGreaterEqual(disp['max_active'], 2, disp)
+        self.assertFalse(disp['idle_timeout'], disp)
         # The reap path is TerminateJobObject on the owned Job, which a plain
         # Popen.kill-only cleanup cannot produce (a kill-only parent leaves the
         # grandchild alive and accounting nonzero).
@@ -1188,18 +1549,52 @@ class BoundedCompletionCases(unittest.TestCase):
 
     # WORK_UNIT_CASE: 850/26
     def test_stdout_stderr_line_bounds_fail_closed(self):
-        launcher = WindowsOwnedTree(output_bytes=2048, line_bytes=256)
+        # R2: descriptor-decoded ceiling plus test-provisioned tighter bounds
+        # (fail-closed subsets; the small outputs below would not trip the
+        # 64KiB descriptor ceiling, so truncation is proven at the tight
+        # subset while the full descriptor mapping is exercised as control).
+        full = _r2_descriptor_bounds('minimal-python-unittest.toml')
+        desc = r.decode_descriptor((DESCRIPTOR_DIR / 'minimal-python-unittest.toml').read_bytes(), FILENAME)
+        self.assertEqual(r.enforcement_plan(bounds=desc['bounds']), full)
+        self.assertEqual(desc['bounds']['output_bytes'], full['output_bytes'])
+        self.assertEqual(desc['bounds']['line_bytes'], full['line_bytes'])
+        self.assertEqual(desc['bounds']['wall_ms'] / 1000, full['wall_s'])
+        self.assertEqual(desc['bounds']['idle_ms'] / 1000, full['idle_s'])
+        self.assertEqual(desc['bounds']['child_processes'], full['max_processes'])
+        self.assertEqual(desc['bounds']['discovery_tests'], full['max_tests'])
+        tight = dict(full, output_bytes=2048, line_bytes=256)
+        self.assertLessEqual(tight['output_bytes'], full['output_bytes'])
+        self.assertLessEqual(tight['line_bytes'], full['line_bytes'])
+        launcher = WindowsOwnedTree()
         over_out = launcher.run([sys.executable, '-c', 'import sys\nfor i in range(200): sys.stdout.write("y" * 20 + "\\n")'],
-                                timeout=30, cwd=str(ROOT), env=self._minimal_env())
+                                cwd=str(ROOT), env=self._minimal_env(), bounds=tight)
         self.assertTrue(over_out['truncated'], over_out['truncate_reason'])
-        self.assertEqual('OUTPUT_BYTE_BOUND', over_out['truncate_reason'])
+        self.assertTrue(over_out['truncate_reason'].startswith('OUTPUT_BYTE_BOUND'), over_out['truncate_reason'])
+        self.assertLessEqual(len(over_out['stdout']), tight['output_bytes'] + 65536)
+        self.assertTrue(over_out['cleanup_ok'], over_out)
+        self.assertEqual(0, over_out['active_processes'], over_out)
         over_line = launcher.run([sys.executable, '-c', 'import sys; sys.stdout.write("z" * 1000 + "\\n")'],
-                                 timeout=30, cwd=str(ROOT), env=self._minimal_env())
+                                 cwd=str(ROOT), env=self._minimal_env(), bounds=tight)
         self.assertTrue(over_line['truncated'], over_line['truncate_reason'])
-        self.assertEqual('LINE_BYTE_BOUND', over_line['truncate_reason'])
+        self.assertTrue(over_line['truncate_reason'].startswith('LINE_BYTE_BOUND'), over_line['truncate_reason'])
         over_err = launcher.run([sys.executable, '-c', 'import sys; sys.stderr.write("e" * 5000)'],
-                                timeout=30, cwd=str(ROOT), env=self._minimal_env())
+                                cwd=str(ROOT), env=self._minimal_env(), bounds=tight)
         self.assertTrue(over_err['truncated'], over_err['truncate_reason'])
+        # Exact frozen ceiling: over-emitting child at output_bytes=65536 /
+        # line_bytes=4096 still truncates (no looser substitute).
+        over_full = launcher.run([sys.executable, '-c', 'import sys\nfor i in range(4000): sys.stdout.write("y" * 20 + "\\n")'],
+                                 cwd=str(ROOT), env=self._minimal_env(), bounds=full)
+        self.assertTrue(over_full['truncated'], over_full['truncate_reason'])
+        self.assertTrue(over_full['truncate_reason'].startswith('OUTPUT_BYTE_BOUND'), over_full['truncate_reason'])
+        self.assertTrue(over_full['cleanup_ok'], over_full)
+        self.assertEqual(0, over_full['active_processes'], over_full)
+        # Descriptor-bounds control: a small output is accepted untruncated
+        # under the full frozen bounds.
+        ok = launcher.run([sys.executable, '-c', 'print("hello-descriptor-control")'],
+                          cwd=str(ROOT), env=self._minimal_env(), bounds=full)
+        self.assertFalse(ok['truncated'], ok)
+        self.assertIn(b'hello-descriptor-control', ok['stdout'])
+        self.assertEqual(0, ok['dropped_bytes'], ok)
         # Fail-closed: over-bound bytes are never accepted as proof.
         with self.assertRaises(r.RunnerInputError):
             r.parse_rust_exact(b'a' * (r.MAX_PROTOCOL_BYTES + 1), 'tiny_ok_a', 0, 2)
@@ -1279,11 +1674,23 @@ class BoundedCompletionCases(unittest.TestCase):
         self.assertEqual(module, r.resolve_metadata_entrypoint(module=module, test_roots=roots))
         with self.assertRaises(r.RunnerInputError):
             r.resolve_metadata_entrypoint(module='other.unregistered', test_roots=roots)
+        rel = r.bind_python_suite(root=ROOT, module=module, test_roots=roots)
+        self.assertEqual('scripts/tests/test_work_unit_descriptor_runner.py', rel)
+        with self.assertRaisesRegex(r.RunnerInputError, 'FOREIGN_TEST_IDENTITY|FOREIGN_TEST_SOURCE'):
+            r.bind_python_suite(root=ROOT, module='other.unregistered', test_roots=roots)
+        with tempfile.TemporaryDirectory() as directory:
+            troot = Path(directory)
+            (troot / 'pkg').mkdir()
+            (troot / 'pkg' / 'suite.py').write_text('x\n', newline='\n')
+            self.assertEqual('pkg/suite.py', r.bind_python_suite(root=troot, module='pkg.suite', test_roots=['pkg']))
+            with self.assertRaisesRegex(r.RunnerInputError, 'FOREIGN_TEST_IDENTITY|FOREIGN_TEST_SOURCE'):
+                r.bind_python_suite(root=troot, module='outside.suite', test_roots=['pkg'])
 
     # WORK_UNIT_CASE: 850/32
     def test_metadata_generator_mutation_network_spellings_rejected(self):
         for spelling in ('mod:gen', 'mod/run', 'mod\\x', 'evil!', 'a b', 'x.py', 'x.ps1', 'x.sh',
-                         'x.pyw', 'x.pyc', 'x.pyd', 'x.psm1', 'x.psd1', 'x.dll', 'x.so', 'x.dylib', 'x.bat', 'x.exe'):
+                         'x.pyw', 'x.pyc', 'x.pyd', 'x.psm1', 'x.psd1', 'x.dll', 'x.so', 'x.dylib', 'x.bat', 'x.exe',
+                         'x.js', 'x.com', 'x.cmd', 'x.vbs'):
             with self.subTest(spelling=spelling):
                 with self.assertRaises(r.RunnerInputError) as ctx:
                     r.resolve_metadata_entrypoint(module=spelling, test_roots=['scripts/tests'])
@@ -1333,26 +1740,46 @@ class BoundedCompletionCases(unittest.TestCase):
 
     # WORK_UNIT_CASE: 850/36
     def test_both_python_modes_enforce_timeout_output_descendant_bounds(self):
+        # R2: per-mode descriptor bounds demonstrably drive the launcher.
+        per_mode_bounds = {}
         for name, mode in (('minimal-python-unittest.toml', 'python-unittest'),
                            ('minimal-metadata-python.toml', 'metadata-python')):
             data = r.decode_descriptor((DESCRIPTOR_DIR / name).read_bytes(), FILENAME)
             self.assertEqual(mode, data['mode'])
             self.assertGreater(data['bounds']['wall_ms'], 0)
+            bounds = _r2_descriptor_bounds(name)
+            self.assertEqual(r.enforcement_plan(bounds=data['bounds']), bounds)
+            self.assertEqual(data['bounds']['wall_ms'] / 1000, bounds['wall_s'])
+            self.assertEqual(data['bounds']['idle_ms'] / 1000, bounds['idle_s'])
+            self.assertEqual(data['bounds']['output_bytes'], bounds['output_bytes'])
+            self.assertEqual(data['bounds']['line_bytes'], bounds['line_bytes'])
+            self.assertEqual(data['bounds']['child_processes'], bounds['max_processes'])
+            self.assertEqual(data['bounds']['discovery_tests'], bounds['max_tests'])
+            per_mode_bounds[mode] = bounds
         argv = r.build_python_child_command(script_rel='scripts/work_unit_gate/descriptor_runner.py', fd=10)
         self.assertEqual(argv, r.build_python_child_command(script_rel='scripts/work_unit_gate/descriptor_runner.py', fd=10))
         slow = BASE.replace('self.assertEqual(2 + 2, 4)', 'import time\n        time.sleep(30)')
         with self.fixture(slow) as root:
             observed, discovery, _, _ = self.child(root)
             self.assertEqual(0, observed.returncode, observed.stderr)
-            disp, body, _ = self._short_child(root, 'execute', discovery['tests'], timeout=3)
+            disp, body, _ = self._short_child(root, 'execute', discovery['tests'], timeout=3,
+                                              bounds=per_mode_bounds['python-unittest'])
             self.assertTrue(disp['timed_out'], disp)
+            self.assertFalse(disp['idle_timeout'], disp)
             self.assertEqual('timeout-reaped', disp['cleanup'], disp)
             self.assertTrue(disp['cleanup_ok'], disp)
             self.assertEqual(0, disp['active_processes'], disp)
             self.assertEqual(b'', body)
-        tiny = WindowsOwnedTree(output_bytes=64, line_bytes=16)
-        disp = tiny.run([sys.executable, '-c', 'print("q" * 1024)'], timeout=30, cwd=str(ROOT), env=self._minimal_env())
+        small = dict(per_mode_bounds['python-unittest'], output_bytes=64, line_bytes=16)
+        disp = WindowsOwnedTree().run([sys.executable, '-c', 'print("q" * 1024)'],
+                                      cwd=str(ROOT), env=self._minimal_env(), bounds=small)
         self.assertTrue(disp['truncated'], disp)
+        over_ceiling = WindowsOwnedTree().run([sys.executable, '-c', 'import sys\nfor i in range(4000): sys.stdout.write("y" * 20 + "\\n")'],
+                                              cwd=str(ROOT), env=self._minimal_env(), bounds=per_mode_bounds['python-unittest'])
+        self.assertTrue(over_ceiling['truncated'], over_ceiling['truncate_reason'])
+        self.assertTrue(over_ceiling['truncate_reason'].startswith('OUTPUT_BYTE_BOUND'), over_ceiling['truncate_reason'])
+        self.assertTrue(over_ceiling['cleanup_ok'], over_ceiling)
+        self.assertEqual(0, over_ceiling['active_processes'], over_ceiling)
 
     # WORK_UNIT_CASE: 850/37
     def test_deterministic_commands_and_semantic_normalization(self):
@@ -1400,6 +1827,15 @@ class BoundedCompletionCases(unittest.TestCase):
         self.assertNotIn('GH_TOKEN', filtered)
         self.assertNotIn('MY_SECRET', filtered)
         self.assertEqual('x', filtered['PATH'])
+        with self.assertRaises(TypeError):
+            r.minimal_child_env({'PATH': 'x'}, allowed={'PATH'})
+        with self.assertRaises(TypeError):
+            r.minimal_child_env({'PATH': 'x'}, allowed_names={'PATH'})
+        with self.assertRaisesRegex(r.RunnerInputError, 'ENV_VALUE_BOUND'):
+            r.minimal_child_env({'PATH': 'x' * (r.ENV_VALUE_CAP + 1)})
+        big = {'PATH': 'p', 'TEMP': 't' * r.ENV_TOTAL_CAP, 'TMP': 'u'}
+        with self.assertRaisesRegex(r.RunnerInputError, 'ENV_TOTAL_BOUND|ENV_VALUE_BOUND'):
+            r.minimal_child_env(big)
 
     # WORK_UNIT_CASE: 850/39
     def test_source_api_guard_excludes_shell_spawn_and_snapshot_writes(self):
@@ -1467,18 +1903,32 @@ class BoundedCompletionCases(unittest.TestCase):
             observed, discovery, _, _ = self.child(root)
             self.assertEqual(0, observed.returncode, observed.stderr)
             self.assertEqual('tests.suite.Suite.test_bridge', discovery['tests'][0]['id'])
-            disp, body, _ = self._short_child(root, 'execute', discovery['tests'], timeout=5)
+            # R2: execute phase runs under frozen descriptor bounds (5s wall
+            # override is tighter than the 10s descriptor ceiling).
+            bounds = _r2_descriptor_bounds('minimal-python-unittest.toml')
+            disp, body, _ = self._short_child(root, 'execute', discovery['tests'], timeout=5, bounds=bounds)
             self.assertTrue(disp['timed_out'], disp)
             self.assertEqual(0, disp['active_processes'], disp)
             self.assertTrue(disp['cleanup_ok'], disp)
             self.assertEqual('timeout-reaped', disp['cleanup'], disp)
             self.assertEqual(b'', body)
+            self.assertGreaterEqual(disp['total_processes'], 2, disp)
+            self.assertGreaterEqual(disp['max_active'], 2, disp)
 
             def is_green(d):
-                return d['cleanup'] in ('clean', 'timeout-reaped') and d['cleanup_ok'] and d['active_processes'] == 0 and not d['truncated']
+                if d.get('idle_timeout', False):
+                    return False
+                return r.cleanup_verdict(cleanup=d['cleanup'], active_processes=d['active_processes'], truncated=d['truncated']) == 'green'
+            self.assertFalse(disp['idle_timeout'], disp)
             self.assertTrue(is_green(disp))
-            fake_unknown = dict(disp, cleanup='unknown-mystery', cleanup_ok=False, active_processes=3)
-            self.assertFalse(is_green(fake_unknown))
+            self.assertEqual('non-green', r.cleanup_verdict(cleanup='unknown-mystery', active_processes=3, truncated=False))
+            self.assertEqual('non-green', r.cleanup_verdict(cleanup='truncated-reaped', active_processes=0, truncated=True))
+            self.assertFalse(is_green(dict(disp, cleanup='truncated-reaped', truncated=True)))
+            self.assertFalse(is_green(dict(disp, cleanup='timeout-reaped', idle_timeout=True)))
+            self.assertFalse(is_green(dict(disp, truncated=True)))
+            self.assertFalse(is_green(dict(disp, cleanup='cleanup-failed', cleanup_ok=False)))
+            with self.assertRaises(r.RunnerInputError):
+                r.cleanup_verdict(cleanup=None, active_processes=0, truncated=False)
 
     # WORK_UNIT_CASE: 850/42
     def test_real_mutation_invalidation_preserves_evidence_without_reset(self):
@@ -1500,6 +1950,22 @@ class BoundedCompletionCases(unittest.TestCase):
             self.assertEqual('mutated-by-test', seed.read_text())
             self.assertNotEqual(before['tests/seed.txt'], after['tests/seed.txt'])
             self.assertEqual(0, observed.returncode, observed.stderr)
+        desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
+        assign = _b1_assignment()
+        required = sorted({p.value for p in desc.source_roots + desc.test_roots} | ({desc.module.value.replace('.', '/') + '.py'} if desc.module is not None else set()))
+        self.assertEqual(['scripts/tests/test_work_unit_descriptor_runner.py', 'scripts/work_unit_gate/descriptor_runner.py'], required)
+        good = {k: 'a' * 64 for k in required}
+        bound = r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot=dict(good))
+        self.assertEqual(required, bound['keys'])
+        self.assertEqual(64, len(bound['digest']))
+        with self.assertRaisesRegex(r.RunnerInputError, 'MISSING_SNAPSHOT_KEY'):
+            r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot={k: 'a' * 64 for k in required[:-1]})
+        with self.assertRaisesRegex(r.RunnerInputError, 'FOREIGN_SNAPSHOT_KEY'):
+            r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot=dict(good, **{'extra/key.py': 'a' * 64}))
+        with self.assertRaisesRegex(r.RunnerInputError, 'SNAPSHOT_DIGEST_SYNTAX|SNAPSHOT_SHAPE|MISSING_SNAPSHOT_KEY'):
+            r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot={})
+        with self.assertRaisesRegex(r.RunnerInputError, 'SNAPSHOT_DIGEST_SYNTAX'):
+            r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot={k: 'not-hex' for k in required})
 
     # WORK_UNIT_CASE: 850/43
     def test_stale_assignment_rejected(self):
@@ -1548,6 +2014,263 @@ class BoundedCompletionCases(unittest.TestCase):
                                results=[{'id': exec_req['expected'][0]['id'], 'outcome': 'success'}])
             with self.assertRaises(r.RunnerInputError):
                 r.parse_python_protocol(json.dumps(bad_outcome).encode(), **kwargs)
+        desc = r.parse_descriptor((DESCRIPTOR_DIR / 'minimal-rust-package.toml').read_bytes(), FILENAME, _b1_assignment())
+        art = {'package': 'wu850_tiny', 'manifest_rel': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'target_name': 'wu850_tiny', 'target_kind': 'lib', 'profile_test': False, 'filenames': ('/tmp/real-test-bin.exe',), 'fresh': False}
+        bound = r.bind_test_binary(artifact=art, binary_name='real-test-bin.exe', binary_sha256='a' * 64)
+        with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_NOT_PRODUCED'):
+            r.bind_test_binary(artifact=art, binary_name='other-bin.exe', binary_sha256='a' * 64)
+        with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_DIGEST_REQUIRED'):
+            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'wu850_tiny', 'manifest_rel': art['manifest_rel'], 'binary_sha256': 'not-hex'}, test_name='tiny_ok_a', kind='rust')
+        with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_DIGEST_REQUIRED'):
+            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'wu850_tiny', 'manifest_rel': art['manifest_rel']}, test_name='tiny_ok_a', kind='rust')
+        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_BINARY_MISMATCH'):
+            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'other_pkg', 'manifest_rel': art['manifest_rel'], 'binary_sha256': 'a' * 64}, test_name='tiny_ok_a', kind='rust')
+        with self.assertRaisesRegex(r.RunnerInputError, 'KIND_MODE_MISMATCH'):
+            r.compose_discovery_receipt(descriptor=desc, binary=bound, test_name='a.B.test_x', kind='python')
+        receipt = r.compose_discovery_receipt(descriptor=desc, binary=bound, test_name='tiny_ok_a', kind='rust')
+        other = r.compose_discovery_receipt(descriptor=desc, binary=bound, test_name='tiny_ok_b', kind='rust')
+        with self.assertRaises(c.ContractViolation):
+            c.TestExecutionRecord(test=other.test, disposition=c.ExecutionDisposition.EXECUTED_PASS, discovery=receipt, detail=None)
+        with self.assertRaisesRegex(r.RunnerInputError, 'UNKNOWN_DISPOSITION|EXECUTION_RECORD_REJECTED'):
+            r.compose_execution_record(discovery=receipt, disposition='bogus-disposition')
+        with self.fixture() as root:
+            _, disc, _, req = self.child(root)
+            cross = dict(disc, tests=[dict(disc['tests'][0], id='foreign.Test.test_x')])
+            with self.assertRaises(r.RunnerInputError):
+                r.parse_python_protocol(json.dumps(cross).encode(), request_sha256=hashlib.sha256(json.dumps(req, sort_keys=True).encode()).hexdigest(), expected_module=req['module'], expected_source_sha256=req['source_sha256'], expected_phase='discover')
+
+
+class R2TransportCases(unittest.TestCase):
+    """R2 lane-B transport conformance (no WORK_UNIT_CASE markers).
+
+    Covers fail-closed bounds, incremental streaming truncation, idle
+    enforcement, the ActiveProcessLimit descendant cap, the POSIX refusal, and
+    the runner-owned toolchain env filter. None of these renumber or restate the
+    44 matrix markers above.
+    """
+
+    def _minimal_env(self):
+        return {'PATH': os.environ.get('PATH', os.defpath), 'SYSTEMROOT': os.environ.get('SYSTEMROOT', r'C:\Windows'),
+                'TEMP': tempfile.gettempdir(), 'TMP': tempfile.gettempdir(),
+                'PYTHONDONTWRITEBYTECODE': '1', 'PYTHONIOENCODING': 'utf-8'}
+
+    def test_bounds_required_fail_closed(self):
+        launcher = WindowsOwnedTree()
+        with self.assertRaisesRegex(RuntimeError, 'BOUNDS_REQUIRED'):
+            launcher.run([sys.executable, '-c', 'print(1)'], timeout=5, cwd=str(ROOT), env=self._minimal_env())
+        with self.assertRaisesRegex(RuntimeError, 'BOUNDS_REQUIRED'):
+            launcher.run([sys.executable, '-c', 'print(1)'], cwd=str(ROOT), env=self._minimal_env(),
+                         bounds={'wall_s': 1, 'idle_s': 2, 'output_bytes': 64, 'line_bytes': 16, 'max_processes': 1})
+
+    def test_streaming_truncation_terminates_early_and_stays_bounded(self):
+        bounds = dict(_r2_descriptor_bounds('minimal-python-unittest.toml'), output_bytes=1024, line_bytes=256)
+        launcher = WindowsOwnedTree()
+        start = time.monotonic()
+        disp = launcher.run(
+            [sys.executable, '-c',
+             'import sys, time\nfor i in range(100000):\n    sys.stdout.write("y" * 40 + "\\n")\n    time.sleep(0.001)\n'],
+            cwd=str(ROOT), env=self._minimal_env(), bounds=bounds)
+        elapsed = time.monotonic() - start
+        self.assertTrue(disp['truncated'], disp['truncate_reason'])
+        self.assertTrue(disp['truncate_reason'].startswith('OUTPUT_BYTE_BOUND'), disp['truncate_reason'])
+        self.assertIn('dropped_bytes=', disp['truncate_reason'])
+        self.assertNotIn('yyyy', disp['truncate_reason'])
+        self.assertLessEqual(len(disp['stdout']), bounds['output_bytes'] + 65536)
+        self.assertTrue(disp['cleanup_ok'], disp)
+        self.assertEqual(0, disp['active_processes'], disp)
+        # Incremental kill: a 100k-line flood must not run to the wall (10s).
+        self.assertLess(elapsed, bounds['wall_s'], disp)
+        self.assertGreaterEqual(disp['dropped_bytes'], 0, disp)
+
+    def test_idle_timeout_terminates_silent_tree(self):
+        bounds = _r2_descriptor_bounds('minimal-python-unittest.toml')
+        launcher = WindowsOwnedTree()
+        disp = launcher.run([sys.executable, '-c', 'import time; time.sleep(60)'],
+                            cwd=str(ROOT), env=self._minimal_env(), bounds=bounds, idle_s=1)
+        self.assertTrue(disp['timed_out'], disp)
+        self.assertTrue(disp['idle_timeout'], disp)
+        self.assertEqual('timeout-reaped', disp['cleanup'], disp)
+        self.assertTrue(disp['cleanup_ok'], disp)
+        self.assertEqual(0, disp['active_processes'], disp)
+
+    def test_active_process_limit_denies_extra_child_and_reaps(self):
+        bounds = dict(_r2_descriptor_bounds('minimal-python-unittest.toml'), max_processes=2)
+        code = ('import subprocess, sys, time; '
+                'ok = 0; fail = 0; pros = []\n'
+                'for i in range(4):\n'
+                '    try:\n'
+                '        pros.append(subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"]))\n'
+                '        ok += 1\n'
+                '    except Exception as exc:\n'
+                '        fail += 1\n'
+                '        print("spawn-denied:" + type(exc).__name__)\n'
+                'for p in pros:\n'
+                '    p.wait(timeout=30)\n'
+                'print("ok=%d fail=%d" % (ok, fail))\n'
+                'sys.exit(0 if fail > 0 else 7)\n')
+        # Idle at the decoded ceiling (5s): the spawn/wait gap (~2s) stays under
+        # it while matrix proof cases never widen past the ceiling.
+        disp = WindowsOwnedTree().run([sys.executable, '-c', code], cwd=str(ROOT),
+                                      env=self._minimal_env(), bounds=bounds, idle_s=5)
+        self.assertEqual(0, disp['returncode'], (disp['returncode'], disp['stdout'][-500:], disp['stderr'][-500:]))
+        self.assertIn(b'fail=', disp['stdout'])
+        self.assertNotIn(b'ok=4 fail=0', disp['stdout'])
+        self.assertTrue(disp['cleanup_ok'], disp)
+        self.assertEqual(0, disp['active_processes'], disp)
+        self.assertEqual('clean', disp['cleanup'], disp)
+
+    def test_posix_containment_refused_before_spawn(self):
+        launcher = WindowsOwnedTree()
+        with self.assertRaisesRegex(RuntimeError, 'unsupported containment on POSIX'):
+            launcher._run_posix([sys.executable, '-c', 'print(1)'], input_bytes=None, timeout=5,
+                                cwd=str(ROOT), env=self._minimal_env(),
+                                bounds=_r2_descriptor_bounds('minimal-python-unittest.toml'))
+        self.assertIn('Windows-only', WindowsOwnedTree.__doc__)
+        self.assertNotIn('setsid', WindowsOwnedTree.__doc__)
+
+    def test_breakaway_spawner_still_reaped_with_zero_active(self):
+        bounds = _r2_descriptor_bounds('minimal-python-unittest.toml')
+        code = ('import ctypes, subprocess, sys\n'
+                'CREATE_BREAKAWAY_FROM_JOB = 0x01000000\n'
+                '_ = ctypes.sizeof(ctypes.c_void_p)\n'
+                'try:\n'
+                '    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"], creationflags=CREATE_BREAKAWAY_FROM_JOB)\n'
+                '    p.wait(timeout=30)\n'
+                '    print("breakaway-allowed")\n'
+                '    sys.exit(7)\n'
+                'except Exception as exc:\n'
+                '    print("breakaway-denied:" + type(exc).__name__)\n'
+                '    sys.exit(0)\n')
+        disp = WindowsOwnedTree().run([sys.executable, '-c', code], cwd=str(ROOT),
+                                      env=self._minimal_env(), bounds=bounds)
+        self.assertEqual(0, disp['returncode'], (disp['returncode'], disp['stdout'][-500:], disp['stderr'][-500:]))
+        self.assertIn(b'breakaway-denied', disp['stdout'])
+        self.assertTrue(disp['cleanup_ok'], disp)
+        self.assertEqual(0, disp['active_processes'], disp)
+        self.assertEqual('clean', disp['cleanup'], disp)
+
+    def test_toolchain_env_proven_set_and_secrets_out(self):
+        for name in ('PATH', 'SYSTEMROOT', 'SYSTEMDRIVE', 'PROGRAMDATA', 'TEMP', 'TMP',
+                     'PATHEXT', 'OS', 'USERPROFILE', 'COMSPEC', 'WINDIR', 'LOCALAPPDATA'):
+            self.assertIn(name, r.TOOLCHAIN_ENV_NAMES, name)
+        self.assertNotIn('INCLUDE', r.TOOLCHAIN_ENV_NAMES)
+        self.assertNotIn('LIB', r.TOOLCHAIN_ENV_NAMES)
+        probe = {'PATH': 'p', 'SYSTEMROOT': 's', 'GH_TOKEN': 'CANARY', 'MY_SECRET': 's',
+                 'CARGO_NET_RETRY': '3', 'RUST_LOG': 'info', 'RUST_SECRET': 'CANARY',
+                 'RUSTC_WRAPPER': 'evil-wrapper'}
+        filtered = r.toolchain_child_env(probe)
+        self.assertEqual('p', filtered['PATH'])
+        self.assertEqual('3', filtered['CARGO_NET_RETRY'])
+        self.assertEqual('info', filtered['RUST_LOG'])
+        self.assertNotIn('GH_TOKEN', filtered)
+        self.assertNotIn('MY_SECRET', filtered)
+        self.assertNotIn('RUST_SECRET', filtered)
+        self.assertEqual('', filtered['RUSTC_WRAPPER'])
+        with self.assertRaisesRegex(r.RunnerInputError, 'ENV_VALUE_BOUND'):
+            r.toolchain_child_env({'PATH': 'p', 'CARGO_HUGE': 'x' * (r.ENV_VALUE_CAP + 1)})
+        live = r.toolchain_child_env(dict(os.environ))
+        self.assertIn('PATH', live)
+        self.assertIn('SYSTEMROOT', live)
+        self.assertEqual('', live['RUSTC_WRAPPER'])
+        for key, value in live.items():
+            self.assertNotIn('CANARY', value)
+        total = sum(len(v.encode('utf-8')) for v in live.values())
+        self.assertLessEqual(total, r.ENV_TOTAL_CAP)
+
+
+class ResidualBindingNegatives(unittest.TestCase):
+    """Unmarked residual negatives for the new runner bindings."""
+
+    def test_build_stream_shapes(self):
+        rel = 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'
+        base = {'package_id': 'path+file:///x#wu850_tiny@0.1.0', 'target': {'name': 'wu850_tiny', 'kind': ['lib']}, 'profile': {'test': False}, 'filenames': ['/tmp/a.rlib'], 'fresh': False}
+        import json as _json
+        def stream(art, fin=True, reason_art='compiler-artifact'):
+            lines = [_json.dumps(dict(art, reason=reason_art)).encode()]
+            if fin:
+                lines.append(b'{"reason":"build-finished","success":true}')
+            return b'\n'.join(lines) + b'\n'
+        good = stream(base)
+        self.assertEqual(1, len(r.parse_cargo_build_stream(good, package='wu850_tiny', manifest_rel=rel)))
+        bad_target = dict(base, target={'name': 'wu850_tiny', 'kind': ['lib', 'rlib']})
+        with self.assertRaisesRegex(r.RunnerInputError, 'TARGET_SHAPE'):
+            r.parse_cargo_build_stream(stream(bad_target), package='wu850_tiny', manifest_rel=rel)
+        bad_profile = dict(base, profile={'test': 'yes'})
+        with self.assertRaisesRegex(r.RunnerInputError, 'PROFILE_SHAPE'):
+            r.parse_cargo_build_stream(stream(bad_profile), package='wu850_tiny', manifest_rel=rel)
+        bad_files = dict(base, filenames=[])
+        with self.assertRaisesRegex(r.RunnerInputError, 'FILENAMES_REQUIRED'):
+            r.parse_cargo_build_stream(stream(bad_files), package='wu850_tiny', manifest_rel=rel)
+        bad_fresh = dict(base, fresh='no')
+        with self.assertRaisesRegex(r.RunnerInputError, 'FRESH_BOOL_REQUIRED'):
+            r.parse_cargo_build_stream(stream(bad_fresh), package='wu850_tiny', manifest_rel=rel)
+        with self.assertRaisesRegex(r.RunnerInputError, 'OUTPUT_BYTE_BOUND'):
+            r.parse_cargo_build_stream(b'x' * (r.MAX_PROTOCOL_BYTES + 1), package='wu850_tiny', manifest_rel=rel)
+
+    def test_test_binary_shapes(self):
+        art = {'package': 'wu850_tiny', 'manifest_rel': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'target_name': 'wu850_tiny', 'target_kind': 'lib', 'profile_test': False, 'filenames': ('/tmp/bin.exe',), 'fresh': False}
+        with self.assertRaisesRegex(r.RunnerInputError, 'ARTIFACT_SHAPE'):
+            r.bind_test_binary(artifact={'package': 'wu850_tiny'}, binary_name='bin.exe', binary_sha256='a' * 64)
+        with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_NAME_SHAPE'):
+            r.bind_test_binary(artifact=art, binary_name='sub/bin.exe', binary_sha256='a' * 64)
+        with self.assertRaisesRegex(r.RunnerInputError, 'TARGET_MISMATCH'):
+            r.bind_test_binary(artifact=art, binary_name='bin.exe', binary_sha256='a' * 64, target='other')
+        with self.assertRaisesRegex(r.RunnerInputError, 'CFGS_SHAPE'):
+            r.bind_test_binary(artifact=art, binary_name='bin.exe', binary_sha256='a' * 64, cfgs='cfg1')
+        ok = r.bind_test_binary(artifact=art, binary_name='bin.exe', binary_sha256='b' * 64, target='wu850_tiny', cfgs=['cfg1'])
+        self.assertEqual('bin.exe', ok['binary_name'])
+
+    def test_package_observation_shapes(self):
+        desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
+        pid = 'path+file:///repo#runner@0.1.0'
+        rel = 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'
+        with self.assertRaisesRegex(r.RunnerInputError, 'DESCRIPTOR_TYPE_REQUIRED'):
+            r.bind_package_observation(descriptor={'package': 'x'}, metadata={'packages': [], 'workspace_members': [], 'excluded': []})
+        with self.assertRaisesRegex(r.RunnerInputError, 'METADATA_SHAPE'):
+            r.bind_package_observation(descriptor=desc, metadata={'packages': [], 'workspace_members': [], 'excluded': 'x'})
+        bad_path = {'packages': [{'name': 'runner', 'manifest_path': 'bad/path.txt', 'id': pid, 'buildable': True}], 'workspace_members': [], 'excluded': []}
+        with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_PATH_SHAPE'):
+            r.bind_package_observation(descriptor=desc, metadata=bad_path)
+        bad_bool = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'buildable': 'yes'}], 'workspace_members': [], 'excluded': []}
+        with self.assertRaisesRegex(r.RunnerInputError, 'BUILDABLE_BOOL_REQUIRED'):
+            r.bind_package_observation(descriptor=desc, metadata=bad_bool)
+
+    def test_snapshot_and_enforcement_shapes(self):
+        desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
+        good = {k: 'a' * 64 for k in ['scripts/tests/test_work_unit_descriptor_runner.py', 'scripts/work_unit_gate/descriptor_runner.py']}
+        with self.assertRaisesRegex(r.RunnerInputError, 'DESCRIPTOR_TYPE_REQUIRED'):
+            r.bind_protected_snapshot(descriptor={}, assignment=_b1_assignment(), snapshot=dict(good))
+        with self.assertRaisesRegex(r.RunnerInputError, 'ASSIGNMENT_RECEIPT_REQUIRED'):
+            r.bind_protected_snapshot(descriptor=desc, assignment=None, snapshot=dict(good))
+        closed = _b1_assignment(state=c.IssueState.CLOSED, source_use=c.AssignmentSourceUse.PREREQUISITE_EVIDENCE)
+        with self.assertRaisesRegex(r.RunnerInputError, 'INACTIVE_ASSIGNMENT'):
+            r.bind_protected_snapshot(descriptor=desc, assignment=closed, snapshot=dict(good))
+        bounds = r.decode_descriptor((DESCRIPTOR_DIR / 'minimal-python-unittest.toml').read_bytes(), FILENAME)['bounds']
+        plan = r.enforcement_plan(bounds=bounds)
+        self.assertEqual({'wall_s', 'idle_s', 'output_bytes', 'line_bytes', 'max_tests', 'max_processes'}, set(plan))
+        with self.assertRaisesRegex(r.RunnerInputError, 'INCONSISTENT_BOUNDS'):
+            r.enforcement_plan(bounds=dict(bounds, idle_ms=bounds['wall_ms'] + 1))
+        with self.assertRaisesRegex(r.RunnerInputError, 'INCONSISTENT_BOUNDS'):
+            r.enforcement_plan(bounds=dict(bounds, line_bytes=bounds['output_bytes'] + 1))
+        with self.assertRaisesRegex(r.RunnerInputError, 'INTEGER_BOUND|CLOSED_FIELDS'):
+            r.enforcement_plan(bounds=dict(bounds, wall_ms=0))
+
+    def test_compose_shapes(self):
+        desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
+        with self.assertRaisesRegex(r.RunnerInputError, 'DESCRIPTOR_TYPE_REQUIRED'):
+            r.compose_discovery_receipt(descriptor={}, binary=None, test_name='a.B.test_x', kind='python')
+        with self.assertRaisesRegex(r.RunnerInputError, 'DISCOVERY_KIND_REQUIRED'):
+            r.compose_discovery_receipt(descriptor=desc, binary=None, test_name='a.B.test_x', kind='go')
+        with self.assertRaisesRegex(r.RunnerInputError, 'RUST_IDENTITY_SYNTAX|PYTHON_MODULE_SYNTAX'):
+            r.compose_discovery_receipt(descriptor=desc, binary=None, test_name='bad name!', kind='python')
+        with self.assertRaisesRegex(r.RunnerInputError, 'KIND_MODE_MISMATCH'):
+            r.compose_discovery_receipt(descriptor=desc, binary={'no_manifest': 1}, test_name='tiny_ok_a', kind='rust')
+        with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_BINDING_REQUIRED'):
+            r.compose_discovery_receipt(descriptor=desc, binary={'no_manifest': 1}, test_name='a.B.test_x', kind='python')
+        receipt = r.compose_discovery_receipt(descriptor=desc, binary=None, test_name='scripts.tests.test_work_unit_descriptor_runner.Fake.test_x', kind='python')
+        self.assertEqual(desc.matrix_sha256, receipt.artifact_sha256)
+        with self.assertRaisesRegex(r.RunnerInputError, 'DISCOVERY_RECEIPT_REQUIRED'):
+            r.compose_execution_record(discovery={}, disposition='executed-pass')
 
 
 if __name__ == '__main__':
