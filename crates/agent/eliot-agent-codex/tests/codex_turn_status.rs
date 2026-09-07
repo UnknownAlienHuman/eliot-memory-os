@@ -17,7 +17,7 @@ fn route() -> eliot_agent_api::RouteFingerprint {
     )
 }
 
-fn session() -> Result<CodexSessionBinding, eliot_agent_api::ContractError> {
+fn session() -> Result<CodexSessionBinding, Box<dyn std::error::Error>> {
     Ok(CodexSessionBinding {
         session_id: SessionId::new("session-1")?,
         thread_id: "thread-1".to_owned(),
