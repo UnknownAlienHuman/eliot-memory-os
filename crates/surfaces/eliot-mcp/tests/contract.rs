@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
@@ -16,6 +18,13 @@ use eliot_mcp::{
 };
 use eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
 use eliot_receipts::{ProofCeiling, SessionBinding};
+use eliot_source_assurance::{
+    AdmissibleUse, AdmissionExpectation, AxisStatus, EffectCeiling as SourceEffectCeiling,
+    GoverningSourceIdentity, GoverningSourceSet, InstructionTaint as SourceInstructionTaint,
+    OwnerSourceEvidence, PrivacyClass as SourcePrivacyClass, QuarantineStatus, ScopeBindingProof,
+    SourceAssurance, SourceAssurancePolicy, SourceFrontierBinding, SourceProvenance,
+    SourceSnapshotBinding, SourceTrustProfile, ThreatStatus, canonical_digest,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -127,6 +136,100 @@ fn resolved_binding(request: &BindingResolutionRequest) -> ActiveSessionBinding 
     }
 }
 
+fn owner_source_evidence(
+    request: &BindingResolutionRequest,
+    binding: &ActiveSessionBinding,
+) -> OwnerSourceEvidence {
+    let frontier = SourceFrontierBinding {
+        frontier_id: "frontier-1".into(),
+        workspace_identity: "workspace-1".into(),
+        repository_revision: "revision-1".into(),
+        dirty_state_digest: canonical_digest(&"dirty").expect("fixture digest"),
+        generation: 1,
+    };
+    let scope = ScopeBindingProof {
+        expected_scope: "scope-1".into(),
+        observed_scope: "scope-1".into(),
+        expected_generation: 1,
+        observed_generation: 1,
+        evidence_digest: canonical_digest(&"scope").expect("fixture digest"),
+    };
+    let sources = GoverningSourceSet::new(
+        "governing-set",
+        "revision-1",
+        vec![GoverningSourceIdentity {
+            source_id: "architecture".into(),
+            kind: "governing".into(),
+            canonical_ref: "docs/architecture.md".into(),
+            content_digest: canonical_digest(&"architecture").expect("fixture digest"),
+            origin_ref: "owner-receipt:architecture".into(),
+            revision: "revision-1".into(),
+        }],
+    )
+    .expect("source fixture");
+    let assurance = SourceAssurance {
+        schema_version: "eliot-source-assurance-v1".into(),
+        governing_sources: sources,
+        provenance: SourceProvenance {
+            producer: "authenticated-owner".into(),
+            acquisition_ref: "capture-1".into(),
+            lineage_digest: canonical_digest(&"lineage").expect("fixture digest"),
+            authentication_ref: "owner-auth:1".into(),
+        },
+        trust: SourceTrustProfile {
+            integrity: AxisStatus::Verified,
+            freshness: AxisStatus::Verified,
+            competence: AxisStatus::Verified,
+            incentives: AxisStatus::Verified,
+            independence: AxisStatus::Verified,
+            privacy: SourcePrivacyClass::Internal,
+            instruction_taint: SourceInstructionTaint::Data,
+            threat: ThreatStatus::NoneObserved,
+        },
+        quarantine: QuarantineStatus::Clear,
+        snapshot: SourceSnapshotBinding {
+            snapshot_id: "snapshot-1".into(),
+            source_set_id: "governing-set".into(),
+            source_set_revision: "revision-1".into(),
+            content_digest: canonical_digest(&"snapshot").expect("fixture digest"),
+            frontier_digest: canonical_digest(&frontier).expect("frontier digest"),
+            state_fence: "fence-1".into(),
+        },
+        frontier: frontier.clone(),
+        scope: scope.clone(),
+        requested_use: AdmissibleUse::Evidence,
+        effect_ceiling: SourceEffectCeiling::ReadOnlyCandidate,
+    };
+    OwnerSourceEvidence {
+        owner_principal_ref: binding.principal_ref.clone(),
+        evidence_ref: "owner-evidence:1".into(),
+        request_id: request.request_id.clone(),
+        original_request_sha256: request.original_request_sha256.clone(),
+        idempotency_key: request.idempotency_key.clone(),
+        cancellation_id: request.cancellation_id.clone(),
+        session_id: request.claimed_session.session_id.to_string(),
+        state_fence_digest: canonical_digest(&request.claimed_session.state_fence)
+            .expect("state fence digest"),
+        canonical_request_sha256: request.canonical_request_sha256.clone(),
+        verifier_ref: Some("verifier/source-v1".into()),
+        assurance,
+        policy: SourceAssurancePolicy {
+            policy_version: "source-policy-v1".into(),
+            expected_source_state_fence: "fence-1".into(),
+            expectation: AdmissionExpectation {
+                source_set_id: "governing-set".into(),
+                source_set_revision: "revision-1".into(),
+                frontier,
+                scope,
+            },
+            allowed_use: AdmissibleUse::Evidence,
+            privacy_class: SourcePrivacyClass::Internal,
+            effect_ceiling: SourceEffectCeiling::ReadOnlyCandidate,
+            required_verifier: Some("verifier/source-v1".into()),
+        },
+    }
+}
+
 macro_rules! test_resolver {
     () => {
         fn resolve_active_session(
@@ -134,6 +237,20 @@ macro_rules! test_resolver {
             request: &BindingResolutionRequest,
         ) -> Result<ActiveSessionBinding, PortFailure> {
             Ok(resolved_binding(request))
+        }
+
+        test_resolver_assurance!();
+    };
+}
+
+macro_rules! test_resolver_assurance {
+    () => {
+        fn resolve_source_assurance(
+            &self,
+            _request: &BindingResolutionRequest,
+            binding: &ActiveSessionBinding,
+        ) -> Result<OwnerSourceEvidence, PortFailure> {
+            Ok(owner_source_evidence(_request, binding))
         }
     };
 }
@@ -165,6 +282,8 @@ impl KernelGovernorPort for ReplayPort {
             .push(request.transport.clone());
         Ok(resolved_binding(request))
     }
+
+    test_resolver_assurance!();
 
     fn dispatch(
         &self,
@@ -219,6 +338,8 @@ impl KernelGovernorPort for BoundPort {
         }
         Ok(resolved_binding(request))
     }
+
+    test_resolver_assurance!();
 
     fn dispatch(
         &self,

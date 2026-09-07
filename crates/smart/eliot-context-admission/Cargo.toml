@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [package.metadata.eliot]
 prototype = true
-source_status = "NOT_IMPLEMENTED"
+source_status = "IMPLEMENTED_PROTOTYPE"
 workspace_admission = "pending_agent_implementation_and_proof"
 functional_cell = "smart.context.admission"
 source_layer = "C1"
@@ -24,6 +24,10 @@ agent_order = 17
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
 eliot-evidence = { path = "../../foundation/eliot-evidence" }
 eliot-context-contracts = { path = "../eliot-context-contracts" }
+eliot-receipts = { path = "../../foundation/eliot-receipts" }
+
+[dev-dependencies]
+eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts" }
 
 [lints]
 workspace = true
