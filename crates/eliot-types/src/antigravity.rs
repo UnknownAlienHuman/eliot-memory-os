@@ -660,7 +660,6 @@ pub struct AntigravityOutputRedactionReceipt {
 pub struct AntigravitySafetyReceipt {
     /// Governed argv with the prompt argument removed before persistence.
     pub typed_argv: Vec<String>,
-    #[serde(default)]
     pub prompt_hash_blake3: String,
     pub shell_false: bool,
     pub stdin_devnull: bool,
@@ -724,7 +723,6 @@ pub struct AntigravityRun {
     pub redaction_receipt: AntigravityOutputRedactionReceipt,
     /// Safe marker facts derived from the internal parsed response before raw
     /// provider text is confined to the protected spool.
-    #[serde(default)]
     pub response_protocol_receipt: AntigravityResponseProtocolReceipt,
     pub normalized_result: Option<AntigravityNormalizedResult>,
     pub message: String,

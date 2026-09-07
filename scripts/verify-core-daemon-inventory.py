@@ -266,6 +266,41 @@ def verify_active_registry(registry: Any) -> list[Finding]:
     else:
         core_daemons = core_daemon_matches[0]
         for field, expected in EXPECTED_ACTIVE_CORE_DAEMON_FIELDS.items():
+            if field == "issue_refs":
+                # The workstream owns a fixed set of issues. As an issue closes it
+                # moves from `issue_refs` to `completed_baseline_issue_refs`, so the
+                # invariant is the union, not the open list alone. A closed issue is
+                # a historical boundary reference and never a valid writer, so it
+                # must not remain in `issue_refs`.
+                open_refs = core_daemons.get("issue_refs")
+                completed_refs = core_daemons.get("completed_baseline_issue_refs", [])
+                if not isinstance(open_refs, list) or not isinstance(completed_refs, list):
+                    findings.append(
+                        _finding(
+                            "active_registry_identity",
+                            "workstream[id=core-daemons].issue_refs",
+                            "issue_refs and completed_baseline_issue_refs must be arrays",
+                        )
+                    )
+                    continue
+                overlap = sorted(set(open_refs) & set(completed_refs))
+                if overlap:
+                    findings.append(
+                        _finding(
+                            "active_registry_identity",
+                            "workstream[id=core-daemons].issue_refs",
+                            f"completed issues remain writable: {overlap}",
+                        )
+                    )
+                if sorted(set(open_refs) | set(completed_refs)) != sorted(expected):
+                    findings.append(
+                        _finding(
+                            "active_registry_identity",
+                            "workstream[id=core-daemons].issue_refs",
+                            "current core-daemons registry binding drifted",
+                        )
+                    )
+                continue
             if core_daemons.get(field) != expected:
                 findings.append(
                     _finding(

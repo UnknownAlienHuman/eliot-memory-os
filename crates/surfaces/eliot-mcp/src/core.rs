@@ -4,6 +4,9 @@ use std::collections::BTreeSet;
 
 use eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
 use eliot_receipts::{ArtifactBinding, ProofCeiling, SessionBinding};
+use eliot_source_assurance::{
+    AdmissionOutcome, OwnerSourceEvidence, SourceAssurance, SourceAssuranceError, canonical_digest,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -183,12 +186,43 @@ pub struct CompatibilityCorrelation {
 pub struct ForwardedRequest {
     /// Validated request with its canonical tool form.
     pub request: ApplicationRequest,
+    /// Original typed request, retained before compatibility normalization.
+    pub original_request: ApplicationRequest,
+    /// Canonical digest of the original typed request.
+    pub original_request_sha256: String,
+    /// Canonical digest of the original typed payload.
+    pub original_payload_sha256: String,
+    /// Canonical digest of the normalized typed payload.
+    pub canonical_payload_sha256: String,
     /// SHA-256 over canonical serialized request bytes, including identity.
     pub canonical_request_sha256: String,
     /// Trusted current operational binding resolved for this exact request.
     pub active_session_binding: ActiveSessionBinding,
     /// Compatibility-only transport correlation hint.
     pub compatibility_correlation_hint: Option<String>,
+    /// Owner-authenticated source evidence required by every semantic handoff.
+    pub source_assurance: ForwardedSourceAssurance,
+}
+
+/// Immutable source-assurance envelope attached immediately before semantic
+/// dispatch. Its owner identity is checked against the active binding.
+#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardedSourceAssurance {
+    pub owner_principal_ref: String,
+    pub evidence_ref: String,
+    pub request_id: String,
+    /// Exact typed pre-normalization request identity.
+    pub original_request_sha256: String,
+    pub idempotency_key: String,
+    pub cancellation_id: String,
+    pub session_id: String,
+    pub state_fence_digest: String,
+    pub canonical_request_sha256: String,
+    pub verifier_ref: Option<String>,
+    pub assurance: SourceAssurance,
+    pub policy: eliot_source_assurance::SourceAssurancePolicy,
+    pub assurance_digest: String,
 }
 
 /// Request sent to the trusted operational-binding resolver.
@@ -201,6 +235,7 @@ pub struct BindingResolutionRequest {
     pub claimed_session: SessionBinding,
     /// Exact request identity.
     pub request_id: String,
+    pub original_request_sha256: String,
     /// Exact retry identity.
     pub idempotency_key: String,
     /// Exact cancellation identity.
@@ -247,6 +282,20 @@ pub trait KernelGovernorPort {
         &self,
         request: &BindingResolutionRequest,
     ) -> Result<ActiveSessionBinding, PortFailure>;
+
+    /// Resolve owner-authenticated source evidence for this exact binding.
+    /// The safe default is an explicit plan gap; callers cannot receive a
+    /// synthesized trusted envelope.
+    fn resolve_source_assurance(
+        &self,
+        _request: &BindingResolutionRequest,
+        _binding: &ActiveSessionBinding,
+    ) -> Result<OwnerSourceEvidence, PortFailure> {
+        Err(PortFailure::PlanGap {
+            missing_capability: "source-assurance-owner-evidence".to_owned(),
+            reason: "owner-authenticated source evidence is not injected".to_owned(),
+        })
+    }
 
     /// Evaluate one validated and explicitly bound request.
     fn dispatch(&self, request: &ForwardedRequest) -> Result<PortProjection, PortFailure>;
@@ -473,6 +522,7 @@ impl McpCore {
         Self::execute_inner(port, transport, request, correlation.transport_session_hint)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn execute_inner<P: KernelGovernorPort + ?Sized>(
         port: &P,
         transport: TransportRequestContext,
@@ -481,7 +531,11 @@ impl McpCore {
     ) -> Result<McpResponse, BridgeError> {
         transport.validate()?;
         validate_application_request(&request)?;
+        let original_request = request.clone();
+        let original_request_sha256 = canonical_sha256(&original_request)?;
+        let original_payload_sha256 = canonical_sha256(&original_request.tool)?;
         request.tool = request.tool.canonicalized();
+        let canonical_payload_sha256 = canonical_sha256(&request.tool)?;
         let request_id = request
             .identity
             .request
@@ -497,6 +551,7 @@ impl McpCore {
             transport,
             claimed_session: request.session.clone(),
             request_id: request_id.clone(),
+            original_request_sha256: original_request_sha256.clone(),
             idempotency_key: idempotency_key.clone(),
             cancellation_id: request.identity.cancellation_id.clone(),
             canonical_request_sha256: canonical_request_sha256.clone(),
@@ -517,11 +572,36 @@ impl McpCore {
             Err(other) => return Err(BridgeError::Port(other)),
         };
         validate_active_session_binding(&resolution_request, &active_session_binding)?;
+        let owner_evidence =
+            match port.resolve_source_assurance(&resolution_request, &active_session_binding) {
+                Ok(evidence) => evidence,
+                Err(failure @ (PortFailure::PlanGap { .. } | PortFailure::Unsupported { .. })) => {
+                    return negative_response(
+                        &request_id,
+                        &idempotency_key,
+                        &canonical_request_sha256,
+                        &canonical_tool_name,
+                        compatibility_hint,
+                        failure,
+                    );
+                }
+                Err(other) => return Err(BridgeError::Port(other)),
+            };
+        let source_assurance = validate_owner_evidence(
+            &owner_evidence,
+            &resolution_request,
+            &active_session_binding,
+        )?;
         let forwarded = ForwardedRequest {
             request,
+            original_request,
+            original_request_sha256,
+            original_payload_sha256,
+            canonical_payload_sha256,
             canonical_request_sha256: canonical_request_sha256.clone(),
             active_session_binding,
             compatibility_correlation_hint: compatibility_hint.clone(),
+            source_assurance,
         };
         let projection = match port.dispatch(&forwarded) {
             Ok(value) => value,
@@ -662,6 +742,9 @@ pub enum BridgeError {
     /// A resource handle did not bind the exact canonical inline content.
     #[error("RESOURCE_BINDING_MISMATCH: resource does not bind canonical content bytes")]
     ResourceBindingMismatch,
+    /// Owner source evidence was absent, invalid, stale, or policy-rejected.
+    #[error("SOURCE_ASSURANCE_REJECTED: {reason}")]
+    SourceAssuranceRejected { reason: String },
 }
 
 impl BridgeError {
@@ -787,6 +870,97 @@ fn validate_active_session_binding(
         ));
     }
     Ok(())
+}
+
+fn validate_owner_evidence(
+    evidence: &OwnerSourceEvidence,
+    resolution: &BindingResolutionRequest,
+    binding: &ActiveSessionBinding,
+) -> Result<ForwardedSourceAssurance, BridgeError> {
+    evidence
+        .validate()
+        .map_err(|error| BridgeError::SourceAssuranceRejected {
+            reason: safe_assurance_error_reason(&error),
+        })?;
+    if evidence.owner_principal_ref != binding.principal_ref {
+        return Err(BridgeError::SourceAssuranceRejected {
+            reason: "owner evidence principal must match the authenticated active binding"
+                .to_owned(),
+        });
+    }
+    let state_fence_digest =
+        canonical_digest(&resolution.claimed_session.state_fence).map_err(|error| {
+            BridgeError::SourceAssuranceRejected {
+                reason: safe_assurance_error_reason(&error),
+            }
+        })?;
+    if evidence.request_id != resolution.request_id
+        || evidence.original_request_sha256 != resolution.original_request_sha256
+        || evidence.idempotency_key != resolution.idempotency_key
+        || evidence.cancellation_id != resolution.cancellation_id
+        || evidence.session_id != resolution.claimed_session.session_id.to_string()
+        || evidence.state_fence_digest != state_fence_digest
+        || evidence.canonical_request_sha256 != resolution.canonical_request_sha256
+    {
+        return Err(BridgeError::SourceAssuranceRejected {
+            reason: "owner evidence must bind the resolver's exact canonical request".to_owned(),
+        });
+    }
+    let outcome = evidence
+        .assurance
+        .admit_with_policy(&evidence.policy)
+        .map_err(|error| BridgeError::SourceAssuranceRejected {
+            reason: safe_assurance_error_reason(&error),
+        })?;
+    let AdmissionOutcome::Admitted { assurance_digest } = outcome else {
+        return Err(BridgeError::SourceAssuranceRejected {
+            reason: admission_outcome_reason(&outcome).to_owned(),
+        });
+    };
+    if evidence.verifier_ref != evidence.policy.required_verifier {
+        return Err(BridgeError::SourceAssuranceRejected {
+            reason: "owner evidence does not satisfy the policy verifier requirement".to_owned(),
+        });
+    }
+    Ok(ForwardedSourceAssurance {
+        owner_principal_ref: evidence.owner_principal_ref.clone(),
+        evidence_ref: evidence.evidence_ref.clone(),
+        request_id: evidence.request_id.clone(),
+        original_request_sha256: evidence.original_request_sha256.clone(),
+        idempotency_key: evidence.idempotency_key.clone(),
+        cancellation_id: evidence.cancellation_id.clone(),
+        session_id: evidence.session_id.clone(),
+        state_fence_digest: evidence.state_fence_digest.clone(),
+        canonical_request_sha256: evidence.canonical_request_sha256.clone(),
+        verifier_ref: evidence.verifier_ref.clone(),
+        assurance: evidence.assurance.clone(),
+        policy: evidence.policy.clone(),
+        assurance_digest,
+    })
+}
+
+fn admission_outcome_reason(outcome: &AdmissionOutcome) -> &'static str {
+    match outcome {
+        AdmissionOutcome::Admitted { .. } => "source assurance admitted",
+        AdmissionOutcome::NeedsRevalidation { .. } => "source assurance needs revalidation",
+        AdmissionOutcome::Missing { .. } => "source assurance is incomplete",
+        AdmissionOutcome::Conflicted { .. } => "source assurance has conflicting identities",
+        AdmissionOutcome::WrongScope { .. } => "source assurance scope does not match",
+        AdmissionOutcome::Quarantined { .. } => "source assurance is quarantined",
+    }
+}
+
+fn safe_assurance_error_reason(error: &SourceAssuranceError) -> String {
+    match error {
+        SourceAssuranceError::MissingField(field) => {
+            format!("required assurance field missing: {field}")
+        }
+        SourceAssuranceError::InvalidDigest(field) => format!("assurance digest invalid: {field}"),
+        SourceAssuranceError::DuplicateSourceId(_) => "duplicate source identity".to_owned(),
+        SourceAssuranceError::NonCanonicalSourceSet => "source set is not canonical".to_owned(),
+        SourceAssuranceError::UnsupportedSchema(_) => "unsupported assurance schema".to_owned(),
+        SourceAssuranceError::Json(_) => "assurance encoding failed".to_owned(),
+    }
 }
 
 fn validate_projection(
