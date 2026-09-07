@@ -227,15 +227,6 @@ fn request(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let root_effects = if specs.iter().any(|spec| spec.write) {
-        BTreeSet::from([
-            EffectKind::Observe,
-            EffectKind::ReadWorkspace,
-            EffectKind::WriteCandidate,
-        ])
-    } else {
-        BTreeSet::from([EffectKind::Observe, EffectKind::ReadWorkspace])
-    };
     Ok(StaffingPlanRequest {
         candidate_id: CandidateId::new(format!("candidate-{tag}"))?,
         launch: AgentLaunchRequest {
@@ -252,7 +243,7 @@ fn request(
             privacy_profile: "PRIVATE".to_owned(),
             effect_ceiling: EffectCeiling {
                 scope_ref: "task-scope".to_owned(),
-                allowed: root_effects,
+                allowed: BTreeSet::from([EffectKind::WriteCandidate]),
                 max_external_effects: 0,
             },
             max_depth: 3,
@@ -368,13 +359,12 @@ fn result_submission(
             attempt_id: lane.attempt_id.clone(),
             disposition,
             artifacts: Vec::<ArtifactId>::new(),
-            evidence_refs: if disposition == ResultDisposition::VerifiedComplete {
+            evidence_refs: if disposition == ResultDisposition::CandidateSucceeded {
                 vec!["verifier-evidence".to_owned()]
             } else {
                 Vec::new()
             },
             proposed_effects: Vec::new(),
-            effect_receipts: Vec::new(),
             unresolved_questions: Vec::new(),
             usage: usage(),
             actual_route: ActualRouteReceipt {
@@ -823,45 +813,6 @@ fn live_capacity_evidence_limits_admission_and_reassignment() -> TestResult {
 }
 
 #[test]
-fn child_plan_cannot_widen_parent_effect_ceiling() -> TestResult {
-    let mut coordinator = coordinator(config(4, 4), &["proof-admission-effect-parent"])?;
-    let parent = plan_and_admit(
-        &mut coordinator,
-        "effect-parent",
-        &[LaneSpec {
-            work: "effect-work-parent",
-            role: "effect-role-parent",
-            route: "a",
-            scope: None,
-            write: false,
-            priority: 1,
-        }],
-        None,
-    )?;
-    let parent_attempt = parent.admitted_lanes[0].attempt_id.clone();
-    let events_before = coordinator.events().len();
-
-    assert!(matches!(
-        coordinator.plan(request(
-            "effect-child",
-            &[LaneSpec {
-                work: "effect-work-child",
-                role: "effect-role-child",
-                route: "b",
-                scope: Some("effect-child-scope"),
-                write: true,
-                priority: 1,
-            }],
-            Some(parent_attempt),
-        )?),
-        Err(CoordinatorError::ProviderContract(message))
-            if message.contains("authority is not sufficient")
-    ));
-    assert_eq!(coordinator.events().len(), events_before);
-    Ok(())
-}
-
-#[test]
 fn explicit_peer_delivery_occurs_only_at_next_boundary() -> TestResult {
     let mut coordinator = coordinator(config(4, 4), &["proof-admission-peer"])?;
     let admitted = plan_and_admit(
@@ -1017,10 +968,13 @@ fn descendant_closure_matches_runtime_before_parent_complete_candidate() -> Test
     coordinator.start_attempt(child_context.clone(), child_lane.attempt_id.clone())?;
     coordinator.submit_result(
         child_context,
-        result_submission("child", &child_lane, ResultDisposition::VerifiedComplete)?,
+        result_submission("child", &child_lane, ResultDisposition::CandidateSucceeded)?,
     )?;
-    let parent_result =
-        result_submission("parent", &parent_lane, ResultDisposition::VerifiedComplete)?;
+    let parent_result = result_submission(
+        "parent",
+        &parent_lane,
+        ResultDisposition::CandidateSucceeded,
+    )?;
     assert_eq!(
         coordinator.submit_result(parent_context.clone(), parent_result.clone()),
         Err(CoordinatorError::IncompleteDescendantClosure)
@@ -1403,89 +1357,6 @@ fn coordinator_case_16_snapshot_v3_and_v4_legacy_fence_reject_before_replay() ->
 }
 
 #[test]
-fn plan_exact_replay_returns_existing_without_new_event_before_ready_backpressure() -> TestResult {
-    let mut coordinator = coordinator(
-        CoordinatorConfig {
-            max_ready_items: 1,
-            max_admitted_attempts: 4,
-            max_active_per_route: 4,
-            capacity_identity: "capacity-a".to_owned(),
-            capacity_revision: rev("capacity-rev-1"),
-        },
-        &[],
-    )?;
-    let spec = LaneSpec {
-        work: "work-replay",
-        role: "reader-replay",
-        route: "a",
-        scope: None,
-        write: false,
-        priority: 1,
-    };
-    let original = request("replay", std::slice::from_ref(&spec), None)?;
-    let first = coordinator.plan(original.clone())?;
-    assert_eq!(coordinator.events().len(), 1);
-    let second = coordinator.plan(original.clone())?;
-    assert_eq!(second, first);
-    assert_eq!(coordinator.events().len(), 1);
-    Ok(())
-}
-
-#[test]
-fn plan_same_identity_changed_bytes_fails_identity_conflict_before_ready_backpressure() -> TestResult
-{
-    let mut coordinator = coordinator(
-        CoordinatorConfig {
-            max_ready_items: 1,
-            max_admitted_attempts: 4,
-            max_active_per_route: 4,
-            capacity_identity: "capacity-a".to_owned(),
-            capacity_revision: rev("capacity-rev-1"),
-        },
-        &[],
-    )?;
-    let spec = LaneSpec {
-        work: "work-conflict",
-        role: "reader-conflict",
-        route: "a",
-        scope: None,
-        write: false,
-        priority: 1,
-    };
-    let original = request("conflict", std::slice::from_ref(&spec), None)?;
-    coordinator.plan(original.clone())?;
-    assert_eq!(coordinator.events().len(), 1);
-    let mut changed = original.clone();
-    changed.task_revision = "task-rev-conflict-changed".to_owned();
-    assert_eq!(
-        coordinator.plan(changed),
-        Err(CoordinatorError::IdentityConflict("candidate_id"))
-    );
-    assert_eq!(coordinator.events().len(), 1);
-    let fresh = request(
-        "conflict-fresh",
-        &[LaneSpec {
-            work: "work-conflict-fresh",
-            role: "reader-conflict-fresh",
-            route: "a",
-            scope: None,
-            write: false,
-            priority: 1,
-        }],
-        None,
-    )?;
-    assert_eq!(
-        coordinator.plan(fresh),
-        Err(CoordinatorError::Backpressure {
-            active: 1,
-            requested: 1,
-            limit: 1
-        })
-    );
-    Ok(())
-}
-
-#[test]
 fn coordinator_case_17_candidate_disposition_is_candidate_only_and_capped() -> TestResult {
     let mut coordinator = coordinator(
         config(2, 2),
@@ -1750,5 +1621,127 @@ fn coordinator_case_20_parent_closure_is_candidate_only_and_requires_descendant_
     let source = include_str!("core.rs");
     assert!(!source.contains("FinishDecision"));
     assert!(!source.contains("CloseCompleted"));
+    Ok(())
+}
+
+#[test]
+fn child_plan_cannot_widen_parent_effect_ceiling() -> TestResult {
+    let mut coordinator = coordinator(config(4, 4), &["proof-admission-effect-parent"])?;
+    let parent = plan_and_admit(
+        &mut coordinator,
+        "effect-parent",
+        &[LaneSpec {
+            work: "effect-work-parent",
+            role: "effect-role-parent",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let parent_attempt = parent.admitted_lanes[0].attempt_id.clone();
+    let events_before = coordinator.events().len();
+
+    assert!(matches!(
+        coordinator.plan(request(
+            "effect-child",
+            &[LaneSpec {
+                work: "effect-work-child",
+                role: "effect-role-child",
+                route: "b",
+                scope: Some("effect-child-scope"),
+                write: true,
+                priority: 1,
+            }],
+            Some(parent_attempt),
+        )?),
+        Err(CoordinatorError::ProviderContract(message))
+            if message.contains("authority is not sufficient")
+    ));
+    assert_eq!(coordinator.events().len(), events_before);
+    Ok(())
+}
+
+#[test]
+fn plan_exact_replay_returns_existing_without_new_event_before_ready_backpressure() -> TestResult {
+    let mut coordinator = coordinator(
+        CoordinatorConfig {
+            max_ready_items: 1,
+            max_admitted_attempts: 4,
+            max_active_per_route: 4,
+            capacity_identity: "capacity-a".to_owned(),
+            capacity_revision: rev("capacity-rev-1"),
+        },
+        &[],
+    )?;
+    let spec = LaneSpec {
+        work: "work-replay",
+        role: "reader-replay",
+        route: "a",
+        scope: None,
+        write: false,
+        priority: 1,
+    };
+    let original = request("replay", std::slice::from_ref(&spec), None)?;
+    let first = coordinator.plan(original.clone())?;
+    assert_eq!(coordinator.events().len(), 1);
+    let second = coordinator.plan(original.clone())?;
+    assert_eq!(second, first);
+    assert_eq!(coordinator.events().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn plan_same_identity_changed_bytes_fails_identity_conflict_before_ready_backpressure() -> TestResult
+{
+    let mut coordinator = coordinator(
+        CoordinatorConfig {
+            max_ready_items: 1,
+            max_admitted_attempts: 4,
+            max_active_per_route: 4,
+            capacity_identity: "capacity-a".to_owned(),
+            capacity_revision: rev("capacity-rev-1"),
+        },
+        &[],
+    )?;
+    let spec = LaneSpec {
+        work: "work-conflict",
+        role: "reader-conflict",
+        route: "a",
+        scope: None,
+        write: false,
+        priority: 1,
+    };
+    let original = request("conflict", std::slice::from_ref(&spec), None)?;
+    coordinator.plan(original.clone())?;
+    assert_eq!(coordinator.events().len(), 1);
+    let mut changed = original.clone();
+    changed.task_revision = "task-rev-conflict-changed".to_owned();
+    assert_eq!(
+        coordinator.plan(changed),
+        Err(CoordinatorError::IdentityConflict("candidate_id"))
+    );
+    assert_eq!(coordinator.events().len(), 1);
+    let fresh = request(
+        "conflict-fresh",
+        &[LaneSpec {
+            work: "work-conflict-fresh",
+            role: "reader-conflict-fresh",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    assert_eq!(
+        coordinator.plan(fresh),
+        Err(CoordinatorError::Backpressure {
+            active: 1,
+            requested: 1,
+            limit: 1
+        })
+    );
     Ok(())
 }

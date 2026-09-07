@@ -1502,6 +1502,8 @@ mod tests {
             valid_until: "later".into(),
         };
         assert!(envelope.validate().is_ok());
+        Ok(())
+    }
 
     #[test]
     fn api_case_13_candidate_result_is_structurally_candidate_only() -> TestResult {
@@ -1592,7 +1594,7 @@ mod tests {
     }
 
     #[test]
-    fn api_case_11_candidate_evidence_does_not_raise_proof_ceiling() -> TestResult {
+    fn api_case_14_candidate_evidence_does_not_raise_proof_ceiling() -> TestResult {
         let mut result = AgentResult {
             attempt_id: AttemptId::new("attempt-case-11")?,
             disposition: ResultDisposition::CandidateSucceeded,
@@ -1643,7 +1645,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::unnecessary_wraps)]
-    fn api_case_12_serialized_forgery_is_rejected() -> TestResult {
+    fn api_case_15_serialized_forgery_is_rejected() -> TestResult {
         // Forged legacy JSON attempting to claim completion.
         let forged = serde_json::json!({
             "attempt_id": "attempt-case-12",
