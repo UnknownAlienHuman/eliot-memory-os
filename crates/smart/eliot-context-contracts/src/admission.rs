@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::ArtifactId;
+use eliot_contracts::{ArtifactId, ContractVersion, canonical_json_bytes, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +68,9 @@ impl DecisionSafetyFloor {
             }
         }
         if seen != expected {
+            return Err(ContextError::MissingFloor);
+        }
+        if self.mandatory_roles.is_empty() || self.mandatory_roles.len() > 64 {
             return Err(ContextError::MissingFloor);
         }
         let role_set: BTreeSet<_> = self.mandatory_roles.iter().collect();
@@ -282,7 +285,38 @@ pub struct AdmittedContextSet {
     pub economy: ContextEconomyReceipt,
 }
 
+#[derive(Serialize)]
+struct CanonicalAdmittedPayload<'a> {
+    schema_version: ContractVersion,
+    binding: &'a ContextBinding,
+    records: &'a [AdmittedAtom],
+}
+
 impl AdmittedContextSet {
+    fn canonical_payload(&self) -> CanonicalAdmittedPayload<'_> {
+        CanonicalAdmittedPayload {
+            schema_version: crate::CONTEXT_CONTRACT_VERSION,
+            binding: &self.binding,
+            records: &self.records,
+        }
+    }
+
+    /// Compute the digest of the ordered admitted payload used for completion.
+    pub fn canonical_payload_digest(&self) -> Result<String, ContextError> {
+        self.validate()?;
+        let bytes = canonical_json_bytes(&self.canonical_payload())
+            .map_err(|_| ContextError::InvalidField("admitted.canonical_payload"))?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Return the exact UTF-8 length of the ordered admitted payload.
+    pub fn canonical_payload_utf8_bytes(&self) -> Result<u64, ContextError> {
+        self.validate()?;
+        let bytes = canonical_json_bytes(&self.canonical_payload())
+            .map_err(|_| ContextError::InvalidField("admitted.canonical_payload"))?;
+        u64::try_from(bytes.len()).map_err(|_| ContextError::Overflow)
+    }
+
     /// Validate candidate/admitted identity conservation and floor outcome.
     pub fn validate(&self) -> Result<(), ContextError> {
         self.binding.validate()?;
@@ -298,37 +332,38 @@ impl AdmittedContextSet {
             {
                 return Err(ContextError::Duplicate("admitted.atom_id"));
             }
-            let floor_member = self
+            if let Some(floor_member) = self
                 .floor
                 .members
                 .iter()
                 .find(|member| member.atom_id == record.candidate.atom_id)
-                .ok_or(ContextError::DenominatorMismatch)?;
-            if record.candidate.provider_role.role != floor_member.role
-                || record.candidate.availability != floor_member.availability
             {
-                return Err(ContextError::IdentityConflict);
+                if record.candidate.provider_role.role != floor_member.role
+                    || record.candidate.availability != floor_member.availability
+                {
+                    return Err(ContextError::IdentityConflict);
+                }
+                if let Some(measurement) = &floor_member.measurement
+                    && record.candidate.measurement != *measurement
+                {
+                    return Err(ContextError::IdentityConflict);
+                }
+                let candidate_dependencies: BTreeSet<_> =
+                    record.candidate.dependencies.iter().cloned().collect();
+                let floor_dependencies: BTreeSet<_> =
+                    floor_member.required_dependencies.iter().cloned().collect();
+                if candidate_dependencies != floor_dependencies {
+                    return Err(ContextError::IdentityConflict);
+                }
             }
-            if let Some(measurement) = &floor_member.measurement
-                && record.candidate.measurement != *measurement
-            {
-                return Err(ContextError::IdentityConflict);
-            }
-            let provider = self
+            if let Some(provider) = self
                 .floor
                 .providers
                 .dispositions
                 .iter()
                 .find(|disposition| disposition.slot == record.candidate.provider_role)
-                .ok_or(ContextError::DenominatorMismatch)?;
-            if record.candidate.availability != provider.state {
-                return Err(ContextError::IdentityConflict);
-            }
-            let candidate_dependencies: BTreeSet<_> =
-                record.candidate.dependencies.iter().cloned().collect();
-            let floor_dependencies: BTreeSet<_> =
-                floor_member.required_dependencies.iter().cloned().collect();
-            if candidate_dependencies != floor_dependencies {
+                && record.candidate.availability != provider.state
+            {
                 return Err(ContextError::IdentityConflict);
             }
             if !matches!(
@@ -375,11 +410,50 @@ impl AdmittedContextSet {
     }
 
     /// Return a complete result only if the floor is complete.
-    pub fn outcome(&self) -> Result<crate::ContextOutcome<Self>, ContextError> {
+    pub fn outcome(
+        &self,
+        measurement: &crate::SerializedContextMeasurement,
+    ) -> Result<crate::ContextOutcome<Self>, ContextError> {
         self.validate()?;
         if let Some(incomplete) = self.floor.incomplete()? {
             Ok(crate::ContextOutcome::Incomplete(incomplete))
         } else {
+            measurement.validate()?;
+            if measurement.context != self.binding {
+                return Err(ContextError::InvalidFence);
+            }
+            if measurement.envelope_digest != self.canonical_payload_digest()?
+                || measurement.rendered_utf8_bytes != self.canonical_payload_utf8_bytes()?
+            {
+                return Err(ContextError::IdentityConflict);
+            }
+            if self.economy.measurement.digest != measurement.envelope_digest
+                || self.economy.measurement.serializer != measurement.serializer_id
+            {
+                return Err(ContextError::IdentityConflict);
+            }
+            let allocations = &self.economy.allocations;
+            let capacity = &self.floor.capacity;
+            if allocations.route_capacity != capacity.route_capacity
+                || allocations.fixed_overhead != capacity.fixed_overhead
+                || allocations.output_reserve != capacity.output_reserve
+                || allocations.review_reserve != capacity.review_reserve
+                || measurement.fixed_overhead != capacity.fixed_overhead
+                || measurement.output_reserve != capacity.output_reserve
+                || measurement.review_reserve != capacity.review_reserve
+            {
+                return Err(ContextError::EconomyMismatch);
+            }
+            let admitted_cost = allocations
+                .admitted_required
+                .checked_add(allocations.admitted_optional)
+                .ok_or(ContextError::Overflow)?;
+            if measurement.rendered_utf8_bytes != admitted_cost {
+                return Err(ContextError::EconomyMismatch);
+            }
+            if !measurement.proves_fit(capacity.route_capacity)? {
+                return Err(ContextError::CapacityExceeded);
+            }
             Ok(crate::ContextOutcome::Complete(self.clone()))
         }
     }

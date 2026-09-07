@@ -37,6 +37,13 @@ fn provider_role() -> ProviderRole {
     }
 }
 
+fn optional_provider_role() -> ProviderRole {
+    ProviderRole {
+        provider: ProviderId::new("fixture-provider").expect("fixture provider"),
+        role: SemanticRole::Optional,
+    }
+}
+
 fn measurement_ref() -> MeasurementRef {
     MeasurementRef {
         digest: digest(),
@@ -154,6 +161,10 @@ fn admitted_set(candidate: ContextCandidate) -> AdmittedContextSet {
     let atom_id = candidate.atom_id.clone();
     let role = candidate.provider_role.role;
     let measurement = candidate.measurement.clone();
+    let mut optional = candidate.clone();
+    optional.atom_id = id("optional-atom");
+    optional.provider_role = optional_provider_role();
+    optional.source.snapshot_id = id("optional-snapshot");
     let provider_denominator = denominator(AtomAvailability::PresentCurrent);
     let floor = DecisionSafetyFloor {
         binding: context.clone(),
@@ -170,48 +181,76 @@ fn admitted_set(candidate: ContextCandidate) -> AdmittedContextSet {
         interpretation_dependencies: Vec::new(),
         rule_evidence: id("floor-rule"),
         capacity: CapacityLimits {
-            route_capacity: 100,
-            fixed_overhead: 0,
-            output_reserve: 0,
-            review_reserve: 0,
+            route_capacity: 100_000,
+            fixed_overhead: 2,
+            output_reserve: 3,
+            review_reserve: 4,
         },
     };
     let economy = ContextEconomyReceipt {
         binding: context.clone(),
         decision_id: context.decision_id.clone(),
-        measurement,
-        requested: vec![atom_id.clone()],
-        admitted: vec![atom_id.clone()],
+        measurement: MeasurementRef {
+            serializer: "serde-json".to_owned(),
+            ..measurement
+        },
+        requested: vec![atom_id.clone(), optional.atom_id.clone()],
+        admitted: vec![atom_id.clone(), optional.atom_id.clone()],
         displaced: Vec::new(),
         omissions: Vec::new(),
         applied_rule: id("economy-rule"),
         allocations: EconomyAllocations {
-            fixed_overhead: 0,
-            output_reserve: 0,
-            review_reserve: 0,
+            fixed_overhead: 2,
+            output_reserve: 3,
+            review_reserve: 4,
             admitted_required: 1,
-            admitted_optional: 0,
-            remaining_headroom: 99,
-            route_capacity: 100,
+            admitted_optional: 1,
+            remaining_headroom: 99_989,
+            route_capacity: 100_000,
         },
         receipt_digest: digest(),
     };
-    AdmittedContextSet {
+    let mut admitted = AdmittedContextSet {
         binding: context,
-        records: vec![AdmittedAtom {
-            candidate,
-            disposition: AdmissionDisposition::Include,
-            rule_evidence: id("admission-rule"),
-        }],
-        admissions: vec![AdmissionRecord {
-            atom_id,
-            provider_role: provider_role(),
-            disposition: AdmissionDisposition::Include,
-            rule_evidence: id("admission-rule"),
-        }],
+        records: vec![
+            AdmittedAtom {
+                candidate,
+                disposition: AdmissionDisposition::Include,
+                rule_evidence: id("admission-rule"),
+            },
+            AdmittedAtom {
+                candidate: optional,
+                disposition: AdmissionDisposition::Include,
+                rule_evidence: id("optional-admission-rule"),
+            },
+        ],
+        admissions: vec![
+            AdmissionRecord {
+                atom_id,
+                provider_role: provider_role(),
+                disposition: AdmissionDisposition::Include,
+                rule_evidence: id("admission-rule"),
+            },
+            AdmissionRecord {
+                atom_id: id("optional-atom"),
+                provider_role: optional_provider_role(),
+                disposition: AdmissionDisposition::Include,
+                rule_evidence: id("optional-admission-rule"),
+            },
+        ],
         floor,
         economy,
-    }
+    };
+    let payload_bytes = admitted
+        .canonical_payload_utf8_bytes()
+        .expect("valid admitted payload");
+    admitted.economy.allocations.admitted_required = payload_bytes;
+    admitted.economy.allocations.admitted_optional = 0;
+    admitted.economy.allocations.remaining_headroom = 100_000 - 2 - 3 - 4 - payload_bytes;
+    admitted.economy.measurement.digest = admitted
+        .canonical_payload_digest()
+        .expect("valid admitted payload digest");
+    admitted
 }
 
 #[test]
@@ -292,6 +331,15 @@ fn denominator_and_floor_preserve_incomplete_observability() {
     incomplete
         .validate()
         .expect("incomplete result remains explicit");
+
+    let mut oversized_missing = floor.clone();
+    oversized_missing.capacity.route_capacity = 2;
+    let oversized = oversized_missing
+        .incomplete()
+        .expect("oversized missing floor remains explicit")
+        .expect("oversized missing floor cannot complete");
+    assert_eq!(oversized.missing, vec![id("atom")]);
+    assert_eq!(oversized.oversized, vec![id("atom")]);
 
     let mut unknown_floor = floor.clone();
     unknown_floor.providers.dispositions[0].state = AtomAvailability::Unknown;
@@ -404,7 +452,11 @@ fn admitted_view_preserves_protected_fields_and_rejects_injected_content() {
     let context = admitted.binding.clone();
     let recipe_digest = digest();
     let fence_digest = "b".repeat(64);
-    let rendered = vec![RenderedAtom::from_admitted(&admitted.records[0])];
+    let rendered: Vec<_> = admitted
+        .records
+        .iter()
+        .map(RenderedAtom::from_admitted)
+        .collect();
     let output_digest = ActiveUnderstandingView::canonical_output_digest(
         &context,
         &recipe_digest,
@@ -436,18 +488,41 @@ fn admitted_view_preserves_protected_fields_and_rejects_injected_content() {
     view.validate_against(&admitted)
         .expect("exact admitted projection");
 
+    let mut qualified = exact_measurement(&context);
+    qualified.envelope_digest = admitted
+        .canonical_payload_digest()
+        .expect("admitted payload digest");
+    qualified.rendered_utf8_bytes = admitted
+        .canonical_payload_utf8_bytes()
+        .expect("admitted payload bytes");
+    assert!(matches!(
+        admitted
+            .outcome(&qualified)
+            .expect("qualified complete outcome"),
+        ContextOutcome::Complete(_)
+    ));
+
     let mut stale = admitted_set(candidate());
     stale.floor.members[0].availability = AtomAvailability::Stale;
     stale.floor.providers.dispositions[0].state = AtomAvailability::Stale;
     stale.records[0].candidate.availability = AtomAvailability::Stale;
     assert!(matches!(
-        stale.outcome().expect("stale admitted set validates"),
+        stale
+            .outcome(&exact_measurement(&stale.binding))
+            .expect("stale admitted set validates"),
         ContextOutcome::Incomplete(_)
     ));
     let mut mismatched = admitted_set(candidate());
     mismatched.floor.members[0].availability = AtomAvailability::Stale;
     mismatched.floor.providers.dispositions[0].state = AtomAvailability::Stale;
     assert_eq!(mismatched.validate(), Err(ContextError::IdentityConflict));
+
+    let mut stale_status = candidate();
+    stale_status.status = EpistemicStatus::Stale;
+    assert_eq!(
+        stale_status.validate(),
+        Err(ContextError::InvalidField("candidate.availability"))
+    );
 
     let mut injected = view.clone();
     let mut extra = injected.rendered[0].clone();

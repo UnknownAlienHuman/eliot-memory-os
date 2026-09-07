@@ -45,6 +45,8 @@ pub struct ContextEconomyReceipt {
     pub binding: ContextBinding,
     pub decision_id: DecisionId,
     pub measurement: MeasurementRef,
+    /// Submitted candidate IDs; expected-but-absent floor material remains in
+    /// the typed floor gap and is not fabricated into this denominator.
     pub requested: Vec<ArtifactId>,
     pub admitted: Vec<ArtifactId>,
     pub displaced: Vec<ArtifactId>,

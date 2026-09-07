@@ -219,7 +219,6 @@ impl DecisionContextIncomplete {
             .iter()
             .chain(self.stale.iter())
             .chain(self.blocked.iter())
-            .chain(self.oversized.iter())
             .chain(self.unavailable.iter())
             .chain(self.omitted.iter())
             .chain(self.exhausted.iter())
@@ -231,10 +230,16 @@ impl DecisionContextIncomplete {
                 return Err(ContextError::Duplicate("incomplete.gap_ids"));
             }
         }
+        let mut oversized = std::collections::BTreeSet::new();
+        for id in &self.oversized {
+            if !oversized.insert(id.clone()) {
+                return Err(ContextError::Duplicate("incomplete.oversized"));
+            }
+        }
         let mut provider_gaps = std::collections::BTreeSet::new();
         for gap in &self.provider_gaps {
             gap.validate()?;
-            if !provider_gaps.insert((gap.slot.clone(), gap.state)) {
+            if !provider_gaps.insert(gap.slot.clone()) {
                 return Err(ContextError::Duplicate("incomplete.provider_gaps"));
             }
         }

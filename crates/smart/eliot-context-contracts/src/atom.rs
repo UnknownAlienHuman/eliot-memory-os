@@ -501,6 +501,14 @@ impl ContextCandidate {
         {
             return Err(ContextError::InvalidField("candidate.assertability"));
         }
+        if self.availability == AtomAvailability::PresentCurrent
+            && matches!(
+                self.status,
+                EpistemicStatus::Stale | EpistemicStatus::Superseded
+            )
+        {
+            return Err(ContextError::InvalidField("candidate.availability"));
+        }
         let mut dependencies = std::collections::BTreeSet::new();
         for dependency in &self.dependencies {
             if !dependencies.insert(dependency.clone()) {

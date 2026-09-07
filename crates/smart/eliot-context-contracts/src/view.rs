@@ -24,6 +24,7 @@ pub struct RenderedAtom {
     pub source_owner: crate::ProviderId,
     pub source_revision: String,
     pub source_digest: String,
+    pub source_predecessor: Option<ArtifactId>,
     pub provider: crate::ProviderId,
     pub representation: crate::AtomRepresentation,
     pub availability: AtomAvailability,
@@ -49,6 +50,7 @@ impl RenderedAtom {
             source_owner: atom.candidate.source.owner.clone(),
             source_revision: atom.candidate.source.revision.clone(),
             source_digest: atom.candidate.source.content_sha256.clone(),
+            source_predecessor: atom.candidate.source.predecessor.clone(),
             provider: atom.candidate.provider_role.provider.clone(),
             representation: atom.candidate.representation.clone(),
             availability: atom.candidate.availability,
@@ -267,6 +269,7 @@ impl ActiveUnderstandingView {
                 || rendered.source_owner != record.candidate.source.owner
                 || rendered.source_revision != record.candidate.source.revision
                 || rendered.source_digest != record.candidate.source.content_sha256
+                || rendered.source_predecessor != record.candidate.source.predecessor
                 || rendered.representation != record.candidate.representation
                 || rendered.availability != record.candidate.availability
                 || rendered.protected != record.candidate.protected
