@@ -179,7 +179,6 @@ pub struct ProviderCallReservation {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct ProviderCallLedger {
     pub budgets: Vec<ProviderCallBudgetState>,
     pub reservations: Vec<ProviderCallReservation>,
