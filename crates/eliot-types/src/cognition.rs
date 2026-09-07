@@ -464,18 +464,15 @@ pub struct AutonomyRunContract {
     pub user_goal: String,
     pub acceptance_items: Vec<String>,
     pub contour_route_policy_ref: String,
-    #[serde(default)]
     pub allowed_projects: Vec<ProjectId>,
     pub max_work_items: u32,
     pub max_active_agents: u32,
     pub max_model_invocations: u32,
-    #[serde(default = "default_max_tool_calls")]
     pub max_tool_calls: u32,
     pub max_wall_time_seconds: u64,
     pub cost_or_token_budget: Option<String>,
     pub allowed_paths: Vec<String>,
     pub forbidden_paths: Vec<String>,
-    #[serde(default)]
     pub forbidden_effects: Vec<String>,
     pub allowed_risk_tiers: Vec<String>,
     pub required_verifiers: Vec<String>,
@@ -483,7 +480,6 @@ pub struct AutonomyRunContract {
     pub pause_conditions: Vec<String>,
     pub stop_conditions: Vec<String>,
     pub fallback_routes: Vec<ContourPreferredRoute>,
-    #[serde(default = "default_recovery_policy_ref")]
     pub recovery_policy_ref: String,
     pub policy_snapshot_id: String,
     pub created_by: String,
@@ -657,14 +653,6 @@ pub struct AutonomyRecoveryRecord {
     pub evidence_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_receipt: Option<WriteReceiptRef>,
-}
-
-const fn default_max_tool_calls() -> u32 {
-    64
-}
-
-fn default_recovery_policy_ref() -> String {
-    "recovery-policy:legacy-safe-default".to_owned()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

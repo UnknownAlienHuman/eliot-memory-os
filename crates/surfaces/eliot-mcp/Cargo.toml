@@ -10,6 +10,7 @@ description = "Stateless MCP contract bridge over ELIOT Kernel and Governor port
 eliot-protocol.workspace = true
 eliot-receipts.workspace = true
 eliot-security-contracts.workspace = true
+eliot-source-assurance.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
