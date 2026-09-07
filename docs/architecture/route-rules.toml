@@ -217,7 +217,7 @@ max_required_bytes = 458752
 id = "repository-root"
 description = "Root-level repository identity, licensing, tool pins, and contributor entry surfaces."
 path_globs = [
-  ".gitattributes", ".gitignore", "LICENSE", "README.md", "WORKFLOW.md",
+  ".gitattributes", ".gitignore", "LICENSE", "README.md", "START.md", "WORKFLOW.md",
   ".typos.toml", "Cargo.toml", "Cargo.lock", "Justfile", "deny.toml", "mcpls.toml", "rust-toolchain.toml", "tool-versions.json",
 ]
 topic_keywords = ["repository root", "license", "toolchain pin"]
