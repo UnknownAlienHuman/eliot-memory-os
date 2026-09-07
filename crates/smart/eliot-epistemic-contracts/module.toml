@@ -18,7 +18,7 @@ owned_mutable_state = []
 allowed_effects = []
 inputs = ["EvidenceEnvelope references", "StateFence", "WorkScope identity"]
 outputs = ["PositionRequest", "CurrentEpistemicPosition", "ProvenanceClosure", "AssumptionRecord", "InvestigationRequirement"]
-depends_on = ["eliot-contracts", "eliot-evidence"]
+depends_on = ["eliot-contracts", "eliot-evidence", "eliot-receipts"]
 consumers = ["eliot-epistemic", "eliot-context-candidates", "Dreamer handlers"]
 non_goals = ["resolve a position", "rank evidence", "retrieve sources", "persist epistemic state"]
 invariants = ["Unknown, assumed, conflicted and stale are distinct", "provenance and fence remain exact", "verifier competence is explicit", "Investigation is a typed outcome, not prose"]
@@ -26,7 +26,7 @@ failure_behavior = "Reject malformed or version-incompatible values without inve
 proof_surface = ["schema round-trip", "unknown-field rejection", "version compatibility", "fence/provenance fixtures"]
 replacement_boundary = "wire contract only; resolver algorithms remain independently replaceable"
 split_trigger = "a contract family acquires an independent version or consumer set"
-rust_contract_dependencies = ["eliot-contracts", "eliot-evidence"]
+rust_contract_dependencies = ["eliot-contracts", "eliot-evidence", "eliot-receipts"]
 
 [[donor]]
 path = "crates/smart/eliot-epistemic/src/lib.rs"
@@ -49,3 +49,20 @@ integration_owner = "cognitive-wave-01-integrator"
 implementation_language = "Rust 2024"
 required_verification = ["schema proof", "old-resolver migration fixtures", "affected context edge proof"]
 workspace_admission = "forbidden until src/lib.rs, package proof, resolver edge proof and integration-owner review"
+
+# Machine-checked completion gate, read by `scripts/verify-work-unit.py`.
+# `cargo fmt|test|clippy` all pass on an empty crate, so they cannot tell a
+# finished cell from an unstarted one. This table can.
+#
+# These are the floors every cell shares. The owning work unit tightens them
+# with `required_exports` and `required_tests` taken from its own brief, so a
+# reviewer decides on one exit code instead of reading prose criteria.
+[acceptance]
+min_source_lines = 200
+min_public_items = 6
+min_tests = 5
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = []
+required_tests = []
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
