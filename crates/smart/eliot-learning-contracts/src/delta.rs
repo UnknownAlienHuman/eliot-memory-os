@@ -377,6 +377,12 @@ impl AttemptLearningDeltaCandidate {
         view: &crate::state_view::CampaignLearningStateView,
     ) -> Result<(), LearningContractError> {
         self.validate()?;
+        view.binding.validate()?;
+        if digest_without_field(view, "canonical_digest")? != view.canonical_digest {
+            return Err(LearningContractError::DigestMismatch {
+                field: "view.canonical_digest",
+            });
+        }
         if self.binding != view.binding
             || self.target != view.target
             || self.base_view_digest != view.canonical_digest

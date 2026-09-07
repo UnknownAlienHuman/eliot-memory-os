@@ -513,9 +513,12 @@ impl CampaignLearningStateView {
                         .members
                         .iter()
                         .all(|member| member.disposition == SlotDisposition::Current);
+                    let current_projection = projection.disposition == SlotDisposition::Current
+                        && (spec.declared_members.is_empty() || members_current);
                     let empty_owner_declaration = spec.declared_members.is_empty()
-                        && projection.disposition == SlotDisposition::KnownEmpty;
-                    if !members_current && !empty_owner_declaration {
+                        && projection.disposition == SlotDisposition::KnownEmpty
+                        && !projection.evidence.is_empty();
+                    if !current_projection && !empty_owner_declaration {
                         return Err(LearningContractError::IncompleteCoverage);
                     }
                 }

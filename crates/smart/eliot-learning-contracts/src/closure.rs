@@ -168,6 +168,7 @@ impl ClosureHandoff {
         assessment: &crate::assessment::LearningAssessmentCandidate,
     ) -> Result<(), LearningContractError> {
         self.validate()?;
+        assessment.validate()?;
         if self.binding != assessment.binding
             || self.target.as_str() != assessment.target.as_str()
             || self.overlay_id != assessment.overlay_id

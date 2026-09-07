@@ -348,6 +348,26 @@ impl HarnessActivationReceiptCandidate {
         overlay: &crate::overlay::CampaignHarnessOverlayCandidate,
     ) -> Result<(), LearningContractError> {
         self.validate()?;
+        for stage in &self.stages {
+            if matches!(
+                stage.disposition,
+                StageDisposition::Observed | StageDisposition::Partial
+            ) && let Some(predecessor) = stage.predecessor
+            {
+                let predecessor_is_positive = self.stages.iter().any(|candidate| {
+                    candidate.stage == predecessor
+                        && matches!(
+                            candidate.disposition,
+                            StageDisposition::Observed | StageDisposition::Partial
+                        )
+                        && candidate.owner_receipt.is_some()
+                        && !candidate.evidence.is_empty()
+                });
+                if !predecessor_is_positive {
+                    return Err(LearningContractError::IncompatiblePredecessor);
+                }
+            }
+        }
         delta.validate_against_view(view)?;
         overlay.validate_against_view_and_deltas(view, std::slice::from_ref(delta))?;
         if self.binding != view.binding
