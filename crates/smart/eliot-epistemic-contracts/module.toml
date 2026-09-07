@@ -18,7 +18,7 @@ owned_mutable_state = []
 allowed_effects = []
 inputs = ["EvidenceEnvelope references", "StateFence", "WorkScope identity"]
 outputs = ["PositionRequest", "CurrentEpistemicPosition", "ProvenanceClosure", "AssumptionRecord", "InvestigationRequirement"]
-depends_on = ["eliot-contracts", "eliot-evidence"]
+depends_on = ["eliot-contracts", "eliot-evidence", "eliot-receipts"]
 consumers = ["eliot-epistemic", "eliot-context-candidates", "Dreamer handlers"]
 non_goals = ["resolve a position", "rank evidence", "retrieve sources", "persist epistemic state"]
 invariants = ["Unknown, assumed, conflicted and stale are distinct", "provenance and fence remain exact", "verifier competence is explicit", "Investigation is a typed outcome, not prose"]
@@ -26,7 +26,7 @@ failure_behavior = "Reject malformed or version-incompatible values without inve
 proof_surface = ["schema round-trip", "unknown-field rejection", "version compatibility", "fence/provenance fixtures"]
 replacement_boundary = "wire contract only; resolver algorithms remain independently replaceable"
 split_trigger = "a contract family acquires an independent version or consumer set"
-rust_contract_dependencies = ["eliot-contracts", "eliot-evidence"]
+rust_contract_dependencies = ["eliot-contracts", "eliot-evidence", "eliot-receipts"]
 
 [[donor]]
 path = "crates/smart/eliot-epistemic/src/lib.rs"
