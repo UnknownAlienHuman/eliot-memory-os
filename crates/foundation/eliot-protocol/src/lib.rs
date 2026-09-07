@@ -32,6 +32,15 @@ pub use pipe_name::{
     MAX_PIPE_SUFFIX_BYTES, PIPE_NAME_CONTRACT_NAME, PIPE_NAME_WIRE_REVISION,
 };
 
+pub mod dreamer_job;
+pub use dreamer_job::{
+    AdmissionRef, CancellationState, DURABLE_JOB_CANONICAL_ENCODING, DURABLE_JOB_CONTRACT_NAME,
+    DURABLE_JOB_CONTRACT_VERSION, DurableJobError, DurableJobRecord, DurableJobRequest,
+    DurableRequestIdentity, JobCapability, JobCheckpoint, JobLease, JobOperation, JobOperationKind,
+    JobOutcome, JobRole, JobState, JobSubmission, LeaseSelector, MutationDisposition,
+    MutationReconciliation, OpaqueContentRef, durable_job_contract_identity,
+};
+
 /// Stable identity of this protocol surface.
 pub const CONTRACT_NAME: &str = "eliot.foundation.protocol";
 /// Current EBP semantic contract revision.
