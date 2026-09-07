@@ -574,6 +574,34 @@ fn unknown_optional_is_visible_without_inventing_zero_cost() {
     assert_eq!(omission.measured_cost, None);
     assert_eq!(omission.reason, OmissionReason::UnknownMeasurement);
 
+    let mut unknown_state = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
+    unknown_state.candidates.candidates[1].availability = AtomAvailability::Unknown;
+    unknown_state.candidates.denominator.dispositions[1].state = AtomAvailability::Unknown;
+    unknown_state.recipe.denominator.dispositions[1].state = AtomAvailability::Unknown;
+    unknown_state.recipe.recipe_sha256 = unknown_state
+        .recipe
+        .canonical_policy_digest()
+        .expect("recipe digest");
+    unknown_state.measurements[1].binding.subject_digest =
+        canonical_digest(&unknown_state.candidates.candidates[1]).expect("unknown subject");
+    let result = admit_context(&unknown_state).expect("unknown availability is explicit");
+    let omission = result
+        .evidence
+        .omissions
+        .first()
+        .expect("unknown availability omission");
+    assert_eq!(omission.measured_cost, Some(1));
+    assert_eq!(omission.reason, OmissionReason::Policy);
+    assert!(matches!(
+        result
+            .evidence
+            .decisions
+            .iter()
+            .find(|decision| decision.atom_id == id("optional"))
+            .map(|decision| decision.disposition),
+        Some(AdmissionDisposition::Revalidate)
+    ));
+
     let mut unavailable = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     unavailable.candidates.candidates[1].availability = AtomAvailability::Unavailable;
     unavailable.candidates.denominator.dispositions[1].state = AtomAvailability::Unavailable;

@@ -17,6 +17,9 @@ use eliot_context_contracts::{
 };
 use eliot_receipts::ProofCeiling;
 
+const UNKNOWN_AVAILABILITY_CONSTRAINT: &str =
+    "candidate availability is unknown; admission deferred until availability is known";
+
 /// Admit one immutable candidate set under one exact recipe and route profile.
 ///
 /// Selection is floor-first and deterministic. Every candidate receives one
@@ -645,11 +648,15 @@ fn optional_failure_cause(
             )),
             AtomAvailability::Unknown => Some((
                 if candidate.atom_id == *root {
-                    OmissionReason::Unavailable
+                    OmissionReason::Policy
                 } else {
                     OmissionReason::Blocked
                 },
-                format!("candidate {} state is unknown", candidate.atom_id),
+                if candidate.atom_id == *root {
+                    UNKNOWN_AVAILABILITY_CONSTRAINT.to_owned()
+                } else {
+                    format!("candidate {} state is unknown", candidate.atom_id)
+                },
             )),
             AtomAvailability::Omitted => Some((
                 OmissionReason::Policy,
@@ -746,8 +753,8 @@ fn make_omission(
             "candidate is missing".to_owned(),
         ),
         AtomAvailability::Unknown => (
-            OmissionReason::UnknownMeasurement,
-            "candidate state is unknown".to_owned(),
+            OmissionReason::Policy,
+            UNKNOWN_AVAILABILITY_CONSTRAINT.to_owned(),
         ),
         AtomAvailability::KnownEmpty => (
             OmissionReason::Unavailable,
@@ -858,7 +865,14 @@ fn all_decisions(
                             }
                             OmissionReason::Privacy
                             | OmissionReason::Authority
-                            | OmissionReason::Policy => AdmissionDisposition::Suppress,
+                            | OmissionReason::Policy => {
+                                if omission.competing_constraint == UNKNOWN_AVAILABILITY_CONSTRAINT
+                                {
+                                    AdmissionDisposition::Revalidate
+                                } else {
+                                    AdmissionDisposition::Suppress
+                                }
+                            }
                         },
                     );
                 AdmissionRecord {
