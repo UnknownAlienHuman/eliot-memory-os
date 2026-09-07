@@ -282,4 +282,60 @@ mod tests {
         let extra = json.replace('}', r#","extra":1}"#);
         assert!(serde_json::from_str::<SemanticSequence>(&extra).is_err());
     }
+
+    #[test]
+    fn item_digest_combined_flood_fails_fast_on_targets() {
+        let fence = crate::registry::fence();
+        let hex = eliot_contracts::sha256_hex(b"model");
+        let receipt = crate::draft::valid_receipt(&hex, fence.clone());
+        let mut payload = crate::curation::sample_payload(crate::curation::CurationKind::Merge);
+        if let crate::curation::CurationPayload::Merge(inner) = &mut payload {
+            let mut targets = vec!["a".to_owned(), "b".to_owned(), "ab".to_owned()];
+            targets.extend((0..1022).map(|i| format!("t-{i:04}")));
+            inner.target_evidence.targets = targets;
+            let flood: Vec<String> = (0..1024).map(|i| format!("e-{i:04}")).collect();
+            inner.target_evidence.evidence_refs = flood;
+        }
+        let item = crate::draft::ValidatedCurationItem {
+            receipt,
+            kind_spelling: "merge".to_owned(),
+            family_spelling: "structure_repair".to_owned(),
+            payload,
+            denominator: crate::registry::TargetDenominator {
+                mode: crate::registry::AtomicityMode::AllOrNothing,
+                members: vec!["a".to_owned(), "b".to_owned(), "ab".to_owned()],
+                expected_total: 3,
+            },
+            source_digest: eliot_contracts::sha256_hex(b"source"),
+            task_id: "task-1".to_owned(),
+            scope_id: "scope-1".to_owned(),
+            state_fence: fence,
+            job_digest: "d".repeat(64),
+            requester: crate::job::Requester {
+                origin: crate::job::RequesterOrigin::Human,
+                principal: "alice".to_owned(),
+                session: None,
+            },
+            budget_note: "n".repeat(2 * 1024 * 1024),
+        };
+        let grounded = crate::draft::GroundedDreamDraft {
+            schema_version: 1,
+            job_id: "job-1".to_owned(),
+            draft_digest: hex,
+            residues: vec![crate::draft::ClaimResidue {
+                claim: "c".to_owned(),
+                state: crate::draft::SupportState::Partial,
+                detail: "d".to_owned(),
+            }],
+            coverage_note: "covers".to_owned(),
+        };
+        let err = item.item_digest(&grounded).expect_err("flood must fail");
+        assert!(matches!(
+            err,
+            crate::error::ContractViolation::OutOfBounds {
+                field: "targets",
+                ..
+            }
+        ));
+    }
 }

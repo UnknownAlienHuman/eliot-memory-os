@@ -24,7 +24,7 @@ use crate::{
     job::{DreamJobInput, Requester},
 };
 use crate::{
-    registry::{AtomicityMode, TargetDenominator, TypedCurationHandlerRequest},
+    registry::{AtomicityMode, TargetDenominator, TypedCurationHandlerRequest, parse_family},
     screen::ScreenBinding,
 };
 
@@ -511,6 +511,21 @@ impl ValidatedCurationItem {
     /// digest-normalized form: order-only target/evidence permutations share
     /// one digest, while scalar, sequence, or set drift stays visible.
     pub fn item_digest(&self, grounded: &GroundedDreamDraft) -> Result<String, ContractViolation> {
+        // Preflight bounds every hashed input before clone/sort/serialize.
+        // Intrinsic and binding-free checks only; no dedup or new tables.
+        // Valid inputs are untouched, so output identity is preserved.
+        self.receipt.validate()?;
+        self.payload.validate()?;
+        self.denominator.validate()?;
+        parse_kind(&self.kind_spelling).map(|_| ())?;
+        parse_family(&self.family_spelling).map(|_| ())?;
+        check_text(&self.task_id, "task_id", 256)?;
+        check_text(&self.scope_id, "scope_id", 256)?;
+        check_fence(&self.state_fence)?;
+        check_digest(&self.source_digest, "source_digest")?;
+        check_digest(&self.job_digest, "job_digest")?;
+        check_digest(&grounded.draft_digest, "draft_digest")?;
+        check_text(&grounded.job_id, "job_id", 256)?;
         let normalized = self.payload.normalized_for_digest();
         let receipt = ItemDigestReceipt {
             validator_contract: &self.receipt.validator_contract,
@@ -987,6 +1002,93 @@ mod tests {
         }
         assert!(probe.validate().is_ok());
         assert_eq!(probe.item_digest(grounded).expect("digest"), permuted);
+    }
+    #[test]
+    fn item_digest_preflight_rejects_unbounded_inputs() {
+        let receipt = valid_receipt(&model_wire_digest(&valid_model()), valid_fence());
+        let grounded = valid_grounded(&model_wire_digest(&valid_model()));
+        let mut job = crate::job::sample_job();
+        job.frozen_manifest_digest = sha256_hex(b"manifest");
+        let base = ValidatedCurationItem {
+            receipt: receipt.clone(),
+            kind_spelling: "merge".to_string(),
+            family_spelling: "structure_repair".to_string(),
+            payload: crate::curation::sample_payload(crate::curation::CurationKind::Merge),
+            denominator: TargetDenominator {
+                mode: crate::registry::AtomicityMode::AllOrNothing,
+                members: vec!["a".to_string(), "b".to_string(), "ab".to_string()],
+                expected_total: 3,
+            },
+            source_digest: sha256_hex(b"curation-source"),
+            task_id: "task-1".to_string(),
+            scope_id: "scope-1".to_string(),
+            state_fence: valid_fence(),
+            job_digest: job_digest_of(&job),
+            requester: crate::job::Requester {
+                origin: crate::job::RequesterOrigin::Human,
+                principal: "alice".to_owned(),
+                session: None,
+            },
+            budget_note: "within dimension".to_string(),
+        };
+        let mut p1 = base.clone();
+        if let crate::curation::CurationPayload::Merge(inner) = &mut p1.payload {
+            let mut targets = vec!["a".to_owned(), "b".to_owned(), "ab".to_owned()];
+            targets.extend((0..1022).map(|i| format!("t-{i:04}")));
+            inner.target_evidence.targets = targets;
+        }
+        let r1 = p1.item_digest(&grounded);
+        assert!(matches!(
+            r1,
+            Err(ContractViolation::OutOfBounds {
+                field: "targets",
+                ..
+            })
+        ));
+        let mut p2 = base.clone();
+        if let crate::curation::CurationPayload::Merge(inner) = &mut p2.payload {
+            let flood: Vec<String> = (0..1025).map(|i| format!("e-{i:04}")).collect();
+            inner.target_evidence.evidence_refs = flood;
+        }
+        let r2 = p2.item_digest(&grounded);
+        assert!(matches!(
+            r2,
+            Err(ContractViolation::OutOfBounds {
+                field: "evidence_refs",
+                ..
+            })
+        ));
+        let mut p3 = base.clone();
+        if let crate::curation::CurationPayload::Merge(inner) = &mut p3.payload {
+            let left = "l".repeat(257);
+            inner.left = left.clone();
+            inner.target_evidence.targets = vec![left, "b".to_owned(), "ab".to_owned()];
+        }
+        let r3 = p3.item_digest(&grounded);
+        assert!(matches!(
+            r3,
+            Err(ContractViolation::OutOfBounds { field: "left", .. })
+        ));
+        let mut g4 = grounded.clone();
+        g4.draft_digest = "ZZ".to_owned();
+        let r4 = base.item_digest(&g4);
+        assert!(matches!(
+            r4,
+            Err(ContractViolation::BindingMismatch {
+                field: "draft_digest",
+                ..
+            })
+        ));
+        let mut g5 = grounded.clone();
+        g5.job_id = "j".repeat(257);
+        let r5 = base.item_digest(&g5);
+        assert!(matches!(
+            r5,
+            Err(ContractViolation::OutOfBounds {
+                field: "job_id",
+                ..
+            })
+        ));
     }
     fn accept_probes_permuted_evidence(
         item: &ValidatedCurationItem,
