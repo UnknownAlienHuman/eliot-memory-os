@@ -1188,11 +1188,16 @@ class PackageManifestCases(unittest.TestCase):
         self.assertEqual('wu850_tiny', binding['name'])
         self.assertEqual('member', binding['member_kind'])
         desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
-        meta = {'packages': [{'name': 'runner', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': 'path+file:///repo#runner@0.1.0', 'version': '0.1.0', 'buildable': True}], 'workspace_members': ['path+file:///repo#runner@0.1.0'], 'excluded': []}
-        obs = r.bind_package_observation(descriptor=desc, metadata=meta)
-        self.assertEqual('runner', obs['name'])
-        self.assertEqual('member', obs['member_kind'])
-        self.assertTrue(obs['manifest_path'].endswith('/Cargo.toml'))
+        with tempfile.TemporaryDirectory() as directory:
+            troot = Path(directory)
+            (troot / 'Cargo.toml').write_text('[package]\nname = "runner"\nversion = "0.1.0"\n', newline='\n')
+            parent = r._safe_path(troot, 'Cargo.toml').parent.as_posix()
+            pid = f"path+file://{parent}#runner@0.1.0"
+            meta = {'packages': [{'name': 'runner', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [pid], 'excluded': []}
+            obs = r.bind_package_observation(descriptor=desc, metadata=meta, root=troot, manifest_rel='Cargo.toml')
+            self.assertEqual('runner', obs['name'])
+            self.assertEqual('member', obs['member_kind'])
+            self.assertTrue(obs['manifest_path'].endswith('/Cargo.toml'))
 
     # WORK_UNIT_CASE: 850/15
     def test_missing_duplicate_package_identity(self):
@@ -1205,12 +1210,18 @@ class PackageManifestCases(unittest.TestCase):
         with self.assertRaises(r.RunnerInputError):
             r.resolve_package_manifest(package_name='wu850_tiny', metadata_packages=dup)
         desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
-        missing_meta = {'packages': [{'name': 'other', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': 'path+file:///repo#other@0.1.0', 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
-        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_NOT_FOUND'):
-            r.bind_package_observation(descriptor=desc, metadata=missing_meta)
-        dup_meta = {'packages': [{'name': 'runner', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': 'path+file:///repo#runner@0.1.0', 'version': '0.1.0', 'buildable': True}, {'name': 'runner', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': 'path+file:///repo#runner@0.1.1', 'version': '0.1.1', 'buildable': True}], 'workspace_members': [], 'excluded': []}
-        with self.assertRaisesRegex(r.RunnerInputError, 'DUPLICATE_PACKAGE_IDENTITY'):
-            r.bind_package_observation(descriptor=desc, metadata=dup_meta)
+        with tempfile.TemporaryDirectory() as directory:
+            troot = Path(directory)
+            (troot / 'Cargo.toml').write_text('[package]\nname = "runner"\nversion = "0.1.0"\n', newline='\n')
+            parent = r._safe_path(troot, 'Cargo.toml').parent.as_posix()
+            runner_pid = f"path+file://{parent}#runner@0.1.0"
+            other_pid = f"path+file://{parent}#other@0.1.0"
+            missing_meta = {'packages': [{'name': 'other', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': other_pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
+            with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_NOT_FOUND'):
+                r.bind_package_observation(descriptor=desc, metadata=missing_meta, root=troot, manifest_rel='Cargo.toml')
+            dup_meta = {'packages': [{'name': 'runner', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': runner_pid, 'version': '0.1.0', 'buildable': True}, {'name': 'runner', 'manifest_path': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'id': f"path+file://{parent}#runner@0.1.1", 'version': '0.1.1', 'buildable': True}], 'workspace_members': [], 'excluded': []}
+            with self.assertRaisesRegex(r.RunnerInputError, 'DUPLICATE_PACKAGE_IDENTITY'):
+                r.bind_package_observation(descriptor=desc, metadata=dup_meta, root=troot, manifest_rel='Cargo.toml')
 
     # WORK_UNIT_CASE: 850/16
     def test_four_member_kinds_distinct(self):
@@ -1230,16 +1241,20 @@ class PackageManifestCases(unittest.TestCase):
         with self.assertRaises(r.RunnerInputError):
             r.resolve_package_manifest(package_name='p', metadata_packages=[{'name': 'p', 'manifest_rel': rel, 'member_kind': 'excluded'}], require_workspace_member=True)
         desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
-        pid = 'path+file:///repo#runner@0.1.0'
-        cases = (('member', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [pid], 'excluded': []}, True), ('excluded', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': ['runner']}, True), ('standalone', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}, True), ('unavailable', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': False}], 'workspace_members': [], 'excluded': []}, False))
-        for kind, meta, ok in cases:
-            with self.subTest(kind=kind):
-                if ok:
-                    obs = r.bind_package_observation(descriptor=desc, metadata=meta)
-                    self.assertEqual(kind, obs['member_kind'])
-                else:
-                    with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_UNAVAILABLE'):
-                        r.bind_package_observation(descriptor=desc, metadata=meta)
+        with tempfile.TemporaryDirectory() as directory:
+            troot = Path(directory)
+            (troot / 'Cargo.toml').write_text('[package]\nname = "runner"\nversion = "0.1.0"\n', newline='\n')
+            parent = r._safe_path(troot, 'Cargo.toml').parent.as_posix()
+            pid = f"path+file://{parent}#runner@0.1.0"
+            cases = (('member', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [pid], 'excluded': []}, True), ('excluded', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': ['runner']}, True), ('standalone', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}, True), ('unavailable', {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': False}], 'workspace_members': [], 'excluded': []}, False))
+            for kind, meta, ok in cases:
+                with self.subTest(kind=kind):
+                    if ok:
+                        obs = r.bind_package_observation(descriptor=desc, metadata=meta, root=troot, manifest_rel='Cargo.toml')
+                        self.assertEqual(kind, obs['member_kind'])
+                    else:
+                        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_UNAVAILABLE'):
+                            r.bind_package_observation(descriptor=desc, metadata=meta, root=troot, manifest_rel='Cargo.toml')
 
     # WORK_UNIT_CASE: 850/17
     def test_package_only_vs_membership_required(self):
@@ -1256,14 +1271,28 @@ class PackageManifestCases(unittest.TestCase):
         integrated = r.parse_descriptor(VALID.replace(b'require_workspace_member = false', b'require_workspace_member = true'), FILENAME, _b1_assignment())
         self.assertNotEqual(local.sha256, integrated.sha256)
         self.assertIs(local.phase, c.VerificationPhase.PACKAGE_LOCAL)
-        pid = 'path+file:///repo#runner@0.1.0'
-        excluded_meta = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': ['runner']}
-        self.assertEqual('excluded', r.bind_package_observation(descriptor=local, metadata=excluded_meta)['member_kind'])
-        with self.assertRaisesRegex(r.RunnerInputError, 'WORKSPACE_MEMBER_REQUIRED'):
-            r.bind_package_observation(descriptor=integrated, metadata=excluded_meta)
+        with tempfile.TemporaryDirectory() as directory:
+            troot = Path(directory)
+            (troot / 'Cargo.toml').write_text('[package]\nname = "runner"\nversion = "0.1.0"\n', newline='\n')
+            parent = r._safe_path(troot, 'Cargo.toml').parent.as_posix()
+            pid = f"path+file://{parent}#runner@0.1.0"
+            excluded_meta = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': ['runner']}
+            self.assertEqual('excluded', r.bind_package_observation(descriptor=local, metadata=excluded_meta, root=troot, manifest_rel='Cargo.toml')['member_kind'])
+            with self.assertRaisesRegex(r.RunnerInputError, 'WORKSPACE_MEMBER_REQUIRED'):
+                r.bind_package_observation(descriptor=integrated, metadata=excluded_meta, root=troot, manifest_rel='Cargo.toml')
         stale = _b1_assignment(body_sha256='c' * 64)
         with self.assertRaisesRegex(r.RunnerInputError, 'STALE_ASSIGNMENT_BINDING'):
             r.bind_protected_snapshot(descriptor=local, assignment=stale, snapshot={k: 'a' * 64 for k in ['scripts/tests/test_work_unit_descriptor_runner.py', 'scripts/work_unit_gate/descriptor_runner.py']}, descriptor_rel=FILENAME, manifest_rel='scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml')
+        snap_manifest = 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'
+        snap_required = sorted({p.value for p in local.source_roots + local.test_roots} | ({local.module.value.replace('.', '/') + '.py'} if local.module is not None else set()) | {FILENAME, snap_manifest})
+        snap_good = {k: 'a' * 64 for k in snap_required}
+        snap_bound = r.bind_protected_snapshot(descriptor=local, assignment=_b1_assignment(), snapshot=dict(snap_good), descriptor_rel=FILENAME, manifest_rel=snap_manifest)
+        self.assertEqual(snap_required, snap_bound['keys'])
+        self.assertEqual(local.proof_ceiling.value, snap_bound['proof_ceiling'])
+        snap_alt_assign = _b1_assignment(proof_ceiling=c.ProofCeiling('workspace-integration'))
+        snap_alt_desc = r.parse_descriptor(VALID.replace(b'package-local', b'workspace-integration'), FILENAME, snap_alt_assign)
+        snap_alt_bound = r.bind_protected_snapshot(descriptor=snap_alt_desc, assignment=snap_alt_assign, snapshot=dict(snap_good), descriptor_rel=FILENAME, manifest_rel=snap_manifest)
+        self.assertNotEqual(snap_bound['digest'], snap_alt_bound['digest'])
 
 
 class RustRealRunnerCases(unittest.TestCase):
@@ -1391,21 +1420,8 @@ class RustRealRunnerCases(unittest.TestCase):
         self.assertIs(bound['profile_test'], True)
         desc = r.parse_descriptor((DESCRIPTOR_DIR / 'minimal-rust-package.toml').read_bytes(), FILENAME, _b1_assignment())
         self.assertIs(type(desc), c.WorkUnitDescriptor)
-        receipt = r.compose_discovery_receipt(descriptor=desc, binary=bound, test_name='tiny_ok_a', kind='rust')
-        self.assertIs(type(receipt), c.DiscoveredTestReceipt)
-        self.assertIs(type(receipt.test), c.TestIdentity)
-        self.assertEqual('tiny_ok_a', receipt.test.qualified_name)
-        self.assertEqual(desc.mode, receipt.test.mode)
-        self.assertEqual(desc.identity, receipt.descriptor)
-        self.assertEqual(desc.sha256, receipt.descriptor_sha256)
-        self.assertEqual(desc.body_sha256, receipt.source_sha256)
-        self.assertEqual(digest, receipt.artifact_sha256)
-        self.assertIs(receipt.phase, desc.phase)
-        self.assertEqual(bound['manifest_rel'], receipt.location.path.value)
-        record = r.compose_execution_record(discovery=receipt, disposition='executed-pass', detail='tiny_ok_a-pass')
-        self.assertIs(type(record), c.TestExecutionRecord)
-        self.assertIs(record.disposition, c.ExecutionDisposition.EXECUTED_PASS)
-        self.assertEqual(receipt.test, record.test)
+        tiny_rel = 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'
+        real_parent = r._safe_path(ROOT, tiny_rel).parent.as_posix()
         meta_argv = ['cargo', 'metadata', '--format-version', '1', '--offline',
                      '--manifest-path', self._manifest_abs, '--no-deps']
         self.assertEqual(tuple(meta_argv), r.assert_no_workspace_wide(meta_argv))
@@ -1427,14 +1443,79 @@ class RustRealRunnerCases(unittest.TestCase):
         raw_manifest = observed_pkg['manifest_path']
         self.assertIn('\\', raw_manifest)
         self.assertIn('Cargo.toml', raw_manifest)
-        raw_entry = {'name': observed_pkg['name'], 'manifest_path': raw_manifest, 'id': observed_pkg['id'], 'version': observed_pkg['version'], 'buildable': True}
-        raw_meta = {'packages': [raw_entry], 'workspace_members': list(observed_meta['workspace_members']), 'excluded': []}
-        rust_desc = r.parse_descriptor((DESCRIPTOR_DIR / 'minimal-rust-package.toml').read_bytes(), FILENAME, _b1_assignment())
-        raw_obs = r.bind_package_observation(descriptor=rust_desc, metadata=raw_meta)
-        self.assertEqual(raw_manifest, raw_obs['manifest_path'])
-        self.assertTrue(raw_obs['manifest_path'].replace('\\', '/').endswith('scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'))
-        self.assertEqual(art['package_id'], raw_obs['id'])
-        self.assertEqual(art['package_version'], raw_obs['version'])
+        real_id = observed_pkg['id']
+        self.assertTrue(real_id.startswith('path+file:///'))
+        pkg_meta = {'packages': [{'name': observed_pkg['name'],
+                                  'manifest_path': raw_manifest,
+                                  'id': real_id, 'version': observed_pkg['version'],
+                                  'buildable': True}],
+                    'workspace_members': [real_id], 'excluded': []}
+        pkg_obs = r.bind_package_observation(descriptor=desc, metadata=pkg_meta, root=ROOT, manifest_rel=tiny_rel)
+        self.assertEqual(real_id, pkg_obs['id'])
+        self.assertEqual(raw_manifest, pkg_obs['manifest_path'])
+        self.assertTrue(pkg_obs['manifest_path'].replace('\\', '/').endswith('scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'))
+        self.assertEqual('0.1.0', pkg_obs['version'])
+        self.assertEqual(observed_pkg['version'], pkg_obs['version'])
+        self.assertEqual('member', pkg_obs['member_kind'])
+        real_art = dict(art, package_id=real_id)
+        pkg_bound = r.bind_test_binary(artifact=real_art, binary_name=Path(real_file).name, binary_sha256=digest)
+        self.assertEqual(real_id, pkg_bound['package_id'])
+        combined = r.bind_execution_observations(package=pkg_obs, binary=pkg_bound)
+        self.assertEqual(12, len(combined))
+        self.assertEqual({'name', 'version', 'id', 'manifest_path', 'manifest_rel', 'member_kind',
+                          'binary_name', 'binary_sha256', 'target', 'target_kind', 'profile_test',
+                          'cfgs'}, set(combined))
+        receipt = r.compose_discovery_receipt(descriptor=desc, binary=pkg_bound, test_name='tiny_ok_a', kind='rust', package=pkg_obs)
+        self.assertIs(type(receipt), c.DiscoveredTestReceipt)
+        self.assertIs(type(receipt.test), c.TestIdentity)
+        self.assertEqual('tiny_ok_a', receipt.test.qualified_name)
+        self.assertEqual(desc.mode, receipt.test.mode)
+        self.assertEqual(desc.identity, receipt.descriptor)
+        self.assertEqual(desc.sha256, receipt.descriptor_sha256)
+        self.assertEqual(desc.body_sha256, receipt.source_sha256)
+        self.assertEqual(digest, receipt.artifact_sha256)
+        self.assertIs(receipt.phase, desc.phase)
+        self.assertEqual(pkg_bound['manifest_rel'], receipt.location.path.value)
+        record = r.compose_execution_record(discovery=receipt, disposition='executed-pass', detail='tiny_ok_a-pass')
+        self.assertIs(type(record), c.TestExecutionRecord)
+        self.assertIs(record.disposition, c.ExecutionDisposition.EXECUTED_PASS)
+        self.assertEqual(receipt.test, record.test)
+        rust_desc = desc
+        evil_id = f"path+file://{real_parent}#wu850_tiny@99.9.9"
+        evil_meta = {'packages': [{'name': 'wu850_tiny', 'manifest_path': 'C:/forged/elsewhere/Cargo.toml',
+                                   'id': evil_id, 'version': '99.9.9', 'buildable': True}],
+                     'workspace_members': [evil_id], 'excluded': []}
+        with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_VERSION_MISMATCH'):
+            r.bind_package_observation(descriptor=rust_desc, metadata=evil_meta, root=ROOT, manifest_rel=tiny_rel)
+        evil_dir_id = 'path+file:///forged/elsewhere#wu850_tiny@0.1.0'
+        evil_dir_meta = {'packages': [{'name': 'wu850_tiny', 'manifest_path': 'C:/forged/elsewhere/Cargo.toml',
+                                       'id': evil_dir_id, 'version': '0.1.0', 'buildable': True}],
+                         'workspace_members': [evil_dir_id], 'excluded': []}
+        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_ID_DIR_MISMATCH'):
+            r.bind_package_observation(descriptor=rust_desc, metadata=evil_dir_meta, root=ROOT, manifest_rel=tiny_rel)
+        registry_id = 'registry+https://github.com/rust-lang/crates.io-index#wu850_tiny@0.1.0'
+        registry_meta = {'packages': [{'name': 'wu850_tiny', 'manifest_path': 'C:/repo/' + tiny_rel,
+                                       'id': registry_id, 'version': '0.1.0', 'buildable': True}],
+                         'workspace_members': [registry_id], 'excluded': []}
+        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_IDENTITY_INCONSISTENT'):
+            r.bind_package_observation(descriptor=rust_desc, metadata=registry_meta, root=ROOT, manifest_rel=tiny_rel)
+        forged_pkg = dict(pkg_obs, manifest_path='C:/forged/elsewhere/Cargo.toml')
+        with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_OBSERVATION_MISMATCH'):
+            r.bind_execution_observations(package=forged_pkg, binary=pkg_bound)
+        with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_OBSERVATION_MISMATCH'):
+            r.compose_discovery_receipt(descriptor=rust_desc, binary=pkg_bound, test_name='tiny_ok_a',
+                                        kind='rust', package=forged_pkg)
+        mismatched = dict(pkg_bound, package_id=f"path+file://{real_parent}#wu850_tiny@9.9.9", version='9.9.9', package_version='9.9.9')
+        with self.assertRaisesRegex(r.RunnerInputError, 'ARTIFACT_OBSERVATION_MISMATCH'):
+            r.bind_execution_observations(package=pkg_obs, binary=mismatched)
+        with self.assertRaisesRegex(r.RunnerInputError, 'ARTIFACT_OBSERVATION_MISMATCH'):
+            r.compose_discovery_receipt(descriptor=rust_desc, binary=mismatched, test_name='tiny_ok_a',
+                                        kind='rust', package=pkg_obs)
+        inconsistent_meta = {'packages': [{'name': 'wu850_tiny', 'manifest_path': 'C:/repo/' + art['manifest_rel'],
+                                           'id': art['package_id'], 'version': '99.9.9', 'buildable': True}],
+                             'workspace_members': [art['package_id']], 'excluded': []}
+        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_IDENTITY_INCONSISTENT'):
+            r.bind_package_observation(descriptor=rust_desc, metadata=inconsistent_meta, root=ROOT, manifest_rel=tiny_rel)
 
     # WORK_UNIT_CASE: 850/21
     def test_ignored_filtered_cfg_disabled_never_pass(self):
@@ -1473,7 +1554,7 @@ class RustRealRunnerCases(unittest.TestCase):
         rel = 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'
         good_art = b'{"reason":"compiler-artifact","package_id":"path+file:///x#wu850_tiny@0.1.0","target":{"name":"wu850_tiny","kind":["lib"]},"profile":{"test":false},"filenames":["/tmp/a.rlib"],"fresh":false}\n'
         good_fin = b'{"reason":"build-finished","success":true}\n'
-        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_ID_MISMATCH'):
+        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_IDENTITY_INCONSISTENT'):
             r.parse_cargo_build_stream(good_art.replace(b'#wu850_tiny@', b'#other@') + good_fin, package='wu850_tiny', manifest_rel=rel)
         with self.assertRaisesRegex(r.RunnerInputError, 'BUILD_NOT_SUCCESSFUL'):
             r.parse_cargo_build_stream(good_art, package='wu850_tiny', manifest_rel=rel)
@@ -1988,6 +2069,13 @@ class BoundedCompletionCases(unittest.TestCase):
         bound = r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot=dict(good), descriptor_rel=FILENAME, manifest_rel=manifest)
         self.assertEqual(required, bound['keys'])
         self.assertEqual(64, len(bound['digest']))
+        self.assertEqual('package-local', bound['proof_ceiling'])
+        self.assertEqual(desc.proof_ceiling.value, bound['proof_ceiling'])
+        alt_assign = _b1_assignment(proof_ceiling=c.ProofCeiling('workspace-integration'))
+        alt_desc = r.parse_descriptor(VALID.replace(b'package-local', b'workspace-integration'), FILENAME, alt_assign)
+        alt_bound = r.bind_protected_snapshot(descriptor=alt_desc, assignment=alt_assign, snapshot=dict(good), descriptor_rel=FILENAME, manifest_rel=manifest)
+        self.assertEqual('workspace-integration', alt_bound['proof_ceiling'])
+        self.assertNotEqual(bound['digest'], alt_bound['digest'])
         with self.assertRaisesRegex(r.RunnerInputError, 'MISSING_SNAPSHOT_KEY'):
             r.bind_protected_snapshot(descriptor=desc, assignment=assign, snapshot={k: 'a' * 64 for k in required[:-1]}, descriptor_rel=FILENAME, manifest_rel=manifest)
         with self.assertRaisesRegex(r.RunnerInputError, 'FOREIGN_SNAPSHOT_KEY'):
@@ -2054,22 +2142,58 @@ class BoundedCompletionCases(unittest.TestCase):
             with self.assertRaises(r.RunnerInputError):
                 r.parse_python_protocol(json.dumps(bad_outcome).encode(), **kwargs)
         desc = r.parse_descriptor((DESCRIPTOR_DIR / 'minimal-rust-package.toml').read_bytes(), FILENAME, _b1_assignment())
-        art = {'package': 'wu850_tiny', 'package_id': 'path+file:///x#wu850_tiny@0.1.0', 'package_version': '0.1.0', 'manifest_rel': 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml', 'target_name': 'wu850_tiny', 'target_kind': 'lib', 'profile_test': True, 'filenames': ('/tmp/real-test-bin.exe',), 'fresh': False}
+        tiny_rel = 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'
+        real_parent = r._safe_path(ROOT, tiny_rel).parent.as_posix()
+        real_pid = f"path+file://{real_parent}#wu850_tiny@0.1.0"
+        art = {'package': 'wu850_tiny', 'package_id': real_pid, 'package_version': '0.1.0', 'manifest_rel': tiny_rel, 'target_name': 'wu850_tiny', 'target_kind': 'lib', 'profile_test': True, 'filenames': ('/tmp/real-test-bin.exe',), 'fresh': False}
         bound = r.bind_test_binary(artifact=art, binary_name='real-test-bin.exe', binary_sha256='a' * 64)
         self.assertEqual('0.1.0', bound['package_version'])
-        self.assertEqual('path+file:///x#wu850_tiny@0.1.0', bound['package_id'])
+        self.assertEqual(real_pid, bound['package_id'])
         with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_NOT_PRODUCED'):
             r.bind_test_binary(artifact=art, binary_name='other-bin.exe', binary_sha256='a' * 64)
+        pkg_meta = {'packages': [{'name': 'wu850_tiny',
+                                  'manifest_path': 'C:/repo/' + art['manifest_rel'],
+                                  'id': art['package_id'], 'version': art['package_version'],
+                                  'buildable': True}],
+                    'workspace_members': [art['package_id']], 'excluded': []}
+        pkg_obs = r.bind_package_observation(descriptor=desc, metadata=pkg_meta, root=ROOT, manifest_rel=tiny_rel)
+        evil_version_id = f"path+file://{real_parent}#wu850_tiny@99.9.9"
+        evil_version_meta = {'packages': [{'name': 'wu850_tiny', 'manifest_path': 'C:/forged/elsewhere/Cargo.toml',
+                                           'id': evil_version_id, 'version': '99.9.9', 'buildable': True}],
+                             'workspace_members': [evil_version_id], 'excluded': []}
+        with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_VERSION_MISMATCH'):
+            r.bind_package_observation(descriptor=desc, metadata=evil_version_meta, root=ROOT, manifest_rel=tiny_rel)
+        evil_dir_id = 'path+file:///forged/elsewhere#wu850_tiny@0.1.0'
+        evil_dir_meta = {'packages': [{'name': 'wu850_tiny', 'manifest_path': 'C:/forged/elsewhere/Cargo.toml',
+                                       'id': evil_dir_id, 'version': '0.1.0', 'buildable': True}],
+                         'workspace_members': [evil_dir_id], 'excluded': []}
+        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_ID_DIR_MISMATCH'):
+            r.bind_package_observation(descriptor=desc, metadata=evil_dir_meta, root=ROOT, manifest_rel=tiny_rel)
+        registry_id = 'registry+https://github.com/rust-lang/crates.io-index#wu850_tiny@0.1.0'
+        registry_meta = {'packages': [{'name': 'wu850_tiny', 'manifest_path': 'C:/repo/' + tiny_rel,
+                                       'id': registry_id, 'version': '0.1.0', 'buildable': True}],
+                         'workspace_members': [registry_id], 'excluded': []}
+        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_IDENTITY_INCONSISTENT'):
+            r.bind_package_observation(descriptor=desc, metadata=registry_meta, root=ROOT, manifest_rel=tiny_rel)
+        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_OBSERVATION_REQUIRED'):
+            r.compose_discovery_receipt(descriptor=desc, binary=bound, test_name='tiny_ok_a', kind='rust')
+        py_desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
+        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_OBSERVATION_UNEXPECTED'):
+            r.compose_discovery_receipt(descriptor=py_desc, binary=None, test_name='a.B.test_x',
+                                        kind='python', package={'name': 'runner'})
         with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_DIGEST_REQUIRED'):
-            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'wu850_tiny', 'manifest_rel': art['manifest_rel'], 'profile_test': True, 'target_kind': 'lib', 'binary_sha256': 'not-hex'}, test_name='tiny_ok_a', kind='rust')
-        with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_DIGEST_REQUIRED'):
-            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'wu850_tiny', 'manifest_rel': art['manifest_rel'], 'profile_test': True, 'target_kind': 'lib'}, test_name='tiny_ok_a', kind='rust')
+            r.compose_discovery_receipt(descriptor=desc, binary=dict(bound, binary_sha256='not-hex'),
+                                        test_name='tiny_ok_a', kind='rust', package=pkg_obs)
+        with self.assertRaisesRegex(r.RunnerInputError, 'OBSERVATION_SHAPE'):
+            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'wu850_tiny', 'manifest_rel': art['manifest_rel'], 'profile_test': True, 'target_kind': 'lib'}, test_name='tiny_ok_a', kind='rust', package=pkg_obs)
+        other_art = dict(art, package='other_pkg', package_id='path+file:///x#other_pkg@0.1.0')
+        other_bound = r.bind_test_binary(artifact=other_art, binary_name='real-test-bin.exe', binary_sha256='a' * 64)
         with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_BINARY_MISMATCH'):
-            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'other_pkg', 'manifest_rel': art['manifest_rel'], 'binary_sha256': 'a' * 64}, test_name='tiny_ok_a', kind='rust')
+            r.compose_discovery_receipt(descriptor=desc, binary=other_bound, test_name='tiny_ok_a', kind='rust', package=pkg_obs)
         with self.assertRaisesRegex(r.RunnerInputError, 'KIND_MODE_MISMATCH'):
             r.compose_discovery_receipt(descriptor=desc, binary=bound, test_name='a.B.test_x', kind='python')
-        receipt = r.compose_discovery_receipt(descriptor=desc, binary=bound, test_name='tiny_ok_a', kind='rust')
-        other = r.compose_discovery_receipt(descriptor=desc, binary=bound, test_name='tiny_ok_b', kind='rust')
+        receipt = r.compose_discovery_receipt(descriptor=desc, binary=bound, test_name='tiny_ok_a', kind='rust', package=pkg_obs)
+        other = r.compose_discovery_receipt(descriptor=desc, binary=bound, test_name='tiny_ok_b', kind='rust', package=pkg_obs)
         with self.assertRaises(c.ContractViolation):
             c.TestExecutionRecord(test=other.test, disposition=c.ExecutionDisposition.EXECUTED_PASS, discovery=receipt, detail=None)
         with self.assertRaisesRegex(r.RunnerInputError, 'UNKNOWN_DISPOSITION|EXECUTION_RECORD_REJECTED'):
@@ -2263,26 +2387,30 @@ class ResidualBindingNegatives(unittest.TestCase):
 
     def test_package_observation_shapes(self):
         desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
-        pid = 'path+file:///repo#runner@0.1.0'
         rel = 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'
-        with self.assertRaisesRegex(r.RunnerInputError, 'DESCRIPTOR_TYPE_REQUIRED'):
-            r.bind_package_observation(descriptor={'package': 'x'}, metadata={'packages': [], 'workspace_members': [], 'excluded': []})
-        with self.assertRaisesRegex(r.RunnerInputError, 'METADATA_SHAPE'):
-            r.bind_package_observation(descriptor=desc, metadata={'packages': [], 'workspace_members': [], 'excluded': 'x'})
-        bad_path = {'packages': [{'name': 'runner', 'manifest_path': 'bad/path.txt', 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
-        with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_PATH_SHAPE'):
-            r.bind_package_observation(descriptor=desc, metadata=bad_path)
-        for bad_manifest in (rel.replace('/Cargo.toml', '//Cargo.toml'), 'C:\\repo\\\\Cargo.toml', 'scripts/testdata/../escape/Cargo.toml', 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml.bak', 'scripts/testdata/\x01gate/descriptor-runner/rust-tiny/Cargo.toml', 'scripts/testdata/\x7fgate/descriptor-runner/rust-tiny/Cargo.toml'):
-            with self.subTest(bad_manifest=repr(bad_manifest)):
-                bad = {'packages': [{'name': 'runner', 'manifest_path': bad_manifest, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
-                with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_PATH_SHAPE'):
-                    r.bind_package_observation(descriptor=desc, metadata=bad)
-        forward = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
-        forward_obs = r.bind_package_observation(descriptor=desc, metadata=forward)
-        self.assertEqual(rel, forward_obs['manifest_path'])
-        bad_bool = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': 'yes'}], 'workspace_members': [], 'excluded': []}
-        with self.assertRaisesRegex(r.RunnerInputError, 'BUILDABLE_BOOL_REQUIRED'):
-            r.bind_package_observation(descriptor=desc, metadata=bad_bool)
+        with tempfile.TemporaryDirectory() as directory:
+            troot = Path(directory)
+            (troot / 'Cargo.toml').write_text('[package]\nname = "runner"\nversion = "0.1.0"\n', newline='\n')
+            parent = r._safe_path(troot, 'Cargo.toml').parent.as_posix()
+            pid = f"path+file://{parent}#runner@0.1.0"
+            with self.assertRaisesRegex(r.RunnerInputError, 'DESCRIPTOR_TYPE_REQUIRED'):
+                r.bind_package_observation(descriptor={'package': 'x'}, metadata={'packages': [], 'workspace_members': [], 'excluded': []}, root=troot, manifest_rel='Cargo.toml')
+            with self.assertRaisesRegex(r.RunnerInputError, 'METADATA_SHAPE'):
+                r.bind_package_observation(descriptor=desc, metadata={'packages': [], 'workspace_members': [], 'excluded': 'x'}, root=troot, manifest_rel='Cargo.toml')
+            bad_path = {'packages': [{'name': 'runner', 'manifest_path': 'bad/path.txt', 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
+            with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_PATH_SHAPE'):
+                r.bind_package_observation(descriptor=desc, metadata=bad_path, root=troot, manifest_rel='Cargo.toml')
+            for bad_manifest in (rel.replace('/Cargo.toml', '//Cargo.toml'), 'C:\\repo\\\\Cargo.toml', 'scripts/testdata/../escape/Cargo.toml', 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml.bak', 'scripts/testdata/\x01gate/descriptor-runner/rust-tiny/Cargo.toml', 'scripts/testdata/\x7fgate/descriptor-runner/rust-tiny/Cargo.toml'):
+                with self.subTest(bad_manifest=repr(bad_manifest)):
+                    bad = {'packages': [{'name': 'runner', 'manifest_path': bad_manifest, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
+                    with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_PATH_SHAPE'):
+                        r.bind_package_observation(descriptor=desc, metadata=bad, root=troot, manifest_rel='Cargo.toml')
+            forward = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
+            forward_obs = r.bind_package_observation(descriptor=desc, metadata=forward, root=troot, manifest_rel='Cargo.toml')
+            self.assertEqual(rel, forward_obs['manifest_path'])
+            bad_bool = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': '0.1.0', 'buildable': 'yes'}], 'workspace_members': [], 'excluded': []}
+            with self.assertRaisesRegex(r.RunnerInputError, 'BUILDABLE_BOOL_REQUIRED'):
+                r.bind_package_observation(descriptor=desc, metadata=bad_bool, root=troot, manifest_rel='Cargo.toml')
 
     def test_snapshot_and_enforcement_shapes(self):
         desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
@@ -2304,6 +2432,16 @@ class ResidualBindingNegatives(unittest.TestCase):
             r.enforcement_plan(bounds=dict(bounds, line_bytes=bounds['output_bytes'] + 1))
         with self.assertRaisesRegex(r.RunnerInputError, 'INTEGER_BOUND|CLOSED_FIELDS'):
             r.enforcement_plan(bounds=dict(bounds, wall_ms=0))
+        snap_manifest = 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'
+        snap_required = sorted({p.value for p in desc.source_roots + desc.test_roots} | ({desc.module.value.replace('.', '/') + '.py'} if desc.module is not None else set()) | {FILENAME, snap_manifest})
+        snap_good = {k: 'a' * 64 for k in snap_required}
+        snap_bound = r.bind_protected_snapshot(descriptor=desc, assignment=_b1_assignment(), snapshot=dict(snap_good), descriptor_rel=FILENAME, manifest_rel=snap_manifest)
+        self.assertEqual(snap_required, snap_bound['keys'])
+        self.assertEqual(desc.proof_ceiling.value, snap_bound['proof_ceiling'])
+        snap_alt_assign = _b1_assignment(proof_ceiling=c.ProofCeiling('workspace-integration'))
+        snap_alt_desc = r.parse_descriptor(VALID.replace(b'package-local', b'workspace-integration'), FILENAME, snap_alt_assign)
+        snap_alt_bound = r.bind_protected_snapshot(descriptor=snap_alt_desc, assignment=snap_alt_assign, snapshot=dict(snap_good), descriptor_rel=FILENAME, manifest_rel=snap_manifest)
+        self.assertNotEqual(snap_bound['digest'], snap_alt_bound['digest'])
 
     def test_compose_shapes(self):
         desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
@@ -2325,14 +2463,32 @@ class ResidualBindingNegatives(unittest.TestCase):
     def test_rust_binary_gates(self):
         desc = r.parse_descriptor((DESCRIPTOR_DIR / 'minimal-rust-package.toml').read_bytes(), FILENAME, _b1_assignment())
         rel = 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'
+        parent = r._safe_path(ROOT, rel).parent.as_posix()
+        pid = f"path+file://{parent}#wu850_tiny@0.1.0"
+        pkg_obs = r.bind_package_observation(descriptor=desc, metadata={
+            'packages': [{'name': 'wu850_tiny', 'manifest_path': 'C:/repo/' + rel,
+                          'id': pid, 'version': '0.1.0', 'buildable': True}],
+            'workspace_members': [pid], 'excluded': []}, root=ROOT, manifest_rel=rel)
+
+        def _bound(**changes):
+            art = {'package': 'wu850_tiny', 'package_id': pid, 'package_version': '0.1.0',
+                   'manifest_rel': rel, 'target_name': 'wu850_tiny', 'target_kind': 'lib',
+                   'profile_test': True, 'filenames': ('/tmp/real-test-bin.exe',), 'fresh': False}
+            art.update(changes)
+            return r.bind_test_binary(artifact=art, binary_name='real-test-bin.exe',
+                                      binary_sha256='a' * 64)
+
+        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_OBSERVATION_REQUIRED'):
+            r.compose_discovery_receipt(descriptor=desc, binary=_bound(), test_name='tiny_ok_a', kind='rust')
         with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_REQUIRED'):
-            r.compose_discovery_receipt(descriptor=desc, binary=None, test_name='tiny_ok_a', kind='rust')
+            r.compose_discovery_receipt(descriptor=desc, binary=None, test_name='tiny_ok_a', kind='rust', package=pkg_obs)
         with self.assertRaisesRegex(r.RunnerInputError, 'BINARY_NOT_TEST_PROFILE'):
-            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'wu850_tiny', 'manifest_rel': rel, 'profile_test': False, 'target_kind': 'lib', 'binary_sha256': 'a' * 64}, test_name='tiny_ok_a', kind='rust')
+            r.compose_discovery_receipt(descriptor=desc, binary=_bound(profile_test=False), test_name='tiny_ok_a', kind='rust', package=pkg_obs)
         with self.assertRaisesRegex(r.RunnerInputError, 'UNSUPPORTED_TARGET_KIND'):
-            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'wu850_tiny', 'manifest_rel': rel, 'profile_test': True, 'target_kind': 'rlib', 'binary_sha256': 'a' * 64}, test_name='tiny_ok_a', kind='rust')
+            r.compose_discovery_receipt(descriptor=desc, binary=_bound(target_kind='rlib'), test_name='tiny_ok_a', kind='rust', package=pkg_obs)
+        other = r.bind_test_binary(artifact={'package': 'other_pkg', 'package_id': 'path+file:///x#other_pkg@0.1.0', 'package_version': '0.1.0', 'manifest_rel': rel, 'target_name': 'other_pkg', 'target_kind': 'lib', 'profile_test': True, 'filenames': ('/tmp/real-test-bin.exe',), 'fresh': False}, binary_name='real-test-bin.exe', binary_sha256='a' * 64)
         with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_BINARY_MISMATCH'):
-            r.compose_discovery_receipt(descriptor=desc, binary={'package': 'other_pkg', 'manifest_rel': rel, 'profile_test': True, 'target_kind': 'lib', 'binary_sha256': 'a' * 64}, test_name='tiny_ok_a', kind='rust')
+            r.compose_discovery_receipt(descriptor=desc, binary=other, test_name='tiny_ok_a', kind='rust', package=pkg_obs)
         with self.assertRaisesRegex(r.RunnerInputError, 'KIND_MODE_MISMATCH'):
             r.compose_discovery_receipt(descriptor=desc, binary=None, test_name='a.B.test_x', kind='python')
 
@@ -2345,16 +2501,63 @@ class ResidualBindingNegatives(unittest.TestCase):
         with self.assertRaisesRegex(r.RunnerInputError, 'ARTIFACT_SHAPE'):
             r.bind_test_binary(artifact=dict(base), binary_name='bin.exe', binary_sha256='a' * 64)
         desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())
-        pid = 'path+file:///repo#runner@0.1.0'
-        bad_version = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': 'not a version', 'buildable': True}], 'workspace_members': [], 'excluded': []}
-        with self.assertRaisesRegex(r.RunnerInputError, 'METADATA_VERSION_SHAPE'):
-            r.bind_package_observation(descriptor=desc, metadata=bad_version)
-        bad_id = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': 7, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
-        with self.assertRaisesRegex(r.RunnerInputError, 'METADATA_ID_SHAPE'):
-            r.bind_package_observation(descriptor=desc, metadata=bad_id)
-        missing_version = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'buildable': True}], 'workspace_members': [], 'excluded': []}
-        with self.assertRaisesRegex(r.RunnerInputError, 'CLOSED_FIELDS'):
-            r.bind_package_observation(descriptor=desc, metadata=missing_version)
+        with tempfile.TemporaryDirectory() as directory:
+            troot = Path(directory)
+            (troot / 'Cargo.toml').write_text('[package]\nname = "runner"\nversion = "0.1.0"\n', newline='\n')
+            parent = r._safe_path(troot, 'Cargo.toml').parent.as_posix()
+            pid = f"path+file://{parent}#runner@0.1.0"
+            bad_version = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'version': 'not a version', 'buildable': True}], 'workspace_members': [], 'excluded': []}
+            with self.assertRaisesRegex(r.RunnerInputError, 'METADATA_VERSION_SHAPE'):
+                r.bind_package_observation(descriptor=desc, metadata=bad_version, root=troot, manifest_rel='Cargo.toml')
+            bad_id = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': 7, 'version': '0.1.0', 'buildable': True}], 'workspace_members': [], 'excluded': []}
+            with self.assertRaisesRegex(r.RunnerInputError, 'METADATA_ID_SHAPE'):
+                r.bind_package_observation(descriptor=desc, metadata=bad_id, root=troot, manifest_rel='Cargo.toml')
+            missing_version = {'packages': [{'name': 'runner', 'manifest_path': rel, 'id': pid, 'buildable': True}], 'workspace_members': [], 'excluded': []}
+            with self.assertRaisesRegex(r.RunnerInputError, 'CLOSED_FIELDS'):
+                r.bind_package_observation(descriptor=desc, metadata=missing_version, root=troot, manifest_rel='Cargo.toml')
+
+    def test_execution_observation_cross_gates(self):
+        desc = r.parse_descriptor((DESCRIPTOR_DIR / 'minimal-rust-package.toml').read_bytes(), FILENAME, _b1_assignment())
+        rel = 'scripts/testdata/work-unit-gate/descriptor-runner/rust-tiny/Cargo.toml'
+        parent = r._safe_path(ROOT, rel).parent.as_posix()
+        pid = f"path+file://{parent}#wu850_tiny@0.1.0"
+        pkg = r.bind_package_observation(descriptor=desc, metadata={
+            'packages': [{'name': 'wu850_tiny', 'manifest_path': 'C:/repo/' + rel,
+                          'id': pid, 'version': '0.1.0', 'buildable': True}],
+            'workspace_members': [pid], 'excluded': []}, root=ROOT, manifest_rel=rel)
+        art = {'package': 'wu850_tiny', 'package_id': pid, 'package_version': '0.1.0',
+               'manifest_rel': rel, 'target_name': 'wu850_tiny', 'target_kind': 'lib',
+               'profile_test': True, 'filenames': ('/tmp/bin.exe',), 'fresh': False}
+        binary = r.bind_test_binary(artifact=art, binary_name='bin.exe', binary_sha256='a' * 64)
+        combined = r.bind_execution_observations(package=pkg, binary=binary)
+        self.assertEqual(12, len(combined))
+        self.assertEqual({'name', 'version', 'id', 'manifest_path', 'manifest_rel', 'member_kind',
+                          'binary_name', 'binary_sha256', 'target', 'target_kind', 'profile_test',
+                          'cfgs'}, set(combined))
+        self.assertEqual('wu850_tiny', combined['name'])
+        self.assertEqual(pid, combined['id'])
+        self.assertEqual(rel, combined['manifest_rel'])
+        with self.assertRaisesRegex(r.RunnerInputError, 'OBSERVATION_SHAPE'):
+            r.bind_execution_observations(package={'name': 'wu850_tiny'}, binary=binary)
+        with self.assertRaisesRegex(r.RunnerInputError, 'OBSERVATION_SHAPE'):
+            r.bind_execution_observations(package=pkg, binary={'package': 'wu850_tiny'})
+        with self.assertRaisesRegex(r.RunnerInputError, 'OBSERVATION_SHAPE'):
+            r.bind_execution_observations(package=dict(pkg, version=7), binary=binary)
+        with self.assertRaisesRegex(r.RunnerInputError, 'OBSERVATION_SHAPE'):
+            r.bind_execution_observations(package=pkg, binary=dict(binary, profile_test='yes'))
+        with self.assertRaisesRegex(r.RunnerInputError, 'OBSERVATION_SHAPE'):
+            r.bind_execution_observations(package=pkg, binary={k: v for k, v in binary.items() if k != 'cfgs'})
+        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_BINARY_MISMATCH'):
+            r.bind_execution_observations(package=pkg, binary=dict(binary, package='other_pkg'))
+        with self.assertRaisesRegex(r.RunnerInputError, 'ARTIFACT_OBSERVATION_MISMATCH'):
+            r.bind_execution_observations(package=pkg, binary=dict(binary, package_id='path+file:///x#wu850_tiny@9.9.9', version='9.9.9'))
+        with self.assertRaisesRegex(r.RunnerInputError, 'MANIFEST_OBSERVATION_MISMATCH'):
+            r.bind_execution_observations(package=dict(pkg, manifest_path='C:/forged/elsewhere/Cargo.toml'), binary=binary)
+        with self.assertRaisesRegex(r.RunnerInputError, 'PACKAGE_IDENTITY_INCONSISTENT'):
+            r.bind_package_observation(descriptor=desc, metadata={
+                'packages': [{'name': 'wu850_tiny', 'manifest_path': 'C:/repo/' + rel,
+                              'id': 'path+file:///x#other@0.1.0', 'version': '0.1.0', 'buildable': True}],
+                'workspace_members': [], 'excluded': []}, root=ROOT, manifest_rel=rel)
 
     def test_snapshot_rel_and_mutation_shapes(self):
         desc = r.parse_descriptor(VALID, FILENAME, _b1_assignment())

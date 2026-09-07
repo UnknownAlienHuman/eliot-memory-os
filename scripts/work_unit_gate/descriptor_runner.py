@@ -448,7 +448,7 @@ def parse_python_protocol(raw: bytes, *, request_sha256: str, expected_module: s
     return data
 
 
-def compose_discovery_receipt(*, descriptor, binary, test_name, kind, line=1):
+def compose_discovery_receipt(*, descriptor, binary, test_name, kind, line=1, package=None):
     """Emit an authoritative typed discovery binding from controller observations.
 
     The adapter consumes the admitted descriptor, an observed binary binding
@@ -461,6 +461,10 @@ def compose_discovery_receipt(*, descriptor, binary, test_name, kind, line=1):
     digest and the descriptor phase. With no binary the artifact digest falls
     back to the descriptor matrix digest; a bound binary must carry its own
     valid digest and, when the descriptor names a package, the same package.
+    kind "rust" additionally requires the metadata package observation and
+    cross-compares it against the binary via bind_execution_observations
+    before any of the checks below; kind "python" has no package concept and
+    rejects a non-None package as PACKAGE_OBSERVATION_UNEXPECTED.
     Execution and containment stay controller-owned.
     """
     from . import contracts as c
@@ -480,22 +484,37 @@ def compose_discovery_receipt(*, descriptor, binary, test_name, kind, line=1):
         if type(test_name) is not str or len(test_name) > 512 or not _PY_MODULE.fullmatch(test_name):
             _reject("PYTHON_MODULE_SYNTAX")
     _integer(line, 2**31 - 1, 1)
+    if kind == "rust" and type(package) is not dict:
+        _reject("PACKAGE_OBSERVATION_REQUIRED")
+    if kind == "python" and package is not None:
+        _reject("PACKAGE_OBSERVATION_UNEXPECTED")
     if binary is None:
         if kind == "rust":
             _reject("BINARY_REQUIRED")
         # python has no binary concept; suite-set binding.
         rel = descriptor.test_roots[0].value
         artifact_digest = descriptor.matrix_sha256
+    elif kind == "rust":
+        combined = bind_execution_observations(package=package, binary=binary)
+        if descriptor.package is not None and combined["name"] != descriptor.package.name:
+            _reject("PACKAGE_BINARY_MISMATCH")
+        if combined["profile_test"] is not True:
+            _reject("BINARY_NOT_TEST_PROFILE")
+        if combined["target_kind"] not in ("lib", "bin", "test"):
+            _reject("UNSUPPORTED_TARGET_KIND")
+        rel = _relative_path(combined["manifest_rel"])
+        candidate = combined["binary_sha256"]
+        if type(candidate) is not str or not _HEX.fullmatch(candidate):
+            _reject("BINARY_DIGEST_REQUIRED")
+        artifact_digest = candidate
     else:
+        # Python with an (ignored-shape) binary: suite-set binding keeps the
+        # legacy binary-digest path; the package observation must be None
+        # (checked above) since python has no package concept.
         if type(binary) is not dict or "manifest_rel" not in binary:
             _reject("BINARY_BINDING_REQUIRED")
         if descriptor.package is not None and binary.get("package") != descriptor.package.name:
             _reject("PACKAGE_BINARY_MISMATCH")
-        if kind == "rust":
-            if binary.get("profile_test") is not True:
-                _reject("BINARY_NOT_TEST_PROFILE")
-            if binary.get("target_kind") not in ("lib", "bin", "test"):
-                _reject("UNSUPPORTED_TARGET_KIND")
         rel = _relative_path(binary["manifest_rel"])
         candidate = binary.get("binary_sha256")
         if type(candidate) is not str or not _HEX.fullmatch(candidate):
@@ -608,12 +627,20 @@ def _parse_build_artifact(data: dict, package: str, manifest_rel: str):
     if type(package_id) is not str:
         _reject("PACKAGE_ID_MISMATCH")
     fragments = package_id.split("#")
-    if len(fragments) != 2 or not fragments[1].startswith(f"{package}@"):
-        _reject("PACKAGE_ID_MISMATCH")
-    version = fragments[1][len(package) + 1:]
+    if len(fragments) != 2:
+        _reject("PACKAGE_IDENTITY_INCONSISTENT")
+    tail = fragments[1]
+    prefix = f"{package}@"
+    if not tail.startswith(prefix):
+        _reject("PACKAGE_IDENTITY_INCONSISTENT")
+    version = tail[len(prefix):]
     if (not version or len(version.encode("utf-8")) > 128 or "#" in version
             or "@" in version or any(ch.isspace() for ch in version)):
         _reject("PACKAGE_VERSION_SHAPE")
+    # Full-tail equality: the id tail must be exactly <package>@<version>
+    # with no extra suffix, not merely start with the package prefix.
+    if tail != f"{package}@{version}":
+        _reject("PACKAGE_IDENTITY_INCONSISTENT")
     _text(package_id, 1024)
     target = data.get("target")
     if type(target) is not dict:
@@ -658,7 +685,7 @@ def parse_cargo_build_stream(raw: bytes, *, package: str, manifest_rel: str):
     nonempty line must carry a reason of exactly compiler-artifact or
     build-finished; any other reason fails closed. Each compiler-artifact must
     belong to the selected package (package_id splits on "#" into exactly two
-    parts whose tail starts with `<package>@`) and
+    parts whose tail exactly equals `<package>@<version>`) and
     carry a well-formed target, profile, filenames and fresh flag. The stream
     must terminate in exactly one successful build-finished event, otherwise
     BUILD_NOT_SUCCESSFUL. Returns one binding per compiler-artifact.
@@ -789,7 +816,23 @@ def bind_test_binary(*, artifact, binary_name, binary_sha256, target=None, cfgs=
             "target_kind": artifact.get("target_kind"), "profile_test": profile}
 
 
-def bind_package_observation(*, descriptor, metadata):
+def _decode_package_id_dir(value):
+    """Strict-decode %XX triplets in a cargo path-id dir part (nothing else)."""
+    parts, i = [], 0
+    while i < len(value):
+        if value[i] != "%":
+            parts.append(value[i])
+            i += 1
+        else:
+            triplet = value[i + 1:i + 3]
+            if len(triplet) != 2 or any(c not in "0123456789ABCDEFabcdef" for c in triplet):
+                _reject("PACKAGE_IDENTITY_INCONSISTENT")
+            parts.append(chr(int(triplet, 16)))
+            i += 3
+    return "".join(parts)
+
+
+def bind_package_observation(*, descriptor, metadata, root, manifest_rel):
     """Classify one observed cargo-metadata package against the descriptor.
 
     The controller owns cargo invocation and metadata acquisition; this
@@ -798,6 +841,14 @@ def bind_package_observation(*, descriptor, metadata):
     [name]} and binds the single entry whose name equals the descriptor
     package name. Membership is derived verbatim from workspace_members,
     excluded and buildable, never edited here.
+
+    Filesystem anchoring (read-only ground truth): the caller also supplies
+    the snapshot root and the repository-relative manifest path; the manifest
+    is resolved through _safe_path and its [package] name/version are read
+    and cross-checked against the entry and descriptor. The verbatim id and
+    manifest_path are still stored in the binding. Observation authenticity
+    beyond these checks stays controller acquisition (#849); mutating the
+    manifest file itself is source mutation caught by the protected snapshot.
     """
     from . import contracts as c
     if type(descriptor) is not c.WorkUnitDescriptor:
@@ -847,6 +898,52 @@ def bind_package_observation(*, descriptor, metadata):
     if len(matches) > 1:
         _reject("DUPLICATE_PACKAGE_IDENTITY")
     found = matches[0]
+    # Internal id/version consistency: the entry id tail must exactly equal
+    # #<name>@<version> built from the entry's own name and version fields.
+    # A self-consistent forgery (same evil id/version in every observation)
+    # passes this leg; cross-observation comparison is bind_execution_observations.
+    if not found["id"].endswith(f"#{found['name']}@{found['version']}"):
+        _reject("PACKAGE_IDENTITY_INCONSISTENT")
+    if not isinstance(root, Path):
+        _reject("SNAPSHOT_ROOT_REQUIRED")
+    manifest = _safe_path(root, _relative_path(manifest_rel))
+    try:
+        with manifest.open("rb") as handle:
+            raw_manifest = handle.read(MAX_DESCRIPTOR_BYTES + 1)
+    except OSError:
+        _reject("MANIFEST_UNREADABLE")
+    if len(raw_manifest) > MAX_DESCRIPTOR_BYTES:
+        _reject("MANIFEST_BYTE_BOUND")
+    try:
+        manifest_data = tomllib.loads(raw_manifest.decode("utf-8"))
+    except (ValueError, UnicodeError, RecursionError):
+        _reject("MANIFEST_UNREADABLE")
+    package_table = manifest_data.get("package") if type(manifest_data) is dict else None
+    if (type(package_table) is not dict or type(package_table.get("name")) is not str
+            or type(package_table.get("version")) is not str):
+        _reject("MANIFEST_PACKAGE_SHAPE")
+    if package_table["name"] != found["name"]:
+        _reject("MANIFEST_PACKAGE_MISMATCH")
+    if package_table["version"] != found["version"]:
+        _reject("MANIFEST_VERSION_MISMATCH")
+    entry_id = found["id"]
+    if not entry_id.startswith("path+file://"):
+        # The workspace member under test is always a path dependency;
+        # registry+ and other non-path schemes fail closed here.
+        _reject("PACKAGE_IDENTITY_INCONSISTENT")
+    fragments = entry_id[len("path+file://"):].split("#")
+    if len(fragments) != 2 or fragments[1] != f"{found['name']}@{found['version']}":
+        _reject("PACKAGE_IDENTITY_INCONSISTENT")
+    decoded_dir = _decode_package_id_dir(fragments[0]).replace("\\", "/")
+    # cargo file-URL form carries a rooted path (path+file:///C:/...) while
+    # filesystem form is C:/...; drop exactly that leading slash.
+    if len(decoded_dir) >= 3 and decoded_dir[0] == "/" and decoded_dir[1].isalpha() and decoded_dir[2] == ":":
+        decoded_dir = decoded_dir[1:]
+    expected_dir = manifest.parent.as_posix()
+    # Exact match, or casefold match on case-insensitive filesystems; the
+    # manifest content check above stays authoritative.
+    if decoded_dir != expected_dir and decoded_dir.casefold() != expected_dir.casefold():
+        _reject("PACKAGE_ID_DIR_MISMATCH")
     member_ids = set(members)
     if found["id"] in member_ids:
         kind = "member"
@@ -862,6 +959,56 @@ def bind_package_observation(*, descriptor, metadata):
         _reject("WORKSPACE_MEMBER_REQUIRED")
     return {"name": found["name"], "manifest_path": found["manifest_path"],
             "member_kind": kind, "version": found["version"], "id": found["id"]}
+
+
+def bind_execution_observations(*, package: dict, binary: dict):
+    """Cross-compare the metadata observation against the artifact observation.
+
+    Both inputs must carry exactly the shapes bind_package_observation and
+    bind_test_binary emit, else OBSERVATION_SHAPE. All cross-checks are exact
+    string equality: binary package name, full package id, version, and the
+    manifest path (separator-insensitive, suffix on the binary manifest_rel).
+    Returns the combined binding verbatim, with no recomputation.
+
+    Trust boundary, stated honestly: this enforces cross-observation
+    consistency plus descriptor binding downstream (compose_discovery_receipt);
+    observation authenticity itself is controller acquisition (#849), per
+    OfflineCaptureBinding. A self-consistent forged caller chain that also
+    forges a consistent manifest layout still requires acquisition forgery.
+    """
+    if type(package) is not dict or set(package) != {"name", "manifest_path", "member_kind", "version", "id"}:
+        _reject("OBSERVATION_SHAPE")
+    if type(binary) is not dict or set(binary) != {"package", "package_id", "package_version", "version",
+                                                   "manifest_rel", "binary_name", "binary_sha256",
+                                                   "target", "cfgs", "target_kind", "profile_test"}:
+        _reject("OBSERVATION_SHAPE")
+    for key in ("name", "manifest_path", "member_kind", "version", "id"):
+        if type(package[key]) is not str:
+            _reject("OBSERVATION_SHAPE")
+    for key in ("package", "package_id", "package_version", "version", "manifest_rel",
+                "binary_name", "binary_sha256"):
+        if type(binary[key]) is not str:
+            _reject("OBSERVATION_SHAPE")
+    if type(binary["target"]) is not str and binary["target"] is not None:
+        _reject("OBSERVATION_SHAPE")
+    if type(binary["cfgs"]) not in (list, tuple):
+        _reject("OBSERVATION_SHAPE")
+    if type(binary["profile_test"]) is not bool:
+        _reject("OBSERVATION_SHAPE")
+    if binary["package"] != package["name"]:
+        _reject("PACKAGE_BINARY_MISMATCH")
+    if binary["package_id"] != package["id"]:
+        _reject("ARTIFACT_OBSERVATION_MISMATCH")
+    if binary["version"] != package["version"]:
+        _reject("ARTIFACT_OBSERVATION_MISMATCH")
+    if not package["manifest_path"].replace("\\", "/").endswith("/" + binary["manifest_rel"]):
+        _reject("MANIFEST_OBSERVATION_MISMATCH")
+    return {"name": package["name"], "version": package["version"], "id": package["id"],
+            "manifest_path": package["manifest_path"], "manifest_rel": binary["manifest_rel"],
+            "member_kind": package["member_kind"], "binary_name": binary["binary_name"],
+            "binary_sha256": binary["binary_sha256"], "target": binary["target"],
+            "target_kind": binary["target_kind"], "profile_test": binary["profile_test"],
+            "cfgs": binary["cfgs"]}
 
 
 def build_python_child_command(*, script_rel: str, fd: int):
@@ -1041,7 +1188,9 @@ def bind_protected_snapshot(*, descriptor, assignment, snapshot: dict, descripto
     source+test root values plus the module file when the descriptor carries
     one, plus the descriptor file itself, plus the package manifest when the
     descriptor carries a package; the digest is sha256 over the canonical
-    JSON of the sorted items.
+    JSON of the sorted items plus the descriptor proof ceiling, so a ceiling
+    swap changes the digest. The returned binding carries that ceiling value
+    as proof_ceiling evidence alongside the digest and keys.
     """
     from . import contracts as c
     if type(descriptor) is not c.WorkUnitDescriptor:
@@ -1083,9 +1232,11 @@ def bind_protected_snapshot(*, descriptor, assignment, snapshot: dict, descripto
     for value in snapshot.values():
         if type(value) is not str or not _HEX.fullmatch(value):
             _reject("SNAPSHOT_DIGEST_SYNTAX")
-    canonical = json.dumps({key: snapshot[key] for key in required},
+    canonical = json.dumps({key: snapshot[key] for key in required}
+                           | {"proof_ceiling": descriptor.proof_ceiling.value},
                            sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return {"digest": hashlib.sha256(canonical).hexdigest(), "keys": required}
+    return {"digest": hashlib.sha256(canonical).hexdigest(), "keys": required,
+            "proof_ceiling": descriptor.proof_ceiling.value}
 
 
 def compose_mutation_finding(*, descriptor, diff: dict, snapshot_digest: str):
