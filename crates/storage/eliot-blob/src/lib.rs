@@ -25,7 +25,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{Seek, SeekFrom};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
@@ -35,16 +35,20 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
+pub use eliot_blob_api::{
+    BlobCapacityCause, BlobCapacityCleanup, BlobCapacityEffect, BlobCapacityEvidence,
+    BlobCapacityFailure, BlobCapacityIdentity, BlobCapacityRecovery, BlobCapacityStage, BlobError,
+    PublishState,
+};
 use eliot_blob_api::{
     BlobCasCapability, BlobCasDurability, BlobCasFailure, BlobCasOutcome, BlobCasReceipt,
-    BlobCasRequest, BlobCasState, BlobCasSuccessKind, BlobError, BlobFuture, BlobGcReceipt,
-    BlobGcRequest, BlobHash, BlobHealth, BlobId, BlobIssuerTrustAnchor, BlobKeyOperation,
-    BlobKeyRecoveryCeiling, BlobLiveSetProof, BlobLocator, BlobPolicyBinding,
-    BlobReachabilityRequest, BlobReachabilityView, BlobReadChunk, BlobReadRequest,
-    BlobReadyReceipt, BlobReceiptBinding, BlobReceiptContext, BlobReferenceObservation,
-    BlobReferenceRequest, BlobRootLease, BlobStageRequest, BlobStoreClient, CompressionDescriptor,
-    CryptoDescriptor, GcState, PublishState, SignedBlobReceiptWire, VerifiedBlobReceipt,
-    metadata_path, payload_path, verify_receipt,
+    BlobCasRequest, BlobCasState, BlobCasSuccessKind, BlobFuture, BlobGcReceipt, BlobGcRequest,
+    BlobHash, BlobHealth, BlobId, BlobIssuerTrustAnchor, BlobKeyOperation, BlobKeyRecoveryCeiling,
+    BlobLiveSetProof, BlobLocator, BlobPolicyBinding, BlobReachabilityRequest,
+    BlobReachabilityView, BlobReadChunk, BlobReadRequest, BlobReadyReceipt, BlobReceiptBinding,
+    BlobReceiptContext, BlobReferenceObservation, BlobReferenceRequest, BlobRootLease,
+    BlobStageRequest, BlobStoreClient, CompressionDescriptor, CryptoDescriptor, GcState,
+    SignedBlobReceiptWire, VerifiedBlobReceipt, metadata_path, payload_path, verify_receipt,
 };
 use eliot_platform::WorkScopePath;
 use eliot_receipts::{
@@ -69,6 +73,8 @@ const ROOT_LEASE_HEARTBEAT_MS: u64 = 1_000;
 const WINDOWS_REPARSE_POINT: u32 = 0x400;
 #[cfg(windows)]
 const WINDOWS_FILE_SHARE_READ: u32 = 0x0000_0001;
+#[cfg(target_os = "linux")]
+const LINUX_ENOSPC: i32 = 28;
 
 static ROOT_LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -106,6 +112,7 @@ struct RootLeaseState {
     lock_file: Mutex<Option<fs::File>>,
     stop: Arc<AtomicBool>,
     heartbeat: Mutex<Option<JoinHandle<()>>>,
+    heartbeat_failure: Mutex<Option<BlobError>>,
 }
 
 #[allow(
@@ -204,6 +211,7 @@ impl BlobRootOwner {
             lock_file: Mutex::new(Some(lock_file)),
             stop: Arc::clone(&stop),
             heartbeat: Mutex::new(None),
+            heartbeat_failure: Mutex::new(None),
         });
         let heartbeat_lease = Arc::downgrade(&lease);
         let heartbeat_stop = Arc::clone(&stop);
@@ -260,16 +268,38 @@ impl BlobRootOwner {
     pub fn claim_id(&self) -> &str {
         &self.claim_id
     }
+
+    /// Returns the last bounded heartbeat failure observed by the native lease
+    /// thread, if any. This is an owner observation; it does not claim that an
+    /// injected service health port has observed the same failure.
+    pub fn heartbeat_failure(&self) -> Option<BlobError> {
+        self.lease
+            .heartbeat_failure
+            .lock()
+            .ok()
+            .and_then(|failure| failure.clone())
+    }
+}
+
+fn redacted_root_id(root_id: &str) -> String {
+    format!("root:{}", sha256_hex(root_id.as_bytes()))
 }
 
 fn canonical_root(configured_root: &str) -> Result<(PathBuf, String), BlobError> {
     let configured = PathBuf::from(configured_root);
     reject_reparse_components(&configured)?;
     fs::create_dir_all(&configured).map_err(|error| {
-        BlobError::Provider(format!(
-            "create configured Blob root {}: {error}",
-            configured.display()
-        ))
+        native_capacity_error(
+            &error,
+            BlobCapacityStage::RootLeaseCreate,
+            BlobCapacityIdentity::RootLease {
+                root_id: redacted_root_id(configured_root),
+                lease_id: None,
+            },
+            None,
+            BlobCapacityEffect::PartialWriteUnknown,
+        )
+        .unwrap_or_else(|| BlobError::Provider("create configured Blob root failed".to_owned()))
     })?;
     let metadata = fs::symlink_metadata(&configured).map_err(|error| {
         BlobError::Provider(format!(
@@ -288,10 +318,19 @@ fn canonical_root(configured_root: &str) -> Result<(PathBuf, String), BlobError>
         ));
     }
     let canonical = fs::canonicalize(&configured).map_err(|error| {
-        BlobError::Provider(format!(
-            "canonicalize configured Blob root {}: {error}",
-            configured.display()
-        ))
+        native_capacity_error(
+            &error,
+            BlobCapacityStage::RootLeaseCreate,
+            BlobCapacityIdentity::RootLease {
+                root_id: redacted_root_id(configured_root),
+                lease_id: None,
+            },
+            None,
+            BlobCapacityEffect::PartialWriteUnknown,
+        )
+        .unwrap_or_else(|| {
+            BlobError::Provider("canonicalize configured Blob root failed".to_owned())
+        })
     })?;
     reject_reparse_components(&canonical)?;
     let identity = canonical_identity(&canonical);
@@ -357,9 +396,9 @@ fn acquire_root_lease(
     process_id: u32,
 ) -> Result<(PathBuf, String, fs::File), BlobError> {
     let lock_path = root.join(ROOT_LEASE_FILE);
-    ensure_lock_path_not_reparse(&lock_path)?;
+    ensure_lock_path_not_reparse(&lock_path, root_id)?;
     let token = lease_token(process_id);
-    let mut file = open_owned_root_lease(&lock_path)?;
+    let mut file = open_owned_root_lease(&lock_path, root_id, Some(&token))?;
     let record = RootLeaseRecord {
         version: ROOT_LEASE_VERSION,
         token: token.clone(),
@@ -368,30 +407,48 @@ fn acquire_root_lease(
         heartbeat_unix_ms: now_unix_ms(),
     };
     write_lease_record(&mut file, &record).map_err(|error| {
-        BlobError::Provider(format!(
-            "write Blob root lease {}: {error}",
-            lock_path.display()
-        ))
+        native_capacity_error(
+            &error,
+            BlobCapacityStage::RootLeaseCreate,
+            BlobCapacityIdentity::RootLease {
+                root_id: redacted_root_id(root_id),
+                lease_id: Some(redacted_root_id(&token)),
+            },
+            None,
+            BlobCapacityEffect::PartialWriteUnknown,
+        )
+        .unwrap_or_else(|| BlobError::Provider("write Blob root lease failed".to_owned()))
     })?;
     Ok((lock_path, token, file))
 }
 
-fn ensure_lock_path_not_reparse(lock_path: &Path) -> Result<(), BlobError> {
+fn ensure_lock_path_not_reparse(lock_path: &Path, root_id: &str) -> Result<(), BlobError> {
     match fs::symlink_metadata(lock_path) {
         Ok(metadata) if is_reparse_point(&metadata) => Err(BlobError::InvalidContract(
             "Blob root lease reparse points are not permitted".to_owned(),
         )),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(BlobError::Provider(format!(
-            "inspect Blob root lease {}: {error}",
-            lock_path.display()
-        ))),
+        Err(error) => Err(native_capacity_error(
+            &error,
+            BlobCapacityStage::RootLeaseCreate,
+            BlobCapacityIdentity::RootLease {
+                root_id: redacted_root_id(root_id),
+                lease_id: None,
+            },
+            None,
+            BlobCapacityEffect::NotAttempted,
+        )
+        .unwrap_or_else(|| BlobError::Provider("inspect Blob root lease failed".to_owned()))),
     }
 }
 
 #[cfg(windows)]
-fn open_owned_root_lease(lock_path: &Path) -> Result<fs::File, BlobError> {
+fn open_owned_root_lease(
+    lock_path: &Path,
+    root_id: &str,
+    lease_id: Option<&str>,
+) -> Result<fs::File, BlobError> {
     use std::os::windows::fs::OpenOptionsExt;
 
     let mut options = OpenOptions::new();
@@ -418,22 +475,42 @@ fn open_owned_root_lease(lock_path: &Path) -> Result<fs::File, BlobError> {
                 ) {
                     BlobError::OwnerConflict
                 } else {
-                    BlobError::Provider(format!(
-                        "open existing Blob root lease {}: {error}",
-                        lock_path.display()
-                    ))
+                    native_capacity_error(
+                        &error,
+                        BlobCapacityStage::RootLeaseCreate,
+                        BlobCapacityIdentity::RootLease {
+                            root_id: redacted_root_id(root_id),
+                            lease_id: lease_id.map(redacted_root_id),
+                        },
+                        None,
+                        BlobCapacityEffect::PartialWriteUnknown,
+                    )
+                    .unwrap_or_else(|| {
+                        BlobError::Provider("open existing Blob root lease failed".to_owned())
+                    })
                 }
             })
         }
-        Err(error) => Err(BlobError::Provider(format!(
-            "create Blob root lease {}: {error}",
-            lock_path.display()
-        ))),
+        Err(error) => Err(native_capacity_error(
+            &error,
+            BlobCapacityStage::RootLeaseCreate,
+            BlobCapacityIdentity::RootLease {
+                root_id: redacted_root_id(root_id),
+                lease_id: lease_id.map(redacted_root_id),
+            },
+            None,
+            BlobCapacityEffect::PartialWriteUnknown,
+        )
+        .unwrap_or_else(|| BlobError::Provider("create Blob root lease failed".to_owned()))),
     }
 }
 
 #[cfg(not(windows))]
-fn open_owned_root_lease(lock_path: &Path) -> Result<fs::File, BlobError> {
+fn open_owned_root_lease(
+    lock_path: &Path,
+    root_id: &str,
+    lease_id: Option<&str>,
+) -> Result<fs::File, BlobError> {
     // The production runtime is native Windows. On other targets, fail closed
     // on an existing path rather than pretending std::fs provides equivalent
     // cross-process write/delete exclusion.
@@ -446,19 +523,303 @@ fn open_owned_root_lease(lock_path: &Path) -> Result<fs::File, BlobError> {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
                 BlobError::OwnerConflict
             } else {
-                BlobError::Provider(format!(
-                    "create Blob root lease {}: {error}",
-                    lock_path.display()
-                ))
+                native_capacity_error(
+                    &error,
+                    BlobCapacityStage::RootLeaseCreate,
+                    BlobCapacityIdentity::RootLease {
+                        root_id: redacted_root_id(root_id),
+                        lease_id: lease_id.map(redacted_root_id),
+                    },
+                    None,
+                    BlobCapacityEffect::PartialWriteUnknown,
+                )
+                .unwrap_or_else(|| BlobError::Provider("create Blob root lease failed".to_owned()))
             }
         })
 }
 
 fn write_lease_record(file: &mut fs::File, record: &RootLeaseRecord) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
-    serde_json::to_writer(&mut *file, record).map_err(std::io::Error::other)?;
+    file.write_all(&bytes)?;
     file.sync_all()
+}
+
+fn native_capacity_cause(error: &std::io::Error) -> Option<BlobCapacityCause> {
+    #[cfg(windows)]
+    if error.kind() == std::io::ErrorKind::StorageFull
+        && let Some(code) = error.raw_os_error()
+    {
+        match code {
+            112 => return Some(BlobCapacityCause::WindowsErrorDiskFull { code: 112 }),
+            39 => return Some(BlobCapacityCause::WindowsErrorHandleDiskFull { code: 39 }),
+            _ => {}
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if error.kind() == std::io::ErrorKind::StorageFull && error.raw_os_error() == Some(LINUX_ENOSPC)
+    {
+        return Some(BlobCapacityCause::PosixEnospc { code: LINUX_ENOSPC });
+    }
+    (error.kind() == std::io::ErrorKind::StorageFull).then_some(BlobCapacityCause::IoStorageFull)
+}
+
+fn native_capacity_error(
+    error: &std::io::Error,
+    stage: BlobCapacityStage,
+    identity: BlobCapacityIdentity,
+    attempted_bytes: Option<u64>,
+    effect: BlobCapacityEffect,
+) -> Option<BlobError> {
+    let cause = native_capacity_cause(error)?;
+    Some(BlobError::StorageCapacity {
+        failure: Box::new(BlobCapacityFailure {
+            identity,
+            stage,
+            evidence: BlobCapacityEvidence {
+                cause,
+                attempted_bytes,
+                effect,
+            },
+            cas_request: None,
+            cas_observed: None,
+            cas_backend_generation: None,
+            cas_durability: None,
+            cleanup: BlobCapacityCleanup::NotApplicable,
+            cleanup_stage: None,
+            cleanup_evidence: None,
+            gc_state: None,
+            recovery: match effect {
+                BlobCapacityEffect::PossiblePublication { .. }
+                | BlobCapacityEffect::DurabilityUnconfirmed { .. }
+                | BlobCapacityEffect::PossibleMutation => {
+                    BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+                }
+                BlobCapacityEffect::NotAttempted | BlobCapacityEffect::PartialWriteUnknown => {
+                    BlobCapacityRecovery::CapacityRevalidationRequired
+                }
+            },
+        }),
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InvalidCapacityEvidence;
+
+fn bind_platform_capacity_attempt(
+    error: BlobError,
+    stage: BlobCapacityStage,
+    identity: BlobCapacityIdentity,
+    attempted_bytes: u64,
+) -> Result<BlobError, InvalidCapacityEvidence> {
+    let error = bind_platform_capacity_with_effect(
+        error,
+        stage,
+        identity,
+        Some(BlobCapacityEffect::PartialWriteUnknown),
+    )?;
+    let BlobError::StorageCapacity { mut failure } = error else {
+        return Ok(error);
+    };
+    failure.evidence.attempted_bytes = Some(attempted_bytes);
+    Ok(BlobError::StorageCapacity { failure })
+}
+
+fn bind_journal_capacity(
+    error: BlobError,
+    journal: &StageJournal,
+    attempted_bytes: u64,
+) -> Result<BlobError, InvalidCapacityEvidence> {
+    let effect = if journal.state == PublishState::JournalPrepared {
+        BlobCapacityEffect::PartialWriteUnknown
+    } else {
+        BlobCapacityEffect::PossiblePublication {
+            state: journal.state,
+        }
+    };
+    let error = bind_platform_capacity_with_effect(
+        error,
+        BlobCapacityStage::JournalWrite,
+        BlobCapacityIdentity::Journal {
+            operation_id: journal.operation_id.clone(),
+            idempotency_key: journal.idempotency_key.clone(),
+            locator: None,
+        },
+        Some(effect),
+    )?;
+    let BlobError::StorageCapacity { mut failure } = error else {
+        return Ok(error);
+    };
+    failure.evidence.attempted_bytes = Some(attempted_bytes);
+    Ok(BlobError::StorageCapacity { failure })
+}
+
+fn bind_platform_capacity_with_effect(
+    error: BlobError,
+    stage: BlobCapacityStage,
+    identity: BlobCapacityIdentity,
+    effect_override: Option<BlobCapacityEffect>,
+) -> Result<BlobError, InvalidCapacityEvidence> {
+    let BlobError::StorageCapacity { failure } = error else {
+        return Ok(error);
+    };
+    let mut evidence = failure.evidence;
+    if let Some(effect) = effect_override {
+        evidence.effect = effect;
+    }
+    let recovery = match evidence.effect {
+        BlobCapacityEffect::PossiblePublication { .. }
+        | BlobCapacityEffect::DurabilityUnconfirmed { .. }
+        | BlobCapacityEffect::PossibleMutation => {
+            BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+        }
+        BlobCapacityEffect::NotAttempted | BlobCapacityEffect::PartialWriteUnknown => {
+            BlobCapacityRecovery::CapacityRevalidationRequired
+        }
+    };
+    let bound = BlobError::StorageCapacity {
+        failure: Box::new(BlobCapacityFailure {
+            identity,
+            stage,
+            evidence,
+            cas_request: failure.cas_request,
+            cas_observed: failure.cas_observed,
+            cas_backend_generation: failure.cas_backend_generation,
+            cas_durability: failure.cas_durability,
+            cleanup: failure.cleanup,
+            cleanup_stage: failure.cleanup_stage,
+            cleanup_evidence: failure.cleanup_evidence,
+            gc_state: failure.gc_state,
+            recovery,
+        }),
+    };
+    if matches!(&bound, BlobError::StorageCapacity { failure } if failure.validate().is_err()) {
+        Err(InvalidCapacityEvidence)
+    } else {
+        Ok(bound)
+    }
+}
+
+fn bind_capacity_cas(
+    error: BlobError,
+    request: &BlobCasRequest,
+) -> Result<BlobError, InvalidCapacityEvidence> {
+    let BlobError::StorageCapacity { failure } = error else {
+        return Ok(error);
+    };
+    let mut failure = *failure;
+    let observations_match = failure
+        .cas_request
+        .as_deref()
+        .is_some_and(|candidate| candidate == request);
+    if failure.cas_request.is_none()
+        && (failure.cas_observed.is_some()
+            || failure.cas_backend_generation.is_some()
+            || failure.cas_durability.is_some())
+    {
+        return Err(InvalidCapacityEvidence);
+    }
+    failure.identity = BlobCapacityIdentity::Operation {
+        context: Box::new(request.context.clone()),
+        locator: None,
+    };
+    failure.stage = BlobCapacityStage::CasJournal;
+    failure.evidence.effect = BlobCapacityEffect::PossibleMutation;
+    failure.cas_request = Some(Box::new(request.clone()));
+    if !observations_match {
+        failure.cas_observed = None;
+        failure.cas_backend_generation = None;
+        failure.cas_durability = None;
+    }
+    failure.recovery = BlobCapacityRecovery::ReconcileSameOperationThenRevalidate;
+    if failure.validate().is_err() {
+        return Err(InvalidCapacityEvidence);
+    }
+    Ok(BlobError::StorageCapacity {
+        failure: Box::new(failure),
+    })
+}
+
+fn retain_capacity_gc_state(error: BlobError, gc_phase: GcState) -> BlobError {
+    let BlobError::StorageCapacity { mut failure } = error else {
+        return error;
+    };
+    failure.gc_state = Some(gc_phase);
+    BlobError::StorageCapacity { failure }
+}
+
+fn bind_cleanup_capacity(
+    error: BlobError,
+    operation_id: &str,
+    idempotency_key: &str,
+    locator: &BlobLocator,
+    state: PublishState,
+) -> BlobError {
+    match error {
+        BlobError::StorageCapacity { .. } => {
+            let error = match bind_platform_capacity_with_effect(
+                error,
+                BlobCapacityStage::Cleanup,
+                BlobCapacityIdentity::Journal {
+                    operation_id: operation_id.to_owned(),
+                    idempotency_key: idempotency_key.to_owned(),
+                    locator: Some(locator.clone()),
+                },
+                Some(BlobCapacityEffect::PossiblePublication { state }),
+            ) {
+                Ok(error) => error,
+                Err(InvalidCapacityEvidence) => {
+                    return BlobError::UnknownPublishOutcome {
+                        operation_id: operation_id.to_owned(),
+                        state,
+                    };
+                }
+            };
+            let BlobError::StorageCapacity { mut failure } = error else {
+                return error;
+            };
+            // The last durable phase is known, but a cleanup error cannot
+            // prove whether this individual removal took effect.
+            failure.cleanup = BlobCapacityCleanup::Unknown;
+            BlobError::StorageCapacity { failure }
+        }
+        other => other,
+    }
+}
+
+fn bind_platform_capacity_gc(
+    error: BlobError,
+    stage: BlobCapacityStage,
+    identity: BlobCapacityIdentity,
+    gc_phase: GcState,
+) -> BlobError {
+    let operation_id = match &identity {
+        BlobCapacityIdentity::Journal { operation_id, .. } => operation_id.clone(),
+        BlobCapacityIdentity::Operation { context, .. } => {
+            context.operation.operation_id.to_string()
+        }
+        BlobCapacityIdentity::RootLease { root_id, .. } => root_id.clone(),
+    };
+    let error = match bind_platform_capacity_with_effect(
+        error,
+        stage,
+        identity,
+        Some(BlobCapacityEffect::PossibleMutation),
+    ) {
+        Ok(error) => error,
+        Err(InvalidCapacityEvidence) => {
+            return BlobError::UnknownGcOutcome {
+                operation_id,
+                state: gc_phase,
+            };
+        }
+    };
+    let BlobError::StorageCapacity { mut failure } = error else {
+        return error;
+    };
+    failure.gc_state = Some(gc_phase);
+    BlobError::StorageCapacity { failure }
 }
 
 fn heartbeat_root_lease(lease: &Weak<RootLeaseState>, stop: &Arc<AtomicBool>) {
@@ -483,7 +844,27 @@ fn heartbeat_root_lease(lease: &Weak<RootLeaseState>, stop: &Arc<AtomicBool>) {
             process_id: lease.process_id,
             heartbeat_unix_ms: now_unix_ms(),
         };
-        if write_lease_record(file, &record).is_err() {
+        if let Err(error) = write_lease_record(file, &record) {
+            let failure = native_capacity_error(
+                &error,
+                BlobCapacityStage::RootLeaseHeartbeat,
+                BlobCapacityIdentity::RootLease {
+                    root_id: redacted_root_id(&lease.root_id),
+                    lease_id: Some(redacted_root_id(&lease.token)),
+                },
+                None,
+                BlobCapacityEffect::PartialWriteUnknown,
+            )
+            .unwrap_or_else(|| {
+                BlobError::Provider(format!(
+                    "Blob root lease heartbeat write failed: kind={:?};raw_os_error={:?}",
+                    error.kind(),
+                    error.raw_os_error()
+                ))
+            });
+            if let Ok(mut retained) = lease.heartbeat_failure.lock() {
+                *retained = Some(failure);
+            }
             break;
         }
     }
@@ -1185,6 +1566,17 @@ struct BlobStoreCore<P, C, K, A, L> {
     issuer_anchor: BlobIssuerTrustAnchor,
 }
 
+struct PublishVerification<'a> {
+    source: &'a WorkScopePath,
+    destination: &'a WorkScopePath,
+    expected_sha256: &'a str,
+    hard_ceiling: u64,
+    operation_id: &'a str,
+    idempotency_key: &'a str,
+    state_before: PublishState,
+    stage: BlobCapacityStage,
+}
+
 impl<P, C, K, A, L> BlobStoreCore<P, C, K, A, L>
 where
     P: BlobPlatformPort,
@@ -1301,6 +1693,14 @@ where
             Ok(physical) => physical,
             Err(BlobError::CasFailure { failure }) if cas_failure_is_bound(&failure, request) => {
                 return Err(BlobError::CasFailure { failure });
+            }
+            Err(error @ BlobError::StorageCapacity { .. }) => {
+                return Err(match bind_capacity_cas(error, request) {
+                    Ok(bound) => bound,
+                    Err(InvalidCapacityEvidence) => {
+                        cas_unknown(request, None, None, BlobCasDurability::Unconfirmed)
+                    }
+                });
             }
             Err(_) => {
                 return Err(cas_unknown(
@@ -1660,32 +2060,56 @@ where
         }
     }
 
-    fn publish_or_verify(
-        &self,
-        source: &WorkScopePath,
-        destination: &WorkScopePath,
-        expected_sha256: &str,
-        hard_ceiling: u64,
-        operation_id: &str,
-        state_before: PublishState,
-    ) -> Result<(), BlobError> {
-        self.contained(source)?;
-        self.contained(destination)?;
-        match self.platform_rename(source, destination) {
+    fn publish_or_verify(&self, verification: &PublishVerification<'_>) -> Result<(), BlobError> {
+        self.contained(verification.source)?;
+        self.contained(verification.destination)?;
+        match self.platform_rename(verification.source, verification.destination) {
             Ok(()) => {
-                if self.exact_bytes_at(destination, expected_sha256, hard_ceiling)? {
+                if self.exact_bytes_at(
+                    verification.destination,
+                    verification.expected_sha256,
+                    verification.hard_ceiling,
+                )? {
                     Ok(())
                 } else {
                     Err(BlobError::UnknownPublishOutcome {
-                        operation_id: operation_id.to_owned(),
-                        state: state_before,
+                        operation_id: verification.operation_id.to_owned(),
+                        state: verification.state_before,
                     })
                 }
             }
-            Err(_) if self.exact_bytes_at(destination, expected_sha256, hard_ceiling)? => Ok(()),
+            Err(error @ BlobError::StorageCapacity { .. }) => {
+                match bind_platform_capacity_with_effect(
+                    error,
+                    verification.stage,
+                    BlobCapacityIdentity::Journal {
+                        operation_id: verification.operation_id.to_owned(),
+                        idempotency_key: verification.idempotency_key.to_owned(),
+                        locator: None,
+                    },
+                    Some(BlobCapacityEffect::PossiblePublication {
+                        state: verification.state_before,
+                    }),
+                ) {
+                    Ok(bound) => Err(bound),
+                    Err(InvalidCapacityEvidence) => Err(BlobError::UnknownPublishOutcome {
+                        operation_id: verification.operation_id.to_owned(),
+                        state: verification.state_before,
+                    }),
+                }
+            }
+            Err(_error)
+                if self.exact_bytes_at(
+                    verification.destination,
+                    verification.expected_sha256,
+                    verification.hard_ceiling,
+                )? =>
+            {
+                Ok(())
+            }
             Err(_) => Err(BlobError::UnknownPublishOutcome {
-                operation_id: operation_id.to_owned(),
-                state: state_before,
+                operation_id: verification.operation_id.to_owned(),
+                state: verification.state_before,
             }),
         }
     }
@@ -1705,11 +2129,21 @@ where
         self.contained(path)?;
         let bytes = serde_json::to_vec(journal)
             .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
-        if replace {
+        let result = if replace {
             self.platform_replace(path, &bytes)
         } else {
             self.platform_write_new(path, &bytes)
-        }
+        };
+        result.map_err(|error| {
+            let bound = bind_journal_capacity(error, journal, bytes.len() as u64);
+            match bound {
+                Ok(bound) => bound,
+                Err(InvalidCapacityEvidence) => BlobError::UnknownPublishOutcome {
+                    operation_id: journal.operation_id.clone(),
+                    state: journal.state,
+                },
+            }
+        })
     }
 
     #[allow(
@@ -1794,7 +2228,8 @@ where
                 }),
             });
         }
-        self.platform_compare_and_replace(&request, &bytes)?;
+        self.platform_compare_and_replace(&request, &bytes)
+            .map_err(|error| retain_capacity_gc_state(error, candidate.state))?;
         Ok(BlobCasState::Digest(sha256_hex(&bytes)))
     }
 
@@ -1819,14 +2254,16 @@ where
                     state: journal.state,
                 });
             }
-            self.publish_or_verify(
-                &journal.temp_payload,
-                &journal.final_payload,
-                &journal.expected_payload_sha256,
-                MAX_BLOB_ENVELOPE_BYTES,
-                &journal.operation_id,
-                journal.state,
-            )?;
+            self.publish_or_verify(&PublishVerification {
+                source: &journal.temp_payload,
+                destination: &journal.final_payload,
+                expected_sha256: &journal.expected_payload_sha256,
+                hard_ceiling: MAX_BLOB_ENVELOPE_BYTES,
+                operation_id: &journal.operation_id,
+                idempotency_key: &journal.idempotency_key,
+                state_before: journal.state,
+                stage: BlobCapacityStage::PayloadPublication,
+            })?;
         }
         journal.state = PublishState::PayloadDurable;
         self.persist_journal(journal_path, journal, true)?;
@@ -1846,14 +2283,16 @@ where
                     state: journal.state,
                 });
             }
-            self.publish_or_verify(
-                &journal.temp_metadata,
-                &journal.final_metadata,
-                &journal.expected_metadata_sha256,
-                MAX_METADATA_BYTES,
-                &journal.operation_id,
-                journal.state,
-            )?;
+            self.publish_or_verify(&PublishVerification {
+                source: &journal.temp_metadata,
+                destination: &journal.final_metadata,
+                expected_sha256: &journal.expected_metadata_sha256,
+                hard_ceiling: MAX_METADATA_BYTES,
+                operation_id: &journal.operation_id,
+                idempotency_key: &journal.idempotency_key,
+                state_before: journal.state,
+                stage: BlobCapacityStage::MetadataPublication,
+            })?;
         }
         journal.state = PublishState::MetadataDurable;
         self.persist_journal(journal_path, journal, true)?;
@@ -1884,7 +2323,7 @@ where
         let commit = OperationCommit {
             operation_id: journal.operation_id.clone(),
             idempotency_key: journal.idempotency_key.clone(),
-            locator: metadata.locator,
+            locator: metadata.locator.clone(),
             metadata_sha256: journal.expected_metadata_sha256.clone(),
         };
         commit.validate()?;
@@ -1895,6 +2334,30 @@ where
         self.contained(&commit_path)?;
         match self.platform_write_new(&commit_path, &commit_bytes) {
             Ok(()) => {}
+            Err(error @ BlobError::StorageCapacity { .. }) => {
+                let bound = bind_platform_capacity_with_effect(
+                    error,
+                    BlobCapacityStage::CommitWrite,
+                    BlobCapacityIdentity::Journal {
+                        operation_id: journal.operation_id.clone(),
+                        idempotency_key: journal.idempotency_key.clone(),
+                        locator: Some(metadata.locator.clone()),
+                    },
+                    Some(BlobCapacityEffect::PossiblePublication {
+                        state: PublishState::MetadataDurable,
+                    }),
+                );
+                let bound = match bound {
+                    Ok(bound) => bound,
+                    Err(InvalidCapacityEvidence) => {
+                        return Err(BlobError::UnknownPublishOutcome {
+                            operation_id: journal.operation_id.clone(),
+                            state: PublishState::MetadataDurable,
+                        });
+                    }
+                };
+                return Err(bound);
+            }
             Err(_)
                 if self.exact_bytes_at(
                     &commit_path,
@@ -1909,9 +2372,35 @@ where
             }
         }
         journal.state = PublishState::CommitDurable;
-        self.remove_if_present(&journal.temp_payload)?;
-        self.remove_if_present(&journal.temp_metadata)?;
-        self.remove_if_present(journal_path)?;
+        self.remove_if_present(&journal.temp_payload)
+            .map_err(|error| {
+                bind_cleanup_capacity(
+                    error,
+                    &journal.operation_id,
+                    &journal.idempotency_key,
+                    &metadata.locator,
+                    PublishState::CommitDurable,
+                )
+            })?;
+        self.remove_if_present(&journal.temp_metadata)
+            .map_err(|error| {
+                bind_cleanup_capacity(
+                    error,
+                    &journal.operation_id,
+                    &journal.idempotency_key,
+                    &metadata.locator,
+                    PublishState::CommitDurable,
+                )
+            })?;
+        self.remove_if_present(journal_path).map_err(|error| {
+            bind_cleanup_capacity(
+                error,
+                &journal.operation_id,
+                &journal.idempotency_key,
+                &metadata.locator,
+                PublishState::CommitDurable,
+            )
+        })?;
         journal.state = PublishState::Cleaned;
         Ok(())
     }
@@ -2018,11 +2507,25 @@ where
                             &tombstone,
                             Some((previous_revision, frozen_cas_state.clone())),
                         )?;
-                        self.platform_remove(target)
-                            .map_err(|_| BlobError::UnknownGcOutcome {
-                                operation_id: operation_id.clone(),
-                                state,
-                            })?;
+                        self.platform_remove(target).map_err(|error| {
+                            if matches!(error, BlobError::StorageCapacity { .. }) {
+                                bind_platform_capacity_gc(
+                                    error,
+                                    BlobCapacityStage::GcCleanup,
+                                    BlobCapacityIdentity::Journal {
+                                        operation_id: operation_id.clone(),
+                                        idempotency_key: tombstone.parent_idempotency_key.clone(),
+                                        locator: Some(locator.clone()),
+                                    },
+                                    state,
+                                )
+                            } else {
+                                BlobError::UnknownGcOutcome {
+                                    operation_id: operation_id.clone(),
+                                    state,
+                                }
+                            }
+                        })?;
                     }
                     BlobPathState::ReparsePoint => {
                         return Err(BlobError::PlanGap(
@@ -2154,7 +2657,28 @@ where
             return Ok(ready);
         }
         if self.platform_stat(&journal_path)? != BlobPathState::Missing {
-            self.reconcile_stage_path(&journal_path)?;
+            let journal_bytes = self.read_bounded_file(&journal_path, MAX_JOURNAL_BYTES)?;
+            let mut journal: StageJournal = serde_json::from_slice(&journal_bytes)
+                .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+            journal.validate()?;
+            // Check the persisted operation and all deterministic artifact
+            // paths before allowing recovery to perform any publication. A
+            // reused operation with a different locator must not advance the
+            // old journal and discover the mismatch only after mutation.
+            // The persisted journal has no policy commitment, so an otherwise
+            // identical content/locator replay with a changed policy remains
+            // an explicitly documented reconciliation limitation; final
+            // metadata binding still rejects the mismatch before readiness.
+            if journal.operation_id != request.context.operation.operation_id.as_str()
+                || journal.idempotency_key != request.context.operation.idempotency_key
+                || journal.temp_payload != Self::temp_path(&request.context, "payload")?
+                || journal.temp_metadata != Self::temp_path(&request.context, "metadata")?
+                || journal.final_payload != payload
+                || journal.final_metadata != metadata_path_value
+            {
+                return Err(BlobError::IdempotencyConflict);
+            }
+            self.finish_journal(&journal_path, &mut journal)?;
         }
         let payload_state = self.platform_stat(&payload)?;
         let metadata_state = self.platform_stat(&metadata_path_value)?;
@@ -2296,7 +2820,7 @@ where
         let temp_metadata = Self::temp_path(&request.context, "metadata")?;
         let mut journal = StageJournal {
             operation_id: request.context.operation.operation_id.to_string(),
-            idempotency_key: request.context.operation.idempotency_key,
+            idempotency_key: request.context.operation.idempotency_key.clone(),
             state: PublishState::JournalPrepared,
             temp_payload: temp_payload.clone(),
             temp_metadata: temp_metadata.clone(),
@@ -2309,10 +2833,56 @@ where
         self.contained(&temp_payload)?;
         self.contained(&temp_metadata)?;
         if let Err(error) = self.platform_write_new(&temp_payload, &sealed) {
+            let error = bind_platform_capacity_attempt(
+                error,
+                BlobCapacityStage::PayloadWrite,
+                BlobCapacityIdentity::Operation {
+                    context: Box::new(request.context.clone()),
+                    locator: Some(locator.clone()),
+                },
+                sealed.len() as u64,
+            );
+            let error = match error {
+                Ok(error) => error,
+                Err(InvalidCapacityEvidence) => {
+                    return Err(BlobError::UnknownPublishOutcome {
+                        operation_id: journal.operation_id.clone(),
+                        state: journal.state,
+                    });
+                }
+            };
+            // Keep the journal as the sole same-operation recovery record;
+            // a capacity failure may have partially written the temp payload.
+            if matches!(error, BlobError::StorageCapacity { .. }) {
+                return Err(error);
+            }
             let _ = self.remove_if_present(&journal_path);
             return Err(error);
         }
         if let Err(error) = self.platform_write_new(&temp_metadata, &metadata_bytes) {
+            let error = bind_platform_capacity_attempt(
+                error,
+                BlobCapacityStage::MetadataWrite,
+                BlobCapacityIdentity::Operation {
+                    context: Box::new(request.context.clone()),
+                    locator: Some(locator.clone()),
+                },
+                metadata_bytes.len() as u64,
+            );
+            let error = match error {
+                Ok(error) => error,
+                Err(InvalidCapacityEvidence) => {
+                    return Err(BlobError::UnknownPublishOutcome {
+                        operation_id: journal.operation_id.clone(),
+                        state: journal.state,
+                    });
+                }
+            };
+            // Preserve both the journal and payload for reconciliation.  The
+            // metadata write may have left a partial artifact as well.
+            if matches!(error, BlobError::StorageCapacity { .. }) {
+                return Err(error);
+            }
             let _ = self.remove_if_present(&temp_payload);
             let _ = self.remove_if_present(&journal_path);
             return Err(error);
@@ -3156,6 +3726,46 @@ mod tests {
             .expect("test anchor")
     }
 
+    fn test_capacity_error(
+        stage: BlobCapacityStage,
+        effect: BlobCapacityEffect,
+        attempted_bytes: Option<u64>,
+    ) -> BlobError {
+        BlobError::StorageCapacity {
+            failure: Box::new(BlobCapacityFailure {
+                identity: BlobCapacityIdentity::Journal {
+                    operation_id: "provider-operation".to_owned(),
+                    idempotency_key: "provider-idempotency".to_owned(),
+                    locator: None,
+                },
+                stage,
+                evidence: BlobCapacityEvidence {
+                    cause: BlobCapacityCause::IoStorageFull,
+                    attempted_bytes,
+                    effect,
+                },
+                cas_request: None,
+                cas_observed: None,
+                cas_backend_generation: None,
+                cas_durability: None,
+                cleanup: BlobCapacityCleanup::NotApplicable,
+                cleanup_stage: None,
+                cleanup_evidence: None,
+                gc_state: None,
+                recovery: match effect {
+                    BlobCapacityEffect::NotAttempted | BlobCapacityEffect::PartialWriteUnknown => {
+                        BlobCapacityRecovery::CapacityRevalidationRequired
+                    }
+                    BlobCapacityEffect::PossibleMutation
+                    | BlobCapacityEffect::PossiblePublication { .. }
+                    | BlobCapacityEffect::DurabilityUnconfirmed { .. } => {
+                        BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+                    }
+                },
+            }),
+        }
+    }
+
     struct MemoryPlatform {
         files: BTreeMap<String, (Vec<u8>, u64)>,
         cas_requests: BTreeMap<String, BlobCasRequest>,
@@ -3163,6 +3773,9 @@ mod tests {
         claim: Option<RootClaimProof>,
         now: u64,
         backend_generation: u64,
+        fail_write: Option<BlobCapacityStage>,
+        fail_rename: bool,
+        fail_remove: bool,
     }
 
     impl Default for MemoryPlatform {
@@ -3174,6 +3787,9 @@ mod tests {
                 claim: None,
                 now: 0,
                 backend_generation: 1,
+                fail_write: None,
+                fail_rename: false,
+                fail_remove: false,
             }
         }
     }
@@ -3226,6 +3842,13 @@ mod tests {
             path: &WorkScopePath,
             bytes: &[u8],
         ) -> Result<(), BlobError> {
+            if let Some(stage) = self.fail_write.take() {
+                return Err(test_capacity_error(
+                    stage,
+                    BlobCapacityEffect::PartialWriteUnknown,
+                    Some(bytes.len() as u64),
+                ));
+            }
             if self.files.contains_key(path.normalized_identity()) {
                 return Err(BlobError::IdempotencyConflict);
             }
@@ -3359,6 +3982,15 @@ mod tests {
             source: &WorkScopePath,
             destination: &WorkScopePath,
         ) -> Result<(), BlobError> {
+            if self.fail_rename {
+                return Err(test_capacity_error(
+                    BlobCapacityStage::PayloadPublication,
+                    BlobCapacityEffect::PossiblePublication {
+                        state: PublishState::JournalPrepared,
+                    },
+                    None,
+                ));
+            }
             if self.files.contains_key(destination.normalized_identity()) {
                 return Err(BlobError::IdempotencyConflict);
             }
@@ -3372,6 +4004,15 @@ mod tests {
         }
 
         fn remove_durable(&mut self, path: &WorkScopePath) -> Result<(), BlobError> {
+            if self.fail_remove {
+                return Err(test_capacity_error(
+                    BlobCapacityStage::Cleanup,
+                    BlobCapacityEffect::PossiblePublication {
+                        state: PublishState::CommitDurable,
+                    },
+                    None,
+                ));
+            }
             self.files.remove(path.normalized_identity());
             Ok(())
         }
@@ -3647,12 +4288,13 @@ mod tests {
         }
     }
 
-    fn store() -> BlobStoreService<MemoryPlatform, TestCompression, TestKeys, TestAead, TestLiveSets>
-    {
+    fn store_with_platform(
+        platform: MemoryPlatform,
+    ) -> BlobStoreService<MemoryPlatform, TestCompression, TestKeys, TestAead, TestLiveSets> {
         let request = stage_request("bootstrap", b"");
         BlobStoreService::new(
             request.root_lease,
-            MemoryPlatform::default(),
+            platform,
             TestCompression,
             TestKeys,
             TestAead,
@@ -3660,6 +4302,11 @@ mod tests {
             test_anchor(),
         )
         .expect("store")
+    }
+
+    fn store() -> BlobStoreService<MemoryPlatform, TestCompression, TestKeys, TestAead, TestLiveSets>
+    {
+        store_with_platform(MemoryPlatform::default())
     }
 
     fn gc_store(
@@ -4080,5 +4727,112 @@ mod tests {
         let error = decode_tombstone(br#"{"operation_id":"legacy"}"#)
             .expect_err("legacy tombstone must not be admitted");
         assert!(matches!(error, BlobError::PlanGap(message) if message.contains("legacy")));
+    }
+
+    #[test]
+    fn native_storage_full_mapping_keeps_unknown_partial_progress() {
+        let io_error = std::io::Error::new(std::io::ErrorKind::StorageFull, "full");
+        let error = native_capacity_error(
+            &io_error,
+            BlobCapacityStage::PayloadWrite,
+            BlobCapacityIdentity::Journal {
+                operation_id: "op-native".to_owned(),
+                idempotency_key: "idem-native".to_owned(),
+                locator: None,
+            },
+            Some(64),
+            BlobCapacityEffect::PartialWriteUnknown,
+        )
+        .expect("StorageFull must classify");
+        let BlobError::StorageCapacity { failure } = error else {
+            panic!("expected storage capacity");
+        };
+        assert_eq!(failure.evidence.attempted_bytes, Some(64));
+        assert_eq!(
+            failure.evidence.effect,
+            BlobCapacityEffect::PartialWriteUnknown
+        );
+        assert_eq!(failure.cleanup, BlobCapacityCleanup::NotApplicable);
+    }
+
+    #[test]
+    fn stage_journal_capacity_retains_operation_and_attempted_bytes() {
+        let platform = MemoryPlatform {
+            fail_write: Some(BlobCapacityStage::JournalWrite),
+            ..MemoryPlatform::default()
+        };
+        let error = block_on(
+            store_with_platform(platform).stage(stage_request("journal-full", b"payload")),
+        )
+        .expect_err("journal capacity must be surfaced");
+        let BlobError::StorageCapacity { failure } = error else {
+            panic!("expected typed journal capacity failure");
+        };
+        assert_eq!(failure.stage, BlobCapacityStage::JournalWrite);
+        assert_eq!(
+            failure.evidence.effect,
+            BlobCapacityEffect::PartialWriteUnknown
+        );
+        assert!(
+            failure
+                .evidence
+                .attempted_bytes
+                .is_some_and(|bytes| bytes > 0)
+        );
+        assert!(matches!(
+            failure.identity,
+            BlobCapacityIdentity::Journal { .. }
+        ));
+    }
+
+    #[test]
+    fn publication_capacity_keeps_possible_effect_for_reconciliation() {
+        let platform = MemoryPlatform {
+            fail_rename: true,
+            ..MemoryPlatform::default()
+        };
+        let error = block_on(
+            store_with_platform(platform).stage(stage_request("publication-full", b"payload")),
+        )
+        .expect_err("publication capacity must remain uncertain");
+        let BlobError::StorageCapacity { failure } = error else {
+            panic!("expected typed publication capacity failure");
+        };
+        assert_eq!(failure.stage, BlobCapacityStage::PayloadPublication);
+        assert!(matches!(
+            failure.evidence.effect,
+            BlobCapacityEffect::PossiblePublication { .. }
+        ));
+        assert_eq!(
+            failure.recovery,
+            BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+        );
+    }
+
+    #[test]
+    fn cleanup_capacity_retains_last_durable_phase_and_unknown_cleanup() {
+        let platform = MemoryPlatform {
+            fail_remove: true,
+            ..MemoryPlatform::default()
+        };
+        let error = block_on(
+            store_with_platform(platform).stage(stage_request("cleanup-full", b"payload")),
+        )
+        .expect_err("cleanup capacity must remain observable");
+        let BlobError::StorageCapacity { failure } = error else {
+            panic!("expected typed cleanup capacity failure");
+        };
+        assert_eq!(failure.stage, BlobCapacityStage::Cleanup);
+        assert!(matches!(
+            failure.evidence.effect,
+            BlobCapacityEffect::PossiblePublication {
+                state: PublishState::CommitDurable
+            }
+        ));
+        assert_eq!(failure.cleanup, BlobCapacityCleanup::Unknown);
+        assert_eq!(
+            failure.recovery,
+            BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+        );
     }
 }
