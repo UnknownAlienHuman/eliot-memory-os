@@ -372,8 +372,25 @@ pub struct CampaignLearningStateView {
 
 impl CampaignLearningStateView {
     /// Validate exact recipe binding, denominator and one disposition per slot/member.
-    #[allow(clippy::too_many_lines)]
     pub fn validate_against(
+        &self,
+        recipe: &LearningStateViewRecipe,
+    ) -> Result<(), LearningContractError> {
+        self.validate_recipe_contract(recipe)?;
+        self.validate_slot_projections(recipe)?;
+        self.validate_view_status()?;
+        self.validate_slot_partition(recipe)?;
+        self.validate_required_coverage(recipe)?;
+        validate_digest(&self.canonical_digest, "view.canonical_digest")?;
+        if digest_without_field(self, "canonical_digest")? != self.canonical_digest {
+            return Err(LearningContractError::DigestMismatch {
+                field: "view.canonical_digest",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_recipe_contract(
         &self,
         recipe: &LearningStateViewRecipe,
     ) -> Result<(), LearningContractError> {
@@ -397,6 +414,13 @@ impl CampaignLearningStateView {
             slot.validate()?;
         }
         ensure_unique(self.slots.iter().map(|s| s.slot_id.as_str()), "view.slots")?;
+        Ok(())
+    }
+
+    fn validate_slot_projections(
+        &self,
+        recipe: &LearningStateViewRecipe,
+    ) -> Result<(), LearningContractError> {
         let recipe_by_id: std::collections::BTreeMap<_, _> = recipe
             .slots
             .iter()
@@ -431,6 +455,10 @@ impl CampaignLearningStateView {
                 return Err(LearningContractError::IncompleteCoverage);
             }
         }
+        Ok(())
+    }
+
+    fn validate_view_status(&self) -> Result<(), LearningContractError> {
         ensure_unique(self.omissions.iter().map(SlotId::as_str), "view.omissions")?;
         ensure_unique(self.frontier.iter().map(SlotId::as_str), "view.frontier")?;
         for disagreement in &self.owner_disagreements {
@@ -452,6 +480,13 @@ impl CampaignLearningStateView {
         {
             return Err(LearningContractError::IncompleteCoverage);
         }
+        Ok(())
+    }
+
+    fn validate_slot_partition(
+        &self,
+        recipe: &LearningStateViewRecipe,
+    ) -> Result<(), LearningContractError> {
         let declared_slots =
             u32::try_from(recipe.slots.len()).map_err(|_| LearningContractError::Bound {
                 field: "recipe.slots",
@@ -491,6 +526,13 @@ impl CampaignLearningStateView {
         } else {
             return Err(LearningContractError::IncompleteCoverage);
         }
+        Ok(())
+    }
+
+    fn validate_required_coverage(
+        &self,
+        recipe: &LearningStateViewRecipe,
+    ) -> Result<(), LearningContractError> {
         if matches!(self.completeness, Completeness::CompleteForDeclaredRecipe) {
             for spec in &recipe.slots {
                 let required = match &spec.requirement {
@@ -531,12 +573,6 @@ impl CampaignLearningStateView {
                     return Err(LearningContractError::IncompleteCoverage);
                 }
             }
-        }
-        validate_digest(&self.canonical_digest, "view.canonical_digest")?;
-        if digest_without_field(self, "canonical_digest")? != self.canonical_digest {
-            return Err(LearningContractError::DigestMismatch {
-                field: "view.canonical_digest",
-            });
         }
         Ok(())
     }

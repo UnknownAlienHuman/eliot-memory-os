@@ -495,8 +495,21 @@ pub struct AdmissionInput {
 
 impl AdmissionInput {
     /// Validate the complete identity, denominator and measurement closure.
-    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ContextError> {
+        self.validate_contract()?;
+        let candidates: std::collections::BTreeMap<_, _> = self
+            .candidates
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.atom_id.clone(), candidate))
+            .collect();
+        self.validate_floor_bindings(&candidates)?;
+        self.validate_measurement_closure(&candidates)?;
+        self.validate_priority_and_omission_closure(&candidates)?;
+        Ok(())
+    }
+
+    fn validate_contract(&self) -> Result<(), ContextError> {
         if self.candidates.candidates.len() > 4096
             || self.measurements.len() > 4096
             || self.priority.priorities.len() > 4096
@@ -542,12 +555,13 @@ impl AdmissionInput {
         ) {
             return Err(ContextError::UnknownMeasurement);
         }
-        let candidates: std::collections::BTreeMap<_, _> = self
-            .candidates
-            .candidates
-            .iter()
-            .map(|candidate| (candidate.atom_id.clone(), candidate))
-            .collect();
+        Ok(())
+    }
+
+    fn validate_floor_bindings(
+        &self,
+        candidates: &std::collections::BTreeMap<ArtifactId, &ContextCandidate>,
+    ) -> Result<(), ContextError> {
         for provider in &self.floor.floor.providers.requested {
             if !self
                 .candidates
@@ -595,6 +609,13 @@ impl AdmissionInput {
                 return Err(ContextError::IdentityConflict);
             }
         }
+        Ok(())
+    }
+
+    fn validate_measurement_closure(
+        &self,
+        candidates: &std::collections::BTreeMap<ArtifactId, &ContextCandidate>,
+    ) -> Result<(), ContextError> {
         let mut seen = BTreeSet::new();
         for measurement in &self.measurements {
             measurement.validate()?;
@@ -642,6 +663,13 @@ impl AdmissionInput {
         if seen != expected {
             return Err(ContextError::DenominatorMismatch);
         }
+        Ok(())
+    }
+
+    fn validate_priority_and_omission_closure(
+        &self,
+        candidates: &std::collections::BTreeMap<ArtifactId, &ContextCandidate>,
+    ) -> Result<(), ContextError> {
         let priority_ids: BTreeSet<_> = self
             .priority
             .priorities
@@ -815,8 +843,28 @@ pub struct AdmissionResult {
 
 impl AdmissionResult {
     /// Validate complete conservation or an explicit incomplete outcome.
-    #[allow(clippy::too_many_lines)]
     pub fn validate_for(&self, input: &AdmissionInput) -> Result<(), ContextError> {
+        self.validate_input_contract(input)?;
+        self.evidence.validate_for(&input.candidates)?;
+        self.validate_omissions(input)?;
+        match &self.outcome {
+            ContextOutcome::Complete(admitted) => {
+                self.validate_complete_economy(input, admitted)?;
+                self.validate_complete_selection(input, admitted)?;
+            }
+            ContextOutcome::Incomplete(incomplete) => {
+                self.validate_incomplete_outcome(incomplete)?;
+            }
+        }
+        let mut unsigned = self.clone();
+        unsigned.result_digest = "0".repeat(64);
+        if self.result_digest != canonical_digest(&unsigned)? {
+            return Err(ContextError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn validate_input_contract(&self, input: &AdmissionInput) -> Result<(), ContextError> {
         input.validate_additive_measurements()?;
         if self.schema_version != CONTEXT_CONTRACT_VERSION || self.binding != input.binding {
             return Err(ContextError::IdentityConflict);
@@ -828,7 +876,10 @@ impl AdmissionResult {
         {
             return Err(ContextError::IdentityConflict);
         }
-        self.evidence.validate_for(&input.candidates)?;
+        Ok(())
+    }
+
+    fn validate_omissions(&self, input: &AdmissionInput) -> Result<(), ContextError> {
         for omission in &self.evidence.omissions {
             let candidate = input
                 .candidate(&omission.atom_id)
@@ -874,127 +925,140 @@ impl AdmissionResult {
                 }
             }
         }
-        match &self.outcome {
-            ContextOutcome::Complete(admitted) => {
-                if self.evidence.incomplete.is_some() {
-                    return Err(ContextError::DenominatorMismatch);
-                }
-                if input.floor.floor.incomplete()?.is_some() {
-                    return Err(ContextError::MissingFloor);
-                }
-                admitted.validate()?;
-                if admitted.binding != self.binding
-                    || admitted.floor != input.floor.floor
-                    || self.evidence.economy.as_ref() != Some(&admitted.economy)
-                    || admitted.economy.measurement.digest != admitted.canonical_payload_digest()?
-                    || admitted.economy.measurement.serializer
-                        != input.measurement_profile.serializer_id
-                {
-                    return Err(ContextError::IdentityConflict);
-                }
-                if admitted.economy.omissions.len() != self.evidence.omissions.len()
-                    || admitted.economy.omissions.iter().any(|economy_omission| {
-                        self.evidence.omissions.iter().find(|evidence_omission| {
-                            evidence_omission.atom_id == economy_omission.atom_id
-                        }) != Some(economy_omission)
-                    })
-                {
-                    return Err(ContextError::EconomyMismatch);
-                }
-                let capacity = &input.recipe.capacity;
-                let allocations = &admitted.economy.allocations;
-                if allocations.route_capacity != capacity.route_capacity
-                    || allocations.fixed_overhead != capacity.fixed_overhead
-                    || allocations.output_reserve != capacity.output_reserve
-                    || allocations.review_reserve != capacity.review_reserve
-                {
-                    return Err(ContextError::EconomyMismatch);
-                }
-                let mut admitted_cost = 0_u64;
-                for record in &admitted.records {
-                    let measurement = input
-                        .measurement(
-                            &record.candidate.atom_id,
-                            record.candidate.representation.kind(),
-                        )
-                        .ok_or(ContextError::DenominatorMismatch)?;
-                    let AdmissionMeasuredCost::ExactUtf8Bytes { value } = &measurement.cost else {
-                        return Err(ContextError::UnknownMeasurement);
-                    };
-                    admitted_cost = admitted_cost
-                        .checked_add(*value)
-                        .ok_or(ContextError::Overflow)?;
-                }
-                let allocated_admitted = allocations
-                    .admitted_required
-                    .checked_add(allocations.admitted_optional)
-                    .ok_or(ContextError::Overflow)?;
-                if admitted_cost != allocated_admitted {
-                    return Err(ContextError::EconomyMismatch);
-                }
-                for admission in &admitted.admissions {
-                    if !self.evidence.decisions.iter().any(|decision| {
-                        decision.atom_id == admission.atom_id
-                            && decision.provider_role == admission.provider_role
-                            && decision.disposition == admission.disposition
-                            && decision.rule_evidence == admission.rule_evidence
-                    }) {
-                        return Err(ContextError::SelectionIntegrityMismatch);
-                    }
-                }
-                for record in &admitted.records {
-                    if input.candidate(&record.candidate.atom_id) != Some(&record.candidate) {
-                        return Err(ContextError::SelectionIntegrityMismatch);
-                    }
-                }
-                let admitted_ids: BTreeSet<_> = admitted
-                    .records
-                    .iter()
-                    .map(|record| record.candidate.atom_id.clone())
-                    .collect();
-                let omission_ids: BTreeSet<_> = self
-                    .evidence
+        Ok(())
+    }
+
+    fn validate_complete_economy(
+        &self,
+        input: &AdmissionInput,
+        admitted: &crate::AdmittedContextSet,
+    ) -> Result<(), ContextError> {
+        if self.evidence.incomplete.is_some() {
+            return Err(ContextError::DenominatorMismatch);
+        }
+        if input.floor.floor.incomplete()?.is_some() {
+            return Err(ContextError::MissingFloor);
+        }
+        admitted.validate()?;
+        if admitted.binding != self.binding
+            || admitted.floor != input.floor.floor
+            || self.evidence.economy.as_ref() != Some(&admitted.economy)
+            || admitted.economy.measurement.digest != admitted.canonical_payload_digest()?
+            || admitted.economy.measurement.serializer != input.measurement_profile.serializer_id
+        {
+            return Err(ContextError::IdentityConflict);
+        }
+        if admitted.economy.omissions.len() != self.evidence.omissions.len()
+            || admitted.economy.omissions.iter().any(|economy_omission| {
+                self.evidence
                     .omissions
                     .iter()
-                    .map(|omission| omission.atom_id.clone())
-                    .collect();
-                for decision in &self.evidence.decisions {
-                    let expected_admitted = matches!(
-                        decision.disposition,
-                        AdmissionDisposition::Include | AdmissionDisposition::HandleOnly
-                    );
-                    if expected_admitted != admitted_ids.contains(&decision.atom_id)
-                        || (!expected_admitted && !omission_ids.contains(&decision.atom_id))
-                    {
-                        return Err(ContextError::SelectionIntegrityMismatch);
-                    }
-                }
-                let admitted_digest = admitted.canonical_payload_digest()?;
-                if self.selection_digest != admitted_digest {
-                    return Err(ContextError::SelectionIntegrityMismatch);
-                }
-            }
-            ContextOutcome::Incomplete(incomplete) => {
-                if self.evidence.incomplete.as_ref() != Some(incomplete)
-                    || self.evidence.economy.is_some()
-                    || self.evidence.decisions.iter().any(|decision| {
-                        matches!(
-                            decision.disposition,
-                            AdmissionDisposition::Include | AdmissionDisposition::HandleOnly
-                        )
-                    })
-                {
-                    return Err(ContextError::DenominatorMismatch);
-                }
-                if self.selection_digest != canonical_digest(incomplete)? {
-                    return Err(ContextError::SelectionIntegrityMismatch);
-                }
+                    .find(|evidence_omission| evidence_omission.atom_id == economy_omission.atom_id)
+                    != Some(economy_omission)
+            })
+        {
+            return Err(ContextError::EconomyMismatch);
+        }
+        let capacity = &input.recipe.capacity;
+        let allocations = &admitted.economy.allocations;
+        if allocations.route_capacity != capacity.route_capacity
+            || allocations.fixed_overhead != capacity.fixed_overhead
+            || allocations.output_reserve != capacity.output_reserve
+            || allocations.review_reserve != capacity.review_reserve
+        {
+            return Err(ContextError::EconomyMismatch);
+        }
+        let mut admitted_cost = 0_u64;
+        for record in &admitted.records {
+            let measurement = input
+                .measurement(
+                    &record.candidate.atom_id,
+                    record.candidate.representation.kind(),
+                )
+                .ok_or(ContextError::DenominatorMismatch)?;
+            let AdmissionMeasuredCost::ExactUtf8Bytes { value } = &measurement.cost else {
+                return Err(ContextError::UnknownMeasurement);
+            };
+            admitted_cost = admitted_cost
+                .checked_add(*value)
+                .ok_or(ContextError::Overflow)?;
+        }
+        let allocated_admitted = allocations
+            .admitted_required
+            .checked_add(allocations.admitted_optional)
+            .ok_or(ContextError::Overflow)?;
+        if admitted_cost != allocated_admitted {
+            return Err(ContextError::EconomyMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_complete_selection(
+        &self,
+        input: &AdmissionInput,
+        admitted: &crate::AdmittedContextSet,
+    ) -> Result<(), ContextError> {
+        for admission in &admitted.admissions {
+            if !self.evidence.decisions.iter().any(|decision| {
+                decision.atom_id == admission.atom_id
+                    && decision.provider_role == admission.provider_role
+                    && decision.disposition == admission.disposition
+                    && decision.rule_evidence == admission.rule_evidence
+            }) {
+                return Err(ContextError::SelectionIntegrityMismatch);
             }
         }
-        let mut unsigned = self.clone();
-        unsigned.result_digest = "0".repeat(64);
-        if self.result_digest != canonical_digest(&unsigned)? {
-            return Err(ContextError::IdentityConflict);
+        for record in &admitted.records {
+            if input.candidate(&record.candidate.atom_id) != Some(&record.candidate) {
+                return Err(ContextError::SelectionIntegrityMismatch);
+            }
+        }
+        let admitted_ids: BTreeSet<_> = admitted
+            .records
+            .iter()
+            .map(|record| record.candidate.atom_id.clone())
+            .collect();
+        let omission_ids: BTreeSet<_> = self
+            .evidence
+            .omissions
+            .iter()
+            .map(|omission| omission.atom_id.clone())
+            .collect();
+        for decision in &self.evidence.decisions {
+            let expected_admitted = matches!(
+                decision.disposition,
+                AdmissionDisposition::Include | AdmissionDisposition::HandleOnly
+            );
+            if expected_admitted != admitted_ids.contains(&decision.atom_id)
+                || (!expected_admitted && !omission_ids.contains(&decision.atom_id))
+            {
+                return Err(ContextError::SelectionIntegrityMismatch);
+            }
+        }
+        let admitted_digest = admitted.canonical_payload_digest()?;
+        if self.selection_digest != admitted_digest {
+            return Err(ContextError::SelectionIntegrityMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_incomplete_outcome(
+        &self,
+        incomplete: &DecisionContextIncomplete,
+    ) -> Result<(), ContextError> {
+        if self.evidence.incomplete.as_ref() != Some(incomplete)
+            || self.evidence.economy.is_some()
+            || self.evidence.decisions.iter().any(|decision| {
+                matches!(
+                    decision.disposition,
+                    AdmissionDisposition::Include | AdmissionDisposition::HandleOnly
+                )
+            })
+        {
+            return Err(ContextError::DenominatorMismatch);
+        }
+        if self.selection_digest != canonical_digest(incomplete)? {
+            return Err(ContextError::SelectionIntegrityMismatch);
         }
         Ok(())
     }

@@ -99,8 +99,42 @@ impl CurationScreenResult {
         })
     }
     /// Validates all cross-record bindings and complete/partial semantics.
-    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ContractError> {
+        self.validate_contract()?;
+        self.validate_progress()?;
+        validate_findings(
+            &self.findings,
+            &self.source.identity,
+            &self.request.profile.profile_id,
+        )?;
+        let source_ids = self.source.member_ids();
+        self.validate_finding_bindings(&source_ids)?;
+        let coverage_ids = self.coverage.member_ids();
+        let coverage_order: Vec<_> = self
+            .coverage
+            .members
+            .iter()
+            .map(|member| member.member_id.clone())
+            .collect();
+        let source_order: Vec<_> = self
+            .source
+            .members
+            .iter()
+            .map(|member| member.member_id.clone())
+            .collect();
+        if !coverage_ids.is_subset(&source_ids) {
+            return Err(ContractError::Reconciliation {
+                field: "coverage.source_members",
+            });
+        }
+        self.validate_protection(&source_ids)?;
+        self.validate_eligibility(&source_ids)?;
+        self.validate_member_dispositions()?;
+        self.validate_completion(&source_ids, &coverage_order, &source_order)?;
+        Ok(())
+    }
+
+    fn validate_contract(&self) -> Result<(), ContractError> {
         self.request.validate_snapshot(&self.source)?;
         if self.result_digest != self.computed_digest()? {
             return Err(ContractError::Reconciliation {
@@ -125,6 +159,10 @@ impl CurationScreenResult {
                 field: "result.limits",
             });
         }
+        Ok(())
+    }
+
+    fn validate_progress(&self) -> Result<(), ContractError> {
         let start =
             usize::try_from(self.coverage.start_position).map_err(|_| ContractError::Bound {
                 field: "coverage.start_position",
@@ -192,12 +230,13 @@ impl CurationScreenResult {
                 field: "result.cumulative_usage",
             });
         }
-        validate_findings(
-            &self.findings,
-            &self.source.identity,
-            &self.request.profile.profile_id,
-        )?;
-        let source_ids = self.source.member_ids();
+        Ok(())
+    }
+
+    fn validate_finding_bindings(
+        &self,
+        source_ids: &BTreeSet<MemberId>,
+    ) -> Result<(), ContractError> {
         for finding in &self.findings {
             if !source_ids.contains(&finding.member_id) {
                 return Err(ContractError::BindingMismatch {
@@ -229,24 +268,10 @@ impl CurationScreenResult {
                 });
             }
         }
-        let coverage_ids = self.coverage.member_ids();
-        let coverage_order: Vec<_> = self
-            .coverage
-            .members
-            .iter()
-            .map(|member| member.member_id.clone())
-            .collect();
-        let source_order: Vec<_> = self
-            .source
-            .members
-            .iter()
-            .map(|member| member.member_id.clone())
-            .collect();
-        if !coverage_ids.is_subset(&source_ids) {
-            return Err(ContractError::Reconciliation {
-                field: "coverage.source_members",
-            });
-        }
+        Ok(())
+    }
+
+    fn validate_protection(&self, source_ids: &BTreeSet<MemberId>) -> Result<(), ContractError> {
         for assessment in &self.protection {
             assessment.validate()?;
             source_matches(&self.source.identity, &assessment.source)?;
@@ -274,6 +299,10 @@ impl CurationScreenResult {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn validate_eligibility(&self, source_ids: &BTreeSet<MemberId>) -> Result<(), ContractError> {
         for item in &self.eligibility {
             item.validate(&self.findings, &self.request.profile.profile_id)?;
             source_matches(&self.source.identity, &item.source)?;
@@ -310,6 +339,10 @@ impl CurationScreenResult {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn validate_member_dispositions(&self) -> Result<(), ContractError> {
         for member in &self.coverage.members {
             if self
                 .member_sets
@@ -379,6 +412,15 @@ impl CurationScreenResult {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn validate_completion(
+        &self,
+        source_ids: &BTreeSet<MemberId>,
+        coverage_order: &[MemberId],
+        source_order: &[MemberId],
+    ) -> Result<(), ContractError> {
         if self
             .protection
             .iter()
@@ -422,8 +464,8 @@ impl CurationScreenResult {
                 field: "result.partial_frontier",
             });
         }
-        if !self.member_sets.changed_targets.is_subset(&source_ids)
-            || !self.member_sets.immutable_references.is_subset(&source_ids)
+        if !self.member_sets.changed_targets.is_subset(source_ids)
+            || !self.member_sets.immutable_references.is_subset(source_ids)
         {
             return Err(ContractError::Reconciliation {
                 field: "member_sets.source",
