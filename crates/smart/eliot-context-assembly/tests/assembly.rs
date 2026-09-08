@@ -56,7 +56,7 @@ fn candidate(context: &ContextBinding) -> ContextCandidate {
             predecessor: None,
         },
         representation: AtomRepresentation::Whole {
-            content: "whole goal material".to_owned(),
+            content: "whole goal matériél".to_owned(),
         },
         loss_policy: LossPolicy::NonDroppable,
         availability: AtomAvailability::PresentCurrent,
@@ -154,6 +154,34 @@ fn admitted() -> AdmittedContextSet {
     value.economy.allocations.admitted_required = payload_bytes;
     value.economy.allocations.remaining_headroom = 100_000 - 9 - payload_bytes;
     value.economy.measurement.digest = value.canonical_payload_digest().expect("admitted digest");
+    value
+}
+
+fn admitted_two() -> AdmittedContextSet {
+    let mut value = admitted();
+    let context = value.binding.clone();
+    let mut second = candidate(&context);
+    second.atom_id = id("atom-two");
+    second.source.snapshot_id = id("snapshot-two");
+    second.representation = AtomRepresentation::Whole {
+        content: "second admitted atom".to_owned(),
+    };
+    value.records.push(AdmittedAtom {
+        candidate: second,
+        disposition: AdmissionDisposition::Include,
+        rule_evidence: id("admission-rule-two"),
+    });
+    value.admissions.push(AdmissionRecord {
+        atom_id: id("atom-two"),
+        provider_role: role(),
+        disposition: AdmissionDisposition::Include,
+        rule_evidence: id("admission-rule-two"),
+    });
+    value.economy.requested.push(id("atom-two"));
+    value.economy.admitted.push(id("atom-two"));
+    value.economy.measurement.digest = value
+        .canonical_payload_digest()
+        .expect("two-atom admitted digest");
     value
 }
 
@@ -286,12 +314,17 @@ fn assembles_exact_admitted_projection_and_measures_once() {
     assert_eq!(calls, 1);
     assert_eq!(view.view.rendered.len(), 1);
     assert_eq!(view.view.admitted_ids, vec![id("atom")]);
-    assert!(view.view.measurement.rendered_utf8_bytes > 0);
+    assert_eq!(
+        view.view.measurement.rendered_utf8_bytes,
+        u64::try_from(view.serialized_bytes.len()).expect("serialized byte count")
+    );
 }
 
 #[test]
 fn canonical_payload_matches_a15_digest_and_order() {
-    let first = admitted();
+    let first = admitted_two();
+    let original_records = first.records.clone();
+    let original_admissions = first.admissions.clone();
     let context = first.binding.clone();
     let left = assemble_active_view(
         &first,
@@ -301,7 +334,14 @@ fn canonical_payload_matches_a15_digest_and_order() {
         |bytes| Ok(measurement(&context, bytes)),
     )
     .expect("first projection");
-    let second = admitted();
+    assert_eq!(first.records, original_records);
+    assert_eq!(first.admissions, original_admissions);
+    let mut second = admitted_two();
+    second.records.reverse();
+    second.admissions.reverse();
+    second.economy.measurement.digest = second
+        .canonical_payload_digest()
+        .expect("reversed admitted digest");
     let right = assemble_active_view(
         &second,
         &recipe(&context),
@@ -310,6 +350,8 @@ fn canonical_payload_matches_a15_digest_and_order() {
         |bytes| Ok(measurement(&context, bytes)),
     )
     .expect("second projection");
+    assert_eq!(left.view.rendered, right.view.rendered);
+    assert_eq!(left.serialized_bytes, right.serialized_bytes);
     assert_eq!(left.view.output_digest, right.view.output_digest);
     assert_eq!(
         left.view.output_digest,

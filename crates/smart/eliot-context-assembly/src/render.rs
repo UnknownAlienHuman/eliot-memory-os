@@ -2,7 +2,8 @@
 
 use eliot_context_contracts::{AdmittedContextSet, RenderedAtom};
 
-/// Render in the admitted order, preserving every A-15 load-bearing field.
+/// Render with the stable A-18 role/provider/atom ordering, preserving every
+/// A-15 load-bearing field.
 pub(crate) fn render(admitted: &AdmittedContextSet) -> Vec<RenderedAtom> {
     let mut rendered: Vec<_> = admitted
         .records
