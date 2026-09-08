@@ -2589,6 +2589,124 @@ pub enum BlobCasFailure {
     SuccessKindMismatch { request: Box<BlobCasRequest> },
 }
 
+/// The precise operation phase at which the storage provider reported a
+/// capacity failure.  This is deliberately narrower than a general provider
+/// error so callers cannot mistake permission, quota, or unknown I/O for a
+/// full-volume condition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobCapacityStage {
+    RootLeaseCreate,
+    RootLeaseHeartbeat,
+    JournalWrite,
+    PayloadWrite,
+    MetadataWrite,
+    PayloadPublication,
+    MetadataPublication,
+    CommitWrite,
+    Cleanup,
+    CasJournal,
+    GcCleanup,
+}
+
+/// Platform-qualified capacity evidence.  Numeric codes are retained only
+/// when they came from the matching target namespace; no cross-platform code
+/// interpretation is performed here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobCapacityCause {
+    IoStorageFull,
+    PosixEnospc { code: i32 },
+    WindowsErrorDiskFull { code: u32 },
+    WindowsErrorHandleDiskFull { code: u32 },
+}
+
+/// Effect certainty is independent from the capacity cause.  In particular,
+/// a full-volume error after publication can leave a possible committed effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobCapacityEffect {
+    NotAttempted,
+    PartialWriteUnknown,
+    PossibleMutation,
+    PossiblePublication { state: PublishState },
+    DurabilityUnconfirmed { state: PublishState },
+}
+
+/// Cleanup is retained as secondary evidence and never replaces the primary
+/// capacity failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobCapacityCleanup {
+    NotApplicable,
+    Succeeded,
+    Failed,
+    Unknown,
+}
+
+/// Recovery instruction for a capacity failure.  A possible effect must be
+/// reconciled under its original operation before any new attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobCapacityRecovery {
+    CapacityRevalidationRequired,
+    ReconcileSameOperationThenRevalidate,
+}
+
+/// Lossless capacity evidence supplied by a platform port before the Blob
+/// service attaches its operation/stage identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobCapacityEvidence {
+    pub cause: BlobCapacityCause,
+    /// Bytes offered to the native write boundary, not bytes proven written,
+    /// committed, or durable after the failure.
+    pub attempted_bytes: Option<u64>,
+    pub effect: BlobCapacityEffect,
+}
+
+/// Identity applicability for a capacity observation.  Root setup occurs
+/// before a Blob operation context exists, so it retains only its root/lease
+/// identity rather than inventing an operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlobCapacityIdentity {
+    Operation {
+        context: Box<BlobReceiptContext>,
+        locator: Option<BlobLocator>,
+    },
+    /// Persisted journal identity retained when the journal predates the full
+    /// request context. It is still sufficient for same-operation recovery.
+    Journal {
+        operation_id: String,
+        idempotency_key: String,
+        locator: Option<BlobLocator>,
+    },
+    RootLease {
+        root_id: String,
+        lease_id: Option<String>,
+    },
+}
+
+/// Typed, stage-specific Blob capacity failure. Root-lease setup uses the
+/// explicit [`BlobCapacityIdentity::RootLease`] form because no Blob operation
+/// context exists yet; no dummy operation is manufactured.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobCapacityFailure {
+    pub identity: BlobCapacityIdentity,
+    pub stage: BlobCapacityStage,
+    pub evidence: BlobCapacityEvidence,
+    /// CAS callers retain the complete original request and observations
+    /// separately from the capacity cause; a capacity error never erases the
+    /// accepted #946/#730 reconciliation state.
+    pub cas_request: Option<Box<BlobCasRequest>>,
+    pub cas_observed: Option<BlobCasState>,
+    pub cas_backend_generation: Option<u64>,
+    pub cas_durability: Option<BlobCasDurability>,
+    pub cleanup: BlobCapacityCleanup,
+    /// When cleanup itself reported typed capacity evidence, retain its
+    /// phase and evidence alongside the primary failure.
+    pub cleanup_stage: Option<BlobCapacityStage>,
+    pub cleanup_evidence: Option<BlobCapacityEvidence>,
+    /// GC retains its exact delete phase separately from the generic mutation
+    /// effect so recovery never has to infer which target was being removed.
+    pub gc_state: Option<GcState>,
+    pub recovery: BlobCapacityRecovery,
+}
+
 /// Recovery ceiling for a missing blob encryption key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlobKeyRecoveryCeiling {
@@ -2654,6 +2772,8 @@ pub enum BlobError {
     ProviderUnavailable(&'static str),
     #[error("CAS failure: {failure}")]
     CasFailure { failure: Box<BlobCasFailure> },
+    #[error("blob storage capacity exhausted during a bounded blob operation")]
+    StorageCapacity { failure: Box<BlobCapacityFailure> },
     #[error(
         "key unavailable during {operation:?}; lineage={key_lineage:?}; generation={key_generation:?}; ceiling={recovery:?}"
     )]
@@ -2665,6 +2785,112 @@ pub enum BlobError {
     },
     #[error("provider failure: {0}")]
     Provider(String),
+}
+
+impl BlobCapacityFailure {
+    /// Checks the intrinsic consistency of a capacity observation before a
+    /// caller uses it for recovery.  This validates representation claims; it
+    /// does not authenticate a provider or turn a caller-supplied observation
+    /// into a successful commit receipt.
+    pub fn validate(&self) -> Result<(), BlobError> {
+        match self.evidence.cause {
+            BlobCapacityCause::IoStorageFull
+            | BlobCapacityCause::PosixEnospc { code: 28 }
+            | BlobCapacityCause::WindowsErrorDiskFull { code: 112 }
+            | BlobCapacityCause::WindowsErrorHandleDiskFull { code: 39 } => {}
+            BlobCapacityCause::PosixEnospc { .. }
+            | BlobCapacityCause::WindowsErrorDiskFull { .. }
+            | BlobCapacityCause::WindowsErrorHandleDiskFull { .. } => {
+                return Err(BlobError::InvalidField {
+                    field: "capacity.cause",
+                    reason: "native code does not match its declared namespace",
+                });
+            }
+        }
+        match &self.identity {
+            BlobCapacityIdentity::Operation { context, locator } => {
+                context.validate_for(EffectClass::ReversibleMutation)?;
+                if let Some(locator) = locator {
+                    locator.validate()?;
+                }
+            }
+            BlobCapacityIdentity::Journal {
+                operation_id,
+                idempotency_key,
+                locator,
+            } => {
+                if operation_id.trim().is_empty() || idempotency_key.trim().is_empty() {
+                    return Err(BlobError::InvalidField {
+                        field: "capacity.identity",
+                        reason: "journal operation and idempotency identities are required",
+                    });
+                }
+                if let Some(locator) = locator {
+                    locator.validate()?;
+                }
+            }
+            BlobCapacityIdentity::RootLease { root_id, lease_id } => {
+                if root_id.trim().is_empty()
+                    || lease_id
+                        .as_deref()
+                        .is_some_and(|value| value.trim().is_empty())
+                {
+                    return Err(BlobError::InvalidField {
+                        field: "capacity.identity",
+                        reason: "root and lease identities must be nonblank",
+                    });
+                }
+            }
+        }
+        let requires_reconciliation = matches!(
+            self.evidence.effect,
+            BlobCapacityEffect::PossibleMutation
+                | BlobCapacityEffect::PossiblePublication { .. }
+                | BlobCapacityEffect::DurabilityUnconfirmed { .. }
+        );
+        if (requires_reconciliation
+            && self.recovery != BlobCapacityRecovery::ReconcileSameOperationThenRevalidate)
+            || (!requires_reconciliation
+                && self.recovery != BlobCapacityRecovery::CapacityRevalidationRequired)
+        {
+            return Err(BlobError::InvalidField {
+                field: "capacity.recovery",
+                reason: "recovery does not match effect certainty",
+            });
+        }
+        if self.stage == BlobCapacityStage::CasJournal && self.cas_request.is_none() {
+            return Err(BlobError::InvalidField {
+                field: "capacity.cas_request",
+                reason: "CAS capacity observations require their complete request",
+            });
+        }
+        if let Some(request) = &self.cas_request {
+            request.validate()?;
+        }
+        if (self.cas_backend_generation.is_some() || self.cas_durability.is_some())
+            && self.cas_request.is_none()
+        {
+            return Err(BlobError::InvalidField {
+                field: "capacity.cas_observation",
+                reason: "CAS generation and durability require a complete request",
+            });
+        }
+        if self.gc_state.is_some() && self.stage != BlobCapacityStage::GcCleanup {
+            return Err(BlobError::InvalidField {
+                field: "capacity.gc_state",
+                reason: "GC state is only valid for GC cleanup",
+            });
+        }
+        if self.cleanup == BlobCapacityCleanup::NotApplicable
+            && (self.cleanup_stage.is_some() || self.cleanup_evidence.is_some())
+        {
+            return Err(BlobError::InvalidField {
+                field: "capacity.cleanup",
+                reason: "cleanup evidence requires an applicable cleanup result",
+            });
+        }
+        Ok(())
+    }
 }
 
 impl From<eliot_receipts::ReceiptError> for BlobError {
