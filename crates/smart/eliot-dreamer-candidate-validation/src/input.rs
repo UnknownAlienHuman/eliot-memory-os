@@ -133,7 +133,7 @@ impl ValidationPolicy {
 }
 
 fn validate_policy_id(value: &str) -> Result<(), DreamDraftValidationError> {
-    if value.trim().is_empty() || value.len() > MAX_POLICY_ID || value.chars().any(char::is_control)
+    if value.len() > MAX_POLICY_ID || value.trim().is_empty() || value.chars().any(char::is_control)
     {
         return Err(summarize_contract(
             "validation policy",
