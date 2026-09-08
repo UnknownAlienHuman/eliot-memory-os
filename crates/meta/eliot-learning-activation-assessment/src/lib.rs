@@ -1,13 +1,30 @@
-//! Capability cell placeholder.
+//! Observation-only composition for the A-32 learning lifecycle contracts.
 //!
-//! NOT IMPLEMENTED. This file exists only so that per-crate
-//! `cargo check`, `cargo test` and `cargo clippy` run and report an
-//! actionable result instead of a manifest error.
+//! This crate constructs candidate records from supplied owner observations. It
+//! does not collect events, authenticate owners, activate candidates, persist a
+//! receipt, or promote a causal claim.
 //!
-//! Cell `meta.learning.activation_assessment`, order 36.
-//! The purpose, contract and dependencies of this cell live in
-//! `module.toml` next to this crate. The owning work unit replaces this
-//! file and, on completion, moves the crate from the root
-//! `workspace.exclude` into `workspace.members`.
+//! Calls are bounded to 4 MiB of input and output, 1 MiB per text/byte leaf,
+//! 65,536 items per collection, and 128 nested containers. These are local
+//! implementation limits, not claims about upstream source completeness.
 
 #![forbid(unsafe_code)]
+
+mod assessment;
+mod bounds;
+mod contracts;
+mod error;
+
+pub use assessment::{AssessmentInput, AssessmentResultOrIncomplete, assess_learning_activation};
+pub use contracts::{
+    AssessmentPolicy, AssessmentResult, IncompleteAssessment, MAX_DIMENSIONS, MAX_INPUT_BYTES,
+    MAX_METRICS, MAX_OUTPUT_BYTES, MAX_REFERENCES, MAX_STAGES, MissingAssessmentField,
+};
+pub use error::ActivationAssessmentError;
+
+pub use eliot_learning_contracts::{
+    AssessmentDimension, AttemptLearningDeltaCandidate, CampaignHarnessOverlayCandidate,
+    CampaignLearningStateView, CausalCeiling, ContractBinding, DimensionAssessment,
+    DimensionStatus, HarnessActivationReceiptCandidate, LearningAssessmentCandidate,
+    LifecycleStage, MetricObservation, SourceDenominator, StageDisposition, StageObservation,
+};
