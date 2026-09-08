@@ -37,6 +37,9 @@ mod bounds;
 mod context;
 mod error;
 mod identity;
+mod index_bounds;
+mod index_candidate;
+mod index_projection;
 mod normalization;
 mod observation;
 mod relation;
@@ -57,6 +60,8 @@ pub use identity::{
     ActivationRequestId, BindingCandidateId, CanonicalCueId, ComparisonKeyId, Digest,
     ObservedCueId, RelationEdgeId, SnapshotId, TargetHandle,
 };
+pub use index_candidate::{CueSnapshotBuildCandidate, INDEX_CONTRACT_REVISION};
+pub use index_projection::{AdmittedCueBindingProjection, CueBindingAdmissionRef};
 pub use normalization::{
     CanonicalCueIdentity, ComparisonForm, ComparisonKey, CueKind, MatchMode, NormalizationOutcome,
     NormalizationProfile, NormalizedCue, TransformationStep,
