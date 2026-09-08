@@ -12,6 +12,7 @@
 pub mod budget;
 pub mod bundle;
 pub mod candidate;
+pub mod classification;
 pub mod curation;
 pub mod draft;
 pub mod encoding;
@@ -30,6 +31,17 @@ pub use bundle::{
 pub use candidate::{
     CandidateDisposition, CandidateProposal, CandidateResult, PRESERVATION_DIMENSIONS,
     PreservationDimension, PreservationReport, propose_candidate,
+};
+pub use classification::{
+    AdmittedTargetRef, ClassificationAssignmentSnapshot, ClassificationCandidate,
+    ClassificationCandidateClosure, ClassificationCriterionRole, ClassificationInput,
+    ClassificationPreservation, ClassificationPreservationDimension,
+    ClassificationPreservationVerdict, ClassificationRecordFamily, ClassificationRollback,
+    CriterionApplicability, CriterionStatus, ExternalGradeRef, FeatureObservation,
+    GroundedCriterion, NamedEvidence, PriorAssignmentRef, TaxonomyAliasMapping,
+    TaxonomyAlternative, TaxonomyCoverage, TaxonomyDenominator, classification_input_digest,
+    preflight_classification_acceptance, seal_classification, validate_classification,
+    validate_classification_acceptance,
 };
 pub use curation::{CURATION_WIRE_KINDS, CurationKind, CurationPayload, kind_family, parse_kind};
 pub use draft::{
