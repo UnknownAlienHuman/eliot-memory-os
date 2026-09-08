@@ -191,7 +191,7 @@ optional_files = []
 [[route]]
 id = "documentation-authority"
 description = "Normative pair, architecture/implementation semantics, indexes, routes, agent instructions, and documentation integrity."
-path_globs = ["docs/**", "AGENTS.md", "**/AGENTS.md", "WORKFLOW.md", ".github/ISSUE_TEMPLATE/**", ".github/pull_request_template.md"]
+path_globs = ["docs/**", "AGENTS.md", "**/AGENTS.md", "WORKFLOW.md", "START.md", ".github/ISSUE_TEMPLATE/**", ".github/pull_request_template.md"]
 topic_keywords = ["documentation", "normative", "architecture", "implementation contract", "index", "navigation", "route"]
 required_handles = ["A0.1..A0.6", "A16.3", "I0.14", "I2.17", "I18"]
 optional_handles = ["A10.4", "A14.8", "I2.20..I2.23"]
@@ -217,7 +217,7 @@ max_required_bytes = 458752
 id = "repository-root"
 description = "Root-level repository identity, licensing, tool pins, and contributor entry surfaces."
 path_globs = [
-  ".gitattributes", ".gitignore", "LICENSE", "README.md", "WORKFLOW.md",
+  ".gitattributes", ".gitignore", "LICENSE", "README.md", "WORKFLOW.md", "START.md",
   ".typos.toml", "Cargo.toml", "Cargo.lock", "Justfile", "deny.toml", "mcpls.toml", "rust-toolchain.toml", "tool-versions.json",
 ]
 topic_keywords = ["repository root", "license", "toolchain pin"]

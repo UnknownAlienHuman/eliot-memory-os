@@ -355,6 +355,21 @@ source = "crates/security/eliot-source-assurance/src/lib.rs"
 path = "docs/ELIOT_ARCHITECTURE.md"
 reason = "The unit-test fixture preserves an incoming legacy identity and is not an operational documentation consumer."
 
+[[repository_paths.allow_missing]]
+source = "crates/security/eliot-source-assurance/tests/mcp_assurance_contract.rs"
+path = "docs/architecture.md"
+reason = "The test fixture preserves a synthetic governing source reference and is not an operational documentation consumer."
+
+[[repository_paths.allow_missing]]
+source = "crates/surfaces/eliot-mcp/tests/contract.rs"
+path = "docs/architecture.md"
+reason = "The test fixture preserves a synthetic governing source reference and is not an operational documentation consumer."
+
+[[repository_paths.allow_missing]]
+source = "crates/surfaces/eliot-mcp/tests/source_assurance_ingress.rs"
+path = "docs/architecture.md"
+reason = "The test fixture preserves a synthetic governing source reference and is not an operational documentation consumer."
+
 [documentation_pipeline]
 shards_front_door = "scripts/docs_shards.py"
 router_front_door = "scripts/docs_router.py"
