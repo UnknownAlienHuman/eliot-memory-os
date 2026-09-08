@@ -1,7 +1,8 @@
 //! Candidate bindings between a normalized cue and a target.
 //!
 //! A binding is a proposal. It is not membership in a snapshot, and it is not
-//! an activation. Admission is A-12's decision; this module carries its shape.
+//! an activation. A-12 proposes a binding; the external Governor owns
+//! admission. This module carries only the proposal shape.
 
 use eliot_evidence::EvidenceFreshness;
 use serde::{Deserialize, Serialize};
