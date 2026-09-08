@@ -153,7 +153,6 @@ pub fn compile_campaign_learning_state_view(
     Ok(view)
 }
 
-#[allow(clippy::too_many_lines)]
 fn bound_input_sizes(
     recipe: &LearningStateViewRecipe,
     projections: &[SlotProjection],
@@ -161,118 +160,162 @@ fn bound_input_sizes(
     disagreements: &[OwnerDisagreement],
     view_id: &ArtifactId,
 ) -> Result<(), LearningContractError> {
-    let mut text_bytes = 0usize;
-    let mut add_text = |value: &str, field: &'static str| {
+    let mut budget = InputBudget::default();
+    bound_recipe_input(recipe, &mut budget)?;
+    bound_projection_input(projections, &mut budget)?;
+    bound_reference_input(required_references, view_id, &mut budget)?;
+    bound_disagreement_input(disagreements, &mut budget)
+}
+
+#[derive(Default)]
+struct InputBudget {
+    declared_members: usize,
+    supplied_members: usize,
+    evidence: usize,
+    text_bytes: usize,
+}
+
+impl InputBudget {
+    fn add_text(&mut self, value: &str, field: &'static str) -> Result<(), LearningContractError> {
         check_label(value, field)?;
-        text_bytes = text_bytes
-            .checked_add(value.len())
-            .ok_or(LearningContractError::Bound {
-                field: "input.text",
-            })?;
-        if text_bytes > MAX_INPUT_TEXT_BYTES {
+        self.text_bytes =
+            self.text_bytes
+                .checked_add(value.len())
+                .ok_or(LearningContractError::Bound {
+                    field: "input.text",
+                })?;
+        if self.text_bytes > MAX_INPUT_TEXT_BYTES {
             return Err(LearningContractError::Bound {
                 field: "input.text",
             });
         }
         Ok(())
-    };
+    }
+
+    fn add_declared_members(&mut self, count: usize) -> Result<(), LearningContractError> {
+        self.declared_members =
+            self.declared_members
+                .checked_add(count)
+                .ok_or(LearningContractError::Bound {
+                    field: "recipe.declared_members",
+                })?;
+        if self.declared_members > MAX_MEMBERS {
+            return Err(LearningContractError::Bound {
+                field: "recipe.declared_members",
+            });
+        }
+        Ok(())
+    }
+
+    fn add_supplied_members(&mut self, count: usize) -> Result<(), LearningContractError> {
+        self.supplied_members =
+            self.supplied_members
+                .checked_add(count)
+                .ok_or(LearningContractError::Bound {
+                    field: "projections.members",
+                })?;
+        if self.supplied_members > MAX_MEMBERS {
+            return Err(LearningContractError::Bound {
+                field: "projections.members",
+            });
+        }
+        Ok(())
+    }
+
+    fn add_evidence(
+        &mut self,
+        count: usize,
+        field: &'static str,
+    ) -> Result<(), LearningContractError> {
+        self.evidence = self
+            .evidence
+            .checked_add(count)
+            .ok_or(LearningContractError::Bound { field })?;
+        if self.evidence > MAX_EVIDENCE {
+            return Err(LearningContractError::Bound { field });
+        }
+        Ok(())
+    }
+}
+
+fn bound_recipe_input(
+    recipe: &LearningStateViewRecipe,
+    budget: &mut InputBudget,
+) -> Result<(), LearningContractError> {
     if recipe.slots.len() > MAX_SLOTS {
         return Err(LearningContractError::Bound {
             field: "recipe.slots",
         });
     }
-    if projections.len() > MAX_SLOTS {
-        return Err(LearningContractError::Bound {
-            field: "projections",
-        });
-    }
-    if required_references.len() > MAX_REFERENCES {
-        return Err(LearningContractError::Bound {
-            field: "required_references",
-        });
-    }
-    if disagreements.len() > MAX_SLOTS {
-        return Err(LearningContractError::Bound {
-            field: "owner_disagreements",
-        });
-    }
-    add_text(recipe.recipe_id.as_str(), "recipe.recipe_id")?;
-    add_text(recipe.campaign_id.as_str(), "recipe.campaign_id")?;
-    add_text(recipe.target.as_str(), "recipe.target")?;
-    add_text(recipe.binding.request_id.as_str(), "binding.request_id")?;
-    add_text(recipe.binding.operation_id.as_str(), "binding.operation_id")?;
-    add_text(recipe.binding.product_id.as_str(), "binding.product_id")?;
-    add_text(recipe.binding.task_id.as_str(), "binding.task_id")?;
-    add_text(recipe.binding.scope.as_str(), "binding.scope")?;
-    add_text(recipe.binding.source.owner.as_str(), "binding.source.owner")?;
-    add_text(
+    budget.add_text(recipe.recipe_id.as_str(), "recipe.recipe_id")?;
+    budget.add_text(recipe.campaign_id.as_str(), "recipe.campaign_id")?;
+    budget.add_text(recipe.target.as_str(), "recipe.target")?;
+    budget.add_text(recipe.binding.request_id.as_str(), "binding.request_id")?;
+    budget.add_text(recipe.binding.operation_id.as_str(), "binding.operation_id")?;
+    budget.add_text(recipe.binding.product_id.as_str(), "binding.product_id")?;
+    budget.add_text(recipe.binding.task_id.as_str(), "binding.task_id")?;
+    budget.add_text(recipe.binding.scope.as_str(), "binding.scope")?;
+    budget.add_text(recipe.binding.source.owner.as_str(), "binding.source.owner")?;
+    budget.add_text(
         recipe.binding.source.snapshot.as_str(),
         "binding.source.snapshot",
     )?;
-    add_text(
+    budget.add_text(
         recipe.binding.source.digest.as_str(),
         "binding.source.digest",
     )?;
-    add_text(recipe.privacy_class.as_str(), "recipe.privacy_class")?;
-    add_text(recipe.canonical_digest.as_str(), "recipe.canonical_digest")?;
-    add_text(view_id.as_str(), "view_id")?;
-    let mut member_count = 0usize;
-    let mut evidence_count = 0usize;
+    budget.add_text(recipe.privacy_class.as_str(), "recipe.privacy_class")?;
+    budget.add_text(recipe.canonical_digest.as_str(), "recipe.canonical_digest")?;
     for slot in &recipe.slots {
         if slot.declared_members.len() > 256 {
             return Err(LearningContractError::Bound {
                 field: "slot.declared_members",
             });
         }
+        budget.add_declared_members(slot.declared_members.len())?;
         check_label(slot.accepted_type.as_str(), "slot.accepted_type")?;
-        add_text(slot.slot_id.as_str(), "slot.slot_id")?;
-        add_text(slot.owner.as_str(), "slot.owner")?;
-        add_text(slot.target.as_str(), "slot.target")?;
-        add_text(slot.accepted_type.as_str(), "slot.accepted_type")?;
-        add_text(slot.schema_digest.as_str(), "slot.schema_digest")?;
-        member_count = member_count
-            .checked_add(slot.declared_members.len())
-            .ok_or(LearningContractError::Bound {
-                field: "recipe.declared_members",
-            })?;
-        if member_count > MAX_MEMBERS {
-            return Err(LearningContractError::Bound {
-                field: "recipe.declared_members",
-            });
+        budget.add_text(slot.slot_id.as_str(), "slot.slot_id")?;
+        budget.add_text(slot.owner.as_str(), "slot.owner")?;
+        budget.add_text(slot.target.as_str(), "slot.target")?;
+        budget.add_text(slot.accepted_type.as_str(), "slot.accepted_type")?;
+        budget.add_text(slot.schema_digest.as_str(), "slot.schema_digest")?;
+        if let SlotRequirement::Conditional { depends_on } = &slot.requirement {
+            budget.add_text(depends_on.as_str(), "slot.depends_on")?;
         }
         for member in &slot.declared_members {
-            add_text(member.as_str(), "slot.declared_members")?;
+            budget.add_text(member.as_str(), "slot.declared_members")?;
         }
     }
+    Ok(())
+}
+
+fn bound_projection_input(
+    projections: &[SlotProjection],
+    budget: &mut InputBudget,
+) -> Result<(), LearningContractError> {
+    if projections.len() > MAX_SLOTS {
+        return Err(LearningContractError::Bound {
+            field: "projections",
+        });
+    }
     for projection in projections {
-        if projection.members.len() > 256 || projection.evidence.len() > MAX_RECORD_EVIDENCE {
+        if projection.members.len() > 256 {
             return Err(LearningContractError::Bound {
-                field: "projection.record",
+                field: "projection.members",
             });
         }
-        add_text(projection.slot_id.as_str(), "projection.slot_id")?;
-        member_count = member_count.checked_add(projection.members.len()).ok_or(
-            LearningContractError::Bound {
-                field: "projections.members",
-            },
-        )?;
-        if member_count > MAX_MEMBERS {
+        if projection.evidence.len() > MAX_RECORD_EVIDENCE {
             return Err(LearningContractError::Bound {
-                field: "projections.members",
+                field: "projection.evidence",
             });
         }
-        evidence_count = evidence_count
-            .checked_add(projection.evidence.len())
-            .ok_or(LearningContractError::Bound {
-                field: "projections.evidence",
-            })?;
-        if evidence_count > MAX_EVIDENCE {
-            return Err(LearningContractError::Bound {
-                field: "projections.evidence",
-            });
-        }
+        budget.add_supplied_members(projection.members.len())?;
+        budget.add_evidence(projection.evidence.len(), "projections.evidence")?;
+    }
+    for projection in projections {
+        budget.add_text(projection.slot_id.as_str(), "projection.slot_id")?;
         for evidence in &projection.evidence {
-            add_text(evidence.as_str(), "projection.evidence")?;
+            budget.add_text(evidence.as_str(), "projection.evidence")?;
         }
         for member in &projection.members {
             if member.evidence.len() > MAX_RECORD_EVIDENCE {
@@ -280,57 +323,70 @@ fn bound_input_sizes(
                     field: "member.evidence",
                 });
             }
-            add_text(member.member_id.as_str(), "member.member_id")?;
-            add_text(member.owner.as_str(), "member.owner")?;
-            add_text(member.source.owner.as_str(), "member.source.owner")?;
-            add_text(member.source.snapshot.as_str(), "member.source.snapshot")?;
-            add_text(member.source.digest.as_str(), "member.source.digest")?;
+            budget.add_evidence(member.evidence.len(), "projections.member_evidence")?;
+            budget.add_text(member.member_id.as_str(), "member.member_id")?;
+            budget.add_text(member.owner.as_str(), "member.owner")?;
+            budget.add_text(member.source.owner.as_str(), "member.source.owner")?;
+            budget.add_text(member.source.snapshot.as_str(), "member.source.snapshot")?;
+            budget.add_text(member.source.digest.as_str(), "member.source.digest")?;
             if let Some(value) = &member.value_digest {
-                add_text(value.as_str(), "member.value_digest")?;
-            }
-            evidence_count = evidence_count.checked_add(member.evidence.len()).ok_or(
-                LearningContractError::Bound {
-                    field: "projections.member_evidence",
-                },
-            )?;
-            if evidence_count > MAX_EVIDENCE {
-                return Err(LearningContractError::Bound {
-                    field: "projections.member_evidence",
-                });
+                budget.add_text(value.as_str(), "member.value_digest")?;
             }
             for evidence in &member.evidence {
-                add_text(evidence.as_str(), "member.evidence")?;
+                budget.add_text(evidence.as_str(), "member.evidence")?;
             }
         }
     }
+    Ok(())
+}
+
+fn bound_reference_input(
+    required_references: &[ArtifactId],
+    view_id: &ArtifactId,
+    budget: &mut InputBudget,
+) -> Result<(), LearningContractError> {
+    if required_references.len() > MAX_REFERENCES {
+        return Err(LearningContractError::Bound {
+            field: "required_references",
+        });
+    }
+    budget.add_text(view_id.as_str(), "view_id")?;
     for reference in required_references {
-        add_text(reference.as_str(), "required_references")?;
+        budget.add_text(reference.as_str(), "required_references")?;
+    }
+    Ok(())
+}
+
+fn bound_disagreement_input(
+    disagreements: &[OwnerDisagreement],
+    budget: &mut InputBudget,
+) -> Result<(), LearningContractError> {
+    if disagreements.len() > MAX_SLOTS {
+        return Err(LearningContractError::Bound {
+            field: "owner_disagreements",
+        });
     }
     for disagreement in disagreements {
-        add_text(disagreement.slot_id.as_str(), "disagreement.slot_id")?;
-        if disagreement.owners.len() > MAX_DISAGREEMENT_OWNERS
-            || disagreement.evidence.len() > MAX_RECORD_EVIDENCE
-        {
+        if disagreement.owners.len() > MAX_DISAGREEMENT_OWNERS {
             return Err(LearningContractError::Bound {
-                field: "owner_disagreement.record",
+                field: "owner_disagreement.owners",
             });
         }
+        if disagreement.evidence.len() > MAX_RECORD_EVIDENCE {
+            return Err(LearningContractError::Bound {
+                field: "owner_disagreement.evidence",
+            });
+        }
+        budget.add_evidence(disagreement.evidence.len(), "owner_disagreement.evidence")?;
+    }
+    for disagreement in disagreements {
+        budget.add_text(disagreement.slot_id.as_str(), "disagreement.slot_id")?;
         for owner in &disagreement.owners {
-            add_text(owner.as_str(), "disagreement.owners")?;
+            budget.add_text(owner.as_str(), "disagreement.owners")?;
         }
         for evidence in &disagreement.evidence {
-            add_text(evidence.as_str(), "disagreement.evidence")?;
+            budget.add_text(evidence.as_str(), "disagreement.evidence")?;
         }
-    }
-    if member_count > MAX_MEMBERS {
-        return Err(LearningContractError::Bound {
-            field: "projections.members",
-        });
-    }
-    if evidence_count > MAX_EVIDENCE {
-        return Err(LearningContractError::Bound {
-            field: "projections.evidence",
-        });
     }
     Ok(())
 }

@@ -13,7 +13,9 @@ use eliot_learning_contracts::{
     SlotProjection, SlotRequirement, SlotSpec, TargetId,
 };
 use eliot_learning_contracts::{ProofCeiling, WorkScopeId};
-use eliot_learning_state_view::compile_campaign_learning_state_view;
+use eliot_learning_state_view::{
+    MAX_EVIDENCE, MAX_LABEL_BYTES, MAX_RECORD_EVIDENCE, compile_campaign_learning_state_view,
+};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -169,12 +171,23 @@ fn complete_reconstruction_preserves_recipe_member_order_and_canonical_digest() 
         OmissionPolicy::RequiredSlots,
     )?;
     let first = projection(&recipe, 0, SlotDisposition::Current)?;
-    let view = compile(
+    let refs = vec![artifact("ref-z")?, artifact("ref-a")?];
+    let view_id = artifact("view-explicit")?;
+    let view = compile_campaign_learning_state_view(
         &recipe,
         std::slice::from_ref(&first),
-        &[artifact("ref-z")?, artifact("ref-a")?],
+        &recipe.binding.state_fence,
+        &refs,
+        &view_id,
+        &[],
     )?;
     assert_eq!(view.completeness, Completeness::CompleteForDeclaredRecipe);
+    assert_eq!(view.view_id, view_id);
+    assert_eq!(view.binding.state_fence, recipe.binding.state_fence);
+    assert_eq!(
+        view.required_references,
+        vec![artifact("ref-a")?, artifact("ref-z")?]
+    );
     assert_eq!(
         view.slots[0].members[0].member_id,
         recipe.slots[0].declared_members[0]
@@ -202,6 +215,20 @@ fn shared_lineage_and_input_order_are_retained_without_resealing_recipe() -> Tes
         &[first.clone(), second.clone()],
         &[artifact("ref-a")?],
     )?;
+    let mut expected_first = first.clone();
+    let mut expected_second = second.clone();
+    for expected in [&mut expected_first, &mut expected_second] {
+        expected
+            .evidence
+            .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        for member in &mut expected.members {
+            member
+                .evidence
+                .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        }
+    }
+    assert_eq!(view.slots[0], expected_first);
+    assert_eq!(view.slots[1], expected_second);
     let mut reverse_first = first;
     reverse_first.members.reverse();
     reverse_first.evidence.reverse();
@@ -228,36 +255,89 @@ fn shared_lineage_and_input_order_are_retained_without_resealing_recipe() -> Tes
 
 #[test]
 fn duplicate_slot_and_changed_shared_lineage_fail_closed() -> TestResult {
-    let recipe = recipe(
+    let base_recipe = recipe(
         vec![SlotRequirement::Required],
         vec![2],
         OmissionPolicy::RequiredSlots,
     )?;
-    let first = projection(&recipe, 0, SlotDisposition::Current)?;
+    let first = projection(&base_recipe, 0, SlotDisposition::Current)?;
     let duplicate = first.clone();
     assert!(matches!(
-        compile(&recipe, &[first, duplicate], &[artifact("ref")?]),
+        compile(&base_recipe, &[first, duplicate], &[artifact("ref")?]),
         Err(eliot_learning_contracts::LearningContractError::Duplicate { .. })
     ));
-    let first = projection(&recipe, 0, SlotDisposition::Current)?;
+    let first = projection(&base_recipe, 0, SlotDisposition::Current)?;
     assert!(matches!(
         compile(
-            &recipe,
+            &base_recipe,
             std::slice::from_ref(&first),
             &[artifact("ref")?, artifact("ref")?]
         ),
         Err(eliot_learning_contracts::LearningContractError::Duplicate { .. })
     ));
-    let mut changed = projection(&recipe, 0, SlotDisposition::Current)?;
+    let mut changed = projection(&base_recipe, 0, SlotDisposition::Current)?;
     changed.members[1].source.revision = TaskRevision::new(2)?;
     assert!(matches!(
-        compile(&recipe, &[changed], &[artifact("ref")?]),
+        compile(&base_recipe, &[changed], &[artifact("ref")?]),
         Err(eliot_learning_contracts::LearningContractError::ScopeMismatch { .. })
     ));
-    let mut inconsistent = projection(&recipe, 0, SlotDisposition::Current)?;
+    let mut duplicate_member = projection(&base_recipe, 0, SlotDisposition::Current)?;
+    let repeated_member = duplicate_member.members[0].clone();
+    duplicate_member.members.push(repeated_member);
+    assert!(matches!(
+        compile(&base_recipe, &[duplicate_member], &[artifact("ref")?]),
+        Err(eliot_learning_contracts::LearningContractError::Duplicate { .. })
+    ));
+
+    let mut oversized_dependency = recipe(
+        vec![SlotRequirement::Required],
+        vec![1],
+        OmissionPolicy::RequiredSlots,
+    )?;
+    oversized_dependency.slots[0].requirement = SlotRequirement::Conditional {
+        depends_on: SlotId::from_artifact(artifact(&"d".repeat(MAX_LABEL_BYTES + 1))?),
+    };
+    let oversized_projection = projection(&oversized_dependency, 0, SlotDisposition::Current)?;
+    assert!(matches!(
+        compile(
+            &oversized_dependency,
+            &[oversized_projection],
+            &[artifact("ref")?]
+        ),
+        Err(eliot_learning_contracts::LearningContractError::Bound {
+            field: "slot.depends_on"
+        })
+    ));
+
+    let mut oversized_disagreements = Vec::new();
+    for record in 0..(MAX_EVIDENCE / MAX_RECORD_EVIDENCE + 1) {
+        let mut evidence = Vec::new();
+        for item in 0..MAX_RECORD_EVIDENCE {
+            evidence.push(artifact(&format!("disagreement-{record}-{item}"))?);
+        }
+        oversized_disagreements.push(OwnerDisagreement {
+            slot_id: base_recipe.slots[0].slot_id.clone(),
+            owners: vec![base_recipe.slots[0].owner.clone()],
+            evidence,
+        });
+    }
+    assert!(matches!(
+        compile_campaign_learning_state_view(
+            &base_recipe,
+            &[],
+            &base_recipe.binding.state_fence,
+            &[artifact("ref")?],
+            &artifact("view-614")?,
+            &oversized_disagreements,
+        ),
+        Err(eliot_learning_contracts::LearningContractError::Bound {
+            field: "owner_disagreement.evidence"
+        })
+    ));
+    let mut inconsistent = projection(&base_recipe, 0, SlotDisposition::Current)?;
     inconsistent.members[0].disposition = SlotDisposition::Stale;
     assert!(matches!(
-        compile(&recipe, &[inconsistent], &[artifact("ref")?]),
+        compile(&base_recipe, &[inconsistent], &[artifact("ref")?]),
         Err(eliot_learning_contracts::LearningContractError::IncompleteCoverage)
     ));
     Ok(())
@@ -350,14 +430,16 @@ fn optional_stale_and_explicit_disagreement_are_preserved() -> TestResult {
     let blocked_optional = projection(&conditional, 1, SlotDisposition::Blocked)?;
     let dependent = compile(
         &conditional,
-        &[required, blocked_optional],
+        &[required, blocked_optional.clone()],
         &[artifact("ref")?],
     )?;
     assert_eq!(dependent.completeness, Completeness::Blocked);
+    assert_eq!(dependent.slots[1], blocked_optional);
     assert_eq!(
         dependent.frontier,
         vec![conditional.slots[2].slot_id.clone()]
     );
+    dependent.validate_against(&conditional)?;
     Ok(())
 }
 
