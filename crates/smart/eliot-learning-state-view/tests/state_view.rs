@@ -310,7 +310,7 @@ fn duplicate_slot_and_changed_shared_lineage_fail_closed() -> TestResult {
     ));
 
     let mut oversized_disagreements = Vec::new();
-    for record in 0..(MAX_EVIDENCE / MAX_RECORD_EVIDENCE + 1) {
+    for record in 0..=(MAX_EVIDENCE / MAX_RECORD_EVIDENCE) {
         let mut evidence = Vec::new();
         for item in 0..MAX_RECORD_EVIDENCE {
             evidence.push(artifact(&format!("disagreement-{record}-{item}"))?);
