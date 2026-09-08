@@ -7,6 +7,7 @@ use eliot_observation::ObservationAdmissionReceipt;
 pub const MAX_TEXT_BYTES: usize = 8_192;
 pub const MAX_INPUT_ROWS: usize = 65_536;
 pub const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_NESTED_ITEMS: usize = 4_096;
 
 pub fn text(value: &str, field: &'static str) -> Result<(), CueBindingError> {
     if value.is_empty() || value.len() > MAX_TEXT_BYTES || value.chars().any(char::is_control) {
@@ -50,8 +51,15 @@ fn option_text(
 
 pub fn profile(profile: &BindingProfile) -> Result<(), CueBindingError> {
     let mut total = 0;
+    profile_into(profile, &mut total)
+}
+
+pub(crate) fn profile_into(
+    profile: &BindingProfile,
+    total: &mut usize,
+) -> Result<(), CueBindingError> {
     text(&profile.profile_id, "profile.profile_id")?;
-    add(&mut total, profile.profile_id.len(), "profile")?;
+    add(total, profile.profile_id.len(), "profile")?;
     if profile.profile_revision == 0 {
         return Err(CueBindingError::Contract {
             field: "profile.profile_revision",
@@ -83,13 +91,15 @@ pub fn profile(profile: &BindingProfile) -> Result<(), CueBindingError> {
             });
         }
         text(&rule.rule_ref, "profile.rule_ref")?;
-        add(&mut total, rule.rule_ref.len(), "profile.rules")?;
+        add(total, rule.rule_ref.len(), "profile.rules")?;
     }
     Ok(())
 }
 
-pub fn admission(receipt: &ObservationAdmissionReceipt) -> Result<(), CueBindingError> {
-    let mut total = 0;
+pub(crate) fn admission_into(
+    receipt: &ObservationAdmissionReceipt,
+    total: &mut usize,
+) -> Result<(), CueBindingError> {
     for (value, field) in [
         (&receipt.operation_id, "admission.operation_id"),
         (&receipt.idempotency_key, "admission.idempotency_key"),
@@ -97,7 +107,7 @@ pub fn admission(receipt: &ObservationAdmissionReceipt) -> Result<(), CueBinding
         (&receipt.request_digest, "admission.request_digest"),
     ] {
         text(value, field)?;
-        add(&mut total, value.len(), field)?;
+        add(total, value.len(), field)?;
     }
     receipt
         .state_fence
@@ -106,20 +116,38 @@ pub fn admission(receipt: &ObservationAdmissionReceipt) -> Result<(), CueBinding
             field: "admission.state_fence",
         })?;
     text(&receipt.record.record_id, "admission.record.record_id")?;
-    add(
-        &mut total,
-        receipt.record.record_id.len(),
-        "admission.record",
-    )?;
+    add(total, receipt.record.record_id.len(), "admission.record")?;
     option_text(
         receipt.record.parent_record_id.as_ref(),
         "admission.parent_record_id",
-        &mut total,
+        total,
     )?;
-    if let Some(event) = &receipt.record.event {
-        admission_event(event, &mut total)?;
+    if let Some(gap) = &receipt.record.coverage_gap {
+        if gap.evidence_refs.len() > MAX_NESTED_ITEMS {
+            return Err(CueBindingError::Bound {
+                field: "admission.coverage_gap.evidence_refs",
+            });
+        }
+        for (value, field) in [
+            (&gap.gap_id, "admission.coverage_gap.gap_id"),
+            (
+                &gap.obligation_profile_ref,
+                "admission.coverage_gap.obligation_profile_ref",
+            ),
+            (&gap.reason_ref, "admission.coverage_gap.reason_ref"),
+        ] {
+            text(value, field)?;
+            add(total, value.len(), field)?;
+        }
+        for value in &gap.evidence_refs {
+            text(value, "admission.coverage_gap.evidence_ref")?;
+            add(total, value.len(), "admission.coverage_gap.evidence_refs")?;
+        }
     }
-    admission_optional(receipt, &mut total)
+    if let Some(event) = &receipt.record.event {
+        admission_event(event, total)?;
+    }
+    admission_optional(receipt, total)
 }
 
 fn admission_event(
@@ -152,6 +180,11 @@ fn admission_event(
         "admission.expected_baseline",
         total,
     )?;
+    option_text(
+        event.affected_scope.module_or_route_ref.as_ref(),
+        "admission.module_or_route_ref",
+        total,
+    )?;
     text(
         &event.coverage_and_blind_intervals.denominator_source_ref,
         "admission.denominator",
@@ -164,6 +197,13 @@ fn admission_event(
             .len(),
         "admission.denominator",
     )?;
+    if event.coverage_and_blind_intervals.blind_intervals.len() > MAX_NESTED_ITEMS
+        || event.evidence_and_raw_handles.len() > MAX_NESTED_ITEMS
+    {
+        return Err(CueBindingError::Bound {
+            field: "admission.event.collections",
+        });
+    }
     for blind in &event.coverage_and_blind_intervals.blind_intervals {
         text(&blind.reason_ref, "admission.blind_reason")?;
         add(total, blind.reason_ref.len(), "admission.blind_reason")?;
@@ -184,6 +224,8 @@ fn admission_event(
         event.affected_scope.work_scope.as_str(),
         "admission.work_scope",
     )?;
+    text(&event.dedup_key, "admission.dedup_key")?;
+    add(total, event.dedup_key.len(), "admission.dedup_key")?;
     option_text(
         event.affected_scope.task_ref.as_ref(),
         "admission.task_ref",
@@ -208,6 +250,11 @@ fn admission_optional(
         add(total, plan.plan_revision.len(), "admission.plan")?;
     }
     if let Some(selection) = &receipt.task_selection {
+        if selection.contamination_flags.len() > MAX_NESTED_ITEMS {
+            return Err(CueBindingError::Bound {
+                field: "admission.selection.contamination_flags",
+            });
+        }
         for (value, field) in [
             (&selection.task_ref, "admission.selection.task"),
             (&selection.acceptance_digest, "admission.selection.digest"),
@@ -228,6 +275,15 @@ fn admission_optional(
     }
     if let Some(evidence) = &receipt.evidence {
         text(
+            evidence.provenance.source_id.as_str(),
+            "admission.evidence.source_id",
+        )?;
+        add(
+            &mut *total,
+            evidence.provenance.source_id.as_str().len(),
+            "admission.evidence.source_id",
+        )?;
+        text(
             &evidence.provenance.capture_route,
             "admission.evidence.route",
         )?;
@@ -240,7 +296,36 @@ fn admission_optional(
             text(value, "admission.evidence.revision")?;
             add(total, value.len(), "admission.evidence.revision")?;
         }
+        if let Some(binding) = &evidence.verification {
+            text(
+                binding.contract_id.as_str(),
+                "admission.evidence.verification.contract_id",
+            )?;
+            text(
+                binding.run_id.as_str(),
+                "admission.evidence.verification.run_id",
+            )?;
+            add(
+                total,
+                binding.contract_id.as_str().len() + binding.run_id.as_str().len(),
+                "admission.evidence.verification",
+            )?;
+            text(
+                &binding.revision,
+                "admission.evidence.verification.revision",
+            )?;
+            add(
+                total,
+                binding.revision.len(),
+                "admission.evidence.verification",
+            )?;
+        }
     }
+    option_text(
+        receipt.evidence_digest.as_ref(),
+        "admission.evidence_digest",
+        total,
+    )?;
     Ok(())
 }
 
@@ -248,6 +333,12 @@ pub fn row(row: &TouchedResourceProjection, total: &mut usize) -> Result<(), Cue
     text(row.target.as_str(), "touched.target")?;
     add(total, row.target.as_str().len(), "touched.target")?;
     let observation = &row.change.observation;
+    text(&row.change.observation_digest, "change.observation_digest")?;
+    add(
+        total,
+        row.change.observation_digest.len(),
+        "change.observation_digest",
+    )?;
     text(&observation.change_id, "change.change_id")?;
     add(total, observation.change_id.len(), "change.change_id")?;
     for (value, field) in [
@@ -266,6 +357,11 @@ pub fn row(row: &TouchedResourceProjection, total: &mut usize) -> Result<(), Cue
         option_text(value, field, total)?;
     }
     row_snapshots(observation, total)?;
+    if observation.invalidations.len() > MAX_NESTED_ITEMS {
+        return Err(CueBindingError::Bound {
+            field: "change.invalidations",
+        });
+    }
     for invalidation in &observation.invalidations {
         text(&invalidation.dependency, "change.invalidation.dependency")?;
         text(&invalidation.reason_ref, "change.invalidation.reason")?;
@@ -311,57 +407,99 @@ fn row_normalization(
     total: &mut usize,
 ) -> Result<(), CueBindingError> {
     let normalized = &row.normalization.normalized;
+    text(&normalized.schema_revision, "normalization.schema_revision")?;
+    add(total, normalized.schema_revision.len(), "normalization")?;
+    if normalized.comparison_keys.len() > eliot_cue_contracts::MAX_COMPARISON_KEYS
+        || normalized.transformation_evidence.len() > eliot_cue_contracts::MAX_TRANSFORMATION_STEPS
+    {
+        return Err(CueBindingError::Bound {
+            field: "normalization.collections",
+        });
+    }
     text(&normalized.observed.original_value, "cue.original_value")?;
     add(total, normalized.observed.original_value.len(), "cue")?;
+    generated_normalization(normalized, total)?;
     text(
         normalized.observed.observed_cue_id.as_str(),
         "cue.observed_cue_id",
     )?;
     for value in [
-        row.normalization.normalized.observed.source.target.as_str(),
-        row.normalization
-            .normalized
-            .observed
-            .source
-            .provenance
-            .capture_route
-            .as_str(),
-        row.normalization
-            .normalized
-            .observed
-            .source
-            .provenance
-            .scope
-            .as_str(),
+        normalized.observed.source.provenance.source_id.as_str(),
+        normalized.observed.source.target.as_str(),
+        normalized.observed.source.provenance.capture_route.as_str(),
+        normalized.observed.source.provenance.scope.as_str(),
         row.normalization.policy.owner_reference.as_str(),
         row.normalization.policy.policy_id.as_str(),
-        row.normalization.normalized.profile.profile_id.as_str(),
+        normalized.profile.profile_id.as_str(),
     ] {
         text(value, "normalization.binding")?;
         add(total, value.len(), "normalization.binding")?;
     }
     option_text(
-        row.normalization
-            .normalized
-            .observed
-            .source
-            .provenance
-            .raw_handle
-            .as_ref(),
+        normalized.observed.source.provenance.raw_handle.as_ref(),
         "cue.raw_handle",
         total,
     )?;
     option_text(
-        row.normalization
-            .normalized
-            .observed
-            .source
-            .provenance
-            .revision
-            .as_ref(),
+        normalized.observed.source.provenance.revision.as_ref(),
         "cue.revision",
         total,
     )
+}
+
+fn generated_normalization(
+    normalized: &eliot_cue_contracts::NormalizedCue,
+    total: &mut usize,
+) -> Result<(), CueBindingError> {
+    if let Some(canonical) = &normalized.canonical {
+        text(&canonical.canonical_value, "normalization.canonical_value")?;
+        add(
+            total,
+            canonical.canonical_value.len(),
+            "normalization.canonical",
+        )?;
+    }
+    for key in &normalized.comparison_keys {
+        text(&key.key_value, "normalization.comparison_key")?;
+        text(key.profile.profile_id.as_str(), "normalization.key_profile")?;
+        add(
+            total,
+            key.key_value.len() + key.profile.profile_id.len(),
+            "normalization.keys",
+        )?;
+    }
+    for step in &normalized.transformation_evidence {
+        text(&step.step, "normalization.step")?;
+        text(&step.result, "normalization.step_result")?;
+        add(
+            total,
+            step.step.len() + step.result.len(),
+            "normalization.steps",
+        )?;
+    }
+    match &normalized.outcome {
+        eliot_cue_contracts::NormalizationOutcome::AuthorizedLoss { policy_ref } => {
+            text(policy_ref, "normalization.loss_policy")?;
+            add(total, policy_ref.len(), "normalization.outcome")?;
+        }
+        eliot_cue_contracts::NormalizationOutcome::Unsupported { reason } => {
+            text(reason, "normalization.unsupported_reason")?;
+            add(total, reason.len(), "normalization.outcome")?;
+        }
+        eliot_cue_contracts::NormalizationOutcome::Ambiguous { rivals } => {
+            if rivals.len() > eliot_cue_contracts::MAX_COMPARISON_KEYS {
+                return Err(CueBindingError::Bound {
+                    field: "normalization.rivals",
+                });
+            }
+            for rival in rivals {
+                text(&rival.canonical_value, "normalization.rival")?;
+                add(total, rival.canonical_value.len(), "normalization.rivals")?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 pub fn hint(hint: Option<&ExpectedReuseHint>, total: &mut usize) -> Result<(), CueBindingError> {
     if let Some(h) = hint {

@@ -9,8 +9,9 @@ use eliot_contracts::{
 };
 use eliot_cue_binding::{BindingProfile, BindingRule, ColdBinding, ColdReason, ResourceField};
 use eliot_cue_contracts::{
-    BindingRole, CONTRACT_REVISION, CueContext, CueKind, Digest, NormalizationProfile, ObservedCue,
-    ObservedCueId, PrivacyClass, SourceHandle, TargetHandle, WorkScopeId,
+    BindingDisposition, BindingRole, CONTRACT_REVISION, CueContext, CueKind, Digest,
+    NormalizationProfile, ObservedCue, ObservedCueId, PrivacyClass, SourceHandle, TargetHandle,
+    WorkScopeId,
 };
 use eliot_cue_normalizer::{NormalizationPolicy, NormalizationRule, PolicyRule, capture_cue};
 use eliot_evidence::{
@@ -82,6 +83,7 @@ fn cue_context(index: usize, state: &StateFence) -> CueContext {
 )]
 fn admitted_rows(
     count: usize,
+    shared_target: bool,
 ) -> (
     eliot_observation::ObservationAdmissionReceipt,
     Vec<eliot_cue_binding::TouchedResourceProjection>,
@@ -108,14 +110,19 @@ fn admitted_rows(
     for index in 0..count {
         let raw = format!("raw-{index}");
         handles.push(raw.clone());
-        let value = format!("src/file-{index}.rs");
+        let value = if shared_target {
+            "src/shared.rs".to_owned()
+        } else {
+            format!("src/file-{index}.rs")
+        };
         let target = TargetHandle::new(value.clone()).expect("target");
+        let content_digest = seeded(u8::try_from(index).expect("fixture index").wrapping_add(1));
         let observed = ObservedCue::new(
             CONTRACT_REVISION.into(),
             ObservedCueId::new(format!("cue-{index}")).expect("cue"),
             CueKind::FilePath,
             value.clone(),
-            SourceHandle::new(target.clone(), seeded(1), provenance(index)),
+            SourceHandle::new(target.clone(), content_digest.clone(), provenance(index)),
             cue_context(index, &state),
         );
         let normalization = capture_cue(&observed, &policy, &a11_profile).expect("normalize");
@@ -136,7 +143,7 @@ fn admitted_rows(
                 revision: format!("rev-{index}"),
                 path: Some(value),
                 symbol: None,
-                content_digest: Some(seeded(1).as_str().into()),
+                content_digest: Some(content_digest.as_str().into()),
                 structural_digest: None,
             }),
             origin: ChangeOrigin::HostEvent,
@@ -246,7 +253,7 @@ fn admitted_rows(
 
 #[test]
 fn derives_two_touched_targets_and_is_permutation_stable() {
-    let (receipt, rows, profile) = admitted_rows(2);
+    let (receipt, rows, profile) = admitted_rows(2, false);
     let first = eliot_cue_binding::derive_cue_binding_candidates(&receipt, &rows, None, &profile)
         .expect("derive");
     let mut reversed = rows.clone();
@@ -256,15 +263,48 @@ fn derives_two_touched_targets_and_is_permutation_stable() {
             .expect("derive");
     assert_eq!(first.candidates, second.candidates);
     assert_eq!(first.result_digest, second.result_digest);
+    assert_eq!(first.candidates.len(), 2);
+    assert!(
+        first
+            .candidates
+            .iter()
+            .all(
+                |candidate| candidate.disposition == BindingDisposition::Withheld
+                    && candidate.freshness == EvidenceFreshness::ExactCandidate
+            )
+    );
 }
 
 #[test]
 fn overflow_retains_omitted_identity_and_continuation() {
-    let (receipt, rows, profile) = admitted_rows(13);
+    let (receipt, rows, profile) = admitted_rows(13, true);
     let result = eliot_cue_binding::derive_cue_binding_candidates(&receipt, &rows, None, &profile)
         .expect("derive");
     assert_eq!(result.candidates.len(), 12);
     assert_eq!(result.omitted.len(), 1);
+    let omitted = &result.omitted[0];
+    assert_eq!(omitted.target.as_str(), "src/shared.rs");
+    let omitted_index = rows
+        .iter()
+        .position(|row| {
+            row.change
+                .observation
+                .after
+                .as_ref()
+                .is_some_and(|after| Some(after.revision.clone()) == omitted.revision)
+        })
+        .expect("omitted revision belongs to a supplied row");
+    let one = eliot_cue_binding::derive_cue_binding_candidates(
+        &receipt,
+        &rows[omitted_index..=omitted_index],
+        None,
+        &profile,
+    )
+    .expect("derive omitted row");
+    assert_eq!(
+        omitted.candidate_digest,
+        Some(one.candidates[0].digest.clone())
+    );
     assert!(result.continuation_digest.is_some());
     assert_eq!(
         result.outcome,
@@ -273,8 +313,8 @@ fn overflow_retains_omitted_identity_and_continuation() {
 }
 
 #[test]
-fn mismatched_change_digest_is_retained_as_cold() {
-    let (receipt, mut rows, profile) = admitted_rows(2);
+fn foreign_origin_link_is_retained_as_cold() {
+    let (receipt, mut rows, profile) = admitted_rows(2, false);
     rows[0].change.observation.origin_ref = Some("foreign-handle".into());
     let result = eliot_cue_binding::derive_cue_binding_candidates(&receipt, &rows, None, &profile)
         .expect("derive");

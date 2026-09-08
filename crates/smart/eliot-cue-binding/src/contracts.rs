@@ -1,6 +1,6 @@
 //! A-12 caller supplied binding parameters and bounded result shapes.
 
-use eliot_change_monitor::{ChangeKind, ObservedChangeRecord, ResourceSnapshot};
+use eliot_change_monitor::{ChangeKind, ObservedChangeRecord};
 use eliot_contracts::StateFence;
 use eliot_cue_contracts::{
     CueBindingCandidate, CueKind, Digest, NormalizationProfile, TargetHandle,
@@ -59,37 +59,51 @@ impl BindingProfile {
         rules: Vec<BindingRule>,
         expected_normalization_profile: NormalizationProfile,
     ) -> Result<Self, eliot_cue_contracts::CueContractError> {
-        #[derive(Serialize)]
-        struct Preimage<'a> {
-            domain: &'static str,
-            profile_id: &'a str,
-            profile_revision: u32,
-            scope_id: &'a str,
-            state_fence: &'a StateFence,
-            rules: &'a [BindingRule],
-            expected_normalization_profile: &'a NormalizationProfile,
-        }
-        let bytes = eliot_contracts::canonical_json_bytes(&Preimage {
-            domain: "eliot.a12.cue-binding.profile.v1",
-            profile_id: &profile_id,
-            profile_revision,
-            scope_id: scope_id.as_str(),
-            state_fence: &state_fence,
-            rules: &rules,
-            expected_normalization_profile: &expected_normalization_profile,
-        })
-        .map_err(|_| eliot_cue_contracts::CueContractError::InvalidText { field: "profile" })?;
-        let profile_digest = Digest::new(eliot_contracts::sha256_hex(&bytes))?;
-        Ok(Self {
+        let placeholder = Digest::new("0".repeat(64))?;
+        let candidate = Self {
             profile_id,
             profile_revision,
-            profile_digest,
+            profile_digest: placeholder,
             scope_id,
             state_fence,
             rules,
             expected_normalization_profile,
+        };
+        crate::bounds::profile(&candidate)
+            .map_err(|_| eliot_cue_contracts::CueContractError::InvalidText { field: "profile" })?;
+        let profile_digest = profile_digest(&candidate)?;
+        Ok(Self {
+            profile_digest,
+            ..candidate
         })
     }
+}
+
+#[derive(Serialize)]
+struct ProfilePreimage<'a> {
+    domain: &'static str,
+    profile_id: &'a str,
+    profile_revision: u32,
+    scope_id: &'a str,
+    state_fence: &'a StateFence,
+    rules: &'a [BindingRule],
+    expected_normalization_profile: &'a NormalizationProfile,
+}
+
+pub(crate) fn profile_digest(
+    profile: &BindingProfile,
+) -> Result<Digest, eliot_cue_contracts::CueContractError> {
+    let bytes = eliot_contracts::canonical_json_bytes(&ProfilePreimage {
+        domain: "eliot.a12.cue-binding.profile.v1",
+        profile_id: &profile.profile_id,
+        profile_revision: profile.profile_revision,
+        scope_id: profile.scope_id.as_str(),
+        state_fence: &profile.state_fence,
+        rules: &profile.rules,
+        expected_normalization_profile: &profile.expected_normalization_profile,
+    })
+    .map_err(|_| eliot_cue_contracts::CueContractError::InvalidText { field: "profile" })?;
+    Digest::new(eliot_contracts::sha256_hex(&bytes))
 }
 
 /// A touched denominator row composed from existing A-10/A-11/C1 contracts.
@@ -172,14 +186,6 @@ pub struct CueBindingResult {
 }
 
 impl CueBindingResult {
-    /// Returns retained after snapshots without reinterpreting their schema.
-    #[must_use]
-    pub fn resources(&self) -> Vec<ResourceSnapshot> {
-        self.touched
-            .iter()
-            .filter_map(|row| row.change.observation.after.clone())
-            .collect()
-    }
     /// Returns the normalization profile from the first supplied row, when present.
     #[must_use]
     pub fn normalization_profile(&self) -> Option<&NormalizationProfile> {

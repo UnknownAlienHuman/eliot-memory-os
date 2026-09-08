@@ -1,12 +1,13 @@
 //! Deterministic candidate derivation and explicit cold handling.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Write};
 
 use eliot_change_monitor::{Attribution, ChangeKind};
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_cue_contracts::{
     BindingCandidateId, BindingDisposition, BindingRole, CueBindingCandidate, CueKind, Digest,
 };
-use eliot_evidence::EvidenceFreshness;
+use eliot_evidence::{Assertability, EpistemicStatus, EvidenceFreshness};
 use eliot_observation::ObservationAdmissionReceipt;
 use serde::Serialize;
 
@@ -36,33 +37,39 @@ struct CandidatePreimage<'a> {
 #[derive(Serialize)]
 struct ResultPreimage<'a> {
     domain: &'static str,
+    schema_revision: &'a str,
     admission: &'a ObservationAdmissionReceipt,
     profile: &'a BindingProfile,
     touched: &'a [TouchedResourceProjection],
     candidates: &'a [CueBindingCandidate],
     cold: &'a [ColdBinding],
     omitted: &'a [OmittedBindingIdentity],
-    hint: &'a Option<ExpectedReuseHint>,
+    hint: Option<&'a ExpectedReuseHint>,
+    input_digest: &'a Digest,
+    continuation_digest: &'a Option<Digest>,
+    state_fence: &'a eliot_contracts::StateFence,
+    outcome: crate::BindingOutcome,
 }
 
 #[derive(Serialize)]
 struct ContinuationPreimage<'a> {
     domain: &'static str,
-    admission_request: &'a str,
-    admission_record: &'a str,
-    profile_digest: &'a Digest,
+    input_digest: &'a Digest,
     omitted: &'a [OmittedBindingIdentity],
 }
 
 #[derive(Serialize)]
-struct ProfilePreimage<'a> {
+struct InputPreimage<'a> {
     domain: &'static str,
-    profile_id: &'a str,
-    profile_revision: u32,
-    scope_id: &'a str,
-    state_fence: &'a eliot_contracts::StateFence,
-    rules: &'a [crate::BindingRule],
-    expected_normalization_profile: &'a eliot_cue_contracts::NormalizationProfile,
+    admission: &'a ObservationAdmissionReceipt,
+    profile: &'a BindingProfile,
+    touched: &'a [TouchedResourceProjection],
+    hint: Option<&'a ExpectedReuseHint>,
+}
+
+struct DerivedCandidate {
+    candidate: CueBindingCandidate,
+    revision: Option<String>,
 }
 
 fn digest<T: Serialize>(value: &T, field: &'static str) -> Result<Digest, CueBindingError> {
@@ -72,6 +79,41 @@ fn digest<T: Serialize>(value: &T, field: &'static str) -> Result<Digest, CueBin
         return Err(CueBindingError::Bound { field });
     }
     Digest::new(sha256_hex(&bytes)).map_err(|_| CueBindingError::Canonicalization { field })
+}
+
+struct CountingWriter {
+    len: usize,
+    limit: usize,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.len = self
+            .len
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("serialized input overflow"))?;
+        if self.len > self.limit {
+            return Err(io::Error::other("serialized input bound"));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_serialized_len<T: Serialize>(
+    value: &T,
+    field: &'static str,
+) -> Result<usize, CueBindingError> {
+    let mut writer = CountingWriter {
+        len: 0,
+        limit: bounds::MAX_OUTPUT_BYTES,
+    };
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|_| CueBindingError::Canonicalization { field })?;
+    Ok(writer.len)
 }
 
 fn cold(row: &TouchedResourceProjection, reason: ColdReason) -> ColdBinding {
@@ -224,7 +266,37 @@ fn validate_row_links(
     {
         return Err(ColdReason::IdentityConflict);
     }
-    Ok(EvidenceFreshness::Unknown)
+    source_freshness(row)
+}
+
+fn source_freshness(row: &TouchedResourceProjection) -> Result<EvidenceFreshness, ColdReason> {
+    let context = &row.normalization.normalized.observed.context;
+    let evidence = &context.evidence;
+    if !row
+        .normalization
+        .normalized
+        .observed
+        .context
+        .lifecycle
+        .is_active()
+        || matches!(
+            evidence.status,
+            EpistemicStatus::Contested
+                | EpistemicStatus::Stale
+                | EpistemicStatus::Superseded
+                | EpistemicStatus::Rejected
+        )
+        || evidence.assertability == Assertability::AbstainOrFence
+        || matches!(
+            evidence.freshness,
+            EvidenceFreshness::KnownOlderSnapshot
+                | EvidenceFreshness::Stale
+                | EvidenceFreshness::Unknown
+        )
+    {
+        return Err(ColdReason::MissingEvidence);
+    }
+    Ok(evidence.freshness)
 }
 
 fn preflight(
@@ -234,21 +306,11 @@ fn preflight(
     profile: &BindingProfile,
 ) -> Result<(usize, Vec<TouchedResourceProjection>), CueBindingError> {
     let mut total = 0;
-    bounds::admission(admission)?;
-    bounds::profile(profile)?;
+    bounds::admission_into(admission, &mut total)?;
+    bounds::profile_into(profile, &mut total)?;
     validate_rules(profile)?;
-    let expected = digest(
-        &ProfilePreimage {
-            domain: "eliot.a12.cue-binding.profile.v1",
-            profile_id: &profile.profile_id,
-            profile_revision: profile.profile_revision,
-            scope_id: profile.scope_id.as_str(),
-            state_fence: &profile.state_fence,
-            rules: &profile.rules,
-            expected_normalization_profile: &profile.expected_normalization_profile,
-        },
-        "profile",
-    )?;
+    let expected = crate::contracts::profile_digest(profile)
+        .map_err(|_| CueBindingError::Canonicalization { field: "profile" })?;
     if expected != profile.profile_digest {
         return Err(CueBindingError::IdentityConflict {
             field: "profile.profile_digest",
@@ -266,13 +328,8 @@ fn preflight(
             field: "profile.state_fence",
         });
     }
-    if profile.scope_id.as_str()
-        != admission
-            .record
-            .event
-            .as_ref()
-            .map(|e| e.affected_scope.work_scope.as_str())
-            .unwrap_or_default()
+    if let Some(event) = admission.record.event.as_ref()
+        && profile.scope_id.as_str() != event.affected_scope.work_scope.as_str()
     {
         return Err(CueBindingError::IdentityConflict {
             field: "profile.scope_id",
@@ -308,6 +365,8 @@ fn validate_rows(
     total: &mut usize,
 ) -> Result<(), CueBindingError> {
     let mut seen = BTreeSet::new();
+    let mut change_digests = BTreeMap::new();
+    let mut cue_digests = BTreeMap::new();
     for row in touched {
         bounds::row(row, total)?;
         row.change
@@ -343,6 +402,29 @@ fn validate_rows(
         if !seen.insert(identity) {
             return Err(CueBindingError::IdentityConflict {
                 field: "touched.projection",
+            });
+        }
+        let change_id = row.change.observation.change_id.as_str();
+        if let Some(previous) =
+            change_digests.insert(change_id.to_owned(), row.change.observation_digest.clone())
+            && previous != row.change.observation_digest
+        {
+            return Err(CueBindingError::IdentityConflict {
+                field: "change.observation_digest",
+            });
+        }
+        let cue_id = row
+            .normalization
+            .normalized
+            .observed
+            .observed_cue_id
+            .as_str();
+        if let Some(previous) =
+            cue_digests.insert(cue_id.to_owned(), row.normalization.input_digest.clone())
+            && previous != row.normalization.input_digest
+        {
+            return Err(CueBindingError::IdentityConflict {
+                field: "normalization.input_digest",
             });
         }
     }
@@ -462,26 +544,14 @@ fn retain_unproved_hint(
     }
 }
 
-/// Derives inert A-10 candidates from a complete admitted observation and a supplied touched denominator.
-pub fn derive_cue_binding_candidates(
+fn assemble_result(
     admission: &ObservationAdmissionReceipt,
-    touched: &[TouchedResourceProjection],
-    hint: Option<&ExpectedReuseHint>,
     profile: &BindingProfile,
+    ordered_touched: Vec<TouchedResourceProjection>,
+    hint: Option<&ExpectedReuseHint>,
+    mut cold_rows: Vec<ColdBinding>,
+    mut candidates: Vec<DerivedCandidate>,
 ) -> Result<CueBindingResult, CueBindingError> {
-    let (_, ordered_touched) = preflight(admission, touched, hint, profile)?;
-    let event = admission.record.event.as_ref();
-    let task_bound =
-        admission.candidate_disposition == eliot_observation::CandidateDisposition::TaskBound;
-    let mut cold_rows = Vec::new();
-    let mut candidates = Vec::new();
-    for row in &ordered_touched {
-        match derive_one(admission, row, profile, task_bound)? {
-            Ok(candidate) => candidates.push(candidate),
-            Err(reason) => cold_rows.push(cold(row, reason)),
-        }
-    }
-    retain_unproved_hint(hint, event, &ordered_touched, &mut cold_rows);
     cold_rows.sort_by(|a, b| {
         a.target
             .as_str()
@@ -490,62 +560,37 @@ pub fn derive_cue_binding_candidates(
             .then_with(|| a.observed_cue_id.cmp(&b.observed_cue_id))
     });
     candidates.sort_by(|a, b| {
-        a.target
+        a.candidate
+            .target
             .as_str()
-            .cmp(b.target.as_str())
-            .then_with(|| a.digest.as_str().cmp(b.digest.as_str()))
+            .cmp(b.candidate.target.as_str())
+            .then_with(|| a.candidate.digest.as_str().cmp(b.candidate.digest.as_str()))
     });
     let mut omitted = Vec::new();
     if candidates.len() > MAX_INLINE_CANDIDATES {
-        for candidate in candidates.drain(MAX_INLINE_CANDIDATES..) {
-            let revision = ordered_touched
-                .iter()
-                .find(|row| row.target == candidate.target)
-                .and_then(|row| row.change.observation.after.as_ref())
-                .map(|after| after.revision.clone());
+        for derived in candidates.drain(MAX_INLINE_CANDIDATES..) {
             omitted.push(OmittedBindingIdentity {
-                target: candidate.target,
-                revision,
-                candidate_digest: Some(candidate.digest),
+                target: derived.candidate.target,
+                revision: derived.revision,
+                candidate_digest: Some(derived.candidate.digest),
             });
         }
     }
-    let continuation_digest = if omitted.is_empty() {
-        None
-    } else {
-        Some(digest(
-            &ContinuationPreimage {
-                domain: "eliot.a12.cue-binding.continuation.v1",
-                admission_request: &admission.request_digest,
-                admission_record: &admission.record_id,
-                profile_digest: &profile.profile_digest,
-                omitted: &omitted,
-            },
-            "continuation",
-        )?)
-    };
+    let candidates: Vec<CueBindingCandidate> = candidates
+        .into_iter()
+        .map(|derived| derived.candidate)
+        .collect();
     let result_hint = hint.cloned();
-    let result_digest = digest(
-        &ResultPreimage {
-            domain: "eliot.a12.cue-binding.result.v1",
-            admission,
-            profile,
-            touched: &ordered_touched,
-            candidates: &candidates,
-            cold: &cold_rows,
-            omitted: &omitted,
-            hint: &result_hint,
-        },
-        "result",
+    let (continuation_digest, outcome, result_digest) = result_digests(
+        admission,
+        profile,
+        &ordered_touched,
+        &candidates,
+        &cold_rows,
+        &omitted,
+        result_hint.as_ref(),
     )?;
-    let outcome = if !omitted.is_empty() {
-        crate::BindingOutcome::PartialOverflow
-    } else if candidates.is_empty() {
-        crate::BindingOutcome::Cold
-    } else {
-        crate::BindingOutcome::CandidatesForSuppliedInputs
-    };
-    Ok(CueBindingResult {
+    let result = CueBindingResult {
         schema_revision: "1.0.0".to_owned(),
         admission: admission.clone(),
         profile: profile.clone(),
@@ -558,5 +603,115 @@ pub fn derive_cue_binding_candidates(
         state_fence: admission.state_fence.clone(),
         outcome,
         result_digest,
-    })
+    };
+    bounded_serialized_len(&result, "result")?;
+    Ok(result)
+}
+
+fn result_digests(
+    admission: &ObservationAdmissionReceipt,
+    profile: &BindingProfile,
+    touched: &[TouchedResourceProjection],
+    candidates: &[CueBindingCandidate],
+    cold_rows: &[ColdBinding],
+    omitted: &[OmittedBindingIdentity],
+    hint: Option<&ExpectedReuseHint>,
+) -> Result<(Option<Digest>, crate::BindingOutcome, Digest), CueBindingError> {
+    bounded_serialized_len(
+        &InputPreimage {
+            domain: "eliot.a12.cue-binding.input.v1",
+            admission,
+            profile,
+            touched,
+            hint,
+        },
+        "input",
+    )?;
+    let input_digest = digest(
+        &InputPreimage {
+            domain: "eliot.a12.cue-binding.input.v1",
+            admission,
+            profile,
+            touched,
+            hint,
+        },
+        "input",
+    )?;
+    let continuation_digest = if omitted.is_empty() {
+        None
+    } else {
+        Some(digest(
+            &ContinuationPreimage {
+                domain: "eliot.a12.cue-binding.continuation.v1",
+                input_digest: &input_digest,
+                omitted,
+            },
+            "continuation",
+        )?)
+    };
+    let schema_revision = "1.0.0".to_owned();
+    let outcome = if !omitted.is_empty() {
+        crate::BindingOutcome::PartialOverflow
+    } else if candidates.is_empty() {
+        crate::BindingOutcome::Cold
+    } else {
+        crate::BindingOutcome::CandidatesForSuppliedInputs
+    };
+    let result_digest = digest(
+        &ResultPreimage {
+            domain: "eliot.a12.cue-binding.result.v1",
+            schema_revision: &schema_revision,
+            admission,
+            profile,
+            touched,
+            candidates,
+            cold: cold_rows,
+            omitted,
+            hint,
+            input_digest: &input_digest,
+            continuation_digest: &continuation_digest,
+            state_fence: &admission.state_fence,
+            outcome,
+        },
+        "result",
+    )?;
+    Ok((continuation_digest, outcome, result_digest))
+}
+
+/// Derives inert A-10 candidates from a complete admitted observation and a supplied touched denominator.
+pub fn derive_cue_binding_candidates(
+    admission: &ObservationAdmissionReceipt,
+    touched: &[TouchedResourceProjection],
+    hint: Option<&ExpectedReuseHint>,
+    profile: &BindingProfile,
+) -> Result<CueBindingResult, CueBindingError> {
+    let (_, ordered_touched) = preflight(admission, touched, hint, profile)?;
+    let event = admission.record.event.as_ref();
+    let task_bound =
+        admission.candidate_disposition == eliot_observation::CandidateDisposition::TaskBound;
+    let mut cold_rows = Vec::new();
+    let mut candidates = Vec::<DerivedCandidate>::new();
+    for row in &ordered_touched {
+        match derive_one(admission, row, profile, task_bound)? {
+            Ok(candidate) => candidates.push(DerivedCandidate {
+                revision: row
+                    .change
+                    .observation
+                    .after
+                    .as_ref()
+                    .map(|after| after.revision.clone()),
+                candidate,
+            }),
+            Err(reason) => cold_rows.push(cold(row, reason)),
+        }
+    }
+    retain_unproved_hint(hint, event, &ordered_touched, &mut cold_rows);
+    assemble_result(
+        admission,
+        profile,
+        ordered_touched,
+        hint,
+        cold_rows,
+        candidates,
+    )
 }
