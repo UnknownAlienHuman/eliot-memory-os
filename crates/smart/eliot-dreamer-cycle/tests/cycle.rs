@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use eliot_agent_contracts::AgentAttemptId;
 use eliot_contracts::{
     ArtifactId, AuthorityEpoch, ClockReading, ContractId, OperationId, PolicyRevision, ProductId,
@@ -297,6 +299,7 @@ fn outcome(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn outcome_at(
     request: &PendingRequest,
     receipt: ReceiptEnvelope,
@@ -329,16 +332,16 @@ fn propose_phase(
 ) -> PendingRequest {
     state.policy_id = policy.policy_id.clone();
     state.policy_revision = policy.policy_revision;
-    state.policy_digest = policy.canonical_digest.clone();
+    state.policy_digest.clone_from(&policy.canonical_digest);
     let mut request = pending(policy);
-    let phase_tag = format!("{:?}", phase).to_lowercase();
+    let phase_tag = format!("{phase:?}").to_lowercase();
     set_phase_identity(&mut request, &phase_tag);
     set_phase(&mut request, phase, kind);
     let rule = &policy.phase_rules[0];
-    request.owner = rule.owner.clone();
+    request.owner.clone_from(&rule.owner);
     request.product_id = rule.product_id.clone();
     request.source_id = rule.source_id.clone();
-    request.operation_kind = rule.operation_kind.clone();
+    request.operation_kind.clone_from(&rule.operation_kind);
     request.effect = rule.effect;
     request.proof_ceiling = rule.proof_ceiling;
     request.predecessor_receipt_id = state
@@ -462,6 +465,7 @@ fn validation_receipt(state: &DreamerCycleState, request: &PendingRequest) -> Va
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn completed_receipt_advances_one_adjacent_phase() {
     let fence = fence();
     let policy = policy(&fence, "bundle_validation");
@@ -748,6 +752,7 @@ fn changed_payload_under_same_receipt_id_is_rejected() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn unknown_then_predecessor_linked_completion_reconciles_same_operation() {
     let fence = fence();
     let screen_policy = policy_for_phase(&fence, CyclePhase::Screened, "curation_screen");
