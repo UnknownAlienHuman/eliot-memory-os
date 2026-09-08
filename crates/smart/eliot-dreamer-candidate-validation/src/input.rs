@@ -38,7 +38,7 @@ pub struct ValidationPolicy {
     pub policy_revision: u64,
     /// Maximum bytes for each receipt-excluded canonical preimage.
     pub max_canonical_bytes: u64,
-    /// SHA-256 of this policy with `canonical_digest` cleared.
+    /// SHA-256 of the receipt-excluded `PolicyPreimage`; this field is omitted.
     pub canonical_digest: String,
 }
 
@@ -82,13 +82,7 @@ impl ValidationPolicy {
 
     /// Seals the policy from its canonical receipt-excluded preimage.
     pub fn seal(&mut self) -> Result<(), DreamDraftValidationError> {
-        if self.policy_id.len() > MAX_POLICY_ID {
-            return Err(DreamDraftValidationError::Bound {
-                field: "validation_policy.policy_id",
-                maximum: MAX_POLICY_ID,
-                actual: self.policy_id.len(),
-            });
-        }
+        validate_policy_id(&self.policy_id)?;
         self.canonical_digest.clear();
         let bytes = canonical_policy_bytes(self)?;
         self.canonical_digest = eliot_dreamer_contracts::digest_hex(&bytes);
@@ -106,15 +100,7 @@ impl ValidationPolicy {
                 },
             ));
         }
-        if self.policy_id.trim().is_empty() || self.policy_id.len() > MAX_POLICY_ID {
-            return Err(summarize_contract(
-                "validation policy",
-                &ContractViolation::BindingMismatch {
-                    field: "policy.policy_id",
-                    reason: "policy identity is blank or too long".to_owned(),
-                },
-            ));
-        }
+        validate_policy_id(&self.policy_id)?;
         if self.policy_revision == 0
             || self.max_canonical_bytes == 0
             || self.max_canonical_bytes > MAX_CANONICAL_BYTES as u64
@@ -144,6 +130,20 @@ impl ValidationPolicy {
         }
         Ok(())
     }
+}
+
+fn validate_policy_id(value: &str) -> Result<(), DreamDraftValidationError> {
+    if value.trim().is_empty() || value.len() > MAX_POLICY_ID || value.chars().any(char::is_control)
+    {
+        return Err(summarize_contract(
+            "validation policy",
+            &ContractViolation::BindingMismatch {
+                field: "policy.policy_id",
+                reason: "policy identity is blank, too long, or malformed".to_owned(),
+            },
+        ));
+    }
+    Ok(())
 }
 
 fn canonical_policy_bytes(policy: &ValidationPolicy) -> Result<Vec<u8>, DreamDraftValidationError> {
