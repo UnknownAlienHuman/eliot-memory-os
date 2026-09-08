@@ -70,7 +70,6 @@ pub enum SemanticRole {
     Optional,
     Conflict,
     Constraint,
-    DecisionTail,
 }
 
 /// Provider/semantic-role slot in the exact requested denominator.
