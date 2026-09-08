@@ -1069,9 +1069,9 @@ fn effective_epoch_policy_substitution_and_excess_metering_fail_closed() {
         },
         ..Config::default()
     };
-    let (mut runtime, _) = runtime(deadline_substitution);
+    let (mut deadline_runtime, _) = runtime(deadline_substitution);
     assert_eq!(
-        runtime.execute(request()).receipt.error,
+        deadline_runtime.execute(request()).receipt.error,
         Some(RuntimeError::EngineContractViolation)
     );
 
@@ -1085,9 +1085,9 @@ fn effective_epoch_policy_substitution_and_excess_metering_fail_closed() {
         },
         ..Config::default()
     };
-    let (mut runtime, _) = runtime(cancellation_substitution);
+    let (mut cancellation_runtime, _) = runtime(cancellation_substitution);
     assert_eq!(
-        runtime.execute(request()).receipt.error,
+        cancellation_runtime.execute(request()).receipt.error,
         Some(RuntimeError::EngineContractViolation)
     );
 
@@ -1098,9 +1098,9 @@ fn effective_epoch_policy_substitution_and_excess_metering_fail_closed() {
         },
         ..Config::default()
     };
-    let (mut runtime, _) = runtime(excess_ticks);
+    let (mut excess_ticks_runtime, _) = runtime(excess_ticks);
     assert_eq!(
-        runtime.execute(request()).receipt.error,
+        excess_ticks_runtime.execute(request()).receipt.error,
         Some(RuntimeError::EngineContractViolation)
     );
 }

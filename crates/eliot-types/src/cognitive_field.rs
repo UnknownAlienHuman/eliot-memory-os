@@ -371,17 +371,11 @@ pub struct CognitiveFieldProviderCallPlan {
     pub provider_smoke: bool,
     pub counts_against_cap: bool,
     pub executions: Vec<CognitiveFieldExecutionKey>,
-    #[serde(default)]
     pub runtime_contract_ref: String,
-    #[serde(default)]
     pub runtime_contract_sha256: String,
-    #[serde(default)]
     pub adapter_id: String,
-    #[serde(default)]
     pub adapter_version: String,
-    #[serde(default)]
     pub execution_request_ref: String,
-    #[serde(default)]
     pub execution_request_sha256: String,
 }
 
@@ -394,13 +388,11 @@ pub struct CognitiveFieldProviderPlan {
     pub calls: Vec<CognitiveFieldProviderCallPlan>,
     pub planned_provider_calls: u8,
     pub planned_smoke_calls: u8,
-    #[serde(default)]
     pub planned_reused_roles: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_evidence_plan_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seal_attempt_id: Option<String>,
-    #[serde(default)]
     pub seal_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_activation_ref: Option<String>,
@@ -477,11 +469,8 @@ pub struct CognitiveFieldProviderEvidenceReceipt {
     pub oracle_exposed: bool,
     pub worker_transcript_exposed: bool,
     pub read_only: bool,
-    #[serde(default)]
     pub runtime_contract_sha256: String,
-    #[serde(default)]
     pub observed_mcp_server_names: Vec<String>,
-    #[serde(default)]
     pub observed_mcp_tool_names: Vec<String>,
 }
 
@@ -516,7 +505,6 @@ pub struct CognitiveFieldProviderProjection {
     pub provider_smoke: bool,
     pub counts_against_cap: bool,
     pub elapsed_ms: u64,
-    #[serde(default)]
     pub runtime_contract_sha256: String,
     #[schemars(with = "String")]
     #[serde(with = "time::serde::rfc3339")]

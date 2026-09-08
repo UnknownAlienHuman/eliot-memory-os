@@ -231,9 +231,15 @@ def validate_selector(selector: str, handles: dict[str, dict[str, Any]]) -> str 
         missing = [candidate for candidate in (start, end) if candidate not in handles]
         if missing:
             return "range selector has unknown endpoint(s): " + ", ".join(missing)
-        if start.startswith("APPENDIX-") or end.startswith("APPENDIX-"):
-            return f"appendix ranges are unsupported: {selector}"
-        if start[0] != end[0]:
+        # Appendices are ordered by letter in `_handle_key`, so a range between
+        # two of them is well defined. Only a range that mixes an appendix with
+        # a numbered handle has no ordering, and a numbered range still may not
+        # cross from Architecture to Implementation.
+        start_is_appendix = start.startswith("APPENDIX-")
+        end_is_appendix = end.startswith("APPENDIX-")
+        if start_is_appendix != end_is_appendix:
+            return f"range mixes an appendix with a numbered handle: {selector}"
+        if not start_is_appendix and start[0] != end[0]:
             return f"cross-book range is prohibited: {selector}"
         if _handle_key(start) > _handle_key(end):
             return f"reversed handle range: {selector}"
@@ -482,7 +488,8 @@ def self_test() -> None:
         if metrics["numeric_reference_candidates"] != 3:
             raise ReferenceAuditError("numeric selector fixture count changed")
 
-        sample.write_text("//! `I2.2`\n", encoding="utf-8", newline="")
+        # Negative fixture: `I2.2` is a nonexistent handle and must be rejected.
+        sample.write_text("//! `I2.2`\n", encoding="utf-8", newline="")  # nonexistent
         if DCC_NUMERIC not in _ids(reference_findings(root)[0]):
             raise ReferenceAuditError("unknown exact numeric handle was accepted")
 

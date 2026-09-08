@@ -1860,6 +1860,735 @@ fn hex_sha256(bytes: &[u8]) -> String {
     output
 }
 
+/// The only targets admitted by the v1 journal CAS contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BlobCasNamespace {
+    StageJournal,
+    Tombstone,
+}
+
+/// Capability reported before a backend considers a CAS mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BlobCasCapability {
+    AtomicCompareAndReplace,
+    UnsupportedAtomicCas,
+}
+
+/// Expected or observed SHA-256 state of a journal object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlobCasState {
+    Missing,
+    Digest(String),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+enum BlobCasStateWire {
+    Missing,
+    Digest { sha256: String },
+}
+
+impl Serialize for BlobCasState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let wire = match self {
+            Self::Missing => BlobCasStateWire::Missing,
+            Self::Digest(sha256) => BlobCasStateWire::Digest {
+                sha256: sha256.clone(),
+            },
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl BlobCasState {
+    pub fn digest(value: impl Into<String>) -> Result<Self, BlobError> {
+        let value = value.into();
+        canonical_sha256(&value, "cas.sha256")?;
+        Ok(Self::Digest(value))
+    }
+
+    pub fn validate(&self) -> Result<(), BlobError> {
+        if let Self::Digest(value) = self {
+            canonical_sha256(value, "cas.sha256")?;
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> Option<&str> {
+        match self {
+            Self::Missing => None,
+            Self::Digest(value) => Some(value),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BlobCasState {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = match BlobCasStateWire::deserialize(deserializer)? {
+            BlobCasStateWire::Missing => Self::Missing,
+            BlobCasStateWire::Digest { sha256 } => Self::Digest(sha256),
+        };
+        value.validate().map_err(de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+/// Durability requested or observed by one journal CAS operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BlobCasDurability {
+    NotRequested,
+    Requested,
+    Confirmed,
+    Unconfirmed,
+}
+
+/// Narrow v1 request for a control-plane journal CAS. Replacement bytes remain
+/// private to the backend; their exact SHA-256 and length are committed here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BlobCasRequest {
+    pub context: BlobReceiptContext,
+    pub root_lease: BlobRootLease,
+    pub namespace: BlobCasNamespace,
+    pub target: WorkScopePath,
+    pub expected: BlobCasState,
+    pub replacement_sha256: String,
+    pub replacement_length: u64,
+    /// Provider generation pinned before the mutation is attempted. This is
+    /// distinct from the root lease generation and prevents a stale provider
+    /// view from being used as the compare-and-replace authority.
+    pub expected_backend_generation: u64,
+    pub requested_durability: BlobCasDurability,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlobCasRequestWire {
+    context: BlobReceiptContext,
+    root_lease: BlobRootLease,
+    namespace: BlobCasNamespace,
+    target: WorkScopePath,
+    expected: BlobCasState,
+    replacement_sha256: String,
+    replacement_length: u64,
+    expected_backend_generation: u64,
+    requested_durability: BlobCasDurability,
+}
+
+#[derive(Serialize)]
+struct BlobCasRequestCommitment<'a> {
+    context: &'a BlobReceiptContext,
+    root_lease: &'a BlobRootLease,
+    namespace: BlobCasNamespace,
+    target: &'a str,
+    expected: &'a BlobCasState,
+    replacement_sha256: &'a str,
+    replacement_length: u64,
+    expected_backend_generation: u64,
+    requested_durability: BlobCasDurability,
+}
+
+impl BlobCasRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        context: BlobReceiptContext,
+        root_lease: BlobRootLease,
+        namespace: BlobCasNamespace,
+        target: WorkScopePath,
+        expected: BlobCasState,
+        replacement_sha256: impl Into<String>,
+        replacement_length: u64,
+        expected_backend_generation: u64,
+        requested_durability: BlobCasDurability,
+    ) -> Result<Self, BlobError> {
+        let value = Self {
+            context,
+            root_lease,
+            namespace,
+            target,
+            expected,
+            replacement_sha256: replacement_sha256.into(),
+            replacement_length,
+            expected_backend_generation,
+            requested_durability,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), BlobError> {
+        self.context.validate_for(EffectClass::ReversibleMutation)?;
+        self.root_lease.validate_context(&self.context)?;
+        self.expected.validate()?;
+        canonical_sha256(&self.replacement_sha256, "replacement_sha256")?;
+        if self.replacement_length == 0 {
+            return Err(BlobError::InvalidField {
+                field: "replacement_length",
+                reason: "must be greater than zero",
+            });
+        }
+        if self.expected_backend_generation == 0 {
+            return Err(BlobError::InvalidField {
+                field: "expected_backend_generation",
+                reason: "must be greater than zero",
+            });
+        }
+        if !matches!(
+            self.requested_durability,
+            BlobCasDurability::NotRequested | BlobCasDurability::Requested
+        ) {
+            return Err(BlobError::InvalidField {
+                field: "requested_durability",
+                reason: "request may only use NOT_REQUESTED or REQUESTED",
+            });
+        }
+        let prefix = match self.namespace {
+            BlobCasNamespace::StageJournal => "transactions/",
+            BlobCasNamespace::Tombstone => "tombstones/",
+        };
+        if !self.target.normalized_identity().starts_with(prefix) {
+            return Err(BlobError::InvalidField {
+                field: "target",
+                reason: "target must be in the declared journal namespace",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn request_commitment_sha256(&self) -> Result<String, BlobError> {
+        self.validate()?;
+        canonical_json_sha256(&(
+            "eliot.storage.blob.cas",
+            "s-04-cas-v1",
+            BlobCasRequestCommitment {
+                context: &self.context,
+                root_lease: &self.root_lease,
+                namespace: self.namespace,
+                target: self.target.normalized_identity(),
+                expected: &self.expected,
+                replacement_sha256: &self.replacement_sha256,
+                replacement_length: self.replacement_length,
+                expected_backend_generation: self.expected_backend_generation,
+                requested_durability: self.requested_durability,
+            },
+        ))
+    }
+
+    /// Rejects replay under a changed operation or request commitment. The
+    /// operation id is a distinct step identity even when all other bytes are
+    /// equal; parent/causal links remain owned by the receipt context.
+    pub fn validate_exact_replay(&self, replay: &Self) -> Result<(), BlobError> {
+        self.validate()?;
+        replay.validate()?;
+        if self.context.operation.operation_id != replay.context.operation.operation_id
+            || self.context.operation.idempotency_key != replay.context.operation.idempotency_key
+            || self.request_commitment_sha256()? != replay.request_commitment_sha256()?
+        {
+            return Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::IdentityConflict {
+                    request: Box::new(self.clone()),
+                }),
+            });
+        }
+        Ok(())
+    }
+
+    /// Stable proof identity used by the existing receipt binding owner.
+    pub fn receipt_proof_id(&self) -> Result<BlobId, BlobError> {
+        BlobId::new(format!(
+            "cas-target-{}",
+            hex_sha256(self.target.normalized_identity().as_bytes())
+        ))
+    }
+
+    /// Computes the exact signed effect commitment for an issuer. The request
+    /// generation fence and confirmed durability are checked here so callers
+    /// cannot construct an artifact for a different provider view.
+    pub fn effect_commitment_sha256(
+        &self,
+        backend_generation: u64,
+        observed_durability: BlobCasDurability,
+        success: BlobCasSuccessKind,
+    ) -> Result<String, BlobError> {
+        self.validate()?;
+        if backend_generation != self.expected_backend_generation
+            || observed_durability != BlobCasDurability::Confirmed
+            || (success == BlobCasSuccessKind::NoOp
+                && self.expected.sha256() != Some(self.replacement_sha256.as_str()))
+            || (success == BlobCasSuccessKind::Applied
+                && self.expected.sha256() == Some(self.replacement_sha256.as_str()))
+        {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        let request_commitment_sha256 = self.request_commitment_sha256()?;
+        cas_effect_commitment_sha256(
+            self,
+            &request_commitment_sha256,
+            backend_generation,
+            observed_durability,
+            success,
+        )
+    }
+
+    /// Artifact identity that must carry the exact request commitment.
+    pub fn request_artifact_id(&self) -> Result<String, BlobError> {
+        Ok(format!(
+            "blob-cas-request-{}",
+            self.request_commitment_sha256()?
+        ))
+    }
+
+    /// Artifact identity that must carry the exact effect commitment.
+    pub fn effect_artifact_id(
+        &self,
+        backend_generation: u64,
+        observed_durability: BlobCasDurability,
+        success: BlobCasSuccessKind,
+    ) -> Result<String, BlobError> {
+        Ok(format!(
+            "blob-cas-effect-{}",
+            self.effect_commitment_sha256(backend_generation, observed_durability, success)?
+        ))
+    }
+}
+
+impl<'de> Deserialize<'de> for BlobCasRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = BlobCasRequestWire::deserialize(deserializer)?;
+        Self::new(
+            wire.context,
+            wire.root_lease,
+            wire.namespace,
+            wire.target,
+            wire.expected,
+            wire.replacement_sha256,
+            wire.replacement_length,
+            wire.expected_backend_generation,
+            wire.requested_durability,
+        )
+        .map_err(de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BlobCasSuccessKind {
+    Applied,
+    NoOp,
+}
+
+/// Authority-issued evidence for one applied CAS or exact supported no-op.
+/// Private fields prevent callers from minting effect evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BlobCasReceipt {
+    receipt: Receipt,
+    request: BlobCasRequest,
+    request_commitment_sha256: String,
+    effect_commitment_sha256: String,
+    namespace: BlobCasNamespace,
+    target: WorkScopePath,
+    expected: BlobCasState,
+    replacement_sha256: String,
+    replacement_length: u64,
+    backend_generation: u64,
+    requested_durability: BlobCasDurability,
+    observed_durability: BlobCasDurability,
+    success: BlobCasSuccessKind,
+}
+
+impl BlobCasReceipt {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_verified(
+        verified: &VerifiedBlobReceipt,
+        expected_anchor: &BlobIssuerTrustAnchor,
+        request: &BlobCasRequest,
+        backend_generation: u64,
+        observed_durability: BlobCasDurability,
+        success: BlobCasSuccessKind,
+    ) -> Result<Self, BlobError> {
+        let proof_id = request.receipt_proof_id()?;
+        if verified.anchor_fingerprint() != expected_anchor.fingerprint()
+            || verified.binding().operation_id() != request.context.operation.operation_id.as_str()
+            || verified.binding().request_id()
+                != request.context.request.metadata.request_id.as_str()
+            || verified.binding().idempotency_key() != request.context.operation.idempotency_key
+            || verified.binding().root_generation() != request.root_lease.root_generation
+            || verified.binding().proof_id() != Some(&proof_id)
+            || backend_generation == 0
+            || backend_generation != request.expected_backend_generation
+            || !matches!(verified.receipt().core.kind, ReceiptKind::Operation)
+            || !matches!(
+                verified.receipt().core.disposition,
+                ReceiptDisposition::Success {
+                    proof: ProofCeiling::ObservedExternalEffect
+                }
+            )
+            || observed_durability != BlobCasDurability::Confirmed
+        {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        let request_commitment_sha256 = request.request_commitment_sha256()?;
+        let effect_commitment_sha256 =
+            request.effect_commitment_sha256(backend_generation, observed_durability, success)?;
+        let request_artifact_id = request.request_artifact_id()?;
+        let effect_artifact_id =
+            request.effect_artifact_id(backend_generation, observed_durability, success)?;
+        require_cas_artifacts(
+            &verified.receipt().core.artifacts,
+            &request_artifact_id,
+            &request_commitment_sha256,
+            &effect_artifact_id,
+            &effect_commitment_sha256,
+        )?;
+        if success == BlobCasSuccessKind::NoOp
+            && request.expected.sha256() != Some(request.replacement_sha256.as_str())
+        {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        let value = Self {
+            receipt: verified.receipt().clone(),
+            request: request.clone(),
+            request_commitment_sha256,
+            effect_commitment_sha256,
+            namespace: request.namespace,
+            target: request.target.clone(),
+            expected: request.expected.clone(),
+            replacement_sha256: request.replacement_sha256.clone(),
+            replacement_length: request.replacement_length,
+            backend_generation,
+            requested_durability: request.requested_durability,
+            observed_durability,
+            success,
+        };
+        value.validate(request)?;
+        Ok(value)
+    }
+
+    fn validate(&self, request: &BlobCasRequest) -> Result<(), BlobError> {
+        request.validate()?;
+        if self.request != *request
+            || self.namespace != request.namespace
+            || self.target != request.target
+            || self.expected != request.expected
+            || self.replacement_sha256 != request.replacement_sha256
+            || self.replacement_length != request.replacement_length
+            || self.requested_durability != request.requested_durability
+            || self.expected_backend_generation() != request.expected_backend_generation
+            || self.backend_generation == 0
+            || self.observed_durability != BlobCasDurability::Confirmed
+            || self.receipt.core.operation.operation_id != request.context.operation.operation_id
+            || self.receipt.core.operation.idempotency_key
+                != request.context.operation.idempotency_key
+            || self.receipt.core.work_scope != request.context.work_scope
+            || self.receipt.core.task != request.context.task
+            || self.receipt.core.session != request.context.session
+            || self.receipt.core.causal != request.context.causal
+            || self.receipt.core.request != request.context.request
+            || self.receipt.core.operation != request.context.operation
+            || self.receipt.core.authority != request.context.authority
+        {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        if self.success == BlobCasSuccessKind::NoOp
+            && request.expected.sha256() != Some(request.replacement_sha256.as_str())
+        {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        canonical_sha256(&self.request_commitment_sha256, "request_commitment_sha256")?;
+        canonical_sha256(&self.effect_commitment_sha256, "effect_commitment_sha256")?;
+        if self.request_commitment_sha256 != request.request_commitment_sha256()?
+            || self.effect_commitment_sha256
+                != request.effect_commitment_sha256(
+                    self.backend_generation,
+                    self.observed_durability,
+                    self.success,
+                )?
+        {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn receipt(&self) -> &Receipt {
+        &self.receipt
+    }
+    #[must_use]
+    pub fn request(&self) -> &BlobCasRequest {
+        &self.request
+    }
+    #[must_use]
+    pub fn request_commitment_sha256(&self) -> &str {
+        &self.request_commitment_sha256
+    }
+    #[must_use]
+    pub fn effect_commitment_sha256(&self) -> &str {
+        &self.effect_commitment_sha256
+    }
+    #[must_use]
+    pub fn target(&self) -> &WorkScopePath {
+        &self.target
+    }
+    #[must_use]
+    pub fn expected(&self) -> &BlobCasState {
+        &self.expected
+    }
+    #[must_use]
+    pub fn replacement_sha256(&self) -> &str {
+        &self.replacement_sha256
+    }
+    #[must_use]
+    pub const fn replacement_length(&self) -> u64 {
+        self.replacement_length
+    }
+    #[must_use]
+    pub const fn backend_generation(&self) -> u64 {
+        self.backend_generation
+    }
+    #[must_use]
+    pub const fn expected_backend_generation(&self) -> u64 {
+        self.request.expected_backend_generation
+    }
+    #[must_use]
+    pub const fn observed_durability(&self) -> BlobCasDurability {
+        self.observed_durability
+    }
+    #[must_use]
+    pub const fn success(&self) -> BlobCasSuccessKind {
+        self.success
+    }
+}
+
+fn canonical_json_sha256<T: Serialize>(value: &T) -> Result<String, BlobError> {
+    serde_json::to_vec(value)
+        .map(|bytes| hex_sha256(&bytes))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))
+}
+
+fn cas_effect_commitment_sha256(
+    request: &BlobCasRequest,
+    request_commitment_sha256: &str,
+    backend_generation: u64,
+    observed_durability: BlobCasDurability,
+    success: BlobCasSuccessKind,
+) -> Result<String, BlobError> {
+    // The signed effect commitment attests that the provider observed the
+    // previous state named by `request.expected`, then classified the result
+    // as Applied or the exact expected==replacement NoOp.
+    canonical_json_sha256(&(
+        "eliot.storage.blob.cas.effect",
+        "s-04-cas-v1",
+        request_commitment_sha256,
+        &request.expected,
+        &request.replacement_sha256,
+        request.replacement_length,
+        backend_generation,
+        observed_durability,
+        success,
+    ))
+}
+
+fn require_cas_artifacts(
+    artifacts: &[ArtifactBinding],
+    request_id: &str,
+    request_sha256: &str,
+    effect_id: &str,
+    effect_sha256: &str,
+) -> Result<(), BlobError> {
+    let mut request_found = false;
+    let mut effect_found = false;
+    if artifacts.len() == 2 {
+        for artifact in artifacts {
+            let id = artifact.artifact_id.to_string();
+            if artifact.role != ReceiptKind::Artifact {
+                return Err(BlobError::MetadataPayloadMismatch);
+            }
+            if id == request_id && artifact.sha256 == request_sha256 && !request_found {
+                request_found = true;
+            } else if id == effect_id && artifact.sha256 == effect_sha256 && !effect_found {
+                effect_found = true;
+            } else {
+                return Err(BlobError::MetadataPayloadMismatch);
+            }
+        }
+    }
+    if request_found && effect_found {
+        Ok(())
+    } else {
+        Err(BlobError::MetadataPayloadMismatch)
+    }
+}
+
+/// Lossless CAS result vocabulary. Failed outcomes map to [`BlobError`] only
+/// through the typed `CasFailure` variant; no state is flattened to transient
+/// provider unavailability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlobCasOutcome {
+    Applied {
+        receipt: BlobCasReceipt,
+    },
+    NoOp {
+        receipt: BlobCasReceipt,
+    },
+    ExpectedStateConflict {
+        request: Box<BlobCasRequest>,
+        observed: BlobCasState,
+    },
+    IdentityConflict {
+        request: Box<BlobCasRequest>,
+    },
+    NotFound {
+        request: Box<BlobCasRequest>,
+    },
+    NotAttempted {
+        request: Box<BlobCasRequest>,
+    },
+    UnsupportedAtomicCas {
+        request: Box<BlobCasRequest>,
+    },
+    UnknownOutcome {
+        request: Box<BlobCasRequest>,
+        /// `None` means the uncertain write had no safe observation. `Some(Missing)`
+        /// is reserved for a positively observed absence.
+        observed: Option<BlobCasState>,
+        observed_backend_generation: Option<u64>,
+        observed_durability: BlobCasDurability,
+    },
+    DurabilityUnconfirmed {
+        request: Box<BlobCasRequest>,
+        /// `None` means durability was not safely observed; it is not a claim
+        /// that the journal is absent.
+        observed: Option<BlobCasState>,
+        observed_backend_generation: Option<u64>,
+    },
+    Internal {
+        request: Box<BlobCasRequest>,
+        reason: BlobCasInternalReason,
+    },
+}
+
+impl BlobCasOutcome {
+    pub fn into_blob_result(self) -> Result<Self, BlobError> {
+        match self {
+            Self::Applied { receipt } if receipt.success() == BlobCasSuccessKind::Applied => {
+                Ok(Self::Applied { receipt })
+            }
+            Self::NoOp { receipt } if receipt.success() == BlobCasSuccessKind::NoOp => {
+                Ok(Self::NoOp { receipt })
+            }
+            Self::Applied { receipt } | Self::NoOp { receipt } => Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::SuccessKindMismatch {
+                    request: Box::new(receipt.request.clone()),
+                }),
+            }),
+            Self::ExpectedStateConflict { request, observed } => Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::ExpectedStateConflict { request, observed }),
+            }),
+            Self::IdentityConflict { request } => Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::IdentityConflict { request }),
+            }),
+            Self::NotFound { request } => Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::NotFound { request }),
+            }),
+            Self::NotAttempted { request } => Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::NotAttempted { request }),
+            }),
+            Self::UnsupportedAtomicCas { request } => Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::UnsupportedAtomicCas { request }),
+            }),
+            Self::UnknownOutcome {
+                request,
+                observed,
+                observed_backend_generation,
+                observed_durability,
+            } => Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::UnknownOutcome {
+                    request,
+                    observed,
+                    observed_backend_generation,
+                    observed_durability,
+                }),
+            }),
+            Self::DurabilityUnconfirmed {
+                request,
+                observed,
+                observed_backend_generation,
+            } => Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::DurabilityUnconfirmed {
+                    request,
+                    observed,
+                    observed_backend_generation,
+                }),
+            }),
+            Self::Internal { request, reason } => Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::Internal { request, reason }),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum BlobCasInternalReason {
+    #[error("invalid CAS request")]
+    InvalidRequest,
+    #[error("CAS receipt did not match its request")]
+    ReceiptMismatch,
+    #[error("CAS receipt artifacts did not match its commitments")]
+    ArtifactMismatch,
+    #[error("CAS success kind did not match its outcome wrapper")]
+    SuccessKindMismatch,
+    #[error("CAS commitment did not match its signed evidence")]
+    CommitmentMismatch,
+    #[error("CAS backend generation fence mismatch")]
+    BackendGenerationMismatch,
+    #[error("CAS protocol failure")]
+    Protocol,
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum BlobCasFailure {
+    #[error("CAS expected state conflict")]
+    ExpectedStateConflict {
+        request: Box<BlobCasRequest>,
+        observed: BlobCasState,
+    },
+    #[error("CAS operation identity conflict")]
+    IdentityConflict { request: Box<BlobCasRequest> },
+    #[error("CAS target not found")]
+    NotFound { request: Box<BlobCasRequest> },
+    #[error("CAS was not attempted")]
+    NotAttempted { request: Box<BlobCasRequest> },
+    #[error("atomic CAS is unsupported")]
+    UnsupportedAtomicCas { request: Box<BlobCasRequest> },
+    #[error("CAS outcome is unknown")]
+    UnknownOutcome {
+        request: Box<BlobCasRequest>,
+        /// `None` means the uncertain write had no safe observation. `Some(Missing)`
+        /// is reserved for a positively observed absence.
+        observed: Option<BlobCasState>,
+        observed_backend_generation: Option<u64>,
+        observed_durability: BlobCasDurability,
+    },
+    #[error("CAS durability is unconfirmed")]
+    DurabilityUnconfirmed {
+        request: Box<BlobCasRequest>,
+        /// `None` means durability was not safely observed; it is not a claim
+        /// that the journal is absent.
+        observed: Option<BlobCasState>,
+        observed_backend_generation: Option<u64>,
+    },
+    #[error("CAS internal failure: {reason}")]
+    Internal {
+        request: Box<BlobCasRequest>,
+        reason: BlobCasInternalReason,
+    },
+    #[error("CAS success kind did not match its outcome wrapper")]
+    SuccessKindMismatch { request: Box<BlobCasRequest> },
+}
+
 /// Recovery ceiling for a missing blob encryption key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlobKeyRecoveryCeiling {
@@ -1923,6 +2652,8 @@ pub enum BlobError {
     PlanGap(String),
     #[error("provider unavailable: {0}")]
     ProviderUnavailable(&'static str),
+    #[error("CAS failure: {failure}")]
+    CasFailure { failure: Box<BlobCasFailure> },
     #[error(
         "key unavailable during {operation:?}; lineage={key_lineage:?}; generation={key_generation:?}; ceiling={recovery:?}"
     )]
