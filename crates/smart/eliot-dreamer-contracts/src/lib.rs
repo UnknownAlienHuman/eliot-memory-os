@@ -19,6 +19,7 @@ pub mod encoding;
 pub mod error;
 pub mod job;
 pub mod registry;
+pub mod relation;
 pub mod screen;
 
 pub use budget::{
@@ -55,6 +56,15 @@ pub use registry::{
     AtomicityMode, CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor,
     CurationHandlerPort, CurationHandlerRegistry, TargetDenominator, TypedCurationHandlerRequest,
     TypedCurationHandlerResult, family_of, parse_family,
+};
+pub use relation::{
+    RELATION_FAMILIES, RelationAlternative, RelationCandidate, RelationCandidateClosure,
+    RelationDirection, RelationDisclosureEvidence, RelationDisposition, RelationEndpoint,
+    RelationEvidence, RelationEvidencePolarity, RelationFamily, RelationFamilyRule, RelationInput,
+    RelationNeighborhood, RelationPredicate, RelationPreservation, RelationPreservationDimension,
+    RelationPreservationVerdict, RelationRegistrySnapshot, RelationRollback, RelationSnapshot,
+    RelationTemporalEvidence, RelationTimePoint, RelationVerifier, relation_input_digest,
+    seal_relation, validate_relation,
 };
 pub use screen::{ScreenBinding, ScreenEligibility, ScreenReference, ScreenState};
 
