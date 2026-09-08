@@ -2787,61 +2787,192 @@ pub enum BlobError {
     Provider(String),
 }
 
+fn validate_capacity_cause(cause: BlobCapacityCause) -> Result<(), BlobError> {
+    match cause {
+        BlobCapacityCause::IoStorageFull
+        | BlobCapacityCause::PosixEnospc { code: 28 }
+        | BlobCapacityCause::WindowsErrorDiskFull { code: 112 }
+        | BlobCapacityCause::WindowsErrorHandleDiskFull { code: 39 } => Ok(()),
+        BlobCapacityCause::PosixEnospc { .. }
+        | BlobCapacityCause::WindowsErrorDiskFull { .. }
+        | BlobCapacityCause::WindowsErrorHandleDiskFull { .. } => Err(BlobError::InvalidField {
+            field: "capacity.cause",
+            reason: "native code does not match its declared namespace",
+        }),
+    }
+}
+
+fn validate_capacity_identity(identity: &BlobCapacityIdentity) -> Result<(), BlobError> {
+    match identity {
+        BlobCapacityIdentity::Operation { context, locator } => {
+            context.validate_for(EffectClass::ReversibleMutation)?;
+            if let Some(locator) = locator {
+                locator.validate()?;
+            }
+        }
+        BlobCapacityIdentity::Journal {
+            operation_id,
+            idempotency_key,
+            locator,
+        } => {
+            if operation_id.trim().is_empty() || idempotency_key.trim().is_empty() {
+                return Err(BlobError::InvalidField {
+                    field: "capacity.identity",
+                    reason: "journal operation and idempotency identities are required",
+                });
+            }
+            if let Some(locator) = locator {
+                locator.validate()?;
+            }
+        }
+        BlobCapacityIdentity::RootLease { root_id, lease_id } => {
+            if root_id.trim().is_empty()
+                || lease_id
+                    .as_deref()
+                    .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err(BlobError::InvalidField {
+                    field: "capacity.identity",
+                    reason: "root and lease identities must be nonblank",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_capacity_cas(failure: &BlobCapacityFailure) -> Result<(), BlobError> {
+    if failure.stage == BlobCapacityStage::CasJournal && failure.cas_request.is_none() {
+        return Err(BlobError::InvalidField {
+            field: "capacity.cas_request",
+            reason: "CAS capacity observations require their complete request",
+        });
+    }
+    if failure.cas_observed.is_some() && failure.cas_request.is_none() {
+        return Err(BlobError::InvalidField {
+            field: "capacity.cas_observed",
+            reason: "CAS observations require their complete request",
+        });
+    }
+    if let Some(observed) = &failure.cas_observed {
+        observed.validate()?;
+    }
+    if let Some(request) = &failure.cas_request {
+        if failure.stage != BlobCapacityStage::CasJournal {
+            return Err(BlobError::InvalidField {
+                field: "capacity.cas_request",
+                reason: "CAS request is only valid for a CAS journal phase",
+            });
+        }
+        request.validate()?;
+        let BlobCapacityIdentity::Operation { context, .. } = &failure.identity else {
+            return Err(BlobError::InvalidField {
+                field: "capacity.identity",
+                reason: "CAS capacity identity must retain its operation context",
+            });
+        };
+        if context.as_ref() != &request.context {
+            return Err(BlobError::InvalidField {
+                field: "capacity.identity",
+                reason: "CAS capacity identity does not match its request",
+            });
+        }
+    }
+    if (failure.cas_backend_generation.is_some() || failure.cas_durability.is_some())
+        && failure.cas_request.is_none()
+    {
+        return Err(BlobError::InvalidField {
+            field: "capacity.cas_observation",
+            reason: "CAS generation and durability require a complete request",
+        });
+    }
+    if failure
+        .cas_backend_generation
+        .is_some_and(|generation| generation == 0)
+    {
+        return Err(BlobError::InvalidField {
+            field: "capacity.cas_backend_generation",
+            reason: "observed backend generation must be nonzero",
+        });
+    }
+    if failure.cas_durability.is_some_and(|durability| {
+        matches!(
+            durability,
+            BlobCasDurability::NotRequested | BlobCasDurability::Requested
+        )
+    }) {
+        return Err(BlobError::InvalidField {
+            field: "capacity.cas_durability",
+            reason: "CAS durability must be an observed value",
+        });
+    }
+    Ok(())
+}
+
+fn validate_capacity_gc(failure: &BlobCapacityFailure) -> Result<(), BlobError> {
+    if failure.gc_state.is_some()
+        && !matches!(
+            failure.stage,
+            BlobCapacityStage::GcCleanup | BlobCapacityStage::CasJournal
+        )
+    {
+        return Err(BlobError::InvalidField {
+            field: "capacity.gc_state",
+            reason: "GC state is only valid for GC cleanup or its CAS journal",
+        });
+    }
+    if failure.gc_state.is_some()
+        && failure.stage == BlobCapacityStage::CasJournal
+        && failure
+            .cas_request
+            .as_ref()
+            .is_some_and(|request| request.namespace != BlobCasNamespace::Tombstone)
+    {
+        return Err(BlobError::InvalidField {
+            field: "capacity.gc_state",
+            reason: "GC state is only valid for a Tombstone CAS journal",
+        });
+    }
+    if failure.gc_state.is_some()
+        && failure.stage == BlobCapacityStage::CasJournal
+        && failure.cas_request.is_none()
+    {
+        return Err(BlobError::InvalidField {
+            field: "capacity.gc_state",
+            reason: "GC CAS state requires its complete CAS request",
+        });
+    }
+    Ok(())
+}
+
+fn validate_capacity_cleanup(failure: &BlobCapacityFailure) -> Result<(), BlobError> {
+    if failure.cleanup_stage.is_some() != failure.cleanup_evidence.is_some() {
+        return Err(BlobError::InvalidField {
+            field: "capacity.cleanup",
+            reason: "cleanup stage and evidence must be supplied together",
+        });
+    }
+    if matches!(
+        failure.cleanup,
+        BlobCapacityCleanup::NotApplicable | BlobCapacityCleanup::Succeeded
+    ) && failure.cleanup_evidence.is_some()
+    {
+        return Err(BlobError::InvalidField {
+            field: "capacity.cleanup",
+            reason: "cleanup evidence cannot accompany an inapplicable or successful result",
+        });
+    }
+    Ok(())
+}
+
 impl BlobCapacityFailure {
     /// Checks the intrinsic consistency of a capacity observation before a
     /// caller uses it for recovery.  This validates representation claims; it
     /// does not authenticate a provider or turn a caller-supplied observation
     /// into a successful commit receipt.
     pub fn validate(&self) -> Result<(), BlobError> {
-        match self.evidence.cause {
-            BlobCapacityCause::IoStorageFull
-            | BlobCapacityCause::PosixEnospc { code: 28 }
-            | BlobCapacityCause::WindowsErrorDiskFull { code: 112 }
-            | BlobCapacityCause::WindowsErrorHandleDiskFull { code: 39 } => {}
-            BlobCapacityCause::PosixEnospc { .. }
-            | BlobCapacityCause::WindowsErrorDiskFull { .. }
-            | BlobCapacityCause::WindowsErrorHandleDiskFull { .. } => {
-                return Err(BlobError::InvalidField {
-                    field: "capacity.cause",
-                    reason: "native code does not match its declared namespace",
-                });
-            }
-        }
-        match &self.identity {
-            BlobCapacityIdentity::Operation { context, locator } => {
-                context.validate_for(EffectClass::ReversibleMutation)?;
-                if let Some(locator) = locator {
-                    locator.validate()?;
-                }
-            }
-            BlobCapacityIdentity::Journal {
-                operation_id,
-                idempotency_key,
-                locator,
-            } => {
-                if operation_id.trim().is_empty() || idempotency_key.trim().is_empty() {
-                    return Err(BlobError::InvalidField {
-                        field: "capacity.identity",
-                        reason: "journal operation and idempotency identities are required",
-                    });
-                }
-                if let Some(locator) = locator {
-                    locator.validate()?;
-                }
-            }
-            BlobCapacityIdentity::RootLease { root_id, lease_id } => {
-                if root_id.trim().is_empty()
-                    || lease_id
-                        .as_deref()
-                        .is_some_and(|value| value.trim().is_empty())
-                {
-                    return Err(BlobError::InvalidField {
-                        field: "capacity.identity",
-                        reason: "root and lease identities must be nonblank",
-                    });
-                }
-            }
-        }
+        validate_capacity_cause(self.evidence.cause)?;
+        validate_capacity_identity(&self.identity)?;
         let requires_reconciliation = matches!(
             self.evidence.effect,
             BlobCapacityEffect::PossibleMutation
@@ -2858,37 +2989,9 @@ impl BlobCapacityFailure {
                 reason: "recovery does not match effect certainty",
             });
         }
-        if self.stage == BlobCapacityStage::CasJournal && self.cas_request.is_none() {
-            return Err(BlobError::InvalidField {
-                field: "capacity.cas_request",
-                reason: "CAS capacity observations require their complete request",
-            });
-        }
-        if let Some(request) = &self.cas_request {
-            request.validate()?;
-        }
-        if (self.cas_backend_generation.is_some() || self.cas_durability.is_some())
-            && self.cas_request.is_none()
-        {
-            return Err(BlobError::InvalidField {
-                field: "capacity.cas_observation",
-                reason: "CAS generation and durability require a complete request",
-            });
-        }
-        if self.gc_state.is_some() && self.stage != BlobCapacityStage::GcCleanup {
-            return Err(BlobError::InvalidField {
-                field: "capacity.gc_state",
-                reason: "GC state is only valid for GC cleanup",
-            });
-        }
-        if self.cleanup == BlobCapacityCleanup::NotApplicable
-            && (self.cleanup_stage.is_some() || self.cleanup_evidence.is_some())
-        {
-            return Err(BlobError::InvalidField {
-                field: "capacity.cleanup",
-                reason: "cleanup evidence requires an applicable cleanup result",
-            });
-        }
+        validate_capacity_cas(self)?;
+        validate_capacity_gc(self)?;
+        validate_capacity_cleanup(self)?;
         Ok(())
     }
 }
