@@ -12,12 +12,13 @@ use eliot_receipts::{WorkScope, WorkScopeId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::PositionState;
 use crate::absence::AbsenceClaimParams;
 use crate::absence::{AbsenceClaim, BoundedProof, OwnerLookup};
 use crate::admitted::{
     AdmittedKind, AdmittedReceipt, AdmittedReceiptParams, ChallengeInvariant, ContractChallenge,
     CurrentEpistemicPosition, CurrentEpistemicPositionView, Currentness, PositionId,
-    PositionRevision, PositionState,
+    PositionRevision,
 };
 use crate::assertability::PositionAssertability;
 use crate::assumption::{
@@ -1873,17 +1874,21 @@ fn valid_admitted_view_with_receipt() -> CaseResult {
     let mut bad_view = view.clone();
     bad_view.digest = sha256_hex("other".as_bytes());
     expect_err!(bad_view.validate(), DigestMismatch, "admitted.digest");
-    // Donor-compatible position states round-trip with exact wire names.
+    // The canonical eight-state position vocabulary round-trips with exact wire names.
     let states = [
         PositionState::Observed,
         PositionState::Supported,
-        PositionState::Assumed,
-        PositionState::Conflicted,
+        PositionState::Verified,
+        PositionState::Contested,
         PositionState::Stale,
+        PositionState::Superseded,
+        PositionState::Rejected,
         PositionState::Unknown,
     ];
-    let states_wire = "\"OBSERVED\",\"SUPPORTED\",\"ASSUMED\",\"CONFLICTED\",\"STALE\",\"UNKNOWN\"";
+    let states_wire = "\"OBSERVED\",\"SUPPORTED\",\"VERIFIED\",\"CONTESTED\",\"STALE\",\"SUPERSEDED\",\"REJECTED\",\"UNKNOWN\"";
     assert_wires(&states, states_wire)?;
+    assert!(serde_json::from_str::<PositionState>("\"ASSUMED\"").is_err());
+    assert!(serde_json::from_str::<PositionState>("\"CONFLICTED\"").is_err());
     // The closure binds the cited receipt contents exactly.
     let closed = closure()?;
     closed.validate()?;

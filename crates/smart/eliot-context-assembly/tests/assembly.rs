@@ -61,7 +61,8 @@ fn candidate(context: &ContextBinding) -> ContextCandidate {
         loss_policy: LossPolicy::NonDroppable,
         availability: AtomAvailability::PresentCurrent,
         protected: true,
-        privacy: PrivacyClass::Restricted,
+        // The pure assembly fixture represents the current public-only route.
+        privacy: PrivacyClass::Public,
         authority: AuthorityClass::DecisionRelevant,
         status: EpistemicStatus::Observed,
         assertability: Assertability::NonAssertableUnverified,
@@ -323,6 +324,37 @@ fn assembles_exact_admitted_projection_and_measures_once() {
         view.view.measurement.rendered_utf8_bytes,
         u64::try_from(view.serialized_bytes.len()).expect("serialized byte count")
     );
+}
+
+#[test]
+fn non_public_admitted_privacy_is_refused_before_measurement() {
+    for privacy in [
+        PrivacyClass::Scoped,
+        PrivacyClass::Restricted,
+        PrivacyClass::Secret,
+    ] {
+        let mut value = admitted();
+        value.records[0].candidate.privacy = privacy;
+        let context = value.binding.clone();
+        let mut calls = 0;
+        let result = assemble_active_view(
+            &value,
+            &recipe(&context),
+            quality(&context),
+            &policy(100_000),
+            |_bytes| {
+                calls += 1;
+                panic!("privacy refusal must precede measurement");
+            },
+        );
+        assert_eq!(calls, 0);
+        assert_eq!(
+            result,
+            Err(AssemblyError::Contract(ContextError::InvalidField(
+                "candidate.privacy"
+            )))
+        );
+    }
 }
 
 #[test]

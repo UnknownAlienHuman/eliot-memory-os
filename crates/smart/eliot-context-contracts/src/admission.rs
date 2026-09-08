@@ -339,6 +339,7 @@ impl AdmittedContextSet {
         ids: &mut BTreeSet<ArtifactId>,
     ) -> Result<(), ContextError> {
         record.candidate.validate()?;
+        record.candidate.validate_public_privacy()?;
         if record.candidate.binding != self.binding || !ids.insert(record.candidate.atom_id.clone())
         {
             return Err(ContextError::Duplicate("admitted.atom_id"));

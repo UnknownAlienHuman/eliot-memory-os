@@ -62,7 +62,9 @@ fn candidate(context: &ContextBinding) -> ContextCandidate {
         loss_policy: LossPolicy::NonDroppable,
         availability: AtomAvailability::PresentCurrent,
         protected: true,
-        privacy: PrivacyClass::Restricted,
+        // Executable admission inputs use the current public-only route;
+        // restricted labels remain covered by inert contract tests.
+        privacy: PrivacyClass::Public,
         authority: AuthorityClass::DecisionRelevant,
         status: EpistemicStatus::Observed,
         assertability: Assertability::NonAssertableUnverified,

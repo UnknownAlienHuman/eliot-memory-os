@@ -464,6 +464,18 @@ pub struct ContextCandidate {
 }
 
 impl ContextCandidate {
+    /// Apply the current public-only disclosure boundary for admission.
+    ///
+    /// A Governor-owned route/disclosure contract must replace this narrow
+    /// prototype rule before scoped or restricted material can cross a route.
+    pub(crate) fn validate_public_privacy(&self) -> Result<(), ContextError> {
+        if self.privacy == PrivacyClass::Public {
+            Ok(())
+        } else {
+            Err(ContextError::InvalidField("candidate.privacy"))
+        }
+    }
+
     /// Validate a candidate without ranking, retrieval or provider calls.
     pub fn validate(&self) -> Result<(), ContextError> {
         self.binding.validate()?;

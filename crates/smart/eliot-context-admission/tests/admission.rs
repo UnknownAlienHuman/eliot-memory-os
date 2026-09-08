@@ -80,7 +80,9 @@ fn candidate(
         loss_policy,
         availability: AtomAvailability::PresentCurrent,
         protected,
-        privacy: PrivacyClass::Scoped,
+        // Admission currently accepts only the public route projection; the
+        // privacy refusal path below covers narrower classes explicitly.
+        privacy: PrivacyClass::Public,
         authority: AuthorityClass::DecisionRelevant,
         status: EpistemicStatus::Observed,
         assertability: Assertability::NonAssertableUnverified,
@@ -402,6 +404,22 @@ fn required_floor_is_admitted_before_fitting_optional_material() {
     assert_eq!(admitted.economy.allocations.admitted_required, 40);
     assert_eq!(admitted.economy.allocations.admitted_optional, 0);
     result.validate_for(&input).expect("result conservation");
+}
+
+#[test]
+fn non_public_privacy_is_refused_before_selection() {
+    for privacy in [
+        PrivacyClass::Scoped,
+        PrivacyClass::Restricted,
+        PrivacyClass::Secret,
+    ] {
+        let mut input = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 20 });
+        input.candidates.candidates[0].privacy = privacy;
+        assert_eq!(
+            admit_context(&input),
+            Err(ContextError::InvalidField("candidate.privacy"))
+        );
+    }
 }
 
 #[test]

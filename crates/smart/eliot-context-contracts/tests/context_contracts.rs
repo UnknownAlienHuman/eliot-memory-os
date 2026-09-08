@@ -74,7 +74,9 @@ fn candidate() -> ContextCandidate {
         loss_policy: LossPolicy::NonDroppable,
         availability: AtomAvailability::PresentCurrent,
         protected: true,
-        privacy: PrivacyClass::Restricted,
+        // Executable admitted fixtures use the public-only route; the test
+        // below changes this inert candidate to Secret and keeps it valid.
+        privacy: PrivacyClass::Public,
         authority: AuthorityClass::DecisionRelevant,
         status: EpistemicStatus::Observed,
         assertability: Assertability::NonAssertableUnverified,
@@ -257,6 +259,10 @@ fn admitted_set(candidate: ContextCandidate) -> AdmittedContextSet {
 fn whole_unit_and_loss_policy_are_closed_and_coherent() {
     let mut candidate = candidate();
     candidate.validate().expect("whole non-droppable candidate");
+    candidate.privacy = PrivacyClass::Secret;
+    candidate
+        .validate()
+        .expect("inert candidate retains its privacy label");
     candidate.representation = AtomRepresentation::Summary {
         content: "lossy".to_owned(),
         source_digest: digest(),
@@ -454,6 +460,38 @@ fn quality_scorecard_requires_each_independent_axis() {
     assert_eq!(scorecard.validate(), Err(ContextError::QualityIncomplete));
 }
 
+fn assert_private_view_rejected(admitted: &AdmittedContextSet, view: &ActiveUnderstandingView) {
+    let context = admitted.binding.clone();
+    let mut private_admitted = admitted.clone();
+    private_admitted.records[0].candidate.privacy = PrivacyClass::Secret;
+    let mut private_view = view.clone();
+    private_view.rendered[0].privacy = PrivacyClass::Secret;
+    private_view.output_digest = ActiveUnderstandingView::canonical_output_digest(
+        &context,
+        &private_view.recipe_digest,
+        &private_view.fence_digest,
+        &private_view.rendered,
+    )
+    .expect("private rendered digest");
+    private_view.selection.output_digest = private_view.output_digest.clone();
+    private_view.measurement.envelope_digest = private_view.output_digest.clone();
+    private_view.measurement.rendered_utf8_bytes =
+        ActiveUnderstandingView::canonical_output_utf8_bytes(
+            &context,
+            &private_view.recipe_digest,
+            &private_view.fence_digest,
+            &private_view.rendered,
+        )
+        .expect("private rendered bytes");
+    private_view
+        .validate()
+        .expect("coherent inert private view");
+    assert_eq!(
+        private_view.validate_against(&private_admitted),
+        Err(ContextError::InvalidField("candidate.privacy"))
+    );
+}
+
 #[test]
 fn admitted_view_preserves_protected_fields_and_rejects_injected_content() {
     let admitted = admitted_set(candidate());
@@ -496,6 +534,7 @@ fn admitted_view_preserves_protected_fields_and_rejects_injected_content() {
     assert_eq!(view.selection.output_digest, output_digest);
     view.validate_against(&admitted)
         .expect("exact admitted projection");
+    assert_private_view_rejected(&admitted, &view);
 
     let mut qualified = exact_measurement(&context);
     qualified.status = MeasurementStatus::ExactTokenizer;

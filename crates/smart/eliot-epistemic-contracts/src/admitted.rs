@@ -240,26 +240,6 @@ impl ContractChallenge {
     }
 }
 
-/// Owner-neutral rendering of the donor position algebra, for record
-/// compatibility: the six donor states are preserved exactly (donor
-/// `resolve` into them is not carried).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum PositionState {
-    /// Directly captured observation, not yet support for a claim.
-    Observed,
-    /// Currently supported within its declared scope.
-    Supported,
-    /// Held under an explicit assumption; never decoded as support.
-    Assumed,
-    /// Competing positions remain unresolved.
-    Conflicted,
-    /// Once useful material whose freshness boundary has passed.
-    Stale,
-    /// The available material cannot establish a position.
-    Unknown,
-}
-
 /// Currentness of the admitted position under its owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
