@@ -73,6 +73,7 @@ struct DerivedCandidate {
 }
 
 fn digest<T: Serialize>(value: &T, field: &'static str) -> Result<Digest, CueBindingError> {
+    bounded_serialized_len(value, field)?;
     let bytes =
         canonical_json_bytes(value).map_err(|_| CueBindingError::Canonicalization { field })?;
     if bytes.len() > bounds::MAX_OUTPUT_BYTES {
@@ -336,6 +337,16 @@ fn preflight(
         });
     }
     validate_rows(touched, profile, &mut total)?;
+    bounded_serialized_len(
+        &InputPreimage {
+            domain: "eliot.a12.cue-binding.input.v1",
+            admission,
+            profile,
+            touched,
+            hint,
+        },
+        "input",
+    )?;
     let mut ordered = touched.to_vec();
     ordered.sort_by(|a, b| {
         a.target
@@ -617,16 +628,6 @@ fn result_digests(
     omitted: &[OmittedBindingIdentity],
     hint: Option<&ExpectedReuseHint>,
 ) -> Result<(Option<Digest>, crate::BindingOutcome, Digest), CueBindingError> {
-    bounded_serialized_len(
-        &InputPreimage {
-            domain: "eliot.a12.cue-binding.input.v1",
-            admission,
-            profile,
-            touched,
-            hint,
-        },
-        "input",
-    )?;
     let input_digest = digest(
         &InputPreimage {
             domain: "eliot.a12.cue-binding.input.v1",
