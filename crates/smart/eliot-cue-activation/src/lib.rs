@@ -1,13 +1,23 @@
-//! Capability cell placeholder.
+//! Bounded A14 cue activation.
 //!
-//! NOT IMPLEMENTED. This file exists only so that per-crate
-//! `cargo check`, `cargo test` and `cargo clippy` run and report an
-//! actionable result instead of a manifest error.
+//! This prototype evaluates a supplied A10 `CueSnapshotBuildCandidate` under a
+//! caller-supplied, versioned numerical profile. It supports exact-first direct
+//! matching and forward-only bounded spreading. It performs no normalization,
+//! indexing, I/O, admission, publication or authority decision.
 //!
-//! Cell `smart.cue.activation`, order 14.
-//! The purpose, contract and dependencies of this cell live in
-//! `module.toml` next to this crate. The owning work unit replaces this
-//! file and, on completion, moves the crate from the root
-//! `workspace.exclude` into `workspace.members`.
-
+//! Row lifecycle must be `Active`; candidate and evidence freshness must be one
+//! of the three exact labels accepted by this prototype, with epistemic status
+//! `Observed`, `Supported` or `Verified`. A14 uses the reused A10 independent
+//! limits and requires the profile bounds to equal the request bounds. The
+//! numerical profile is caller supplied, unbenchmarked and never default enabled.
+//! Full currentness/authentication, registry authorization, publication and the
+//! complete 42-case matrix remain outside this prototype.
 #![forbid(unsafe_code)]
+
+mod error;
+mod evaluate;
+mod profile;
+
+pub use error::ActivationError;
+pub use evaluate::{CueActivationEvaluation, evaluate_activation};
+pub use profile::{ACTIVATION_PROFILE_REVISION, ActivationProfile, MatchRule, RelationRule};
