@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [package.metadata.eliot]
 prototype = true
-source_status = "NOT_IMPLEMENTED"
+source_status = "IMPLEMENTED"
 workspace_admission = "pending_agent_implementation_and_proof"
 functional_cell = "smart.cue.activation"
 source_layer = "C1"
@@ -23,7 +23,11 @@ agent_order = 14
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
 eliot-evidence = { path = "../../foundation/eliot-evidence" }
+eliot-receipts = { path = "../../foundation/eliot-receipts" }
 eliot-cue-contracts = { path = "../eliot-cue-contracts" }
+schemars = { version = "1.2.1", features = ["derive", "uuid1"] }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
 
 [lints]
 workspace = true
