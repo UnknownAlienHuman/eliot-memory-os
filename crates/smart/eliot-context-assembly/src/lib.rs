@@ -1,13 +1,23 @@
-//! Capability cell placeholder.
+//! Deterministic projection of one admitted A-15 context set.
 //!
-//! NOT IMPLEMENTED. This file exists only so that per-crate
-//! `cargo check`, `cargo test` and `cargo clippy` run and report an
-//! actionable result instead of a manifest error.
-//!
-//! Cell `smart.context.assembly`, order 18.
-//! The purpose, contract and dependencies of this cell live in
-//! `module.toml` next to this crate. The owning work unit replaces this
-//! file and, on completion, moves the crate from the root
-//! `workspace.exclude` into `workspace.members`.
+//! This crate owns assembly only. It never retrieves, ranks, re-admits, edits,
+//! or persists context. The returned [`ActiveUnderstandingView`] remains a
+//! candidate projection whose measurement is supplied by the caller.
 
 #![forbid(unsafe_code)]
+
+mod assemble;
+mod bounds;
+mod error;
+mod measurement;
+mod render;
+
+pub use assemble::{
+    ASSEMBLY_ORDERING_REVISION, ActiveUnderstandingViewResult, AssemblyPolicy, assemble_active_view,
+};
+pub use error::AssemblyError;
+
+pub use eliot_context_contracts::{
+    ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextOutcome, QualityScorecard,
+    RenderedAtom, SelectionIntegrityProof, SerializedContextMeasurement,
+};

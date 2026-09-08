@@ -5,14 +5,14 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Render one admitted set into semantic sections, reversible omission manifest and decision-local tail without re-running admission."
+description = "Project one admitted A-15 context set into a bounded ActiveUnderstandingView without re-running admission."
 
 [lib]
 path = "src/lib.rs"
 
 [package.metadata.eliot]
 prototype = true
-source_status = "NOT_IMPLEMENTED"
+source_status = "IMPLEMENTED"
 workspace_admission = "pending_agent_implementation_and_proof"
 functional_cell = "smart.context.assembly"
 source_layer = "C1"
@@ -22,9 +22,14 @@ agent_order = 18
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
-eliot-evidence = { path = "../../foundation/eliot-evidence" }
 eliot-context-contracts = { path = "../eliot-context-contracts" }
-eliot-context-admission = { path = "../eliot-context-admission" }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+
+[dev-dependencies]
+eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }
+eliot-receipts = { path = "../../foundation/eliot-receipts" }
 
 [lints]
 workspace = true
