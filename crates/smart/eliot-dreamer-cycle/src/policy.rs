@@ -73,6 +73,6 @@ pub(crate) const fn request_kind(phase: CyclePhase) -> Option<RequestKind> {
         CyclePhase::IntrinsicOutputChecked => Some(RequestKind::IntrinsicOutput),
         CyclePhase::ExternalAdmission => Some(RequestKind::ExternalAdmission),
         CyclePhase::ClosureObserved => Some(RequestKind::Closure),
-        _ => None,
+        CyclePhase::Validated => None,
     }
 }

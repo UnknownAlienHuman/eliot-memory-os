@@ -21,6 +21,18 @@ pub(crate) fn validate_observation(
     outcome.receipt.validate()?;
     let core = &outcome.receipt.core;
     validate_receipt_bounds(core, outcome)?;
+    validate_outer_binding(pending, outcome, expected_predecessor, core)?;
+    validate_typed_evidence(state, pending, outcome, core)?;
+    validate_required_evidence(state, pending, outcome)?;
+    validate_phase_rule(pending, policy, core)
+}
+
+fn validate_outer_binding(
+    pending: &PendingRequest,
+    outcome: &ObservedOutcome,
+    expected_predecessor: Option<&eliot_contracts::ReceiptId>,
+    core: &eliot_receipts::ReceiptCore,
+) -> Result<(), CycleError> {
     if core.kind != ReceiptKind::Operation {
         return Err(CycleError::BindingMismatch {
             field: "receipt.kind",
@@ -112,6 +124,15 @@ pub(crate) fn validate_observation(
             reason: "possible effect must remain unknown for reconciliation",
         });
     }
+    Ok(())
+}
+
+fn validate_typed_evidence(
+    state: &DreamerCycleState,
+    pending: &PendingRequest,
+    outcome: &ObservedOutcome,
+    core: &eliot_receipts::ReceiptCore,
+) -> Result<(), CycleError> {
     if let Some(request) = &pending.handler_request {
         if request.job_id != state.job.canonical_id()
             || request.task_id != pending.task_id
@@ -142,140 +163,47 @@ pub(crate) fn validate_observation(
         }
     }
     if let Some(result) = &outcome.handler_result {
-        result.validate().map_err(contract_error)?;
-        let request = pending
-            .handler_request
-            .as_ref()
-            .ok_or(CycleError::IncompleteOutcome("handler_result.request"))?;
-        if result.request_id != request.request_id
-            || result.kind != request.kind
-            || result.family != request.family
-            || result.handler_id != pending.owner
-        {
-            return Err(CycleError::BindingMismatch {
-                field: "handler_result.binding",
-                reason: "handler result identity differs from pending request",
-            });
-        }
-        let request_bytes = canonical_bytes(request).map_err(contract_error)?;
-        let typed_request_digest = eliot_contracts::sha256_hex(&request_bytes);
-        if result.request_digest != typed_request_digest {
-            return Err(CycleError::BindingMismatch {
-                field: "handler_result.request_digest",
-                reason: "handler result does not bind canonical typed request",
-            });
-        }
-        require_evidence_artifact(
-            &core.artifacts,
-            &outcome.evidence_refs,
-            &result.result_digest,
-            "handler_result.result_digest",
-        )?;
-        require_full_evidence_artifact(
-            &core.artifacts,
-            &outcome.evidence_refs,
-            result,
-            "handler_result.canonical_artifact",
-        )?;
-        if outcome.disposition == OutcomeDisposition::Completed
-            && pending.phase == crate::contract::CyclePhase::HandlerObserved
-            && state.job.job_class == JobClass::Curation
-            && result.disposition != eliot_dreamer_contracts::CandidateDisposition::Candidate
-        {
-            return Err(CycleError::BindingMismatch {
-                field: "handler_result.disposition",
-                reason: "only a candidate result can complete curation handler observation",
-            });
-        }
+        validate_handler_result(pending, outcome, core, result)?;
     }
     if let Some(receipt) = &outcome.validation_receipt {
-        receipt.validate().map_err(contract_error)?;
-        if receipt.job_id != state.job.canonical_id()
-            || receipt.task_id != pending.task_id
-            || receipt.scope_id != pending.scope_id
-            || receipt.bundle_digest != pending.bundle_digest
-            || receipt.manifest_digest != state.job.frozen_manifest_digest
-            || receipt.state_fence != pending.state_fence
-        {
-            return Err(CycleError::BindingMismatch {
-                field: "validation_receipt",
-                reason: "validation receipt is outside the pending scope",
-            });
-        }
-        require_evidence_artifact(
-            &core.artifacts,
-            &outcome.evidence_refs,
-            &receipt.input_digest,
-            "validation_receipt.input_digest",
-        )?;
-        require_full_evidence_artifact(
-            &core.artifacts,
-            &outcome.evidence_refs,
-            receipt,
-            "validation_receipt.canonical_artifact",
-        )?;
-        require_evidence_artifact(
-            &core.artifacts,
-            &outcome.evidence_refs,
-            &receipt.output_digest,
-            "validation_receipt.output_digest",
-        )?;
+        validate_validation_receipt(state, pending, outcome, core, receipt)?;
     }
     if let Some(screen) = &outcome.screen_binding {
-        screen.validate().map_err(contract_error)?;
-        if screen.request_id.as_str() != pending.request_id.as_str()
-            || screen.task_id != pending.task_id
-            || screen.scope_id != pending.scope_id
-            || screen.state_fence != pending.state_fence
-        {
-            return Err(CycleError::BindingMismatch {
-                field: "screen_binding",
-                reason: "screen binding is outside the pending scope",
-            });
-        }
-        require_evidence_artifact(
-            &core.artifacts,
-            &outcome.evidence_refs,
-            &screen.result_digest,
-            "screen_binding.result_digest",
-        )?;
-        if screen.item_digest != pending.payload_digest {
-            require_evidence_artifact(
-                &core.artifacts,
-                &outcome.evidence_refs,
-                &screen.item_digest,
-                "screen_binding.item_digest",
-            )?;
-        }
-        require_full_evidence_artifact(
-            &core.artifacts,
-            &outcome.evidence_refs,
-            screen,
-            "screen_binding.canonical_artifact",
-        )?;
+        validate_screen_binding(pending, outcome, core, screen)?;
     }
-    if outcome.disposition == OutcomeDisposition::Completed
-        && pending.phase == crate::contract::CyclePhase::Screened
-        && outcome.screen_binding.is_none()
-    {
+    Ok(())
+}
+
+fn validate_required_evidence(
+    state: &DreamerCycleState,
+    pending: &PendingRequest,
+    outcome: &ObservedOutcome,
+) -> Result<(), CycleError> {
+    if outcome.disposition != OutcomeDisposition::Completed {
+        return Ok(());
+    }
+    if pending.phase == crate::contract::CyclePhase::Screened && outcome.screen_binding.is_none() {
         return Err(CycleError::IncompleteOutcome("screen_binding"));
     }
-    if outcome.disposition == OutcomeDisposition::Completed
-        && pending.phase == crate::contract::CyclePhase::CommonValidated
-        && !outcome
-            .validation_receipt
-            .as_ref()
-            .is_some_and(|receipt| receipt.terminal_disposition == "accepted")
+    if pending.phase == crate::contract::CyclePhase::CommonValidated
+        && outcome.validation_receipt.is_none()
     {
         return Err(CycleError::IncompleteOutcome("validation_receipt"));
     }
-    if outcome.disposition == OutcomeDisposition::Completed
-        && state.job.job_class == JobClass::Curation
+    if state.job.job_class == JobClass::Curation
         && pending.phase == crate::contract::CyclePhase::HandlerObserved
         && (pending.handler_request.is_none() || outcome.handler_result.is_none())
     {
         return Err(CycleError::IncompleteOutcome("curation.handler_evidence"));
     }
+    Ok(())
+}
+
+fn validate_phase_rule(
+    pending: &PendingRequest,
+    policy: &crate::contract::CyclePolicy,
+    core: &eliot_receipts::ReceiptCore,
+) -> Result<(), CycleError> {
     if let Some(rule) = policy
         .phase_rules
         .iter()
@@ -293,6 +221,128 @@ pub(crate) fn validate_observation(
         });
     }
     Ok(())
+}
+
+fn validate_handler_result(
+    pending: &PendingRequest,
+    outcome: &ObservedOutcome,
+    core: &eliot_receipts::ReceiptCore,
+    result: &eliot_dreamer_contracts::TypedCurationHandlerResult,
+) -> Result<(), CycleError> {
+    result.validate().map_err(|error| contract_error(&error))?;
+    let request = pending
+        .handler_request
+        .as_ref()
+        .ok_or(CycleError::IncompleteOutcome("handler_result.request"))?;
+    if result.request_id != request.request_id
+        || result.kind != request.kind
+        || result.family != request.family
+        || result.handler_id != pending.owner
+    {
+        return Err(CycleError::BindingMismatch {
+            field: "handler_result.binding",
+            reason: "handler result identity differs from pending request",
+        });
+    }
+    let request_bytes = canonical_bytes(request).map_err(|error| contract_error(&error))?;
+    let typed_request_digest = eliot_contracts::sha256_hex(&request_bytes);
+    if result.request_digest != typed_request_digest {
+        return Err(CycleError::BindingMismatch {
+            field: "handler_result.request_digest",
+            reason: "handler result does not bind canonical typed request",
+        });
+    }
+    require_evidence_artifact(
+        &core.artifacts,
+        &outcome.evidence_refs,
+        &result.result_digest,
+        "handler_result.result_digest",
+    )?;
+    require_full_evidence_artifact(
+        &core.artifacts,
+        &outcome.evidence_refs,
+        result,
+        "handler_result.canonical_artifact",
+    )
+}
+
+fn validate_validation_receipt(
+    state: &DreamerCycleState,
+    pending: &PendingRequest,
+    outcome: &ObservedOutcome,
+    core: &eliot_receipts::ReceiptCore,
+    receipt: &eliot_dreamer_contracts::ValidationReceipt,
+) -> Result<(), CycleError> {
+    receipt.validate().map_err(|error| contract_error(&error))?;
+    if receipt.job_id != state.job.canonical_id()
+        || receipt.task_id != pending.task_id
+        || receipt.scope_id != pending.scope_id
+        || receipt.bundle_digest != pending.bundle_digest
+        || receipt.manifest_digest != state.job.frozen_manifest_digest
+        || receipt.state_fence != pending.state_fence
+    {
+        return Err(CycleError::BindingMismatch {
+            field: "validation_receipt",
+            reason: "validation receipt is outside the pending scope",
+        });
+    }
+    require_evidence_artifact(
+        &core.artifacts,
+        &outcome.evidence_refs,
+        &receipt.input_digest,
+        "validation_receipt.input_digest",
+    )?;
+    require_full_evidence_artifact(
+        &core.artifacts,
+        &outcome.evidence_refs,
+        receipt,
+        "validation_receipt.canonical_artifact",
+    )?;
+    require_evidence_artifact(
+        &core.artifacts,
+        &outcome.evidence_refs,
+        &receipt.output_digest,
+        "validation_receipt.output_digest",
+    )
+}
+
+fn validate_screen_binding(
+    pending: &PendingRequest,
+    outcome: &ObservedOutcome,
+    core: &eliot_receipts::ReceiptCore,
+    screen: &eliot_dreamer_contracts::ScreenBinding,
+) -> Result<(), CycleError> {
+    screen.validate().map_err(|error| contract_error(&error))?;
+    if screen.request_id.as_str() != pending.request_id.as_str()
+        || screen.task_id != pending.task_id
+        || screen.scope_id != pending.scope_id
+        || screen.state_fence != pending.state_fence
+    {
+        return Err(CycleError::BindingMismatch {
+            field: "screen_binding",
+            reason: "screen binding is outside the pending scope",
+        });
+    }
+    require_evidence_artifact(
+        &core.artifacts,
+        &outcome.evidence_refs,
+        &screen.result_digest,
+        "screen_binding.result_digest",
+    )?;
+    if screen.item_digest != pending.payload_digest {
+        require_evidence_artifact(
+            &core.artifacts,
+            &outcome.evidence_refs,
+            &screen.item_digest,
+            "screen_binding.item_digest",
+        )?;
+    }
+    require_full_evidence_artifact(
+        &core.artifacts,
+        &outcome.evidence_refs,
+        screen,
+        "screen_binding.canonical_artifact",
+    )
 }
 
 fn validate_expected_artifacts(
@@ -341,10 +391,11 @@ fn validate_expected_artifacts(
             });
         }
     }
-    if !actual
+    let request_artifacts: Vec<_> = actual
         .iter()
-        .any(|artifact| artifact.role == ReceiptKind::Request && artifact.sha256 == request_digest)
-    {
+        .filter(|artifact| artifact.role == ReceiptKind::Request)
+        .collect();
+    if request_artifacts.len() != 1 || request_artifacts[0].sha256 != request_digest {
         return Err(CycleError::IncompleteOutcome("receipt.request_artifact"));
     }
     if !expected.iter().any(|item| item.sha256 == payload_digest) {
@@ -434,7 +485,7 @@ fn require_full_evidence_artifact<T: serde::Serialize>(
     value: &T,
     field: &'static str,
 ) -> Result<(), CycleError> {
-    let bytes = canonical_bytes(value).map_err(contract_error)?;
+    let bytes = canonical_bytes(value).map_err(|error| contract_error(&error))?;
     let digest = eliot_contracts::sha256_hex(&bytes);
     require_evidence_artifact(artifacts, evidence_refs, &digest, field)
 }
@@ -477,6 +528,6 @@ pub(crate) fn request_digest(pending: &PendingRequest) -> Result<String, CycleEr
     Ok(eliot_contracts::sha256_hex(&bytes))
 }
 
-fn contract_error(error: ContractViolation) -> CycleError {
+fn contract_error(error: &ContractViolation) -> CycleError {
     CycleError::Contract(error.to_string())
 }

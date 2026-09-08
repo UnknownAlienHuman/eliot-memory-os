@@ -33,7 +33,116 @@ pub fn step_dreamer_cycle_at(
 ) -> Result<CycleStep, CycleError> {
     crate::bounds::preflight_step_inputs(current, observed_external_outcomes, cycle_policy)?;
     validate_step_inputs(current, observed_external_outcomes, cycle_policy)?;
+    let new_outcomes = classify_new_outcomes(current, observed_external_outcomes)?;
 
+    let mut next = current.clone();
+
+    let Some(outcome) = new_outcomes.first().copied() else {
+        return finish_without_new_observation(
+            current,
+            next,
+            cycle_policy,
+            observation_time_ms,
+            !observed_external_outcomes.is_empty(),
+        );
+    };
+
+    let pending_index = next
+        .pending
+        .iter()
+        .position(|pending| pending.request_id == outcome.receipt.core.request.metadata.request_id)
+        .ok_or(CycleError::IncompleteOutcome("outcome.pending_request"))?;
+    let pending = next.pending[pending_index].clone();
+    let expected_predecessor = current
+        .outcomes
+        .iter()
+        .rfind(|previous| previous.receipt.core.request.metadata.request_id == pending.request_id)
+        .map(|previous| previous.receipt.identity.receipt_id.clone())
+        .or_else(|| pending.predecessor_receipt_id.clone());
+    validate_observation(
+        current,
+        &pending,
+        outcome,
+        expected_predecessor.as_ref(),
+        cycle_policy,
+    )?;
+
+    let advances = outcome.disposition == OutcomeDisposition::Completed
+        && completion_is_admissible(current, &pending, outcome);
+    if next.outcomes.len() >= cycle_policy.max_outcomes as usize {
+        return Err(CycleError::BudgetBlocked);
+    }
+    if advances {
+        let expected = current.phase.next().ok_or(CycleError::PhaseViolation(
+            "accepted outcome has no adjacent phase",
+        ))?;
+        if pending.phase != expected {
+            return Err(CycleError::PhaseViolation("pending phase is not adjacent"));
+        }
+    }
+
+    let disposition = record_outcome(
+        current,
+        &mut next,
+        pending_index,
+        &pending,
+        outcome,
+        advances,
+        cycle_policy,
+        observation_time_ms,
+    )?;
+
+    increment_revision(&mut next)?;
+    next.predecessor_digest = Some(current.canonical_digest.clone());
+    next.seal()?;
+    let requests = if disposition == StepDisposition::ReconciliationRequired {
+        reconciliation_requests(&next, &pending.request_id)?
+    } else {
+        requests_for_pending(&next)?
+    };
+    finish_step_with_requests(current, next, requests, disposition, cycle_policy)
+}
+
+fn finish_without_new_observation(
+    current: &DreamerCycleState,
+    mut next: DreamerCycleState,
+    cycle_policy: &CyclePolicy,
+    observation_time_ms: Option<i64>,
+    replayed_input: bool,
+) -> Result<CycleStep, CycleError> {
+    let disposition = StepDisposition::Replayed;
+    if replayed_input || !next.pending.is_empty() {
+        let requests = requests_for_pending_with_reconciliation(&next)?;
+        return finish_step_with_requests(current, next, requests, disposition, cycle_policy);
+    }
+    if next.phase.next().is_some_and(|phase| {
+        next.proposed_requests
+            .iter()
+            .any(|request| request.phase == phase)
+    }) && check_dispatch_budget(current, cycle_policy, observation_time_ms).is_err()
+    {
+        return finish_step_with_requests(current, next, Vec::new(), disposition, cycle_policy);
+    }
+    if activate_proposed_request(&mut next, cycle_policy)? {
+        increment_revision(&mut next)?;
+        next.predecessor_digest = Some(current.canonical_digest.clone());
+        next.seal()?;
+        let requests = requests_for_pending(&next)?;
+        return finish_step_with_requests(
+            current,
+            next,
+            requests,
+            StepDisposition::Advanced,
+            cycle_policy,
+        );
+    }
+    finish_step_with_requests(current, next, Vec::new(), disposition, cycle_policy)
+}
+
+fn classify_new_outcomes<'a>(
+    current: &DreamerCycleState,
+    observed_external_outcomes: &'a [ObservedOutcome],
+) -> Result<Vec<&'a ObservedOutcome>, CycleError> {
     let mut new_outcomes = Vec::new();
     let mut seen_receipts = BTreeSet::new();
     for outcome in observed_external_outcomes {
@@ -55,77 +164,26 @@ pub fn step_dreamer_cycle_at(
             None => new_outcomes.push(outcome),
         }
     }
-
-    // A call may replay known receipts, but may append at most one new
-    // observation. This prevents a batch from skipping adjacent phases.
     if new_outcomes.len() > 1 {
         return Err(CycleError::PhaseViolation(
             "one new observation per transition",
         ));
     }
+    Ok(new_outcomes)
+}
 
-    let mut next = current.clone();
-    let mut disposition = StepDisposition::Replayed;
-
-    let Some(outcome) = new_outcomes.first().copied() else {
-        if !observed_external_outcomes.is_empty() || !next.pending.is_empty() {
-            return finish_step(current, next, disposition, cycle_policy);
-        }
-        if next.phase.next().is_some_and(|phase| {
-            next.proposed_requests
-                .iter()
-                .any(|request| request.phase == phase)
-        }) {
-            if check_dispatch_budget(current, cycle_policy, observation_time_ms).is_err() {
-                return finish_step(current, next, disposition, cycle_policy);
-            }
-        }
-        if activate_proposed_request(&mut next, cycle_policy)? {
-            increment_revision(&mut next)?;
-            next.seal()?;
-            disposition = StepDisposition::Advanced;
-        }
-        return finish_step(current, next, disposition, cycle_policy);
-    };
-
-    let pending_index = next
-        .pending
-        .iter()
-        .position(|pending| pending.request_id == outcome.receipt.core.request.metadata.request_id)
-        .ok_or(CycleError::IncompleteOutcome("outcome.pending_request"))?;
-    let pending = next.pending[pending_index].clone();
-    let expected_predecessor = current
-        .outcomes
-        .iter()
-        .filter(|previous| previous.receipt.core.request.metadata.request_id == pending.request_id)
-        .last()
-        .map(|previous| previous.receipt.identity.receipt_id.clone())
-        .or_else(|| pending.predecessor_receipt_id.clone());
-    validate_observation(
-        current,
-        &pending,
-        outcome,
-        expected_predecessor.as_ref(),
-        cycle_policy,
-    )?;
-
-    let advances = matches!(outcome.disposition, OutcomeDisposition::Completed);
-    if next.outcomes.len() >= cycle_policy.max_outcomes as usize {
-        return Err(CycleError::BudgetBlocked);
-    }
-    if advances {
-        let expected = current.phase.next().ok_or(CycleError::PhaseViolation(
-            "accepted outcome has no adjacent phase",
-        ))?;
-        if pending.phase != expected {
-            return Err(CycleError::PhaseViolation("pending phase is not adjacent"));
-        }
-    } else if next.outcomes.len() >= cycle_policy.max_outcomes as usize {
-        return Err(CycleError::BudgetBlocked);
-    }
-
+fn record_outcome(
+    current: &DreamerCycleState,
+    next: &mut DreamerCycleState,
+    pending_index: usize,
+    pending: &crate::contract::PendingRequest,
+    outcome: &ObservedOutcome,
+    advances: bool,
+    cycle_policy: &CyclePolicy,
+    observation_time_ms: Option<i64>,
+) -> Result<StepDisposition, CycleError> {
     next.outcomes.push(outcome.clone());
-    match outcome.disposition {
+    let disposition = match outcome.disposition {
         OutcomeDisposition::Accepted => {
             if !next
                 .frontier
@@ -135,9 +193,9 @@ pub fn step_dreamer_cycle_at(
                 next.frontier
                     .push("owner accepted; completion remains pending".to_owned());
             }
-            disposition = StepDisposition::ReconciliationRequired;
+            StepDisposition::ReconciliationRequired
         }
-        OutcomeDisposition::Completed => {
+        OutcomeDisposition::Completed if advances => {
             if outcome.phase == CyclePhase::ClosureObserved {
                 if outcome.receipt.core.operation.effect != EffectClass::ExternalEffect
                     || outcome.receipt.core.authority.proof_ceiling
@@ -147,15 +205,20 @@ pub fn step_dreamer_cycle_at(
                 }
                 next.phase = CyclePhase::ClosureObserved;
                 next.pending.remove(pending_index);
-                disposition = StepDisposition::Terminal;
+                StepDisposition::Terminal
             } else {
                 next.phase = pending.phase;
                 next.pending.remove(pending_index);
                 if check_dispatch_budget(current, cycle_policy, observation_time_ms).is_ok() {
-                    activate_proposed_request(&mut next, cycle_policy)?;
+                    activate_proposed_request(next, cycle_policy)?;
                 }
-                disposition = StepDisposition::Advanced;
+                StepDisposition::Advanced
             }
+        }
+        OutcomeDisposition::Completed => {
+            next.frontier
+                .push("completed outcome has blocked typed evidence".to_owned());
+            StepDisposition::Blocked
         }
         OutcomeDisposition::Unknown => {
             if !next
@@ -165,27 +228,40 @@ pub fn step_dreamer_cycle_at(
             {
                 next.frontier.push("unknown external outcome".to_owned());
             }
-            disposition = StepDisposition::ReconciliationRequired;
+            StepDisposition::ReconciliationRequired
         }
         OutcomeDisposition::Partial => {
             next.frontier.push("partial owner outcome".to_owned());
-            disposition = StepDisposition::Blocked;
+            StepDisposition::Blocked
         }
         _ => {
             next.frontier
                 .push("owner outcome did not advance".to_owned());
-            disposition = StepDisposition::Blocked;
+            StepDisposition::Blocked
         }
-    }
-
-    increment_revision(&mut next)?;
-    next.seal()?;
-    let requests = if disposition == StepDisposition::ReconciliationRequired {
-        reconciliation_requests(&next, &pending.request_id)?
-    } else {
-        requests_for_pending(&next)?
     };
-    finish_step_with_requests(current, next, requests, disposition, cycle_policy)
+    Ok(disposition)
+}
+
+fn completion_is_admissible(
+    state: &DreamerCycleState,
+    pending: &crate::contract::PendingRequest,
+    outcome: &ObservedOutcome,
+) -> bool {
+    if pending.phase == CyclePhase::CommonValidated {
+        return outcome
+            .validation_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.terminal_disposition == "accepted");
+    }
+    if state.job.job_class == eliot_dreamer_contracts::JobClass::Curation
+        && pending.phase == CyclePhase::HandlerObserved
+    {
+        return outcome.handler_result.as_ref().is_some_and(|result| {
+            result.disposition == eliot_dreamer_contracts::CandidateDisposition::Candidate
+        });
+    }
+    true
 }
 
 fn validate_step_inputs(
@@ -265,7 +341,8 @@ fn activate_proposed_request(
     validate_pending_rule(&request, policy)?;
     let expected_predecessor = state
         .outcomes
-        .last()
+        .iter()
+        .next_back()
         .map(|outcome| outcome.receipt.identity.receipt_id.clone());
     if request.predecessor_receipt_id != expected_predecessor {
         return Err(CycleError::BindingMismatch {
@@ -320,14 +397,29 @@ fn reconciliation_requests(
     Ok(requests)
 }
 
-fn finish_step(
-    current: &DreamerCycleState,
-    next: DreamerCycleState,
-    disposition: StepDisposition,
-    policy: &CyclePolicy,
-) -> Result<CycleStep, CycleError> {
-    let requests = requests_for_pending(&next)?;
-    finish_step_with_requests(current, next, requests, disposition, policy)
+fn requests_for_pending_with_reconciliation(
+    state: &DreamerCycleState,
+) -> Result<Vec<InertOwnerRequest>, CycleError> {
+    let mut requests = requests_for_pending(state)?;
+    for request in &mut requests {
+        let Some(outcome) =
+            state.outcomes.iter().rev().find(|outcome| {
+                outcome.receipt.core.request.metadata.request_id == request.request_id
+            })
+        else {
+            continue;
+        };
+        if matches!(
+            outcome.disposition,
+            OutcomeDisposition::Accepted | OutcomeDisposition::Unknown
+        ) {
+            request.kind = RequestKind::EffectReconciliation;
+            request.predecessor_receipt_id = Some(outcome.receipt.identity.receipt_id.clone());
+            request.reason =
+                "reconcile the same operation; do not issue a replacement retry".to_owned();
+        }
+    }
+    Ok(requests)
 }
 
 fn finish_step_with_requests(

@@ -27,36 +27,16 @@ pub(crate) fn preflight_step_inputs(
     text(state.policy_id.as_str(), &mut total, "state.policy_id")?;
     text(&state.bundle_digest, &mut total, "state.bundle_digest")?;
     text(&state.policy_digest, &mut total, "state.policy_digest")?;
+    if let Some(digest) = &state.predecessor_digest {
+        text(digest, &mut total, "state.predecessor_digest")?;
+    }
     text(
         &state.canonical_digest,
         &mut total,
         "state.canonical_digest",
     )?;
-    text(&state.job.operation_id, &mut total, "job.operation_id")?;
-    text(
-        &state.job.idempotency_key,
-        &mut total,
-        "job.idempotency_key",
-    )?;
-    text(&state.job.task_id, &mut total, "job.task_id")?;
-    text(&state.job.scope_id, &mut total, "job.scope_id")?;
-    text(
-        &state.job.requester.principal,
-        &mut total,
-        "job.requester.principal",
-    )?;
-    text(&state.job.contract_ref, &mut total, "job.contract_ref")?;
-    text(&state.job.policy_ref, &mut total, "job.policy_ref")?;
-    text(
-        &state.job.privacy_profile,
-        &mut total,
-        "job.privacy_profile",
-    )?;
-    text(
-        &state.job.frozen_manifest_digest,
-        &mut total,
-        "job.frozen_manifest_digest",
-    )?;
+    preflight_job(&state.job, &mut total)?;
+    text(policy.policy_id.as_str(), &mut total, "policy.policy_id")?;
     text(
         &policy.canonical_digest,
         &mut total,
@@ -131,6 +111,12 @@ pub(crate) fn preflight_policy(policy: &CyclePolicy) -> Result<(), CycleError> {
             "policy.phase_rule.operation_kind",
         )?;
     }
+    if total > crate::contract::MAX_CANONICAL_BYTES {
+        return Err(CycleError::Bound {
+            field: "policy.scalar_bytes",
+            maximum: crate::contract::MAX_CANONICAL_BYTES,
+        });
+    }
     Ok(())
 }
 
@@ -151,6 +137,10 @@ pub(crate) fn preflight_state(state: &DreamerCycleState) -> Result<(), CycleErro
     text(state.policy_id.as_str(), &mut total, "state.policy_id")?;
     text(&state.bundle_digest, &mut total, "state.bundle_digest")?;
     text(&state.policy_digest, &mut total, "state.policy_digest")?;
+    if let Some(digest) = &state.predecessor_digest {
+        text(digest, &mut total, "state.predecessor_digest")?;
+    }
+    preflight_job(&state.job, &mut total)?;
     text(
         &state.canonical_digest,
         &mut total,
@@ -192,6 +182,13 @@ fn preflight_pending(pending: &PendingRequest, total: &mut usize) -> Result<(), 
     ] {
         text(value, total, field)?;
     }
+    if let Some(predecessor) = &pending.predecessor_receipt_id {
+        text(
+            predecessor.as_str(),
+            total,
+            "pending.predecessor_receipt_id",
+        )?;
+    }
     if pending.expected_artifacts.len() > crate::contract::MAX_RECORDS {
         return Err(CycleError::Bound {
             field: "pending.expected_artifacts",
@@ -222,7 +219,7 @@ fn preflight_pending(pending: &PendingRequest, total: &mut usize) -> Result<(), 
         ] {
             text(value, total, field)?;
         }
-        preflight_facets(request.payload.facets(), total, "handler.payload")?;
+        preflight_payload(&request.payload, total)?;
         if request.denominator.members.len() > crate::contract::MAX_RECORDS {
             return Err(CycleError::Bound {
                 field: "handler.denominator.members",
@@ -247,14 +244,22 @@ fn preflight_outcome(outcome: &ObservedOutcome, total: &mut usize) -> Result<(),
             maximum: crate::contract::MAX_RECORDS,
         });
     }
-    let core = &outcome.receipt.core;
+    preflight_receipt_core(&outcome.receipt, total)?;
+    preflight_outcome_evidence(outcome, total)
+}
+
+fn preflight_receipt_core(
+    receipt: &eliot_receipts::ReceiptEnvelope,
+    total: &mut usize,
+) -> Result<(), CycleError> {
+    let core = &receipt.core;
     text(
-        outcome.receipt.identity.receipt_id.as_str(),
+        receipt.identity.receipt_id.as_str(),
         total,
         "receipt.receipt_id",
     )?;
     text(
-        &outcome.receipt.identity.canonical_sha256,
+        &receipt.identity.canonical_sha256,
         total,
         "receipt.canonical_sha256",
     )?;
@@ -284,10 +289,23 @@ fn preflight_outcome(outcome: &ObservedOutcome, total: &mut usize) -> Result<(),
         total,
         "receipt.product_id",
     )?;
+    if let Some(task_id) = &core.request.metadata.task_id {
+        text(task_id.as_str(), total, "receipt.metadata.task_id")?;
+    }
     text(
         core.request.metadata.source_id.as_str(),
         total,
         "receipt.source_id",
+    )?;
+    text(
+        core.work_scope.scope_id.as_str(),
+        total,
+        "receipt.work_scope.scope_id",
+    )?;
+    text(
+        core.work_scope.product_id.as_str(),
+        total,
+        "receipt.work_scope.product_id",
     )?;
     for predecessor in &core.causal.predecessor_receipt_ids {
         text(predecessor.as_str(), total, "receipt.predecessor")?;
@@ -332,6 +350,11 @@ fn preflight_outcome(outcome: &ObservedOutcome, total: &mut usize) -> Result<(),
         "receipt.authority_id",
     )?;
     if let Some(verifier) = &core.verifier {
+        text(
+            verifier.verifier_id.as_str(),
+            total,
+            "receipt.verifier.verifier_id",
+        )?;
         if verifier.artifact_ids.len() > crate::contract::MAX_RECORDS {
             return Err(CycleError::Bound {
                 field: "receipt.verifier.artifact_ids",
@@ -360,6 +383,32 @@ fn preflight_outcome(outcome: &ObservedOutcome, total: &mut usize) -> Result<(),
             "receipt.coordination_idempotency",
         )?;
     }
+    match &core.disposition {
+        eliot_receipts::ReceiptDisposition::Partial { unresolved, .. } => {
+            if unresolved.len() > crate::contract::MAX_RECORDS {
+                return Err(CycleError::Bound {
+                    field: "receipt.disposition.unresolved",
+                    maximum: crate::contract::MAX_RECORDS,
+                });
+            }
+            for item in unresolved {
+                text(item, total, "receipt.disposition.unresolved")?;
+            }
+        }
+        eliot_receipts::ReceiptDisposition::Unknown { reason }
+        | eliot_receipts::ReceiptDisposition::Cancelled { reason } => {
+            text(reason, total, "receipt.disposition.reason")?;
+        }
+        eliot_receipts::ReceiptDisposition::Success { .. }
+        | eliot_receipts::ReceiptDisposition::Failure { .. } => {}
+    }
+    Ok(())
+}
+
+fn preflight_outcome_evidence(
+    outcome: &ObservedOutcome,
+    total: &mut usize,
+) -> Result<(), CycleError> {
     for evidence in &outcome.evidence_refs {
         text(evidence.as_str(), total, "outcome.evidence_ref")?;
     }
@@ -431,6 +480,95 @@ fn preflight_facets(
     Ok(())
 }
 
+fn preflight_job(
+    job: &eliot_dreamer_contracts::DreamJobInput,
+    total: &mut usize,
+) -> Result<(), CycleError> {
+    for (value, field) in [
+        (&job.operation_id, "job.operation_id"),
+        (&job.idempotency_key, "job.idempotency_key"),
+        (&job.task_id, "job.task_id"),
+        (&job.scope_id, "job.scope_id"),
+        (&job.requester.principal, "job.requester.principal"),
+        (&job.contract_ref, "job.contract_ref"),
+        (&job.policy_ref, "job.policy_ref"),
+        (&job.privacy_profile, "job.privacy_profile"),
+        (&job.frozen_manifest_digest, "job.frozen_manifest_digest"),
+    ] {
+        text(value, total, field)?;
+    }
+    if let Some(session) = &job.requester.session {
+        text(session, total, "job.requester.session")?;
+    }
+    Ok(())
+}
+
+fn preflight_payload(
+    payload: &eliot_dreamer_contracts::curation::CurationPayload,
+    total: &mut usize,
+) -> Result<(), CycleError> {
+    use eliot_dreamer_contracts::curation::CurationPayload;
+
+    match payload {
+        CurationPayload::Classification(value) => {
+            text(&value.label, total, "payload.label")?;
+            preflight_facets(&value.target_evidence, total, "payload.facets")?;
+        }
+        CurationPayload::Relation(value) => {
+            text(&value.from_handle, total, "payload.from_handle")?;
+            text(&value.to_handle, total, "payload.to_handle")?;
+            text(&value.relation, total, "payload.relation")?;
+            preflight_facets(&value.target_evidence, total, "payload.facets")?;
+        }
+        CurationPayload::Episode(value) => {
+            text(&value.episode, total, "payload.episode")?;
+            preflight_facets(&value.target_evidence, total, "payload.facets")?;
+        }
+        CurationPayload::Concept(value) => {
+            text(&value.concept, total, "payload.concept")?;
+            text(&value.definition, total, "payload.definition")?;
+            preflight_facets(&value.target_evidence, total, "payload.facets")?;
+        }
+        CurationPayload::Procedure(value) => {
+            text(&value.procedure, total, "payload.procedure")?;
+            preflight_facets(&value.target_evidence, total, "payload.facets")?;
+        }
+        CurationPayload::Failure(value) => {
+            text(&value.fingerprint, total, "payload.fingerprint")?;
+            text(&value.signature, total, "payload.signature")?;
+            preflight_facets(&value.target_evidence, total, "payload.facets")?;
+        }
+        CurationPayload::Merge(value) => {
+            text(&value.left, total, "payload.left")?;
+            text(&value.right, total, "payload.right")?;
+            text(&value.merged, total, "payload.merged")?;
+            preflight_facets(&value.target_evidence, total, "payload.facets")?;
+        }
+        CurationPayload::Split(value) => {
+            text(&value.whole, total, "payload.whole")?;
+            text(&value.first, total, "payload.first")?;
+            text(&value.second, total, "payload.second")?;
+            preflight_facets(&value.target_evidence, total, "payload.facets")?;
+        }
+        CurationPayload::Reconsolidation(value) => {
+            text(&value.target, total, "payload.target")?;
+            text(&value.update, total, "payload.update")?;
+            preflight_facets(&value.target_evidence, total, "payload.facets")?;
+        }
+        CurationPayload::Accessibility(value) => {
+            text(&value.handle, total, "payload.handle")?;
+            text(&value.note, total, "payload.note")?;
+            preflight_facets(&value.target_evidence, total, "payload.facets")?;
+        }
+        CurationPayload::Repair(value) => {
+            text(&value.target, total, "payload.target")?;
+            text(&value.repair, total, "payload.repair")?;
+            preflight_facets(&value.target_evidence, total, "payload.facets")?;
+        }
+    }
+    Ok(())
+}
+
 fn preflight_screen(
     screen: &eliot_dreamer_contracts::ScreenBinding,
     total: &mut usize,
@@ -471,5 +609,11 @@ fn text(value: &str, total: &mut usize, field: &'static str) -> Result<(), Cycle
         field: "transition.scalar_bytes",
         maximum: crate::contract::MAX_CANONICAL_BYTES,
     })?;
+    if *total > crate::contract::MAX_CANONICAL_BYTES {
+        return Err(CycleError::Bound {
+            field: "transition.scalar_bytes",
+            maximum: crate::contract::MAX_CANONICAL_BYTES,
+        });
+    }
     Ok(())
 }

@@ -298,7 +298,7 @@ pub struct DreamerCycleState {
     pub schema_version: u32,
     /// Cycle identity.
     pub cycle_id: ArtifactId,
-    /// Frozen Dreamer job input.
+    /// Frozen [`DreamJobInput`] request.
     pub job: DreamJobInput,
     /// Digest of the frozen input bundle, distinct from the job manifest.
     pub bundle_digest: String,
@@ -506,6 +506,8 @@ impl DreamerCycleState {
                 &self.job.scope_id,
                 &mut pending_ids,
             )?;
+            validate_handler_request(self, pending)?;
+            validate_historical_request_binding(pending, &self.outcomes)?;
         }
         if self.proposed_requests.len() > MAX_REQUESTS {
             return Err(CycleError::Bound {
@@ -523,6 +525,8 @@ impl DreamerCycleState {
                 &self.job.scope_id,
                 &mut pending_ids,
             )?;
+            validate_handler_request(self, pending)?;
+            validate_historical_request_binding(pending, &self.outcomes)?;
         }
         let mut outcome_ids = BTreeSet::new();
         for outcome in &self.outcomes {
@@ -652,6 +656,68 @@ fn validate_pending(
     }
     if let Some(request) = &pending.handler_request {
         request.validate()?;
+    }
+    Ok(())
+}
+
+fn validate_handler_request(
+    state: &DreamerCycleState,
+    pending: &PendingRequest,
+) -> Result<(), CycleError> {
+    let Some(request) = pending.handler_request.as_ref() else {
+        return Ok(());
+    };
+    if request.job_id != state.job.canonical_id()
+        || request.task_id != state.job.task_id
+        || request.scope_id != state.job.scope_id
+        || request.state_fence != state.job.state_fence
+    {
+        return Err(CycleError::BindingMismatch {
+            field: "pending.handler_request",
+            reason: "typed handler request is outside the frozen job binding",
+        });
+    }
+    let Some(screen) = request.screen_binding.as_ref() else {
+        return Err(CycleError::IncompleteOutcome(
+            "handler_request.screen_binding",
+        ));
+    };
+    let retained_screen = state
+        .outcomes
+        .iter()
+        .rev()
+        .find(|outcome| outcome.phase == CyclePhase::Screened)
+        .and_then(|outcome| outcome.screen_binding.as_ref());
+    if retained_screen != Some(screen) {
+        return Err(CycleError::BindingMismatch {
+            field: "handler_request.screen_binding",
+            reason: "typed handler request does not use the retained eligible screen",
+        });
+    }
+    Ok(())
+}
+
+fn validate_historical_request_binding(
+    pending: &PendingRequest,
+    outcomes: &[ObservedOutcome],
+) -> Result<(), CycleError> {
+    let expected_digest = crate::receipt::request_digest(pending)?;
+    for outcome in outcomes.iter().filter(|outcome| {
+        outcome.receipt.core.request.metadata.request_id == pending.request_id
+            || outcome.receipt.core.operation.operation_id == pending.operation_id
+    }) {
+        let request_artifacts: Vec<_> = outcome
+            .receipt
+            .core
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.role == ReceiptKind::Request)
+            .collect();
+        if request_artifacts.len() != 1 || request_artifacts[0].sha256 != expected_digest {
+            return Err(CycleError::IdentityConflict {
+                identity: pending.request_id.as_str().to_owned(),
+            });
+        }
     }
     Ok(())
 }
