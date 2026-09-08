@@ -26,10 +26,23 @@ use serde_json::Value;
 use thiserror::Error;
 
 mod pipe_name;
+pub mod reactive_context;
 pub use pipe_name::{
     ELIOT_PIPE_PREFIX, EliotPipeFamily, EliotPipeName, EliotPipeNameError, EliotPipeSegment,
     EliotPipeSegmentReason, LegacyEliotPipeName, MAX_PIPE_NAME_BYTES, MAX_PIPE_SEGMENT_BYTES,
     MAX_PIPE_SUFFIX_BYTES, PIPE_NAME_CONTRACT_NAME, PIPE_NAME_WIRE_REVISION,
+};
+pub use reactive_context::{
+    MAX_REACTIVE_CONTEXT_ACK_HISTORY, MAX_REACTIVE_CONTEXT_CONTENT_BYTES,
+    MAX_REACTIVE_CONTEXT_PAYLOAD_BYTES, MAX_REACTIVE_CONTEXT_PREDECESSORS,
+    MAX_REACTIVE_CONTEXT_TEXT_BYTES, REACTIVE_CONTEXT_CONTRACT_NAME,
+    REACTIVE_CONTEXT_CONTRACT_VERSION, REACTIVE_CONTEXT_PAYLOAD_TYPE, REACTIVE_CONTEXT_PRODUCER_ID,
+    ReactiveContextAckDisposition, ReactiveContextAckEvidence, ReactiveContextAckLedger,
+    ReactiveContextContentRef, ReactiveContextError, ReactiveContextLifecycleEvidence,
+    ReactiveContextMeasurement, ReactiveContextPayload, ReactiveContextPlannerBinding,
+    ReactiveContextPrivacy, ReactiveContextRecipient, ReactiveContextSafetyFloor,
+    ReactiveContextSequence, ReactiveContextStage, ReactiveContextValidity,
+    ReactiveContextViewBinding, reactive_context_contract_identity,
 };
 
 pub mod dreamer_job;
