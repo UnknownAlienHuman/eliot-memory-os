@@ -17,7 +17,6 @@ pub(crate) fn validate_observation(
     outcome: &ObservedOutcome,
     expected_predecessor: Option<&eliot_contracts::ReceiptId>,
     policy: &crate::contract::CyclePolicy,
-    observation_time_ms: Option<i64>,
 ) -> Result<(), CycleError> {
     outcome.receipt.validate()?;
     let core = &outcome.receipt.core;
@@ -107,15 +106,6 @@ pub(crate) fn validate_observation(
         &outcome.evidence_refs,
     )?;
     validate_outcome_disposition(core.disposition.kind(), outcome.disposition)?;
-    if let Some(deadline) = policy.deadline_ms
-        && observation_time_ms.is_some_and(|observed| observed > deadline)
-        && outcome.disposition != OutcomeDisposition::Expired
-    {
-        return Err(CycleError::BindingMismatch {
-            field: "outcome.deadline",
-            reason: "observation is after the injected deadline",
-        });
-    }
     if outcome.possible_effect && outcome.disposition != OutcomeDisposition::Unknown {
         return Err(CycleError::BindingMismatch {
             field: "outcome.possible_effect",
@@ -123,8 +113,7 @@ pub(crate) fn validate_observation(
         });
     }
     if let Some(request) = &pending.handler_request {
-        if request.request_id != pending.request_id.as_str()
-            || request.job_id != state.cycle_id.as_str()
+        if request.job_id != state.job.canonical_id()
             || request.task_id != pending.task_id
             || request.scope_id != pending.scope_id
             || request.state_fence != pending.state_fence
@@ -134,6 +123,23 @@ pub(crate) fn validate_observation(
                 reason: "typed handler request is outside the exact cycle binding",
             });
         }
+        let Some(screen) = request.screen_binding.as_ref() else {
+            return Err(CycleError::IncompleteOutcome(
+                "handler_request.screen_binding",
+            ));
+        };
+        let prior_screen = state
+            .outcomes
+            .iter()
+            .rev()
+            .find(|previous| previous.phase == crate::contract::CyclePhase::Screened)
+            .and_then(|previous| previous.screen_binding.as_ref());
+        if prior_screen != Some(screen) {
+            return Err(CycleError::BindingMismatch {
+                field: "handler_request.screen_binding",
+                reason: "handler request screen differs from retained eligible screen",
+            });
+        }
     }
     if let Some(result) = &outcome.handler_result {
         result.validate().map_err(contract_error)?;
@@ -141,7 +147,7 @@ pub(crate) fn validate_observation(
             .handler_request
             .as_ref()
             .ok_or(CycleError::IncompleteOutcome("handler_result.request"))?;
-        if result.request_id != pending.request_id.as_str()
+        if result.request_id != request.request_id
             || result.kind != request.kind
             || result.family != request.family
             || result.handler_id != pending.owner
@@ -165,13 +171,29 @@ pub(crate) fn validate_observation(
             &result.result_digest,
             "handler_result.result_digest",
         )?;
+        require_full_evidence_artifact(
+            &core.artifacts,
+            &outcome.evidence_refs,
+            result,
+            "handler_result.canonical_artifact",
+        )?;
+        if outcome.disposition == OutcomeDisposition::Completed
+            && pending.phase == crate::contract::CyclePhase::HandlerObserved
+            && state.job.job_class == JobClass::Curation
+            && result.disposition != eliot_dreamer_contracts::CandidateDisposition::Candidate
+        {
+            return Err(CycleError::BindingMismatch {
+                field: "handler_result.disposition",
+                reason: "only a candidate result can complete curation handler observation",
+            });
+        }
     }
     if let Some(receipt) = &outcome.validation_receipt {
         receipt.validate().map_err(contract_error)?;
-        if receipt.job_id != state.cycle_id.as_str()
+        if receipt.job_id != state.job.canonical_id()
             || receipt.task_id != pending.task_id
             || receipt.scope_id != pending.scope_id
-            || receipt.bundle_digest != pending.payload_digest
+            || receipt.bundle_digest != pending.bundle_digest
             || receipt.manifest_digest != state.job.frozen_manifest_digest
             || receipt.state_fence != pending.state_fence
         {
@@ -186,6 +208,12 @@ pub(crate) fn validate_observation(
             &receipt.input_digest,
             "validation_receipt.input_digest",
         )?;
+        require_full_evidence_artifact(
+            &core.artifacts,
+            &outcome.evidence_refs,
+            receipt,
+            "validation_receipt.canonical_artifact",
+        )?;
         require_evidence_artifact(
             &core.artifacts,
             &outcome.evidence_refs,
@@ -196,7 +224,6 @@ pub(crate) fn validate_observation(
     if let Some(screen) = &outcome.screen_binding {
         screen.validate().map_err(contract_error)?;
         if screen.request_id.as_str() != pending.request_id.as_str()
-            || screen.receipt_id != outcome.receipt.identity.receipt_id
             || screen.task_id != pending.task_id
             || screen.scope_id != pending.scope_id
             || screen.state_fence != pending.state_fence
@@ -220,16 +247,30 @@ pub(crate) fn validate_observation(
                 "screen_binding.item_digest",
             )?;
         }
+        require_full_evidence_artifact(
+            &core.artifacts,
+            &outcome.evidence_refs,
+            screen,
+            "screen_binding.canonical_artifact",
+        )?;
     }
-    if pending.phase == crate::contract::CyclePhase::Screened && outcome.screen_binding.is_none() {
+    if outcome.disposition == OutcomeDisposition::Completed
+        && pending.phase == crate::contract::CyclePhase::Screened
+        && outcome.screen_binding.is_none()
+    {
         return Err(CycleError::IncompleteOutcome("screen_binding"));
     }
-    if pending.phase == crate::contract::CyclePhase::CommonValidated
-        && outcome.validation_receipt.is_none()
+    if outcome.disposition == OutcomeDisposition::Completed
+        && pending.phase == crate::contract::CyclePhase::CommonValidated
+        && !outcome
+            .validation_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.terminal_disposition == "accepted")
     {
         return Err(CycleError::IncompleteOutcome("validation_receipt"));
     }
-    if state.job.job_class == JobClass::Curation
+    if outcome.disposition == OutcomeDisposition::Completed
+        && state.job.job_class == JobClass::Curation
         && pending.phase == crate::contract::CyclePhase::HandlerObserved
         && (pending.handler_request.is_none() || outcome.handler_result.is_none())
     {
@@ -377,6 +418,7 @@ fn require_evidence_artifact(
 ) -> Result<(), CycleError> {
     if artifacts.iter().any(|artifact| {
         artifact.sha256 == digest
+            && artifact.role != ReceiptKind::Request
             && evidence_refs
                 .iter()
                 .any(|reference| reference == &artifact.artifact_id)
@@ -384,6 +426,17 @@ fn require_evidence_artifact(
         return Ok(());
     }
     Err(CycleError::IncompleteOutcome(field))
+}
+
+fn require_full_evidence_artifact<T: serde::Serialize>(
+    artifacts: &[eliot_receipts::ArtifactBinding],
+    evidence_refs: &[eliot_contracts::ArtifactId],
+    value: &T,
+    field: &'static str,
+) -> Result<(), CycleError> {
+    let bytes = canonical_bytes(value).map_err(contract_error)?;
+    let digest = eliot_contracts::sha256_hex(&bytes);
+    require_evidence_artifact(artifacts, evidence_refs, &digest, field)
 }
 
 fn validate_outcome_disposition(
@@ -399,12 +452,10 @@ fn validate_outcome_disposition(
         ReceiptDispositionKind::Failure => matches!(
             specialized,
             OutcomeDisposition::Rejected
-                | OutcomeDisposition::FailedBeforeEffect
                 | OutcomeDisposition::Unavailable
                 | OutcomeDisposition::Stale
                 | OutcomeDisposition::Expired
                 | OutcomeDisposition::Superseded
-                | OutcomeDisposition::NotAttempted
         ),
         ReceiptDispositionKind::Unknown => specialized == OutcomeDisposition::Unknown,
         ReceiptDispositionKind::Cancelled => specialized == OutcomeDisposition::Cancelled,

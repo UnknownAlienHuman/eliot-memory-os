@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod bounds;
 mod error;
 mod policy;
 mod receipt;

@@ -112,6 +112,8 @@ fn pending(policy: &CyclePolicy) -> PendingRequest {
         phase: CyclePhase::BundleValidated,
         attempt_id: AgentAttemptId::new("attempt-1").unwrap(),
         payload_digest: PAYLOAD.to_owned(),
+        bundle_digest: PAYLOAD.to_owned(),
+        job_digest: sha256_hex(&canonical_json_bytes(&job(&policy.state_fence)).unwrap()),
         task_id: "task-1".to_owned(),
         scope_id: "scope-1".to_owned(),
         state_fence: policy.state_fence.clone(),
@@ -136,6 +138,7 @@ fn state(policy: &CyclePolicy, request: PendingRequest) -> DreamerCycleState {
         schema_version: 1,
         cycle_id: ArtifactId::new("cycle-1").unwrap(),
         job: job(&policy.state_fence),
+        bundle_digest: PAYLOAD.to_owned(),
         policy_id: policy.policy_id.clone(),
         policy_revision: policy.policy_revision,
         policy_digest: policy.canonical_digest.clone(),
@@ -272,7 +275,7 @@ fn completed_receipt_advances_one_adjacent_phase() {
     let policy = policy(&fence, "bundle_validation");
     let request = pending(&policy);
     let current = state(&policy, request.clone());
-    let receipt = receipt(
+    let bundle_receipt = receipt(
         &request,
         ReceiptDisposition::Success {
             proof: ProofCeiling::Observation,
@@ -283,7 +286,7 @@ fn completed_receipt_advances_one_adjacent_phase() {
         &current,
         &[outcome(
             &request,
-            receipt,
+            bundle_receipt,
             OutcomeDisposition::Completed,
             false,
         )],
@@ -293,6 +296,72 @@ fn completed_receipt_advances_one_adjacent_phase() {
     assert_eq!(step.disposition, StepDisposition::Advanced);
     assert_eq!(step.next_state.phase, CyclePhase::BundleValidated);
     assert!(step.next_state.pending.is_empty());
+
+    let external_policy =
+        policy_for_phase(&fence, CyclePhase::ExternalAdmission, "external_admission");
+    let mut external_request = pending(&external_policy);
+    set_phase(
+        &mut external_request,
+        CyclePhase::ExternalAdmission,
+        RequestKind::ExternalAdmission,
+    );
+    let mut external_state = state(&external_policy, external_request.clone());
+    external_state.phase = CyclePhase::IntrinsicOutputChecked;
+    external_state.seal().unwrap();
+    let external_receipt = receipt(
+        &external_request,
+        ReceiptDisposition::Success {
+            proof: ProofCeiling::CandidateArtifact,
+        },
+        None,
+    );
+    let mut external_outcome = outcome(
+        &external_request,
+        external_receipt.clone(),
+        OutcomeDisposition::Completed,
+        false,
+    );
+    external_outcome.phase = CyclePhase::ExternalAdmission;
+    let external_step =
+        step_dreamer_cycle(&external_state, &[external_outcome], &external_policy).unwrap();
+    assert_eq!(
+        external_step.next_state.phase,
+        CyclePhase::ExternalAdmission
+    );
+
+    let closure_policy = policy_for_phase(&fence, CyclePhase::ClosureObserved, "closure");
+    let mut closure_request = pending(&closure_policy);
+    set_phase(
+        &mut closure_request,
+        CyclePhase::ClosureObserved,
+        RequestKind::Closure,
+    );
+    closure_request.effect = EffectClass::ExternalEffect;
+    closure_request.proof_ceiling = ProofCeiling::ObservedExternalEffect;
+    closure_request.predecessor_receipt_id = Some(external_receipt.identity.receipt_id.clone());
+    let mut closure_state = external_step.next_state;
+    closure_state.policy_digest = closure_policy.canonical_digest.clone();
+    closure_state.phase = CyclePhase::ExternalAdmission;
+    closure_state.pending = vec![closure_request.clone()];
+    closure_state.seal().unwrap();
+    let closure_receipt = receipt(
+        &closure_request,
+        ReceiptDisposition::Success {
+            proof: ProofCeiling::ObservedExternalEffect,
+        },
+        Some(external_receipt.identity.receipt_id),
+    );
+    let mut closure_outcome = outcome(
+        &closure_request,
+        closure_receipt,
+        OutcomeDisposition::Completed,
+        false,
+    );
+    closure_outcome.phase = CyclePhase::ClosureObserved;
+    let closure_step =
+        step_dreamer_cycle(&closure_state, &[closure_outcome], &closure_policy).unwrap();
+    assert_eq!(closure_step.disposition, StepDisposition::Terminal);
+    assert_eq!(closure_step.next_state.phase, CyclePhase::ClosureObserved);
 }
 
 #[test]
@@ -310,10 +379,13 @@ fn exact_receipt_replays_without_mutation() {
     );
     let observed = outcome(&request, receipt, OutcomeDisposition::Completed, false);
     let first = step_dreamer_cycle(&current, std::slice::from_ref(&observed), &policy).unwrap();
+    let mut replay_state = first.next_state.clone();
+    replay_state.proposed_requests.push(request);
+    replay_state.seal().unwrap();
     let replay =
-        step_dreamer_cycle(&first.next_state, std::slice::from_ref(&observed), &policy).unwrap();
+        step_dreamer_cycle(&replay_state, std::slice::from_ref(&observed), &policy).unwrap();
     assert_eq!(replay.disposition, StepDisposition::Replayed);
-    assert_eq!(replay.next_state, first.next_state);
+    assert_eq!(replay.next_state, replay_state);
 }
 
 #[test]

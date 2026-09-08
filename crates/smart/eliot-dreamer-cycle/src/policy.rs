@@ -3,28 +3,28 @@
 use crate::contract::{CyclePhase, CyclePolicy, DreamerCycleState, RequestKind};
 use crate::error::CycleError;
 
-/// Checks the independent count, transition and cancellation ceilings before
-/// the step constructs a candidate or owner request.
-pub(crate) fn check_step_budget(
+/// Checks whether a new owner request may be dispatched.
+pub(crate) fn check_dispatch_budget(
     state: &DreamerCycleState,
     policy: &CyclePolicy,
-    outcome_count: usize,
+    observation_time_ms: Option<i64>,
 ) -> Result<(), CycleError> {
     if state.pending.len() > policy.max_pending as usize {
-        return Err(CycleError::BudgetBlocked);
-    }
-    if state
-        .outcomes
-        .len()
-        .checked_add(outcome_count)
-        .is_none_or(|count| count > policy.max_outcomes as usize)
-    {
         return Err(CycleError::BudgetBlocked);
     }
     if state.controller_revision >= policy.max_transitions {
         return Err(CycleError::BudgetBlocked);
     }
     if state.cancellation_requested || policy.cancellation_requested {
+        return Err(CycleError::BudgetBlocked);
+    }
+    if state.budget_usage.fits(&state.job.budget).is_err() {
+        return Err(CycleError::BudgetBlocked);
+    }
+    if policy
+        .deadline_ms
+        .is_some_and(|deadline| observation_time_ms.is_none_or(|observed| observed > deadline))
+    {
         return Err(CycleError::BudgetBlocked);
     }
     Ok(())

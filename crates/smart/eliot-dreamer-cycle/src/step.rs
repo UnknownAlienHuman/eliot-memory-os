@@ -9,7 +9,7 @@ use crate::contract::{
     OutcomeDisposition, RequestKind, StepDisposition,
 };
 use crate::error::CycleError;
-use crate::policy::{check_step_budget, validate_pending_rule};
+use crate::policy::{check_dispatch_budget, validate_pending_rule};
 use crate::receipt::validate_observation;
 
 /// Performs one finite state transition and emits only inert owner requests.
@@ -31,6 +31,7 @@ pub fn step_dreamer_cycle_at(
     cycle_policy: &CyclePolicy,
     observation_time_ms: Option<i64>,
 ) -> Result<CycleStep, CycleError> {
+    crate::bounds::preflight_step_inputs(current, observed_external_outcomes, cycle_policy)?;
     validate_step_inputs(current, observed_external_outcomes, cycle_policy)?;
 
     let mut new_outcomes = Vec::new();
@@ -67,7 +68,7 @@ pub fn step_dreamer_cycle_at(
     let mut disposition = StepDisposition::Replayed;
 
     let Some(outcome) = new_outcomes.first().copied() else {
-        if !next.pending.is_empty() {
+        if !observed_external_outcomes.is_empty() || !next.pending.is_empty() {
             return finish_step(current, next, disposition, cycle_policy);
         }
         if next.phase.next().is_some_and(|phase| {
@@ -75,7 +76,9 @@ pub fn step_dreamer_cycle_at(
                 .iter()
                 .any(|request| request.phase == phase)
         }) {
-            check_step_budget(current, cycle_policy, 0)?;
+            if check_dispatch_budget(current, cycle_policy, observation_time_ms).is_err() {
+                return finish_step(current, next, disposition, cycle_policy);
+            }
         }
         if activate_proposed_request(&mut next, cycle_policy)? {
             increment_revision(&mut next)?;
@@ -91,10 +94,6 @@ pub fn step_dreamer_cycle_at(
         .position(|pending| pending.request_id == outcome.receipt.core.request.metadata.request_id)
         .ok_or(CycleError::IncompleteOutcome("outcome.pending_request"))?;
     let pending = next.pending[pending_index].clone();
-    let has_prior_observation = current
-        .outcomes
-        .iter()
-        .any(|previous| previous.receipt.core.request.metadata.request_id == pending.request_id);
     let expected_predecessor = current
         .outcomes
         .iter()
@@ -108,16 +107,13 @@ pub fn step_dreamer_cycle_at(
         outcome,
         expected_predecessor.as_ref(),
         cycle_policy,
-        if has_prior_observation {
-            None
-        } else {
-            observation_time_ms
-        },
     )?;
 
     let advances = matches!(outcome.disposition, OutcomeDisposition::Completed);
-    if advances && !has_prior_observation {
-        check_step_budget(current, cycle_policy, 1)?;
+    if next.outcomes.len() >= cycle_policy.max_outcomes as usize {
+        return Err(CycleError::BudgetBlocked);
+    }
+    if advances {
         let expected = current.phase.next().ok_or(CycleError::PhaseViolation(
             "accepted outcome has no adjacent phase",
         ))?;
@@ -155,7 +151,7 @@ pub fn step_dreamer_cycle_at(
             } else {
                 next.phase = pending.phase;
                 next.pending.remove(pending_index);
-                if check_step_budget(current, cycle_policy, 0).is_ok() {
+                if check_dispatch_budget(current, cycle_policy, observation_time_ms).is_ok() {
                     activate_proposed_request(&mut next, cycle_policy)?;
                 }
                 disposition = StepDisposition::Advanced;
@@ -185,7 +181,7 @@ pub fn step_dreamer_cycle_at(
     increment_revision(&mut next)?;
     next.seal()?;
     let requests = if disposition == StepDisposition::ReconciliationRequired {
-        reconciliation_requests(&next)?
+        reconciliation_requests(&next, &pending.request_id)?
     } else {
         requests_for_pending(&next)?
     };
@@ -306,8 +302,10 @@ fn requests_for_pending(state: &DreamerCycleState) -> Result<Vec<InertOwnerReque
 
 fn reconciliation_requests(
     state: &DreamerCycleState,
+    request_id: &eliot_contracts::RequestId,
 ) -> Result<Vec<InertOwnerRequest>, CycleError> {
     let mut requests = requests_for_pending(state)?;
+    requests.retain(|request| &request.request_id == request_id);
     for request in &mut requests {
         request.predecessor_receipt_id = state
             .outcomes
@@ -316,7 +314,6 @@ fn reconciliation_requests(
             .find(|outcome| outcome.receipt.core.request.metadata.request_id == request.request_id)
             .map(|outcome| outcome.receipt.identity.receipt_id.clone());
         request.kind = RequestKind::EffectReconciliation;
-        request.phase = CyclePhase::ReconciliationRequired;
         request.reason =
             "reconcile the same operation; do not issue a replacement retry".to_owned();
     }

@@ -49,18 +49,10 @@ pub enum CyclePhase {
     HandlerObserved,
     /// Intrinsic output checks have been observed.
     IntrinsicOutputChecked,
-    /// A candidate is available for an external owner decision.
-    CandidateBoundary,
     /// External candidate admission is being observed.
     ExternalAdmission,
     /// External closure evidence has been observed.
     ClosureObserved,
-    /// An external effect or completion must be reconciled under its same operation.
-    ReconciliationRequired,
-    /// Progress is blocked by a typed condition.
-    Blocked,
-    /// Exact external terminal evidence has been observed.
-    Terminal,
 }
 
 impl CyclePhase {
@@ -75,11 +67,9 @@ impl CyclePhase {
             Self::GroundingValidated => Some(Self::CommonValidated),
             Self::CommonValidated => Some(Self::HandlerObserved),
             Self::HandlerObserved => Some(Self::IntrinsicOutputChecked),
-            Self::IntrinsicOutputChecked => Some(Self::CandidateBoundary),
-            Self::CandidateBoundary => Some(Self::ExternalAdmission),
+            Self::IntrinsicOutputChecked => Some(Self::ExternalAdmission),
             Self::ExternalAdmission => Some(Self::ClosureObserved),
             Self::ClosureObserved => None,
-            Self::ReconciliationRequired | Self::Blocked | Self::Terminal => None,
         }
     }
 }
@@ -176,6 +166,10 @@ pub struct PendingRequest {
     pub attempt_id: AgentAttemptId,
     /// Digest of the typed payload or request envelope.
     pub payload_digest: String,
+    /// Digest of the frozen input bundle used by downstream validation.
+    pub bundle_digest: String,
+    /// Digest of the complete frozen DreamJobInput bound by this request.
+    pub job_digest: String,
     /// Job task identity.
     pub task_id: String,
     /// Job scope identity.
@@ -306,6 +300,8 @@ pub struct DreamerCycleState {
     pub cycle_id: ArtifactId,
     /// Frozen Dreamer job input.
     pub job: DreamJobInput,
+    /// Digest of the frozen input bundle, distinct from the job manifest.
+    pub bundle_digest: String,
     /// Frozen policy identity used to validate this snapshot.
     pub policy_id: ArtifactId,
     /// Frozen policy revision used to validate this snapshot.
@@ -395,15 +391,23 @@ pub struct CyclePolicy {
 impl CyclePolicy {
     /// Seals the policy with a deterministic digest.
     pub fn seal(&mut self) -> Result<(), CycleError> {
+        crate::bounds::preflight_policy(self)?;
         self.canonical_digest.clear();
         let bytes = eliot_contracts::canonical_json_bytes(self)
             .map_err(|error| CycleError::Encoding(error.to_string()))?;
+        if bytes.len() > MAX_CANONICAL_BYTES {
+            return Err(CycleError::Bound {
+                field: "policy.canonical_bytes",
+                maximum: MAX_CANONICAL_BYTES,
+            });
+        }
         self.canonical_digest = eliot_contracts::sha256_hex(&bytes);
         Ok(())
     }
 
     /// Validates the frozen policy and its digest.
     pub fn validate(&self) -> Result<(), CycleError> {
+        crate::bounds::preflight_policy(self)?;
         if self.schema_version != CYCLE_SCHEMA_VERSION {
             return Err(CycleError::BindingMismatch {
                 field: "policy.schema_version",
@@ -451,6 +455,7 @@ impl CyclePolicy {
 impl DreamerCycleState {
     /// Seals the immutable state with a deterministic digest.
     pub fn seal(&mut self) -> Result<(), CycleError> {
+        crate::bounds::preflight_state(self)?;
         self.canonical_digest.clear();
         let bytes = eliot_contracts::canonical_json_bytes(self)
             .map_err(|error| CycleError::Encoding(error.to_string()))?;
@@ -466,6 +471,7 @@ impl DreamerCycleState {
 
     /// Validates immutable state shape and its digest.
     pub fn validate(&self) -> Result<(), CycleError> {
+        crate::bounds::preflight_state(self)?;
         if self.schema_version != CYCLE_SCHEMA_VERSION {
             return Err(CycleError::BindingMismatch {
                 field: "state.schema_version",
@@ -479,6 +485,9 @@ impl DreamerCycleState {
         if self.policy_id.as_str().trim().is_empty() || !is_digest(&self.policy_digest) {
             return Err(CycleError::IncompleteOutcome("state.policy_identity"));
         }
+        if !is_digest(&self.bundle_digest) {
+            return Err(CycleError::IncompleteOutcome("state.bundle_digest"));
+        }
         if self.pending.len() > MAX_RECORDS || self.outcomes.len() > MAX_RECORDS {
             return Err(CycleError::Bound {
                 field: "state.records",
@@ -486,8 +495,17 @@ impl DreamerCycleState {
             });
         }
         let mut pending_ids = BTreeSet::new();
+        let expected_job_digest = job_digest(&self.job)?;
         for pending in &self.pending {
-            validate_pending(pending, &self.job.state_fence, &mut pending_ids)?;
+            validate_pending(
+                pending,
+                &self.job.state_fence,
+                &expected_job_digest,
+                &self.bundle_digest,
+                &self.job.task_id,
+                &self.job.scope_id,
+                &mut pending_ids,
+            )?;
         }
         if self.proposed_requests.len() > MAX_REQUESTS {
             return Err(CycleError::Bound {
@@ -496,7 +514,15 @@ impl DreamerCycleState {
             });
         }
         for pending in &self.proposed_requests {
-            validate_pending(pending, &self.job.state_fence, &mut pending_ids)?;
+            validate_pending(
+                pending,
+                &self.job.state_fence,
+                &expected_job_digest,
+                &self.bundle_digest,
+                &self.job.task_id,
+                &self.job.scope_id,
+                &mut pending_ids,
+            )?;
         }
         let mut outcome_ids = BTreeSet::new();
         for outcome in &self.outcomes {
@@ -528,6 +554,10 @@ impl DreamerCycleState {
 fn validate_pending(
     pending: &PendingRequest,
     expected_fence: &StateFence,
+    expected_job_digest: &str,
+    expected_bundle_digest: &str,
+    expected_task_id: &str,
+    expected_scope_id: &str,
     ids: &mut BTreeSet<String>,
 ) -> Result<(), CycleError> {
     if !ids.insert(pending.request_id.as_str().to_owned()) {
@@ -540,6 +570,8 @@ fn validate_pending(
         ("pending.owner", pending.owner.as_str()),
         ("pending.attempt_id", pending.attempt_id.as_str()),
         ("pending.payload_digest", pending.payload_digest.as_str()),
+        ("pending.job_digest", pending.job_digest.as_str()),
+        ("pending.bundle_digest", pending.bundle_digest.as_str()),
         ("pending.task_id", pending.task_id.as_str()),
         ("pending.scope_id", pending.scope_id.as_str()),
     ] {
@@ -551,11 +583,29 @@ fn validate_pending(
             reason: "payload digest must be lowercase sha256",
         });
     }
+    if !is_digest(&pending.job_digest) || pending.job_digest != expected_job_digest {
+        return Err(CycleError::BindingMismatch {
+            field: "pending.job_digest",
+            reason: "request is not bound to the complete frozen job",
+        });
+    }
+    if !is_digest(&pending.bundle_digest) || pending.bundle_digest != expected_bundle_digest {
+        return Err(CycleError::BindingMismatch {
+            field: "pending.bundle_digest",
+            reason: "request is not bound to the complete frozen bundle",
+        });
+    }
     pending.state_fence.validate()?;
     if &pending.state_fence != expected_fence {
         return Err(CycleError::BindingMismatch {
             field: "pending.state_fence",
             reason: "pending request fence differs from job",
+        });
+    }
+    if pending.task_id != expected_task_id || pending.scope_id != expected_scope_id {
+        return Err(CycleError::BindingMismatch {
+            field: "pending.job_binding",
+            reason: "pending task or scope differs from the frozen job",
         });
     }
     validate_text(&pending.operation_kind, "pending.operation_kind")?;
@@ -567,6 +617,7 @@ fn validate_pending(
     }
     let mut artifact_ids = BTreeSet::new();
     let mut payload_bound = false;
+    let mut bundle_bound = false;
     for expected in &pending.expected_artifacts {
         validate_text(
             expected.artifact_id.as_str(),
@@ -581,6 +632,9 @@ fn validate_pending(
         if expected.sha256 == pending.payload_digest {
             payload_bound = true;
         }
+        if expected.sha256 == pending.bundle_digest {
+            bundle_bound = true;
+        }
         if !artifact_ids.insert(expected.artifact_id.as_str()) {
             return Err(CycleError::IdentityConflict {
                 identity: expected.artifact_id.as_str().to_owned(),
@@ -592,6 +646,9 @@ fn validate_pending(
     }
     if !payload_bound {
         return Err(CycleError::IncompleteOutcome("pending.payload_artifact"));
+    }
+    if !bundle_bound {
+        return Err(CycleError::IncompleteOutcome("pending.bundle_artifact"));
     }
     if let Some(request) = &pending.handler_request {
         request.validate()?;
@@ -623,6 +680,12 @@ fn policy_digest(value: &CyclePolicy) -> Result<String, CycleError> {
     let mut value = value.clone();
     value.canonical_digest.clear();
     let bytes = eliot_contracts::canonical_json_bytes(&value)
+        .map_err(|error| CycleError::Encoding(error.to_string()))?;
+    Ok(eliot_contracts::sha256_hex(&bytes))
+}
+
+fn job_digest(value: &DreamJobInput) -> Result<String, CycleError> {
+    let bytes = eliot_contracts::canonical_json_bytes(value)
         .map_err(|error| CycleError::Encoding(error.to_string()))?;
     Ok(eliot_contracts::sha256_hex(&bytes))
 }
