@@ -26,10 +26,8 @@ const UNKNOWN_AVAILABILITY_CONSTRAINT: &str =
 /// disposition, and optional omissions retain the supplied reversible handle
 /// or non-recoverable reason. No source is fetched and no representation is
 /// generated here.
-#[allow(clippy::too_many_lines)]
 pub fn admit_context(input: &AdmissionInput) -> Result<AdmissionResult, ContextError> {
-    input.validate_additive_measurements()?;
-    validate_selection_contract(input)?;
+    validate_admission_contract(input)?;
     let input_digest = input.canonical_digest()?;
     let profile_digest = input.measurement_profile.canonical_digest()?;
     let candidates: BTreeMap<_, _> = input
@@ -52,201 +50,160 @@ pub fn admit_context(input: &AdmissionInput) -> Result<AdmissionResult, ContextE
 
     // Capacity validation is deliberately before any candidate selection.
     input.recipe.capacity.validate()?;
-    let floor_ids = floor_closure(input, &candidates)?;
-    for candidate in candidates.values() {
-        if !floor_ids.contains(&candidate.atom_id)
-            && (candidate.protected
-                || candidate.loss_policy == eliot_context_contracts::LossPolicy::NonDroppable)
-        {
-            return Err(ContextError::MissingFloor);
-        }
-        validate_representation(
-            input,
-            candidate,
-            &supplied,
-            floor_ids.contains(&candidate.atom_id),
-        )?;
-    }
-    if let Some(incomplete) = floor_gap(input, &candidates, &floor_ids)? {
-        return incomplete_result(input, input_digest, profile_digest, &incomplete);
-    }
-    let mut admitted: BTreeMap<_, _> = BTreeMap::new();
-    let mut required_cost = 0_u64;
-    for atom_id in &floor_ids {
-        let candidate = candidates.get(atom_id).ok_or(ContextError::MissingFloor)?;
-        let cost = exact_cost(input, candidate)?;
-        required_cost = if let Some(total) = required_cost.checked_add(cost) {
-            total
-        } else {
-            let mut incomplete =
-                DecisionContextIncomplete::new(input.floor.floor.rule_evidence.clone());
-            incomplete.oversized.extend(floor_ids.iter().cloned());
-            incomplete
-                .measurements
-                .extend(floor_measurement_ids(input, &floor_ids));
-            incomplete.reopening_requirements.push(
-                "reopen with a qualified route envelope that can hold the exact Safety Floor"
-                    .to_owned(),
-            );
+    let floor_ids = match prepare_floor(input, &candidates, &supplied)? {
+        Ok(floor_ids) => floor_ids,
+        Err(incomplete) => {
             return incomplete_result(input, input_digest, profile_digest, &incomplete);
-        };
-        let disposition = if candidate.representation.kind() == RepresentationKind::Handle {
-            AdmissionDisposition::HandleOnly
-        } else {
-            AdmissionDisposition::Include
-        };
-        admitted.insert(
-            atom_id.clone(),
-            AdmittedAtom {
-                candidate: (*candidate).clone(),
-                disposition,
-                rule_evidence: input.rule.rule_id.clone(),
-            },
-        );
-    }
-    let fixed = fixed_cost(input)?;
-    let Some(floor_total) = fixed.checked_add(required_cost) else {
-        let mut incomplete =
-            DecisionContextIncomplete::new(input.floor.floor.rule_evidence.clone());
-        incomplete.oversized.extend(floor_ids.iter().cloned());
-        incomplete
-            .measurements
-            .extend(floor_measurement_ids(input, &floor_ids));
-        incomplete.reopening_requirements.push(
-            "reopen with a qualified route envelope that can hold the exact Safety Floor"
-                .to_owned(),
-        );
-        return incomplete_result(input, input_digest, profile_digest, &incomplete);
+        }
     };
-    if floor_total > input.recipe.capacity.route_capacity {
-        let mut incomplete =
-            DecisionContextIncomplete::new(input.floor.floor.rule_evidence.clone());
-        incomplete.oversized.extend(floor_ids.iter().cloned());
-        incomplete
-            .measurements
-            .extend(floor_measurement_ids(input, &floor_ids));
-        incomplete.reopening_requirements.push(
-            "reopen with a qualified route envelope that can hold the exact Safety Floor"
-                .to_owned(),
-        );
-        incomplete.validate()?;
-        return incomplete_result(input, input_digest, profile_digest, &incomplete);
-    }
-
-    let mut optional_cost = 0_u64;
-    let mut failure_causes: BTreeMap<eliot_contracts::ArtifactId, (OmissionReason, String)> =
-        BTreeMap::new();
-    let mut optional_ids: Vec<_> = candidates
-        .keys()
-        .filter(|id| !floor_ids.contains(*id))
-        .cloned()
-        .collect();
-    optional_ids.sort_by(|left, right| {
-        let Some(l) = priorities.get(left) else {
-            return std::cmp::Ordering::Equal;
-        };
-        let Some(r) = priorities.get(right) else {
-            return std::cmp::Ordering::Equal;
-        };
-        (l.class, l.ordinal, left).cmp(&(r.class, r.ordinal, right))
-    });
-    let available = input
-        .recipe
-        .capacity
-        .route_capacity
-        .checked_sub(fixed)
-        .and_then(|value| value.checked_sub(required_cost))
-        .ok_or(ContextError::Overflow)?;
-    for atom_id in optional_ids {
-        if admitted.contains_key(&atom_id) {
-            continue;
-        }
-        let candidate = candidates
-            .get(&atom_id)
-            .ok_or(ContextError::DenominatorMismatch)?;
-        let closure = optional_closure(&atom_id, &floor_ids, &candidates)?;
-        let closure_candidates = closure
-            .iter()
-            .filter_map(|id| candidates.get(id).copied())
-            .filter(|candidate| !admitted.contains_key(&candidate.atom_id))
-            .collect::<Vec<_>>();
-        let closure_missing = closure.iter().any(|id| !candidates.contains_key(id));
-        let cost = match candidate.availability {
-            AtomAvailability::PresentCurrent => match exact_cost(input, candidate) {
-                Ok(value) => Some(value),
-                Err(ContextError::UnknownMeasurement) => None,
-                Err(error) => return Err(error),
-            },
-            _ => None,
-        };
-        let closure_cost = closure_candidates.iter().try_fold(0_u64, |total, item| {
-            exact_cost(input, item)
-                .and_then(|value| total.checked_add(value).ok_or(ContextError::Overflow))
-        });
-        let closure_current = closure_candidates
-            .iter()
-            .all(|item| item.availability == AtomAvailability::PresentCurrent);
-        let fits = !closure_missing
-            && closure_current
-            && candidate.availability == AtomAvailability::PresentCurrent
-            && cost.is_some()
-            && closure_cost.as_ref().is_ok_and(|value| {
-                optional_cost
-                    .checked_add(*value)
-                    .is_some_and(|total| total <= available)
-            });
-        if fits {
-            let value = closure_cost?;
-            for item in closure_candidates {
-                validate_representation(input, item, &supplied, false)?;
-                let disposition = if item.representation.kind() == RepresentationKind::Handle {
-                    AdmissionDisposition::HandleOnly
-                } else {
-                    AdmissionDisposition::Include
-                };
-                admitted.insert(
-                    item.atom_id.clone(),
-                    AdmittedAtom {
-                        candidate: item.clone(),
-                        disposition,
-                        rule_evidence: input.rule.rule_id.clone(),
-                    },
-                );
+    let (mut admitted, required_cost, fixed) =
+        match select_required(input, &candidates, &floor_ids)? {
+            Ok(selection) => selection,
+            Err(incomplete) => {
+                return incomplete_result(input, input_digest, profile_digest, &incomplete);
             }
-            optional_cost = optional_cost
-                .checked_add(value)
-                .ok_or(ContextError::Overflow)?;
-        } else {
-            let failure = optional_failure_cause(
-                input,
-                &atom_id,
-                &closure,
-                &candidates,
-                &closure_candidates,
-                closure_missing,
-            )?;
-            failure_causes.insert(
-                atom_id,
-                failure.unwrap_or((
-                    OmissionReason::Capacity,
-                    "optional allocation exceeds remaining capacity".to_owned(),
-                )),
-            );
-        }
-    }
+        };
+
+    let (optional_cost, failure_causes) = select_optional(OptionalSelectionInput {
+        input,
+        candidates: &candidates,
+        priorities: &priorities,
+        supplied: &supplied,
+        floor_ids: &floor_ids,
+        admitted: &mut admitted,
+        fixed,
+        required_cost,
+    })?;
+    let omissions = build_omissions(
+        input,
+        &candidates,
+        &floor_ids,
+        &admitted,
+        &supplied,
+        &failure_causes,
+    )?;
+    assemble_result(ResultAssemblyInput {
+        input,
+        input_digest,
+        profile_digest,
+        candidates: &candidates,
+        admitted,
+        omissions: &omissions,
+        supplied: &supplied,
+        required_cost,
+        optional_cost,
+        fixed,
+    })
+}
+
+fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextError> {
+    input.validate_additive_measurements()?;
+    validate_selection_contract(input)
+}
+
+fn build_omissions(
+    input: &AdmissionInput,
+    candidates: &BTreeMap<eliot_contracts::ArtifactId, &eliot_context_contracts::ContextCandidate>,
+    floor_ids: &BTreeSet<eliot_contracts::ArtifactId>,
+    admitted: &BTreeMap<eliot_contracts::ArtifactId, AdmittedAtom>,
+    supplied: &BTreeMap<
+        eliot_contracts::ArtifactId,
+        &eliot_context_contracts::SuppliedOmissionBinding,
+    >,
+    failure_causes: &BTreeMap<eliot_contracts::ArtifactId, (OmissionReason, String)>,
+) -> Result<Vec<OmissionRecord>, ContextError> {
     let mut omissions = Vec::new();
-    for (atom_id, candidate) in &candidates {
+    for (atom_id, candidate) in candidates {
         if floor_ids.contains(atom_id) || admitted.contains_key(atom_id) {
             continue;
         }
         let item_cost = exact_cost(input, candidate).ok();
         let failure = failure_causes.get(atom_id).cloned();
         omissions.push(make_omission(
-            input, candidate, &supplied, item_cost, failure,
+            input, candidate, supplied, item_cost, failure,
         )?);
     }
     omissions.sort_by(|left, right| left.atom_id.cmp(&right.atom_id));
+    Ok(omissions)
+}
 
+struct ResultAssemblyInput<'a> {
+    input: &'a AdmissionInput,
+    input_digest: String,
+    profile_digest: String,
+    candidates:
+        &'a BTreeMap<eliot_contracts::ArtifactId, &'a eliot_context_contracts::ContextCandidate>,
+    admitted: BTreeMap<eliot_contracts::ArtifactId, AdmittedAtom>,
+    omissions: &'a [OmissionRecord],
+    supplied: &'a BTreeMap<
+        eliot_contracts::ArtifactId,
+        &'a eliot_context_contracts::SuppliedOmissionBinding,
+    >,
+    required_cost: u64,
+    optional_cost: u64,
+    fixed: u64,
+}
+
+fn assemble_result(assembly: ResultAssemblyInput<'_>) -> Result<AdmissionResult, ContextError> {
+    let ResultAssemblyInput {
+        input,
+        input_digest,
+        profile_digest,
+        candidates,
+        admitted,
+        omissions,
+        supplied,
+        required_cost,
+        optional_cost,
+        fixed,
+    } = assembly;
+    let (admitted_set, selection_digest) = assemble_admitted_set(
+        input,
+        candidates,
+        admitted,
+        omissions,
+        required_cost,
+        optional_cost,
+        fixed,
+    )?;
+    let evidence = eliot_context_contracts::AdmissionDecisionEvidence {
+        binding: input.binding.clone(),
+        decisions: all_decisions(input, &admitted_set, omissions),
+        omissions: omissions.to_owned(),
+        supplied_omissions: omissions
+            .iter()
+            .filter_map(|omission| supplied.get(&omission.atom_id).copied().cloned())
+            .collect(),
+        incomplete: None,
+        economy: Some(admitted_set.economy.clone()),
+        proof_ceiling: proof_ceiling(input),
+    };
+    let mut result = AdmissionResult {
+        schema_version: eliot_context_contracts::CONTEXT_CONTRACT_VERSION,
+        binding: input.binding.clone(),
+        input_digest,
+        recipe_digest: input.recipe.recipe_sha256.clone(),
+        profile_digest,
+        floor_id: input.floor.floor_id.clone(),
+        outcome: ContextOutcome::Complete(admitted_set),
+        evidence,
+        selection_digest,
+        result_digest: "0".repeat(64),
+    };
+    result.result_digest = eliot_context_contracts::canonical_digest(&result)?;
+    result.validate_for(input)?;
+    Ok(result)
+}
+
+fn assemble_admitted_set(
+    input: &AdmissionInput,
+    candidates: &BTreeMap<eliot_contracts::ArtifactId, &eliot_context_contracts::ContextCandidate>,
+    admitted: BTreeMap<eliot_contracts::ArtifactId, AdmittedAtom>,
+    omissions: &[OmissionRecord],
+    required_cost: u64,
+    optional_cost: u64,
+    fixed: u64,
+) -> Result<(AdmittedContextSet, String), ContextError> {
     let records: Vec<_> = admitted.into_values().collect();
     let admissions = records
         .iter()
@@ -292,7 +249,7 @@ pub fn admit_context(input: &AdmissionInput) -> Result<AdmissionResult, ContextE
         requested,
         admitted: admitted_ids,
         displaced,
-        omissions: omissions.clone(),
+        omissions: omissions.to_owned(),
         applied_rule: input.rule.rule_id.clone(),
         allocations,
         receipt_digest: "0".repeat(64),
@@ -319,33 +276,291 @@ pub fn admit_context(input: &AdmissionInput) -> Result<AdmissionResult, ContextE
         .receipt_digest
         .clone_from(&economy.receipt_digest);
     admitted_set.validate()?;
-    let evidence = eliot_context_contracts::AdmissionDecisionEvidence {
-        binding: input.binding.clone(),
-        decisions: all_decisions(input, &admitted_set, &omissions),
-        omissions: omissions.clone(),
-        supplied_omissions: omissions
+    Ok((admitted_set, selection_digest))
+}
+
+struct OptionalSelectionInput<'a> {
+    input: &'a AdmissionInput,
+    candidates:
+        &'a BTreeMap<eliot_contracts::ArtifactId, &'a eliot_context_contracts::ContextCandidate>,
+    priorities:
+        &'a BTreeMap<eliot_contracts::ArtifactId, &'a eliot_context_contracts::CandidatePriority>,
+    supplied: &'a BTreeMap<
+        eliot_contracts::ArtifactId,
+        &'a eliot_context_contracts::SuppliedOmissionBinding,
+    >,
+    floor_ids: &'a BTreeSet<eliot_contracts::ArtifactId>,
+    admitted: &'a mut BTreeMap<eliot_contracts::ArtifactId, AdmittedAtom>,
+    fixed: u64,
+    required_cost: u64,
+}
+
+enum OptionalDecision {
+    Include(u64),
+    Omit((OmissionReason, String)),
+}
+
+type FailureCauses = BTreeMap<eliot_contracts::ArtifactId, (OmissionReason, String)>;
+type RequiredSelection = Result<
+    (
+        BTreeMap<eliot_contracts::ArtifactId, AdmittedAtom>,
+        u64,
+        u64,
+    ),
+    DecisionContextIncomplete,
+>;
+
+fn select_optional(
+    selection: OptionalSelectionInput<'_>,
+) -> Result<(u64, FailureCauses), ContextError> {
+    let OptionalSelectionInput {
+        input,
+        candidates,
+        priorities,
+        supplied,
+        floor_ids,
+        admitted,
+        fixed,
+        required_cost,
+    } = selection;
+    let mut failure_causes = BTreeMap::new();
+    let mut optional_ids: Vec<_> = candidates
+        .keys()
+        .filter(|id| !floor_ids.contains(*id))
+        .cloned()
+        .collect();
+    optional_ids.sort_by(|left, right| {
+        let Some(l) = priorities.get(left) else {
+            return std::cmp::Ordering::Equal;
+        };
+        let Some(r) = priorities.get(right) else {
+            return std::cmp::Ordering::Equal;
+        };
+        (l.class, l.ordinal, left).cmp(&(r.class, r.ordinal, right))
+    });
+    let available = input
+        .recipe
+        .capacity
+        .route_capacity
+        .checked_sub(fixed)
+        .and_then(|value| value.checked_sub(required_cost))
+        .ok_or(ContextError::Overflow)?;
+    let mut selection = OptionalSelection {
+        input,
+        candidates,
+        supplied,
+        floor_ids,
+        admitted,
+        available,
+        optional_cost: 0,
+    };
+    for atom_id in optional_ids {
+        if selection.admitted.contains_key(&atom_id) {
+            continue;
+        }
+        match selection.consider(&atom_id)? {
+            OptionalDecision::Include(value) => {
+                selection.optional_cost = selection
+                    .optional_cost
+                    .checked_add(value)
+                    .ok_or(ContextError::Overflow)?;
+            }
+            OptionalDecision::Omit(failure) => {
+                failure_causes.insert(atom_id, failure);
+            }
+        }
+    }
+    Ok((selection.optional_cost, failure_causes))
+}
+
+struct OptionalSelection<'a> {
+    input: &'a AdmissionInput,
+    candidates:
+        &'a BTreeMap<eliot_contracts::ArtifactId, &'a eliot_context_contracts::ContextCandidate>,
+    supplied: &'a BTreeMap<
+        eliot_contracts::ArtifactId,
+        &'a eliot_context_contracts::SuppliedOmissionBinding,
+    >,
+    floor_ids: &'a BTreeSet<eliot_contracts::ArtifactId>,
+    admitted: &'a mut BTreeMap<eliot_contracts::ArtifactId, AdmittedAtom>,
+    available: u64,
+    optional_cost: u64,
+}
+
+impl OptionalSelection<'_> {
+    fn consider(
+        &mut self,
+        atom_id: &eliot_contracts::ArtifactId,
+    ) -> Result<OptionalDecision, ContextError> {
+        let candidate = self
+            .candidates
+            .get(atom_id)
+            .ok_or(ContextError::DenominatorMismatch)?;
+        let closure = optional_closure(atom_id, self.floor_ids, self.candidates)?;
+        let closure_candidates = closure
             .iter()
-            .filter_map(|omission| supplied.get(&omission.atom_id).copied().cloned())
-            .collect(),
-        incomplete: None,
-        economy: Some(admitted_set.economy.clone()),
-        proof_ceiling: proof_ceiling(input),
+            .filter_map(|id| self.candidates.get(id).copied())
+            .filter(|candidate| !self.admitted.contains_key(&candidate.atom_id))
+            .collect::<Vec<_>>();
+        let closure_missing = closure.iter().any(|id| !self.candidates.contains_key(id));
+        let cost = match candidate.availability {
+            AtomAvailability::PresentCurrent => match exact_cost(self.input, candidate) {
+                Ok(value) => Some(value),
+                Err(ContextError::UnknownMeasurement) => None,
+                Err(error) => return Err(error),
+            },
+            _ => None,
+        };
+        let closure_cost = closure_candidates.iter().try_fold(0_u64, |total, item| {
+            exact_cost(self.input, item)
+                .and_then(|value| total.checked_add(value).ok_or(ContextError::Overflow))
+        });
+        let closure_current = closure_candidates
+            .iter()
+            .all(|item| item.availability == AtomAvailability::PresentCurrent);
+        let fits = !closure_missing
+            && closure_current
+            && candidate.availability == AtomAvailability::PresentCurrent
+            && cost.is_some()
+            && closure_cost.as_ref().is_ok_and(|value| {
+                self.optional_cost
+                    .checked_add(*value)
+                    .is_some_and(|total| total <= self.available)
+            });
+        if fits {
+            let value = closure_cost?;
+            for item in closure_candidates {
+                validate_representation(self.input, item, self.supplied, false)?;
+                let disposition = if item.representation.kind() == RepresentationKind::Handle {
+                    AdmissionDisposition::HandleOnly
+                } else {
+                    AdmissionDisposition::Include
+                };
+                self.admitted.insert(
+                    item.atom_id.clone(),
+                    AdmittedAtom {
+                        candidate: item.clone(),
+                        disposition,
+                        rule_evidence: self.input.rule.rule_id.clone(),
+                    },
+                );
+            }
+            Ok(OptionalDecision::Include(value))
+        } else {
+            let failure = optional_failure_cause(
+                self.input,
+                atom_id,
+                &closure,
+                self.candidates,
+                &closure_candidates,
+                closure_missing,
+            )?;
+            Ok(OptionalDecision::Omit(failure.unwrap_or((
+                OmissionReason::Capacity,
+                "optional allocation exceeds remaining capacity".to_owned(),
+            ))))
+        }
+    }
+}
+
+fn prepare_floor(
+    input: &AdmissionInput,
+    candidates: &BTreeMap<eliot_contracts::ArtifactId, &eliot_context_contracts::ContextCandidate>,
+    supplied: &BTreeMap<
+        eliot_contracts::ArtifactId,
+        &eliot_context_contracts::SuppliedOmissionBinding,
+    >,
+) -> Result<Result<BTreeSet<eliot_contracts::ArtifactId>, DecisionContextIncomplete>, ContextError>
+{
+    let floor_ids = floor_closure(input, candidates)?;
+    for candidate in candidates.values() {
+        if !floor_ids.contains(&candidate.atom_id)
+            && (candidate.protected
+                || candidate.loss_policy == eliot_context_contracts::LossPolicy::NonDroppable)
+        {
+            return Err(ContextError::MissingFloor);
+        }
+        validate_representation(
+            input,
+            candidate,
+            supplied,
+            floor_ids.contains(&candidate.atom_id),
+        )?;
+    }
+    if let Some(incomplete) = floor_gap(input, candidates, &floor_ids)? {
+        return Ok(Err(incomplete));
+    }
+    Ok(Ok(floor_ids))
+}
+
+fn select_required(
+    input: &AdmissionInput,
+    candidates: &BTreeMap<eliot_contracts::ArtifactId, &eliot_context_contracts::ContextCandidate>,
+    floor_ids: &BTreeSet<eliot_contracts::ArtifactId>,
+) -> Result<RequiredSelection, ContextError> {
+    let mut admitted = BTreeMap::new();
+    let mut required_cost = 0_u64;
+    for atom_id in floor_ids {
+        let candidate = candidates.get(atom_id).ok_or(ContextError::MissingFloor)?;
+        let cost = exact_cost(input, candidate)?;
+        required_cost = if let Some(total) = required_cost.checked_add(cost) {
+            total
+        } else {
+            let mut incomplete =
+                DecisionContextIncomplete::new(input.floor.floor.rule_evidence.clone());
+            incomplete.oversized.extend(floor_ids.iter().cloned());
+            incomplete
+                .measurements
+                .extend(floor_measurement_ids(input, floor_ids));
+            incomplete.reopening_requirements.push(
+                "reopen with a qualified route envelope that can hold the exact Safety Floor"
+                    .to_owned(),
+            );
+            return Ok(Err(incomplete));
+        };
+        let disposition = if candidate.representation.kind() == RepresentationKind::Handle {
+            AdmissionDisposition::HandleOnly
+        } else {
+            AdmissionDisposition::Include
+        };
+        admitted.insert(
+            atom_id.clone(),
+            AdmittedAtom {
+                candidate: (*candidate).clone(),
+                disposition,
+                rule_evidence: input.rule.rule_id.clone(),
+            },
+        );
+    }
+    let fixed = fixed_cost(input)?;
+    let Some(floor_total) = fixed.checked_add(required_cost) else {
+        let mut incomplete =
+            DecisionContextIncomplete::new(input.floor.floor.rule_evidence.clone());
+        incomplete.oversized.extend(floor_ids.iter().cloned());
+        incomplete
+            .measurements
+            .extend(floor_measurement_ids(input, floor_ids));
+        incomplete.reopening_requirements.push(
+            "reopen with a qualified route envelope that can hold the exact Safety Floor"
+                .to_owned(),
+        );
+        return Ok(Err(incomplete));
     };
-    let mut result = AdmissionResult {
-        schema_version: eliot_context_contracts::CONTEXT_CONTRACT_VERSION,
-        binding: input.binding.clone(),
-        input_digest,
-        recipe_digest: input.recipe.recipe_sha256.clone(),
-        profile_digest,
-        floor_id: input.floor.floor_id.clone(),
-        outcome: ContextOutcome::Complete(admitted_set),
-        evidence,
-        selection_digest,
-        result_digest: "0".repeat(64),
-    };
-    result.result_digest = eliot_context_contracts::canonical_digest(&result)?;
-    result.validate_for(input)?;
-    Ok(result)
+    if floor_total > input.recipe.capacity.route_capacity {
+        let mut incomplete =
+            DecisionContextIncomplete::new(input.floor.floor.rule_evidence.clone());
+        incomplete.oversized.extend(floor_ids.iter().cloned());
+        incomplete
+            .measurements
+            .extend(floor_measurement_ids(input, floor_ids));
+        incomplete.reopening_requirements.push(
+            "reopen with a qualified route envelope that can hold the exact Safety Floor"
+                .to_owned(),
+        );
+        incomplete.validate()?;
+        return Ok(Err(incomplete));
+    }
+    Ok(Ok((admitted, required_cost, fixed)))
 }
 
 fn floor_closure(
