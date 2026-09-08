@@ -253,6 +253,16 @@ fn preflight_receipt_core(
     total: &mut usize,
 ) -> Result<(), CycleError> {
     let core = &receipt.core;
+    preflight_receipt_identity(receipt, total)?;
+    preflight_receipt_artifacts(core, total)?;
+    preflight_receipt_bindings(core, total)?;
+    preflight_receipt_optional(core, total)
+}
+
+fn preflight_receipt_identity(
+    receipt: &eliot_receipts::ReceiptEnvelope,
+    total: &mut usize,
+) -> Result<(), CycleError> {
     text(
         receipt.identity.receipt_id.as_str(),
         total,
@@ -263,7 +273,17 @@ fn preflight_receipt_core(
         total,
         "receipt.canonical_sha256",
     )?;
-    text(core.contract.name.as_str(), total, "receipt.contract")?;
+    text(
+        receipt.core.contract.name.as_str(),
+        total,
+        "receipt.contract",
+    )
+}
+
+fn preflight_receipt_artifacts(
+    core: &eliot_receipts::ReceiptCore,
+    total: &mut usize,
+) -> Result<(), CycleError> {
     if core.artifacts.len() > crate::contract::MAX_RECORDS
         || core.causal.predecessor_receipt_ids.len() > crate::contract::MAX_RECORDS
     {
@@ -279,6 +299,13 @@ fn preflight_receipt_core(
             text(revision, total, "receipt.artifact.source_revision")?;
         }
     }
+    Ok(())
+}
+
+fn preflight_receipt_bindings(
+    core: &eliot_receipts::ReceiptCore,
+    total: &mut usize,
+) -> Result<(), CycleError> {
     text(
         core.request.metadata.request_id.as_str(),
         total,
@@ -310,6 +337,13 @@ fn preflight_receipt_core(
     for predecessor in &core.causal.predecessor_receipt_ids {
         text(predecessor.as_str(), total, "receipt.predecessor")?;
     }
+    preflight_receipt_operation(core, total)
+}
+
+fn preflight_receipt_operation(
+    core: &eliot_receipts::ReceiptCore,
+    total: &mut usize,
+) -> Result<(), CycleError> {
     text(
         core.operation.operation_id.as_str(),
         total,
@@ -365,6 +399,13 @@ fn preflight_receipt_core(
             text(artifact_id.as_str(), total, "receipt.verifier.artifact_id")?;
         }
     }
+    Ok(())
+}
+
+fn preflight_receipt_optional(
+    core: &eliot_receipts::ReceiptCore,
+    total: &mut usize,
+) -> Result<(), CycleError> {
     if let Some(parent) = &core.causal.parent_receipt_id {
         text(parent.as_str(), total, "receipt.parent_receipt_id")?;
     }

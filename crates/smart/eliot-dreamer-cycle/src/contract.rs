@@ -168,7 +168,7 @@ pub struct PendingRequest {
     pub payload_digest: String,
     /// Digest of the frozen input bundle used by downstream validation.
     pub bundle_digest: String,
-    /// Digest of the complete frozen DreamJobInput bound by this request.
+    /// Digest of the complete frozen [`DreamJobInput`] bound by this request.
     pub job_digest: String,
     /// Job task identity.
     pub task_id: String,

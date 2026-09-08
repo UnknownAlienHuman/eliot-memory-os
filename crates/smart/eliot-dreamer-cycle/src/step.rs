@@ -82,14 +82,16 @@ pub fn step_dreamer_cycle_at(
     }
 
     let disposition = record_outcome(
-        current,
         &mut next,
         pending_index,
         &pending,
         outcome,
         advances,
-        cycle_policy,
-        observation_time_ms,
+        RecordContext {
+            current,
+            cycle_policy,
+            observation_time_ms,
+        },
     )?;
 
     increment_revision(&mut next)?;
@@ -172,15 +174,20 @@ fn classify_new_outcomes<'a>(
     Ok(new_outcomes)
 }
 
+#[derive(Clone, Copy)]
+struct RecordContext<'a> {
+    current: &'a DreamerCycleState,
+    cycle_policy: &'a CyclePolicy,
+    observation_time_ms: Option<i64>,
+}
+
 fn record_outcome(
-    current: &DreamerCycleState,
     next: &mut DreamerCycleState,
     pending_index: usize,
     pending: &crate::contract::PendingRequest,
     outcome: &ObservedOutcome,
     advances: bool,
-    cycle_policy: &CyclePolicy,
-    observation_time_ms: Option<i64>,
+    context: RecordContext<'_>,
 ) -> Result<StepDisposition, CycleError> {
     next.outcomes.push(outcome.clone());
     let disposition = match outcome.disposition {
@@ -209,8 +216,14 @@ fn record_outcome(
             } else {
                 next.phase = pending.phase;
                 next.pending.remove(pending_index);
-                if check_dispatch_budget(current, cycle_policy, observation_time_ms).is_ok() {
-                    activate_proposed_request(next, cycle_policy)?;
+                if check_dispatch_budget(
+                    context.current,
+                    context.cycle_policy,
+                    context.observation_time_ms,
+                )
+                .is_ok()
+                {
+                    activate_proposed_request(next, context.cycle_policy)?;
                 }
                 StepDisposition::Advanced
             }
@@ -358,6 +371,7 @@ fn requests_for_pending(state: &DreamerCycleState) -> Result<Vec<InertOwnerReque
     state
         .pending
         .iter()
+        .filter(|pending| !pending_has_blocked_outcome(state, pending))
         .map(|pending| {
             Ok(InertOwnerRequest {
                 request_id: pending.request_id.clone(),
@@ -377,6 +391,23 @@ fn requests_for_pending(state: &DreamerCycleState) -> Result<Vec<InertOwnerReque
         .collect()
 }
 
+fn pending_has_blocked_outcome(
+    state: &DreamerCycleState,
+    pending: &crate::contract::PendingRequest,
+) -> bool {
+    state
+        .outcomes
+        .iter()
+        .rev()
+        .find(|outcome| outcome.receipt.core.request.metadata.request_id == pending.request_id)
+        .is_some_and(|outcome| {
+            !matches!(
+                outcome.disposition,
+                OutcomeDisposition::Accepted | OutcomeDisposition::Unknown
+            )
+        })
+}
+
 fn reconciliation_requests(
     state: &DreamerCycleState,
     request_id: &eliot_contracts::RequestId,
@@ -391,8 +422,8 @@ fn reconciliation_requests(
             .find(|outcome| outcome.receipt.core.request.metadata.request_id == request.request_id)
             .map(|outcome| outcome.receipt.identity.receipt_id.clone());
         request.kind = RequestKind::EffectReconciliation;
-        request.reason =
-            "reconcile the same operation; do not issue a replacement retry".to_owned();
+        "reconcile the same operation; do not issue a replacement retry"
+            .clone_into(&mut request.reason);
     }
     Ok(requests)
 }
@@ -415,8 +446,8 @@ fn requests_for_pending_with_reconciliation(
         ) {
             request.kind = RequestKind::EffectReconciliation;
             request.predecessor_receipt_id = Some(outcome.receipt.identity.receipt_id.clone());
-            request.reason =
-                "reconcile the same operation; do not issue a replacement retry".to_owned();
+            "reconcile the same operation; do not issue a replacement retry"
+                .clone_into(&mut request.reason);
         }
     }
     Ok(requests)

@@ -79,9 +79,9 @@ fn policy_for_phase(fence: &StateFence, phase: CyclePhase, operation_kind: &str)
         policy_revision: PolicyRevision::genesis(),
         state_fence: fence.clone(),
         max_pending: 8,
-        max_outcomes: 8,
+        max_outcomes: 32,
         max_requests: 8,
-        max_transitions: 8,
+        max_transitions: 32,
         max_bytes: 1_000_000,
         deadline_ms: None,
         cancellation_requested: false,
@@ -334,6 +334,13 @@ fn propose_phase(
     let phase_tag = format!("{:?}", phase).to_lowercase();
     set_phase_identity(&mut request, &phase_tag);
     set_phase(&mut request, phase, kind);
+    let rule = &policy.phase_rules[0];
+    request.owner = rule.owner.clone();
+    request.product_id = rule.product_id.clone();
+    request.source_id = rule.source_id.clone();
+    request.operation_kind = rule.operation_kind.clone();
+    request.effect = rule.effect;
+    request.proof_ceiling = rule.proof_ceiling;
     request.predecessor_receipt_id = state
         .outcomes
         .last()
@@ -500,7 +507,10 @@ fn completed_receipt_advances_one_adjacent_phase() {
             proof: ProofCeiling::Observation,
         },
         screen_request.predecessor_receipt_id.clone(),
-        &[("screen-evidence", &screen_digest)],
+        &[
+            ("screen-result", &screen.result_digest),
+            ("screen-evidence", &screen_digest),
+        ],
     );
     let screen_outcome = outcome_at(
         &screen_request,
@@ -510,6 +520,7 @@ fn completed_receipt_advances_one_adjacent_phase() {
         false,
         vec![
             ArtifactId::new("payload-1").unwrap(),
+            ArtifactId::new("screen-result").unwrap(),
             ArtifactId::new("screen-evidence").unwrap(),
         ],
         None,
@@ -788,6 +799,8 @@ fn unknown_then_predecessor_linked_completion_reconciles_same_operation() {
         OutcomeDisposition::Unknown,
         true,
     );
+    let mut unknown = unknown;
+    unknown.phase = CyclePhase::HandlerObserved;
     let waiting = step_dreamer_cycle(&current, &[unknown], &policy).unwrap();
     assert_eq!(waiting.disposition, StepDisposition::ReconciliationRequired);
     assert_eq!(
