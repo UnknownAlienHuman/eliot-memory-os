@@ -101,7 +101,7 @@ pub struct NormalizationPolicy {
     pub state_fence: StateFence,
     /// Bounded rule set.
     pub rules: Vec<PolicyRule>,
-    /// Digest of the receipt-excluded policy preimage.
+    /// Digest of the receipt-excluded policy preimage; both policy and profile digest fields are excluded.
     pub digest: Digest,
 }
 
@@ -145,7 +145,7 @@ impl NormalizationPolicy {
         Ok(())
     }
 
-    /// Returns the policy digest that excludes the digest field itself.
+    /// Returns the policy digest that excludes both the policy and profile digest fields.
     pub fn expected_digest(&self) -> Result<Digest, NormalizationError> {
         crate::bounds::preflight_policy(self)?;
         self.validate_shape()?;
@@ -164,6 +164,7 @@ impl NormalizationPolicy {
     }
 
     fn validate_shape(&self) -> Result<(), NormalizationError> {
+        crate::bounds::preflight_policy(self)?;
         if self.schema_revision != crate::A11_CONTRACT_REVISION {
             return Err(NormalizationError::InvalidField {
                 field: "policy.schema_revision",

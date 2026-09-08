@@ -59,7 +59,24 @@ impl NormalizationEnvelope {
                 field: "envelope.schema_revision",
             });
         }
-        bounds::preflight_binding(&self.policy)?;
+        let mut input_total = 0usize;
+        bounds::preflight_observed(&self.normalized.observed, &mut input_total)?;
+        bounds::preflight_profile(&self.policy.profile, &mut input_total)?;
+        bounds::preflight_binding_into(&self.policy, &mut input_total)?;
+        if self.policy.policy_revision == 0 {
+            return Err(NormalizationError::InvalidField {
+                field: "envelope.policy.policy_revision",
+            });
+        }
+        if self.policy.policy_digest != self.policy.profile.digest {
+            return Err(NormalizationError::PolicyDigestMismatch);
+        }
+        self.policy
+            .state_fence
+            .validate()
+            .map_err(|_| NormalizationError::InvalidField {
+                field: "envelope.policy.state_fence",
+            })?;
         self.policy
             .profile
             .validate()
@@ -302,7 +319,7 @@ fn derive_key(
                 separator_value
             };
             Ok(DerivedKey {
-                form: if steps.is_empty() {
+                form: if *case == CasePolicy::Preserve && *separators == SeparatorPolicy::Preserve {
                     ComparisonForm::Exact
                 } else {
                     ComparisonForm::PathNormalized
@@ -330,7 +347,7 @@ fn derive_key(
                 )]
             };
             Ok(DerivedKey {
-                form: if steps.is_empty() {
+                form: if *case == CasePolicy::Preserve {
                     ComparisonForm::Exact
                 } else {
                     ComparisonForm::CaseInsensitive

@@ -21,6 +21,8 @@ pub use policy::{
     MAX_POLICY_RULES, NormalizationPolicy, NormalizationRule, PolicyRule, SeparatorPolicy,
 };
 
+pub use bounds::{MAX_INPUT_BYTES, MAX_KEYS, MAX_OUTPUT_BYTES, MAX_STEPS};
+
 use eliot_cue_contracts::{NormalizationProfile, ObservedCue};
 
 /// Normalizes one observed cue under one exact policy and profile binding.

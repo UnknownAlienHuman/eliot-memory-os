@@ -8,8 +8,8 @@ use eliot_cue_contracts::{
     ObservedCueId, PrivacyClass, SourceHandle, TargetHandle, WorkScopeId,
 };
 use eliot_cue_normalizer::{
-    CasePolicy, NormalizationError, NormalizationPolicy, NormalizationRule, PolicyRule,
-    SeparatorPolicy, capture_cue, fire_cue,
+    CasePolicy, MAX_POLICY_ID_BYTES, NormalizationError, NormalizationPolicy, NormalizationRule,
+    PolicyRule, SeparatorPolicy, capture_cue, fire_cue,
 };
 use eliot_evidence::{
     Assertability, EpistemicStatus, EvidenceAuthority, EvidenceCoverage, EvidenceEnvelope,
@@ -232,6 +232,25 @@ fn bounds_and_envelope_binding_reject_tampering() -> TestResult {
     let mut tampered = result.clone();
     tampered.input_digest = digest(9);
     assert!(tampered.validate().is_err());
+
+    let mut oversized_profile = result.clone();
+    oversized_profile.policy.profile.profile_id = "p".repeat(MAX_POLICY_ID_BYTES + 1);
+    assert!(matches!(
+        oversized_profile.validate(),
+        Err(NormalizationError::BoundExceeded {
+            field: "profile.profile_id",
+            ..
+        })
+    ));
+
+    let mut invalid_revision = result.clone();
+    invalid_revision.policy.policy_revision = 0;
+    assert!(matches!(
+        invalid_revision.validate(),
+        Err(NormalizationError::InvalidField {
+            field: "envelope.policy.policy_revision"
+        })
+    ));
 
     let huge = NormalizationPolicy::sealed(
         "a".repeat(513),

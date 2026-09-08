@@ -30,7 +30,10 @@ pub(crate) fn preflight_inputs(
     Ok(())
 }
 
-fn preflight_observed(observed: &ObservedCue, total: &mut usize) -> Result<(), NormalizationError> {
+pub(crate) fn preflight_observed(
+    observed: &ObservedCue,
+    total: &mut usize,
+) -> Result<(), NormalizationError> {
     add_text(
         total,
         &observed.schema_revision,
@@ -82,7 +85,7 @@ fn preflight_observed(observed: &ObservedCue, total: &mut usize) -> Result<(), N
     Ok(())
 }
 
-fn preflight_profile(
+pub(crate) fn preflight_profile(
     profile: &NormalizationProfile,
     total: &mut usize,
 ) -> Result<(), NormalizationError> {
@@ -99,6 +102,7 @@ fn preflight_policy_into(
     policy: &NormalizationPolicy,
     total: &mut usize,
 ) -> Result<(), NormalizationError> {
+    preflight_profile(&policy.profile, total)?;
     add_text(
         total,
         &policy.schema_revision,
@@ -198,49 +202,48 @@ pub(crate) fn add_text(
     Ok(())
 }
 
-pub(crate) fn preflight_binding(
+pub(crate) fn preflight_binding_into(
     binding: &crate::normalize::PolicyBinding,
+    total: &mut usize,
 ) -> Result<(), NormalizationError> {
-    let mut total = 0usize;
     add_text(
-        &mut total,
+        total,
         &binding.owner_reference,
         "envelope.policy.owner_reference",
         MAX_OWNER_REFERENCE_BYTES,
     )?;
     add_text(
-        &mut total,
+        total,
         &binding.policy_id,
         "envelope.policy.policy_id",
         MAX_POLICY_ID_BYTES,
     )?;
     add_text(
-        &mut total,
+        total,
         binding.scope_id.as_str(),
         "envelope.policy.scope_id",
         MAX_POLICY_ID_BYTES,
     )?;
     add_text(
-        &mut total,
+        total,
         binding.policy_digest.as_str(),
         "envelope.policy.digest",
         64,
     )?;
     add_text(
-        &mut total,
+        total,
         &binding.profile.profile_id,
         "envelope.policy.profile_id",
         MAX_POLICY_ID_BYTES,
     )?;
     add_text(
-        &mut total,
+        total,
         binding.profile.digest.as_str(),
         "envelope.policy.profile_digest",
         64,
     )?;
     Ok(())
 }
-
 pub(crate) fn output_bytes<T: serde::Serialize>(value: &T) -> Result<usize, NormalizationError> {
     let bytes = eliot_contracts::canonical_json_bytes(value).map_err(|_| {
         NormalizationError::Canonicalization {
