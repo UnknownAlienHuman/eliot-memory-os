@@ -94,6 +94,9 @@ where
         return Err(AssemblyError::Contract(ContextError::IdentityConflict));
     }
     admitted.validate()?;
+    if admitted.economy.measurement.digest != admitted.canonical_payload_digest()? {
+        return Err(AssemblyError::Contract(ContextError::IdentityConflict));
+    }
     validate_recipe_membership(admitted, recipe)?;
     if quality.binding != admitted.binding {
         return Err(AssemblyError::Contract(ContextError::InvalidFence));
@@ -188,6 +191,14 @@ fn validate_recipe_membership(
     admitted: &AdmittedContextSet,
     recipe: &ContextRecipe,
 ) -> Result<(), AssemblyError> {
+    if recipe.mandatory_roles.len() != admitted.floor.mandatory_roles.len()
+        || recipe
+            .mandatory_roles
+            .iter()
+            .any(|role| !admitted.floor.mandatory_roles.contains(role))
+    {
+        return Err(AssemblyError::Contract(ContextError::DenominatorMismatch));
+    }
     for slot in &admitted.floor.providers.requested {
         let matching = recipe
             .denominator

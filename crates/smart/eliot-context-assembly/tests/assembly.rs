@@ -471,4 +471,41 @@ fn rendered_fields_and_quality_binding_are_retained() {
     view.view
         .validate_against(&value)
         .expect("A15 conservation");
+
+    let mut stale_admission = admitted();
+    stale_admission.economy.measurement.digest = "c".repeat(64);
+    let result = assemble_active_view(
+        &stale_admission,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |_bytes| panic!("stale admission digest must preflight before measurement"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::IdentityConflict))
+    );
+
+    let mut mismatched_recipe = recipe(&context);
+    mismatched_recipe.mandatory_roles.push(SemanticRole::Source);
+    mismatched_recipe.role_policies.push(RoleLossRule {
+        role: SemanticRole::Source,
+        loss_policy: LossPolicy::NonDroppable,
+        required: true,
+        allowed_representations: vec![RepresentationKind::Whole],
+    });
+    mismatched_recipe.recipe_sha256 = mismatched_recipe
+        .canonical_policy_digest()
+        .expect("mismatched recipe digest");
+    let result = assemble_active_view(
+        &value,
+        &mismatched_recipe,
+        quality(&context),
+        &policy(100_000),
+        |_bytes| panic!("mandatory-role mismatch must preflight before measurement"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::DenominatorMismatch))
+    );
 }
