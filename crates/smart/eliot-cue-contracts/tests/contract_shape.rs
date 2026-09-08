@@ -266,6 +266,42 @@ fn canonical_identity_differs_from_comparison_key() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn normalization_outcomes_preserve_unsupported_and_reject_exact_loss() -> TestResult {
+    let unsupported = NormalizedCue::new(
+        REVISION.to_owned(),
+        observed("unavailable"),
+        profile(),
+        None,
+        Vec::new(),
+        NormalizationOutcome::Unsupported {
+            reason: "profile does not cover this cue".to_owned(),
+        },
+        Vec::new(),
+    );
+    unsupported.validate()?;
+    let round_trip: NormalizedCue = serde_json::from_str(&serde_json::to_string(&unsupported)?)?;
+    assert_eq!(round_trip.canonical, None);
+    assert_eq!(round_trip.profile, unsupported.profile);
+    assert_eq!(round_trip.observed, unsupported.observed);
+    round_trip.validate()?;
+
+    let mut lossy = normalized(
+        "TaskContract",
+        vec![key("TaskContract", MatchMode::Exact, 1)],
+    );
+    lossy.outcome = NormalizationOutcome::AuthorizedLoss {
+        policy_ref: "bounded-loss".to_owned(),
+    };
+    assert_eq!(
+        lossy.validate(),
+        Err(CueContractError::Foundation {
+            field: "comparison_key.match_mode"
+        })
+    );
+    Ok(())
+}
+
 // Rule 3 -------------------------------------------------------------------
 #[test]
 fn snapshot_rebuild_digest_is_stable() -> TestResult {

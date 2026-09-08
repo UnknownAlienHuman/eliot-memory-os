@@ -173,6 +173,12 @@ impl CueSnapshot {
     }
 
     fn validate_shape(&self) -> Result<(), CueContractError> {
+        bounds::collection(
+            &self.rebuild.source_denominator,
+            MAX_SNAPSHOT_MEMBERS,
+            "source_denominator",
+        )?;
+        bounds::collection(&self.members, MAX_SNAPSHOT_MEMBERS, "members")?;
         self.validate_payload_budget()?;
         if self.schema_revision != crate::CONTRACT_REVISION {
             return Err(CueContractError::InvalidText {
@@ -185,15 +191,9 @@ impl CueSnapshot {
                 field: "snapshot.state_fence",
             })?;
         self.rebuild.normalization_profile.validate()?;
-        bounds::collection(
-            &self.rebuild.source_denominator,
-            MAX_SNAPSHOT_MEMBERS,
-            "source_denominator",
-        )?;
         for source in &self.rebuild.source_denominator {
             source.validate()?;
         }
-        bounds::collection(&self.members, MAX_SNAPSHOT_MEMBERS, "members")?;
         let mut seen = BTreeSet::new();
         let mut source_seen = BTreeSet::new();
         for source in &self.rebuild.source_denominator {

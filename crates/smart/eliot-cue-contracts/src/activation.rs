@@ -277,46 +277,7 @@ impl ActivationRequest {
                 });
             }
         }
-        let mut edge_ids = BTreeSet::new();
-        for seed in &self.seeds {
-            seed.validate()?;
-            if matches!(
-                &seed.outcome,
-                crate::NormalizationOutcome::Ambiguous { .. }
-                    | crate::NormalizationOutcome::Unsupported { .. }
-            ) {
-                return Err(CueContractError::Foundation {
-                    field: "request.seed_outcome",
-                });
-            }
-            if seed
-                .comparison_keys
-                .iter()
-                .any(|key| key.profile != self.normalization_profile)
-            {
-                return Err(CueContractError::Foundation {
-                    field: "request.seed_profile",
-                });
-            }
-            if seed.observed.context.state_fence != self.state_fence {
-                return Err(CueContractError::Foundation {
-                    field: "request.seed_fence",
-                });
-            }
-        }
-        for edge in &self.relation_edges {
-            edge.validate()?;
-            if !edge_ids.insert(edge.relation_edge_id.clone()) {
-                return Err(CueContractError::DuplicateIdentity {
-                    field: "request.relation_edges",
-                });
-            }
-            if edge.evidence.state_fence != self.state_fence {
-                return Err(CueContractError::Foundation {
-                    field: "request.edge_fence",
-                });
-            }
-        }
+        validate_request_members(self)?;
         self.bounds.validate()?;
         Ok(())
     }
@@ -328,7 +289,56 @@ impl ActivationRequest {
     }
 }
 
-/// A direct hit. It carries no path, because there is none.
+fn validate_request_members(request: &ActivationRequest) -> Result<(), CueContractError> {
+    let mut edge_ids = BTreeSet::new();
+    for seed in &request.seeds {
+        seed.validate()?;
+        if matches!(
+            &seed.outcome,
+            crate::NormalizationOutcome::Ambiguous { .. }
+                | crate::NormalizationOutcome::Unsupported { .. }
+        ) {
+            return Err(CueContractError::Foundation {
+                field: "request.seed_outcome",
+            });
+        }
+        if seed.comparison_keys.is_empty() {
+            return Err(CueContractError::Foundation {
+                field: "request.seed_comparison_keys",
+            });
+        }
+        if seed
+            .comparison_keys
+            .iter()
+            .any(|key| key.profile != request.normalization_profile)
+        {
+            return Err(CueContractError::Foundation {
+                field: "request.seed_profile",
+            });
+        }
+        if seed.observed.context.state_fence != request.state_fence {
+            return Err(CueContractError::Foundation {
+                field: "request.seed_fence",
+            });
+        }
+    }
+    for edge in &request.relation_edges {
+        edge.validate()?;
+        if !edge_ids.insert(edge.relation_edge_id.clone()) {
+            return Err(CueContractError::DuplicateIdentity {
+                field: "request.relation_edges",
+            });
+        }
+        if edge.evidence.state_fence != request.state_fence {
+            return Err(CueContractError::Foundation {
+                field: "request.edge_fence",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A direct comparison hit. It carries no path, because there is none.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -586,7 +596,7 @@ pub struct ActivationResult {
     pub observed_at: ClockReading,
     pub deadline_ms: Option<i64>,
     pub cancelled: bool,
-    /// Exact hits.
+    /// Direct comparison hits; their match mode remains explicit on each key.
     pub direct: Vec<DirectActivation>,
     /// Relation-derived hits.
     pub derived: Vec<DerivedActivation>,

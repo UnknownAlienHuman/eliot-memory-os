@@ -431,6 +431,15 @@ impl NormalizedCue {
             NormalizationOutcome::Lossless => {}
             NormalizationOutcome::AuthorizedLoss { policy_ref } => {
                 validate_text(policy_ref, "outcome.policy_ref")?;
+                if self
+                    .comparison_keys
+                    .iter()
+                    .any(|key| key.match_mode == MatchMode::Exact)
+                {
+                    return Err(CueContractError::Foundation {
+                        field: "comparison_key.match_mode",
+                    });
+                }
             }
             NormalizationOutcome::Ambiguous { rivals } => {
                 crate::bounds::collection(rivals, MAX_COMPARISON_KEYS, "outcome.rivals")?;
