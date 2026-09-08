@@ -619,6 +619,105 @@ fn prior_context(context: &DerivationContext<'static>) -> &'static DerivationCon
     }))
 }
 
+fn isolated_evaluation_context(
+    evaluation: EvaluationContext<'static>,
+) -> &'static DerivationContext<'static> {
+    Box::leak(Box::new(DerivationContext {
+        current: evaluation,
+        prior: None,
+    }))
+}
+
+fn prior_context_with_environment(
+    context: &DerivationContext<'static>,
+    environment: &str,
+) -> &'static DerivationContext<'static> {
+    let prior = context.prior.expect("prior context");
+    let mut invocation = (*prior.invocation).clone();
+    environment.clone_into(&mut invocation.environment_fingerprint);
+    let invocation = Box::leak(Box::new(invocation));
+    Box::leak(Box::new(DerivationContext {
+        current: context.current,
+        prior: Some(EvaluationContext {
+            invocation,
+            ..prior
+        }),
+    }))
+}
+
+fn prior_context_with_mechanism(
+    context: &DerivationContext<'static>,
+) -> &'static DerivationContext<'static> {
+    let prior = context.prior.expect("prior context");
+    let mut raw_records = prior.raw_evidence.to_vec();
+    let mechanism = raw_records
+        .iter_mut()
+        .find(|raw| raw.artifact_id == aid("prior-mechanism"))
+        .expect("prior mechanism");
+    mechanism.bytes = b"changed-prior-mechanism".to_vec();
+    mechanism.sha256 = sha256_hex(&mechanism.bytes);
+    let raw_records = Box::leak(raw_records.into_boxed_slice());
+    Box::leak(Box::new(DerivationContext {
+        current: context.current,
+        prior: Some(EvaluationContext {
+            raw_evidence: raw_records,
+            ..prior
+        }),
+    }))
+}
+
+fn prior_fingerprint_input(
+    input: &AttemptEvidence,
+    prior: EvaluationContext<'static>,
+) -> AttemptEvidence {
+    let mut prior_input = input.clone();
+    prior_input.pre_observation_discriminator = aid("prior-discriminator");
+    prior_input.discriminator_evidence = aid("prior-discriminator");
+    prior_input.intended_strategy = aid("prior-intended");
+    prior_input.intended_strategy_evidence = aid("prior-intended");
+    prior_input.attempted_strategy = aid("prior-attempted");
+    prior_input.attempted_strategy_evidence = aid("prior-attempted");
+    prior_input.mechanism_evidence = aid("prior-mechanism");
+    prior_input.probe_evidence = aid("prior-probe");
+    prior_input.action_plan_evidence = aid("prior-action-plan");
+    prior_input.pre_observation_invocation_id =
+        prior.invocation.pre_observation_invocation_id.clone();
+    prior_input
+        .retry
+        .environment_fingerprint
+        .clone_from(&prior.invocation.environment_fingerprint);
+    prior_input
+}
+
+fn configure_distinct_retry(
+    input: &mut AttemptEvidence,
+    prior: EvaluationContext<'static>,
+    fingerprint: String,
+) {
+    input.retry.prior_attempt = Some(prior.invocation.attempt_id.clone());
+    input.retry.prior_fingerprint = Some(fingerprint);
+    let mut prior_binding = input.binding.clone();
+    prior_binding.request_id = RequestId::new("prior-request").expect("prior request");
+    prior_binding.operation_id = OperationId::new("prior-operation").expect("prior operation");
+    input.retry.prior_binding = Some(prior_binding);
+    input.retry.prior_target = Some(prior.invocation.target.clone());
+    input.retry.prior_outcome = Some(prior.binding.pass_outcome);
+    input
+        .retry
+        .prior_evidence
+        .clone_from(&prior.run.raw_evidence);
+    input.retry.prior_material_evidence = vec![
+        aid("prior-discriminator"),
+        aid("prior-intended"),
+        aid("prior-attempted"),
+        aid("prior-mechanism"),
+        aid("prior-probe"),
+        aid("prior-action-plan"),
+    ];
+    input.retry.reason = None;
+    input.no_change = None;
+}
+
 fn renamed_material_context(
     context: &DerivationContext<'static>,
 ) -> &'static DerivationContext<'static> {
@@ -856,7 +955,7 @@ fn equivalent_retry_requires_exact_allowed_reason() {
 
 #[test]
 fn retry_fingerprint_includes_strategy_content_and_is_deterministic() {
-    let (_, _, mut input, context) = base_input("fingerprint");
+    let (_, view, mut input, context) = base_input("fingerprint");
     let first = canonical_retry_fingerprint(&input, context).expect("fingerprint");
     let second = canonical_retry_fingerprint(&input, context).expect("fingerprint");
     assert_eq!(first, second);
@@ -865,6 +964,65 @@ fn retry_fingerprint_includes_strategy_content_and_is_deterministic() {
     let changed_environment = canonical_retry_fingerprint(&input, context).expect("environment");
     assert_ne!(first, changed_environment);
     input.retry.environment_fingerprint = "env-a".to_owned();
+
+    let prior_environment_context = prior_context(context);
+    let prior_environment = prior_environment_context.prior.expect("prior evaluation");
+    let changed_environment_context =
+        prior_context_with_environment(prior_environment_context, "env-b");
+    let changed_environment_prior = changed_environment_context
+        .prior
+        .expect("prior environment");
+    let environment_input = prior_fingerprint_input(&input, changed_environment_prior);
+    let environment_claim = canonical_retry_fingerprint(
+        &environment_input,
+        isolated_evaluation_context(changed_environment_prior),
+    )
+    .expect("prior environment fingerprint");
+    let mut environment_retry = input.clone();
+    configure_distinct_retry(&mut environment_retry, prior_environment, environment_claim);
+    assert!(matches!(
+        derive_attempt_learning_outcome(
+            &view,
+            &environment_retry,
+            changed_environment_context,
+            None,
+            &policy(SemanticOutcome::Benefit),
+        ),
+        Ok(AttemptLearningOutcome::Delta(_))
+    ));
+
+    let changed_mechanism_context = prior_context_with_mechanism(prior_environment_context);
+    let changed_mechanism_prior = changed_mechanism_context.prior.expect("prior mechanism");
+    let mut mechanism_input = prior_fingerprint_input(&input, changed_mechanism_prior);
+    mechanism_input.mechanism_fingerprint = changed_mechanism_prior
+        .raw_evidence
+        .iter()
+        .find(|raw| raw.artifact_id == aid("prior-mechanism"))
+        .expect("changed mechanism")
+        .sha256
+        .clone();
+    let mechanism_claim = canonical_retry_fingerprint(
+        &mechanism_input,
+        isolated_evaluation_context(changed_mechanism_prior),
+    )
+    .expect("prior mechanism fingerprint");
+    let mut mechanism_retry = input.clone();
+    configure_distinct_retry(
+        &mut mechanism_retry,
+        changed_mechanism_prior,
+        mechanism_claim,
+    );
+    assert!(matches!(
+        derive_attempt_learning_outcome(
+            &view,
+            &mechanism_retry,
+            changed_mechanism_context,
+            None,
+            &policy(SemanticOutcome::Benefit),
+        ),
+        Ok(AttemptLearningOutcome::Delta(_))
+    ));
+
     let renamed = renamed_material_context(context);
     input.pre_observation_discriminator = aid("discriminator-b");
     input.discriminator_evidence = aid("discriminator-b");

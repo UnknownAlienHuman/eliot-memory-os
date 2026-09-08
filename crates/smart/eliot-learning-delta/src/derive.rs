@@ -14,8 +14,8 @@ use eliot_learning_contracts::{
 
 use crate::{
     AttemptEvidence, AttemptStatus, BeforeSelector, ChangeRequest, DependencyRole,
-    DerivationContext, DerivationPolicy, EvidenceKind, LearningDeltaError, NoChangeProof,
-    RefinerDraft, SemanticOutcome,
+    DerivationContext, DerivationPolicy, EvidenceKind, EvidenceReceipt, LearningDeltaError,
+    NoChangeProof, RefinerDraft, SemanticOutcome,
     input::{operation_from_values, validate_unique_ids},
     retry::{RetryAssessment, assess_retry},
 };
@@ -329,6 +329,7 @@ fn validate_preflight_collections(
 ) -> Result<(), LearningDeltaError> {
     let bounded = [
         (input.observations.len(), "observations"),
+        (state_view.slots.len(), "view.slots"),
         (
             input.owner_empty_declarations.len(),
             "owner_empty_declarations",
@@ -343,6 +344,7 @@ fn validate_preflight_collections(
             input.retry.prior_material_evidence.len(),
             "retry.material_references",
         ),
+        (input.retry.prior_evidence.len(), "retry.evidence"),
         (
             input
                 .no_change
@@ -688,6 +690,8 @@ fn validate_current_evaluator(
         || run.invocation_id != frozen.invocation_id
         || run.property != frozen.property
         || run.scope != frozen.scope
+        || run.scope != input.binding.scope.as_str()
+        || frozen.scope != input.binding.scope.as_str()
         || run.state_fence != input.binding.state_fence
     {
         return Err(LearningDeltaError::EvidenceBinding {
@@ -702,6 +706,12 @@ fn validate_current_evaluator(
         || invocation.state_fence != input.binding.state_fence
         || invocation.invocation_id != run.invocation_id
         || invocation.pre_observation_invocation_id != input.pre_observation_invocation_id
+        || invocation
+            .pre_observation_invocation_id
+            .as_str()
+            .trim()
+            .is_empty()
+        || invocation.pre_observation_invocation_id == invocation.invocation_id
         || invocation.environment_fingerprint != input.retry.environment_fingerprint
         || invocation.relation_receipt.as_str().trim().is_empty()
     {
@@ -714,6 +724,17 @@ fn validate_current_evaluator(
         run,
         invocation.relation_receipt.as_str(),
     )?;
+    validate_current_raw_and_outcome(input, context, evaluator, expected, run, &raw_ids)
+}
+
+fn validate_current_raw_and_outcome(
+    input: &AttemptEvidence,
+    context: &DerivationContext<'_>,
+    evaluator: &EvidenceReceipt,
+    expected: &crate::EvaluatorBinding,
+    run: &eliot_instrument_api::VerificationRun,
+    raw_ids: &BTreeSet<&str>,
+) -> Result<(), LearningDeltaError> {
     for record in input.observations.iter().chain(input.evaluator.iter()) {
         let raw = context
             .current
@@ -739,7 +760,7 @@ fn validate_current_evaluator(
             field: "raw_evidence.membership",
         });
     }
-    validate_pre_observation_materials(input, context, &raw_ids)?;
+    validate_pre_observation_materials(input, context, raw_ids)?;
     let mapped =
         map_verification_outcome(run.outcome, expected.pass_outcome, expected.fail_outcome)?;
     if evaluator.outcome != mapped || !matches!(run.execution, ExecutionStatus::Succeeded) {
