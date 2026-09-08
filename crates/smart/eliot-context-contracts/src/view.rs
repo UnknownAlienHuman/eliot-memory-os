@@ -233,6 +233,7 @@ impl ActiveUnderstandingView {
 
     /// Validate every rendered field against the exact admitted record.
     pub fn validate_against(&self, admitted: &AdmittedContextSet) -> Result<(), ContextError> {
+        admitted.validate()?;
         self.validate()?;
         if self.binding != admitted.binding {
             return Err(ContextError::InvalidFence);

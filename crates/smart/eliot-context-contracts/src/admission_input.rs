@@ -529,6 +529,9 @@ impl AdmissionInput {
         self.binding.validate()?;
         self.recipe.validate()?;
         self.candidates.validate_for_admission()?;
+        for candidate in &self.candidates.candidates {
+            candidate.validate_public_privacy()?;
+        }
         self.floor.validate()?;
         self.priority.decision.validate()?;
         if !self.priority.priorities.is_empty() {

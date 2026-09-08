@@ -56,7 +56,7 @@ pub use absence::{AbsenceClaim, AbsenceClaimParams, BoundedProof, OwnerLookup};
 pub use admitted::{
     AdmittedKind, AdmittedReceipt, AdmittedReceiptParams, ChallengeInvariant, ContractChallenge,
     CurrentEpistemicPosition, CurrentEpistemicPositionView, Currentness, PositionId,
-    PositionRevision, PositionState,
+    PositionRevision,
 };
 pub use assertability::PositionAssertability;
 pub use assumption::{
@@ -77,6 +77,8 @@ pub use coverage::{
     ExclusionRecord, FrontierRevision, FrontierSpec, PaginationBounds, QueryRevision, QuerySpec,
     SnapshotRef,
 };
+/// Canonical eight-state epistemic vocabulary owned by foundation evidence.
+pub use eliot_evidence::EpistemicStatus as PositionState;
 pub use error::{
     ContractError, MAX_HANDLES, MAX_MEMBERS, MAX_POSITIONS, MAX_PROOF_BYTES, MAX_SHORT_TEXT,
     MAX_STATEMENT_TEXT,
