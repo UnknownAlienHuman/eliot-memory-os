@@ -179,6 +179,11 @@ fn admitted_two() -> AdmittedContextSet {
     });
     value.economy.requested.push(id("atom-two"));
     value.economy.admitted.push(id("atom-two"));
+    let payload_bytes = value
+        .canonical_payload_utf8_bytes()
+        .expect("two-atom admitted payload");
+    value.economy.allocations.admitted_required = payload_bytes;
+    value.economy.allocations.remaining_headroom = 100_000 - 9 - payload_bytes;
     value.economy.measurement.digest = value
         .canonical_payload_digest()
         .expect("two-atom admitted digest");
