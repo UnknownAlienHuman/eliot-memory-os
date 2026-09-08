@@ -12,8 +12,8 @@ use eliot_contracts::{ArtifactId, StateFence};
 use eliot_learning_contracts::identity::SourceLineage;
 use eliot_learning_contracts::{
     CampaignLearningStateView, Completeness, LearningContractError, LearningStateViewRecipe,
-    OmissionPolicy, OwnerDisagreement, SlotDisposition, SlotProjection, SlotRequirement, SlotSpec,
-    SourceDenominator,
+    MemberProjection, OmissionPolicy, OwnerDisagreement, SlotDisposition, SlotProjection,
+    SlotRequirement, SlotSpec, SourceDenominator,
 };
 
 /// Maximum declared slots accepted by this pure compiler.
@@ -70,6 +70,7 @@ pub fn compile_campaign_learning_state_view(
     }
     validate_references(required_references)?;
     validate_disagreements(recipe, supplied_disagreements)?;
+    validate_shared_lineage(projections)?;
 
     let recipe_by_id: BTreeMap<_, _> = recipe
         .slots
@@ -100,7 +101,7 @@ pub fn compile_campaign_learning_state_view(
     let mut frontier = Vec::new();
     for spec in &recipe.slots {
         if let Some(projection) = by_slot.get(spec.slot_id.as_str()) {
-            slots.push((*projection).clone());
+            slots.push(canonical_slot_projection(projection, spec)?);
         } else {
             match (&spec.requirement, recipe.omission_policy) {
                 (SlotRequirement::Optional, OmissionPolicy::RequiredSlots) => {
@@ -137,7 +138,7 @@ pub fn compile_campaign_learning_state_view(
         completeness,
         omissions,
         frontier,
-        owner_disagreements: supplied_disagreements.to_vec(),
+        owner_disagreements: canonical_disagreements(supplied_disagreements),
         required_references: references,
         invalidated: false,
         invalidation_reason: None,
@@ -148,6 +149,7 @@ pub fn compile_campaign_learning_state_view(
             field: "view.slots",
         })?;
     view.seal()?;
+    view.validate_against(recipe)?;
     Ok(view)
 }
 
@@ -430,19 +432,10 @@ fn validate_projection_against_spec(
     if projection.disposition == SlotDisposition::KnownEmpty && !projection.members.is_empty() {
         return Err(LearningContractError::IncompleteCoverage);
     }
-    let mut source_lineage: BTreeMap<(&str, &str), &SourceLineage> = BTreeMap::new();
     for member in &projection.members {
         if member.owner != spec.owner {
             return Err(LearningContractError::ScopeMismatch {
                 field: "member.owner",
-            });
-        }
-        let key = (member.owner.as_str(), member.source.snapshot.as_str());
-        if let Some(previous) = source_lineage.insert(key, &member.source)
-            && previous != &member.source
-        {
-            return Err(LearningContractError::ScopeMismatch {
-                field: "member.source",
             });
         }
     }
@@ -460,6 +453,79 @@ fn validate_projection_against_spec(
         });
     }
     Ok(())
+}
+
+fn validate_shared_lineage(projections: &[SlotProjection]) -> Result<(), LearningContractError> {
+    let mut source_lineage: BTreeMap<(&str, &str), &SourceLineage> = BTreeMap::new();
+    for projection in projections {
+        for member in &projection.members {
+            let key = (
+                member.source.owner.as_str(),
+                member.source.snapshot.as_str(),
+            );
+            if let Some(previous) = source_lineage.insert(key, &member.source)
+                && previous != &member.source
+            {
+                return Err(LearningContractError::ScopeMismatch {
+                    field: "member.source",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn canonical_slot_projection(
+    projection: &SlotProjection,
+    spec: &SlotSpec,
+) -> Result<SlotProjection, LearningContractError> {
+    let mut members_by_id: BTreeMap<&str, &MemberProjection> = BTreeMap::new();
+    for member in &projection.members {
+        if members_by_id
+            .insert(member.member_id.as_str(), member)
+            .is_some()
+        {
+            return Err(LearningContractError::Duplicate {
+                field: "projection.members",
+            });
+        }
+    }
+    let mut members = Vec::with_capacity(spec.declared_members.len());
+    for member_id in &spec.declared_members {
+        let member = members_by_id
+            .remove(member_id.as_str())
+            .ok_or(LearningContractError::IncompleteCoverage)?;
+        let mut member = (*member).clone();
+        member
+            .evidence
+            .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        members.push(member);
+    }
+    if !members_by_id.is_empty() {
+        return Err(LearningContractError::IncompleteCoverage);
+    }
+    let mut evidence = projection.evidence.clone();
+    evidence.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    Ok(SlotProjection {
+        slot_id: projection.slot_id.clone(),
+        disposition: projection.disposition,
+        members,
+        evidence,
+    })
+}
+
+fn canonical_disagreements(disagreements: &[OwnerDisagreement]) -> Vec<OwnerDisagreement> {
+    let mut result = disagreements.to_vec();
+    result.sort_by(|left, right| left.slot_id.as_str().cmp(right.slot_id.as_str()));
+    for disagreement in &mut result {
+        disagreement
+            .owners
+            .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        disagreement
+            .evidence
+            .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    }
+    result
 }
 
 fn recipe_slot<'a>(
@@ -481,52 +547,52 @@ fn classify_completeness(
     let mut blocked = false;
     let mut stale = false;
     let mut partial = !frontier.is_empty();
+    let mut required_ids = BTreeSet::new();
     for spec in &recipe.slots {
-        let required = !matches!(spec.requirement, SlotRequirement::Optional);
+        if !matches!(spec.requirement, SlotRequirement::Optional) {
+            required_ids.insert(spec.slot_id.as_str());
+        }
+        if let SlotRequirement::Conditional { depends_on } = &spec.requirement {
+            required_ids.insert(depends_on.as_str());
+        }
+    }
+    for spec in &recipe.slots {
+        if !required_ids.contains(spec.slot_id.as_str()) {
+            continue;
+        }
         let Some(slot) = slots
             .iter()
             .find(|candidate| candidate.slot_id == spec.slot_id)
         else {
-            if required {
-                partial = true;
-            }
+            partial = true;
             continue;
         };
-        if required {
-            match slot.disposition {
+        match slot.disposition {
+            SlotDisposition::Blocked | SlotDisposition::Unavailable => blocked = true,
+            SlotDisposition::Stale => stale = true,
+            SlotDisposition::Current => {}
+            SlotDisposition::KnownEmpty => {
+                if !slot.evidence.is_empty() && spec.declared_members.is_empty() {
+                    // An explicitly evidenced empty owner projection is ready.
+                } else {
+                    partial = true;
+                }
+            }
+            SlotDisposition::Historical
+            | SlotDisposition::Superseded
+            | SlotDisposition::Unknown
+            | SlotDisposition::Conflicted => partial = true,
+        }
+        for member in &slot.members {
+            match member.disposition {
                 SlotDisposition::Blocked | SlotDisposition::Unavailable => blocked = true,
                 SlotDisposition::Stale => stale = true,
-                SlotDisposition::Current => {
-                    if slot
-                        .members
-                        .iter()
-                        .any(|member| member.disposition != SlotDisposition::Current)
-                    {
-                        partial = true;
-                    }
-                }
-                SlotDisposition::KnownEmpty => {
-                    if !slot.evidence.is_empty() && !spec.declared_members.is_empty() {
-                        partial = true;
-                    }
-                }
+                SlotDisposition::Current => {}
                 SlotDisposition::Historical
                 | SlotDisposition::Superseded
                 | SlotDisposition::Unknown
-                | SlotDisposition::Conflicted => partial = true,
-            }
-        }
-        if let SlotRequirement::Conditional { depends_on } = &spec.requirement {
-            let dependency_ready = slots
-                .iter()
-                .find(|candidate| candidate.slot_id == *depends_on)
-                .is_some_and(|dependency| {
-                    dependency.disposition == SlotDisposition::Current
-                        || (dependency.disposition == SlotDisposition::KnownEmpty
-                            && !dependency.evidence.is_empty())
-                });
-            if !dependency_ready {
-                partial = true;
+                | SlotDisposition::Conflicted
+                | SlotDisposition::KnownEmpty => partial = true,
             }
         }
     }

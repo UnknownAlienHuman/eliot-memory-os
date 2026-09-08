@@ -101,8 +101,17 @@ fn projection(
     slot_index: usize,
     disposition: SlotDisposition,
 ) -> Result<SlotProjection, Box<dyn Error>> {
-    let spec = &recipe.slots[slot_index];
     let lineage = source(&format!("slot-{slot_index}"), 1)?;
+    projection_with_lineage(recipe, slot_index, disposition, &lineage)
+}
+
+fn projection_with_lineage(
+    recipe: &LearningStateViewRecipe,
+    slot_index: usize,
+    disposition: SlotDisposition,
+    lineage: &eliot_learning_contracts::identity::SourceLineage,
+) -> Result<SlotProjection, Box<dyn Error>> {
+    let spec = &recipe.slots[slot_index];
     let members = spec
         .declared_members
         .iter()
@@ -119,7 +128,10 @@ fn projection(
                     disposition
                 },
                 value_digest: Some(digest(&format!("value-{slot_index}-{index}"))),
-                evidence: vec![artifact(&format!("evidence-{slot_index}-{index}"))?],
+                evidence: vec![
+                    artifact(&format!("evidence-{slot_index}-{index}-a"))?,
+                    artifact(&format!("evidence-{slot_index}-{index}-b"))?,
+                ],
             })
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
@@ -127,7 +139,10 @@ fn projection(
         slot_id: spec.slot_id.clone(),
         disposition,
         members,
-        evidence: vec![artifact(&format!("slot-evidence-{slot_index}"))?],
+        evidence: vec![
+            artifact(&format!("slot-evidence-{slot_index}-a"))?,
+            artifact(&format!("slot-evidence-{slot_index}-b"))?,
+        ],
     })
 }
 
@@ -178,11 +193,34 @@ fn shared_lineage_and_input_order_are_retained_without_resealing_recipe() -> Tes
         vec![2, 1],
         OmissionPolicy::RequiredSlots,
     )?;
-    let second = projection(&recipe, 1, SlotDisposition::Current)?;
-    let first = projection(&recipe, 0, SlotDisposition::Current)?;
+    let shared = source("shared", 1)?;
+    let second = projection_with_lineage(&recipe, 1, SlotDisposition::Current, &shared)?;
+    let first = projection_with_lineage(&recipe, 0, SlotDisposition::Current, &shared)?;
     let before = recipe.canonical_digest.clone();
-    let view = compile(&recipe, &[second, first], &[artifact("ref-a")?])?;
+    let view = compile(
+        &recipe,
+        &[first.clone(), second.clone()],
+        &[artifact("ref-a")?],
+    )?;
+    let mut reverse_first = first;
+    reverse_first.members.reverse();
+    reverse_first.evidence.reverse();
+    for member in &mut reverse_first.members {
+        member.evidence.reverse();
+    }
+    let mut reverse_second = second;
+    reverse_second.members.reverse();
+    reverse_second.evidence.reverse();
+    for member in &mut reverse_second.members {
+        member.evidence.reverse();
+    }
+    let reversed = compile(
+        &recipe,
+        &[reverse_second, reverse_first],
+        &[artifact("ref-a")?],
+    )?;
     assert_eq!(recipe.canonical_digest, before);
+    assert_eq!(view, reversed);
     assert_eq!(view.slots[0].slot_id, recipe.slots[0].slot_id);
     assert_eq!(view.slots[1].slot_id, recipe.slots[1].slot_id);
     Ok(())
@@ -248,22 +286,30 @@ fn omission_policy_and_conditional_unknown_remain_explicit() -> TestResult {
         OmissionPolicy::ExplicitFrontier,
     )?;
     let view = compile(&frontier, &[], &[artifact("ref")?])?;
-    assert_eq!(view.frontier.len(), 3);
+    assert_eq!(
+        view.frontier,
+        frontier
+            .slots
+            .iter()
+            .map(|slot| slot.slot_id.clone())
+            .collect::<Vec<_>>()
+    );
     assert_eq!(view.completeness, Completeness::Partial);
+    view.validate_against(&frontier)?;
     Ok(())
 }
 
 #[test]
 fn optional_stale_and_explicit_disagreement_are_preserved() -> TestResult {
-    let recipe = recipe(
+    let base_recipe = recipe(
         vec![SlotRequirement::Required, SlotRequirement::Optional],
         vec![1, 1],
         OmissionPolicy::RequiredSlots,
     )?;
-    let required = projection(&recipe, 0, SlotDisposition::Current)?;
-    let optional = projection(&recipe, 1, SlotDisposition::Stale)?;
+    let required = projection(&base_recipe, 0, SlotDisposition::Current)?;
+    let optional = projection(&base_recipe, 1, SlotDisposition::Stale)?;
     let disagreement = OwnerDisagreement {
-        slot_id: recipe.slots[1].slot_id.clone(),
+        slot_id: base_recipe.slots[1].slot_id.clone(),
         owners: vec![
             OwnerId::from_artifact(artifact("owner-b")?),
             OwnerId::from_artifact(artifact("owner-a")?),
@@ -271,30 +317,67 @@ fn optional_stale_and_explicit_disagreement_are_preserved() -> TestResult {
         evidence: vec![artifact("disagreement-z")?, artifact("disagreement-a")?],
     };
     let view = compile_campaign_learning_state_view(
-        &recipe,
+        &base_recipe,
         &[optional.clone(), required],
-        &recipe.binding.state_fence,
+        &base_recipe.binding.state_fence,
         &[artifact("ref")?],
         &artifact("view-614")?,
         std::slice::from_ref(&disagreement),
     )?;
     assert_eq!(view.completeness, Completeness::CompleteForDeclaredRecipe);
     assert_eq!(view.slots[1], optional);
-    assert_eq!(view.owner_disagreements, vec![disagreement]);
+    let mut expected_disagreement = disagreement;
+    expected_disagreement
+        .owners
+        .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    expected_disagreement
+        .evidence
+        .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    assert_eq!(view.owner_disagreements, vec![expected_disagreement]);
+
+    let conditional = recipe(
+        vec![
+            SlotRequirement::Required,
+            SlotRequirement::Optional,
+            SlotRequirement::Conditional {
+                depends_on: SlotId::from_artifact(artifact("slot-1")?),
+            },
+        ],
+        vec![1, 1, 1],
+        OmissionPolicy::ExplicitFrontier,
+    )?;
+    let required = projection(&conditional, 0, SlotDisposition::Current)?;
+    let blocked_optional = projection(&conditional, 1, SlotDisposition::Blocked)?;
+    let dependent = compile(
+        &conditional,
+        &[required, blocked_optional],
+        &[artifact("ref")?],
+    )?;
+    assert_eq!(dependent.completeness, Completeness::Blocked);
+    assert_eq!(
+        dependent.frontier,
+        vec![conditional.slots[2].slot_id.clone()]
+    );
     Ok(())
 }
 
 #[test]
 fn required_status_precedence_survives_missing_frontier() -> TestResult {
     let recipe = recipe(
-        vec![SlotRequirement::Required, SlotRequirement::Required],
-        vec![1, 1],
+        vec![
+            SlotRequirement::Required,
+            SlotRequirement::Required,
+            SlotRequirement::Required,
+        ],
+        vec![1, 1, 1],
         OmissionPolicy::ExplicitFrontier,
     )?;
     let blocked = projection(&recipe, 0, SlotDisposition::Blocked)?;
-    let view = compile(&recipe, &[blocked], &[artifact("ref")?])?;
+    let stale = projection(&recipe, 1, SlotDisposition::Stale)?;
+    let view = compile(&recipe, &[blocked, stale], &[artifact("ref")?])?;
     assert_eq!(view.completeness, Completeness::Blocked);
-    assert_eq!(view.frontier, vec![recipe.slots[1].slot_id.clone()]);
+    assert_eq!(view.frontier, vec![recipe.slots[2].slot_id.clone()]);
     assert_eq!(view.slots[0].disposition, SlotDisposition::Blocked);
+    assert_eq!(view.slots[1].disposition, SlotDisposition::Stale);
     Ok(())
 }
