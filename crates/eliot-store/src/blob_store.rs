@@ -1,5 +1,9 @@
 use crate::StoreError;
 use crate::blob_validation::{expected_blob_relative_path, validate_blob_ref};
+use crate::error::{
+    StorageCleanup, StorageExhausted, StorageExhaustedEffect, StorageExhaustedRetry,
+    StorageExhaustedStage, StorageIoCause,
+};
 use eliot_types::secret_boundary::MAX_SECRET_BOUNDARY_BYTES;
 use eliot_types::{
     BlobRef, BlobStoreConfig, CANONICAL_MEMORY_SCHEMA_VERSION,
@@ -132,12 +136,69 @@ pub struct BlobStore {
     root: PathBuf,
 }
 
+struct StorageExhaustedDetails {
+    operation: &'static str,
+    stage: StorageExhaustedStage,
+    storage_identity: String,
+    local_attempt_id: Option<String>,
+    attempted_bytes: Option<u64>,
+    effect: StorageExhaustedEffect,
+    cleanup: StorageCleanup,
+}
+
+struct PutFailure<'a> {
+    temp_path: &'a Path,
+    path: &'a Path,
+    blob: &'a BlobRef,
+    attempt_id: &'a str,
+    temp_owned: bool,
+    stage: StorageExhaustedStage,
+    attempted_bytes: Option<u64>,
+    effect: StorageExhaustedEffect,
+    error: std::io::Error,
+}
+
 impl BlobStore {
     pub fn open(config: &BlobStoreConfig) -> Result<Self, StoreError> {
         let root = PathBuf::from(&config.root);
-        std::fs::create_dir_all(&root)?;
+        let storage_identity = storage_identity(&root);
+        if let Err(error) = std::fs::create_dir_all(&root) {
+            if error.kind() == std::io::ErrorKind::StorageFull {
+                return Err(storage_exhausted(
+                    StorageExhaustedDetails {
+                        operation: "blob.open",
+                        stage: StorageExhaustedStage::RootCreate,
+                        storage_identity,
+                        local_attempt_id: None,
+                        attempted_bytes: None,
+                        effect: StorageExhaustedEffect::AttemptedNoPublication,
+                        cleanup: StorageCleanup::NotAttempted,
+                    },
+                    error,
+                ));
+            }
+            return Err(error.into());
+        }
+        let canonical_root = match std::fs::canonicalize(&root) {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::StorageFull => {
+                return Err(storage_exhausted(
+                    StorageExhaustedDetails {
+                        operation: "blob.open",
+                        stage: StorageExhaustedStage::RootCanonicalize,
+                        storage_identity,
+                        local_attempt_id: None,
+                        attempted_bytes: None,
+                        effect: StorageExhaustedEffect::AttemptedNoPublication,
+                        cleanup: StorageCleanup::NotAttempted,
+                    },
+                    error,
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
         Ok(Self {
-            root: std::fs::canonicalize(root)?,
+            root: canonical_root,
         })
     }
 
@@ -148,10 +209,7 @@ impl BlobStore {
         let (prefix, suffix) = digest_hex.split_at(2);
         let relative_path = format!("{prefix}/{suffix}.blob");
         let path = self.root.join(Path::new(&relative_path));
-
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        self.ensure_blob_parent(&path)?;
 
         let blob = BlobRef {
             algorithm: "blake3".to_owned(),
@@ -164,27 +222,135 @@ impl BlobStore {
             return Ok(blob);
         }
 
-        let temp_path =
-            path.with_extension(format!("blob-stage-{}", uuid::Uuid::new_v4().as_simple()));
-        let write_result = (|| -> Result<(), std::io::Error> {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            std::fs::rename(&temp_path, &path)
-        })();
-        if let Err(error) = write_result {
-            let _ = std::fs::remove_file(&temp_path);
-            if path.exists() {
-                self.read_verified(&blob)?;
-                return Ok(blob);
+        let attempt_id = uuid::Uuid::new_v4().as_simple().to_string();
+        let temp_path = path.with_extension(format!("blob-stage-{attempt_id}"));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                return self.handle_put_failure(PutFailure {
+                    temp_path: &temp_path,
+                    path: &path,
+                    blob: &blob,
+                    attempt_id: &attempt_id,
+                    temp_owned: false,
+                    stage: StorageExhaustedStage::TempCreate,
+                    attempted_bytes: None,
+                    effect: StorageExhaustedEffect::AttemptedNoPublication,
+                    error,
+                });
             }
-            return Err(error.into());
+        };
+        if let Err(error) = file.write_all(bytes) {
+            drop(file);
+            return self.handle_put_failure(PutFailure {
+                temp_path: &temp_path,
+                path: &path,
+                blob: &blob,
+                attempt_id: &attempt_id,
+                temp_owned: true,
+                stage: StorageExhaustedStage::PayloadWrite,
+                attempted_bytes: Some(blob.size_bytes),
+                effect: StorageExhaustedEffect::StagedUnknown,
+                error,
+            });
+        }
+        if let Err(error) = file.sync_all() {
+            drop(file);
+            return self.handle_put_failure(PutFailure {
+                temp_path: &temp_path,
+                path: &path,
+                blob: &blob,
+                attempt_id: &attempt_id,
+                temp_owned: true,
+                stage: StorageExhaustedStage::PayloadSync,
+                attempted_bytes: Some(blob.size_bytes),
+                effect: StorageExhaustedEffect::StagedUnknown,
+                error,
+            });
+        }
+        drop(file);
+        if let Err(error) = std::fs::rename(&temp_path, &path) {
+            return self.handle_put_failure(PutFailure {
+                temp_path: &temp_path,
+                path: &path,
+                blob: &blob,
+                attempt_id: &attempt_id,
+                temp_owned: true,
+                stage: StorageExhaustedStage::Rename,
+                attempted_bytes: Some(blob.size_bytes),
+                effect: StorageExhaustedEffect::PossiblePublication,
+                error,
+            });
         }
         self.read_verified(&blob)?;
         Ok(blob)
+    }
+
+    fn ensure_blob_parent(&self, path: &Path) -> Result<(), StoreError> {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        let Err(error) = std::fs::create_dir_all(parent) else {
+            return Ok(());
+        };
+        if error.kind() == std::io::ErrorKind::StorageFull {
+            return Err(storage_exhausted(
+                StorageExhaustedDetails {
+                    operation: "blob.put_bytes",
+                    stage: StorageExhaustedStage::ParentCreate,
+                    storage_identity: storage_identity(&self.root),
+                    local_attempt_id: None,
+                    attempted_bytes: None,
+                    effect: StorageExhaustedEffect::AttemptedNoPublication,
+                    cleanup: StorageCleanup::NotAttempted,
+                },
+                error,
+            ));
+        }
+        Err(error.into())
+    }
+
+    fn handle_put_failure(&self, failure: PutFailure<'_>) -> Result<BlobRef, StoreError> {
+        let is_capacity = failure.error.kind() == std::io::ErrorKind::StorageFull;
+        if is_capacity {
+            let cleanup = if failure.temp_owned {
+                match std::fs::remove_file(failure.temp_path) {
+                    Ok(()) => StorageCleanup::Removed,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        StorageCleanup::Absent
+                    }
+                    Err(error) => {
+                        StorageCleanup::Failed(StorageIoCause::new(error, native_namespace()))
+                    }
+                }
+            } else {
+                StorageCleanup::NotAttempted
+            };
+            return Err(storage_exhausted(
+                StorageExhaustedDetails {
+                    operation: "blob.put_bytes",
+                    stage: failure.stage,
+                    storage_identity: storage_identity(&self.root),
+                    local_attempt_id: Some(failure.attempt_id.to_owned()),
+                    attempted_bytes: failure.attempted_bytes,
+                    effect: failure.effect,
+                    cleanup,
+                },
+                failure.error,
+            ));
+        }
+        if failure.temp_owned {
+            let _ = std::fs::remove_file(failure.temp_path);
+        }
+        if failure.path.exists() {
+            self.read_verified(failure.blob)?;
+            return Ok(failure.blob.clone());
+        }
+        Err(failure.error.into())
     }
 
     pub fn blob_path(&self, blob: &BlobRef) -> PathBuf {
@@ -449,6 +615,31 @@ fn invalid_blob(message: impl Into<String>) -> StoreError {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message.into()).into()
 }
 
+fn native_namespace() -> &'static str {
+    std::env::consts::OS
+}
+
+fn storage_identity(root: &Path) -> String {
+    format!(
+        "root-blake3:{}",
+        blake3::hash(root.as_os_str().as_encoded_bytes()).to_hex()
+    )
+}
+
+fn storage_exhausted(details: StorageExhaustedDetails, error: std::io::Error) -> StoreError {
+    StoreError::StorageExhausted(Box::new(StorageExhausted {
+        operation: details.operation,
+        stage: details.stage,
+        storage_identity: details.storage_identity,
+        local_attempt_id: details.local_attempt_id,
+        attempted_bytes: details.attempted_bytes,
+        effect: details.effect,
+        retry: StorageExhaustedRetry::CapacityRevalidationRequired,
+        cleanup: details.cleanup,
+        cause: StorageIoCause::new(error, native_namespace()),
+    }))
+}
+
 fn bounded_label<'a>(value: &'a str, label: &str, max_bytes: usize) -> Result<&'a str, StoreError> {
     let value = value.trim();
     if value.is_empty() || value.len() > max_bytes {
@@ -652,6 +843,9 @@ pub(crate) fn verify_canonical_memory_child_set(
 mod tests {
     use super::{BlobStore, CanonicalMemoryStagedRecord, verify_canonical_memory_child_set};
     use crate::StoreError;
+    use crate::error::{
+        StorageCleanup, StorageExhaustedEffect, StorageExhaustedRetry, StorageExhaustedStage,
+    };
     use eliot_types::{
         AgentId, BlobStoreConfig, CommandContext, CueBinding, CueKind, CueMatchMode, CueStrength,
         LifecycleStatus, ProjectId, SemanticCommand, TaintClass, Visibility, WriteId,
@@ -721,6 +915,177 @@ mod tests {
         assert!(matches!(error, StoreError::PolicyViolation(_)));
         assert!(std::fs::read_dir(&temp_dir)?.next().is_none());
         std::fs::remove_dir(temp_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn capacity_failure_retains_stage_and_bypasses_matching_destination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "eliot-capacity-failure-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = BlobStore::open(&BlobStoreConfig {
+            root: temp_dir.display().to_string(),
+        })?;
+        let blob = store.put_bytes(b"already durable")?;
+        let destination = store.blob_path(&blob);
+        let temp_path = destination.with_extension("blob-stage-test");
+        std::fs::write(&temp_path, b"partial")?;
+        let error = std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "private configured path must not appear",
+        );
+
+        let result = store.handle_put_failure(super::PutFailure {
+            temp_path: &temp_path,
+            path: &destination,
+            blob: &blob,
+            attempt_id: "local-attempt-1",
+            temp_owned: true,
+            stage: StorageExhaustedStage::PayloadWrite,
+            attempted_bytes: Some(7),
+            effect: StorageExhaustedEffect::StagedUnknown,
+            error,
+        });
+        let Err(StoreError::StorageExhausted(error)) = result else {
+            return Err("capacity failure was upgraded to a successful matching blob".into());
+        };
+        assert_eq!(error.operation, "blob.put_bytes");
+        assert_eq!(error.stage, StorageExhaustedStage::PayloadWrite);
+        assert_eq!(error.attempted_bytes, Some(7));
+        assert_eq!(error.effect, StorageExhaustedEffect::StagedUnknown);
+        assert_eq!(
+            error.retry,
+            StorageExhaustedRetry::CapacityRevalidationRequired
+        );
+        assert_eq!(error.cause.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(error.cause.namespace(), super::native_namespace());
+        assert_eq!(error.cause.namespace(), std::env::consts::OS);
+        assert!(std::error::Error::source(&error.cause).is_none());
+        assert!(matches!(error.cleanup, StorageCleanup::Removed));
+        assert!(!temp_path.exists());
+        assert!(format!("{error}").contains("blob.put_bytes"));
+        assert!(!format!("{error:?}").contains("private configured path"));
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn noncapacity_failure_keeps_native_io_behavior() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "eliot-noncapacity-failure-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = BlobStore::open(&BlobStoreConfig {
+            root: temp_dir.display().to_string(),
+        })?;
+        let blob = store.put_bytes(b"noncapacity")?;
+        let destination = store.blob_path(&blob);
+        std::fs::remove_file(&destination)?;
+        let result = store.handle_put_failure(super::PutFailure {
+            temp_path: &destination.with_extension("blob-stage-test"),
+            path: &destination,
+            blob: &blob,
+            attempt_id: "local-attempt-2",
+            temp_owned: false,
+            stage: StorageExhaustedStage::TempCreate,
+            attempted_bytes: None,
+            effect: StorageExhaustedEffect::AttemptedNoPublication,
+            error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "native detail"),
+        });
+        let Err(StoreError::Io(error)) = result else {
+            return Err("non-capacity failure changed its legacy error family".into());
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        #[cfg(windows)]
+        {
+            let classify = |code| {
+                store.handle_put_failure(super::PutFailure {
+                    temp_path: &destination.with_extension("blob-stage-native-code"),
+                    path: &destination,
+                    blob: &blob,
+                    attempt_id: "local-attempt-native-code",
+                    temp_owned: false,
+                    stage: StorageExhaustedStage::TempCreate,
+                    attempted_bytes: None,
+                    effect: StorageExhaustedEffect::AttemptedNoPublication,
+                    error: std::io::Error::from_raw_os_error(code),
+                })
+            };
+            for code in [39, 112] {
+                let Err(StoreError::StorageExhausted(error)) = classify(code) else {
+                    return Err(format!("Windows capacity code {code} was not typed").into());
+                };
+                assert_eq!(error.cause.kind(), std::io::ErrorKind::StorageFull);
+                assert_eq!(error.cause.raw_os_error(), Some(code));
+                assert_eq!(error.cause.namespace(), std::env::consts::OS);
+            }
+            let Err(StoreError::Io(error)) = classify(28) else {
+                return Err("foreign Windows code 28 was classified as capacity".into());
+            };
+            assert_eq!(error.raw_os_error(), Some(28));
+        }
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn capacity_failure_does_not_remove_unowned_staging_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "eliot-unowned-staging-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = BlobStore::open(&BlobStoreConfig {
+            root: temp_dir.display().to_string(),
+        })?;
+        let blob = store.put_bytes(b"unowned staging")?;
+        let destination = store.blob_path(&blob);
+        let temp_path = destination.with_extension("blob-stage-collision");
+        std::fs::write(&temp_path, b"preexisting")?;
+        let result = store.handle_put_failure(super::PutFailure {
+            temp_path: &temp_path,
+            path: &destination,
+            blob: &blob,
+            attempt_id: "local-attempt-3",
+            temp_owned: false,
+            stage: StorageExhaustedStage::TempCreate,
+            attempted_bytes: None,
+            effect: StorageExhaustedEffect::AttemptedNoPublication,
+            error: std::io::Error::new(std::io::ErrorKind::StorageFull, "capacity detail"),
+        });
+        let Err(StoreError::StorageExhausted(error)) = result else {
+            return Err("capacity failure was not retained as typed uncertainty".into());
+        };
+        assert!(matches!(error.cleanup, StorageCleanup::NotAttempted));
+        assert_eq!(std::fs::read(&temp_path)?, b"preexisting");
+        assert!(destination.exists());
+
+        let cleanup_path = destination.with_extension("blob-stage-cleanup-failure");
+        std::fs::create_dir(&cleanup_path)?;
+        let result = store.handle_put_failure(super::PutFailure {
+            temp_path: &cleanup_path,
+            path: &destination,
+            blob: &blob,
+            attempt_id: "local-attempt-4",
+            temp_owned: true,
+            stage: StorageExhaustedStage::PayloadWrite,
+            attempted_bytes: Some(blob.size_bytes),
+            effect: StorageExhaustedEffect::StagedUnknown,
+            error: std::io::Error::new(std::io::ErrorKind::StorageFull, "primary capacity"),
+        });
+        let Err(StoreError::StorageExhausted(error)) = result else {
+            return Err("owned cleanup failure lost the typed primary cause".into());
+        };
+        assert_eq!(error.cause.kind(), std::io::ErrorKind::StorageFull);
+        assert!(matches!(&error.cleanup, StorageCleanup::Failed(_)));
+        std::fs::remove_dir_all(cleanup_path)?;
+
+        std::fs::remove_dir_all(temp_dir)?;
         Ok(())
     }
 
