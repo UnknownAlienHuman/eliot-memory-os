@@ -13,6 +13,7 @@ pub mod budget;
 pub mod bundle;
 pub mod candidate;
 pub mod classification;
+pub mod concept;
 pub mod curation;
 pub mod draft;
 pub mod encoding;
@@ -43,6 +44,14 @@ pub use classification::{
     TaxonomyAlternative, TaxonomyCoverage, TaxonomyDenominator, classification_input_digest,
     preflight_classification_acceptance, seal_classification, validate_classification,
     validate_classification_acceptance,
+};
+pub use concept::{
+    ConceptApplicability, ConceptCandidate, ConceptCase, ConceptCaseKind, ConceptCoverage,
+    ConceptCriterion, ConceptCriterionRole, ConceptDependency, ConceptDiscriminator,
+    ConceptDisposition, ConceptEvidence, ConceptInput, ConceptMode, ConceptNeighborhood,
+    ConceptParameter, ConceptProposal, ConceptRollback, ConceptSnapshot, ConceptSourceDenominator,
+    ConceptSourceRef, ConceptSourceSet, ConceptVerifierRef, concept_input_digest,
+    concept_proposal_digest, seal_concept, validate_concept, validate_concept_acceptance,
 };
 pub use curation::{CURATION_WIRE_KINDS, CurationKind, CurationPayload, kind_family, parse_kind};
 pub use draft::{
