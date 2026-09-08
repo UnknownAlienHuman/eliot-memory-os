@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::bounds::{MAX_CANONICAL_BYTES, preflight_inputs};
 use crate::error::{
     CandidateRejectionReport, CandidateValidationOutcome, DreamDraftValidationError, RejectionCode,
-    ValidatedCandidate,
+    ValidatedCandidate, summarize_contract,
 };
 use crate::receipt::{
     InputPreimage, OutputContext, ReceiptContext, bundle_digest, input_digest_and_size,
@@ -98,22 +98,22 @@ impl ValidationPolicy {
     /// Validates policy shape and recomputes its canonical digest.
     pub fn validate(&self) -> Result<(), DreamDraftValidationError> {
         if self.schema_version != POLICY_SCHEMA_VERSION {
-            return Err(DreamDraftValidationError::InvalidContract {
-                phase: "validation policy",
-                error: ContractViolation::BindingMismatch {
+            return Err(summarize_contract(
+                "validation policy",
+                &ContractViolation::BindingMismatch {
                     field: "policy.schema_version",
                     reason: "unsupported policy schema version".to_owned(),
                 },
-            });
+            ));
         }
         if self.policy_id.trim().is_empty() || self.policy_id.len() > MAX_POLICY_ID {
-            return Err(DreamDraftValidationError::InvalidContract {
-                phase: "validation policy",
-                error: ContractViolation::BindingMismatch {
+            return Err(summarize_contract(
+                "validation policy",
+                &ContractViolation::BindingMismatch {
                     field: "policy.policy_id",
                     reason: "policy identity is blank or too long".to_owned(),
                 },
-            });
+            ));
         }
         if self.policy_revision == 0
             || self.max_canonical_bytes == 0
@@ -124,23 +124,23 @@ impl ValidationPolicy {
                 .bytes()
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         {
-            return Err(DreamDraftValidationError::InvalidContract {
-                phase: "validation policy",
-                error: ContractViolation::BindingMismatch {
+            return Err(summarize_contract(
+                "validation policy",
+                &ContractViolation::BindingMismatch {
                     field: "policy.identity_or_limit",
                     reason: "policy revision, digest or byte ceiling is invalid".to_owned(),
                 },
-            });
+            ));
         }
         let expected = eliot_dreamer_contracts::digest_hex(&canonical_policy_bytes(self)?);
         if expected != self.canonical_digest {
-            return Err(DreamDraftValidationError::InvalidContract {
-                phase: "validation policy",
-                error: ContractViolation::BindingMismatch {
+            return Err(summarize_contract(
+                "validation policy",
+                &ContractViolation::BindingMismatch {
                     field: "policy.canonical_digest",
                     reason: "policy digest does not match its receipt-excluded preimage".to_owned(),
                 },
-            });
+            ));
         }
         Ok(())
     }
@@ -173,7 +173,7 @@ fn invalid_contract(
     phase: &'static str,
     result: Result<(), ContractViolation>,
 ) -> Result<(), DreamDraftValidationError> {
-    result.map_err(|error| DreamDraftValidationError::InvalidContract { phase, error })
+    result.map_err(|error| summarize_contract(phase, &error))
 }
 
 /// Validates one supplied A-03 model/grounded pair before semantic handling.
@@ -298,10 +298,21 @@ fn validate_budget_deadline(
             "supplied source width is below the model's admitted source handles".to_owned(),
         ));
     }
-    if inputs.usage.reference_width < inputs.bundle.materials.len() as u64 {
+    let Some(reference_count) = inputs
+        .bundle
+        .materials
+        .len()
+        .checked_add(inputs.bundle.omissions.len())
+    else {
         return Some((
             RejectionCode::BudgetExceeded,
-            "supplied reference width is below the carried bundle materials".to_owned(),
+            "bundle reference count overflows the bounded counter".to_owned(),
+        ));
+    };
+    if inputs.usage.reference_width < reference_count as u64 {
+        return Some((
+            RejectionCode::BudgetExceeded,
+            "supplied reference width is below the carried bundle references".to_owned(),
         ));
     }
     if inputs.usage.candidates == 0 {
@@ -376,13 +387,13 @@ fn assemble_accepted(
     if validated.state_fence != inputs.job.state_fence
         || validated.receipt.state_fence != inputs.job.state_fence
     {
-        return Err(DreamDraftValidationError::InvalidContract {
-            phase: "validated output",
-            error: ContractViolation::BindingMismatch {
+        return Err(summarize_contract(
+            "validated output",
+            &ContractViolation::BindingMismatch {
                 field: "state_fence",
                 reason: "validated draft fence differs from frozen job fence".to_owned(),
             },
-        });
+        ));
     }
     let candidate = retained_candidate(inputs, validated);
     let outcome = CandidateValidationOutcome::Accepted(Box::new(candidate.clone()));

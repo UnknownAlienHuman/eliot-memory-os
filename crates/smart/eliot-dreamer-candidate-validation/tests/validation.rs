@@ -112,7 +112,7 @@ fn fixture() -> (
         input_bytes: MAX,
         output_bytes: MAX,
         source_width: 1,
-        reference_width: 1,
+        reference_width: 2,
         candidates: 1,
         report_bytes: MAX,
         ..BudgetUsage::default()

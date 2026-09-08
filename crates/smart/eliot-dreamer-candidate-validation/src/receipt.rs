@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::error::{
     CandidateRejectionReport, CandidateValidationOutcome, DreamDraftValidationError,
+    summarize_contract,
 };
 use crate::input::ValidationPolicy;
 
@@ -181,10 +182,7 @@ pub(crate) fn make_receipt(
     };
     validated
         .validate()
-        .map_err(|error| DreamDraftValidationError::InvalidContract {
-            phase: "validated output",
-            error,
-        })?;
+        .map_err(|error| summarize_contract("validated output", &error))?;
     Ok(validated)
 }
 

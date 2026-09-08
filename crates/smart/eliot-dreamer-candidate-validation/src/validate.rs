@@ -2,7 +2,7 @@
 
 use eliot_dreamer_contracts::PreservationReport;
 
-use crate::error::DreamDraftValidationError;
+use crate::error::{DreamDraftValidationError, summarize_contract};
 
 /// Checks the complete seven-dimension preservation contract.
 pub(crate) fn validate_preservation(
@@ -10,8 +10,5 @@ pub(crate) fn validate_preservation(
 ) -> Result<(), DreamDraftValidationError> {
     preservation
         .overall()
-        .map_err(|error| DreamDraftValidationError::InvalidContract {
-            phase: "preservation",
-            error,
-        })
+        .map_err(|error| summarize_contract("preservation", &error))
 }

@@ -120,11 +120,38 @@ pub enum DreamDraftValidationError {
         detail: String,
     },
     /// An A-03 value was not structurally valid enough to preserve safely.
-    #[error("invalid {phase} contract: {error}")]
+    ///
+    /// The canonical error's caller-controlled reason is deliberately
+    /// redacted; exact supplied values remain available only in bounded
+    /// rejection reports after the report itself passes size checks.
+    #[error("invalid {phase} contract at {field}")]
     InvalidContract {
         /// Validation phase.
         phase: &'static str,
-        /// Canonical A-03 diagnostic.
-        error: eliot_dreamer_contracts::ContractViolation,
+        /// Stable field or dimension identifier.
+        field: &'static str,
     },
+}
+
+pub(crate) fn summarize_contract(
+    phase: &'static str,
+    error: &eliot_dreamer_contracts::ContractViolation,
+) -> DreamDraftValidationError {
+    use eliot_dreamer_contracts::ContractViolation;
+    let field = match error {
+        ContractViolation::UnknownVariant { field, .. }
+        | ContractViolation::MissingField(field)
+        | ContractViolation::ImplicitDefault(field)
+        | ContractViolation::OutOfBounds { field, .. }
+        | ContractViolation::BindingMismatch { field, .. }
+        | ContractViolation::Malformed { field, .. } => *field,
+        ContractViolation::Budget { dimension, .. } => *dimension,
+        ContractViolation::CrossStage(_)
+        | ContractViolation::KindPayload(_)
+        | ContractViolation::Registry(_)
+        | ContractViolation::ScreenIneligible(_)
+        | ContractViolation::Preservation(_)
+        | ContractViolation::ForbiddenCarry(_) => "contract",
+    };
+    DreamDraftValidationError::InvalidContract { phase, field }
 }
