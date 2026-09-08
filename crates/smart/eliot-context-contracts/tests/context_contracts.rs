@@ -267,6 +267,15 @@ fn whole_unit_and_loss_policy_are_closed_and_coherent() {
     assert_eq!(encoded, "\"NON_DROPPABLE\"");
     assert!(serde_json::from_str::<LossPolicy>("\"OTHER\"").is_err());
 
+    let retained_role =
+        serde_json::to_string(&SemanticRole::Constraint).expect("role wire encoding");
+    assert_eq!(retained_role, "\"CONSTRAINT\"");
+    assert!(serde_json::from_str::<SemanticRole>("\"DECISION_TAIL\"").is_err());
+    let role_schema =
+        serde_json::to_string(&schemars::schema_for!(SemanticRole)).expect("role schema encoding");
+    assert!(role_schema.contains("CONSTRAINT"));
+    assert!(!role_schema.contains("DECISION_TAIL"));
+
     let incompatible_rule = RoleLossRule {
         role: SemanticRole::Goal,
         loss_policy: LossPolicy::NonDroppable,
