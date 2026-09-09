@@ -204,11 +204,12 @@ impl CoverageEvidence {
                 });
             }
             if self.source.artifact_id.as_ref().is_none_or(|artifact_id| {
-                !receipt
-                    .core
-                    .artifacts
-                    .iter()
-                    .any(|artifact| &artifact.artifact_id == artifact_id)
+                !receipt.core.artifacts.iter().any(|artifact| {
+                    &artifact.artifact_id == artifact_id
+                        && artifact.sha256 == self.source.content_sha256
+                        && artifact.source_revision.as_deref()
+                            == Some(self.source.source_revision.as_str())
+                })
             }) {
                 return Err(ReactiveInputError::BindingMismatch {
                     field: "coverage.receipt_source_binding",
