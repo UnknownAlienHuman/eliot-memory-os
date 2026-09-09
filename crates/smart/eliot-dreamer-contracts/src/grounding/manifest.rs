@@ -42,6 +42,7 @@ impl AuthorizedReference {
     pub fn preflight_bytes(&self) -> Result<usize, ContractViolation> {
         crate::grounding::encoding::preflight(self)
     }
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ContractViolation> {
         if let Some(lineage) = &self.source_lineage {
             lineage

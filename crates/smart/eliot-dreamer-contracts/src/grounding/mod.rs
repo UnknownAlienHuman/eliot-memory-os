@@ -728,6 +728,7 @@ fn validate_grounded_records(self_: &GroundedDreamDraft) -> Result<(), ContractV
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_grounded_record(
     self_: &GroundedDreamDraft,
     claim: &MaterialClaim,
