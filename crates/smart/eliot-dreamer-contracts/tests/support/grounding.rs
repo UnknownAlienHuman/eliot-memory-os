@@ -2,7 +2,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{ArtifactId, AuthorityEpoch, ResourceGeneration, StateFence, TaskId};
+use eliot_dreamer_contracts::grounding::canonical::{
+    ArtifactId, AuthorityEpoch, EvidenceAuthority, EvidenceFreshness, EvidenceGrade,
+    GradeAssignment, PositionAssertability, PrivacyHandling, ResourceGeneration, StateFence,
+    TaskId, ValidityBounds,
+};
 use eliot_dreamer_contracts::grounding::{
     AllowedReferenceManifest, AssertionWitness, AttemptIdentity, ClaimGroundingLedger,
     ClaimGroundingRecord, ClaimKind, GroundingDisposition, GroundingPolicy, MaterialClaim,
@@ -191,14 +195,13 @@ pub fn manifest() -> AllowedReferenceManifest {
                 content_digest: DIGEST.into(),
                 source_revision: "revision-1".into(),
                 authority_digest: DIGEST.into(),
-                authority: eliot_evidence::EvidenceAuthority::SourceIdentity,
-                freshness: eliot_evidence::EvidenceFreshness::ExactCommit,
+                authority: EvidenceAuthority::SourceIdentity,
+                freshness: EvidenceFreshness::ExactCommit,
                 source_assurance: None,
-                grade_ceiling: eliot_epistemic_contracts::EvidenceGrade::Grounded,
-                assertability_ceiling:
-                    eliot_epistemic_contracts::PositionAssertability::QualifiedInference,
-                privacy: eliot_epistemic_contracts::PrivacyHandling::Unrestricted,
-                disclosure: eliot_epistemic_contracts::DisclosureClass::Open,
+                grade_ceiling: EvidenceGrade::Grounded,
+                assertability_ceiling: PositionAssertability::QualifiedInference,
+                privacy: PrivacyHandling::Unrestricted,
+                disclosure: eliot_dreamer_contracts::grounding::canonical::DisclosureClass::Open,
                 origin: "grounding-fixture".into(),
                 invalidated: false,
                 revocation_reason: None,
@@ -231,30 +234,30 @@ pub fn manifest() -> AllowedReferenceManifest {
                         uncertainty: Some("exact".into()),
                     },
                     source_span_digest: DIGEST.into(),
-                    support: Some(Box::new(eliot_epistemic_contracts::SupportRecord {
-                        proposition: eliot_dreamer_contracts::grounding::PropositionId::new(
-                            "proposition-claim-1",
-                        )
-                        .expect("proposition"),
-                        result: GroundingDisposition::Supported,
-                        handles: BTreeSet::from([artifact("evidence-1")]),
-                        validity: eliot_epistemic_contracts::ValidityBounds {
-                            scope: "scope-1".into(),
-                            window_start_ms: None,
-                            window_end_ms: None,
-                            version: "revision-1".into(),
-                            precision: "file".into(),
+                    support: Some(Box::new(
+                        eliot_dreamer_contracts::grounding::canonical::SupportRecord {
+                            proposition: eliot_dreamer_contracts::grounding::PropositionId::new(
+                                "proposition-claim-1",
+                            )
+                            .expect("proposition"),
+                            result: GroundingDisposition::Supported,
+                            handles: BTreeSet::from([artifact("evidence-1")]),
+                            validity: ValidityBounds {
+                                scope: "scope-1".into(),
+                                window_start_ms: None,
+                                window_end_ms: None,
+                                version: "revision-1".into(),
+                                precision: "file".into(),
+                            },
+                            grade: GradeAssignment::known(EvidenceGrade::Grounded),
+                            task_id: task(),
+                            fence: fence(),
+                            temporal: None,
+                            assurance: None,
+                            reopen_reason: None,
+                            proof_digest: DIGEST.into(),
                         },
-                        grade: eliot_epistemic_contracts::GradeAssignment::known(
-                            eliot_epistemic_contracts::EvidenceGrade::Grounded,
-                        ),
-                        task_id: task(),
-                        fence: fence(),
-                        temporal: None,
-                        assurance: None,
-                        reopen_reason: None,
-                        proof_digest: DIGEST.into(),
-                    })),
+                    )),
                 }],
                 stale: false,
             },
@@ -350,8 +353,8 @@ pub fn ledger() -> ClaimGroundingLedger {
         component_outcomes: BTreeMap::from([("value".into(), GroundingDisposition::Supported)]),
         disposition: GroundingDisposition::Supported,
         grade: None,
-        grade_ceiling: eliot_epistemic_contracts::EvidenceGrade::Grounded,
-        assertability_ceiling: eliot_epistemic_contracts::PositionAssertability::QualifiedInference,
+        grade_ceiling: EvidenceGrade::Grounded,
+        assertability_ceiling: PositionAssertability::QualifiedInference,
         coverage_denominator_ids: BTreeSet::new(),
         dependence_groups: BTreeSet::from(["independent-1".into()]),
         unknowns: BTreeSet::new(),

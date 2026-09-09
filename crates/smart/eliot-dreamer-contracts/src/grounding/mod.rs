@@ -29,6 +29,32 @@ pub use eliot_epistemic_contracts::{
     ProvenanceClosure, SourceAssurance, SourceLineage, SupportRecord, SupportResult,
     TemporalRecord,
 };
+
+/// Canonical lower-owner vocabulary and constructors for A03-only consumers.
+///
+/// These are direct reexports of the existing foundation, evidence, and
+/// epistemic contracts used by the retained grounding shapes. This namespace
+/// adds no wire fields or variants and keeps consumers from bypassing A03 with
+/// lower-owner dependencies.
+pub mod canonical {
+    pub use eliot_contracts::{
+        ArtifactId, AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, SourceId, StateFence,
+        TaskId, canonical_json_bytes, sha256_hex,
+    };
+    pub use eliot_epistemic_contracts::{
+        AbsenceClaim, AbsenceClaimParams, BoundedProof, CausalClaim, CausalClaimParams,
+        CausalStatus, CoverageDenominator, CoverageDenominatorParams, CoverageReceipt,
+        CoverageReceiptParams, DenominatorKind, DisclosureClass, EvidenceGrade, ExclusionReason,
+        ExclusionRecord, FrontierRevision, FrontierSpec, GradeAssignment, LineageRootId,
+        MemberDisposition, MemberOutcome, OmittedMember, OwnerLookup, PaginationBounds,
+        PositionAssertability, Precision, PrivacyHandling, PropositionId, ProvenanceClosure,
+        ProvenanceClosureKind, ProvenanceClosureParams, QueryRevision, QuerySpec, SnapshotRef,
+        SourceAssurance, SourceLineage, SourceRevisionId, SupportRecord, SupportRecordParams,
+        SupportResult, TemporalRecord, ValidityBounds,
+    };
+    pub use eliot_evidence::{Assertability, EvidenceAuthority, EvidenceFreshness};
+}
+
 pub use ledger::{
     AssertionWitness, ClaimGroundingLedger, ClaimGroundingRecord, GroundingDisposition,
 };
