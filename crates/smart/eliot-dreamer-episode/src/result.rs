@@ -11,9 +11,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::input::{
     EpisodeOutcome, EpisodeParticipant, ExistingEpisodeSnapshot, GroundedEvent, MAX_EVENTS,
-    MAX_LINKS, MAX_OUTCOMES, MAX_PARTICIPANTS, MAX_TEXT,
+    MAX_LINKS, MAX_OUTCOMES, MAX_PARTICIPANTS, MAX_SERIALIZED_INPUT, MAX_TEXT,
+    capped_serialized_len,
 };
 use eliot_dreamer_contracts::ContractViolation;
+use eliot_epistemic_contracts::{CoverageDenominator, CoverageReceipt};
+use std::collections::BTreeSet;
 
 /// Episode-specific status retained alongside the common disposition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -46,8 +49,8 @@ pub enum ChronologyRelation {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChronologyLink {
-    pub before_event_id: String,
-    pub after_event_id: String,
+    pub left_event_id: String,
+    pub right_event_id: String,
     pub relation: ChronologyRelation,
     pub support: Vec<crate::input::EvidenceBinding>,
 }
@@ -123,6 +126,10 @@ pub struct EpisodeCandidate {
     pub policy_digest: String,
     pub handler_id: String,
     pub handler_request_digest: String,
+    pub admission_item_digest: String,
+    pub admission_receipt_digest: String,
+    pub screen_coverage_digest: String,
+    pub whole_input_digest: String,
     pub kind: CurationKind,
     pub family: CurationFamily,
     pub episode: String,
@@ -138,6 +145,8 @@ pub struct EpisodeCandidate {
     pub rollback: EpisodeRollback,
     pub preservation: PreservationReport,
     pub source: SourceSnapshot,
+    pub event_denominator: CoverageDenominator,
+    pub event_receipt: CoverageReceipt,
     pub existing: ExistingEpisodeSnapshot,
     pub handler_result: TypedCurationHandlerResult,
     pub result_digest: String,
@@ -160,6 +169,19 @@ impl EpisodeCandidate {
                 &self.handler_request_digest,
                 "candidate.handler_request_digest",
             ),
+            (
+                &self.admission_item_digest,
+                "candidate.admission_item_digest",
+            ),
+            (
+                &self.admission_receipt_digest,
+                "candidate.admission_receipt_digest",
+            ),
+            (
+                &self.screen_coverage_digest,
+                "candidate.screen_coverage_digest",
+            ),
+            (&self.whole_input_digest, "candidate.whole_input_digest"),
             (&self.episode, "candidate.episode"),
         ] {
             eliot_dreamer_contracts::error::check_text(value, field, MAX_TEXT)?;
@@ -196,19 +218,18 @@ impl EpisodeCandidate {
         }
         self.validate_records()?;
         self.validate_rollback()?;
-        self.source
-            .validate()
-            .map_err(|error| ContractViolation::BindingMismatch {
-                field: "candidate.source",
-                reason: error.to_string(),
-            })?;
+        self.validate_bindings()?;
         self.existing.validate()?;
         self.preservation.validate()?;
         if self.disposition == CandidateDisposition::Candidate {
             self.preservation.overall()?;
         }
         self.handler_result.validate()?;
-        if self.handler_result.handler_id != self.handler_id
+        if self.handler_result.request_id != self.request_id
+            || self.handler_result.kind != self.kind
+            || self.handler_result.family != self.family
+            || self.handler_result.disposition != self.disposition
+            || self.handler_result.handler_id != self.handler_id
             || self.handler_result.request_digest != self.handler_request_digest
             || self.handler_result.result_digest != self.result_digest
         {
@@ -221,6 +242,94 @@ impl EpisodeCandidate {
             return Err(ContractViolation::BindingMismatch {
                 field: "candidate.result_digest",
                 reason: "candidate digest drift".to_owned(),
+            });
+        }
+        if self.candidate_id != self.computed_identity()? {
+            return Err(ContractViolation::BindingMismatch {
+                field: "candidate.id",
+                reason: "candidate identity does not cover retained bindings".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_bindings(&self) -> Result<(), ContractViolation> {
+        self.source
+            .validate()
+            .map_err(|error| ContractViolation::BindingMismatch {
+                field: "candidate.source",
+                reason: error.to_string(),
+            })?;
+        self.event_denominator
+            .validate()
+            .map_err(|error| ContractViolation::BindingMismatch {
+                field: "candidate.event_denominator",
+                reason: error.to_string(),
+            })?;
+        self.event_receipt
+            .validate()
+            .map_err(|error| ContractViolation::BindingMismatch {
+                field: "candidate.event_receipt",
+                reason: error.to_string(),
+            })?;
+        if self.event_receipt.denominator != self.event_denominator.digest
+            || self.event_receipt.denominator_size != self.event_denominator.members.len() as u64
+            || self.coverage.event_denominator_size != self.event_denominator.members.len() as u64
+            || self.coverage.observed_events != self.events.len() as u64
+            || !eliot_dreamer_contracts::is_hex64_lower(&self.admission_item_digest)
+            || !eliot_dreamer_contracts::is_hex64_lower(&self.admission_receipt_digest)
+            || !eliot_dreamer_contracts::is_hex64_lower(&self.screen_coverage_digest)
+            || !eliot_dreamer_contracts::is_hex64_lower(&self.whole_input_digest)
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "candidate.coverage_binding",
+                reason: "retained admission or event coverage identity drift".to_owned(),
+            });
+        }
+        if self.state_fence != self.source.identity.state_fence
+            || self.state_fence != self.existing.state_fence
+            || self.rollback.source_fence != self.state_fence
+            || self.rollback.episode_id != self.episode
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "candidate.fence_closure",
+                reason: "candidate closure does not retain one fence and episode".to_owned(),
+            });
+        }
+        let event_ids: BTreeSet<_> = self
+            .events
+            .iter()
+            .map(|event| event.core.event_id_and_time.event_id.clone())
+            .collect();
+        let rollback_event_ids: BTreeSet<_> =
+            self.rollback.retained_event_ids.iter().cloned().collect();
+        let source_ids: BTreeSet<_> = self
+            .events
+            .iter()
+            .map(|event| event.source_member_id.as_str().to_owned())
+            .collect();
+        let rollback_source_ids: BTreeSet<_> = self
+            .rollback
+            .retained_source_member_ids
+            .iter()
+            .cloned()
+            .collect();
+        if event_ids != rollback_event_ids || source_ids != rollback_source_ids {
+            return Err(ContractViolation::BindingMismatch {
+                field: "candidate.rollback.closure",
+                reason: "rollback IDs differ from retained event closure".to_owned(),
+            });
+        }
+        if !event_ids.contains(&self.boundary.start_event_id)
+            || self
+                .boundary
+                .end_event_id
+                .as_ref()
+                .is_some_and(|id| !event_ids.contains(id))
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "candidate.boundary",
+                reason: "boundary names an absent retained event".to_owned(),
             });
         }
         Ok(())
@@ -243,17 +352,17 @@ impl EpisodeCandidate {
             .collect();
         for link in &self.chronology {
             eliot_dreamer_contracts::error::check_text(
-                &link.before_event_id,
+                &link.left_event_id,
                 "candidate.chronology.before",
                 MAX_TEXT,
             )?;
             eliot_dreamer_contracts::error::check_text(
-                &link.after_event_id,
+                &link.right_event_id,
                 "candidate.chronology.after",
                 MAX_TEXT,
             )?;
-            if !event_ids.contains(link.before_event_id.as_str())
-                || !event_ids.contains(link.after_event_id.as_str())
+            if !event_ids.contains(link.left_event_id.as_str())
+                || !event_ids.contains(link.right_event_id.as_str())
             {
                 return Err(ContractViolation::BindingMismatch {
                     field: "candidate.chronology",
@@ -307,6 +416,10 @@ impl EpisodeCandidate {
             policy_digest: &self.policy_digest,
             handler_id: &self.handler_id,
             handler_request_digest: &self.handler_request_digest,
+            admission_item_digest: &self.admission_item_digest,
+            admission_receipt_digest: &self.admission_receipt_digest,
+            screen_coverage_digest: &self.screen_coverage_digest,
+            whole_input_digest: &self.whole_input_digest,
             kind: self.kind,
             family: self.family,
             episode: &self.episode,
@@ -322,8 +435,42 @@ impl EpisodeCandidate {
             rollback: &self.rollback,
             preservation: &self.preservation,
             source: &self.source,
+            event_denominator: &self.event_denominator,
+            event_receipt: &self.event_receipt,
             existing: &self.existing,
         };
+        capped_serialized_len(&preimage, MAX_SERIALIZED_INPUT).map_err(|reason| {
+            ContractViolation::Budget {
+                dimension: "episode.result_bytes",
+                reason,
+            }
+        })?;
+        Ok(digest_hex(&canonical_bytes(&preimage)?))
+    }
+
+    pub(crate) fn computed_identity(&self) -> Result<String, ContractViolation> {
+        let preimage = CandidateIdentityPreimage {
+            request_id: &self.request_id,
+            receipt_id: &self.receipt_id,
+            job_id: &self.job_id,
+            task_id: &self.task_id,
+            scope_id: &self.scope_id,
+            policy_id: &self.policy_id,
+            policy_digest: &self.policy_digest,
+            episode: &self.episode,
+            events: &self.events,
+            source: &self.source.identity,
+            event_denominator: &self.event_denominator,
+            event_receipt: &self.event_receipt,
+            existing: &self.existing,
+            whole_input_digest: &self.whole_input_digest,
+        };
+        capped_serialized_len(&preimage, MAX_SERIALIZED_INPUT).map_err(|reason| {
+            ContractViolation::Budget {
+                dimension: "episode.identity_bytes",
+                reason,
+            }
+        })?;
         Ok(digest_hex(&canonical_bytes(&preimage)?))
     }
 }
@@ -341,6 +488,10 @@ struct CandidatePreimage<'a> {
     policy_digest: &'a str,
     handler_id: &'a str,
     handler_request_digest: &'a str,
+    admission_item_digest: &'a str,
+    admission_receipt_digest: &'a str,
+    screen_coverage_digest: &'a str,
+    whole_input_digest: &'a str,
     kind: CurationKind,
     family: CurationFamily,
     episode: &'a str,
@@ -356,5 +507,25 @@ struct CandidatePreimage<'a> {
     rollback: &'a EpisodeRollback,
     preservation: &'a PreservationReport,
     source: &'a SourceSnapshot,
+    event_denominator: &'a CoverageDenominator,
+    event_receipt: &'a CoverageReceipt,
     existing: &'a ExistingEpisodeSnapshot,
+}
+
+#[derive(Serialize)]
+struct CandidateIdentityPreimage<'a> {
+    request_id: &'a str,
+    receipt_id: &'a str,
+    job_id: &'a str,
+    task_id: &'a str,
+    scope_id: &'a str,
+    policy_id: &'a str,
+    policy_digest: &'a str,
+    episode: &'a str,
+    events: &'a [GroundedEvent],
+    source: &'a eliot_memory_curation_contracts::SourceIdentity,
+    event_denominator: &'a CoverageDenominator,
+    event_receipt: &'a CoverageReceipt,
+    existing: &'a ExistingEpisodeSnapshot,
+    whole_input_digest: &'a str,
 }

@@ -122,6 +122,7 @@ fn core(event_id: &str, valid_time_ms: Option<i64>) -> ObservationEventCore {
 fn temporal(
     valid_time_ms: Option<i64>,
     clock_ref: &str,
+    uncertainty_ms: u64,
 ) -> eliot_dreamer_contracts::RelationTemporalEvidence {
     let point = valid_time_ms.map(|value| eliot_dreamer_contracts::RelationTimePoint {
         reading: ClockReading {
@@ -131,7 +132,7 @@ fn temporal(
             monotonic_ns: None,
         },
         clock_ref: clock_ref.to_owned(),
-        uncertainty_ms: 0,
+        uncertainty_ms,
         conversion_ref: None,
     });
     eliot_dreamer_contracts::RelationTemporalEvidence {
@@ -302,14 +303,19 @@ fn enumeration(denominator: &CoverageDenominator) -> CoverageReceipt {
     .expect("enumeration")
 }
 
-fn event(event_id: &str, value: Option<i64>, clock_ref: &str) -> GroundedEvent {
+fn event_with_uncertainty(
+    event_id: &str,
+    value: Option<i64>,
+    clock_ref: &str,
+    uncertainty_ms: u64,
+) -> GroundedEvent {
     GroundedEvent {
         core: core(event_id, value),
         source_member_id: member(event_id),
         source_revision: TaskRevision::new(1).expect("revision"),
         source_content_digest: digest_value(event_id),
         event_binding: binding("event", event_id, event_id),
-        temporal: temporal(value, clock_ref),
+        temporal: temporal(value, clock_ref, uncertainty_ms),
         temporal_binding: value
             .map(|_| binding("temporal", event_id, &format!("{event_id}-temporal"))),
         participants: vec![EpisodeParticipant {
@@ -362,11 +368,11 @@ fn job() -> DreamJobInput {
 
 #[allow(clippy::too_many_lines)]
 pub fn fixture() -> Fixture {
-    fixture_with_modes(false, false)
+    fixture_with_modes(false, false, false)
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn fixture_with_modes(unknown_start: bool, cross_domain: bool) -> Fixture {
+pub fn fixture_with_modes(unknown_start: bool, cross_domain: bool, near_overlap: bool) -> Fixture {
     let source = source_snapshot();
     let source_ref = Box::leak(Box::new(source.clone()));
     let coverage_ref = Box::leak(Box::new(coverage(source_ref)));
@@ -379,11 +385,17 @@ pub fn fixture_with_modes(unknown_start: bool, cross_domain: bool) -> Fixture {
             declared_member_ids: vec![member("event-start"), member("event-end")],
         },
         events: vec![
-            event("event-start", (!unknown_start).then_some(100), "clock-1"),
-            event(
+            event_with_uncertainty(
+                "event-start",
+                (!unknown_start).then_some(100),
+                "clock-1",
+                if near_overlap { 10 } else { 0 },
+            ),
+            event_with_uncertainty(
                 "event-end",
-                Some(200),
+                Some(if near_overlap { 105 } else { 200 }),
                 if cross_domain { "clock-2" } else { "clock-1" },
+                if near_overlap { 10 } else { 0 },
             ),
         ],
     };

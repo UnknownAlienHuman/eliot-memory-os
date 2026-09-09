@@ -1,31 +1,26 @@
 //! Pure Episode reconstruction phases.
 
-use std::collections::BTreeSet;
-use std::io::{self, Write};
-
 use crate::input::{
     BoundaryRule, EpisodePolicy, EventAndSourceSnapshot, ExistingEpisodeSnapshot, GroundedEvent,
-    GroundedEventSet, ValidatedCurationInput, event_time_point,
+    GroundedEventSet, MAX_SERIALIZED_INPUT, ValidatedCurationInput, capped_serialized_len,
+    event_time_point,
 };
 use crate::result::{
     ChronologyLink, ChronologyRelation, EpisodeBoundary, EpisodeCandidate, EpisodeCoverage,
     EpisodeGap, EpisodeRollback, EpisodeStatus, OverlapAssessment, OverlapDisposition,
 };
-use eliot_contracts::sha256_hex;
 use eliot_dreamer_contracts::candidate::DimensionVerdict;
 use eliot_dreamer_contracts::{
     CandidateDisposition, ContractViolation, CurationFamily, CurationKind, PreservationDimension,
-    TypedCurationHandlerResult, canonical_bytes, digest_hex,
+    TypedCurationHandlerResult, ValidatedCurationItem, canonical_bytes, digest_hex,
 };
 use eliot_epistemic_contracts::MemberDisposition as ReceiptDisposition;
 use eliot_memory_curation_contracts::MemberDisposition;
-use eliot_memory_curation_contracts::SourceAvailability;
+use eliot_memory_curation_contracts::{SourceAvailability, SourceMemberKind};
 use serde::Serialize;
-
-const MAX_SERIALIZED_INPUT: usize = 16 * 1024 * 1024;
+use std::collections::BTreeSet;
 
 /// Reconstructs one inert Episode candidate from five validated, immutable inputs.
-#[allow(clippy::too_many_lines)]
 pub fn reconstruct_episode_candidate(
     validated_curation_input: &ValidatedCurationInput<'_>,
     grounded_event_set: &GroundedEventSet,
@@ -33,7 +28,13 @@ pub fn reconstruct_episode_candidate(
     existing_episode_snapshot: &ExistingEpisodeSnapshot,
     episode_policy: &EpisodePolicy,
 ) -> Result<EpisodeCandidate, ContractViolation> {
-    admission_phase(validated_curation_input)?;
+    whole_input_preflight(
+        validated_curation_input,
+        grounded_event_set,
+        event_and_source_snapshot,
+        existing_episode_snapshot,
+        episode_policy,
+    )?;
     capacity_preflight(
         grounded_event_set,
         event_and_source_snapshot,
@@ -41,6 +42,7 @@ pub fn reconstruct_episode_candidate(
         episode_policy,
         validated_curation_input,
     )?;
+    admission_phase(validated_curation_input)?;
     policy_phase(validated_curation_input, episode_policy)?;
     source_phase(
         validated_curation_input,
@@ -61,6 +63,23 @@ pub fn reconstruct_episode_candidate(
             reason: "existing Episode identity differs from admitted payload".to_owned(),
         });
     }
+    let target_member = event_and_source_snapshot
+        .source
+        .members
+        .iter()
+        .find(|member| member.member_id.as_str() == episode)
+        .ok_or(ContractViolation::BindingMismatch {
+            field: "episode.target_member",
+            reason: "admitted Episode target is absent from the source snapshot".to_owned(),
+        })?;
+    if existing_episode_snapshot.revision != target_member.revision
+        || existing_episode_snapshot.content_digest != target_member.content_digest
+    {
+        return Err(ContractViolation::BindingMismatch {
+            field: "existing.target_binding",
+            reason: "prior Episode is not bound to the admitted changed target revision".to_owned(),
+        });
+    }
     grounded_event_set.validate()?;
     if grounded_event_set.events.len() > episode_policy.max_events {
         return Err(ContractViolation::Budget {
@@ -68,27 +87,68 @@ pub fn reconstruct_episode_candidate(
             reason: "event count exceeds policy".to_owned(),
         });
     }
-
-    let event_index = join_events(
+    planned_output_preflight(
         grounded_event_set,
         event_and_source_snapshot,
+        existing_episode_snapshot,
+        episode_policy,
+    )?;
+
+    let semantic = semantic_phase(
+        grounded_event_set,
+        event_and_source_snapshot,
+        existing_episode_snapshot,
+        episode_policy,
         validated_curation_input,
     )?;
-    let boundary = boundary_phase(&event_index, episode_policy)?;
-    let chronology = chronology_phase(&event_index)?;
-    let overlap = overlap_phase(&event_index, existing_episode_snapshot, episode_policy)?;
-    let gaps = coverage_gaps(grounded_event_set, event_and_source_snapshot);
-    if gaps.len() > episode_policy.max_gaps {
+    finalize_candidate(
+        validated_curation_input,
+        grounded_event_set,
+        event_and_source_snapshot,
+        existing_episode_snapshot,
+        episode_policy,
+        episode,
+        semantic,
+    )
+}
+
+struct SemanticAssembly {
+    events: Vec<GroundedEvent>,
+    boundary: EpisodeBoundary,
+    chronology: Vec<ChronologyLink>,
+    overlap: OverlapAssessment,
+    participants: Vec<crate::input::EpisodeParticipant>,
+    outcomes: Vec<crate::input::EpisodeOutcome>,
+    coverage: EpisodeCoverage,
+    preservation: eliot_dreamer_contracts::PreservationReport,
+    disposition: CandidateDisposition,
+    status: EpisodeStatus,
+    rollback: EpisodeRollback,
+}
+
+fn semantic_phase(
+    grounded_event_set: &GroundedEventSet,
+    source_snapshot: &EventAndSourceSnapshot,
+    existing: &ExistingEpisodeSnapshot,
+    policy: &EpisodePolicy,
+    input: &ValidatedCurationInput<'_>,
+) -> Result<SemanticAssembly, ContractViolation> {
+    let events = join_events(grounded_event_set, source_snapshot, input)?;
+    let boundary = boundary_phase(&events, policy)?;
+    let chronology = chronology_phase(&events)?;
+    let overlap = overlap_phase(&events, existing, &boundary, policy)?;
+    let gaps = coverage_gaps(grounded_event_set, source_snapshot);
+    if gaps.len() > policy.max_gaps {
         return Err(ContractViolation::Budget {
             dimension: "episode.gaps",
             reason: "gap count exceeds policy".to_owned(),
         });
     }
-    let participants = event_index
+    let participants = events
         .iter()
         .flat_map(|event| event.participants.iter().cloned())
         .collect::<Vec<_>>();
-    let outcomes = event_index
+    let outcomes = events
         .iter()
         .flat_map(|event| event.outcomes.iter().cloned())
         .collect::<Vec<_>>();
@@ -96,93 +156,231 @@ pub fn reconstruct_episode_candidate(
         event_denominator_size: grounded_event_set.denominator.total_members,
         observed_events: grounded_event_set.events.len() as u64,
         gaps,
-        source_availability: event_and_source_snapshot.source.availability,
+        source_availability: source_snapshot.source.availability,
     };
     let preservation = preservation_phase(
         &coverage,
         &chronology,
         &overlap,
-        &event_index,
-        &event_and_source_snapshot.source,
-        existing_episode_snapshot,
+        &events,
+        &source_snapshot.source,
+        existing,
+        admission_closure(input),
     );
     let disposition = disposition_for(&coverage, &chronology, &overlap, &preservation);
     let status = status_for(&coverage, &chronology, &overlap, &boundary);
     let rollback = EpisodeRollback {
-        source_fence: event_and_source_snapshot
-            .source
-            .identity
-            .state_fence
-            .clone(),
-        episode_id: episode.clone(),
-        retained_event_ids: event_index
+        source_fence: source_snapshot.source.identity.state_fence.clone(),
+        episode_id: existing.episode_id.clone(),
+        retained_event_ids: events
             .iter()
             .map(|event| event.core.event_id_and_time.event_id.clone())
             .collect(),
-        retained_source_member_ids: event_index
+        retained_source_member_ids: events
             .iter()
             .map(|event| event.source_member_id.as_str().to_owned())
             .collect(),
         note: "drop this candidate and retain the immutable source closure".to_owned(),
     };
+    Ok(SemanticAssembly {
+        events,
+        boundary,
+        chronology,
+        overlap,
+        participants,
+        outcomes,
+        coverage,
+        preservation,
+        disposition,
+        status,
+        rollback,
+    })
+}
+
+fn admission_phase(input: &ValidatedCurationInput<'_>) -> Result<(), ContractViolation> {
+    input.accept()
+}
+
+fn finalize_candidate(
+    input: &ValidatedCurationInput<'_>,
+    grounded_event_set: &GroundedEventSet,
+    source_snapshot: &EventAndSourceSnapshot,
+    existing: &ExistingEpisodeSnapshot,
+    policy: &EpisodePolicy,
+    episode: String,
+    semantic: SemanticAssembly,
+) -> Result<EpisodeCandidate, ContractViolation> {
+    let admission_item_digest = input.item.item_digest(input.ctx.grounded)?;
+    let admission_receipt_digest = digest_hex(&canonical_bytes(input.ctx.receipt)?);
+    let whole_input_digest =
+        whole_input_digest(input, grounded_event_set, source_snapshot, existing, policy)?;
+    let handler_request_digest = digest_hex(&canonical_bytes(input.ctx.request)?);
+    let handler_result = TypedCurationHandlerResult {
+        request_id: input.ctx.request.request_id.clone(),
+        kind: CurationKind::Episode,
+        family: CurationFamily::Episode,
+        disposition: semantic.disposition,
+        handler_id: "eliot-dreamer-episode".to_owned(),
+        request_digest: handler_request_digest.clone(),
+        result_digest: "0".repeat(64),
+    };
     let mut candidate = EpisodeCandidate {
         candidate_id: String::new(),
-        request_id: validated_curation_input.ctx.request.request_id.clone(),
-        receipt_id: validated_curation_input.ctx.request.receipt_id.clone(),
-        job_id: validated_curation_input.ctx.job.canonical_id(),
-        task_id: validated_curation_input.ctx.job.task_id.clone(),
-        scope_id: validated_curation_input.ctx.job.scope_id.clone(),
-        state_fence: episode_policy.state_fence.clone(),
-        policy_id: episode_policy.policy_id.clone(),
-        policy_digest: episode_policy.policy_digest.clone(),
+        request_id: input.ctx.request.request_id.clone(),
+        receipt_id: input.ctx.request.receipt_id.clone(),
+        job_id: input.ctx.job.canonical_id(),
+        task_id: input.ctx.job.task_id.clone(),
+        scope_id: input.ctx.job.scope_id.clone(),
+        state_fence: policy.state_fence.clone(),
+        policy_id: policy.policy_id.clone(),
+        policy_digest: policy.policy_digest.clone(),
         handler_id: "eliot-dreamer-episode".to_owned(),
-        handler_request_digest: digest_hex(&canonical_bytes(validated_curation_input.ctx.request)?),
+        handler_request_digest,
+        admission_item_digest,
+        admission_receipt_digest,
+        screen_coverage_digest: source_snapshot.coverage.digest.to_string(),
+        whole_input_digest,
         kind: CurationKind::Episode,
         family: CurationFamily::Episode,
         episode,
-        status,
-        disposition,
-        boundary,
-        events: event_index,
-        participants,
-        outcomes,
-        chronology,
-        coverage,
-        overlap,
-        rollback,
-        preservation,
-        source: event_and_source_snapshot.source.clone(),
-        existing: existing_episode_snapshot.clone(),
-        handler_result: TypedCurationHandlerResult {
-            request_id: validated_curation_input.ctx.request.request_id.clone(),
-            kind: CurationKind::Episode,
-            family: CurationFamily::Episode,
-            disposition,
-            handler_id: "eliot-dreamer-episode".to_owned(),
-            request_digest: digest_hex(&canonical_bytes(validated_curation_input.ctx.request)?),
-            result_digest: "0".repeat(64),
-        },
+        status: semantic.status,
+        disposition: semantic.disposition,
+        boundary: semantic.boundary,
+        events: semantic.events,
+        participants: semantic.participants,
+        outcomes: semantic.outcomes,
+        chronology: semantic.chronology,
+        coverage: semantic.coverage,
+        overlap: semantic.overlap,
+        rollback: semantic.rollback,
+        preservation: semantic.preservation,
+        source: source_snapshot.source.clone(),
+        event_denominator: source_snapshot.event_denominator.clone(),
+        event_receipt: source_snapshot.enumeration.clone(),
+        existing: existing.clone(),
+        handler_result,
         result_digest: String::new(),
     };
-    candidate.candidate_id = candidate_identity(&candidate)?;
+    candidate.candidate_id = candidate.computed_identity()?;
     candidate.result_digest = candidate.computed_digest()?;
     candidate
         .handler_result
         .result_digest
         .clone_from(&candidate.result_digest);
-    let output_bytes = canonical_bytes(&candidate)?.len();
-    if output_bytes > episode_policy.max_output_bytes {
-        return Err(ContractViolation::Budget {
+    capped_serialized_len(&candidate, policy.max_output_bytes).map_err(|reason| {
+        ContractViolation::Budget {
             dimension: "episode.output_bytes",
-            reason: "candidate exceeds output ceiling".to_owned(),
-        });
-    }
+            reason,
+        }
+    })?;
     candidate.validate()?;
     Ok(candidate)
 }
 
-fn admission_phase(input: &ValidatedCurationInput<'_>) -> Result<(), ContractViolation> {
-    input.accept()
+#[derive(Serialize)]
+struct WholeInputPreimage<'a> {
+    item: &'a ValidatedCurationItem,
+    job: &'a eliot_dreamer_contracts::DreamJobInput,
+    bundle: &'a eliot_dreamer_contracts::DreamInputBundle,
+    receipt: &'a eliot_dreamer_contracts::ValidationReceipt,
+    screen: &'a eliot_dreamer_contracts::ScreenBinding,
+    grounded: &'a eliot_dreamer_contracts::GroundedDreamDraft,
+    request: &'a eliot_dreamer_contracts::TypedCurationHandlerRequest,
+    usage: &'a eliot_dreamer_contracts::BudgetUsage,
+    events: &'a GroundedEventSet,
+    source: &'a EventAndSourceSnapshot,
+    existing: &'a ExistingEpisodeSnapshot,
+    policy: &'a EpisodePolicy,
+}
+
+#[derive(Serialize)]
+struct PlannedOutputPreimage<'a> {
+    events: &'a GroundedEventSet,
+    source: &'a EventAndSourceSnapshot,
+    existing: &'a ExistingEpisodeSnapshot,
+    policy: &'a EpisodePolicy,
+}
+
+fn planned_output_preflight(
+    events: &GroundedEventSet,
+    source: &EventAndSourceSnapshot,
+    existing: &ExistingEpisodeSnapshot,
+    policy: &EpisodePolicy,
+) -> Result<(), ContractViolation> {
+    let plan = PlannedOutputPreimage {
+        events,
+        source,
+        existing,
+        policy,
+    };
+    capped_serialized_len(&plan, policy.max_output_bytes).map_err(|reason| {
+        ContractViolation::Budget {
+            dimension: "episode.output_bytes",
+            reason,
+        }
+    })?;
+    Ok(())
+}
+
+fn whole_input_preflight(
+    input: &ValidatedCurationInput<'_>,
+    events: &GroundedEventSet,
+    source: &EventAndSourceSnapshot,
+    existing: &ExistingEpisodeSnapshot,
+    policy: &EpisodePolicy,
+) -> Result<(), ContractViolation> {
+    let cap = usize::try_from(policy.max_input_bytes)
+        .unwrap_or(usize::MAX)
+        .min(MAX_SERIALIZED_INPUT);
+    let preimage = WholeInputPreimage {
+        item: input.item,
+        job: input.ctx.job,
+        bundle: input.ctx.bundle,
+        receipt: input.ctx.receipt,
+        screen: input.ctx.screen,
+        grounded: input.ctx.grounded,
+        request: input.ctx.request,
+        usage: input.ctx.usage,
+        events,
+        source,
+        existing,
+        policy,
+    };
+    capped_serialized_len(&preimage, cap).map_err(|reason| ContractViolation::Budget {
+        dimension: "episode.input_bytes",
+        reason,
+    })?;
+    Ok(())
+}
+
+fn whole_input_digest(
+    input: &ValidatedCurationInput<'_>,
+    events: &GroundedEventSet,
+    source: &EventAndSourceSnapshot,
+    existing: &ExistingEpisodeSnapshot,
+    policy: &EpisodePolicy,
+) -> Result<String, ContractViolation> {
+    let preimage = WholeInputPreimage {
+        item: input.item,
+        job: input.ctx.job,
+        bundle: input.ctx.bundle,
+        receipt: input.ctx.receipt,
+        screen: input.ctx.screen,
+        grounded: input.ctx.grounded,
+        request: input.ctx.request,
+        usage: input.ctx.usage,
+        events,
+        source,
+        existing,
+        policy,
+    };
+    capped_serialized_len(&preimage, MAX_SERIALIZED_INPUT).map_err(|reason| {
+        ContractViolation::Budget {
+            dimension: "episode.input_bytes",
+            reason,
+        }
+    })?;
+    Ok(digest_hex(&canonical_bytes(&preimage)?))
 }
 
 fn capacity_preflight(
@@ -192,23 +390,6 @@ fn capacity_preflight(
     policy: &EpisodePolicy,
     input: &ValidatedCurationInput<'_>,
 ) -> Result<(), ContractViolation> {
-    let serialized_cap = usize::try_from(policy.max_input_bytes)
-        .unwrap_or(usize::MAX)
-        .min(MAX_SERIALIZED_INPUT);
-    macro_rules! preflight_value {
-        ($value:expr, $field:literal) => {
-            capped_serialized_len($value, serialized_cap).map_err(|reason| {
-                ContractViolation::Budget {
-                    dimension: $field,
-                    reason,
-                }
-            })?;
-        };
-    }
-    preflight_value!(events, "episode.events_bytes");
-    preflight_value!(snapshot, "episode.source_bytes");
-    preflight_value!(existing, "episode.existing_bytes");
-    preflight_value!(policy, "episode.policy_bytes");
     if events.events.len() > policy.max_events
         || events.events.len() > policy.max_source_members
         || snapshot.source.members.len() > policy.max_source_members
@@ -228,6 +409,13 @@ fn capacity_preflight(
             reason: "coverage cardinality exceeds policy".to_owned(),
         });
     }
+    let gap_count = gap_count(events, snapshot)?;
+    if gap_count > policy.max_gaps {
+        return Err(ContractViolation::Budget {
+            dimension: "episode.gaps",
+            reason: "planned gap count exceeds policy".to_owned(),
+        });
+    }
     let participant_count = events
         .events
         .iter()
@@ -243,26 +431,39 @@ fn capacity_preflight(
             reason: "participant count exceeds policy".to_owned(),
         });
     }
+    let outcome_count = events
+        .events
+        .iter()
+        .map(|event| event.outcomes.len())
+        .try_fold(0usize, usize::checked_add)
+        .ok_or(ContractViolation::Budget {
+            dimension: "episode.outcomes",
+            reason: "outcome count overflow".to_owned(),
+        })?;
+    if outcome_count > crate::input::MAX_OUTCOMES {
+        return Err(ContractViolation::Budget {
+            dimension: "episode.outcomes",
+            reason: "outcome count exceeds class ceiling".to_owned(),
+        });
+    }
     if existing.members.len() > policy.max_events {
         return Err(ContractViolation::Budget {
             dimension: "episode.neighborhood",
             reason: "existing Episode neighborhood exceeds policy".to_owned(),
         });
     }
-    let pair_count = events
-        .events
-        .len()
-        .checked_mul(events.events.len().saturating_sub(1))
-        .ok_or(ContractViolation::Budget {
-            dimension: "episode.work",
-            reason: "chronology work bound overflow".to_owned(),
-        })?;
-    if pair_count > policy.max_neighborhood || pair_count as u64 > policy.max_work {
-        return Err(ContractViolation::Budget {
-            dimension: "episode.work",
-            reason: "chronology neighborhood exceeds policy".to_owned(),
-        });
-    }
+    phase_work_preflight(
+        events,
+        snapshot,
+        existing,
+        policy,
+        input,
+        CapacityCounts {
+            participants: participant_count,
+            outcomes: outcome_count,
+            gaps: gap_count,
+        },
+    )?;
     let input_bytes = input
         .ctx
         .bundle
@@ -283,33 +484,104 @@ fn capacity_preflight(
     Ok(())
 }
 
-struct CappedWriter {
-    written: usize,
-    cap: usize,
+#[derive(Clone, Copy)]
+struct CapacityCounts {
+    participants: usize,
+    outcomes: usize,
+    gaps: usize,
 }
 
-impl Write for CappedWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let next = self
-            .written
-            .checked_add(bytes.len())
-            .ok_or_else(|| io::Error::other("serialized length overflow"))?;
-        if next > self.cap {
-            return Err(io::Error::other("serialized value exceeds cap"));
-        }
-        self.written = next;
-        Ok(bytes.len())
+fn phase_work_preflight(
+    events: &GroundedEventSet,
+    snapshot: &EventAndSourceSnapshot,
+    existing: &ExistingEpisodeSnapshot,
+    policy: &EpisodePolicy,
+    input: &ValidatedCurationInput<'_>,
+    counts: CapacityCounts,
+) -> Result<(), ContractViolation> {
+    let pair_count = events
+        .events
+        .len()
+        .checked_mul(
+            events
+                .events
+                .len()
+                .checked_sub(1)
+                .ok_or(ContractViolation::Budget {
+                    dimension: "episode.work",
+                    reason: "chronology cardinality underflow".to_owned(),
+                })?,
+        )
+        .ok_or(ContractViolation::Budget {
+            dimension: "episode.work",
+            reason: "chronology work bound overflow".to_owned(),
+        })?
+        / 2;
+    if pair_count > policy.max_neighborhood
+        || u64::try_from(pair_count).unwrap_or(u64::MAX) > policy.max_work
+    {
+        return Err(ContractViolation::Budget {
+            dimension: "episode.work",
+            reason: "chronology neighborhood exceeds policy".to_owned(),
+        });
     }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+    let scan_count = snapshot
+        .enumeration
+        .members
+        .len()
+        .checked_add(snapshot.enumeration.omissions.len())
+        .and_then(|value| value.checked_add(input.ctx.bundle.materials.len()))
+        .and_then(|value| value.checked_add(snapshot.coverage.members.len()))
+        .and_then(|value| value.checked_add(1))
+        .ok_or(ContractViolation::Budget {
+            dimension: "episode.work",
+            reason: "owner scan count overflow".to_owned(),
+        })?;
+    let work = events
+        .events
+        .len()
+        .checked_add(counts.participants)
+        .and_then(|value| value.checked_add(counts.outcomes))
+        .and_then(|value| value.checked_add(snapshot.source.members.len()))
+        .and_then(|value| value.checked_add(existing.members.len()))
+        .and_then(|value| value.checked_add(counts.gaps))
+        .and_then(|value| value.checked_add(pair_count))
+        .and_then(|value| value.checked_add(scan_count))
+        .ok_or(ContractViolation::Budget {
+            dimension: "episode.work",
+            reason: "cumulative phase work overflow".to_owned(),
+        })?;
+    if u64::try_from(work).unwrap_or(u64::MAX) > policy.max_work {
+        return Err(ContractViolation::Budget {
+            dimension: "episode.work",
+            reason: "cumulative phase work exceeds policy".to_owned(),
+        });
     }
+    Ok(())
 }
 
-fn capped_serialized_len<T: Serialize>(value: &T, cap: usize) -> Result<usize, String> {
-    let mut writer = CappedWriter { written: 0, cap };
-    serde_json::to_writer(&mut writer, value).map_err(|error| error.to_string())?;
-    Ok(writer.written)
+fn gap_count(
+    events: &GroundedEventSet,
+    snapshot: &EventAndSourceSnapshot,
+) -> Result<usize, ContractViolation> {
+    let present: BTreeSet<_> = events
+        .events
+        .iter()
+        .map(|event| event.source_member_id.clone())
+        .collect();
+    let mut missing = events
+        .denominator
+        .declared_member_ids
+        .iter()
+        .filter(|member| !present.contains(*member))
+        .count();
+    if snapshot.source.availability != SourceAvailability::Available {
+        missing = missing.checked_add(1).ok_or(ContractViolation::Budget {
+            dimension: "episode.gaps",
+            reason: "gap count overflow".to_owned(),
+        })?;
+    }
+    Ok(missing)
 }
 
 fn policy_phase(
@@ -398,28 +670,7 @@ fn source_phase(
     }
     validate_event_receipt(events, snapshot)?;
     for event in &events.events {
-        if !snapshot
-            .source
-            .partition
-            .immutable_references
-            .contains(&event.source_member_id)
-        {
-            return Err(ContractViolation::BindingMismatch {
-                field: "event.partition",
-                reason: "raw event must remain an immutable source reference".to_owned(),
-            });
-        }
-        let receipt = snapshot
-            .enumeration
-            .members
-            .iter()
-            .find(|outcome| outcome.member.as_str() == event.source_member_id.as_str());
-        if receipt.is_none_or(|outcome| outcome.disposition != ReceiptDisposition::Observed) {
-            return Err(ContractViolation::BindingMismatch {
-                field: "event.enumeration.disposition",
-                reason: "grounded event is not Observed by the event receipt".to_owned(),
-            });
-        }
+        validate_event_membership(input, event, snapshot)?;
     }
     if input.ctx.request.source_snapshot != snapshot.source.identity.snapshot_id.as_str()
         || input.ctx.request.source_revision != snapshot.source.identity.revision.to_string()
@@ -451,6 +702,120 @@ fn source_phase(
         }
     }
     Ok(())
+}
+
+fn validate_event_membership(
+    input: &ValidatedCurationInput<'_>,
+    event: &GroundedEvent,
+    snapshot: &EventAndSourceSnapshot,
+) -> Result<(), ContractViolation> {
+    let member =
+        snapshot
+            .member(&event.source_member_id)
+            .ok_or(ContractViolation::BindingMismatch {
+                field: "event.source_member_id",
+                reason: "event member is absent from source snapshot".to_owned(),
+            })?;
+    if member.kind != SourceMemberKind::Observation {
+        return Err(ContractViolation::BindingMismatch {
+            field: "event.kind",
+            reason: "ObservationEventCore requires an Observation source member".to_owned(),
+        });
+    }
+    if event.core.affected_scope.work_scope.as_str() != snapshot.source.identity.scope.as_str()
+        || event
+            .core
+            .affected_scope
+            .task_ref
+            .as_deref()
+            .is_some_and(|task| task != input.ctx.job.task_id)
+    {
+        return Err(ContractViolation::BindingMismatch {
+            field: "event.scope",
+            reason: "event scope/task differs from accepted source/job".to_owned(),
+        });
+    }
+    if event
+        .core
+        .evidence_and_raw_handles
+        .iter()
+        .any(|handle| !owner_evidence_contains(member, handle))
+    {
+        return Err(ContractViolation::BindingMismatch {
+            field: "event.evidence_handles",
+            reason: "raw event handle is outside exact member evidence union".to_owned(),
+        });
+    }
+    if !snapshot
+        .source
+        .partition
+        .immutable_references
+        .contains(&event.source_member_id)
+    {
+        return Err(ContractViolation::BindingMismatch {
+            field: "event.partition",
+            reason: "raw event must remain an immutable source reference".to_owned(),
+        });
+    }
+    let receipt = snapshot
+        .enumeration
+        .members
+        .iter()
+        .find(|outcome| outcome.member.as_str() == event.source_member_id.as_str());
+    if receipt.is_none_or(|outcome| outcome.disposition != ReceiptDisposition::Observed) {
+        return Err(ContractViolation::BindingMismatch {
+            field: "event.enumeration.disposition",
+            reason: "grounded event is not Observed by the event receipt".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn owner_evidence_contains(
+    member: &eliot_memory_curation_contracts::SourceMember,
+    handle: &str,
+) -> bool {
+    member
+        .evidence
+        .provenance
+        .iter()
+        .any(|value| value.as_str() == handle)
+        || member
+            .evidence
+            .owner_status
+            .iter()
+            .any(|value| value.as_str() == handle)
+        || member
+            .evidence
+            .protection
+            .iter()
+            .any(|value| value.as_str() == handle)
+        || member
+            .evidence
+            .conflict
+            .iter()
+            .any(|value| value.as_str() == handle)
+        || member
+            .evidence
+            .audit
+            .iter()
+            .any(|value| value.as_str() == handle)
+}
+
+fn admission_closure(input: &ValidatedCurationInput<'_>) -> bool {
+    let ctx = input.ctx;
+    input.item.task_id == ctx.job.task_id
+        && input.item.scope_id == ctx.job.scope_id
+        && input.item.state_fence == ctx.job.state_fence
+        && ctx.request.task_id == ctx.job.task_id
+        && ctx.request.scope_id == ctx.job.scope_id
+        && ctx.request.state_fence == ctx.job.state_fence
+        && ctx.receipt.task_id == ctx.job.task_id
+        && ctx.receipt.scope_id == ctx.job.scope_id
+        && ctx.receipt.state_fence == ctx.job.state_fence
+        && ctx.screen.task_id == ctx.job.task_id
+        && ctx.screen.scope_id == ctx.job.scope_id
+        && ctx.screen.state_fence == ctx.job.state_fence
 }
 
 fn validate_event_receipt(
@@ -494,14 +859,10 @@ fn validate_event_receipt(
             reason: "event receipt does not account for exact event universe".to_owned(),
         });
     }
-    if declared_events != owner_events
-        || snapshot.event_denominator.kind
-            != eliot_epistemic_contracts::DenominatorKind::CompleteScope
-        || !snapshot.enumeration.is_terminal()
-    {
+    if declared_events != owner_events {
         return Err(ContractViolation::BindingMismatch {
             field: "event.denominator_owner",
-            reason: "event denominator or receipt is not complete and terminal".to_owned(),
+            reason: "event denominator differs from its owner denominator".to_owned(),
         });
     }
     if snapshot
@@ -739,7 +1100,17 @@ fn chronology_phase(events: &[GroundedEvent]) -> Result<Vec<ChronologyLink>, Con
                 (Some(left_point), Some(right_point))
                     if left_point.clock_ref == right_point.clock_ref
                         && left.temporal_binding.is_some()
-                        && right.temporal_binding.is_some() =>
+                        && right.temporal_binding.is_some()
+                        && matches!(
+                            left.temporal.temporal_status,
+                            eliot_evidence::EpistemicStatus::Supported
+                                | eliot_evidence::EpistemicStatus::Verified
+                        )
+                        && matches!(
+                            right.temporal.temporal_status,
+                            eliot_evidence::EpistemicStatus::Supported
+                                | eliot_evidence::EpistemicStatus::Verified
+                        ) =>
                 {
                     let left_ms = left_point
                         .reading
@@ -784,8 +1155,8 @@ fn chronology_phase(events: &[GroundedEvent]) -> Result<Vec<ChronologyLink>, Con
                 _ => (ChronologyRelation::Unknown, Vec::new()),
             };
             links.push(ChronologyLink {
-                before_event_id: left.core.event_id_and_time.event_id.clone(),
-                after_event_id: right.core.event_id_and_time.event_id.clone(),
+                left_event_id: left.core.event_id_and_time.event_id.clone(),
+                right_event_id: right.core.event_id_and_time.event_id.clone(),
                 relation,
                 support,
             });
@@ -797,18 +1168,18 @@ fn chronology_phase(events: &[GroundedEvent]) -> Result<Vec<ChronologyLink>, Con
 fn overlap_phase(
     events: &[GroundedEvent],
     existing: &ExistingEpisodeSnapshot,
+    boundary: &EpisodeBoundary,
     policy: &EpisodePolicy,
 ) -> Result<OverlapAssessment, ContractViolation> {
     let proposed: BTreeSet<_> = events
         .iter()
         .map(|event| event.core.event_id_and_time.event_id.clone())
         .collect();
+    let replay = exact_replay(events, existing, boundary);
     let mut overlap = Vec::new();
     for member in &existing.members {
         if proposed.contains(&member.event_id) {
-            if matches!(policy.overlap_rule, crate::input::OverlapRule::Block)
-                && !exact_replay(events, existing)
-            {
+            if matches!(policy.overlap_rule, crate::input::OverlapRule::Block) && !replay {
                 return Err(ContractViolation::BindingMismatch {
                     field: "episode.overlap",
                     reason: "overlap policy blocks a changed existing member".to_owned(),
@@ -820,7 +1191,7 @@ fn overlap_phase(
     overlap.sort();
     let disposition = if overlap.is_empty() {
         OverlapDisposition::None
-    } else if exact_replay(events, existing) {
+    } else if replay {
         OverlapDisposition::ExactReplay
     } else {
         OverlapDisposition::Conflict
@@ -831,8 +1202,14 @@ fn overlap_phase(
     })
 }
 
-fn exact_replay(events: &[GroundedEvent], existing: &ExistingEpisodeSnapshot) -> bool {
+fn exact_replay(
+    events: &[GroundedEvent],
+    existing: &ExistingEpisodeSnapshot,
+    boundary: &EpisodeBoundary,
+) -> bool {
     events.len() == existing.members.len()
+        && boundary.start_event_id == existing.boundary_start_event_id
+        && boundary.end_event_id == existing.boundary_end_event_id
         && events.iter().all(|event| {
             existing.members.iter().any(|member| {
                 member.event_id == event.core.event_id_and_time.event_id
@@ -879,9 +1256,12 @@ fn disposition_for(
     }
     if preservation.overall().is_err()
         || !coverage.gaps.is_empty()
-        || chronology
-            .iter()
-            .any(|link| link.relation == ChronologyRelation::Unknown)
+        || chronology.iter().any(|link| {
+            matches!(
+                link.relation,
+                ChronologyRelation::Unknown | ChronologyRelation::Incomparable
+            )
+        })
     {
         CandidateDisposition::Partial
     } else if overlap.disposition == OverlapDisposition::ExactReplay {
@@ -898,15 +1278,18 @@ fn status_for(
     boundary: &EpisodeBoundary,
 ) -> EpisodeStatus {
     if !coverage.gaps.is_empty()
-        || chronology
-            .iter()
-            .any(|link| link.relation == ChronologyRelation::Unknown)
+        || chronology.iter().any(|link| {
+            matches!(
+                link.relation,
+                ChronologyRelation::Unknown | ChronologyRelation::Incomparable
+            )
+        })
     {
         EpisodeStatus::Partial
-    } else if overlap.disposition == OverlapDisposition::Conflict {
-        EpisodeStatus::Conflicted
     } else if boundary.end_event_id.is_none() {
         EpisodeStatus::Open
+    } else if overlap.disposition == OverlapDisposition::Conflict {
+        EpisodeStatus::Conflicted
     } else {
         EpisodeStatus::Closed
     }
@@ -919,54 +1302,24 @@ fn preservation_phase(
     events: &[GroundedEvent],
     source: &eliot_memory_curation_contracts::SourceSnapshot,
     existing: &ExistingEpisodeSnapshot,
+    admission_bound: bool,
 ) -> eliot_dreamer_contracts::PreservationReport {
-    let coverage_ok = coverage.gaps.is_empty();
-    let temporal_known = chronology
-        .iter()
-        .all(|link| link.relation != ChronologyRelation::Unknown);
-    let temporal_grounded = chronology.iter().all(|link| {
-        matches!(
-            link.relation,
-            ChronologyRelation::Incomparable | ChronologyRelation::Unknown
-        ) || link.support.len() == 2
-    });
-    let lineage_ok = events.iter().all(|event| {
-        !event.event_binding.evidence_handles.is_empty()
-            && event
-                .participants
-                .iter()
-                .all(|p| !p.binding.evidence_handles.is_empty())
-            && event
-                .outcomes
-                .iter()
-                .all(|o| !o.binding.evidence_handles.is_empty())
-    });
-    let source_ids: BTreeSet<_> = source
-        .members
-        .iter()
-        .map(|member| member.member_id.clone())
-        .collect();
-    let retained_ids: BTreeSet<_> = events
-        .iter()
-        .map(|event| event.source_member_id.clone())
-        .collect();
-    let immutable_closure = !events.is_empty()
-        && retained_ids
-            .iter()
-            .all(|member_id| source_ids.contains(member_id))
-        && source
-            .partition
-            .immutable_references
-            .is_superset(&retained_ids)
-        && !existing.episode_id.is_empty();
-    let reversible = immutable_closure && overlap.disposition != OverlapDisposition::Blocked;
-    let authority_ceiling = overlap.disposition != OverlapDisposition::Blocked;
-    let dependency_closure = immutable_closure && !source.members.is_empty();
+    let (
+        coverage_ok,
+        coverage_known,
+        temporal_known,
+        temporal_grounded,
+        lineage_ok,
+        reversible,
+        authority_ceiling,
+        dependency_closure,
+        provenance_ok,
+    ) = preservation_facts(coverage, chronology, overlap, events, source, existing);
     let all = [
         (
             PreservationDimension::Coverage,
             coverage_ok,
-            coverage_ok,
+            coverage_known,
             "all event members are accounted",
         ),
         (
@@ -995,14 +1348,14 @@ fn preservation_phase(
         ),
         (
             PreservationDimension::DependencyClosure,
-            dependency_closure,
-            dependency_closure,
+            dependency_closure && admission_bound,
+            dependency_closure && admission_bound,
             "source and existing closures are retained",
         ),
         (
             PreservationDimension::ProvenanceRetention,
-            !events.is_empty(),
-            !events.is_empty(),
+            provenance_ok,
+            provenance_ok,
             "raw event provenance is retained",
         ),
     ];
@@ -1019,16 +1372,78 @@ fn preservation_phase(
     }
 }
 
-fn candidate_identity(candidate: &EpisodeCandidate) -> Result<String, ContractViolation> {
-    let preimage = (
-        &candidate.request_id,
-        &candidate.receipt_id,
-        &candidate.job_id,
-        &candidate.task_id,
-        &candidate.scope_id,
-        &candidate.episode,
-        &candidate.events,
-        &candidate.source.identity,
-    );
-    Ok(sha256_hex(&canonical_bytes(&preimage)?))
+fn preservation_facts(
+    coverage: &EpisodeCoverage,
+    chronology: &[ChronologyLink],
+    overlap: &OverlapAssessment,
+    events: &[GroundedEvent],
+    source: &eliot_memory_curation_contracts::SourceSnapshot,
+    existing: &ExistingEpisodeSnapshot,
+) -> (bool, bool, bool, bool, bool, bool, bool, bool, bool) {
+    let coverage_ok = coverage.gaps.is_empty();
+    let coverage_known = source.availability != SourceAvailability::Unknown;
+    let temporal_known = chronology
+        .iter()
+        .all(|link| link.relation != ChronologyRelation::Unknown);
+    let temporal_grounded = chronology.iter().all(|link| {
+        matches!(
+            link.relation,
+            ChronologyRelation::Incomparable | ChronologyRelation::Unknown
+        ) || link.support.len() == 2
+    });
+    let lineage_ok = events.iter().all(|event| {
+        !event.event_binding.evidence_handles.is_empty()
+            && event
+                .participants
+                .iter()
+                .all(|participant| !participant.binding.evidence_handles.is_empty())
+            && event
+                .outcomes
+                .iter()
+                .all(|outcome| !outcome.binding.evidence_handles.is_empty())
+    });
+    let source_ids: BTreeSet<_> = source
+        .members
+        .iter()
+        .map(|member| member.member_id.clone())
+        .collect();
+    let retained_ids: BTreeSet<_> = events
+        .iter()
+        .map(|event| event.source_member_id.clone())
+        .collect();
+    let immutable_closure = !events.is_empty()
+        && retained_ids
+            .iter()
+            .all(|member_id| source_ids.contains(member_id))
+        && source
+            .partition
+            .immutable_references
+            .is_superset(&retained_ids)
+        && !existing.episode_id.is_empty();
+    let reversible = immutable_closure && overlap.disposition != OverlapDisposition::Blocked;
+    let authority_ceiling = overlap.disposition != OverlapDisposition::Blocked;
+    let dependency_closure = immutable_closure && !source.members.is_empty();
+    let provenance_ok = events.iter().all(|event| {
+        source.members.iter().any(|member| {
+            member.member_id == event.source_member_id
+                && member.revision == event.source_revision
+                && member.content_digest == event.source_content_digest
+                && event
+                    .core
+                    .evidence_and_raw_handles
+                    .iter()
+                    .all(|handle| owner_evidence_contains(member, handle))
+        })
+    });
+    (
+        coverage_ok,
+        coverage_known,
+        temporal_known,
+        temporal_grounded,
+        lineage_ok,
+        reversible,
+        authority_ceiling,
+        dependency_closure,
+        provenance_ok,
+    )
 }

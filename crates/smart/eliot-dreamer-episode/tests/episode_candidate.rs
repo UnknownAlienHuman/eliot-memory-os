@@ -32,7 +32,7 @@ fn closed_episode_preserves_full_immutable_closure() {
     let chronology = candidate
         .chronology
         .iter()
-        .find(|link| link.before_event_id == "event-start")
+        .find(|link| link.left_event_id == "event-start")
         .expect("chronology");
     assert_eq!(chronology.relation, ChronologyRelation::Before);
     assert_eq!(chronology.support.len(), 2);
@@ -72,7 +72,7 @@ fn open_episode_requires_start_anchor_only() {
 
 #[test]
 fn partial_event_denominator_retains_explicit_gap() {
-    let fixture = support::fixture_with_modes(true, false);
+    let fixture = support::fixture_with_modes(true, false, false);
     let mut events = fixture.events.clone();
     events.denominator.coverage = eliot_memory_curation_contracts::DenominatorCoverage::Partial;
     events.events.pop();
@@ -117,7 +117,7 @@ fn changed_identity_is_rejected_against_exact_member_digest() {
 
 #[test]
 fn grounding_mismatch_rejects_changed_temporal_payload() {
-    let cross_domain = support::fixture_with_modes(false, true);
+    let cross_domain = support::fixture_with_modes(false, true, false);
     let cross_candidate = reconstruct_episode_candidate(
         &cross_domain.input,
         &cross_domain.events,
@@ -128,6 +128,21 @@ fn grounding_mismatch_rejects_changed_temporal_payload() {
     .expect("cross-domain chronology");
     assert!(
         cross_candidate
+            .chronology
+            .iter()
+            .all(|link| link.relation == ChronologyRelation::Incomparable)
+    );
+    let near_overlap = support::fixture_with_modes(false, false, true);
+    let near_candidate = reconstruct_episode_candidate(
+        &near_overlap.input,
+        &near_overlap.events,
+        &near_overlap.snapshot,
+        &near_overlap.existing,
+        &near_overlap.policy,
+    )
+    .expect("near-overlap chronology");
+    assert!(
+        near_candidate
             .chronology
             .iter()
             .all(|link| link.relation == ChronologyRelation::Incomparable)

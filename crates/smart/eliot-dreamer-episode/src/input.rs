@@ -3,6 +3,7 @@
 //! immutable event/source evidence needed by one episode candidate.
 
 use std::collections::BTreeSet;
+use std::io::{self, Write};
 
 use eliot_contracts::{ArtifactId, StateFence, TaskRevision};
 use eliot_dreamer_contracts::RelationTemporalEvidence;
@@ -23,6 +24,7 @@ pub(crate) const MAX_PARTICIPANTS: usize = 4_096;
 pub(crate) const MAX_OUTCOMES: usize = 2_048;
 pub(crate) const MAX_LINKS: usize = 8_192;
 pub(crate) const MAX_TEXT: usize = 1_024;
+pub(crate) const MAX_SERIALIZED_INPUT: usize = 16 * 1024 * 1024;
 
 /// Canonical material identity computed from the actual semantic preimage.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,6 +34,12 @@ pub struct MaterialPreimage {
 }
 
 fn material_preimage<T: Serialize>(value: &T) -> Result<MaterialPreimage, ContractViolation> {
+    capped_serialized_len(value, MAX_SERIALIZED_INPUT).map_err(|reason| {
+        ContractViolation::Budget {
+            dimension: "episode.material_bytes",
+            reason,
+        }
+    })?;
     let bytes = canonical_bytes(value)?;
     let length = u64::try_from(bytes.len()).map_err(|_| ContractViolation::Budget {
         dimension: "episode.material_bytes",
@@ -41,6 +49,35 @@ fn material_preimage<T: Serialize>(value: &T) -> Result<MaterialPreimage, Contra
         digest: digest_hex(&bytes),
         bytes: length,
     })
+}
+
+struct CappedWriter {
+    written: usize,
+    cap: usize,
+}
+
+impl Write for CappedWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let next = self
+            .written
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("serialized length overflow"))?;
+        if next > self.cap {
+            return Err(io::Error::other("serialized value exceeds cap"));
+        }
+        self.written = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn capped_serialized_len<T: Serialize>(value: &T, cap: usize) -> Result<usize, String> {
+    let mut writer = CappedWriter { written: 0, cap };
+    serde_json::to_writer(&mut writer, value).map_err(|error| error.to_string())?;
+    Ok(writer.written)
 }
 
 fn source_error(field: &'static str, error: &SourceError) -> ContractViolation {
@@ -329,8 +366,15 @@ impl GroundedEventSet {
             .validate(self.events.len())
             .map_err(|error| source_error("event.denominator", &error))?;
         let mut ids = BTreeSet::new();
+        let mut event_ids = BTreeSet::new();
         for event in &self.events {
             event.validate()?;
+            if !event_ids.insert(event.core.event_id_and_time.event_id.clone()) {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "events.event_id",
+                    reason: "duplicate core event identity".to_owned(),
+                });
+            }
             if !ids.insert(event.source_member_id.clone()) {
                 return Err(ContractViolation::BindingMismatch {
                     field: "events.source_member_id",
@@ -684,6 +728,12 @@ impl EpisodePolicy {
             now_ms: self.now_ms,
             cancellation_requested: self.cancellation_requested,
         };
+        capped_serialized_len(&material, MAX_SERIALIZED_INPUT).map_err(|reason| {
+            ContractViolation::Budget {
+                dimension: "episode.policy_bytes",
+                reason,
+            }
+        })?;
         Ok(digest_hex(&canonical_bytes(&material)?))
     }
 }
