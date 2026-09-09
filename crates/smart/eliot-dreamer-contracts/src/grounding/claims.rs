@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{ArtifactId, StateFence};
+use eliot_contracts::{ArtifactId, StateFence, TaskId};
 use eliot_epistemic_contracts::{
     AbsenceClaim, CausalClaim, CoverageDenominator, CoverageReceipt, PropositionId, SupportRecord,
     TemporalRecord,
@@ -227,6 +227,127 @@ impl PrecisionPayload {
         }
         Ok(())
     }
+
+    /// Validates the typed payload against the handoff proposition and context.
+    pub fn validate_for_context(
+        &self,
+        proposition: &PropositionId,
+        task_id: &TaskId,
+        scope: &str,
+        fence: &StateFence,
+    ) -> Result<(), ContractViolation> {
+        self.validate()?;
+        match self {
+            Self::Causal { causal } => {
+                if causal.subject != *proposition {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "causal.subject",
+                        reason: "causal subject differs from enclosing proposition".into(),
+                    });
+                }
+                if causal.scope != scope || causal.fence != *fence {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "causal.context",
+                        reason: "causal scope or fence differs from the enclosing context".into(),
+                    });
+                }
+            }
+            Self::AbsenceExhaustiveNegative {
+                domain,
+                denominator,
+                receipt,
+                absence_proof,
+            } => {
+                if denominator.scope != scope || denominator.fence != *fence {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "absence.denominator",
+                        reason:
+                            "absence denominator scope or fence differs from the enclosing context"
+                                .into(),
+                    });
+                }
+                if domain != &denominator.class {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "absence.domain",
+                        reason: "absence domain differs from denominator class".into(),
+                    });
+                }
+                if let Some(receipt) = receipt {
+                    validate_receipt_context(receipt, denominator, task_id, scope, fence)?;
+                }
+                if let Some(proof) = absence_proof {
+                    if proof.proposition != *proposition
+                        || proof.domain != denominator.class
+                        || proof.task_id != *task_id
+                        || proof.scope != scope
+                        || proof.receipt.fence != *fence
+                    {
+                        return Err(ContractViolation::BindingMismatch {
+                            field: "absence_proof.context",
+                            reason: "absence proof proposition, domain, task, scope, or fence differs from the enclosing context".into(),
+                        });
+                    }
+                    validate_receipt_context(&proof.receipt, denominator, task_id, scope, fence)?;
+                    if receipt.is_some_and(|receipt| receipt != &proof.receipt) {
+                        return Err(ContractViolation::BindingMismatch {
+                            field: "absence_receipt",
+                            reason: "payload receipt and absence proof receipt differ".into(),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+fn validate_receipt_context(
+    receipt: &CoverageReceipt,
+    denominator: &CoverageDenominator,
+    task_id: &TaskId,
+    scope: &str,
+    fence: &StateFence,
+) -> Result<(), ContractViolation> {
+    if denominator.roles.len() != 1
+        || receipt.denominator != denominator.digest
+        || receipt.denominator_size != denominator.members.len() as u64
+        || receipt.task_id != *task_id
+        || receipt.scope != scope
+        || receipt.fence != *fence
+        || denominator.query.as_ref() != Some(&receipt.query)
+        || denominator.frontier.as_ref() != Some(&receipt.frontier)
+    {
+        return Err(ContractViolation::BindingMismatch {
+            field: "absence_receipt",
+            reason: "receipt does not bind the exact single-role denominator and context".into(),
+        });
+    }
+    let Some(role) = denominator.roles.iter().next() else {
+        return Err(ContractViolation::MissingField("absence_receipt.role"));
+    };
+    let mut seen = BTreeSet::new();
+    for member in &receipt.members {
+        if member.role != *role
+            || !denominator.members.contains(&member.member)
+            || !seen.insert(member.member.clone())
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "absence_receipt",
+                reason: "receipt contains a foreign or duplicate member".into(),
+            });
+        }
+    }
+    for omission in &receipt.omissions {
+        if !denominator.members.contains(&omission.member) || !seen.insert(omission.member.clone())
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "absence_receipt",
+                reason: "receipt omission contains a foreign or duplicate member".into(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Content digest for a typed proposition payload. The canonical proposition
@@ -304,6 +425,25 @@ impl ScreenTargetBinding {
         }
         Ok(())
     }
+
+    pub fn validate_for_context(
+        &self,
+        task_id: &TaskId,
+        scope: &str,
+        fence: &StateFence,
+    ) -> Result<(), ContractViolation> {
+        self.validate()?;
+        if self.screen.task_id != task_id.to_string()
+            || self.screen.scope_id != scope
+            || self.screen.state_fence != *fence
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "screen_target",
+                reason: "screen target context differs from the enclosing handoff".into(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// One material claim with stable proposed support and counterevidence sets.
@@ -365,6 +505,8 @@ impl TypedEvidenceAssertion {
         fence: &StateFence,
     ) -> Result<(), ContractViolation> {
         self.validate()?;
+        self.precision
+            .validate_for_context(&self.proposition, task_id, scope, fence)?;
         if let Some(support) = &self.support {
             support
                 .validate_for(task_id, scope, fence)
@@ -372,7 +514,12 @@ impl TypedEvidenceAssertion {
                     field: "assertion.support",
                     reason: error.to_string(),
                 })?;
-            if support.proposition != self.proposition || !support.handles.contains(handle) {
+            if support.fence != *fence
+                || support.task_id != *task_id
+                || support.validity.scope != scope
+                || support.proposition != self.proposition
+                || !support.handles.contains(handle)
+            {
                 return Err(ContractViolation::BindingMismatch {
                     field: "assertion.support",
                     reason: "support proposition or enclosing handle differs from assertion".into(),
@@ -461,6 +608,21 @@ impl MaterialClaim {
         }
         if let Some(binding) = &self.screen_target {
             binding.validate()?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_context(
+        &self,
+        task_id: &TaskId,
+        scope: &str,
+        fence: &StateFence,
+    ) -> Result<(), ContractViolation> {
+        self.validate()?;
+        self.payload
+            .validate_for_context(&self.proposition, task_id, scope, fence)?;
+        if let Some(binding) = &self.screen_target {
+            binding.validate_for_context(task_id, scope, fence)?;
         }
         Ok(())
     }

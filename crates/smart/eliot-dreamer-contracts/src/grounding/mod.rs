@@ -111,6 +111,12 @@ impl ModelDraft {
     #[allow(clippy::items_after_statements)]
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
         encoding::preflight(self)?;
+        crate::error::check_vec_bound(self.claims.len(), MAX_CLAIMS, "claims")?;
+        crate::error::check_vec_bound(
+            self.non_material_claims.len(),
+            MAX_CLAIMS,
+            "non_material_claims",
+        )?;
         let mut claims: Vec<_> = self.claims.iter().collect();
         claims.sort_by(|left, right| left.claim_id.cmp(&right.claim_id));
         if claims
@@ -299,6 +305,17 @@ impl GroundedDreamDraft {
     #[allow(clippy::too_many_lines, clippy::items_after_statements)]
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
         encoding::preflight(self)?;
+        crate::error::check_vec_bound(self.input.claims.len(), MAX_CLAIMS, "claims")?;
+        crate::error::check_vec_bound(
+            self.input.non_material_claims.len(),
+            MAX_CLAIMS,
+            "non_material_claims",
+        )?;
+        crate::error::check_vec_bound(
+            self.manifest.references.len(),
+            manifest::MAX_REFERENCES,
+            "references",
+        )?;
         let mut claims: Vec<_> = self.input.claims.iter().collect();
         claims.sort_by(|left, right| left.claim_id.cmp(&right.claim_id));
         if claims
@@ -415,347 +432,11 @@ impl GroundedDreamDraft {
             screen: &self.screen,
         })
     }
-    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ContractViolation> {
-        // Phase 1: bounded retained-value preflight and policy ceiling.
-        let retained_bytes = encoding::preflight(self)?;
-        let output_ceiling = usize::try_from(self.policy.max_output_bytes).map_err(|_| {
-            ContractViolation::Budget {
-                dimension: "grounding_output_bytes",
-                reason: "policy output ceiling does not fit this platform".into(),
-            }
-        })?;
-        if output_ceiling == 0 || retained_bytes > MAX_HANDOFF_BYTES.min(output_ceiling) {
-            return Err(ContractViolation::Budget {
-                dimension: "grounding_output_bytes",
-                reason: "retained grounded output exceeds the intrinsic or policy ceiling".into(),
-            });
-        }
-        // Phase 2: retained job, manifest, ledger, and fence context.
-        crate::error::check_schema_version(self.schema_version, GROUNDING_SCHEMA_VERSION)?;
-        check_text(&self.job_id, "job_id")?;
-        check_text(&self.scope_id, "scope_id")?;
-        check_digest(&self.draft_digest, "draft_digest")?;
-        check_digest(&self.manifest_digest, "manifest_digest")?;
-        check_digest(&self.policy_digest, "policy_digest")?;
-        check_digest(&self.output_digest, "output_digest")?;
-        if self.computed_digest()? != self.output_digest {
-            return Err(ContractViolation::BindingMismatch {
-                field: "output_digest",
-                reason: "grounded draft preimage digest mismatch".into(),
-            });
-        }
-        crate::error::check_fence(&self.state_fence)?;
-        self.input.validate()?;
-        self.manifest.validate()?;
-        self.policy.validate()?;
-        self.ledger.validate()?;
-        if encoding::preflight(self)?
-            > usize::try_from(self.policy.max_output_bytes).map_err(|_| {
-                ContractViolation::Budget {
-                    dimension: "grounding_output_bytes",
-                    reason: "policy output ceiling does not fit this platform".into(),
-                }
-            })?
-        {
-            return Err(ContractViolation::Budget {
-                dimension: "grounding_output_bytes",
-                reason: "retained grounded output exceeds the caller policy cap".into(),
-            });
-        }
-        if self.policy.max_output_bytes > self.input.job.budget.output_bytes.unwrap_or(0) {
-            return Err(ContractViolation::Budget {
-                dimension: "grounding_output_bytes",
-                reason: "policy output ceiling exceeds the retained job budget".into(),
-            });
-        }
-        if self.input.draft_digest != self.draft_digest
-            || self.manifest.digest != self.manifest_digest
-            || self.policy.digest != self.policy_digest
-            || self.ledger.draft_digest != self.draft_digest
-            || self.ledger.manifest_digest != self.manifest_digest
-            || self.ledger.policy_digest != self.policy_digest
-        {
-            return Err(ContractViolation::BindingMismatch {
-                field: "grounding_handoff",
-                reason: "retained preimages and ledger digests must agree".into(),
-            });
-        }
-        if self.input.task_id != self.task_id
-            || self.input.job_id != self.job_id
-            || self.input.input_manifest_digest != self.manifest_digest
-            || self.input.scope_id != self.scope_id
-            || self.input.state_fence != self.state_fence
-        {
-            return Err(ContractViolation::BindingMismatch {
-                field: "grounding_handoff",
-                reason: "task, scope, or fence drift".into(),
-            });
-        }
-        if self.manifest.task_id != self.task_id
-            || self.manifest.scope_id != self.scope_id
-            || self.manifest.state_fence != self.state_fence
-            || self.ledger.task_id != self.task_id
-            || self.ledger.scope_id != self.scope_id
-            || self.ledger.state_fence != self.state_fence
-            || self.ledger.operation_id != self.input.job.operation_id
-            || self.ledger.run_id != self.manifest.run_id
-            || self.ledger.job_id != self.job_id
-        {
-            return Err(ContractViolation::BindingMismatch {
-                field: "grounding_handoff",
-                reason: "manifest or ledger task, scope, or fence drift".into(),
-            });
-        }
-        // Phase 3: exact material, subclaim, and coverage denominators.
-        let expected_ids: BTreeSet<_> = self
-            .input
-            .claims
-            .iter()
-            .map(|claim| claim.claim_id.clone())
-            .collect();
-        if expected_ids != self.ledger.expected_claim_ids {
-            return Err(ContractViolation::BindingMismatch {
-                field: "claim_denominator",
-                reason: "ledger denominator must equal retained material claim identities".into(),
-            });
-        }
-        let expected_subclaims: std::collections::BTreeMap<_, _> = self
-            .input
-            .claims
-            .iter()
-            .map(|claim| (claim.claim_id.clone(), claim.subclaim_ids.clone()))
-            .collect();
-        if expected_subclaims != self.ledger.expected_subclaim_ids {
-            return Err(ContractViolation::BindingMismatch {
-                field: "subclaim_denominator",
-                reason: "ledger subclaim denominator must equal retained claim subclaims".into(),
-            });
-        }
-        let claim_ids: BTreeSet<_> = self
-            .input
-            .claims
-            .iter()
-            .map(|c| c.claim_id.as_str())
-            .collect();
-        // Phase 4: per-record witness and typed relation closure.
-        for claim in &self.input.claims {
-            for subclaim in &claim.subclaim_ids {
-                if subclaim == &claim.claim_id || !claim_ids.contains(subclaim.as_str()) {
-                    return Err(ContractViolation::BindingMismatch {
-                        field: "subclaim_denominator",
-                        reason: "subclaim must resolve to a distinct material claim in this draft"
-                            .into(),
-                    });
-                }
-            }
-        }
-        let expected_nonmaterial: BTreeSet<_> = self
-            .input
-            .non_material_claims
-            .iter()
-            .map(|claim| claim.claim_id.clone())
-            .collect();
-        if expected_nonmaterial != self.ledger.nonmaterial_claim_ids {
-            return Err(ContractViolation::BindingMismatch {
-                field: "nonmaterial_denominator",
-                reason: "ledger non-material denominator must equal retained residue".into(),
-            });
-        }
-        if self.input.claims.len() > self.policy.max_claims as usize
-            || self.input.claims.iter().any(|claim| {
-                claim.subclaim_ids.len() > self.policy.max_subclaims_per_claim as usize
-                    || claim.proposed_support.len()
-                        > self.policy.max_support_handles_per_claim as usize
-                    || claim.proposed_counterevidence.len()
-                        > self.policy.max_support_handles_per_claim as usize
-            })
-            || self.input.non_material_claims.iter().any(|claim| {
-                !self
-                    .policy
-                    .permitted_nonmaterial_classes
-                    .contains(&claim.category)
-            })
-        {
-            return Err(ContractViolation::Budget {
-                dimension: "grounding_policy",
-                reason: "retained claims or non-material classes exceed the policy".into(),
-            });
-        }
-        for claim in &self.input.claims {
-            let Some(record) = self.ledger.records.get(&claim.claim_id) else {
-                continue;
-            };
-            if record.proposition_digest != claim.proposition_digest
-                || record.proposition != claim.proposition
-                || record.kind != claim.kind
-                || record.proposed_support != claim.proposed_support
-                || record.proposed_counterevidence != claim.proposed_counterevidence
-            {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "grounding_handoff",
-                    reason: "ledger record does not match retained claim identity".into(),
-                });
-            }
-            if !self.policy.permitted_kinds.contains(&claim.kind) {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "grounding_policy",
-                    reason: "claim kind is not admitted by the retained policy".into(),
-                });
-            }
-            if record.proposed_support.len() > self.policy.max_support_handles_per_claim as usize
-                || record.proposed_counterevidence.len()
-                    > self.policy.max_support_handles_per_claim as usize
-                || record.component_outcomes.keys().collect::<BTreeSet<_>>()
-                    != claim.component_digests.keys().collect::<BTreeSet<_>>()
-            {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "grounding_policy",
-                    reason: "retained claim exceeds support or component denominator".into(),
-                });
-            }
-            for witness in &record.witnesses {
-                if witness.claim_id != claim.claim_id
-                    || (!record.accepted_support.contains(&witness.handle)
-                        && !record.accepted_counterevidence.contains(&witness.handle))
-                {
-                    return Err(ContractViolation::BindingMismatch {
-                        field: "grounding_assertion",
-                        reason: "witness tuple is not owned by the exact record partition".into(),
-                    });
-                }
-                let reference = self.manifest.references.get(&witness.handle).ok_or(
-                    ContractViolation::BindingMismatch {
-                        field: "grounding_assertion",
-                        reason: "witness handle is absent from the manifest".into(),
-                    },
-                )?;
-                let assertion = reference
-                    .assertions
-                    .iter()
-                    .find(|a| a.assertion_id == witness.assertion_id)
-                    .ok_or(ContractViolation::BindingMismatch {
-                        field: "grounding_assertion",
-                        reason: "witness assertion ID is unresolved".into(),
-                    })?;
-                if assertion.proposition != claim.proposition
-                    || assertion.proposition_digest != claim.proposition_digest
-                    || assertion.precision.kind() != claim.kind
-                    || assertion.component != witness.component
-                    || !claim.component_digests.contains_key(&witness.component)
-                    || (matches!(
-                        record.component_outcomes.get(&witness.component),
-                        Some(SupportResult::Supported | SupportResult::Contradicted)
-                    ) && assertion.support.is_none())
-                {
-                    return Err(ContractViolation::BindingMismatch {
-                        field: "grounding_assertion",
-                        reason: "witness tuple does not match claim proposition/component".into(),
-                    });
-                }
-            }
-            for (component, outcome) in &record.component_outcomes {
-                if matches!(
-                    outcome,
-                    SupportResult::Supported | SupportResult::Contradicted
-                ) && !record.witnesses.iter().any(|w| {
-                    if &w.component != component {
-                        return false;
-                    }
-                    self.manifest
-                        .references
-                        .get(&w.handle)
-                        .and_then(|reference| {
-                            reference
-                                .assertions
-                                .iter()
-                                .find(|assertion| assertion.assertion_id == w.assertion_id)
-                        })
-                        .and_then(|assertion| assertion.support.as_ref())
-                        .is_some_and(|support| support.result == *outcome)
-                }) {
-                    return Err(ContractViolation::BindingMismatch {
-                        field: "grounding_assertion",
-                        reason: "supported or contradicted component lacks a relation witness"
-                            .into(),
-                    });
-                }
-            }
-            for handle in record
-                .accepted_support
-                .iter()
-                .chain(record.accepted_counterevidence.iter())
-            {
-                if !self.manifest.contains(handle) {
-                    return Err(ContractViolation::BindingMismatch {
-                        field: "grounding_handoff",
-                        reason: "accepted evidence must resolve in the live manifest".into(),
-                    });
-                }
-                let witness = record
-                    .witnesses
-                    .iter()
-                    .find(|w| &w.handle == handle && w.claim_id == claim.claim_id)
-                    .ok_or(ContractViolation::BindingMismatch {
-                        field: "grounding_assertion",
-                        reason: "every accepted handle requires an explicit witness".into(),
-                    })?;
-                let reference = &self.manifest.references[handle];
-                let assertion = reference
-                    .assertions
-                    .iter()
-                    .find(|a| a.assertion_id == witness.assertion_id)
-                    .ok_or(ContractViolation::BindingMismatch {
-                        field: "grounding_assertion",
-                        reason: "witness assertion ID is unresolved".into(),
-                    })?;
-                if assertion.proposition != claim.proposition
-                    || assertion.proposition_digest != claim.proposition_digest
-                    || assertion.precision.kind() != claim.kind
-                    || assertion.component != witness.component
-                    || !(claim.component_digests.contains_key(&witness.component)
-                        || witness.component.is_empty() && claim.component_digests.is_empty())
-                {
-                    return Err(ContractViolation::BindingMismatch {
-                        field: "grounding_assertion",
-                        reason: "accepted witness lacks a matching typed component assertion"
-                            .into(),
-                    });
-                }
-            }
-            if record
-                .coverage_denominator_ids
-                .iter()
-                .any(|id| !self.manifest.coverage_denominators.contains_key(id))
-            {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "grounding_coverage",
-                    reason: "claim coverage references must resolve in the retained manifest"
-                        .into(),
-                });
-            }
-        }
-        // Phase 5: carried screen identity; eligibility remains owner logic.
-        if let Some(screen) = &self.screen {
-            screen.validate()?;
-            check_screen_context(screen, &self.task_id, &self.scope_id, &self.state_fence)?;
-        }
-        if self.input.screen != self.screen {
-            return Err(ContractViolation::BindingMismatch {
-                field: "screen",
-                reason: "screen identity must be retained unchanged across the handoff".into(),
-            });
-        }
-        for claim in &self.input.claims {
-            if let Some(binding) = &claim.screen_target {
-                check_screen_context(
-                    &binding.screen,
-                    &self.task_id,
-                    &self.scope_id,
-                    &self.state_fence,
-                )?;
-            }
-        }
+        validate_grounded_preflight_context(self)?;
+        validate_grounded_denominators_policy(self)?;
+        validate_grounded_records(self)?;
+        validate_grounded_screens(self)?;
         Ok(())
     }
 }
@@ -874,6 +555,316 @@ fn validate_subclaim_forest(claims: &[MaterialClaim]) -> Result<(), ContractViol
                     stack.push((child.as_str(), false));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_grounded_preflight_context(
+    self_: &GroundedDreamDraft,
+) -> Result<(), ContractViolation> {
+    // Phase 1: bounded retained-value preflight and policy ceiling.
+    let retained_bytes = encoding::preflight(self_)?;
+    let output_ceiling =
+        usize::try_from(self_.policy.max_output_bytes).map_err(|_| ContractViolation::Budget {
+            dimension: "grounding_output_bytes",
+            reason: "policy output ceiling does not fit this platform".into(),
+        })?;
+    if output_ceiling == 0 || retained_bytes > MAX_HANDOFF_BYTES.min(output_ceiling) {
+        return Err(ContractViolation::Budget {
+            dimension: "grounding_output_bytes",
+            reason: "retained grounded output exceeds the intrinsic or policy ceiling".into(),
+        });
+    }
+    // Phase 2: retained job, manifest, ledger, and fence context.
+    crate::error::check_schema_version(self_.schema_version, GROUNDING_SCHEMA_VERSION)?;
+    check_text(&self_.job_id, "job_id")?;
+    check_text(&self_.scope_id, "scope_id")?;
+    check_digest(&self_.draft_digest, "draft_digest")?;
+    check_digest(&self_.manifest_digest, "manifest_digest")?;
+    check_digest(&self_.policy_digest, "policy_digest")?;
+    check_digest(&self_.output_digest, "output_digest")?;
+    if self_.computed_digest()? != self_.output_digest {
+        return Err(ContractViolation::BindingMismatch {
+            field: "output_digest",
+            reason: "grounded draft preimage digest mismatch".into(),
+        });
+    }
+    crate::error::check_fence(&self_.state_fence)?;
+    self_.input.validate()?;
+    self_.manifest.validate()?;
+    self_.policy.validate()?;
+    self_.ledger.validate()?;
+    if encoding::preflight(self_)?
+        > usize::try_from(self_.policy.max_output_bytes).map_err(|_| ContractViolation::Budget {
+            dimension: "grounding_output_bytes",
+            reason: "policy output ceiling does not fit this platform".into(),
+        })?
+    {
+        return Err(ContractViolation::Budget {
+            dimension: "grounding_output_bytes",
+            reason: "retained grounded output exceeds the caller policy cap".into(),
+        });
+    }
+    if self_.policy.max_output_bytes > self_.input.job.budget.output_bytes.unwrap_or(0) {
+        return Err(ContractViolation::Budget {
+            dimension: "grounding_output_bytes",
+            reason: "policy output ceiling exceeds the retained job budget".into(),
+        });
+    }
+    if self_.input.draft_digest != self_.draft_digest
+        || self_.manifest.digest != self_.manifest_digest
+        || self_.policy.digest != self_.policy_digest
+        || self_.ledger.draft_digest != self_.draft_digest
+        || self_.ledger.manifest_digest != self_.manifest_digest
+        || self_.ledger.policy_digest != self_.policy_digest
+    {
+        return Err(ContractViolation::BindingMismatch {
+            field: "grounding_handoff",
+            reason: "retained preimages and ledger digests must agree".into(),
+        });
+    }
+    if self_.input.task_id != self_.task_id
+        || self_.input.job_id != self_.job_id
+        || self_.input.input_manifest_digest != self_.manifest_digest
+        || self_.input.scope_id != self_.scope_id
+        || self_.input.state_fence != self_.state_fence
+    {
+        return Err(ContractViolation::BindingMismatch {
+            field: "grounding_handoff",
+            reason: "task, scope, or fence drift".into(),
+        });
+    }
+    if self_.manifest.task_id != self_.task_id
+        || self_.manifest.scope_id != self_.scope_id
+        || self_.manifest.state_fence != self_.state_fence
+        || self_.ledger.task_id != self_.task_id
+        || self_.ledger.scope_id != self_.scope_id
+        || self_.ledger.state_fence != self_.state_fence
+        || self_.ledger.operation_id != self_.input.job.operation_id
+        || self_.ledger.run_id != self_.manifest.run_id
+        || self_.ledger.job_id != self_.job_id
+    {
+        return Err(ContractViolation::BindingMismatch {
+            field: "grounding_handoff",
+            reason: "manifest or ledger task, scope, or fence drift".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_grounded_denominators_policy(
+    self_: &GroundedDreamDraft,
+) -> Result<(), ContractViolation> {
+    // Phase 3: exact material, subclaim, and coverage denominators.
+    let expected_ids: BTreeSet<_> = self_
+        .input
+        .claims
+        .iter()
+        .map(|claim| claim.claim_id.clone())
+        .collect();
+    if expected_ids != self_.ledger.expected_claim_ids {
+        return Err(ContractViolation::BindingMismatch {
+            field: "claim_denominator",
+            reason: "ledger denominator must equal retained material claim identities".into(),
+        });
+    }
+    let expected_subclaims: std::collections::BTreeMap<_, _> = self_
+        .input
+        .claims
+        .iter()
+        .map(|claim| (claim.claim_id.clone(), claim.subclaim_ids.clone()))
+        .collect();
+    if expected_subclaims != self_.ledger.expected_subclaim_ids {
+        return Err(ContractViolation::BindingMismatch {
+            field: "subclaim_denominator",
+            reason: "ledger subclaim denominator must equal retained claim subclaims".into(),
+        });
+    }
+    validate_subclaim_forest(&self_.input.claims)?;
+    Ok(())
+}
+
+fn validate_grounded_records(self_: &GroundedDreamDraft) -> Result<(), ContractViolation> {
+    // Phase 4: per-record witness and typed relation closure.
+    for claim in &self_.input.claims {
+        let Some(record) = self_.ledger.records.get(&claim.claim_id) else {
+            continue;
+        };
+        validate_grounded_record(self_, claim, record)?;
+    }
+    Ok(())
+}
+
+fn validate_grounded_record(
+    self_: &GroundedDreamDraft,
+    claim: &MaterialClaim,
+    record: &ClaimGroundingRecord,
+) -> Result<(), ContractViolation> {
+    if record.proposition_digest != claim.proposition_digest
+        || record.proposition != claim.proposition
+        || record.kind != claim.kind
+        || record.proposed_support != claim.proposed_support
+        || record.proposed_counterevidence != claim.proposed_counterevidence
+    {
+        return Err(ContractViolation::BindingMismatch {
+            field: "grounding_handoff",
+            reason: "ledger record does not match retained claim identity".into(),
+        });
+    }
+    if !self_.policy.permitted_kinds.contains(&claim.kind) {
+        return Err(ContractViolation::BindingMismatch {
+            field: "grounding_policy",
+            reason: "claim kind is not admitted by the retained policy".into(),
+        });
+    }
+    if record.proposed_support.len() > self_.policy.max_support_handles_per_claim as usize
+        || record.proposed_counterevidence.len()
+            > self_.policy.max_support_handles_per_claim as usize
+        || record.component_outcomes.keys().collect::<BTreeSet<_>>()
+            != claim.component_digests.keys().collect::<BTreeSet<_>>()
+    {
+        return Err(ContractViolation::BindingMismatch {
+            field: "grounding_policy",
+            reason: "retained claim exceeds support or component denominator".into(),
+        });
+    }
+    for witness in &record.witnesses {
+        if witness.claim_id != claim.claim_id
+            || (!record.accepted_support.contains(&witness.handle)
+                && !record.accepted_counterevidence.contains(&witness.handle))
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "grounding_assertion",
+                reason: "witness tuple is not owned by the exact record partition".into(),
+            });
+        }
+        let reference = self_.manifest.references.get(&witness.handle).ok_or(
+            ContractViolation::BindingMismatch {
+                field: "grounding_assertion",
+                reason: "witness handle is absent from the manifest".into(),
+            },
+        )?;
+        let assertion = reference
+            .assertions
+            .iter()
+            .find(|a| a.assertion_id == witness.assertion_id)
+            .ok_or(ContractViolation::BindingMismatch {
+                field: "grounding_assertion",
+                reason: "witness assertion ID is unresolved".into(),
+            })?;
+        if assertion.proposition != claim.proposition
+            || assertion.proposition_digest != claim.proposition_digest
+            || assertion.precision.kind() != claim.kind
+            || assertion.component != witness.component
+            || !claim.component_digests.contains_key(&witness.component)
+            || (matches!(
+                record.component_outcomes.get(&witness.component),
+                Some(SupportResult::Supported | SupportResult::Contradicted)
+            ) && assertion.support.is_none())
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "grounding_assertion",
+                reason: "witness tuple does not match claim proposition/component".into(),
+            });
+        }
+    }
+    for (component, outcome) in &record.component_outcomes {
+        if matches!(
+            outcome,
+            SupportResult::Supported | SupportResult::Contradicted
+        ) && !record.witnesses.iter().any(|w| {
+            if &w.component != component {
+                return false;
+            }
+            self_
+                .manifest
+                .references
+                .get(&w.handle)
+                .and_then(|reference| {
+                    reference
+                        .assertions
+                        .iter()
+                        .find(|assertion| assertion.assertion_id == w.assertion_id)
+                })
+                .and_then(|assertion| assertion.support.as_ref())
+                .is_some_and(|support| support.result == *outcome)
+        }) {
+            return Err(ContractViolation::BindingMismatch {
+                field: "grounding_assertion",
+                reason: "supported or contradicted component lacks a relation witness".into(),
+            });
+        }
+    }
+    for handle in record
+        .accepted_support
+        .iter()
+        .chain(record.accepted_counterevidence.iter())
+    {
+        if !self_.manifest.contains(handle) {
+            return Err(ContractViolation::BindingMismatch {
+                field: "grounding_handoff",
+                reason: "accepted evidence must resolve in the live manifest".into(),
+            });
+        }
+        let witness = record
+            .witnesses
+            .iter()
+            .find(|w| &w.handle == handle && w.claim_id == claim.claim_id)
+            .ok_or(ContractViolation::BindingMismatch {
+                field: "grounding_assertion",
+                reason: "every accepted handle requires an explicit witness".into(),
+            })?;
+        let reference = &self_.manifest.references[handle];
+        let assertion = reference
+            .assertions
+            .iter()
+            .find(|a| a.assertion_id == witness.assertion_id)
+            .ok_or(ContractViolation::BindingMismatch {
+                field: "grounding_assertion",
+                reason: "witness assertion ID is unresolved".into(),
+            })?;
+        if assertion.proposition != claim.proposition
+            || assertion.proposition_digest != claim.proposition_digest
+            || assertion.precision.kind() != claim.kind
+            || assertion.component != witness.component
+            || !(claim.component_digests.contains_key(&witness.component)
+                || witness.component.is_empty() && claim.component_digests.is_empty())
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "grounding_assertion",
+                reason: "accepted witness lacks a matching typed component assertion".into(),
+            });
+        }
+    }
+    if record
+        .coverage_denominator_ids
+        .iter()
+        .any(|id| !self_.manifest.coverage_denominators.contains_key(id))
+    {
+        return Err(ContractViolation::BindingMismatch {
+            field: "grounding_coverage",
+            reason: "claim coverage references must resolve in the retained manifest".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_grounded_screens(self_: &GroundedDreamDraft) -> Result<(), ContractViolation> {
+    // Phase 5: carried screen identity; eligibility remains owner logic.
+    if let Some(screen) = &self_.screen {
+        screen.validate()?;
+        check_screen_context(screen, &self_.task_id, &self_.scope_id, &self_.state_fence)?;
+    }
+    if self_.input.screen != self_.screen {
+        return Err(ContractViolation::BindingMismatch {
+            field: "screen",
+            reason: "screen identity must be retained unchanged across the handoff".into(),
+        });
+    }
+    for claim in &self_.input.claims {
+        if let Some(binding) = &claim.screen_target {
+            binding.validate_for_context(&self_.task_id, &self_.scope_id, &self_.state_fence)?;
         }
     }
     Ok(())

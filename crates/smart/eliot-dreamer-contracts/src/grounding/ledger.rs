@@ -275,6 +275,7 @@ impl ClaimGroundingLedger {
     #[allow(clippy::items_after_statements)]
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
         crate::grounding::encoding::preflight(self)?;
+        crate::error::check_vec_bound(self.records.len(), super::MAX_CLAIMS, "records")?;
         let mut normalized = self.clone();
         for record in normalized.records.values_mut() {
             record.witnesses.sort_by(|left, right| {

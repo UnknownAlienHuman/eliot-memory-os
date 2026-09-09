@@ -169,4 +169,36 @@ fn curation_screen_and_target_denominator_remain_bound() {
         target_digest,
     };
     binding.validate().expect("screen binding");
+
+    let mut input = draft();
+    input.screen = Some(binding.screen.clone());
+    input.claims[0].screen_target = Some(binding.clone());
+    input.claims[0].source_preimage_digest = input.claims[0]
+        .computed_digest()
+        .expect("screen claim digest");
+    input.draft_digest = input.computed_digest().expect("screen draft digest");
+
+    let manifest = manifest();
+    let policy = policy();
+    let mut ledger = ledger();
+    ledger.draft_digest = input.draft_digest.clone();
+    ledger.ledger_digest = ledger.computed_digest().expect("screen ledger digest");
+    let mut output = grounding::GroundedDreamDraft {
+        schema_version: 2,
+        job_id: input.job_id.clone(),
+        task_id: task(),
+        scope_id: "scope-1".into(),
+        state_fence: fence(),
+        draft_digest: input.draft_digest.clone(),
+        manifest_digest: manifest.digest.clone(),
+        policy_digest: policy.digest.clone(),
+        input,
+        manifest,
+        policy,
+        ledger,
+        screen: Some(binding.screen.clone()),
+        output_digest: String::new(),
+    };
+    output.output_digest = output.computed_digest().expect("screen output digest");
+    output.validate().expect("screen handoff");
 }

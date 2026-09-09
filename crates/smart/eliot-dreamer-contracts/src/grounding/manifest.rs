@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_MANIFEST_BYTES: usize = 1_048_576;
-const MAX_REFERENCES: usize = 4_096;
+pub(super) const MAX_REFERENCES: usize = 4_096;
 
 /// One authorized, revision-bound reference. Handles are data, never authority by themselves.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +111,23 @@ impl AuthorizedReference {
                 });
             }
         }
+        if let (Some(lineage), Some(provenance)) = (&self.source_lineage, &self.provenance) {
+            let matching = provenance
+                .lineage
+                .iter()
+                .filter(|candidate| {
+                    candidate.content_digest == self.content_digest
+                        && candidate.revision == self.source_revision
+                })
+                .collect::<Vec<_>>();
+            if matching.is_empty() || matching.iter().any(|candidate| *candidate != lineage) {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "provenance.lineage",
+                    reason: "standalone and closure lineage entries disagree for the reference"
+                        .into(),
+                });
+            }
+        }
         digest(&self.content_digest, "content_digest")?;
         text(&self.source_revision, "source_revision")?;
         digest(&self.authority_digest, "authority_digest")?;
@@ -160,6 +177,7 @@ impl AllowedReferenceManifest {
     #[allow(clippy::items_after_statements)]
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
         crate::grounding::encoding::preflight(self)?;
+        crate::error::check_vec_bound(self.references.len(), MAX_REFERENCES, "references")?;
         let mut normalized = self.clone();
         for reference in normalized.references.values_mut() {
             reference
