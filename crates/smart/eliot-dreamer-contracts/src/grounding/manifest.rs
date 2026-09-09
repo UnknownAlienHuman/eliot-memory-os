@@ -157,7 +157,25 @@ pub struct AllowedReferenceManifest {
 }
 
 impl AllowedReferenceManifest {
+    #[allow(clippy::items_after_statements)]
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
+        crate::grounding::encoding::preflight(self)?;
+        let mut normalized = self.clone();
+        for reference in normalized.references.values_mut() {
+            reference
+                .assertions
+                .sort_by(|left, right| left.assertion_id.cmp(&right.assertion_id));
+            if reference
+                .assertions
+                .windows(2)
+                .any(|pair| pair[0].assertion_id == pair[1].assertion_id)
+            {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "assertions",
+                    reason: "duplicate assertion identity cannot be normalized".into(),
+                });
+            }
+        }
         #[derive(Serialize)]
         struct Preimage<'a> {
             schema_version: u32,
@@ -174,18 +192,18 @@ impl AllowedReferenceManifest {
             dependence_groups: &'a BTreeSet<String>,
         }
         crate::grounding::encoding::digest(&Preimage {
-            schema_version: self.schema_version,
-            manifest_id: &self.manifest_id,
-            run_id: &self.run_id,
-            task_id: &self.task_id,
-            scope_id: &self.scope_id,
-            state_fence: &self.state_fence,
-            source_snapshot: &self.source_snapshot,
-            source_revision: &self.source_revision,
-            references: &self.references,
-            coverage_denominators: &self.coverage_denominators,
-            coverage_receipts: &self.coverage_receipts,
-            dependence_groups: &self.dependence_groups,
+            schema_version: normalized.schema_version,
+            manifest_id: &normalized.manifest_id,
+            run_id: &normalized.run_id,
+            task_id: &normalized.task_id,
+            scope_id: &normalized.scope_id,
+            state_fence: &normalized.state_fence,
+            source_snapshot: &normalized.source_snapshot,
+            source_revision: &normalized.source_revision,
+            references: &normalized.references,
+            coverage_denominators: &normalized.coverage_denominators,
+            coverage_receipts: &normalized.coverage_receipts,
+            dependence_groups: &normalized.dependence_groups,
         })
     }
     #[allow(clippy::too_many_lines)]
@@ -237,6 +255,75 @@ impl AllowedReferenceManifest {
         }
         for (key, value) in &self.references {
             value.validate()?;
+            if let Some(assurance) = &value.source_assurance {
+                let owner = value
+                    .source_lineage
+                    .as_ref()
+                    .filter(|lineage| {
+                        lineage.content_digest == value.content_digest
+                            && lineage.revision == value.source_revision
+                    })
+                    .map(|lineage| lineage.owner.clone())
+                    .or_else(|| {
+                        value.provenance.as_ref().and_then(|closure| {
+                            closure
+                                .lineage
+                                .iter()
+                                .find(|lineage| {
+                                    lineage.content_digest == value.content_digest
+                                        && lineage.revision == value.source_revision
+                                })
+                                .map(|lineage| lineage.owner.clone())
+                        })
+                    });
+                if owner.as_ref() != Some(&assurance.source) {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "source_assurance.source",
+                        reason: "reference assurance owner is not resolved by lineage closure"
+                            .into(),
+                    });
+                }
+            }
+            for assertion in &value.assertions {
+                assertion.validate_for(
+                    &value.handle,
+                    &self.task_id,
+                    &self.scope_id,
+                    &self.state_fence,
+                )?;
+                if let Some(support) = &assertion.support
+                    && let Some(assurance) = &support.assurance
+                {
+                    let owner = value
+                        .source_lineage
+                        .as_ref()
+                        .filter(|lineage| {
+                            lineage.content_digest == value.content_digest
+                                && lineage.revision == value.source_revision
+                        })
+                        .map(|lineage| lineage.owner.clone())
+                        .or_else(|| {
+                            value.provenance.as_ref().and_then(|closure| {
+                                closure
+                                    .lineage
+                                    .iter()
+                                    .find(|lineage| {
+                                        lineage.content_digest == value.content_digest
+                                            && lineage.revision == value.source_revision
+                                    })
+                                    .map(|lineage| lineage.owner.clone())
+                            })
+                        });
+                    if owner.as_ref() != Some(&assurance.source)
+                        || assurance.revision != value.source_revision
+                    {
+                        return Err(ContractViolation::BindingMismatch {
+                            field: "assertion.support.assurance",
+                            reason: "assertion assurance does not resolve the reference source and revision".into(),
+                        });
+                    }
+                }
+            }
             if let Some(provenance) = &value.provenance
                 && (provenance.scope != self.scope_id || provenance.fence != self.state_fence)
             {

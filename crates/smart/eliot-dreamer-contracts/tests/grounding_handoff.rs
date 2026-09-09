@@ -40,13 +40,33 @@ fn full_handoff_round_trips_without_loss() {
         decoded.input.claims[0].kind,
         grounding::ClaimKind::NumericQuantified
     );
+    let mut permuted = output.clone();
+    permuted.input.claims.reverse();
+    for reference in permuted.manifest.references.values_mut() {
+        reference.assertions.reverse();
+    }
+    for record in permuted.ledger.records.values_mut() {
+        record.witnesses.reverse();
+        record.record_digest = record.computed_digest().expect("record digest");
+    }
+    permuted.input.draft_digest = permuted.input.computed_digest().expect("draft digest");
+    permuted.draft_digest = permuted.input.draft_digest.clone();
+    permuted.ledger.draft_digest = permuted.draft_digest.clone();
+    permuted.ledger.ledger_digest = permuted.ledger.computed_digest().expect("ledger digest");
+    permuted.output_digest = permuted.computed_digest().expect("permuted output digest");
+    assert_eq!(permuted.output_digest, output.output_digest);
+    permuted.validate().expect("permuted handoff validates");
 }
 
 #[test]
 fn v1_shape_cannot_cross_decode_and_payload_kind_is_closed() {
     let mut claim = claim("claim-1");
     claim.kind = grounding::ClaimKind::Causal;
-    assert!(claim.validate().is_err());
+    claim.source_preimage_digest = claim.computed_digest().expect("claim digest");
+    assert!(matches!(
+        claim.validate(),
+        Err(eliot_dreamer_contracts::ContractViolation::KindPayload(_))
+    ));
     let legacy = r#"{"statement":"old","source_handles":["x"]}"#;
     assert!(serde_json::from_str::<grounding::ModelDraft>(legacy).is_err());
 }
@@ -54,9 +74,10 @@ fn v1_shape_cannot_cross_decode_and_payload_kind_is_closed() {
 #[test]
 fn ledger_requires_exact_claim_denominator_reconciliation() {
     let mut value = ledger();
-    value.expected_claim_ids.insert("claim-2".into());
+    value.expected_claim_ids.insert("claim-3".into());
+    value.ledger_digest = value.computed_digest().expect("ledger digest");
     assert!(value.validate().is_err());
-    value.unprocessed_claim_ids.insert("claim-2".into());
+    value.unprocessed_claim_ids.insert("claim-3".into());
     value.unprocessed_reason = Some("algorithm frontier retained".into());
     value.ledger_digest = value.computed_digest().expect("ledger digest");
     value.validate().expect("explicit residue reconciles");
@@ -94,7 +115,16 @@ fn manifest_is_a_revision_bound_firewall() {
         stale: false,
     };
     value.references.insert(artifact("evidence-1"), wrong);
-    assert!(value.validate().is_err());
+    value.digest = value.computed_digest().expect("manifest digest");
+    assert!(matches!(
+        value.validate(),
+        Err(
+            eliot_dreamer_contracts::ContractViolation::BindingMismatch {
+                field: "references",
+                ..
+            }
+        )
+    ));
 }
 
 #[test]

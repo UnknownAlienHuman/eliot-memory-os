@@ -21,12 +21,13 @@ pub mod policy;
 
 pub use claims::{
     ClaimKind, MaterialClaim, NonMaterialClaim, PrecisionPayload, ScreenTargetBinding,
-    TypedEvidenceAssertion,
+    TypedEvidenceAssertion, component_content_digest, proposition_content_digest,
 };
 pub use eliot_epistemic_contracts::{
     AbsenceClaim, CausalClaim, CoverageDenominator, CoverageReceipt, DisclosureClass,
-    EvidenceGrade, GradeAssignment, PositionAssertability, PrivacyHandling, ProvenanceClosure,
-    SourceAssurance, SourceLineage, SupportRecord, SupportResult, TemporalRecord,
+    EvidenceGrade, GradeAssignment, PositionAssertability, PrivacyHandling, PropositionId,
+    ProvenanceClosure, SourceAssurance, SourceLineage, SupportRecord, SupportResult,
+    TemporalRecord,
 };
 pub use ledger::{
     AssertionWitness, ClaimGroundingLedger, ClaimGroundingRecord, GroundingDisposition,
@@ -110,16 +111,28 @@ impl ModelDraft {
     #[allow(clippy::items_after_statements)]
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
         encoding::preflight(self)?;
-        let claims: BTreeMap<_, _> = self
-            .claims
-            .iter()
-            .map(|claim| (claim.claim_id.as_str(), claim))
-            .collect();
-        let non_material_claims: BTreeMap<_, _> = self
-            .non_material_claims
-            .iter()
-            .map(|claim| (claim.claim_id.as_str(), claim))
-            .collect();
+        let mut claims: Vec<_> = self.claims.iter().collect();
+        claims.sort_by(|left, right| left.claim_id.cmp(&right.claim_id));
+        if claims
+            .windows(2)
+            .any(|pair| pair[0].claim_id == pair[1].claim_id)
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "claims",
+                reason: "duplicate claim identity cannot be normalized".into(),
+            });
+        }
+        let mut non_material_claims: Vec<_> = self.non_material_claims.iter().collect();
+        non_material_claims.sort_by(|left, right| left.claim_id.cmp(&right.claim_id));
+        if non_material_claims
+            .windows(2)
+            .any(|pair| pair[0].claim_id == pair[1].claim_id)
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "non_material_claims",
+                reason: "duplicate residue identity cannot be normalized".into(),
+            });
+        }
         #[derive(Serialize)]
         struct Preimage<'a> {
             schema_version: u32,
@@ -136,8 +149,8 @@ impl ModelDraft {
             budget_digest: &'a str,
             bundle_digest: &'a str,
             input_manifest_digest: &'a str,
-            claims: BTreeMap<&'a str, &'a MaterialClaim>,
-            non_material_claims: BTreeMap<&'a str, &'a NonMaterialClaim>,
+            claims: Vec<&'a MaterialClaim>,
+            non_material_claims: Vec<&'a NonMaterialClaim>,
             screen: &'a Option<ScreenBinding>,
         }
         encoding::digest(&Preimage {
@@ -241,6 +254,7 @@ impl ModelDraft {
                 });
             }
         }
+        validate_subclaim_forest(&self.claims)?;
         for claim in &self.claims {
             claim.validate()?;
         }
@@ -249,6 +263,7 @@ impl ModelDraft {
         }
         if let Some(screen) = &self.screen {
             screen.validate()?;
+            check_screen_context(screen, &self.task_id, &self.scope_id, &self.state_fence)?;
         }
         if self.computed_digest()? != self.draft_digest {
             return Err(ContractViolation::BindingMismatch {
@@ -281,7 +296,74 @@ pub struct GroundedDreamDraft {
 }
 
 impl GroundedDreamDraft {
+    #[allow(clippy::too_many_lines, clippy::items_after_statements)]
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
+        encoding::preflight(self)?;
+        let mut claims: Vec<_> = self.input.claims.iter().collect();
+        claims.sort_by(|left, right| left.claim_id.cmp(&right.claim_id));
+        if claims
+            .windows(2)
+            .any(|pair| pair[0].claim_id == pair[1].claim_id)
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "claims",
+                reason: "duplicate claim identity cannot be normalized".into(),
+            });
+        }
+        let mut residues: Vec<_> = self.input.non_material_claims.iter().collect();
+        residues.sort_by(|left, right| left.claim_id.cmp(&right.claim_id));
+        if residues
+            .windows(2)
+            .any(|pair| pair[0].claim_id == pair[1].claim_id)
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "non_material_claims",
+                reason: "duplicate residue identity cannot be normalized".into(),
+            });
+        }
+        let mut normalized = self.clone();
+        for reference in normalized.manifest.references.values_mut() {
+            reference
+                .assertions
+                .sort_by(|left, right| left.assertion_id.cmp(&right.assertion_id));
+        }
+        for record in normalized.ledger.records.values_mut() {
+            record.witnesses.sort_by(|left, right| {
+                (
+                    &left.claim_id,
+                    &left.component,
+                    &left.handle,
+                    &left.assertion_id,
+                )
+                    .cmp(&(
+                        &right.claim_id,
+                        &right.component,
+                        &right.handle,
+                        &right.assertion_id,
+                    ))
+            });
+        }
+        #[derive(Serialize)]
+        struct InputView<'a> {
+            schema_version: u32,
+            job_id: &'a str,
+            task_id: &'a TaskId,
+            scope_id: &'a str,
+            state_fence: &'a StateFence,
+            job: &'a DreamJobInput,
+            bundle: &'a DreamInputBundle,
+            raw_output_digest: &'a str,
+            requester_digest: &'a str,
+            attempt: &'a AttemptIdentity,
+            route: &'a RouteIdentity,
+            budget_digest: &'a str,
+            bundle_digest: &'a str,
+            input_manifest_digest: &'a str,
+            claims: Vec<&'a MaterialClaim>,
+            non_material_claims: Vec<&'a NonMaterialClaim>,
+            screen: &'a Option<ScreenBinding>,
+            draft_digest: &'a str,
+        }
         #[derive(Serialize)]
         struct Preimage<'a> {
             schema_version: u32,
@@ -292,7 +374,7 @@ impl GroundedDreamDraft {
             draft_digest: &'a str,
             manifest_digest: &'a str,
             policy_digest: &'a str,
-            input: &'a ModelDraft,
+            input: InputView<'a>,
             manifest: &'a AllowedReferenceManifest,
             policy: &'a GroundingPolicy,
             ledger: &'a ClaimGroundingLedger,
@@ -307,15 +389,35 @@ impl GroundedDreamDraft {
             draft_digest: &self.draft_digest,
             manifest_digest: &self.manifest_digest,
             policy_digest: &self.policy_digest,
-            input: &self.input,
-            manifest: &self.manifest,
-            policy: &self.policy,
-            ledger: &self.ledger,
+            input: InputView {
+                schema_version: self.input.schema_version,
+                job_id: &self.input.job_id,
+                task_id: &self.input.task_id,
+                scope_id: &self.input.scope_id,
+                state_fence: &self.input.state_fence,
+                job: &self.input.job,
+                bundle: &self.input.bundle,
+                raw_output_digest: &self.input.raw_output_digest,
+                requester_digest: &self.input.requester_digest,
+                attempt: &self.input.attempt,
+                route: &self.input.route,
+                budget_digest: &self.input.budget_digest,
+                bundle_digest: &self.input.bundle_digest,
+                input_manifest_digest: &self.input.input_manifest_digest,
+                claims,
+                non_material_claims: residues,
+                screen: &self.input.screen,
+                draft_digest: &self.input.draft_digest,
+            },
+            manifest: &normalized.manifest,
+            policy: &normalized.policy,
+            ledger: &normalized.ledger,
             screen: &self.screen,
         })
     }
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ContractViolation> {
+        // Phase 1: bounded retained-value preflight and policy ceiling.
         let retained_bytes = encoding::preflight(self)?;
         let output_ceiling = usize::try_from(self.policy.max_output_bytes).map_err(|_| {
             ContractViolation::Budget {
@@ -329,6 +431,7 @@ impl GroundedDreamDraft {
                 reason: "retained grounded output exceeds the intrinsic or policy ceiling".into(),
             });
         }
+        // Phase 2: retained job, manifest, ledger, and fence context.
         crate::error::check_schema_version(self.schema_version, GROUNDING_SCHEMA_VERSION)?;
         check_text(&self.job_id, "job_id")?;
         check_text(&self.scope_id, "scope_id")?;
@@ -371,6 +474,7 @@ impl GroundedDreamDraft {
             || self.policy.digest != self.policy_digest
             || self.ledger.draft_digest != self.draft_digest
             || self.ledger.manifest_digest != self.manifest_digest
+            || self.ledger.policy_digest != self.policy_digest
         {
             return Err(ContractViolation::BindingMismatch {
                 field: "grounding_handoff",
@@ -403,6 +507,7 @@ impl GroundedDreamDraft {
                 reason: "manifest or ledger task, scope, or fence drift".into(),
             });
         }
+        // Phase 3: exact material, subclaim, and coverage denominators.
         let expected_ids: BTreeSet<_> = self
             .input
             .claims
@@ -433,6 +538,7 @@ impl GroundedDreamDraft {
             .iter()
             .map(|c| c.claim_id.as_str())
             .collect();
+        // Phase 4: per-record witness and typed relation closure.
         for claim in &self.input.claims {
             for subclaim in &claim.subclaim_ids {
                 if subclaim == &claim.claim_id || !claim_ids.contains(subclaim.as_str()) {
@@ -481,6 +587,7 @@ impl GroundedDreamDraft {
                 continue;
             };
             if record.proposition_digest != claim.proposition_digest
+                || record.proposition != claim.proposition
                 || record.kind != claim.kind
                 || record.proposed_support != claim.proposed_support
                 || record.proposed_counterevidence != claim.proposed_counterevidence
@@ -506,6 +613,73 @@ impl GroundedDreamDraft {
                     field: "grounding_policy",
                     reason: "retained claim exceeds support or component denominator".into(),
                 });
+            }
+            for witness in &record.witnesses {
+                if witness.claim_id != claim.claim_id
+                    || (!record.accepted_support.contains(&witness.handle)
+                        && !record.accepted_counterevidence.contains(&witness.handle))
+                {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "grounding_assertion",
+                        reason: "witness tuple is not owned by the exact record partition".into(),
+                    });
+                }
+                let reference = self.manifest.references.get(&witness.handle).ok_or(
+                    ContractViolation::BindingMismatch {
+                        field: "grounding_assertion",
+                        reason: "witness handle is absent from the manifest".into(),
+                    },
+                )?;
+                let assertion = reference
+                    .assertions
+                    .iter()
+                    .find(|a| a.assertion_id == witness.assertion_id)
+                    .ok_or(ContractViolation::BindingMismatch {
+                        field: "grounding_assertion",
+                        reason: "witness assertion ID is unresolved".into(),
+                    })?;
+                if assertion.proposition != claim.proposition
+                    || assertion.proposition_digest != claim.proposition_digest
+                    || assertion.precision.kind() != claim.kind
+                    || assertion.component != witness.component
+                    || !claim.component_digests.contains_key(&witness.component)
+                    || (matches!(
+                        record.component_outcomes.get(&witness.component),
+                        Some(SupportResult::Supported | SupportResult::Contradicted)
+                    ) && assertion.support.is_none())
+                {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "grounding_assertion",
+                        reason: "witness tuple does not match claim proposition/component".into(),
+                    });
+                }
+            }
+            for (component, outcome) in &record.component_outcomes {
+                if matches!(
+                    outcome,
+                    SupportResult::Supported | SupportResult::Contradicted
+                ) && !record.witnesses.iter().any(|w| {
+                    if &w.component != component {
+                        return false;
+                    }
+                    self.manifest
+                        .references
+                        .get(&w.handle)
+                        .and_then(|reference| {
+                            reference
+                                .assertions
+                                .iter()
+                                .find(|assertion| assertion.assertion_id == w.assertion_id)
+                        })
+                        .and_then(|assertion| assertion.support.as_ref())
+                        .is_some_and(|support| support.result == *outcome)
+                }) {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "grounding_assertion",
+                        reason: "supported or contradicted component lacks a relation witness"
+                            .into(),
+                    });
+                }
             }
             for handle in record
                 .accepted_support
@@ -535,7 +709,8 @@ impl GroundedDreamDraft {
                         field: "grounding_assertion",
                         reason: "witness assertion ID is unresolved".into(),
                     })?;
-                if assertion.proposition_digest != claim.proposition_digest
+                if assertion.proposition != claim.proposition
+                    || assertion.proposition_digest != claim.proposition_digest
                     || assertion.precision.kind() != claim.kind
                     || assertion.component != witness.component
                     || !(claim.component_digests.contains_key(&witness.component)
@@ -560,14 +735,26 @@ impl GroundedDreamDraft {
                 });
             }
         }
+        // Phase 5: carried screen identity; eligibility remains owner logic.
         if let Some(screen) = &self.screen {
             screen.validate()?;
+            check_screen_context(screen, &self.task_id, &self.scope_id, &self.state_fence)?;
         }
         if self.input.screen != self.screen {
             return Err(ContractViolation::BindingMismatch {
                 field: "screen",
                 reason: "screen identity must be retained unchanged across the handoff".into(),
             });
+        }
+        for claim in &self.input.claims {
+            if let Some(binding) = &claim.screen_target {
+                check_screen_context(
+                    &binding.screen,
+                    &self.task_id,
+                    &self.scope_id,
+                    &self.state_fence,
+                )?;
+            }
         }
         Ok(())
     }
@@ -611,6 +798,83 @@ fn check_route(route: &RouteIdentity) -> Result<(), ContractViolation> {
             field: "route.fingerprint",
             reason: "route fingerprint does not match retained route identity".into(),
         });
+    }
+    Ok(())
+}
+
+fn check_screen_context(
+    screen: &ScreenBinding,
+    task: &TaskId,
+    scope: &str,
+    fence: &StateFence,
+) -> Result<(), ContractViolation> {
+    if screen.task_id != task.to_string()
+        || screen.scope_id != scope
+        || screen.state_fence != *fence
+    {
+        return Err(ContractViolation::BindingMismatch {
+            field: "screen",
+            reason: "screen task, scope, and fence differ from the handoff context".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_subclaim_forest(claims: &[MaterialClaim]) -> Result<(), ContractViolation> {
+    let ids: BTreeSet<_> = claims.iter().map(|claim| claim.claim_id.as_str()).collect();
+    let mut owners = BTreeMap::new();
+    for claim in claims {
+        for child in &claim.subclaim_ids {
+            if child == &claim.claim_id
+                || !ids.contains(child.as_str())
+                || owners.insert(child, &claim.claim_id).is_some()
+            {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "subclaim_ids",
+                    reason: "subclaims must form a resolved single-owner forest".into(),
+                });
+            }
+        }
+    }
+    let by_id: BTreeMap<_, _> = claims
+        .iter()
+        .map(|claim| (claim.claim_id.as_str(), claim))
+        .collect();
+    let mut active = BTreeSet::new();
+    let mut done = BTreeSet::new();
+    for id in ids {
+        if done.contains(id) {
+            continue;
+        }
+        let mut stack = vec![(id, false)];
+        while let Some((current, exiting)) = stack.pop() {
+            if exiting {
+                active.remove(current);
+                done.insert(current.to_owned());
+                continue;
+            }
+            if done.contains(current) {
+                continue;
+            }
+            if !active.insert(current.to_owned()) {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "subclaim_ids",
+                    reason: "subclaim cycle detected".into(),
+                });
+            }
+            stack.push((current, true));
+            if let Some(claim) = by_id.get(current) {
+                for child in claim.subclaim_ids.iter().rev() {
+                    if active.contains(child) {
+                        return Err(ContractViolation::BindingMismatch {
+                            field: "subclaim_ids",
+                            reason: "subclaim cycle detected".into(),
+                        });
+                    }
+                    stack.push((child.as_str(), false));
+                }
+            }
+        }
     }
     Ok(())
 }

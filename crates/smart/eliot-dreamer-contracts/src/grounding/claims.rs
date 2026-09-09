@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{ArtifactId, StateFence};
 use eliot_epistemic_contracts::{
-    AbsenceClaim, CausalClaim, CoverageDenominator, CoverageReceipt, TemporalRecord,
+    AbsenceClaim, CausalClaim, CoverageDenominator, CoverageReceipt, PropositionId, SupportRecord,
+    TemporalRecord,
 };
 use serde::{Deserialize, Serialize};
 
@@ -228,6 +229,42 @@ impl PrecisionPayload {
     }
 }
 
+/// Content digest for a typed proposition payload. The canonical proposition
+/// identity remains separate from this content binding.
+pub fn proposition_content_digest(
+    kind: &ClaimKind,
+    payload: &PrecisionPayload,
+) -> Result<String, ContractViolation> {
+    #[derive(Serialize)]
+    struct Preimage<'a> {
+        schema_version: u32,
+        kind: &'a ClaimKind,
+        payload: &'a PrecisionPayload,
+    }
+    crate::grounding::encoding::digest(&Preimage {
+        schema_version: super::GROUNDING_SCHEMA_VERSION,
+        kind,
+        payload,
+    })
+}
+
+pub fn component_content_digest(
+    proposition: &PropositionId,
+    component: &str,
+) -> Result<String, ContractViolation> {
+    #[derive(Serialize)]
+    struct Preimage<'a> {
+        schema_version: u32,
+        proposition: &'a PropositionId,
+        component: &'a str,
+    }
+    crate::grounding::encoding::digest(&Preimage {
+        schema_version: super::GROUNDING_SCHEMA_VERSION,
+        proposition,
+        component,
+    })
+}
+
 /// Exact screen and target denominator identity retained with a claim.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -239,8 +276,20 @@ pub struct ScreenTargetBinding {
 
 impl ScreenTargetBinding {
     pub fn validate(&self) -> Result<(), ContractViolation> {
+        crate::grounding::encoding::preflight(self)?;
         self.screen.validate()?;
         self.target_denominator.validate()?;
+        let mut screened = self.screen.screened_targets.clone();
+        screened.sort();
+        let mut members = self.target_denominator.members.clone();
+        members.sort();
+        if screened != members {
+            return Err(ContractViolation::BindingMismatch {
+                field: "target_denominator",
+                reason: "screened target membership must equal the retained target denominator"
+                    .into(),
+            });
+        }
         digest(&self.target_digest, "target_digest")?;
         let expected = crate::digest_hex(&crate::canonical_bytes(&(
             &self.target_denominator.mode,
@@ -262,6 +311,7 @@ impl ScreenTargetBinding {
 #[serde(deny_unknown_fields)]
 pub struct MaterialClaim {
     pub claim_id: String,
+    pub proposition: PropositionId,
     pub proposition_digest: String,
     pub kind: ClaimKind,
     pub payload: PrecisionPayload,
@@ -278,19 +328,58 @@ pub struct MaterialClaim {
 #[serde(deny_unknown_fields)]
 pub struct TypedEvidenceAssertion {
     pub assertion_id: String,
+    pub proposition: PropositionId,
     pub proposition_digest: String,
     pub component: String,
     pub precision: PrecisionPayload,
     pub source_span_digest: String,
+    pub support: Option<Box<SupportRecord>>,
 }
 
 impl TypedEvidenceAssertion {
     pub fn validate(&self) -> Result<(), ContractViolation> {
         text(&self.assertion_id, "assertion.assertion_id")?;
+        if self.proposition.as_str().is_empty() {
+            return Err(ContractViolation::MissingField("assertion.proposition"));
+        }
         digest(&self.proposition_digest, "assertion.proposition_digest")?;
         text(&self.component, "assertion.component")?;
         digest(&self.source_span_digest, "assertion.source_span_digest")?;
-        self.precision.validate()
+        self.precision.validate()?;
+        if self.proposition_digest
+            != proposition_content_digest(&self.precision.kind(), &self.precision)?
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "assertion.proposition_digest",
+                reason: "assertion content digest does not bind its typed payload".into(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(
+        &self,
+        handle: &ArtifactId,
+        task_id: &eliot_contracts::TaskId,
+        scope: &str,
+        fence: &StateFence,
+    ) -> Result<(), ContractViolation> {
+        self.validate()?;
+        if let Some(support) = &self.support {
+            support
+                .validate_for(task_id, scope, fence)
+                .map_err(|error| ContractViolation::BindingMismatch {
+                    field: "assertion.support",
+                    reason: error.to_string(),
+                })?;
+            if support.proposition != self.proposition || !support.handles.contains(handle) {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "assertion.support",
+                    reason: "support proposition or enclosing handle differs from assertion".into(),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -303,6 +392,7 @@ impl MaterialClaim {
         struct Preimage<'a> {
             schema_version: u32,
             claim_id: &'a str,
+            proposition: &'a PropositionId,
             proposition_digest: &'a str,
             kind: ClaimKind,
             payload: &'a PrecisionPayload,
@@ -315,6 +405,7 @@ impl MaterialClaim {
         crate::grounding::encoding::digest(&Preimage {
             schema_version: super::GROUNDING_SCHEMA_VERSION,
             claim_id: &self.claim_id,
+            proposition: &self.proposition,
             proposition_digest: &self.proposition_digest,
             kind: self.kind,
             payload: &self.payload,
@@ -340,6 +431,12 @@ impl MaterialClaim {
                 "claim kind does not match typed precision payload".into(),
             ));
         }
+        if self.proposition_digest != proposition_content_digest(&self.kind, &self.payload)? {
+            return Err(ContractViolation::BindingMismatch {
+                field: "proposition_digest",
+                reason: "claim content digest does not bind its typed payload".into(),
+            });
+        }
         if self.proposed_support.len() > MAX_SUPPORT_HANDLES
             || self.proposed_counterevidence.len() > MAX_SUPPORT_HANDLES
         {
@@ -355,6 +452,12 @@ impl MaterialClaim {
         for (component, digest) in &self.component_digests {
             text(component, "component_digests")?;
             super_digest(digest, "component_digests")?;
+            if *digest != component_content_digest(&self.proposition, component)? {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "component_digests",
+                    reason: "component digest does not bind its typed component identity".into(),
+                });
+            }
         }
         if let Some(binding) = &self.screen_target {
             binding.validate()?;
@@ -376,11 +479,31 @@ impl NonMaterialClaim {
     pub fn preflight_bytes(&self) -> Result<usize, ContractViolation> {
         crate::grounding::encoding::preflight(self)
     }
+    pub fn computed_digest(&self) -> Result<String, ContractViolation> {
+        #[derive(Serialize)]
+        struct Preimage<'a> {
+            claim_id: &'a str,
+            category: &'a str,
+            reason: &'a str,
+        }
+        crate::grounding::encoding::digest(&Preimage {
+            claim_id: &self.claim_id,
+            category: &self.category,
+            reason: &self.reason,
+        })
+    }
     pub fn validate(&self) -> Result<(), ContractViolation> {
         text(&self.claim_id, "claim_id")?;
         text(&self.category, "category")?;
         text(&self.reason, "reason")?;
-        digest(&self.source_preimage_digest, "source_preimage_digest")
+        digest(&self.source_preimage_digest, "source_preimage_digest")?;
+        if self.computed_digest()? != self.source_preimage_digest {
+            return Err(ContractViolation::BindingMismatch {
+                field: "source_preimage_digest",
+                reason: "non-material residue preimage digest mismatch".into(),
+            });
+        }
+        Ok(())
     }
 }
 

@@ -3,7 +3,7 @@
 use crate::{error::ContractViolation, grounding::claims::ClaimKind};
 use eliot_contracts::{ArtifactId, StateFence, TaskId};
 use eliot_epistemic_contracts::{
-    EvidenceGrade, GradeAssignment, PositionAssertability, SupportResult,
+    EvidenceGrade, GradeAssignment, PositionAssertability, PropositionId, SupportResult,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,7 +19,6 @@ pub type GroundingDisposition = SupportResult;
 #[serde(deny_unknown_fields)]
 pub struct AssertionWitness {
     pub claim_id: String,
-    pub subclaim_id: Option<String>,
     pub component: String,
     pub handle: ArtifactId,
     pub assertion_id: String,
@@ -30,6 +29,7 @@ pub struct AssertionWitness {
 #[serde(deny_unknown_fields)]
 pub struct ClaimGroundingRecord {
     pub claim_id: String,
+    pub proposition: PropositionId,
     pub proposition_digest: String,
     pub kind: ClaimKind,
     pub proposed_support: BTreeSet<ArtifactId>,
@@ -54,11 +54,47 @@ pub struct ClaimGroundingRecord {
 }
 
 impl ClaimGroundingRecord {
+    #[allow(clippy::items_after_statements)]
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
+        crate::grounding::encoding::preflight(self)?;
+        let mut witnesses: Vec<_> = self.witnesses.iter().collect();
+        witnesses.sort_by(|left, right| {
+            (
+                &left.claim_id,
+                &left.component,
+                &left.handle,
+                &left.assertion_id,
+            )
+                .cmp(&(
+                    &right.claim_id,
+                    &right.component,
+                    &right.handle,
+                    &right.assertion_id,
+                ))
+        });
+        if witnesses.windows(2).any(|pair| {
+            (
+                &pair[0].claim_id,
+                &pair[0].component,
+                &pair[0].handle,
+                &pair[0].assertion_id,
+            ) == (
+                &pair[1].claim_id,
+                &pair[1].component,
+                &pair[1].handle,
+                &pair[1].assertion_id,
+            )
+        }) {
+            return Err(ContractViolation::BindingMismatch {
+                field: "witnesses",
+                reason: "duplicate witness identity cannot be normalized".into(),
+            });
+        }
         #[derive(Serialize)]
         struct Preimage<'a> {
             schema_version: u32,
             claim_id: &'a str,
+            proposition: &'a PropositionId,
             proposition_digest: &'a str,
             kind: ClaimKind,
             proposed_support: &'a BTreeSet<ArtifactId>,
@@ -69,7 +105,7 @@ impl ClaimGroundingRecord {
             accepted_counterevidence: &'a BTreeSet<ArtifactId>,
             rejected_counterevidence: &'a BTreeSet<ArtifactId>,
             unresolved_counterevidence: &'a BTreeSet<ArtifactId>,
-            witnesses: &'a Vec<AssertionWitness>,
+            witnesses: Vec<&'a AssertionWitness>,
             component_outcomes: &'a BTreeMap<String, SupportResult>,
             disposition: GroundingDisposition,
             grade: &'a Option<GradeAssignment>,
@@ -83,6 +119,7 @@ impl ClaimGroundingRecord {
         crate::grounding::encoding::digest(&Preimage {
             schema_version: super::GROUNDING_SCHEMA_VERSION,
             claim_id: &self.claim_id,
+            proposition: &self.proposition,
             proposition_digest: &self.proposition_digest,
             kind: self.kind,
             proposed_support: &self.proposed_support,
@@ -93,7 +130,7 @@ impl ClaimGroundingRecord {
             accepted_counterevidence: &self.accepted_counterevidence,
             rejected_counterevidence: &self.rejected_counterevidence,
             unresolved_counterevidence: &self.unresolved_counterevidence,
-            witnesses: &self.witnesses,
+            witnesses,
             component_outcomes: &self.component_outcomes,
             disposition: self.disposition,
             grade: &self.grade,
@@ -105,8 +142,12 @@ impl ClaimGroundingRecord {
             precision_findings: &self.precision_findings,
         })
     }
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ContractViolation> {
         text(&self.claim_id, "claim_id")?;
+        if self.proposition.as_str().is_empty() {
+            return Err(ContractViolation::MissingField("proposition"));
+        }
         digest(&self.proposition_digest, "proposition_digest")?;
         digest(&self.record_digest, "record_digest")?;
         if self.computed_digest()? != self.record_digest {
@@ -130,6 +171,14 @@ impl ClaimGroundingRecord {
         for item in &self.coverage_denominator_ids {
             text(item, "coverage_denominator_ids")?;
         }
+        if let Some(grade) = &self.grade {
+            grade
+                .validate()
+                .map_err(|error| ContractViolation::BindingMismatch {
+                    field: "grade",
+                    reason: error.to_string(),
+                })?;
+        }
         for witness in &self.witnesses {
             if witness.claim_id != self.claim_id {
                 return Err(ContractViolation::BindingMismatch {
@@ -138,9 +187,6 @@ impl ClaimGroundingRecord {
                 });
             }
             text(&witness.claim_id, "witness.claim_id")?;
-            if let Some(subclaim) = &witness.subclaim_id {
-                text(subclaim, "witness.subclaim_id")?;
-            }
             text(&witness.component, "witness.component")?;
             text(&witness.assertion_id, "witness.assertion_id")?;
             if !self.accepted_support.contains(&witness.handle)
@@ -226,7 +272,26 @@ pub struct ClaimGroundingLedger {
 }
 
 impl ClaimGroundingLedger {
+    #[allow(clippy::items_after_statements)]
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
+        crate::grounding::encoding::preflight(self)?;
+        let mut normalized = self.clone();
+        for record in normalized.records.values_mut() {
+            record.witnesses.sort_by(|left, right| {
+                (
+                    &left.claim_id,
+                    &left.component,
+                    &left.handle,
+                    &left.assertion_id,
+                )
+                    .cmp(&(
+                        &right.claim_id,
+                        &right.component,
+                        &right.handle,
+                        &right.assertion_id,
+                    ))
+            });
+        }
         #[derive(Serialize)]
         struct Preimage<'a> {
             schema_version: u32,
@@ -259,10 +324,10 @@ impl ClaimGroundingLedger {
             policy_digest: &self.policy_digest,
             expected_claim_ids: &self.expected_claim_ids,
             expected_subclaim_ids: &self.expected_subclaim_ids,
-            records: &self.records,
-            nonmaterial_claim_ids: &self.nonmaterial_claim_ids,
-            unprocessed_claim_ids: &self.unprocessed_claim_ids,
-            unprocessed_reason: &self.unprocessed_reason,
+            records: &normalized.records,
+            nonmaterial_claim_ids: &normalized.nonmaterial_claim_ids,
+            unprocessed_claim_ids: &normalized.unprocessed_claim_ids,
+            unprocessed_reason: &normalized.unprocessed_reason,
         })
     }
     pub fn validate(&self) -> Result<(), ContractViolation> {
