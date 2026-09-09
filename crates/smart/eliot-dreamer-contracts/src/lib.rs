@@ -18,6 +18,7 @@ pub mod curation;
 pub mod draft;
 pub mod encoding;
 pub mod error;
+pub mod failure;
 pub mod job;
 pub mod registry;
 pub mod relation;
@@ -61,6 +62,18 @@ pub use draft::{
 };
 pub use encoding::{canonical_bytes, digest_hex};
 pub use error::{ContractViolation, check_fence, check_vec_bound, is_hex64_lower};
+pub use failure::{
+    FailureAction, FailureActionEvidence, FailureApplicability, FailureCandidate,
+    FailureCausalStatus, FailureClass, FailureComparator, FailureComparisonProfile,
+    FailureControlRecord, FailureCoverage, FailureDimension, FailureDimensionDescriptor,
+    FailureDimensionSource, FailureDimensionValue, FailureDisposition, FailureEnvironment,
+    FailureEvidence, FailureEvidenceKind, FailureExpectation, FailureExpectedState, FailureHistory,
+    FailureHistoryEntry, FailureHypothesis, FailureInput, FailureLifecycle, FailureMitigation,
+    FailureObservationState, FailureOperation, FailureOutcome, FailurePreservation,
+    FailureProfileDefinition, FailureProposal, FailureReceiptMaterial, FailureResult,
+    FailureRollback, FailureSourceMember, failure_input_digest, failure_proposal_digest,
+    failure_result_digest, seal_failure, validate_failure,
+};
 pub use job::{DreamJobInput, JobClass, Requester, RequesterOrigin, parse_job_class};
 pub use registry::{
     AtomicityMode, CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor,
