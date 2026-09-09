@@ -1,13 +1,24 @@
-//! Capability cell placeholder.
+//! Deterministic, candidate-only `FailureFingerprint` synthesis.
 //!
-//! NOT IMPLEMENTED. This file exists only so that per-crate
-//! `cargo check`, `cargo test` and `cargo clippy` run and report an
-//! actionable result instead of a manifest error.
-//!
-//! Cell `smart.dreamer.failure`, order 26.
-//! The purpose, contract and dependencies of this cell live in
-//! `module.toml` next to this crate. The owning work unit replaces this
-//! file and, on completion, moves the crate from the root
-//! `workspace.exclude` into `workspace.members`.
+//! The handler consumes the complete A03 Failure closure and emits one sealed
+//! candidate artifact. It never performs I/O, calls a provider, reads a clock,
+//! mutates memory, blocks an action, or promotes causal authority.
 
 #![forbid(unsafe_code)]
+
+mod assessment;
+mod policy;
+mod result;
+
+pub use assessment::{
+    ApplicabilityAssessment, CausalLimits, FailureAssessment, FailureCountSummary,
+    OutcomeAssessment, TriggerAssessment,
+};
+pub use eliot_dreamer_contracts::FailureDisposition;
+pub use policy::FailurePolicy;
+pub use result::{
+    FailureHandlerDecision, FailureResult, handler_port, propose_failure_fingerprint,
+};
+
+/// Stable registry identity for this handler.
+pub const HANDLER_ID: &str = "eliot-dreamer-failure";
