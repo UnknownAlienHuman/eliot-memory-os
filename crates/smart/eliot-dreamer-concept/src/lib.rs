@@ -1,13 +1,17 @@
-//! Capability cell placeholder.
+//! Deterministic, candidate-only Concept and Abstraction synthesis.
 //!
-//! NOT IMPLEMENTED. This file exists only so that per-crate
-//! `cargo check`, `cargo test` and `cargo clippy` run and report an
-//! actionable result instead of a manifest error.
+//! This cell consumes the A03 typed closure and emits one reversible candidate.
+//! It has no provider, storage, clock, model, or canonical-state effects.
 //!
-//! Cell `smart.dreamer.concept`, order 24.
-//! The purpose, contract and dependencies of this cell live in
-//! `module.toml` next to this crate. The owning work unit replaces this
-//! file and, on completion, moves the crate from the root
-//! `workspace.exclude` into `workspace.members`.
-
 #![forbid(unsafe_code)]
+
+mod compare;
+mod evidence;
+mod policy;
+mod synthesis;
+
+pub use policy::ConceptPolicy;
+pub use synthesis::{ConceptDecision, handler_port, propose_concept_or_abstraction};
+
+/// Stable handler identity for the single `Concept` wire kind.
+pub const HANDLER_ID: &str = "eliot-dreamer-concept";
