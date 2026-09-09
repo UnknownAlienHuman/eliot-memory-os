@@ -12,6 +12,7 @@ use eliot_contracts::{
     AuthorityEpoch, ReceiptId, ResourceGeneration, SourceId, StateFence, canonical_json_bytes,
     sha256_hex,
 };
+use eliot_dreamer_contracts::relation::RelationPreservationDimension;
 use eliot_dreamer_contracts::validation::{
     InputPreimage, OutputContext, PROOF_CEILING, VALIDATOR_CONTRACT, budget_digest, bundle_digest,
     input_digest_and_size, model_digest, output_digest, preservation_digest,
@@ -26,7 +27,7 @@ use eliot_dreamer_contracts::{
 use eliot_dreamer_orientation::{
     AdmittedOrientationJob, CanonicalEvidenceHandle, CoverageCepMember, CoverageEvidenceMember,
     CurrentEpistemicPositionHandle, LocalOrientationFrame, OrientationCoverageDenominator,
-    OrientationDisposition, OrientationPolicy, project_orientation,
+    OrientationDisposition, OrientationPacketCandidate, OrientationPolicy, project_orientation,
 };
 use eliot_epistemic_contracts::{
     AdmittedReceipt, AdmittedReceiptParams, ClaimId, CurrentEpistemicPosition, Currentness,
@@ -422,9 +423,28 @@ fn projects_minimal_complete_packet() {
     let packet =
         project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
     assert_eq!(packet.disposition, OrientationDisposition::Complete);
+    assert_eq!(packet.schema_version, 2);
+    assert_eq!(
+        packet
+            .preservation
+            .verdicts
+            .iter()
+            .map(|verdict| verdict.dimension)
+            .collect::<Vec<_>>(),
+        RelationPreservationDimension::all()
+    );
     assert_eq!(packet.sections.len(), 11);
     assert_eq!(packet.model_draft, candidate.model);
     assert_eq!(packet.grounded_draft, candidate.grounded);
+    assert_eq!(packet.resolved_epistemic_position_handles, handles);
+    assert_eq!(packet.rival_models_and_dissent.len(), 1);
+    assert_eq!(
+        packet.rival_models_and_dissent[0].text,
+        candidate.model.counterevidence[0]
+    );
+    let mut old_shape = serde_json::to_value(&packet).expect("packet json");
+    old_shape["schema_version"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<OrientationPacketCandidate>(old_shape).is_err());
     let mut permuted_job = job.clone();
     permuted_job.admitted_evidence.reverse();
     let mut permuted_handles = handles.clone();
@@ -450,11 +470,20 @@ fn preserves_model_and_grounding_without_promoting_residue_to_evidence() {
         project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
     assert_eq!(packet.disposition, OrientationDisposition::Partial);
     assert_eq!(packet.omission_handles, candidate.bundle.omissions);
+    assert_eq!(packet.unknowns_and_gaps.len(), 1);
+    assert_eq!(
+        packet.unknowns_and_gaps[0].text,
+        candidate.bundle.omissions[0].reason
+    );
+    assert_eq!(
+        packet.unknowns_and_gaps[0].source,
+        candidate.bundle.omissions[0].handle
+    );
     let reversibility = packet
         .preservation
         .verdicts
         .iter()
-        .find(|verdict| verdict.dimension == PreservationDimension::Reversibility)
+        .find(|verdict| verdict.dimension == RelationPreservationDimension::Reversibility)
         .expect("reversibility verdict");
     assert!(!reversibility.passed);
     let preservation_section = packet

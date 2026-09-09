@@ -4,17 +4,35 @@ use std::collections::BTreeSet;
 use std::io::{self, Write};
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_dreamer_contracts::relation::{
+    RelationPreservation, RelationPreservationDimension, RelationPreservationVerdict,
+};
 use eliot_dreamer_contracts::{
     BudgetUsage, BundleCompleteness, SourceDisposition, SupportState, ValidatedCandidate,
 };
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::input::{
     AdmittedOrientationJob, CanonicalEvidenceHandle, CurrentEpistemicPositionHandle,
     OrientationError,
 };
 use crate::policy::OrientationPolicy;
+
+const ORIENTATION_PACKET_SCHEMA_VERSION: u32 = 2;
+
+fn deserialize_orientation_packet_schema<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let version = u32::deserialize(deserializer)?;
+    if version != ORIENTATION_PACKET_SCHEMA_VERSION {
+        return Err(serde::de::Error::custom(format_args!(
+            "unsupported orientation packet schema version {version}"
+        )));
+    }
+    Ok(version)
+}
 
 /// Implementation grouping names used to account for every I9.5 semantic field.
 #[derive(
@@ -145,6 +163,7 @@ pub struct OrientationProvenance {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OrientationPacketCandidate {
+    #[serde(deserialize_with = "deserialize_orientation_packet_schema")]
     pub schema_version: u32,
     pub packet_id: String,
     pub job_id: String,
@@ -170,7 +189,7 @@ pub struct OrientationPacketCandidate {
     pub invalidation_conditions: Vec<String>,
     pub provenance: OrientationProvenance,
     pub sections: Vec<OrientationSection>,
-    pub preservation: eliot_dreamer_contracts::PreservationReport,
+    pub preservation: RelationPreservation,
     pub upstream_preservation: eliot_dreamer_contracts::PreservationReport,
     pub model_draft: eliot_dreamer_contracts::ModelDraft,
     pub grounded_draft: eliot_dreamer_contracts::GroundedDreamDraft,
@@ -192,7 +211,7 @@ impl OrientationPacketCandidate {
     /// Validates deterministic packet structure and output fit.
     fn validate(&self, policy: &OrientationPolicy) -> Result<(), OrientationError> {
         policy.validate()?;
-        if self.schema_version != 1
+        if self.schema_version != ORIENTATION_PACKET_SCHEMA_VERSION
             || self.sections.len() != 11
             || self.sections.len()
                 > usize::try_from(policy.max_sections).map_err(|_| OrientationError::Bound)?
@@ -1085,29 +1104,12 @@ fn make_packet(
     } else {
         advanced("Architecture implications")
     };
-    let preservation = projection_preservation(candidate, &data);
+    let preservation = projection_preservation(candidate, &data, handles, evidence);
     let local_preservation_complete = preservation
         .verdicts
         .iter()
         .all(|verdict| verdict.passed && verdict.known);
-    let mut sections = data.sections;
-    if let Some(preservation_section) = sections
-        .iter_mut()
-        .find(|section| section.kind == OrientationSectionKind::Preservation)
-    {
-        let items = preservation
-            .verdicts
-            .iter()
-            .map(|verdict| format!("{}:{}", verdict.dimension.as_str(), verdict.passed))
-            .collect();
-        let replacement = section(
-            OrientationSectionKind::Preservation,
-            items,
-            preservation.verdicts.iter().all(|verdict| verdict.known),
-            preservation_section.denominator.clone(),
-        )?;
-        *preservation_section = replacement;
-    }
+    let sections = rebuild_preservation_section(data.sections, &preservation)?;
     let disposition = if local_preservation_complete
         && matches!(
             data.disposition,
@@ -1117,8 +1119,16 @@ fn make_packet(
     } else {
         crate::result::OrientationDisposition::Partial
     };
+    let input_digest = orientation_input_digest(
+        admitted,
+        candidate,
+        handles,
+        evidence,
+        policy,
+        &preservation,
+    )?;
     Ok(OrientationPacketCandidate {
-        schema_version: 1,
+        schema_version: ORIENTATION_PACKET_SCHEMA_VERSION,
         packet_id: String::new(),
         job_id: candidate.job.canonical_id(),
         operation_id: candidate.job.operation_id.clone(),
@@ -1161,9 +1171,33 @@ fn make_packet(
         model_draft: candidate.model.clone(),
         grounded_draft: candidate.grounded.clone(),
         disposition,
-        input_digest: orientation_input_digest(admitted, candidate, handles, evidence, policy)?,
+        input_digest,
         output_digest: String::new(),
     })
+}
+
+fn rebuild_preservation_section(
+    mut sections: Vec<OrientationSection>,
+    preservation: &RelationPreservation,
+) -> Result<Vec<OrientationSection>, OrientationError> {
+    if let Some(preservation_section) = sections
+        .iter_mut()
+        .find(|section| section.kind == OrientationSectionKind::Preservation)
+    {
+        let items = preservation
+            .verdicts
+            .iter()
+            .map(|verdict| format!("{}:{}", verdict.dimension.as_str(), verdict.passed))
+            .collect();
+        let replacement = section(
+            OrientationSectionKind::Preservation,
+            items,
+            preservation.verdicts.iter().all(|verdict| verdict.known),
+            preservation_section.denominator.clone(),
+        )?;
+        *preservation_section = replacement;
+    }
+    Ok(sections)
 }
 
 fn ordered_handles(
@@ -1186,23 +1220,28 @@ fn orientation_input_digest(
     handles: &[CurrentEpistemicPositionHandle],
     evidence: &[CanonicalEvidenceHandle],
     policy: &OrientationPolicy,
+    preservation: &RelationPreservation,
 ) -> Result<String, OrientationError> {
     #[derive(Serialize)]
     struct Input<'a> {
+        packet_schema_version: u32,
         admitted: &'a AdmittedOrientationJob,
         candidate: &'a ValidatedCandidate,
         bundle: &'a eliot_dreamer_contracts::DreamInputBundle,
         cep: &'a [CurrentEpistemicPositionHandle],
         policy: &'a OrientationPolicy,
+        preservation: &'a RelationPreservation,
     }
     let mut canonical_admitted = admitted.clone();
     canonical_admitted.admitted_evidence = evidence.to_vec();
     let bytes = canonical_json_bytes(&Input {
+        packet_schema_version: ORIENTATION_PACKET_SCHEMA_VERSION,
         admitted: &canonical_admitted,
         candidate,
         bundle: &candidate.bundle,
         cep: handles,
         policy,
+        preservation,
     })
     .map_err(|_| OrientationError::Encoding("orientation input"))?;
     Ok(sha256_hex(&bytes))
@@ -1235,7 +1274,7 @@ fn finalize_packet(
     }
     if let Some(report_cap) = job_budget.report_bytes {
         let report = canonical_json_bytes(&(
-            "orientation_report_v1",
+            "orientation_report_v2",
             &packet.source_coverage,
             &packet.sections,
             &packet.preservation,
@@ -1295,139 +1334,207 @@ fn section_digests(
     Ok((item_digests, sha256_hex(&preimage)))
 }
 
-#[allow(clippy::too_many_lines)]
 fn projection_preservation(
     candidate: &ValidatedCandidate,
     data: &ProjectionData,
-) -> eliot_dreamer_contracts::PreservationReport {
-    use eliot_dreamer_contracts::candidate::{
-        DimensionVerdict, PRESERVATION_DIMENSIONS, PreservationDimension,
+    handles: &[CurrentEpistemicPositionHandle],
+    evidence: &[CanonicalEvidenceHandle],
+) -> RelationPreservation {
+    let verdict = |dimension, passed, note: &'static str| RelationPreservationVerdict {
+        dimension,
+        passed,
+        known: true,
+        note: note.to_owned(),
     };
-    eliot_dreamer_contracts::PreservationReport {
-        verdicts: PRESERVATION_DIMENSIONS
+    RelationPreservation {
+        verdicts: RelationPreservationDimension::all()
             .iter()
-            .filter_map(|name| {
-                let dimension = PreservationDimension::parse(name).ok()?;
-                let note = match dimension {
-                    PreservationDimension::Coverage => {
-                        "all emitted I9.5 groups retain section accounting"
-                    }
-                    PreservationDimension::Faithfulness => {
-                        "model and grounded values are copied without additions"
-                    }
-                    PreservationDimension::Lineage => {
-                        "job, bundle, receipt and frame bindings are retained"
-                    }
-                    PreservationDimension::Reversibility => {
-                        "retained source references and reversible omission declarations remain under the upstream admission proof ceiling; no source-store access occurs here"
-                    }
-                    PreservationDimension::AuthorityCeiling => {
-                        "no truth, authority, delivery or effect is emitted"
-                    }
-                    PreservationDimension::DependencyClosure => {
-                        "A03 receipt binding is checked before projection"
-                    }
-                    PreservationDimension::ProvenanceRetention => {
-                        "requester, source and validation provenance are carried"
-                    }
-                };
-                let (passed, known) = match dimension {
-                    PreservationDimension::Coverage => (
-                        data.gaps.len() == candidate.bundle.omissions.len()
-                            && data.omissions == candidate.bundle.omissions
-                            && data.materials == candidate.bundle.materials
-                            && data.sources.len()
-                                == candidate
-                                    .bundle
-                                    .materials
-                                    .iter()
-                                    .filter(|m| {
-                                        !matches!(m.disposition, SourceDisposition::Excluded)
-                                    })
-                                    .count(),
-                        true,
-                    ),
-                    PreservationDimension::Faithfulness => (
-                        data.interpretation.statement == candidate.model.statement
-                            && data.interpretation.uncertainty == candidate.model.uncertainty
-                            && data.interpretation.expected_benefit
-                                == candidate.model.expected_benefit
-                            && data.interpretation.source_handles == candidate.model.source_handles
-                            && data.interpretation.counterevidence
-                                == candidate.model.counterevidence
-                            && data.interpretation.invalidation_conditions
-                                == candidate.model.invalidation_conditions,
-                        true,
-                    ),
-                    PreservationDimension::Lineage => (
-                        data.provenance.manifest_digest == candidate.bundle.manifest_digest
-                            && data.provenance.validation_input_digest
-                                == candidate.validated.receipt.input_digest
-                            && data.provenance.operation_id == candidate.job.operation_id
-                            && data.provenance.idempotency_key == candidate.job.idempotency_key
-                            && data.provenance.task_id == candidate.job.task_id
-                            && data.provenance.scope_id == candidate.job.scope_id
-                            && data.provenance.state_fence == candidate.job.state_fence,
-                        true,
-                    ),
-                    PreservationDimension::Reversibility => (
-                        data.omissions.iter().all(|omission| omission.reversible)
-                            && data.materials == candidate.bundle.materials,
-                        true,
-                    ),
-                    PreservationDimension::AuthorityCeiling => (true, true),
-                    PreservationDimension::DependencyClosure => {
-                        let expected_sources = candidate
-                            .bundle
-                            .materials
-                            .iter()
-                            .filter(|material| {
-                                !matches!(material.disposition, SourceDisposition::Excluded)
-                            })
-                            .map(|material| material.handle.clone())
-                            .collect::<Vec<_>>();
-                        let denominator_retained = match (
-                            data.denominator.as_ref(),
-                            data.coverage.denominator_digest.as_ref(),
-                        ) {
-                            (Some(denominator), Some(digest)) => &denominator.body_digest == digest,
-                            (None, None) => true,
-                            _ => false,
-                        };
-                        (
-                            data.sources == expected_sources
-                                && data.omissions == candidate.bundle.omissions
-                                && denominator_retained
-                                && data.denominator.is_some()
-                                    == candidate.bundle.authoritative_denominator.is_some(),
-                            true,
-                        )
-                    }
-                    PreservationDimension::ProvenanceRetention => (
-                        data.provenance.requester_origin == candidate.job.requester.origin
-                            && data.provenance.requester_principal == candidate.job.requester.principal
-                            && data.provenance.requester_session == candidate.job.requester.session
-                            && data.provenance.privacy_profile == candidate.job.privacy_profile
-                            && data.provenance.source_handles
-                                == candidate
-                                    .bundle
-                                    .materials
-                                    .iter()
-                                    .filter(|material| {
-                                        !matches!(material.disposition, SourceDisposition::Excluded)
-                                    })
-                                    .map(|material| material.handle.clone())
-                                    .collect::<Vec<_>>(),
-                        true,
-                    ),
-                };
-                Some(DimensionVerdict {
+            .copied()
+            .map(|dimension| match dimension {
+                RelationPreservationDimension::Coverage => verdict(
                     dimension,
-                    passed,
-                    known,
-                    note: note.to_owned(),
-                })
+                    preserves_coverage(candidate, data),
+                    "supplied materials, omissions, source counts and section accounting are retained",
+                ),
+                RelationPreservationDimension::Preservation => verdict(
+                    dimension,
+                    preserves_rivals_counterevidence_and_temporal_status(
+                        candidate, data, handles, evidence,
+                    ),
+                    "supplied rivals, counterevidence, evidence status and CEP currentness/supersession distinctions are retained",
+                ),
+                RelationPreservationDimension::Faithfulness => verdict(
+                    dimension,
+                    preserves_faithfulness(candidate, data),
+                    "model and grounded values are copied without additions",
+                ),
+                RelationPreservationDimension::Lineage => verdict(
+                    dimension,
+                    preserves_lineage(candidate, data),
+                    "job, bundle, receipt, frame and state-fence bindings are retained",
+                ),
+                RelationPreservationDimension::Reversibility => verdict(
+                    dimension,
+                    preserves_reversibility(candidate, data),
+                    "admitted source references and reversible omissions stay within the upstream proof boundary; no live source-store claim is made",
+                ),
+                RelationPreservationDimension::SourceAuthority => verdict(
+                    dimension,
+                    preserves_source_authority(candidate, data, evidence),
+                    "privacy, evidence, effect, proof and source ceilings remain bounded by the admitted candidate",
+                ),
+                RelationPreservationDimension::DependencyClosure => verdict(
+                    dimension,
+                    preserves_dependency_closure(candidate, data),
+                    "retained source references, omissions and the admitted denominator keep dependency closure",
+                ),
             })
             .collect(),
     }
+}
+
+fn expected_source_handles(candidate: &ValidatedCandidate) -> Vec<String> {
+    candidate
+        .bundle
+        .materials
+        .iter()
+        .filter(|material| !matches!(material.disposition, SourceDisposition::Excluded))
+        .map(|material| material.handle.clone())
+        .collect()
+}
+
+fn preserves_coverage(candidate: &ValidatedCandidate, data: &ProjectionData) -> bool {
+    let expected_sources = expected_source_handles(candidate);
+    data.gaps.len() == candidate.bundle.omissions.len()
+        && data.omissions == candidate.bundle.omissions
+        && data.materials == candidate.bundle.materials
+        && data.sources == expected_sources
+        && u64::try_from(candidate.bundle.materials.len()).ok()
+            == Some(data.coverage.material_count)
+        && u64::try_from(candidate.bundle.omissions.len()).ok()
+            == Some(data.coverage.omission_count)
+        && u64::try_from(expected_sources.len()).ok() == Some(data.coverage.non_excluded_count)
+}
+
+fn preserves_rivals_counterevidence_and_temporal_status(
+    candidate: &ValidatedCandidate,
+    data: &ProjectionData,
+    handles: &[CurrentEpistemicPositionHandle],
+    evidence: &[CanonicalEvidenceHandle],
+) -> bool {
+    let expected_rivals = candidate
+        .model
+        .counterevidence
+        .iter()
+        .map(|text| OrientationResidue {
+            kind: "counterevidence".to_owned(),
+            text: text.clone(),
+            source: "model_draft".to_owned(),
+        })
+        .collect::<Vec<_>>();
+    let mut expected_evidence = Vec::with_capacity(evidence.len());
+    for entry in evidence {
+        let Ok(envelope_bytes) = canonical_json_bytes(&entry.envelope) else {
+            return false;
+        };
+        expected_evidence.push(AnchoredEvidence {
+            source_handle: entry.source_handle.clone(),
+            envelope: entry.envelope.clone(),
+            canonical_digest: sha256_hex(&envelope_bytes),
+        });
+    }
+    let positions_section_matches = data
+        .sections
+        .iter()
+        .find(|section| section.kind == OrientationSectionKind::Positions)
+        .is_some_and(|section| {
+            let expected = handles
+                .iter()
+                .map(|handle| format!("position:{}", handle.position.digest))
+                .collect::<Vec<_>>();
+            section.items == expected
+        });
+    data.rivals == expected_rivals
+        && data.interpretation.counterevidence == candidate.model.counterevidence
+        && data.evidence == expected_evidence
+        && positions_section_matches
+}
+
+fn preserves_faithfulness(candidate: &ValidatedCandidate, data: &ProjectionData) -> bool {
+    data.interpretation.statement == candidate.model.statement
+        && data.interpretation.uncertainty == candidate.model.uncertainty
+        && data.interpretation.expected_benefit == candidate.model.expected_benefit
+        && data.interpretation.source_handles == candidate.model.source_handles
+        && data.interpretation.counterevidence == candidate.model.counterevidence
+        && data.interpretation.invalidation_conditions == candidate.model.invalidation_conditions
+}
+
+fn preserves_lineage(candidate: &ValidatedCandidate, data: &ProjectionData) -> bool {
+    data.provenance.requester_origin == candidate.job.requester.origin
+        && data.provenance.requester_principal == candidate.job.requester.principal
+        && data.provenance.requester_session == candidate.job.requester.session
+        && data.provenance.source_handles == expected_source_handles(candidate)
+        && data.provenance.manifest_digest == candidate.bundle.manifest_digest
+        && data.provenance.validation_input_digest == candidate.validated.receipt.input_digest
+        && data.provenance.validation_output_digest == candidate.validated.receipt.output_digest
+        && data.provenance.operation_id == candidate.job.operation_id
+        && data.provenance.idempotency_key == candidate.job.idempotency_key
+        && data.provenance.task_id == candidate.job.task_id
+        && data.provenance.scope_id == candidate.job.scope_id
+        && data.provenance.state_fence == candidate.job.state_fence
+}
+
+fn preserves_reversibility(candidate: &ValidatedCandidate, data: &ProjectionData) -> bool {
+    data.sources == expected_source_handles(candidate)
+        && data.materials == candidate.bundle.materials
+        && data.omissions.iter().all(|omission| omission.reversible)
+}
+
+fn preserves_source_authority(
+    candidate: &ValidatedCandidate,
+    data: &ProjectionData,
+    evidence: &[CanonicalEvidenceHandle],
+) -> bool {
+    let evidence_retained = data
+        .evidence
+        .iter()
+        .zip(evidence)
+        .all(|(retained, admitted)| {
+            retained.source_handle == admitted.source_handle
+                && retained.envelope == admitted.envelope
+                && canonical_json_bytes(&admitted.envelope)
+                    .map(|bytes| retained.canonical_digest == sha256_hex(&bytes))
+                    .is_ok_and(|matches| matches)
+        });
+    data.evidence.len() == evidence.len()
+        && data.provenance.privacy_profile == candidate.job.privacy_profile
+        && data.sources == expected_source_handles(candidate)
+        && data.materials == candidate.bundle.materials
+        && data.provenance.validation_input_digest == candidate.validated.receipt.input_digest
+        && data.provenance.validation_output_digest == candidate.validated.receipt.output_digest
+        && candidate.validated.receipt.proof_ceiling
+            == eliot_dreamer_contracts::validation::PROOF_CEILING
+        && evidence_retained
+        && preserves_candidate_effect_ceiling(data)
+}
+
+fn preserves_candidate_effect_ceiling(data: &ProjectionData) -> bool {
+    data.probes
+        .iter()
+        .all(|probe| probe.status == "model_recommendation_inert" && probe.result_space.is_none())
+}
+
+fn preserves_dependency_closure(candidate: &ValidatedCandidate, data: &ProjectionData) -> bool {
+    let denominator_retained = match (
+        data.denominator.as_ref(),
+        data.coverage.denominator_digest.as_ref(),
+    ) {
+        (Some(denominator), Some(digest)) => &denominator.body_digest == digest,
+        (None, None) => true,
+        _ => false,
+    };
+    data.sources == expected_source_handles(candidate)
+        && data.omissions == candidate.bundle.omissions
+        && denominator_retained
+        && data.denominator.is_some() == candidate.bundle.authoritative_denominator.is_some()
 }
