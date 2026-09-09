@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [package.metadata.eliot]
 prototype = true
-source_status = "NOT_IMPLEMENTED"
+source_status = "IMPLEMENTED"
 workspace_admission = "pending_agent_implementation_and_proof"
 functional_cell = "smart.dreamer.orientation"
 source_layer = "C1"
@@ -23,8 +23,14 @@ agent_order = 6
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
 eliot-evidence = { path = "../../foundation/eliot-evidence" }
+eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts" }
 eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
-eliot-dreamer-candidate-validation = { path = "../eliot-dreamer-candidate-validation" }
+schemars = { version = "1.2.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+
+[dev-dependencies]
 
 [lints]
 workspace = true
