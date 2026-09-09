@@ -40,48 +40,7 @@ pub struct AuthorizedReference {
 
 impl AuthorizedReference {
     pub fn preflight_bytes(&self) -> Result<usize, ContractViolation> {
-        let mut total = 0usize;
-        for value in [
-            self.handle.as_str(),
-            &self.content_digest,
-            &self.source_revision,
-            &self.authority_digest,
-        ] {
-            total = total
-                .checked_add(value.len())
-                .ok_or(ContractViolation::Budget {
-                    dimension: "manifest_bytes",
-                    reason: "reference preflight overflow".into(),
-                })?;
-        }
-        total = total
-            .checked_add(self.assertions.len().checked_mul(256).ok_or(
-                ContractViolation::Budget {
-                    dimension: "manifest_bytes",
-                    reason: "assertion count overflow".into(),
-                },
-            )?)
-            .ok_or(ContractViolation::Budget {
-                dimension: "manifest_bytes",
-                reason: "reference preflight overflow".into(),
-            })?;
-        for allowance in [
-            if self.source_lineage.is_some() {
-                1_024
-            } else {
-                0
-            },
-            if self.support.is_some() { 8_192 } else { 0 },
-            if self.provenance.is_some() { 32_768 } else { 0 },
-        ] {
-            total = total
-                .checked_add(allowance)
-                .ok_or(ContractViolation::Budget {
-                    dimension: "manifest_bytes",
-                    reason: "reference preflight overflow".into(),
-                })?;
-        }
-        Ok(total)
+        crate::grounding::encoding::preflight(self)
     }
     pub fn validate(&self) -> Result<(), ContractViolation> {
         if let Some(lineage) = &self.source_lineage {
@@ -97,6 +56,14 @@ impl AuthorizedReference {
                 return Err(ContractViolation::BindingMismatch {
                     field: "source_lineage",
                     reason: "reference lineage content or revision drift".into(),
+                });
+            }
+            if let Some(assurance) = &self.source_assurance
+                && assurance.source != lineage.owner
+            {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "source_assurance.source",
+                    reason: "assurance owner differs from source lineage owner".into(),
                 });
             }
         }
@@ -191,9 +158,35 @@ pub struct AllowedReferenceManifest {
 
 impl AllowedReferenceManifest {
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
-        let mut preimage = self.clone();
-        preimage.digest.clear();
-        crate::grounding::encoding::digest(&preimage)
+        #[derive(Serialize)]
+        struct Preimage<'a> {
+            schema_version: u32,
+            manifest_id: &'a str,
+            run_id: &'a str,
+            task_id: &'a TaskId,
+            scope_id: &'a str,
+            state_fence: &'a StateFence,
+            source_snapshot: &'a str,
+            source_revision: &'a str,
+            references: &'a BTreeMap<ArtifactId, AuthorizedReference>,
+            coverage_denominators: &'a BTreeMap<String, CoverageDenominator>,
+            coverage_receipts: &'a BTreeMap<String, CoverageReceipt>,
+            dependence_groups: &'a BTreeSet<String>,
+        }
+        crate::grounding::encoding::digest(&Preimage {
+            schema_version: self.schema_version,
+            manifest_id: &self.manifest_id,
+            run_id: &self.run_id,
+            task_id: &self.task_id,
+            scope_id: &self.scope_id,
+            state_fence: &self.state_fence,
+            source_snapshot: &self.source_snapshot,
+            source_revision: &self.source_revision,
+            references: &self.references,
+            coverage_denominators: &self.coverage_denominators,
+            coverage_receipts: &self.coverage_receipts,
+            dependence_groups: &self.dependence_groups,
+        })
     }
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ContractViolation> {
@@ -244,6 +237,14 @@ impl AllowedReferenceManifest {
         }
         for (key, value) in &self.references {
             value.validate()?;
+            if let Some(provenance) = &value.provenance
+                && (provenance.scope != self.scope_id || provenance.fence != self.state_fence)
+            {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "provenance",
+                    reason: "provenance scope or fence differs from manifest".into(),
+                });
+            }
             if let Some(support) = &value.support
                 && (support.task_id != self.task_id
                     || support.fence != self.state_fence
@@ -299,6 +300,54 @@ impl AllowedReferenceManifest {
                     reason: "receipt denominator, task, policy, scope, or fence drift".into(),
                 });
             }
+            let denominator =
+                self.coverage_denominators
+                    .get(key)
+                    .ok_or(ContractViolation::BindingMismatch {
+                        field: "coverage_receipts",
+                        reason: "receipt denominator is absent from manifest".into(),
+                    })?;
+            if denominator.roles.len() != 1
+                || value.denominator_size != denominator.members.len() as u64
+                || denominator.query.as_ref() != Some(&value.query)
+                || denominator.frontier.as_ref() != Some(&value.frontier)
+            {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "coverage_receipts",
+                    reason: "receipt does not close the exact single-role denominator".into(),
+                });
+            }
+            let Some(role) = denominator.roles.iter().next() else {
+                return Err(ContractViolation::MissingField("coverage_receipts.role"));
+            };
+            let mut seen = BTreeSet::new();
+            for member in &value.members {
+                if member.role != *role
+                    || !denominator.members.contains(&member.member)
+                    || !seen.insert(member.member.clone())
+                {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "coverage_receipts",
+                        reason: "receipt contains a foreign or duplicate member".into(),
+                    });
+                }
+            }
+            for omission in &value.omissions {
+                if !denominator.members.contains(&omission.member)
+                    || !seen.insert(omission.member.clone())
+                {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "coverage_receipts",
+                        reason: "receipt omission contains a foreign or duplicate member".into(),
+                    });
+                }
+            }
+            if seen != denominator.members {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "coverage_receipts",
+                    reason: "receipt does not account for every denominator member".into(),
+                });
+            }
         }
         for group in &self.dependence_groups {
             text(group, "dependence_groups")?;
@@ -308,6 +357,8 @@ impl AllowedReferenceManifest {
     pub fn contains(&self, handle: &ArtifactId) -> bool {
         self.references.get(handle).is_some_and(|r| {
             !r.stale
+                && !r.invalidated
+                && r.revocation_reason.is_none()
                 && !matches!(
                     r.freshness,
                     EvidenceFreshness::Stale | EvidenceFreshness::Unknown

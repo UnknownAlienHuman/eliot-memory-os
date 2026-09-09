@@ -17,7 +17,7 @@ fn full_handoff_round_trips_without_loss() {
     let ledger = ledger();
     let mut output = grounding::GroundedDreamDraft {
         schema_version: 2,
-        job_id: "job-grounding".into(),
+        job_id: input.job_id.clone(),
         task_id: task(),
         scope_id: "scope-1".into(),
         state_fence: fence(),
@@ -123,14 +123,20 @@ fn curation_screen_and_target_denominator_remain_bound() {
         result_digest: DIGEST.into(),
         item_digest: DIGEST.into(),
     };
+    let target_mode = AtomicityMode::AllOrNothing;
+    let target_members = vec!["target-1".into()];
+    let target_digest = eliot_contracts::sha256_hex(
+        &eliot_contracts::canonical_json_bytes(&(&target_mode, &target_members, 1u32))
+            .expect("target preimage"),
+    );
     let binding = grounding::ScreenTargetBinding {
         screen,
         target_denominator: TargetDenominator {
-            mode: AtomicityMode::AllOrNothing,
-            members: vec!["target-1".into()],
+            mode: target_mode,
+            members: target_members,
             expected_total: 1,
         },
-        target_digest: DIGEST.into(),
+        target_digest,
     };
     binding.validate().expect("screen binding");
 }

@@ -7,9 +7,9 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_contracts::{StateFence, TaskId};
+pub use eliot_contracts::{ArtifactId, StateFence, TaskId};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{ContractViolation, DreamInputBundle, DreamJobInput, ScreenBinding};
 
@@ -24,11 +24,13 @@ pub use claims::{
     TypedEvidenceAssertion,
 };
 pub use eliot_epistemic_contracts::{
-    CausalClaim, CoverageDenominator, CoverageReceipt, DisclosureClass, EvidenceGrade,
-    GradeAssignment, PositionAssertability, PrivacyHandling, ProvenanceClosure, SourceAssurance,
-    SourceLineage, SupportRecord, SupportResult, TemporalRecord,
+    AbsenceClaim, CausalClaim, CoverageDenominator, CoverageReceipt, DisclosureClass,
+    EvidenceGrade, GradeAssignment, PositionAssertability, PrivacyHandling, ProvenanceClosure,
+    SourceAssurance, SourceLineage, SupportRecord, SupportResult, TemporalRecord,
 };
-pub use ledger::{ClaimGroundingLedger, ClaimGroundingRecord, GroundingDisposition};
+pub use ledger::{
+    AssertionWitness, ClaimGroundingLedger, ClaimGroundingRecord, GroundingDisposition,
+};
 pub use manifest::{AllowedReferenceManifest, AuthorizedReference};
 pub use policy::GroundingPolicy;
 
@@ -36,6 +38,49 @@ pub use policy::GroundingPolicy;
 pub const GROUNDING_SCHEMA_VERSION: u32 = 2;
 pub const MAX_CLAIMS: usize = 4_096;
 const MAX_HANDOFF_BYTES: usize = 1_048_576;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptIdentity {
+    pub attempt_id: String,
+    pub attempt_number: u32,
+    pub maximum_attempts: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteIdentity {
+    pub provider: String,
+    pub model: String,
+    pub route_revision: String,
+    pub fingerprint: String,
+}
+
+pub fn requester_digest(job: &DreamJobInput) -> Result<String, ContractViolation> {
+    encoding::digest(&job.requester)
+}
+
+pub fn budget_digest(job: &DreamJobInput) -> Result<String, ContractViolation> {
+    encoding::digest(&job.budget)
+}
+
+pub fn bundle_digest(bundle: &DreamInputBundle) -> Result<String, ContractViolation> {
+    encoding::digest(bundle)
+}
+
+pub fn route_fingerprint(route: &RouteIdentity) -> Result<String, ContractViolation> {
+    #[derive(Serialize)]
+    struct RoutePreimage<'a> {
+        provider: &'a str,
+        model: &'a str,
+        route_revision: &'a str,
+    }
+    encoding::digest(&RoutePreimage {
+        provider: &route.provider,
+        model: &route.model,
+        route_revision: &route.route_revision,
+    })
+}
 
 /// Structured provider output retained before grounding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,8 +95,8 @@ pub struct ModelDraft {
     pub bundle: DreamInputBundle,
     pub raw_output_digest: String,
     pub requester_digest: String,
-    pub attempt_digest: String,
-    pub route_digest: String,
+    pub attempt: AttemptIdentity,
+    pub route: RouteIdentity,
     pub budget_digest: String,
     pub bundle_digest: String,
     pub input_manifest_digest: String,
@@ -62,10 +107,58 @@ pub struct ModelDraft {
 }
 
 impl ModelDraft {
+    #[allow(clippy::items_after_statements)]
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
-        let mut preimage = self.clone();
-        preimage.draft_digest.clear();
-        encoding::digest(&preimage)
+        encoding::preflight(self)?;
+        let claims: BTreeMap<_, _> = self
+            .claims
+            .iter()
+            .map(|claim| (claim.claim_id.as_str(), claim))
+            .collect();
+        let non_material_claims: BTreeMap<_, _> = self
+            .non_material_claims
+            .iter()
+            .map(|claim| (claim.claim_id.as_str(), claim))
+            .collect();
+        #[derive(Serialize)]
+        struct Preimage<'a> {
+            schema_version: u32,
+            job_id: &'a str,
+            task_id: &'a TaskId,
+            scope_id: &'a str,
+            state_fence: &'a StateFence,
+            job: &'a DreamJobInput,
+            bundle: &'a DreamInputBundle,
+            raw_output_digest: &'a str,
+            requester_digest: &'a str,
+            attempt: &'a AttemptIdentity,
+            route: &'a RouteIdentity,
+            budget_digest: &'a str,
+            bundle_digest: &'a str,
+            input_manifest_digest: &'a str,
+            claims: BTreeMap<&'a str, &'a MaterialClaim>,
+            non_material_claims: BTreeMap<&'a str, &'a NonMaterialClaim>,
+            screen: &'a Option<ScreenBinding>,
+        }
+        encoding::digest(&Preimage {
+            schema_version: self.schema_version,
+            job_id: &self.job_id,
+            task_id: &self.task_id,
+            scope_id: &self.scope_id,
+            state_fence: &self.state_fence,
+            job: &self.job,
+            bundle: &self.bundle,
+            raw_output_digest: &self.raw_output_digest,
+            requester_digest: &self.requester_digest,
+            attempt: &self.attempt,
+            route: &self.route,
+            budget_digest: &self.budget_digest,
+            bundle_digest: &self.bundle_digest,
+            input_manifest_digest: &self.input_manifest_digest,
+            claims,
+            non_material_claims,
+            screen: &self.screen,
+        })
     }
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ContractViolation> {
@@ -74,13 +167,12 @@ impl ModelDraft {
         check_text(&self.scope_id, "scope_id")?;
         check_digest(&self.raw_output_digest, "raw_output_digest")?;
         check_digest(&self.requester_digest, "requester_digest")?;
-        check_digest(&self.attempt_digest, "attempt_digest")?;
-        check_digest(&self.route_digest, "route_digest")?;
         check_digest(&self.budget_digest, "budget_digest")?;
         check_digest(&self.bundle_digest, "bundle_digest")?;
         check_digest(&self.input_manifest_digest, "input_manifest_digest")?;
         check_digest(&self.draft_digest, "draft_digest")?;
         crate::error::check_fence(&self.state_fence)?;
+        encoding::preflight(self)?;
         self.job
             .validate()
             .map_err(|error| ContractViolation::BindingMismatch {
@@ -93,7 +185,9 @@ impl ModelDraft {
                 field: "bundle",
                 reason: error.to_string(),
             })?;
-        if encoding::digest(&self.bundle)? != self.bundle_digest
+        if self.job_id != self.job.canonical_id()
+            || self.bundle.job_id != self.job.canonical_id()
+            || encoding::digest(&self.bundle)? != self.bundle_digest
             || self.job.frozen_manifest_digest != self.input_manifest_digest
         {
             return Err(ContractViolation::BindingMismatch {
@@ -120,39 +214,14 @@ impl ModelDraft {
             MAX_CLAIMS,
             "non_material_claims",
         )?;
-        let mut retained_bytes = 0usize;
-        for value in [
-            &self.job_id,
-            &self.scope_id,
-            &self.raw_output_digest,
-            &self.requester_digest,
-            &self.attempt_digest,
-            &self.route_digest,
-            &self.budget_digest,
-            &self.bundle_digest,
-            &self.input_manifest_digest,
-            &self.draft_digest,
-        ] {
-            add_bytes(&mut retained_bytes, value.len(), "grounding_handoff_bytes")?;
-        }
-        for claim in &self.claims {
-            add_bytes(
-                &mut retained_bytes,
-                claim.preflight_bytes()?,
-                "grounding_handoff_bytes",
-            )?;
-        }
-        for claim in &self.non_material_claims {
-            add_bytes(
-                &mut retained_bytes,
-                claim.preflight_bytes(),
-                "grounding_handoff_bytes",
-            )?;
-        }
-        if retained_bytes > MAX_HANDOFF_BYTES {
-            return Err(ContractViolation::Budget {
-                dimension: "grounding_handoff_bytes",
-                reason: "retained structured input exceeds the contract ceiling".into(),
+        check_attempt(&self.attempt, &self.job)?;
+        check_route(&self.route)?;
+        if self.requester_digest != requester_digest(&self.job)?
+            || self.budget_digest != budget_digest(&self.job)?
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "job_digests",
+                reason: "requester and budget digests must match retained job values".into(),
             });
         }
         let mut claim_ids = BTreeSet::new();
@@ -213,12 +282,53 @@ pub struct GroundedDreamDraft {
 
 impl GroundedDreamDraft {
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
-        let mut preimage = self.clone();
-        preimage.output_digest.clear();
-        encoding::digest(&preimage)
+        #[derive(Serialize)]
+        struct Preimage<'a> {
+            schema_version: u32,
+            job_id: &'a str,
+            task_id: &'a TaskId,
+            scope_id: &'a str,
+            state_fence: &'a StateFence,
+            draft_digest: &'a str,
+            manifest_digest: &'a str,
+            policy_digest: &'a str,
+            input: &'a ModelDraft,
+            manifest: &'a AllowedReferenceManifest,
+            policy: &'a GroundingPolicy,
+            ledger: &'a ClaimGroundingLedger,
+            screen: &'a Option<ScreenBinding>,
+        }
+        encoding::digest(&Preimage {
+            schema_version: self.schema_version,
+            job_id: &self.job_id,
+            task_id: &self.task_id,
+            scope_id: &self.scope_id,
+            state_fence: &self.state_fence,
+            draft_digest: &self.draft_digest,
+            manifest_digest: &self.manifest_digest,
+            policy_digest: &self.policy_digest,
+            input: &self.input,
+            manifest: &self.manifest,
+            policy: &self.policy,
+            ledger: &self.ledger,
+            screen: &self.screen,
+        })
     }
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ContractViolation> {
+        let retained_bytes = encoding::preflight(self)?;
+        let output_ceiling = usize::try_from(self.policy.max_output_bytes).map_err(|_| {
+            ContractViolation::Budget {
+                dimension: "grounding_output_bytes",
+                reason: "policy output ceiling does not fit this platform".into(),
+            }
+        })?;
+        if output_ceiling == 0 || retained_bytes > MAX_HANDOFF_BYTES.min(output_ceiling) {
+            return Err(ContractViolation::Budget {
+                dimension: "grounding_output_bytes",
+                reason: "retained grounded output exceeds the intrinsic or policy ceiling".into(),
+            });
+        }
         crate::error::check_schema_version(self.schema_version, GROUNDING_SCHEMA_VERSION)?;
         check_text(&self.job_id, "job_id")?;
         check_text(&self.scope_id, "scope_id")?;
@@ -237,6 +347,25 @@ impl GroundedDreamDraft {
         self.manifest.validate()?;
         self.policy.validate()?;
         self.ledger.validate()?;
+        if encoding::preflight(self)?
+            > usize::try_from(self.policy.max_output_bytes).map_err(|_| {
+                ContractViolation::Budget {
+                    dimension: "grounding_output_bytes",
+                    reason: "policy output ceiling does not fit this platform".into(),
+                }
+            })?
+        {
+            return Err(ContractViolation::Budget {
+                dimension: "grounding_output_bytes",
+                reason: "retained grounded output exceeds the caller policy cap".into(),
+            });
+        }
+        if self.policy.max_output_bytes > self.input.job.budget.output_bytes.unwrap_or(0) {
+            return Err(ContractViolation::Budget {
+                dimension: "grounding_output_bytes",
+                reason: "policy output ceiling exceeds the retained job budget".into(),
+            });
+        }
         if self.input.draft_digest != self.draft_digest
             || self.manifest.digest != self.manifest_digest
             || self.policy.digest != self.policy_digest
@@ -265,7 +394,8 @@ impl GroundedDreamDraft {
             || self.ledger.task_id != self.task_id
             || self.ledger.scope_id != self.scope_id
             || self.ledger.state_fence != self.state_fence
-            || self.ledger.operation_id != self.manifest.run_id
+            || self.ledger.operation_id != self.input.job.operation_id
+            || self.ledger.run_id != self.manifest.run_id
             || self.ledger.job_id != self.job_id
         {
             return Err(ContractViolation::BindingMismatch {
@@ -297,6 +427,23 @@ impl GroundedDreamDraft {
                 reason: "ledger subclaim denominator must equal retained claim subclaims".into(),
             });
         }
+        let claim_ids: BTreeSet<_> = self
+            .input
+            .claims
+            .iter()
+            .map(|c| c.claim_id.as_str())
+            .collect();
+        for claim in &self.input.claims {
+            for subclaim in &claim.subclaim_ids {
+                if subclaim == &claim.claim_id || !claim_ids.contains(subclaim.as_str()) {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "subclaim_denominator",
+                        reason: "subclaim must resolve to a distinct material claim in this draft"
+                            .into(),
+                    });
+                }
+            }
+        }
         let expected_nonmaterial: BTreeSet<_> = self
             .input
             .non_material_claims
@@ -309,11 +456,35 @@ impl GroundedDreamDraft {
                 reason: "ledger non-material denominator must equal retained residue".into(),
             });
         }
+        if self.input.claims.len() > self.policy.max_claims as usize
+            || self.input.claims.iter().any(|claim| {
+                claim.subclaim_ids.len() > self.policy.max_subclaims_per_claim as usize
+                    || claim.proposed_support.len()
+                        > self.policy.max_support_handles_per_claim as usize
+                    || claim.proposed_counterevidence.len()
+                        > self.policy.max_support_handles_per_claim as usize
+            })
+            || self.input.non_material_claims.iter().any(|claim| {
+                !self
+                    .policy
+                    .permitted_nonmaterial_classes
+                    .contains(&claim.category)
+            })
+        {
+            return Err(ContractViolation::Budget {
+                dimension: "grounding_policy",
+                reason: "retained claims or non-material classes exceed the policy".into(),
+            });
+        }
         for claim in &self.input.claims {
             let Some(record) = self.ledger.records.get(&claim.claim_id) else {
                 continue;
             };
-            if record.proposition_digest != claim.proposition_digest || record.kind != claim.kind {
+            if record.proposition_digest != claim.proposition_digest
+                || record.kind != claim.kind
+                || record.proposed_support != claim.proposed_support
+                || record.proposed_counterevidence != claim.proposed_counterevidence
+            {
                 return Err(ContractViolation::BindingMismatch {
                     field: "grounding_handoff",
                     reason: "ledger record does not match retained claim identity".into(),
@@ -325,58 +496,55 @@ impl GroundedDreamDraft {
                     reason: "claim kind is not admitted by the retained policy".into(),
                 });
             }
-            if record.accepted_support.iter().any(|handle| {
-                !self.manifest.contains(handle)
-                    || !self.manifest.references[handle]
-                        .assertions
-                        .iter()
-                        .any(|assertion| {
-                            assertion.claim_id == claim.claim_id
-                                && assertion.proposition_digest == claim.proposition_digest
-                        })
-            }) || record.accepted_counterevidence.iter().any(|handle| {
-                !self.manifest.contains(handle)
-                    || !self.manifest.references[handle]
-                        .assertions
-                        .iter()
-                        .any(|assertion| {
-                            assertion.claim_id == claim.claim_id
-                                && assertion.proposition_digest == claim.proposition_digest
-                        })
-            }) {
+            if record.proposed_support.len() > self.policy.max_support_handles_per_claim as usize
+                || record.proposed_counterevidence.len()
+                    > self.policy.max_support_handles_per_claim as usize
+                || record.component_outcomes.keys().collect::<BTreeSet<_>>()
+                    != claim.component_digests.keys().collect::<BTreeSet<_>>()
+            {
                 return Err(ContractViolation::BindingMismatch {
-                    field: "grounding_handoff",
-                    reason: "accepted evidence must resolve in the live manifest".into(),
+                    field: "grounding_policy",
+                    reason: "retained claim exceeds support or component denominator".into(),
                 });
             }
-            let witness_handles = record
+            for handle in record
                 .accepted_support
                 .iter()
-                .chain(record.accepted_counterevidence.iter());
-            for handle in witness_handles {
-                let reference = self.manifest.references.get(handle).ok_or(
-                    ContractViolation::BindingMismatch {
+                .chain(record.accepted_counterevidence.iter())
+            {
+                if !self.manifest.contains(handle) {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "grounding_handoff",
+                        reason: "accepted evidence must resolve in the live manifest".into(),
+                    });
+                }
+                let witness = record
+                    .witnesses
+                    .iter()
+                    .find(|w| &w.handle == handle && w.claim_id == claim.claim_id)
+                    .ok_or(ContractViolation::BindingMismatch {
                         field: "grounding_assertion",
-                        reason: "accepted witness handle is absent from the manifest".into(),
-                    },
-                )?;
-                let witness_ids = record.witness_assertions.get(handle).ok_or(
-                    ContractViolation::BindingMismatch {
+                        reason: "every accepted handle requires an explicit witness".into(),
+                    })?;
+                let reference = &self.manifest.references[handle];
+                let assertion = reference
+                    .assertions
+                    .iter()
+                    .find(|a| a.assertion_id == witness.assertion_id)
+                    .ok_or(ContractViolation::BindingMismatch {
                         field: "grounding_assertion",
-                        reason: "accepted witness has no assertion identity".into(),
-                    },
-                )?;
-                if !reference.assertions.iter().any(|assertion| {
-                    witness_ids.contains(&assertion.assertion_id)
-                        && assertion.claim_id == claim.claim_id
-                        && assertion.proposition_digest == claim.proposition_digest
-                        && assertion.precision.kind() == claim.kind
-                        && (record.component_outcomes.is_empty()
-                            || record.component_outcomes.contains_key(&assertion.component))
-                }) {
+                        reason: "witness assertion ID is unresolved".into(),
+                    })?;
+                if assertion.proposition_digest != claim.proposition_digest
+                    || assertion.precision.kind() != claim.kind
+                    || assertion.component != witness.component
+                    || !(claim.component_digests.contains_key(&witness.component)
+                        || witness.component.is_empty() && claim.component_digests.is_empty())
+                {
                     return Err(ContractViolation::BindingMismatch {
                         field: "grounding_assertion",
-                        reason: "accepted witness lacks a matching typed assertion".into(),
+                        reason: "accepted witness lacks a matching typed component assertion"
+                            .into(),
                     });
                 }
             }
@@ -419,19 +587,29 @@ fn check_digest(value: &str, field: &'static str) -> Result<(), ContractViolatio
     }
 }
 
-fn add_bytes(
-    total: &mut usize,
-    amount: usize,
-    field: &'static str,
-) -> Result<(), ContractViolation> {
-    *total = total.checked_add(amount).ok_or(ContractViolation::Budget {
-        dimension: field,
-        reason: "cumulative preflight overflow".into(),
-    })?;
-    if *total > MAX_HANDOFF_BYTES {
-        return Err(ContractViolation::Budget {
-            dimension: field,
-            reason: "retained structured input exceeds the contract ceiling".into(),
+fn check_attempt(attempt: &AttemptIdentity, job: &DreamJobInput) -> Result<(), ContractViolation> {
+    check_text(&attempt.attempt_id, "attempt_id")?;
+    if attempt.attempt_number == 0
+        || attempt.attempt_number > attempt.maximum_attempts
+        || job.budget.attempts != Some(u64::from(attempt.maximum_attempts))
+    {
+        return Err(ContractViolation::BindingMismatch {
+            field: "attempt",
+            reason: "attempt identity must bind the job attempts budget".into(),
+        });
+    }
+    Ok(())
+}
+
+fn check_route(route: &RouteIdentity) -> Result<(), ContractViolation> {
+    check_text(&route.provider, "route.provider")?;
+    check_text(&route.model, "route.model")?;
+    check_text(&route.route_revision, "route.route_revision")?;
+    check_digest(&route.fingerprint, "route.fingerprint")?;
+    if route.fingerprint != route_fingerprint(route)? {
+        return Err(ContractViolation::BindingMismatch {
+            field: "route.fingerprint",
+            reason: "route fingerprint does not match retained route identity".into(),
         });
     }
     Ok(())

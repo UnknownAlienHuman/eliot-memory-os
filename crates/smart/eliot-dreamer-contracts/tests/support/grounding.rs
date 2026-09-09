@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{ArtifactId, AuthorityEpoch, ResourceGeneration, StateFence, TaskId};
 use eliot_dreamer_contracts::grounding::{
-    AllowedReferenceManifest, ClaimGroundingLedger, ClaimGroundingRecord, ClaimKind,
-    GroundingDisposition, GroundingPolicy, MaterialClaim, ModelDraft, NonMaterialClaim,
-    PrecisionPayload,
+    AllowedReferenceManifest, AssertionWitness, AttemptIdentity, ClaimGroundingLedger,
+    ClaimGroundingRecord, ClaimKind, GroundingDisposition, GroundingPolicy, MaterialClaim,
+    ModelDraft, NonMaterialClaim, PrecisionPayload, RouteIdentity,
 };
 use eliot_dreamer_contracts::{
     BudgetLimits, BundleCompleteness, DreamInputBundle, DreamJobInput, JobClass, Requester,
@@ -63,7 +63,7 @@ pub fn job() -> DreamJobInput {
 pub fn bundle() -> DreamInputBundle {
     DreamInputBundle {
         schema_version: 1,
-        job_id: "job-grounding".into(),
+        job_id: job().canonical_id(),
         scope_id: "scope-1".into(),
         task_id: "task-grounding".into(),
         state_fence: fence(),
@@ -88,7 +88,7 @@ pub fn claim(id: &str) -> MaterialClaim {
             rounding: None,
             uncertainty: Some("exact".into()),
         },
-        subclaim_ids: BTreeSet::from([format!("{id}.value")]),
+        subclaim_ids: BTreeSet::new(),
         proposed_support: BTreeSet::from([artifact("evidence-1")]),
         proposed_counterevidence: BTreeSet::new(),
         component_digests: BTreeMap::from([("value".into(), DIGEST.into())]),
@@ -102,18 +102,36 @@ pub fn claim(id: &str) -> MaterialClaim {
 pub fn draft() -> ModelDraft {
     let mut draft = ModelDraft {
         schema_version: 2,
-        job_id: "job-grounding".into(),
+        job_id: job().canonical_id(),
         task_id: task(),
         scope_id: "scope-1".into(),
         state_fence: fence(),
         raw_output_digest: DIGEST.into(),
         job: job(),
         bundle: bundle(),
-        requester_digest: DIGEST.into(),
-        attempt_digest: DIGEST.into(),
-        route_digest: DIGEST.into(),
-        budget_digest: DIGEST.into(),
-        bundle_digest: eliot_dreamer_contracts::grounding::encoding::digest(&bundle())
+        requester_digest: eliot_dreamer_contracts::grounding::requester_digest(&job())
+            .expect("requester digest"),
+        attempt: AttemptIdentity {
+            attempt_id: "attempt-1".into(),
+            attempt_number: 1,
+            maximum_attempts: 2,
+        },
+        route: {
+            let route = RouteIdentity {
+                provider: "fixture".into(),
+                model: "model-1".into(),
+                route_revision: "r1".into(),
+                fingerprint: String::new(),
+            };
+            RouteIdentity {
+                fingerprint: eliot_dreamer_contracts::grounding::route_fingerprint(&route)
+                    .expect("route digest"),
+                ..route
+            }
+        },
+        budget_digest: eliot_dreamer_contracts::grounding::budget_digest(&job())
+            .expect("budget digest"),
+        bundle_digest: eliot_dreamer_contracts::grounding::bundle_digest(&bundle())
             .expect("bundle digest"),
         input_manifest_digest: manifest().digest,
         claims: vec![claim("claim-1")],
@@ -158,7 +176,6 @@ pub fn manifest() -> AllowedReferenceManifest {
                 revocation_reason: None,
                 assertions: vec![eliot_dreamer_contracts::grounding::TypedEvidenceAssertion {
                     assertion_id: "assertion-1".into(),
-                    claim_id: "claim-1".into(),
                     proposition_digest: DIGEST.into(),
                     component: "value".into(),
                     precision: PrecisionPayload::NumericQuantified {
@@ -200,8 +217,9 @@ pub fn policy() -> GroundingPolicy {
         ]),
         max_claims: 100,
         max_subclaims_per_claim: 100,
-        max_support_handles_per_claim: 100,
-        max_output_bytes: 1_000_000,
+        max_support_handles_per_claim: 64,
+        permitted_nonmaterial_classes: BTreeSet::from(["unresolved".into()]),
+        max_output_bytes: 500_000,
         digest: String::new(),
     };
     policy.digest = policy.computed_digest().expect("policy digest");
@@ -221,11 +239,14 @@ pub fn ledger() -> ClaimGroundingLedger {
         accepted_counterevidence: BTreeSet::new(),
         rejected_counterevidence: BTreeSet::new(),
         unresolved_counterevidence: BTreeSet::new(),
-        witness_assertions: BTreeMap::from([(
-            artifact("evidence-1"),
-            BTreeSet::from(["assertion-1".into()]),
-        )]),
-        component_outcomes: BTreeMap::new(),
+        witnesses: vec![AssertionWitness {
+            claim_id: "claim-1".into(),
+            subclaim_id: None,
+            component: "value".into(),
+            handle: artifact("evidence-1"),
+            assertion_id: "assertion-1".into(),
+        }],
+        component_outcomes: BTreeMap::from([("value".into(), GroundingDisposition::Supported)]),
         disposition: GroundingDisposition::Supported,
         grade: None,
         grade_ceiling: eliot_epistemic_contracts::EvidenceGrade::Grounded,
@@ -239,8 +260,9 @@ pub fn ledger() -> ClaimGroundingLedger {
     record.record_digest = record.computed_digest().expect("record digest");
     let mut ledger = ClaimGroundingLedger {
         schema_version: 2,
-        operation_id: "run-1".into(),
-        job_id: "job-grounding".into(),
+        operation_id: "operation-grounding".into(),
+        run_id: "run-1".into(),
+        job_id: job().canonical_id(),
         task_id: task(),
         scope_id: "scope-1".into(),
         state_fence: fence(),
@@ -248,10 +270,7 @@ pub fn ledger() -> ClaimGroundingLedger {
         manifest_digest: manifest().digest,
         policy_digest: policy().digest,
         expected_claim_ids: BTreeSet::from(["claim-1".into()]),
-        expected_subclaim_ids: BTreeMap::from([(
-            "claim-1".into(),
-            BTreeSet::from(["claim-1.value".into()]),
-        )]),
+        expected_subclaim_ids: BTreeMap::from([("claim-1".into(), BTreeSet::new())]),
         records: BTreeMap::from([("claim-1".into(), record)]),
         nonmaterial_claim_ids: BTreeSet::new(),
         unprocessed_claim_ids: BTreeSet::new(),

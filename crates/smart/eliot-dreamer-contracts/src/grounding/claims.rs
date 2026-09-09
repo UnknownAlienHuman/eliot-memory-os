@@ -4,13 +4,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{ArtifactId, StateFence};
 use eliot_epistemic_contracts::{
-    CausalClaim, CoverageDenominator, CoverageReceipt, TemporalRecord,
+    AbsenceClaim, CausalClaim, CoverageDenominator, CoverageReceipt, TemporalRecord,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{error::ContractViolation, registry::TargetDenominator, screen::ScreenBinding};
 
 const MAX_TEXT: usize = 16_384;
+const MAX_SUPPORT_HANDLES: usize = 64;
 
 /// The eight precision distinctions in A-14b.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -50,6 +51,7 @@ pub enum PrecisionPayload {
         domain: String,
         denominator: Box<CoverageDenominator>,
         receipt: Option<Box<CoverageReceipt>>,
+        absence_proof: Option<Box<AbsenceClaim>>,
     },
     ComparativeSuperlative {
         measure: String,
@@ -105,17 +107,13 @@ impl PrecisionPayload {
                 rounding,
                 uncertainty,
             } => {
-                for value in [
-                    value,
-                    unit,
-                    denominator.as_deref().unwrap_or(""),
-                    interval.as_deref().unwrap_or(""),
-                    rounding.as_deref().unwrap_or(""),
-                    uncertainty.as_deref().unwrap_or(""),
-                ] {
-                    if !value.is_empty() {
-                        text(value, "numeric_precision")?;
-                    }
+                text(value, "numeric_precision.value")?;
+                text(unit, "numeric_precision.unit")?;
+                for value in [denominator, interval, rounding, uncertainty]
+                    .into_iter()
+                    .flatten()
+                {
+                    text(value, "numeric_precision.optional")?;
                 }
             }
             Self::TemporalVersioned {
@@ -144,6 +142,7 @@ impl PrecisionPayload {
                 domain,
                 denominator,
                 receipt,
+                absence_proof,
             } => {
                 text(domain, "absence_domain")?;
                 denominator
@@ -160,6 +159,21 @@ impl PrecisionPayload {
                             reason: error.to_string(),
                         })?;
                 }
+                if let Some(proof) = absence_proof {
+                    proof.validate_closed(denominator).map_err(|error| {
+                        ContractViolation::BindingMismatch {
+                            field: "absence_proof",
+                            reason: error.to_string(),
+                        }
+                    })?;
+                    if proof.denominator_digest != denominator.digest {
+                        return Err(ContractViolation::BindingMismatch {
+                            field: "absence_proof",
+                            reason: "absence proof denominator differs from payload denominator"
+                                .into(),
+                        });
+                    }
+                }
             }
             Self::ComparativeSuperlative {
                 measure,
@@ -168,16 +182,11 @@ impl PrecisionPayload {
                 relation,
                 value,
             } => {
-                for value in [
-                    measure,
-                    population,
-                    reference,
-                    relation,
-                    value.as_deref().unwrap_or(""),
-                ] {
-                    if !value.is_empty() {
-                        text(value, "comparative_precision")?;
-                    }
+                for value in [measure, population, reference, relation] {
+                    text(value, "comparative_precision")?;
+                }
+                if let Some(value) = value {
+                    text(value, "comparative_precision.value")?;
                 }
             }
             Self::QuoteAttribution {
@@ -232,7 +241,19 @@ impl ScreenTargetBinding {
     pub fn validate(&self) -> Result<(), ContractViolation> {
         self.screen.validate()?;
         self.target_denominator.validate()?;
-        digest(&self.target_digest, "target_digest")
+        digest(&self.target_digest, "target_digest")?;
+        let expected = crate::digest_hex(&crate::canonical_bytes(&(
+            &self.target_denominator.mode,
+            &self.target_denominator.members,
+            self.target_denominator.expected_total,
+        ))?);
+        if expected != self.target_digest {
+            return Err(ContractViolation::BindingMismatch {
+                field: "target_digest",
+                reason: "target digest does not bind the retained member denominator".into(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -257,7 +278,6 @@ pub struct MaterialClaim {
 #[serde(deny_unknown_fields)]
 pub struct TypedEvidenceAssertion {
     pub assertion_id: String,
-    pub claim_id: String,
     pub proposition_digest: String,
     pub component: String,
     pub precision: PrecisionPayload,
@@ -267,7 +287,6 @@ pub struct TypedEvidenceAssertion {
 impl TypedEvidenceAssertion {
     pub fn validate(&self) -> Result<(), ContractViolation> {
         text(&self.assertion_id, "assertion.assertion_id")?;
-        text(&self.claim_id, "assertion.claim_id")?;
         digest(&self.proposition_digest, "assertion.proposition_digest")?;
         text(&self.component, "assertion.component")?;
         digest(&self.source_span_digest, "assertion.source_span_digest")?;
@@ -276,141 +295,35 @@ impl TypedEvidenceAssertion {
 }
 
 impl MaterialClaim {
-    #[allow(clippy::too_many_lines)]
     pub fn preflight_bytes(&self) -> Result<usize, ContractViolation> {
-        let mut bytes = 0usize;
-        let add = |total: &mut usize, amount: usize| -> Result<(), ContractViolation> {
-            *total = total.checked_add(amount).ok_or(ContractViolation::Budget {
-                dimension: "grounding_handoff_bytes",
-                reason: "claim preflight overflow".into(),
-            })?;
-            Ok(())
-        };
-        add(&mut bytes, self.claim_id.len())?;
-        add(&mut bytes, self.proposition_digest.len())?;
-        add(&mut bytes, self.source_preimage_digest.len())?;
-        for value in &self.subclaim_ids {
-            add(&mut bytes, value.len())?;
-        }
-        for value in self.component_digests.keys() {
-            add(&mut bytes, value.len())?;
-            add(&mut bytes, 64)?;
-        }
-        add(
-            &mut bytes,
-            self.proposed_support
-                .len()
-                .checked_mul(64)
-                .ok_or(ContractViolation::Budget {
-                    dimension: "grounding_edges",
-                    reason: "support edge count overflow".into(),
-                })?,
-        )?;
-        add(
-            &mut bytes,
-            self.proposed_counterevidence.len().checked_mul(64).ok_or(
-                ContractViolation::Budget {
-                    dimension: "grounding_edges",
-                    reason: "counterevidence edge count overflow".into(),
-                },
-            )?,
-        )?;
-        match &self.payload {
-            PrecisionPayload::NumericQuantified {
-                value,
-                unit,
-                denominator,
-                interval,
-                rounding,
-                uncertainty,
-            } => {
-                for value in [
-                    value,
-                    unit,
-                    denominator.as_deref().unwrap_or(""),
-                    interval.as_deref().unwrap_or(""),
-                    rounding.as_deref().unwrap_or(""),
-                    uncertainty.as_deref().unwrap_or(""),
-                ] {
-                    add(&mut bytes, value.len())?;
-                }
-            }
-            PrecisionPayload::TemporalVersioned {
-                version, revision, ..
-            } => {
-                add(&mut bytes, version.len())?;
-                add(&mut bytes, revision.len())?;
-                add(&mut bytes, 40)?;
-            }
-            PrecisionPayload::Causal { causal } => {
-                add(&mut bytes, causal.mechanism.len())?;
-                add(&mut bytes, causal.outcome.len())?;
-                add(&mut bytes, causal.control.len())?;
-                add(&mut bytes, causal.scope.len())?;
-                add(&mut bytes, 640)?;
-            }
-            PrecisionPayload::AbsenceExhaustiveNegative { domain, .. } => {
-                add(&mut bytes, domain.len())?;
-                add(&mut bytes, 1024)?;
-            }
-            PrecisionPayload::ComparativeSuperlative {
-                measure,
-                population,
-                reference,
-                relation,
-                value,
-            } => {
-                for value in [
-                    measure,
-                    population,
-                    reference,
-                    relation,
-                    value.as_deref().unwrap_or(""),
-                ] {
-                    add(&mut bytes, value.len())?;
-                }
-            }
-            PrecisionPayload::QuoteAttribution {
-                quoted_text,
-                span,
-                attributed_to,
-                ..
-            } => {
-                add(&mut bytes, quoted_text.len())?;
-                add(&mut bytes, span.len())?;
-                add(&mut bytes, attributed_to.len())?;
-                add(&mut bytes, 64)?;
-            }
-            PrecisionPayload::RecommendationNormativeInference {
-                recommendation,
-                inference_rule,
-                fact_components,
-                assumptions,
-            } => {
-                add(&mut bytes, recommendation.len())?;
-                add(&mut bytes, inference_rule.len())?;
-                for value in fact_components.iter().chain(assumptions) {
-                    add(&mut bytes, value.len())?;
-                }
-            }
-            PrecisionPayload::IdentityEntity {
-                entity,
-                entity_type,
-                version,
-                scope,
-            } => {
-                add(&mut bytes, entity.len())?;
-                add(&mut bytes, entity_type.len())?;
-                add(&mut bytes, version.len())?;
-                add(&mut bytes, scope.len())?;
-            }
-        }
-        Ok(bytes)
+        crate::grounding::encoding::preflight(self)
     }
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
-        let mut preimage = self.clone();
-        preimage.source_preimage_digest.clear();
-        crate::grounding::encoding::digest(&preimage)
+        #[derive(Serialize)]
+        struct Preimage<'a> {
+            schema_version: u32,
+            claim_id: &'a str,
+            proposition_digest: &'a str,
+            kind: ClaimKind,
+            payload: &'a PrecisionPayload,
+            subclaim_ids: &'a BTreeSet<String>,
+            proposed_support: &'a BTreeSet<ArtifactId>,
+            proposed_counterevidence: &'a BTreeSet<ArtifactId>,
+            component_digests: &'a BTreeMap<String, String>,
+            screen_target: &'a Option<ScreenTargetBinding>,
+        }
+        crate::grounding::encoding::digest(&Preimage {
+            schema_version: super::GROUNDING_SCHEMA_VERSION,
+            claim_id: &self.claim_id,
+            proposition_digest: &self.proposition_digest,
+            kind: self.kind,
+            payload: &self.payload,
+            subclaim_ids: &self.subclaim_ids,
+            proposed_support: &self.proposed_support,
+            proposed_counterevidence: &self.proposed_counterevidence,
+            component_digests: &self.component_digests,
+            screen_target: &self.screen_target,
+        })
     }
     pub fn validate(&self) -> Result<(), ContractViolation> {
         text(&self.claim_id, "claim_id")?;
@@ -426,6 +339,14 @@ impl MaterialClaim {
             return Err(ContractViolation::KindPayload(
                 "claim kind does not match typed precision payload".into(),
             ));
+        }
+        if self.proposed_support.len() > MAX_SUPPORT_HANDLES
+            || self.proposed_counterevidence.len() > MAX_SUPPORT_HANDLES
+        {
+            return Err(ContractViolation::Budget {
+                dimension: "grounding_edges",
+                reason: "support and counterevidence exceed the canonical 64-handle ceiling".into(),
+            });
         }
         self.payload.validate()?;
         for id in &self.subclaim_ids {
@@ -452,11 +373,8 @@ pub struct NonMaterialClaim {
     pub source_preimage_digest: String,
 }
 impl NonMaterialClaim {
-    pub fn preflight_bytes(&self) -> usize {
-        self.claim_id.len()
-            + self.category.len()
-            + self.reason.len()
-            + self.source_preimage_digest.len()
+    pub fn preflight_bytes(&self) -> Result<usize, ContractViolation> {
+        crate::grounding::encoding::preflight(self)
     }
     pub fn validate(&self) -> Result<(), ContractViolation> {
         text(&self.claim_id, "claim_id")?;

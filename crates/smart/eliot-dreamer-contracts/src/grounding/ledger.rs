@@ -8,8 +8,22 @@ use eliot_epistemic_contracts::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+const MAX_SUPPORT_HANDLES: usize = 64;
+
 /// Grounding result uses the canonical epistemic support vocabulary verbatim.
 pub type GroundingDisposition = SupportResult;
+
+/// Explicit link from a retained claim component to one independent typed
+/// assertion. The frozen manifest does not need to know future model IDs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssertionWitness {
+    pub claim_id: String,
+    pub subclaim_id: Option<String>,
+    pub component: String,
+    pub handle: ArtifactId,
+    pub assertion_id: String,
+}
 
 /// Full outcome for one claim, including rejected material and ceilings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,7 +40,7 @@ pub struct ClaimGroundingRecord {
     pub accepted_counterevidence: BTreeSet<ArtifactId>,
     pub rejected_counterevidence: BTreeSet<ArtifactId>,
     pub unresolved_counterevidence: BTreeSet<ArtifactId>,
-    pub witness_assertions: BTreeMap<ArtifactId, BTreeSet<String>>,
+    pub witnesses: Vec<AssertionWitness>,
     pub component_outcomes: BTreeMap<String, SupportResult>,
     pub disposition: GroundingDisposition,
     pub grade: Option<GradeAssignment>,
@@ -41,9 +55,55 @@ pub struct ClaimGroundingRecord {
 
 impl ClaimGroundingRecord {
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
-        let mut preimage = self.clone();
-        preimage.record_digest.clear();
-        crate::grounding::encoding::digest(&preimage)
+        #[derive(Serialize)]
+        struct Preimage<'a> {
+            schema_version: u32,
+            claim_id: &'a str,
+            proposition_digest: &'a str,
+            kind: ClaimKind,
+            proposed_support: &'a BTreeSet<ArtifactId>,
+            accepted_support: &'a BTreeSet<ArtifactId>,
+            rejected_support: &'a BTreeSet<ArtifactId>,
+            unresolved_support: &'a BTreeSet<ArtifactId>,
+            proposed_counterevidence: &'a BTreeSet<ArtifactId>,
+            accepted_counterevidence: &'a BTreeSet<ArtifactId>,
+            rejected_counterevidence: &'a BTreeSet<ArtifactId>,
+            unresolved_counterevidence: &'a BTreeSet<ArtifactId>,
+            witnesses: &'a Vec<AssertionWitness>,
+            component_outcomes: &'a BTreeMap<String, SupportResult>,
+            disposition: GroundingDisposition,
+            grade: &'a Option<GradeAssignment>,
+            grade_ceiling: EvidenceGrade,
+            assertability_ceiling: PositionAssertability,
+            coverage_denominator_ids: &'a BTreeSet<String>,
+            dependence_groups: &'a BTreeSet<String>,
+            unknowns: &'a BTreeSet<String>,
+            precision_findings: &'a BTreeSet<String>,
+        }
+        crate::grounding::encoding::digest(&Preimage {
+            schema_version: super::GROUNDING_SCHEMA_VERSION,
+            claim_id: &self.claim_id,
+            proposition_digest: &self.proposition_digest,
+            kind: self.kind,
+            proposed_support: &self.proposed_support,
+            accepted_support: &self.accepted_support,
+            rejected_support: &self.rejected_support,
+            unresolved_support: &self.unresolved_support,
+            proposed_counterevidence: &self.proposed_counterevidence,
+            accepted_counterevidence: &self.accepted_counterevidence,
+            rejected_counterevidence: &self.rejected_counterevidence,
+            unresolved_counterevidence: &self.unresolved_counterevidence,
+            witnesses: &self.witnesses,
+            component_outcomes: &self.component_outcomes,
+            disposition: self.disposition,
+            grade: &self.grade,
+            grade_ceiling: self.grade_ceiling,
+            assertability_ceiling: self.assertability_ceiling,
+            coverage_denominator_ids: &self.coverage_denominator_ids,
+            dependence_groups: &self.dependence_groups,
+            unknowns: &self.unknowns,
+            precision_findings: &self.precision_findings,
+        })
     }
     pub fn validate(&self) -> Result<(), ContractViolation> {
         text(&self.claim_id, "claim_id")?;
@@ -70,18 +130,39 @@ impl ClaimGroundingRecord {
         for item in &self.coverage_denominator_ids {
             text(item, "coverage_denominator_ids")?;
         }
-        for (handle, assertions) in &self.witness_assertions {
-            if !self.accepted_support.contains(handle)
-                && !self.accepted_counterevidence.contains(handle)
+        for witness in &self.witnesses {
+            if witness.claim_id != self.claim_id {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "witness.claim_id",
+                    reason: "witness claim identity differs from record".into(),
+                });
+            }
+            text(&witness.claim_id, "witness.claim_id")?;
+            if let Some(subclaim) = &witness.subclaim_id {
+                text(subclaim, "witness.subclaim_id")?;
+            }
+            text(&witness.component, "witness.component")?;
+            text(&witness.assertion_id, "witness.assertion_id")?;
+            if !self.accepted_support.contains(&witness.handle)
+                && !self.accepted_counterevidence.contains(&witness.handle)
             {
                 return Err(ContractViolation::BindingMismatch {
-                    field: "witness_assertions",
+                    field: "witnesses",
                     reason: "witness handle must be accepted evidence".into(),
                 });
             }
-            for assertion in assertions {
-                text(assertion, "witness_assertions")?;
-            }
+        }
+        if self.proposed_support.len() > MAX_SUPPORT_HANDLES
+            || self.proposed_counterevidence.len() > MAX_SUPPORT_HANDLES
+            || (!self.rejected_support.is_empty() && self.precision_findings.is_empty())
+            || (!self.rejected_counterevidence.is_empty() && self.precision_findings.is_empty())
+            || (!self.unresolved_support.is_empty() && self.unknowns.is_empty())
+            || (!self.unresolved_counterevidence.is_empty() && self.unknowns.is_empty())
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "record_evidence",
+                reason: "evidence residue requires bounded explicit reasons".into(),
+            });
         }
         let mut accounted_support = self.accepted_support.clone();
         accounted_support.extend(self.rejected_support.iter().cloned());
@@ -127,6 +208,7 @@ impl ClaimGroundingRecord {
 pub struct ClaimGroundingLedger {
     pub schema_version: u32,
     pub operation_id: String,
+    pub run_id: String,
     pub job_id: String,
     pub task_id: TaskId,
     pub scope_id: String,
@@ -145,9 +227,43 @@ pub struct ClaimGroundingLedger {
 
 impl ClaimGroundingLedger {
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
-        let mut preimage = self.clone();
-        preimage.ledger_digest.clear();
-        crate::grounding::encoding::digest(&preimage)
+        #[derive(Serialize)]
+        struct Preimage<'a> {
+            schema_version: u32,
+            operation_id: &'a str,
+            run_id: &'a str,
+            job_id: &'a str,
+            task_id: &'a TaskId,
+            scope_id: &'a str,
+            state_fence: &'a StateFence,
+            draft_digest: &'a str,
+            manifest_digest: &'a str,
+            policy_digest: &'a str,
+            expected_claim_ids: &'a BTreeSet<String>,
+            expected_subclaim_ids: &'a BTreeMap<String, BTreeSet<String>>,
+            records: &'a BTreeMap<String, ClaimGroundingRecord>,
+            nonmaterial_claim_ids: &'a BTreeSet<String>,
+            unprocessed_claim_ids: &'a BTreeSet<String>,
+            unprocessed_reason: &'a Option<String>,
+        }
+        crate::grounding::encoding::digest(&Preimage {
+            schema_version: self.schema_version,
+            operation_id: &self.operation_id,
+            run_id: &self.run_id,
+            job_id: &self.job_id,
+            task_id: &self.task_id,
+            scope_id: &self.scope_id,
+            state_fence: &self.state_fence,
+            draft_digest: &self.draft_digest,
+            manifest_digest: &self.manifest_digest,
+            policy_digest: &self.policy_digest,
+            expected_claim_ids: &self.expected_claim_ids,
+            expected_subclaim_ids: &self.expected_subclaim_ids,
+            records: &self.records,
+            nonmaterial_claim_ids: &self.nonmaterial_claim_ids,
+            unprocessed_claim_ids: &self.unprocessed_claim_ids,
+            unprocessed_reason: &self.unprocessed_reason,
+        })
     }
     pub fn validate(&self) -> Result<(), ContractViolation> {
         crate::error::check_schema_version(self.schema_version, super::GROUNDING_SCHEMA_VERSION)?;
@@ -176,6 +292,7 @@ impl ClaimGroundingLedger {
             text(id, "unprocessed_claim_ids")?;
         }
         text(&self.operation_id, "operation_id")?;
+        text(&self.run_id, "run_id")?;
         text(&self.job_id, "job_id")?;
         digest(&self.draft_digest, "draft_digest")?;
         digest(&self.manifest_digest, "manifest_digest")?;
