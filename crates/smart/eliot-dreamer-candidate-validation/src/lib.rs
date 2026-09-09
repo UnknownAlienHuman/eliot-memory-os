@@ -14,8 +14,9 @@ mod input;
 mod receipt;
 mod validate;
 
+pub use eliot_dreamer_contracts::ValidationPolicy;
 pub use error::{
     CandidateRejectionReport, CandidateValidationOutcome, DreamDraftValidationError, RejectionCode,
     ValidatedCandidate,
 };
-pub use input::{ValidationPolicy, validate_grounded_dream_draft_at};
+pub use input::validate_grounded_dream_draft_at;
