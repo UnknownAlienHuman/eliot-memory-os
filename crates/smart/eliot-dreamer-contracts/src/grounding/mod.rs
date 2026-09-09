@@ -262,7 +262,7 @@ impl ModelDraft {
         }
         validate_subclaim_forest(&self.claims)?;
         for claim in &self.claims {
-            claim.validate()?;
+            claim.validate_for_context(&self.task_id, &self.scope_id, &self.state_fence)?;
         }
         for claim in &self.non_material_claims {
             claim.validate()?;
@@ -682,6 +682,38 @@ fn validate_grounded_denominators_policy(
         });
     }
     validate_subclaim_forest(&self_.input.claims)?;
+    let expected_nonmaterial: BTreeSet<_> = self_
+        .input
+        .non_material_claims
+        .iter()
+        .map(|claim| claim.claim_id.clone())
+        .collect();
+    if expected_nonmaterial != self_.ledger.nonmaterial_claim_ids {
+        return Err(ContractViolation::BindingMismatch {
+            field: "nonmaterial_denominator",
+            reason: "ledger non-material denominator must equal retained residue".into(),
+        });
+    }
+    if self_.input.claims.len() > self_.policy.max_claims as usize
+        || self_.input.claims.iter().any(|claim| {
+            claim.subclaim_ids.len() > self_.policy.max_subclaims_per_claim as usize
+                || claim.proposed_support.len()
+                    > self_.policy.max_support_handles_per_claim as usize
+                || claim.proposed_counterevidence.len()
+                    > self_.policy.max_support_handles_per_claim as usize
+        })
+        || self_.input.non_material_claims.iter().any(|claim| {
+            !self_
+                .policy
+                .permitted_nonmaterial_classes
+                .contains(&claim.category)
+        })
+    {
+        return Err(ContractViolation::Budget {
+            dimension: "grounding_policy",
+            reason: "retained claims or non-material classes exceed the policy".into(),
+        });
+    }
     Ok(())
 }
 

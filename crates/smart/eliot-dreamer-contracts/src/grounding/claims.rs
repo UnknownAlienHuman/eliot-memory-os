@@ -288,7 +288,10 @@ impl PrecisionPayload {
                         });
                     }
                     validate_receipt_context(&proof.receipt, denominator, task_id, scope, fence)?;
-                    if receipt.is_some_and(|receipt| receipt != &proof.receipt) {
+                    if receipt
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.as_ref() != &proof.receipt)
+                    {
                         return Err(ContractViolation::BindingMismatch {
                             field: "absence_receipt",
                             reason: "payload receipt and absence proof receipt differ".into(),
