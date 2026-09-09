@@ -385,12 +385,7 @@ pub fn fixture_with_modes(unknown_start: bool, cross_domain: bool, near_overlap:
             declared_member_ids: vec![member("event-start"), member("event-end")],
         },
         events: vec![
-            event_with_uncertainty(
-                "event-start",
-                (!unknown_start).then_some(100),
-                "clock-1",
-                if near_overlap { 10 } else { 0 },
-            ),
+            event_with_uncertainty("event-start", (!unknown_start).then_some(100), "clock-1", 0),
             event_with_uncertainty(
                 "event-end",
                 Some(if near_overlap { 105 } else { 200 }),

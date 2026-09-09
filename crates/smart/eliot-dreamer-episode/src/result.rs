@@ -15,6 +15,7 @@ use crate::input::{
     capped_serialized_len,
 };
 use eliot_dreamer_contracts::ContractViolation;
+use eliot_epistemic_contracts::DenominatorKind;
 use eliot_epistemic_contracts::{CoverageDenominator, CoverageReceipt};
 use std::collections::BTreeSet;
 
@@ -155,6 +156,15 @@ pub struct EpisodeCandidate {
 impl EpisodeCandidate {
     /// Validates bounded output shape and all retained input closures.
     pub fn validate(&self) -> Result<(), ContractViolation> {
+        self.validate_shape()?;
+        self.validate_records()?;
+        self.validate_rollback()?;
+        self.validate_bindings()?;
+        self.existing.validate()?;
+        self.validate_integrity()
+    }
+
+    fn validate_shape(&self) -> Result<(), ContractViolation> {
         for (value, field) in [
             (&self.candidate_id, "candidate.id"),
             (&self.request_id, "candidate.request_id"),
@@ -216,13 +226,20 @@ impl EpisodeCandidate {
                     .unwrap_or(i64::MAX),
             });
         }
-        self.validate_records()?;
-        self.validate_rollback()?;
-        self.validate_bindings()?;
-        self.existing.validate()?;
+        Ok(())
+    }
+
+    fn validate_integrity(&self) -> Result<(), ContractViolation> {
         self.preservation.validate()?;
+        if self.coverage.source_availability != self.source.availability {
+            return Err(ContractViolation::BindingMismatch {
+                field: "candidate.coverage.source_availability",
+                reason: "coverage availability differs from retained source".to_owned(),
+            });
+        }
         if self.disposition == CandidateDisposition::Candidate {
             self.preservation.overall()?;
+            self.validate_candidate_completeness()?;
         }
         self.handler_result.validate()?;
         if self.handler_result.request_id != self.request_id
@@ -253,7 +270,39 @@ impl EpisodeCandidate {
         Ok(())
     }
 
+    fn validate_candidate_completeness(&self) -> Result<(), ContractViolation> {
+        let all_observed = self.event_receipt.members.iter().all(|outcome| {
+            outcome.disposition == eliot_epistemic_contracts::MemberDisposition::Observed
+        });
+        if self.event_denominator.kind != DenominatorKind::CompleteScope
+            || !self.event_receipt.is_terminal()
+            || !self.event_receipt.omissions.is_empty()
+            || !all_observed
+            || self.events.len() as u64 != self.event_denominator.members.len() as u64
+            || !self.coverage.gaps.is_empty()
+            || self.source.availability
+                != eliot_memory_curation_contracts::SourceAvailability::Available
+            || self.chronology.iter().any(|link| {
+                matches!(
+                    link.relation,
+                    ChronologyRelation::Unknown | ChronologyRelation::Incomparable
+                )
+            })
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "candidate.completeness",
+                reason: "Candidate contradicts retained coverage or chronology".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn validate_bindings(&self) -> Result<(), ContractViolation> {
+        self.validate_coverage_bindings()?;
+        self.validate_closure_bindings()
+    }
+
+    fn validate_coverage_bindings(&self) -> Result<(), ContractViolation> {
         self.source
             .validate()
             .map_err(|error| ContractViolation::BindingMismatch {
@@ -274,6 +323,18 @@ impl EpisodeCandidate {
             })?;
         if self.event_receipt.denominator != self.event_denominator.digest
             || self.event_receipt.denominator_size != self.event_denominator.members.len() as u64
+            || self.event_denominator.scope != self.scope_id
+            || self.event_denominator.revision != self.source.identity.revision.to_string()
+            || self.event_denominator.snapshot.snapshot_id
+                != self.source.identity.snapshot_id.as_str()
+            || self.event_denominator.snapshot.owner != self.source.identity.source_id
+            || self.event_denominator.fence != self.state_fence
+            || self.event_receipt.task_id.as_str() != self.task_id
+            || self.event_receipt.scope != self.scope_id
+            || self.event_receipt.fence != self.state_fence
+            || self.event_receipt.policy != self.policy_id
+            || self.event_denominator.query.as_ref() != Some(&self.event_receipt.query)
+            || self.event_denominator.frontier.as_ref() != Some(&self.event_receipt.frontier)
             || self.coverage.event_denominator_size != self.event_denominator.members.len() as u64
             || self.coverage.observed_events != self.events.len() as u64
             || !eliot_dreamer_contracts::is_hex64_lower(&self.admission_item_digest)
@@ -286,6 +347,56 @@ impl EpisodeCandidate {
                 reason: "retained admission or event coverage identity drift".to_owned(),
             });
         }
+        let receipt_members: BTreeSet<_> = self
+            .event_receipt
+            .members
+            .iter()
+            .map(|outcome| outcome.member.clone())
+            .chain(
+                self.event_receipt
+                    .omissions
+                    .iter()
+                    .map(|omission| omission.member.clone()),
+            )
+            .collect();
+        if receipt_members != self.event_denominator.members
+            || self.event_denominator.roles.len() != 1
+            || !self.event_denominator.roles.contains("event")
+            || self
+                .event_receipt
+                .members
+                .iter()
+                .any(|outcome| outcome.role != "event")
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "candidate.event_coverage_universe",
+                reason: "retained receipt does not cover the typed event denominator".to_owned(),
+            });
+        }
+        let observed_members: BTreeSet<_> = self
+            .event_receipt
+            .members
+            .iter()
+            .filter(|outcome| {
+                outcome.disposition == eliot_epistemic_contracts::MemberDisposition::Observed
+            })
+            .map(|outcome| outcome.member.as_str().to_owned())
+            .collect();
+        let retained_members: BTreeSet<_> = self
+            .events
+            .iter()
+            .map(|event| event.source_member_id.as_str().to_owned())
+            .collect();
+        if !retained_members.is_subset(&observed_members) {
+            return Err(ContractViolation::BindingMismatch {
+                field: "candidate.event_observed_members",
+                reason: "retained events differ from observed receipt members".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_closure_bindings(&self) -> Result<(), ContractViolation> {
         if self.state_fence != self.source.identity.state_fence
             || self.state_fence != self.existing.state_fence
             || self.rollback.source_fence != self.state_fence
@@ -336,8 +447,92 @@ impl EpisodeCandidate {
     }
 
     fn validate_records(&self) -> Result<(), ContractViolation> {
+        self.validate_event_records()?;
+        self.validate_flattened_records()?;
+        self.validate_chronology_records()?;
+        for gap in &self.coverage.gaps {
+            eliot_dreamer_contracts::error::check_text(
+                &gap.reason,
+                "candidate.coverage.gap",
+                MAX_TEXT,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_event_records(&self) -> Result<(), ContractViolation> {
         for event in &self.events {
             event.validate()?;
+            let member = self
+                .source
+                .members
+                .iter()
+                .find(|member| member.member_id == event.source_member_id)
+                .ok_or(ContractViolation::BindingMismatch {
+                    field: "candidate.event_source",
+                    reason: "retained event source member is absent".to_owned(),
+                })?;
+            if member.kind != eliot_memory_curation_contracts::SourceMemberKind::Observation
+                || !self
+                    .source
+                    .partition
+                    .immutable_references
+                    .contains(&event.source_member_id)
+                || member.revision != event.source_revision
+                || member.content_digest != event.source_content_digest
+                || event.core.affected_scope.work_scope.as_str() != self.scope_id
+                || event.core.evidence_and_raw_handles.iter().any(|handle| {
+                    !member
+                        .evidence
+                        .provenance
+                        .iter()
+                        .any(|value| value.as_str() == handle)
+                        && !member
+                            .evidence
+                            .owner_status
+                            .iter()
+                            .any(|value| value.as_str() == handle)
+                        && !member
+                            .evidence
+                            .protection
+                            .iter()
+                            .any(|value| value.as_str() == handle)
+                        && !member
+                            .evidence
+                            .conflict
+                            .iter()
+                            .any(|value| value.as_str() == handle)
+                        && !member
+                            .evidence
+                            .audit
+                            .iter()
+                            .any(|value| value.as_str() == handle)
+                })
+            {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "candidate.event_source",
+                    reason: "retained event is outside the immutable observation closure"
+                        .to_owned(),
+                });
+            }
+            if event.participants.iter().any(|participant| {
+                participant.binding.member_id != event.source_member_id
+                    || participant.binding.member_revision != event.source_revision
+                    || participant.binding.member_content_digest != event.source_content_digest
+            }) || event.outcomes.iter().any(|outcome| {
+                outcome.binding.member_id != event.source_member_id
+                    || outcome.binding.member_revision != event.source_revision
+                    || outcome.binding.member_content_digest != event.source_content_digest
+            }) || event.temporal_binding.as_ref().is_some_and(|binding| {
+                binding.member_id != event.source_member_id
+                    || binding.member_revision != event.source_revision
+                    || binding.member_content_digest != event.source_content_digest
+            }) {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "candidate.event_bindings",
+                    reason: "nested event records are not bound to their source member".to_owned(),
+                });
+            }
         }
         for participant in &self.participants {
             participant.validate()?;
@@ -345,6 +540,38 @@ impl EpisodeCandidate {
         for outcome in &self.outcomes {
             outcome.validate()?;
         }
+        Ok(())
+    }
+
+    fn validate_flattened_records(&self) -> Result<(), ContractViolation> {
+        let expected_participants: Vec<_> = self
+            .events
+            .iter()
+            .flat_map(|event| event.participants.iter())
+            .collect();
+        let retained_participants: Vec<_> = self.participants.iter().collect();
+        if expected_participants != retained_participants {
+            return Err(ContractViolation::BindingMismatch {
+                field: "candidate.participants",
+                reason: "flattened participants differ from retained events".to_owned(),
+            });
+        }
+        let expected_outcomes: Vec<_> = self
+            .events
+            .iter()
+            .flat_map(|event| event.outcomes.iter())
+            .collect();
+        let retained_outcomes: Vec<_> = self.outcomes.iter().collect();
+        if expected_outcomes != retained_outcomes {
+            return Err(ContractViolation::BindingMismatch {
+                field: "candidate.outcomes",
+                reason: "flattened outcomes differ from retained events".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_chronology_records(&self) -> Result<(), ContractViolation> {
         let event_ids: std::collections::BTreeSet<_> = self
             .events
             .iter()
@@ -363,22 +590,61 @@ impl EpisodeCandidate {
             )?;
             if !event_ids.contains(link.left_event_id.as_str())
                 || !event_ids.contains(link.right_event_id.as_str())
+                || link.left_event_id == link.right_event_id
             {
                 return Err(ContractViolation::BindingMismatch {
                     field: "candidate.chronology",
                     reason: "chronology edge names an absent event".to_owned(),
                 });
             }
+            let left = self
+                .events
+                .iter()
+                .find(|event| event.core.event_id_and_time.event_id == link.left_event_id)
+                .ok_or(ContractViolation::BindingMismatch {
+                    field: "candidate.chronology",
+                    reason: "chronology left endpoint is absent".to_owned(),
+                })?;
+            let right = self
+                .events
+                .iter()
+                .find(|event| event.core.event_id_and_time.event_id == link.right_event_id)
+                .ok_or(ContractViolation::BindingMismatch {
+                    field: "candidate.chronology",
+                    reason: "chronology right endpoint is absent".to_owned(),
+                })?;
+            match link.relation {
+                ChronologyRelation::Before | ChronologyRelation::After => {
+                    let expected: Vec<_> = [
+                        left.temporal_binding.as_ref(),
+                        right.temporal_binding.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+                    .collect();
+                    if expected.len() != 2 || link.support != expected {
+                        return Err(ContractViolation::BindingMismatch {
+                            field: "candidate.chronology.support",
+                            reason: "ordered chronology lacks both endpoint bindings".to_owned(),
+                        });
+                    }
+                }
+                ChronologyRelation::Concurrent
+                | ChronologyRelation::Incomparable
+                | ChronologyRelation::Unknown
+                    if !link.support.is_empty() =>
+                {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "candidate.chronology.support",
+                        reason: "nonordered chronology carries unsupported evidence".to_owned(),
+                    });
+                }
+                _ => {}
+            }
             for support in &link.support {
                 support.validate()?;
             }
-        }
-        for gap in &self.coverage.gaps {
-            eliot_dreamer_contracts::error::check_text(
-                &gap.reason,
-                "candidate.coverage.gap",
-                MAX_TEXT,
-            )?;
         }
         Ok(())
     }

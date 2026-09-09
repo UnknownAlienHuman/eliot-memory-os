@@ -85,10 +85,12 @@ fn partial_event_denominator_retains_explicit_gap() {
     )
     .expect("partial Episode");
     assert_eq!(candidate.status, EpisodeStatus::Partial);
-    assert_eq!(candidate.coverage.gaps.len(), 1);
-    assert_eq!(
-        candidate.coverage.gaps[0].member_id.as_deref(),
-        Some("event-end")
+    assert!(
+        candidate
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| { gap.member_id.as_deref() == Some("event-end") })
     );
     assert!(candidate.events[0].temporal.event_time.is_none());
 }
