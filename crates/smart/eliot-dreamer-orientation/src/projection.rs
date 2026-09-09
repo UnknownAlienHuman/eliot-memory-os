@@ -62,6 +62,8 @@ impl OrientationSectionKind {
 pub struct OrientationSection {
     pub kind: OrientationSectionKind,
     pub items: Vec<String>,
+    pub item_digests: Vec<String>,
+    pub digest: String,
     pub known: bool,
     pub denominator: Option<String>,
 }
@@ -79,7 +81,8 @@ pub struct OrientationCoverage {
     pub manifest_digest: String,
 }
 
-/// One grounded residue, retaining the `SupportState` separate from CEP status.
+/// One admitted canonical evidence envelope, retained separately from the
+/// model-grounding residues and from CEP support/currentness status.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AnchoredEvidence {
@@ -210,6 +213,17 @@ impl OrientationPacketCandidate {
         {
             return Err(OrientationError::Invalid("packet sections"));
         }
+        for section in &self.sections {
+            let (item_digests, digest) = section_digests(
+                section.kind,
+                &section.items,
+                section.known,
+                section.denominator.as_ref(),
+            )?;
+            if section.item_digests != item_digests || section.digest != digest {
+                return Err(OrientationError::Binding("section digest"));
+            }
+        }
         let max_items = usize::try_from(policy.max_items).map_err(|_| OrientationError::Bound)?;
         if self.sections.iter().any(|s| s.items.len() > max_items) {
             return Err(OrientationError::Bounded("packet item count"));
@@ -324,6 +338,7 @@ pub fn build_projection(
             data,
         )?,
         orientation_policy,
+        &bounded_bundle.job.budget,
     )
 }
 
@@ -640,6 +655,24 @@ fn orientation_preflight(
         return Err(OrientationError::Bounded("stu"));
     }
     let max_items = usize::try_from(policy.max_items).map_err(|_| OrientationError::Bound)?;
+    if handles.len() > max_items || admitted.admitted_evidence.len() > max_items {
+        return Err(OrientationError::Bounded("input item count"));
+    }
+    if let Some(denominator) = &admitted.coverage_denominator
+        && (denominator.cep_members.len() > max_items
+            || denominator.evidence_members.len() > max_items
+            || denominator.known_empty_sections.len() > max_items)
+    {
+        return Err(OrientationError::Bounded("denominator item count"));
+    }
+    let supersession_count = handles.iter().try_fold(0usize, |total, handle| {
+        if handle.position.supersession.len() > max_items {
+            return Err(OrientationError::Bounded("CEP supersession count"));
+        }
+        total
+            .checked_add(handle.position.supersession.len())
+            .ok_or(OrientationError::Bounded("CEP supersession count"))
+    })?;
     let counts = [
         candidate.bundle.materials.len(),
         candidate.bundle.omissions.len(),
@@ -653,10 +686,7 @@ fn orientation_preflight(
         admitted.frame.constraints.len(),
         handles.len(),
         admitted.admitted_evidence.len(),
-        handles
-            .iter()
-            .map(|handle| handle.position.supersession.len())
-            .sum(),
+        supersession_count,
         admitted
             .admitted_evidence
             .iter()
@@ -670,10 +700,18 @@ fn orientation_preflight(
             .coverage_denominator
             .as_ref()
             .map_or(0, |d| d.evidence_members.len()),
+        admitted
+            .coverage_denominator
+            .as_ref()
+            .map_or(0, |d| d.known_empty_sections.len()),
     ];
     if counts.into_iter().any(|count| count > max_items) {
         return Err(OrientationError::Bounded("item count"));
     }
+    // The job's input ceiling bounds the admitted serialized input; the
+    // local policy may tighten it but cannot enlarge that envelope.
+    let job_input_cap = candidate.job.budget.input_bytes.unwrap_or(u64::MAX);
+    let input_cap = policy.max_input_bytes.min(job_input_cap);
     let input_bytes = bounded_json_size(
         &FullInputs {
             admitted,
@@ -682,7 +720,7 @@ fn orientation_preflight(
             current_epistemic_position_handles: handles,
             policy,
         },
-        policy.max_input_bytes,
+        input_cap,
     )
     .map_err(|error| match error {
         OrientationError::Bound => OrientationError::Bounded("input bytes"),
@@ -697,12 +735,16 @@ fn orientation_preflight(
                 .checked_add(material.bytes)
                 .ok_or(OrientationError::Bounded("source bytes"))
         })?;
-    if material_bytes > policy.max_source_bytes {
+    if material_bytes > policy.max_source_bytes || material_bytes > job_input_cap {
         return Err(OrientationError::Bounded("source bytes"));
     }
-    let source_count = u32::try_from(candidate.bundle.materials.len())
+    // `source_width` is the job-owned source-count dimension. Material byte
+    // totals remain a local source-byte policy measurement.
+    let source_count = u64::try_from(candidate.bundle.materials.len())
         .map_err(|_| OrientationError::Bounded("source count"))?;
-    if source_count > policy.max_source_count {
+    if source_count > u64::from(policy.max_source_count)
+        || source_count > candidate.job.budget.source_width.unwrap_or(u64::MAX)
+    {
         return Err(OrientationError::Bounded("source count"));
     }
     let item_work = counts.into_iter().try_fold(0_u64, |total, count| {
@@ -851,7 +893,7 @@ fn project_values(
                 .iter()
                 .any(|section| section == "relation_candidates")
         }),
-    );
+    )?;
     let upstream_preservation_complete = candidate
         .preservation
         .verdicts
@@ -897,6 +939,7 @@ fn project_values(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_sections(
     admitted: &AdmittedOrientationJob,
     candidate: &ValidatedCandidate,
@@ -905,7 +948,7 @@ fn build_sections(
     gaps: &[OrientationResidue],
     probes: &[InertProbe],
     relations_known_empty: bool,
-) -> Vec<OrientationSection> {
+) -> Result<Vec<OrientationSection>, OrientationError> {
     let denominator = admitted.coverage_denominator.as_ref();
     let known_empty = |name: &str| {
         denominator.is_some_and(|d| d.known_empty_sections.iter().any(|section| section == name))
@@ -917,19 +960,30 @@ fn build_sections(
     } else {
         vec!["relation candidates are not admitted".to_owned()]
     };
+    let mut interpretation_items = vec![format!(
+        "model_draft:statement:{}",
+        candidate.model.statement
+    )];
+    interpretation_items.extend(
+        candidate
+            .model
+            .counterevidence
+            .iter()
+            .map(|text| format!("model_draft:counterevidence:{text}")),
+    );
     let mut sections = vec![
         section(
             OrientationSectionKind::IdentityTaskFrame,
             vec![admitted.frame.body_digest.clone()],
             true,
             None,
-        ),
+        )?,
         section(
             OrientationSectionKind::Constraints,
             admitted.frame.constraints.clone(),
             true,
             None,
-        ),
+        )?,
         section(
             OrientationSectionKind::EvidenceCoverage,
             vec![format!(
@@ -938,7 +992,7 @@ fn build_sections(
             )],
             coverage_known,
             coverage.denominator_digest.clone(),
-        ),
+        )?,
         section(
             OrientationSectionKind::Positions,
             handles
@@ -947,31 +1001,31 @@ fn build_sections(
                 .collect(),
             positions_known,
             coverage.denominator_digest.clone(),
-        ),
+        )?,
         section(
             OrientationSectionKind::InterpretationsRivalsDissent,
-            vec![candidate.model.statement.clone()],
+            interpretation_items,
             true,
             None,
-        ),
+        )?,
         section(
             OrientationSectionKind::UnknownsGaps,
             gaps.iter().map(|g| g.text.clone()).collect(),
             true,
             None,
-        ),
+        )?,
         section(
             OrientationSectionKind::RelationCandidates,
             relation_items,
             relations_known_empty,
             None,
-        ),
+        )?,
         section(
             OrientationSectionKind::InertProbes,
             probes.iter().map(|p| p.text.clone()).collect(),
             true,
             None,
-        ),
+        )?,
         section(
             OrientationSectionKind::SafeExternalHandoff,
             if known_empty("safe_external_handoff") {
@@ -981,13 +1035,13 @@ fn build_sections(
             },
             known_empty("safe_external_handoff"),
             None,
-        ),
+        )?,
         section(
             OrientationSectionKind::OmissionsExpansionFrontierInvalidation,
             candidate.model.invalidation_conditions.clone(),
             true,
             None,
-        ),
+        )?,
         section(
             OrientationSectionKind::Preservation,
             candidate
@@ -998,10 +1052,10 @@ fn build_sections(
                 .collect(),
             true,
             None,
-        ),
+        )?,
     ];
     sections.sort_by_key(|s| s.kind.as_str());
-    sections
+    Ok(sections)
 }
 
 fn make_packet(
@@ -1032,6 +1086,37 @@ fn make_packet(
         advanced("Architecture implications")
     };
     let preservation = projection_preservation(candidate, &data);
+    let local_preservation_complete = preservation
+        .verdicts
+        .iter()
+        .all(|verdict| verdict.passed && verdict.known);
+    let mut sections = data.sections;
+    if let Some(preservation_section) = sections
+        .iter_mut()
+        .find(|section| section.kind == OrientationSectionKind::Preservation)
+    {
+        let items = preservation
+            .verdicts
+            .iter()
+            .map(|verdict| format!("{}:{}", verdict.dimension.as_str(), verdict.passed))
+            .collect();
+        let replacement = section(
+            OrientationSectionKind::Preservation,
+            items,
+            preservation.verdicts.iter().all(|verdict| verdict.known),
+            preservation_section.denominator.clone(),
+        )?;
+        *preservation_section = replacement;
+    }
+    let disposition = if local_preservation_complete
+        && matches!(
+            data.disposition,
+            crate::result::OrientationDisposition::Complete
+        ) {
+        crate::result::OrientationDisposition::Complete
+    } else {
+        crate::result::OrientationDisposition::Partial
+    };
     Ok(OrientationPacketCandidate {
         schema_version: 1,
         packet_id: String::new(),
@@ -1049,7 +1134,7 @@ fn make_packet(
         anchored_evidence_by_status: data.evidence,
         synthesized_interpretations: vec![data.interpretation],
         rival_models_and_dissent: data.rivals,
-        hidden_relation_candidates: if data.sections.iter().any(|section| {
+        hidden_relation_candidates: if sections.iter().any(|section| {
             section.kind == OrientationSectionKind::RelationCandidates && section.known
         }) {
             Vec::new()
@@ -1070,12 +1155,12 @@ fn make_packet(
         budget_usage: candidate.usage,
         invalidation_conditions: candidate.model.invalidation_conditions.clone(),
         provenance: data.provenance,
-        sections: data.sections,
+        sections,
         preservation,
         upstream_preservation: candidate.preservation.clone(),
         model_draft: candidate.model.clone(),
         grounded_draft: candidate.grounded.clone(),
-        disposition: data.disposition,
+        disposition,
         input_digest: orientation_input_digest(admitted, candidate, handles, evidence, policy)?,
         output_digest: String::new(),
     })
@@ -1126,18 +1211,43 @@ fn orientation_input_digest(
 fn finalize_packet(
     mut packet: OrientationPacketCandidate,
     policy: &OrientationPolicy,
+    job_budget: &eliot_dreamer_contracts::BudgetLimits,
 ) -> Result<OrientationPacketCandidate, OrientationError> {
     let preimage =
         canonical_json_bytes(&packet).map_err(|_| OrientationError::Encoding("packet preimage"))?;
     packet.packet_id = sha256_hex(&preimage);
     let output =
         canonical_json_bytes(&packet).map_err(|_| OrientationError::Encoding("packet output"))?;
-    if u64::try_from(output.len()).map_err(|_| OrientationError::Bounded("output bytes"))?
-        > policy.max_output_bytes
-    {
-        return Err(OrientationError::Bound);
-    }
+    // Whole-packet output and the report slice use their independent job
+    // dimensions; the local output policy can only tighten output bytes.
+    let output_cap = policy
+        .max_output_bytes
+        .min(job_budget.output_bytes.unwrap_or(u64::MAX));
+    // The digest is derived from the unchanged empty-digest preimage, while
+    // the cap applies to the complete packet carrying that digest.
     packet.output_digest = sha256_hex(&output);
+    let final_output = canonical_json_bytes(&packet)
+        .map_err(|_| OrientationError::Encoding("packet final output"))?;
+    if u64::try_from(final_output.len()).map_err(|_| OrientationError::Bounded("output bytes"))?
+        > output_cap
+    {
+        return Err(OrientationError::Bounded("output bytes"));
+    }
+    if let Some(report_cap) = job_budget.report_bytes {
+        let report = canonical_json_bytes(&(
+            "orientation_report_v1",
+            &packet.source_coverage,
+            &packet.sections,
+            &packet.preservation,
+            &packet.upstream_preservation,
+        ))
+        .map_err(|_| OrientationError::Encoding("orientation report"))?;
+        if u64::try_from(report.len()).map_err(|_| OrientationError::Bounded("report bytes"))?
+            > report_cap
+        {
+            return Err(OrientationError::Bounded("report bytes"));
+        }
+    }
     packet.validate(policy)?;
     Ok(packet)
 }
@@ -1146,13 +1256,43 @@ fn section(
     items: Vec<String>,
     known: bool,
     denominator: Option<String>,
-) -> OrientationSection {
-    OrientationSection {
+) -> Result<OrientationSection, OrientationError> {
+    let (item_digests, digest) = section_digests(kind, &items, known, denominator.as_ref())?;
+    Ok(OrientationSection {
         kind,
+        items,
+        item_digests,
+        digest,
+        known,
+        denominator,
+    })
+}
+
+fn section_digests(
+    kind: OrientationSectionKind,
+    items: &[String],
+    known: bool,
+    denominator: Option<&String>,
+) -> Result<(Vec<String>, String), OrientationError> {
+    let item_digests = items
+        .iter()
+        .map(|item| {
+            let preimage =
+                canonical_json_bytes(&("orientation_section_item_v1", kind.as_str(), item))
+                    .map_err(|_| OrientationError::Encoding("section item digest"))?;
+            Ok(sha256_hex(&preimage))
+        })
+        .collect::<Result<Vec<_>, OrientationError>>()?;
+    let preimage = canonical_json_bytes(&(
+        "orientation_section_v1",
+        kind.as_str(),
         items,
         known,
         denominator,
-    }
+        &item_digests,
+    ))
+    .map_err(|_| OrientationError::Encoding("section digest"))?;
+    Ok((item_digests, sha256_hex(&preimage)))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1179,7 +1319,7 @@ fn projection_preservation(
                         "job, bundle, receipt and frame bindings are retained"
                     }
                     PreservationDimension::Reversibility => {
-                        "packet is candidate-only and source handles remain reopenable"
+                        "retained source references and reversible omission declarations remain under the upstream admission proof ceiling; no source-store access occurs here"
                     }
                     PreservationDimension::AuthorityCeiling => {
                         "no truth, authority, delivery or effect is emitted"
@@ -1209,7 +1349,14 @@ fn projection_preservation(
                     ),
                     PreservationDimension::Faithfulness => (
                         data.interpretation.statement == candidate.model.statement
-                            && data.interpretation.uncertainty == candidate.model.uncertainty,
+                            && data.interpretation.uncertainty == candidate.model.uncertainty
+                            && data.interpretation.expected_benefit
+                                == candidate.model.expected_benefit
+                            && data.interpretation.source_handles == candidate.model.source_handles
+                            && data.interpretation.counterevidence
+                                == candidate.model.counterevidence
+                            && data.interpretation.invalidation_conditions
+                                == candidate.model.invalidation_conditions,
                         true,
                     ),
                     PreservationDimension::Lineage => (
@@ -1258,7 +1405,7 @@ fn projection_preservation(
                     }
                     PreservationDimension::ProvenanceRetention => (
                         data.provenance.requester_origin == candidate.job.requester.origin
-                            && !data.provenance.requester_principal.is_empty()
+                            && data.provenance.requester_principal == candidate.job.requester.principal
                             && data.provenance.requester_session == candidate.job.requester.session
                             && data.provenance.privacy_profile == candidate.job.privacy_profile
                             && data.provenance.source_handles

@@ -18,9 +18,10 @@ use eliot_dreamer_contracts::validation::{
 };
 use eliot_dreamer_contracts::{
     BudgetLimits, BudgetUsage, BundleCompleteness, BundleMaterial, ClaimResidue, DreamInputBundle,
-    DreamJobInput, GroundedDreamDraft, JobClass, ModelDraft, PRESERVATION_DIMENSIONS,
-    PreservationDimension, PreservationReport, Requester, RequesterOrigin, SourceDisposition,
-    SupportState, ValidatedCandidate, ValidatedDreamDraft, ValidationPolicy, ValidationReceipt,
+    DreamJobInput, GroundedDreamDraft, JobClass, ModelDraft, OmissionHandle,
+    PRESERVATION_DIMENSIONS, PreservationDimension, PreservationReport, Requester, RequesterOrigin,
+    SourceDisposition, SupportState, ValidatedCandidate, ValidatedDreamDraft, ValidationPolicy,
+    ValidationReceipt,
 };
 use eliot_dreamer_orientation::{
     AdmittedOrientationJob, CanonicalEvidenceHandle, CoverageCepMember, CoverageEvidenceMember,
@@ -38,6 +39,7 @@ use eliot_evidence::{
 
 fn fixture(
     partial: bool,
+    nonrecoverable_omission: bool,
 ) -> (
     AdmittedOrientationJob,
     DreamInputBundle,
@@ -202,6 +204,17 @@ fn fixture(
         bytes: envelope2_bytes.len() as u64,
         digest: sha256_hex(&envelope2_bytes),
     });
+    if nonrecoverable_omission {
+        bundle.omissions.push(OmissionHandle {
+            handle: "missing-source".into(),
+            reason: "source was not supplied".into(),
+            reversible: false,
+            scope_id: job.scope_id.clone(),
+            task_id: job.task_id.clone(),
+            digest: sha256_hex(b"orientation-nonrecoverable-omission"),
+            nonrecoverable_reason: Some("provider permanently unavailable".into()),
+        });
+    }
     let coverage_denominator = if partial {
         None
     } else {
@@ -405,7 +418,7 @@ fn fixture(
 
 #[test]
 fn projects_minimal_complete_packet() {
-    let (job, bundle, candidate, policy, handles) = fixture(false);
+    let (job, bundle, candidate, policy, handles) = fixture(false, false);
     let packet =
         project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
     assert_eq!(packet.disposition, OrientationDisposition::Complete);
@@ -432,9 +445,29 @@ fn projects_minimal_complete_packet() {
 
 #[test]
 fn preserves_model_and_grounding_without_promoting_residue_to_evidence() {
-    let (job, bundle, candidate, policy, handles) = fixture(false);
+    let (job, bundle, candidate, policy, handles) = fixture(false, true);
     let packet =
         project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
+    assert_eq!(packet.disposition, OrientationDisposition::Partial);
+    assert_eq!(packet.omission_handles, candidate.bundle.omissions);
+    let reversibility = packet
+        .preservation
+        .verdicts
+        .iter()
+        .find(|verdict| verdict.dimension == PreservationDimension::Reversibility)
+        .expect("reversibility verdict");
+    assert!(!reversibility.passed);
+    let preservation_section = packet
+        .sections
+        .iter()
+        .find(|section| section.kind.as_str() == "preservation")
+        .expect("preservation section");
+    assert!(
+        preservation_section
+            .items
+            .iter()
+            .any(|item| item == "reversibility:false")
+    );
     assert_eq!(packet.anchored_evidence_by_status.len(), 2);
     assert_eq!(
         packet.anchored_evidence_by_status[0].envelope,
@@ -456,21 +489,21 @@ fn preserves_model_and_grounding_without_promoting_residue_to_evidence() {
 
 #[test]
 fn rejects_wrong_job_class() {
-    let (mut job, bundle, candidate, policy, handles) = fixture(false);
+    let (mut job, bundle, candidate, policy, handles) = fixture(false, false);
     job.job.job_class = JobClass::Curation;
     assert!(project_orientation(&job, &bundle, &candidate, &handles, &policy).is_err());
 }
 
 #[test]
 fn frame_question_is_bound_to_material_body() {
-    let (mut job, bundle, candidate, policy, handles) = fixture(false);
+    let (mut job, bundle, candidate, policy, handles) = fixture(false, false);
     job.frame.question = "different question".into();
     assert!(project_orientation(&job, &bundle, &candidate, &handles, &policy).is_err());
 }
 
 #[test]
 fn partial_bundle_remains_explicit_and_replay_is_stable() {
-    let (job, bundle, candidate, policy, handles) = fixture(true);
+    let (job, bundle, candidate, policy, handles) = fixture(true, false);
     let first = project_orientation(&job, &bundle, &candidate, &handles, &policy)
         .expect("partial projection");
     let second = project_orientation(&job, &bundle, &candidate, &handles, &policy)

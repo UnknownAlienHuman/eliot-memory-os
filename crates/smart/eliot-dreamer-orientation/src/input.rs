@@ -459,9 +459,11 @@ impl OrientationCoverageDenominator {
         }) || self
             .known_empty_sections
             .windows(2)
-            .any(|sections| sections[0] > sections[1])
+            .any(|sections| sections[0] >= sections[1])
         {
-            return Err(OrientationError::Invalid("coverage denominator order"));
+            return Err(OrientationError::Invalid(
+                "coverage denominator duplicate or order",
+            ));
         }
         Ok(())
     }
