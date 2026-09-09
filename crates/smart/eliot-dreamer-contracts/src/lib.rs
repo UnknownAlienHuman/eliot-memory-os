@@ -22,6 +22,7 @@ pub mod job;
 pub mod registry;
 pub mod relation;
 pub mod screen;
+pub mod validation;
 
 pub use budget::{
     BudgetDimension, BudgetLimits, BudgetUsage, DEX_BUDGET_DIMENSIONS, check_no_cross_subsidy,
@@ -76,6 +77,7 @@ pub use relation::{
     seal_relation, validate_relation,
 };
 pub use screen::{ScreenBinding, ScreenEligibility, ScreenReference, ScreenState};
+pub use validation::{DreamDraftValidationError, ValidatedCandidate, ValidationPolicy};
 
 /// Contract hub identity (`name@version`).
 pub const CONTRACT_NAME: &str = "eliot.smart.dreamer.contracts";
