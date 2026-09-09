@@ -117,7 +117,12 @@ fn unknown_effect_is_not_semantic_failure() {
     let (mut input, policy) = prepared();
     input.action_evidence.outcome.failure_state =
         Some(eliot_dreamer_contracts::FailureObservationState::UnknownOutcome);
+    input.history.coverage = eliot_dreamer_contracts::FailureCoverage::Partial;
     input.proposal.outcome = input.action_evidence.outcome.clone();
+    input.proposal.history = input.history.clone();
+    input
+        .validate()
+        .expect("partial history remains a valid closure");
     let decision = propose_failure_fingerprint(
         &input,
         &input.proposal,
@@ -135,6 +140,16 @@ fn unknown_effect_is_not_semantic_failure() {
         decision.result.common_disposition,
         eliot_dreamer_contracts::CandidateDisposition::Partial
     );
+    let coverage = decision
+        .result
+        .final_preservation
+        .verdicts
+        .iter()
+        .find(|verdict| {
+            verdict.dimension == eliot_dreamer_contracts::RelationPreservationDimension::Coverage
+        })
+        .expect("coverage predicate is returned");
+    assert!(!coverage.passed);
 }
 
 #[test]

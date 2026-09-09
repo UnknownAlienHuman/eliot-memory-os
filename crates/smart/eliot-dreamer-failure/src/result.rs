@@ -407,11 +407,9 @@ fn local_preservation(
     rollback: &eliot_dreamer_contracts::FailureRollback,
 ) -> eliot_dreamer_contracts::RelationPreservation {
     use eliot_dreamer_contracts::{
-        BundleCompleteness, RelationPreservation, RelationPreservationDimension,
-        RelationPreservationVerdict,
+        RelationPreservation, RelationPreservationDimension, RelationPreservationVerdict,
     };
-    let coverage = result.input.bundle.completeness == BundleCompleteness::CompleteForScope
-        && assessment.missing_evidence_refs.is_empty();
+    let coverage = complete_coverage(result, assessment);
     let preservation = result.input == *input
         && result.proposal == input.proposal
         && result.proposal.validate().is_ok();
@@ -504,6 +502,20 @@ fn local_preservation(
             })
             .collect(),
     }
+}
+
+fn complete_coverage(result: &FailureResult, assessment: &FailureAssessment) -> bool {
+    result.input.bundle.completeness
+        == eliot_dreamer_contracts::bundle::BundleCompleteness::CompleteForScope
+        && result.input.action_evidence.coverage
+            == eliot_dreamer_contracts::FailureCoverage::Complete
+        && result.input.history.coverage == eliot_dreamer_contracts::FailureCoverage::Complete
+        && result.proposal.outcome.coverage == eliot_dreamer_contracts::FailureCoverage::Complete
+        && result.proposal.environment.coverage
+            == eliot_dreamer_contracts::FailureCoverage::Complete
+        && result.proposal.applicability.coverage
+            == eliot_dreamer_contracts::FailureCoverage::Complete
+        && assessment.missing_evidence_refs.is_empty()
 }
 
 fn unknown_preservation() -> eliot_dreamer_contracts::RelationPreservation {
