@@ -348,17 +348,8 @@ fn build_item_ledger(
                 &evidence.base.input_digest,
             )
         })?;
-    let (required_ids, floor_scan_work) =
-        required_floor_ids(view, remaining_work).ok_or_else(|| {
-            internal(
-                ReactiveInputError::InvalidField {
-                    field: "planning.floor_work",
-                    reason: "required floor traversal work overflowed",
-                },
-                policy,
-                &evidence.base.input_digest,
-            )
-        })?;
+    let (required_ids, floor_scan_work) = required_floor_ids(view, remaining_work)
+        .map_err(|failure| required_floor_failure(policy, &evidence.base.input_digest, failure))?;
     let mut atoms = view.view.rendered.clone();
     atoms.sort_by_key(|atom| {
         (
@@ -834,18 +825,12 @@ fn finish_selection_outcome(
         );
     }
     if !accounting.budget_fit {
-        return no_injection_for_ledger(
+        return no_injection_with_items(
             base,
             "REQUIRED_CAPACITY_OR_UNKNOWN_COST",
             items,
-            required_ids,
-            required_attention,
-            input_bytes,
-            planning_work,
-            sticky_obligations,
-            input_references,
+            accounting,
             frontier,
-            policy,
         );
     }
     if no_new_work {
@@ -1059,18 +1044,9 @@ fn preflight_inputs(
     // Only after the capped stream succeeds do we walk retained nested
     // collections. This keeps structural counting from becoming an
     // uncapped scan of attacker-sized inputs.
-    let (work, references) = count_input_work(
-        view, activation, session, attention, coverage, policy,
-    )
-    .ok_or_else(|| {
-        planning_error(
-            policy,
-            PlanningErrorDisposition::UnavailableOrCapacity,
-            PlanningErrorKind::Overflow,
-            "INPUT_PREFLIGHT_WORK_OVERFLOW",
-            "six-input bounded preflight counters overflowed",
-        )
-    })?;
+    let (work, references) =
+        count_input_work(view, activation, session, attention, coverage, policy)
+            .map_err(|failure| preflight_counter_failure(policy, failure))?;
     if work > policy.max_work {
         return Err(planning_error(
             policy,
@@ -1101,6 +1077,33 @@ fn preflight_inputs(
     Ok((bytes, work, references))
 }
 
+fn preflight_counter_failure(
+    policy: &ReactiveDeliveryPolicy,
+    failure: CounterFailure,
+) -> ReactiveContextPlanningError {
+    let (reason_code, detail) = match failure {
+        CounterFailure::WorkLimit => (
+            "WORK_EXCEEDED",
+            "six-input bounded preflight work exceeds policy limit",
+        ),
+        CounterFailure::ReferenceLimit => (
+            "REFERENCES_EXCEEDED",
+            "six-input retained references exceed policy limit",
+        ),
+        CounterFailure::ArithmeticOverflow => (
+            "INPUT_PREFLIGHT_WORK_OVERFLOW",
+            "six-input bounded preflight counters overflowed",
+        ),
+    };
+    planning_error(
+        policy,
+        PlanningErrorDisposition::UnavailableOrCapacity,
+        PlanningErrorKind::Overflow,
+        reason_code,
+        detail,
+    )
+}
+
 struct CappedWriter {
     written: usize,
     cap: usize,
@@ -1124,20 +1127,53 @@ impl Write for CappedWriter {
     }
 }
 
-fn bump(total: &mut u64, amount: usize) -> Option<()> {
-    *total = total.checked_add(u64::try_from(amount).ok()?)?;
-    Some(())
+#[derive(Clone, Copy)]
+enum CounterFailure {
+    WorkLimit,
+    ReferenceLimit,
+    ArithmeticOverflow,
 }
 
-fn bounded_bump(total: &mut u64, amount: usize, limit: u64) -> Option<()> {
-    bump(total, amount)?;
-    (*total <= limit).then_some(())
+struct BoundedCounters {
+    work: u64,
+    references: u64,
+    max_work: u64,
+    max_references: u64,
 }
 
-fn sum_lengths(parts: &[usize]) -> Option<usize> {
+impl BoundedCounters {
+    fn add_work(&mut self, amount: usize) -> Result<(), CounterFailure> {
+        let amount = u64::try_from(amount).map_err(|_| CounterFailure::ArithmeticOverflow)?;
+        let next = self
+            .work
+            .checked_add(amount)
+            .ok_or(CounterFailure::ArithmeticOverflow)?;
+        if next > self.max_work {
+            return Err(CounterFailure::WorkLimit);
+        }
+        self.work = next;
+        Ok(())
+    }
+
+    fn add_references(&mut self, amount: usize) -> Result<(), CounterFailure> {
+        let amount = u64::try_from(amount).map_err(|_| CounterFailure::ArithmeticOverflow)?;
+        let next = self
+            .references
+            .checked_add(amount)
+            .ok_or(CounterFailure::ArithmeticOverflow)?;
+        if next > self.max_references {
+            return Err(CounterFailure::ReferenceLimit);
+        }
+        self.references = next;
+        Ok(())
+    }
+}
+
+fn sum_lengths(parts: &[usize]) -> Result<usize, CounterFailure> {
     parts
         .iter()
         .try_fold(0usize, |total, part| total.checked_add(*part))
+        .ok_or(CounterFailure::ArithmeticOverflow)
 }
 
 /// Count logical retained visits and reference handles without canonicalizing.
@@ -1149,22 +1185,34 @@ fn count_input_work(
     attention: &CriticalAttentionProjection,
     coverage: &IntegrationCoverageProfile,
     policy: &ReactiveDeliveryPolicy,
-) -> Option<(u64, u64)> {
-    let mut work = 1u64;
+) -> Result<(u64, u64), CounterFailure> {
+    let mut counters = BoundedCounters {
+        work: 0,
+        references: 0,
+        max_work: policy.max_work,
+        max_references: policy.max_references,
+    };
+    counters.add_work(1)?;
     // Keep the view reference denominator aligned with A15's authoritative
     // enumeration, including selection, quality, provider, proof and
     // measurement handles. The owner helper is private, so this bounded
     // package-local mirror is intentional.
-    let mut references = count_view_references(view)?;
+    count_view_references(view, &mut counters)?;
     count_view_input_work(
-        view, activation, session, attention, coverage, policy, &mut work,
+        view,
+        activation,
+        session,
+        attention,
+        coverage,
+        policy,
+        &mut counters,
     )?;
-    count_session_input_work(session, &mut work, &mut references)?;
-    count_attention_input_work(attention, &mut work, &mut references)?;
-    count_coverage_input_work(coverage, &mut work, &mut references)?;
-    count_activation_input_work(activation, &mut work, &mut references)?;
-    count_delivery_input_work(view, activation, &mut work, &mut references)?;
-    Some((work, references))
+    count_session_input_work(session, &mut counters)?;
+    count_attention_input_work(attention, &mut counters)?;
+    count_coverage_input_work(coverage, &mut counters)?;
+    count_activation_input_work(activation, &mut counters)?;
+    count_delivery_input_work(view, activation, &mut counters)?;
+    Ok((counters.work, counters.references))
 }
 
 fn count_view_input_work(
@@ -1174,8 +1222,8 @@ fn count_view_input_work(
     attention: &CriticalAttentionProjection,
     coverage: &IntegrationCoverageProfile,
     policy: &ReactiveDeliveryPolicy,
-    work: &mut u64,
-) -> Option<()> {
+    counters: &mut BoundedCounters,
+) -> Result<(), CounterFailure> {
     for length in [
         view.view.rendered.len(),
         view.view.admitted_ids.len(),
@@ -1202,199 +1250,180 @@ fn count_view_input_work(
         policy.priority.len(),
         policy.attention_disclosure.len(),
     ] {
-        bump(work, length)?;
+        counters.add_work(length)?;
     }
     for atom in &view.view.rendered {
-        bump(work, atom.dependencies.len())?;
+        counters.add_work(atom.dependencies.len())?;
     }
     for member in &view.admitted.floor.members {
-        bump(work, member.required_dependencies.len())?;
+        counters.add_work(member.required_dependencies.len())?;
     }
-    Some(())
+    Ok(())
 }
 
 fn count_session_input_work(
     session: &SessionDeliverySnapshot,
-    work: &mut u64,
-    references: &mut u64,
-) -> Option<()> {
+    counters: &mut BoundedCounters,
+) -> Result<(), CounterFailure> {
     for record in &session.records {
-        bump(work, record.predecessor_ids.len())?;
-        bump(references, sum_lengths(&[3, record.predecessor_ids.len()])?)?;
+        counters.add_work(record.predecessor_ids.len())?;
+        counters.add_references(sum_lengths(&[3, record.predecessor_ids.len()])?)?;
         if let Some(closure) = &record.closure {
-            *references = references.checked_add(count_view_references(&closure.context_view)?)?;
-            bump(work, 1)?; // context_view
-            bump(work, 1)?; // profile
-            bump(work, usize::from(closure.delivery_claim.is_some()))?;
-            bump(work, usize::from(closure.delivery_owner_id.is_some()))?;
-            bump(work, 1)?; // assembly_receipt
-            bump(work, 1)?; // payload
-            bump(work, 1)?; // event
-            bump(work, closure.acknowledgements.len())?;
-            bump(work, closure.receipts.len())?;
-            bump(work, closure.evidence.len())?;
-            bump(
-                references,
-                sum_lengths(&[
-                    1,
-                    1,
-                    usize::from(closure.delivery_claim.is_some()),
-                    usize::from(closure.delivery_owner_id.is_some()),
-                    1,
-                    1,
-                    1,
-                    closure.acknowledgements.len(),
-                    closure.receipts.len(),
-                    closure.evidence.len(),
-                ])?,
-            )?;
+            count_view_references(&closure.context_view, counters)?;
+            counters.add_work(1)?; // context_view
+            counters.add_work(1)?; // profile
+            counters.add_work(usize::from(closure.delivery_claim.is_some()))?;
+            counters.add_work(usize::from(closure.delivery_owner_id.is_some()))?;
+            counters.add_work(1)?; // assembly_receipt
+            counters.add_work(1)?; // payload
+            counters.add_work(1)?; // event
+            counters.add_work(closure.acknowledgements.len())?;
+            counters.add_work(closure.receipts.len())?;
+            counters.add_work(closure.evidence.len())?;
+            counters.add_references(sum_lengths(&[
+                1,
+                1,
+                usize::from(closure.delivery_claim.is_some()),
+                usize::from(closure.delivery_owner_id.is_some()),
+                1,
+                1,
+                1,
+                closure.acknowledgements.len(),
+                closure.receipts.len(),
+                closure.evidence.len(),
+            ])?)?;
         }
     }
-    Some(())
+    Ok(())
 }
 
 fn count_attention_input_work(
     attention: &CriticalAttentionProjection,
-    work: &mut u64,
-    references: &mut u64,
-) -> Option<()> {
+    counters: &mut BoundedCounters,
+) -> Result<(), CounterFailure> {
     for member in &attention.members {
-        bump(work, member.source.len())?;
-        bump(work, member.evidence.len())?;
-        bump(
-            references,
-            sum_lengths(&[member.source.len(), member.evidence.len()])?,
-        )?;
-        bump(work, member.owner_closure.source.len())?;
-        bump(work, member.owner_closure.receipts.len())?;
-        bump(work, member.owner_closure.evidence.len())?;
-        bump(
-            work,
+        counters.add_work(member.source.len())?;
+        counters.add_work(member.evidence.len())?;
+        counters.add_references(sum_lengths(&[member.source.len(), member.evidence.len()])?)?;
+        counters.add_work(member.owner_closure.source.len())?;
+        counters.add_work(member.owner_closure.receipts.len())?;
+        counters.add_work(member.owner_closure.evidence.len())?;
+        counters.add_work(usize::from(
+            member.owner_closure.resolution_receipt.is_some(),
+        ))?;
+        counters.add_references(sum_lengths(&[
+            member.owner_closure.source.len(),
+            member.owner_closure.receipts.len(),
+            member.owner_closure.evidence.len(),
             usize::from(member.owner_closure.resolution_receipt.is_some()),
-        )?;
-        bump(
-            references,
-            sum_lengths(&[
-                member.owner_closure.source.len(),
-                member.owner_closure.receipts.len(),
-                member.owner_closure.evidence.len(),
-                usize::from(member.owner_closure.resolution_receipt.is_some()),
-            ])?,
-        )?;
+        ])?)?;
     }
-    Some(())
+    Ok(())
 }
 
 fn count_coverage_input_work(
     coverage: &IntegrationCoverageProfile,
-    work: &mut u64,
-    references: &mut u64,
-) -> Option<()> {
+    counters: &mut BoundedCounters,
+) -> Result<(), CounterFailure> {
     for event in &coverage.events {
-        bump(work, event.gaps.len())?;
-        bump(work, event.receipts.len())?;
-        bump(work, event.evidence.len())?;
-        bump(
-            references,
-            sum_lengths(&[
-                1,
-                event.gaps.len(),
-                event.receipts.len(),
-                event.evidence.len(),
-            ])?,
-        )?;
+        counters.add_work(event.gaps.len())?;
+        counters.add_work(event.receipts.len())?;
+        counters.add_work(event.evidence.len())?;
+        counters.add_references(sum_lengths(&[
+            1,
+            event.gaps.len(),
+            event.receipts.len(),
+            event.evidence.len(),
+        ])?)?;
     }
-    Some(())
+    Ok(())
 }
 
 fn count_activation_input_work(
     activation: &ReactiveCueActivation,
-    work: &mut u64,
-    references: &mut u64,
-) -> Option<()> {
+    counters: &mut BoundedCounters,
+) -> Result<(), CounterFailure> {
     for seed in &activation.request.seeds {
-        bump(work, seed.comparison_keys.len())?;
-        bump(work, seed.transformation_evidence.len())?;
-        bump(
-            references,
-            sum_lengths(&[
-                seed.comparison_keys.len(),
-                seed.transformation_evidence.len(),
-            ])?,
-        )?;
+        counters.add_work(seed.comparison_keys.len())?;
+        counters.add_work(seed.transformation_evidence.len())?;
+        counters.add_references(sum_lengths(&[
+            seed.comparison_keys.len(),
+            seed.transformation_evidence.len(),
+        ])?)?;
         if let eliot_cue_contracts::NormalizationOutcome::Ambiguous { rivals } = &seed.outcome {
-            bump(work, rivals.len())?;
-            bump(references, rivals.len())?;
+            counters.add_work(rivals.len())?;
+            counters.add_references(rivals.len())?;
         }
     }
     for _edge in &activation.request.relation_edges {
-        bump(work, 2)?;
-        bump(references, 3)?;
+        counters.add_work(2)?;
+        counters.add_references(3)?;
     }
     for _direct in &activation.result.direct {
-        bump(work, 2)?;
-        bump(references, 2)?;
+        counters.add_work(2)?;
+        counters.add_references(2)?;
     }
     for derived in &activation.result.derived {
         let units = sum_lengths(&[2, derived.path.len()])?;
-        bump(work, units)?;
-        bump(references, units)?;
+        counters.add_work(units)?;
+        counters.add_references(units)?;
     }
     for step in &activation.result.trace.steps {
         let units = sum_lengths(&[1, usize::from(step.edge.is_some())])?;
-        bump(work, units)?;
-        bump(references, units)?;
+        counters.add_work(units)?;
+        counters.add_references(units)?;
     }
     match &activation.result.completeness {
         Completeness::Truncated { frontier, .. } | Completeness::Partial { frontier } => {
-            bump(work, frontier.len())?;
-            bump(references, frontier.len())?;
+            counters.add_work(frontier.len())?;
+            counters.add_references(frontier.len())?;
         }
         _ => {}
     }
-    Some(())
+    Ok(())
 }
 
 fn count_delivery_input_work(
     view: &ContextPlanningView,
     activation: &ReactiveCueActivation,
-    work: &mut u64,
-    references: &mut u64,
-) -> Option<()> {
+    counters: &mut BoundedCounters,
+) -> Result<(), CounterFailure> {
     for binding in &activation.target_bindings {
-        bump(work, 2)?;
+        counters.add_work(2)?;
         let optional = sum_lengths(&[
             usize::from(binding.source_revision.is_some()),
             usize::from(binding.source_digest.is_some()),
         ])?;
-        bump(work, optional)?;
-        bump(references, 2)?;
-        bump(references, optional)?;
+        counters.add_work(optional)?;
+        counters.add_references(2)?;
+        counters.add_references(optional)?;
     }
     for omission in &view.admitted.economy.omissions {
-        bump(work, 2)?;
+        counters.add_work(2)?;
         let optional = sum_lengths(&[
             usize::from(omission.expansion.is_some()),
             usize::from(omission.expires.is_some()),
             usize::from(omission.invalidation.is_some()),
         ])?;
-        bump(work, optional)?;
+        counters.add_work(optional)?;
         if let Some(expansion) = &omission.expansion {
             let expansion_units = sum_lengths(&[
                 1,
                 usize::from(expansion.expires.is_some()),
                 usize::from(expansion.invalidation.is_some()),
             ])?;
-            bump(work, expansion_units)?;
+            counters.add_work(expansion_units)?;
         }
     }
-    Some(())
+    Ok(())
 }
 
 /// Mirror A15's retained-reference accounting without importing its private
 /// counter. Each unit is a semantic handle or retained collection element.
-fn count_view_references(view: &ContextPlanningView) -> Option<u64> {
-    let mut references = 0u64;
+fn count_view_references(
+    view: &ContextPlanningView,
+    counters: &mut BoundedCounters,
+) -> Result<(), CounterFailure> {
     for count in [
         view.view.admitted_ids.len(),
         view.view.rendered.len(),
@@ -1414,61 +1443,46 @@ fn count_view_references(view: &ContextPlanningView) -> Option<u64> {
         view.admitted.floor.providers.dispositions.len(),
         view.view.quality.results.len(),
     ] {
-        bump(&mut references, count)?;
+        counters.add_references(count)?;
     }
-    bump(&mut references, 2)?; // economy.applied_rule and floor.rule_evidence
-    bump(
-        &mut references,
-        view.admitted.floor.interpretation_dependencies.len(),
-    )?;
+    counters.add_references(2)?; // economy.applied_rule and floor.rule_evidence
+    counters.add_references(view.admitted.floor.interpretation_dependencies.len())?;
     for item in &view.view.rendered {
-        bump(&mut references, 1)?; // source_id
-        bump(&mut references, item.dependencies.len())?;
-        bump(
-            &mut references,
-            usize::from(item.source_predecessor.is_some()),
-        )?;
-        bump(&mut references, 2)?; // measurement and proof evidence
+        counters.add_references(1)?; // source_id
+        counters.add_references(item.dependencies.len())?;
+        counters.add_references(usize::from(item.source_predecessor.is_some()))?;
+        counters.add_references(2)?; // measurement and proof evidence
     }
     for record in &view.admitted.records {
-        bump(&mut references, 1)?; // candidate.source.snapshot_id
-        bump(&mut references, record.candidate.dependencies.len())?;
-        bump(
-            &mut references,
-            usize::from(record.candidate.source.predecessor.is_some()),
-        )?;
-        bump(&mut references, 3)?; // rule evidence, proof evidence, measurement
+        counters.add_references(1)?; // candidate.source.snapshot_id
+        counters.add_references(record.candidate.dependencies.len())?;
+        counters.add_references(usize::from(record.candidate.source.predecessor.is_some()))?;
+        counters.add_references(3)?; // rule evidence, proof evidence, measurement
     }
     for member in &view.admitted.floor.members {
-        bump(&mut references, member.required_dependencies.len())?;
-        bump(&mut references, usize::from(member.measurement.is_some()))?;
+        counters.add_references(member.required_dependencies.len())?;
+        counters.add_references(usize::from(member.measurement.is_some()))?;
     }
-    bump(&mut references, view.admitted.admissions.len())?; // rule evidence
+    counters.add_references(view.admitted.admissions.len())?; // rule evidence
     for disposition in &view.admitted.floor.providers.dispositions {
-        bump(&mut references, usize::from(disposition.evidence.is_some()))?;
+        counters.add_references(usize::from(disposition.evidence.is_some()))?;
     }
     for result in &view.view.quality.results {
-        bump(&mut references, result.evidence.len())?;
-        bump(&mut references, result.measurements.len())?;
-        bump(&mut references, result.unknown_evidence.len())?;
-        bump(
-            &mut references,
-            usize::from(result.failed_invariant.is_some()),
-        )?;
-        bump(&mut references, usize::from(result.invalidation.is_some()))?;
+        counters.add_references(result.evidence.len())?;
+        counters.add_references(result.measurements.len())?;
+        counters.add_references(result.unknown_evidence.len())?;
+        counters.add_references(usize::from(result.failed_invariant.is_some()))?;
+        counters.add_references(usize::from(result.invalidation.is_some()))?;
     }
     for omission in &view.admitted.economy.omissions {
-        bump(&mut references, 2)?; // source_id and decision
-        bump(&mut references, usize::from(omission.expires.is_some()))?;
-        bump(
-            &mut references,
-            usize::from(omission.invalidation.is_some()),
-        )?;
+        counters.add_references(2)?; // source_id and decision
+        counters.add_references(usize::from(omission.expires.is_some()))?;
+        counters.add_references(usize::from(omission.invalidation.is_some()))?;
         if omission.expansion.is_some() {
-            bump(&mut references, 6)?; // expansion handle and its bounds
+            counters.add_references(6)?; // expansion handle and its bounds
         }
     }
-    Some(references)
+    Ok(())
 }
 
 fn charge_planning_work(
@@ -2411,23 +2425,29 @@ fn unmatched_activation_targets(
 fn required_floor_ids(
     view: &ContextPlanningView,
     max_work: u64,
-) -> Option<(BTreeSet<String>, u64)> {
-    let mut scan_work = 1u64;
+) -> Result<(BTreeSet<String>, u64), CounterFailure> {
+    let mut counters = BoundedCounters {
+        work: 0,
+        references: 0,
+        max_work,
+        max_references: u64::MAX,
+    };
+    counters.add_work(1)?;
     let mut ids = BTreeSet::new();
     for atom_id in &view.admitted.floor.mandatory_atoms {
-        bounded_bump(&mut scan_work, 1, max_work)?;
+        counters.add_work(1)?;
         ids.insert(atom_id.to_string());
     }
     for atom_id in &view.admitted.floor.interpretation_dependencies {
-        bounded_bump(&mut scan_work, 1, max_work)?;
+        counters.add_work(1)?;
         ids.insert(atom_id.to_string());
     }
     let mut changed = true;
     while changed {
         changed = false;
         for member in &view.admitted.floor.members {
-            bounded_bump(&mut scan_work, 1, max_work)?;
-            bounded_bump(&mut scan_work, member.required_dependencies.len(), max_work)?;
+            counters.add_work(1)?;
+            counters.add_work(member.required_dependencies.len())?;
             if ids.contains(member.atom_id.as_str()) {
                 let before = ids.len();
                 ids.extend(member.required_dependencies.iter().map(ToString::to_string));
@@ -2435,8 +2455,8 @@ fn required_floor_ids(
             }
         }
         for atom in &view.view.rendered {
-            bounded_bump(&mut scan_work, 1, max_work)?;
-            bounded_bump(&mut scan_work, atom.dependencies.len(), max_work)?;
+            counters.add_work(1)?;
+            counters.add_work(atom.dependencies.len())?;
             if ids.contains(atom.atom_id.as_str()) {
                 let before = ids.len();
                 ids.extend(atom.dependencies.iter().map(ToString::to_string));
@@ -2444,7 +2464,35 @@ fn required_floor_ids(
             }
         }
     }
-    Some((ids, scan_work))
+    Ok((ids, counters.work))
+}
+
+fn required_floor_failure(
+    policy: &ReactiveDeliveryPolicy,
+    input_digest: &str,
+    failure: CounterFailure,
+) -> ReactiveContextPlanningError {
+    match failure {
+        CounterFailure::WorkLimit => {
+            let mut error = planning_error(
+                policy,
+                PlanningErrorDisposition::UnavailableOrCapacity,
+                PlanningErrorKind::Overflow,
+                "REQUIRED_FLOOR_WORK_EXCEEDED",
+                "required floor traversal exceeds the remaining planning work limit",
+            );
+            error.input_digest = Some(input_digest.to_owned());
+            error
+        }
+        CounterFailure::ArithmeticOverflow | CounterFailure::ReferenceLimit => internal(
+            ReactiveInputError::InvalidField {
+                field: "planning.floor_work",
+                reason: "required floor traversal work overflowed",
+            },
+            policy,
+            input_digest,
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
