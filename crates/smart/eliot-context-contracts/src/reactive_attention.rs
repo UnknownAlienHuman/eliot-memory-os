@@ -11,6 +11,8 @@ use crate::{ReactiveInputError, bounded_preflight};
 
 const MAX_MEMBERS: usize = 256;
 const MAX_HANDLES: usize = 256;
+const ATTENTION_CLAIM_DOMAIN: &str = "eliot.context-contracts.reactive.attention-resolution";
+const ATTENTION_CLAIM_VERSION: u16 = 1;
 
 fn text(value: &str, field: &'static str) -> Result<(), ReactiveInputError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
@@ -158,12 +160,74 @@ pub struct CriticalAttentionMember {
     pub escalation_target: Option<String>,
     pub resolution_condition: String,
     pub waiver_authority: Option<String>,
+    pub superseded_by: Option<eliot_protocol::ReactiveContextContentRef>,
     pub missing_coverage: Vec<String>,
     pub state_fence: StateFence,
     pub owner_closure: AttentionOwnerClosure,
 }
 
 impl CriticalAttentionMember {
+    fn superseding_ref(
+        &self,
+    ) -> Result<Option<&eliot_protocol::ReactiveContextContentRef>, ReactiveInputError> {
+        let Some(replacement) = self.superseded_by.as_ref() else {
+            if matches!(self.resolution, AttentionResolution::Superseded) {
+                return Err(ReactiveInputError::InvalidField {
+                    field: "attention.superseded_by",
+                    reason: "superseded attention needs an explicit replacement",
+                });
+            }
+            return Ok(None);
+        };
+        replacement
+            .validate()
+            .map_err(|_| ReactiveInputError::InvalidField {
+                field: "attention.superseded_by",
+                reason: "invalid replacement binding",
+            })?;
+        if replacement.artifact_id.is_none() {
+            return Err(ReactiveInputError::InvalidField {
+                field: "attention.superseded_by",
+                reason: "replacement needs an explicit artifact identity",
+            });
+        }
+        if replacement.artifact_id.as_ref() == Some(&self.attention_id) {
+            return Err(ReactiveInputError::BindingMismatch {
+                field: "attention.superseded_by",
+            });
+        }
+        if matches!(self.resolution, AttentionResolution::Superseded) {
+            Ok(Some(replacement))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn terminal_receipt_matches(
+        &self,
+        receipt: &ReceiptEnvelope,
+        authority: &str,
+        replacement: Option<&eliot_protocol::ReactiveContextContentRef>,
+    ) -> bool {
+        matches!(
+            &receipt.core.disposition,
+            ReceiptDisposition::Success { .. }
+        ) && receipt.core.authority.authority_owner == authority
+            && receipt.core.artifacts.iter().any(|artifact| {
+                artifact.artifact_id == self.claim_artifact_id
+                    && artifact.sha256 == self.claim_digest
+                    && artifact.source_revision.as_deref() == Some(self.source_revision.as_str())
+            })
+            && replacement.is_none_or(|replacement| {
+                receipt.core.artifacts.iter().any(|artifact| {
+                    replacement.artifact_id.as_ref() == Some(&artifact.artifact_id)
+                        && replacement.content_sha256 == artifact.sha256
+                        && artifact.source_revision.as_deref()
+                            == Some(replacement.source_revision.as_str())
+                })
+            })
+    }
+
     fn validate_terminal_claim(&self) -> Result<(), ReactiveInputError> {
         if self.claim_digest != self.canonical_resolution_claim_digest()? {
             return Err(ReactiveInputError::DigestMismatch {
@@ -191,24 +255,37 @@ impl CriticalAttentionMember {
                 reason: "resolved attention needs verified owner evidence",
             });
         }
-        let claim_receipt = self
-            .owner_closure
-            .receipts
-            .iter()
-            .chain(self.owner_closure.resolution_receipt.iter())
-            .any(|receipt| {
-                matches!(
-                    &receipt.core.disposition,
-                    ReceiptDisposition::Success { .. }
-                ) && receipt.core.authority.authority_owner == self.owner_id
-                    && receipt.core.artifacts.iter().any(|artifact| {
-                        artifact.artifact_id == self.claim_artifact_id
-                            && artifact.sha256 == self.claim_digest
-                            && artifact.source_revision.as_deref()
-                                == Some(self.source_revision.as_str())
-                    })
-            });
-        if !claim_receipt {
+        let superseding_ref = self.superseding_ref()?;
+        let required_authority = if matches!(self.resolution, AttentionResolution::Waived) {
+            self.waiver_authority
+                .as_deref()
+                .ok_or(ReactiveInputError::InvalidField {
+                    field: "attention.waiver_authority",
+                    reason: "waiver requires an explicit authority",
+                })?
+        } else {
+            self.owner_id.as_str()
+        };
+        let claim_receipt = !matches!(self.resolution, AttentionResolution::Waived)
+            && self
+                .owner_closure
+                .receipts
+                .iter()
+                .chain(self.owner_closure.resolution_receipt.iter())
+                .any(|receipt| {
+                    self.terminal_receipt_matches(receipt, required_authority, superseding_ref)
+                });
+        let waiver_receipt = matches!(self.resolution, AttentionResolution::Waived)
+            && self
+                .owner_closure
+                .resolution_receipt
+                .as_ref()
+                .is_some_and(|receipt| {
+                    self.terminal_receipt_matches(receipt, required_authority, superseding_ref)
+                });
+        if (!matches!(self.resolution, AttentionResolution::Waived) && !claim_receipt)
+            || (matches!(self.resolution, AttentionResolution::Waived) && !waiver_receipt)
+        {
             return Err(ReactiveInputError::BindingMismatch {
                 field: "attention.claim_receipt",
             });
@@ -218,21 +295,57 @@ impl CriticalAttentionMember {
 
     pub fn canonical_resolution_claim_digest(&self) -> Result<String, ReactiveInputError> {
         crate::canonical_planning_digest(&(
-            &self.claim_artifact_id,
-            &self.attention_id,
-            &self.source_revision,
-            &self.owner_id,
-            &self.task_id,
-            &self.scope_id,
-            &self.state_fence,
-            &self.resolution,
-            &self.resolution_condition,
-            &self.waiver_authority,
-            &self.review_ref,
-            &self.source,
-            &self.evidence,
-            &self.owner_closure.evidence,
+            ATTENTION_CLAIM_DOMAIN,
+            ATTENTION_CLAIM_VERSION,
+            (
+                &self.claim_artifact_id,
+                &self.attention_id,
+                &self.source_revision,
+                &self.owner_id,
+                &self.task_id,
+                &self.scope_id,
+                &self.state_fence,
+                &self.resolution,
+                &self.resolution_condition,
+                &self.waiver_authority,
+                &self.superseded_by,
+                &self.review_ref,
+                &self.source,
+                &self.evidence,
+                &self.owner_closure.evidence,
+            ),
         ))
+    }
+
+    fn validate_owner_receipt(
+        &self,
+        receipt: &ReceiptEnvelope,
+        expected_owner: &str,
+    ) -> Result<(), ReactiveInputError> {
+        if receipt.core.work_scope.scope_id != self.scope_id
+            || receipt.core.work_scope.state_fence != self.state_fence
+            || receipt.core.authority.authority_owner != expected_owner
+            || !receipt
+                .core
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.artifact_id == self.attention_id)
+        {
+            return Err(ReactiveInputError::BindingMismatch {
+                field: "attention.receipt_binding",
+            });
+        }
+        if matches!(
+            &receipt.core.disposition,
+            ReceiptDisposition::Failure { .. }
+                | ReceiptDisposition::Unknown { .. }
+                | ReceiptDisposition::Cancelled { .. }
+        ) {
+            return Err(ReactiveInputError::BindingMismatch {
+                field: "attention.receipt_resolution",
+            });
+        }
+        Ok(())
     }
 
     fn validate_owner_binding(&self) -> Result<(), ReactiveInputError> {
@@ -271,35 +384,18 @@ impl CriticalAttentionMember {
                 });
             }
         }
-        for receipt in self
-            .owner_closure
-            .receipts
-            .iter()
-            .chain(self.owner_closure.resolution_receipt.iter())
-        {
-            if receipt.core.work_scope.scope_id != self.scope_id
-                || receipt.core.work_scope.state_fence != self.state_fence
-                || receipt.core.authority.authority_owner != self.owner_id
-                || !receipt
-                    .core
-                    .artifacts
-                    .iter()
-                    .any(|artifact| artifact.artifact_id == self.attention_id)
-            {
-                return Err(ReactiveInputError::BindingMismatch {
-                    field: "attention.receipt_binding",
-                });
-            }
-            if matches!(
-                &receipt.core.disposition,
-                ReceiptDisposition::Failure { .. }
-                    | ReceiptDisposition::Unknown { .. }
-                    | ReceiptDisposition::Cancelled { .. }
-            ) {
-                return Err(ReactiveInputError::BindingMismatch {
-                    field: "attention.receipt_resolution",
-                });
-            }
+        for receipt in &self.owner_closure.receipts {
+            self.validate_owner_receipt(receipt, self.owner_id.as_str())?;
+        }
+        if let Some(receipt) = &self.owner_closure.resolution_receipt {
+            let expected_owner = if matches!(self.resolution, AttentionResolution::Waived) {
+                self.waiver_authority
+                    .as_deref()
+                    .unwrap_or(self.owner_id.as_str())
+            } else {
+                self.owner_id.as_str()
+            };
+            self.validate_owner_receipt(receipt, expected_owner)?;
         }
         Ok(())
     }

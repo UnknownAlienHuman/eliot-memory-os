@@ -90,7 +90,7 @@ impl Write for CappedWriter {
 pub(crate) fn bounded_preflight<T: Serialize>(
     value: &T,
     field: &'static str,
-) -> Result<(), ReactiveInputError> {
+) -> Result<usize, ReactiveInputError> {
     let mut sink = CappedWriter {
         written: 0,
         cap: MAX_REACTIVE_INPUT_BYTES,
@@ -98,7 +98,105 @@ pub(crate) fn bounded_preflight<T: Serialize>(
     serde_json::to_writer(&mut sink, value).map_err(|_| ReactiveInputError::InvalidField {
         field,
         reason: "borrowed input exceeds bounded serialized bytes",
-    })
+    })?;
+    Ok(sink.written)
+}
+
+fn checked_reference_add(total: &mut usize, count: usize) -> Result<(), ReactiveInputError> {
+    *total = total
+        .checked_add(count)
+        .ok_or(ReactiveInputError::InvalidField {
+            field: "bindings.input_references",
+            reason: "reference accounting overflowed",
+        })?;
+    Ok(())
+}
+
+fn count_retained_references(view: &ContextPlanningView) -> Result<usize, ReactiveInputError> {
+    // Count retained membership, selection, omission, rule, dependency,
+    // predecessor, proof, and measurement handle collections explicitly.
+    let mut references = 0usize;
+    for count in [
+        view.view.admitted_ids.len(),
+        view.view.rendered.len(),
+        view.view.selection.admitted_ids.len(),
+        view.view.selection.rendered_ids.len(),
+        view.view.selection.omission_evidence.len(),
+        view.admitted.records.len(),
+        view.admitted.admissions.len(),
+        view.admitted.floor.members.len(),
+        view.admitted.floor.mandatory_atoms.len(),
+        view.admitted.floor.mandatory_roles.len(),
+        view.admitted.economy.requested.len(),
+        view.admitted.economy.admitted.len(),
+        view.admitted.economy.displaced.len(),
+        view.admitted.economy.omissions.len(),
+        view.admitted.floor.providers.requested.len(),
+        view.admitted.floor.providers.dispositions.len(),
+        view.view.quality.results.len(),
+    ] {
+        checked_reference_add(&mut references, count)?;
+    }
+    checked_reference_add(&mut references, 1)?; // economy.applied_rule
+    checked_reference_add(&mut references, 1)?; // floor.rule_evidence
+    checked_reference_add(
+        &mut references,
+        view.admitted.floor.interpretation_dependencies.len(),
+    )?;
+    for item in &view.view.rendered {
+        checked_reference_add(&mut references, 1)?; // rendered.source_id
+        checked_reference_add(&mut references, item.dependencies.len())?;
+        checked_reference_add(
+            &mut references,
+            usize::from(item.source_predecessor.is_some()),
+        )?;
+        checked_reference_add(&mut references, 1)?; // rendered.measurement
+        checked_reference_add(&mut references, 1)?; // rendered.proof evidence
+    }
+    for record in &view.admitted.records {
+        checked_reference_add(&mut references, 1)?; // candidate.source.snapshot_id
+        checked_reference_add(&mut references, record.candidate.dependencies.len())?;
+        checked_reference_add(
+            &mut references,
+            usize::from(record.candidate.source.predecessor.is_some()),
+        )?;
+        checked_reference_add(&mut references, 1)?; // record.rule_evidence
+        checked_reference_add(&mut references, 1)?; // record.proof evidence
+        checked_reference_add(&mut references, 1)?; // record.measurement
+    }
+    for member in &view.admitted.floor.members {
+        checked_reference_add(&mut references, member.required_dependencies.len())?;
+        checked_reference_add(&mut references, usize::from(member.measurement.is_some()))?;
+    }
+    for _admission in &view.admitted.admissions {
+        checked_reference_add(&mut references, 1)?; // admission.rule_evidence
+    }
+    for disposition in &view.admitted.floor.providers.dispositions {
+        checked_reference_add(&mut references, usize::from(disposition.evidence.is_some()))?;
+    }
+    for result in &view.view.quality.results {
+        checked_reference_add(&mut references, result.evidence.len())?;
+        checked_reference_add(&mut references, result.measurements.len())?;
+        checked_reference_add(&mut references, result.unknown_evidence.len())?;
+        checked_reference_add(
+            &mut references,
+            usize::from(result.failed_invariant.is_some()),
+        )?;
+        checked_reference_add(&mut references, usize::from(result.invalidation.is_some()))?;
+    }
+    for omission in &view.admitted.economy.omissions {
+        checked_reference_add(&mut references, 2)?; // omission.source_id and decision
+        checked_reference_add(&mut references, usize::from(omission.expires.is_some()))?;
+        checked_reference_add(
+            &mut references,
+            usize::from(omission.invalidation.is_some()),
+        )?;
+        if omission.expansion.is_some() {
+            checked_reference_add(&mut references, 6)?;
+            // handle_id, atom_id, source_id, decision, expiry, invalidation
+        }
+    }
+    Ok(references)
 }
 
 /// Explicit finite limits for a single planning handoff.
@@ -155,6 +253,7 @@ pub struct ReactivePlanningBindings {
 impl ReactivePlanningBindings {
     /// Validate exact identity and digest joins without authenticating callers.
     pub fn validate(&self) -> Result<(), ReactiveInputError> {
+        bounded_preflight(self, "bindings.preflight")?;
         for (value, field) in [
             (self.request_id.as_str(), "bindings.request_id"),
             (self.operation_id.as_str(), "bindings.operation_id"),
@@ -187,21 +286,17 @@ impl ReactivePlanningBindings {
     /// Validate digest joins against one retained A15 Context closure.
     pub fn validate_against(&self, view: &ContextPlanningView) -> Result<(), ReactiveInputError> {
         self.validate()?;
-        view.validate()?;
-        let input_bytes = view
-            .canonical_bytes
-            .len()
-            .checked_add(view.admitted_canonical_bytes.len())
-            .ok_or(ReactiveInputError::InvalidField {
-                field: "bindings.input_bytes",
-                reason: "input byte accounting overflowed",
-            })?;
-        if input_bytes as u64 > self.bounds.max_input_bytes {
+        // Stream the complete retained view, including nested graphs and both
+        // original byte payloads, before invoking the expensive Context
+        // validators or any canonicalizing helper.
+        let serialized_bytes = bounded_preflight(view, "bindings.input_preflight")?;
+        if serialized_bytes as u64 > self.bounds.max_input_bytes {
             return Err(ReactiveInputError::InvalidField {
                 field: "bindings.input_bytes",
                 reason: "retained input exceeds declared byte bound",
             });
         }
+        view.validate()?;
         let items = view
             .view
             .rendered
@@ -214,22 +309,7 @@ impl ReactivePlanningBindings {
                 reason: "retained input exceeds declared item bound",
             });
         }
-        let references = view
-            .view
-            .rendered
-            .iter()
-            .map(|item| item.dependencies.len())
-            .sum::<usize>()
-            + view
-                .admitted
-                .records
-                .iter()
-                .map(|record| record.candidate.dependencies.len() + 1)
-                .sum::<usize>()
-            + view.admitted.admissions.len()
-            + view.admitted.economy.requested.len()
-            + view.admitted.economy.admitted.len()
-            + view.admitted.economy.displaced.len();
+        let references = count_retained_references(view)?;
         if references as u64 > self.bounds.max_references {
             return Err(ReactiveInputError::InvalidField {
                 field: "bindings.input_references",

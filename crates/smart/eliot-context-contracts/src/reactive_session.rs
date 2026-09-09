@@ -20,6 +20,8 @@ use crate::{
 
 const MAX_RECORDS: usize = 256;
 const MAX_CLOSURE_ITEMS: usize = 128;
+const DELIVERY_CLAIM_DOMAIN: &str = "eliot.context-contracts.reactive.delivery-stage";
+const DELIVERY_CLAIM_VERSION: u16 = 1;
 
 #[derive(Serialize)]
 struct CanonicalSession<'a> {
@@ -40,6 +42,29 @@ struct CanonicalSession<'a> {
     state_fence: &'a StateFence,
     denominator: &'a SnapshotDenominator,
     records: &'a [PriorDeliveryBinding],
+}
+
+#[derive(Serialize)]
+struct CanonicalDeliveryClaim<'a> {
+    domain: &'static str,
+    version: u16,
+    stage: &'a ReactiveContextStage,
+    validity: &'a ReactiveContextValidity,
+    delivery_owner_id: &'a str,
+    payload_sha256: &'a str,
+    profile: &'a eliot_protocol::ReactiveContextContentRef,
+    operation_id: &'a OperationId,
+    request_id: &'a RequestId,
+    idempotency_key: &'a str,
+    task_id: &'a TaskId,
+    attempt_id: &'a AgentAttemptId,
+    session_id: &'a SessionId,
+    runtime_id: &'a str,
+    runtime_generation: &'a ResourceGeneration,
+    host_generation: &'a ResourceGeneration,
+    route: &'a str,
+    scope_id: &'a WorkScopeId,
+    state_fence: &'a StateFence,
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), ReactiveInputError> {
@@ -97,6 +122,11 @@ pub struct DeliveryEvidenceClosure {
     pub context_view: ContextPlanningView,
     /// The exact owner-issued delivery profile reference used for this event.
     pub profile: eliot_protocol::ReactiveContextContentRef,
+    /// Optional owner-issued claim used only when a delivery stage has no
+    /// qualifying current recipient acknowledgement.
+    pub delivery_claim: Option<eliot_protocol::ReactiveContextContentRef>,
+    /// Explicit owner identity for an owner-issued delivery-stage claim.
+    pub delivery_owner_id: Option<String>,
     /// The original assembly receipt; its operation is historical and remains
     /// distinct from the delivery operation carried by `payload`.
     pub assembly_receipt: ReceiptEnvelope,
@@ -108,6 +138,46 @@ pub struct DeliveryEvidenceClosure {
 }
 
 impl DeliveryEvidenceClosure {
+    fn validate_assembly_receipt(&self) -> Result<(), ReactiveInputError> {
+        self.assembly_receipt
+            .validate()
+            .map_err(|_| ReactiveInputError::InvalidField {
+                field: "delivery.assembly_receipt",
+                reason: "invalid retained assembly ReceiptEnvelope",
+            })?;
+        if self.payload.view.assembly_receipt.content_sha256
+            != self.assembly_receipt.identity.canonical_sha256
+            || self.assembly_receipt.core.work_scope.scope_id
+                != self.context_view.view.binding.scope_id
+            || self.assembly_receipt.core.work_scope.state_fence
+                != self.context_view.view.binding.state_fence
+            || self
+                .assembly_receipt
+                .core
+                .task
+                .as_ref()
+                .is_none_or(|task| task.task_id != self.context_view.view.binding.task_id)
+            || self
+                .context_view
+                .view
+                .binding
+                .operation_id
+                .as_ref()
+                .is_some_and(|operation| {
+                    self.assembly_receipt.core.operation.operation_id != *operation
+                })
+            || !self.assembly_receipt.core.artifacts.iter().any(|artifact| {
+                artifact.artifact_id == self.context_view.view_id
+                    && artifact.sha256 == self.context_view.canonical_sha256
+            })
+        {
+            return Err(ReactiveInputError::BindingMismatch {
+                field: "delivery.assembly_receipt",
+            });
+        }
+        Ok(())
+    }
+
     fn validate_view_join(&self) -> Result<(), ReactiveInputError> {
         if self.payload.view.view_id != self.context_view.view_id
             || self.payload.view.admitted_set.content_sha256
@@ -157,6 +227,20 @@ impl DeliveryEvidenceClosure {
                 || receipt.core.operation.operation_id != self.payload.operation_id
                 || receipt.core.operation.request_id != self.payload.request_id
                 || receipt.core.operation.idempotency_key != self.payload.idempotency_key
+                || receipt
+                    .core
+                    .task
+                    .as_ref()
+                    .is_none_or(|task| task.task_id != self.payload.task_id)
+                || receipt
+                    .core
+                    .session
+                    .as_ref()
+                    .is_none_or(|session| session.session_id != self.payload.recipient.session_id)
+                || receipt.core.request.metadata.request_id != self.payload.request_id
+                || receipt.core.request.metadata.task_id.as_ref() != Some(&self.payload.task_id)
+                || receipt.core.request.metadata.session_id.as_ref()
+                    != Some(&self.payload.recipient.session_id)
                 || !receipt.core.artifacts.iter().any(|artifact| {
                     Some(&artifact.artifact_id)
                         == self.payload.view.representation.artifact_id.as_ref()
@@ -204,25 +288,23 @@ impl DeliveryEvidenceClosure {
                 field: "delivery.profile",
                 reason: "invalid delivery profile binding",
             })?;
-        self.assembly_receipt
-            .validate()
-            .map_err(|_| ReactiveInputError::InvalidField {
-                field: "delivery.assembly_receipt",
-                reason: "invalid retained assembly ReceiptEnvelope",
-            })?;
-        if self.payload.view.assembly_receipt.content_sha256
-            != self.assembly_receipt.identity.canonical_sha256
-            || self
-                .assembly_receipt
-                .core
-                .artifacts
-                .iter()
-                .all(|artifact| artifact.sha256 != self.context_view.canonical_sha256)
+        if let Some(claim) = &self.delivery_claim {
+            claim
+                .validate()
+                .map_err(|_| ReactiveInputError::InvalidField {
+                    field: "delivery.delivery_claim",
+                    reason: "invalid delivery-stage claim binding",
+                })?;
+        }
+        if let Some(owner_id) = &self.delivery_owner_id
+            && (owner_id.trim().is_empty() || owner_id.chars().any(char::is_control))
         {
-            return Err(ReactiveInputError::BindingMismatch {
-                field: "delivery.assembly_receipt",
+            return Err(ReactiveInputError::InvalidField {
+                field: "delivery.delivery_owner_id",
+                reason: "delivery owner must be non-blank and free of control characters",
             });
         }
+        self.validate_assembly_receipt()?;
         self.validate_view_join()?;
         self.event
             .validate()
@@ -316,7 +398,103 @@ impl PriorDeliveryBinding {
             })
     }
 
-    fn has_qualified_delivery(closure: &DeliveryEvidenceClosure) -> bool {
+    /// Compute a full-payload owner claim for a delivery-stage assertion.
+    /// Semantic item/source joins remain validated separately on the record.
+    pub fn canonical_delivery_claim_digest(
+        &self,
+        closure: &DeliveryEvidenceClosure,
+    ) -> Result<String, ReactiveInputError> {
+        let delivery_owner_id =
+            closure
+                .delivery_owner_id
+                .as_deref()
+                .ok_or(ReactiveInputError::BindingMismatch {
+                    field: "delivery.delivery_owner_id",
+                })?;
+        let payload_sha256 =
+            closure
+                .payload
+                .payload_sha256()
+                .map_err(|_| ReactiveInputError::InvalidField {
+                    field: "delivery.payload",
+                    reason: "payload digest cannot be computed",
+                })?;
+        canonical_planning_digest(&CanonicalDeliveryClaim {
+            domain: DELIVERY_CLAIM_DOMAIN,
+            version: DELIVERY_CLAIM_VERSION,
+            stage: &self.stage,
+            validity: &self.validity,
+            delivery_owner_id,
+            payload_sha256: &payload_sha256,
+            profile: &closure.profile,
+            operation_id: &closure.payload.operation_id,
+            request_id: &closure.payload.request_id,
+            idempotency_key: &closure.payload.idempotency_key,
+            task_id: &closure.payload.task_id,
+            attempt_id: &closure.payload.attempt_id,
+            session_id: &closure.payload.recipient.session_id,
+            runtime_id: &closure.payload.recipient.runtime_id,
+            runtime_generation: &closure.payload.recipient.runtime_generation,
+            host_generation: &self.host_generation,
+            route: &closure.payload.recipient.route,
+            scope_id: &closure.payload.work_scope.scope_id,
+            state_fence: &closure.payload.work_scope.state_fence,
+        })
+    }
+
+    fn validate_delivery_claim(
+        &self,
+        closure: &DeliveryEvidenceClosure,
+    ) -> Result<(), ReactiveInputError> {
+        let claim = closure
+            .delivery_claim
+            .as_ref()
+            .ok_or(ReactiveInputError::BindingMismatch {
+                field: "delivery.delivery_claim",
+            })?;
+        let delivery_owner_id =
+            closure
+                .delivery_owner_id
+                .as_deref()
+                .ok_or(ReactiveInputError::BindingMismatch {
+                    field: "delivery.delivery_owner_id",
+                })?;
+        claim
+            .artifact_id
+            .as_ref()
+            .ok_or(ReactiveInputError::BindingMismatch {
+                field: "delivery.delivery_claim",
+            })?;
+        if claim.content_sha256 != self.canonical_delivery_claim_digest(closure)? {
+            return Err(ReactiveInputError::DigestMismatch {
+                field: "delivery.delivery_claim",
+            });
+        }
+        if !closure.receipts.iter().any(|receipt| {
+            matches!(
+                &receipt.core.disposition,
+                eliot_receipts::ReceiptDisposition::Success { .. }
+            ) && receipt.core.authority.authority_owner == delivery_owner_id
+                && receipt.core.artifacts.iter().any(|artifact| {
+                    claim.artifact_id.as_ref() == Some(&artifact.artifact_id)
+                        && artifact.sha256 == claim.content_sha256
+                        && artifact.source_revision.as_deref()
+                            == Some(claim.source_revision.as_str())
+                })
+        }) {
+            return Err(ReactiveInputError::BindingMismatch {
+                field: "delivery.delivery_claim_receipt",
+            });
+        }
+        Ok(())
+    }
+
+    fn has_qualified_delivery(&self, closure: &DeliveryEvidenceClosure) -> bool {
+        if !matches!(self.validity, ReactiveContextValidity::Current)
+            || !matches!(closure.payload.validity, ReactiveContextValidity::Current)
+        {
+            return false;
+        }
         let current_ack = closure.acknowledgements.iter().any(|ack| {
             ack.validate_against(&closure.payload).is_ok()
                 && matches!(
@@ -327,24 +505,7 @@ impl PriorDeliveryBinding {
                         | eliot_protocol::AckPhase::Applied
                 )
         });
-        let receipt = closure.receipts.iter().any(|receipt| {
-            matches!(
-                &receipt.core.disposition,
-                eliot_receipts::ReceiptDisposition::Success { .. }
-            ) && receipt.core.artifacts.iter().any(|artifact| {
-                Some(&artifact.artifact_id)
-                    == closure.payload.view.representation.artifact_id.as_ref()
-                    && artifact.sha256 == closure.payload.view.representation.content_sha256
-                    && artifact.source_revision.as_deref()
-                        == Some(closure.payload.view.representation.source_revision.as_str())
-            }) && receipt.core.artifacts.iter().any(|artifact| {
-                Some(&artifact.artifact_id) == closure.profile.artifact_id.as_ref()
-                    && artifact.sha256 == closure.profile.content_sha256
-                    && artifact.source_revision.as_deref()
-                        == Some(closure.profile.source_revision.as_str())
-            })
-        });
-        current_ack || receipt
+        current_ack || self.validate_delivery_claim(closure).is_ok()
     }
 
     fn validate_closure(
@@ -377,6 +538,28 @@ impl PriorDeliveryBinding {
         if self.profile != closure.profile {
             return Err(ReactiveInputError::BindingMismatch {
                 field: "delivery.profile",
+            });
+        }
+        if self.validity != closure.payload.validity {
+            return Err(ReactiveInputError::BindingMismatch {
+                field: "delivery.validity",
+            });
+        }
+        let required_phase = match self.stage {
+            ReactiveContextStage::RecipientReceived => Some(AckPhase::Received),
+            ReactiveContextStage::RecipientDurable => Some(AckPhase::Durable),
+            ReactiveContextStage::NormalizedProjection => Some(AckPhase::Normalized),
+            ReactiveContextStage::AppliedProjection => Some(AckPhase::Applied),
+            _ => None,
+        };
+        if let Some(required_phase) = required_phase
+            && !closure.acknowledgements.iter().any(|ack| {
+                ack.observed_phase == required_phase
+                    && ack.validate_against(&closure.payload).is_ok()
+            })
+        {
+            return Err(ReactiveInputError::BindingMismatch {
+                field: "delivery.stage_acknowledgement",
             });
         }
         let item = closure
@@ -482,7 +665,15 @@ impl PriorDeliveryBinding {
                 });
             }
         }
+        let stage_requires_ack = matches!(
+            self.stage,
+            ReactiveContextStage::RecipientReceived
+                | ReactiveContextStage::RecipientDurable
+                | ReactiveContextStage::NormalizedProjection
+                | ReactiveContextStage::AppliedProjection
+        );
         if (self.stage == ReactiveContextStage::DeliveredToExactEndpoint
+            || stage_requires_ack
             || self.acknowledgement_phase.is_some())
             && self.closure.as_ref().is_none_or(|closure| {
                 closure.receipts.is_empty() && closure.acknowledgements.is_empty()
@@ -496,7 +687,7 @@ impl PriorDeliveryBinding {
         if let Some(closure) = &self.closure {
             self.validate_closure(closure)?;
             if self.stage == ReactiveContextStage::DeliveredToExactEndpoint
-                && !Self::has_qualified_delivery(closure)
+                && !self.has_qualified_delivery(closure)
             {
                 return Err(ReactiveInputError::BindingMismatch {
                     field: "delivery.qualification",
@@ -539,6 +730,13 @@ impl SessionDeliverySnapshot {
         let mut replay_ids = std::collections::BTreeSet::new();
         for record in &self.records {
             record.validate()?;
+            if record.state_fence != self.state_fence
+                && matches!(record.validity, ReactiveContextValidity::Current)
+            {
+                return Err(ReactiveInputError::BindingMismatch {
+                    field: "session.record_historical_fence",
+                });
+            }
             if record.session_id != self.session_id
                 || record.runtime_id != self.runtime_id
                 || record.runtime_generation != self.runtime_generation

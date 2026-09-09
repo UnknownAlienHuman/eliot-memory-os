@@ -287,6 +287,7 @@ pub fn open_attention() -> CriticalAttentionMember {
         escalation_target: None,
         resolution_condition: "owner review".to_owned(),
         waiver_authority: None,
+        superseded_by: None,
         missing_coverage: Vec::new(),
         state_fence: fence(),
         owner_closure: AttentionOwnerClosure {

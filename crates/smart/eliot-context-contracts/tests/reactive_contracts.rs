@@ -18,6 +18,33 @@ fn context_planning_view_retains_original_canonical_closure() {
     )
     .expect("complete immutable context closure");
     retained.validate().expect("retained context closure");
+    let bounded = eliot_context_contracts::ReactivePlanningBindings {
+        request_id: eliot_contracts::RequestId::new("request-bound").expect("request"),
+        operation_id: eliot_contracts::OperationId::new("operation-bound").expect("operation"),
+        idempotency_key: "idempotency-bound".to_owned(),
+        task_id: support::task(),
+        attempt_id: eliot_agent_contracts::AgentAttemptId::new("attempt-bound").expect("attempt"),
+        scope_id: support::scope(),
+        state_fence: support::fence(),
+        view_id: support::id("view"),
+        view_digest: support::digest(),
+        admitted_set_digest: support::digest(),
+        assembly_digest: support::digest(),
+        measurement_digest: support::digest(),
+        input_digest: support::digest(),
+        bounds: eliot_context_contracts::ReactivePlanningBounds {
+            max_input_bytes: 1,
+            max_items: 1,
+            max_references: 1,
+        },
+    };
+    assert!(matches!(
+        bounded.validate_against(&retained),
+        Err(ReactiveInputError::InvalidField {
+            field: "bindings.input_bytes",
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -29,6 +56,8 @@ fn delivered_protocol_closure_is_valid_and_bounded() {
         context_view,
         profile,
         assembly_receipt,
+        delivery_claim: None,
+        delivery_owner_id: None,
         payload: payload.clone(),
         event: event.clone(),
         acknowledgements: vec![ack],
@@ -62,6 +91,8 @@ fn delivered_protocol_closure_is_valid_and_bounded() {
         context_view,
         profile: profile.clone(),
         assembly_receipt,
+        delivery_claim: None,
+        delivery_owner_id: None,
         payload: payload.clone(),
         event,
         acknowledgements: vec![ack],
@@ -172,6 +203,75 @@ fn attention_acknowledgement_does_not_resolve_obligation() {
     resolved
         .validate()
         .expect("terminal attention retains owner evidence");
+
+    let mut waived = support::open_attention();
+    waived.resolution = AttentionResolution::Waived;
+    waived.waiver_authority = Some("waiver-authority".to_owned());
+    waived.claim_digest = waived
+        .canonical_resolution_claim_digest()
+        .expect("waiver claim digest");
+    let (_context, _payload, _event, _ack, receipt, _assembly, _profile) =
+        support::delivered_fixture();
+    let mut waiver_core = receipt.core;
+    waiver_core.authority.authority_owner = "waiver-authority".to_owned();
+    waiver_core.artifacts.push(eliot_receipts::ArtifactBinding {
+        artifact_id: waived.attention_id.clone(),
+        sha256: waived.claim_digest.clone(),
+        role: eliot_receipts::ReceiptKind::Artifact,
+        source_revision: Some(waived.source_revision.clone()),
+    });
+    waiver_core.artifacts.push(eliot_receipts::ArtifactBinding {
+        artifact_id: waived.claim_artifact_id.clone(),
+        sha256: waived.claim_digest.clone(),
+        role: eliot_receipts::ReceiptKind::Artifact,
+        source_revision: Some(waived.source_revision.clone()),
+    });
+    waived.owner_closure.resolution_receipt =
+        Some(eliot_receipts::ReceiptEnvelope::issue(waiver_core).expect("waiver receipt"));
+    waived.validate().expect("named waiver authority receipt");
+
+    let mut superseded = support::open_attention();
+    superseded.resolution = AttentionResolution::Superseded;
+    let mut replacement = support::content_ref();
+    replacement.artifact_id = Some(support::id("replacement"));
+    superseded.superseded_by = Some(replacement.clone());
+    superseded.claim_digest = superseded
+        .canonical_resolution_claim_digest()
+        .expect("supersession claim digest");
+    let (_context, _payload, _event, _ack, receipt, _assembly, _profile) =
+        support::delivered_fixture();
+    let mut supersession_core = receipt.core;
+    supersession_core.authority.authority_owner = superseded.owner_id.clone();
+    supersession_core
+        .artifacts
+        .push(eliot_receipts::ArtifactBinding {
+            artifact_id: superseded.attention_id.clone(),
+            sha256: superseded.claim_digest.clone(),
+            role: eliot_receipts::ReceiptKind::Artifact,
+            source_revision: Some(superseded.source_revision.clone()),
+        });
+    supersession_core
+        .artifacts
+        .push(eliot_receipts::ArtifactBinding {
+            artifact_id: superseded.claim_artifact_id.clone(),
+            sha256: superseded.claim_digest.clone(),
+            role: eliot_receipts::ReceiptKind::Artifact,
+            source_revision: Some(superseded.source_revision.clone()),
+        });
+    supersession_core
+        .artifacts
+        .push(eliot_receipts::ArtifactBinding {
+            artifact_id: replacement.artifact_id.clone().expect("replacement id"),
+            sha256: replacement.content_sha256.clone(),
+            role: eliot_receipts::ReceiptKind::Artifact,
+            source_revision: Some(replacement.source_revision.clone()),
+        });
+    superseded.owner_closure.resolution_receipt = Some(
+        eliot_receipts::ReceiptEnvelope::issue(supersession_core).expect("supersession receipt"),
+    );
+    superseded
+        .validate()
+        .expect("explicit replacement owner receipt");
 }
 
 #[test]

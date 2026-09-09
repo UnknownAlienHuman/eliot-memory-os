@@ -14,6 +14,8 @@ use crate::{
 const MAX_EVENTS: usize = 64;
 const MAX_GAPS: usize = 128;
 const MAX_EVIDENCE: usize = 128;
+const COVERAGE_CLAIM_DOMAIN: &str = "eliot.context-contracts.reactive.coverage-observation";
+const COVERAGE_CLAIM_VERSION: u16 = 1;
 const I716_EVENTS: [&str; 10] = [
     "SessionStart",
     "UserPromptSubmit",
@@ -136,6 +138,8 @@ pub struct CoverageEvidence {
 
 #[derive(Serialize)]
 struct CanonicalCoverageClaim<'a> {
+    domain: &'static str,
+    version: u16,
     owner_id: &'a str,
     claim_artifact_id: &'a eliot_contracts::ArtifactId,
     host_id: &'a str,
@@ -161,6 +165,8 @@ struct CanonicalCoverageClaim<'a> {
 impl CoverageEvidence {
     pub fn canonical_claim_digest(&self) -> Result<String, ReactiveInputError> {
         canonical_planning_digest(&CanonicalCoverageClaim {
+            domain: COVERAGE_CLAIM_DOMAIN,
+            version: COVERAGE_CLAIM_VERSION,
             owner_id: &self.owner_id,
             claim_artifact_id: &self.claim_artifact_id,
             host_id: &self.host_id,
