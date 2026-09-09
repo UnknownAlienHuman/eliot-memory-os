@@ -16,6 +16,10 @@ mod identity;
 mod measurement;
 mod omission;
 mod quality;
+mod reactive_attention;
+mod reactive_coverage;
+mod reactive_input;
+mod reactive_session;
 mod view;
 
 pub use admission::{
@@ -46,6 +50,23 @@ pub use measurement::{
 };
 pub use omission::{ExpansionHandle, NonRecoverableReason, OmissionReason, OmissionRecord};
 pub use quality::{QualityDimension, QualityDimensionResult, QualityScorecard};
+pub use reactive_attention::{
+    AttentionAcknowledgement, AttentionInfluence, AttentionOwnerClosure, AttentionResolution,
+    CriticalAttentionMember, CriticalAttentionProjection,
+};
+pub use reactive_coverage::{
+    CoverageAxis, CoverageEvidence, CoverageFreshness, IntegrationCoverageProfile,
+    ReactiveDeliveryMode,
+};
+pub(crate) use reactive_input::bounded_preflight;
+pub use reactive_input::{
+    ContextPlanningView, ReactiveInputError, ReactivePlanningBindings, ReactivePlanningBounds,
+    canonical_planning_digest,
+};
+pub use reactive_session::{
+    DeliveryEvidenceClosure, PriorDeliveryBinding, SessionDeliverySnapshot, SnapshotCompleteness,
+    SnapshotDenominator,
+};
 pub use view::{ActiveUnderstandingView, RenderedAtom, SelectionIntegrityProof};
 
 /// Compatibility spelling for a provider-produced whole atom.

@@ -24,6 +24,7 @@ eliot-contracts = { path = "../../foundation/eliot-contracts" }
 eliot-evidence = { path = "../../foundation/eliot-evidence" }
 eliot-receipts = { path = "../../foundation/eliot-receipts" }
 eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts" }
+eliot-protocol = { path = "../../foundation/eliot-protocol" }
 schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
