@@ -50,7 +50,50 @@ pub fn plan_pending_context_injection(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+struct ValidatedInputs<'a> {
+    view: &'a ContextPlanningView,
+    cue_activation: &'a ReactiveCueActivation,
+    session_snapshot: &'a SessionDeliverySnapshot,
+    critical_attention: &'a CriticalAttentionProjection,
+    integration_coverage: &'a IntegrationCoverageProfile,
+    policy: &'a ReactiveDeliveryPolicy,
+    input_bytes: u64,
+    preflight_work: u64,
+    input_references: u64,
+}
+
+type ActivationMap = BTreeMap<
+    String,
+    (
+        ActivationEvidenceKind,
+        eliot_cue_contracts::ActivationStrength,
+        Vec<eliot_cue_contracts::TargetHandle>,
+    ),
+>;
+
+struct PlanningEvidence {
+    base: OutputIdentity,
+    floor_safety_refusal: Option<FloorSafetyRefusal>,
+    frontier: Vec<String>,
+    incomplete_activation: bool,
+    mode: Option<ReactiveDeliveryMode>,
+    selected_mode: ReactiveDeliveryMode,
+    effective_proof_ceiling: ProofCeiling,
+    activation_map: ActivationMap,
+    profile_ref: ReactiveContextContentRef,
+    attention_blocked: bool,
+}
+
+struct ItemLedger {
+    items: Vec<PlannedContextItem>,
+    required_ids: BTreeSet<String>,
+    sticky_obligations: u64,
+    required_attention: bool,
+    planning_work: u64,
+    work_exhausted: bool,
+}
+
+/// Plan one bounded context injection from six immutable projections.
 fn plan_inner(
     view: &ContextPlanningView,
     cue_activation: &ReactiveCueActivation,
@@ -59,6 +102,27 @@ fn plan_inner(
     integration_coverage: &IntegrationCoverageProfile,
     policy: &ReactiveDeliveryPolicy,
 ) -> Result<ReactiveContextPlanResult, ReactiveContextPlanningError> {
+    let inputs = validate_planning_inputs(
+        view,
+        cue_activation,
+        session_snapshot,
+        critical_attention,
+        integration_coverage,
+        policy,
+    )?;
+    let evidence = derive_planning_evidence(&inputs)?;
+    let ledger = build_item_ledger(&inputs, &evidence)?;
+    resolve_selection_and_emit(&inputs, evidence, ledger)
+}
+
+fn validate_planning_inputs<'a>(
+    view: &'a ContextPlanningView,
+    cue_activation: &'a ReactiveCueActivation,
+    session_snapshot: &'a SessionDeliverySnapshot,
+    critical_attention: &'a CriticalAttentionProjection,
+    integration_coverage: &'a IntegrationCoverageProfile,
+    policy: &'a ReactiveDeliveryPolicy,
+) -> Result<ValidatedInputs<'a>, ReactiveContextPlanningError> {
     policy.validate_preflight().map_err(invalid_preflight)?;
     let (input_bytes, preflight_work, input_references) = preflight_inputs(
         view,
@@ -89,7 +153,127 @@ fn plan_inner(
         integration_coverage,
         policy,
     )?;
+    Ok(ValidatedInputs {
+        view,
+        cue_activation,
+        session_snapshot,
+        critical_attention,
+        integration_coverage,
+        policy,
+        input_bytes,
+        preflight_work,
+        input_references,
+    })
+}
 
+fn derive_planning_evidence(
+    inputs: &ValidatedInputs<'_>,
+) -> Result<PlanningEvidence, ReactiveContextPlanningError> {
+    let ValidatedInputs {
+        view,
+        cue_activation,
+        session_snapshot,
+        critical_attention,
+        integration_coverage,
+        policy,
+        ..
+    } = inputs;
+    let input_digest = derive_input_identity(inputs)?;
+
+    let activation_digest =
+        canonical_planning_digest(cue_activation).map_err(|error| invalid(error, policy))?;
+    let session_digest = session_snapshot
+        .canonical_digest()
+        .map_err(|error| invalid(error, policy))?;
+    let attention_digest = critical_attention
+        .canonical_digest()
+        .map_err(|error| invalid(error, policy))?;
+    let coverage_digest = integration_coverage
+        .canonical_digest()
+        .map_err(|error| invalid(error, policy))?;
+    let floor_safety_refusal =
+        inspect_floor_safety(view).map_err(|error| invalid(error, policy))?;
+
+    let mut frontier = activation_frontier(&cue_activation.result);
+    let incomplete_activation =
+        !matches!(cue_activation.result.completeness, Completeness::Complete);
+    if incomplete_activation && frontier.is_empty() {
+        frontier.push("activation:incomplete".to_owned());
+    }
+    let mode = choose_mode(integration_coverage, policy);
+    let selected_mode = mode.unwrap_or(ReactiveDeliveryMode::ToolOnly);
+    let effective_proof_ceiling =
+        effective_proof_ceiling(integration_coverage, policy, selected_mode);
+    let activation_map =
+        activation_targets(&cue_activation.result, &cue_activation.target_bindings);
+    frontier.extend(unmatched_activation_targets(
+        &cue_activation.result,
+        &cue_activation.target_bindings,
+    ));
+    let profile_ref = profile_reference(policy);
+    let attention_blocked = critical_attention.members.iter().any(|member| {
+        matches!(
+            member.resolution,
+            AttentionResolution::Open | AttentionResolution::Unknown
+        ) && !attention_rule_allowed(member, policy, integration_coverage)
+    });
+    let base = OutputIdentity {
+        request_id: policy.request_id.clone(),
+        operation_id: policy.operation_id.clone(),
+        idempotency_key: policy.idempotency_key.clone(),
+        plan_id: policy.plan_id.clone(),
+        input_digest,
+        view_digest: view.view.output_digest.clone(),
+        admitted_set_digest: view.admitted_canonical_sha256.clone(),
+        assembly_digest: view.view.selection.output_digest.clone(),
+        activation_digest,
+        session_snapshot_digest: session_digest,
+        attention_projection_digest: attention_digest,
+        coverage_profile_digest: coverage_digest,
+        coverage_completeness: integration_coverage.completeness,
+        coverage_gaps: integration_coverage.gaps.clone(),
+        selected_event_evidence: integration_coverage
+            .events
+            .iter()
+            .filter(|event| event.event == policy.target_event)
+            .cloned()
+            .collect(),
+        session_completeness: session_snapshot.denominator.completeness,
+        session_denominator: session_snapshot.denominator,
+        context_measurement: view.view.measurement.clone(),
+        floor_capacity: view.admitted.floor.capacity,
+        floor_incomplete: floor_safety_refusal
+            .as_ref()
+            .and_then(|refusal| refusal.incomplete.clone()),
+        policy_digest: policy.policy_digest.clone(),
+        activation_result: cue_activation.result.clone(),
+    };
+    Ok(PlanningEvidence {
+        base,
+        floor_safety_refusal,
+        frontier,
+        incomplete_activation,
+        mode,
+        selected_mode,
+        effective_proof_ceiling,
+        activation_map,
+        profile_ref,
+        attention_blocked,
+    })
+}
+
+fn derive_input_identity(
+    inputs: &ValidatedInputs<'_>,
+) -> Result<String, ReactiveContextPlanningError> {
+    let ValidatedInputs {
+        view,
+        cue_activation,
+        session_snapshot,
+        critical_attention,
+        integration_coverage,
+        policy,
+        ..
+    } = inputs;
     let bounds = policy.planning_bounds();
     let input_digest = canonical_planning_digest(&(
         view,
@@ -136,88 +320,34 @@ fn plan_inner(
     bindings
         .validate_against(view)
         .map_err(|error| invalid(error, policy))?;
+    Ok(input_digest)
+}
 
-    let activation_digest =
-        canonical_planning_digest(cue_activation).map_err(|error| invalid(error, policy))?;
-    let session_digest = session_snapshot
-        .canonical_digest()
-        .map_err(|error| invalid(error, policy))?;
-    let attention_digest = critical_attention
-        .canonical_digest()
-        .map_err(|error| invalid(error, policy))?;
-    let coverage_digest = integration_coverage
-        .canonical_digest()
-        .map_err(|error| invalid(error, policy))?;
-    let floor_safety_refusal =
-        inspect_floor_safety(view).map_err(|error| invalid(error, policy))?;
-
-    let mut frontier = activation_frontier(&cue_activation.result);
-    let incomplete_activation =
-        !matches!(cue_activation.result.completeness, Completeness::Complete);
-    if incomplete_activation && frontier.is_empty() {
-        frontier.push("activation:incomplete".to_owned());
-    }
-    let mode = choose_mode(integration_coverage, policy);
-    let base = OutputIdentity {
-        request_id: policy.request_id.clone(),
-        operation_id: policy.operation_id.clone(),
-        idempotency_key: policy.idempotency_key.clone(),
-        plan_id: policy.plan_id.clone(),
-        input_digest: input_digest.clone(),
-        view_digest: view.view.output_digest.clone(),
-        admitted_set_digest: view.admitted_canonical_sha256.clone(),
-        assembly_digest: view.view.selection.output_digest.clone(),
-        activation_digest,
-        session_snapshot_digest: session_digest,
-        attention_projection_digest: attention_digest.clone(),
-        coverage_profile_digest: coverage_digest,
-        coverage_completeness: integration_coverage.completeness,
-        coverage_gaps: integration_coverage.gaps.clone(),
-        selected_event_evidence: integration_coverage
-            .events
-            .iter()
-            .filter(|event| event.event == policy.target_event)
-            .cloned()
-            .collect(),
-        session_completeness: session_snapshot.denominator.completeness,
-        session_denominator: session_snapshot.denominator,
-        context_measurement: view.view.measurement.clone(),
-        floor_capacity: view.admitted.floor.capacity,
-        floor_incomplete: floor_safety_refusal
-            .as_ref()
-            .and_then(|refusal| refusal.incomplete.clone()),
-        policy_digest: policy.policy_digest.clone(),
-        activation_result: cue_activation.result.clone(),
-    };
-
-    let selected_mode = mode.unwrap_or(ReactiveDeliveryMode::ToolOnly);
-    let effective_proof_ceiling =
-        effective_proof_ceiling(integration_coverage, policy, selected_mode);
-
-    let activation_map =
-        activation_targets(&cue_activation.result, &cue_activation.target_bindings);
-    frontier.extend(unmatched_activation_targets(
-        &cue_activation.result,
-        &cue_activation.target_bindings,
-    ));
-    let profile_ref = profile_reference(policy);
-    let attention_blocked = critical_attention.members.iter().any(|member| {
-        matches!(
-            member.resolution,
-            AttentionResolution::Open | AttentionResolution::Unknown
-        ) && !attention_rule_allowed(member, policy, integration_coverage)
-    });
-    let mut items = Vec::new();
-    let remaining_work = policy.max_work.checked_sub(preflight_work).ok_or_else(|| {
-        internal(
-            ReactiveInputError::InvalidField {
-                field: "planning.floor_work",
-                reason: "preflight consumed the complete planning work budget",
-            },
-            policy,
-            &input_digest,
-        )
-    })?;
+fn build_item_ledger(
+    inputs: &ValidatedInputs<'_>,
+    evidence: &PlanningEvidence,
+) -> Result<ItemLedger, ReactiveContextPlanningError> {
+    let ValidatedInputs {
+        view,
+        session_snapshot,
+        critical_attention,
+        policy,
+        preflight_work,
+        ..
+    } = inputs;
+    let remaining_work = policy
+        .max_work
+        .checked_sub(*preflight_work)
+        .ok_or_else(|| {
+            internal(
+                ReactiveInputError::InvalidField {
+                    field: "planning.floor_work",
+                    reason: "preflight consumed the complete planning work budget",
+                },
+                policy,
+                &evidence.base.input_digest,
+            )
+        })?;
     let (required_ids, floor_scan_work) =
         required_floor_ids(view, remaining_work).ok_or_else(|| {
             internal(
@@ -226,7 +356,7 @@ fn plan_inner(
                     reason: "required floor traversal work overflowed",
                 },
                 policy,
-                &input_digest,
+                &evidence.base.input_digest,
             )
         })?;
     let mut atoms = view.view.rendered.clone();
@@ -238,12 +368,13 @@ fn plan_inner(
                 .position(|role| role == &atom.role)
                 .unwrap_or(policy.priority.len()),
             i32::from(!matches!(
-                activation_map
+                evidence
+                    .activation_map
                     .get(atom.atom_id.as_str())
                     .map(|(kind, _, _)| kind),
                 Some(ActivationEvidenceKind::Direct | ActivationEvidenceKind::DirectAndDerived,)
             )),
-            activation_map.get(atom.atom_id.as_str()).map_or(
+            evidence.activation_map.get(atom.atom_id.as_str()).map_or(
                 Reverse(eliot_cue_contracts::ActivationStrength(0)),
                 |(_, strength, _)| Reverse(*strength),
             ),
@@ -254,8 +385,8 @@ fn plan_inner(
     });
     let mut atom_handles = BTreeMap::new();
     for atom in &atoms {
-        let handles =
-            item_handles(atom, policy).map_err(|error| internal(error, policy, &input_digest))?;
+        let handles = item_handles(atom, policy)
+            .map_err(|error| internal(error, policy, &evidence.base.input_digest))?;
         atom_handles.insert(atom.atom_id.to_string(), handles);
     }
     if session_operation_conflict(session_snapshot, policy, view, &atom_handles) {
@@ -267,101 +398,69 @@ fn plan_inner(
             "supplied delivery identity conflicts with retained current history",
         ));
     }
-    for atom in &atoms {
-        let (content, source, byte_cost) = atom_handles
-            .get(atom.atom_id.as_str())
-            .cloned()
-            .ok_or_else(|| {
-                internal(
-                    ReactiveInputError::InvalidField {
-                        field: "delivery.item_handles",
-                        reason: "current atom handles were not retained",
-                    },
-                    policy,
-                    &input_digest,
-                )
-            })?;
-        let activated = activation_map
-            .get(atom.atom_id.as_str())
-            .map(|(kind, _, _)| *kind);
-        let current_record = session_snapshot
-            .records
-            .iter()
-            .find(|record| record.item_id == atom.atom_id.as_str());
-        let (disposition, reason) = classify_normal(
-            atom,
-            current_record,
-            activated,
-            selected_mode,
-            &content,
-            &source,
-            &profile_ref,
-            effective_proof_ceiling,
-            session_snapshot.denominator.completeness,
-            incomplete_activation,
-            required_ids.contains(atom.atom_id.as_str()),
-            view,
-            session_snapshot,
-        );
-        let activation_targets = activation_map
-            .get(atom.atom_id.as_str())
-            .map(|(_, _, handles)| handles.clone())
-            .unwrap_or_default();
-        items.push(PlannedContextItem {
-            item_id: atom.atom_id.to_string(),
-            kind: PlannedItemKind::Context,
-            rendered: Some(atom.clone()),
-            content,
-            source,
-            profile: profile_ref.clone(),
-            activation_kind: activated,
-            activation_targets,
-            attention_kind: None,
-            attention: None,
-            omission: None,
-            disposition,
-            byte_cost,
-            stu_cost: None,
-            reason,
-        });
-    }
+    let mut items = build_context_items(
+        &atoms,
+        &atom_handles,
+        view,
+        session_snapshot,
+        policy,
+        &required_ids,
+        evidence,
+    )?;
+    append_attention_items(&mut items, critical_attention, policy, evidence)?;
+    items.extend(build_omission_items(view, policy, evidence)?);
+
+    let summary = finish_item_ledger(
+        &items,
+        floor_scan_work,
+        *preflight_work,
+        policy,
+        &evidence.base.input_digest,
+    )?;
+    Ok(ItemLedger {
+        items,
+        required_ids,
+        sticky_obligations: summary.sticky_obligations,
+        required_attention: summary.required_attention,
+        planning_work: summary.planning_work,
+        work_exhausted: summary.work_exhausted,
+    })
+}
+
+fn append_attention_items(
+    items: &mut Vec<PlannedContextItem>,
+    critical_attention: &CriticalAttentionProjection,
+    policy: &ReactiveDeliveryPolicy,
+    evidence: &PlanningEvidence,
+) -> Result<(), ReactiveContextPlanningError> {
     for member in &critical_attention.members {
         items.push(
-            attention_item(member, &profile_ref, selected_mode, &attention_digest)
-                .map_err(|error| internal(error, policy, &input_digest))?,
+            attention_item(
+                member,
+                &evidence.profile_ref,
+                evidence.selected_mode,
+                &evidence.base.attention_projection_digest,
+            )
+            .map_err(|error| internal(error, policy, &evidence.base.input_digest))?,
         );
     }
-    for omission in &view.admitted.economy.omissions {
-        let omission_bytes = canonical_json_bytes(omission)
-            .map_err(|error| internal(error, policy, &input_digest))?;
-        items.push(PlannedContextItem {
-            item_id: format!("omission:{}", omission.atom_id),
-            kind: PlannedItemKind::Omission,
-            rendered: None,
-            content: Vec::new(),
-            source: Vec::new(),
-            profile: profile_ref.clone(),
-            activation_kind: None,
-            activation_targets: Vec::new(),
-            attention_kind: None,
-            attention: None,
-            omission: Some(omission.clone()),
-            disposition: DeliveryDisposition::OmissionReferenceOnly,
-            byte_cost: u64::try_from(omission_bytes.len()).map_err(|_| {
-                internal(
-                    ReactiveInputError::InvalidField {
-                        field: "delivery.omission",
-                        reason: "omission size overflowed",
-                    },
-                    policy,
-                    &input_digest,
-                )
-            })?,
-            stu_cost: None,
-            reason: format!("admitted omission: {:?}", omission.reason),
-        });
-    }
+    Ok(())
+}
 
+struct ItemLedgerSummary {
+    sticky_obligations: u64,
+    required_attention: bool,
+    planning_work: u64,
+    work_exhausted: bool,
+}
+
+fn finish_item_ledger(
+    items: &[PlannedContextItem],
+    floor_scan_work: u64,
+    preflight_work: u64,
+    policy: &ReactiveDeliveryPolicy,
+    input_digest: &str,
+) -> Result<ItemLedgerSummary, ReactiveContextPlanningError> {
     let sticky_obligations = items
         .iter()
         .filter(|item| {
@@ -381,14 +480,12 @@ fn plan_inner(
                 reason: "item ledger count overflowed",
             },
             policy,
-            &input_digest,
+            input_digest,
         )
     })?;
     let ledger_units = floor_scan_work
         .checked_add(item_count)
         .and_then(|work| work.checked_add(item_count))
-        // Charge final accounting traversal and output/result digest work
-        // before any selection can claim the remaining budget.
         .and_then(|work| work.checked_add(item_count))
         .and_then(|work| work.checked_add(2))
         .ok_or_else(|| {
@@ -398,148 +495,433 @@ fn plan_inner(
                     reason: "item ledger work overflowed",
                 },
                 policy,
-                &input_digest,
+                input_digest,
             )
         })?;
     let work_exhausted = !charge_planning_work(&mut planning_work, ledger_units, policy.max_work)
-        .map_err(|error| internal(error, policy, &input_digest))?;
+        .map_err(|error| internal(error, policy, input_digest))?;
+    Ok(ItemLedgerSummary {
+        sticky_obligations,
+        required_attention,
+        planning_work,
+        work_exhausted,
+    })
+}
+
+fn build_context_items(
+    atoms: &[eliot_context_contracts::RenderedAtom],
+    atom_handles: &BTreeMap<
+        String,
+        (
+            Vec<ReactiveContextContentRef>,
+            Vec<ReactiveContextContentRef>,
+            u64,
+        ),
+    >,
+    view: &ContextPlanningView,
+    session: &SessionDeliverySnapshot,
+    policy: &ReactiveDeliveryPolicy,
+    required_ids: &BTreeSet<String>,
+    evidence: &PlanningEvidence,
+) -> Result<Vec<PlannedContextItem>, ReactiveContextPlanningError> {
+    let mut items = Vec::new();
+    for atom in atoms {
+        let (content, source, byte_cost) = atom_handles
+            .get(atom.atom_id.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                internal(
+                    ReactiveInputError::InvalidField {
+                        field: "delivery.item_handles",
+                        reason: "current atom handles were not retained",
+                    },
+                    policy,
+                    &evidence.base.input_digest,
+                )
+            })?;
+        let activated = evidence
+            .activation_map
+            .get(atom.atom_id.as_str())
+            .map(|(kind, _, _)| *kind);
+        let current_record = session
+            .records
+            .iter()
+            .find(|record| record.item_id == atom.atom_id.as_str());
+        let (disposition, reason) = classify_normal(
+            atom,
+            current_record,
+            activated,
+            evidence.selected_mode,
+            &content,
+            &source,
+            &evidence.profile_ref,
+            evidence.effective_proof_ceiling,
+            session.denominator.completeness,
+            evidence.incomplete_activation,
+            required_ids.contains(atom.atom_id.as_str()),
+            view,
+            session,
+        );
+        let activation_targets = evidence
+            .activation_map
+            .get(atom.atom_id.as_str())
+            .map(|(_, _, handles)| handles.clone())
+            .unwrap_or_default();
+        items.push(PlannedContextItem {
+            item_id: atom.atom_id.to_string(),
+            kind: PlannedItemKind::Context,
+            rendered: Some(atom.clone()),
+            content,
+            source,
+            profile: evidence.profile_ref.clone(),
+            activation_kind: activated,
+            activation_targets,
+            attention_kind: None,
+            attention: None,
+            omission: None,
+            disposition,
+            byte_cost,
+            stu_cost: None,
+            reason,
+        });
+    }
+    Ok(items)
+}
+
+fn build_omission_items(
+    view: &ContextPlanningView,
+    policy: &ReactiveDeliveryPolicy,
+    evidence: &PlanningEvidence,
+) -> Result<Vec<PlannedContextItem>, ReactiveContextPlanningError> {
+    view.admitted
+        .economy
+        .omissions
+        .iter()
+        .map(|omission| {
+            let omission_bytes = canonical_json_bytes(omission)
+                .map_err(|error| internal(error, policy, &evidence.base.input_digest))?;
+            Ok(PlannedContextItem {
+                item_id: format!("omission:{}", omission.atom_id),
+                kind: PlannedItemKind::Omission,
+                rendered: None,
+                content: Vec::new(),
+                source: Vec::new(),
+                profile: evidence.profile_ref.clone(),
+                activation_kind: None,
+                activation_targets: Vec::new(),
+                attention_kind: None,
+                attention: None,
+                omission: Some(omission.clone()),
+                disposition: DeliveryDisposition::OmissionReferenceOnly,
+                byte_cost: u64::try_from(omission_bytes.len()).map_err(|_| {
+                    internal(
+                        ReactiveInputError::InvalidField {
+                            field: "delivery.omission",
+                            reason: "omission size overflowed",
+                        },
+                        policy,
+                        &evidence.base.input_digest,
+                    )
+                })?,
+                stu_cost: None,
+                reason: format!("admitted omission: {:?}", omission.reason),
+            })
+        })
+        .collect()
+}
+
+struct SelectionRefusal {
+    disposition: DeliveryDisposition,
+    reason: String,
+    frontier: Vec<String>,
+}
+
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+fn early_selection_refusal(
+    policy: &ReactiveDeliveryPolicy,
+    mode: Option<ReactiveDeliveryMode>,
+    expired: bool,
+    deadline_unknown: bool,
+    floor_safety_refusal: Option<&FloorSafetyRefusal>,
+    work_exhausted: bool,
+    items: &[PlannedContextItem],
+    required_ids: &BTreeSet<String>,
+    attention_blocked: bool,
+) -> Option<SelectionRefusal> {
+    if let Some(reason) = global_selection_refusal(policy, expired, deadline_unknown, mode) {
+        return Some(SelectionRefusal {
+            disposition: DeliveryDisposition::UnsupportedCapability,
+            reason: reason.to_owned(),
+            frontier: vec![format!("global:{reason}")],
+        });
+    }
+    if let Some(refusal) = floor_safety_refusal {
+        let FloorSafetyRefusal {
+            reason, evidence, ..
+        } = refusal;
+        return Some(SelectionRefusal {
+            disposition: DeliveryDisposition::WithheldProfile,
+            reason: reason.clone(),
+            frontier: evidence.clone(),
+        });
+    }
+    if work_exhausted {
+        return Some(SelectionRefusal {
+            disposition: DeliveryDisposition::WithheldBudget,
+            reason: "PLANNING_WORK_EXCEEDED".to_owned(),
+            frontier: Vec::new(),
+        });
+    }
+    if let Some(reason) = required_safety_refusal(items, required_ids) {
+        return Some(SelectionRefusal {
+            disposition: DeliveryDisposition::WithheldProfile,
+            frontier: vec![format!("floor:required:{reason}")],
+            reason,
+        });
+    }
+    attention_blocked.then(|| SelectionRefusal {
+        disposition: DeliveryDisposition::WithheldPrivacy,
+        reason: "ATTENTION_DISCLOSURE_RULE_REQUIRED".to_owned(),
+        frontier: vec!["attention:disclosure-rule-required".to_owned()],
+    })
+}
+
+fn resolve_selection_and_emit(
+    inputs: &ValidatedInputs<'_>,
+    evidence: PlanningEvidence,
+    ledger: ItemLedger,
+) -> Result<ReactiveContextPlanResult, ReactiveContextPlanningError> {
+    let ValidatedInputs {
+        session_snapshot,
+        policy,
+        input_bytes,
+        input_references,
+        ..
+    } = inputs;
+    let PlanningEvidence {
+        base,
+        floor_safety_refusal,
+        mut frontier,
+        mode,
+        selected_mode,
+        attention_blocked,
+        ..
+    } = evidence;
+    let ItemLedger {
+        mut items,
+        required_ids,
+        sticky_obligations,
+        required_attention,
+        mut planning_work,
+        work_exhausted,
+    } = ledger;
+    let input_bytes = *input_bytes;
+    let input_references = *input_references;
     let deadline_unknown =
         policy.deadline_ms.is_some() && policy.observed_at.valid_time_ms.is_none();
     let expired = policy
         .deadline_ms
         .zip(policy.observed_at.valid_time_ms)
         .is_some_and(|(deadline, observed)| deadline < observed);
-    if let Some(reason) = global_selection_refusal(policy, expired, deadline_unknown, mode) {
-        refuse_before_selection(
-            &mut items,
-            DeliveryDisposition::UnsupportedCapability,
-            reason,
-        );
-        frontier.push(format!("global:{reason}"));
-        let accounting = build_accounting(
-            &items,
-            policy,
-            &required_ids,
-            required_attention,
-            input_bytes,
-            planning_work,
-            None,
-            sticky_obligations,
-            input_references,
-        )?;
-        return no_injection_with_items(&base, reason, items, accounting, frontier);
-    }
-    if let Some(refusal) = floor_safety_refusal {
-        let FloorSafetyRefusal {
-            reason, evidence, ..
-        } = refusal;
-        refuse_before_selection(&mut items, DeliveryDisposition::WithheldProfile, &reason);
-        frontier.extend(evidence);
-        let accounting = build_accounting(
-            &items,
-            policy,
-            &required_ids,
-            required_attention,
-            input_bytes,
-            planning_work,
-            None,
-            sticky_obligations,
-            input_references,
-        )?;
-        return no_injection_with_items(&base, &reason, items, accounting, frontier);
-    }
-    if work_exhausted {
-        refuse_before_selection(
-            &mut items,
-            DeliveryDisposition::WithheldBudget,
-            "PLANNING_WORK_EXCEEDED",
-        );
-        let accounting = build_accounting(
-            &items,
-            policy,
-            &required_ids,
-            required_attention,
-            input_bytes,
-            planning_work,
-            None,
-            sticky_obligations,
-            input_references,
-        )?;
-        return no_injection_with_items(
+    if let Some(refusal) = early_selection_refusal(
+        policy,
+        mode,
+        expired,
+        deadline_unknown,
+        floor_safety_refusal.as_ref(),
+        work_exhausted,
+        &items,
+        &required_ids,
+        attention_blocked,
+    ) {
+        refuse_before_selection(&mut items, refusal.disposition, &refusal.reason);
+        frontier.extend(refusal.frontier);
+        return no_injection_for_ledger(
             &base,
-            "PLANNING_WORK_EXCEEDED",
+            &refusal.reason,
             items,
-            accounting,
-            frontier,
-        );
-    }
-    if let Some(reason) = required_safety_refusal(&items, &required_ids) {
-        refuse_before_selection(
-            &mut items,
-            DeliveryDisposition::WithheldProfile,
-            reason.as_str(),
-        );
-        frontier.push(format!("floor:required:{reason}"));
-        let accounting = build_accounting(
-            &items,
-            policy,
             &required_ids,
             required_attention,
             input_bytes,
             planning_work,
-            None,
             sticky_obligations,
             input_references,
-        )?;
-        return no_injection_with_items(&base, reason.as_str(), items, accounting, frontier);
-    }
-    if attention_blocked {
-        refuse_before_selection(
-            &mut items,
-            DeliveryDisposition::WithheldPrivacy,
-            "ATTENTION_DISCLOSURE_RULE_REQUIRED",
-        );
-        frontier.push("attention:disclosure-rule-required".to_owned());
-        let accounting = build_accounting(
-            &items,
-            policy,
-            &required_ids,
-            required_attention,
-            input_bytes,
-            planning_work,
-            None,
-            sticky_obligations,
-            input_references,
-        )?;
-        return no_injection_with_items(
-            &base,
-            "ATTENTION_DISCLOSURE_RULE_REQUIRED",
-            items,
-            accounting,
             frontier,
+            policy,
         );
     }
     let trigger = has_new_obligation(&items, required_attention);
     if trigger {
         force_complete_floor(&mut items, &required_ids, selected_mode);
     }
-    let selected = select_required_then_optional(
+    let (selected, accounting, no_new_work) = run_selection_and_accounting(
         &mut items,
         &required_ids,
         trigger,
         selected_mode,
         session_snapshot,
         policy,
+        input_bytes,
+        input_references,
+        required_attention,
+        sticky_obligations,
+        &base.input_digest,
         &mut planning_work,
-    )
-    .map_err(|error| internal(error, policy, &input_digest))?;
-    let mut accounting = build_accounting(
-        &items,
-        policy,
+    )?;
+    finish_selection_outcome(
+        &base,
+        selected_mode,
+        items,
         &required_ids,
         required_attention,
         input_bytes,
         planning_work,
+        sticky_obligations,
+        input_references,
+        frontier,
+        policy,
+        trigger,
+        selected,
+        accounting,
+        no_new_work,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_selection_outcome(
+    base: &OutputIdentity,
+    selected_mode: ReactiveDeliveryMode,
+    mut items: Vec<PlannedContextItem>,
+    required_ids: &BTreeSet<String>,
+    required_attention: bool,
+    input_bytes: u64,
+    planning_work: u64,
+    sticky_obligations: u64,
+    input_references: u64,
+    frontier: Vec<String>,
+    policy: &ReactiveDeliveryPolicy,
+    trigger: bool,
+    selected: Option<InertDeliveryRequest>,
+    mut accounting: PlanningAccounting,
+    no_new_work: bool,
+) -> Result<ReactiveContextPlanResult, ReactiveContextPlanningError> {
+    if trigger && selected.is_none() {
+        for item in &mut items {
+            if selection_candidate(item) {
+                item.disposition = DeliveryDisposition::WithheldBudget;
+                "required Safety Floor or Attention cannot fit final request"
+                    .clone_into(&mut item.reason);
+            }
+        }
+        accounting = build_accounting(
+            &items,
+            policy,
+            required_ids,
+            required_attention,
+            input_bytes,
+            planning_work,
+            None,
+            sticky_obligations,
+            input_references,
+        )?;
+        accounting.budget_fit = false;
+        return no_injection_with_items(
+            base,
+            "REQUIRED_CAPACITY_OR_UNKNOWN_COST",
+            items,
+            accounting,
+            frontier,
+        );
+    }
+    if !accounting.budget_fit {
+        return no_injection_for_ledger(
+            base,
+            "REQUIRED_CAPACITY_OR_UNKNOWN_COST",
+            items,
+            required_ids,
+            required_attention,
+            input_bytes,
+            planning_work,
+            sticky_obligations,
+            input_references,
+            frontier,
+            policy,
+        );
+    }
+    if no_new_work {
+        return no_injection_for_ledger(
+            base,
+            if required_attention {
+                "STICKY_ATTENTION_RETAINED"
+            } else {
+                "NO_NEW_ELIGIBLE_ITEMS"
+            },
+            items,
+            required_ids,
+            required_attention,
+            input_bytes,
+            planning_work,
+            sticky_obligations,
+            input_references,
+            frontier,
+            policy,
+        );
+    }
+
+    let request = selected.ok_or_else(|| {
+        internal(
+            ReactiveInputError::InvalidField {
+                field: "delivery.request",
+                reason: "required selection did not produce a request",
+            },
+            policy,
+            &base.input_digest,
+        )
+    })?;
+    emit_pending(
+        base,
+        selected_mode,
+        items,
+        accounting,
+        frontier,
+        request,
+        policy,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_selection_and_accounting(
+    items: &mut [PlannedContextItem],
+    required_ids: &BTreeSet<String>,
+    trigger: bool,
+    selected_mode: ReactiveDeliveryMode,
+    session_snapshot: &SessionDeliverySnapshot,
+    policy: &ReactiveDeliveryPolicy,
+    input_bytes: u64,
+    input_references: u64,
+    required_attention: bool,
+    sticky_obligations: u64,
+    input_digest: &str,
+    planning_work: &mut u64,
+) -> Result<(Option<InertDeliveryRequest>, PlanningAccounting, bool), ReactiveContextPlanningError>
+{
+    let selected = select_required_then_optional(
+        items,
+        required_ids,
+        trigger,
+        selected_mode,
+        session_snapshot,
+        policy,
+        planning_work,
+    )
+    .map_err(|error| internal(error, policy, input_digest))?;
+    let accounting = build_accounting(
+        items,
+        policy,
+        required_ids,
+        required_attention,
+        input_bytes,
+        *planning_work,
         selected.as_ref(),
         sticky_obligations,
         input_references,
@@ -552,74 +934,20 @@ fn plan_inner(
                 | DeliveryDisposition::StickyPendingResolution
         )
     });
-    if trigger && selected.is_none() {
-        for item in &mut items {
-            if matches!(
-                item.disposition,
-                DeliveryDisposition::EventPlan
-                    | DeliveryDisposition::ToolOnlyAdvisory
-                    | DeliveryDisposition::StickyPendingResolution
-            ) {
-                item.disposition = DeliveryDisposition::WithheldBudget;
-                "required Safety Floor or Attention cannot fit final request"
-                    .clone_into(&mut item.reason);
-            }
-        }
-        accounting = build_accounting(
-            &items,
-            policy,
-            &required_ids,
-            required_attention,
-            input_bytes,
-            planning_work,
-            None,
-            sticky_obligations,
-            input_references,
-        )?;
-        accounting.budget_fit = false;
-        return no_injection_with_items(
-            &base,
-            "REQUIRED_CAPACITY_OR_UNKNOWN_COST",
-            items,
-            accounting,
-            frontier,
-        );
-    }
-    if !accounting.budget_fit {
-        return no_injection_with_items(
-            &base,
-            "REQUIRED_CAPACITY_OR_UNKNOWN_COST",
-            items,
-            accounting,
-            frontier,
-        );
-    }
-    if no_new_work {
-        return no_injection_with_items(
-            &base,
-            if required_attention {
-                "STICKY_ATTENTION_RETAINED"
-            } else {
-                "NO_NEW_ELIGIBLE_ITEMS"
-            },
-            items,
-            accounting,
-            frontier,
-        );
-    }
+    Ok((selected, accounting, no_new_work))
+}
 
-    let request = selected.ok_or_else(|| {
-        internal(
-            ReactiveInputError::InvalidField {
-                field: "delivery.request",
-                reason: "required selection did not produce a request",
-            },
-            policy,
-            &input_digest,
-        )
-    })?;
+fn emit_pending(
+    base: &OutputIdentity,
+    selected_mode: ReactiveDeliveryMode,
+    items: Vec<PlannedContextItem>,
+    accounting: PlanningAccounting,
+    frontier: Vec<String>,
+    request: InertDeliveryRequest,
+    policy: &ReactiveDeliveryPolicy,
+) -> Result<ReactiveContextPlanResult, ReactiveContextPlanningError> {
     let result_digest = output_digest(
-        &base,
+        base,
         "PENDING",
         Some(selected_mode),
         None,
@@ -630,38 +958,67 @@ fn plan_inner(
         Some(&request),
     )
     .map_err(|error| invalid(error, policy))?;
-    let plan = PendingContextInjectionPlan {
-        request_id: base.request_id,
-        operation_id: base.operation_id,
-        idempotency_key: base.idempotency_key,
-        plan_id: base.plan_id,
-        input_digest: base.input_digest,
-        result_digest,
-        view_digest: base.view_digest,
-        admitted_set_digest: base.admitted_set_digest,
-        assembly_digest: base.assembly_digest,
-        activation_digest: base.activation_digest,
-        activation_result: base.activation_result,
-        session_snapshot_digest: base.session_snapshot_digest,
-        attention_projection_digest: base.attention_projection_digest,
-        coverage_profile_digest: base.coverage_profile_digest,
-        coverage_completeness: base.coverage_completeness,
-        coverage_gaps: base.coverage_gaps,
-        selected_event_evidence: base.selected_event_evidence,
-        session_completeness: base.session_completeness,
-        session_denominator: base.session_denominator,
-        context_measurement: base.context_measurement,
-        floor_capacity: base.floor_capacity,
-        floor_incomplete: base.floor_incomplete.clone(),
-        policy_digest: base.policy_digest,
-        mode: selected_mode,
-        items,
-        accounting,
-        frontier,
-        invalidation: Vec::new(),
-        request,
-    };
-    Ok(ReactiveContextPlanResult::Pending(plan))
+    Ok(ReactiveContextPlanResult::Pending(
+        PendingContextInjectionPlan {
+            request_id: base.request_id.clone(),
+            operation_id: base.operation_id.clone(),
+            idempotency_key: base.idempotency_key.clone(),
+            plan_id: base.plan_id.clone(),
+            input_digest: base.input_digest.clone(),
+            result_digest,
+            view_digest: base.view_digest.clone(),
+            admitted_set_digest: base.admitted_set_digest.clone(),
+            assembly_digest: base.assembly_digest.clone(),
+            activation_digest: base.activation_digest.clone(),
+            activation_result: base.activation_result.clone(),
+            session_snapshot_digest: base.session_snapshot_digest.clone(),
+            attention_projection_digest: base.attention_projection_digest.clone(),
+            coverage_profile_digest: base.coverage_profile_digest.clone(),
+            coverage_completeness: base.coverage_completeness,
+            coverage_gaps: base.coverage_gaps.clone(),
+            selected_event_evidence: base.selected_event_evidence.clone(),
+            session_completeness: base.session_completeness,
+            session_denominator: base.session_denominator,
+            context_measurement: base.context_measurement.clone(),
+            floor_capacity: base.floor_capacity,
+            floor_incomplete: base.floor_incomplete.clone(),
+            policy_digest: base.policy_digest.clone(),
+            mode: selected_mode,
+            items,
+            accounting,
+            frontier,
+            invalidation: Vec::new(),
+            request,
+        },
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn no_injection_for_ledger(
+    base: &OutputIdentity,
+    reason: &str,
+    items: Vec<PlannedContextItem>,
+    required_ids: &BTreeSet<String>,
+    required_attention: bool,
+    input_bytes: u64,
+    planning_work: u64,
+    sticky_obligations: u64,
+    input_references: u64,
+    frontier: Vec<String>,
+    policy: &ReactiveDeliveryPolicy,
+) -> Result<ReactiveContextPlanResult, ReactiveContextPlanningError> {
+    let accounting = build_accounting(
+        &items,
+        policy,
+        required_ids,
+        required_attention,
+        input_bytes,
+        planning_work,
+        None,
+        sticky_obligations,
+        input_references,
+    )?;
+    no_injection_with_items(base, reason, items, accounting, frontier)
 }
 
 fn invalid_preflight<E: std::fmt::Display>(error: E) -> ReactiveContextPlanningError {
@@ -785,7 +1142,6 @@ fn sum_lengths(parts: &[usize]) -> Option<usize> {
 
 /// Count logical retained visits and reference handles without canonicalizing.
 /// A unit is a bounded collection element or nested handle, never elapsed CPU.
-#[allow(clippy::too_many_lines)]
 fn count_input_work(
     view: &ContextPlanningView,
     activation: &ReactiveCueActivation,
@@ -800,6 +1156,26 @@ fn count_input_work(
     // measurement handles. The owner helper is private, so this bounded
     // package-local mirror is intentional.
     let mut references = count_view_references(view)?;
+    count_view_input_work(
+        view, activation, session, attention, coverage, policy, &mut work,
+    )?;
+    count_session_input_work(session, &mut work, &mut references)?;
+    count_attention_input_work(attention, &mut work, &mut references)?;
+    count_coverage_input_work(coverage, &mut work, &mut references)?;
+    count_activation_input_work(activation, &mut work, &mut references)?;
+    count_delivery_input_work(view, activation, &mut work, &mut references)?;
+    Some((work, references))
+}
+
+fn count_view_input_work(
+    view: &ContextPlanningView,
+    activation: &ReactiveCueActivation,
+    session: &SessionDeliverySnapshot,
+    attention: &CriticalAttentionProjection,
+    coverage: &IntegrationCoverageProfile,
+    policy: &ReactiveDeliveryPolicy,
+    work: &mut u64,
+) -> Option<()> {
     for length in [
         view.view.rendered.len(),
         view.view.admitted_ids.len(),
@@ -826,34 +1202,39 @@ fn count_input_work(
         policy.priority.len(),
         policy.attention_disclosure.len(),
     ] {
-        bump(&mut work, length)?;
+        bump(work, length)?;
     }
     for atom in &view.view.rendered {
-        bump(&mut work, atom.dependencies.len())?;
+        bump(work, atom.dependencies.len())?;
     }
     for member in &view.admitted.floor.members {
-        bump(&mut work, member.required_dependencies.len())?;
+        bump(work, member.required_dependencies.len())?;
     }
+    Some(())
+}
+
+fn count_session_input_work(
+    session: &SessionDeliverySnapshot,
+    work: &mut u64,
+    references: &mut u64,
+) -> Option<()> {
     for record in &session.records {
-        bump(&mut work, record.predecessor_ids.len())?;
-        bump(
-            &mut references,
-            sum_lengths(&[3, record.predecessor_ids.len()])?,
-        )?;
+        bump(work, record.predecessor_ids.len())?;
+        bump(references, sum_lengths(&[3, record.predecessor_ids.len()])?)?;
         if let Some(closure) = &record.closure {
-            references = references.checked_add(count_view_references(&closure.context_view)?)?;
-            bump(&mut work, 1)?; // context_view
-            bump(&mut work, 1)?; // profile
-            bump(&mut work, usize::from(closure.delivery_claim.is_some()))?;
-            bump(&mut work, usize::from(closure.delivery_owner_id.is_some()))?;
-            bump(&mut work, 1)?; // assembly_receipt
-            bump(&mut work, 1)?; // payload
-            bump(&mut work, 1)?; // event
-            bump(&mut work, closure.acknowledgements.len())?;
-            bump(&mut work, closure.receipts.len())?;
-            bump(&mut work, closure.evidence.len())?;
+            *references = references.checked_add(count_view_references(&closure.context_view)?)?;
+            bump(work, 1)?; // context_view
+            bump(work, 1)?; // profile
+            bump(work, usize::from(closure.delivery_claim.is_some()))?;
+            bump(work, usize::from(closure.delivery_owner_id.is_some()))?;
+            bump(work, 1)?; // assembly_receipt
+            bump(work, 1)?; // payload
+            bump(work, 1)?; // event
+            bump(work, closure.acknowledgements.len())?;
+            bump(work, closure.receipts.len())?;
+            bump(work, closure.evidence.len())?;
             bump(
-                &mut references,
+                references,
                 sum_lengths(&[
                     1,
                     1,
@@ -869,22 +1250,30 @@ fn count_input_work(
             )?;
         }
     }
+    Some(())
+}
+
+fn count_attention_input_work(
+    attention: &CriticalAttentionProjection,
+    work: &mut u64,
+    references: &mut u64,
+) -> Option<()> {
     for member in &attention.members {
-        bump(&mut work, member.source.len())?;
-        bump(&mut work, member.evidence.len())?;
+        bump(work, member.source.len())?;
+        bump(work, member.evidence.len())?;
         bump(
-            &mut references,
+            references,
             sum_lengths(&[member.source.len(), member.evidence.len()])?,
         )?;
-        bump(&mut work, member.owner_closure.source.len())?;
-        bump(&mut work, member.owner_closure.receipts.len())?;
-        bump(&mut work, member.owner_closure.evidence.len())?;
+        bump(work, member.owner_closure.source.len())?;
+        bump(work, member.owner_closure.receipts.len())?;
+        bump(work, member.owner_closure.evidence.len())?;
         bump(
-            &mut work,
+            work,
             usize::from(member.owner_closure.resolution_receipt.is_some()),
         )?;
         bump(
-            &mut references,
+            references,
             sum_lengths(&[
                 member.owner_closure.source.len(),
                 member.owner_closure.receipts.len(),
@@ -893,12 +1282,20 @@ fn count_input_work(
             ])?,
         )?;
     }
+    Some(())
+}
+
+fn count_coverage_input_work(
+    coverage: &IntegrationCoverageProfile,
+    work: &mut u64,
+    references: &mut u64,
+) -> Option<()> {
     for event in &coverage.events {
-        bump(&mut work, event.gaps.len())?;
-        bump(&mut work, event.receipts.len())?;
-        bump(&mut work, event.evidence.len())?;
+        bump(work, event.gaps.len())?;
+        bump(work, event.receipts.len())?;
+        bump(work, event.evidence.len())?;
         bump(
-            &mut references,
+            references,
             sum_lengths(&[
                 1,
                 event.gaps.len(),
@@ -907,74 +1304,91 @@ fn count_input_work(
             ])?,
         )?;
     }
+    Some(())
+}
+
+fn count_activation_input_work(
+    activation: &ReactiveCueActivation,
+    work: &mut u64,
+    references: &mut u64,
+) -> Option<()> {
     for seed in &activation.request.seeds {
-        bump(&mut work, seed.comparison_keys.len())?;
-        bump(&mut work, seed.transformation_evidence.len())?;
+        bump(work, seed.comparison_keys.len())?;
+        bump(work, seed.transformation_evidence.len())?;
         bump(
-            &mut references,
+            references,
             sum_lengths(&[
                 seed.comparison_keys.len(),
                 seed.transformation_evidence.len(),
             ])?,
         )?;
         if let eliot_cue_contracts::NormalizationOutcome::Ambiguous { rivals } = &seed.outcome {
-            bump(&mut work, rivals.len())?;
-            bump(&mut references, rivals.len())?;
+            bump(work, rivals.len())?;
+            bump(references, rivals.len())?;
         }
     }
     for _edge in &activation.request.relation_edges {
-        bump(&mut work, 2)?;
-        bump(&mut references, 3)?;
+        bump(work, 2)?;
+        bump(references, 3)?;
     }
     for _direct in &activation.result.direct {
-        bump(&mut work, 2)?;
-        bump(&mut references, 2)?;
+        bump(work, 2)?;
+        bump(references, 2)?;
     }
     for derived in &activation.result.derived {
         let units = sum_lengths(&[2, derived.path.len()])?;
-        bump(&mut work, units)?;
-        bump(&mut references, units)?;
+        bump(work, units)?;
+        bump(references, units)?;
     }
     for step in &activation.result.trace.steps {
         let units = sum_lengths(&[1, usize::from(step.edge.is_some())])?;
-        bump(&mut work, units)?;
-        bump(&mut references, units)?;
+        bump(work, units)?;
+        bump(references, units)?;
     }
     match &activation.result.completeness {
         Completeness::Truncated { frontier, .. } | Completeness::Partial { frontier } => {
-            bump(&mut work, frontier.len())?;
-            bump(&mut references, frontier.len())?;
+            bump(work, frontier.len())?;
+            bump(references, frontier.len())?;
         }
         _ => {}
     }
+    Some(())
+}
+
+fn count_delivery_input_work(
+    view: &ContextPlanningView,
+    activation: &ReactiveCueActivation,
+    work: &mut u64,
+    references: &mut u64,
+) -> Option<()> {
     for binding in &activation.target_bindings {
-        bump(&mut work, 2)?;
+        bump(work, 2)?;
         let optional = sum_lengths(&[
             usize::from(binding.source_revision.is_some()),
             usize::from(binding.source_digest.is_some()),
         ])?;
-        bump(&mut work, optional)?;
-        bump(&mut references, 2)?;
-        bump(&mut references, optional)?;
+        bump(work, optional)?;
+        bump(references, 2)?;
+        bump(references, optional)?;
     }
     for omission in &view.admitted.economy.omissions {
-        bump(&mut work, 2)?;
+        bump(work, 2)?;
         let optional = sum_lengths(&[
             usize::from(omission.expansion.is_some()),
             usize::from(omission.expires.is_some()),
             usize::from(omission.invalidation.is_some()),
         ])?;
-        bump(&mut work, optional)?;
+        bump(work, optional)?;
         if let Some(expansion) = &omission.expansion {
             let expansion_units = sum_lengths(&[
                 1,
                 usize::from(expansion.expires.is_some()),
                 usize::from(expansion.invalidation.is_some()),
             ])?;
-            bump(&mut work, expansion_units)?;
+            bump(work, expansion_units)?;
         }
     }
-    Some((work, references))
+    Some(())
 }
 
 /// Mirror A15's retained-reference accounting without importing its private
@@ -1414,7 +1828,6 @@ fn selected_proof_ceiling(items: &[PlannedContextItem]) -> ProofCeiling {
         .unwrap_or(ProofCeiling::Observation)
 }
 
-#[allow(clippy::too_many_lines)]
 fn select_required_then_optional(
     items: &mut [PlannedContextItem],
     required_ids: &BTreeSet<String>,
@@ -1427,27 +1840,59 @@ fn select_required_then_optional(
     if !trigger {
         return Ok(None);
     }
-    let candidate = |item: &PlannedContextItem| {
-        matches!(
-            item.disposition,
-            DeliveryDisposition::EventPlan
-                | DeliveryDisposition::ToolOnlyAdvisory
-                | DeliveryDisposition::StickyPendingResolution
-        )
+    let Some(mut accumulator) =
+        select_required_phase(items, required_ids, mode, session, policy, planning_work)?
+    else {
+        return Ok(None);
     };
+    select_optional_groups(
+        items,
+        required_ids,
+        mode,
+        session,
+        policy,
+        planning_work,
+        &mut accumulator,
+    )?;
+    finish_selection(items, &accumulator.chosen);
+    Ok(accumulator.last_request)
+}
+
+#[derive(Default)]
+struct SelectionAccumulator {
+    chosen: Vec<PlannedContextItem>,
+    last_request: Option<InertDeliveryRequest>,
+}
+
+fn selection_candidate(item: &PlannedContextItem) -> bool {
+    matches!(
+        item.disposition,
+        DeliveryDisposition::EventPlan
+            | DeliveryDisposition::ToolOnlyAdvisory
+            | DeliveryDisposition::StickyPendingResolution
+    )
+}
+
+fn select_required_phase(
+    items: &[PlannedContextItem],
+    required_ids: &BTreeSet<String>,
+    mode: ReactiveDeliveryMode,
+    session: &SessionDeliverySnapshot,
+    policy: &ReactiveDeliveryPolicy,
+    planning_work: &mut u64,
+) -> Result<Option<SelectionAccumulator>, ReactiveInputError> {
     let required: Vec<_> = items
         .iter()
         .enumerate()
         .filter(|(_, item)| {
-            candidate(item)
+            selection_candidate(item)
                 && (required_ids.contains(&item.item_id) || item.kind == PlannedItemKind::Attention)
         })
         .map(|(index, _)| index)
         .collect();
-    let mut chosen = Vec::new();
-    let mut last_request = None;
+    let mut accumulator = SelectionAccumulator::default();
     for index in required {
-        let trial_work = selection_trial_work(&chosen, Some(&items[index])).ok_or(
+        let trial_work = selection_trial_work(&accumulator.chosen, Some(&items[index])).ok_or(
             ReactiveInputError::InvalidField {
                 field: "planning.work",
                 reason: "required selection work overflowed",
@@ -1456,44 +1901,64 @@ fn select_required_then_optional(
         if !charge_planning_work(planning_work, trial_work, policy.max_work)? {
             return Ok(None);
         }
-        chosen.push(items[index].clone());
+        accumulator.chosen.push(items[index].clone());
         let request = inert_request(
-            &chosen,
+            &accumulator.chosen,
             mode,
             session,
             policy,
-            selected_proof_ceiling(&chosen),
+            selected_proof_ceiling(&accumulator.chosen),
         )?;
-        if !request_fits(&chosen, &request, policy, *planning_work) {
+        if !request_fits(&accumulator.chosen, &request, policy, *planning_work) {
             return Ok(None);
         }
-        last_request = Some(request);
+        accumulator.last_request = Some(request);
     }
-    if required_ids
-        .iter()
-        .any(|required_id| !chosen.iter().any(|item| item.item_id == *required_id))
-    {
+    if required_ids.iter().any(|required_id| {
+        !accumulator
+            .chosen
+            .iter()
+            .any(|item| item.item_id == *required_id)
+    }) {
         return Ok(None);
     }
+    Ok(Some(accumulator))
+}
+
+fn select_optional_groups(
+    items: &mut [PlannedContextItem],
+    required_ids: &BTreeSet<String>,
+    mode: ReactiveDeliveryMode,
+    session: &SessionDeliverySnapshot,
+    policy: &ReactiveDeliveryPolicy,
+    planning_work: &mut u64,
+    accumulator: &mut SelectionAccumulator,
+) -> Result<(), ReactiveInputError> {
     let optional: Vec<_> = items
         .iter()
         .enumerate()
         .filter(|(_, item)| {
-            candidate(item)
+            selection_candidate(item)
                 && !required_ids.contains(&item.item_id)
                 && item.kind == PlannedItemKind::Context
         })
         .map(|(index, _)| index)
         .collect();
     for index in optional {
-        if chosen
+        if accumulator
+            .chosen
             .iter()
             .any(|selected| selected.item_id == items[index].item_id)
         {
             continue;
         }
-        let (group, group_reason) =
-            optional_dependency_group(items, index, &chosen, planning_work, policy.max_work)?;
+        let (group, group_reason) = optional_dependency_group(
+            items,
+            index,
+            &accumulator.chosen,
+            planning_work,
+            policy.max_work,
+        )?;
         let Some(group) = group else {
             let item = &mut items[index];
             let exhausted = group_reason.contains("work");
@@ -1512,7 +1977,8 @@ fn select_required_then_optional(
         let additions: Vec<_> = group
             .iter()
             .filter(|group_index| {
-                !chosen
+                !accumulator
+                    .chosen
                     .iter()
                     .any(|selected| selected.item_id == items[**group_index].item_id)
             })
@@ -1523,7 +1989,7 @@ fn select_required_then_optional(
             })
             .collect();
         let addition_items: Vec<_> = additions.iter().map(|(_, item)| item.clone()).collect();
-        let trial_work = selection_group_work(&chosen, &addition_items).ok_or(
+        let trial_work = selection_group_work(&accumulator.chosen, &addition_items).ok_or(
             ReactiveInputError::InvalidField {
                 field: "planning.work",
                 reason: "optional selection work overflowed",
@@ -1535,7 +2001,7 @@ fn select_required_then_optional(
                 .clone_into(&mut items[index].reason);
             break;
         }
-        let mut trial = chosen.clone();
+        let mut trial = accumulator.chosen.clone();
         trial.extend(addition_items);
         let request = inert_request(
             &trial,
@@ -1545,8 +2011,8 @@ fn select_required_then_optional(
             selected_proof_ceiling(&trial),
         )?;
         if request_fits(&trial, &request, policy, *planning_work) {
-            chosen = trial;
-            last_request = Some(request);
+            accumulator.chosen = trial;
+            accumulator.last_request = Some(request);
             for (group_index, promoted) in additions {
                 items[group_index] = promoted;
             }
@@ -1556,8 +2022,12 @@ fn select_required_then_optional(
                 .clone_into(&mut items[index].reason);
         }
     }
+    Ok(())
+}
+
+fn finish_selection(items: &mut [PlannedContextItem], chosen: &[PlannedContextItem]) {
     for item in items.iter_mut() {
-        if candidate(item)
+        if selection_candidate(item)
             && !chosen
                 .iter()
                 .any(|selected| selected.item_id == item.item_id)
@@ -1566,10 +2036,6 @@ fn select_required_then_optional(
             "required selection cannot fit final request".clone_into(&mut item.reason);
         }
     }
-    // Return the last measured fitting request. A separate final
-    // serialization would both repeat work and turn an exhausted optional
-    // trial into an unnecessary required failure.
-    Ok(last_request)
 }
 
 #[derive(Clone)]
@@ -1982,7 +2448,6 @@ fn required_floor_ids(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
 fn classify_normal(
     atom: &eliot_context_contracts::RenderedAtom,
     record: Option<&eliot_context_contracts::PriorDeliveryBinding>,
@@ -1998,93 +2463,13 @@ fn classify_normal(
     view: &ContextPlanningView,
     session: &SessionDeliverySnapshot,
 ) -> (DeliveryDisposition, String) {
-    if atom.privacy != eliot_context_contracts::PrivacyClass::Public {
-        return (
-            DeliveryDisposition::WithheldPrivacy,
-            "coverage privacy ceiling is below atom disclosure class".to_owned(),
-        );
+    if let Some(disposition) = classify_privacy_and_proof(atom, coverage_proof_ceiling) {
+        return disposition;
     }
-    if !atom.proof.ceiling.is_at_most(coverage_proof_ceiling) {
-        return (
-            DeliveryDisposition::WithheldProfile,
-            "atom proof ceiling exceeds current integration coverage".to_owned(),
-        );
-    }
-    if let Some(record) = record {
-        let refs_match = content.len() == 1
-            && content
-                .first()
-                .is_some_and(|current| current == &record.content)
-            && source.len() == 1
-            && source
-                .first()
-                .is_some_and(|current| current == &record.source)
-            && record.profile == *profile;
-        let current = record.validity == eliot_protocol::ReactiveContextValidity::Current
-            && record.item_id == atom.atom_id.as_str()
-            && refs_match
-            && record.session_id == session.session_id
-            && record.runtime_id == session.runtime_id
-            && record.runtime_generation == session.runtime_generation
-            && record.host_generation == session.host_generation
-            && record.task_id == session.task_id
-            && record.attempt_id == session.attempt_id
-            && record.scope_id == session.scope_id
-            && record.state_fence == session.state_fence
-            && record
-                .closure
-                .as_ref()
-                .is_none_or(|closure| closure.context_view == *view)
-            && !matches!(
-                record.stage,
-                ReactiveContextStage::ValidatedNotEnqueued
-                    | ReactiveContextStage::CancelledRetracted
-                    | ReactiveContextStage::StaleSuperseded
-                    | ReactiveContextStage::UnavailableFenced
-            );
-        if current {
-            return match record.stage {
-                ReactiveContextStage::DeliveredToExactEndpoint
-                | ReactiveContextStage::RecipientReceived
-                | ReactiveContextStage::RecipientDurable
-                | ReactiveContextStage::NormalizedProjection
-                | ReactiveContextStage::AppliedProjection => (
-                    if record
-                        .closure
-                        .as_ref()
-                        .is_some_and(|closure| closure.context_view == *view)
-                    {
-                        DeliveryDisposition::DeliveredDuplicate
-                    } else {
-                        DeliveryDisposition::AmbiguousUnknown
-                    },
-                    if record
-                        .closure
-                        .as_ref()
-                        .is_some_and(|closure| closure.context_view == *view)
-                    {
-                        "exact current owner delivery evidence"
-                    } else {
-                        "delivery stage lacks the retained view closure"
-                    }
-                    .to_owned(),
-                ),
-                ReactiveContextStage::EnqueuedPersisted
-                | ReactiveContextStage::DeliveryAttempted => (
-                    DeliveryDisposition::InFlight,
-                    "enqueued or attempted state is not delivery".to_owned(),
-                ),
-                ReactiveContextStage::UnknownDelivery
-                | ReactiveContextStage::AcknowledgementUnknown => (
-                    DeliveryDisposition::AmbiguousUnknown,
-                    "unknown delivery requires reconciliation".to_owned(),
-                ),
-                _ => (
-                    DeliveryDisposition::ExplicitNotSelected,
-                    "prior state does not qualify as current delivery".to_owned(),
-                ),
-            };
-        }
+    if let Some(disposition) =
+        classify_prior_delivery(atom, record, content, source, profile, session, view)
+    {
+        return disposition;
     }
     if activation_kind.is_none() {
         return (
@@ -2113,6 +2498,111 @@ fn classify_normal(
             _ => "activation is partial; absence is not inferred".to_owned(),
         },
     )
+}
+
+fn classify_privacy_and_proof(
+    atom: &eliot_context_contracts::RenderedAtom,
+    coverage_proof_ceiling: ProofCeiling,
+) -> Option<(DeliveryDisposition, String)> {
+    if atom.privacy != eliot_context_contracts::PrivacyClass::Public {
+        return Some((
+            DeliveryDisposition::WithheldPrivacy,
+            "coverage privacy ceiling is below atom disclosure class".to_owned(),
+        ));
+    }
+    if !atom.proof.ceiling.is_at_most(coverage_proof_ceiling) {
+        return Some((
+            DeliveryDisposition::WithheldProfile,
+            "atom proof ceiling exceeds current integration coverage".to_owned(),
+        ));
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_prior_delivery(
+    atom: &eliot_context_contracts::RenderedAtom,
+    record: Option<&eliot_context_contracts::PriorDeliveryBinding>,
+    content: &[ReactiveContextContentRef],
+    source: &[ReactiveContextContentRef],
+    profile: &ReactiveContextContentRef,
+    session: &SessionDeliverySnapshot,
+    view: &ContextPlanningView,
+) -> Option<(DeliveryDisposition, String)> {
+    let record = record?;
+    let refs_match = content.len() == 1
+        && content
+            .first()
+            .is_some_and(|current| current == &record.content)
+        && source.len() == 1
+        && source
+            .first()
+            .is_some_and(|current| current == &record.source)
+        && record.profile == *profile;
+    let current = record.validity == eliot_protocol::ReactiveContextValidity::Current
+        && record.item_id == atom.atom_id.as_str()
+        && refs_match
+        && record.session_id == session.session_id
+        && record.runtime_id == session.runtime_id
+        && record.runtime_generation == session.runtime_generation
+        && record.host_generation == session.host_generation
+        && record.task_id == session.task_id
+        && record.attempt_id == session.attempt_id
+        && record.scope_id == session.scope_id
+        && record.state_fence == session.state_fence
+        && record
+            .closure
+            .as_ref()
+            .is_none_or(|closure| closure.context_view == *view)
+        && !matches!(
+            record.stage,
+            ReactiveContextStage::ValidatedNotEnqueued
+                | ReactiveContextStage::CancelledRetracted
+                | ReactiveContextStage::StaleSuperseded
+                | ReactiveContextStage::UnavailableFenced
+        );
+    if !current {
+        return None;
+    }
+    Some(match record.stage {
+        ReactiveContextStage::DeliveredToExactEndpoint
+        | ReactiveContextStage::RecipientReceived
+        | ReactiveContextStage::RecipientDurable
+        | ReactiveContextStage::NormalizedProjection
+        | ReactiveContextStage::AppliedProjection => (
+            if record
+                .closure
+                .as_ref()
+                .is_some_and(|closure| closure.context_view == *view)
+            {
+                DeliveryDisposition::DeliveredDuplicate
+            } else {
+                DeliveryDisposition::AmbiguousUnknown
+            },
+            if record
+                .closure
+                .as_ref()
+                .is_some_and(|closure| closure.context_view == *view)
+            {
+                "exact current owner delivery evidence"
+            } else {
+                "delivery stage lacks the retained view closure"
+            }
+            .to_owned(),
+        ),
+        ReactiveContextStage::EnqueuedPersisted | ReactiveContextStage::DeliveryAttempted => (
+            DeliveryDisposition::InFlight,
+            "enqueued or attempted state is not delivery".to_owned(),
+        ),
+        ReactiveContextStage::UnknownDelivery | ReactiveContextStage::AcknowledgementUnknown => (
+            DeliveryDisposition::AmbiguousUnknown,
+            "unknown delivery requires reconciliation".to_owned(),
+        ),
+        _ => (
+            DeliveryDisposition::ExplicitNotSelected,
+            "prior state does not qualify as current delivery".to_owned(),
+        ),
+    })
 }
 
 fn item_handles(
@@ -2267,7 +2757,7 @@ fn force_complete_floor(
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn build_accounting(
     items: &[PlannedContextItem],
     policy: &ReactiveDeliveryPolicy,
@@ -2279,58 +2769,14 @@ fn build_accounting(
     sticky_obligations: u64,
     input_references: u64,
 ) -> Result<PlanningAccounting, ReactiveContextPlanningError> {
-    let selected: Vec<_> = items
-        .iter()
-        .filter(|item| {
-            matches!(
-                item.disposition,
-                DeliveryDisposition::EventPlan
-                    | DeliveryDisposition::ToolOnlyAdvisory
-                    | DeliveryDisposition::StickyPendingResolution
-            )
-        })
-        .collect();
-    let item_delivery_bytes = selected
-        .iter()
-        .try_fold(0u64, |total, item| {
-            total.checked_add(item.byte_cost).ok_or(())
-        })
-        .map_err(|()| ReactiveContextPlanningError {
-            disposition: PlanningErrorDisposition::Failed,
-            kind: PlanningErrorKind::Overflow,
-            reason_code: "ACCOUNTING_OVERFLOW".to_owned(),
-            operation_id: Some(policy.operation_id.clone()),
-            request_id: Some(policy.request_id.clone()),
-            input_digest: None,
-            detail: "delivery byte accounting overflowed".to_owned(),
-        })?;
-    let required_floor_bytes = items
-        .iter()
-        .filter(|item| required_ids.contains(&item.item_id))
-        .map(|item| item.byte_cost)
-        .try_fold(0u64, u64::checked_add)
-        .ok_or_else(|| accounting_overflow(policy, "required floor byte accounting overflowed"))?;
-    let required_attention_bytes = if required_attention {
-        items
-            .iter()
-            .filter(|item| {
-                item.kind == PlannedItemKind::Attention
-                    && item
-                        .attention
-                        .as_ref()
-                        .is_some_and(|attention| attention.sticky)
-            })
-            .map(|item| item.byte_cost)
-            .try_fold(0u64, u64::checked_add)
-            .ok_or_else(|| accounting_overflow(policy, "Attention byte accounting overflowed"))?
-    } else {
-        0
-    };
+    let totals = accounting_totals(items, policy, required_ids, required_attention)?;
     let reserves = reserve_bytes(policy)
         .ok_or_else(|| accounting_overflow(policy, "delivery reserve accounting overflowed"))?;
     let references = input_references;
     let work = planning_work;
-    let delivery_bytes = request.map_or(item_delivery_bytes, |request| request.serialized_bytes);
+    let delivery_bytes = request.map_or(totals.item_delivery_bytes, |request| {
+        request.serialized_bytes
+    });
     let selected_delivery_stu = match policy.max_delivery_stu {
         Some(_) => Some(
             delivery_bytes
@@ -2340,23 +2786,21 @@ fn build_accounting(
         ),
         None => None,
     };
-    let budget_fit = input_bytes <= policy.max_input_bytes
-        && (items.len() as u64) <= policy.max_items
-        && references <= policy.max_references
-        && work <= policy.max_work
-        && reserves
-            .checked_add(delivery_bytes)
-            .is_some_and(|total| total <= policy.max_delivery_bytes)
-        && required_floor_bytes
-            .checked_add(required_attention_bytes)
-            .and_then(|required| reserves.checked_add(required))
-            .is_some_and(|required| required <= policy.max_delivery_bytes);
-    let budget_fit = budget_fit
-        && selected_delivery_stu
-            .is_none_or(|stu| policy.max_delivery_stu.is_some_and(|limit| stu <= limit));
+    let budget_fit = accounting_budget_fit(
+        policy,
+        input_bytes,
+        items.len(),
+        references,
+        work,
+        reserves,
+        delivery_bytes,
+        totals.required_floor_bytes,
+        totals.required_attention_bytes,
+        selected_delivery_stu,
+    );
     Ok(PlanningAccounting {
         considered: items.len() as u64,
-        planned: selected.len() as u64,
+        planned: totals.selected.len() as u64,
         deduped: items
             .iter()
             .filter(|item| matches!(item.disposition, DeliveryDisposition::DeliveredDuplicate))
@@ -2406,13 +2850,101 @@ fn build_accounting(
         output_reserve: policy.output_reserve,
         review_reserve: policy.review_reserve,
         delivery_reserve: policy.delivery_reserve,
-        required_floor_bytes,
-        required_attention_bytes,
+        required_floor_bytes: totals.required_floor_bytes,
+        required_attention_bytes: totals.required_attention_bytes,
         budget_fit,
     })
 }
 
-#[allow(clippy::too_many_lines)]
+struct AccountingTotals<'a> {
+    selected: Vec<&'a PlannedContextItem>,
+    item_delivery_bytes: u64,
+    required_floor_bytes: u64,
+    required_attention_bytes: u64,
+}
+
+fn accounting_totals<'a>(
+    items: &'a [PlannedContextItem],
+    policy: &ReactiveDeliveryPolicy,
+    required_ids: &BTreeSet<String>,
+    required_attention: bool,
+) -> Result<AccountingTotals<'a>, ReactiveContextPlanningError> {
+    let selected: Vec<_> = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.disposition,
+                DeliveryDisposition::EventPlan
+                    | DeliveryDisposition::ToolOnlyAdvisory
+                    | DeliveryDisposition::StickyPendingResolution
+            )
+        })
+        .collect();
+    let item_delivery_bytes = selected
+        .iter()
+        .try_fold(0u64, |total, item| {
+            total.checked_add(item.byte_cost).ok_or(())
+        })
+        .map_err(|()| accounting_overflow(policy, "delivery byte accounting overflowed"))?;
+    let required_floor_bytes = items
+        .iter()
+        .filter(|item| required_ids.contains(&item.item_id))
+        .map(|item| item.byte_cost)
+        .try_fold(0u64, u64::checked_add)
+        .ok_or_else(|| accounting_overflow(policy, "required floor byte accounting overflowed"))?;
+    let required_attention_bytes = if required_attention {
+        items
+            .iter()
+            .filter(|item| {
+                item.kind == PlannedItemKind::Attention
+                    && item
+                        .attention
+                        .as_ref()
+                        .is_some_and(|attention| attention.sticky)
+            })
+            .map(|item| item.byte_cost)
+            .try_fold(0u64, u64::checked_add)
+            .ok_or_else(|| accounting_overflow(policy, "Attention byte accounting overflowed"))?
+    } else {
+        0
+    };
+    Ok(AccountingTotals {
+        selected,
+        item_delivery_bytes,
+        required_floor_bytes,
+        required_attention_bytes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accounting_budget_fit(
+    policy: &ReactiveDeliveryPolicy,
+    input_bytes: u64,
+    item_count: usize,
+    references: u64,
+    work: u64,
+    reserves: u64,
+    delivery_bytes: u64,
+    required_floor_bytes: u64,
+    required_attention_bytes: u64,
+    selected_delivery_stu: Option<u64>,
+) -> bool {
+    let budget_fit = input_bytes <= policy.max_input_bytes
+        && (item_count as u64) <= policy.max_items
+        && references <= policy.max_references
+        && work <= policy.max_work
+        && reserves
+            .checked_add(delivery_bytes)
+            .is_some_and(|total| total <= policy.max_delivery_bytes)
+        && required_floor_bytes
+            .checked_add(required_attention_bytes)
+            .and_then(|required| reserves.checked_add(required))
+            .is_some_and(|required| required <= policy.max_delivery_bytes);
+    budget_fit
+        && selected_delivery_stu
+            .is_none_or(|stu| policy.max_delivery_stu.is_some_and(|limit| stu <= limit))
+}
+
 fn inert_request(
     selected: &[PlannedContextItem],
     mode: ReactiveDeliveryMode,
@@ -2420,6 +2952,18 @@ fn inert_request(
     policy: &ReactiveDeliveryPolicy,
     proof_ceiling: ProofCeiling,
 ) -> Result<InertDeliveryRequest, ReactiveInputError> {
+    let mut request = inert_request_skeleton(selected, mode, session, policy, proof_ceiling);
+    request.request_digest = inert_request_digest(&request)?;
+    seal_inert_request_length(request)
+}
+
+fn inert_request_skeleton(
+    selected: &[PlannedContextItem],
+    mode: ReactiveDeliveryMode,
+    session: &SessionDeliverySnapshot,
+    policy: &ReactiveDeliveryPolicy,
+    proof_ceiling: ProofCeiling,
+) -> InertDeliveryRequest {
     let selected_attention_privacy = selected
         .iter()
         .filter(|item| item.kind == PlannedItemKind::Attention)
@@ -2432,7 +2976,7 @@ fn inert_request(
         })
         .max()
         .unwrap_or(ReactiveContextPrivacy::Public);
-    let mut request = InertDeliveryRequest {
+    InertDeliveryRequest {
         request_id: policy.request_id.clone(),
         operation_id: policy.operation_id.clone(),
         idempotency_key: policy.idempotency_key.clone(),
@@ -2460,7 +3004,10 @@ fn inert_request(
         items: selected.to_vec(),
         request_digest: String::new(),
         serialized_bytes: 0,
-    };
+    }
+}
+
+fn inert_request_digest(request: &InertDeliveryRequest) -> Result<String, ReactiveInputError> {
     let digest_preimage = canonical_json_bytes(&(
         (
             &request.request_id,
@@ -2500,7 +3047,12 @@ fn inert_request(
         field: "delivery.request",
         reason: "canonical inert request digest preimage failed",
     })?;
-    request.request_digest = eliot_contracts::sha256_hex(&digest_preimage);
+    Ok(eliot_contracts::sha256_hex(&digest_preimage))
+}
+
+fn seal_inert_request_length(
+    mut request: InertDeliveryRequest,
+) -> Result<InertDeliveryRequest, ReactiveInputError> {
     let mut previous = None;
     for _ in 0..4 {
         let bytes =
