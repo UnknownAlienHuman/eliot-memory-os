@@ -3,9 +3,12 @@
 #[path = "support/grounding.rs"]
 mod support;
 
-use eliot_contracts::{ReceiptId, RequestId};
 use eliot_dreamer_contracts::{
     AtomicityMode, ScreenBinding, ScreenState, TargetDenominator, grounding,
+};
+use grounding::canonical::{
+    DisclosureClass, EvidenceAuthority, EvidenceFreshness, EvidenceGrade, PositionAssertability,
+    PrivacyHandling, ReceiptId, RequestId, canonical_json_bytes, sha256_hex,
 };
 use support::*;
 
@@ -101,13 +104,13 @@ fn manifest_is_a_revision_bound_firewall() {
         content_digest: DIGEST.into(),
         source_revision: "revision-1".into(),
         authority_digest: DIGEST.into(),
-        authority: eliot_evidence::EvidenceAuthority::SourceIdentity,
-        freshness: eliot_evidence::EvidenceFreshness::ExactCommit,
+        authority: EvidenceAuthority::SourceIdentity,
+        freshness: EvidenceFreshness::ExactCommit,
         source_assurance: None,
-        grade_ceiling: eliot_epistemic_contracts::EvidenceGrade::Grounded,
-        assertability_ceiling: eliot_epistemic_contracts::PositionAssertability::QualifiedInference,
-        privacy: eliot_epistemic_contracts::PrivacyHandling::Unrestricted,
-        disclosure: eliot_epistemic_contracts::DisclosureClass::Open,
+        grade_ceiling: EvidenceGrade::Grounded,
+        assertability_ceiling: PositionAssertability::QualifiedInference,
+        privacy: PrivacyHandling::Unrestricted,
+        disclosure: DisclosureClass::Open,
         origin: "grounding-test".into(),
         invalidated: false,
         revocation_reason: None,
@@ -155,9 +158,8 @@ fn curation_screen_and_target_denominator_remain_bound() {
     };
     let target_mode = AtomicityMode::AllOrNothing;
     let target_members = vec!["target-1".into()];
-    let target_digest = eliot_contracts::sha256_hex(
-        &eliot_contracts::canonical_json_bytes(&(&target_mode, &target_members, 1u32))
-            .expect("target preimage"),
+    let target_digest = sha256_hex(
+        &canonical_json_bytes(&(&target_mode, &target_members, 1u32)).expect("target preimage"),
     );
     let binding = grounding::ScreenTargetBinding {
         screen,
