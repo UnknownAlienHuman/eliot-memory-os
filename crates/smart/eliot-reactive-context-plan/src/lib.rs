@@ -1,13 +1,24 @@
-//! Capability cell placeholder.
+//! Pure planning of one bounded reactive Context injection.
 //!
-//! NOT IMPLEMENTED. This file exists only so that per-crate
-//! `cargo check`, `cargo test` and `cargo clippy` run and report an
-//! actionable result instead of a manifest error.
-//!
-//! Cell `smart.context.reactive_delivery_plan`, order 19.
-//! The purpose, contract and dependencies of this cell live in
-//! `module.toml` next to this crate. The owning work unit replaces this
-//! file and, on completion, moves the crate from the root
-//! `workspace.exclude` into `workspace.members`.
+//! The planner consumes immutable A-15, A-10, session, Attention, coverage
+//! and policy projections. It emits an inert downstream request or a complete
+//! no-injection accounting record. It performs no I/O, delivery, receipt
+//! issuance, session mutation, authority grant or Attention resolution.
 
 #![forbid(unsafe_code)]
+#![allow(clippy::result_large_err, clippy::large_enum_variant)]
+
+mod input;
+mod plan;
+mod result;
+
+pub use input::{
+    AttentionDisclosureRule, ReactiveCueActivation, ReactiveDeliveryPolicy, ReactiveTargetBinding,
+};
+pub use plan::plan_pending_context_injection;
+pub use result::{
+    ActivationEvidenceKind, DeliveryDisposition, InertDeliveryRequest, NoInjectionDisposition,
+    PendingContextInjectionPlan, PlannedAttentionBinding, PlannedContextItem, PlannedItemKind,
+    PlanningAccounting, PlanningErrorDisposition, PlanningErrorKind, ReactiveContextPlanResult,
+    ReactiveContextPlanningError,
+};
