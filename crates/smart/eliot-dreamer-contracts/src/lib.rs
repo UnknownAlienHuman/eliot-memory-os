@@ -19,6 +19,7 @@ pub mod draft;
 pub mod encoding;
 pub mod error;
 pub mod failure;
+pub mod grounding;
 pub mod job;
 pub mod registry;
 pub mod relation;
