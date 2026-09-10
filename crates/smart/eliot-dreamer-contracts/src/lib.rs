@@ -23,6 +23,7 @@ pub mod error;
 pub mod failure;
 pub mod grounding;
 pub mod job;
+pub mod probe;
 pub mod registry;
 pub mod relation;
 pub mod rival;
@@ -104,6 +105,11 @@ pub use failure::{
     failure_result_digest, seal_failure, validate_failure,
 };
 pub use job::{DreamJobInput, JobClass, Requester, RequesterOrigin, parse_job_class};
+pub use probe::{
+    GapUpdateMeaning, PossibleResultSchema, PossibleResultValue, ProbeObjective,
+    ProbeObjectiveOrigin, ProbeObjectiveRef, ProbeObjectiveTarget, ProbeOwnerRef, ResultBranch,
+    ResultTarget, ResultUpdate, RivalUpdateMeaning,
+};
 pub use registry::{
     AtomicityMode, CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor,
     CurationHandlerPort, CurationHandlerRegistry, TargetDenominator, TypedCurationHandlerRequest,
