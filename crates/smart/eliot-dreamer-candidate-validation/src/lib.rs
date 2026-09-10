@@ -12,6 +12,7 @@ mod bounds;
 mod error;
 mod input;
 mod receipt;
+mod structured;
 mod validate;
 
 pub use eliot_dreamer_contracts::ValidationPolicy;
@@ -20,3 +21,7 @@ pub use error::{
     ValidatedCandidate,
 };
 pub use input::validate_grounded_dream_draft_at;
+pub use structured::{
+    StructuredCandidateRejectionReport, StructuredCandidateValidationOutcome,
+    validate_grounding_candidate_at,
+};
