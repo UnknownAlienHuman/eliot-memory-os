@@ -496,12 +496,18 @@ pub struct ArchitectureDependencyDenominator {
 
 impl ArchitectureDependencyDenominator {
     pub fn compute_digest(&self) -> Result<String, SelfQueryContractError> {
+        check_id(self.denominator_id.as_str(), "denominator.denominator_id")?;
         if self.members.len() > MAX_DEPENDENCY_MEMBERS {
             return Err(SelfQueryContractError::Bound {
                 field: "denominator.members",
                 maximum: MAX_DEPENDENCY_MEMBERS,
                 actual: self.members.len(),
             });
+        }
+        for member in &self.members {
+            check_id(member.member_id.as_str(), "denominator.member_id")?;
+            check_id(member.anchor_id.as_str(), "denominator.anchor_id")?;
+            check_id(member.source_handle.as_str(), "denominator.source_handle")?;
         }
         canonical_digest(
             &(
