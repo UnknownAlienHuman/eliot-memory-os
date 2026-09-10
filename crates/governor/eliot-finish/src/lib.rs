@@ -460,6 +460,16 @@ impl FinishService {
         context: &FinishContext,
     ) -> Result<FinishAdmission, FinishError> {
         attempt.validate()?;
+        let attempt_digest = attempt.digest()?;
+        if let Some(existing) = self.receipts.get(&attempt.attempt_id) {
+            if existing.attempt_digest != attempt_digest {
+                return Err(FinishError::IdentityConflict);
+            }
+            return Ok(FinishAdmission::Replayed {
+                receipt: existing.clone(),
+            });
+        }
+
         context.validate()?;
         if context.lifecycle.is_closed() {
             return Err(FinishError::ClosedTask);
@@ -474,15 +484,6 @@ impl FinishService {
             || attempt.evidence.current_task_revision != context.current_task_revision
         {
             return Err(FinishError::Canonical(CanonicalError::StaleTaskRevision));
-        }
-        let attempt_digest = attempt.digest()?;
-        if let Some(existing) = self.receipts.get(&attempt.attempt_id) {
-            if existing.attempt_digest != attempt_digest {
-                return Err(FinishError::IdentityConflict);
-            }
-            return Ok(FinishAdmission::Replayed {
-                receipt: existing.clone(),
-            });
         }
 
         let mut evidence = attempt.evidence.clone();
@@ -648,4 +649,92 @@ pub fn contract_identity() -> Result<ContractIdentity, FinishError> {
         }),
     )
     .map_err(FinishError::Foundation)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use eliot_canonical::{AcceptanceCoverage, FinishAttemptDraft, FinishEvidence};
+    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+
+    fn attempt() -> FinishAttempt {
+        FinishAttempt {
+            attempt_id: "attempt-1".to_owned(),
+            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            draft: FinishAttemptDraft {
+                task_id: "task-1".to_owned(),
+                expected_task_revision: 1,
+                requested_outcome: RequestedFinishOutcome::CompleteCandidate,
+                artifact_refs: vec!["artifact-1".to_owned()],
+                observation_refs: vec![],
+                verifier_run_refs: vec![],
+                remaining_unknowns_declared_by_caller: vec![],
+                rationale_candidate: "all required work is complete".to_owned(),
+            },
+            evidence: FinishEvidence {
+                task_id: "task-1".to_owned(),
+                current_task_revision: 1,
+                acceptance: vec![AcceptanceCoverage {
+                    item_id: "acceptance-1".to_owned(),
+                    satisfied: true,
+                    evidence_refs: vec!["evidence-1".to_owned()],
+                    verifier_run_refs: vec![],
+                    requires_verifier: false,
+                }],
+                executed_verifier_run_refs: vec![],
+                stale_verifier_run_refs: vec![],
+                unresolved_effect_refs: vec![],
+            },
+            closure_intent: FinishClosureIntent::Continue,
+        }
+    }
+
+    fn context() -> FinishContext {
+        FinishContext {
+            task_id: "task-1".to_owned(),
+            current_task_revision: 1,
+            current_state_fence: StateFence::new(
+                AuthorityEpoch::genesis(),
+                ResourceGeneration::genesis(),
+            ),
+            lifecycle: TaskLifecycleState::Open,
+            finish_authority_ref: "finish-owner".to_owned(),
+            closure_authority_ref: Some("task-owner".to_owned()),
+            descendant_closure: DescendantClosure::Complete {
+                receipt_ref: "descendant-receipt".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn exact_replay_returns_receipt_after_context_changes() {
+        let mut service = FinishService::default();
+        let original_attempt = attempt();
+        let accepted = service
+            .evaluate(original_attempt.clone(), &context())
+            .expect("initial finish evaluation");
+        let accepted_receipt = match accepted {
+            FinishAdmission::Accepted { receipt } => receipt,
+            FinishAdmission::Replayed { .. } => panic!("first evaluation cannot replay"),
+        };
+
+        let changed_context = FinishContext {
+            current_task_revision: 2,
+            current_state_fence: StateFence::new(
+                AuthorityEpoch::new(2).expect("non-zero authority epoch"),
+                ResourceGeneration::new(2).expect("non-zero resource generation"),
+            ),
+            lifecycle: TaskLifecycleState::Closed,
+            ..context()
+        };
+        let replayed = service
+            .evaluate(original_attempt, &changed_context)
+            .expect("exact replay should return the accepted receipt");
+
+        match replayed {
+            FinishAdmission::Replayed { receipt } => assert_eq!(receipt, accepted_receipt),
+            FinishAdmission::Accepted { .. } => panic!("existing attempt must replay"),
+        }
+    }
 }
