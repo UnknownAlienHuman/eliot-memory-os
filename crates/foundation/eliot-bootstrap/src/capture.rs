@@ -10,8 +10,8 @@
 
 use std::{
     ffi::OsString,
-    fs::{self, OpenOptions},
-    io::{self, Write},
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
@@ -25,22 +25,11 @@ use thiserror::Error;
 use crate::{
     CurrentSystemEvidenceCompiler, CurrentSystemEvidenceSnapshot, CurrentSystemEvidenceSource,
     EvidenceEvaluation, EvidenceRecord, NormativePair, SourceProjection,
+    normative::{self, parse_normative_pair_receipt},
 };
 
 const SNAPSHOT_TEMP_CREATE_ATTEMPTS: usize = 128;
 static SNAPSHOT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-/// Returns the normative pair used by the current Architecture 4.5 /
-/// Implementation 0.29 working line. These are identities, not completion
-/// evidence.
-pub fn current_normative_pair() -> NormativePair {
-    NormativePair {
-        architecture_sha256: "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8"
-            .to_owned(),
-        implementation_sha256: "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b"
-            .to_owned(),
-    }
-}
 
 /// Immutable receipt proving which snapshot was emitted.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -145,6 +134,55 @@ pub enum CaptureError {
     ReceiptDigestMismatch,
     #[error("snapshot serialization failed: {0}")]
     Serialization(String),
+    #[error("normative pair receipt is unavailable at {path}: {detail}")]
+    NormativePairReceipt { path: PathBuf, detail: String },
+}
+
+/// Read and parse the accepted normative pair from an explicit repository root.
+pub fn load_normative_pair(repository_root: &Path) -> Result<NormativePair, CaptureError> {
+    if !repository_root.is_absolute() {
+        return Err(CaptureError::RepositoryRootNotAbsolute(
+            repository_root.to_owned(),
+        ));
+    }
+    if !repository_root.is_dir() {
+        return Err(CaptureError::RepositoryRootMissing(
+            repository_root.to_owned(),
+        ));
+    }
+    let canonical_root =
+        fs::canonicalize(repository_root).map_err(|error| CaptureError::NormativePairReceipt {
+            path: repository_root.to_owned(),
+            detail: error.to_string(),
+        })?;
+    let path = canonical_root.join("docs/normative-pair.toml");
+    let canonical_path =
+        fs::canonicalize(&path).map_err(|error| CaptureError::NormativePairReceipt {
+            path: path.clone(),
+            detail: error.to_string(),
+        })?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(CaptureError::NormativePairReceipt {
+            path: canonical_path,
+            detail: "receipt resolves outside the canonical repository root".to_owned(),
+        });
+    }
+    let mut bytes = Vec::with_capacity(normative::MAX_RECEIPT_BYTES + 1);
+    File::open(&canonical_path)
+        .map_err(|error| CaptureError::NormativePairReceipt {
+            path: canonical_path.clone(),
+            detail: error.to_string(),
+        })?
+        .take((normative::MAX_RECEIPT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| CaptureError::NormativePairReceipt {
+            path: canonical_path.clone(),
+            detail: error.to_string(),
+        })?;
+    parse_normative_pair_receipt(&bytes).map_err(|error| CaptureError::NormativePairReceipt {
+        path: canonical_path,
+        detail: error.to_string(),
+    })
 }
 
 /// Capture and compile one immutable snapshot from an explicit repository root.
@@ -169,6 +207,7 @@ pub fn capture_snapshot(repository_root: &Path) -> Result<SnapshotExecutionArtif
             discovered: discovered_root,
         });
     }
+    let normative_pair = load_normative_pair(&discovered_root)?;
 
     let source_head = git_output(&discovered_root, ["rev-parse", "HEAD"])?
         .trim()
@@ -227,7 +266,7 @@ pub fn capture_snapshot(repository_root: &Path) -> Result<SnapshotExecutionArtif
         "current-system",
         source_head.clone(),
         CurrentSystemEvidenceSource {
-            normative_pair: current_normative_pair(),
+            normative_pair,
             selected_repository_root: discovered_root.display().to_string(),
             selected_source_head: source_head,
             dirty_delta_artifact_ref,
@@ -504,17 +543,40 @@ fn same_path(left: &Path, right: &Path) -> bool {
 mod tests {
     use super::*;
 
+    fn repository_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")
+    }
+
+    fn copy_normative_pair_receipt(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let destination = root.join("docs/normative-pair.toml");
+        fs::create_dir_all(destination.parent().ok_or("receipt has no parent")?)?;
+        fs::copy(
+            repository_root().join("docs/normative-pair.toml"),
+            destination,
+        )?;
+        Ok(())
+    }
+
     #[test]
     fn canonical_normative_pair_contains_only_architecture_and_implementation()
     -> Result<(), Box<dyn std::error::Error>> {
-        let pair = current_normative_pair();
+        let root = repository_root();
+        let receipt = fs::read(root.join("docs/normative-pair.toml"))?;
+        let parsed: toml::Value = toml::from_str(std::str::from_utf8(&receipt)?)?;
+        let pair = load_normative_pair(&root)?;
         assert_eq!(
             pair.architecture_sha256,
-            "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8"
+            parsed
+                .get("architecture_sha256")
+                .and_then(toml::Value::as_str)
+                .ok_or("architecture digest missing")?
         );
         assert_eq!(
             pair.implementation_sha256,
-            "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b"
+            parsed
+                .get("implementation_sha256")
+                .and_then(toml::Value::as_str)
+                .ok_or("implementation digest missing")?
         );
         let value = serde_json::to_value(&pair)?;
         let object = value.as_object().ok_or("normative pair is not an object")?;
@@ -610,13 +672,17 @@ mod tests {
         ));
         fs::create_dir_all(&repository_root)?;
         git(&repository_root, &["init", "-q"])?;
+        copy_normative_pair_receipt(&repository_root)?;
         git(&repository_root, &["config", "user.name", "eliot-test"])?;
         git(
             &repository_root,
             &["config", "user.email", "eliot-test@example.invalid"],
         )?;
         fs::write(repository_root.join("tracked.txt"), "initial\n")?;
-        git(&repository_root, &["add", "tracked.txt"])?;
+        git(
+            &repository_root,
+            &["add", "tracked.txt", "docs/normative-pair.toml"],
+        )?;
         git(
             &repository_root,
             &["-c", "commit.gpgSign=false", "commit", "-qm", "initial"],
@@ -646,13 +712,17 @@ mod tests {
         ));
         fs::create_dir_all(&repository_root)?;
         git(&repository_root, &["init", "-q"])?;
+        copy_normative_pair_receipt(&repository_root)?;
         git(&repository_root, &["config", "user.name", "eliot-test"])?;
         git(
             &repository_root,
             &["config", "user.email", "eliot-test@example.invalid"],
         )?;
         fs::write(repository_root.join("tracked.txt"), "source\n")?;
-        git(&repository_root, &["add", "tracked.txt"])?;
+        git(
+            &repository_root,
+            &["add", "tracked.txt", "docs/normative-pair.toml"],
+        )?;
         git(
             &repository_root,
             &["-c", "commit.gpgSign=false", "commit", "-qm", "initial"],

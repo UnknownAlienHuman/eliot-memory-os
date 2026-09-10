@@ -12,7 +12,8 @@ use std::{
 use eliot_agent_api::AgentWorkUnitBrief;
 use eliot_bootstrap::{
     BootstrapBrief, BootstrapBriefCompiler, BootstrapDraftInput, BootstrapImprovementDraft,
-    DraftImportDisposition, capture::capture_snapshot,
+    DraftImportDisposition,
+    capture::{capture_snapshot, load_normative_pair},
 };
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use serde_json::{Value, json};
@@ -94,7 +95,13 @@ pub(crate) fn execute(
         BootstrapCommandError::SourceUnavailable(format!("capture explicit repo root: {error}"))
     })?;
     let snapshot = &snapshot_artifact.snapshot;
-    let brief = BootstrapBriefCompiler::compile(work_unit.clone(), snapshot)
+    let expected_pair = load_normative_pair(Path::new(&snapshot_artifact.receipt.repository_root))
+        .map_err(|error| {
+            BootstrapCommandError::SourceUnavailable(format!(
+                "load accepted normative pair: {error}"
+            ))
+        })?;
+    let brief = BootstrapBriefCompiler::compile(work_unit.clone(), snapshot, &expected_pair)
         .map_err(|error| BootstrapCommandError::ContractChallenge(error.to_string()))?;
     let response = command_response(&brief, work_unit_path, repo_root)?;
     let draft = BootstrapImprovementDraft::new(

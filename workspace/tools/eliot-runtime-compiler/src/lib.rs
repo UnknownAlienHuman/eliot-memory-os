@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use eliot_bootstrap::{NormativePair, capture::load_normative_pair};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -13,10 +14,6 @@ const EXPECTED_MANIFEST_SHA256: &str =
     "4f53344519857e3237379fc26d6bc839f683271347bdc1d2110aa02798ee1d89";
 const EXPECTED_PAYLOAD_ROOT_SHA256: &str =
     "32e3f3b3193bc081eba15cdd199aac5dcbdb819bd9848ea2a47ffd7c1075918d";
-const EXPECTED_ARCHITECTURE_SHA256: &str =
-    "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8";
-const EXPECTED_IMPLEMENTATION_SHA256: &str =
-    "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b";
 const EXPECTED_RUNTIME_SHA256: &str =
     "8cee5d0fb4fa58bf37730b9a92edf1a1e37d83695c62febfabb4e0450a3814bf";
 const EXPECTED_TEMPLATE_SHA256: &str =
@@ -2558,6 +2555,84 @@ fn check_finish_edges(a: &mut Audit, finish: &Value, graph: &Value, index: &Valu
     Ok(())
 }
 
+fn load_expected_normative_pair(a: &mut Audit, repository: &Path) -> Option<NormativePair> {
+    let canonical_root = match repository.canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            a.error(
+                "bootstrap.normative_pair_receipt",
+                "accepted normative pair receipt is unavailable",
+                json!({
+                    "path": repository.display().to_string(),
+                    "expected": Value::Null,
+                    "reason": error.to_string(),
+                }),
+            );
+            return None;
+        }
+    };
+    match load_normative_pair(&canonical_root) {
+        Ok(pair) => {
+            a.check(
+                "bootstrap.normative_pair_receipt",
+                true,
+                "accepted normative pair receipt was parsed from the repository",
+                json!({
+                    "path": canonical_root.join("docs/normative-pair.toml").display().to_string(),
+                    "architecture_sha256": pair.architecture_sha256.as_str(),
+                    "implementation_sha256": pair.implementation_sha256.as_str(),
+                }),
+            );
+            Some(pair)
+        }
+        Err(error) => {
+            a.error(
+                "bootstrap.normative_pair_receipt",
+                "accepted normative pair receipt is unavailable",
+                json!({
+                    "path": canonical_root.join("docs/normative-pair.toml").display().to_string(),
+                    "expected": Value::Null,
+                    "reason": error.to_string(),
+                }),
+            );
+            None
+        }
+    }
+}
+
+fn check_seed_normative_pair(a: &mut Audit, seed: &Value, expected: Option<&NormativePair>) {
+    let fixed = seed
+        .get("bootstrap_campaign_seed_template")
+        .and_then(|value| value.get("template_payload"))
+        .and_then(|value| value.get("fixed_identity_values"));
+    let actual_architecture = fixed
+        .and_then(|value| value.get("architecture_sha256"))
+        .and_then(Value::as_str);
+    let actual_implementation = fixed
+        .and_then(|value| value.get("implementation_sha256"))
+        .and_then(Value::as_str);
+    let expected_architecture = expected.map(|pair| pair.architecture_sha256.as_str());
+    let expected_implementation = expected.map(|pair| pair.implementation_sha256.as_str());
+    a.check(
+        "bootstrap.normative_pair",
+        expected_architecture.is_some()
+            && expected_implementation.is_some()
+            && actual_architecture == expected_architecture
+            && actual_implementation == expected_implementation,
+        "bootstrap seed fixed normative identity matches the supplied receipt",
+        json!({
+            "actual": {
+                "architecture_sha256": actual_architecture,
+                "implementation_sha256": actual_implementation,
+            },
+            "expected": expected.map(|pair| json!({
+                "architecture_sha256": pair.architecture_sha256.as_str(),
+                "implementation_sha256": pair.implementation_sha256.as_str(),
+            })),
+        }),
+    );
+}
+
 // Bootstrap trust bindings are intentionally decided together to prevent partial trust.
 #[allow(clippy::too_many_lines)]
 fn check_bootstrap_identity(
@@ -2638,32 +2713,32 @@ fn check_bootstrap_identity(
         .get("fixed_identity_values")
         .ok_or_else(|| anyhow!("fixed_identity_values missing"))?;
     let expected_docs = [
-        (
-            "architecture_sha256",
-            "architecture",
-            "ELIOT_ARCHITECTURE.md",
-        ),
-        (
-            "implementation_sha256",
-            "implementation",
-            "ELIOT_IMPLEMENTATION.md",
-        ),
-        ("runtime_sha256", "runtime", "ELIOT_RUNTIME.md"),
+        ("architecture", "ELIOT_ARCHITECTURE.md"),
+        ("implementation", "ELIOT_IMPLEMENTATION.md"),
+        ("runtime", "ELIOT_RUNTIME.md"),
     ];
-    let mut doc_bad = Vec::new();
-    for (key, seed_doc, file) in expected_docs {
-        if fixed_values.get(key).and_then(Value::as_str)
-            != payload_hashes.get(file).and_then(Value::as_str)
-            || seed
-                .get("documents")
-                .and_then(|docs| docs.get(seed_doc))
-                .and_then(|doc| doc.get("sha256"))
-                .and_then(Value::as_str)
-                != payload_hashes.get(file).and_then(Value::as_str)
-        {
-            doc_bad.push(file);
+    let mut document_bad = Vec::new();
+    for (seed_doc, file) in expected_docs {
+        let actual = payload_hashes.get(file).and_then(Value::as_str);
+        let declared = seed
+            .get("documents")
+            .and_then(|docs| docs.get(seed_doc))
+            .and_then(|doc| doc.get("sha256"))
+            .and_then(Value::as_str);
+        if actual.is_none() || declared != actual {
+            document_bad.push(file);
         }
     }
+    a.check(
+        "bootstrap.document_files",
+        document_bad.is_empty(),
+        "seed document identities match the actual payload files",
+        json!({"bad":document_bad}),
+    );
+    let runtime_payload_hash = payload_hashes
+        .get("ELIOT_RUNTIME.md")
+        .and_then(Value::as_str);
+    let runtime_fixed_hash = fixed_values.get("runtime_sha256").and_then(Value::as_str);
     let graph_hash = payload_hashes
         .get("Eliot_Runtime_WorkGraph.json")
         .and_then(Value::as_str);
@@ -2671,40 +2746,33 @@ fn check_bootstrap_identity(
         work.get("graph")
             .ok_or_else(|| anyhow!("WorkGraph graph missing"))?,
     ));
-    if fixed_values
-        .get("work_graph_file_sha256")
-        .and_then(Value::as_str)
-        != graph_hash
-        || fixed_values
-            .get("work_graph_array_sha256")
-            .and_then(Value::as_str)
-            != Some(graph_array_hash.as_str())
-    {
-        doc_bad.push("Eliot_Runtime_WorkGraph.json");
-    }
     a.check(
-        "bootstrap.normative_identity",
-        doc_bad.is_empty()
-            && fixed_values
-                .get("architecture_sha256")
-                .and_then(Value::as_str)
-                == Some(EXPECTED_ARCHITECTURE_SHA256)
-            && fixed_values
-                .get("implementation_sha256")
-                .and_then(Value::as_str)
-                == Some(EXPECTED_IMPLEMENTATION_SHA256)
-            && fixed_values.get("runtime_sha256").and_then(Value::as_str)
-                == Some(EXPECTED_RUNTIME_SHA256)
+        "bootstrap.runtime_graph_identity",
+        runtime_fixed_hash == Some(EXPECTED_RUNTIME_SHA256)
+            && runtime_fixed_hash == runtime_payload_hash
             && fixed_values
                 .get("work_graph_file_sha256")
                 .and_then(Value::as_str)
                 == Some(EXPECTED_WORK_GRAPH_SHA256)
             && fixed_values
+                .get("work_graph_file_sha256")
+                .and_then(Value::as_str)
+                == graph_hash
+            && fixed_values
+                .get("work_graph_array_sha256")
+                .and_then(Value::as_str)
+                == Some(graph_array_hash.as_str())
+            && fixed_values
                 .get("work_graph_array_sha256")
                 .and_then(Value::as_str)
                 == Some(EXPECTED_WORK_GRAPH_ARRAY_SHA256),
-        "normative books and graph identities match pinned seed",
-        json!({"bad":doc_bad}),
+        "runtime and WorkGraph identities match pinned seed",
+        json!({
+            "runtime_fixed": runtime_fixed_hash,
+            "runtime_payload": runtime_payload_hash,
+            "work_graph": graph_hash,
+            "work_graph_array": graph_array_hash,
+        }),
     );
     let receipts: BTreeSet<String> = [
         "Eliot_Runtime_Validation.json",
@@ -3453,6 +3521,7 @@ pub fn compile(opts: &CompileOptions) -> Value {
     let mut payload_root = Value::Null;
     let mut gaps = Vec::new();
     let result: Result<()> = (|| {
+        let expected_pair = load_expected_normative_pair(&mut audit, &opts.repository);
         let manifest_path = opts.runtime_root.join("Eliot_Runtime_BundleManifest.json");
         let (manifest, manifest_bytes) = read_json(&manifest_path).context("bundle manifest")?;
         manifest_sha = Value::String(sha256(&manifest_bytes));
@@ -3531,6 +3600,7 @@ pub fn compile(opts: &CompileOptions) -> Value {
         let work = read("Eliot_Runtime_WorkGraph.json")?;
         let (nodes, deps) = check_graph(&mut audit, &work)?;
         let manifest_names = names.clone();
+        check_seed_normative_pair(&mut audit, &seed, expected_pair.as_ref());
         check_bootstrap_identity(
             &mut audit,
             &manifest,
