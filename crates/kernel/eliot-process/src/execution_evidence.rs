@@ -174,25 +174,20 @@ impl ProcessEvidence {
         stderr: Option<ProcessStreamEvidence>,
         axes: EvidenceAxes,
     ) -> Result<Self, ContractError> {
-        view.validate_internal()?;
-        axes.validate().map_err(|_| ContractError::InvalidValue {
-            field: "evidence_axes",
-            reason: "C0-05 evidence axes are invalid",
-        })?;
-        if axes.status != EvidenceStatus::Observed
-            || axes.assertability != Assertability::NonAssertableUnverified
-        {
-            return Err(ContractError::EvidenceAuthorityEscalation);
-        }
-        validate_stream(&view, stdout.as_ref(), ProcessStreamKind::Stdout)?;
-        validate_stream(&view, stderr.as_ref(), ProcessStreamKind::Stderr)?;
-        Ok(Self {
+        let value = Self {
             schema_version: PROCESS_EVIDENCE_SCHEMA_VERSION.to_owned(),
             view,
             stdout,
             stderr,
             axes,
-        })
+        };
+        value.validate()?;
+        if axes.status != EvidenceStatus::Observed
+            || axes.assertability != Assertability::NonAssertableUnverified
+        {
+            return Err(ContractError::EvidenceAuthorityEscalation);
+        }
+        Ok(value)
     }
 
     /// Returns the exact binding through the view.
@@ -249,7 +244,8 @@ impl ProcessEvidence {
         self.axes
     }
 
-    /// Revalidates the complete typed envelope.
+    /// Validates the passive evidence structure without promoting or rejecting
+    /// its epistemic status. Persistence owners apply their own status policy.
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.schema_version != PROCESS_EVIDENCE_SCHEMA_VERSION {
             return Err(ContractError::SchemaVersion {
@@ -257,6 +253,7 @@ impl ProcessEvidence {
                 observed: self.schema_version.clone(),
             });
         }
+        self.view.binding.validate()?;
         self.view.validate_internal()?;
         self.axes
             .validate()
@@ -264,11 +261,6 @@ impl ProcessEvidence {
                 field: "evidence_axes",
                 reason: "C0-05 evidence axes are invalid",
             })?;
-        if self.axes.status != EvidenceStatus::Observed
-            || self.axes.assertability != Assertability::NonAssertableUnverified
-        {
-            return Err(ContractError::EvidenceAuthorityEscalation);
-        }
         validate_stream(&self.view, self.stdout.as_ref(), ProcessStreamKind::Stdout)?;
         validate_stream(&self.view, self.stderr.as_ref(), ProcessStreamKind::Stderr)
     }
@@ -330,7 +322,15 @@ impl<'de> Deserialize<'de> for ProcessEvidence {
                 ));
             }
         };
-        Self::new_typed(wire.view, stdout, stderr, wire.axes).map_err(de::Error::custom)
+        let value = Self {
+            schema_version: PROCESS_EVIDENCE_SCHEMA_VERSION.to_owned(),
+            view: wire.view,
+            stdout,
+            stderr,
+            axes: wire.axes,
+        };
+        value.validate().map_err(de::Error::custom)?;
+        Ok(value)
     }
 }
 
