@@ -16,12 +16,14 @@ pub use eliot_evidence::{
     EvidenceFreshness, LifecycleState, ObservationRecord,
 };
 pub use eliot_observation_contracts::{
-    ActiveObservationPlan, BlindInterval, CaptureMode, CaptureRoute, CoverageAssessment,
-    CoverageDisposition, CoverageEvidence, CoverageGap, CoverageInterval, DenominatorSpec,
-    Durability, EliotSystemObservationEvent, GapDisposition, GapPolicy, ObservationEventCore,
-    ObservationEventIdentity, ObservationKind, ObservationObligationProfile,
-    ObservationRecordEnvelope, ObservationRecordKind, ObservationScope, ProducerGenerationRef,
-    ProducerTrace, SamplingPolicy, SystemObservationJournalRecord,
+    ActiveObservationPlan, AmbiguousOrdinaryRecordV2, BlindInterval, CaptureMode, CaptureRoute,
+    CoverageAssessment, CoverageDisposition, CoverageEvidence, CoverageGap, CoverageInterval,
+    DenominatorSpec, Durability, EliotSystemObservationEvent, GapDisposition, GapPolicy,
+    ObservationEventCore, ObservationEventIdentity, ObservationKind, ObservationObligationProfile,
+    ObservationRecordEnvelope, ObservationRecordEnvelopeV2, ObservationRecordKind,
+    ObservationScope, PrivacyRetentionDisclosure, ProducerGenerationRef, ProducerTrace,
+    RecordFamilyClassification, RecordFamilyContractError, RecordFamilyPayloadV2, SamplingPolicy,
+    SystemObservationJournalRecord,
 };
 
 use eliot_contracts::{
@@ -49,6 +51,9 @@ pub enum GovernorObservationError {
     /// A semantic evidence envelope rejected its status or provenance.
     #[error("evidence contract: {0}")]
     Evidence(eliot_evidence::EvidenceError),
+    /// The v2 record-family contract rejected a family payload or migration.
+    #[error("record-family contract: {0}")]
+    RecordFamily(RecordFamilyContractError),
     /// A required field is blank or malformed.
     #[error("invalid field {field}: {reason}")]
     InvalidField {
@@ -72,6 +77,15 @@ pub enum GovernorObservationError {
     /// Reusing an identity with different canonical bytes is forbidden.
     #[error("observation identity conflict")]
     IdentityConflict,
+    /// A replay marker is a transient result and cannot be persisted as input.
+    #[error("persisted replay result is not canonical journal input")]
+    PersistedReplay,
+    /// A non-exact v2 family record is retained cold rather than accepted.
+    #[error("non-exact v2 record-family material remains cold: {disposition:?}")]
+    RecordFamilyNotAccepted {
+        /// Classification retained for the cold fallback.
+        disposition: RecordFamilyClassification,
+    },
     /// A task-bound observation did not include exact selection evidence.
     #[error("task selection evidence is required")]
     TaskSelectionRequired,
@@ -104,6 +118,12 @@ impl From<eliot_observation_contracts::ObservationError> for GovernorObservation
 impl From<eliot_evidence::EvidenceError> for GovernorObservationError {
     fn from(error: eliot_evidence::EvidenceError) -> Self {
         Self::Evidence(error)
+    }
+}
+
+impl From<RecordFamilyContractError> for GovernorObservationError {
+    fn from(error: RecordFamilyContractError) -> Self {
+        Self::RecordFamily(error)
     }
 }
 
@@ -264,6 +284,38 @@ pub struct ObservationCandidate {
     pub reason_ref: String,
 }
 
+/// Governor's bounded consumer decision for a v2 family payload.
+///
+/// Only field-complete v2 payloads can enter the accepted path. Generic
+/// ordinary material remains cold, even when it carries a compatible caller
+/// hint; later classifier work may preserve it but cannot promote it here.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "disposition")]
+pub enum RecordFamilyAdmission {
+    /// Exact family evidence is eligible for the normal Governor path.
+    AcceptedExact {
+        /// Mechanically established family.
+        family: ObservationRecordKind,
+    },
+    /// The record is preserved as cold material and is not accepted.
+    Cold {
+        /// Non-exact classification retained for a later bounded decision.
+        classification: RecordFamilyClassification,
+    },
+}
+
+/// Validates the v2 record at the real Governor consumer boundary.
+pub fn admit_record_family_v2(
+    record: &ObservationRecordEnvelopeV2,
+) -> Result<RecordFamilyAdmission, GovernorObservationError> {
+    match record.classification()? {
+        RecordFamilyClassification::Exact { family } => {
+            Ok(RecordFamilyAdmission::AcceptedExact { family })
+        }
+        classification => Ok(RecordFamilyAdmission::Cold { classification }),
+    }
+}
+
 impl ObservationCandidate {
     /// Validates the candidate without promoting its semantic status.
     pub fn validate(&self) -> Result<(), GovernorObservationError> {
@@ -292,6 +344,9 @@ pub struct ObservationSubmission {
     pub state_fence: StateFence,
     /// Normalized journal record.
     pub record: ObservationRecordEnvelope,
+    /// Optional family-complete v2 record for the additive admission edge.
+    #[serde(default)]
+    pub record_v2: Option<ObservationRecordEnvelopeV2>,
     /// Route through which the observation was captured.
     pub capture_route: CaptureRoute,
     /// Durability claimed by this submission.
@@ -311,6 +366,16 @@ impl ObservationSubmission {
         text(&self.idempotency_key, "submission.idempotency_key")?;
         self.state_fence.validate()?;
         self.record.validate()?;
+        if let Some(record_v2) = &self.record_v2 {
+            eliot_observation_contracts::check_v1_v2_coherence(&self.record, record_v2)?;
+            if let RecordFamilyAdmission::Cold { classification } =
+                admit_record_family_v2(record_v2)?
+            {
+                return Err(GovernorObservationError::RecordFamilyNotAccepted {
+                    disposition: classification,
+                });
+            }
+        }
         if !route_supports(self.capture_route, self.durability) {
             return Err(GovernorObservationError::InsufficientDurability);
         }
@@ -371,7 +436,20 @@ impl ObservationSubmission {
         if self.record.validate().is_err() {
             return None;
         }
-        let (disposition, reason_ref) = match &self.task_selection {
+        let valid_selection = self.task_selection.as_ref().filter(|selection| {
+            if selection.validate().is_err() {
+                return false;
+            }
+            let Some(event) = &self.record.event else {
+                return false;
+            };
+            let Some(task_ref) = &event.affected_scope.task_ref else {
+                return false;
+            };
+            selection.task_ref == *task_ref
+                && selection.work_scope_ref == event.affected_scope.work_scope.as_str()
+        });
+        let (disposition, reason_ref) = match valid_selection {
             Some(selection) if selection.is_contaminated() => (
                 CandidateDisposition::Quarantined,
                 "task-selection-contaminated",
@@ -419,6 +497,9 @@ pub struct ObservationAdmissionReceipt {
     pub state_fence: StateFence,
     /// Immutable normalized observation retained by the journal.
     pub record: ObservationRecordEnvelope,
+    /// Optional family-complete v2 record retained by the additive path.
+    #[serde(default)]
+    pub record_v2: Option<ObservationRecordEnvelopeV2>,
     /// Optional semantic evidence retained by exact handle/binding.
     pub evidence: Option<EvidenceEnvelope>,
     /// Capture route and durability recorded as observation metadata.
@@ -446,6 +527,9 @@ impl ObservationAdmissionReceipt {
         if self.record.record_id != self.record_id {
             return Err(GovernorObservationError::IdentityConflict);
         }
+        if let Some(record_v2) = &self.record_v2 {
+            eliot_observation_contracts::check_v1_v2_coherence(&self.record, record_v2)?;
+        }
         if let Some(evidence) = &self.evidence {
             evidence.validate()?;
             if evidence.state_fence != self.state_fence {
@@ -460,6 +544,7 @@ impl ObservationAdmissionReceipt {
             idempotency_key: self.idempotency_key.clone(),
             state_fence: self.state_fence.clone(),
             record: self.record.clone(),
+            record_v2: self.record_v2.clone(),
             capture_route: self.capture_route,
             durability: self.durability,
             plan: self.plan.clone(),
@@ -478,6 +563,12 @@ impl ObservationAdmissionReceipt {
         }
         if let Some(selection) = &self.task_selection {
             selection.validate()?;
+        }
+        if self.candidate_disposition != request.candidate_disposition() {
+            return Err(GovernorObservationError::InvalidField {
+                field: "admission.candidate_disposition",
+                reason: "must equal the disposition derived from the submission",
+            });
         }
         if let Some(value) = &self.evidence_digest {
             digest(value, "admission.evidence_digest")?;
@@ -593,8 +684,7 @@ impl ObservationJournal {
             text(&entry.idempotency_key, "journal_entry.idempotency_key")?;
             digest(&entry.request_digest, "journal_entry.request_digest")?;
             match &entry.result {
-                ObservationAdmissionResult::Accepted { receipt }
-                | ObservationAdmissionResult::Replayed { receipt } => {
+                ObservationAdmissionResult::Accepted { receipt } => {
                     receipt.validate()?;
                     if receipt.idempotency_key != entry.idempotency_key
                         || receipt.request_digest != entry.request_digest
@@ -615,6 +705,9 @@ impl ObservationJournal {
                     {
                         return Err(GovernorObservationError::IdentityConflict);
                     }
+                }
+                ObservationAdmissionResult::Replayed { .. } => {
+                    return Err(GovernorObservationError::PersistedReplay);
                 }
                 ObservationAdmissionResult::Rejected { rejection } => {
                     if rejection.idempotency_key != entry.idempotency_key
@@ -714,6 +807,7 @@ impl ObservationJournal {
             request_digest: request_digest.clone(),
             state_fence: submission.state_fence.clone(),
             record: submission.record.clone(),
+            record_v2: submission.record_v2.clone(),
             evidence: submission.evidence.clone(),
             capture_route: submission.capture_route,
             durability: submission.durability,
@@ -869,6 +963,7 @@ pub fn contract_identity() -> Result<ContractIdentity, GovernorObservationError>
             "plan_binding": schemars::schema_for!(ObservationPlanBinding),
             "task_selection": schemars::schema_for!(TaskSelectionEvidence),
             "candidate": schemars::schema_for!(ObservationCandidate),
+            "record_family_admission": schemars::schema_for!(RecordFamilyAdmission),
             "submission": schemars::schema_for!(ObservationSubmission),
             "admission": schemars::schema_for!(ObservationAdmissionReceipt),
             "rejection": schemars::schema_for!(ObservationAdmissionRejection),
@@ -876,4 +971,597 @@ pub fn contract_identity() -> Result<ContractIdentity, GovernorObservationError>
         }),
     )
     .map_err(GovernorObservationError::Foundation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_contracts::{AuthorityEpoch, ClockReading, ResourceGeneration};
+
+    fn fence() -> StateFence {
+        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    }
+
+    fn event() -> ObservationEventCore {
+        let Ok(work_scope) = "scope:test".parse() else {
+            unreachable!("fixture work scope is valid")
+        };
+        let Ok(interval) = CoverageInterval::new(1, 1) else {
+            unreachable!("fixture interval is valid")
+        };
+        ObservationEventCore {
+            event_id_and_time: ObservationEventIdentity {
+                event_id: "event:test".to_owned(),
+                clock: ClockReading::default(),
+            },
+            producer_generation_and_trace: ProducerTrace {
+                producer: "producer:test".to_owned(),
+                generation: "generation:test".to_owned(),
+                trace_ref: None,
+            },
+            kind: ObservationKind::QueueResource,
+            affected_scope: ObservationScope {
+                work_scope,
+                task_ref: None,
+                attempt_ref: None,
+                module_or_route_ref: None,
+            },
+            observed_delta: "queue observed".to_owned(),
+            expected_baseline: None,
+            evidence_and_raw_handles: vec!["raw:test".to_owned()],
+            coverage_and_blind_intervals: CoverageEvidence {
+                disposition: CoverageDisposition::Complete,
+                denominator_source_ref: "denominator:test".to_owned(),
+                interval: Some(interval),
+                blind_intervals: Vec::new(),
+                observed_count: 1,
+            },
+            privacy_retention_and_disclosure: PrivacyRetentionDisclosure {
+                privacy_domain_ref: "privacy:test".to_owned(),
+                retention_policy_ref: "retention:test".to_owned(),
+                disclosure_class: "internal".to_owned(),
+            },
+            candidate_importance: 1,
+            dedup_key: "dedup:test".to_owned(),
+        }
+    }
+
+    fn v1_submission() -> ObservationSubmission {
+        ObservationSubmission {
+            operation_id: "operation:test".to_owned(),
+            idempotency_key: "idempotency:test".to_owned(),
+            state_fence: fence(),
+            record: ObservationRecordEnvelope {
+                record_id: "record:test".to_owned(),
+                kind: ObservationRecordKind::Telemetry,
+                event: Some(event()),
+                coverage_gap: None,
+                journal_control_event: false,
+                parent_record_id: None,
+            },
+            capture_route: CaptureRoute::OperationalLog,
+            durability: Durability::Volatile,
+            plan: None,
+            task_selection: None,
+            evidence: None,
+            record_v2: None,
+        }
+    }
+
+    #[test]
+    fn v2_compatible_hint_is_cold_at_governor_boundary() {
+        let record = ObservationRecordEnvelopeV2 {
+            payload: RecordFamilyPayloadV2::AmbiguousOrdinary(AmbiguousOrdinaryRecordV2 {
+                record_id: "record:ambiguous".to_owned(),
+                event: event(),
+                source_contract_ref: "source:generic".to_owned(),
+                ambiguity_reason_ref: "family-fields-unavailable".to_owned(),
+            }),
+            caller_family_hint: Some(ObservationRecordKind::Telemetry),
+            parent_record_id: None,
+        };
+        assert_eq!(
+            admit_record_family_v2(&record)
+                .unwrap_or_else(|error| { panic!("valid v2 record rejected: {error}") }),
+            RecordFamilyAdmission::Cold {
+                classification: RecordFamilyClassification::CompatibleHint {
+                    hinted_family: ObservationRecordKind::Telemetry,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn v2_exact_family_reaches_the_bounded_governor_edge() {
+        let record = ObservationRecordEnvelopeV2 {
+            payload: RecordFamilyPayloadV2::Audit(eliot_observation_contracts::AuditRecord {
+                record_id: "record:audit".to_owned(),
+                core: event(),
+                audit_action: "checked".to_owned(),
+                state_fence: fence(),
+            }),
+            caller_family_hint: Some(ObservationRecordKind::Audit),
+            parent_record_id: None,
+        };
+        assert_eq!(
+            admit_record_family_v2(&record)
+                .unwrap_or_else(|error| { panic!("valid v2 record rejected: {error}") }),
+            RecordFamilyAdmission::AcceptedExact {
+                family: ObservationRecordKind::Audit,
+            }
+        );
+    }
+
+    #[test]
+    fn journal_admission_rejects_v2_compatible_material_as_cold() {
+        let mut submission = v1_submission();
+        submission.record_v2 = Some(ObservationRecordEnvelopeV2 {
+            payload: RecordFamilyPayloadV2::AmbiguousOrdinary(AmbiguousOrdinaryRecordV2 {
+                record_id: "record:test".to_owned(),
+                event: event(),
+                source_contract_ref: "source:generic".to_owned(),
+                ambiguity_reason_ref: "family-fields-unavailable".to_owned(),
+            }),
+            caller_family_hint: Some(ObservationRecordKind::Telemetry),
+            parent_record_id: None,
+        });
+        let mut journal = ObservationJournal::default();
+        let result = journal
+            .admit(submission)
+            .unwrap_or_else(|error| panic!("admission failed: {error}"));
+        let ObservationAdmissionResult::Rejected { rejection } = result else {
+            panic!("compatible material must not be accepted");
+        };
+        assert!(
+            rejection
+                .all_contract_errors
+                .iter()
+                .any(|error| error.contains("non-exact v2 record-family"))
+        );
+        assert_eq!(
+            rejection
+                .safe_capture_fallback
+                .map(|candidate| candidate.disposition),
+            Some(CandidateDisposition::Cold)
+        );
+    }
+
+    #[test]
+    fn journal_admission_retains_an_exact_v2_receipt() {
+        let mut submission = v1_submission();
+        submission.record.kind = ObservationRecordKind::Audit;
+        submission.record_v2 = Some(ObservationRecordEnvelopeV2 {
+            payload: RecordFamilyPayloadV2::Audit(eliot_observation_contracts::AuditRecord {
+                record_id: "record:test".to_owned(),
+                core: event(),
+                audit_action: "checked".to_owned(),
+                state_fence: fence(),
+            }),
+            caller_family_hint: Some(ObservationRecordKind::Audit),
+            parent_record_id: None,
+        });
+        let mut journal = ObservationJournal::default();
+        let result = journal
+            .admit(submission)
+            .unwrap_or_else(|error| panic!("admission failed: {error}"));
+        let ObservationAdmissionResult::Accepted { receipt } = result else {
+            panic!("exact v2 material should be accepted");
+        };
+        assert!(receipt.record_v2.is_some());
+        assert!(receipt.validate().is_ok());
+    }
+
+    #[test]
+    fn receipt_candidate_disposition_is_derived_not_caller_selected() {
+        let submission = v1_submission();
+        let mut journal = ObservationJournal::default();
+        let result = journal
+            .admit(submission)
+            .unwrap_or_else(|error| panic!("admission failed: {error}"));
+        let ObservationAdmissionResult::Accepted { mut receipt } = result else {
+            panic!("expected accepted receipt");
+        };
+        receipt.candidate_disposition = CandidateDisposition::TaskBound;
+        assert!(matches!(
+            receipt.validate(),
+            Err(GovernorObservationError::InvalidField {
+                field: "admission.candidate_disposition",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn persisted_replayed_entry_is_rejected_during_rebuild() {
+        let submission = v1_submission();
+        let mut journal = ObservationJournal::default();
+        let result = journal
+            .admit(submission)
+            .unwrap_or_else(|error| panic!("admission failed: {error}"));
+        let ObservationAdmissionResult::Accepted { receipt } = result else {
+            panic!("expected accepted receipt");
+        };
+        let entry = ObservationJournalEntry {
+            idempotency_key: receipt.idempotency_key.clone(),
+            request_digest: receipt.request_digest.clone(),
+            result: ObservationAdmissionResult::Replayed { receipt },
+        };
+        assert!(matches!(
+            ObservationJournal::from_entries([entry]),
+            Err(GovernorObservationError::PersistedReplay)
+        ));
+    }
+    #[test]
+    fn coherence_rejects_telemetry_v1_with_audit_v2() {
+        let mut submission = v1_submission();
+        // v1 is Telemetry, v2 is Audit with same record_id => family mismatch
+        submission.record_v2 = Some(ObservationRecordEnvelopeV2 {
+            payload: RecordFamilyPayloadV2::Audit(eliot_observation_contracts::AuditRecord {
+                record_id: "record:test".to_owned(),
+                core: event(),
+                audit_action: "checked".to_owned(),
+                state_fence: fence(),
+            }),
+            caller_family_hint: Some(ObservationRecordKind::Audit),
+            parent_record_id: None,
+        });
+        let mut journal = ObservationJournal::default();
+        let result = journal
+            .admit(submission)
+            .unwrap_or_else(|error| panic!("admission failed: {error}"));
+        let ObservationAdmissionResult::Rejected { rejection } = result else {
+            panic!("telemetry/audit mismatch must be rejected");
+        };
+        assert!(
+            rejection
+                .all_contract_errors
+                .iter()
+                .any(|e| e.contains("family mismatch") || e.contains("ShapeConflict"))
+        );
+    }
+
+    #[test]
+    fn coherence_journal_control_audit_mapping() {
+        // Wrong non-Audit family should reject
+        let mut wrong = v1_submission();
+        wrong.record.kind = ObservationRecordKind::Audit;
+        wrong.record.journal_control_event = true;
+        wrong.record_v2 = Some(ObservationRecordEnvelopeV2 {
+            payload: RecordFamilyPayloadV2::Telemetry(
+                eliot_observation_contracts::TelemetryRecord {
+                    record_id: "record:test".to_owned(),
+                    core: event(),
+                    capture_mode: CaptureMode::Sampled,
+                    sample_count: 1,
+                    raw_evidence_handle: Some("blob:1".to_owned()),
+                },
+            ),
+            caller_family_hint: Some(ObservationRecordKind::Telemetry),
+            parent_record_id: None,
+        });
+        let mut journal = ObservationJournal::default();
+        let result = journal
+            .admit(wrong)
+            .unwrap_or_else(|e| panic!("admission failed: {e}"));
+        assert!(
+            matches!(result, ObservationAdmissionResult::Rejected { .. }),
+            "journal-control with wrong family must reject"
+        );
+
+        // Correct JournalControlAudit mapping must accept
+        let mut correct = v1_submission();
+        correct.record.kind = ObservationRecordKind::Audit;
+        correct.record.journal_control_event = true;
+        correct.record.record_id = "record:control".to_owned();
+        correct.record_v2 = Some(ObservationRecordEnvelopeV2 {
+            payload: RecordFamilyPayloadV2::JournalControlAudit(
+                eliot_observation_contracts::JournalControlAuditRecordV2 {
+                    record_id: "record:control".to_owned(),
+                    event: event(),
+                },
+            ),
+            caller_family_hint: Some(ObservationRecordKind::Audit),
+            parent_record_id: None,
+        });
+        // v1 also needs event for Audit? journal_control true already has event
+        let mut journal2 = ObservationJournal::default();
+        let result2 = journal2
+            .admit(correct)
+            .unwrap_or_else(|e| panic!("admission failed: {e}"));
+        let ObservationAdmissionResult::Accepted { receipt } = result2 else {
+            panic!("correct journal-control audit mapping must be accepted");
+        };
+        assert!(receipt.validate().is_ok());
+        assert!(receipt.record.journal_control_event);
+    }
+
+    #[test]
+    fn coherence_coverage_mismatch_rejected() {
+        let mut submission = v1_submission();
+        // v1 is CoverageGap but v2 is Telemetry => mismatch
+        submission.record.kind = ObservationRecordKind::CoverageGap;
+        submission.record.event = None;
+        submission.record.coverage_gap = Some(eliot_observation_contracts::CoverageGap {
+            gap_id: "gap:1".to_owned(),
+            obligation_profile_ref: "profile:1".to_owned(),
+            reason_ref: "reason:1".to_owned(),
+            affected_interval: None,
+            disposition: GapDisposition::DegradeDependentGuarantees,
+            protected: false,
+            evidence_refs: vec!["evidence:1".to_owned()],
+        });
+        submission.record_v2 = Some(ObservationRecordEnvelopeV2 {
+            payload: RecordFamilyPayloadV2::Telemetry(
+                eliot_observation_contracts::TelemetryRecord {
+                    record_id: "record:test".to_owned(),
+                    core: event(),
+                    capture_mode: CaptureMode::Sampled,
+                    sample_count: 1,
+                    raw_evidence_handle: Some("blob:1".to_owned()),
+                },
+            ),
+            caller_family_hint: Some(ObservationRecordKind::Telemetry),
+            parent_record_id: None,
+        });
+        let mut journal = ObservationJournal::default();
+        let result = journal
+            .admit(submission)
+            .unwrap_or_else(|e| panic!("admission failed: {e}"));
+        assert!(
+            matches!(result, ObservationAdmissionResult::Rejected { .. }),
+            "coverage mismatch must reject"
+        );
+    }
+
+    #[test]
+    fn coherence_parent_mismatch_rejected() {
+        let mut submission = v1_submission();
+        submission.record.kind = ObservationRecordKind::Audit;
+        submission.record.parent_record_id = Some("parent:1".to_owned());
+        submission.record_v2 = Some(ObservationRecordEnvelopeV2 {
+            payload: RecordFamilyPayloadV2::Audit(eliot_observation_contracts::AuditRecord {
+                record_id: "record:test".to_owned(),
+                core: event(),
+                audit_action: "checked".to_owned(),
+                state_fence: fence(),
+            }),
+            caller_family_hint: Some(ObservationRecordKind::Audit),
+            parent_record_id: Some("parent:2".to_owned()),
+        });
+        let mut journal = ObservationJournal::default();
+        let result = journal
+            .admit(submission)
+            .unwrap_or_else(|e| panic!("admission failed: {e}"));
+        assert!(
+            matches!(result, ObservationAdmissionResult::Rejected { .. }),
+            "parent mismatch must reject"
+        );
+
+        // presence contradiction: v1 has parent, v2 None
+        let mut submission2 = v1_submission();
+        submission2.record.kind = ObservationRecordKind::Audit;
+        submission2.record.parent_record_id = Some("parent:1".to_owned());
+        submission2.record_v2 = Some(ObservationRecordEnvelopeV2 {
+            payload: RecordFamilyPayloadV2::Audit(eliot_observation_contracts::AuditRecord {
+                record_id: "record:test".to_owned(),
+                core: event(),
+                audit_action: "checked".to_owned(),
+                state_fence: fence(),
+            }),
+            caller_family_hint: Some(ObservationRecordKind::Audit),
+            parent_record_id: None,
+        });
+        let mut journal2 = ObservationJournal::default();
+        let result2 = journal2
+            .admit(submission2)
+            .unwrap_or_else(|e| panic!("admission failed: {e}"));
+        assert!(
+            matches!(result2, ObservationAdmissionResult::Rejected { .. }),
+            "parent presence contradiction must reject"
+        );
+    }
+
+    #[test]
+    fn coherence_caller_hint_conflict_remains_fail_closed() {
+        // v2 payload Audit with hint Telemetry => FamilyHintConflict
+        let mut submission = v1_submission();
+        submission.record.kind = ObservationRecordKind::Audit;
+        submission.record_v2 = Some(ObservationRecordEnvelopeV2 {
+            payload: RecordFamilyPayloadV2::Audit(eliot_observation_contracts::AuditRecord {
+                record_id: "record:test".to_owned(),
+                core: event(),
+                audit_action: "checked".to_owned(),
+                state_fence: fence(),
+            }),
+            caller_family_hint: Some(ObservationRecordKind::Telemetry),
+            parent_record_id: None,
+        });
+        let mut journal = ObservationJournal::default();
+        let result = journal
+            .admit(submission)
+            .unwrap_or_else(|e| panic!("admission failed: {e}"));
+        let ObservationAdmissionResult::Rejected { rejection } = result else {
+            panic!("hint conflict must be rejected");
+        };
+        assert!(
+            rejection
+                .all_contract_errors
+                .iter()
+                .any(|e| e.contains("hint")
+                    || e.contains("FamilyHintConflict")
+                    || e.contains("family"))
+        );
+    }
+
+    #[test]
+    fn coherence_persisted_contradictory_receipt_rejected_on_rebuild() {
+        // Build a valid accepted receipt then tamper v2 to be contradictory
+        let mut submission = v1_submission();
+        submission.record.kind = ObservationRecordKind::Audit;
+        submission.record_v2 = Some(ObservationRecordEnvelopeV2 {
+            payload: RecordFamilyPayloadV2::Audit(eliot_observation_contracts::AuditRecord {
+                record_id: "record:test".to_owned(),
+                core: event(),
+                audit_action: "checked".to_owned(),
+                state_fence: fence(),
+            }),
+            caller_family_hint: Some(ObservationRecordKind::Audit),
+            parent_record_id: None,
+        });
+        let mut journal = ObservationJournal::default();
+        let result = journal
+            .admit(submission)
+            .unwrap_or_else(|e| panic!("admission failed: {e}"));
+        let ObservationAdmissionResult::Accepted { mut receipt } = result else {
+            panic!("expected accepted");
+        };
+        // tamper receipt to have contradictory family: change v2 to Telemetry but keep v1 Audit
+        receipt.record_v2 = Some(ObservationRecordEnvelopeV2 {
+            payload: RecordFamilyPayloadV2::Telemetry(
+                eliot_observation_contracts::TelemetryRecord {
+                    record_id: "record:test".to_owned(),
+                    core: event(),
+                    capture_mode: CaptureMode::Sampled,
+                    sample_count: 1,
+                    raw_evidence_handle: Some("blob:1".to_owned()),
+                },
+            ),
+            caller_family_hint: Some(ObservationRecordKind::Telemetry),
+            parent_record_id: None,
+        });
+        // receipt.validate should now fail closed
+        assert!(
+            receipt.validate().is_err(),
+            "contradictory persisted receipt must fail validation"
+        );
+        // rebuild must also fail
+        let entry = ObservationJournalEntry {
+            idempotency_key: receipt.idempotency_key.clone(),
+            request_digest: receipt.request_digest.clone(),
+            result: ObservationAdmissionResult::Accepted { receipt },
+        };
+        assert!(
+            ObservationJournal::from_entries([entry]).is_err(),
+            "rebuild with contradictory receipt must reject"
+        );
+        // also test parent contradiction in persisted receipt
+        let mut submission2 = v1_submission();
+        submission2.record.kind = ObservationRecordKind::Audit;
+        submission2.record.parent_record_id = None;
+        submission2.record_v2 = Some(ObservationRecordEnvelopeV2 {
+            payload: RecordFamilyPayloadV2::Audit(eliot_observation_contracts::AuditRecord {
+                record_id: "record:test2".to_owned(),
+                core: event(),
+                audit_action: "checked".to_owned(),
+                state_fence: fence(),
+            }),
+            caller_family_hint: Some(ObservationRecordKind::Audit),
+            parent_record_id: None,
+        });
+        submission2.operation_id = "operation:test2".to_owned();
+        submission2.idempotency_key = "idempotency:test2".to_owned();
+        submission2.record.record_id = "record:test2".to_owned();
+        let mut journal2 = ObservationJournal::default();
+        let result2 = journal2
+            .admit(submission2)
+            .unwrap_or_else(|e| panic!("admission failed: {e}"));
+        let ObservationAdmissionResult::Accepted {
+            receipt: mut receipt2,
+        } = result2
+        else {
+            panic!("expected accepted2");
+        };
+        // tamper parent to mismatch
+        receipt2.record.parent_record_id = Some("parent:tampered".to_owned());
+        // v2 still has None, so coherence fails
+        assert!(
+            receipt2.validate().is_err(),
+            "parent contradictory persisted receipt must fail"
+        );
+        assert!(
+            ObservationJournal::from_entries([ObservationJournalEntry {
+                idempotency_key: receipt2.idempotency_key.clone(),
+                request_digest: receipt2.request_digest.clone(),
+                result: ObservationAdmissionResult::Accepted { receipt: receipt2 },
+            }])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn positive_aligned_exact_family_deterministic_and_byte_stable() {
+        // Telemetry aligned
+        let mut sub = v1_submission();
+        sub.operation_id = "op:pos1".to_owned();
+        sub.idempotency_key = "idem:pos1".to_owned();
+        sub.record.record_id = "record:pos1".to_owned();
+        sub.record.kind = ObservationRecordKind::Telemetry;
+        sub.record_v2 = Some(ObservationRecordEnvelopeV2 {
+            payload: RecordFamilyPayloadV2::Telemetry(
+                eliot_observation_contracts::TelemetryRecord {
+                    record_id: "record:pos1".to_owned(),
+                    core: event(),
+                    capture_mode: CaptureMode::Sampled,
+                    sample_count: 2,
+                    raw_evidence_handle: Some("blob:pos1".to_owned()),
+                },
+            ),
+            caller_family_hint: Some(ObservationRecordKind::Telemetry),
+            parent_record_id: None,
+        });
+        let mut j1 = ObservationJournal::default();
+        let r1 = j1
+            .admit(sub.clone())
+            .unwrap_or_else(|e| panic!("admit failed: {e}"));
+        let mut j2 = ObservationJournal::default();
+        let r2 = j2
+            .admit(sub.clone())
+            .unwrap_or_else(|e| panic!("admit failed: {e}"));
+        assert_eq!(r1, r2, "aligned submission must be deterministic");
+        if let ObservationAdmissionResult::Accepted { receipt } = r1 {
+            let bytes1 =
+                serde_json::to_vec(&receipt).unwrap_or_else(|e| panic!("serde failed: {e}"));
+            let bytes2 =
+                serde_json::to_vec(&receipt).unwrap_or_else(|e| panic!("serde failed: {e}"));
+            assert_eq!(bytes1, bytes2);
+            // rebuild from persisted entry must succeed and preserve receipt
+            let entry = ObservationJournalEntry {
+                idempotency_key: receipt.idempotency_key.clone(),
+                request_digest: receipt.request_digest.clone(),
+                result: ObservationAdmissionResult::Accepted {
+                    receipt: receipt.clone(),
+                },
+            };
+            let rebuilt = ObservationJournal::from_entries([entry])
+                .unwrap_or_else(|e| panic!("rebuild failed: {e}"));
+            let snap = rebuilt.snapshot();
+            assert_eq!(snap.len(), 1);
+            // cold semantics: ambiguous remains cold
+            let mut cold_sub = v1_submission();
+            cold_sub.operation_id = "op:cold".to_owned();
+            cold_sub.idempotency_key = "idem:cold".to_owned();
+            cold_sub.record.record_id = "record:cold".to_owned();
+            cold_sub.record.kind = ObservationRecordKind::Telemetry;
+            cold_sub.record_v2 = Some(ObservationRecordEnvelopeV2 {
+                payload: RecordFamilyPayloadV2::AmbiguousOrdinary(AmbiguousOrdinaryRecordV2 {
+                    record_id: "record:cold".to_owned(),
+                    event: event(),
+                    source_contract_ref: "source:generic".to_owned(),
+                    ambiguity_reason_ref: "family-fields-unavailable".to_owned(),
+                }),
+                caller_family_hint: Some(ObservationRecordKind::Telemetry),
+                parent_record_id: None,
+            });
+            let mut jc = ObservationJournal::default();
+            let cr = jc
+                .admit(cold_sub)
+                .unwrap_or_else(|e| panic!("admit failed: {e}"));
+            assert!(
+                matches!(cr, ObservationAdmissionResult::Rejected { .. }),
+                "ambiguous must remain cold"
+            );
+        } else {
+            panic!("positive aligned must be accepted");
+        }
+    }
 }
