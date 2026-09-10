@@ -25,6 +25,7 @@ pub mod grounding;
 pub mod job;
 pub mod registry;
 pub mod relation;
+pub mod rival;
 pub mod screen;
 pub mod self_query;
 pub mod validation;
@@ -116,6 +117,17 @@ pub use relation::{
     RelationPreservationVerdict, RelationRegistrySnapshot, RelationRollback, RelationSnapshot,
     RelationTemporalEvidence, RelationTimePoint, RelationVerifier, relation_input_digest,
     seal_relation, validate_relation,
+};
+pub use rival::{
+    ClaimDeclarations, CommonModeDisclosure, ConditionAssumptionRef, CurrentPositionAvailability,
+    CurrentPositionBinding, DeclarationAvailability, ForecastAvailability, MaterialClaimRef,
+    PredictionAvailability, RIVAL_DECLARATION_SET_SCHEMA_VERSION, RIVAL_MODEL_SCHEMA_VERSION,
+    RIVAL_PREDICTION_SCHEMA_VERSION, RelatedRivalModelReference, RivalAssumptionSlot,
+    RivalClaimSlot, RivalCoverageDeclaration, RivalCoverageReceipt, RivalDeclarationSet,
+    RivalDeclarationSetParams, RivalDependency, RivalForecast, RivalModelDeclaration,
+    RivalModelDeclarationParams, RivalModelRef, RivalModelSlot, RivalPrediction,
+    RivalPredictionParams, RivalPredictionRef, RivalPredictionSlot, RivalSourceSlot,
+    SuppliedLineage, TemporalAvailability, VerifierAvailability,
 };
 pub use screen::{ScreenBinding, ScreenEligibility, ScreenReference, ScreenState};
 pub use self_query::{
