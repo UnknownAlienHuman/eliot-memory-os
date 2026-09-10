@@ -9,8 +9,8 @@ use eliot_governor::{GovernorLaunchConfig, KernelGenerationExpectation};
 use eliot_installation::{
     AgentBridgeSourceMaterializationFactory, AgentBridgeSourceMaterializationPlan, AuthorityEpoch,
     GenerationPackagePlanner, InstallationEpoch, InstallationError, InstallationProfile,
-    LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlatformHandle,
-    RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
+    InstallationRecoveryStage, LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PackageArtifactDigest,
+    PlatformHandle, RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
     RuntimeStateRoots, SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
     SourceBundlePublicationJournal, SourceBundlePublicationJournalState,
     SourceBundlePublicationRole, StateFence, SupervisionAuthorityBinding,
@@ -259,6 +259,15 @@ pub enum MaterializeError {
     Platform(String),
     #[error("materialize typed contract rejected: {0}")]
     Contract(String),
+    #[error(
+        "materialize recovery required for {operation} at {stage:?} ({source_context}); cleanup={cleanup:?}"
+    )]
+    RecoveryRequired {
+        operation: String,
+        stage: InstallationRecoveryStage,
+        source_context: String,
+        cleanup: Option<String>,
+    },
 }
 
 impl From<MaterializeError> for InstallationError {
@@ -272,6 +281,17 @@ impl From<MaterializeError> for InstallationError {
             MaterializeError::Contract(reason) => Self::InvalidField {
                 field: "source_bundle_materialize.typed_contract".to_owned(),
                 reason,
+            },
+            MaterializeError::RecoveryRequired {
+                operation,
+                stage,
+                source_context,
+                cleanup,
+            } => Self::RecoveryRequired {
+                operation,
+                stage,
+                source_context,
+                cleanup,
             },
         }
     }
@@ -1011,38 +1031,8 @@ fn write_create_new(path: &Path, bytes: &[u8]) -> Result<(), MaterializeError> {
 
 #[cfg(windows)]
 fn sync_directory(path: &Path) -> Result<(), MaterializeError> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-
-    let directory = OpenOptions::new()
-        .read(true)
-        // The retained publication root itself denies delete sharing and
-        // carries DELETE access for the eventual native rename.  This
-        // readback handle must explicitly share DELETE to coexist with that
-        // exact root handle; it cannot authorize a rename while the root is
-        // retained.
-        .share_mode(FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|error| MaterializeError::Platform(format!("open temporary bundle: {error}")))?;
-    let metadata = directory
-        .metadata()
-        .map_err(|error| MaterializeError::Platform(format!("stat temporary bundle: {error}")))?;
-    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(MaterializeError::Invalid(
-            "temporary bundle is not a regular directory".to_owned(),
-        ));
-    }
-    // Windows does not support flushing a directory handle on every file
-    // system and may return ERROR_ACCESS_DENIED even after a valid no-follow
-    // directory open. Every role file is already flushed before this point;
-    // retain the directory validation and treat the platform flush as best
-    // effort, matching the platform's existing atomic staging helper.
-    let _ = directory.sync_all();
-    Ok(())
+    eliot_platform_windows::sync_directory_for_publication(path)
+        .map_err(|error| MaterializeError::Platform(format!("sync temporary bundle: {error}")))
 }
 
 #[cfg(not(windows))]
@@ -1350,7 +1340,14 @@ fn persist_unknown_publication(
     };
     let recorded = store
         .record_source_bundle_publication(&unknown)
-        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+        .map_err(|error| MaterializeError::RecoveryRequired {
+            operation: journal.operation_id.as_str().to_owned(),
+            stage: InstallationRecoveryStage::Recovery,
+            source_context: diagnostic.clone(),
+            cleanup: Some(format!(
+                "durable unknown-publication record failed: {error}"
+            )),
+        })?;
     Ok(journal_unknown_outcome(
         &recorded,
         precommit_files,
@@ -1668,7 +1665,14 @@ fn materialize_with_executables(
             }
         }
     }
-    sync_directory(&temp)?;
+    sync_directory(&temp).map_err(|error| MaterializeError::RecoveryRequired {
+        operation: input.transaction_id.as_str().to_owned(),
+        stage: InstallationRecoveryStage::ParentSync,
+        source_context: temp.to_string_lossy().into_owned(),
+        cleanup: Some(format!(
+            "temporary publication retained for exact recovery after sync failure: {error}"
+        )),
+    })?;
 
     let precommit_bundle = publication.trusted_source_bundle().map_err(|error| {
         MaterializeError::Platform(format!("open precommit source bundle: {error}"))

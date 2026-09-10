@@ -13,14 +13,17 @@ use super::{
 pub const PROCESS_STREAM_SINK_SCHEMA_VERSION: &str = "eliot-process-stream-sink-v1";
 const MAX_REFERENCE_BYTES: usize = 256;
 const MAX_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_APPEND_WIRE_BYTES: usize = 16 * 1024 * 1024;
 
 mod command;
+mod model;
 mod port;
 mod requests;
 mod terminal;
 mod types;
 
 pub use command::{ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkTerminalCommandKind};
+pub use model::ProcessStreamSinkModel;
 pub use port::{ProcessStreamSinkClient, ProcessStreamSinkFuture};
 pub use requests::{
     ProcessStreamSinkAbortReason, ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend,
@@ -190,6 +193,8 @@ pub enum ProcessStreamSinkError {
     MismatchedReplay,
     #[error("chunk size exceeds the session ceiling")]
     ChunkLimitExceeded,
+    #[error("append payload exceeds the protocol byte ceiling")]
+    AppendPayloadLimitExceeded,
     #[error("total admitted bytes exceed the session ceiling")]
     TotalLimitExceeded,
     #[error("admitted chunk count exceeds the session ceiling")]
@@ -206,6 +211,8 @@ pub enum ProcessStreamSinkError {
     Terminal,
     #[error("terminal identity conflicts with the existing terminal")]
     TerminalIdentityConflict,
+    #[error("terminal command is incompatible with the requested terminal state")]
+    TerminalCommandStateMismatch,
     #[error("terminal/evidence invariant failed: {reason}")]
     EvidenceInvariant { reason: String },
     #[error("provider unavailable before an exact session result")]

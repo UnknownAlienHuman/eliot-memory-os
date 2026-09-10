@@ -87,6 +87,8 @@ pub enum PublicationUnknown {
     PostCommitIdentityUnavailable,
     /// The destination was replaced again before the receipt could be bound.
     DestinationIdentityChanged,
+    /// Replacement committed but the parent directory entry was not flushed.
+    ParentSyncUnavailable,
 }
 
 /// Reconciliation evidence returned after a replacement whose final provider
@@ -245,7 +247,14 @@ pub fn publish_atomic_owned_runtime_receipt(
             let _ = std::fs::remove_file(&temporary);
             return Err(error);
         }
-        flush_directory(&pins);
+        if flush_directory(&pins).is_err() {
+            #[cfg(any(test, feature = "test-support"))]
+            TEST_RECEIPT_PUBLICATION_UNKNOWN.with(|slot| slot.replace(false));
+            return Ok(PublicationOutcome::Unknown(PublicationUnknownReceipt {
+                reason: PublicationUnknown::ParentSyncUnavailable,
+                expected_identity: staged_identity,
+            }));
+        }
         #[cfg(any(test, feature = "test-support"))]
         if TEST_RECEIPT_PUBLICATION_UNKNOWN.with(|slot| slot.replace(false)) {
             return Ok(PublicationOutcome::Unknown(PublicationUnknownReceipt {

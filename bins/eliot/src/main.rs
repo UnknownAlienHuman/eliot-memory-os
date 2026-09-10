@@ -1462,6 +1462,13 @@ fn run_installation_materialize_source_bundle(
                 return Ok(UNKNOWN_OUTCOME_EXIT);
             }
             Err(error) => {
+                if let InstallationError::RecoveryRequired { .. } = &error {
+                    write_installation_error(
+                        "SOURCE_BUNDLE_MATERIALIZATION_RECOVERY_REQUIRED",
+                        &error.to_string(),
+                    );
+                    return Ok(UNKNOWN_OUTCOME_EXIT);
+                }
                 write_installation_error(
                     "SOURCE_BUNDLE_MATERIALIZATION_REJECTED",
                     &error.to_string(),

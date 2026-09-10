@@ -15,6 +15,10 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod epoch_identity;
+
+pub use epoch_identity::*;
+
 /// The current wire revision of this foundation surface.
 pub const CONTRACT_NAME: &str = "eliot.foundation.contracts";
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
