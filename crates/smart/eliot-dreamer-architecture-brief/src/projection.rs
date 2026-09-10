@@ -23,6 +23,7 @@ use crate::synthesis::{
 };
 
 const ZERO_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const MAX_CANONICAL_WRAPPER_BYTES: u64 = 16 * 1024 * 1024;
 
 struct WorkMeter {
     used: u64,
@@ -46,6 +47,13 @@ impl WorkMeter {
         self.used = next;
         Ok(())
     }
+}
+
+struct Selection {
+    selected: BTreeSet<ArtifactId>,
+    unresolved: BTreeSet<ArtifactId>,
+    required_unresolved: bool,
+    frontier: Vec<String>,
 }
 
 struct CountingWriter {
@@ -131,18 +139,31 @@ impl ArchitectureBriefProjection {
 
     /// Validates wrapper lineage, resource bounds and the projection digest.
     pub fn validate(&self) -> Result<(), SelfQueryContractError> {
-        self.candidate.validate()?;
-        self.model_synthesis.validate()?;
-        if self.question.trim().is_empty() || self.question.chars().any(char::is_control) {
-            return Err(SelfQueryContractError::Missing {
-                field: "projection.question",
-            });
-        }
         if self.question.len() > 64 * 1024 {
             return Err(SelfQueryContractError::Bound {
                 field: "projection.question",
                 maximum: 64 * 1024,
                 actual: self.question.len(),
+            });
+        }
+        self.candidate.policy.validate()?;
+        self.model_synthesis.validate()?;
+        let maximum = usize::try_from(
+            self.candidate
+                .policy
+                .max_output_bytes
+                .min(MAX_CANONICAL_WRAPPER_BYTES),
+        )
+        .unwrap_or(usize::MAX);
+        let measured = bounded_canonical_size(self, maximum, "projection.output_wire")?;
+        if measured != usize::try_from(self.total_output_bytes).unwrap_or(usize::MAX) {
+            return Err(SelfQueryContractError::BindingMismatch {
+                field: "projection.total_output_bytes",
+            });
+        }
+        if self.question.trim().is_empty() || self.question.chars().any(char::is_control) {
+            return Err(SelfQueryContractError::Missing {
+                field: "projection.question",
             });
         }
         if self
@@ -174,18 +195,7 @@ impl ArchitectureBriefProjection {
                 field: "projection.budget_limits",
             }
         })?;
-        let maximum = usize::try_from(self.candidate.policy.max_output_bytes).unwrap_or(usize::MAX);
-        let measured = bounded_canonical_size(self, maximum, "projection.output_wire")?;
-        let output = canonical_json_bytes(self).map_err(|_| SelfQueryContractError::Encoding {
-            field: "projection.output_wire",
-        })?;
-        if measured != output.len()
-            || measured != usize::try_from(self.total_output_bytes).unwrap_or(usize::MAX)
-        {
-            return Err(SelfQueryContractError::BindingMismatch {
-                field: "projection.total_output_bytes",
-            });
-        }
+        self.candidate.validate()?;
         if self.total_output_bytes > self.candidate.policy.max_output_bytes {
             return Err(SelfQueryContractError::Bound {
                 field: "projection.total_output_bytes",
@@ -225,7 +235,11 @@ impl ArchitectureBriefProjection {
     }
 }
 
-/// Builds the pure ArchitectureSelfQuery → ArchitectureBrief projection.
+/// Builds the pure `ArchitectureSelfQuery` → `ArchitectureBrief` projection.
+#[expect(
+    clippy::too_many_lines,
+    reason = "explicit bounded projection orchestration keeps wire construction auditable"
+)]
 pub fn project_architecture_brief(
     input: &SelfQueryInput,
 ) -> Result<ArchitectureBriefProjection, SelfQueryContractError> {
@@ -238,11 +252,15 @@ pub fn project_architecture_brief(
     let mut meter = WorkMeter::new(input.policy.max_work);
     meter.charge("projection.work_units")?;
     let input_digest = input.input_digest()?;
-    let (selected, unresolved, required_unresolved, mut frontier) =
-        select_governing_closure(input, &mut meter)?;
+    let Selection {
+        selected,
+        unresolved,
+        required_unresolved,
+        mut frontier,
+    } = select_governing_closure(input, &mut meter)?;
     let mut sections = sections_for(input, &selected, &mut meter)?;
     sections.sort_by_key(|section| section.kind);
-    let mut gaps = gaps_for(input, &unresolved, &mut meter)?;
+    let gaps = gaps_for(input, &unresolved, &mut meter)?;
     let mut omissions = omissions_for(input, &mut meter)?;
     omissions.sort_by(|left, right| left.handle.cmp(&right.handle));
 
@@ -271,8 +289,9 @@ pub fn project_architecture_brief(
 
     let source_status = input.source.as_ref().map(|source| source.status);
     let mut disposition = match source_status {
-        None => ArchitectureBriefDisposition::NoSource,
-        Some(ArchitectureSourceStatus::Unavailable) => ArchitectureBriefDisposition::NoSource,
+        None | Some(ArchitectureSourceStatus::Unavailable) => {
+            ArchitectureBriefDisposition::NoSource
+        }
         Some(
             ArchitectureSourceStatus::Draft
             | ArchitectureSourceStatus::Rejected
@@ -321,7 +340,7 @@ pub fn project_architecture_brief(
     .unwrap_or(u64::MAX);
     let reference_width =
         retained_reference_width(input, &gaps, &omissions, &expansion_handles, &mut meter)?;
-    let mut usage = eliot_dreamer_contracts::BudgetUsage {
+    let usage = eliot_dreamer_contracts::BudgetUsage {
         input_bytes,
         output_bytes: 0,
         source_width: u64::from(input.source.is_some()),
@@ -474,18 +493,14 @@ pub fn project_architecture_brief(
     Ok(projection)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "explicit bounded governing-closure traversal keeps authority checks auditable"
+)]
 fn select_governing_closure(
     input: &SelfQueryInput,
     meter: &mut WorkMeter,
-) -> Result<
-    (
-        BTreeSet<ArtifactId>,
-        BTreeSet<ArtifactId>,
-        bool,
-        Vec<String>,
-    ),
-    SelfQueryContractError,
-> {
+) -> Result<Selection, SelfQueryContractError> {
     if input
         .source
         .as_ref()
@@ -529,7 +544,12 @@ fn select_governing_closure(
                         | ArchitectureDependencyKind::GlobalBoundary
                 )
         });
-        return Ok((BTreeSet::new(), unresolved, required_unresolved, frontier));
+        return Ok(Selection {
+            selected: BTreeSet::new(),
+            unresolved,
+            required_unresolved,
+            frontier,
+        });
     }
     let by_id = input
         .anchors
@@ -609,13 +629,8 @@ fn select_governing_closure(
         }
     }
     for member in &input.denominator.members {
-        if (member.required
-            && matches!(
-                member.kind,
-                ArchitectureDependencyKind::HardBoundary
-                    | ArchitectureDependencyKind::GlobalBoundary
-            )
-            || member.kind == ArchitectureDependencyKind::GlobalBoundary)
+        if member.required && member.kind == ArchitectureDependencyKind::HardBoundary
+            || member.kind == ArchitectureDependencyKind::GlobalBoundary
         {
             let state = by_id
                 .get(&member.anchor_id)
@@ -635,7 +650,12 @@ fn select_governing_closure(
             }
         }
     }
-    Ok((selected, unresolved, required_unresolved, frontier))
+    Ok(Selection {
+        selected,
+        unresolved,
+        required_unresolved,
+        frontier,
+    })
 }
 
 fn sections_for(

@@ -1,4 +1,4 @@
-//! Errors for the pure ArchitectureBrief projection boundary.
+//! Errors for the pure `ArchitectureBrief` projection boundary.
 
 /// The projection reuses the exact self-query contract error vocabulary.
 ///
