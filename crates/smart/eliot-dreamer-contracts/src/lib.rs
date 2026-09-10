@@ -25,6 +25,7 @@ pub mod job;
 pub mod registry;
 pub mod relation;
 pub mod screen;
+pub mod self_query;
 pub mod validation;
 
 pub use assembly::{
@@ -105,6 +106,17 @@ pub use relation::{
     seal_relation, validate_relation,
 };
 pub use screen::{ScreenBinding, ScreenEligibility, ScreenReference, ScreenState};
+pub use self_query::{
+    ArchitectureAnchor, ArchitectureAnchorClass, ArchitectureApplicability,
+    ArchitectureApplicabilityBasis, ArchitectureApplicabilityState, ArchitectureBriefCandidate,
+    ArchitectureBriefDisposition, ArchitectureBriefGap, ArchitectureBriefGapClass,
+    ArchitectureBriefGapState, ArchitectureBriefOmission, ArchitectureBriefSection,
+    ArchitectureBriefSectionKind, ArchitectureBriefStatement, ArchitectureDependencyDenominator,
+    ArchitectureDependencyKind, ArchitectureDependencyMember, ArchitectureSourceSnapshot,
+    ArchitectureSourceStatus, ArchitectureStatementModality, AttemptBinding, NormativePairBinding,
+    SelfQueryContractError, SelfQueryInput, SelfQueryOutputProfile, SelfQueryPolicy,
+    SelfQueryProfile,
+};
 pub use validation::{DreamDraftValidationError, ValidatedCandidate, ValidationPolicy};
 
 /// Contract hub identity (`name@version`).
