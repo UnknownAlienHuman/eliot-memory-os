@@ -258,6 +258,10 @@ impl PossibleResultSchema {
         ))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one bounded pass validates matrix identity and branch coverage"
+    )]
     fn validate_shape(&self) -> Result<(), ContractViolation> {
         if self.schema_version != PROBE_RESULT_SCHEMA_VERSION {
             return Err(ContractViolation::BindingMismatch {
