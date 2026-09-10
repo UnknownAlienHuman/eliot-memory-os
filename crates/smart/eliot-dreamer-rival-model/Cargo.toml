@@ -12,6 +12,10 @@ path = "src/lib.rs"
 
 [dependencies]
 eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
+eliot-evaluation-contracts = { path = "../../foundation/eliot-evaluation-contracts" }
+eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150" }
 
 [package.metadata.eliot]
 prototype = true
