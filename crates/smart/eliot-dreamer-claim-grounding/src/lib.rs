@@ -1,13 +1,15 @@
-//! Capability cell placeholder.
+//! Deterministic, candidate-only claim grounding for the Dreamer handoff.
 //!
-//! NOT IMPLEMENTED. This file exists only so that per-crate
-//! `cargo check`, `cargo test` and `cargo clippy` run and report an
-//! actionable result instead of a manifest error.
-//!
-//! Cell `smart.dreamer.claim_grounding`, order 14.
-//! The purpose, contract and dependencies of this cell live in
-//! `module.toml` next to this crate. The owning work unit replaces this
-//! file and, on completion, moves the crate from the root
-//! `workspace.exclude` into `workspace.members`.
+//! This cell consumes the complete A03 v2 input context and binds only explicit
+//! proposed handles to typed assertions already present in the frozen manifest.
+//! It has no retrieval, model, clock, I/O, state, or truth-promotion surface.
 
 #![forbid(unsafe_code)]
+
+mod evidence;
+pub mod grounding;
+mod precision;
+
+pub use grounding::{
+    Cancellation, GroundingControls, GroundingRequest, ground_draft, ground_draft_with_controls,
+};
