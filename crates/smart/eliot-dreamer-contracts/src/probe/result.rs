@@ -1,6 +1,6 @@
 //! Finite possible-result schemas and supplied update declarations.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::ArtifactId;
 use eliot_epistemic_contracts::CoverageDenominator;
@@ -193,8 +193,8 @@ impl ResultBranch {
             return Err(ContractViolation::OutOfBounds {
                 field: "probe.result.updates",
                 min: 0,
-                max: MAX_PROBE_UPDATES_PER_BRANCH as i64,
-                got: self.updates.len() as i64,
+                max: crate::error::len_i64(MAX_PROBE_UPDATES_PER_BRANCH),
+                got: crate::error::len_i64(self.updates.len()),
             });
         }
         for update in &self.updates {
@@ -248,6 +248,7 @@ impl PossibleResultSchema {
     }
 
     pub fn compute_digest(&self) -> Result<String, ContractViolation> {
+        validation::preflight(self)?;
         self.validate_shape()?;
         validation::canonical_digest(&(
             self.schema_version,
@@ -281,8 +282,51 @@ impl PossibleResultSchema {
             ));
         }
         let mut targets = BTreeSet::new();
+        let mut model_refs = BTreeMap::new();
+        let mut prediction_refs = BTreeMap::new();
+        let mut objective_refs = BTreeMap::new();
         for target in &self.targets {
             target.validate()?;
+            match target {
+                ResultTarget::Rival { model, prediction } => {
+                    if let Some(previous) = model_refs.get(&model.model_id) {
+                        if previous != model {
+                            return Err(ContractViolation::BindingMismatch {
+                                field: "probe.result_schema.targets",
+                                reason: "model identity maps to changed declaration".to_owned(),
+                            });
+                        }
+                    } else {
+                        model_refs.insert(model.model_id.clone(), model.clone());
+                    }
+                    if let Some(prediction) = prediction {
+                        if let Some(previous) = prediction_refs.get(&prediction.prediction_id) {
+                            if previous != prediction {
+                                return Err(ContractViolation::BindingMismatch {
+                                    field: "probe.result_schema.targets",
+                                    reason: "prediction identity maps to changed declaration"
+                                        .to_owned(),
+                                });
+                            }
+                        } else {
+                            prediction_refs
+                                .insert(prediction.prediction_id.clone(), prediction.clone());
+                        }
+                    }
+                }
+                ResultTarget::Gap { objective } => {
+                    if let Some(previous) = objective_refs.get(&objective.objective_id) {
+                        if previous != objective {
+                            return Err(ContractViolation::BindingMismatch {
+                                field: "probe.result_schema.targets",
+                                reason: "objective identity maps to changed declaration".to_owned(),
+                            });
+                        }
+                    } else {
+                        objective_refs.insert(objective.objective_id.clone(), objective.clone());
+                    }
+                }
+            }
             if !targets.insert(target.clone()) {
                 return Err(ContractViolation::BindingMismatch {
                     field: "probe.result_schema.targets",

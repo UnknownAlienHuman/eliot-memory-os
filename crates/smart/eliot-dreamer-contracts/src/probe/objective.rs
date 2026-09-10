@@ -42,7 +42,7 @@ impl ProbeOwnerRef {
         match self {
             Self::Source { owner } => validation::text(owner.as_str(), "probe.owner.source")?,
             Self::Verifier { verifier_id } => {
-                validation::text(verifier_id.as_str(), "probe.owner.verifier")?
+                validation::text(verifier_id.as_str(), "probe.owner.verifier")?;
             }
             Self::Unavailable { reason } => validation::text(reason, "probe.owner.reason")?,
         }
@@ -132,7 +132,7 @@ impl ProbeObjectiveTarget {
                     .map_err(|error| ContractViolation::BindingMismatch {
                         field: "probe.objective.target.requirement",
                         reason: error.to_string(),
-                    })?
+                    })?;
             }
             Self::Verifier { verifier } => {
                 verifier
@@ -140,7 +140,7 @@ impl ProbeObjectiveTarget {
                     .map_err(|error| ContractViolation::BindingMismatch {
                         field: "probe.objective.target.verifier",
                         reason: error.to_string(),
-                    })?
+                    })?;
             }
         }
         Ok(())
@@ -185,6 +185,10 @@ pub struct ProbeObjective {
 }
 
 impl ProbeObjective {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "constructor mirrors the complete canonical objective declaration"
+    )]
     pub fn new(
         objective_id: ArtifactId,
         origin: ProbeObjectiveOrigin,
@@ -228,6 +232,8 @@ impl ProbeObjective {
     }
 
     pub fn compute_digest(&self) -> Result<String, ContractViolation> {
+        validation::preflight(self)?;
+        self.validate_shape()?;
         validation::canonical_digest(&(
             self.schema_version,
             &self.objective_id,
@@ -271,8 +277,8 @@ impl ProbeObjective {
             return Err(ContractViolation::OutOfBounds {
                 field: "probe.objective.source_refs",
                 min: 0,
-                max: MAX_PROBE_ITEMS as i64,
-                got: self.source_refs.len() as i64,
+                max: crate::error::len_i64(MAX_PROBE_ITEMS),
+                got: crate::error::len_i64(self.source_refs.len()),
             });
         }
         for source in &self.source_refs {
