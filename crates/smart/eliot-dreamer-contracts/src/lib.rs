@@ -16,6 +16,7 @@ pub mod candidate;
 pub mod classification;
 pub mod concept;
 pub mod curation;
+pub mod diagnosis;
 pub mod draft;
 pub mod encoding;
 pub mod error;
@@ -72,6 +73,17 @@ pub use concept::{
     concept_proposal_digest, seal_concept, validate_concept, validate_concept_acceptance,
 };
 pub use curation::{CURATION_WIRE_KINDS, CurationKind, CurationPayload, kind_family, parse_kind};
+pub use diagnosis::{
+    ACCEPTANCE_BINDING_SCHEMA_VERSION, AcceptanceBinding, CURRENT_DISCRIMINATOR_SCHEMA_VERSION,
+    ConfirmationIndependenceClaim, CurrentDiscriminator, CurrentObservation,
+    DiscriminatorPrecondition, LoadBearingChange, MechanismExercise, MechanismProjection,
+    ObservationDeclaration, ObservedValueKind, ObservedValueRef, PRODUCT_CONTEXT_SCHEMA_VERSION,
+    PostHocConfirmation, PreconditionState, ProductContext, REPAIR_LINEAGE_SCHEMA_VERSION,
+    RepairAttemptEntry, RepairAttemptRecord, RepairContextEndpoint, RepairContextUnavailable,
+    RepairEvent, RepairEventEntry, RepairEventOutcome, RepairHistoryPresence, RepairLineage,
+    RepairStageKind, RepeatJustification, RepeatReason, ReplayBinding, RunEvidenceAssociation,
+    SuppliedRunBinding, UnavailableEvidence, UnavailableField,
+};
 pub use draft::{
     ClaimResidue, CurationAcceptanceCtx, GroundedDreamDraft, ModelDraft, RawProviderOutput,
     SupportState, ValidatedCurationItem, ValidatedDreamDraft, ValidationReceipt,

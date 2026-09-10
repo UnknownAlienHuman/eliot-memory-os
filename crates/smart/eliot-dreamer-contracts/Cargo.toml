@@ -23,6 +23,7 @@ agent_order = 3
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
 eliot-context-contracts = { path = "../eliot-context-contracts" }
+eliot-evaluation-contracts = { path = "../../foundation/eliot-evaluation-contracts" }
 eliot-evidence = { path = "../../foundation/eliot-evidence" }
 eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts" }
 eliot-receipts = { path = "../../foundation/eliot-receipts" }
