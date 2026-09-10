@@ -43,6 +43,9 @@ When the HTTP bridge is not configured, the existing bounded one-shot process
 bridge remains a compatibility fallback. It receives only an explicit
 environment allowlist. Attached mutating tools fail closed without an explicit
 usable gate decision; passive observations degrade without blocking OpenCode.
-The payload includes identities, event/tool kind, changed path, and argument
-names only—never prompts, tool argument values, command text, model output,
-file contents, stdout/stderr, environment values, headers, cookies, or secrets.
+The payload includes identities, event/tool kind, changed path, argument names,
+and versioned effect digests only—never prompts, tool argument values, command
+text, model output, file contents, stdout/stderr, environment values, headers,
+cookies, or secrets. Exact read-only tools return a deterministic skipped
+receipt and send the corresponding observation through the same host-event
+bridge; aliases and unknown tools fail closed.

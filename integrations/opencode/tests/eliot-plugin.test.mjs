@@ -63,6 +63,12 @@ test("mutating gate prefers authenticated loopback HTTP and never sends argument
     assert.equal(request.headers["idempotency-key"], payload.event_id)
     assert.equal(payload.tool, "bash")
     assert.deepEqual(payload.argument_keys, ["command"])
+    assert.equal(payload.effect_descriptor.schema_version, "eliot.opencode.effect.v1")
+    assert.equal(payload.effect_descriptor.normalization_version, "eliot.opencode.arguments.v1")
+    assert.equal(payload.effect_descriptor.tool, "bash")
+    assert.deepEqual(payload.effect_descriptor.argument_keys, ["command"])
+    assert.match(payload.effect_descriptor.argument_digest, /^[0-9a-f]{64}$/)
+    assert.match(payload.effect_digest, /^[0-9a-f]{64}$/)
     assert.equal(text.includes("top-secret-command"), false)
     assert.equal(text.includes("unit-token"), false)
 
@@ -332,12 +338,9 @@ test("case-insensitive JSON media types accept valid parameters and whitespace",
   assert.equal(reads, 2)
 })
 
-test("normalized argument keys keep exactly 64 entries and reject the 65th", async () => {
-  let payload
+test("argument key count beyond 64 fails closed instead of truncating the action", async () => {
   await withServer(async (request, response) => {
-    const chunks = []
-    for await (const chunk of request) chunks.push(chunk)
-    payload = JSON.parse(Buffer.concat(chunks).toString("utf8"))
+    request.resume()
     response.writeHead(200, { "content-type": "application/json" })
     response.end(JSON.stringify({ decision: "allow" }))
   }, async (url) => {
@@ -348,19 +351,16 @@ test("normalized argument keys keep exactly 64 entries and reject the 65th", asy
       Array.from({ length: 65 }, (_, index) => [`key-${String(index).padStart(2, "0")}`, true]),
     )
     const plugin = await hooks()
-    await plugin["tool.execute.before"]({ tool: "write", callID: "call-64-keys", args }, {})
+    await assert.rejects(
+      plugin["tool.execute.before"]({ tool: "write", callID: "call-65-keys", args }, {}),
+      /key count exceeds its bounded contract/,
+    )
   })
-  assert.equal(payload.argument_keys.length, 64)
-  assert.equal(payload.argument_keys.includes("key-64"), false)
-  assert.equal(payload.argument_keys.includes("key-00"), true)
 })
 
-test("normalized argument keys accept 128 characters and reject 129", async () => {
-  let payload
+test("argument key length beyond 128 fails closed instead of dropping the key", async () => {
   await withServer(async (request, response) => {
-    const chunks = []
-    for await (const chunk of request) chunks.push(chunk)
-    payload = JSON.parse(Buffer.concat(chunks).toString("utf8"))
+    request.resume()
     response.writeHead(200, { "content-type": "application/json" })
     response.end(JSON.stringify({ decision: "allow" }))
   }, async (url) => {
@@ -370,13 +370,14 @@ test("normalized argument keys accept 128 characters and reject 129", async () =
     const accepted = "a".repeat(128)
     const rejected = "r".repeat(129)
     const plugin = await hooks()
-    await plugin["tool.execute.before"](
-      { tool: "write", callID: "call-key-length", args: { [accepted]: true, [rejected]: true } },
-      {},
+    await assert.rejects(
+      plugin["tool.execute.before"](
+        { tool: "write", callID: "call-key-length", args: { [accepted]: true, [rejected]: true } },
+        {},
+      ),
+      /key exceeds its bounded contract/,
     )
   })
-  assert.equal(payload.argument_keys.includes("a".repeat(128)), true)
-  assert.equal(payload.argument_keys.includes("r".repeat(129)), false)
 })
 
 test("the gate payload carries exactly the contract allowlist and nothing else", async () => {
@@ -406,28 +407,144 @@ test("the gate payload carries exactly the contract allowlist and nothing else",
   })
 })
 
-test("string-shaped tool arguments never become one key per byte", async () => {
+test("string-shaped tool arguments fail closed instead of becoming one key per byte", async () => {
+  process.env.ELIOT_TASK_ID = "task-1"
+  const plugin = await hooks()
+  await assert.rejects(
+    plugin["tool.execute.before"](
+      { tool: "bash", callID: "call-string-args", args: "top-secret-command" },
+      {},
+    ),
+    /arguments must be a plain object/,
+  )
+})
+
+test("effect binding is stable for key order and changes for argument values", async () => {
+  const payloads = []
   await withServer(async (request, response) => {
     const chunks = []
     for await (const chunk of request) chunks.push(chunk)
-    const text = Buffer.concat(chunks).toString("utf8")
-    const payload = JSON.parse(text)
-
-    assert.deepEqual(payload.argument_keys, [])
-    assert.equal(text.includes("top-secret-command"), false)
-
+    payloads.push(JSON.parse(Buffer.concat(chunks).toString("utf8")))
     response.writeHead(200, { "content-type": "application/json" })
     response.end(JSON.stringify({ decision: "allow" }))
   }, async (url) => {
-    process.env.ELIOT_TASK_ID = "task-1"
+    process.env.ELIOT_TASK_ID = "task-digest"
     process.env.ELIOT_OPENCODE_BRIDGE_URL = url
     process.env.ELIOT_OPENCODE_BRIDGE_TOKEN = "unit-token"
     const plugin = await hooks()
-    await plugin["tool.execute.before"](
-      { tool: "bash", callID: "call-string-args", args: "top-secret-command" },
-      {},
-    )
+    await plugin["tool.execute.before"]({ tool: "bash", callID: "call-digest-1", args: { b: 2, a: 1 } }, {})
+    await plugin["tool.execute.before"]({ tool: "bash", callID: "call-digest-2", args: { a: 1, b: 2 } }, {})
+    await plugin["tool.execute.before"]({ tool: "bash", callID: "call-digest-3", args: { a: 1, b: 3 } }, {})
+    await plugin["tool.execute.before"]({ tool: "bash", callID: "call-digest-4" }, { args: { a: 1, b: 2 } })
+    await plugin["tool.execute.before"]({ tool: "write", callID: "call-digest-5", args: { a: 1, b: 2 } }, {})
   })
+
+  assert.equal(payloads[0].effect_digest, payloads[1].effect_digest)
+  assert.equal(payloads[0].effect_descriptor.argument_digest, payloads[1].effect_descriptor.argument_digest)
+  assert.equal(payloads[0].effect_digest, payloads[3].effect_digest)
+  assert.deepEqual(payloads[3].argument_keys, ["a", "b"])
+  assert.notEqual(payloads[0].effect_digest, payloads[2].effect_digest)
+  assert.notEqual(payloads[0].effect_descriptor.argument_digest, payloads[2].effect_descriptor.argument_digest)
+  assert.notEqual(payloads[0].event_id, payloads[2].event_id)
+  assert.notEqual(payloads[0].effect_digest, payloads[4].effect_digest)
+})
+
+test("read-only tools return deterministic skipped receipts through host-event transport", async () => {
+  const payloads = []
+  let resolvePayloads
+  const received = new Promise((resolve) => {
+    resolvePayloads = resolve
+  })
+  await withServer(async (request, response) => {
+    const chunks = []
+    for await (const chunk of request) chunks.push(chunk)
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"))
+    payloads.push(payload)
+    if (payloads.length === 2) resolvePayloads()
+    response.writeHead(200, { "content-type": "application/json" })
+    response.end(JSON.stringify({ decision: "recorded" }))
+  }, async (url) => {
+    process.env.ELIOT_TASK_ID = "task-read-only"
+    process.env.ELIOT_OPENCODE_BRIDGE_URL = url
+    process.env.ELIOT_OPENCODE_BRIDGE_TOKEN = "unit-token"
+    const plugin = await hooks()
+    const first = await plugin["tool.execute.before"]({ tool: "read", args: { path: "README.md" } }, {})
+    const second = await plugin["tool.execute.before"]({ tool: "read", args: { path: "README.md" } }, {})
+    await received
+
+    assert.deepEqual(first, second)
+    assert.equal(first.decision, "skipped")
+    assert.equal(first.reason, "read_only_tool")
+    assert.equal(first.tool, "read")
+    assert.deepEqual(first.effect_descriptor.argument_keys, ["path"])
+    assert.match(first.effect_descriptor.argument_digest, /^[0-9a-f]{64}$/)
+    assert.match(first.effect_digest, /^[0-9a-f]{64}$/)
+    assert.equal(payloads[0].event_kind, "tool.execute.skipped")
+    assert.equal(payloads[0].effect_digest, first.effect_digest)
+    assert.equal(JSON.stringify(payloads).includes("README.md"), false)
+    assert.equal(payloads[0].event_id, payloads[1].event_id)
+  })
+})
+
+test("aliases and unknown tools fail closed before bridge dispatch", async () => {
+  process.env.ELIOT_TASK_ID = "task-classification"
+  const plugin = await hooks()
+  for (const tool of ["Bash", " bash", "bash ", "bash.foo", "apply_patch", "notebook", "unknown_tool"]) {
+    await assert.rejects(
+      plugin["tool.execute.before"]({ tool, args: {} }, {}),
+      /cannot classify this OpenCode tool/,
+    )
+  }
+})
+
+test("unsupported argument values fail closed before bridge dispatch", async () => {
+  let bridgeCalls = 0
+  await withServer(async (request, response) => {
+    bridgeCalls += 1
+    request.resume()
+    response.writeHead(200, { "content-type": "application/json" })
+    response.end(JSON.stringify({ decision: "allow" }))
+  }, async (url) => {
+    process.env.ELIOT_TASK_ID = "task-unbindable"
+    process.env.ELIOT_OPENCODE_BRIDGE_URL = url
+    process.env.ELIOT_OPENCODE_BRIDGE_TOKEN = "unit-token"
+    const plugin = await hooks()
+    const cyclic = {}
+    cyclic.self = cyclic
+    const accessor = {}
+    Object.defineProperty(accessor, "value", { enumerable: true, get: () => "coerced" })
+    const sparse = []
+    sparse[1] = "coerced"
+    const cases = [
+      { value: () => "function" },
+      { value: undefined },
+      { value: Symbol("secret") },
+      { value: 1n },
+      { value: Number.NaN },
+      { value: Number.POSITIVE_INFINITY },
+      { value: new Date(0) },
+      { value: new Map([ ["key", "value"] ]) },
+      { value: sparse },
+      { value: accessor },
+      { value: cyclic },
+    ]
+    for (const args of cases) {
+      await assert.rejects(
+        plugin["tool.execute.before"]({ tool: "write", args }, {}),
+        /cannot bind exact action arguments/,
+      )
+    }
+  })
+  assert.equal(bridgeCalls, 0)
+})
+
+test("oversized action arguments fail closed before bridge dispatch", async () => {
+  process.env.ELIOT_TASK_ID = "task-input-limit"
+  const plugin = await hooks()
+  await assert.rejects(
+    plugin["tool.execute.before"]({ tool: "bash", args: { command: "x".repeat(20_000) } }, {}),
+    /effect descriptor exceeds its bounded contract/,
+  )
 })
 
 test("configured HTTP outage never crosses transport into the legacy process bridge", async () => {
