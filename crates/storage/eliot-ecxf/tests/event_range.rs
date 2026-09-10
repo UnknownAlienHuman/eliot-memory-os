@@ -77,10 +77,7 @@ fn single_event_accepts_zero_regular_and_maximum_sequence() -> TestResult {
 // WORK_UNIT_CASE: 862/4
 #[test]
 fn multi_event_interval_requires_its_exact_count() -> TestResult {
-    for (id, first, last, count) in [
-        ("contiguous", 10, 13, 4),
-        ("contiguous_from_zero", 0, 3, 4),
-    ] {
+    for (id, first, last, count) in [("contiguous", 10, 13, 4), ("contiguous_from_zero", 0, 3, 4)] {
         let value = range(id)?;
         assert_eq!(
             (value.first_sequence, value.last_sequence, value.count),
@@ -199,8 +196,8 @@ fn maximum_width_is_checked_and_matches_a_wider_integer_oracle() -> TestResult {
     for first in boundaries {
         for last in boundaries {
             for count in boundaries {
-                let expected = first <= last
-                    && u128::from(count) == u128::from(last) + 1 - u128::from(first);
+                let expected =
+                    first <= last && u128::from(count) == u128::from(last) + 1 - u128::from(first);
                 let value = EventRange {
                     first_sequence: Some(first),
                     last_sequence: Some(last),

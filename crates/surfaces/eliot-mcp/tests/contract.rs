@@ -160,7 +160,7 @@ fn owner_source_evidence(
         vec![GoverningSourceIdentity {
             source_id: "architecture".into(),
             kind: "governing".into(),
-            canonical_ref: "docs/architecture.md".into(),
+            canonical_ref: "docs/ARCHITECTURE_CONTRACT.md".into(),
             content_digest: canonical_digest(&"architecture").expect("fixture digest"),
             origin_ref: "owner-receipt:architecture".into(),
             revision: "revision-1".into(),
