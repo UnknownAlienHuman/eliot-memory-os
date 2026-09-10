@@ -1201,8 +1201,22 @@ impl AssemblyMaterialSet {
     }
 
     /// Validates the complete manifest/material/context identity closure.
-    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ContractViolation> {
+        self.validate_header()?;
+        self.validate_selected_materials()?;
+        self.validate_ledger()?;
+        self.validate_supplied_identity()?;
+        self.validate_role_cardinality()?;
+        self.validate_role_outcomes()?;
+        self.validate_conditional_evaluations()?;
+        self.validate_retained_links()?;
+        self.validate_measurements()?;
+        self.validate_context()?;
+        self.validate_curation()?;
+        Ok(())
+    }
+
+    fn validate_header(&self) -> Result<(), ContractViolation> {
         super::preflight(self, "assembly_carrier", super::ASSEMBLY_CARRIER_CEILING)?;
         self.preflight_representation_bounds()?;
         if self.schema_version != MATERIAL_SCHEMA_VERSION {
@@ -1239,6 +1253,10 @@ impl AssemblyMaterialSet {
                 reason: "expected lowercase SHA-256 digest".to_owned(),
             });
         }
+        Ok(())
+    }
+
+    fn validate_selected_materials(&self) -> Result<(), ContractViolation> {
         check_vec_bound(self.materials.len(), MAX_MATERIALS, "material.materials")?;
         let mut handles = BTreeSet::new();
         let mut ordinals = BTreeSet::new();
@@ -1330,6 +1348,10 @@ impl AssemblyMaterialSet {
                 reason: "selected manifest digest mismatch".to_owned(),
             });
         }
+        Ok(())
+    }
+
+    fn validate_ledger(&self) -> Result<(), ContractViolation> {
         check_vec_bound(self.ledger.len(), MAX_LEDGER, "material.ledger")?;
         let mut ledger_ordinals = BTreeSet::new();
         let mut omission_coverage_members = BTreeSet::new();
@@ -1353,169 +1375,9 @@ impl AssemblyMaterialSet {
                     reason: "not-applicable recipe role cannot carry an item outcome".to_owned(),
                 });
             }
-            if let Some(omission) = &entry.omission
-                && !omission_handles.insert(omission.handle.clone())
-            {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "material.ledger.omission",
-                    reason: "omission handles must be unique across the complete ledger".to_owned(),
-                });
-            }
-            if entry.disposition == MaterialDisposition::Omitted {
-                let omission = entry
-                    .omission
-                    .as_ref()
-                    .ok_or(ContractViolation::MissingField("material.ledger.omission"))?;
-                match role.omission_policy {
-                    RoleOmissionPolicy::NonDroppable => {
-                        return Err(ContractViolation::BindingMismatch {
-                            field: "material.ledger.omission",
-                            reason: "non-droppable role cannot be omitted".to_owned(),
-                        });
-                    }
-                    RoleOmissionPolicy::ReversibleHandle if !omission.reversible => {
-                        return Err(ContractViolation::BindingMismatch {
-                            field: "material.ledger.omission",
-                            reason: "role requires a reversible omission handle".to_owned(),
-                        });
-                    }
-                    RoleOmissionPolicy::NonRecoverableReason
-                        if omission.reversible
-                            || omission
-                                .nonrecoverable_reason
-                                .as_deref()
-                                .is_none_or(|reason| reason.trim().is_empty()) =>
-                    {
-                        return Err(ContractViolation::BindingMismatch {
-                            field: "material.ledger.omission",
-                            reason: "role requires an explicit non-recoverable omission reason"
-                                .to_owned(),
-                        });
-                    }
-                    RoleOmissionPolicy::ReversibleHandle
-                    | RoleOmissionPolicy::NonRecoverableReason => {}
-                    RoleOmissionPolicy::NotApplicable => {
-                        return Err(ContractViolation::BindingMismatch {
-                            field: "material.ledger.omission",
-                            reason: "not-applicable role cannot be omitted".to_owned(),
-                        });
-                    }
-                }
-            }
-            if let Some(coverage) = entry
-                .omission_accounting
-                .as_ref()
-                .and_then(|accounting| accounting.coverage.as_ref())
-            {
-                let denominator = self
-                    .manifest
-                    .coverage_denominators
-                    .get(&coverage.denominator)
-                    .ok_or(ContractViolation::BindingMismatch {
-                        field: "material.ledger.omission_accounting.coverage",
-                        reason: "coverage denominator is absent from the exact manifest".to_owned(),
-                    })?;
-                let receipt = self
-                    .manifest
-                    .coverage_receipts
-                    .get(&coverage.denominator)
-                    .ok_or(ContractViolation::BindingMismatch {
-                        field: "material.ledger.omission_accounting.coverage",
-                        reason: "coverage receipt is absent for the exact denominator".to_owned(),
-                    })?;
-                let receipt_accounts_member = receipt
-                    .members
-                    .iter()
-                    .any(|outcome| outcome.member == coverage.member)
-                    || receipt
-                        .omissions
-                        .iter()
-                        .any(|omission| omission.member == coverage.member);
-                if receipt.denominator != coverage.denominator
-                    || !denominator.members.contains(&coverage.member)
-                    || !receipt_accounts_member
-                    || !omission_coverage_members
-                        .insert((coverage.denominator.clone(), coverage.member.clone()))
-                {
-                    return Err(ContractViolation::BindingMismatch {
-                        field: "material.ledger.omission_accounting.coverage",
-                        reason: "coverage mapping does not join one exact manifest member"
-                            .to_owned(),
-                    });
-                }
-            }
-            if entry.disposition == MaterialDisposition::Included {
-                if role.source_rule.is_none() && entry.handle.is_some() {
-                    return Err(ContractViolation::BindingMismatch {
-                        field: "material.ledger.handle",
-                        reason: "source-free role cannot use a manifest handle".to_owned(),
-                    });
-                }
-                if !role.source_rule.is_none() && entry.handle.is_none() {
-                    return Err(ContractViolation::BindingMismatch {
-                        field: "material.ledger.handle",
-                        reason: "source-bearing role requires a manifest handle".to_owned(),
-                    });
-                }
-            }
-            if entry.disposition != MaterialDisposition::NotApplicable && role.source_rule.is_none()
-            {
-                let digest =
-                    entry
-                        .content_digest
-                        .as_deref()
-                        .ok_or(ContractViolation::MissingField(
-                            "material.ledger.content_digest",
-                        ))?;
-                let expected = source_free_value_digest(&self.recipe, entry.role)?.ok_or(
-                    ContractViolation::MissingField("material.ledger.content_digest"),
-                )?;
-                if digest != expected {
-                    return Err(ContractViolation::BindingMismatch {
-                        field: "material.ledger.content_digest",
-                        reason: "source-free ledger identity differs from retained job input"
-                            .to_owned(),
-                    });
-                }
-            } else if entry.disposition != MaterialDisposition::NotApplicable {
-                let handle = entry
-                    .handle
-                    .as_ref()
-                    .ok_or(ContractViolation::MissingField("material.ledger.handle"))?;
-                let mismatch_reason = matches!(
-                    entry.reason,
-                    Some(
-                        MaterialOutcomeReason::AuthorityMismatch
-                            | MaterialOutcomeReason::ScopeMismatch
-                            | MaterialOutcomeReason::Stale
-                            | MaterialOutcomeReason::Conflict
-                    )
-                );
-                let foreign_identity_allowed = matches!(
-                    entry.disposition,
-                    MaterialDisposition::Blocked | MaterialDisposition::Unavailable
-                ) && mismatch_reason;
-                let reference = self.manifest.references.get(handle);
-                if let Some(reference) = reference {
-                    if !foreign_identity_allowed
-                        && (entry.source_revision.as_deref()
-                            != Some(reference.source_revision.as_str())
-                            || entry.content_digest.as_deref()
-                                != Some(reference.content_digest.as_str()))
-                    {
-                        return Err(ContractViolation::BindingMismatch {
-                            field: "material.ledger.identity",
-                            reason: "ledger handle identity differs from the frozen manifest"
-                                .to_owned(),
-                        });
-                    }
-                } else if !foreign_identity_allowed {
-                    return Err(ContractViolation::BindingMismatch {
-                        field: "material.ledger.handle",
-                        reason: "ledger handle is absent from the frozen manifest".to_owned(),
-                    });
-                }
-            }
+            Self::validate_ledger_entry(entry, role, &mut omission_handles)?;
+            self.validate_ledger_coverage(entry, &mut omission_coverage_members)?;
+            self.validate_ledger_identity(entry, role)?;
             if !ledger_ordinals.insert((entry.role.as_str(), entry.ordinal)) {
                 return Err(ContractViolation::BindingMismatch {
                     field: "material.ledger",
@@ -1523,6 +1385,194 @@ impl AssemblyMaterialSet {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn validate_ledger_entry(
+        entry: &MaterialLedgerEntry,
+        role: &crate::assembly::recipe::RecipeRole,
+        omission_handles: &mut BTreeSet<String>,
+    ) -> Result<(), ContractViolation> {
+        if let Some(omission) = &entry.omission
+            && !omission_handles.insert(omission.handle.clone())
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "material.ledger.omission",
+                reason: "omission handles must be unique across the complete ledger".to_owned(),
+            });
+        }
+        if entry.disposition == MaterialDisposition::Omitted {
+            let omission = entry
+                .omission
+                .as_ref()
+                .ok_or(ContractViolation::MissingField("material.ledger.omission"))?;
+            match role.omission_policy {
+                RoleOmissionPolicy::NonDroppable => {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "material.ledger.omission",
+                        reason: "non-droppable role cannot be omitted".to_owned(),
+                    });
+                }
+                RoleOmissionPolicy::ReversibleHandle if !omission.reversible => {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "material.ledger.omission",
+                        reason: "role requires a reversible omission handle".to_owned(),
+                    });
+                }
+                RoleOmissionPolicy::NonRecoverableReason
+                    if omission.reversible
+                        || omission
+                            .nonrecoverable_reason
+                            .as_deref()
+                            .is_none_or(|reason| reason.trim().is_empty()) =>
+                {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "material.ledger.omission",
+                        reason: "role requires an explicit non-recoverable omission reason"
+                            .to_owned(),
+                    });
+                }
+                RoleOmissionPolicy::ReversibleHandle | RoleOmissionPolicy::NonRecoverableReason => {
+                }
+                RoleOmissionPolicy::NotApplicable => {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "material.ledger.omission",
+                        reason: "not-applicable role cannot be omitted".to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_ledger_coverage(
+        &self,
+        entry: &MaterialLedgerEntry,
+        omission_coverage_members: &mut BTreeSet<(String, ArtifactId)>,
+    ) -> Result<(), ContractViolation> {
+        if let Some(coverage) = entry
+            .omission_accounting
+            .as_ref()
+            .and_then(|accounting| accounting.coverage.as_ref())
+        {
+            let denominator = self
+                .manifest
+                .coverage_denominators
+                .get(&coverage.denominator)
+                .ok_or(ContractViolation::BindingMismatch {
+                    field: "material.ledger.omission_accounting.coverage",
+                    reason: "coverage denominator is absent from the exact manifest".to_owned(),
+                })?;
+            let receipt = self
+                .manifest
+                .coverage_receipts
+                .get(&coverage.denominator)
+                .ok_or(ContractViolation::BindingMismatch {
+                    field: "material.ledger.omission_accounting.coverage",
+                    reason: "coverage receipt is absent for the exact denominator".to_owned(),
+                })?;
+            let receipt_accounts_member = receipt
+                .members
+                .iter()
+                .any(|outcome| outcome.member == coverage.member)
+                || receipt
+                    .omissions
+                    .iter()
+                    .any(|omission| omission.member == coverage.member);
+            if receipt.denominator != coverage.denominator
+                || !denominator.members.contains(&coverage.member)
+                || !receipt_accounts_member
+                || !omission_coverage_members
+                    .insert((coverage.denominator.clone(), coverage.member.clone()))
+            {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "material.ledger.omission_accounting.coverage",
+                    reason: "coverage mapping does not join one exact manifest member".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_ledger_identity(
+        &self,
+        entry: &MaterialLedgerEntry,
+        role: &crate::assembly::recipe::RecipeRole,
+    ) -> Result<(), ContractViolation> {
+        if entry.disposition == MaterialDisposition::Included {
+            if role.source_rule.is_none() && entry.handle.is_some() {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "material.ledger.handle",
+                    reason: "source-free role cannot use a manifest handle".to_owned(),
+                });
+            }
+            if !role.source_rule.is_none() && entry.handle.is_none() {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "material.ledger.handle",
+                    reason: "source-bearing role requires a manifest handle".to_owned(),
+                });
+            }
+        }
+        if entry.disposition != MaterialDisposition::NotApplicable && role.source_rule.is_none() {
+            let digest = entry
+                .content_digest
+                .as_deref()
+                .ok_or(ContractViolation::MissingField(
+                    "material.ledger.content_digest",
+                ))?;
+            let expected = source_free_value_digest(&self.recipe, entry.role)?.ok_or(
+                ContractViolation::MissingField("material.ledger.content_digest"),
+            )?;
+            if digest != expected {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "material.ledger.content_digest",
+                    reason: "source-free ledger identity differs from retained job input"
+                        .to_owned(),
+                });
+            }
+        } else if entry.disposition != MaterialDisposition::NotApplicable {
+            let handle = entry
+                .handle
+                .as_ref()
+                .ok_or(ContractViolation::MissingField("material.ledger.handle"))?;
+            let mismatch_reason = matches!(
+                entry.reason,
+                Some(
+                    MaterialOutcomeReason::AuthorityMismatch
+                        | MaterialOutcomeReason::ScopeMismatch
+                        | MaterialOutcomeReason::Stale
+                        | MaterialOutcomeReason::Conflict
+                )
+            );
+            let foreign_identity_allowed = matches!(
+                entry.disposition,
+                MaterialDisposition::Blocked | MaterialDisposition::Unavailable
+            ) && mismatch_reason;
+            let reference = self.manifest.references.get(handle);
+            if let Some(reference) = reference {
+                if !foreign_identity_allowed
+                    && (entry.source_revision.as_deref()
+                        != Some(reference.source_revision.as_str())
+                        || entry.content_digest.as_deref()
+                            != Some(reference.content_digest.as_str()))
+                {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "material.ledger.identity",
+                        reason: "ledger handle identity differs from the frozen manifest"
+                            .to_owned(),
+                    });
+                }
+            } else if !foreign_identity_allowed {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "material.ledger.handle",
+                    reason: "ledger handle is absent from the frozen manifest".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_supplied_identity(&self) -> Result<(), ContractViolation> {
         check_vec_bound(
             self.supplied_items.len(),
             MAX_LEDGER,
@@ -1603,6 +1653,10 @@ impl AssemblyMaterialSet {
                     .to_owned(),
             });
         }
+        Ok(())
+    }
+
+    fn validate_role_cardinality(&self) -> Result<(), ContractViolation> {
         for role in &self.recipe.roles {
             let mut ordinals: Vec<_> = self
                 .ledger
@@ -1649,6 +1703,10 @@ impl AssemblyMaterialSet {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn validate_role_outcomes(&self) -> Result<(), ContractViolation> {
         check_vec_bound(
             self.role_outcomes.len(),
             MAX_ROLE_OUTCOMES,
@@ -1720,7 +1778,10 @@ impl AssemblyMaterialSet {
                 reason: "role outcomes contain a duplicate or missing role".to_owned(),
             });
         }
-        self.validate_conditional_evaluations()?;
+        Ok(())
+    }
+
+    fn validate_retained_links(&self) -> Result<(), ContractViolation> {
         for material in &self.materials {
             let Some(entry) = self.ledger.iter().find(|entry| {
                 entry.role == material.role
@@ -1759,6 +1820,10 @@ impl AssemblyMaterialSet {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn validate_measurements(&self) -> Result<(), ContractViolation> {
         check_vec_bound(
             self.measurements.len(),
             MAX_MEASUREMENTS,
@@ -1816,6 +1881,11 @@ impl AssemblyMaterialSet {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn validate_context(&self) -> Result<(), ContractViolation> {
+        let job = &self.recipe.job;
         if let Some(context) = &self.context {
             context.validate_for(
                 &job.task_id,
@@ -1825,22 +1895,13 @@ impl AssemblyMaterialSet {
                 Some(&job.operation_id),
             )?;
         }
+        Ok(())
+    }
+
+    fn validate_curation(&self) -> Result<(), ContractViolation> {
+        let job = &self.recipe.job;
         if let Some(curation) = &self.curation {
-            if job.job_class != crate::job::JobClass::Curation {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "curation",
-                    reason: "Curation material is only valid for a Curation job".to_owned(),
-                });
-            }
-            curation.validate_for(&job.task_id, &job.scope_id, &job.state_fence)?;
-            if curation.source_snapshot != self.manifest.source_snapshot
-                || curation.source_revision != self.manifest.source_revision
-            {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "curation.source_snapshot",
-                    reason: "Curation source identity differs from the full manifest".to_owned(),
-                });
-            }
+            self.validate_curation_header(curation, job)?;
             for (role, handle) in [
                 (
                     DreamInputRole::CurationSourceSnapshot,
@@ -1928,6 +1989,29 @@ impl AssemblyMaterialSet {
         Ok(())
     }
 
+    fn validate_curation_header(
+        &self,
+        curation: &CurationMaterial,
+        job: &crate::job::DreamJobInput,
+    ) -> Result<(), ContractViolation> {
+        if job.job_class != crate::job::JobClass::Curation {
+            return Err(ContractViolation::BindingMismatch {
+                field: "curation",
+                reason: "Curation material is only valid for a Curation job".to_owned(),
+            });
+        }
+        curation.validate_for(&job.task_id, &job.scope_id, &job.state_fence)?;
+        if curation.source_snapshot != self.manifest.source_snapshot
+            || curation.source_revision != self.manifest.source_revision
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "curation.source_snapshot",
+                reason: "Curation source identity differs from the full manifest".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Returns whether all mandatory Curation material is retained.
     #[must_use]
     pub fn has_complete_curation_material(&self) -> bool {
@@ -1961,7 +2045,6 @@ impl AssemblyMaterialSet {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     fn validate_conditional_evaluations(&self) -> Result<(), ContractViolation> {
         let expected = self
             .recipe
@@ -1984,194 +2067,19 @@ impl AssemblyMaterialSet {
         }
         let mut seen = BTreeSet::new();
         for evaluation in &self.conditional_evaluations {
-            evaluation.validate()?;
-            let role = self
-                .recipe
-                .roles
-                .iter()
-                .find(|role| role.role == evaluation.role)
-                .ok_or(ContractViolation::BindingMismatch {
-                    field: "material.conditional.role",
-                    reason: "conditional evaluation role is absent from recipe".to_owned(),
-                })?;
-            if role.disposition != crate::assembly::recipe::RoleDisposition::Conditional
-                || !seen.insert(evaluation.role)
-                || role.condition.as_ref() != Some(&evaluation.condition)
-            {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "material.conditional.condition",
-                    reason: "evaluation does not bind the exact recipe condition".to_owned(),
-                });
-            }
+            self.validate_conditional_header(evaluation, &mut seen)?;
             match evaluation.state {
                 ConditionalEvaluationState::True => match evaluation.condition.predicate {
                     crate::assembly::recipe::ConditionalPredicate::EvidenceAvailable
                     | crate::assembly::recipe::ConditionalPredicate::RolePresent => {
-                        if evaluation.evidence_items.is_empty()
-                            || evaluation.conflict_atom.is_some()
-                            || evaluation.evidence_items.iter().any(|identity| {
-                                identity.role != evaluation.condition.evidence_role
-                                    || !self.ledger.iter().any(|entry| {
-                                        entry.role == identity.role
-                                            && entry.ordinal == identity.ordinal
-                                            && entry.handle == identity.handle
-                                            && entry.content_digest == identity.content_digest
-                                            && entry.source_revision == identity.source_revision
-                                            && entry.disposition == MaterialDisposition::Included
-                                    })
-                            })
-                        {
-                            return Err(ContractViolation::BindingMismatch {
-                                field: "material.conditional.evidence_items",
-                                reason: "true conditional lacks exact included earlier evidence"
-                                    .to_owned(),
-                            });
-                        }
+                        self.validate_conditional_true_evidence(evaluation)?;
                     }
                     crate::assembly::recipe::ConditionalPredicate::ConflictPresent => {
-                        if evaluation.evidence_items.is_empty()
-                            || evaluation.condition.evidence_role
-                                != DreamInputRole::ConflictsAndUnknowns
-                        {
-                            return Err(ContractViolation::BindingMismatch {
-                                field: "material.conditional.conflict",
-                                reason: "conflict predicate requires earlier conflict evidence"
-                                    .to_owned(),
-                            });
-                        }
-                        let Some(conflict) = &evaluation.conflict_atom else {
-                            return Err(ContractViolation::MissingField(
-                                "material.conditional.conflict_atom",
-                            ));
-                        };
-                        let Some(context) = &self.context else {
-                            return Err(ContractViolation::MissingField("material.context"));
-                        };
-                        if !context.view.rendered.iter().any(|atom| {
-                            atom.atom_id == conflict.atom_id
-                                && atom.role == SemanticRole::Conflict
-                                && atom.source_revision == conflict.source_revision
-                                && atom.source_digest == conflict.source_digest
-                        }) {
-                            return Err(ContractViolation::BindingMismatch {
-                                field: "material.conditional.conflict_atom",
-                                reason: "conflict atom is not an admitted A-15 Conflict witness"
-                                    .to_owned(),
-                            });
-                        }
-                        let conflict_atom = context.view.rendered.iter().find(|atom| {
-                            atom.atom_id == conflict.atom_id
-                                && atom.role == SemanticRole::Conflict
-                                && atom.source_revision == conflict.source_revision
-                                && atom.source_digest == conflict.source_digest
-                        });
-                        let Some(conflict_atom) = conflict_atom else {
-                            return Err(ContractViolation::BindingMismatch {
-                                field: "material.conditional.conflict_atom",
-                                reason: "conflict atom disappeared during identity join".to_owned(),
-                            });
-                        };
-                        if evaluation.evidence_items.iter().any(|identity| {
-                            identity.role != DreamInputRole::ConflictsAndUnknowns
-                                || identity.handle.is_none()
-                                || !self.ledger.iter().any(|entry| {
-                                    entry.role == identity.role
-                                        && entry.ordinal == identity.ordinal
-                                        && entry.handle == identity.handle
-                                        && entry.content_digest == identity.content_digest
-                                        && entry.source_revision == identity.source_revision
-                                        && entry.disposition == MaterialDisposition::Included
-                                })
-                                || identity
-                                    .handle
-                                    .as_ref()
-                                    .and_then(|handle| self.selected_references.get(handle))
-                                    .is_none_or(|reference| {
-                                        reference.source_revision != conflict.source_revision
-                                            || reference.content_digest != conflict.source_digest
-                                            || reference
-                                                .source_lineage
-                                                .as_ref()
-                                                .map(|lineage| {
-                                                    lineage.owner != conflict_atom.source_identity
-                                                })
-                                                .or_else(|| {
-                                                    reference.provenance.as_ref().and_then(
-                                                        |provenance| {
-                                                            provenance
-                                                                .lineage
-                                                                .iter()
-                                                                .find(|lineage| {
-                                                                    lineage.content_digest
-                                                                        == reference.content_digest
-                                                                        && lineage.revision
-                                                                            == reference
-                                                                                .source_revision
-                                                                })
-                                                                .map(|lineage| {
-                                                                    lineage.owner
-                                                                        != conflict_atom
-                                                                            .source_identity
-                                                                })
-                                                        },
-                                                    )
-                                                })
-                                                .unwrap_or(true)
-                                    })
-                        }) {
-                            return Err(ContractViolation::BindingMismatch {
-                                field: "material.conditional.conflict",
-                                reason:
-                                    "conflict witness lacks the exact authorized evidence identity"
-                                        .to_owned(),
-                            });
-                        }
+                        self.validate_conditional_conflict(evaluation)?;
                     }
                 },
                 ConditionalEvaluationState::KnownFalse => {
-                    let binding = evaluation
-                        .condition
-                        .coverage
-                        .as_ref()
-                        .ok_or(ContractViolation::MissingField("role.condition.coverage"))?;
-                    let denominator = self
-                        .manifest
-                        .coverage_denominators
-                        .get(&binding.denominator)
-                        .ok_or(ContractViolation::BindingMismatch {
-                            field: "material.conditional.coverage",
-                            reason: "known-false denominator is absent".to_owned(),
-                        })?;
-                    let receipt = self
-                        .manifest
-                        .coverage_receipts
-                        .get(&binding.denominator)
-                        .ok_or(ContractViolation::BindingMismatch {
-                            field: "material.conditional.coverage",
-                            reason: "known-false receipt is absent".to_owned(),
-                        })?;
-                    if denominator.kind != eliot_epistemic_contracts::DenominatorKind::CompleteScope
-                        || denominator.roles.len() != 1
-                        || denominator.roles.iter().next().map(String::as_str)
-                            != Some(evaluation.condition.evidence_role.as_str())
-                        || !denominator.members.is_empty()
-                        || denominator.bounds.total != 0
-                        || denominator.bounds.truncated
-                        || denominator.query.is_none()
-                        || denominator.frontier.is_none()
-                        || receipt.digest != binding.receipt
-                        || receipt.denominator != binding.denominator
-                        || receipt.denominator_size != 0
-                        || !receipt.members.is_empty()
-                        || !receipt.omissions.is_empty()
-                        || receipt.fence != denominator.fence
-                    {
-                        return Err(ContractViolation::BindingMismatch {
-                            field: "material.conditional.coverage",
-                            reason: "known-false coverage pair does not close an empty scope"
-                                .to_owned(),
-                        });
-                    }
+                    self.validate_conditional_known_false(evaluation)?;
                 }
                 ConditionalEvaluationState::Unresolved => {}
             }
@@ -2180,6 +2088,198 @@ impl AssemblyMaterialSet {
             return Err(ContractViolation::BindingMismatch {
                 field: "material.conditional_evaluations",
                 reason: "conditional evaluation role set is incomplete".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_conditional_header(
+        &self,
+        evaluation: &ConditionalEvaluation,
+        seen: &mut BTreeSet<DreamInputRole>,
+    ) -> Result<(), ContractViolation> {
+        evaluation.validate()?;
+        let role = self
+            .recipe
+            .roles
+            .iter()
+            .find(|role| role.role == evaluation.role)
+            .ok_or(ContractViolation::BindingMismatch {
+                field: "material.conditional.role",
+                reason: "conditional evaluation role is absent from recipe".to_owned(),
+            })?;
+        if role.disposition != crate::assembly::recipe::RoleDisposition::Conditional
+            || !seen.insert(evaluation.role)
+            || role.condition.as_ref() != Some(&evaluation.condition)
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "material.conditional.condition",
+                reason: "evaluation does not bind the exact recipe condition".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_conditional_true_evidence(
+        &self,
+        evaluation: &ConditionalEvaluation,
+    ) -> Result<(), ContractViolation> {
+        if evaluation.evidence_items.is_empty()
+            || evaluation.conflict_atom.is_some()
+            || evaluation.evidence_items.iter().any(|identity| {
+                identity.role != evaluation.condition.evidence_role
+                    || !self.ledger.iter().any(|entry| {
+                        entry.role == identity.role
+                            && entry.ordinal == identity.ordinal
+                            && entry.handle == identity.handle
+                            && entry.content_digest == identity.content_digest
+                            && entry.source_revision == identity.source_revision
+                            && entry.disposition == MaterialDisposition::Included
+                    })
+            })
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "material.conditional.evidence_items",
+                reason: "true conditional lacks exact included earlier evidence".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_conditional_conflict(
+        &self,
+        evaluation: &ConditionalEvaluation,
+    ) -> Result<(), ContractViolation> {
+        if evaluation.evidence_items.is_empty()
+            || evaluation.condition.evidence_role != DreamInputRole::ConflictsAndUnknowns
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "material.conditional.conflict",
+                reason: "conflict predicate requires earlier conflict evidence".to_owned(),
+            });
+        }
+        let Some(conflict) = &evaluation.conflict_atom else {
+            return Err(ContractViolation::MissingField(
+                "material.conditional.conflict_atom",
+            ));
+        };
+        let Some(context) = &self.context else {
+            return Err(ContractViolation::MissingField("material.context"));
+        };
+        if !context.view.rendered.iter().any(|atom| {
+            atom.atom_id == conflict.atom_id
+                && atom.role == SemanticRole::Conflict
+                && atom.source_revision == conflict.source_revision
+                && atom.source_digest == conflict.source_digest
+        }) {
+            return Err(ContractViolation::BindingMismatch {
+                field: "material.conditional.conflict_atom",
+                reason: "conflict atom is not an admitted A-15 Conflict witness".to_owned(),
+            });
+        }
+        let conflict_atom = context.view.rendered.iter().find(|atom| {
+            atom.atom_id == conflict.atom_id
+                && atom.role == SemanticRole::Conflict
+                && atom.source_revision == conflict.source_revision
+                && atom.source_digest == conflict.source_digest
+        });
+        let Some(conflict_atom) = conflict_atom else {
+            return Err(ContractViolation::BindingMismatch {
+                field: "material.conditional.conflict_atom",
+                reason: "conflict atom disappeared during identity join".to_owned(),
+            });
+        };
+        if evaluation.evidence_items.iter().any(|identity| {
+            identity.role != DreamInputRole::ConflictsAndUnknowns
+                || identity.handle.is_none()
+                || !self.ledger.iter().any(|entry| {
+                    entry.role == identity.role
+                        && entry.ordinal == identity.ordinal
+                        && entry.handle == identity.handle
+                        && entry.content_digest == identity.content_digest
+                        && entry.source_revision == identity.source_revision
+                        && entry.disposition == MaterialDisposition::Included
+                })
+                || identity
+                    .handle
+                    .as_ref()
+                    .and_then(|handle| self.selected_references.get(handle))
+                    .is_none_or(|reference| {
+                        reference.source_revision != conflict.source_revision
+                            || reference.content_digest != conflict.source_digest
+                            || reference
+                                .source_lineage
+                                .as_ref()
+                                .map(|lineage| lineage.owner != conflict_atom.source_identity)
+                                .or_else(|| {
+                                    reference.provenance.as_ref().and_then(|provenance| {
+                                        provenance
+                                            .lineage
+                                            .iter()
+                                            .find(|lineage| {
+                                                lineage.content_digest == reference.content_digest
+                                                    && lineage.revision == reference.source_revision
+                                            })
+                                            .map(|lineage| {
+                                                lineage.owner != conflict_atom.source_identity
+                                            })
+                                    })
+                                })
+                                .unwrap_or(true)
+                    })
+        }) {
+            return Err(ContractViolation::BindingMismatch {
+                field: "material.conditional.conflict",
+                reason: "conflict witness lacks the exact authorized evidence identity".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_conditional_known_false(
+        &self,
+        evaluation: &ConditionalEvaluation,
+    ) -> Result<(), ContractViolation> {
+        let binding = evaluation
+            .condition
+            .coverage
+            .as_ref()
+            .ok_or(ContractViolation::MissingField("role.condition.coverage"))?;
+        let denominator = self
+            .manifest
+            .coverage_denominators
+            .get(&binding.denominator)
+            .ok_or(ContractViolation::BindingMismatch {
+                field: "material.conditional.coverage",
+                reason: "known-false denominator is absent".to_owned(),
+            })?;
+        let receipt = self
+            .manifest
+            .coverage_receipts
+            .get(&binding.denominator)
+            .ok_or(ContractViolation::BindingMismatch {
+                field: "material.conditional.coverage",
+                reason: "known-false receipt is absent".to_owned(),
+            })?;
+        if denominator.kind != eliot_epistemic_contracts::DenominatorKind::CompleteScope
+            || denominator.roles.len() != 1
+            || denominator.roles.iter().next().map(String::as_str)
+                != Some(evaluation.condition.evidence_role.as_str())
+            || !denominator.members.is_empty()
+            || denominator.bounds.total != 0
+            || denominator.bounds.truncated
+            || denominator.query.is_none()
+            || denominator.frontier.is_none()
+            || receipt.digest != binding.receipt
+            || receipt.denominator != binding.denominator
+            || receipt.denominator_size != 0
+            || !receipt.members.is_empty()
+            || !receipt.omissions.is_empty()
+            || receipt.fence != denominator.fence
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "material.conditional.coverage",
+                reason: "known-false coverage pair does not close an empty scope".to_owned(),
             });
         }
         Ok(())

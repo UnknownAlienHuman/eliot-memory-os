@@ -1065,9 +1065,18 @@ impl DreamJobRecipe {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     fn validate_class_roles(&self) -> Result<(), ContractViolation> {
         let input_roles: BTreeSet<_> = self.inputs.iter().map(RecipeInput::role).collect();
+        self.validate_positive_role_minimum()?;
+        self.validate_orientation_roles()?;
+        self.validate_required_class_roles(&input_roles)?;
+        self.validate_source_free_inputs()?;
+        self.validate_deadline_role()?;
+        self.validate_curation_dispositions()?;
+        Ok(())
+    }
+
+    fn validate_positive_role_minimum(&self) -> Result<(), ContractViolation> {
         if !self
             .roles
             .iter()
@@ -1075,6 +1084,10 @@ impl DreamJobRecipe {
         {
             return Err(ContractViolation::MissingField("roles.minimum"));
         }
+        Ok(())
+    }
+
+    fn validate_orientation_roles(&self) -> Result<(), ContractViolation> {
         if self.job.job_class == JobClass::Orientation {
             for role in [DreamInputRole::Architecture, DreamInputRole::Implementation] {
                 if !self.roles.iter().any(|candidate| candidate.role == role) {
@@ -1085,6 +1098,13 @@ impl DreamJobRecipe {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn validate_required_class_roles(
+        &self,
+        input_roles: &BTreeSet<DreamInputRole>,
+    ) -> Result<(), ContractViolation> {
         for required in required_roles(self.job.job_class) {
             let role = self
                 .roles
@@ -1115,6 +1135,10 @@ impl DreamJobRecipe {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn validate_source_free_inputs(&self) -> Result<(), ContractViolation> {
         for input in &self.inputs {
             let role = self
                 .roles
@@ -1143,6 +1167,10 @@ impl DreamJobRecipe {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn validate_deadline_role(&self) -> Result<(), ContractViolation> {
         if let Some(deadline_role) = self
             .roles
             .iter()
@@ -1155,6 +1183,10 @@ impl DreamJobRecipe {
                 reason: "deadline without a job deadline must be not-applicable".to_owned(),
             });
         }
+        Ok(())
+    }
+
+    fn validate_curation_dispositions(&self) -> Result<(), ContractViolation> {
         for curation_role in CURATION_ROLES {
             let role = self
                 .roles

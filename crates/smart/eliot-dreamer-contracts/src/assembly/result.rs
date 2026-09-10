@@ -163,7 +163,6 @@ pub struct DisclosureAuthorization {
 }
 
 impl DisclosureAuthorization {
-    #[allow(clippy::too_many_lines)]
     fn validate_retained(
         &self,
         input_digest: &str,
@@ -183,6 +182,20 @@ impl DisclosureAuthorization {
                 field: "result.disclosure.decision",
                 reason: error.to_string(),
             })?;
+        self.validate_retained_identity(input_digest, route_id, policy_ref, state_fence)?;
+        self.validate_retained_domains()?;
+        self.validate_retained_receipts(input_digest, state_fence)?;
+        self.validate_retained_payload()?;
+        Ok(())
+    }
+
+    fn validate_retained_identity(
+        &self,
+        input_digest: &str,
+        route_id: &str,
+        policy_ref: &str,
+        state_fence: &eliot_contracts::StateFence,
+    ) -> Result<(), ContractViolation> {
         if self.closure.subject_ref != input_digest
             || self.decision.subject_and_closure_ref != self.closure.closure_id
             || self.decision.recipient_principal_or_route != route_id
@@ -202,6 +215,10 @@ impl DisclosureAuthorization {
                 reason: "disclosure authorization does not close the exact model input".to_owned(),
             });
         }
+        Ok(())
+    }
+
+    fn validate_retained_domains(&self) -> Result<(), ContractViolation> {
         let closure_domains: BTreeSet<_> = self
             .closure
             .direct_domain_refs
@@ -236,6 +253,14 @@ impl DisclosureAuthorization {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn validate_retained_receipts(
+        &self,
+        input_digest: &str,
+        state_fence: &eliot_contracts::StateFence,
+    ) -> Result<(), ContractViolation> {
         let mut declared_receipts = BTreeSet::new();
         for receipt_ref in &self.closure.declassification_receipt_refs {
             check_text(
@@ -282,6 +307,10 @@ impl DisclosureAuthorization {
                     .to_owned(),
             });
         }
+        Ok(())
+    }
+
+    fn validate_retained_payload(&self) -> Result<(), ContractViolation> {
         match self.decision.decision {
             DisclosureDecisionKind::Allow => {
                 if self.redacted_output_digest.is_some()
@@ -592,8 +621,18 @@ impl AssemblyResult {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     fn validate_preimage_shape(&self) -> Result<(), ContractViolation> {
+        self.validate_preimage_header()?;
+        self.validate_preimage_inputs()?;
+        self.validate_retained_disclosure()?;
+        self.validate_artifacts_and_accounting()?;
+        self.validate_complete_disclosure()?;
+        self.validate_bundle_identity_and_projection()?;
+        self.validate_complete_materials()?;
+        self.validate_final_stop_and_frontier()
+    }
+
+    fn validate_preimage_header(&self) -> Result<(), ContractViolation> {
         super::preflight(self, "assembly_carrier", super::ASSEMBLY_CARRIER_CEILING)?;
         if self.schema_version != RESULT_SCHEMA_VERSION {
             return Err(ContractViolation::OutOfBounds {
@@ -620,6 +659,10 @@ impl AssemblyResult {
                 reason: "v1 source-scope denominator is not owned by assembly".to_owned(),
             });
         }
+        Ok(())
+    }
+
+    fn validate_preimage_inputs(&self) -> Result<(), ContractViolation> {
         self.bundle.validate()?;
         self.materials.validate()?;
         self.stop.validate()?;
@@ -628,10 +671,14 @@ impl AssemblyResult {
             .validate_against(&self.materials.recipe.reserves)?;
         self.bundle_measurement.validate_for(&self.materials)?;
         validate_omission_accounting(&self.materials, &self.bundle_measurement)?;
-        let job = &self.materials.recipe.job;
         if self.status == BundleStatus::KnownEmpty {
             validate_known_empty(&self.materials, &self.bundle)?;
         }
+        Ok(())
+    }
+
+    fn validate_retained_disclosure(&self) -> Result<(), ContractViolation> {
+        let job = &self.materials.recipe.job;
         if let Some(disclosure) = &self.disclosure {
             disclosure.validate_retained(
                 &self.bundle_measurement.input_digest,
@@ -640,6 +687,11 @@ impl AssemblyResult {
                 &job.state_fence,
             )?;
         }
+        Ok(())
+    }
+
+    fn validate_artifacts_and_accounting(&self) -> Result<(), ContractViolation> {
+        let job = &self.materials.recipe.job;
         let input_bytes = self.materials.model_input_bytes_unchecked()?;
         let output_bytes = super::canonical_bytes(
             &self.bundle,
@@ -656,6 +708,11 @@ impl AssemblyResult {
             output_bytes.len(),
             audit_bytes.len(),
         )?;
+        Ok(())
+    }
+
+    fn validate_complete_disclosure(&self) -> Result<(), ContractViolation> {
+        let job = &self.materials.recipe.job;
         if self.status == BundleStatus::Complete {
             let disclosure = self
                 .disclosure
@@ -668,6 +725,11 @@ impl AssemblyResult {
                 &job.state_fence,
             )?;
         }
+        Ok(())
+    }
+
+    fn validate_bundle_identity_and_projection(&self) -> Result<(), ContractViolation> {
+        let job = &self.materials.recipe.job;
         if self.bundle.job_id != job.canonical_id()
             || self.bundle.task_id != job.task_id
             || self.bundle.scope_id != job.scope_id
@@ -686,6 +748,11 @@ impl AssemblyResult {
                 reason: "status and bundle completeness disagree".to_owned(),
             });
         }
+        Ok(())
+    }
+
+    fn validate_complete_materials(&self) -> Result<(), ContractViolation> {
+        let job = &self.materials.recipe.job;
         if self.status == BundleStatus::Complete
             && job.job_class == crate::job::JobClass::Curation
             && !self.materials.has_complete_curation_material()
@@ -701,6 +768,10 @@ impl AssemblyResult {
             }
             validate_complete_roles(&self.materials)?;
         }
+        Ok(())
+    }
+
+    fn validate_final_stop_and_frontier(&self) -> Result<(), ContractViolation> {
         validate_stop_and_frontier(self.status, &self.stop, &self.frontier, &self.materials)
     }
 
@@ -1175,7 +1246,6 @@ fn validate_known_empty(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 fn validate_complete_roles(materials: &AssemblyMaterialSet) -> Result<(), ContractViolation> {
     for role in &materials.recipe.roles {
         let entries: Vec<_> = materials
@@ -1192,125 +1262,155 @@ fn validate_complete_roles(materials: &AssemblyMaterialSet) -> Result<(), Contra
             .iter()
             .find(|outcome| outcome.role == role.role)
             .ok_or(ContractViolation::MissingField("material.role_outcomes"))?;
-        match role.disposition {
-            RoleDisposition::Required if included < role.minimum as usize => {
+        validate_complete_role_minimum(materials, role, included)?;
+        validate_complete_role_outcome(role, outcome)?;
+        validate_complete_role_protection(materials, role)?;
+        validate_complete_role_dependencies(materials, role, included)?;
+    }
+    Ok(())
+}
+
+fn validate_complete_role_minimum(
+    materials: &AssemblyMaterialSet,
+    role: &super::recipe::RecipeRole,
+    included: usize,
+) -> Result<(), ContractViolation> {
+    match role.disposition {
+        RoleDisposition::Required if included < role.minimum as usize => {
+            return Err(ContractViolation::BindingMismatch {
+                field: "result.roles",
+                reason: "complete result does not meet a required role minimum".to_owned(),
+            });
+        }
+        RoleDisposition::Conditional => {
+            let evaluation = materials
+                .conditional_evaluations
+                .iter()
+                .find(|evaluation| evaluation.role == role.role)
+                .ok_or(ContractViolation::MissingField(
+                    "material.conditional_evaluations",
+                ))?;
+            match evaluation.state {
+                super::material::ConditionalEvaluationState::KnownFalse if included != 0 => {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "result.roles",
+                        reason: "known-false conditional role retained an item".to_owned(),
+                    });
+                }
+                super::material::ConditionalEvaluationState::KnownFalse => {}
+                super::material::ConditionalEvaluationState::Unresolved => {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "result.roles",
+                        reason: "complete result has an unresolved conditional role".to_owned(),
+                    });
+                }
+                super::material::ConditionalEvaluationState::True => {
+                    if included < role.minimum as usize {
+                        return Err(ContractViolation::BindingMismatch {
+                            field: "result.roles",
+                            reason: "true conditional role misses its positive minimum".to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_complete_role_outcome(
+    role: &super::recipe::RecipeRole,
+    outcome: &RoleOutcome,
+) -> Result<(), ContractViolation> {
+    if outcome.state == super::material::RoleOutcomeState::Unresolved {
+        return Err(ContractViolation::BindingMismatch {
+            field: "result.roles",
+            reason: "complete result has an unresolved role outcome".to_owned(),
+        });
+    }
+    if outcome.state == super::material::RoleOutcomeState::Missing
+        && role.disposition == RoleDisposition::Required
+    {
+        return Err(ContractViolation::BindingMismatch {
+            field: "result.roles",
+            reason: "required role is marked missing".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_complete_role_protection(
+    materials: &AssemblyMaterialSet,
+    role: &super::recipe::RecipeRole,
+) -> Result<(), ContractViolation> {
+    if role.disposition != RoleDisposition::NotApplicable
+        && (role.protected
+            || matches!(
+                role.representation_loss,
+                eliot_context_contracts::LossPolicy::NonDroppable
+            ))
+    {
+        for supplied in materials
+            .supplied_items
+            .iter()
+            .filter(|identity| identity.role == role.role)
+        {
+            if !materials.ledger.iter().any(|entry| {
+                entry.disposition == MaterialDisposition::Included
+                    && entry.role == supplied.role
+                    && entry.ordinal == supplied.ordinal
+                    && entry.handle == supplied.handle
+                    && entry.content_digest == supplied.content_digest
+                    && entry.source_revision == supplied.source_revision
+            }) {
                 return Err(ContractViolation::BindingMismatch {
                     field: "result.roles",
-                    reason: "complete result does not meet a required role minimum".to_owned(),
+                    reason: "protected or non-droppable role dropped a supplied item".to_owned(),
                 });
             }
-            RoleDisposition::Conditional => {
-                let evaluation = materials
-                    .conditional_evaluations
-                    .iter()
-                    .find(|evaluation| evaluation.role == role.role)
-                    .ok_or(ContractViolation::MissingField(
-                        "material.conditional_evaluations",
-                    ))?;
-                match evaluation.state {
-                    super::material::ConditionalEvaluationState::KnownFalse if included != 0 => {
-                        return Err(ContractViolation::BindingMismatch {
-                            field: "result.roles",
-                            reason: "known-false conditional role retained an item".to_owned(),
-                        });
-                    }
-                    super::material::ConditionalEvaluationState::KnownFalse => {}
-                    super::material::ConditionalEvaluationState::Unresolved => {
-                        return Err(ContractViolation::BindingMismatch {
-                            field: "result.roles",
-                            reason: "complete result has an unresolved conditional role".to_owned(),
-                        });
-                    }
-                    super::material::ConditionalEvaluationState::True => {
-                        if included < role.minimum as usize {
-                            return Err(ContractViolation::BindingMismatch {
-                                field: "result.roles",
-                                reason: "true conditional role misses its positive minimum"
-                                    .to_owned(),
-                            });
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
-        if outcome.state == super::material::RoleOutcomeState::Unresolved {
-            return Err(ContractViolation::BindingMismatch {
-                field: "result.roles",
-                reason: "complete result has an unresolved role outcome".to_owned(),
-            });
-        }
-        if outcome.state == super::material::RoleOutcomeState::Missing
-            && role.disposition == RoleDisposition::Required
-        {
-            return Err(ContractViolation::BindingMismatch {
-                field: "result.roles",
-                reason: "required role is marked missing".to_owned(),
-            });
-        }
-        if role.disposition != RoleDisposition::NotApplicable
-            && (role.protected
-                || matches!(
-                    role.representation_loss,
-                    eliot_context_contracts::LossPolicy::NonDroppable
-                ))
-        {
-            for supplied in materials
-                .supplied_items
+    }
+    Ok(())
+}
+
+fn validate_complete_role_dependencies(
+    materials: &AssemblyMaterialSet,
+    role: &super::recipe::RecipeRole,
+    included: usize,
+) -> Result<(), ContractViolation> {
+    if included > 0 {
+        for dependency in &role.interpretation_dependencies {
+            let dependency_role = materials
+                .recipe
+                .roles
                 .iter()
-                .filter(|identity| identity.role == role.role)
+                .find(|candidate| candidate.role == *dependency)
+                .ok_or(ContractViolation::BindingMismatch {
+                    field: "result.roles",
+                    reason: "role dependency is absent from recipe".to_owned(),
+                })?;
+            if dependency_role.disposition == RoleDisposition::NotApplicable
+                || dependency_role.maximum == 0
             {
-                if !materials.ledger.iter().any(|entry| {
-                    entry.disposition == MaterialDisposition::Included
-                        && entry.role == supplied.role
-                        && entry.ordinal == supplied.ordinal
-                        && entry.handle == supplied.handle
-                        && entry.content_digest == supplied.content_digest
-                        && entry.source_revision == supplied.source_revision
-                }) {
-                    return Err(ContractViolation::BindingMismatch {
-                        field: "result.roles",
-                        reason: "protected or non-droppable role dropped a supplied item"
-                            .to_owned(),
-                    });
-                }
+                return Err(ContractViolation::BindingMismatch {
+                    field: "result.roles",
+                    reason: "role dependency must target an applicable non-empty role".to_owned(),
+                });
             }
-        }
-        if included > 0 {
-            for dependency in &role.interpretation_dependencies {
-                let dependency_role = materials
-                    .recipe
-                    .roles
-                    .iter()
-                    .find(|candidate| candidate.role == *dependency)
-                    .ok_or(ContractViolation::BindingMismatch {
-                        field: "result.roles",
-                        reason: "role dependency is absent from recipe".to_owned(),
-                    })?;
-                if dependency_role.disposition == RoleDisposition::NotApplicable
-                    || dependency_role.maximum == 0
-                {
-                    return Err(ContractViolation::BindingMismatch {
-                        field: "result.roles",
-                        reason: "role dependency must target an applicable non-empty role"
-                            .to_owned(),
-                    });
-                }
-                let minimum = usize::max(1, dependency_role.minimum as usize);
-                let dependency_included = materials
-                    .ledger
-                    .iter()
-                    .filter(|entry| {
-                        entry.role == *dependency
-                            && entry.disposition == MaterialDisposition::Included
-                    })
-                    .count();
-                if dependency_included < minimum {
-                    return Err(ContractViolation::BindingMismatch {
-                        field: "result.roles",
-                        reason: "included role lacks its dependency minimum".to_owned(),
-                    });
-                }
+            let minimum = usize::max(1, dependency_role.minimum as usize);
+            let dependency_included = materials
+                .ledger
+                .iter()
+                .filter(|entry| {
+                    entry.role == *dependency && entry.disposition == MaterialDisposition::Included
+                })
+                .count();
+            if dependency_included < minimum {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "result.roles",
+                    reason: "included role lacks its dependency minimum".to_owned(),
+                });
             }
         }
     }
@@ -1348,10 +1448,19 @@ fn selected_source_owner_count(materials: &AssemblyMaterialSet) -> Result<u64, C
     })
 }
 
-#[allow(clippy::too_many_lines)]
 fn validate_stop_and_frontier(
     status: BundleStatus,
     stop: &AssemblyStop,
+    frontier: &AssemblyFrontier,
+    materials: &AssemblyMaterialSet,
+) -> Result<(), ContractViolation> {
+    validate_frontier_roles(frontier, materials)?;
+    let outstanding = validate_frontier_supplied_items(frontier, materials)?;
+    validate_frontier_references(frontier, materials, &outstanding)?;
+    validate_frontier_status(status, stop, frontier)
+}
+
+fn validate_frontier_roles(
     frontier: &AssemblyFrontier,
     materials: &AssemblyMaterialSet,
 ) -> Result<(), ContractViolation> {
@@ -1390,6 +1499,13 @@ fn validate_stop_and_frontier(
             reason: "frontier roles differ from unresolved declared roles".to_owned(),
         });
     }
+    Ok(())
+}
+
+fn validate_frontier_supplied_items(
+    frontier: &AssemblyFrontier,
+    materials: &AssemblyMaterialSet,
+) -> Result<BTreeSet<SuppliedItemIdentity>, ContractViolation> {
     let outstanding: BTreeSet<_> = materials
         .supplied_items
         .iter()
@@ -1415,6 +1531,14 @@ fn validate_stop_and_frontier(
             reason: "frontier supplied identities differ from outstanding ledger items".to_owned(),
         });
     }
+    Ok(outstanding)
+}
+
+fn validate_frontier_references(
+    frontier: &AssemblyFrontier,
+    materials: &AssemblyMaterialSet,
+    outstanding: &BTreeSet<SuppliedItemIdentity>,
+) -> Result<(), ContractViolation> {
     let expected_references: BTreeSet<_> = outstanding
         .iter()
         .filter_map(|identity| identity.handle.as_ref())
@@ -1429,6 +1553,14 @@ fn validate_stop_and_frontier(
                 .to_owned(),
         });
     }
+    Ok(())
+}
+
+fn validate_frontier_status(
+    status: BundleStatus,
+    stop: &AssemblyStop,
+    frontier: &AssemblyFrontier,
+) -> Result<(), ContractViolation> {
     if status == BundleStatus::Complete
         && (stop.reason != AssemblyStopReason::Completed
             || !frontier.roles.is_empty()
