@@ -22,9 +22,11 @@ agent_order = 3
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-context-contracts = { path = "../eliot-context-contracts" }
 eliot-evidence = { path = "../../foundation/eliot-evidence" }
 eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts" }
 eliot-receipts = { path = "../../foundation/eliot-receipts" }
+eliot-security-contracts = { path = "../../foundation/eliot-security-contracts" }
 blake3 = "1.8.5"
 schemars = { version = "1.2.1", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
