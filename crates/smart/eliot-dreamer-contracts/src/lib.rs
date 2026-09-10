@@ -141,7 +141,11 @@ pub use self_query::{
     SelfQueryContractError, SelfQueryInput, SelfQueryOutputProfile, SelfQueryPolicy,
     SelfQueryProfile,
 };
-pub use validation::{DreamDraftValidationError, ValidatedCandidate, ValidationPolicy};
+pub use validation::{
+    DreamDraftValidationError, GroundingValidationInput, STRUCTURED_VALIDATION_SCHEMA_VERSION,
+    STRUCTURED_VALIDATOR_CONTRACT, ValidatedCandidate, ValidatedGroundingCandidate,
+    ValidationPolicy,
+};
 
 /// Contract hub identity (`name@version`).
 pub const CONTRACT_NAME: &str = "eliot.smart.dreamer.contracts";
