@@ -313,6 +313,7 @@ impl super::CoordinationOwner {
                 || lease.holder_session_id != session_id
                 || lease.authority_epoch != authority_epoch
                 || lease.state_fence != *state_fence
+                || lease.retired_at.is_some()
                 || lease.issued_at == 0
                 || lease.expires_at == 0
                 || lease.issued_at > lease.expires_at
@@ -567,6 +568,19 @@ mod tests {
             ))
         );
         assert_eq!(owner.events().len(), 3);
+    }
+
+    #[test]
+    fn legacy_acquisition_cannot_be_promoted_to_canonical_issuance() {
+        let (mut owner, state_fence) = ready_owner();
+        let claim = request(&state_fence);
+        owner.acquire_work(claim.clone()).expect("legacy claim");
+        assert_eq!(
+            owner.acquire_work_with_issuance(claim),
+            Err(WorkLeaseIssuanceFailure::Evidence(
+                WorkLeaseIssuanceError::PostHocIssuanceRejected
+            ))
+        );
     }
 
     #[test]
