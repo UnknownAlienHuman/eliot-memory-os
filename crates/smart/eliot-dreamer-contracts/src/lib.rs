@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod assembly;
 pub mod budget;
 pub mod bundle;
 pub mod candidate;
@@ -26,6 +27,19 @@ pub mod relation;
 pub mod screen;
 pub mod validation;
 
+pub use assembly::{
+    AssemblyFrontier, AssemblyMaterial, AssemblyMaterialSet, AssemblyOmissionAccounting,
+    AssemblyOmissionConstraint, AssemblyOmissionCoverage, AssemblyReserve, AssemblyReserveSet,
+    AssemblyResult, AssemblyStop, AssemblyStopReason, BundleMeasurement,
+    ConditionalCoverageBinding, ConditionalEvaluation, ConditionalEvaluationState,
+    ConditionalPredicate, ConditionalRequirement, ConflictAtomIdentity, ContextMaterialClosure,
+    ContributionMeasurement, ContributionStatus, CurationMaterial, DisclosureAuthorization,
+    DreamInputRole, DreamJobRecipe, MaterialDisposition, MaterialLedgerEntry,
+    MaterialOutcomeReason, MaterialRepresentation, RECIPE_SCHEMA_VERSION, RecipeInput, RecipeRole,
+    ReserveUsage, RoleDisposition, RoleOmissionPolicy, RoleOutcome, RoleOutcomeState, SourceRule,
+    SourceRuleKind, SuppliedItemIdentity, material_schema_version, required_roles,
+    result_schema_version,
+};
 pub use budget::{
     BudgetDimension, BudgetLimits, BudgetUsage, DEX_BUDGET_DIMENSIONS, check_no_cross_subsidy,
 };
