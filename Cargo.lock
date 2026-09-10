@@ -832,6 +832,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -1892,6 +1893,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "eliot-bootstrap",
  "serde",
  "serde_json",
  "sha2 0.10.9",

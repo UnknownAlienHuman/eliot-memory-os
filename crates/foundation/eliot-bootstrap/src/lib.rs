@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod capture;
+pub mod normative;
 
 /// Stable contract name for the C0-09 compiler surface.
 pub const CONTRACT_NAME: &str = "eliot.foundation.bootstrap";
@@ -984,9 +985,16 @@ fn provider_registry() -> ReasonDirectiveRegistry {
     }
 }
 
-/// Builds the provider-owned GAP projection for the frozen normative pair.
-pub fn provider_normative_gap() -> Result<ProviderNormativeProjection, BootstrapCompileError> {
-    let normative_pair = capture::current_normative_pair();
+/// Builds the provider-owned GAP projection for a caller-supplied normative pair.
+///
+/// The pair must be selected independently from the repository receipt that the
+/// caller intends to use. This function validates shape and equality only; it
+/// does not authenticate the receipt or establish document authority.
+pub fn provider_normative_gap(
+    expected: &NormativePair,
+) -> Result<ProviderNormativeProjection, BootstrapCompileError> {
+    expected.validate("expected-normative-pair")?;
+    let normative_pair = expected.clone();
     let identity = provider_identity(&normative_pair)?;
     let catalogue = RuleCatalogue {
         normative_pair_identity: identity.clone(),
@@ -1031,18 +1039,22 @@ pub fn provider_normative_gap() -> Result<ProviderNormativeProjection, Bootstrap
     };
     projection.catalogue_sha256 = canonical_digest(&projection.catalogue, "normative-catalogue")?;
     projection.registry_sha256 = canonical_digest(&projection.registry, "normative-registry")?;
-    projection.validate()?;
+    projection.validate(expected)?;
     Ok(projection)
 }
 
 impl ProviderNormativeProjection {
-    /// Validates frozen identity, provider provenance, digests and gap shape.
-    pub fn validate(&self) -> Result<(), BootstrapCompileError> {
+    /// Validates the projection against an independently supplied normative pair.
+    ///
+    /// Validation enforces shape, equality, provenance fields, digests, and GAP
+    /// structure. It does not authenticate the pair or establish its authority.
+    pub fn validate(&self, expected: &NormativePair) -> Result<(), BootstrapCompileError> {
+        expected.validate("expected-normative-pair")?;
         if self.status != NormativeProjectionStatus::Gap
             || self.provider_id != NORMATIVE_PROVIDER_ID
             || self.provider_revision != NORMATIVE_PROVIDER_REVISION
             || self.source_revision != NORMATIVE_SOURCE_REVISION
-            || self.normative_pair != capture::current_normative_pair()
+            || self.normative_pair != *expected
         {
             return Err(BootstrapCompileError::ProviderValidation {
                 provider: NORMATIVE_PROVIDER_ID,
@@ -1109,9 +1121,14 @@ pub struct BootstrapBriefCompiler;
 
 impl BootstrapBriefCompiler {
     /// Builds the provider-owned rule/scope projection for one canonical seed.
+    ///
+    /// `expected` must be supplied independently from the selected repository's
+    /// accepted receipt. Compilation checks shape and equality only; it does not
+    /// authenticate the receipt or promote it to current authority.
     pub fn compile(
         seed: AgentWorkUnitBrief,
         snapshot: &CurrentSystemEvidenceSnapshot,
+        expected: &NormativePair,
     ) -> Result<BootstrapBrief, BootstrapCompileError> {
         seed.validate()
             .map_err(|error| BootstrapCompileError::ProviderValidation {
@@ -1119,14 +1136,14 @@ impl BootstrapBriefCompiler {
                 detail: error.to_string(),
             })?;
         snapshot.validate()?;
-        let canonical_pair = capture::current_normative_pair();
-        if snapshot.normative_pair != canonical_pair {
+        expected.validate("expected-normative-pair")?;
+        if snapshot.normative_pair != *expected {
             return Err(BootstrapCompileError::ConflictingIdentity {
                 source_id: "current-system-evidence".to_owned(),
                 identity: "normative_pair".to_owned(),
             });
         }
-        let projection = provider_normative_gap()?;
+        let projection = provider_normative_gap(expected)?;
         let snapshot_sha256 = snapshot.snapshot_sha256.clone();
         let catalogue_sha256 = projection.catalogue_sha256.clone();
         let mut source_refs = seed.source_refs;
@@ -1375,6 +1392,11 @@ mod tests {
         }
     }
 
+    fn accepted_pair_for_test() -> Result<NormativePair, Box<dyn std::error::Error>> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        Ok(capture::load_normative_pair(&root)?)
+    }
+
     fn evidence_source() -> SourceProjection<CurrentSystemEvidenceSource> {
         SourceProjection::complete(
             "current-system",
@@ -1550,8 +1572,9 @@ mod tests {
 
     #[test]
     fn provider_gap_is_owned_empty_and_byte_stable() -> Result<(), Box<dyn std::error::Error>> {
-        let first = provider_normative_gap()?;
-        let second = provider_normative_gap()?;
+        let expected = accepted_pair_for_test()?;
+        let first = provider_normative_gap(&expected)?;
+        let second = provider_normative_gap(&expected)?;
         assert_eq!(first, second);
         assert_eq!(first.status, NormativeProjectionStatus::Gap);
         assert!(first.catalogue.entries.is_empty());
@@ -1571,19 +1594,21 @@ mod tests {
     #[test]
     fn provider_gap_rejects_identity_and_reason_tampering() -> Result<(), Box<dyn std::error::Error>>
     {
-        let mut identity_tampered = provider_normative_gap()?;
+        let expected = accepted_pair_for_test()?;
+        let mut identity_tampered = provider_normative_gap(&expected)?;
         identity_tampered.source_revision = "caller-revision".to_owned();
-        assert!(identity_tampered.validate().is_err());
+        assert!(identity_tampered.validate(&expected).is_err());
 
-        let mut reason_tampered = provider_normative_gap()?;
+        let mut reason_tampered = provider_normative_gap(&expected)?;
         reason_tampered.registry.reasons.clear();
-        assert!(reason_tampered.validate().is_err());
+        assert!(reason_tampered.validate(&expected).is_err());
         Ok(())
     }
 
     #[test]
     fn coverage_is_bijective_projection_of_manifest() -> Result<(), Box<dyn std::error::Error>> {
-        let projection = provider_normative_gap()?;
+        let expected = accepted_pair_for_test()?;
+        let projection = provider_normative_gap(&expected)?;
         let coverage = BootstrapCoverage::from_manifest(&projection.manifest);
         coverage.validate_bijective(&projection.manifest)?;
         let mut forged = coverage;
@@ -1599,14 +1624,15 @@ mod tests {
             .value
             .as_mut()
             .ok_or("complete evidence fixture must carry a value")?;
-        value.normative_pair = capture::current_normative_pair();
+        let expected = accepted_pair_for_test()?;
+        value.normative_pair = expected.clone();
         let snapshot = CurrentSystemEvidenceCompiler::compile(source)?;
         let snapshot_ref = snapshot.snapshot_sha256.clone();
-        let first = BootstrapBriefCompiler::compile(seed(), &snapshot)?;
-        let second = BootstrapBriefCompiler::compile(seed(), &snapshot)?;
+        let first = BootstrapBriefCompiler::compile(seed(), &snapshot, &expected)?;
+        let second = BootstrapBriefCompiler::compile(seed(), &snapshot, &expected)?;
         assert_eq!(serde_json::to_vec(&first)?, serde_json::to_vec(&second)?);
 
-        let pair = current_normative_pair_for_test();
+        let pair = expected;
         let failure = BootstrapFailureDraft::new(
             BootstrapDraftInput {
                 source_identity: "capture".to_owned(),
@@ -1641,18 +1667,15 @@ mod tests {
     fn provider_gap_brief_rejects_a_noncanonical_snapshot_pair()
     -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = CurrentSystemEvidenceCompiler::compile(evidence_source())?;
+        let expected = accepted_pair_for_test()?;
         assert!(matches!(
-            BootstrapBriefCompiler::compile(seed(), &snapshot),
+            BootstrapBriefCompiler::compile(seed(), &snapshot, &expected),
             Err(BootstrapCompileError::ConflictingIdentity {
                 ref source_id,
                 ref identity,
             }) if source_id == "current-system-evidence" && identity == "normative_pair"
         ));
         Ok(())
-    }
-
-    fn current_normative_pair_for_test() -> NormativePair {
-        capture::current_normative_pair()
     }
 
     #[test]
