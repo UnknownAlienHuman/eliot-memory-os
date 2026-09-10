@@ -190,9 +190,18 @@ fn reject_candidate(
     reason: MaterialOutcomeReason,
     constraints: Vec<AssemblyOmissionConstraint>,
 ) {
-    current.deferred = append_deferred(current.deferred.clone(), item, reason);
-    current.omissions =
-        append_omission(input, current.omissions.clone(), item, reason, constraints);
+    if permitted_omission(input, item).is_some() {
+        current.omissions =
+            append_omission(input, current.omissions.clone(), item, reason, constraints);
+        current
+            .deferred
+            .retain(|deferred| deferred.identity != item.identity);
+    } else {
+        current.deferred = append_deferred(current.deferred.clone(), item, reason);
+        current
+            .omissions
+            .retain(|omission| omission.identity != item.identity);
+    }
 }
 
 pub(crate) fn core_ready(
