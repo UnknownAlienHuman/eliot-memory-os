@@ -9,6 +9,7 @@ pub mod bounds;
 pub mod encoding;
 pub mod error;
 pub mod policy;
+pub mod structured;
 
 use crate::{
     BudgetUsage, DreamInputBundle, DreamJobInput, GroundedDreamDraft, ModelDraft,
@@ -24,6 +25,10 @@ pub use encoding::{
 };
 pub use error::DreamDraftValidationError;
 pub use policy::ValidationPolicy;
+pub use structured::{
+    GroundingValidationInput, STRUCTURED_VALIDATION_SCHEMA_VERSION, STRUCTURED_VALIDATOR_CONTRACT,
+    ValidatedGroundingCandidate,
+};
 
 /// Complete A03 aggregate retained after the A05 semantic gate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
