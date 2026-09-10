@@ -42,8 +42,9 @@ def standalone_crates(root: Path) -> list[Path]:
     """
     members, exclude = workspace_paths(root)
     found: list[Path] = []
+    ignored_parts = {"target", "testdata", "fixtures"}
     for manifest in sorted(root.rglob("Cargo.toml")):
-        if "target" in manifest.parts or manifest == root / "Cargo.toml":
+        if any(part in ignored_parts for part in manifest.parts) or manifest == root / "Cargo.toml":
             continue
         text = manifest.read_text(encoding="utf-8")
         if "[workspace]" not in text:
