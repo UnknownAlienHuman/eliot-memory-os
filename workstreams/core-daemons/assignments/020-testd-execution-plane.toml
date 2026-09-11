@@ -1,0 +1,113 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "PARTIAL_LIBRARY_PRESENT_BINARY_FAIL_CLOSED"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "TESTD_EXECUTION_EDGE_CANDIDATE"
+issue = 20
+integration_issue_refs = [15, 18, 11]
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A02-03-modular-architecture.md#a23-modular-architecture",
+  "docs/architecture/A10-08-harness-architecture.md#a108-harness-architecture",
+  "docs/architecture/A13-05-bounded-resources-and-control-reserve.md#a135-bounded-resources-and-control-reserve",
+]
+implementation = [
+  "docs/architecture/I10-08-01-purpose-and-ownership.md#i1081-purpose-and-ownership",
+  "docs/architecture/I10-08-02-ip0-one-windows-processexecutor.md#i1082-ip0--one-windows-processexecutor",
+  "docs/architecture/I10-08-03-ip1-typed-extensible-instrument-contracts.md#i1083-ip1--typed-extensible-instrument-contracts",
+  "docs/architecture/I18-04-test-tiers.md#i184-test-tiers",
+  "docs/architecture/I18-32-stateful-test-environments.md#i1832-stateful-test-environments",
+]
+anchors = ["ARCH-GROUND-01", "ARCH-FIN-01", "ARCH-ORD-01", "ARCH-RES-01"]
+
+[confirmed_gap]
+main = "bins/eliot-testd/src/main.rs@1d8592c7b9164bc72df9535bb0ec9d73589f04cf"
+library = "bins/eliot-testd/src/lib.rs@8791a7766fcc56c402b023aba83d6b4384c8db56"
+core = "crates/instrument/eliot-testd-core"
+discriminator = "Run eliot-testd from current main. It writes KERNEL_ADMISSION_REQUIRED and exits 78 before accepting any authenticated request. Repository search finds no production KernelProcessAdmissionProvider other than UnavailableProcessIssuer; all other implementations are test fixtures."
+reusable_source = [
+  "TestdComposition already owns durable TestdStore admission/status/cancel.",
+  "TargetContract validates isolated source/build/cache roots and rejects traversal/reparse overlap.",
+  "start_claimed validates a fresh Kernel-issued ProcessAdmissionPermit and delegates physical execution to ProcessExecutor.",
+  "compose_process_executor already constructs the shared WindowsProcessExecutor from an authority-owned validation port.",
+]
+
+[causal_property]
+statement = "One authenticated Kernel-issued Instrument job executes once in an isolated bounded process tree, preserves raw and normalized evidence, and reaches a durable terminal or exact reconciliation state without granting testd task, budget, authority, canonical-write or Finish ownership."
+
+[scope]
+primary_paths = [
+  "bins/eliot-testd/src/main.rs",
+  "bins/eliot-testd/src/lib.rs",
+  "crates/instrument/eliot-testd-core/src/**",
+  "focused tests under bins/eliot-testd and crates/instrument/eliot-testd-core",
+]
+required_edges = [
+  "Kernel process-admission request/permit transport",
+  "shared Windows ProcessExecutor",
+  "raw output/evidence sink",
+  "durable TestdStore lease/cancel/reconcile path",
+]
+forbidden_ownership = [
+  "Task or WorkScope scheduling",
+  "authority or ProcessRequest issuance",
+  "canonical Store credentials or writes",
+  "verifier truth or Task Finish",
+  "generic shell commands invented by callers",
+]
+
+[what_to_do]
+steps = [
+  "Replace the unconditional exit-only binary with authenticated one-shot or bounded service request handling.",
+  "Implement the real KernelProcessAdmissionProvider adapter; retain UnavailableProcessIssuer only as an explicit fail-closed profile/test seam.",
+  "Bind submit, claim, start, cancel, status and reconcile to one exact job/attempt/operation/fence identity.",
+  "Preserve stdout, stderr, exit, timeout, cancellation, descendant cleanup and omitted-payload handles as evidence.",
+  "Keep durable scheduling in eliot-testd-core and physical process semantics in the shared ProcessExecutor.",
+]
+
+[how_to_do]
+steps = [
+  "Use authenticated generation-bound Kernel IPC; accept no permit, authority, executable path or environment expansion from ambient stdin/argv/env.",
+  "Decode only the closed typed Testd request profile and validate bounds before filesystem allocation or process start.",
+  "Obtain a fresh single-use ProcessAdmissionPermit for the exact claimed job and consume it in start_claimed.",
+  "Persist job/lease/checkpoint state before effects and reconcile exact operation identity after timeout, crash or disconnect.",
+  "Use ProcessEvidenceSink to retain material stdout/stderr or immutable omission handles before normalization/truncation.",
+  "Separate execution, parsing, evaluation, artifact binding, independence and coverage status; exit zero alone is not verification.",
+  "Quarantine cleanup uncertainty and never mark an unobserved descendant tree clean.",
+]
+
+[acceptance]
+criteria = [
+  "A valid authenticated Kernel job reaches TestdComposition and one shared ProcessExecutor invocation.",
+  "Missing, malformed, stale or mismatched admission performs no process or filesystem effect.",
+  "Job, attempt, operation, request, fence, target roots and invocation digest remain identical across admission, durable state, executor request and receipt.",
+  "Cancel/timeout/crash kills or reconciles the exact Job Object lineage with no unaccounted descendant.",
+  "Raw stdout/stderr and truncation/omission are explicit; parser failure cannot masquerade as complete evidence.",
+  "NOT_EXECUTED, SIMULATED, EXECUTED and UNKNOWN_OUTCOME remain distinct.",
+  "Exact replay is idempotent; changed same-identity payload conflicts.",
+  "testd cannot decide Task Finish, issue authority, choose arbitrary commands or write canonical state.",
+  "The binary no longer exits unconditionally when a valid current Kernel admission is supplied.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-testd-core -p eliot-testd --all-targets",
+  "cargo test --locked -p eliot-testd-core -p eliot-testd --all-targets",
+  "cargo clippy --locked -p eliot-testd-core -p eliot-testd --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run one real Windows compiler/test Instrument through Kernel admission, ProcessExecutor, raw evidence, normalization, cancellation and restart reconciliation."
+
+[boundaries]
+non_goals = [
+  "new scheduler or task database",
+  "automatic workflow trigger",
+  "provider/model orchestration",
+  "Product or release claim from package tests",
+]
