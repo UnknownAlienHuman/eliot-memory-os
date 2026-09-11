@@ -1,0 +1,131 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "BLOCKED_ON_905_907_READY_FOR_PROVIDER_IMPLEMENTATION"
+implementation_support = "GIT_TOOL_PRESENT_PROVIDER_MODULE_ABSENT"
+evidence_execution_status = "SOURCE_AND_ISSUE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "ISOLATED_GIT_PROVIDER_EDGE_CANDIDATE_ONLY"
+issue = 913
+inventory_issue = 905
+harness_issue = 907
+containment_issue = 850
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "integration.provider.git-fixture-topology"
+causal_property = "One exact Git-class inventory selection receives one deterministic disposable repository/ref/worktree topology under a unique owned run root; no source checkout, user configuration, credentials, remote or foreign resource is read, mutated, adopted or deleted."
+current_discriminator = "IntegrationHarness.Git.psm1 and its Python/PowerShell suites are absent on main; the previous #926 PR was closed unmerged and no #907 provider supplies deterministic fixture identities, mutation reconciliation and exact cleanup."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/913"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-17-parallel-agent-development-contract.md#i217-parallel-agent-development-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-22-parallel-build-cache-artifact-and-environment-lanes.md#i222-parallel-build-cache-artifact-and-environment-lanes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-08-02-ip0-one-windows-processexecutor.md#i1082-ip0-one-windows-processexecutor",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-21-unknown-commit-recovery.md#i1421-unknown-commit-recovery",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-04-secrets.md#i154-secrets",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-17-agent-generated-rust-build-threat-model.md#i1517-agent-generated-rust-build-threat-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+]
+anchors = ["ARCH-GROUND-01", "ARCH-SEC-01", "ARCH-RES-04", "ARCH-OBS-01"]
+
+[current_source]
+confirmed = [
+  "scripts/integration/IntegrationHarness.Git.psm1 is absent on main.",
+  "The previous implementation PR #926 was closed unmerged.",
+  "The existing source checkout and its .git/config/refs/index/worktrees/remotes are outside provider ownership.",
+  "Remote/provider/production-SCM requirements must remain explicit unsupported/external dispositions and cannot be converted to local fixture success.",
+]
+
+[scope]
+primary_paths = [
+  "scripts/integration/IntegrationHarness.Git.psm1",
+  "scripts/tests/IntegrationHarness.Git.Tests.ps1",
+  "scripts/tests/test_integration_harness_git.py",
+  "scripts/testdata/integration/git-provider/**",
+  ".github/temporary/work-unit-913.md only if present",
+]
+forbidden = [
+  "Core/Model/public entrypoint or shared bridge",
+  "inventory, Store or Runtime providers",
+  "Rust source/tests, Cargo, lockfile, workflows or documentation",
+  "source checkout .git, refs, index, worktrees, config or remotes",
+  "global/system/user Git configuration, HOME, credentials, safe.directory, hooks or templates",
+  "network clone/fetch/push/remotes or production SCM",
+  "arbitrary Git subcommand, executable, shell, config key, URL, refspec or argv",
+  "foreign repository/worktree adoption or path/name-only deletion",
+  "provider-selected denominator or test pass",
+]
+
+[[waves]]
+id = "A"
+what = "Implement #907's closed Git provider and mutation-free plan."
+how = [
+  "Validate exact Git requirement/class, provider revision and fixture profile from #905.",
+  "Plan derives one canonical owner-marked run-local repository or declared bare-plus-worktree topology without mutation.",
+  "Resolve the approved Git executable/version through repository policy; caller executable is forbidden.",
+]
+
+[[waves]]
+id = "B"
+what = "Create a deterministic isolated repository without ambient Git authority."
+how = [
+  "Use a closed fixed command set with shell disabled and a minimal environment.",
+  "Disable global/system/user config inheritance, aliases, hooks, templates, filters, signing, credential helpers and protocol/network paths through command/fixture-local settings only.",
+  "Freeze object format, initial branch, fixture bytes, author/committer identities and deterministic timestamps internally.",
+  "Reject path/reparse/symlink escape, nested foreign repository and owner-marker mismatch.",
+]
+
+[[waves]]
+id = "C"
+what = "Verify exact objects, refs, worktrees, replay and reset."
+how = [
+  "Independently verify object/tree/commit/ref identities and both registered and materialized worktree paths; init/status exit alone is not readiness.",
+  "Bind run/provider/tool/config/fixture/source/test-group/repository/operation identity to every receipt.",
+  "Exact operation replay creates no duplicate commit/ref/worktree; changed fixture/config under one identity conflicts.",
+  "Lost mutation response requires exact object/ref reconciliation before retry.",
+  "Reset only the declared owned disposable baseline; unexpected dirty/foreign state is preserved as contamination/reconciliation evidence.",
+]
+
+[[waves]]
+id = "D"
+what = "Close evidence and exact-owned cleanup."
+how = [
+  "Collect bounded redacted status/ref/worktree identities, never raw config/content/credentials/private paths.",
+  "Before cleanup, verify owner marker, topology, allowed disposition, registrations, locks and roots.",
+  "Remove only exact owned refs/worktrees/repository; repeated cleanup is idempotent and foreign state survives.",
+  "Implement exactly WORK_UNIT_CASE: 913/1..22 through #907's fixed bridge under #850 containment, plus one mandatory real fixture prepare-ready-reset-cleanup smoke.",
+]
+
+[acceptance]
+criteria = [
+  "Only exact Git-class requirements activate; remote/provider/production-SCM remains explicit unsupported/external.",
+  "Plan is deterministic and creates no repository, config, ref or worktree.",
+  "Arbitrary subcommand, executable, shell, config, hook, URL, refspec and argv are unrepresentable.",
+  "The repository root is canonical, owner-marked and below the exact run root; source checkout and other runs are unchanged.",
+  "Path/reparse/symlink/nested foreign repository/owner-marker escape fails before mutation.",
+  "Initial branch, object format, fixture bytes, author/committer and timestamps are deterministic and load-bearing.",
+  "Global/system/user config, HOME and credential helpers remain untouched and unread as payload.",
+  "Readiness verifies exact object/tree/commit/ref/registered/materialized worktree identities beyond exit status.",
+  "Foreign/preexisting refs and worktrees are rejected without adoption.",
+  "Lost mutation response is reconciled before retry; exact replay is idempotent and changed profile/config conflicts.",
+  "Reset restores only the declared owned baseline; unexpected dirty/foreign state blocks destructive cleanup.",
+  "Evidence is bounded/redacted and retains identities without secret/config/content/private-path canaries.",
+  "Cleanup removes only exact owned topology, verifies locks/registrations/roots and preserves foreign state.",
+  "Exactly 22 substantive cases execute through #907/#850 and one real local fixture smoke proves source checkout/ref/config non-mutation.",
+]
+
+[verification]
+commands = [
+  "python -m py_compile scripts/tests/test_integration_harness_git.py",
+  "python -m unittest scripts.tests.test_integration_harness_git -v",
+  "git diff --check",
+]
+contained_proof = "Run all 22 Python-to-PowerShell cases under #850 and retain exact source/suite/case/result/cleanup records."
+real_smoke = "Run one fixture-only prepare→object/ref/worktree-ready→reset→cleanup cycle through #907 and prove nonsecret before/after source-checkout/ref/config identities are unchanged."
+product_proof = "This proves disposable local Git provisioning only; remote SCM, full ignored tier and Product proof remain outside #913."
