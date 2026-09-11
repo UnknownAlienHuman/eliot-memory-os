@@ -14,6 +14,12 @@ use super::{
 };
 
 #[cfg(windows)]
+use super::host_durable_persistence::{sync_dir, write_durable_file};
+
+#[cfg(all(test, windows))]
+use super::host_durable_persistence::ordering;
+
+#[cfg(windows)]
 fn store_recovery_store_dir(host_state_root: &Path) -> PathBuf {
     host_state_root.join("store-recoveries")
 }
@@ -439,10 +445,8 @@ pub(super) fn read_store_recovery_pending_identity(
 }
 
 #[cfg(windows)]
-fn sync_store_recovery_dir(dir: &Path) {
-    if let Ok(file) = std::fs::OpenOptions::new().read(true).open(dir) {
-        let _ = file.sync_all();
-    }
+fn sync_store_recovery_dir(dir: &Path) -> Result<(), HostError> {
+    sync_dir(dir)
 }
 
 #[cfg(windows)]
@@ -468,6 +472,9 @@ pub(super) fn persist_store_recovery_pending(
     let path = store_recovery_pending_path(host_state_root, request.mutation_digest.as_str());
     if let Some(existing) = read_store_recovery_pending_identity(&path)? {
         if existing == identity {
+            // An earlier attempt may have linked this record and then failed its
+            // directory sync; confirm the entry is durable before treating it as published.
+            sync_store_recovery_dir(&dir)?;
             return Ok(StoreRecoveryPendingPublication::Replay);
         }
         return Err(HostError::RecoveryRequired(
@@ -482,13 +489,14 @@ pub(super) fn persist_store_recovery_pending(
         Uuid::new_v4().simple()
     ));
     let publication = (|| {
-        std::fs::write(&tmp, bytes).map_err(|e| HostError::Platform(e.to_string()))?;
-        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&tmp) {
-            let _ = file.sync_all();
-        }
+        write_durable_file(&tmp, &bytes)?;
+        #[cfg(all(test, windows))]
+        ordering::record("store_pending_hardlink_attempt");
         match std::fs::hard_link(&tmp, &path) {
             Ok(()) => {
-                sync_store_recovery_dir(&dir);
+                sync_store_recovery_dir(&dir)?;
+                #[cfg(all(test, windows))]
+                ordering::record("store_pending_publication_dir_sync_success");
                 Ok(StoreRecoveryPendingPublication::Created)
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -498,6 +506,9 @@ pub(super) fn persist_store_recovery_pending(
                     ));
                 };
                 if existing == identity {
+                    // An earlier attempt may have linked this record and then failed its
+                    // directory sync; confirm the entry is durable before treating it as published.
+                    sync_store_recovery_dir(&dir)?;
                     Ok(StoreRecoveryPendingPublication::Replay)
                 } else {
                     Err(HostError::RecoveryRequired(
@@ -509,17 +520,37 @@ pub(super) fn persist_store_recovery_pending(
             Err(error) => Err(HostError::Platform(error.to_string())),
         }
     })();
+    #[cfg(all(test, windows))]
+    ordering::record("store_pending_tmp_cleanup_attempt");
     let cleanup = std::fs::remove_file(&tmp);
-    sync_store_recovery_dir(&dir);
+    #[cfg(all(test, windows))]
+    ordering::record("store_pending_tmp_cleanup_done");
+    let sync_after_cleanup = sync_store_recovery_dir(&dir);
+    #[cfg(all(test, windows))]
+    {
+        if sync_after_cleanup.is_ok() {
+            ordering::record("store_pending_tmp_cleanup_dir_sync_success");
+        } else {
+            ordering::record("store_pending_tmp_cleanup_dir_sync_error");
+        }
+    }
     match publication {
         Err(error) => Err(error),
-        Ok(value) => match cleanup {
-            Ok(()) => Ok(value),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(value),
-            Err(error) => Err(HostError::RecoveryRequired(format!(
-                "store recovery pending temporary cleanup failed: {error}"
-            ))),
-        },
+        Ok(value) => {
+            match cleanup {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(HostError::RecoveryRequired(format!(
+                        "store recovery pending temporary cleanup failed: {error}"
+                    )));
+                }
+            }
+            sync_after_cleanup?;
+            #[cfg(all(test, windows))]
+            ordering::record("store_pending_publication_complete");
+            Ok(value)
+        }
     }
 }
 
@@ -581,6 +612,9 @@ pub(super) fn persist_store_recovery_termination_evidence(
         read_store_recovery_termination_evidence(host_state_root, request.mutation_digest.as_str())?
     {
         if existing == evidence {
+            // An earlier attempt may have linked this record and then failed its
+            // directory sync; confirm the entry is durable before treating it as published.
+            sync_store_recovery_dir(&dir)?;
             return Ok(());
         }
         return Err(HostError::RecoveryRequired(
@@ -595,13 +629,14 @@ pub(super) fn persist_store_recovery_termination_evidence(
         Uuid::new_v4().simple()
     ));
     let publication = (|| {
-        std::fs::write(&tmp, bytes).map_err(|error| HostError::Platform(error.to_string()))?;
-        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&tmp) {
-            let _ = file.sync_all();
-        }
+        write_durable_file(&tmp, &bytes)?;
+        #[cfg(all(test, windows))]
+        ordering::record("store_termination_hardlink_attempt");
         match std::fs::hard_link(&tmp, &path) {
             Ok(()) => {
-                sync_store_recovery_dir(&dir);
+                sync_store_recovery_dir(&dir)?;
+                #[cfg(all(test, windows))]
+                ordering::record("store_termination_publication_dir_sync_success");
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -615,6 +650,9 @@ pub(super) fn persist_store_recovery_termination_evidence(
                     ));
                 };
                 if existing == evidence {
+                    // An earlier attempt may have linked this record and then failed its
+                    // directory sync; confirm the entry is durable before treating it as published.
+                    sync_store_recovery_dir(&dir)?;
                     Ok(())
                 } else {
                     Err(HostError::RecoveryRequired(
@@ -626,18 +664,32 @@ pub(super) fn persist_store_recovery_termination_evidence(
             Err(error) => Err(HostError::Platform(error.to_string())),
         }
     })();
+    #[cfg(all(test, windows))]
+    ordering::record("store_termination_tmp_cleanup_attempt");
     let cleanup = std::fs::remove_file(&tmp);
-    sync_store_recovery_dir(&dir);
-    match publication {
-        Err(error) => Err(error),
-        Ok(()) => match cleanup {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(HostError::RecoveryRequired(format!(
-                "Store termination temporary cleanup failed: {error}"
-            ))),
-        },
+    #[cfg(all(test, windows))]
+    ordering::record("store_termination_tmp_cleanup_done");
+    let sync_after_cleanup = sync_store_recovery_dir(&dir);
+    #[cfg(all(test, windows))]
+    {
+        if sync_after_cleanup.is_ok() {
+            ordering::record("store_termination_tmp_cleanup_dir_sync_success");
+        } else {
+            ordering::record("store_termination_tmp_cleanup_dir_sync_error");
+        }
     }
+    publication?;
+    match cleanup {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "Store termination temporary cleanup failed: {error}"
+            )));
+        }
+    }
+    sync_after_cleanup?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -714,6 +766,9 @@ pub(super) fn persist_store_recovery_inner_binding(
         read_store_recovery_inner_binding(host_state_root, request.mutation_digest.as_str())?
     {
         return if existing == binding {
+            // An earlier attempt may have linked this record and then failed its
+            // directory sync; confirm the entry is durable before treating it as published.
+            sync_store_recovery_dir(&dir)?;
             Ok(())
         } else {
             Err(HostError::RecoveryRequired(
@@ -729,13 +784,14 @@ pub(super) fn persist_store_recovery_inner_binding(
         Uuid::new_v4().simple()
     ));
     let publication = (|| {
-        std::fs::write(&tmp, bytes).map_err(|error| HostError::Platform(error.to_string()))?;
-        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&tmp) {
-            let _ = file.sync_all();
-        }
+        write_durable_file(&tmp, &bytes)?;
+        #[cfg(all(test, windows))]
+        ordering::record("store_inner_hardlink_attempt");
         match std::fs::hard_link(&tmp, &path) {
             Ok(()) => {
-                sync_store_recovery_dir(&dir);
+                sync_store_recovery_dir(&dir)?;
+                #[cfg(all(test, windows))]
+                ordering::record("store_inner_publication_dir_sync_success");
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -749,6 +805,9 @@ pub(super) fn persist_store_recovery_inner_binding(
                     )
                 })?;
                 if existing == binding {
+                    // An earlier attempt may have linked this record and then failed its
+                    // directory sync; confirm the entry is durable before treating it as published.
+                    sync_store_recovery_dir(&dir)?;
                     Ok(())
                 } else {
                     Err(HostError::RecoveryRequired(
@@ -759,18 +818,34 @@ pub(super) fn persist_store_recovery_inner_binding(
             Err(error) => Err(HostError::Platform(error.to_string())),
         }
     })();
+    #[cfg(all(test, windows))]
+    ordering::record("store_inner_tmp_cleanup_attempt");
     let cleanup = std::fs::remove_file(&tmp);
-    sync_store_recovery_dir(&dir);
-    match publication {
-        Err(error) => Err(error),
-        Ok(()) => match cleanup {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(HostError::RecoveryRequired(format!(
-                "Store recovery inner-binding temporary cleanup failed: {error}"
-            ))),
-        },
+    #[cfg(all(test, windows))]
+    ordering::record("store_inner_tmp_cleanup_done");
+    let sync_after_cleanup = sync_store_recovery_dir(&dir);
+    #[cfg(all(test, windows))]
+    {
+        if sync_after_cleanup.is_ok() {
+            ordering::record("store_inner_tmp_cleanup_dir_sync_success");
+        } else {
+            ordering::record("store_inner_tmp_cleanup_dir_sync_error");
+        }
     }
+    publication?;
+    match cleanup {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "Store recovery inner-binding temporary cleanup failed: {error}"
+            )));
+        }
+    }
+    sync_after_cleanup?;
+    #[cfg(all(test, windows))]
+    ordering::record("store_inner_publication_complete");
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -816,6 +891,7 @@ pub(super) fn persist_store_recovery_receipt(
     host_state_root: &Path,
     receipt: &HostStoreRecoveryReceipt,
 ) -> Result<(), HostError> {
+    receipt.validate().map_err(HostError::RecoveryRequired)?;
     let dir = store_recovery_store_dir(host_state_root);
     std::fs::create_dir_all(&dir).map_err(|e| HostError::Platform(e.to_string()))?;
     let path = store_recovery_receipt_path(
@@ -827,6 +903,9 @@ pub(super) fn persist_store_recovery_receipt(
         receipt.external_control_mutation_digest.as_str(),
     )? {
         if existing == *receipt {
+            // An earlier attempt may have linked this record and then failed its
+            // directory sync; confirm the entry is durable before treating it as published.
+            sync_store_recovery_dir(&dir)?;
             return Ok(());
         }
         return Err(HostError::RecoveryRequired(
@@ -838,56 +917,75 @@ pub(super) fn persist_store_recovery_receipt(
         receipt.external_control_mutation_digest.as_str(),
         Uuid::new_v4().simple()
     ));
-    std::fs::write(
-        &tmp,
-        serde_json::to_vec(receipt).map_err(|e| HostError::Platform(e.to_string()))?,
-    )
-    .map_err(|e| HostError::Platform(e.to_string()))?;
-    {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&tmp)
-            .map_err(|e| HostError::Platform(e.to_string()))?;
-        let _ = file.sync_all();
-    }
-    // Publish with a hard link so a concurrent writer can never replace an
-    // already durable outer receipt.  The winner is read back and must be the
-    // exact same canonical authority; a conflicting winner remains Unknown.
-    let publication = match std::fs::hard_link(&tmp, &path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let bytes =
-                read_bounded_runtime_restart_file(&path, 16 * 1024, "Store recovery receipt")?;
-            let existing =
-                serde_json::from_slice::<HostStoreRecoveryReceipt>(&bytes).map_err(|error| {
-                    HostError::RecoveryRequired(format!(
-                        "existing Store recovery receipt is malformed: {error}"
-                    ))
-                })?;
-            existing.validate().map_err(HostError::RecoveryRequired)?;
-            if existing == *receipt {
+    let bytes = serde_json::to_vec(receipt).map_err(|e| HostError::Platform(e.to_string()))?;
+    let publication = (|| {
+        write_durable_file(&tmp, &bytes)?;
+        #[cfg(all(test, windows))]
+        ordering::record("store_receipt_hardlink_attempt");
+        // Publish with a hard link so a concurrent writer can never replace an
+        // already durable outer receipt.  The winner is read back and must be the
+        // exact same canonical authority; a conflicting winner remains Unknown.
+        match std::fs::hard_link(&tmp, &path) {
+            Ok(()) => {
+                sync_store_recovery_dir(&dir)?;
+                #[cfg(all(test, windows))]
+                ordering::record("store_receipt_publication_dir_sync_success");
                 Ok(())
-            } else {
-                Err(HostError::RecoveryRequired(
-                    "existing Store recovery receipt conflicts with reconstructed authority"
-                        .to_owned(),
-                ))
             }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let bytes =
+                    read_bounded_runtime_restart_file(&path, 16 * 1024, "Store recovery receipt")?;
+                let existing = serde_json::from_slice::<HostStoreRecoveryReceipt>(&bytes).map_err(
+                    |error| {
+                        HostError::RecoveryRequired(format!(
+                            "existing Store recovery receipt is malformed: {error}"
+                        ))
+                    },
+                )?;
+                existing.validate().map_err(HostError::RecoveryRequired)?;
+                if existing == *receipt {
+                    // An earlier attempt may have linked this record and then failed its
+                    // directory sync; confirm the entry is durable before treating it as published.
+                    sync_store_recovery_dir(&dir)?;
+                    Ok(())
+                } else {
+                    Err(HostError::RecoveryRequired(
+                        "existing Store recovery receipt conflicts with reconstructed authority"
+                            .to_owned(),
+                    ))
+                }
+            }
+            Err(error) => Err(HostError::Platform(error.to_string())),
         }
-        Err(error) => Err(HostError::Platform(error.to_string())),
-    };
+    })();
+    #[cfg(all(test, windows))]
+    ordering::record("store_receipt_tmp_cleanup_attempt");
     let cleanup = std::fs::remove_file(&tmp);
-    sync_store_recovery_dir(&dir);
-    match publication {
-        Err(error) => Err(error),
-        Ok(()) => match cleanup {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(HostError::RecoveryRequired(format!(
-                "Store recovery receipt temporary cleanup failed: {error}"
-            ))),
-        },
+    #[cfg(all(test, windows))]
+    ordering::record("store_receipt_tmp_cleanup_done");
+    let sync_after_cleanup = sync_store_recovery_dir(&dir);
+    #[cfg(all(test, windows))]
+    {
+        if sync_after_cleanup.is_ok() {
+            ordering::record("store_receipt_tmp_cleanup_dir_sync_success");
+        } else {
+            ordering::record("store_receipt_tmp_cleanup_dir_sync_error");
+        }
     }
+    publication?;
+    match cleanup {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "Store recovery receipt temporary cleanup failed: {error}"
+            )));
+        }
+    }
+    sync_after_cleanup?;
+    #[cfg(all(test, windows))]
+    ordering::record("store_receipt_publication_complete");
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -915,6 +1013,8 @@ pub(super) fn cleanup_store_recovery_supporting_evidence_for(
         ));
     }
     let dir = store_recovery_store_dir(host_state_root);
+    #[cfg(all(test, windows))]
+    ordering::record("cleanup_for_evidence_remove_attempt");
     for path in [
         store_recovery_pending_path(host_state_root, mutation_digest),
         store_recovery_termination_path(host_state_root, mutation_digest),
@@ -931,7 +1031,11 @@ pub(super) fn cleanup_store_recovery_supporting_evidence_for(
             }
         }
     }
-    sync_store_recovery_dir(&dir);
+    #[cfg(all(test, windows))]
+    ordering::record("cleanup_for_evidence_remove_done");
+    sync_store_recovery_dir(&dir)?;
+    #[cfg(all(test, windows))]
+    ordering::record("cleanup_for_dir_sync_success");
     Ok(())
 }
 
@@ -945,6 +1049,8 @@ pub(super) fn cleanup_completed_store_recovery_supporting_evidence(
         if !store_recovery_receipt_path(host_state_root, &fence.mutation_digest).exists() {
             continue;
         }
+        #[cfg(all(test, windows))]
+        ordering::record("cleanup_completed_for_fence");
         for path in [
             store_recovery_pending_path(host_state_root, &fence.mutation_digest),
             store_recovery_termination_path(host_state_root, &fence.mutation_digest),
@@ -962,7 +1068,11 @@ pub(super) fn cleanup_completed_store_recovery_supporting_evidence(
             }
         }
     }
-    sync_store_recovery_dir(&dir);
+    #[cfg(all(test, windows))]
+    ordering::record("cleanup_completed_remove_done");
+    sync_store_recovery_dir(&dir)?;
+    #[cfg(all(test, windows))]
+    ordering::record("cleanup_completed_dir_sync_success");
     Ok(())
 }
 
@@ -1070,4 +1180,253 @@ pub(super) fn committed_store_rebind_receipt(
         .validate()
         .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
     Ok(inner)
+}
+
+#[cfg(all(test, windows))]
+mod durability_repair_tests {
+    use super::*;
+    use crate::TestResult;
+    use crate::host_durable_persistence::{ordering, test_fault};
+    use crate::{HostInstallationEpoch, PlatformHandle};
+    use uuid::Uuid;
+
+    fn test_host() -> Result<HostInstallationEpoch, Box<dyn std::error::Error>> {
+        Ok(crate::fresh_host_epoch(
+            PlatformHandle::new("test-installation")?,
+            None,
+        )?)
+    }
+
+    fn temp_root(label: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-host-store-durability-{label}-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root)?;
+        Ok(root)
+    }
+
+    fn store_request(
+        digest: &str,
+        label: &str,
+    ) -> Result<HostRuntimeControlRequest, Box<dyn std::error::Error>> {
+        Ok(HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RecoverStore,
+            PlatformHandle::new(label)?,
+            PlatformHandle::new(digest.to_owned())?,
+        )?)
+    }
+
+    fn make_store_receipt(
+        digest: &str,
+    ) -> Result<crate::HostStoreRecoveryReceipt, Box<dyn std::error::Error>> {
+        let mut receipt = crate::HostStoreRecoveryReceipt {
+            external_control_mutation_digest: PlatformHandle::new(digest.to_owned())?,
+            request_digest: PlatformHandle::new("a".repeat(64))?,
+            store_rebind_request_digest: PlatformHandle::new("b".repeat(64))?,
+            store_fence: PlatformHandle::new("c".repeat(64))?,
+            new_store_process_id: PlatformHandle::new("d".repeat(64))?,
+            kernel_generation: PlatformHandle::new("e".repeat(64))?,
+            activation_nonce_digest: PlatformHandle::new("f".repeat(64))?,
+            ready_receipt_digest: PlatformHandle::new("1".repeat(64))?,
+            receipt_digest: PlatformHandle::new("2".repeat(64))?,
+        };
+        receipt.receipt_digest = receipt.computed_digest()?;
+        Ok(receipt)
+    }
+
+    #[test]
+    fn store_pending_dir_sync_permission_denied_propagates() -> TestResult {
+        let root = temp_root("pending-perm")?;
+        let host = test_host()?;
+        let digest = "b1".repeat(32);
+        let request = store_request(&digest, "store-pending-perm")?;
+        test_fault::clear_sync_fault();
+        ordering::clear();
+        test_fault::inject_sync_fault(std::io::ErrorKind::PermissionDenied);
+        let result = persist_store_recovery_pending(&root, &request, &host);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(crate::HostError::Platform(_))));
+        // The link precedes the failed directory sync, so the record exists; a
+        // retry must confirm durability instead of replaying it.
+        assert!(store_recovery_pending_path(&root, &digest).exists());
+        test_fault::inject_sync_fault(std::io::ErrorKind::PermissionDenied);
+        assert!(persist_store_recovery_pending(&root, &request, &host).is_err());
+        test_fault::clear_sync_fault();
+        assert_eq!(
+            persist_store_recovery_pending(&root, &request, &host)?,
+            StoreRecoveryPendingPublication::Replay
+        );
+        test_fault::clear_sync_fault();
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn store_pending_dir_sync_invalid_input_propagates() -> TestResult {
+        let root = temp_root("pending-invalid")?;
+        let host = test_host()?;
+        let digest = "b2".repeat(32);
+        let request = store_request(&digest, "store-pending-invalid")?;
+        test_fault::clear_sync_fault();
+        test_fault::inject_sync_fault(std::io::ErrorKind::InvalidInput);
+        let result = persist_store_recovery_pending(&root, &request, &host);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(crate::HostError::Platform(_))));
+        test_fault::clear_sync_fault();
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn store_pending_dir_sync_unsupported_propagates() -> TestResult {
+        let root = temp_root("pending-unsupported")?;
+        let host = test_host()?;
+        let digest = "b3".repeat(32);
+        let request = store_request(&digest, "store-pending-unsupported")?;
+        test_fault::clear_sync_fault();
+        test_fault::inject_sync_fault(std::io::ErrorKind::Unsupported);
+        let result = persist_store_recovery_pending(&root, &request, &host);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(crate::HostError::Platform(_))));
+        test_fault::clear_sync_fault();
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn store_receipt_dir_sync_failure_does_not_remove_evidence() -> TestResult {
+        let root = temp_root("receipt-fail-evidence")?;
+        let host = test_host()?;
+        let digest = "e4".repeat(32);
+        let request = store_request(&digest, "store-receipt-fail")?;
+        test_fault::clear_sync_fault();
+        persist_store_recovery_pending(&root, &request, &host)?;
+        let receipt = make_store_receipt(&digest)?;
+        test_fault::inject_sync_fault(std::io::ErrorKind::Unsupported);
+        let result = persist_store_recovery_receipt(&root, &receipt);
+        assert!(result.is_err(), "receipt dir sync failure must propagate");
+        assert!(
+            store_recovery_pending_path(&root, &digest).exists(),
+            "pending must remain"
+        );
+        test_fault::clear_sync_fault();
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn store_ordering_file_sync_before_dir_sync() -> TestResult {
+        let root = temp_root("store-ordering")?;
+        let host = test_host()?;
+        let digest = "f4".repeat(32);
+        let request = store_request(&digest, "store-ordering")?;
+        test_fault::clear_sync_fault();
+        ordering::clear();
+        persist_store_recovery_pending(&root, &request, &host)?;
+        let log = ordering::take_log();
+        let file_idx = log
+            .iter()
+            .position(|e| e == "file_sync_success")
+            .ok_or("file sync logged")?;
+        let dir_idx = log
+            .iter()
+            .position(|e| e.contains("store_pending_publication_dir_sync_success"))
+            .ok_or("dir sync logged")?;
+        assert!(
+            file_idx < dir_idx,
+            "file sync must precede dir sync: {log:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn store_cleanup_failed_dir_sync_propagates() -> TestResult {
+        let root = temp_root("store-cleanup-fail")?;
+        let host = test_host()?;
+        let digest = "a5".repeat(32);
+        let request = store_request(&digest, "store-cleanup-fail")?;
+        test_fault::clear_sync_fault();
+        persist_store_recovery_pending(&root, &request, &host)?;
+        let receipt = make_store_receipt(&digest)?;
+        let receipt_path = store_recovery_receipt_path(&root, &digest);
+        std::fs::write(&receipt_path, serde_json::to_vec(&receipt)?)?;
+        test_fault::inject_sync_fault(std::io::ErrorKind::PermissionDenied);
+        let result = cleanup_store_recovery_supporting_evidence_for(&root, &digest);
+        assert!(result.is_err(), "cleanup dir sync failure must propagate");
+        test_fault::clear_sync_fault();
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "child-process target of the abrupt-termination test; returns early unless spawned with its environment"]
+    fn durability_child_store() -> TestResult {
+        if std::env::var("ELIOT_HOST_DURABILITY_CHILD_STORE").is_err() {
+            return Ok(());
+        }
+        let root = PathBuf::from(std::env::var("ELIOT_HOST_CHILD_ROOT")?);
+        let digest = std::env::var("ELIOT_HOST_CHILD_DIGEST")?;
+        let mode = std::env::var("ELIOT_HOST_CHILD_MODE").unwrap_or_else(|_| "success".to_owned());
+        let host = test_host()?;
+        let request = store_request(&digest, "store-child")?;
+        if mode == "success" {
+            persist_store_recovery_pending(&root, &request, &host)?;
+            let _ = std::fs::File::open(&root).and_then(|f| f.sync_all());
+        } else if mode == "fault" {
+            if !store_recovery_pending_path(&root, &digest).exists() {
+                persist_store_recovery_pending(&root, &request, &host)?;
+            }
+            let receipt = make_store_receipt(&digest)?;
+            test_fault::inject_sync_fault(std::io::ErrorKind::PermissionDenied);
+            let result = persist_store_recovery_receipt(&root, &receipt);
+            let marker = root.join("child_store_fault_marker");
+            if result.is_err() {
+                std::fs::write(&marker, b"fault_propagated")?;
+                let _ = std::fs::File::open(&marker).and_then(|f| f.sync_all());
+            } else {
+                std::fs::write(&marker, b"unexpected_success")?;
+            }
+        }
+        std::process::abort();
+    }
+
+    #[test]
+    fn store_abrupt_child_causal_success_and_fault_reopen() -> TestResult {
+        let root = temp_root("store-abrupt-causal")?;
+        let digest = "b5".repeat(32);
+        let exe = std::env::current_exe()?;
+        let mut child = std::process::Command::new(&exe)
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("store_recovery_persistence::durability_repair_tests::durability_child_store")
+            .env("ELIOT_HOST_DURABILITY_CHILD_STORE", "1")
+            .env("ELIOT_HOST_CHILD_ROOT", &root)
+            .env("ELIOT_HOST_CHILD_DIGEST", &digest)
+            .env("ELIOT_HOST_CHILD_MODE", "success")
+            .spawn()?;
+        let status = child.wait()?;
+        assert!(!status.success(), "child must abort");
+        let fences = load_durable_store_recoveries(&root)?;
+        assert!(fences.iter().any(|f| f.mutation_digest == digest));
+        let digest2 = "b6".repeat(32);
+        let mut child2 = std::process::Command::new(&exe)
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("store_recovery_persistence::durability_repair_tests::durability_child_store")
+            .env("ELIOT_HOST_DURABILITY_CHILD_STORE", "1")
+            .env("ELIOT_HOST_CHILD_ROOT", &root)
+            .env("ELIOT_HOST_CHILD_DIGEST", &digest2)
+            .env("ELIOT_HOST_CHILD_MODE", "fault")
+            .spawn()?;
+        let status2 = child2.wait()?;
+        assert!(!status2.success());
+        let marker = root.join("child_store_fault_marker");
+        let bytes = std::fs::read(&marker)?;
+        assert_eq!(bytes, b"fault_propagated");
+        assert!(store_recovery_pending_path(&root, &digest2).exists());
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
 }
