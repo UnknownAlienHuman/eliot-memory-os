@@ -1,0 +1,155 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_CURRENT_DIAGNOSTIC_CAPTURE"
+implementation_support = "HISTORICAL_SUPPRESSION_CANDIDATE_REJECTED_CURRENT_BASELINE_UNEXECUTED"
+evidence_execution_status = "SOURCE_AND_CLOSED_CANDIDATE_INSPECTED_CLIPPY_NOT_EXECUTED"
+proof_ceiling = "LOCKED_ALL_TARGET_CLIPPY_BASELINE_ONLY"
+issue = 838
+activation_wiring_issue = 839
+verification_profile_issue = 750
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "quality.current-all-target-clippy-baseline"
+causal_property = "Every actual current locked workspace all-target Clippy diagnostic receives one source-bound disposition and the resulting clean baseline preserves behavior, public contracts, evidence axes and owner boundaries without broad suppression or target exclusion."
+current_discriminator = "No verified current full JSON diagnostic stream or repeated clean run exists. Closed PR #842 was rejected as a suppression-heavy historical candidate; current main differs and must be recomputed rather than forced into the old 97-warning/28-edit counts."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/838"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-21-local-and-ci-parity.md#i1821-local-and-ci-parity",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-27-oracle-ownership-and-test-change-governance.md#i1827-oracle-ownership-and-test-change-governance",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-03-workspace-topology-and-dependency-direction.md#i23-workspace-topology-and-dependency-direction",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-06-error-and-crash-model.md#i26-error-and-crash-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+]
+anchors = ["ARCH-GROUND-01", "ARCH-MOD-03", "ARCH-OBS-01", "ARCH-FIN-01"]
+
+[current_source]
+confirmed = [
+  "Closed PR #842 was not merged; its own closure records broad/weak suppressions and a forbidden production module-wide dead_code allowance.",
+  "No final exit status or complete diagnostic stream was recovered from its historical Clippy attempt, so historical warning counts are unverified.",
+  "Current activation_projection.rs uses item-level cfg_attr dead_code annotations tied to #839 rather than the rejected module-wide allowance.",
+  "The current v2 activation mapping remains production-unwired until #839; unit tests do not establish daemon reachability.",
+  "The current actual diagnostic denominator can be established only by a fresh untruncated locked workspace all-target JSON Clippy run.",
+]
+
+[scope]
+production_whitelist = [
+  "bins/eliot-agent-bridge/src/main.rs",
+  "bins/eliot-host/src/journal_tests.rs",
+  "bins/eliot-host/src/runtime_restart_state/pending_codec.rs",
+  "bins/eliotd/src/activation_projection.rs",
+  "bins/eliotd/src/daemon_runtime.rs",
+  "bins/eliotd/src/main.rs",
+  "crates/eliot-app/src/dogfood.rs",
+  "crates/eliot-app/src/host_runtime/event_and_authority.rs",
+  "crates/eliot-app/src/host_runtime/supervised_process_contract.rs",
+  "crates/eliot-app/src/mcp_stdio.rs",
+  "crates/eliot-app/src/mcp_stdio/catalog.rs",
+  "crates/eliot-app/src/mcp_stdio/memory_grant.rs",
+  "crates/eliot-app/src/mcp_stdio/operator.rs",
+  "crates/eliot-app/src/mcp_stdio/protocol_tests.rs",
+  "crates/eliot-app/src/mcp_stdio/runtime_handlers.rs",
+  "crates/eliot-app/src/mcp_stdio/task.rs",
+  "crates/eliot-app/src/named_pipe_ipc.rs",
+  "crates/eliot-app/tests/dogfood_runtime.rs",
+  "crates/eliot-app/tests/first_working_loop.rs",
+  "crates/eliot-store/tests/ul_observability_store.rs",
+  "crates/governor/eliot-authority/src/grants.rs",
+  "crates/governor/eliot-canonical/src/lib.rs",
+  "crates/governor/eliot-coordination/src/lib.rs",
+  "crates/governor/eliot-governor/src/activation_outcome.rs",
+  "crates/governor/eliot-workscope/src/lib.rs",
+  "crates/kernel/eliot-kernel-service/src/protocol.rs",
+  "crates/surfaces/eliot-mcp/src/host.rs",
+  "crates/surfaces/eliot-mcp/src/host_gateway.rs",
+]
+additional_paths = [
+  "scripts/tests/test_clippy_baseline_acceptance.py",
+  "scripts/testdata/clippy-baseline/invalid_evidence.json",
+  ".github/temporary/work-unit-838.md only if present",
+]
+forbidden = [
+  "clippy.toml, Cargo manifests, Cargo.lock, dependency/features/toolchain or workflows",
+  "normative documentation, process policy, generated indexes or unrelated tests/source",
+  "public API, wire, Serde, cfg, feature or semantic redesign",
+  "package/target exclusion, warning downgrade, broad lint group or module-level suppression",
+  "test weakening, count-forcing edits or production reachability changes owned by #839",
+  "caller-authored passed diagnostic inventories",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Capture and reconcile the exact current diagnostic denominator."
+how = [
+  "Run cargo clippy --locked --workspace --all-targets --message-format=json and retain the complete untruncated JSON stream, command exit, source/toolchain/lock/metadata identity and target denominator.",
+  "Distinguish compiler diagnostics from non-diagnostic Cargo JSON records.",
+  "For every current and historical row record package/target/path/item/span/lint, production/test/build/example class, owner, classification, proposed/final disposition, behavior/API risk, focused proof and exact diff.",
+  "Historical 97 rows are reconciled as fixed, narrow expectation, already resolved, owner-blocked or separate issue; never recreated merely to match an obsolete count.",
+]
+
+[[waves]]
+id = "B"
+what = "Apply only behavior-preserving necessary corrections."
+how = [
+  "Prefer mechanical/documentation corrections with exact behavior, bytes, ordering, error domain, concurrency/lifetime, retry, public contract, feature/cfg and authority/privacy/effect equivalence.",
+  "PE conversion, hash storage/buffer and fallback-output changes require focused equivalence and malformed-boundary proof.",
+  "Use item-level expect/allow only when a concrete accepted invariant makes rewrite worse; record lint, item, reason, reachability, owner, removal condition and proof.",
+  "Test expect/unwrap is valid only at a real assertion boundary; too_many_lines requires one named ordered scenario.",
+]
+
+[[waves]]
+id = "C"
+what = "Reconcile activation projection without stealing #839."
+how = [
+  "Recompute the five historical v2 mapping functions and current production call graph.",
+  "Reject module-wide dead_code and any cfg(test) conversion of useful production mapping.",
+  "If #839 is not yet integrated, retain only exact item annotations naming #839 and a removal trigger; if wired, remove obsolete annotations.",
+  "A mutation fixture adding an unrelated dead function must fail the actual lint; mapping unit tests cannot be labelled daemon reachability.",
+]
+
+[[waves]]
+id = "D"
+what = "Prove the clean current baseline twice and bind 35 cases."
+how = [
+  "Implement exactly WORK_UNIT_CASE: 838/1..35 in one substantive metadata suite consuming actual immutable source/diagnostic/run evidence.",
+  "Run fmt, locked workspace all-target check and locked workspace all-target Clippy -D warnings.",
+  "Repeat the exact same-source/tool/config Clippy run once and require the same clean result.",
+  "Record before/after/current arithmetic, all historical/current dispositions and external-owner residuals; blocked/unknown cannot become clean.",
+]
+
+[acceptance]
+criteria = [
+  "The complete current JSON diagnostic stream is source/toolchain/lock/target bound and untruncated.",
+  "Every actual warning maps to one path/item/lint/disposition and no historical/current row disappears silently.",
+  "Current count is derived from the exact base; neither 97 warnings nor 28 changed paths is forced.",
+  "Documentation/import/pattern/conversion/buffer/fallback corrections preserve their named production invariants and exact error/byte semantics.",
+  "No public API, wire, Serde, feature, cfg, package/target denominator, warning level or authority/privacy/effect meaning changes.",
+  "No broad warnings/Clippy-group/workspace/module dead_code suppression exists.",
+  "Every retained expectation is item-scoped, justified, reachable, owner-bound and has a removal condition and focused proof.",
+  "Test assertion expectations still fail on their negative and ordered too-many-lines scenarios remain intact.",
+  "Protected/secret canaries are absent from changed diagnostics and fallback output is used only after structured output failure.",
+  "The activation projection call graph and historical five items are completely reconciled; #839 annotations remain only where genuinely unwired.",
+  "An unrelated new dead function or semantic warning fails the actual gate.",
+  "Every non-documentation correction has passing focused equivalence proof.",
+  "Actual fmt, locked workspace all-target check and two identical locked Clippy -D warnings runs pass.",
+  "Production diff is a necessary subset of the frozen whitelist; extra paths are only the exact acceptance suite/fixture and marker removal.",
+  "Exactly 35 substantive cases execute and clean Clippy is not labelled ProcessExecutor, runtime, Product or release proof.",
+]
+
+[verification]
+commands = [
+  "python -m py_compile scripts/tests/test_clippy_baseline_acceptance.py",
+  "python -m unittest scripts.tests.test_clippy_baseline_acceptance -v",
+  "cargo fmt --all -- --check",
+  "cargo check --locked --workspace --all-targets",
+  "cargo clippy --locked --workspace --all-targets -- -D warnings",
+  "cargo clippy --locked --workspace --all-targets -- -D warnings",
+  "git diff --check",
+]
+product_proof = "A clean baseline proves only the exact locked warning gate; it does not prove runtime, ProcessExecutor, Product or release support."
