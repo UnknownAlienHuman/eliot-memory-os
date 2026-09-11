@@ -1,0 +1,129 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_CONSUMER_DISPOSITION_AND_MIGRATION"
+implementation_support = "HISTORICAL_EFFECTING_CONTROLLER_PRESENT"
+evidence_execution_status = "SOURCE_AND_CONSUMER_SEARCH_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "D02_CAMPAIGN_RETIREMENT_CANDIDATE_ONLY"
+issue = 1193
+process_executor_issue = 100
+orchestration_issue = 681
+swarm_issue = 1126
+adapter_registry_issue = 874
+registry_issue = 13
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "workspace.legacy-d02-campaign-disposition"
+causal_property = "Every retained D-02 campaign function maps to the current durable-job, work-unit, AgentCoordinator/swarm, Kernel/ORS, provider and verifier owners; the package is reduced to a read-only historical importer or removed."
+current_discriminator = "The package is its own only consumer and hardcodes D-02 plan, one OpenCode route, D-01 evidence pins and private epoch/fence/claim/lease/checkpoint/integration/Finish semantics."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1193"
+
+[documentation]
+implementation = [
+  "docs/architecture/I02-17-parallel-agent-development-contract.md#i217-parallel-agent-development-contract",
+  "docs/architecture/I02-22-parallel-build-cache-artifact-and-environment-lanes.md#i222-parallel-build-cache-artifact-and-environment-lanes",
+  "docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-identity-and-effect-identity",
+  "docs/architecture/I10-15-agent-execution-fabric-and-durable-swarm.md#i1015-agent-execution-fabric-and-durable-swarm",
+  "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "docs/architecture/I17-14-agent-work-unit-over-a-functionalcapabilitycell.md#i1714-agent-work-unit-over-a-functionalcapabilitycell",
+  "docs/architecture/I18-27-oracle-ownership-and-test-change-governance.md#i1827-oracle-ownership-and-test-change-governance",
+]
+anchors = ["ARCH-SWM-02", "ARCH-AUTH-01", "ARCH-LIFE-01", "ARCH-ORD-01", "ARCH-RES-04", "ARCH-FIN-01"]
+
+[current_source]
+confirmed = [
+  "Only the package binary constructs CampaignExecutor.",
+  "PLAN_ID is D-02:plan-v4 and the sole admitted OpenCode route is opencode-go/deepseek-v4-flash.",
+  "Bootstrap adoption uses fixed historical D-01 report, handle, checkpoint, event and receipt digests and filenames.",
+  "The package defines private EpochId, StateFence, attempts, claims, work/package/integration leases, checkpoints and ledger state.",
+  "The CLI exposes write-source, assemble-package, integrate-package, replan and finish-parent commands.",
+  "canonical_bytes returns empty bytes on serialization failure rather than failing closed.",
+  "A private git Command path is tracked as direct_process_launch debt under issue #100.",
+]
+
+[scope]
+primary_paths = [
+  "workspace/tools/eliot-campaign-executor/**",
+  "exact current work-unit, swarm, Governor and Kernel contracts needed for one-at-a-time migration",
+  "config/architecture-boundaries.toml only after the debt is actually removed or reclassified",
+  "package index and root Cargo/lock only in the final serialized removal wave",
+  "directly relevant tests and finite historical fixtures",
+]
+serialized_dependencies = ["#100 ProcessExecutor", "#681 work-unit planning", "#1126 durable swarm", "#874 adapter registry", "#15/#18 Kernel/Governor", "#13 registry", "#11 Product proof"]
+forbidden = [
+  "new generic campaign orchestrator",
+  "duplicate DurableJob, task, authority, lease or Finish state",
+  "caller-selected shell or arbitrary commands",
+  "ambient credentials or direct provider SDK",
+  "current support claims from historical D-02 evidence",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Build an item-level consumer and responsibility disposition."
+how = [
+  "Inventory every public type, command, transition, effect, artifact and actual current consumer.",
+  "Record replacement owner/contract, compatibility need, proof, expiry and removal condition.",
+  "Select migrate-and-delete, bounded read-only LEGACY_D02 importer, or full deletion.",
+]
+
+[[waves]]
+id = "B"
+what = "Remove duplicate control and authority ontologies."
+how = [
+  "Use current owner-neutral epoch/fence/attempt/operation types only for demonstrated consumers.",
+  "Route planning/admission/durable state/process/provider/verification to their existing owners.",
+  "Remove finish-parent and effecting source/package commands from the historical tool.",
+]
+
+[[waves]]
+id = "C"
+what = "Constrain historical evidence and process behavior."
+how = [
+  "Allow fixed plan/model/hashes only inside an explicit versioned read-only LEGACY_D02 import profile.",
+  "Make serialization failure typed and fatal; never substitute empty bytes.",
+  "Move retained Git/process inspection behind #100 or a fixed bounded non-effecting repository-tool exception.",
+]
+
+[[waves]]
+id = "D"
+what = "Remove the package after zero-current-consumer proof."
+how = [
+  "Run current orchestration with the package unavailable and no fallback.",
+  "Preserve differential fixtures only for intentionally retained historical validation.",
+  "Remove Cargo, lockfile, package-index, docs, boundary-debt and call-site residue through one final integrator.",
+]
+
+[acceptance]
+criteria = [
+  "Every public type, command and effect has one current replacement, bounded legacy disposition or deletion.",
+  "No current runtime or developer workflow uses private D-02 control state as authority.",
+  "No current path hardcodes D-02:plan-v4, opencode-go/deepseek-v4-flash or D-01 hashes as current policy.",
+  "Retained historical values are accepted only under a non-effecting LEGACY_D02 import schema and cannot promote support.",
+  "Serialization failure is typed and fail-closed; empty bytes never replace failed serialization.",
+  "Finish, source writes and package integration execute only through current owners.",
+  "No private process/Git bypass remains; retained inspection is fixed, bounded and identity-bound.",
+  "Historical import replay is deterministic and changed same-identity bytes conflict.",
+  "Current work-unit/swarm runtime has no fallback to this package.",
+  "A retained package is read-only, explicitly legacy and absent from current capability/runtime support.",
+  "A deleted package leaves no Cargo, lockfile, index, docs, debt, fixture or call-site reference.",
+  "#13 records no parallel current campaign controller and #11 runs without effecting D-02 paths.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-campaign-executor --all-targets",
+  "cargo test --locked -p eliot-campaign-executor --all-targets",
+  "cargo clippy --locked -p eliot-campaign-executor --all-targets -- -D warnings",
+  "cargo metadata --locked --all-features --format-version 1",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "Run current work-unit/swarm flows with eliot-campaign-executor unavailable plus deterministic legacy-import fixtures if retained."
+product_proof = "Issues #681, #1126 and #11 remain open."
