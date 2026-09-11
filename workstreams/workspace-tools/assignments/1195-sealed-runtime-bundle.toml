@@ -1,0 +1,128 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_ARTIFACT_OWNER_DECISION"
+implementation_support = "VERIFIER_PRESENT_CURRENT_BUNDLE_PRODUCER_AND_CONSUMER_MISSING"
+evidence_execution_status = "SOURCE_AND_CONSUMER_SEARCH_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "SEALED_RUNTIME_BUNDLE_EDGE_CANDIDATE_ONLY"
+issue = 1195
+normative_pair_issue = 1067
+registry_issue = 13
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "workspace.sealed-runtime-bundle-lifecycle"
+causal_property = "One current sealed runtime bundle is reproducibly generated, content-addressed, installation-bound, invalidation-complete and consumed by the current runtime; otherwise the D-01 verifier is explicitly legacy or removed."
+current_discriminator = "The verifier expects BundleManifest and BootstrapSeed, carries fixed D-01 artifact pins, and has no in-repository current producer, installation consumer or generated accepted-pair fixture."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1195"
+
+[documentation]
+implementation = [
+  "docs/architecture/I00-05-current-system-evidence-and-source-support-model.md#i05-current-system-evidence-and-source-support-model",
+  "docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
+  "docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions",
+  "docs/architecture/I14-14-module-hot-replacement.md#i1414-module-hot-replacement",
+  "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "docs/architecture/I17-08-delivery-depth-d0-replaceable-runtime-and-process-grounding-skeleton.md#i178-delivery-depth-d0-replaceable-runtime-and-process-grounding-skeleton",
+  "docs/architecture/I18-04-test-tiers.md#i184-test-tiers",
+]
+anchors = ["ARCH-MOD-01", "ARCH-MOD-02", "ARCH-MOD-03", "ARCH-GROUND-01", "ARCH-OBS-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "The CLI and library are their own only code consumer.",
+  "The compiler expects Eliot_Runtime_BundleManifest.json and Eliot_Runtime_BootstrapSeed.json under caller-selected roots.",
+  "No current checked-in bundle, producer, installation consumer or runtime admission consumer was found.",
+  "Issue #1067 source repair reads the accepted normative receipt, but its accepted-pair bundle execution remains unproved for this reason.",
+  "The verifier still carries fixed manifest, payload-root, runtime, template and WorkGraph SHA-256 pins under D-01:plan-v2.",
+  "Receipt serialization and canonicalization paths still contain panic-based failure handling.",
+]
+
+[scope]
+primary_paths = [
+  "workspace/tools/eliot-runtime-compiler/**",
+  "exact installation, artifact, generation and capability-registry contracts needed for one owner",
+  "one bounded bundle producer and one installation/runtime consumer if retained",
+  "root Cargo/index/lock only in the final disposition wave",
+  "directly relevant tests and finite fixtures",
+]
+serialized_dependencies = ["#1067 normative receipt", "#13 capability registry", "#14/#15/#18/#19 runtime owners", "#11 Product proof"]
+forbidden = [
+  "changes to docs/normative-pair.toml",
+  "guessed replacement hashes",
+  "caller path strings treated as authority",
+  "network/provider/credential access",
+  "live runtime-root copying",
+  "second installation or generation owner",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Inventory every artifact, pin, producer, consumer and lifecycle owner."
+how = [
+  "Cover BundleManifest, BootstrapSeed, all expected payloads, six fixed pins, report output and CLI invocations.",
+  "Compare with current installation, artifact, generation, capability and proof manifests.",
+  "Select current generated bundle, read-only LEGACY_D01 verifier or deletion.",
+]
+
+[[waves]]
+id = "B"
+what = "Define and generate a current bundle if justified."
+how = [
+  "Reuse the existing installation/generation owner rather than defining parallel state.",
+  "Bind normative pair, source tree, dirty policy, Cargo lock/toolchain/target/profile/features, package/artifact identities, capability/contract/proof registries, configuration/schema, payload root, generator, invalidation and compatibility.",
+  "Generate create-new bounded artifacts and an immutable producer receipt without network or credentials.",
+]
+
+[[waves]]
+id = "C"
+what = "Validate and consume the same identity."
+how = [
+  "Validate producer receipt, complete payload denominator, bytes/digests and exact root/source/installation bindings.",
+  "Derive current trust roots from the admitted manifest/receipt; fixed D-01 pins may exist only in a legacy fixture.",
+  "Require installation/runtime admission to consume the same manifest before activation.",
+]
+
+[[waves]]
+id = "D"
+what = "Close failures, invalidation and disposition."
+how = [
+  "Return typed failures for JSON, canonicalization and receipt serialization; never panic or emit partial PASS.",
+  "Invalidate on any source, normative, lock/toolchain, registry, manifest or generator change.",
+  "Stage candidate replacement through Host/Kernel cutover and rollback, or prove zero current consumers and relabel/delete the tool.",
+]
+
+[acceptance]
+criteria = [
+  "Every expected artifact, pin and CLI input has one producer, consumer, owner, schema, proof ceiling and invalidation rule, or is explicitly legacy/deleted.",
+  "A retained current bundle is reproducibly generated from complete authoritative inputs and has an immutable producer receipt.",
+  "Equivalent inputs generate byte-identical artifacts; every load-bearing input change invalidates identity.",
+  "An actual fixture using the accepted normative pair passes and the superseded pair fails.",
+  "Current validation derives trust roots from the admitted manifest/receipt, not fixed D-01 literals.",
+  "Independent roots require one owner manifest binding them to the same source, installation and generation.",
+  "Missing, extra, stale, conflicting, malformed, oversized or changed payloads cannot yield PASS.",
+  "Serialization/canonicalization failure is typed and never panics or substitutes defaults.",
+  "Installation/runtime consumes the same manifest identity and verifier PASS alone cannot claim support.",
+  "Relevant source/input changes invalidate reuse and replacement preserves fencing/rollback evidence.",
+  "A retained legacy verifier is read-only, explicitly LEGACY_D01 and absent from current support paths.",
+  "A deleted tool leaves no Cargo, lockfile, index, docs, fixture or invocation residue.",
+  "#1067 acceptance is re-executed against the generated fixture and #11 remains Product owner.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-runtime-compiler --all-targets",
+  "cargo test --locked -p eliot-runtime-compiler --all-targets",
+  "cargo clippy --locked -p eliot-runtime-compiler --all-targets -- -D warnings",
+  "cargo metadata --locked --all-features --format-version 1",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "Generate twice, compare exact bytes, compile, mutate every load-bearing input and exercise installation admission plus cutover/rollback; or prove zero current consumers for a legacy/delete disposition."
+product_proof = "Issue #11 remains open."
