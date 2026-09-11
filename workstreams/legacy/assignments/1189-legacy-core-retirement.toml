@@ -1,0 +1,134 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_ITEM_LEVEL_CONSUMER_DISPOSITION"
+implementation_support = "LEGACY_AGGREGATE_STACK_PRESENT"
+evidence_execution_status = "DEPENDENCY_AND_SOURCE_CONSUMER_SEARCH_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "LEGACY_CORE_RETIREMENT_CANDIDATE_ONLY"
+issue = 1189
+governor_issue = 18
+store_issue = 19
+registry_issue = 13
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "legacy.aggregate-core-retirement"
+causal_property = "Every public behavior, state and wire contract in eliot-app, eliot-engine, eliot-store and eliot-types maps to one current owner/consumer, remains a bounded expiring fixture, or is deleted; no aggregate remains a parallel runtime owner."
+current_discriminator = "eliot-app is the only workspace consumer of eliot-engine; eliot-engine depends on legacy eliot-store, eliot-types and eliot-windows-ipc, while current split owners already exist."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1189"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-05-current-system-evidence-and-source-support-model.md#i05-current-system-evidence-and-source-support-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-03-workspace-topology-and-dependency-direction.md#i23-workspace-topology-and-dependency-direction",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-01-store-boundary.md#i51-store-boundary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-20-read-model-consistency-and-cache.md#i520-read-model-consistency-and-cache",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I06-04-kernel.md#i64-kernel",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I06-05-governor.md#i65-governor",
+]
+anchors = ["ARCH-MOD-01", "ARCH-MOD-02", "ARCH-MOD-03", "ARCH-AUTH-01", "ARCH-SEC-02", "ARCH-RES-03", "ARCH-OBS-01"]
+
+[packages]
+paths = ["crates/eliot-app", "crates/eliot-engine", "crates/eliot-store", "crates/eliot-types"]
+required_dispositions = ["MIGRATE_TO_CURRENT_OWNER", "BOUNDED_COMPATIBILITY_FIXTURE", "DELETE_UNREFERENCED"]
+
+[current_source]
+confirmed = [
+  "eliot-app depends on eliot-engine, eliot-store and eliot-types.",
+  "eliot-app is the only workspace consumer found for eliot-engine.workspace.",
+  "eliot-engine depends on legacy eliot-store, eliot-types and eliot-windows-ipc.",
+  "eliot-store carries redb/WebSocket/legacy IPC behavior parallel to current Store API, Surreal bridge and Blob owners.",
+  "eliot-types defines broad legacy DTOs including a second RuntimeStatusReport.",
+  "eliot-app contains legacy command, MCP, host/process/provider and cognitive owners parallel to the current split topology.",
+]
+
+[scope]
+primary_paths = [
+  "crates/eliot-app/**",
+  "crates/eliot-engine/**",
+  "crates/eliot-store/**",
+  "crates/eliot-types/**",
+  "exact current-owner consumers needed for one-at-a-time migration",
+  "machine-readable disposition ledger and differential fixtures",
+  "root Cargo/lock only in the final serialized removal wave",
+]
+serialized_dependencies = ["#18 Governor facade", "#19 Store", "#15 Kernel", "#13 registry", "#100/#1109 provider/process", "#1117 cognitive aggregates", "#1119 read owner", "#11 Product proof"]
+forbidden = [
+  "normative edits that bless legacy behavior",
+  "replacement monolith",
+  "parallel current writers or semantic owners",
+  "generic JSON/shell authority or direct credentials",
+  "new features/state/effects in the migration facade",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Generate an item-level reverse-consumer and state/effect ledger."
+how = [
+  "Inventory every public item, serialization identifier, feature, mutable state, external effect and source construction/call site.",
+  "Record legacy owner, current consumer, replacement owner/type, compatibility need, proof, expiry and removal condition.",
+  "Treat membership, LOC, tests and public exports as evidence only, not consumers or support.",
+]
+
+[[waves]]
+id = "B"
+what = "Migrate real capability edges to current owners."
+how = [
+  "Move task/WorkScope/Session/Finish semantics to Governor, process/generation/fencing to Host/Kernel, Store operations to current Store owners, provider execution to governed adapters and UI/MCP to current surfaces.",
+  "Replace broad legacy DTOs with lowest-dependency current contracts instead of copying fields.",
+  "Use exact differential fixtures only for identified current compatibility consumers.",
+]
+
+[[waves]]
+id = "C"
+what = "Eliminate duplicate ontologies and fallbacks."
+how = [
+  "Resolve duplicate RuntimeStatusReport and same-purpose types through one owner and explicit versioned decoder where needed.",
+  "Prevent legacy Store from production roots, credentials or fallback status.",
+  "Prohibit new imports of eliot-engine as a convenience dependency.",
+]
+
+[[waves]]
+id = "D"
+what = "Remove the aggregate closure after zero-reference proof."
+how = [
+  "Remove eliot-app production commands/MCP/runtime routes and the legacy binary after all consumers migrate.",
+  "Delete aggregate libraries only after Cargo, features, docs, tests, fixtures, generated indices and serialized consumers close.",
+  "Perform root workspace/dependency/lock removal once through one serialized integrator.",
+]
+
+[acceptance]
+criteria = [
+  "Every public item and state/effect site has one current owner/consumer, bounded expiring fixture, or deletion.",
+  "No aggregate remains an undocumented production dependency, fallback or runtime route.",
+  "eliot-engine has no production consumer after eliot-app migration and cannot be reintroduced as convenience infrastructure.",
+  "legacy eliot-store has no production root/credential access and cannot coexist as a second writer/read owner.",
+  "legacy eliot-types owns no duplicate current DTO; every retained compatibility type has one consumer and removal condition.",
+  "Current split packages retain one owner for every migrated state and effect.",
+  "Preserved compatibility has exact source/schema-bound differential fixtures.",
+  "Corrected divergence does not restore known unsafe or semantically wrong legacy behavior.",
+  "Observation, support, evidence execution, runtime readiness and Product status remain separate.",
+  "eliot-app/eliot-governor are absent from current release/install/runtime routes before final deletion.",
+  "Deleted crates leave no Cargo, feature, route, docs, fixture, generated-index, workspace-dependency or lockfile residue.",
+  "#13 resolves all migrated capabilities and #11 runs with the aggregate stack unavailable.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo metadata --locked --all-features --format-version 1",
+  "cargo check --locked --workspace --all-targets",
+  "cargo test --locked --workspace --all-targets --no-fail-fast",
+  "cargo clippy --locked --workspace --all-targets -- -D warnings",
+  "python scripts/audit-architecture-boundaries.py",
+  "python scripts/crate_reachability_inventory.py --repo-root . --output .eliot/legacy-core-disposition.json",
+  "git diff --check",
+]
+edge_proof = "Run migrated capability edges with all four aggregate crates unavailable, exact differential fixtures and zero-reference checks before final removal."
+product_proof = "Issue #11 remains open."
