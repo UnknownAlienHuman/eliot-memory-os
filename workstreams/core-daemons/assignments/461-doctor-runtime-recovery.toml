@@ -1,0 +1,135 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_WAVE_A_BLOCKED_FOR_AUTHORITY_AND_PROCESS_WAVES"
+implementation_support = "PARTIAL"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "DOCTOR_ONE_SHOT_RECOVERY_EDGE_CANDIDATE"
+parent_issue = 17
+handoff_issue = 461
+issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/461"
+integration_issue_refs = [64, 100, 14, 15, 18, 11]
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "meta.doctor-one-shot-recovery"
+causal_property = "One short-lived Doctor process executes or reconciles one exact Kernel-admitted registered repair attempt, after durable effect intent, without minting authority, selecting arbitrary commands, writing canonical state or verifying itself."
+old_path_discriminator = "bins/eliot-doctor/src/main.rs always emits KERNEL_ADMISSION_REQUIRED and exits 78; eliot-doctor-core has a pure candidate state machine but no production KernelDoctorClient, canonical authority/fence owner, durable ORS effect path, named effect adapter or independent verifier edge."
+result = "Wave A contract candidate followed by serialized Kernel/process/verifier waves; no Product claim"
+
+[documentation]
+architecture_sections = [
+  "docs/architecture/A13-03-module-supervision-and-doctor.md#a133-module-supervision-and-doctor",
+  "docs/architecture/A13-04-problem-lifecycle.md#a134-problem-lifecycle",
+]
+implementation_sections = [
+  "docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
+  "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "docs/architecture/I14-22-maintenance-jobs.md#i1422-maintenance-jobs",
+  "docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+  "docs/architecture/I14-25-doctor-implementation-contract.md#i1425-doctor-implementation-contract",
+]
+decision_anchors = ["ARCH-RES-02", "ARCH-RES-05", "ARCH-SEC-02", "ARCH-MOD-03", "ARCH-OBS-01"]
+
+[current_source]
+binary_path = "bins/eliot-doctor/src/main.rs"
+core_path = "crates/meta/eliot-doctor-core/src/lib.rs"
+confirmed_facts = [
+  "The production binary has no admitted IPC path and unconditionally exits with code 78.",
+  "KernelDoctorClient exists only as an abstract provider-neutral trait; repository search finds no production implementation.",
+  "Doctor core defines local StateFence and RecoveryLease shapes instead of consuming the canonical lineaged authority owner.",
+  "RepairRecipe.allowed_effects and operations are free-form String collections rather than registered named effect references.",
+  "The core correctly prevents DiagnoseOnly from carrying operations, but execution authority remains string-shaped.",
+  "Effect intent and reconciliation exist only behind the in-process client abstraction; no durable ORS owner edge is present.",
+  "InvocationOutcome::Completed is not a sufficiently precise repair disposition and does not by itself prove independent verification.",
+]
+
+[dependency_policy]
+wave_a_ready = "Pure contract correction may begin after reading the current canonical type owners and must not duplicate them."
+authority_blocker = "Authority-bearing migration must consume issue #64's accepted canonical lineaged epoch/fence/lease types; do not coerce them back to local scalar u64 values."
+process_blocker = "Any native effect execution must consume issue #100's accepted ProcessExecutor contour; no direct Command, shell, PowerShell or arbitrary executable fallback."
+verification_blocker = "REPAIRED_VERIFIED requires an independently owned verifier result and Governor application; Doctor cannot certify its own effect."
+
+[decomposition]
+wave_a_contract = [
+  "Reuse the canonical StateFence, lineaged epoch and recovery/operation identities from their owning contracts.",
+  "Define immutable RepairRecipeIdentity, RepairAttemptIdentity and RepairEffectIdentity with canonical versioned encoding and explicit domain separation.",
+  "Replace free-form executable operations with closed RepairOperationRef values resolved against a Kernel/Governor-supplied immutable recipe manifest.",
+  "Separate effect execution/disposition, process receipt, verification execution, evaluation, target binding, freshness, independence and cleanup/rollback axes.",
+  "Replace ambiguous Completed with closed dispositions including DIAGNOSED, REPAIRED_PENDING_VERIFICATION, REPAIRED_VERIFIED, REPAIR_FAILED, PARTIAL, UNKNOWN_EFFECT_OUTCOME, RECONCILING, CANCELLED, QUARANTINED and ESCALATED.",
+]
+wave_b_kernel_ors = [
+  "Add one exact Doctor operation to the Kernel authority projection and EBP contract.",
+  "Kernel resolves the registered recipe and issues one RecoveryLease/attempt admission bound to Problem evidence, target, recipe digest, named effects, budget, deadline, cooldown, approval and cancellation identity.",
+  "Persist attempt and effect intent in ORS before execution and persist/reconcile exact outcome by RepairEffectIdentity.",
+  "Enforce budget, cooldown and quarantine across Doctor process restarts.",
+]
+wave_c_effect_adapters = [
+  "Implement only explicit registered adapters, initially one narrow automatic-safe operation whose current owner permits it.",
+  "Use the shared governed ProcessExecutor for native effects and preserve stdout/stderr/process/cleanup evidence.",
+  "Return exact receipt or UNKNOWN_EFFECT_OUTCOME; blind retry after uncertain effect is forbidden.",
+  "Model rollback or compensation as another registered effect with its own identity and permit.",
+]
+wave_d_binary = [
+  "Replace unconditional exit-only main with authenticated generation-bound Kernel bootstrap.",
+  "Accept no recipe or effect authority from stdin, argv or environment.",
+  "Execute exactly one attempt or reconciliation request, emit one typed result, flush evidence and exit.",
+]
+wave_e_verifier = [
+  "Invoke the independently owned registered verifier against the exact target, artifact and effect receipt.",
+  "Governor, not Doctor, applies the semantic Problem/repair transition.",
+  "Missing, stale, simulated, inconclusive or unbound verification remains non-verified and visible.",
+]
+
+[mutable_scope]
+wave_a = [
+  "crates/meta/eliot-doctor-core/Cargo.toml only for accepted existing-owner dependencies",
+  "crates/meta/eliot-doctor-core/src/**",
+  "crates/meta/eliot-doctor-core/tests/** focused contract fixtures",
+]
+wave_b = [
+  "crates/kernel/eliot-kernel-service/src/**doctor** exact new or existing owner modules",
+  "crates/kernel/eliot-ors/src/**doctor** exact durable records",
+  "bins/eliot-kernel/src/**doctor** exact composition adapter",
+]
+wave_c_d = [
+  "bins/eliot-doctor/Cargo.toml only for accepted workspace dependencies",
+  "bins/eliot-doctor/src/**",
+  "bins/eliot-doctor/tests/**",
+  "Cargo.lock only when dependency resolution changes",
+]
+forbidden = [
+  "direct canonical Store dependency or credentials in Doctor",
+  "generic shell, PowerShell, SQL, HTTP or arbitrary executable recipe",
+  "model call in execution or verification gate",
+  "Doctor-owned semantic resolution or Finish",
+  "self-update, self-verification or active-build repair",
+  "automatic workflow trigger",
+]
+
+[acceptance]
+criteria = [
+  "A valid current Kernel admission can execute one bounded Doctor attempt; missing, invalid or stale admission performs no effect.",
+  "Caller-supplied recipe or executable authority is rejected.",
+  "Recipe, attempt and effect identities are deterministic and change when any load-bearing target, fence, recipe, operation, approval, budget or deadline field changes.",
+  "DiagnoseOnly cannot open an effect path; Guarded requires exact approval bound to the same attempt/effect identity.",
+  "Unregistered operation cannot execute.",
+  "Effect intent persistence failure produces no effect.",
+  "Crash after effect start but before receipt becomes UNKNOWN_EFFECT_OUTCOME and reconciles the exact identity; blind retry is rejected.",
+  "Budget exhaustion and cooldown survive process restart and terminate in quarantine/escalation rather than a restart storm.",
+  "Process exit zero without independent current verifier evidence is not repaired or resolved.",
+  "Only an independent executed PASS bound to the exact target may produce a verified repair candidate, and only Governor applies semantic resolution.",
+  "Doctor has no canonical Store, model client, generic shell, authority minting or Finish dependency.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-doctor-core -p eliot-doctor -p eliot-kernel-service -p eliot-ors --all-targets",
+  "cargo test --locked -p eliot-doctor-core -p eliot-doctor -p eliot-kernel-service -p eliot-ors --all-targets",
+  "cargo clippy --locked -p eliot-doctor-core -p eliot-doctor -p eliot-kernel-service -p eliot-ors --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run one real Windows automatic-safe repair, uncertain-outcome reconciliation and independent verifier path through a one-shot Doctor process."
+product_pulse = "Owned by issue #11 and remains NOT_EXECUTED."
