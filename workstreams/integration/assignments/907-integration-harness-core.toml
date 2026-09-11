@@ -1,0 +1,133 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_AFTER_750_AND_905_CONTRACTS"
+implementation_support = "LEGACY_MONOLITH_PRESENT_TYPED_CORE_ABSENT"
+evidence_execution_status = "SOURCE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "INTEGRATION_HARNESS_CORE_FAKE_PROVIDER_MODULE_PROOF_ONLY"
+issue = 907
+inventory_issue = 905
+verification_issue = 750
+containment_issue = 850
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "integration.harness-core-state-machine"
+causal_property = "One frozen finite inventory selection is validated, planned, provisioned, executed, evidenced and cleaned through a bounded deterministic state machine; every selected test and every possibly started resource receives one exact terminal or reconciliation disposition."
+current_discriminator = "scripts/run-isolated-tests.ps1 is a monolithic Surreal/nextest runner with caller-supplied package, binary, filter and executable parameters; IntegrationHarness.Core/Model and the fixed PowerShell case bridge do not exist on main."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/907"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-32-stateful-test-environments.md#i1832-stateful-test-environments",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-04-test-tiers.md#i184-test-tiers",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-22-flake-hang-and-recurrence-handling.md#i1822-flake-hang-and-recurrence-handling",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-21-local-and-ci-parity.md#i1821-local-and-ci-parity",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-22-parallel-build-cache-artifact-and-environment-lanes.md#i222-parallel-build-cache-artifact-and-environment-lanes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-08-02-ip0-one-windows-processexecutor.md#i1082-ip0-one-windows-processexecutor",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-21-unknown-commit-recovery.md#i1421-unknown-commit-recovery",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-04-secrets.md#i154-secrets",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+]
+anchors = ["ARCH-GROUND-01", "ARCH-RES-04", "ARCH-OBS-01", "ARCH-ORD-01"]
+
+[current_source]
+confirmed = [
+  "run-isolated-tests.ps1 currently combines configuration, Surreal acquisition, process lifecycle, nextest selection, evidence and cleanup in one script.",
+  "Its public parameters include caller-selected package, binary, target, test name/filter and Surreal executable.",
+  "scripts/integration/IntegrationHarness.Core.psm1 and IntegrationHarness.Model.psm1 are absent on main.",
+  ".github/workflows/integration.yml is absent and remains owned by #915.",
+  "The prior #920 PR was closed unmerged and declared itself marker-only.",
+]
+
+[scope]
+primary_paths = [
+  "scripts/run-isolated-tests.ps1",
+  "scripts/integration/IntegrationHarness.Core.psm1",
+  "scripts/integration/IntegrationHarness.Model.psm1",
+  "scripts/integration/powershell_case_bridge.py",
+  "scripts/tests/IntegrationHarness.Core.Tests.ps1",
+  "scripts/tests/test_integration_harness_core.py",
+  "scripts/testdata/integration/harness-core/**",
+  ".github/temporary/work-unit-907.md only if present",
+]
+forbidden = [
+  "inventory implementation or generated current-run artifact",
+  "Store, Runtime or Git concrete providers",
+  "Rust source/tests, Cargo or lockfile",
+  "workflows, Justfile or verify.ps1",
+  "machine/global Git, service, firewall, ACL or environment mutation",
+  "arbitrary command, executable, argv, URL, credentials or environment map from caller",
+  "implicit wildcard run-all, empty-selection success or provider-selected denominator",
+]
+
+[[waves]]
+id = "A"
+what = "Replace the monolith with one closed Core/Model contract while preserving the public entrypoint."
+how = [
+  "Retain exactly mutually exclusive -WhatIf, -ValidateConfiguration and -Run profiles; default or conflicting invocation launches nothing and fails usage validation.",
+  "Consume the frozen #905 inventory and an explicit finite selected row set; no implicit wildcard or package exclusion.",
+  "Derive commands/resources internally from accepted identities and committed tool policy.",
+]
+
+[[waves]]
+id = "B"
+what = "Implement the closed provider interface and deterministic state machine."
+how = [
+  "Expose only ValidateRequirement, Plan, Allocate, Start, ObserveReadiness, ResetForTest, CollectEvidence, Stop and VerifyCleanup.",
+  "Bind every provider operation to run/class/provider revision, owner/generation receipt and deadline.",
+  "Validate the complete plan before external action and prepare in deterministic dependency order.",
+  "On failure/cancellation/exception, clean every resource whose preparation may have started in reverse order, preserving primary and cleanup failures.",
+]
+
+[[waves]]
+id = "C"
+what = "Execute exact selected tests with bounded evidence and no-progress semantics."
+how = [
+  "Group only identical provider/isolation/target/reset/serialization classes and require exact group union equals the selected inventory rows.",
+  "Use prebuilt binary/source/toolchain receipts and exact qualified test IDs; zero discovery is nonpassing.",
+  "Preserve Passed, AssertionFailed, TimedOut, ProcessCrashed, InfrastructureBlocked, UnsupportedExternalCredential, HarnessError, Cancelled and NotExecutedDueToPriorContamination separately.",
+  "No automatic retry; explicit recurrence retains every attempt and never averages failure into pass.",
+]
+
+[[waves]]
+id = "D"
+what = "Add the fixed Python-to-PowerShell case bridge and 40-case proof."
+how = [
+  "Register only the exact Core/Store/Runtime/Git suite paths in the test-only bridge; reject arbitrary script/executable/argv/environment/working-directory input.",
+  "Run fixed pwsh -NoProfile -NonInteractive -File <registered suite> -CaseId <id> under #850 containment.",
+  "Validate case ID, suite path/content digest, result schema, assertion outcome, exit status, output bounds and cleanup disposition.",
+  "Implement exactly WORK_UNIT_CASE: 907/1..40, with cases 1..32 executing actual PowerShell assertions and 33..40 testing bridge/containment failures.",
+]
+
+[acceptance]
+criteria = [
+  "Exactly one public profile is selected; default/conflicting invocation performs no allocation.",
+  "WhatIf and ValidateConfiguration are mutation-free and deterministic.",
+  "Run requires a finite nonempty selection whose exact union equals all execution groups.",
+  "Provider methods and revisions are closed; providers cannot alter the denominator, inject commands or mark tests passed.",
+  "Observed process/port/pipe or exit zero cannot become semantic readiness or test pass.",
+  "Every selected test has exactly one terminal disposition and every possibly started resource has one cleanup/reconciliation disposition.",
+  "Failure, cancellation, timeout, crash, unsupported credentials, infrastructure block, contamination and harness error remain distinct.",
+  "Unknown launch/commit/cleanup is never retried blindly and blocks clean completion.",
+  "Reverse cleanup is idempotent and preserves the original failure beside cleanup failure.",
+  "Foreign PID, path, port, pipe, worktree and resource are never killed or deleted.",
+  "Evidence binds source/worktree, inventory, selected rows, harness/provider/tool identities, readiness, test execution, artifacts, truncation, cleanup arithmetic and proof ceiling.",
+  "Secrets, connection values, private paths and raw source/model/test payloads are absent from public evidence.",
+  "Exactly 40 substantive Python cases execute; zero exit, missing/duplicate/foreign/skipped/malformed/oversized case results cannot pass.",
+  "No concrete provisioning, Rust/Cargo/workflow mutation or Product support claim enters the Core implementation.",
+]
+
+[verification]
+commands = [
+  "python -m py_compile scripts/integration/powershell_case_bridge.py scripts/tests/test_integration_harness_core.py",
+  "python -m unittest scripts.tests.test_integration_harness_core -v",
+  "pwsh -NoProfile -File scripts/tests/IntegrationHarness.Core.Tests.ps1",
+  "git diff --check",
+]
+contained_proof = "Run the accepted #850 contained descriptor over the Python suite and retain all 40 source/discovery/executed-result records plus PowerShell suite/case identities."
+product_proof = "Fake-provider Core proof does not establish Store, Runtime, Git, complete ignored-tier or Product support; those remain #909/#911/#913/#915/#11."
