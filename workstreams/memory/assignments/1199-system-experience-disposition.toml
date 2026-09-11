@@ -1,0 +1,116 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_CONSUMER_DISPOSITION"
+implementation_support = "PURE_PROJECTION_WITHOUT_CURRENT_CONSUMER"
+evidence_execution_status = "SOURCE_AND_REVERSE_CONSUMER_SEARCH_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "SYSTEM_EXPERIENCE_PROJECTION_EDGE_CANDIDATE_ONLY"
+issue = 1199
+parent_issue = 39
+source_repair_issue = 209
+governor_issue = 18
+store_issue = 19
+read_issue = 1119
+registry_issue = 13
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "memory.system-experience-projection-disposition"
+causal_property = "One owner-supplied immutable system-experience read set is projected by exactly one current read owner under exact source, scope, denominator, consistency, privacy, freshness and invalidation identities; an unconsumed compatibility package cannot advertise current support."
+current_discriminator = "The stateless v2 package has no external Cargo/source/runtime consumer but still advertises a compatibility functional cell and proof profile."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1199"
+
+[documentation]
+implementation = [
+  "docs/architecture/I04-08-eliot-self-scope-and-immediate-system-experience-bank.md#i48-eliot-self-scope-and-immediate-system-experience-bank",
+  "docs/architecture/I05-20-read-model-consistency-and-cache.md#i520-read-model-consistency-and-cache",
+  "docs/architecture/I05-24-operational-control-state-versus-cognitive-inheritance.md#i524-operational-control-state-versus-cognitive-inheritance",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions",
+  "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+]
+anchors = ["ARCH-MOD-03", "ARCH-MEM-04", "ARCH-SEC-02", "ARCH-OBS-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "Closed #209 removed the duplicate mutable SystemExperienceOwner and retained one pure bounded projection.",
+  "Exact search finds no external use eliot_system_experience, eliot_system_experience:: or eliot-system-experience.workspace consumer.",
+  "No Governor, Store, Context, Operator, ControlBoard, runtime-status or installation composition invokes project_experience.",
+  "Package metadata still advertises smart.experience.projection.compatibility and an independent proof profile.",
+  "cognitive-donor-map.toml says RETIRE_AS_STATE_OWNER_DEFER_READ_PROJECTION_IDEAS and names no target package.",
+]
+
+[scope]
+primary_paths = [
+  "crates/smart/eliot-system-experience/**",
+  "exact Governor, Store and read-projection contracts/consumers required for migration",
+  "root workspace/lock only in the final serialized deletion wave",
+  "current capability/donor/routing metadata through existing owners/generators",
+  "directly relevant tests and finite fixtures",
+]
+serialized_dependencies = ["#18/#19 Governor and Store", "#1119 read owner", "#39 parent retirement", "#13 registry", "#11 Product proof"]
+forbidden = [
+  "mutable experience, relation, lifecycle, revision or history state",
+  "Store I/O/credentials or direct Context membership",
+  "retrieval reinforcement or current-system status ownership",
+  "model/provider calls, authority, effects or Finish",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Revalidate consumers and compare current read contracts."
+how = [
+  "Run Cargo/source/runtime/install/registry reverse-consumer inventory.",
+  "Build a field-level table against current Governor read, Store API and #1119 contracts covering source revision, scope, filters, denominator, relation closure, ordering, omissions, digest, evidence, privacy, freshness and invalidation.",
+  "Select one current consumer, bounded fixture, migration-and-deletion or deletion disposition.",
+]
+
+[[waves]]
+id = "B"
+what = "Wire one exact owner/consumer only when an independent boundary is justified."
+how = [
+  "Construct the projection from one owner-issued immutable snapshot and bind principal/Session where applicable, WorkScope, source owner/revision/digest, ordering heads, StateFence, consistency, coverage, privacy, observed time, expiry and invalidation set.",
+  "Treat missing owner/fence/freshness evidence as partial or unknown.",
+  "Keep query terms read-only and unable to alter support, lifecycle, accessibility, influence or usefulness.",
+]
+
+[[waves]]
+id = "C"
+what = "Migrate or retire without duplicate projection ownership."
+how = [
+  "Use exact differential fixtures only for behavior a current consumer requires.",
+  "Correct metadata and #13 to current, fixture-only or removed state.",
+  "If removed, delete package, member/dependency, lock entry and current route/index/registry claims after zero-consumer proof.",
+]
+
+[acceptance]
+criteria = [
+  "Current inventory identifies one real consumer or proves zero consumers.",
+  "The package has exactly one current, fixture, migrated-and-deleted or deleted disposition.",
+  "A current consumer, if retained, uses an exact owner-issued snapshot with explicit source/scope/fence/consistency/coverage/freshness/invalidation identity.",
+  "A fixture-only package is marked non-runtime/non-current with one consumer and removal condition.",
+  "A removed package leaves no workspace/dependency/lock/route/index/manifest/registry reference.",
+  "No duplicate query, coverage, ordering or digest owner remains.",
+  "Missing, partial, stale, conflicted, unavailable and unknown evidence cannot become complete/current output.",
+  "Rank, retrieval count or repeated delivery cannot modify support, lifecycle, accessibility, influence or usefulness.",
+  "No mutable system-experience or relation/lifecycle state is reintroduced.",
+  "Exact replay is deterministic and changed source/scope/denominator/fence/consistency/privacy/invalidation changes identity or conflicts.",
+  "#13 resolves one final owner/proof surface and #39 remains open until both duplicate-owner removals and affected proof complete.",
+  "Package proof alone is not runtime or Product support.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo metadata --locked --all-features --format-version 1",
+  "cargo check --locked -p eliot-system-experience -p eliot-governor -p eliot-store-api -p eliot-read --all-targets",
+  "cargo test --locked -p eliot-system-experience -p eliot-governor -p eliot-store-api -p eliot-read --all-targets",
+  "cargo clippy --locked -p eliot-system-experience -p eliot-governor -p eliot-store-api -p eliot-read --all-targets -- -D warnings",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "Execute the identified owner -> immutable snapshot -> projection -> consumer edge with partial/stale/conflicted/unavailable input, or prove zero references with the package unavailable."
+product_proof = "Issue #11 remains open."
