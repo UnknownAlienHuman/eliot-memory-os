@@ -437,7 +437,8 @@ pub(super) fn rebind_runtime_restart_receipt(
     Ok(rebound)
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 mod durability_repair_tests {
     use super::*;
     use crate::HostKernelRestartReceipt;

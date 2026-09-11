@@ -9,6 +9,8 @@
 //! deliberately removed so a failed directory sync can never be misreported
 //! as durable publication nor allow evidence removal.
 
+#![forbid(unsafe_code)]
+
 use std::path::Path;
 
 use super::HostError;

@@ -1182,7 +1182,8 @@ pub(super) fn committed_store_rebind_receipt(
     Ok(inner)
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 mod durability_repair_tests {
     use super::*;
     use crate::TestResult;
