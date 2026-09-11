@@ -1,0 +1,124 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "PROVIDER_CONTRACTS_PRESENT_CURRENT_ACCOUNT_CATALOGUE_EDGE_OPEN"
+evidence_execution_status = "ISSUE_AND_SOURCE_ROUTING_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "PROVIDER_CATALOGUE_OBSERVATION_EDGE_CANDIDATE_ONLY"
+issue = 265
+related_issue_refs = [361, 368, 369, 370, 371, 874, 1109, 1100]
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "agent.provider-current-catalogue-and-capacity-observation"
+causal_property = "One current provider/account catalogue projects exact available routes, models, capability facets, quotas, rate limits, liveness and invalidation evidence without minting provider admission, credentials, authority, support or retry policy."
+current_discriminator = "Provider-neutral route and adapter contracts exist, but no accepted production observation path proves the current account/model catalogue, remaining quota/capacity, rate-limit state and liveness under exact account, route, provider generation and freshness identities."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/265"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-05-current-system-evidence-and-source-support-model.md#i05-current-system-evidence-and-source-support-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I03-04-capability-and-route-registry.md#i34-capability-and-route-registry",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I03-06-model-route-and-portfolio-policy.md#i36-model-route-and-portfolio-policy",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-11-external-model-bridges.md#i1011-external-model-bridges",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-04-secrets.md#i154-secrets",
+]
+anchors = ["ARCH-PORT-01", "ARCH-SEC-01", "ARCH-OBS-01", "ARCH-RES-04", "ARCH-AUTH-01"]
+
+[current_source]
+confirmed = [
+  "Provider-neutral route/admission/result contracts and provider-specific adapter packages exist.",
+  "The current account/model/quota/liveness projection remains a distinct prerequisite from provider admission and execution.",
+  "Provider names, successful authentication, process liveness and cached model lists cannot independently prove current route availability or remaining quota.",
+  "Catalogue evidence must remain owner-neutral and secret-free so Governor/Coordinator can consume it without importing provider SDK or credentials.",
+]
+
+[scope]
+primary_paths = [
+  "the exact current provider catalogue/account observation package selected after reverse-consumer review",
+  "provider-neutral route/capability/capacity observation contracts",
+  "provider-specific catalogue adapters for retained providers from #1109/#874",
+  "exact Governor/Coordinator selection consumers",
+  "directly relevant tests and finite provider fixtures",
+]
+serialized_dependencies = [
+  "#361 and #368-#371 provider-neutral contracts",
+  "#874 native adapter registry",
+  "#1109 provider package dispositions",
+  "#1100 Dreamer runtime",
+  "#15/#18 Kernel and Governor owners",
+]
+forbidden = [
+  "raw credentials, tokens, cookies or billing identifiers in public catalogue output",
+  "provider SDK types in Governor, Kernel or Coordinator public contracts",
+  "catalogue presence treated as provider admission, execution readiness or support",
+  "automatic route selection from stale/unknown capacity",
+  "quota compensation across independent accounts or resource dimensions",
+  "retry policy, task scheduling, canonical writes, authority or Finish ownership",
+  "automatic GitHub workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze one owner-neutral account, route and model catalogue contract."
+how = [
+  "Bind each observation to provider/account reference, credential-binding reference, adapter/artifact/protocol generation, route/model revision, acquisition operation, observed/expiry time and invalidation set.",
+  "Represent model/route capabilities, context/input/output limits, tool/modalities, privacy/data-use class, region, pricing/billing unit and account eligibility as closed typed fields.",
+  "Reject duplicate route/model identity, same-ID changed meaning, unknown schema version and stale provider generation.",
+]
+
+[[waves]]
+id = "B"
+what = "Observe quota, rate limit, capacity and liveness independently."
+how = [
+  "Keep authentication validity, catalogue availability, route health, model availability, quota remaining, rate-limit window, concurrency capacity, billing status and provider incident state separate.",
+  "Represent known, unavailable, not-observable, stale, conflicted and unknown explicitly.",
+  "Do not derive remaining quota from successful requests, local counters or provider marketing limits without an authoritative observation receipt.",
+]
+
+[[waves]]
+id = "C"
+what = "Implement secret-safe provider adapters and bounded refresh."
+how = [
+  "Resolve credentials only through the owning credential binding; public records retain opaque references and redacted diagnostics.",
+  "Use fixed provider API operations with bounded input/output/time and exact response/version identity; no generic authenticated fetch surface.",
+  "Refresh only under explicit owner policy, deadline and budget; failed refresh leaves the prior row stale rather than deleting or silently extending it.",
+]
+
+[[waves]]
+id = "D"
+what = "Consume catalogue evidence without creating admission."
+how = [
+  "Governor/Coordinator selection may filter and rank only current eligible rows while preserving uncertainty, independent resource bounds and required provider admission.",
+  "A selected row remains a route candidate; the execution owner must still obtain an exact current provider-admission receipt.",
+  "After rate limit, quota exhaustion, credential revocation or generation invalidation, reject new selection while preserving already possible attempt reconciliation.",
+]
+
+[acceptance]
+criteria = [
+  "Every catalogue row binds exact provider/account reference, credential binding, adapter/protocol generation, route/model revision, observation time/expiry and invalidation set.",
+  "Authentication, catalogue availability, route health, model availability, quota, rate limit, concurrency, billing and incident state remain independent.",
+  "Known, unavailable, not-observable, stale, conflicted and unknown states cannot be coerced into available or zero.",
+  "Raw credentials, tokens, cookies and sensitive billing identifiers never enter public rows, logs, diagnostics or model context.",
+  "Provider SDK types do not cross into provider-neutral Governor/Kernel/Coordinator contracts.",
+  "Successful authentication/request/process liveness cannot prove current model availability, quota or execution readiness.",
+  "Failed refresh preserves the prior row as stale and cannot silently extend freshness or delete the denominator member.",
+  "Exact replay is deterministic; changed same-identity provider/account/model/capability/quota observation conflicts.",
+  "Selection consumes only current eligible evidence and cannot compensate one exhausted/unknown resource dimension with another.",
+  "Catalogue selection never creates provider admission, authority, credentials, an attempt, canonical state or task Finish.",
+  "Quota exhaustion, rate limit, credential revocation and generation invalidation block new attempts while preserving reconciliation of possible existing attempts.",
+  "Retained provider adapters pass a shared catalogue/capacity/redaction/freshness corpus plus provider-specific bounded fixtures.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p <provider-catalogue-owner> -p eliot-agent-coordinator --all-targets",
+  "cargo test --locked -p <provider-catalogue-owner> -p eliot-agent-coordinator --all-targets",
+  "cargo clippy --locked -p <provider-catalogue-owner> -p eliot-agent-coordinator --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Observe current, stale, unavailable, unknown, rate-limited, quota-exhausted and revoked provider rows, then prove selection remains candidate-only and execution still requires exact admission."
+product_proof = "Issue #11 remains open; catalogue evidence cannot prove provider execution or Product behavior."
