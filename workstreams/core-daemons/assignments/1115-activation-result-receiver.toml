@@ -1,0 +1,124 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "V2_PROTOCOL_AND_MAPPER_PRESENT_KERNEL_RECEIVER_MISSING"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "ACTIVATION_V2_KERNEL_EDGE_CANDIDATE"
+issue = 1115
+parent_issue = 66
+daemon_producer_issue = 839
+bridge_integration_issue_refs = [77, 23]
+product_pulse_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A10-01-agent-interaction-loop.md#a101-agent-interaction-loop",
+  "docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+]
+implementation = [
+  "docs/architecture/I01-11-startup-algorithm.md#i111-startup-algorithm",
+  "docs/architecture/I05-16-common-durable-fields.md#i516-common-durable-fields",
+  "docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
+  "docs/architecture/I07-02-frame.md#i72-frame",
+  "docs/architecture/I07-17-scope-and-task-onboarding.md#i717-scope-and-task-onboarding",
+  "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "docs/architecture/I13-02-conflict-set.md#i132-conflict-set",
+  "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-AUTH-01", "ARCH-SWM-02", "ARCH-OBS-01", "ARCH-RES-05", "ARCH-LIFE-01"]
+
+[confirmed_gap]
+protocol_source = "crates/foundation/eliot-protocol/src/activation_resolution.rs"
+daemon_mapper_source = "bins/eliotd/src/activation_projection.rs"
+daemon_transport_source = "bins/eliotd/src/daemon_kernel_client.rs"
+kernel_dispatch_source = "bins/eliot-kernel/src/daemon_request_dispatch.rs"
+kernel_pending_source = "bins/eliot-kernel/src/lib.rs"
+kernel_bridge_source = "bins/eliot-kernel/src/agent_bridge.rs"
+observations = [
+  "AgentActivationResolutionResult v2 and all seven dispositions exist.",
+  "eliotd has a lossless GovernorActivationOutcome to v2 mapper.",
+  "daemon_runtime still calls the legacy success-oriented resolver and submit_agent_activation_decision.",
+  "DaemonKernelClient and daemon_request_dispatch carry only AgentActivationResolutionDecision v1.",
+  "AgentActivationPendingState and Kernel submission retain the legacy decision rather than one v2 result identity and submission phase.",
+  "Non-success semantic outcomes therefore cannot be durably accepted and immediately projected to the bridge.",
+]
+discriminator = "Produce TaskSelectionRequired, ScopeAmbiguous, NotReady, StaleFence or FailedInternal in the Governor. The current production daemon/Kernel path cannot submit or retain the v2 disposition and eventually falls back toward claim expiry/generic timeout."
+
+[causal_property]
+statement = "One Kernel-issued activation ticket accepts at most one durable semantic result identity. All seven outcomes remain exact; only Resolved may activate a Session, and unknown submission is reconciled without recomputation."
+
+[scope]
+primary_paths = [
+  "bins/eliot-kernel/src/agent_bridge.rs",
+  "bins/eliot-kernel/src/daemon_request_dispatch.rs",
+  "bins/eliot-kernel/src/lib.rs",
+  "bins/eliot-kernel/src/tests/**activation**",
+  "crates/foundation/eliot-protocol/src/activation_resolution.rs only if the existing public contract lacks a required transport envelope",
+  "focused protocol/Kernel tests",
+]
+serialized_peer_paths = [
+  "bins/eliotd/src/activation_projection.rs",
+  "bins/eliotd/src/daemon_kernel_client.rs",
+  "bins/eliotd/src/daemon_runtime.rs",
+]
+forbidden_ownership = [
+  "second semantic resolver",
+  "daemon-owned durable replay ledger",
+  "Session or authority creation for non-Resolved results",
+  "Store/provider SDK or canonical write",
+  "Task Finish",
+]
+
+[what_to_do]
+steps = [
+  "Add one closed v2 semantic-result submit/reconcile operation to the daemon-to-Kernel transport.",
+  "Extend Kernel pending/replay state with exact result identity, payload digest, disposition and submission phase.",
+  "Validate all seven result dispositions against the original pending ticket, bridge admission/connection, current fence and deadline/cancellation state.",
+  "Project non-success dispositions immediately to the bridge and activate a Session only for an exact valid Resolved binding.",
+  "Retain legacy v1 only behind an explicit compatibility decoder and make current production v2-only.",
+  "Coordinate the peer producer changes with #839 after this receiver contract is accepted.",
+]
+
+[how_to_do]
+steps = [
+  "Define a typed Kernel request/response kind carrying AgentActivationResolutionResult and reject unknown versions before adoption.",
+  "Validate wire ID/version, ticket ID/digest, activation request ID/digest, admission receipt, connection, State Fence, resolved time and result digest against the exact pending entry.",
+  "Persist the result or exact submitting/unknown/reconciling phase before acknowledging acceptance.",
+  "Return the same acknowledgement/bridge response for exact replay and IDENTITY_CONFLICT for changed same-ticket result.",
+  "Preserve Resolved, TaskSelectionRequired, ScopeSelectionRequired, ScopeAmbiguous, NotReady, StaleFence and FailedInternal without fallback/default coercion.",
+  "For Resolved, verify principal/session/task/work-unit/scope/task revision/plan identity against the exact ticket and current Kernel owners before Session creation.",
+  "For every non-Resolved result, create no Session, authority, capability or Finish state.",
+  "Allow NotReady reconsideration only after not_before and an actual changed named dependency revision; claim-lease expiry is not a semantic delta.",
+  "Let Kernel own deadline/cancel races and keep an already accepted result terminal even if the deadline later expires.",
+  "On possible delivery with lost acknowledgement, reconcile ticket plus result digest before any second Governor read.",
+]
+
+[acceptance]
+criteria = [
+  "Current production transport accepts and validates AgentActivationResolutionResult v2.",
+  "Kernel retains exactly one semantic result identity and submission phase per ticket.",
+  "All seven dispositions produce lossless immediate bridge-visible outcomes.",
+  "Every non-Resolved disposition creates no Session or authority.",
+  "Resolved creates a Session only after exact current-owner binding validation.",
+  "Exact replay is idempotent and changed same-ticket result conflicts.",
+  "Lost acknowledgement cannot trigger another Governor read or a different result.",
+  "NotReady cannot retry solely on claim expiry and requires due time plus changed dependency revision.",
+  "Deadline/cancel races preserve one terminal or exact reconciling disposition.",
+  "Legacy v1 cannot trial-decode current v2 data and remains compatibility input only.",
+  "Human detail and log text do not control mapping, retry or Session creation.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-protocol -p eliot-kernel -p eliotd --all-targets",
+  "cargo test --locked -p eliot-protocol -p eliot-kernel -p eliotd --all-targets",
+  "cargo clippy --locked -p eliot-protocol -p eliot-kernel -p eliotd --all-targets -- -D warnings",
+  "python scripts/verify-agent-bridge-protocol.py",
+  "git diff --check",
+]
+edge_proof = "Run real Agent Bridge onboarding for all seven outcomes, duplicate/conflicting replay, daemon disconnect after possible submission, deadline race and Kernel restart."
