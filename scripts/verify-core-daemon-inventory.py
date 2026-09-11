@@ -49,6 +49,7 @@ EXPECTED_ACTIVE_BRANCH_POLICY = {
     "merged_or_closed_branch_is_retired": True,
     "unlisted_branch_mutation_allowed": False,
 }
+EXPECTED_BASELINE_ISSUE_REFS = [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
 EXPECTED_ACTIVE_CORE_DAEMON_FIELDS = {
     "id": "core-daemons",
     "status": "active",
@@ -294,7 +295,7 @@ def verify_active_registry(registry: Any) -> list[Finding]:
                             f"completed issues remain writable: {overlap}",
                         )
                     )
-                if sorted(set(open_refs) | set(completed_refs)) != sorted(expected):
+                if sorted(set(open_refs) | set(completed_refs)) != EXPECTED_BASELINE_ISSUE_REFS:
                     findings.append(
                         _finding(
                             "active_registry_identity",
