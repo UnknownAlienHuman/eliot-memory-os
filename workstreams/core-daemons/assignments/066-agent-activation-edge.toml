@@ -1,0 +1,132 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_INTEGRATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "BLOCKED_ON_COMPONENT_EDGES_READY_FOR_INTEGRATION"
+implementation_support = "V2_COMPONENTS_PARTIAL_END_TO_END_EDGE_UNPROVED"
+evidence_execution_status = "SOURCE_AND_ISSUE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "AGENT_ACTIVATION_ONBOARDING_EDGE_CANDIDATE_ONLY"
+issue = 66
+bridge_port_issue = 342
+daemon_producer_issue = 839
+kernel_receiver_issue = 1095
+kernel_issue = 15
+governor_issue = 18
+user_broker_issue = 23
+agent_bridge_issue = 77
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "runtime.agent-activation-onboarding-edge"
+causal_property = "One bounded Agent Bridge activation request produces one Kernel-owned ticket, at most one Governor semantic read, one durable typed v2 result, one immediate agent-visible disposition, and a Session only for an exact current Resolved binding; restart, replay, cancellation, deadline, ambiguity, and unknown submission cannot lose work or create authority."
+current_discriminator = "The v2 result contract, daemon mapper, Kernel receiver allocation, and Agent Bridge host-port allocation are split across #839, #1095, and #342, but no accepted end-to-end edge proves request-to-ticket-to-result-to-bridge behavior for all seven dispositions and failure races."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/66"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-01-agent-interaction-loop.md#a101-agent-interaction-loop",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I01-11-startup-algorithm.md#i111-startup-algorithm",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-16-common-durable-fields.md#i516-common-durable-fields",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md#i71-eliot-bridge-protocol-ebp1",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-02-frame.md#i72-frame",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-17-scope-and-task-onboarding.md#i717-scope-and-task-onboarding",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I13-02-conflict-set.md#i132-conflict-set",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-AUTH-01", "ARCH-SWM-02", "ARCH-OBS-01", "ARCH-RES-04", "ARCH-RES-05", "ARCH-LIFE-01"]
+
+[current_source]
+confirmed = [
+  "AgentActivationResolutionResult v2 and seven closed dispositions exist.",
+  "The daemon producer and Kernel receiver remain separately owned by #839 and #1095.",
+  "The real Agent Bridge KernelHostRequestPort remains separately owned by #342 and the broader bridge lifecycle by #77.",
+  "Without one cross-process integration corpus, package tests can pass while semantic outcomes are dropped, replay causes a second Governor read, or Session creation occurs under a stale binding.",
+]
+
+[scope]
+primary_paths = [
+  "cross-process activation integration tests and finite fixtures",
+  "exact composition wiring required to connect #342, #839, and #1095",
+  "minimal shared protocol adapters only where a demonstrated integration mismatch exists",
+  "installed-test harness hooks required by #11 without production semantic duplication",
+]
+serialized_dependencies = ["#342", "#839", "#1095", "#15", "#18", "#23", "#77", "#11"]
+forbidden = [
+  "reimplementing component logic owned by #342, #839, or #1095",
+  "second ticket, resolver, replay, Session, task, WorkScope, authority, Store, or Finish owner",
+  "generic timeout used for expected semantic selection/ambiguity outcomes",
+  "blind ticket reclaim after possible semantic read or result submission",
+  "current control behavior derived from human detail or logs",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Compose one exact activation identity chain across bridge, Kernel, daemon, Governor, and response."
+how = [
+  "Bind bridge request/correlation, authenticated peer/connection, principal, activation request digest, Kernel ticket/digest, claim identity, daemon generation, StateFence, Governor source revision, v2 result identity/digest, response acknowledgement, and optional Session identity.",
+  "Prove every stage consumes the exact predecessor identity and rejects changed or stale bindings before semantic work or Session creation.",
+  "Keep connection, request, ticket, semantic read, result, acknowledgement, Session, task, and WorkScope identities distinct.",
+]
+
+[[waves]]
+id = "B"
+what = "Execute every closed semantic result through the production path."
+how = [
+  "Run Resolved, TaskSelectionRequired, ScopeSelectionRequired, ScopeAmbiguous, NotReady, StaleFence, and FailedInternal from one real Governor fixture through daemon mapping, Kernel persistence, and Agent Bridge response.",
+  "Require exactly one Governor read for a newly admitted ticket and zero additional reads for accepted replay/reconciliation.",
+  "Create a Session only for a valid current Resolved binding; every non-Resolved result remains immediate and non-authorizing.",
+]
+
+[[waves]]
+id = "C"
+what = "Close replay, lost acknowledgement, deadline, cancellation, and no-progress races."
+how = [
+  "Inject bridge disconnect before/after request submission, daemon disconnect before/after Governor read, Kernel acknowledgement loss, duplicate result, changed result, ticket deadline race, cancellation, and StateFence change.",
+  "Persist or reconcile the original ticket/result before any new semantic read or claim.",
+  "Permit NotReady reconsideration only after its due time and a changed named dependency revision; claim expiry alone cannot cause progress.",
+]
+
+[[waves]]
+id = "D"
+what = "Prove restart, recovery, immediate response, and Product-facing observability."
+how = [
+  "Restart Agent Bridge, Kernel, and daemon at every durable boundary and require one stable terminal or reconciling disposition.",
+  "Expose bounded operation/ticket/result state, exact blocker, retry eligibility, and recovery action without credentials or protected payloads.",
+  "Run the installed attach/onboarding Product Pulse only after the component and Edge proofs pass; retain #11 as the sole Product acceptance owner.",
+]
+
+[acceptance]
+criteria = [
+  "One valid bounded Agent Bridge request creates one exact Kernel activation ticket and one complete identity chain through the v2 response.",
+  "Every stage rejects wrong request/ticket/peer/connection/generation/fence/predecessor/result identity before semantic work or Session creation.",
+  "All seven v2 dispositions travel losslessly from Governor through daemon and Kernel to the agent-visible response.",
+  "A newly admitted ticket causes exactly one Governor read; exact replay, lost acknowledgement, restart, and reconciliation cause no second read.",
+  "Only Resolved creates a Session, and only after exact current principal/task/WorkScope/revision/plan/fence validation.",
+  "Task/scope selection, ambiguity, NotReady, StaleFence, and FailedInternal create no Session, authority, capability, canonical state, or Finish result.",
+  "Expected semantic outcomes are returned immediately and never hidden behind generic timeout or connection failure.",
+  "Changed result or changed binding under one ticket/result identity conflicts.",
+  "Possible semantic read/result submission is reconciled before claim reuse, retry, or route replacement.",
+  "NotReady cannot retry on claim expiry alone and requires due time plus changed named dependency revision.",
+  "Cancellation/deadline/fence races produce one stable terminal or exact reconciling disposition and cannot revive expired/stale work.",
+  "Bridge, daemon, and Kernel restart preserve the original ticket/result state and do not duplicate a Session or agent response effect.",
+  "No integration adapter becomes a second semantic, ticket, Session, authority, Store, or Finish owner.",
+  "#11 executes installed attach/onboarding after the Edge corpus passes; package/Edge proof alone does not claim Product support.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-protocol -p eliot-mcp -p eliot-agent-bridge -p eliot-kernel-service -p eliot-kernel -p eliotd --all-targets",
+  "cargo test --locked -p eliot-protocol -p eliot-mcp -p eliot-agent-bridge -p eliot-kernel-service -p eliot-kernel -p eliotd --all-targets",
+  "cargo clippy --locked -p eliot-protocol -p eliot-mcp -p eliot-agent-bridge -p eliot-kernel-service -p eliot-kernel -p eliotd --all-targets -- -D warnings",
+  "python scripts/verify-agent-bridge-protocol.py",
+  "git diff --check",
+]
+edge_proof = "Run all seven outcomes plus duplicate/changed replay, bridge and daemon disconnect at every boundary, Kernel acknowledgement loss, deadline/cancellation/fence races, NotReady dependency change, process restart, and exact Session non-duplication."
+product_proof = "Issue #11 remains the only installed Product acceptance owner."
