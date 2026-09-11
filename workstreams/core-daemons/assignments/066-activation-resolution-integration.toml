@@ -1,0 +1,153 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_INTEGRATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_AFTER_PRODUCER_RECEIVER_AND_P04_CONTRACTS"
+implementation_support = "V2_CONTRACT_AND_PURE_MAPPING_PRESENT_END_TO_END_RUNTIME_EDGE_INCOMPLETE"
+evidence_execution_status = "CURRENT_BRIDGE_KERNEL_DAEMON_GOVERNOR_PATHS_AND_CHILD_ISSUES_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "ACTIVATION_RESOLUTION_INTEGRATION_EDGE_CANDIDATE_ONLY"
+issue = 66
+daemon_producer_issue = 839
+kernel_receiver_issue = 1095
+kernel_p04_issue = 342
+agent_bridge_issue = 77
+operator_issue = 1105
+kernel_issue = 15
+governor_issue = 18
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "integration.activation-request-ticket-resolution-response"
+causal_property = "One exact Agent Bridge activation request creates at most one Kernel-owned ticket and one Governor semantic resolution identity; every request reaches one immediate typed disposition or an exact durable pending/reconciling state, and no error, lease expiry, reconnect or lost acknowledgement can silently drop the result, repeat semantic resolution, create a duplicate Session or loop without a changed discriminator."
+current_discriminator = "AgentActivationResolutionResult v2 and the pure Governor mapper exist, but the live path is split across unfinished daemon producer #839, Kernel receiver/replay #1095, P-04 admission #342 and executable bridge #77. No parent integration PR currently proves all seven dispositions, exact replay, transport-loss reconciliation, selection follow-up and restart behavior end to end."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/66"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-01-agent-interaction-loop.md#a101-agent-interaction-loop",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I01-11-startup-algorithm.md#i111-startup-algorithm",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-16-common-durable-fields.md#i516-common-durable-fields",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-02-frame.md#i72-frame",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-17-scope-and-task-onboarding.md#i717-scope-and-task-onboarding",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I13-02-conflict-set.md#i132-conflict-set",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-21-unknown-commit-recovery.md#i1421-unknown-commit-recovery",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-AUTH-01", "ARCH-SWM-02", "ARCH-OBS-01", "ARCH-LIFE-01", "ARCH-RES-04", "ARCH-RES-05", "ARCH-FIN-01"]
+
+[current_source]
+confirmed = [
+  "AgentActivationResolutionResult v2 defines seven closed semantic dispositions and exact validation/digest semantics.",
+  "GovernorComposition has a typed activation-resolution owner and eliotd has a pure exhaustive mapper, but production daemon submission remains owned by #839.",
+  "Kernel ticket result persistence, exact replay and unknown-submission reconciliation remain owned by #1095.",
+  "Kernel bridge admission/request state remains #342 and the executable KernelHostRequestPort remains #77.",
+  "The current parent Issue has no open integration PR covering the complete bridge-to-Governor-to-bridge cycle.",
+  "A claim lease, transport timeout or bridge reconnect is not a changed semantic discriminator and cannot justify another Governor read by itself.",
+]
+
+[scope]
+primary_paths = [
+  "cross-package activation integration tests and finite fixtures",
+  "minimal exact glue required after #839/#1095/#342/#77 land",
+  "one versioned activation trace/receipt projection if the existing public contracts cannot expose the complete stage lineage",
+  "directly relevant Product Pulse scenario registration under #11",
+]
+read_only_owners = [
+  "bins/eliot-agent-bridge activation request/result adapter from #77",
+  "Kernel P-04/ticket/replay state from #342/#1095",
+  "eliotd typed producer from #839",
+  "Governor activation resolver from #18",
+]
+forbidden = [
+  "duplicating producer, receiver, resolver, ticket, Session or P-04 owners",
+  "trial-decoding current v2 as legacy v1",
+  "using human detail, logs, process exit, timeout or claim expiry to choose a semantic disposition",
+  "creating a Session for a non-Resolved result",
+  "repeating the Governor read after possible result submission without exact reconciliation",
+  "retrying NotReady without its due time and a changed named dependency revision",
+  "turning TaskSelectionRequired, ScopeSelectionRequired or ScopeAmbiguous into generic failure/timeout",
+  "automatic task selection, scope widening, authority issue, canonical write or Finish",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze one complete activation trace and stage denominator."
+how = [
+  "Bind host correlation, bridge process/connection, principal, activation request, Kernel ticket/claim, daemon generation, Governor read snapshot, semantic result, Kernel acceptance/replay, Session creation when applicable and bridge delivery/acknowledgement identities.",
+  "Declare every stage as not-attempted, accepted, started, submitted, possibly-submitted, accepted-result, delivered, acknowledged, expired, cancelled, conflicted, unknown/reconciling or terminal.",
+  "Require one current StateFence, task/WorkScope source revision and deadline/cancellation lineage across all applicable stages.",
+  "Do not collapse result delivery, Session activation and host acknowledgement.",
+]
+
+[[waves]]
+id = "B"
+what = "Compose the exact once-only semantic resolution path."
+how = [
+  "Accept one bounded bridge activation request through #77/#342 and issue at most one Kernel ticket identity.",
+  "Let one current daemon generation claim the ticket and invoke the Governor typed resolver once for a newly admitted ticket.",
+  "Map and submit exactly one of Resolved, TaskSelectionRequired, ScopeSelectionRequired, ScopeAmbiguous, NotReady, StaleFence or FailedInternal through #839/#1095.",
+  "Create a Session only for an exact current Resolved binding after Kernel validation; every other disposition is immediately returned without Session authority.",
+]
+
+[[waves]]
+id = "C"
+what = "Close selection follow-up, retry/no-progress and transport uncertainty."
+how = [
+  "A user task/scope selection is a new explicitly related activation request with the chosen exact identity and revised request digest, not mutation of the prior result.",
+  "NotReady may be reconsidered only after not_before and a changed named dependency revision; lease expiry, reconnect and elapsed wall time alone are insufficient.",
+  "After possible daemon-to-Kernel submission or Kernel-to-bridge delivery, reconcile the same result/request identity before semantic recomputation or resend.",
+  "Changed same-identity request, ticket, result, selected task/scope, fence or owner revision is IDENTITY_CONFLICT.",
+  "Bound retry/reconciliation counts and surface no-progress rather than looping indefinitely.",
+]
+
+[[waves]]
+id = "D"
+what = "Prove independent restart, cancellation and all seven dispositions end to end."
+how = [
+  "Execute every disposition through the real bounded bridge, authenticated P-04, daemon producer, Kernel receiver and host result mapping.",
+  "Restart or disconnect bridge, Kernel and daemon independently before claim, after Governor read, after possible result submission and after Kernel acceptance but before host acknowledgement.",
+  "Race cancellation/deadline with claim, semantic result and Session creation and prove one stable terminal/reconciling disposition.",
+  "Verify no duplicate Governor read, no duplicate Session, no lost semantic result and no stale-generation revival through independent state/readback evidence.",
+]
+
+[acceptance]
+criteria = [
+  "One activation request creates at most one Kernel ticket and one semantic result identity.",
+  "Every stage retains exact bridge/connection/principal/request/ticket/claim/daemon/Governor/result/Session/delivery identities and one explicit disposition.",
+  "A newly admitted ticket causes exactly one Governor typed read; exact replay or reconciliation causes zero additional reads.",
+  "All seven result dispositions traverse the complete production path losslessly and are immediately host-visible.",
+  "Only Resolved may create a Session, and only after exact current principal/task/WorkScope/revision/fence validation.",
+  "Selection-required and ambiguity results create no Session and are not rendered as generic failure or timeout.",
+  "User selection creates a new related request identity; the prior result remains immutable.",
+  "NotReady cannot retry solely from claim expiry, reconnect or time passage; due time plus changed named dependency revision is required.",
+  "StaleFence cannot create Session/authority and cannot be retried as the same request under a new fence.",
+  "FailedInternal remains a terminal or explicitly owner-authorized retry disposition and cannot become ambiguity/transient unavailability by string parsing.",
+  "Possible result submission/delivery is reconciled before another Governor read or resend.",
+  "Changed request/result/selection/fence/owner revision under one identity conflicts.",
+  "Bridge, Kernel and daemon restart at every stage preserves one result and creates no duplicate Session, lost ticket or stale-generation authority.",
+  "Cancellation/deadline races produce one stable terminal or exact reconciling state and cannot erase an accepted result or Session.",
+  "Retry/reconciliation is finite and repeated unchanged failure surfaces no-progress.",
+  "No integration glue becomes a second resolver, ticket owner, Session allocator, authority issuer, canonical writer or Finish owner.",
+  "A real Operator/host onboarding trace is included in #11 before #66 closes.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-protocol -p eliot-agent-bridge -p eliot-kernel-service -p eliot-kernel -p eliotd -p eliot-governor --all-targets",
+  "cargo test --locked -p eliot-protocol -p eliot-agent-bridge -p eliot-kernel-service -p eliot-kernel -p eliotd -p eliot-governor --all-targets",
+  "cargo clippy --locked -p eliot-protocol -p eliot-agent-bridge -p eliot-kernel-service -p eliot-kernel -p eliotd -p eliot-governor --all-targets -- -D warnings",
+  "python scripts/verify-agent-bridge-protocol.py",
+  "git diff --check",
+]
+edge_proof = "Execute all seven outcomes plus selection follow-up, NotReady dependency change, cancellation/deadline races and bridge/Kernel/daemon loss at every submission/delivery boundary; prove exactly one semantic read and at most one Session."
+product_proof = "This closes the activation integration Edge candidate only; real installed onboarding remains #11."
