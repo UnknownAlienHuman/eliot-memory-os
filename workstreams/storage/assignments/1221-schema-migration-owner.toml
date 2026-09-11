@@ -1,0 +1,129 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "CURRENT_EMBEDDED_GRAPH_PLUS_ORPHAN_AND_LEGACY_ROOTS"
+evidence_execution_status = "SOURCE_AND_CONSUMER_SEARCH_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "STORE_SCHEMA_GENERATION_EDGE_CANDIDATE_ONLY"
+issue = 1221
+store_issue = 19
+legacy_core_issue = 1189
+portability_issue = 1113
+configuration_issue = 1219
+parent_product_issue = 11
+audited_source_base = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "storage.schema-generation-owner"
+causal_property = "One current Store owner publishes an immutable ordered migration graph bound to exact predecessor, DDL, bridge, provider, root, fence and operation identities; orphan and legacy roots are non-executable."
+current_discriminator = "The tree has an unconsumed root bootstrap migration, a large executable legacy eliot-store migration/schema tree and a separate current embedded v1/v2 migration graph in eliot-store-surreal-adapter."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1221"
+
+[documentation]
+architecture = ["docs/architecture/A13-07-backups-restore-and-migration.md#a137-backups-restore-and-migration"]
+implementation = [
+  "docs/architecture/I05-01-store-boundary.md#i51-store-boundary",
+  "docs/architecture/I05-09-surrealdb-implementation.md#i59-surrealdb-implementation",
+  "docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
+  "docs/architecture/I14-14-module-hot-replacement.md#i1414-module-hot-replacement",
+  "docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+]
+anchors = ["ARCH-RES-03", "ARCH-ORD-01", "ARCH-SEC-02", "ARCH-MOD-03", "ARCH-OBS-01"]
+
+[current_source]
+confirmed = [
+  "migrations/0001_bootstrap.surql defines only health_record and migration_record and has no discovered consumer.",
+  "legacy crates/eliot-store/migrations and src/surql define the pre-split schema selected by legacy config/app code.",
+  "current eliot-store-surreal-adapter privately owns raw SurrealQL, embedded checksummed v1/v2 baselines and one additive v1-to-v2 migration.",
+  "current readiness is explicit and migrations require apply_migration rather than implicit startup execution.",
+  "no complete inventory maps every legacy table/index/field and migration byte to one current owner or retirement disposition.",
+]
+
+[scope]
+primary_paths = [
+  "migrations/**",
+  "crates/eliot-store/migrations/** and crates/eliot-store/src/surql/** only for inventory, fixture extraction and retirement",
+  "crates/storage/eliot-store-surreal-adapter/src/schema.rs",
+  "crates/storage/eliot-store-surreal-adapter/src/readiness.rs",
+  "crates/storage/eliot-store-surreal-adapter/src/apply/**",
+  "exact Store service, installation, config, ECXF/backup and release consumers",
+  "focused migration inventory, rehearsal and recovery fixtures",
+]
+serialized_dependencies = ["#19 Store", "#1189 legacy core", "#1113 portability", "#1219 config", "#15 Kernel reconciliation", "#11 Product proof"]
+forbidden = [
+  "arbitrary raw SQL execution",
+  "filesystem migration-directory discovery as authority",
+  "implicit startup migration",
+  "live database-file copying",
+  "second Store writer",
+  "unproved destructive downgrade",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Inventory and select one migration owner."
+how = [
+  "Enumerate every .surql body, embedded DDL constant, constructor, executor, config/release consumer and restore dependency.",
+  "Give every body one owner, migration generation/digest and executable, fixture, archive or delete disposition.",
+  "Map every legacy table/index/field to a current capability owner, explicit transform, archive-only handling or deletion rationale.",
+]
+
+[[waves]]
+id = "B"
+what = "Publish one closed immutable migration graph."
+how = [
+  "Bind each node to migration ID, predecessor generation/digest, target generation, statement digest, bridge range, operation manifest, data transform, effect ceiling, rehearsal/backup profile and invalidation set.",
+  "Keep raw SurrealQL private to the sole adapter or one compiled immutable asset under the same owner.",
+  "Reject skipped/unordered nodes, wrong predecessor/root/provider/fence and changed same-ID bytes before execution.",
+]
+
+[[waves]]
+id = "C"
+what = "Close durable execution and reconciliation."
+how = [
+  "Persist exact intent and plan identity before provider work.",
+  "Apply DDL/data transform and schema metadata atomically where possible.",
+  "Treat timeout/disconnect after possible application as UNKNOWN_OUTCOME and reconcile exact schema metadata/receipt before retry.",
+  "Keep normal writer readiness blocked during partial or unknown migration state.",
+]
+
+[[waves]]
+id = "D"
+what = "Prove rehearsal, cutover, restore and root retirement."
+how = [
+  "Rehearse against an isolated candidate from an exact backup/export identity.",
+  "Quiesce/reconcile pending writes and prove exclusive root ownership before cutover.",
+  "Allow rollback only under proved compatibility; otherwise require forward repair.",
+  "Remove root/legacy migration paths from current config, packaging and restore after complete mapping.",
+]
+
+[acceptance]
+criteria = [
+  "Every .surql and embedded DDL body has one owner, consumer/disposition, generation and digest.",
+  "Exactly one current executable migration graph exists and current config/launch/package/restore cannot select root or legacy directories.",
+  "The orphan root bootstrap migration is deleted or an explicit non-executable expiring fixture.",
+  "Every legacy table/index/field has a current migration/archive/delete disposition with no silent omission.",
+  "Migration identity binds predecessor, target, DDL, bridge range, operation manifest, provider/root, fence and operation ID.",
+  "Wrong predecessor/root/provider/fence or changed same-ID bytes fail before execution.",
+  "Readiness mismatch remains MIGRATION_REQUIRED until an admitted operation runs; no implicit startup migration exists.",
+  "Intent is durable, exact replay is idempotent and unknown outcome is reconciled before retry.",
+  "Partial or unknown migration blocks normal writer readiness and cannot be reported complete.",
+  "Rehearsal uses an isolated candidate and exact backup/export identity.",
+  "Cutover proves pending-work reconciliation, exclusive root release and target semantic readiness.",
+  "Restore/import rejects incomplete or incompatible migration, tombstone or revocation provenance.",
+  "Source/packaging checks reject any second executable migration root or arbitrary migration-directory config.",
+]
+
+[verification]
+commands = [
+  "cargo test --locked -p eliot-store-surreal-adapter -p eliot-store-surreal -p eliot-store-api -p eliot-installation -p eliot-ecxf --all-targets",
+  "cargo clippy --locked -p eliot-store-surreal-adapter -p eliot-store-surreal -p eliot-store-api -p eliot-installation -p eliot-ecxf --all-targets -- -D warnings",
+  "cargo metadata --locked --all-features --format-version 1",
+  "python scripts/audit-architecture-boundaries.py",
+  "python scripts/audit-runtime-source-hygiene.py",
+  "git diff --check",
+]
+edge_proof = "Run complete legacy mapping, isolated v1/v2 rehearsal, checksum/predecessor negatives, crash after possible apply, exact reconciliation, cutover and ECXF restore."
+product_proof = "Issue #11 remains open; source and rehearsal proof alone cannot establish installed Product support."
