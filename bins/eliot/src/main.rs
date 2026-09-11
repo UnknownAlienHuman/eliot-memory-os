@@ -324,6 +324,9 @@ enum SystemCommand {
 
 #[derive(Debug, Subcommand)]
 enum CatalogueCommand {
+    /// Print the generated catalogue help text. Named `help-text` because clap
+    /// reserves `help` on every command that has subcommands.
+    #[command(name = "help-text")]
     Help,
     Schema,
     Validate,
@@ -3037,6 +3040,20 @@ fn init_tracing() {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_tree_is_valid_and_catalogue_help_text_parses() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        let parsed = Cli::try_parse_from(["eliot", "catalogue", "help-text"])
+            .expect("catalogue help-text parses");
+        assert!(matches!(
+            parsed.command,
+            Command::Catalogue {
+                command: CatalogueCommand::Help
+            }
+        ));
+    }
 
     #[cfg(windows)]
     #[test]
