@@ -1,0 +1,140 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "CURATION_PIPELINE_DECLARED_PRE_MODEL_SCREEN_PROOF_OPEN"
+evidence_execution_status = "ISSUE_AND_PIPELINE_ROUTING_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "CURATION_SCREEN_MODULE_AND_EDGE_CANDIDATE_ONLY"
+issue = 588
+bundle_issue = 593
+validation_issue = 595
+grounding_issue = 602
+fan_in_issue = 684
+controller_issue = 806
+runtime_issue = 1100
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "dreamer.curation-pre-model-screen"
+causal_property = "One exact frozen Curation input denominator is screened into immutable target, evidence and future-allocation roles under current owner, policy, scope and fence evidence before model work; every member receives one explicit disposition and the screen creates no candidate, mutation, authority or effect."
+current_discriminator = "The Curation fan-in requires an exact immutable A-19c screen result, and the governed pipeline places screening before model work, but the current source/Issue graph does not yet prove one production owner, complete denominator, terminal role dispositions and no-recomputation consumption."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/588"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A09-dreamer.md#a9-dreamer",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-02-dreamer-service-responsibilities.md#i92-dreamer-service-responsibilities",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-03-job-classes.md#i93-job-classes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-04-dreamer-input-bundle.md#i94-dreamer-input-bundle",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-05-dream-packet.md#i95-dream-packet",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-06-candidate-kinds.md#i96-candidate-kinds",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-07-memory-transformation-validation.md#i97-memory-transformation-validation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I12-19-negative-memory.md#i1219-negative-memory",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I12-20-influence-revocation.md#i1220-influence-revocation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I12-26-memory-admission-and-retrieval-trace.md#i1226-memory-admission-and-retrieval-trace",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-DRM-02", "ARCH-DRM-03", "ARCH-AUTH-01", "ARCH-SEC-01", "ARCH-GROUND-01"]
+
+[current_source]
+confirmed = [
+  "The Curation fan-in in #684 explicitly consumes an exact immutable A-19c screen result and must not recompute it.",
+  "The #702/#1100 pipeline places Curation screening after the frozen bundle and before model generation.",
+  "Existing mutable targets, immutable evidence/counterevidence and future allocation requests are distinct roles and cannot be exchanged.",
+  "Protected, stale, missing, unknown, partial, unprocessed or foreign targets must not be silently treated as current eligible mutation targets.",
+]
+
+[scope]
+primary_paths = [
+  "the exact Curation screening package/cell owned by #588",
+  "shared A-19c screen contracts only when an owning defect is proven",
+  "exact #593 bundle and #684 fan-in adapters",
+  "focused denominator, role, policy, freshness and replay fixtures",
+]
+serialized_dependencies = [
+  "#593 frozen input bundle",
+  "#602 grounding and #595 common validation after model output",
+  "#684 Curation fan-in",
+  "#806 pure controller",
+  "#1100 runtime composition",
+]
+forbidden = [
+  "model/provider/tool invocation",
+  "Store, graph, index, cache or filesystem query",
+  "candidate generation, grounding, semantic handler validation or dispatch",
+  "record mutation, allocation, deletion, revocation or influence change",
+  "authority, effect, retry policy or task Finish",
+  "generic string roles, Other variants or warning-only eligibility",
+  "automatic GitHub workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze one exact Curation screen input and denominator."
+how = [
+  "Bind the screen to job/request/task/attempt/scope/fence, job class, frozen bundle/grounding identity, policy revision, current target-owner snapshots, expected member denominator and evaluation time/freshness/invalidation evidence.",
+  "Separate existing mutable targets, immutable supporting/counterevidence and future allocation requests in the input schema.",
+  "Reject duplicate member identity, same-ID changed revision/role, mixed bundle boundaries and hidden denominator branches.",
+]
+
+[[waves]]
+id = "B"
+what = "Apply the closed A-19c role and eligibility rules."
+how = [
+  "Use the exact existing A-19c disposition vocabulary; define no generic eligible boolean, warning-only result or Other fallback.",
+  "Require exact current owner, scope, privacy/retention, protection, lifecycle, influence and StateFence compatibility before an existing record can be a mutable target.",
+  "Allow protected or otherwise non-mutable records to remain immutable evidence/counterevidence only when their evidence role is explicitly admitted.",
+  "Future allocation requests remain requests and cannot impersonate an existing canonical target or preallocated identity.",
+]
+
+[[waves]]
+id = "C"
+what = "Preserve complete member accounting and fail closed."
+how = [
+  "Give every expected member exactly one terminal disposition or one explicit unknown/unprocessed blocking state.",
+  "Keep missing, stale, protected, foreign, conflicted, partial, unavailable, unknown, unprocessed and not-applicable distinct.",
+  "A current eligible subset cannot hide an unresolved member when the admitted job requires all-or-nothing treatment.",
+  "Low retrieval, non-use, model agreement, confidence or recency cannot create eligibility or weaken protection.",
+]
+
+[[waves]]
+id = "D"
+what = "Emit one immutable screen receipt and prohibit recomputation."
+how = [
+  "Canonicalize semantic sets only and retain meaningful source/target ordering where required.",
+  "Bind the receipt digest to the complete input, denominator, per-member dispositions, policy, owner revisions, freshness, blind boundaries and invalidation set.",
+  "The model stage, #595 validator and #684 fan-in consume this exact receipt by identity and reject stale/mismatched or absent results rather than rerunning screening.",
+  "Exact replay returns the same receipt; changed same-identity input or policy conflicts.",
+]
+
+[acceptance]
+criteria = [
+  "One package/cell is the sole A-19c Curation screen owner and exposes a closed typed input, disposition and immutable receipt contract.",
+  "The input binds exact job/task/attempt/scope/fence, frozen bundle, policy, owner snapshots, denominator, freshness and invalidation identities.",
+  "Existing mutable targets, immutable evidence/counterevidence and future allocation requests cannot be exchanged or inferred from one another.",
+  "Every expected member receives exactly one terminal or explicit blocking disposition; no member disappears from the denominator.",
+  "Only exact current eligible existing targets may proceed as mutation targets; protected/stale/foreign/missing/unknown/partial/unprocessed members cannot.",
+  "Protected material may survive only as explicitly admitted immutable evidence and cannot be mutated through role confusion.",
+  "Future allocation requests cannot claim an existing canonical identity or mutation receipt.",
+  "Low use, retrieval, confidence, recency, citation/model count and warning text cannot establish eligibility or remove protection.",
+  "All-or-nothing jobs remain blocked by any unresolved required member; explicit partial jobs retain exact rejected/blocked/unprocessed accounting.",
+  "Receipt identity covers the complete denominator, dispositions, policy, owner revisions, freshness, blind boundaries and invalidation set.",
+  "Exact replay is deterministic; changed same-identity member, role, revision, policy or fence conflicts.",
+  "#595 and #684 consume the exact receipt and cannot recompute, repair or bypass the screen.",
+  "No model/tool/Store/graph query, candidate generation, handler dispatch, mutation, allocation, deletion, revocation, authority, effect or Finish API exists.",
+  "Fixtures cover role confusion, protected evidence, stale target, unknown owner, partial denominator, all-or-nothing blocking, replay and stale receipt rejection.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p <curation-screen-owner> --all-targets",
+  "cargo test --locked -p <curation-screen-owner> --all-targets",
+  "cargo clippy --locked -p <curation-screen-owner> --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Compose the accepted receipt through #806/#1100 into model, #595 and #684, proving one screen execution, zero recomputation and zero handler calls for every blocked target."
+product_proof = "Issue #11 remains open; screening proves only target-role eligibility for the exact input snapshot."
