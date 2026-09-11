@@ -17,8 +17,8 @@ python scripts/code_navigation.py check --root .
 
 ## Coverage
 
-- Nonmember Cargo packages: **45**.
-- Explicitly classified prototypes: **45**.
+- Nonmember Cargo packages: **46**.
+- Explicitly classified prototypes: **46**.
 - Governing logical blocks represented: **3**.
 
 ## Governing logical blocks
@@ -56,6 +56,7 @@ python scripts/code_navigation.py check --root .
 | [`crates/smart/eliot-dreamer-conflict-analysis`](../../crates/smart/eliot-dreamer-conflict-analysis/Cargo.toml) | `nonmember prototype` | `smart-memory-context` |
 | [`crates/smart/eliot-dreamer-contracts`](../../crates/smart/eliot-dreamer-contracts/Cargo.toml) | `nonmember prototype` | `smart-memory-context` |
 | [`crates/smart/eliot-dreamer-curation`](../../crates/smart/eliot-dreamer-curation/Cargo.toml) | `nonmember prototype` | `smart-memory-context` |
+| [`crates/smart/eliot-dreamer-cycle`](../../crates/smart/eliot-dreamer-cycle/Cargo.toml) | `nonmember prototype` | `smart-memory-context` |
 | [`crates/smart/eliot-dreamer-development-diagnosis`](../../crates/smart/eliot-dreamer-development-diagnosis/Cargo.toml) | `nonmember prototype` | `smart-memory-context` |
 | [`crates/smart/eliot-dreamer-episode`](../../crates/smart/eliot-dreamer-episode/Cargo.toml) | `nonmember prototype` | `smart-memory-context` |
 | [`crates/smart/eliot-dreamer-failure`](../../crates/smart/eliot-dreamer-failure/Cargo.toml) | `nonmember prototype` | `smart-memory-context` |

@@ -1,13 +1,18 @@
-//! Capability cell placeholder.
+//! Native ingress boundary for bounded Dreamer input assembly.
 //!
-//! NOT IMPLEMENTED. This file exists only so that per-crate
-//! `cargo check`, `cargo test` and `cargo clippy` run and report an
-//! actionable result instead of a manifest error.
-//!
-//! Cell `smart.dreamer.bundle`, order 4.
-//! The purpose, contract and dependencies of this cell live in
-//! `module.toml` next to this crate. The owning work unit replaces this
-//! file and, on completion, moves the crate from the root
-//! `workspace.exclude` into `workspace.members`.
+//! This crate owns assembly orchestration only. Canonical job, recipe,
+//! material, Context, measurement and result shapes remain in their owning
+//! contract crates.
 
 #![forbid(unsafe_code)]
+
+mod assembly;
+mod budget;
+mod finalization;
+mod input;
+mod packing;
+mod recipe;
+
+pub use assembly::AssemblyPlan;
+pub use finalization::{AssemblyFinalObservations, finalize_bundle, plan_bundle};
+pub use input::{AssemblyPolicy, AssemblyRequest, SuppliedAssemblyItem, SuppliedItemState};

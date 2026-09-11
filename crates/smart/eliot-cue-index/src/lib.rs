@@ -1,13 +1,15 @@
-//! Capability cell placeholder.
+//! Deterministic, bounded cue-snapshot construction from A-10 projections.
 //!
-//! NOT IMPLEMENTED. This file exists only so that per-crate
-//! `cargo check`, `cargo test` and `cargo clippy` run and report an
-//! actionable result instead of a manifest error.
+//! The builder is a bounded strict all-or-error prototype: it accepts active
+//! records with exact freshness and supported evidence statuses, caps measured
+//! input at 512 KiB, and sorts the resulting member set deterministically. The
+//! registry revision is optional only for zero-edge builds. It remains a
+//! candidate producer and does not authenticate admission, publish a snapshot,
+//! run activation, or provide a complete rejection report.
 //!
-//! Cell `smart.cue.index`, order 13.
-//! The purpose, contract and dependencies of this cell live in
-//! `module.toml` next to this crate. The owning work unit replaces this
-//! file and, on completion, moves the crate from the root
-//! `workspace.exclude` into `workspace.members`.
-
 #![forbid(unsafe_code)]
+
+mod bounds;
+mod build;
+
+pub use build::{build_cue_snapshot, rebuild_cue_snapshot};

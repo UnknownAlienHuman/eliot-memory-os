@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [package.metadata.eliot]
 prototype = true
-source_status = "NOT_IMPLEMENTED"
+source_status = "IMPLEMENTED_PROTOTYPE"
 workspace_admission = "pending_agent_implementation_and_proof"
 functional_cell = "smart.learning.state_view"
 source_layer = "C1"

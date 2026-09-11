@@ -2052,7 +2052,6 @@ pub struct WorkLease {
     pub task_id: TaskId,
     pub role: AgentRole,
     pub state: WorkLeaseState,
-    #[serde(default)]
     pub epoch: u64,
     pub scope: WorkScope,
     pub decision: WorkLeaseDecision,

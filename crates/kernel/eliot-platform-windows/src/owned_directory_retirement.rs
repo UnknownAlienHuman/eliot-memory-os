@@ -101,11 +101,25 @@ impl OwnedDirectoryRetirementPrecondition {
 /// A directory retirement crossed its first delete disposition but final
 /// absence could not be classified. The directory is never current authority;
 /// callers must rescan and surface a bounded recovery gap before continuing.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OwnedDirectoryRetirementUnknownReason {
+    /// A delete disposition committed but a later delete operation failed.
+    DeleteDisposition,
+    /// The parent entry could not be made durable after cleanup.
+    ParentSyncUnavailable,
+    /// The final pathname observation was unavailable after cleanup.
+    FinalAbsenceUnavailable,
+}
+
+/// Durable classification of the cleanup uncertainty.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OwnedDirectoryRetirementUnknown {
     /// Exact directory identity whose retirement began.
     pub directory_identity: FileIdentity,
+    /// Exact cleanup stage that became uncertain.
+    pub reason: OwnedDirectoryRetirementUnknownReason,
 }
 
 /// Exact retirement outcome. A post-delete ambiguity is never returned as a
@@ -430,16 +444,19 @@ where
         }
     }
 
-    let unknown = || {
+    let unknown = |reason| {
         Ok(OwnedDirectoryRetirementOutcome::CommittedUnknown(
-            OwnedDirectoryRetirementUnknown { directory_identity },
+            OwnedDirectoryRetirementUnknown {
+                directory_identity,
+                reason,
+            },
         ))
     };
     let mut committed = false;
     for child in retained {
         if mark_delete(&child.file).is_err() {
             return if committed {
-                unknown()
+                unknown(OwnedDirectoryRetirementUnknownReason::DeleteDisposition)
             } else {
                 Err(OwnedDirectoryRetirementError::Io)
             };
@@ -448,7 +465,12 @@ where
         drop(child);
     }
     if mark_delete(&directory).is_err() {
-        return unknown();
+        return unknown(OwnedDirectoryRetirementUnknownReason::DeleteDisposition);
+    }
+    if let Some((_, _, parent)) = contour.entries.last()
+        && crate::sync_directory_handle(parent).is_err()
+    {
+        return unknown(OwnedDirectoryRetirementUnknownReason::ParentSyncUnavailable);
     }
     drop(directory);
     drop(contour);
@@ -456,7 +478,7 @@ where
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(OwnedDirectoryRetirementOutcome::Retired)
         }
-        Ok(_) | Err(_) => unknown(),
+        Ok(_) | Err(_) => unknown(OwnedDirectoryRetirementUnknownReason::FinalAbsenceUnavailable),
     }
 }
 
@@ -724,6 +746,25 @@ mod tests {
             path.parent()
                 .ok_or_else(|| std::io::Error::other("fixture parent missing"))?,
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn parent_sync_failure_is_a_typed_cleanup_unknown() -> Result<(), Box<dyn std::error::Error>> {
+        let (path, expected) = fixture()?;
+        crate::test_support::force_next_directory_sync_failure();
+        let outcome = retire_owned_directory_exact(&path, &expected)?;
+        let OwnedDirectoryRetirementOutcome::CommittedUnknown(unknown) = outcome else {
+            return Err("cleanup parent sync unexpectedly reported Retired".into());
+        };
+        assert_eq!(
+            unknown.reason,
+            OwnedDirectoryRetirementUnknownReason::ParentSyncUnavailable
+        );
+        let _ = std::fs::remove_dir_all(
+            path.parent()
+                .ok_or_else(|| std::io::Error::other("fixture parent missing"))?,
+        );
         Ok(())
     }
 

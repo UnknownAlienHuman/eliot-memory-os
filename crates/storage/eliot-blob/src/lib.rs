@@ -25,7 +25,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{Seek, SeekFrom};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
@@ -35,19 +35,25 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
+pub use eliot_blob_api::{
+    BlobCapacityCause, BlobCapacityCleanup, BlobCapacityEffect, BlobCapacityEvidence,
+    BlobCapacityFailure, BlobCapacityIdentity, BlobCapacityRecovery, BlobCapacityStage, BlobError,
+    PublishState,
+};
 use eliot_blob_api::{
-    BlobError, BlobFuture, BlobGcReceipt, BlobGcRequest, BlobHash, BlobHealth, BlobId,
-    BlobIssuerTrustAnchor, BlobKeyOperation, BlobKeyRecoveryCeiling, BlobLiveSetProof, BlobLocator,
-    BlobPolicyBinding, BlobReachabilityRequest, BlobReachabilityView, BlobReadChunk,
-    BlobReadRequest, BlobReadyReceipt, BlobReceiptBinding, BlobReceiptContext,
-    BlobReferenceObservation, BlobReferenceRequest, BlobRootLease, BlobStageRequest,
-    BlobStoreClient, CompressionDescriptor, CryptoDescriptor, GcState, PublishState,
+    BlobCasCapability, BlobCasDurability, BlobCasFailure, BlobCasOutcome, BlobCasReceipt,
+    BlobCasRequest, BlobCasState, BlobCasSuccessKind, BlobFuture, BlobGcReceipt, BlobGcRequest,
+    BlobHash, BlobHealth, BlobId, BlobIssuerTrustAnchor, BlobKeyOperation, BlobKeyRecoveryCeiling,
+    BlobLiveSetProof, BlobLocator, BlobPolicyBinding, BlobReachabilityRequest,
+    BlobReachabilityView, BlobReadChunk, BlobReadRequest, BlobReadyReceipt, BlobReceiptBinding,
+    BlobReceiptContext, BlobReferenceObservation, BlobReferenceRequest, BlobRootLease,
+    BlobStageRequest, BlobStoreClient, CompressionDescriptor, CryptoDescriptor, GcState,
     SignedBlobReceiptWire, VerifiedBlobReceipt, metadata_path, payload_path, verify_receipt,
 };
 use eliot_platform::WorkScopePath;
 use eliot_receipts::{
-    ArtifactBinding, ProofCeiling, Receipt, ReceiptCore, ReceiptDisposition, ReceiptKind,
-    contract_identity,
+    ArtifactBinding, OperationId, ProofCeiling, Receipt, ReceiptCore, ReceiptDisposition,
+    ReceiptKind, contract_identity,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -67,6 +73,8 @@ const ROOT_LEASE_HEARTBEAT_MS: u64 = 1_000;
 const WINDOWS_REPARSE_POINT: u32 = 0x400;
 #[cfg(windows)]
 const WINDOWS_FILE_SHARE_READ: u32 = 0x0000_0001;
+#[cfg(target_os = "linux")]
+const LINUX_ENOSPC: i32 = 28;
 
 static ROOT_LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -104,6 +112,7 @@ struct RootLeaseState {
     lock_file: Mutex<Option<fs::File>>,
     stop: Arc<AtomicBool>,
     heartbeat: Mutex<Option<JoinHandle<()>>>,
+    heartbeat_failure: Mutex<Option<BlobError>>,
 }
 
 #[allow(
@@ -202,6 +211,7 @@ impl BlobRootOwner {
             lock_file: Mutex::new(Some(lock_file)),
             stop: Arc::clone(&stop),
             heartbeat: Mutex::new(None),
+            heartbeat_failure: Mutex::new(None),
         });
         let heartbeat_lease = Arc::downgrade(&lease);
         let heartbeat_stop = Arc::clone(&stop);
@@ -258,16 +268,38 @@ impl BlobRootOwner {
     pub fn claim_id(&self) -> &str {
         &self.claim_id
     }
+
+    /// Returns the last bounded heartbeat failure observed by the native lease
+    /// thread, if any. This is an owner observation; it does not claim that an
+    /// injected service health port has observed the same failure.
+    pub fn heartbeat_failure(&self) -> Option<BlobError> {
+        self.lease
+            .heartbeat_failure
+            .lock()
+            .ok()
+            .and_then(|failure| failure.clone())
+    }
+}
+
+fn redacted_root_id(root_id: &str) -> String {
+    format!("root:{}", sha256_hex(root_id.as_bytes()))
 }
 
 fn canonical_root(configured_root: &str) -> Result<(PathBuf, String), BlobError> {
     let configured = PathBuf::from(configured_root);
     reject_reparse_components(&configured)?;
     fs::create_dir_all(&configured).map_err(|error| {
-        BlobError::Provider(format!(
-            "create configured Blob root {}: {error}",
-            configured.display()
-        ))
+        native_capacity_error(
+            &error,
+            BlobCapacityStage::RootLeaseCreate,
+            BlobCapacityIdentity::RootLease {
+                root_id: redacted_root_id(configured_root),
+                lease_id: None,
+            },
+            None,
+            BlobCapacityEffect::PartialWriteUnknown,
+        )
+        .unwrap_or_else(|| BlobError::Provider("create configured Blob root failed".to_owned()))
     })?;
     let metadata = fs::symlink_metadata(&configured).map_err(|error| {
         BlobError::Provider(format!(
@@ -286,10 +318,19 @@ fn canonical_root(configured_root: &str) -> Result<(PathBuf, String), BlobError>
         ));
     }
     let canonical = fs::canonicalize(&configured).map_err(|error| {
-        BlobError::Provider(format!(
-            "canonicalize configured Blob root {}: {error}",
-            configured.display()
-        ))
+        native_capacity_error(
+            &error,
+            BlobCapacityStage::RootLeaseCreate,
+            BlobCapacityIdentity::RootLease {
+                root_id: redacted_root_id(configured_root),
+                lease_id: None,
+            },
+            None,
+            BlobCapacityEffect::PartialWriteUnknown,
+        )
+        .unwrap_or_else(|| {
+            BlobError::Provider("canonicalize configured Blob root failed".to_owned())
+        })
     })?;
     reject_reparse_components(&canonical)?;
     let identity = canonical_identity(&canonical);
@@ -355,9 +396,9 @@ fn acquire_root_lease(
     process_id: u32,
 ) -> Result<(PathBuf, String, fs::File), BlobError> {
     let lock_path = root.join(ROOT_LEASE_FILE);
-    ensure_lock_path_not_reparse(&lock_path)?;
+    ensure_lock_path_not_reparse(&lock_path, root_id)?;
     let token = lease_token(process_id);
-    let mut file = open_owned_root_lease(&lock_path)?;
+    let mut file = open_owned_root_lease(&lock_path, root_id, Some(&token))?;
     let record = RootLeaseRecord {
         version: ROOT_LEASE_VERSION,
         token: token.clone(),
@@ -366,30 +407,48 @@ fn acquire_root_lease(
         heartbeat_unix_ms: now_unix_ms(),
     };
     write_lease_record(&mut file, &record).map_err(|error| {
-        BlobError::Provider(format!(
-            "write Blob root lease {}: {error}",
-            lock_path.display()
-        ))
+        native_capacity_error(
+            &error,
+            BlobCapacityStage::RootLeaseCreate,
+            BlobCapacityIdentity::RootLease {
+                root_id: redacted_root_id(root_id),
+                lease_id: Some(redacted_root_id(&token)),
+            },
+            None,
+            BlobCapacityEffect::PartialWriteUnknown,
+        )
+        .unwrap_or_else(|| BlobError::Provider("write Blob root lease failed".to_owned()))
     })?;
     Ok((lock_path, token, file))
 }
 
-fn ensure_lock_path_not_reparse(lock_path: &Path) -> Result<(), BlobError> {
+fn ensure_lock_path_not_reparse(lock_path: &Path, root_id: &str) -> Result<(), BlobError> {
     match fs::symlink_metadata(lock_path) {
         Ok(metadata) if is_reparse_point(&metadata) => Err(BlobError::InvalidContract(
             "Blob root lease reparse points are not permitted".to_owned(),
         )),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(BlobError::Provider(format!(
-            "inspect Blob root lease {}: {error}",
-            lock_path.display()
-        ))),
+        Err(error) => Err(native_capacity_error(
+            &error,
+            BlobCapacityStage::RootLeaseCreate,
+            BlobCapacityIdentity::RootLease {
+                root_id: redacted_root_id(root_id),
+                lease_id: None,
+            },
+            None,
+            BlobCapacityEffect::NotAttempted,
+        )
+        .unwrap_or_else(|| BlobError::Provider("inspect Blob root lease failed".to_owned()))),
     }
 }
 
 #[cfg(windows)]
-fn open_owned_root_lease(lock_path: &Path) -> Result<fs::File, BlobError> {
+fn open_owned_root_lease(
+    lock_path: &Path,
+    root_id: &str,
+    lease_id: Option<&str>,
+) -> Result<fs::File, BlobError> {
     use std::os::windows::fs::OpenOptionsExt;
 
     let mut options = OpenOptions::new();
@@ -416,22 +475,42 @@ fn open_owned_root_lease(lock_path: &Path) -> Result<fs::File, BlobError> {
                 ) {
                     BlobError::OwnerConflict
                 } else {
-                    BlobError::Provider(format!(
-                        "open existing Blob root lease {}: {error}",
-                        lock_path.display()
-                    ))
+                    native_capacity_error(
+                        &error,
+                        BlobCapacityStage::RootLeaseCreate,
+                        BlobCapacityIdentity::RootLease {
+                            root_id: redacted_root_id(root_id),
+                            lease_id: lease_id.map(redacted_root_id),
+                        },
+                        None,
+                        BlobCapacityEffect::PartialWriteUnknown,
+                    )
+                    .unwrap_or_else(|| {
+                        BlobError::Provider("open existing Blob root lease failed".to_owned())
+                    })
                 }
             })
         }
-        Err(error) => Err(BlobError::Provider(format!(
-            "create Blob root lease {}: {error}",
-            lock_path.display()
-        ))),
+        Err(error) => Err(native_capacity_error(
+            &error,
+            BlobCapacityStage::RootLeaseCreate,
+            BlobCapacityIdentity::RootLease {
+                root_id: redacted_root_id(root_id),
+                lease_id: lease_id.map(redacted_root_id),
+            },
+            None,
+            BlobCapacityEffect::PartialWriteUnknown,
+        )
+        .unwrap_or_else(|| BlobError::Provider("create Blob root lease failed".to_owned()))),
     }
 }
 
 #[cfg(not(windows))]
-fn open_owned_root_lease(lock_path: &Path) -> Result<fs::File, BlobError> {
+fn open_owned_root_lease(
+    lock_path: &Path,
+    root_id: &str,
+    lease_id: Option<&str>,
+) -> Result<fs::File, BlobError> {
     // The production runtime is native Windows. On other targets, fail closed
     // on an existing path rather than pretending std::fs provides equivalent
     // cross-process write/delete exclusion.
@@ -444,19 +523,303 @@ fn open_owned_root_lease(lock_path: &Path) -> Result<fs::File, BlobError> {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
                 BlobError::OwnerConflict
             } else {
-                BlobError::Provider(format!(
-                    "create Blob root lease {}: {error}",
-                    lock_path.display()
-                ))
+                native_capacity_error(
+                    &error,
+                    BlobCapacityStage::RootLeaseCreate,
+                    BlobCapacityIdentity::RootLease {
+                        root_id: redacted_root_id(root_id),
+                        lease_id: lease_id.map(redacted_root_id),
+                    },
+                    None,
+                    BlobCapacityEffect::PartialWriteUnknown,
+                )
+                .unwrap_or_else(|| BlobError::Provider("create Blob root lease failed".to_owned()))
             }
         })
 }
 
 fn write_lease_record(file: &mut fs::File, record: &RootLeaseRecord) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
-    serde_json::to_writer(&mut *file, record).map_err(std::io::Error::other)?;
+    file.write_all(&bytes)?;
     file.sync_all()
+}
+
+fn native_capacity_cause(error: &std::io::Error) -> Option<BlobCapacityCause> {
+    #[cfg(windows)]
+    if error.kind() == std::io::ErrorKind::StorageFull
+        && let Some(code) = error.raw_os_error()
+    {
+        match code {
+            112 => return Some(BlobCapacityCause::WindowsErrorDiskFull { code: 112 }),
+            39 => return Some(BlobCapacityCause::WindowsErrorHandleDiskFull { code: 39 }),
+            _ => {}
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if error.kind() == std::io::ErrorKind::StorageFull && error.raw_os_error() == Some(LINUX_ENOSPC)
+    {
+        return Some(BlobCapacityCause::PosixEnospc { code: LINUX_ENOSPC });
+    }
+    (error.kind() == std::io::ErrorKind::StorageFull).then_some(BlobCapacityCause::IoStorageFull)
+}
+
+fn native_capacity_error(
+    error: &std::io::Error,
+    stage: BlobCapacityStage,
+    identity: BlobCapacityIdentity,
+    attempted_bytes: Option<u64>,
+    effect: BlobCapacityEffect,
+) -> Option<BlobError> {
+    let cause = native_capacity_cause(error)?;
+    Some(BlobError::StorageCapacity {
+        failure: Box::new(BlobCapacityFailure {
+            identity,
+            stage,
+            evidence: BlobCapacityEvidence {
+                cause,
+                attempted_bytes,
+                effect,
+            },
+            cas_request: None,
+            cas_observed: None,
+            cas_backend_generation: None,
+            cas_durability: None,
+            cleanup: BlobCapacityCleanup::NotApplicable,
+            cleanup_stage: None,
+            cleanup_evidence: None,
+            gc_state: None,
+            recovery: match effect {
+                BlobCapacityEffect::PossiblePublication { .. }
+                | BlobCapacityEffect::DurabilityUnconfirmed { .. }
+                | BlobCapacityEffect::PossibleMutation => {
+                    BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+                }
+                BlobCapacityEffect::NotAttempted | BlobCapacityEffect::PartialWriteUnknown => {
+                    BlobCapacityRecovery::CapacityRevalidationRequired
+                }
+            },
+        }),
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InvalidCapacityEvidence;
+
+fn bind_platform_capacity_attempt(
+    error: BlobError,
+    stage: BlobCapacityStage,
+    identity: BlobCapacityIdentity,
+    attempted_bytes: u64,
+) -> Result<BlobError, InvalidCapacityEvidence> {
+    let error = bind_platform_capacity_with_effect(
+        error,
+        stage,
+        identity,
+        Some(BlobCapacityEffect::PartialWriteUnknown),
+    )?;
+    let BlobError::StorageCapacity { mut failure } = error else {
+        return Ok(error);
+    };
+    failure.evidence.attempted_bytes = Some(attempted_bytes);
+    Ok(BlobError::StorageCapacity { failure })
+}
+
+fn bind_journal_capacity(
+    error: BlobError,
+    journal: &StageJournal,
+    attempted_bytes: u64,
+) -> Result<BlobError, InvalidCapacityEvidence> {
+    let effect = if journal.state == PublishState::JournalPrepared {
+        BlobCapacityEffect::PartialWriteUnknown
+    } else {
+        BlobCapacityEffect::PossiblePublication {
+            state: journal.state,
+        }
+    };
+    let error = bind_platform_capacity_with_effect(
+        error,
+        BlobCapacityStage::JournalWrite,
+        BlobCapacityIdentity::Journal {
+            operation_id: journal.operation_id.clone(),
+            idempotency_key: journal.idempotency_key.clone(),
+            locator: None,
+        },
+        Some(effect),
+    )?;
+    let BlobError::StorageCapacity { mut failure } = error else {
+        return Ok(error);
+    };
+    failure.evidence.attempted_bytes = Some(attempted_bytes);
+    Ok(BlobError::StorageCapacity { failure })
+}
+
+fn bind_platform_capacity_with_effect(
+    error: BlobError,
+    stage: BlobCapacityStage,
+    identity: BlobCapacityIdentity,
+    effect_override: Option<BlobCapacityEffect>,
+) -> Result<BlobError, InvalidCapacityEvidence> {
+    let BlobError::StorageCapacity { failure } = error else {
+        return Ok(error);
+    };
+    let mut evidence = failure.evidence;
+    if let Some(effect) = effect_override {
+        evidence.effect = effect;
+    }
+    let recovery = match evidence.effect {
+        BlobCapacityEffect::PossiblePublication { .. }
+        | BlobCapacityEffect::DurabilityUnconfirmed { .. }
+        | BlobCapacityEffect::PossibleMutation => {
+            BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+        }
+        BlobCapacityEffect::NotAttempted | BlobCapacityEffect::PartialWriteUnknown => {
+            BlobCapacityRecovery::CapacityRevalidationRequired
+        }
+    };
+    let bound = BlobError::StorageCapacity {
+        failure: Box::new(BlobCapacityFailure {
+            identity,
+            stage,
+            evidence,
+            cas_request: failure.cas_request,
+            cas_observed: failure.cas_observed,
+            cas_backend_generation: failure.cas_backend_generation,
+            cas_durability: failure.cas_durability,
+            cleanup: failure.cleanup,
+            cleanup_stage: failure.cleanup_stage,
+            cleanup_evidence: failure.cleanup_evidence,
+            gc_state: failure.gc_state,
+            recovery,
+        }),
+    };
+    if matches!(&bound, BlobError::StorageCapacity { failure } if failure.validate().is_err()) {
+        Err(InvalidCapacityEvidence)
+    } else {
+        Ok(bound)
+    }
+}
+
+fn bind_capacity_cas(
+    error: BlobError,
+    request: &BlobCasRequest,
+) -> Result<BlobError, InvalidCapacityEvidence> {
+    let BlobError::StorageCapacity { failure } = error else {
+        return Ok(error);
+    };
+    let mut failure = *failure;
+    let observations_match = failure
+        .cas_request
+        .as_deref()
+        .is_some_and(|candidate| candidate == request);
+    if failure.cas_request.is_none()
+        && (failure.cas_observed.is_some()
+            || failure.cas_backend_generation.is_some()
+            || failure.cas_durability.is_some())
+    {
+        return Err(InvalidCapacityEvidence);
+    }
+    failure.identity = BlobCapacityIdentity::Operation {
+        context: Box::new(request.context.clone()),
+        locator: None,
+    };
+    failure.stage = BlobCapacityStage::CasJournal;
+    failure.evidence.effect = BlobCapacityEffect::PossibleMutation;
+    failure.cas_request = Some(Box::new(request.clone()));
+    if !observations_match {
+        failure.cas_observed = None;
+        failure.cas_backend_generation = None;
+        failure.cas_durability = None;
+    }
+    failure.recovery = BlobCapacityRecovery::ReconcileSameOperationThenRevalidate;
+    if failure.validate().is_err() {
+        return Err(InvalidCapacityEvidence);
+    }
+    Ok(BlobError::StorageCapacity {
+        failure: Box::new(failure),
+    })
+}
+
+fn retain_capacity_gc_state(error: BlobError, gc_phase: GcState) -> BlobError {
+    let BlobError::StorageCapacity { mut failure } = error else {
+        return error;
+    };
+    failure.gc_state = Some(gc_phase);
+    BlobError::StorageCapacity { failure }
+}
+
+fn bind_cleanup_capacity(
+    error: BlobError,
+    operation_id: &str,
+    idempotency_key: &str,
+    locator: &BlobLocator,
+    state: PublishState,
+) -> BlobError {
+    match error {
+        BlobError::StorageCapacity { .. } => {
+            let error = match bind_platform_capacity_with_effect(
+                error,
+                BlobCapacityStage::Cleanup,
+                BlobCapacityIdentity::Journal {
+                    operation_id: operation_id.to_owned(),
+                    idempotency_key: idempotency_key.to_owned(),
+                    locator: Some(locator.clone()),
+                },
+                Some(BlobCapacityEffect::PossiblePublication { state }),
+            ) {
+                Ok(error) => error,
+                Err(InvalidCapacityEvidence) => {
+                    return BlobError::UnknownPublishOutcome {
+                        operation_id: operation_id.to_owned(),
+                        state,
+                    };
+                }
+            };
+            let BlobError::StorageCapacity { mut failure } = error else {
+                return error;
+            };
+            // The last durable phase is known, but a cleanup error cannot
+            // prove whether this individual removal took effect.
+            failure.cleanup = BlobCapacityCleanup::Unknown;
+            BlobError::StorageCapacity { failure }
+        }
+        other => other,
+    }
+}
+
+fn bind_platform_capacity_gc(
+    error: BlobError,
+    stage: BlobCapacityStage,
+    identity: BlobCapacityIdentity,
+    gc_phase: GcState,
+) -> BlobError {
+    let operation_id = match &identity {
+        BlobCapacityIdentity::Journal { operation_id, .. } => operation_id.clone(),
+        BlobCapacityIdentity::Operation { context, .. } => {
+            context.operation.operation_id.to_string()
+        }
+        BlobCapacityIdentity::RootLease { root_id, .. } => root_id.clone(),
+    };
+    let error = match bind_platform_capacity_with_effect(
+        error,
+        stage,
+        identity,
+        Some(BlobCapacityEffect::PossibleMutation),
+    ) {
+        Ok(error) => error,
+        Err(InvalidCapacityEvidence) => {
+            return BlobError::UnknownGcOutcome {
+                operation_id,
+                state: gc_phase,
+            };
+        }
+    };
+    let BlobError::StorageCapacity { mut failure } = error else {
+        return error;
+    };
+    failure.gc_state = Some(gc_phase);
+    BlobError::StorageCapacity { failure }
 }
 
 fn heartbeat_root_lease(lease: &Weak<RootLeaseState>, stop: &Arc<AtomicBool>) {
@@ -481,7 +844,27 @@ fn heartbeat_root_lease(lease: &Weak<RootLeaseState>, stop: &Arc<AtomicBool>) {
             process_id: lease.process_id,
             heartbeat_unix_ms: now_unix_ms(),
         };
-        if write_lease_record(file, &record).is_err() {
+        if let Err(error) = write_lease_record(file, &record) {
+            let failure = native_capacity_error(
+                &error,
+                BlobCapacityStage::RootLeaseHeartbeat,
+                BlobCapacityIdentity::RootLease {
+                    root_id: redacted_root_id(&lease.root_id),
+                    lease_id: Some(redacted_root_id(&lease.token)),
+                },
+                None,
+                BlobCapacityEffect::PartialWriteUnknown,
+            )
+            .unwrap_or_else(|| {
+                BlobError::Provider(format!(
+                    "Blob root lease heartbeat write failed: kind={:?};raw_os_error={:?}",
+                    error.kind(),
+                    error.raw_os_error()
+                ))
+            });
+            if let Ok(mut retained) = lease.heartbeat_failure.lock() {
+                *retained = Some(failure);
+            }
             break;
         }
     }
@@ -547,23 +930,24 @@ pub trait BlobPlatformPort: Send + Sync {
     fn read_bounded(&self, path: &WorkScopePath, max_bytes: u64) -> Result<Vec<u8>, BlobError>;
     fn write_new_durable(&mut self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError>;
     fn replace_durable(&mut self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError>;
-    /// Replaces one durable record only when its exact prior bytes still have
-    /// the supplied digest. Providers with an atomic CAS should override this
-    /// default; the fallback remains fail-closed on a stale observed digest.
+    /// Replaces one durable journal record through the provider's conditional
+    /// primitive. Implementations must compare and install while their stable
+    /// serialization boundary remains held; a read/compare/replace fallback is
+    /// not a valid implementation.
+    fn cas_capability(&self) -> BlobCasCapability;
     fn compare_and_replace_durable(
         &mut self,
-        path: &WorkScopePath,
-        expected_sha256: &str,
+        request: &BlobCasRequest,
         bytes: &[u8],
-    ) -> Result<(), BlobError> {
-        let current = self.read_bounded(path, MAX_JOURNAL_BYTES)?;
-        if sha256_hex(&current) != expected_sha256 {
-            return Err(BlobError::PlanGap(
-                "durable blob journal CAS revision is stale".to_owned(),
-            ));
-        }
-        self.replace_durable(path, bytes)
-    }
+    ) -> Result<BlobCasProviderResult, BlobError>;
+    /// Returns retained operation-bound evidence for a prior CAS step. A
+    /// provider that cannot retain this status must return `Ok(None)`; the
+    /// service then stops recovery with an unknown outcome.
+    fn cas_status(&self, operation_id: &str) -> Result<Option<BlobCasProviderResult>, BlobError>;
+    /// Provider generation used to fence a conditional operation. It must be
+    /// stable for the provider instance and change whenever its authority view
+    /// changes.
+    fn backend_generation(&self) -> Result<u64, BlobError>;
     fn rename_no_replace_durable(
         &mut self,
         source: &WorkScopePath,
@@ -573,6 +957,21 @@ pub trait BlobPlatformPort: Send + Sync {
     fn stat(&self, path: &WorkScopePath) -> Result<BlobPathState, BlobError>;
     fn list(&self, prefix: &WorkScopePath) -> Result<Vec<WorkScopePath>, BlobError>;
     fn now_unix_ms(&mut self) -> Result<u64, BlobError>;
+}
+
+/// Provider evidence for one conditional journal operation. The service binds
+/// this physical result to the authority-issued request and receipt before it
+/// exposes success to its caller.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobCasProviderResult {
+    pub operation_id: String,
+    pub request_commitment_sha256: String,
+    pub observed: BlobCasState,
+    pub replacement_sha256: String,
+    pub replacement_length: u64,
+    pub backend_generation: u64,
+    pub observed_durability: BlobCasDurability,
+    pub success: BlobCasSuccessKind,
 }
 
 /// Compression provider. `BlobStore` never treats compression as encryption.
@@ -859,8 +1258,22 @@ impl StageJournal {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct TombstoneCas {
+    /// Tombstone journal wire revision. Revision 2 requires the full CAS block.
+    version: u32,
+    context: BlobReceiptContext,
+    root_lease: BlobRootLease,
+    target: WorkScopePath,
+    expected: BlobCasState,
+    expected_backend_generation: u64,
+    requested_durability: BlobCasDurability,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Tombstone {
     operation_id: String,
+    parent_idempotency_key: String,
     revision: u64,
     intent_revision: u64,
     proof_id: BlobId,
@@ -871,11 +1284,18 @@ struct Tombstone {
     metadata: WorkScopePath,
     state: GcState,
     receipt: Option<BlobDeletionReceipt>,
+    /// Versioned exact CAS authority and target context. `None` is used only
+    /// while a new record is being assembled; legacy decoded records fail closed.
+    cas: Option<TombstoneCas>,
 }
 
 impl Tombstone {
-    fn validate(&self) -> Result<(), BlobError> {
+    fn validate_base(&self) -> Result<(), BlobError> {
         valid_operation_text(&self.operation_id, "tombstone.operation_id")?;
+        valid_operation_text(
+            &self.parent_idempotency_key,
+            "tombstone.parent_idempotency_key",
+        )?;
         if self.revision == 0 || self.intent_revision == 0 || self.intent_revision > self.revision {
             return Err(BlobError::PlanGap(
                 "GC tombstone revision is missing".to_owned(),
@@ -898,6 +1318,165 @@ impl Tombstone {
             validate_deletion_receipt(receipt, self)?;
         }
         Ok(())
+    }
+
+    fn validate(&self) -> Result<(), BlobError> {
+        self.validate_base()?;
+        let Some(cas) = &self.cas else {
+            return Err(BlobError::PlanGap(
+                "legacy GC tombstone is missing exact CAS authority context".to_owned(),
+            ));
+        };
+        if cas.version != 2 {
+            return Err(BlobError::PlanGap(
+                "GC tombstone CAS wire version is unsupported".to_owned(),
+            ));
+        }
+        cas.context
+            .validate_for(eliot_receipts::EffectClass::ReversibleMutation)?;
+        cas.root_lease.validate_context(&cas.context)?;
+        cas.expected.validate()?;
+        if cas.target.normalized_identity().is_empty()
+            || !cas.target.normalized_identity().starts_with("tombstones/")
+        {
+            return Err(BlobError::PlanGap(
+                "GC tombstone CAS target is outside its journal namespace".to_owned(),
+            ));
+        }
+        if cas.context.operation.operation_id.to_string() == self.operation_id {
+            return Err(BlobError::PlanGap(
+                "GC tombstone CAS step identity must differ from its parent operation".to_owned(),
+            ));
+        }
+        let expected_step_identity =
+            tombstone_cas_step_identity(&self.operation_id, &cas.target, self.revision);
+        if cas.context.operation.operation_id.as_str() != expected_step_identity
+            || cas.context.operation.idempotency_key != expected_step_identity
+            || cas.context.operation.operation_kind != "blob-tombstone-cas"
+        {
+            return Err(BlobError::PlanGap(
+                "GC tombstone CAS step identity does not match its parent, target, and revision"
+                    .to_owned(),
+            ));
+        }
+        if cas.expected_backend_generation == 0 {
+            return Err(BlobError::PlanGap(
+                "GC tombstone CAS backend generation is missing".to_owned(),
+            ));
+        }
+        if !matches!(
+            cas.requested_durability,
+            BlobCasDurability::NotRequested | BlobCasDurability::Requested
+        ) {
+            return Err(BlobError::PlanGap(
+                "GC tombstone CAS durability request is invalid".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn decode_tombstone(bytes: &[u8]) -> Result<Tombstone, BlobError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| BlobError::MetadataPayloadMismatch)?;
+    if value.get("cas").is_none() {
+        return Err(BlobError::PlanGap(
+            "legacy GC tombstone is missing versioned CAS authority context".to_owned(),
+        ));
+    }
+    serde_json::from_value(value).map_err(|_| BlobError::MetadataPayloadMismatch)
+}
+
+fn tombstone_cas_step_identity(
+    parent_operation_id: &str,
+    target: &WorkScopePath,
+    revision: u64,
+) -> String {
+    format!(
+        "{parent_operation_id}:tombstone-cas:target={}:revision={revision}",
+        target.normalized_identity()
+    )
+}
+
+fn cas_unknown(
+    request: &BlobCasRequest,
+    observed: Option<BlobCasState>,
+    backend_generation: Option<u64>,
+    durability: BlobCasDurability,
+) -> BlobError {
+    BlobError::CasFailure {
+        failure: Box::new(BlobCasFailure::UnknownOutcome {
+            request: Box::new(request.clone()),
+            observed,
+            observed_backend_generation: backend_generation,
+            observed_durability: durability,
+        }),
+    }
+}
+
+fn cas_failure_is_bound(failure: &BlobCasFailure, request: &BlobCasRequest) -> bool {
+    let candidate = match failure {
+        BlobCasFailure::ExpectedStateConflict { request, .. }
+        | BlobCasFailure::IdentityConflict { request }
+        | BlobCasFailure::NotFound { request }
+        | BlobCasFailure::NotAttempted { request }
+        | BlobCasFailure::UnsupportedAtomicCas { request }
+        | BlobCasFailure::UnknownOutcome { request, .. }
+        | BlobCasFailure::DurabilityUnconfirmed { request, .. }
+        | BlobCasFailure::Internal { request, .. }
+        | BlobCasFailure::SuccessKindMismatch { request } => request,
+    };
+    let Ok(candidate_commitment) = candidate.request_commitment_sha256() else {
+        return false;
+    };
+    let Ok(request_commitment) = request.request_commitment_sha256() else {
+        return false;
+    };
+    candidate.context.operation.operation_id == request.context.operation.operation_id
+        && candidate.context.operation.idempotency_key == request.context.operation.idempotency_key
+        && candidate_commitment == request_commitment
+}
+
+fn validate_retained_cas_status(
+    request: &BlobCasRequest,
+    status: &BlobCasProviderResult,
+) -> Result<(), BlobError> {
+    let expected_success = if request.expected.sha256() == Some(request.replacement_sha256.as_str())
+    {
+        BlobCasSuccessKind::NoOp
+    } else {
+        BlobCasSuccessKind::Applied
+    };
+    if status.operation_id != request.context.operation.operation_id.to_string()
+        || status.request_commitment_sha256 != request.request_commitment_sha256()?
+        || status.observed != request.expected
+        || status.replacement_sha256 != request.replacement_sha256
+        || status.replacement_length != request.replacement_length
+        || status.backend_generation != request.expected_backend_generation
+        || status.observed_durability != BlobCasDurability::Confirmed
+        || status.success != expected_success
+    {
+        return Err(cas_unknown(
+            request,
+            Some(status.observed.clone()),
+            Some(status.backend_generation),
+            status.observed_durability,
+        ));
+    }
+    Ok(())
+}
+
+fn cas_durability_unconfirmed(
+    request: &BlobCasRequest,
+    observed: Option<BlobCasState>,
+    backend_generation: Option<u64>,
+) -> BlobError {
+    BlobError::CasFailure {
+        failure: Box::new(BlobCasFailure::DurabilityUnconfirmed {
+            request: Box::new(request.clone()),
+            observed,
+            observed_backend_generation: backend_generation,
+        }),
     }
 }
 
@@ -987,6 +1566,17 @@ struct BlobStoreCore<P, C, K, A, L> {
     issuer_anchor: BlobIssuerTrustAnchor,
 }
 
+struct PublishVerification<'a> {
+    source: &'a WorkScopePath,
+    destination: &'a WorkScopePath,
+    expected_sha256: &'a str,
+    hard_ceiling: u64,
+    operation_id: &'a str,
+    idempotency_key: &'a str,
+    state_before: PublishState,
+    stage: BlobCapacityStage,
+}
+
 impl<P, C, K, A, L> BlobStoreCore<P, C, K, A, L>
 where
     P: BlobPlatformPort,
@@ -1069,14 +1659,179 @@ where
         self.platform_write()?.replace_durable(path, bytes)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "CAS receipt validation keeps the provider-to-authority boundary in one path"
+    )]
     fn platform_compare_and_replace(
         &self,
-        path: &WorkScopePath,
-        expected_sha256: &str,
+        request: &BlobCasRequest,
         bytes: &[u8],
     ) -> Result<(), BlobError> {
-        self.platform_write()?
-            .compare_and_replace_durable(path, expected_sha256, bytes)
+        request.validate()?;
+        if bytes.len() as u64 != request.replacement_length
+            || sha256_hex(bytes) != request.replacement_sha256
+        {
+            return Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::Internal {
+                    request: Box::new(request.clone()),
+                    reason: eliot_blob_api::BlobCasInternalReason::CommitmentMismatch,
+                }),
+            });
+        }
+        if self.platform_read()?.cas_capability() != BlobCasCapability::AtomicCompareAndReplace {
+            return Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::UnsupportedAtomicCas {
+                    request: Box::new(request.clone()),
+                }),
+            });
+        }
+        let physical = match self
+            .platform_write()
+            .and_then(|mut platform| platform.compare_and_replace_durable(request, bytes))
+        {
+            Ok(physical) => physical,
+            Err(BlobError::CasFailure { failure }) if cas_failure_is_bound(&failure, request) => {
+                return Err(BlobError::CasFailure { failure });
+            }
+            Err(error @ BlobError::StorageCapacity { .. }) => {
+                return Err(match bind_capacity_cas(error, request) {
+                    Ok(bound) => bound,
+                    Err(InvalidCapacityEvidence) => {
+                        cas_unknown(request, None, None, BlobCasDurability::Unconfirmed)
+                    }
+                });
+            }
+            Err(_) => {
+                return Err(cas_unknown(
+                    request,
+                    None,
+                    None,
+                    BlobCasDurability::Unconfirmed,
+                ));
+            }
+        };
+        let expected_commitment = request.request_commitment_sha256()?;
+        let expected_success =
+            if request.expected.sha256() == Some(request.replacement_sha256.as_str()) {
+                BlobCasSuccessKind::NoOp
+            } else {
+                BlobCasSuccessKind::Applied
+            };
+        if physical.observed_durability != BlobCasDurability::Confirmed {
+            return Err(cas_durability_unconfirmed(
+                request,
+                Some(physical.observed),
+                Some(physical.backend_generation),
+            ));
+        }
+        if physical.operation_id != request.context.operation.operation_id.to_string()
+            || physical.request_commitment_sha256 != expected_commitment
+            || physical.observed != request.expected
+            || physical.replacement_sha256 != request.replacement_sha256
+            || physical.replacement_length != request.replacement_length
+            || physical.backend_generation != request.expected_backend_generation
+            || physical.observed_durability != BlobCasDurability::Confirmed
+            || physical.success != expected_success
+        {
+            return Err(cas_unknown(
+                request,
+                Some(physical.observed),
+                Some(physical.backend_generation),
+                physical.observed_durability,
+            ));
+        }
+        let success = physical.success;
+        let request_commitment_sha256 = expected_commitment;
+        let physical_observed = physical.observed.clone();
+        let receipt_result = (|| -> Result<BlobCasReceipt, BlobError> {
+            let effect_commitment_sha256 = request.effect_commitment_sha256(
+                request.expected_backend_generation,
+                BlobCasDurability::Confirmed,
+                success,
+            )?;
+            let request_artifact = ArtifactBinding {
+                artifact_id: request
+                    .request_artifact_id()?
+                    .parse()
+                    .map_err(|error| BlobError::InvalidContract(format!("{error}")))?,
+                sha256: request_commitment_sha256,
+                role: ReceiptKind::Artifact,
+                source_revision: Some(format!(
+                    "backend-generation:{};target:{}",
+                    request.expected_backend_generation,
+                    request.target.normalized_identity()
+                )),
+            };
+            let effect_artifact = ArtifactBinding {
+                artifact_id: request
+                    .effect_artifact_id(
+                        request.expected_backend_generation,
+                        BlobCasDurability::Confirmed,
+                        success,
+                    )?
+                    .parse()
+                    .map_err(|error| BlobError::InvalidContract(format!("{error}")))?,
+                sha256: effect_commitment_sha256,
+                role: ReceiptKind::Artifact,
+                source_revision: Some(format!(
+                    "backend-generation:{};durability:CONFIRMED",
+                    request.expected_backend_generation
+                )),
+            };
+            let proof_id = request.receipt_proof_id()?;
+            let binding = BlobReceiptBinding::for_operation(
+                &request.context,
+                request.root_lease.root_generation,
+                None,
+                Some(&proof_id),
+            )?;
+            let verified = self.issue_receipt(
+                &request.context,
+                vec![request_artifact, effect_artifact],
+                ReceiptKind::Operation,
+                ReceiptDisposition::Success {
+                    proof: ProofCeiling::ObservedExternalEffect,
+                },
+                binding,
+            )?;
+            BlobCasReceipt::from_verified(
+                &verified,
+                &self.issuer_anchor,
+                request,
+                request.expected_backend_generation,
+                BlobCasDurability::Confirmed,
+                success,
+            )
+        })();
+        let receipt = match receipt_result {
+            Ok(receipt) => receipt,
+            Err(BlobError::CasFailure { failure }) if cas_failure_is_bound(&failure, request) => {
+                return Err(BlobError::CasFailure { failure });
+            }
+            Err(_) => {
+                return Err(cas_unknown(
+                    request,
+                    Some(physical_observed),
+                    Some(physical.backend_generation),
+                    physical.observed_durability,
+                ));
+            }
+        };
+        let outcome = if success == BlobCasSuccessKind::Applied {
+            BlobCasOutcome::Applied { receipt }
+        } else {
+            BlobCasOutcome::NoOp { receipt }
+        };
+        match outcome.into_blob_result()? {
+            BlobCasOutcome::Applied { .. } | BlobCasOutcome::NoOp { .. } => Ok(()),
+            _ => Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::Internal {
+                    request: Box::new(request.clone()),
+                    reason: eliot_blob_api::BlobCasInternalReason::SuccessKindMismatch,
+                }),
+            }),
+        }
     }
 
     fn platform_rename(
@@ -1094,6 +1849,30 @@ where
 
     fn platform_now_ms(&self) -> Result<u64, BlobError> {
         self.platform_write()?.now_unix_ms()
+    }
+
+    fn platform_backend_generation(&self) -> Result<u64, BlobError> {
+        self.platform_read()?.backend_generation()
+    }
+
+    fn tombstone_cas_request(
+        tombstone: &Tombstone,
+        bytes: &[u8],
+    ) -> Result<BlobCasRequest, BlobError> {
+        let cas = tombstone.cas.as_ref().ok_or_else(|| {
+            BlobError::PlanGap("GC tombstone is missing exact CAS authority context".to_owned())
+        })?;
+        BlobCasRequest::new(
+            cas.context.clone(),
+            cas.root_lease.clone(),
+            eliot_blob_api::BlobCasNamespace::Tombstone,
+            cas.target.clone(),
+            cas.expected.clone(),
+            sha256_hex(bytes),
+            bytes.len() as u64,
+            cas.expected_backend_generation,
+            cas.requested_durability,
+        )
     }
 
     fn compression_descriptor(&self) -> Result<CompressionDescriptor, BlobError> {
@@ -1281,32 +2060,56 @@ where
         }
     }
 
-    fn publish_or_verify(
-        &self,
-        source: &WorkScopePath,
-        destination: &WorkScopePath,
-        expected_sha256: &str,
-        hard_ceiling: u64,
-        operation_id: &str,
-        state_before: PublishState,
-    ) -> Result<(), BlobError> {
-        self.contained(source)?;
-        self.contained(destination)?;
-        match self.platform_rename(source, destination) {
+    fn publish_or_verify(&self, verification: &PublishVerification<'_>) -> Result<(), BlobError> {
+        self.contained(verification.source)?;
+        self.contained(verification.destination)?;
+        match self.platform_rename(verification.source, verification.destination) {
             Ok(()) => {
-                if self.exact_bytes_at(destination, expected_sha256, hard_ceiling)? {
+                if self.exact_bytes_at(
+                    verification.destination,
+                    verification.expected_sha256,
+                    verification.hard_ceiling,
+                )? {
                     Ok(())
                 } else {
                     Err(BlobError::UnknownPublishOutcome {
-                        operation_id: operation_id.to_owned(),
-                        state: state_before,
+                        operation_id: verification.operation_id.to_owned(),
+                        state: verification.state_before,
                     })
                 }
             }
-            Err(_) if self.exact_bytes_at(destination, expected_sha256, hard_ceiling)? => Ok(()),
+            Err(error @ BlobError::StorageCapacity { .. }) => {
+                match bind_platform_capacity_with_effect(
+                    error,
+                    verification.stage,
+                    BlobCapacityIdentity::Journal {
+                        operation_id: verification.operation_id.to_owned(),
+                        idempotency_key: verification.idempotency_key.to_owned(),
+                        locator: None,
+                    },
+                    Some(BlobCapacityEffect::PossiblePublication {
+                        state: verification.state_before,
+                    }),
+                ) {
+                    Ok(bound) => Err(bound),
+                    Err(InvalidCapacityEvidence) => Err(BlobError::UnknownPublishOutcome {
+                        operation_id: verification.operation_id.to_owned(),
+                        state: verification.state_before,
+                    }),
+                }
+            }
+            Err(_error)
+                if self.exact_bytes_at(
+                    verification.destination,
+                    verification.expected_sha256,
+                    verification.hard_ceiling,
+                )? =>
+            {
+                Ok(())
+            }
             Err(_) => Err(BlobError::UnknownPublishOutcome {
-                operation_id: operation_id.to_owned(),
-                state: state_before,
+                operation_id: verification.operation_id.to_owned(),
+                state: verification.state_before,
             }),
         }
     }
@@ -1318,45 +2121,116 @@ where
         replace: bool,
     ) -> Result<(), BlobError> {
         journal.validate()?;
+        if !path.normalized_identity().starts_with("transactions/") {
+            return Err(BlobError::PlanGap(
+                "stage journal replacement is restricted to transactions namespace".to_owned(),
+            ));
+        }
         self.contained(path)?;
         let bytes = serde_json::to_vec(journal)
             .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
-        if replace {
+        let result = if replace {
             self.platform_replace(path, &bytes)
         } else {
             self.platform_write_new(path, &bytes)
-        }
+        };
+        result.map_err(|error| {
+            let bound = bind_journal_capacity(error, journal, bytes.len() as u64);
+            match bound {
+                Ok(bound) => bound,
+                Err(InvalidCapacityEvidence) => BlobError::UnknownPublishOutcome {
+                    operation_id: journal.operation_id.clone(),
+                    state: journal.state,
+                },
+            }
+        })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "journal preparation and conditional publication share one linearization path"
+    )]
     fn persist_tombstone(
         &self,
         path: &WorkScopePath,
         tombstone: &Tombstone,
-        expected_revision: Option<u64>,
-    ) -> Result<(), BlobError> {
-        tombstone.validate()?;
+        expected_revision: Option<(u64, BlobCasState)>,
+    ) -> Result<BlobCasState, BlobError> {
+        tombstone.validate_base()?;
         self.contained(path)?;
-        let current_digest = if let Some(expected) = expected_revision {
-            let current_bytes = self.read_bounded_file(path, MAX_JOURNAL_BYTES)?;
-            let current: Tombstone = serde_json::from_slice(&current_bytes)
-                .map_err(|_| BlobError::MetadataPayloadMismatch)?;
-            current.validate()?;
-            if current.revision != expected {
-                return Err(BlobError::PlanGap(
-                    "GC tombstone CAS revision is stale".to_owned(),
-                ));
-            }
-            Some(sha256_hex(&current_bytes))
-        } else {
-            None
-        };
-        let bytes = serde_json::to_vec(tombstone)
-            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
-        if let Some(current_digest) = current_digest {
-            self.platform_compare_and_replace(path, &current_digest, &bytes)
-        } else {
-            self.platform_write_new(path, &bytes)
+        let (expected_state, observed_state, conflict_observed) =
+            if let Some((expected, frozen)) = expected_revision {
+                let current_bytes = self.read_bounded_file(path, MAX_JOURNAL_BYTES)?;
+                let current = decode_tombstone(&current_bytes)?;
+                current.validate()?;
+                let observed = BlobCasState::Digest(sha256_hex(&current_bytes));
+                let conflict = current.revision != expected || frozen != observed;
+                (frozen, observed, conflict)
+            } else {
+                (BlobCasState::Missing, BlobCasState::Missing, false)
+            };
+        let backend_generation = self.platform_backend_generation()?;
+        if backend_generation == 0 {
+            return Err(BlobError::PlanGap(
+                "blob platform returned an invalid backend generation".to_owned(),
+            ));
         }
+        let mut candidate = tombstone.clone();
+        let context = candidate
+            .cas
+            .as_ref()
+            .map(|cas| cas.context.clone())
+            .ok_or_else(|| {
+                BlobError::PlanGap(
+                    "new GC tombstone is missing owner-issued CAS step context".to_owned(),
+                )
+            })?;
+        let context = Self::tombstone_cas_context(
+            &context,
+            &candidate.operation_id,
+            path,
+            candidate.revision,
+        )?;
+        candidate.cas = Some(TombstoneCas {
+            version: 2,
+            context,
+            root_lease: self.owner.lease.clone(),
+            target: path.clone(),
+            expected: expected_state.clone(),
+            expected_backend_generation: backend_generation,
+            requested_durability: BlobCasDurability::Requested,
+        });
+        let context = candidate
+            .cas
+            .as_ref()
+            .map(|cas| cas.context.clone())
+            .ok_or_else(|| {
+                BlobError::PlanGap("CAS context disappeared during preparation".to_owned())
+            })?;
+        let bytes = serde_json::to_vec(&candidate)
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let request = BlobCasRequest::new(
+            context,
+            self.owner.lease.clone(),
+            eliot_blob_api::BlobCasNamespace::Tombstone,
+            path.clone(),
+            expected_state,
+            sha256_hex(&bytes),
+            bytes.len() as u64,
+            backend_generation,
+            BlobCasDurability::Requested,
+        )?;
+        if conflict_observed {
+            return Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::ExpectedStateConflict {
+                    request: Box::new(request),
+                    observed: observed_state,
+                }),
+            });
+        }
+        self.platform_compare_and_replace(&request, &bytes)
+            .map_err(|error| retain_capacity_gc_state(error, candidate.state))?;
+        Ok(BlobCasState::Digest(sha256_hex(&bytes)))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1380,14 +2254,16 @@ where
                     state: journal.state,
                 });
             }
-            self.publish_or_verify(
-                &journal.temp_payload,
-                &journal.final_payload,
-                &journal.expected_payload_sha256,
-                MAX_BLOB_ENVELOPE_BYTES,
-                &journal.operation_id,
-                journal.state,
-            )?;
+            self.publish_or_verify(&PublishVerification {
+                source: &journal.temp_payload,
+                destination: &journal.final_payload,
+                expected_sha256: &journal.expected_payload_sha256,
+                hard_ceiling: MAX_BLOB_ENVELOPE_BYTES,
+                operation_id: &journal.operation_id,
+                idempotency_key: &journal.idempotency_key,
+                state_before: journal.state,
+                stage: BlobCapacityStage::PayloadPublication,
+            })?;
         }
         journal.state = PublishState::PayloadDurable;
         self.persist_journal(journal_path, journal, true)?;
@@ -1407,14 +2283,16 @@ where
                     state: journal.state,
                 });
             }
-            self.publish_or_verify(
-                &journal.temp_metadata,
-                &journal.final_metadata,
-                &journal.expected_metadata_sha256,
-                MAX_METADATA_BYTES,
-                &journal.operation_id,
-                journal.state,
-            )?;
+            self.publish_or_verify(&PublishVerification {
+                source: &journal.temp_metadata,
+                destination: &journal.final_metadata,
+                expected_sha256: &journal.expected_metadata_sha256,
+                hard_ceiling: MAX_METADATA_BYTES,
+                operation_id: &journal.operation_id,
+                idempotency_key: &journal.idempotency_key,
+                state_before: journal.state,
+                stage: BlobCapacityStage::MetadataPublication,
+            })?;
         }
         journal.state = PublishState::MetadataDurable;
         self.persist_journal(journal_path, journal, true)?;
@@ -1445,7 +2323,7 @@ where
         let commit = OperationCommit {
             operation_id: journal.operation_id.clone(),
             idempotency_key: journal.idempotency_key.clone(),
-            locator: metadata.locator,
+            locator: metadata.locator.clone(),
             metadata_sha256: journal.expected_metadata_sha256.clone(),
         };
         commit.validate()?;
@@ -1456,6 +2334,30 @@ where
         self.contained(&commit_path)?;
         match self.platform_write_new(&commit_path, &commit_bytes) {
             Ok(()) => {}
+            Err(error @ BlobError::StorageCapacity { .. }) => {
+                let bound = bind_platform_capacity_with_effect(
+                    error,
+                    BlobCapacityStage::CommitWrite,
+                    BlobCapacityIdentity::Journal {
+                        operation_id: journal.operation_id.clone(),
+                        idempotency_key: journal.idempotency_key.clone(),
+                        locator: Some(metadata.locator.clone()),
+                    },
+                    Some(BlobCapacityEffect::PossiblePublication {
+                        state: PublishState::MetadataDurable,
+                    }),
+                );
+                let bound = match bound {
+                    Ok(bound) => bound,
+                    Err(InvalidCapacityEvidence) => {
+                        return Err(BlobError::UnknownPublishOutcome {
+                            operation_id: journal.operation_id.clone(),
+                            state: PublishState::MetadataDurable,
+                        });
+                    }
+                };
+                return Err(bound);
+            }
             Err(_)
                 if self.exact_bytes_at(
                     &commit_path,
@@ -1470,9 +2372,35 @@ where
             }
         }
         journal.state = PublishState::CommitDurable;
-        self.remove_if_present(&journal.temp_payload)?;
-        self.remove_if_present(&journal.temp_metadata)?;
-        self.remove_if_present(journal_path)?;
+        self.remove_if_present(&journal.temp_payload)
+            .map_err(|error| {
+                bind_cleanup_capacity(
+                    error,
+                    &journal.operation_id,
+                    &journal.idempotency_key,
+                    &metadata.locator,
+                    PublishState::CommitDurable,
+                )
+            })?;
+        self.remove_if_present(&journal.temp_metadata)
+            .map_err(|error| {
+                bind_cleanup_capacity(
+                    error,
+                    &journal.operation_id,
+                    &journal.idempotency_key,
+                    &metadata.locator,
+                    PublishState::CommitDurable,
+                )
+            })?;
+        self.remove_if_present(journal_path).map_err(|error| {
+            bind_cleanup_capacity(
+                error,
+                &journal.operation_id,
+                &journal.idempotency_key,
+                &metadata.locator,
+                PublishState::CommitDurable,
+            )
+        })?;
         journal.state = PublishState::Cleaned;
         Ok(())
     }
@@ -1501,9 +2429,36 @@ where
     ) -> Result<ConditionalDeleteOutcome, BlobError> {
         self.contained(path)?;
         let bytes = self.read_bounded_file(path, MAX_JOURNAL_BYTES)?;
-        let mut tombstone: Tombstone =
-            serde_json::from_slice(&bytes).map_err(|_| BlobError::MetadataPayloadMismatch)?;
+        let mut tombstone = decode_tombstone(&bytes)?;
         tombstone.validate()?;
+        let cas = tombstone.cas.as_ref().ok_or_else(|| {
+            BlobError::PlanGap("legacy GC tombstone is missing exact CAS context".to_owned())
+        })?;
+        if cas.target.normalized_identity() != path.normalized_identity() {
+            return Err(BlobError::PlanGap(
+                "GC tombstone CAS target does not match its journal path".to_owned(),
+            ));
+        }
+        if cas.root_lease != self.owner.lease {
+            return Err(BlobError::StaleFence);
+        }
+        // A persisted tombstone is not evidence that its preceding CAS
+        // completed. Reconstruct the exact request from the protected v2
+        // context and recorded bytes, then require the provider's retained
+        // operation-bound result. Byte equality alone never settles recovery.
+        let request = Self::tombstone_cas_request(&tombstone, &bytes)?;
+        let Ok(Some(status)) = self.platform_read().and_then(|platform| {
+            platform.cas_status(request.context.operation.operation_id.as_str())
+        }) else {
+            return Err(cas_unknown(
+                &request,
+                None,
+                None,
+                BlobCasDurability::Unconfirmed,
+            ));
+        };
+        validate_retained_cas_status(&request, &status)?;
+        let mut frozen_cas_state = BlobCasState::Digest(sha256_hex(&bytes));
         if let Some(receipt) = &tombstone.receipt {
             validate_deletion_receipt(receipt, &tombstone)?;
             return Ok(ConditionalDeleteOutcome::Deleted);
@@ -1520,7 +2475,11 @@ where
                 .ok_or_else(|| BlobError::PlanGap("GC tombstone revision overflow".to_owned()))?;
             tombstone.intent_revision = tombstone.revision;
             tombstone.state = GcState::LiveSetRevalidated;
-            self.persist_tombstone(path, &tombstone, Some(previous_revision))?;
+            frozen_cas_state = self.persist_tombstone(
+                path,
+                &tombstone,
+                Some((previous_revision, frozen_cas_state.clone())),
+            )?;
         }
 
         let payload = tombstone.payload.clone();
@@ -1543,12 +2502,30 @@ where
                             BlobError::PlanGap("GC tombstone revision overflow".to_owned())
                         })?;
                         tombstone.state = state;
-                        self.persist_tombstone(path, &tombstone, Some(previous_revision))?;
-                        self.platform_remove(target)
-                            .map_err(|_| BlobError::UnknownGcOutcome {
-                                operation_id: operation_id.clone(),
-                                state,
-                            })?;
+                        frozen_cas_state = self.persist_tombstone(
+                            path,
+                            &tombstone,
+                            Some((previous_revision, frozen_cas_state.clone())),
+                        )?;
+                        self.platform_remove(target).map_err(|error| {
+                            if matches!(error, BlobError::StorageCapacity { .. }) {
+                                bind_platform_capacity_gc(
+                                    error,
+                                    BlobCapacityStage::GcCleanup,
+                                    BlobCapacityIdentity::Journal {
+                                        operation_id: operation_id.clone(),
+                                        idempotency_key: tombstone.parent_idempotency_key.clone(),
+                                        locator: Some(locator.clone()),
+                                    },
+                                    state,
+                                )
+                            } else {
+                                BlobError::UnknownGcOutcome {
+                                    operation_id: operation_id.clone(),
+                                    state,
+                                }
+                            }
+                        })?;
                     }
                     BlobPathState::ReparsePoint => {
                         return Err(BlobError::PlanGap(
@@ -1611,7 +2588,11 @@ where
             .ok_or_else(|| BlobError::PlanGap("GC tombstone revision overflow".to_owned()))?;
         tombstone.state = GcState::TombstoneCleaned;
         tombstone.receipt = Some(applied);
-        self.persist_tombstone(path, &tombstone, Some(previous_revision))?;
+        let _ = self.persist_tombstone(
+            path,
+            &tombstone,
+            Some((previous_revision, frozen_cas_state)),
+        )?;
         Ok(ConditionalDeleteOutcome::Deleted)
     }
 
@@ -1621,8 +2602,7 @@ where
         self.contained(&tombstones)?;
         for path in self.platform_list(&tombstones)? {
             let bytes = self.read_bounded_file(&path, MAX_JOURNAL_BYTES)?;
-            let tombstone: Tombstone =
-                serde_json::from_slice(&bytes).map_err(|_| BlobError::MetadataPayloadMismatch)?;
+            let tombstone = decode_tombstone(&bytes)?;
             tombstone.validate()?;
             if tombstone.locator == *locator {
                 return Err(BlobError::PlanGap(
@@ -1677,7 +2657,28 @@ where
             return Ok(ready);
         }
         if self.platform_stat(&journal_path)? != BlobPathState::Missing {
-            self.reconcile_stage_path(&journal_path)?;
+            let journal_bytes = self.read_bounded_file(&journal_path, MAX_JOURNAL_BYTES)?;
+            let mut journal: StageJournal = serde_json::from_slice(&journal_bytes)
+                .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+            journal.validate()?;
+            // Check the persisted operation and all deterministic artifact
+            // paths before allowing recovery to perform any publication. A
+            // reused operation with a different locator must not advance the
+            // old journal and discover the mismatch only after mutation.
+            // The persisted journal has no policy commitment, so an otherwise
+            // identical content/locator replay with a changed policy remains
+            // an explicitly documented reconciliation limitation; final
+            // metadata binding still rejects the mismatch before readiness.
+            if journal.operation_id != request.context.operation.operation_id.as_str()
+                || journal.idempotency_key != request.context.operation.idempotency_key
+                || journal.temp_payload != Self::temp_path(&request.context, "payload")?
+                || journal.temp_metadata != Self::temp_path(&request.context, "metadata")?
+                || journal.final_payload != payload
+                || journal.final_metadata != metadata_path_value
+            {
+                return Err(BlobError::IdempotencyConflict);
+            }
+            self.finish_journal(&journal_path, &mut journal)?;
         }
         let payload_state = self.platform_stat(&payload)?;
         let metadata_state = self.platform_stat(&metadata_path_value)?;
@@ -1819,7 +2820,7 @@ where
         let temp_metadata = Self::temp_path(&request.context, "metadata")?;
         let mut journal = StageJournal {
             operation_id: request.context.operation.operation_id.to_string(),
-            idempotency_key: request.context.operation.idempotency_key,
+            idempotency_key: request.context.operation.idempotency_key.clone(),
             state: PublishState::JournalPrepared,
             temp_payload: temp_payload.clone(),
             temp_metadata: temp_metadata.clone(),
@@ -1832,10 +2833,56 @@ where
         self.contained(&temp_payload)?;
         self.contained(&temp_metadata)?;
         if let Err(error) = self.platform_write_new(&temp_payload, &sealed) {
+            let error = bind_platform_capacity_attempt(
+                error,
+                BlobCapacityStage::PayloadWrite,
+                BlobCapacityIdentity::Operation {
+                    context: Box::new(request.context.clone()),
+                    locator: Some(locator.clone()),
+                },
+                sealed.len() as u64,
+            );
+            let error = match error {
+                Ok(error) => error,
+                Err(InvalidCapacityEvidence) => {
+                    return Err(BlobError::UnknownPublishOutcome {
+                        operation_id: journal.operation_id.clone(),
+                        state: journal.state,
+                    });
+                }
+            };
+            // Keep the journal as the sole same-operation recovery record;
+            // a capacity failure may have partially written the temp payload.
+            if matches!(error, BlobError::StorageCapacity { .. }) {
+                return Err(error);
+            }
             let _ = self.remove_if_present(&journal_path);
             return Err(error);
         }
         if let Err(error) = self.platform_write_new(&temp_metadata, &metadata_bytes) {
+            let error = bind_platform_capacity_attempt(
+                error,
+                BlobCapacityStage::MetadataWrite,
+                BlobCapacityIdentity::Operation {
+                    context: Box::new(request.context.clone()),
+                    locator: Some(locator.clone()),
+                },
+                metadata_bytes.len() as u64,
+            );
+            let error = match error {
+                Ok(error) => error,
+                Err(InvalidCapacityEvidence) => {
+                    return Err(BlobError::UnknownPublishOutcome {
+                        operation_id: journal.operation_id.clone(),
+                        state: journal.state,
+                    });
+                }
+            };
+            // Preserve both the journal and payload for reconciliation.  The
+            // metadata write may have left a partial artifact as well.
+            if matches!(error, BlobError::StorageCapacity { .. }) {
+                return Err(error);
+            }
             let _ = self.remove_if_present(&temp_payload);
             let _ = self.remove_if_present(&journal_path);
             return Err(error);
@@ -2114,8 +3161,7 @@ where
             self.contained(&tombstone_path)?;
             if self.platform_stat(&tombstone_path)? != BlobPathState::Missing {
                 let bytes = self.read_bounded_file(&tombstone_path, MAX_JOURNAL_BYTES)?;
-                let tombstone: Tombstone = serde_json::from_slice(&bytes)
-                    .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+                let tombstone = decode_tombstone(&bytes)?;
                 tombstone.validate()?;
                 if tombstone.locator != *locator
                     || tombstone.proof_id != request.live_set.proof_id
@@ -2124,6 +3170,9 @@ where
                     return Err(BlobError::PlanGap(
                         "GC tombstone identity does not match the exact request".to_owned(),
                     ));
+                }
+                if tombstone.parent_idempotency_key != request.context.operation.idempotency_key {
+                    return Err(BlobError::IdempotencyConflict);
                 }
                 match self.reconcile_tombstone_path(&tombstone_path)? {
                     ConditionalDeleteOutcome::Deleted => deleted.push(locator.clone()),
@@ -2169,6 +3218,7 @@ where
             Self::validate_revalidation(&request, &current)?;
             let tombstone = Tombstone {
                 operation_id: request.context.operation.operation_id.to_string(),
+                parent_idempotency_key: request.context.operation.idempotency_key.clone(),
                 revision: 1,
                 intent_revision: 1,
                 proof_id: request.live_set.proof_id.clone(),
@@ -2179,6 +3229,20 @@ where
                 metadata,
                 state: GcState::TombstoneDurable,
                 receipt: None,
+                cas: Some(TombstoneCas {
+                    version: 2,
+                    context: Self::tombstone_cas_context(
+                        &request.context,
+                        request.context.operation.operation_id.as_str(),
+                        &tombstone_path,
+                        1,
+                    )?,
+                    root_lease: self.owner.lease.clone(),
+                    target: tombstone_path.clone(),
+                    expected: BlobCasState::Missing,
+                    expected_backend_generation: self.platform_backend_generation()?,
+                    requested_durability: BlobCasDurability::Requested,
+                }),
             };
             self.persist_tombstone(&tombstone_path, &tombstone, None)?;
             match self.reconcile_tombstone_path(&tombstone_path)? {
@@ -2244,9 +3308,33 @@ where
         for path in paths {
             let result = (|| -> Result<(), BlobError> {
                 let bytes = self.read_bounded_file(&path, MAX_JOURNAL_BYTES)?;
-                let tombstone: Tombstone = serde_json::from_slice(&bytes)
-                    .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+                let tombstone = decode_tombstone(&bytes)?;
                 tombstone.validate()?;
+                let cas = tombstone.cas.as_ref().ok_or_else(|| {
+                    BlobError::PlanGap(
+                        "GC tombstone is missing exact CAS authority context".to_owned(),
+                    )
+                })?;
+                if cas.target.normalized_identity() != path.normalized_identity() {
+                    return Err(BlobError::PlanGap(
+                        "GC tombstone CAS target does not match its scanned path".to_owned(),
+                    ));
+                }
+                if cas.root_lease != self.owner.lease {
+                    return Err(BlobError::StaleFence);
+                }
+                let request = Self::tombstone_cas_request(&tombstone, &bytes)?;
+                let Ok(Some(status)) = self.platform_read().and_then(|platform| {
+                    platform.cas_status(request.context.operation.operation_id.as_str())
+                }) else {
+                    return Err(cas_unknown(
+                        &request,
+                        None,
+                        None,
+                        BlobCasDurability::Unconfirmed,
+                    ));
+                };
+                validate_retained_cas_status(&request, &status)?;
                 if !matches!(tombstone.state, GcState::TombstoneCleaned)
                     || tombstone.receipt.is_none()
                 {
@@ -2355,6 +3443,21 @@ where
             suffix
         ))
         .map_err(|error| BlobError::InvalidContract(error.to_string()))
+    }
+
+    fn tombstone_cas_context(
+        context: &BlobReceiptContext,
+        parent_operation_id: &str,
+        target: &WorkScopePath,
+        revision: u64,
+    ) -> Result<BlobReceiptContext, BlobError> {
+        let mut cas = context.clone();
+        let step_identity = tombstone_cas_step_identity(parent_operation_id, target, revision);
+        cas.operation.operation_id = OperationId::new(step_identity.clone())
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        step_identity.clone_into(&mut cas.operation.idempotency_key);
+        "blob-tombstone-cas".clone_into(&mut cas.operation.operation_kind);
+        Ok(cas)
     }
 
     fn temp_path(context: &BlobReceiptContext, suffix: &str) -> Result<WorkScopePath, BlobError> {
@@ -2623,11 +3726,72 @@ mod tests {
             .expect("test anchor")
     }
 
-    #[derive(Default)]
+    fn test_capacity_error(
+        stage: BlobCapacityStage,
+        effect: BlobCapacityEffect,
+        attempted_bytes: Option<u64>,
+    ) -> BlobError {
+        BlobError::StorageCapacity {
+            failure: Box::new(BlobCapacityFailure {
+                identity: BlobCapacityIdentity::Journal {
+                    operation_id: "provider-operation".to_owned(),
+                    idempotency_key: "provider-idempotency".to_owned(),
+                    locator: None,
+                },
+                stage,
+                evidence: BlobCapacityEvidence {
+                    cause: BlobCapacityCause::IoStorageFull,
+                    attempted_bytes,
+                    effect,
+                },
+                cas_request: None,
+                cas_observed: None,
+                cas_backend_generation: None,
+                cas_durability: None,
+                cleanup: BlobCapacityCleanup::NotApplicable,
+                cleanup_stage: None,
+                cleanup_evidence: None,
+                gc_state: None,
+                recovery: match effect {
+                    BlobCapacityEffect::NotAttempted | BlobCapacityEffect::PartialWriteUnknown => {
+                        BlobCapacityRecovery::CapacityRevalidationRequired
+                    }
+                    BlobCapacityEffect::PossibleMutation
+                    | BlobCapacityEffect::PossiblePublication { .. }
+                    | BlobCapacityEffect::DurabilityUnconfirmed { .. } => {
+                        BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+                    }
+                },
+            }),
+        }
+    }
+
     struct MemoryPlatform {
         files: BTreeMap<String, (Vec<u8>, u64)>,
+        cas_requests: BTreeMap<String, BlobCasRequest>,
+        cas_statuses: BTreeMap<String, BlobCasProviderResult>,
         claim: Option<RootClaimProof>,
         now: u64,
+        backend_generation: u64,
+        fail_write: Option<BlobCapacityStage>,
+        fail_rename: bool,
+        fail_remove: bool,
+    }
+
+    impl Default for MemoryPlatform {
+        fn default() -> Self {
+            Self {
+                files: BTreeMap::new(),
+                cas_requests: BTreeMap::new(),
+                cas_statuses: BTreeMap::new(),
+                claim: None,
+                now: 0,
+                backend_generation: 1,
+                fail_write: None,
+                fail_rename: false,
+                fail_remove: false,
+            }
+        }
     }
 
     impl BlobPlatformPort for MemoryPlatform {
@@ -2678,6 +3842,13 @@ mod tests {
             path: &WorkScopePath,
             bytes: &[u8],
         ) -> Result<(), BlobError> {
+            if let Some(stage) = self.fail_write.take() {
+                return Err(test_capacity_error(
+                    stage,
+                    BlobCapacityEffect::PartialWriteUnknown,
+                    Some(bytes.len() as u64),
+                ));
+            }
             if self.files.contains_key(path.normalized_identity()) {
                 return Err(BlobError::IdempotencyConflict);
             }
@@ -2699,11 +3870,127 @@ mod tests {
             Ok(())
         }
 
+        fn compare_and_replace_durable(
+            &mut self,
+            request: &BlobCasRequest,
+            bytes: &[u8],
+        ) -> Result<BlobCasProviderResult, BlobError> {
+            request.validate()?;
+            let operation_id = request.context.operation.operation_id.to_string();
+            if self.cas_capability() != BlobCasCapability::AtomicCompareAndReplace {
+                return Err(BlobError::CasFailure {
+                    failure: Box::new(BlobCasFailure::UnsupportedAtomicCas {
+                        request: Box::new(request.clone()),
+                    }),
+                });
+            }
+            if let Some(previous) = self.cas_requests.get(&operation_id) {
+                if previous.context.operation.idempotency_key
+                    != request.context.operation.idempotency_key
+                    || previous.request_commitment_sha256()?
+                        != request.request_commitment_sha256()?
+                {
+                    return Err(BlobError::CasFailure {
+                        failure: Box::new(BlobCasFailure::IdentityConflict {
+                            request: Box::new(request.clone()),
+                        }),
+                    });
+                }
+                return self
+                    .cas_statuses
+                    .get(&operation_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        cas_unknown(request, None, None, BlobCasDurability::Unconfirmed)
+                    });
+            }
+            if self.backend_generation != request.expected_backend_generation {
+                return Err(BlobError::CasFailure {
+                    failure: Box::new(BlobCasFailure::Internal {
+                        request: Box::new(request.clone()),
+                        reason: eliot_blob_api::BlobCasInternalReason::BackendGenerationMismatch,
+                    }),
+                });
+            }
+            if bytes.len() as u64 != request.replacement_length
+                || sha256_hex(bytes) != request.replacement_sha256
+            {
+                return Err(BlobError::CasFailure {
+                    failure: Box::new(BlobCasFailure::Internal {
+                        request: Box::new(request.clone()),
+                        reason: eliot_blob_api::BlobCasInternalReason::CommitmentMismatch,
+                    }),
+                });
+            }
+            let observed = self
+                .files
+                .get(request.target.normalized_identity())
+                .map_or(BlobCasState::Missing, |(current, _)| {
+                    BlobCasState::Digest(sha256_hex(current))
+                });
+            if observed != request.expected {
+                return Err(BlobError::CasFailure {
+                    failure: Box::new(BlobCasFailure::ExpectedStateConflict {
+                        request: Box::new(request.clone()),
+                        observed,
+                    }),
+                });
+            }
+            if request.expected.sha256() != Some(request.replacement_sha256.as_str()) {
+                self.files.insert(
+                    request.target.normalized_identity().to_owned(),
+                    (bytes.to_vec(), self.now),
+                );
+            }
+            let result = BlobCasProviderResult {
+                operation_id: operation_id.clone(),
+                request_commitment_sha256: request.request_commitment_sha256()?,
+                observed: request.expected.clone(),
+                replacement_sha256: request.replacement_sha256.clone(),
+                replacement_length: request.replacement_length,
+                backend_generation: self.backend_generation,
+                observed_durability: BlobCasDurability::Confirmed,
+                success: if request.expected.sha256() == Some(request.replacement_sha256.as_str()) {
+                    BlobCasSuccessKind::NoOp
+                } else {
+                    BlobCasSuccessKind::Applied
+                },
+            };
+            self.cas_requests
+                .insert(operation_id.clone(), request.clone());
+            self.cas_statuses.insert(operation_id, result.clone());
+            Ok(result)
+        }
+
+        fn cas_status(
+            &self,
+            operation_id: &str,
+        ) -> Result<Option<BlobCasProviderResult>, BlobError> {
+            Ok(self.cas_statuses.get(operation_id).cloned())
+        }
+
+        fn cas_capability(&self) -> BlobCasCapability {
+            BlobCasCapability::AtomicCompareAndReplace
+        }
+
+        fn backend_generation(&self) -> Result<u64, BlobError> {
+            Ok(self.backend_generation)
+        }
+
         fn rename_no_replace_durable(
             &mut self,
             source: &WorkScopePath,
             destination: &WorkScopePath,
         ) -> Result<(), BlobError> {
+            if self.fail_rename {
+                return Err(test_capacity_error(
+                    BlobCapacityStage::PayloadPublication,
+                    BlobCapacityEffect::PossiblePublication {
+                        state: PublishState::JournalPrepared,
+                    },
+                    None,
+                ));
+            }
             if self.files.contains_key(destination.normalized_identity()) {
                 return Err(BlobError::IdempotencyConflict);
             }
@@ -2717,6 +4004,15 @@ mod tests {
         }
 
         fn remove_durable(&mut self, path: &WorkScopePath) -> Result<(), BlobError> {
+            if self.fail_remove {
+                return Err(test_capacity_error(
+                    BlobCapacityStage::Cleanup,
+                    BlobCapacityEffect::PossiblePublication {
+                        state: PublishState::CommitDurable,
+                    },
+                    None,
+                ));
+            }
             self.files.remove(path.normalized_identity());
             Ok(())
         }
@@ -2992,12 +4288,13 @@ mod tests {
         }
     }
 
-    fn store() -> BlobStoreService<MemoryPlatform, TestCompression, TestKeys, TestAead, TestLiveSets>
-    {
+    fn store_with_platform(
+        platform: MemoryPlatform,
+    ) -> BlobStoreService<MemoryPlatform, TestCompression, TestKeys, TestAead, TestLiveSets> {
         let request = stage_request("bootstrap", b"");
         BlobStoreService::new(
             request.root_lease,
-            MemoryPlatform::default(),
+            platform,
             TestCompression,
             TestKeys,
             TestAead,
@@ -3005,6 +4302,11 @@ mod tests {
             test_anchor(),
         )
         .expect("store")
+    }
+
+    fn store() -> BlobStoreService<MemoryPlatform, TestCompression, TestKeys, TestAead, TestLiveSets>
+    {
+        store_with_platform(MemoryPlatform::default())
     }
 
     fn gc_store(
@@ -3124,6 +4426,12 @@ mod tests {
         let health = block_on(store.health()).expect("health");
         assert!(health.ready);
         assert!(health.recovery_clean);
+        let mut changed_parent = request.clone();
+        changed_parent.context.operation.idempotency_key = "gc-operation-changed".to_owned();
+        assert_eq!(
+            block_on(store.gc(changed_parent)),
+            Err(BlobError::IdempotencyConflict)
+        );
         let replay = block_on(store.gc(request)).expect("exact gc replay");
         assert_eq!(replay, receipt);
     }
@@ -3181,6 +4489,49 @@ mod tests {
         assert!(matches!(
             block_on(store.gc(request.clone())),
             Err(BlobError::UnknownGcOutcome { .. })
+        ));
+        let tombstones = WorkScopePath::new("tombstones").expect("tombstones path");
+        let tombstone_path = store
+            .core
+            .platform
+            .read()
+            .expect("platform lock")
+            .list(&tombstones)
+            .expect("tombstone list")
+            .into_iter()
+            .next()
+            .expect("durable tombstone");
+        let current_bytes = store
+            .core
+            .platform
+            .read()
+            .expect("platform lock")
+            .read_bounded(&tombstone_path, MAX_JOURNAL_BYTES)
+            .expect("tombstone bytes");
+        let current = decode_tombstone(&current_bytes).expect("tombstone");
+        let revision_one_id =
+            tombstone_cas_step_identity(&current.operation_id, &tombstone_path, 1);
+        let revision_one_status = store
+            .core
+            .platform
+            .read()
+            .expect("platform lock")
+            .cas_status(&revision_one_id)
+            .expect("retained status")
+            .expect("revision one status");
+        let revision_one_expected = revision_one_status.replacement_sha256.clone();
+        let mut stale = current.clone();
+        stale.revision = current.revision.saturating_add(1);
+        let stale_error = store.core.persist_tombstone(
+            &tombstone_path,
+            &stale,
+            Some((1, BlobCasState::Digest(revision_one_expected.clone()))),
+        );
+        assert!(matches!(
+            stale_error,
+                Err(BlobError::CasFailure { failure })
+                    if matches!(&*failure, BlobCasFailure::ExpectedStateConflict { request, .. }
+                    if request.expected == BlobCasState::Digest(revision_one_expected.clone()))
         ));
         assert!(block_on(store.read(read_request(&orphan, "unknown-read"))).is_ok());
         let health = block_on(store.health()).expect("health");
@@ -3240,5 +4591,248 @@ mod tests {
             block_on(store.read(read_request(&orphan, "crash-read"))),
             Err(BlobError::NotFound)
         ));
+    }
+
+    #[test]
+    fn memory_cas_compares_and_installs_under_one_provider_boundary() {
+        let context: BlobReceiptContext = serde_json::from_str(&context_json(
+            "REVERSIBLE_MUTATION",
+            "cas-apply",
+            "request-cas-apply",
+        ))
+        .expect("context");
+        let lease = lease(&context);
+        let target = WorkScopePath::new("tombstones/cas-apply.json").expect("target");
+        let bytes = b"replacement";
+        let request = BlobCasRequest::new(
+            context,
+            lease.clone(),
+            eliot_blob_api::BlobCasNamespace::Tombstone,
+            target.clone(),
+            BlobCasState::Missing,
+            sha256_hex(bytes),
+            bytes.len() as u64,
+            1,
+            BlobCasDurability::Requested,
+        )
+        .expect("request");
+        let mut platform = MemoryPlatform::default();
+        platform.claim_root(&lease).expect("claim");
+        assert_eq!(
+            platform.cas_capability(),
+            BlobCasCapability::AtomicCompareAndReplace
+        );
+        let applied = platform
+            .compare_and_replace_durable(&request, bytes)
+            .expect("first CAS");
+        assert_eq!(applied.success, BlobCasSuccessKind::Applied);
+        assert_eq!(applied.observed, BlobCasState::Missing);
+        let replay = platform
+            .compare_and_replace_durable(&request, bytes)
+            .expect("exact CAS replay");
+        assert_eq!(replay, applied);
+        assert_eq!(
+            platform
+                .cas_status(request.context.operation.operation_id.as_str())
+                .expect("retained status"),
+            Some(applied.clone())
+        );
+        let mut changed = request.clone();
+        changed.replacement_sha256 = sha256_hex(b"changed");
+        changed.replacement_length = 7;
+        let conflict = platform.compare_and_replace_durable(&changed, b"changed");
+        assert!(matches!(
+            conflict,
+            Err(BlobError::CasFailure { failure })
+                if matches!(*failure, BlobCasFailure::IdentityConflict { .. })
+        ));
+        assert_eq!(platform.read_bounded(&target, 1024).expect("read"), bytes);
+
+        let target_b = WorkScopePath::new("tombstones/cas-apply-other.json").expect("target");
+        let step_a_r1 = BlobStoreCore::<
+            MemoryPlatform,
+            TestCompression,
+            TestKeys,
+            TestAead,
+            TestLiveSets,
+        >::tombstone_cas_context(&request.context, "cas-parent", &target, 1)
+        .expect("step identity");
+        let step_other_target = BlobStoreCore::<
+            MemoryPlatform,
+            TestCompression,
+            TestKeys,
+            TestAead,
+            TestLiveSets,
+        >::tombstone_cas_context(
+            &request.context, "cas-parent", &target_b, 1
+        )
+        .expect("step identity");
+        let step_a_r2 = BlobStoreCore::<
+            MemoryPlatform,
+            TestCompression,
+            TestKeys,
+            TestAead,
+            TestLiveSets,
+        >::tombstone_cas_context(&request.context, "cas-parent", &target, 2)
+        .expect("step identity");
+        assert_ne!(
+            step_a_r1.operation.operation_id,
+            step_other_target.operation.operation_id
+        );
+        assert_ne!(
+            step_a_r1.operation.operation_id,
+            step_a_r2.operation.operation_id
+        );
+        assert_ne!(
+            step_other_target.operation.idempotency_key,
+            step_a_r2.operation.idempotency_key
+        );
+    }
+
+    #[test]
+    fn memory_cas_reports_exact_equal_replacement_as_noop() {
+        let context: BlobReceiptContext = serde_json::from_str(&context_json(
+            "REVERSIBLE_MUTATION",
+            "cas-noop",
+            "request-cas-noop",
+        ))
+        .expect("context");
+        let lease = lease(&context);
+        let target = WorkScopePath::new("tombstones/cas-noop.json").expect("target");
+        let bytes = b"same";
+        let mut platform = MemoryPlatform::default();
+        platform.claim_root(&lease).expect("claim");
+        platform.write_new_durable(&target, bytes).expect("seed");
+        let request = BlobCasRequest::new(
+            context,
+            lease,
+            eliot_blob_api::BlobCasNamespace::Tombstone,
+            target.clone(),
+            BlobCasState::Digest(sha256_hex(bytes)),
+            sha256_hex(bytes),
+            bytes.len() as u64,
+            1,
+            BlobCasDurability::Requested,
+        )
+        .expect("request");
+        let result = platform
+            .compare_and_replace_durable(&request, bytes)
+            .expect("no-op CAS");
+        assert_eq!(result.success, BlobCasSuccessKind::NoOp);
+        assert_eq!(platform.read_bounded(&target, 1024).expect("read"), bytes);
+    }
+
+    #[test]
+    fn legacy_tombstone_without_cas_context_stops_before_mutation() {
+        let error = decode_tombstone(br#"{"operation_id":"legacy"}"#)
+            .expect_err("legacy tombstone must not be admitted");
+        assert!(matches!(error, BlobError::PlanGap(message) if message.contains("legacy")));
+    }
+
+    #[test]
+    fn native_storage_full_mapping_keeps_unknown_partial_progress() {
+        let io_error = std::io::Error::new(std::io::ErrorKind::StorageFull, "full");
+        let error = native_capacity_error(
+            &io_error,
+            BlobCapacityStage::PayloadWrite,
+            BlobCapacityIdentity::Journal {
+                operation_id: "op-native".to_owned(),
+                idempotency_key: "idem-native".to_owned(),
+                locator: None,
+            },
+            Some(64),
+            BlobCapacityEffect::PartialWriteUnknown,
+        )
+        .expect("StorageFull must classify");
+        let BlobError::StorageCapacity { failure } = error else {
+            panic!("expected storage capacity");
+        };
+        assert_eq!(failure.evidence.attempted_bytes, Some(64));
+        assert_eq!(
+            failure.evidence.effect,
+            BlobCapacityEffect::PartialWriteUnknown
+        );
+        assert_eq!(failure.cleanup, BlobCapacityCleanup::NotApplicable);
+    }
+
+    #[test]
+    fn stage_journal_capacity_retains_operation_and_attempted_bytes() {
+        let platform = MemoryPlatform {
+            fail_write: Some(BlobCapacityStage::JournalWrite),
+            ..MemoryPlatform::default()
+        };
+        let error = block_on(
+            store_with_platform(platform).stage(stage_request("journal-full", b"payload")),
+        )
+        .expect_err("journal capacity must be surfaced");
+        let BlobError::StorageCapacity { failure } = error else {
+            panic!("expected typed journal capacity failure");
+        };
+        assert_eq!(failure.stage, BlobCapacityStage::JournalWrite);
+        assert_eq!(
+            failure.evidence.effect,
+            BlobCapacityEffect::PartialWriteUnknown
+        );
+        assert!(
+            failure
+                .evidence
+                .attempted_bytes
+                .is_some_and(|bytes| bytes > 0)
+        );
+        assert!(matches!(
+            failure.identity,
+            BlobCapacityIdentity::Journal { .. }
+        ));
+    }
+
+    #[test]
+    fn publication_capacity_keeps_possible_effect_for_reconciliation() {
+        let platform = MemoryPlatform {
+            fail_rename: true,
+            ..MemoryPlatform::default()
+        };
+        let error = block_on(
+            store_with_platform(platform).stage(stage_request("publication-full", b"payload")),
+        )
+        .expect_err("publication capacity must remain uncertain");
+        let BlobError::StorageCapacity { failure } = error else {
+            panic!("expected typed publication capacity failure");
+        };
+        assert_eq!(failure.stage, BlobCapacityStage::PayloadPublication);
+        assert!(matches!(
+            failure.evidence.effect,
+            BlobCapacityEffect::PossiblePublication { .. }
+        ));
+        assert_eq!(
+            failure.recovery,
+            BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+        );
+    }
+
+    #[test]
+    fn cleanup_capacity_retains_last_durable_phase_and_unknown_cleanup() {
+        let platform = MemoryPlatform {
+            fail_remove: true,
+            ..MemoryPlatform::default()
+        };
+        let error = block_on(
+            store_with_platform(platform).stage(stage_request("cleanup-full", b"payload")),
+        )
+        .expect_err("cleanup capacity must remain observable");
+        let BlobError::StorageCapacity { failure } = error else {
+            panic!("expected typed cleanup capacity failure");
+        };
+        assert_eq!(failure.stage, BlobCapacityStage::Cleanup);
+        assert!(matches!(
+            failure.evidence.effect,
+            BlobCapacityEffect::PossiblePublication {
+                state: PublishState::CommitDurable
+            }
+        ));
+        assert_eq!(failure.cleanup, BlobCapacityCleanup::Unknown);
+        assert_eq!(
+            failure.recovery,
+            BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+        );
     }
 }

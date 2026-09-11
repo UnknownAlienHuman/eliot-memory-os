@@ -50,7 +50,9 @@
       "tool",
       "changed_path",
       "argument_keys",
-      "attached_task"
+      "attached_task",
+      "effect_descriptor",
+      "effect_digest"
     ],
     "forbidden_classes": [
       "prompt_or_message_body",
@@ -69,6 +71,22 @@
     "failure_mode": "fail_closed",
     "explicit_allow_decisions": ["recorded", "allow", "allowed", "pass"],
     "explicit_deny_decision": "deny"
+  },
+  "effect_binding": {
+    "schema_version": "eliot.opencode.effect.v1",
+    "normalization_version": "eliot.opencode.arguments.v1",
+    "tool_identity": "exact_case_sensitive_allowlist_member",
+    "argument_binding": "bounded_plain_json_values_sorted_by_key_and_tagged_by_type",
+    "digest_algorithm": "sha256_hex",
+    "raw_values_in_receipt": false,
+    "unsupported_values": "fail_closed_without_bridge_dispatch"
+  },
+  "skipped_tool_receipt": {
+    "applies_when": "attached_task_and_exact_read_only_tool",
+    "decision": "skipped",
+    "reason": "read_only_tool",
+    "transport": "tool.execute.skipped_through_existing_host_event_bridge",
+    "execution_authority": "none"
   },
   "passive_observation": {
     "failure_mode": "degraded_non_blocking",

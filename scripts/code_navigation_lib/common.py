@@ -28,6 +28,8 @@ SKIP_DIRS = {
     "dist",
     "node_modules",
     "obj",
+    "testdata",
+    "fixtures",
 }
 DEPENDENCY_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
 

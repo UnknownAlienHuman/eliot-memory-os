@@ -29,8 +29,16 @@ fn repository_fixture() -> TestResult<tempfile::TempDir> {
         repository.path(),
         &["config", "user.email", "eliot-test@example.invalid"],
     )?;
+    fs::create_dir_all(repository.path().join("docs"))?;
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/normative-pair.toml"),
+        repository.path().join("docs/normative-pair.toml"),
+    )?;
     fs::write(repository.path().join("tracked.txt"), "source\n")?;
-    git(repository.path(), &["add", "tracked.txt"])?;
+    git(
+        repository.path(),
+        &["add", "tracked.txt", "docs/normative-pair.toml"],
+    )?;
     git(
         repository.path(),
         &["-c", "commit.gpgSign=false", "commit", "-qm", "initial"],

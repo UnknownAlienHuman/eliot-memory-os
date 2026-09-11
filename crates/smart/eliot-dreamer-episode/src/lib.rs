@@ -1,13 +1,24 @@
-//! Capability cell placeholder.
+//! Pure Episode-specific curation candidate reconstruction.
 //!
-//! NOT IMPLEMENTED. This file exists only so that per-crate
-//! `cargo check`, `cargo test` and `cargo clippy` run and report an
-//! actionable result instead of a manifest error.
-//!
-//! Cell `smart.dreamer.episode`, order 23.
-//! The purpose, contract and dependencies of this cell live in
-//! `module.toml` next to this crate. The owning work unit replaces this
-//! file and, on completion, moves the crate from the root
-//! `workspace.exclude` into `workspace.members`.
+//! The handler consumes an already admitted A-03 item and immutable owner
+//! snapshots. It joins Episode membership, boundaries, chronology, coverage,
+//! participants, outcomes and rollback evidence without I/O or mutation.
 
 #![forbid(unsafe_code)]
+
+mod input;
+mod reconstruct;
+mod result;
+
+pub use input::{
+    BoundaryRule, EpisodeOutcome, EpisodeParticipant, EpisodePolicy, EventAndSourceSnapshot,
+    EvidenceBinding, ExistingEpisodeMember, ExistingEpisodeSnapshot, GroundedEvent,
+    GroundedEventSet, MaterialPreimage, OverlapRule, ValidatedCurationInput,
+    event_material_preimage, outcome_material_preimage, participant_material_preimage,
+    temporal_material_preimage,
+};
+pub use reconstruct::reconstruct_episode_candidate;
+pub use result::{
+    ChronologyLink, ChronologyRelation, EpisodeBoundary, EpisodeCandidate, EpisodeCoverage,
+    EpisodeGap, EpisodeRollback, EpisodeStatus, OverlapAssessment, OverlapDisposition,
+};

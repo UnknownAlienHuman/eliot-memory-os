@@ -28,21 +28,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// A deterministic reference store with no external authority or I/O.
+///
+/// `MemoryStore` intentionally does not implement `Clone`; use [`MemoryStore::snapshot`]
+/// when a value projection is needed.
+///
+/// ```compile_fail
+/// use eliot_store_memory::MemoryStore;
+/// fn needs_clone<T: Clone>() {}
+/// needs_clone::<MemoryStore>();
+/// ```
 #[derive(Debug)]
 pub struct MemoryStore {
     state: Mutex<MemoryState>,
-}
-
-impl Clone for MemoryStore {
-    fn clone(&self) -> Self {
-        let state = match self.state.lock() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
-        Self {
-            state: Mutex::new(state),
-        }
-    }
 }
 
 impl Default for MemoryStore {
@@ -1658,6 +1655,37 @@ mod tests {
         assert_eq!(left.snapshot()?, right.snapshot()?);
         assert_eq!(left.projections()?, right.projections()?);
         assert_eq!(left.outbox()?, right.outbox()?);
+
+        let left_before = left.snapshot()?;
+        let right_before = right.snapshot()?;
+        let expected_next_revision = vec![RevisionHeadExpectation {
+            key: RevisionKey::new("scope:scope-1")?,
+            expected_revision: 2,
+            state_fence: state_fence.clone(),
+        }];
+        let expected_next_ordering = vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new("scope-1")?,
+            expected_sequence: 2,
+            state_fence: state_fence.clone(),
+        }];
+        left.apply_transaction(
+            &ctx,
+            transition("op-left", &state_fence)?,
+            &expected_next_revision,
+            &expected_next_ordering,
+        )?;
+        let left_after = left.snapshot()?;
+        assert_ne!(left_after, left_before);
+        assert_eq!(right.snapshot()?, right_before);
+
+        right.apply_transaction(
+            &ctx,
+            transition("op-right", &state_fence)?,
+            &expected_next_revision,
+            &expected_next_ordering,
+        )?;
+        assert_ne!(right.snapshot()?, right_before);
+        assert_eq!(left.snapshot()?, left_after);
         Ok(())
     }
 
@@ -1804,16 +1832,8 @@ mod tests {
     }
 
     #[test]
-    fn clone_recovers_exact_poisoned_snapshot_without_panicking() -> Result<(), StoreError> {
-        let state_fence = fence();
+    fn poisoned_store_refuses_snapshot_and_reports_unavailable() -> Result<(), StoreError> {
         let store = store()?;
-        store.apply_transaction(
-            &metadata(&state_fence)?,
-            transition("op-before-poison", &state_fence)?,
-            &[],
-            &[],
-        )?;
-        let expected = store.snapshot()?;
 
         let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let Ok(_guard) = store.state.lock() else {
@@ -1823,11 +1843,8 @@ mod tests {
         }));
         assert!(poison_result.is_err());
 
-        let clone_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.clone()));
-        let Ok(cloned) = clone_result else {
-            panic!("cloning a poisoned memory store panicked");
-        };
-        assert_eq!(expected, cloned.snapshot()?);
+        assert_eq!(store.snapshot(), Err(StoreError::Unavailable));
+        assert_eq!(store.health_sync()?.status, StoreHealthStatus::Unavailable);
         Ok(())
     }
 

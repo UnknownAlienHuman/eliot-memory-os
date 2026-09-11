@@ -21,7 +21,7 @@ outputs = ["PositionRequest", "CurrentEpistemicPosition", "ProvenanceClosure", "
 depends_on = ["eliot-contracts", "eliot-evidence", "eliot-receipts"]
 consumers = ["eliot-epistemic", "eliot-context-candidates", "Dreamer handlers"]
 non_goals = ["resolve a position", "rank evidence", "retrieve sources", "persist epistemic state"]
-invariants = ["Unknown, assumed, conflicted and stale are distinct", "provenance and fence remain exact", "verifier competence is explicit", "Investigation is a typed outcome, not prose"]
+invariants = ["The canonical eight epistemic statuses remain distinct from currentness and lifecycle", "provenance and fence remain exact", "verifier competence is explicit", "Investigation is a typed outcome, not prose"]
 failure_behavior = "Reject malformed or version-incompatible values without inventing a position."
 proof_surface = ["schema round-trip", "unknown-field rejection", "version compatibility", "fence/provenance fixtures"]
 replacement_boundary = "wire contract only; resolver algorithms remain independently replaceable"
@@ -31,7 +31,7 @@ rust_contract_dependencies = ["eliot-contracts", "eliot-evidence", "eliot-receip
 [[donor]]
 path = "crates/smart/eliot-epistemic/src/lib.rs"
 disposition = "extract_types_and_harden"
-scope = "PositionRequest, CurrentEpistemicPosition, ProvenanceView and errors; preserve semantics while adding missing assumption/investigation fields"
+scope = "PositionRequest, CurrentEpistemicPosition, ProvenanceView and errors; preserve architecture-owned status semantics while adding missing assumption/investigation fields"
 
 [[donor]]
 path = "ELIOT Architecture/Implementation English edition 2026-08-28"

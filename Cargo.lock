@@ -609,6 +609,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "eliot-agent-api",
+ "eliot-contracts",
  "eliot-process",
  "eliot-source-assurance",
  "schemars",
@@ -831,6 +832,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -1531,6 +1533,7 @@ dependencies = [
  "eliot-protocol",
  "eliot-receipts",
  "eliot-security-contracts",
+ "eliot-source-assurance",
  "schemars",
  "serde",
  "serde_json",
@@ -1890,6 +1893,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "eliot-bootstrap",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -35,23 +35,16 @@ pub struct ForgettingPolicy {
     pub evidence_refs: Vec<String>,
     pub rollback_or_tombstone_ref: Option<String>,
     pub reactivation_condition: Option<ReactivationCondition>,
-    #[serde(default)]
     pub expected_current_state: MemoryLifecycleState,
-    #[serde(default = "observed_epistemic_status")]
     pub observed_epistemic_status: EpistemicStatus,
-    #[serde(default)]
     pub scope: Vec<String>,
-    #[serde(default)]
     pub precondition_refs: Vec<String>,
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub effective_at: Option<OffsetDateTime>,
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
-    #[serde(default)]
     pub expected_admission_effect: MemoryEcologyDecision,
-    #[serde(default = "default_true")]
     pub reversible: bool,
-    #[serde(default)]
     pub requires_admin_approval: bool,
     #[serde(default)]
     pub approval_ref: Option<String>,
@@ -229,13 +222,10 @@ pub struct MemoryStateTransition {
     pub reason: ForgettingReason,
     pub policy_ref: String,
     pub evidence_refs: Vec<String>,
-    #[serde(default)]
     pub precondition_refs: Vec<String>,
-    #[serde(default)]
     pub expected_admission_effect: MemoryEcologyDecision,
     #[serde(default)]
     pub reactivation_condition: Option<ReactivationCondition>,
-    #[serde(default = "default_true")]
     pub reversible: bool,
     #[serde(default)]
     pub approval_ref: Option<String>,
@@ -476,8 +466,4 @@ pub struct MemoryPressureReport {
 
 const fn default_true() -> bool {
     true
-}
-
-const fn observed_epistemic_status() -> EpistemicStatus {
-    EpistemicStatus::Observed
 }

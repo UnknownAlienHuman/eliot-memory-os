@@ -208,11 +208,75 @@ pub struct ProcessStreamSinkAppend {
     wait_budget_ms: u64,
 }
 
+fn deserialize_bounded_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedBytesVisitor;
+
+    impl<'de> de::Visitor<'de> for BoundedBytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a byte array within the stream append ceiling")
+        }
+
+        fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if value.len() > super::MAX_APPEND_WIRE_BYTES {
+                return Err(E::custom("stream append exceeds the protocol byte ceiling"));
+            }
+            Ok(value.to_vec())
+        }
+
+        fn visit_borrowed_bytes<E>(self, value: &'de [u8]) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_bytes(value)
+        }
+
+        fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_bytes(&value)?;
+            Ok(value)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut bytes = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or(0)
+                    .min(super::MAX_APPEND_WIRE_BYTES),
+            );
+            while let Some(byte) = sequence.next_element()? {
+                if bytes.len() == super::MAX_APPEND_WIRE_BYTES {
+                    return Err(de::Error::custom(
+                        "stream append exceeds the protocol byte ceiling",
+                    ));
+                }
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+
+    deserializer.deserialize_byte_buf(BoundedBytesVisitor)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AppendWire {
     sequence: u64,
     offset: u64,
+    #[serde(deserialize_with = "deserialize_bounded_bytes")]
     bytes: Vec<u8>,
     sha256: String,
     wait_budget_ms: u64,
@@ -248,6 +312,9 @@ impl ProcessStreamSinkAppend {
     }
 
     pub fn validate(&self) -> Result<(), ProcessStreamSinkError> {
+        if self.bytes.len() > super::MAX_APPEND_WIRE_BYTES {
+            return Err(ProcessStreamSinkError::AppendPayloadLimitExceeded);
+        }
         validate_digest("append.sha256", &self.sha256)?;
         if self.sha256 != eliot_contracts::sha256_hex(&self.bytes) {
             return Err(ProcessStreamSinkError::InvalidDigest {
@@ -925,6 +992,7 @@ pub enum ProcessStreamSinkReadback {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessStreamSinkUnknownOutcome {
+    schema_version: String,
     session_id: ProcessStreamSinkSessionId,
     terminal_id: ProcessStreamSinkTerminalId,
     open_request_sha256: String,
@@ -934,6 +1002,7 @@ pub struct ProcessStreamSinkUnknownOutcome {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UnknownOutcomeWire {
+    schema_version: String,
     session_id: ProcessStreamSinkSessionId,
     terminal_id: ProcessStreamSinkTerminalId,
     open_request_sha256: String,
@@ -948,14 +1017,44 @@ impl ProcessStreamSinkUnknownOutcome {
         uncertainty_sha256: impl Into<String>,
     ) -> Result<Self, ProcessStreamSinkError> {
         let value = Self {
+            schema_version: PROCESS_STREAM_SINK_SCHEMA_VERSION.to_owned(),
             session_id,
             terminal_id,
             open_request_sha256: open_request_sha256.into(),
             uncertainty_sha256: uncertainty_sha256.into(),
         };
-        validate_digest("open_request_sha256", &value.open_request_sha256)?;
-        validate_digest("uncertainty_sha256", &value.uncertainty_sha256)?;
+        value.validate()?;
         Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), ProcessStreamSinkError> {
+        if self.schema_version != PROCESS_STREAM_SINK_SCHEMA_VERSION {
+            return Err(ProcessStreamSinkError::InvalidRequest {
+                reason: "unsupported sink schema version",
+            });
+        }
+        validate_digest("open_request_sha256", &self.open_request_sha256)?;
+        validate_digest("uncertainty_sha256", &self.uncertainty_sha256)
+    }
+
+    pub fn validate_against_session(
+        &self,
+        session: &super::ProcessStreamSinkSession,
+    ) -> Result<(), ProcessStreamSinkError> {
+        self.validate()?;
+        if self.session_id != *session.session_id() {
+            return Err(ProcessStreamSinkError::SessionMismatch);
+        }
+        if self.terminal_id != *session.terminal_id() {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
+        if self.open_request_sha256 != session.open_request_sha256() {
+            return Err(ProcessStreamSinkError::OpenDigestMismatch);
+        }
+        Ok(())
+    }
+    pub fn schema_version(&self) -> &str {
+        &self.schema_version
     }
     pub const fn session_id(&self) -> &ProcessStreamSinkSessionId {
         &self.session_id
@@ -974,13 +1073,15 @@ impl ProcessStreamSinkUnknownOutcome {
 impl<'de> Deserialize<'de> for ProcessStreamSinkUnknownOutcome {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = UnknownOutcomeWire::deserialize(deserializer)?;
-        Self::new(
-            wire.session_id,
-            wire.terminal_id,
-            wire.open_request_sha256,
-            wire.uncertainty_sha256,
-        )
-        .map_err(de::Error::custom)
+        let value = Self {
+            schema_version: wire.schema_version,
+            session_id: wire.session_id,
+            terminal_id: wire.terminal_id,
+            open_request_sha256: wire.open_request_sha256,
+            uncertainty_sha256: wire.uncertainty_sha256,
+        };
+        value.validate().map_err(de::Error::custom)?;
+        Ok(value)
     }
 }
 

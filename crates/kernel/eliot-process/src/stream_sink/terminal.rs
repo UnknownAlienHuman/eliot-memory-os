@@ -208,6 +208,12 @@ impl ProcessStreamSinkTerminal {
     ) -> Result<Self, ProcessStreamSinkError> {
         session.validate_finalize(&request)?;
         let command_identity = request.command_identity()?;
+        if matches!(
+            state,
+            ProcessStreamSinkState::Cancelled | ProcessStreamSinkState::UnknownOutcome
+        ) {
+            return Err(ProcessStreamSinkError::TerminalCommandStateMismatch);
+        }
         let admitted_sha256 = admitted_sha256.into();
         if command_identity.terminal_id() != session.terminal_id()
             || final_sequence != request.expected_final_sequence()
@@ -251,6 +257,30 @@ impl ProcessStreamSinkTerminal {
     ) -> Result<Self, ProcessStreamSinkError> {
         session.validate_abort(&request)?;
         let command_identity = request.command_identity()?;
+        let state_matches_reason = match request.reason() {
+            super::ProcessStreamSinkAbortReason::Cancellation
+            | super::ProcessStreamSinkAbortReason::CallerShutdown => matches!(
+                state,
+                ProcessStreamSinkState::Cancelled
+                    | ProcessStreamSinkState::PartialSource
+                    | ProcessStreamSinkState::SourceUnavailable
+            ),
+            super::ProcessStreamSinkAbortReason::PolicyProhibition => {
+                state == ProcessStreamSinkState::PolicyProhibited
+            }
+            super::ProcessStreamSinkAbortReason::RedactionFailure => {
+                state == ProcessStreamSinkState::RedactionFailed
+            }
+            super::ProcessStreamSinkAbortReason::TransportFailure => matches!(
+                state,
+                ProcessStreamSinkState::PartialSource
+                    | ProcessStreamSinkState::SourceUnavailable
+                    | ProcessStreamSinkState::PersistenceFailed
+            ),
+        };
+        if !state_matches_reason || state == ProcessStreamSinkState::UnknownOutcome {
+            return Err(ProcessStreamSinkError::TerminalCommandStateMismatch);
+        }
         let admitted_sha256 = admitted_sha256.into();
         if command_identity.terminal_id() != session.terminal_id()
             || final_sequence != request.expected_final_sequence()

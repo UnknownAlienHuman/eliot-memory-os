@@ -5,6 +5,7 @@ use super::ProcessStreamSinkError;
 use super::requests::{
     ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
     ProcessStreamSinkFinalizeRequest, ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback,
+    ProcessStreamSinkUnknownOutcome,
 };
 use super::terminal::{ProcessStreamSinkSession, ProcessStreamSinkTerminal};
 
@@ -40,5 +41,12 @@ pub trait ProcessStreamSinkClient: Send + Sync {
     fn readback(
         &self,
         session: ProcessStreamSinkSession,
+    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkReadback>;
+
+    /// Reconciles an uncertain provider effect under its exact session fence.
+    fn reconcile(
+        &self,
+        session: ProcessStreamSinkSession,
+        outcome: ProcessStreamSinkUnknownOutcome,
     ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkReadback>;
 }

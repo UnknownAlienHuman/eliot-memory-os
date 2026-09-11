@@ -2842,6 +2842,26 @@ mod tests {
         .expect("valid coordination heartbeat");
         assert!(valid.read_unique_agent_activation(20).is_ok());
 
+        let mut malformed_owner = activation_fake(&observed);
+        let mut coordination: serde_json::Value = serde_json::from_slice(
+            malformed_owner
+                .payloads
+                .get(&RecoveryOwner::Coordination)
+                .expect("coordination payload"),
+        )
+        .expect("coordination snapshot");
+        coordination["work"]["work-1"]["owner_session_id"] =
+            serde_json::Value::String("missing-session".to_owned());
+        malformed_owner.payloads.insert(
+            RecoveryOwner::Coordination,
+            canonical_json_bytes(&coordination).expect("coordination bytes"),
+        );
+        assert!(
+            GovernorComposition::new(Arc::new(malformed_owner), &expected, QueueLimits::default())
+                .is_err(),
+            "recovery accepted an active work item with a missing session"
+        );
+
         for (name, field, value) in [
             ("zero deadline", "heartbeat_deadline", 0),
             ("heartbeat after deadline", "last_heartbeat", 101),

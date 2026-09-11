@@ -9,17 +9,41 @@
 
 #![forbid(unsafe_code)]
 
+pub mod assembly;
 pub mod budget;
 pub mod bundle;
 pub mod candidate;
+pub mod classification;
+pub mod concept;
 pub mod curation;
+pub mod diagnosis;
 pub mod draft;
 pub mod encoding;
 pub mod error;
+pub mod failure;
+pub mod grounding;
 pub mod job;
+pub mod probe;
 pub mod registry;
+pub mod relation;
+pub mod rival;
 pub mod screen;
+pub mod self_query;
+pub mod validation;
 
+pub use assembly::{
+    AssemblyFrontier, AssemblyMaterial, AssemblyMaterialSet, AssemblyOmissionAccounting,
+    AssemblyOmissionConstraint, AssemblyOmissionCoverage, AssemblyReserve, AssemblyReserveSet,
+    AssemblyResult, AssemblyStop, AssemblyStopReason, BundleMeasurement,
+    ConditionalCoverageBinding, ConditionalEvaluation, ConditionalEvaluationState,
+    ConditionalPredicate, ConditionalRequirement, ConflictAtomIdentity, ContextMaterialClosure,
+    ContributionMeasurement, ContributionStatus, CurationMaterial, DisclosureAuthorization,
+    DreamInputRole, DreamJobRecipe, MaterialDisposition, MaterialLedgerEntry,
+    MaterialOutcomeReason, MaterialRepresentation, RECIPE_SCHEMA_VERSION, RecipeInput, RecipeRole,
+    ReserveUsage, RoleDisposition, RoleOmissionPolicy, RoleOutcome, RoleOutcomeState, SourceRule,
+    SourceRuleKind, SuppliedItemIdentity, material_schema_version, required_roles,
+    result_schema_version,
+};
 pub use budget::{
     BudgetDimension, BudgetLimits, BudgetUsage, DEX_BUDGET_DIMENSIONS, check_no_cross_subsidy,
 };
@@ -31,20 +55,103 @@ pub use candidate::{
     CandidateDisposition, CandidateProposal, CandidateResult, PRESERVATION_DIMENSIONS,
     PreservationDimension, PreservationReport, propose_candidate,
 };
+pub use classification::{
+    AdmittedTargetRef, ClassificationAssignmentSnapshot, ClassificationCandidate,
+    ClassificationCandidateClosure, ClassificationCriterionRole, ClassificationInput,
+    ClassificationPreservation, ClassificationPreservationDimension,
+    ClassificationPreservationVerdict, ClassificationRecordFamily, ClassificationRollback,
+    CriterionApplicability, CriterionStatus, ExternalGradeRef, FeatureObservation,
+    GroundedCriterion, NamedEvidence, PriorAssignmentRef, TaxonomyAliasMapping,
+    TaxonomyAlternative, TaxonomyCoverage, TaxonomyDenominator, classification_input_digest,
+    preflight_classification_acceptance, seal_classification, validate_classification,
+    validate_classification_acceptance,
+};
+pub use concept::{
+    ConceptApplicability, ConceptCandidate, ConceptCase, ConceptCaseKind, ConceptCoverage,
+    ConceptCriterion, ConceptCriterionRole, ConceptDependency, ConceptDiscriminator,
+    ConceptDisposition, ConceptEvidence, ConceptInput, ConceptMode, ConceptNeighborhood,
+    ConceptParameter, ConceptProposal, ConceptRollback, ConceptSnapshot, ConceptSourceDenominator,
+    ConceptSourceRef, ConceptSourceSet, ConceptVerifierRef, concept_input_digest,
+    concept_proposal_digest, seal_concept, validate_concept, validate_concept_acceptance,
+};
 pub use curation::{CURATION_WIRE_KINDS, CurationKind, CurationPayload, kind_family, parse_kind};
+pub use diagnosis::{
+    ACCEPTANCE_BINDING_SCHEMA_VERSION, AcceptanceBinding, CURRENT_DISCRIMINATOR_SCHEMA_VERSION,
+    ConfirmationIndependenceClaim, CurrentDiscriminator, CurrentObservation,
+    DiscriminatorPrecondition, LoadBearingChange, MechanismExercise, MechanismProjection,
+    ObservationDeclaration, ObservedValueKind, ObservedValueRef, PRODUCT_CONTEXT_SCHEMA_VERSION,
+    PostHocConfirmation, PreconditionState, ProductContext, REPAIR_LINEAGE_SCHEMA_VERSION,
+    RepairAttemptEntry, RepairAttemptRecord, RepairContextEndpoint, RepairContextUnavailable,
+    RepairEvent, RepairEventEntry, RepairEventOutcome, RepairHistoryPresence, RepairLineage,
+    RepairStageKind, RepeatJustification, RepeatReason, ReplayBinding, RunEvidenceAssociation,
+    SuppliedRunBinding, UnavailableEvidence, UnavailableField,
+};
 pub use draft::{
     ClaimResidue, CurationAcceptanceCtx, GroundedDreamDraft, ModelDraft, RawProviderOutput,
     SupportState, ValidatedCurationItem, ValidatedDreamDraft, ValidationReceipt,
 };
 pub use encoding::{canonical_bytes, digest_hex};
 pub use error::{ContractViolation, check_fence, check_vec_bound, is_hex64_lower};
+pub use failure::{
+    FailureAction, FailureActionEvidence, FailureApplicability, FailureCandidate,
+    FailureCausalStatus, FailureClass, FailureComparator, FailureComparisonProfile,
+    FailureControlRecord, FailureCoverage, FailureDimension, FailureDimensionDescriptor,
+    FailureDimensionSource, FailureDimensionValue, FailureDisposition, FailureEnvironment,
+    FailureEvidence, FailureEvidenceKind, FailureExpectation, FailureExpectedState, FailureHistory,
+    FailureHistoryEntry, FailureHypothesis, FailureInput, FailureLifecycle, FailureMitigation,
+    FailureObservationState, FailureOperation, FailureOutcome, FailurePreservation,
+    FailureProfileDefinition, FailureProposal, FailureReceiptMaterial, FailureResult,
+    FailureRollback, FailureSourceMember, failure_input_digest, failure_proposal_digest,
+    failure_result_digest, seal_failure, validate_failure,
+};
 pub use job::{DreamJobInput, JobClass, Requester, RequesterOrigin, parse_job_class};
+pub use probe::{
+    GapUpdateMeaning, PossibleResultSchema, PossibleResultValue, ProbeObjective,
+    ProbeObjectiveOrigin, ProbeObjectiveRef, ProbeObjectiveTarget, ProbeOwnerRef, ResultBranch,
+    ResultTarget, ResultUpdate, RivalUpdateMeaning,
+};
 pub use registry::{
     AtomicityMode, CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor,
     CurationHandlerPort, CurationHandlerRegistry, TargetDenominator, TypedCurationHandlerRequest,
     TypedCurationHandlerResult, family_of, parse_family,
 };
+pub use relation::{
+    RELATION_FAMILIES, RelationAlternative, RelationCandidate, RelationCandidateClosure,
+    RelationDirection, RelationDisclosureEvidence, RelationDisposition, RelationEndpoint,
+    RelationEvidence, RelationEvidencePolarity, RelationFamily, RelationFamilyRule, RelationInput,
+    RelationNeighborhood, RelationPredicate, RelationPreservation, RelationPreservationDimension,
+    RelationPreservationVerdict, RelationRegistrySnapshot, RelationRollback, RelationSnapshot,
+    RelationTemporalEvidence, RelationTimePoint, RelationVerifier, relation_input_digest,
+    seal_relation, validate_relation,
+};
+pub use rival::{
+    ClaimDeclarations, CommonModeDisclosure, ConditionAssumptionRef, CurrentPositionAvailability,
+    CurrentPositionBinding, DeclarationAvailability, ForecastAvailability, MaterialClaimRef,
+    PredictionAvailability, RIVAL_DECLARATION_SET_SCHEMA_VERSION, RIVAL_MODEL_SCHEMA_VERSION,
+    RIVAL_PREDICTION_SCHEMA_VERSION, RelatedRivalModelReference, RivalAssumptionSlot,
+    RivalClaimSlot, RivalCoverageDeclaration, RivalCoverageReceipt, RivalDeclarationSet,
+    RivalDeclarationSetParams, RivalDependency, RivalForecast, RivalModelDeclaration,
+    RivalModelDeclarationParams, RivalModelRef, RivalModelSlot, RivalPrediction,
+    RivalPredictionParams, RivalPredictionRef, RivalPredictionSlot, RivalSourceSlot,
+    SuppliedLineage, TemporalAvailability, VerifierAvailability,
+};
 pub use screen::{ScreenBinding, ScreenEligibility, ScreenReference, ScreenState};
+pub use self_query::{
+    ArchitectureAnchor, ArchitectureAnchorClass, ArchitectureApplicability,
+    ArchitectureApplicabilityBasis, ArchitectureApplicabilityState, ArchitectureBriefCandidate,
+    ArchitectureBriefDisposition, ArchitectureBriefGap, ArchitectureBriefGapClass,
+    ArchitectureBriefGapState, ArchitectureBriefOmission, ArchitectureBriefSection,
+    ArchitectureBriefSectionKind, ArchitectureBriefStatement, ArchitectureDependencyDenominator,
+    ArchitectureDependencyKind, ArchitectureDependencyMember, ArchitectureSourceSnapshot,
+    ArchitectureSourceStatus, ArchitectureStatementModality, AttemptBinding, NormativePairBinding,
+    SelfQueryContractError, SelfQueryInput, SelfQueryOutputProfile, SelfQueryPolicy,
+    SelfQueryProfile,
+};
+pub use validation::{
+    DreamDraftValidationError, GroundingValidationInput, STRUCTURED_VALIDATION_SCHEMA_VERSION,
+    STRUCTURED_VALIDATOR_CONTRACT, ValidatedCandidate, ValidatedGroundingCandidate,
+    ValidationPolicy,
+};
 
 /// Contract hub identity (`name@version`).
 pub const CONTRACT_NAME: &str = "eliot.smart.dreamer.contracts";

@@ -693,25 +693,24 @@ fn production_owned_receipt_publication_enforces_identity_and_content_fence()
     prepare_protected_directory(&host)?;
     let path = host.join("eliotd-receipt.json");
 
-    let PublicationOutcome::Published(first) =
-        publish_atomic_owned_runtime_receipt(&path, b"receipt-v1", None)?
-    else {
-        panic!("first publication must be classified");
+    let first_identity = match publish_atomic_owned_runtime_receipt(&path, b"receipt-v1", None)? {
+        PublicationOutcome::Published(receipt) => receipt.identity,
+        PublicationOutcome::Unknown(receipt) => receipt.expected_identity,
     };
     let first_lease = ProtectedRuntimePathLease::open_existing_absolute(&path)?;
-    assert_eq!(first_lease.identity(), first.identity);
+    assert_eq!(first_lease.identity(), first_identity);
     let first_bytes = first_lease.read_bounded(64)?;
-    let precondition = PublicationPrecondition::from_bytes(first.identity, &first_bytes);
+    let precondition = PublicationPrecondition::from_bytes(first_identity, &first_bytes);
     drop(first_lease);
 
-    let PublicationOutcome::Published(second) =
-        publish_atomic_owned_runtime_receipt(&path, b"receipt-v2", Some(&precondition))?
-    else {
-        panic!("compare-and-swap publication must be classified");
-    };
-    assert_ne!(second.identity, first.identity);
+    let second_identity =
+        match publish_atomic_owned_runtime_receipt(&path, b"receipt-v2", Some(&precondition))? {
+            PublicationOutcome::Published(receipt) => receipt.identity,
+            PublicationOutcome::Unknown(receipt) => receipt.expected_identity,
+        };
+    assert_ne!(second_identity, first_identity);
     let second_lease = ProtectedRuntimePathLease::open_existing_absolute(&path)?;
-    assert_eq!(second_lease.identity(), second.identity);
+    assert_eq!(second_lease.identity(), second_identity);
     assert_eq!(second_lease.read_bounded(64)?, b"receipt-v2");
     drop(second_lease);
 
@@ -796,7 +795,7 @@ fn concurrent_owned_receipt_create_is_atomic_no_replace() -> Result<(), Box<dyn 
             panic!("publisher thread panicked");
         };
         match outcome {
-            Ok(PublicationOutcome::Published(_)) => {
+            Ok(PublicationOutcome::Published(_) | PublicationOutcome::Unknown(_)) => {
                 published += 1;
                 published_bytes = Some(bytes);
             }
@@ -829,14 +828,14 @@ fn concurrent_owned_receipt_substitution_preserves_exact_predecessor_cas()
     let host = root.join("host");
     prepare_protected_directory(&host)?;
     let path = host.join("eliotd-receipt.json");
-    let PublicationOutcome::Published(initial) =
-        publish_atomic_owned_runtime_receipt(&path, b"predecessor", None)?
-    else {
-        panic!("initial publication must be known");
+    let initial_identity = match publish_atomic_owned_runtime_receipt(&path, b"predecessor", None)?
+    {
+        PublicationOutcome::Published(receipt) => receipt.identity,
+        PublicationOutcome::Unknown(receipt) => receipt.expected_identity,
     };
     let initial_lease = ProtectedRuntimePathLease::open_existing_absolute(&path)?;
     let initial_bytes = initial_lease.read_bounded(64)?;
-    let precondition = PublicationPrecondition::from_bytes(initial.identity, &initial_bytes);
+    let precondition = PublicationPrecondition::from_bytes(initial_identity, &initial_bytes);
     drop(initial_lease);
     drop(root_override);
 
@@ -865,7 +864,7 @@ fn concurrent_owned_receipt_substitution_preserves_exact_predecessor_cas()
             panic!("publisher thread panicked");
         };
         match outcome {
-            Ok(PublicationOutcome::Published(_)) => {
+            Ok(PublicationOutcome::Published(_) | PublicationOutcome::Unknown(_)) => {
                 published += 1;
                 published_bytes = Some(bytes);
             }
@@ -2566,14 +2565,22 @@ fn real_windows_identity_and_atomic_publication_are_safe_and_reproducible() {
     std::fs::create_dir(root.join("state")).unwrap_or_else(|_| unreachable!());
     let adapter = WindowsPlatform::new(&root).unwrap_or_else(|_| unreachable!());
     let path = WorkScopePath::new("state/current.bin").unwrap_or_else(|_| unreachable!());
-    let first = adapter
-        .publish_atomic_receipt(&path, b"first")
-        .unwrap_or_else(|_| unreachable!());
-    let second = adapter
-        .publish_atomic_receipt(&path, b"second")
-        .unwrap_or_else(|_| unreachable!());
+    let first = match adapter
+        .publish_atomic_outcome(&path, b"first")
+        .unwrap_or_else(|_| unreachable!())
+    {
+        PublicationOutcome::Published(receipt) => receipt.identity,
+        PublicationOutcome::Unknown(receipt) => receipt.expected_identity,
+    };
+    let second = match adapter
+        .publish_atomic_outcome(&path, b"second")
+        .unwrap_or_else(|_| unreachable!())
+    {
+        PublicationOutcome::Published(receipt) => receipt.identity,
+        PublicationOutcome::Unknown(receipt) => receipt.expected_identity,
+    };
     assert_ne!(
-        first.identity,
+        first,
         FileIdentity {
             volume_serial_number: 0,
             file_index: 0
@@ -2583,7 +2590,7 @@ fn real_windows_identity_and_atomic_publication_are_safe_and_reproducible() {
         adapter
             .file_identity(&path)
             .unwrap_or_else(|_| unreachable!()),
-        second.identity
+        second
     );
     assert_eq!(
         std::fs::read(root.join("state/current.bin")).unwrap_or_default(),
@@ -3379,6 +3386,37 @@ fn directory_publication_postcommit_failure_is_reconcilable_not_error() {
             .unwrap_or_else(|error| panic!("read committed role: {error}")),
         b"candidate"
     );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn directory_publication_parent_sync_failure_is_reconcilable_not_published() {
+    let root = std::env::temp_dir().join(format!(
+        "eliot-directory-publication-parent-sync-{}",
+        unique_suffix()
+    ));
+    std::fs::create_dir(&root).unwrap_or_else(|error| panic!("create fixture: {error}"));
+    let destination = root.join("bundle");
+    let publication = OwnedDirectoryPublication::create(&destination)
+        .unwrap_or_else(|error| panic!("prepare publication: {error}"));
+    std::fs::write(publication.temporary_path().join("role.bin"), b"candidate")
+        .unwrap_or_else(|error| panic!("write candidate: {error}"));
+    let identity = publication.temporary_identity();
+    crate::test_support::force_next_directory_sync_failure();
+
+    let outcome = publication.publish(identity).unwrap_or_else(|error| {
+        panic!("post-commit sync failure became pre-commit error: {error}")
+    });
+    let DirectoryPublicationOutcome::CommittedUnknown(receipt) = outcome else {
+        panic!("parent sync failure must withhold publication");
+    };
+    assert_eq!(
+        receipt.reason,
+        DirectoryPublicationUnknown::PostCommitParentSyncUnavailable
+    );
+    assert!(destination.exists());
+    assert!(!root.join(".bundle.tmp").exists());
     let _ = std::fs::remove_dir_all(root);
 }
 

@@ -1160,6 +1160,10 @@ impl ProcessEvidenceRecord {
         ))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "fail-closed ORS validation is kept together"
+    )]
     pub(crate) fn validate(&self) -> Result<(), OrsError> {
         if self.contract_version != CONTRACT_VERSION {
             return Err(OrsError::UnsupportedContractVersion(self.contract_version));
@@ -1186,6 +1190,12 @@ impl ProcessEvidenceRecord {
                 reason: "epoch, generation, and observation time must be positive",
             });
         }
+        self.evidence
+            .validate()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "process_evidence",
+                reason: error.to_string(),
+            })?;
         let axes = self.evidence.axes();
         let axes =
             serde_json::to_value(axes).map_err(|error| OrsError::Encoding(error.to_string()))?;
@@ -1220,6 +1230,16 @@ impl ProcessEvidenceRecord {
             });
         }
         let binding = self.evidence.binding();
+        if self.process_tree_id.as_str() != binding.process_tree_id().as_str()
+            || self.job_id.as_str() != binding.job_id().as_str()
+            || self.image_id.as_str() != binding.image_id().as_str()
+            || self.session_id.as_str() != binding.session_id().as_str()
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "process_evidence",
+                reason: "evidence identity does not match its durable projection".to_owned(),
+            });
+        }
         let binding_bytes =
             serde_json::to_vec(binding).map_err(|error| OrsError::Encoding(error.to_string()))?;
         let state_fence_bytes = serde_json::to_vec(binding.state_fence())

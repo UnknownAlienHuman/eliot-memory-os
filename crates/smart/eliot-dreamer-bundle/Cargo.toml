@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [package.metadata.eliot]
 prototype = true
-source_status = "NOT_IMPLEMENTED"
+source_status = "IMPLEMENTED_PROTOTYPE"
 workspace_admission = "pending_agent_implementation_and_proof"
 functional_cell = "smart.dreamer.bundle"
 source_layer = "C1"
@@ -24,6 +24,8 @@ agent_order = 4
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
 eliot-context-contracts = { path = "../eliot-context-contracts" }
 eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }
+eliot-security-contracts = { path = "../../foundation/eliot-security-contracts" }
 
 [lints]
 workspace = true

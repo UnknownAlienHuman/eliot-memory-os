@@ -91,7 +91,7 @@
         "continuation_kind": "native_resume"
       },
       "event_contract": {
-        "source": "GET /event or /global/event server-sent event stream plus plugin pre-effect observations",
+        "source": "GET /event or /global/event server-sent event stream plus plugin pre-effect observations and transported read-only skips",
         "ordering": "server event identity and cursor wrapped in ELIOT EventEnvelope sequence",
         "durable_bridge_required": true,
         "terminal_result_separate": true,
@@ -140,6 +140,9 @@
     "pin executable and OpenAPI digest for the exact installed runtime",
     "prove health, provider/model discovery, session create, prompt, SSE terminal event, fork, and abort",
     "prove plugin mutating gates fail closed only for attached mutating tasks",
+    "prove exact tool identity and canonical argument values bind the versioned effect digest",
+    "prove exact read-only tools emit deterministic skipped receipts through the host-event bridge",
+    "prove aliases, unknown tools, unsupported values, sparse values, and oversize values fail closed before dispatch",
     "prove the plugin prefers authenticated literal-loopback HTTP and preserves one event identity across a bounded transient retry",
     "prove an attempted HTTP delivery never crosses transport into the legacy process fallback",
     "prove passive plugin events use bounded serialized dispatch and cannot exhaust child processes",

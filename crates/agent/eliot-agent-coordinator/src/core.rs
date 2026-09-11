@@ -915,7 +915,7 @@ impl AgentCoordinator {
         {
             return Err(CoordinatorError::RouteMismatch);
         }
-        if submission.result.disposition == ResultDisposition::VerifiedComplete {
+        if submission.result.disposition == ResultDisposition::CandidateSucceeded {
             self.require_descendant_closure(&current.attempt_id)?;
         }
         let receipt = CandidateResultReceipt {
@@ -1068,9 +1068,9 @@ impl AgentCoordinator {
                     .get(&attempt.attempt_id)
                     .and_then(|submission_id| self.submissions.get(submission_id))
                     .map(|record| match record.receipt.provider_disposition {
-                        ResultDisposition::VerifiedComplete => DescendantTerminalState::Completed,
+                        ResultDisposition::CandidateSucceeded => DescendantTerminalState::Completed,
                         ResultDisposition::Partial => DescendantTerminalState::Partial,
-                        ResultDisposition::Cancelled => DescendantTerminalState::Cancelled,
+                        ResultDisposition::CancelledObserved => DescendantTerminalState::Cancelled,
                         ResultDisposition::UnknownOutcome => {
                             DescendantTerminalState::UnknownOutcome
                         }
@@ -1078,7 +1078,7 @@ impl AgentCoordinator {
                         ResultDisposition::Blocked
                         | ResultDisposition::FailedVerification
                         | ResultDisposition::DegradedNoProof
-                        | ResultDisposition::UnsafeToFinish => DescendantTerminalState::Failed,
+                        | ResultDisposition::Unsafe => DescendantTerminalState::Failed,
                     })
                     .ok_or(CoordinatorError::IncompleteDescendantClosure)?,
             };

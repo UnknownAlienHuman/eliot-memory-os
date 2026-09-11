@@ -94,6 +94,8 @@ pub enum CoordinationError {
     NoActiveBinding,
     #[error("multiple active work bindings exist")]
     AmbiguousActiveBinding,
+    #[error("active work lease selection exceeds the ceiling of {limit}")]
+    ActiveWorkLeaseSelectionCeilingExceeded { limit: usize },
     #[error("legacy work lease cannot be given canonical issuance provenance")]
     LegacyWorkLeaseCannotBeCanonicalized,
     #[error("work lease issuance evidence could not be encoded")]
@@ -199,6 +201,9 @@ pub struct WorkLease {
     pub issued_at: u64,
     pub expires_at: u64,
     pub last_heartbeat: u64,
+    /// Set when this lease is retained as history but cannot authorize work.
+    #[serde(default)]
+    pub retired_at: Option<u64>,
 }
 
 /// The exact, cloned coordination records needed to inspect one live lease.
@@ -212,6 +217,22 @@ pub struct ActiveWorkLeaseProjection {
     pub session: AgentSession,
     pub work_item: WorkItem,
     pub lease: WorkLease,
+}
+
+/// Maximum number of validated active work projections retained by one read.
+pub const ACTIVE_WORK_LEASE_SELECTION_CEILING: usize = 64;
+
+/// Complete, immutable selection state over the validated active-work denominator.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub enum ActiveWorkLeaseSelection {
+    None,
+    Unique {
+        projection: Box<ActiveWorkLeaseProjection>,
+    },
+    Ambiguous {
+        projections: Vec<ActiveWorkLeaseProjection>,
+    },
 }
 
 /// Exact assignment request.  `request_id` is the retry identity.
@@ -464,6 +485,13 @@ impl CoordinationOwner {
         if snapshot.sequence != snapshot.events.len() as u64 {
             return Err(CoordinationError::CausalPredecessorMismatch);
         }
+        if snapshot.leases.values().any(|lease| {
+            lease
+                .retired_at
+                .is_some_and(|retired_at| retired_at == 0 || retired_at < lease.issued_at)
+        }) {
+            return Err(CoordinationError::InvalidState);
+        }
         for session in snapshot
             .sessions
             .values()
@@ -483,6 +511,7 @@ impl CoordinationOwner {
         {
             return Err(CoordinationError::InvalidState);
         }
+        snapshot.validate_active_bindings()?;
         snapshot.validate_issuance_snapshot()?;
         Ok(snapshot)
     }
@@ -499,6 +528,56 @@ impl CoordinationOwner {
         owner.validate_current_bindings(authority_epoch, state_fence)?;
         Ok(owner)
     }
+
+    fn validate_active_bindings(&self) -> Result<(), CoordinationError> {
+        for (work_item_id, item) in self.work.iter().filter(|(_, item)| {
+            matches!(
+                item.state,
+                WorkState::Claimed
+                    | WorkState::Running
+                    | WorkState::Checkpointed
+                    | WorkState::Reassigned
+            )
+        }) {
+            let session_id = item
+                .owner_session_id
+                .as_deref()
+                .ok_or(CoordinationError::InvalidState)?;
+            let lease_id = item
+                .lease_id
+                .as_deref()
+                .ok_or(CoordinationError::InvalidState)?;
+            let session = self
+                .sessions
+                .get(session_id)
+                .ok_or(CoordinationError::InvalidState)?;
+            let lease = self
+                .leases
+                .get(lease_id)
+                .ok_or(CoordinationError::InvalidState)?;
+            if item.work_item_id != *work_item_id
+                || item.state_fence.validate().is_err()
+                || session.state != SessionState::Active
+                || session.session_id != session_id
+                || session.authority_epoch != item.state_fence.authority_epoch
+                || session.state_fence != item.state_fence
+                || lease.lease_id != lease_id
+                || lease.work_item_id != item.work_item_id
+                || lease.holder_session_id != session_id
+                || lease.authority_epoch != item.state_fence.authority_epoch
+                || lease.state_fence != item.state_fence
+                || lease.issued_at == 0
+                || lease.expires_at == 0
+                || lease.issued_at > lease.expires_at
+                || lease.last_heartbeat < lease.issued_at
+                || lease.last_heartbeat > lease.expires_at
+            {
+                return Err(CoordinationError::InvalidState);
+            }
+        }
+        Ok(())
+    }
+
     pub fn current_sequence(&self) -> u64 {
         self.sequence
     }
@@ -570,7 +649,10 @@ impl CoordinationOwner {
         }
         if !matches!(
             work_item.state,
-            WorkState::Claimed | WorkState::Running | WorkState::Checkpointed
+            WorkState::Claimed
+                | WorkState::Running
+                | WorkState::Checkpointed
+                | WorkState::Reassigned
         ) {
             return Err(CoordinationError::InvalidState);
         }
@@ -601,6 +683,9 @@ impl CoordinationOwner {
         if lease.authority_epoch != authority_epoch || lease.state_fence != *state_fence {
             return Err(CoordinationError::FenceMismatch);
         }
+        if lease.retired_at.is_some() {
+            return Err(CoordinationError::InvalidState);
+        }
         if lease.issued_at == 0 || lease.expires_at == 0 || lease.issued_at > lease.expires_at {
             return Err(CoordinationError::InvalidField("lease_interval"));
         }
@@ -623,17 +708,17 @@ impl CoordinationOwner {
         })
     }
 
-    /// Reads the sole active work lease without accepting a semantic identity.
+    /// Reads the complete bounded active-work selection without accepting a semantic identity.
     ///
     /// Every active session and every nonterminal work item is validated before
     /// the result is counted.  Malformed or orphaned active-looking state is a
     /// hard error; map order is never used to select a result.
-    pub fn read_unique_active_work_lease(
+    pub fn read_active_work_lease_selection(
         &self,
         now: u64,
         authority_epoch: AuthorityEpoch,
         state_fence: &StateFence,
-    ) -> Result<ActiveWorkLeaseProjection, CoordinationError> {
+    ) -> Result<ActiveWorkLeaseSelection, CoordinationError> {
         self.common(authority_epoch, state_fence)?;
         for session_id in self.sessions.keys() {
             if self.sessions[session_id].state == SessionState::Active {
@@ -650,7 +735,10 @@ impl CoordinationOwner {
             }
             if !matches!(
                 work_item.state,
-                WorkState::Claimed | WorkState::Running | WorkState::Checkpointed
+                WorkState::Claimed
+                    | WorkState::Running
+                    | WorkState::Checkpointed
+                    | WorkState::Reassigned
             ) {
                 continue;
             }
@@ -669,19 +757,61 @@ impl CoordinationOwner {
                 authority_epoch,
                 state_fence,
             )?;
-            projections.push(projection);
+            if projections.len() < ACTIVE_WORK_LEASE_SELECTION_CEILING {
+                projections.push(projection);
+            }
         }
         for (lease_id, lease) in &self.leases {
+            if lease.retired_at.is_some() {
+                if linked_leases.contains(lease_id) {
+                    return Err(CoordinationError::InvalidState);
+                }
+                continue;
+            }
             if lease.expires_at >= now && !linked_leases.contains(lease_id) {
                 return Err(CoordinationError::InvalidState);
             }
         }
-        match projections.len() {
-            0 => Err(CoordinationError::NoActiveBinding),
-            1 => Ok(projections
-                .pop()
-                .ok_or(CoordinationError::NoActiveBinding)?),
-            _ => Err(CoordinationError::AmbiguousActiveBinding),
+        let active_count = self
+            .work
+            .values()
+            .filter(|item| {
+                matches!(
+                    item.state,
+                    WorkState::Claimed
+                        | WorkState::Running
+                        | WorkState::Checkpointed
+                        | WorkState::Reassigned
+                )
+            })
+            .count();
+        if active_count > ACTIVE_WORK_LEASE_SELECTION_CEILING {
+            return Err(CoordinationError::ActiveWorkLeaseSelectionCeilingExceeded {
+                limit: ACTIVE_WORK_LEASE_SELECTION_CEILING,
+            });
+        }
+        Ok(match projections.len() {
+            0 => ActiveWorkLeaseSelection::None,
+            1 => ActiveWorkLeaseSelection::Unique {
+                projection: Box::new(projections.pop().ok_or(CoordinationError::InvalidState)?),
+            },
+            _ => ActiveWorkLeaseSelection::Ambiguous { projections },
+        })
+    }
+
+    /// Reads the sole active work lease through the complete selection boundary.
+    pub fn read_unique_active_work_lease(
+        &self,
+        now: u64,
+        authority_epoch: AuthorityEpoch,
+        state_fence: &StateFence,
+    ) -> Result<ActiveWorkLeaseProjection, CoordinationError> {
+        match self.read_active_work_lease_selection(now, authority_epoch, state_fence)? {
+            ActiveWorkLeaseSelection::None => Err(CoordinationError::NoActiveBinding),
+            ActiveWorkLeaseSelection::Unique { projection } => Ok(*projection),
+            ActiveWorkLeaseSelection::Ambiguous { .. } => {
+                Err(CoordinationError::AmbiguousActiveBinding)
+            }
         }
     }
 
@@ -694,6 +824,54 @@ impl CoordinationOwner {
             .validate()
             .map_err(|_| CoordinationError::FenceMismatch)
     }
+
+    fn exact_work_replay(
+        &self,
+        req: &WorkLeaseRequest,
+    ) -> Result<Option<WorkLeaseDecision>, CoordinationError> {
+        let Some(event) = self.event_by_request.get(&req.request_id) else {
+            return Ok(None);
+        };
+        let expires_at = req.now.checked_add(req.lease_duration);
+        let exact_event = event.kind == CoordinationEventKind::WorkClaimed
+            && event.idempotency_key == req.request_id
+            && event.event_id == format!("claim:{}", req.lease_id)
+            && event.subject_id == req.work_item_id
+            && event.actor_id == req.session_id
+            && event.authority_epoch == req.authority_epoch
+            && event.state_fence == req.state_fence
+            && event.payload_digest == req.lease_id;
+        let exact_lease = self.leases.get(&req.lease_id).is_some_and(|lease| {
+            Some(lease.expires_at) == expires_at
+                && lease.lease_id == req.lease_id
+                && lease.work_item_id == req.work_item_id
+                && lease.holder_session_id == req.session_id
+                && lease.authority_epoch == req.authority_epoch
+                && lease.state_fence == req.state_fence
+                && lease.issued_at == req.now
+                && lease.last_heartbeat == req.now
+        });
+        let exact_item = self.work.get(&req.work_item_id).is_some_and(|item| {
+            item.work_item_id == req.work_item_id
+                && item.owner_session_id.as_deref() == Some(req.session_id.as_str())
+                && item.lease_id.as_deref() == Some(req.lease_id.as_str())
+        });
+        if !(exact_event && exact_lease && exact_item) {
+            return Err(CoordinationError::IdempotencyConflict(
+                req.request_id.clone(),
+            ));
+        }
+        let lease = self
+            .leases
+            .get(&req.lease_id)
+            .cloned()
+            .ok_or(CoordinationError::InvalidState)?;
+        Ok(Some(WorkLeaseDecision {
+            lease,
+            event: event.clone(),
+        }))
+    }
+
     #[allow(clippy::unused_self)]
     fn request(&self, id: &str) -> Result<(), CoordinationError> {
         text(id, "request_id")
@@ -810,6 +988,9 @@ impl CoordinationOwner {
         if l.authority_epoch != epoch || l.state_fence != *fence {
             return Err(CoordinationError::FenceMismatch);
         }
+        if l.retired_at.is_some() {
+            return Err(CoordinationError::InvalidState);
+        }
         Ok(l.clone())
     }
 
@@ -897,6 +1078,13 @@ impl CoordinationOwner {
         &mut self,
         req: WorkLeaseRequest,
     ) -> Result<WorkLeaseDecision, CoordinationError> {
+        if self.event_by_request.contains_key(&req.request_id) {
+            let decision = self
+                .exact_work_replay(&req)?
+                .ok_or(CoordinationError::InvalidState)?;
+            self.common(req.authority_epoch, &req.state_fence)?;
+            return Ok(decision);
+        }
         self.common(req.authority_epoch, &req.state_fence)?;
         nonzero(req.lease_duration, "lease_duration")?;
         let session = self.session(&req.session_id, req.authority_epoch, &req.state_fence)?;
@@ -908,19 +1096,6 @@ impl CoordinationOwner {
                 id: req.work_item_id.clone(),
             })?;
         if item.state != WorkState::Ready {
-            if item.lease_id.as_deref() == Some(&req.lease_id) {
-                let l = self
-                    .leases
-                    .get(&req.lease_id)
-                    .cloned()
-                    .ok_or(CoordinationError::InvalidState)?;
-                let e = self
-                    .event_by_request
-                    .get(&req.request_id)
-                    .cloned()
-                    .ok_or(CoordinationError::InvalidState)?;
-                return Ok(WorkLeaseDecision { lease: l, event: e });
-            }
             return Err(CoordinationError::WorkAlreadyOwned);
         }
         text(&req.lease_id, "lease_id")?;
@@ -936,6 +1111,7 @@ impl CoordinationOwner {
                 .checked_add(req.lease_duration)
                 .ok_or(CoordinationError::InvalidField("lease_duration"))?,
             last_heartbeat: req.now,
+            retired_at: None,
         };
         let event = self.event(
             &req.request_id,
@@ -1100,7 +1276,10 @@ impl CoordinationOwner {
         if !matches!(
             (current, state),
             (
-                WorkState::Claimed | WorkState::Running | WorkState::Checkpointed,
+                WorkState::Claimed
+                    | WorkState::Running
+                    | WorkState::Checkpointed
+                    | WorkState::Reassigned,
                 WorkState::Checkpointed | WorkState::Submitted
             )
         ) {
@@ -1183,21 +1362,75 @@ impl CoordinationOwner {
         })
     }
 
-    /// Reassignment fences the old lease before installing the new owner.
-    pub fn reassign(
-        &mut self,
-        req: ReassignWorkRequest,
+    fn reassignment_retry(
+        &self,
+        req: &ReassignWorkRequest,
+        expires_at: u64,
+        existing: &CoordinationEvent,
     ) -> Result<WorkLeaseDecision, CoordinationError> {
-        self.common(req.authority_epoch, &req.state_fence)?;
-        let old =
-            self.leases
-                .get(&req.old_lease_id)
-                .ok_or_else(|| CoordinationError::NotFound {
-                    kind: "lease",
-                    id: req.old_lease_id.clone(),
-                })?;
-        if old.authority_epoch == req.authority_epoch && old.state_fence != req.state_fence {
+        if !reassignment_event_matches_request(existing, req) {
+            return Err(CoordinationError::IdempotencyConflict(
+                req.request_id.clone(),
+            ));
+        }
+        let item = self
+            .work
+            .get(&req.work_item_id)
+            .ok_or(CoordinationError::InvalidState)?;
+        let lease = self
+            .leases
+            .get(&req.new_lease_id)
+            .ok_or(CoordinationError::InvalidState)?;
+        if item.state != WorkState::Reassigned
+            || item.owner_session_id.as_deref() != Some(req.new_session_id.as_str())
+            || item.lease_id.as_deref() != Some(req.new_lease_id.as_str())
+            || lease.retired_at.is_some()
+            || lease.work_item_id != req.work_item_id
+            || lease.holder_session_id != req.new_session_id
+            || lease.authority_epoch != req.authority_epoch
+            || lease.state_fence != req.state_fence
+            || lease.issued_at != req.now
+            || lease.expires_at != expires_at
+            || lease.last_heartbeat != req.now
+        {
+            return Err(CoordinationError::IdempotencyConflict(
+                req.request_id.clone(),
+            ));
+        }
+        Ok(WorkLeaseDecision {
+            lease: lease.clone(),
+            event: existing.clone(),
+        })
+    }
+
+    fn validate_reassignment_source(
+        &self,
+        req: &ReassignWorkRequest,
+    ) -> Result<(), CoordinationError> {
+        let old = self.leases.get(&req.old_lease_id).cloned().ok_or_else(|| {
+            CoordinationError::NotFound {
+                kind: "lease",
+                id: req.old_lease_id.clone(),
+            }
+        })?;
+        if old.retired_at.is_some() {
+            return Err(CoordinationError::InvalidState);
+        }
+        if old.lease_id != req.old_lease_id
+            || old.work_item_id != req.work_item_id
+            || old.authority_epoch != req.authority_epoch
+            || old.state_fence != req.state_fence
+        {
             return Err(CoordinationError::FenceMismatch);
+        }
+        if old.issued_at == 0 || old.expires_at == 0 || old.issued_at > old.expires_at {
+            return Err(CoordinationError::InvalidField("lease_interval"));
+        }
+        if old.last_heartbeat < old.issued_at || old.last_heartbeat > old.expires_at {
+            return Err(CoordinationError::InvalidField("lease_last_heartbeat"));
+        }
+        if req.now < old.issued_at {
+            return Err(CoordinationError::LeaseNotYetValid);
         }
         let item = self
             .work
@@ -1206,17 +1439,63 @@ impl CoordinationOwner {
                 kind: "work_item",
                 id: req.work_item_id.clone(),
             })?;
-        if item.lease_id.as_deref() != Some(&req.old_lease_id) {
+        if item.state_fence != req.state_fence
+            || !matches!(
+                item.state,
+                WorkState::Claimed
+                    | WorkState::Running
+                    | WorkState::Checkpointed
+                    | WorkState::Reassigned
+            )
+            || item.lease_id.as_deref() != Some(req.old_lease_id.as_str())
+            || item.owner_session_id.as_deref() != Some(old.holder_session_id.as_str())
+        {
             return Err(CoordinationError::LeaseOwnerMismatch {
                 holder: item.owner_session_id.clone().unwrap_or_default(),
             });
         }
-        self.sessions
-            .get(&req.new_session_id)
-            .ok_or_else(|| CoordinationError::NotFound {
-                kind: "session",
-                id: req.new_session_id.clone(),
-            })?;
+        Ok(())
+    }
+
+    /// Reassignment retires the old lease before installing the new owner.
+    pub fn reassign(
+        &mut self,
+        req: ReassignWorkRequest,
+    ) -> Result<WorkLeaseDecision, CoordinationError> {
+        for (value, field) in [
+            (&req.request_id, "request_id"),
+            (&req.work_item_id, "work_item_id"),
+            (&req.old_lease_id, "old_lease_id"),
+            (&req.new_lease_id, "new_lease_id"),
+            (&req.new_session_id, "new_session_id"),
+        ] {
+            text(value, field)?;
+        }
+        self.common(req.authority_epoch, &req.state_fence)?;
+        nonzero(req.now, "now")?;
+        nonzero(req.lease_duration, "lease_duration")?;
+        let expires_at = req
+            .now
+            .checked_add(req.lease_duration)
+            .ok_or(CoordinationError::InvalidField("lease_duration"))?;
+        if req.old_lease_id == req.new_lease_id {
+            return Err(CoordinationError::Duplicate(req.new_lease_id));
+        }
+
+        if let Some(existing) = self.event_by_request.get(&req.request_id) {
+            return self.reassignment_retry(&req, expires_at, existing);
+        }
+
+        self.validate_reassignment_source(&req)?;
+        self.read_active_session(
+            &req.new_session_id,
+            req.now,
+            req.authority_epoch,
+            &req.state_fence,
+        )?;
+        if self.leases.contains_key(&req.new_lease_id) {
+            return Err(CoordinationError::Duplicate(req.new_lease_id));
+        }
         let lease = WorkLease {
             lease_id: req.new_lease_id.clone(),
             work_item_id: req.work_item_id.clone(),
@@ -1224,11 +1503,9 @@ impl CoordinationOwner {
             authority_epoch: req.authority_epoch,
             state_fence: req.state_fence.clone(),
             issued_at: req.now,
-            expires_at: req
-                .now
-                .checked_add(req.lease_duration)
-                .ok_or(CoordinationError::InvalidField("lease_duration"))?,
+            expires_at,
             last_heartbeat: req.now,
+            retired_at: None,
         };
         let event = self.event(
             &req.request_id,
@@ -1238,8 +1515,8 @@ impl CoordinationOwner {
             req.new_session_id.clone(),
             (self.sequence != 0).then_some(self.sequence),
             req.authority_epoch,
-            req.state_fence,
-            req.new_lease_id.clone(),
+            req.state_fence.clone(),
+            reassignment_payload(&req),
             ClockReading {
                 valid_time_ms: None,
                 known_time_ms: None,
@@ -1248,6 +1525,11 @@ impl CoordinationOwner {
             },
         )?;
         let event = self.commit(&req.request_id, event)?;
+        let old = self
+            .leases
+            .get_mut(&req.old_lease_id)
+            .ok_or(CoordinationError::InvalidState)?;
+        old.retired_at = Some(req.now);
         let item = self
             .work
             .get_mut(&req.work_item_id)
@@ -1268,12 +1550,12 @@ impl CoordinationOwner {
         text(&req.candidate_ref, "candidate_ref")?;
         text(&req.target_scope, "target_scope")?;
         self.common(req.authority_epoch, &req.state_fence)?;
-        self.lease_for_work(
+        self.read_active_work_lease(
             &req.source_work_item_id,
             &req.session_id,
+            req.now,
             req.authority_epoch,
             &req.state_fence,
-            req.now,
         )?;
         let event = self.event(
             &req.request_id,
@@ -1299,28 +1581,6 @@ impl CoordinationOwner {
             event,
         })
     }
-    fn lease_for_work(
-        &self,
-        work: &str,
-        session: &str,
-        epoch: AuthorityEpoch,
-        fence: &StateFence,
-        now: u64,
-    ) -> Result<(), CoordinationError> {
-        let item = self
-            .work
-            .get(work)
-            .ok_or_else(|| CoordinationError::NotFound {
-                kind: "work_item",
-                id: work.to_owned(),
-            })?;
-        let lease = item
-            .lease_id
-            .as_ref()
-            .ok_or(CoordinationError::InvalidState)?;
-        self.lease(lease, session, now, epoch, fence).map(|_| ())
-    }
-
     /// Acquires the single integration writer for a target scope.
     pub fn acquire_integration(
         &mut self,
@@ -1389,6 +1649,24 @@ impl CoordinationOwner {
     }
 }
 
+fn reassignment_payload(req: &ReassignWorkRequest) -> String {
+    format!("{}:{}", req.old_lease_id, req.new_lease_id)
+}
+
+fn reassignment_event_matches_request(
+    event: &CoordinationEvent,
+    request: &ReassignWorkRequest,
+) -> bool {
+    event.kind == CoordinationEventKind::WorkReassigned
+        && event.idempotency_key == request.request_id
+        && event.event_id == format!("reassign:{}", request.work_item_id)
+        && event.subject_id == request.work_item_id
+        && event.actor_id == request.new_session_id
+        && event.authority_epoch == request.authority_epoch
+        && event.state_fence == request.state_fence
+        && event.payload_digest == reassignment_payload(request)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::similar_names, clippy::unwrap_used)]
 mod tests {
@@ -1442,18 +1720,36 @@ mod tests {
             )
             .expect("work registration");
         owner
-            .acquire_work(WorkLeaseRequest {
-                request_id: "claim-work".to_owned(),
-                lease_id: "lease-1".to_owned(),
-                work_item_id: "work-1".to_owned(),
-                session_id: "session-1".to_owned(),
-                authority_epoch: AuthorityEpoch::genesis(),
-                state_fence: state_fence.clone(),
-                now: 20,
-                lease_duration: 40,
-            })
+            .acquire_work(claim_request(&state_fence))
             .expect("work claim");
         (owner, state_fence)
+    }
+
+    fn claim_request(state_fence: &StateFence) -> WorkLeaseRequest {
+        WorkLeaseRequest {
+            request_id: "claim-work".to_owned(),
+            lease_id: "lease-1".to_owned(),
+            work_item_id: "work-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            authority_epoch: AuthorityEpoch::genesis(),
+            state_fence: state_fence.clone(),
+            now: 20,
+            lease_duration: 40,
+        }
+    }
+
+    fn candidate_request() -> IntegrationCandidateDraft {
+        IntegrationCandidateDraft {
+            request_id: "candidate-request".to_owned(),
+            candidate_id: "candidate-1".to_owned(),
+            source_work_item_id: "work-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            authority_epoch: AuthorityEpoch::genesis(),
+            state_fence: fence(),
+            candidate_ref: "candidate-ref".to_owned(),
+            target_scope: "scope-1".to_owned(),
+            now: 50,
+        }
     }
 
     fn add_claim(owner: &mut CoordinationOwner, state_fence: &StateFence, suffix: &str) {
@@ -1762,6 +2058,147 @@ mod tests {
     }
 
     #[test]
+    fn reassignment_retires_old_lease_and_preserves_one_active_binding() {
+        let (mut owner, state_fence) = claimed_owner();
+        owner
+            .register_session(RegisterSession {
+                request_id: "register-session-2".to_owned(),
+                session_id: "session-2".to_owned(),
+                principal_id: "principal-2".to_owned(),
+                route_ref: "route-2".to_owned(),
+                authority_epoch: AuthorityEpoch::genesis(),
+                state_fence: state_fence.clone(),
+                now: 10,
+                heartbeat_deadline: 100,
+            })
+            .expect("replacement session");
+        let request = ReassignWorkRequest {
+            request_id: "reassign-work".to_owned(),
+            work_item_id: "work-1".to_owned(),
+            old_lease_id: "lease-1".to_owned(),
+            new_lease_id: "lease-2".to_owned(),
+            new_session_id: "session-2".to_owned(),
+            authority_epoch: AuthorityEpoch::genesis(),
+            state_fence: state_fence.clone(),
+            now: 50,
+            lease_duration: 40,
+        };
+        let decision = owner.reassign(request.clone()).expect("reassignment");
+        assert_eq!(owner.leases["lease-1"].retired_at, Some(50));
+        assert_eq!(owner.work["work-1"].state, WorkState::Reassigned);
+        assert_eq!(decision.lease.lease_id, "lease-2");
+        assert_eq!(
+            owner.heartbeat(AgentHeartbeat {
+                request_id: "old-heartbeat".to_owned(),
+                session_id: "session-1".to_owned(),
+                lease_id: "lease-1".to_owned(),
+                authority_epoch: AuthorityEpoch::genesis(),
+                state_fence: state_fence.clone(),
+                now: 50,
+                extend_to: 90,
+            }),
+            Err(CoordinationError::InvalidState)
+        );
+        let selection = owner
+            .read_active_work_lease_selection(50, AuthorityEpoch::genesis(), &state_fence)
+            .expect("one active reassigned binding");
+        assert!(matches!(
+            &selection,
+            ActiveWorkLeaseSelection::Unique { .. }
+        ));
+        if let ActiveWorkLeaseSelection::Unique { projection } = selection {
+            assert_eq!(projection.work_item.state, WorkState::Reassigned);
+            assert_eq!(projection.lease.lease_id, "lease-2");
+        }
+        let sequence = owner.current_sequence();
+        assert_eq!(
+            owner.reassign(request.clone()).expect("idempotent retry"),
+            decision
+        );
+        assert_eq!(owner.current_sequence(), sequence);
+
+        let mut changed = ReassignWorkRequest {
+            lease_duration: 41,
+            ..request
+        };
+        assert_eq!(
+            owner.reassign(changed.clone()),
+            Err(CoordinationError::IdempotencyConflict(
+                "reassign-work".to_owned()
+            ))
+        );
+        changed.old_lease_id = "other-old-lease".to_owned();
+        assert_eq!(
+            owner.reassign(changed),
+            Err(CoordinationError::IdempotencyConflict(
+                "reassign-work".to_owned()
+            ))
+        );
+        let mut malformed = owner.clone();
+        malformed.leases.get_mut("lease-1").unwrap().retired_at = Some(0);
+        assert!(matches!(
+            CoordinationOwner::from_snapshot(malformed),
+            Err(CoordinationError::InvalidState)
+        ));
+        let recovered =
+            CoordinationOwner::from_snapshot_at(owner, AuthorityEpoch::genesis(), &state_fence)
+                .expect("reassignment recovery");
+        assert_eq!(
+            recovered
+                .read_unique_active_work_lease(50, AuthorityEpoch::genesis(), &state_fence)
+                .expect("recovered active binding")
+                .lease
+                .lease_id,
+            "lease-2"
+        );
+    }
+
+    #[test]
+    fn active_work_selection_is_ordered_and_cloned() {
+        let (owner, state_fence) = two_claimed_owner(["b", "a"]);
+        let mut selection = owner
+            .read_active_work_lease_selection(50, AuthorityEpoch::genesis(), &state_fence)
+            .expect("ambiguous active work");
+        assert!(matches!(
+            &selection,
+            ActiveWorkLeaseSelection::Ambiguous { .. }
+        ));
+        if let ActiveWorkLeaseSelection::Ambiguous { projections } = &mut selection {
+            assert_eq!(
+                projections
+                    .iter()
+                    .map(|projection| projection.work_item.work_item_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["work-a", "work-b"]
+            );
+            projections[0].lease.lease_id = "mutated-clone".to_owned();
+        }
+        assert_eq!(
+            owner
+                .read_unique_active_work_lease(50, AuthorityEpoch::genesis(), &state_fence)
+                .expect_err("two active work bindings")
+                .to_string(),
+            "multiple active work bindings exist"
+        );
+        assert_eq!(owner.leases["lease-a"].lease_id, "lease-a");
+    }
+
+    #[test]
+    fn active_work_selection_rejects_more_than_the_ceiling_without_truncation() {
+        let mut owner = CoordinationOwner::new();
+        let state_fence = fence();
+        for suffix in (0..=ACTIVE_WORK_LEASE_SELECTION_CEILING).map(|index| index.to_string()) {
+            add_claim(&mut owner, &state_fence, &suffix);
+        }
+        assert_eq!(
+            owner.read_active_work_lease_selection(50, AuthorityEpoch::genesis(), &state_fence),
+            Err(CoordinationError::ActiveWorkLeaseSelectionCeilingExceeded {
+                limit: ACTIVE_WORK_LEASE_SELECTION_CEILING,
+            })
+        );
+    }
+
+    #[test]
     fn unique_active_work_read_reports_zero_without_candidates() {
         let owner = CoordinationOwner::new();
         let state_fence = fence();
@@ -1810,5 +2247,102 @@ mod tests {
             owner.read_unique_active_work_lease(50, AuthorityEpoch::genesis(), &state_fence),
             Err(CoordinationError::InvalidState)
         );
+    }
+
+    #[test]
+    fn plain_work_replay_requires_the_exact_request_payload() {
+        let (mut owner, state_fence) = claimed_owner();
+        let request = claim_request(&state_fence);
+        let first = owner
+            .acquire_work(request.clone())
+            .expect("exact replay source");
+        assert_eq!(owner.acquire_work(request.clone()), Ok(first));
+
+        let mut changed_lease = request.clone();
+        changed_lease.lease_id = "lease-other".to_owned();
+        assert_eq!(
+            owner.acquire_work(changed_lease),
+            Err(CoordinationError::IdempotencyConflict(
+                "claim-work".to_owned()
+            ))
+        );
+
+        let mut changed_payload = request;
+        changed_payload.lease_duration += 1;
+        assert_eq!(
+            owner.acquire_work(changed_payload),
+            Err(CoordinationError::IdempotencyConflict(
+                "claim-work".to_owned()
+            ))
+        );
+        assert_eq!(owner.events().len(), 3);
+    }
+
+    #[test]
+    fn integration_candidate_requires_exact_live_work_lease_links() {
+        let (owner, _state_fence) = claimed_owner();
+        owner
+            .clone()
+            .submit_integration_candidate(candidate_request())
+            .expect("valid candidate");
+
+        let mut wrong_work = owner.clone();
+        wrong_work.leases.get_mut("lease-1").unwrap().work_item_id = "work-2".to_owned();
+        assert!(matches!(
+            wrong_work.submit_integration_candidate(candidate_request()),
+            Err(CoordinationError::LeaseOwnerMismatch { .. })
+        ));
+
+        let mut wrong_session = owner.clone();
+        wrong_session
+            .work
+            .get_mut("work-1")
+            .unwrap()
+            .owner_session_id = Some("session-2".to_owned());
+        assert!(matches!(
+            wrong_session.submit_integration_candidate(candidate_request()),
+            Err(CoordinationError::LeaseOwnerMismatch { .. })
+        ));
+
+        let mut inactive_session = owner.clone();
+        inactive_session
+            .sessions
+            .get_mut("session-1")
+            .unwrap()
+            .state = SessionState::Lost;
+        assert_eq!(
+            inactive_session.submit_integration_candidate(candidate_request()),
+            Err(CoordinationError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn from_snapshot_rejects_malformed_active_owner_links() {
+        let (owner, _state_fence) = claimed_owner();
+        let mut malformed = owner.clone();
+        malformed.work.get_mut("work-1").unwrap().owner_session_id =
+            Some("missing-session".to_owned());
+        assert!(matches!(
+            CoordinationOwner::from_snapshot(malformed),
+            Err(CoordinationError::InvalidState)
+        ));
+
+        let (mut inactive, _state_fence) = claimed_owner();
+        inactive.sessions.get_mut("session-1").unwrap().state = SessionState::Lost;
+        assert!(matches!(
+            CoordinationOwner::from_snapshot(inactive),
+            Err(CoordinationError::InvalidState)
+        ));
+
+        let (mut wrong_lease, _state_fence) = claimed_owner();
+        wrong_lease
+            .leases
+            .get_mut("lease-1")
+            .unwrap()
+            .holder_session_id = "other-session".to_owned();
+        assert!(matches!(
+            CoordinationOwner::from_snapshot(wrong_lease),
+            Err(CoordinationError::InvalidState)
+        ));
     }
 }

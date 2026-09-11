@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ELIOT observation obligation, coverage and gap contracts"
+description = "ELIOT observation obligation, coverage, gap, and record-family contracts"
 
 [package.metadata.eliot]
 work_id = "C0-11"

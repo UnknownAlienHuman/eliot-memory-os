@@ -28,12 +28,14 @@ committed as repository authority.
 | `code_navigation.py` | Navigate current Cargo packages, Rust files, logical blocks, local dependencies, and documentation routes | Repository navigation and static path/dependency consistency only |
 | `verify-standalone-crates.py` | Runs fmt, clippy and tests for every crate that declares its own `[workspace]` and is neither a workspace member nor an excluded capability cell | Package proof for crates no other gate reaches; admits nothing to the workspace |
 | `verify-doc-code-conformance.py` | Public conformance front door for reader instructions, workflow claims, retired/nonexistent references, script/binary maps, owner bindings, and documentation-pipeline integrity | Static repository path/inventory/instruction consistency only |
+| `verify-process-deadline-owner.py` | Source-shape discriminator for the #83 failure where a resumed process receives a start receipt while the wall-deadline owner thread is never spawned | Static source-shape evidence only; not Windows containment or wall-time proof |
 | `doc_code_conformance_core.py` | Established deterministic DCC-001…DCC-007 implementation called by the public conformance front door | Internal conformance implementation |
 | `audit-architecture-boundaries.py` | Detect forbidden dependencies, SurrealDB leakage, untracked direct process launch, placeholders, and exact tracked debt | Static source/build architecture evidence only |
 | `verify-agent-guardrails.py` | Require bounded nearest-path owner/proof/stop instructions for declared source subtrees | Routing/control-plane evidence only |
 | `verify-core-daemon-inventory.py` | Verify the core-daemon inventory identity, owner references, proof requirements, exclusions, and fixed proof ceiling | Static inventory/routing evidence only |
 | `audit-runtime-source-hygiene.py` | Expose unsafe, panic/unwrap/expect, ambient configuration, unbounded-output, blocking-sleep, and source-concentration signals | Static source-quality evidence only |
 | `verify-agent-bridge-protocol.py` | Reject raw canonical Frame ingress, host-minted authority fields, validation bypass, correlation loss, and mandatory cancellation prose | Static protocol/source-policy evidence only |
+| `verify-wasm-toolchain.py` | Check the declared WASI component target without installing or executing external binaries | Offline toolchain declaration evidence only |
 | `verify-lint-policy.ps1` | Verify the Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
 | `requirements-verification.txt` | Python dependency manifest for repository verification scripts | Verification dependency manifest |
 

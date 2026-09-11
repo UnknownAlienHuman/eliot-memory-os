@@ -1,4 +1,5 @@
-const MUTATING_TOOLS = new Set(["bash", "edit", "write", "patch", "notebook"])
+const MUTATING_TOOLS = new Set(["bash", "edit", "write", "patch"])
+const READ_ONLY_TOOLS = new Set(["read", "grep", "glob", "list", "webfetch", "websearch", "lsp", "codesearch"])
 const USEFUL_EVENTS = new Set([
   "session.created",
   "session.compacted",
@@ -40,6 +41,9 @@ const BRIDGE_ENV_KEYS = [
 
 const MAX_ARGUMENT_KEYS = 64
 const MAX_ARGUMENT_KEY_LENGTH = 128
+const MAX_EFFECT_DESCRIPTOR_BYTES = 64 * 1024
+const EFFECT_SCHEMA_VERSION = "eliot.opencode.effect.v1"
+const ARGUMENT_NORMALIZATION_VERSION = "eliot.opencode.arguments.v1"
 const MEDIA_TYPE_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
 
 function boundedInteger(name, fallback, minimum, maximum) {
@@ -102,16 +106,6 @@ function firstPositiveInteger(...values) {
   return values.find((value) => Number.isSafeInteger(value) && value > 0) ?? null
 }
 
-function canonicalIdentityMaterial(value) {
-  if (Array.isArray(value)) return value.map(canonicalIdentityMaterial)
-  if (!value || typeof value !== "object") return value
-  return Object.fromEntries(
-    Object.keys(value)
-      .sort()
-      .map((key) => [key, canonicalIdentityMaterial(value[key])]),
-  )
-}
-
 async function sha256Hex(value) {
   const subtle = globalThis.crypto?.subtle
   if (!subtle) return null
@@ -120,17 +114,165 @@ async function sha256Hex(value) {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")
 }
 
-// Argument NAMES are the only argument-derived material the contract admits.
-// A host that hands us a raw string would otherwise yield one Object.keys entry
-// per byte, which both unbounds the request and discloses the command's length.
-function boundedArgumentKeys(candidate) {
-  if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return []
-  const prototype = Object.getPrototypeOf(candidate)
-  if (prototype !== Object.prototype && prototype !== null) return []
-  return Object.keys(candidate)
-    .filter((key) => key.length <= MAX_ARGUMENT_KEY_LENGTH)
-    .sort()
-    .slice(0, MAX_ARGUMENT_KEYS)
+function appendCanonical(state, value) {
+  state.bytes += new TextEncoder().encode(value).byteLength
+  if (state.bytes > MAX_EFFECT_DESCRIPTOR_BYTES) {
+    throw new Error("effect descriptor exceeds its bounded contract")
+  }
+  state.parts.push(value)
+}
+
+function appendCanonicalString(state, value) {
+  appendCanonical(state, `s${value.length}:`)
+  for (let index = 0; index < value.length; index += 1) {
+    appendCanonical(state, value.charCodeAt(index).toString(16).padStart(4, "0"))
+  }
+}
+
+function plainObjectEntries(value) {
+  const prototype = Object.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new Error("unsupported object container")
+  }
+  if (Object.getOwnPropertySymbols(value).length > 0) throw new Error("symbol properties are not bindable")
+
+  const keys = Object.getOwnPropertyNames(value)
+  if (keys.length > MAX_ARGUMENT_KEYS) throw new Error("argument key count exceeds its bounded contract")
+  for (const key of keys) {
+    if (key.length > MAX_ARGUMENT_KEY_LENGTH) throw new Error("argument key exceeds its bounded contract")
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) {
+      throw new Error("accessor or non-enumerable argument is not bindable")
+    }
+  }
+  return keys.sort().map((key) => [key, Object.getOwnPropertyDescriptor(value, key).value])
+}
+
+function arrayValues(value) {
+  if (Object.getPrototypeOf(value) !== Array.prototype) throw new Error("unsupported array container")
+  if (Object.getOwnPropertySymbols(value).length > 0) throw new Error("symbol properties are not bindable")
+  if (value.length > MAX_ARGUMENT_KEYS) throw new Error("array entry count exceeds its bounded contract")
+
+  const names = Object.getOwnPropertyNames(value)
+  if (names.length !== value.length + 1 || !names.includes("length")) {
+    throw new Error("sparse or extended arrays are not bindable")
+  }
+  const values = []
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index))
+    if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, "value")) {
+      throw new Error("sparse or accessor arrays are not bindable")
+    }
+    values.push(descriptor.value)
+  }
+  return values
+}
+
+function appendCanonicalValue(state, value, active) {
+  if (value === null) {
+    appendCanonical(state, "null")
+    return
+  }
+
+  switch (typeof value) {
+    case "string":
+      appendCanonicalString(state, value)
+      return
+    case "boolean":
+      appendCanonical(state, value ? "true" : "false")
+      return
+    case "number": {
+      if (!Number.isFinite(value)) throw new Error("non-finite number is not bindable")
+      const number = Object.is(value, -0) ? "-0" : String(value)
+      appendCanonical(state, `number${number.length}:${number}`)
+      return
+    }
+    case "object":
+      break
+    default:
+      throw new Error(`${typeof value} argument is not bindable`)
+  }
+
+  if (active.has(value)) throw new Error("cyclic argument container")
+  active.add(value)
+  try {
+    if (Array.isArray(value)) {
+      const values = arrayValues(value)
+      appendCanonical(state, `array${value.length}[`)
+      for (const item of values) appendCanonicalValue(state, item, active)
+      appendCanonical(state, "]")
+      return
+    }
+
+    const entries = plainObjectEntries(value)
+    appendCanonical(state, `object${entries.length}{`)
+    for (const [key, item] of entries) {
+      appendCanonicalString(state, key)
+      appendCanonicalValue(state, item, active)
+    }
+    appendCanonical(state, "}")
+  } finally {
+    active.delete(value)
+  }
+}
+
+function canonicalArguments(candidate) {
+  if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) {
+    throw new Error("arguments must be a plain object")
+  }
+  const state = { bytes: 0, parts: [] }
+  appendCanonicalValue(state, candidate, new WeakSet())
+  return {
+    argumentKeys: plainObjectEntries(candidate).map(([key]) => key),
+    encoded: state.parts.join(""),
+  }
+}
+
+function argumentCandidate(input, output = {}) {
+  for (const source of [input, output]) {
+    if (!source || typeof source !== "object") continue
+    for (const key of ["args", "arguments"]) {
+      if (Object.hasOwn(source, key)) return source[key]
+    }
+  }
+  return {}
+}
+
+function eventArgumentKeys(input, output) {
+  try {
+    return canonicalArguments(argumentCandidate(input, output)).argumentKeys
+  } catch {
+    return []
+  }
+}
+
+function actionBindingError(error) {
+  return new Error(`ELIOT ActionGate cannot bind exact action arguments: ${error.message}`)
+}
+
+async function createEffectBinding(input, output) {
+  try {
+    if (!input || typeof input.tool !== "string" || input.tool.length === 0) {
+      throw new Error("tool identity is not bindable")
+    }
+    const { argumentKeys, encoded } = canonicalArguments(argumentCandidate(input, output))
+    const argumentDigest = await sha256Hex(`${ARGUMENT_NORMALIZATION_VERSION}:arguments:${encoded}`)
+    if (argumentDigest === null) throw new Error("SHA-256 is unavailable")
+    const descriptor = {
+      schema_version: EFFECT_SCHEMA_VERSION,
+      normalization_version: ARGUMENT_NORMALIZATION_VERSION,
+      tool: input.tool,
+      argument_keys: argumentKeys,
+      argument_digest: argumentDigest,
+    }
+    const descriptorState = { bytes: 0, parts: [] }
+    appendCanonicalValue(descriptorState, descriptor, new WeakSet())
+    const effectDigest = await sha256Hex(`${EFFECT_SCHEMA_VERSION}:effect:${descriptorState.parts.join("")}`)
+    if (effectDigest === null) throw new Error("SHA-256 is unavailable")
+    return { descriptor, effectDigest }
+  } catch (error) {
+    throw actionBindingError(error)
+  }
 }
 
 function isJsonMediaType(value) {
@@ -197,7 +339,7 @@ async function cancelResponseBody(response, reason) {
   }
 }
 
-async function compactEvent(kind, input = {}, output = {}) {
+async function compactEvent(kind, input = {}, output = {}, effectBinding = null) {
   const event = input.event ?? input
   const properties = event.properties ?? {}
   const nativeSequence = firstPositiveInteger(
@@ -236,31 +378,30 @@ async function compactEvent(kind, input = {}, output = {}) {
   const emittedAt =
     firstString(event.emitted_at, event.timestamp, event.time, properties.emitted_at, properties.timestamp) ??
     new Date().toISOString()
-  const argumentKeys = boundedArgumentKeys(
-    input.args ?? input.arguments ?? output.args ?? output.arguments ?? {},
-  )
-  const identityMaterial = JSON.stringify(
-    canonicalIdentityMaterial({
-      vendor_event_kind: vendorEventKind,
-      native_event_id: nativeEventId,
-      native_sequence: nativeSequence,
-      host_session_id: hostSessionId,
-      tool,
-      changed_path: changedPath,
-      argument_keys: argumentKeys,
-      emitted_at: emittedAt,
-      fallback_sequence: nativeEventId || nativeSequence !== null ? null : sequence,
-    }),
-  )
+  const argumentKeys = effectBinding?.descriptor.argument_keys ?? eventArgumentKeys(input, output)
+  const identityMaterial = JSON.stringify({
+    vendor_event_kind: vendorEventKind,
+    native_event_id: nativeEventId,
+    native_sequence: nativeSequence,
+    host_session_id: hostSessionId,
+    tool,
+    changed_path: changedPath,
+    argument_keys: argumentKeys,
+    emitted_at: emittedAt,
+    fallback_sequence: nativeEventId || nativeSequence !== null ? null : sequence,
+    effect_digest: effectBinding?.effectDigest ?? null,
+  })
   const identityDigest = await sha256Hex(identityMaterial)
   const eventId =
-    nativeEventId !== null
-      ? `opencode:${vendorEventKind}:${nativeEventId}`
-      : identityDigest !== null
-        ? `opencode:sha256:${identityDigest}`
-        : `opencode:${hostSessionId ?? "unknown"}:${vendorEventKind}:${sequence}`
+    effectBinding !== null
+      ? `opencode:effect:${effectBinding.effectDigest}${nativeEventId === null ? "" : `:${nativeEventId}`}`
+      : nativeEventId !== null
+        ? `opencode:${vendorEventKind}:${nativeEventId}`
+        : identityDigest !== null
+          ? `opencode:sha256:${identityDigest}`
+          : `opencode:${hostSessionId ?? "unknown"}:${vendorEventKind}:${sequence}`
 
-  return {
+  const payload = {
     event_id: eventId,
     sequence,
     emitted_at: emittedAt,
@@ -274,6 +415,11 @@ async function compactEvent(kind, input = {}, output = {}) {
     argument_keys: argumentKeys,
     attached_task: attachedTask(),
   }
+  if (effectBinding !== null) {
+    payload.effect_descriptor = effectBinding.descriptor
+    payload.effect_digest = effectBinding.effectDigest
+  }
+  return payload
 }
 
 function sleep(milliseconds) {
@@ -594,8 +740,8 @@ async function invokeLegacyProcessBridge(kind, payload, { required = false } = {
   }
 }
 
-async function invokeBridge(kind, input, output, { required = false } = {}) {
-  const payload = await compactEvent(kind, input, output)
+async function invokeBridge(kind, input, output, { required = false, effectBinding = null } = {}) {
+  const payload = await compactEvent(kind, input, output, effectBinding)
   let httpConfig
   try {
     httpConfig = httpBridgeConfiguration()
@@ -656,7 +802,7 @@ function notePassiveOverflow(client, kind) {
   armOverflowLog(client)
 }
 
-function enqueuePassive(client, kind, input, output) {
+function enqueuePassive(client, kind, input, output, options = {}) {
   if (passiveDepth >= maximumPassiveQueue()) {
     notePassiveOverflow(client, kind)
     return
@@ -665,7 +811,7 @@ function enqueuePassive(client, kind, input, output) {
   passiveDepth += 1
   const run = async () => {
     try {
-      const result = await invokeBridge(kind, input, output)
+      const result = await invokeBridge(kind, input, output, options)
       if (result.decision === "degraded") {
         await log(client, "warn", "ELIOT passive lifecycle dispatch degraded", { kind, reason: result.reason })
       }
@@ -678,8 +824,10 @@ function enqueuePassive(client, kind, input, output) {
   passiveQueue = passiveQueue.then(run, run)
 }
 
-async function requireMutationGate(input, output) {
-  const gate = await invokeBridge("tool.execute.before", input, output, { required: true })
+async function requireMutationGate(input, output, effectBinding) {
+  const gateOptions = { required: true }
+  gateOptions.effectBinding = effectBinding
+  const gate = await invokeBridge("tool.execute.before", input, output, gateOptions)
   if (gate.decision === "deny") {
     throw new Error("ELIOT ActionGate denied mutation")
   }
@@ -693,8 +841,23 @@ export const EliotPlugin = async ({ client } = {}) => ({
     if (USEFUL_EVENTS.has(event.type)) enqueuePassive(client, event.type, { event }, {})
   },
   "tool.execute.before": async (input, output) => {
-    if (!attachedTask() || !MUTATING_TOOLS.has(input.tool)) return
-    await requireMutationGate(input, output)
+    if (!attachedTask()) return
+    if (READ_ONLY_TOOLS.has(input?.tool)) {
+      const effectBinding = await createEffectBinding(input, output)
+      enqueuePassive(client, "tool.execute.skipped", input, output, { effectBinding })
+      return {
+        decision: "skipped",
+        reason: "read_only_tool",
+        tool: input.tool,
+        effect_descriptor: effectBinding.descriptor,
+        effect_digest: effectBinding.effectDigest,
+      }
+    }
+    if (!MUTATING_TOOLS.has(input?.tool)) {
+      throw new Error("ELIOT ActionGate cannot classify this OpenCode tool")
+    }
+    const effectBinding = await createEffectBinding(input, output)
+    await requireMutationGate(input, output, effectBinding)
   },
   "tool.execute.after": async (input, output) => {
     enqueuePassive(client, "tool.execute.after", input, output)

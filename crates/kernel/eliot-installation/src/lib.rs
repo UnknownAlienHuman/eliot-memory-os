@@ -344,6 +344,26 @@ pub fn contract_identity() -> Result<ContractIdentity, InstallationError> {
     })
 }
 
+/// Stage at which a durable installation operation requires recovery.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum InstallationRecoveryStage {
+    /// Creating the operation-owned object was not classified.
+    Create,
+    /// Writing an operation-owned object was not classified.
+    Write,
+    /// A file or directory flush was not classified.
+    FileSync,
+    /// Publication crossed its external commit boundary.
+    Publish,
+    /// The publication parent entry could not be made durable.
+    ParentSync,
+    /// Cleanup crossed its delete boundary.
+    Cleanup,
+    /// Recovery bookkeeping itself could not be completed.
+    Recovery,
+}
+
 /// Typed installation failures. No variant carries secrets or raw provider output.
 #[derive(Clone, Debug, Eq, Error, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -380,6 +400,22 @@ pub enum InstallationError {
     UnknownOutcome {
         /// Stage at which the provider outcome became unknown.
         stage: InstallationStage,
+    },
+    /// A publication or cleanup uncertainty retains its operation and source
+    /// context so callers can degrade readiness without treating it as input.
+    #[error(
+        "installation recovery required for {operation} at {stage:?} ({source_context}); cleanup={cleanup:?}"
+    )]
+    RecoveryRequired {
+        /// Stable operation identity.
+        operation: String,
+        /// Durable stage that became uncertain.
+        stage: InstallationRecoveryStage,
+        /// Bounded non-secret source/path context.
+        source_context: String,
+        /// Cleanup failure, when the primary uncertainty and cleanup failure
+        /// both need to be retained.
+        cleanup: Option<String>,
     },
     /// A known observation does not prove the requested postcondition.
     #[error("installation postcondition is incomplete: {0}")]

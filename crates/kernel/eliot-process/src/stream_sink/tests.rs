@@ -215,11 +215,23 @@ fn terminal_for(
             evidence,
         )?)
     } else {
+        let reason = match state {
+            ProcessStreamSinkState::PolicyProhibited => {
+                ProcessStreamSinkAbortReason::PolicyProhibition
+            }
+            ProcessStreamSinkState::RedactionFailed => {
+                ProcessStreamSinkAbortReason::RedactionFailure
+            }
+            ProcessStreamSinkState::PersistenceFailed => {
+                ProcessStreamSinkAbortReason::TransportFailure
+            }
+            _ => ProcessStreamSinkAbortReason::Cancellation,
+        };
         Ok(ProcessStreamSinkTerminal::from_abort(
             session,
             ProcessStreamSinkAbortRequest::new(
                 terminal_id,
-                ProcessStreamSinkAbortReason::Cancellation,
+                reason,
                 final_sequence,
                 final_offset,
                 1,
@@ -280,6 +292,18 @@ fn append_is_owned_checked_and_budgeted() -> TestResult {
     assert_eq!(append.byte_length(), 3);
     assert!(ProcessStreamSinkAppend::new(0, 0, b"abc".to_vec(), "d".repeat(64), 1).is_err());
     Ok(())
+}
+
+#[test]
+fn append_wire_payload_is_bounded_before_validation() {
+    let oversized = serde_json::json!({
+        "sequence": 0,
+        "offset": 0,
+        "bytes": vec![0_u8; 16 * 1024 * 1024 + 1],
+        "sha256": sha256_hex(&[]),
+        "wait_budget_ms": 1,
+    });
+    assert!(serde_json::from_value::<ProcessStreamSinkAppend>(oversized).is_err());
 }
 
 #[test]
@@ -359,6 +383,26 @@ fn malformed_wires_and_live_capabilities_fail_closed() -> TestResult {
     let serialized = serde_json::to_value(session)?;
     assert!(serialized.is_object());
     // Session and terminal deliberately have no Deserialize implementation.
+    Ok(())
+}
+
+#[test]
+fn unknown_outcome_schema_version_is_checked() -> TestResult {
+    let outcome = ProcessStreamSinkUnknownOutcome::new(
+        ProcessStreamSinkSessionId::new("session")?,
+        ProcessStreamSinkTerminalId::new("terminal")?,
+        "a".repeat(64),
+        "b".repeat(64),
+    )?;
+    let mut wire = serde_json::to_value(&outcome)?;
+    wire["schema_version"] = serde_json::json!("old-sink-schema");
+    assert!(serde_json::from_value::<ProcessStreamSinkUnknownOutcome>(wire).is_err());
+    let mut missing = serde_json::to_value(&outcome)?;
+    let Some(object) = missing.as_object_mut() else {
+        return Err("unknown outcome wire must be an object".into());
+    };
+    object.remove("schema_version");
+    assert!(serde_json::from_value::<ProcessStreamSinkUnknownOutcome>(missing).is_err());
     Ok(())
 }
 
@@ -952,6 +996,9 @@ impl ProcessStreamSinkClient for Fake {
         session: ProcessStreamSinkSession,
     ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkReadback> {
         let state = self.lock();
+        if state.session.as_ref() != Some(&session) {
+            return ready(Err(ProcessStreamSinkError::SessionMismatch));
+        }
         if let Some(outcome) = &state.unknown_outcome {
             return ready(Ok(ProcessStreamSinkReadback::UnknownOutcome {
                 outcome: outcome.clone(),
@@ -977,6 +1024,34 @@ impl ProcessStreamSinkClient for Fake {
         )
         .unwrap_or_else(|_| unreachable!("zero-count fake view is valid"));
         ready(Ok(ProcessStreamSinkReadback::Session { view }))
+    }
+
+    fn reconcile(
+        &self,
+        session: ProcessStreamSinkSession,
+        outcome: ProcessStreamSinkUnknownOutcome,
+    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkReadback> {
+        let state = self.lock();
+        let result = state
+            .session
+            .as_ref()
+            .ok_or(ProcessStreamSinkError::ProviderUnavailable)
+            .and_then(|existing| {
+                if existing != &session {
+                    return Err(ProcessStreamSinkError::SessionMismatch);
+                }
+                outcome.validate_against_session(&session)?;
+                if let Some(terminal) = &state.terminal {
+                    return Ok(ProcessStreamSinkReadback::Terminal {
+                        terminal: terminal.clone(),
+                    });
+                }
+                if state.unknown_outcome.as_ref() != Some(&outcome) {
+                    return Err(ProcessStreamSinkError::ProviderUnavailable);
+                }
+                Ok(ProcessStreamSinkReadback::UnknownOutcome { outcome })
+            });
+        ready(result)
     }
 }
 
@@ -1219,7 +1294,7 @@ fn partial_policy_redaction_cancelled_and_unknown_terminals_preserve_gaps() -> T
             sha256_hex(b"abc"),
             unknown,
         )
-        .is_ok()
+        .is_err()
     );
     Ok(())
 }
