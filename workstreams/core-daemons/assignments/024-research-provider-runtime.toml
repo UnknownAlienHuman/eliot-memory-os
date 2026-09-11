@@ -1,0 +1,120 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "PARTIAL_EXCHANGE_PRESENT_AMBIENT_PROCESS_BRIDGE_AND_DISABLED_BINARY"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "RESEARCH_PROVIDER_EDGE_CANDIDATE"
+issue = 24
+integration_issue_refs = [13, 15, 18, 20, 22, 11]
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A05-07-two-lanes-and-evidence-discipline.md#a57-two-lanes-and-evidence-discipline",
+  "docs/architecture/A09-02-dreamer-researcher-and-memory-curator.md#a92-dreamer-researcher-and-memory-curator",
+  "docs/architecture/A12-security-provenance-and-bounded-influence.md#a12-security-provenance-and-bounded-influence",
+]
+implementation = [
+  "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "docs/architecture/I07-23-raw-and-normalized-host-events.md#i723-raw-and-normalized-host-events",
+  "docs/architecture/I15-10-sandboxing.md#i1510-sandboxing",
+  "docs/architecture/I21-01-researcher-is-a-plane-not-a-future-module.md#i211-researcher-is-a-plane-not-a-future-module",
+  "docs/architecture/I21-02-evidence-grade.md#i212-evidence-grade",
+  "docs/architecture/I21-06-source-portfolio-coverage-denominator-and-coveragereceipt.md#i216-source-portfolio-coverage-denominator-and-coveragereceipt",
+  "docs/architecture/I21-11-research-federation-provider.md#i2111-research-federation-provider",
+  "docs/architecture/I21-13-failure-degradation-and-honest-closure.md#i2113-failure-degradation-and-honest-closure",
+]
+anchors = ["ARCH-DRM-04", "ARCH-SEC-01", "ARCH-PORT-01", "ARCH-GROUND-01", "ARCH-OBS-01"]
+
+[confirmed_gap]
+main = "bins/eliot-mod-research/src/main.rs@bb174a93a69b868009044993f41f4e86b20385c8"
+composition = "bins/eliot-mod-research/src/lib.rs@4769db814b4d45151bf6fea2abed9c9860980dc5"
+discriminator = "The production binary always emits KERNEL_ADMISSION_REQUIRED and exits 78. The library's only concrete bridge reads ELIOT_RESEARCH_BRIDGE from ambient environment, launches that path through std::process::Command, discards stderr, has no deadline/cancellation/Job Object/resource/credential/fence manifest, and treats exit success plus a provider-local job_id as the complete process result."
+reusable_source = [
+  "eliot-research-exchange already owns typed exchange job lifecycle and candidate-only results.",
+  "eliot-research-exchange-api already owns ResearchQueryRequest.",
+  "eliot-researcher already separates Researcher inquiry ownership from the physical ResearchBridge.",
+  "ProcessResearchBridge is a replaceable adapter and should not be promoted as-is.",
+]
+
+[causal_property]
+statement = "One admitted bounded research-provider operation runs through the shared governed process contour, preserves exact route/source/coverage/raw evidence and effect outcome, and returns candidate material without gaining synthesis, canonical, authority, policy or Finish ownership."
+
+[scope]
+primary_paths = [
+  "bins/eliot-mod-research/src/main.rs",
+  "bins/eliot-mod-research/src/lib.rs",
+  "crates/research/eliot-research-exchange/src/**",
+  "crates/research/eliot-research-exchange-api/src/**",
+  "crates/research/eliot-researcher/src/**",
+  "focused package and process-edge tests",
+]
+required_edges = [
+  "authenticated Kernel provider admission",
+  "immutable BridgeContract/provider generation",
+  "shared ProcessExecutor",
+  "raw stdout/stderr/evidence sink",
+  "credential/privacy/budget/deadline/cancellation envelope",
+  "exact-operation replay and reconciliation",
+]
+forbidden_ownership = [
+  "Dreamer synthesis or truth promotion",
+  "canonical write or memory admission",
+  "task scheduling or Finish",
+  "generic shell/arbitrary caller executable",
+  "hidden paid/network/privacy fallback",
+]
+
+[what_to_do]
+steps = [
+  "Replace environment-selected direct Command execution with a registered immutable provider bridge and shared ProcessExecutor.",
+  "Replace the unconditional binary exit with authenticated one-shot or bounded provider request handling.",
+  "Bind every operation to artifact/config/protocol/provider/route/privacy/budget/deadline/cancellation/fence and generation identity.",
+  "Preserve raw stdout, stderr, process lineage and provider outcome as immutable evidence or omission handles.",
+  "Implement exact cancellation, timeout, crash and unknown-outcome reconciliation without blind retry.",
+]
+
+[how_to_do]
+steps = [
+  "Kernel/Governor resolves the provider generation and supplies a closed BridgeContract; no executable path comes from task text, stdin or ambient environment.",
+  "Use the shared Windows ProcessExecutor and Job Object contour for start, streams, limits, cancellation and descendant cleanup.",
+  "Use a typed versioned EBP/provider protocol. Provider-local job_id remains subordinate to the canonical operation identity.",
+  "Persist operation intent before provider execution and preserve exact raw output/evidence lineage before parsing or reduction.",
+  "Bind source portfolio and coverage denominator to the request; unavailable providers narrow coverage and return a typed gap rather than fabricated empty results.",
+  "Keep returned material candidate-only until normal Governor admission; a successful provider exit does not prove correctness, completeness or support.",
+  "On disconnect/timeout after possible execution, reconcile the same operation/provider identity before any retry.",
+]
+
+[acceptance]
+criteria = [
+  "No production path launches a research executable solely from ELIOT_RESEARCH_BRIDGE or a caller-supplied path.",
+  "The production binary executes a valid authenticated provider request instead of always exiting 78.",
+  "Artifact, provider, route, protocol, privacy, budget, deadline, cancellation, epoch/fence and operation identities remain exact end-to-end.",
+  "stdout, stderr, exit and process lineage are retained or represented by immutable omission handles; stderr is never silently discarded.",
+  "Timeout/cancel/crash leaves no descendant and returns a terminal or exact unknown/reconciliation state.",
+  "Exact replay is idempotent; changed same-identity payload conflicts.",
+  "Unavailable provider yields RESEARCH_SOURCE_UNAVAILABLE/coverage gap, not fabricated no-match or semantic failure.",
+  "Coverage completeness is impossible without an exact denominator and actual source dispositions.",
+  "Provider output remains candidate-only and cannot write canonical state, promote truth, issue authority or Finish.",
+  "Provider failure degrades only the dependent acquisition path.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-research-exchange-api -p eliot-research-exchange -p eliot-researcher -p eliot-mod-research --all-targets",
+  "cargo test --locked -p eliot-research-exchange-api -p eliot-research-exchange -p eliot-researcher -p eliot-mod-research --all-targets",
+  "cargo clippy --locked -p eliot-research-exchange-api -p eliot-research-exchange -p eliot-researcher -p eliot-mod-research --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run one real approved provider, one unavailable provider, cancellation, timeout, stderr failure and unknown-outcome reconciliation through authenticated Kernel admission."
+
+[boundaries]
+non_goals = [
+  "Dreamer implementation",
+  "research synthesis or claim evaluation",
+  "automatic workflow trigger",
+  "Product or release promotion from package tests",
+]
