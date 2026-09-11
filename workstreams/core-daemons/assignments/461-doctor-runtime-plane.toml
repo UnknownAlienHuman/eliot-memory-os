@@ -1,0 +1,122 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_AFTER_PROCESS_EXECUTOR"
+implementation_support = "PARTIAL_CONTRACTS_WITH_UNCLOSED_LIVE_EDGE"
+evidence_execution_status = "SOURCE_AND_ISSUE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "DOCTOR_DIAGNOSIS_AND_REPAIR_EDGE_CANDIDATE_ONLY"
+issue = 461
+process_executor_issue = 100
+kernel_issue = 15
+host_issue = 14
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "runtime.doctor-governed-diagnosis-and-repair"
+causal_property = "One Kernel-admitted Doctor operation observes an exact bounded target generation, produces a typed diagnosis, and executes only an explicitly authorized reversible repair through the owning lifecycle/process boundary without becoming a second supervisor, authority, canonical writer, or Finish owner."
+current_discriminator = "Doctor contracts and package-local behavior exist, but the live process-backed observation/repair edge, exact target ownership, unknown-outcome reconciliation, and installed Windows evidence remain unclosed."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/461"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-03-module-supervision-and-doctor.md#a133-module-supervision-and-doctor",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-02-discriminator-first-repair.md#i182-discriminator-first-repair",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-22-flake-hang-and-recurrence-handling.md#i1822-flake-hang-and-recurrence-handling",
+]
+anchors = ["ARCH-RES-01", "ARCH-RES-04", "ARCH-OBS-01", "ARCH-AUTH-01", "ARCH-SEC-02"]
+
+[current_source]
+confirmed = [
+  "Doctor is an optional governed runtime contour, not an authority or replacement Host/Kernel supervisor.",
+  "The complete live observation and repair effect path depends on the single ProcessExecutor owner under issue #100.",
+  "Package-local tests cannot prove Windows process identity, Job Object containment, stale generation fencing, repair interruption, or no-orphan cleanup.",
+  "Any current fail-closed or unavailable execution seam is honest absence, not implemented repair support.",
+]
+
+[scope]
+primary_paths = [
+  "bins/eliot-doctor/src/**",
+  "crates/supervision/eliot-doctor-core/src/**",
+  "exact Kernel Doctor admission/status/reconcile adapter",
+  "exact Host/process lifecycle repair adapter",
+  "directly relevant tests and finite fixtures",
+]
+serialized_dependencies = ["#100 governed ProcessExecutor", "#15 Kernel", "#14 Host", "#13 capability registry", "#11 Product proof"]
+forbidden = [
+  "second Host or Kernel supervisor",
+  "caller-selected executable, PID, service, path, registry root, or arbitrary command",
+  "semantic task, WorkScope, Store, model, MCP, or provider ownership",
+  "repair without an exact owner-issued permit and inverse/cleanup contract",
+  "blind retry after possible effect",
+  "authority, canonical write, or Finish ownership",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Bind exact Doctor admission, target, observation, and diagnosis identities."
+how = [
+  "Require Kernel-issued operation, principal/session, target capability cell, artifact/process generation, AuthorityEpoch, StateFence, deadline, cancellation, observation profile, and resource envelope.",
+  "Read target identity from current owner receipts and independent OS/process readback; PID, name, path, port, or liveness alone is insufficient.",
+  "Preserve observed, not-running, unavailable, stale, conflicted, partial, unknown, and not-applicable independently.",
+]
+
+[[waves]]
+id = "B"
+what = "Make every diagnosis discriminator-first and evidence-bound."
+how = [
+  "Require exact expected/observed result, current-path discriminator, source/evidence handles, coverage, blind boundaries, assumptions, rival failure classes, and invalidation set.",
+  "Do not diagnose from log prose, newest timestamp, process exit, metric movement, or model confidence alone.",
+  "Repeated equivalent failed repair under unchanged conditions produces MechanismReviewRequired rather than another attempt.",
+]
+
+[[waves]]
+id = "C"
+what = "Execute only closed reversible owner-directed repairs."
+how = [
+  "Use issue #100 for every process/tool effect and the exact Host/Kernel/service owner for lifecycle changes.",
+  "Bind one repair plan to immutable preconditions, effect ceiling, expected observable delta, semantic verifier, cancellation, timeout, cleanup, inverse/rollback, and reopen rule.",
+  "Persist repair intent before effects and retain exact per-effect receipts or UNKNOWN_OUTCOME for reconciliation.",
+]
+
+[[waves]]
+id = "D"
+what = "Close restart, cancellation, reconciliation, and operator status."
+how = [
+  "Rehydrate nonterminal Doctor operations from the owning durable record after Doctor/Kernel restart.",
+  "Cancel only the exact still-cancellable operation and preserve possibly committed effects.",
+  "Expose bounded diagnosis, target owner, evidence, terminal/reconciling state, blocker, and next safe action without protected payloads.",
+]
+
+[acceptance]
+criteria = [
+  "A valid current Kernel admission reaches one bounded Doctor observation/diagnosis; invalid, stale, expired, or foreign admission performs no process/tool effect.",
+  "Target adoption, cancellation, termination, restart, or repair requires exact artifact/process/start/generation/epoch/fence ownership rather than PID/name/path presence.",
+  "Observation, diagnosis, proposed repair, admitted repair, effect execution, verification, cleanup, rollback, and reconciliation remain separate states and identities.",
+  "A repair is executable only with one exact owner-issued permit, bounded effect plan, verifier, inverse/cleanup, deadline, and cancellation contract.",
+  "Exact replay is idempotent; changed target, evidence, plan, permit, effect, or fence under one identity conflicts.",
+  "Possible effect without final receipt remains UNKNOWN_OUTCOME and is reconciled before retry.",
+  "Timeout, cancellation, crash, parent loss, stream pressure, and cleanup failure leave no unaccounted descendant or handle.",
+  "Equivalent failed repair cannot repeat without changed discriminator, evidence, conditions, or explicit controlled-repeat justification.",
+  "Doctor cannot create task truth, support, canonical state, authority, policy, provider route, or VERIFIED_COMPLETE.",
+  "A real Windows edge proves diagnosis plus one authorized repair, interrupted repair reconciliation, rollback, stale-generation rejection, and no-orphan cleanup.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-doctor -p eliot-doctor-core -p eliot-process -p eliot-platform-windows --all-targets",
+  "cargo test --locked -p eliot-doctor -p eliot-doctor-core -p eliot-process -p eliot-platform-windows --all-targets",
+  "cargo clippy --locked -p eliot-doctor -p eliot-doctor-core -p eliot-process -p eliot-platform-windows --all-targets -- -D warnings",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "Run one current Windows target diagnosis, one admitted reversible repair, interruption at every effect boundary, exact reconciliation, rollback, stale-generation rejection, cancellation, and descendant cleanup."
+product_proof = "Issue #11 remains open; Doctor package or Edge proof alone does not establish Product support."
