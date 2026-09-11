@@ -1,0 +1,119 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "PARTIAL_CORE_AND_FRAMING_PRESENT_CLAIM_FAIL_CLOSED"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "NATIVE_WORKER_RUNTIME_EDGE_CANDIDATE"
+issue = 22
+integration_issue_refs = [13, 15, 18, 23, 11]
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A02-03-modular-architecture.md#a23-modular-architecture",
+  "docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+  "docs/architecture/A13-03-module-supervision-and-doctor.md#a133-module-supervision-and-doctor",
+]
+implementation = [
+  "docs/architecture/I06-15-capability-grant-lineage-introductions-and-resource-facets.md#i615-capability-grant-lineage-introductions-and-resource-facets",
+  "docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md#i71-eliot-bridge-protocol-ebp1",
+  "docs/architecture/I14-13-idle-drain-and-cancellation.md#i1413-idle-drain-and-cancellation",
+  "docs/architecture/I14-14-module-hot-replacement.md#i1414-module-hot-replacement",
+  "docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+  "docs/architecture/I15-10-sandboxing.md#i1510-sandboxing",
+]
+anchors = ["ARCH-MOD-01", "ARCH-PORT-01", "ARCH-SEC-01", "ARCH-AUTH-01", "ARCH-RES-01"]
+
+[confirmed_gap]
+main = "bins/eliot-native-worker/src/main.rs@aadb4e6dcf7f5f65a291cbcb52f19dd90a24f28a"
+composition = "bins/eliot-native-worker/src/lib.rs@079aedf38c2bb50aab9f1fd584027c44a3763917"
+claim_adapter = "bins/eliot-native-worker/src/kernel_admission_client.rs@c01b17160e14e072de3b57bab897cfef2a1adcf1"
+core = "crates/modules/eliot-native-worker-core"
+discriminator = "KernelNativeWorkerClient probes Kernel health and calls generic transact_json(native_worker.claim), then unconditionally returns KernelAdmissionRequired because the response has no typed session-bound claim. main converts every result, including hypothetical Ok, into an admission error and exits 78. NativeWorker/WorkerCore framing and lifecycle are never composed in production."
+reusable_source = [
+  "NativeWorker already wraps WorkerCore and exposes start, recover, handle and bounded serve_stdio.",
+  "WorkerCore already separates ProcessExecutor, CapabilityAdmissionPort, DurableReplayPort and DurableCheckpointPort.",
+  "Length-delimited worker frames already enforce a 4 MiB maximum and reject zero length.",
+  "The current generic KernelClient probe is only a capability-gap detector and must not become the final typed claim protocol.",
+]
+
+[causal_property]
+statement = "One native worker generation starts only from an authenticated Kernel-issued immutable execution claim bound to exact artifact, protocol, facet, process/Job lineage, principal/session, Authority Epoch, State Fence, capabilities, credentials, limits, cancellation and checkpoint identity."
+
+[scope]
+primary_paths = [
+  "bins/eliot-native-worker/src/main.rs",
+  "bins/eliot-native-worker/src/kernel_admission_client.rs",
+  "bins/eliot-native-worker/src/lib.rs",
+  "crates/modules/eliot-native-worker-core/src/**",
+  "focused package and process-edge tests",
+]
+required_edges = [
+  "typed Kernel native-worker claim protocol",
+  "shared ProcessExecutor and Job Object lineage",
+  "CapabilityAdmissionPort",
+  "DurableReplayPort and DurableCheckpointPort",
+  "User Broker credential/resource lease when applicable",
+]
+forbidden_ownership = [
+  "task plan or scheduler",
+  "authority or capability grant issuance",
+  "canonical memory or Store credentials",
+  "generic shell service",
+  "implicit user-token or credential inheritance",
+  "Finish or self-promotion",
+]
+
+[what_to_do]
+steps = [
+  "Define and implement the typed session-bound native-worker claim across Kernel and worker.",
+  "Replace generic transact_json probing with the exact versioned claim/ready/request/result protocol.",
+  "Compose the real WorkerCore ports and run start or recovery before serving frames.",
+  "Bind process, replay, checkpoint, cancellation and effects to one immutable generation identity.",
+  "Prove stale-generation fencing, credential revocation, no-orphan cleanup and contour conformance.",
+]
+
+[how_to_do]
+steps = [
+  "Kernel returns a closed claim containing artifact/config/protocol/facet hashes, principal/session/task/scope, process and Job Object binding, State Fence, Authority Epoch, capabilities, limits, deadline, cancellation, checkpoint and replay identities.",
+  "Validate the claim before constructing WorkerCore or accepting stdin frames; reject unknown fields and every identity mismatch.",
+  "Do not use generic JSON operation names as authority. Use a versioned EBP/native stub generated from the owning facet contract.",
+  "Materialize user credentials/resources only through an exact User Broker lease; keep secrets out of argv, environment dumps, logs and model context.",
+  "Use shared ProcessExecutor semantics for streams, timeout, cancellation and descendant cleanup.",
+  "Fence the old generation before cutover; reject stale reconnect, checkpoint and effect publication.",
+  "For unknown effect or transport outcome, reconcile the exact operation before retry and preserve durable event sequence.",
+]
+
+[acceptance]
+criteria = [
+  "The production main no longer converts every connect result into exit 78; a valid claim starts one worker generation.",
+  "Missing, malformed, stale or mismatched claim accepts no frame and starts no process/effect.",
+  "Artifact, protocol, facet, principal/session, process/Job, epoch/fence, capabilities, limits and operation identity remain exact end-to-end.",
+  "Old generation cannot accept work, checkpoint, reconnect or publish an effect after fencing.",
+  "Cancel/timeout/crash leaves no descendant or leaked resource handle.",
+  "Credential/resource lease loss revokes use and cannot be replayed by another principal/session/operation.",
+  "Exact replay/recovery preserves event sequence; changed same-identity request conflicts.",
+  "Native/core/WASM compatibility claims use one semantic conformance corpus and report divergence explicitly.",
+  "Worker failure degrades only its capability and cannot kill Kernel or independent work.",
+  "No task scheduler, canonical writer, authority issuer, generic shell or Finish owner is introduced.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-native-worker-core -p eliot-native-worker --all-targets",
+  "cargo test --locked -p eliot-native-worker-core -p eliot-native-worker --all-targets",
+  "cargo clippy --locked -p eliot-native-worker-core -p eliot-native-worker --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run a real Windows native-worker claim, process start, frame exchange, checkpoint/replay, cancellation, stale-generation reconnect and credential-revocation profile."
+
+[boundaries]
+non_goals = [
+  "dynamic Rust library loading",
+  "new provider-specific semantics",
+  "automatic workflow trigger",
+  "Product or release promotion from package tests",
+]
