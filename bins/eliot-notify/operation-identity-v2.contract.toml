@@ -1,0 +1,113 @@
+schema = "eliot.notify.operation-identity-migration.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "PARENT_REQUEST_IDENTITY_REUSED_ACROSS_VERIFY_DELIVERY_AND_LEDGER_STAGES"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "NOTIFICATION_CHILD_IDENTITY_EDGE_CANDIDATE"
+issue = 78
+parent_issue_refs = [15, 18]
+product_pulse_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A12-03-one-governed-write-path.md#a123-one-governed-write-path",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
+  "docs/architecture/I05-21-transactional-outbox-and-notifications.md#i521-transactional-outbox-and-notifications",
+  "docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-identity-and-effect-identity",
+  "docs/architecture/I07-02-frame.md#i72-frame",
+  "docs/architecture/I07-16-notifications.md#i716-notifications",
+  "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+]
+anchors = ["ARCH-OBS-01", "ARCH-RES-04", "ARCH-SEC-02", "ARCH-LIFE-01"]
+
+[confirmed_gap]
+source = "bins/eliot-notify/src/lib.rs"
+observations = [
+  "Normal Kernel-backed delivery constructs one KernelClient and installs the caller NotificationRequest.context.request_identity once.",
+  "G-08 source verification, A-08 policy admission, one-shot ledger reserve, provider delivery and ledger commit execute as distinct stages but inherit the same parent RequestIdentity.",
+  "The Kernel port methods accept operation name plus payload and do not receive an explicit child RequestIdentity.",
+  "Fallback delivery already separates reservation and commit records but still binds them to the same parent request identity rather than explicit child operation lineage.",
+  "UnavailableFallbackLedger and notify-core UnavailableLedger are test fixtures, not the production defect.",
+]
+discriminator = "Deliver one notification through source verify, policy admit, ledger reserve, provider effect and ledger commit. Current normal path presents the same parent request/idempotency/cancellation identity at each Kernel boundary."
+
+[causal_property]
+statement = "One parent notification request deterministically derives distinct child identities for source verification, policy admission, ledger reservation, provider effect and ledger commit; each stage replays and reconciles independently while retaining exact parent and predecessor lineage."
+
+[scope]
+primary_paths = [
+  "bins/eliot-notify/src/lib.rs",
+  "bins/eliot-notify/src/main.rs",
+  "crates/supervision/eliot-notify-core/src/**notification**",
+  "focused notify identity/replay tests",
+]
+serialized_kernel_paths = [
+  "crates/surfaces/eliot-cli/src/kernel_client.rs",
+  "crates/kernel/eliot-kernel-service/src/**notify**",
+  "crates/kernel/eliot-ors/src/**notify**",
+]
+read_only_contracts = [
+  "crates/foundation/eliot-contracts/src/**operation**",
+  "crates/foundation/eliot-protocol/src/**request**",
+  "crates/supervision/eliot-notify-core/src/lib.rs",
+]
+forbidden_ownership = [
+  "private notify request-identity ontology",
+  "notification process authority or Session issuance",
+  "canonical task/Problem/Finish ownership",
+  "provider-specific retry policy or secret storage",
+]
+
+[what_to_do]
+steps = [
+  "Define one shared deterministic parent-to-child identity derivation for the five notification stages.",
+  "Pass an explicit child RequestIdentity and EffectIdentity into every Kernel/provider/ledger call rather than mutable client-global parent state.",
+  "Persist stage lineage and exact submission/effect/commit disposition in the existing Kernel/ledger owners.",
+  "Keep normal Kernel-backed delivery and Watchdog fallback semantics distinct while sharing the same child identity contract.",
+  "Preserve one-shot replay, unknown provider outcome and ledger poison/reconciliation behavior under exact stage identities.",
+  "Migrate any serialized notification receipt/ledger shape additively or through an explicit compatibility decoder.",
+]
+
+[how_to_do]
+steps = [
+  "Derive child operation IDs with domain separation over parent operation/request identity, stage kind, canonical stage payload digest, State Fence and parent/predecessor references.",
+  "Create distinct cancellation/idempotency identities for G08_VERIFY, A08_ADMIT, LEDGER_RESERVE, DELIVERY_EFFECT and LEDGER_COMMIT.",
+  "Keep provider delivery as the only external-effect child and bind its EffectIdentity to the reservation/one-shot key without conflating it with the final ledger commit.",
+  "Persist reservation intent before delivery and commit only after an exact provider observation or reconciled effect outcome.",
+  "On provider timeout/disconnect, reconcile the DELIVERY_EFFECT identity before any new provider call; do not repeat source/policy stages unless their own evidence is stale or invalidated.",
+  "On ledger commit unknown outcome, reconcile LEDGER_COMMIT independently; never infer delivery did or did not happen from commit visibility alone.",
+  "Exact child replay returns the same receipt/observation. Changed payload or stage kind under one child identity is IDENTITY_CONFLICT.",
+  "Reject cross-stage cancellation, receipt, reservation and commit adoption even when the parent request matches.",
+  "Keep Watchdog fallback free of caller-selected authority: derive its children from the signed fallback envelope and verified scheduler identity.",
+]
+
+[acceptance]
+criteria = [
+  "One request yields five distinct child operation identities with exact parent/predecessor lineage.",
+  "G-08, A-08, reserve, delivery and commit cannot reuse each other's request, idempotency, cancellation or effect identities.",
+  "Exact retry of one child is idempotent; changed stage/payload under the same child identity conflicts before effect.",
+  "Provider unknown outcome blocks only delivery/reconciliation and never causes a blind second provider effect.",
+  "Ledger commit unknown outcome reconciles independently and cannot prove provider non-delivery.",
+  "One-shot replay returns the original observation without rerunning provider delivery.",
+  "Cross-stage or cross-request receipt/cancel/reservation adoption is rejected.",
+  "Normal and Watchdog fallback paths produce compatible child-lineage receipts without sharing caller authority.",
+  "Legacy serialized forms are explicit compatibility input and cannot be interpreted as complete v2 lineage.",
+  "Notification delivery gains no Session, authority, canonical task/Problem or Finish ownership.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-notify-core -p eliot-notify -p eliot-kernel-service -p eliot-ors --all-targets",
+  "cargo test --locked -p eliot-notify-core -p eliot-notify -p eliot-kernel-service -p eliot-ors --all-targets",
+  "cargo clippy --locked -p eliot-notify-core -p eliot-notify -p eliot-kernel-service -p eliot-ors --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run normal and Watchdog fallback delivery with successful effect, exact replay, provider timeout, lost provider response, lost ledger commit response, cross-stage cancellation and restart reconciliation."
