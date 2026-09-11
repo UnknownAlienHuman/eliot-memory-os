@@ -1,0 +1,115 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_CONTRACT_AND_SPOOL_IMPLEMENTATION"
+implementation_support = "PARTIAL"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "WATCHDOG_EXPORT_EDGE_CANDIDATE"
+parent_issue = 16
+handoff_issue = 458
+issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/458"
+integration_issue_refs = [15, 18, 11]
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "supervision.watchdog-spool-export"
+causal_property = "A retained Watchdog spool record advances past the Watchdog-owned cursor only after an exact authenticated sink acknowledgement for the same immutable batch and per-entry disposition."
+old_path_discriminator = "IndependentKernelSensor::readback opens the protected redb spool and returns the complete Vec<WatchdogSpoolEntry>; no production caller exports it, no durable cursor/batch/ack contract exists, and no Governor consumer admits heartbeat/gap/recovery records."
+result = "Wave A/B source candidate; Kernel/Governor Edge and Product proof remain separate"
+
+[documentation]
+architecture_sections = [
+  "docs/architecture/A08-01-purpose.md#a81-purpose",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation_sections = [
+  "docs/architecture/I07-02-frame.md#i72-frame",
+  "docs/architecture/I07-23-raw-and-normalized-host-events.md#i723-raw-and-normalized-host-events",
+  "docs/architecture/I08-01-process-and-authority.md#i81-process-and-authority",
+  "docs/architecture/I08-02-independent-observation-routes.md#i82-independent-observation-routes",
+]
+decision_anchors = ["ARCH-WDG-01", "ARCH-WDG-02", "ARCH-SEC-02", "ARCH-OBS-01", "ARCH-RES-01", "ARCH-RES-04"]
+
+[current_source]
+primary_path = "bins/eliot-watchdog/src/lib.rs"
+confirmed_facts = [
+  "IndependentKernelSensor owns a protected WatchdogSpool and can append Heartbeat and Gap records.",
+  "IndependentKernelSensor::readback returns every validated spool entry as one Vec.",
+  "Repository search finds no production call to IndependentKernelSensor::readback.",
+  "No WatchdogSpoolCursor, bounded export batch, sink disposition or acknowledgement type exists on the active path.",
+  "The Watchdog process has no canonical Store client and must remain non-semantic.",
+]
+
+[mutable_scope]
+wave_a = [
+  "crates/supervision/eliot-watchdog-core/Cargo.toml only if an existing dependency/export is required",
+  "crates/supervision/eliot-watchdog-core/src/** exact new reconciliation-contract files",
+  "crates/supervision/eliot-watchdog-core/tests/** focused contract fixtures",
+]
+wave_b = [
+  "bins/eliot-watchdog/src/watchdog_spool.rs",
+  "bins/eliot-watchdog/src/watchdog_spool/**",
+  "bins/eliot-watchdog/src/lib.rs exact export/cursor integration",
+  "bins/eliot-watchdog/tests/** focused spool export fixtures",
+]
+serialized_follow_up = [
+  "Kernel authenticated transport adapter",
+  "eliotd/Governor semantic candidate admission",
+  "real restart/replay Edge proof",
+]
+forbidden = [
+  "canonical Store client or credentials in Watchdog",
+  "direct Problem or Incident write",
+  "Watchdog-created semantic severity",
+  "sink-owned deletion of source records",
+  "cursor advancement on transport receipt alone",
+  "conflation with SupervisionLease renewal issue #88",
+]
+
+[required_change]
+steps = [
+  "Define versioned owner-neutral WatchdogSpoolCursor, WatchdogSpoolExportEntry, WatchdogSpoolExportBatch, WatchdogSpoolSinkDisposition, WatchdogSpoolAcknowledgement and typed reconciliation errors.",
+  "Preserve exact sequence, schema, payload digest, installation/generation/epoch, lease or coverage identity, predecessor cursor and batch digest.",
+  "Persist the export cursor beside the existing spool under the same single writer; do not create a second state file owner.",
+  "Read bounded item/byte batches from cursor + 1 instead of returning the complete spool.",
+  "Make exact retry byte-stable for the same cursor/high-water state and reject changed payload under the same batch identity.",
+  "Advance the cursor only after an acknowledgement from the configured current sink carrying the exact batch digest, predecessor and per-entry terminal disposition.",
+  "Keep RECEIVED, DURABLE, ADMITTED_CANDIDATE, APPLIED, REJECTED, UNKNOWN and GAP_REQUIRES_RECOVERY distinct.",
+  "Keep UNKNOWN, timeout, disconnect, missing acknowledgement and unresolved gap replayable without cursor advancement.",
+  "Prevent a later acknowledgement from skipping a Gap, pressure eviction or recovery marker.",
+  "Allow compaction only below the durably acknowledged cursor and never across an unresolved gap/recovery boundary.",
+]
+
+[acceptance]
+criteria = [
+  "Empty spool exports a bounded empty batch with exact cursor and high-water state.",
+  "Exact export retry is byte-equivalent and carries the same semantic digest.",
+  "Wrong predecessor, generation, epoch, sink identity or payload digest is rejected.",
+  "RECEIVED, DURABLE and UNKNOWN do not advance an application-bound cursor.",
+  "A valid terminal acknowledgement advances the cursor exactly once.",
+  "A later acknowledgement cannot skip a gap, pressure or recovery marker.",
+  "Restart preserves cursor, pending batch identity and replayability.",
+  "Canonical Store unavailability leaves the Watchdog spool intact and coverage visibly degraded.",
+  "Watchdog has no direct canonical write path, semantic admission, authority issuance or Product completion claim.",
+]
+negative_cases = [
+  "duplicate transport",
+  "wrong cursor predecessor",
+  "wrong Watchdog generation or epoch",
+  "same sequence with changed payload",
+  "forged sink acknowledgement",
+  "timeout or unknown sink outcome",
+  "attempt to acknowledge past an unresolved gap",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-watchdog-core -p eliot-watchdog --all-targets",
+  "cargo test --locked -p eliot-watchdog-core -p eliot-watchdog --all-targets",
+  "cargo clippy --locked -p eliot-watchdog-core -p eliot-watchdog --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "After Wave A/B, add serialized Kernel/Governor adapters and execute Watchdog -> Kernel -> eliotd replay across independent process restarts."
+product_pulse = "Owned by issue #11 and remains NOT_EXECUTED."
