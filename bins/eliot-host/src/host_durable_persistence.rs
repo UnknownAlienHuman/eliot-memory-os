@@ -55,9 +55,9 @@ pub(super) fn sync_dir(dir: &Path) -> Result<(), HostError> {
 
 #[cfg(windows)]
 pub(super) fn write_durable_file(path: &Path, bytes: &[u8]) -> Result<(), HostError> {
+    use std::io::Write;
     #[cfg(test)]
     ordering::record("file_write_start");
-    use std::io::Write;
     let mut file =
         std::fs::File::create(path).map_err(|error| HostError::Platform(error.to_string()))?;
     file.write_all(bytes)
@@ -100,7 +100,7 @@ pub(crate) mod test_fault {
 
     pub(crate) fn take_sync_fault_if_set() -> Option<ErrorKind> {
         SYNC_FAULT.with(|slot| {
-            let taken = SYNC_FAULT_TAKEN.with(|t| t.get());
+            let taken = SYNC_FAULT_TAKEN.with(std::cell::Cell::get);
             if taken {
                 return None;
             }
@@ -119,7 +119,7 @@ pub(crate) mod ordering {
     use std::cell::RefCell;
 
     thread_local! {
-        static LOG: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        static LOG: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     }
 
     pub fn record(event: &str) {

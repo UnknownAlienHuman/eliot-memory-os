@@ -200,6 +200,10 @@ pub(super) fn read_runtime_restart_pending_identity(
 }
 
 #[cfg(all(test, windows))]
+#[allow(
+    clippy::expect_used,
+    reason = "small pure clock-conversion tests state their impossible fixture states explicitly"
+)]
 mod tests {
     use std::time::Duration;
 
