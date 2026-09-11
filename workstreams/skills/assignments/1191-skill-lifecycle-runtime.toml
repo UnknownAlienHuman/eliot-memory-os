@@ -1,0 +1,132 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_AFTER_CANONICAL_AND_SURFACE_EDGES"
+implementation_support = "LIFECYCLE_CONTRACT_RECOVERED_BUT_NOT_CALLABLE_IN_PRODUCTION"
+evidence_execution_status = "SOURCE_AND_CONSUMER_SEARCH_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "SKILL_LIFECYCLE_EDGE_CANDIDATE_ONLY"
+issue = 1191
+contract_predecessor_issue = 44
+dreamer_procedure_issue = 661
+dreamer_runtime_issue = 1100
+governor_issue = 18
+store_issue = 19
+registry_issue = 13
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "governor.skill-lifecycle-runtime"
+causal_property = "One accepted procedure and portable Skill package becomes current only through the Governor Skill owner, exact promotion evidence, canonical transition, immutable Store receipt and restart-safe lifecycle state; delivery, activation, execution and usefulness remain separate observations."
+current_discriminator = "SkillLifecycleApi has no implementation, SkillRegistry::propose/promote have no production callers, and the current Governor only rebuilds SkillRegistry from owner snapshots."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1191"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-25-skill-lifecycle-interaction-and-execution-evidence.md#i725-skill-lifecycle-interaction-and-execution-evidence",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I12-24-meta-learning-and-improvement-delivery.md#i1224-meta-learning-and-improvement-delivery",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-AUTH-01", "ARCH-GROUND-01", "ARCH-ORD-01", "ARCH-SEC-02", "ARCH-OBS-01", "ARCH-FIN-01"]
+
+[current_source]
+confirmed = [
+  "eliot-skills owns pure portable generated-package and procedure projection contracts.",
+  "eliot-skill owns SkillLifecycleView, SkillCandidate, PromotionGate, SkillPromotionReceipt, SkillRegistry and SkillLifecycleApi.",
+  "GovernorComposition recovers one SkillRegistry from canonical owner snapshots.",
+  "No repository implementation of SkillLifecycleApi was found.",
+  "No production call site for SkillRegistry::propose or SkillRegistry::promote was found.",
+  "SkillRegistry::promote changes only its local map and returns a local receipt; no production path proves canonical commit before currentness.",
+  "Remaining effecting Skill commands are in the legacy eliot-app/eliot-engine stack owned by #1189.",
+]
+
+[scope]
+primary_paths = [
+  "crates/governor/eliot-skill/** only for current lifecycle owner/API and proven contract defects",
+  "exact eliot-governor and eliotd composition/canonical transition adapters",
+  "exact eliot-skills materialization consumer boundary",
+  "exact Agent Bridge, Operator and ControlBoard read/command adapters",
+  "directly relevant tests and finite fixtures",
+]
+serialized_dependencies = ["#661/#1100 procedure candidate/runtime", "#18/#19 canonical and Store path", "#77/#1098 user/agent delivery", "#13 registry", "#11 Product proof"]
+forbidden = [
+  "legacy eliot-engine SkillRegistryService as current owner",
+  "direct Store, provider, process or credential access",
+  "generated Skill text granting capabilities or executing tools",
+  "second package manifest, lifecycle registry, promotion gate or execution ontology",
+  "task scheduling, authority issuance or Finish ownership",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Implement the current Governor-owned lifecycle API and exact materialization input."
+how = [
+  "Construct SkillLifecycleApi only inside the current Governor composition.",
+  "Bind every request to installation, principal/Session, task/WorkScope, request/operation/idempotency, base lifecycle revision/digest, package/procedure digest, AuthorityEpoch, StateFence, deadline, policy and privacy/effect ceilings.",
+  "Require one accepted GovernedProcedureProjection with source/counterevidence, applicability, negative triggers, verifier, rollback, capabilities and target compatibility; candidate-on-candidate promotion is invalid.",
+]
+
+[[waves]]
+id = "B"
+what = "Route promotion through canonical commit before currentness."
+how = [
+  "Treat SkillRegistry as a recovered working projection, not the persistence owner.",
+  "Validate against the current owner snapshot, prepare one canonical transition, submit through Kernel/Store and reconcile the immutable receipt before updating or rebuilding local state.",
+  "Exact replay is idempotent; changed package/base/evidence/gate/scope/dependency/fence/policy under one identity conflicts.",
+]
+
+[[waves]]
+id = "C"
+what = "Preserve complete lifecycle and evidence-stage separation."
+how = [
+  "Keep installed, delivered, expanded, eligible, activated, adhered, executed, semantically verified, useful, failed and uncertain distinct.",
+  "Ingest activation/execution evidence only when bound to exact revision, recipient/session/attempt, packet position, steps, artifacts, verifier, window and source lineage.",
+  "Missing observation remains unknown; installation, retrieval, repetition, confidence, process exit and model agreement prove no later stage.",
+]
+
+[[waves]]
+id = "D"
+what = "Close invalidation, conflict, rollback and current surface access."
+how = [
+  "Mark affected Skills stale before use when dependency/tool/configuration identity changes.",
+  "Resolve conflict, ordering and mutual exclusion only from exact owner evidence, never prompt order or majority.",
+  "Route rollback, suppress, archive, quarantine and restore through exact reversible canonical operations and reconcile possible effects before retry.",
+  "Expose typed read/propose/promote/evidence operations through current Bridge/Operator/ControlBoard paths with no legacy fallback.",
+]
+
+[acceptance]
+criteria = [
+  "A real non-test SkillLifecycleApi implementation is constructed by the current Governor runtime.",
+  "Production Skill proposal/promotion no longer depends on legacy eliot-app/eliot-engine commands.",
+  "Every proposal binds exact accepted procedure/package, base view, scope/fence, dependencies, evidence, policy and operation identity.",
+  "Promotion is canonically committed and receipted before the recovered registry exposes it as current.",
+  "Local in-memory mutation alone cannot produce current Skill state or an authoritative promotion receipt.",
+  "Exact replay is idempotent and changed same-identity input conflicts.",
+  "Restart rehydrates the committed lifecycle revision and rejects stale/local divergence.",
+  "Every later lifecycle stage requires exact compatible predecessor and owner evidence.",
+  "Missing instrumentation remains unknown and cannot be transformed into compliance, execution or usefulness.",
+  "Dependency/tool/configuration changes invalidate affected revisions before use.",
+  "Conflicting Skills preserve every alternative and are not resolved by prompt order, popularity, confidence or majority.",
+  "Rollback/quarantine/archive/restore are exact, reversible where promised, receipted and unknown-outcome safe.",
+  "Generated Skill content cannot grant capabilities, launch tools/processes, write canonical state, issue authority or decide Finish.",
+  "Current Bridge/Operator/ControlBoard paths expose typed lifecycle operations without generic JSON or legacy fallback.",
+  "Tests cover materialization, proposal, canonical promotion/restart, replay/conflict, invalidation, stage separation, unknown outcome and rollback.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-skills -p eliot-skill -p eliot-governor -p eliotd -p eliot-controlboard --all-targets",
+  "cargo test --locked -p eliot-skills -p eliot-skill -p eliot-governor -p eliotd -p eliot-controlboard --all-targets",
+  "cargo clippy --locked -p eliot-skills -p eliot-skill -p eliot-governor -p eliotd -p eliot-controlboard --all-targets -- -D warnings",
+  "cargo tree --locked -p eliot-skill --edges normal",
+  "git diff --check",
+]
+edge_proof = "Run accepted procedure -> portable package -> proposal -> canonical promotion -> restart/readback -> activation/execution evidence -> dependency invalidation -> rollback, including lost acknowledgement and identity conflict."
+product_proof = "Issue #11 remains open."
