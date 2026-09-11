@@ -1,0 +1,159 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_AFTER_P04_CONTRACT"
+implementation_support = "TYPED_LOCAL_DISPATCH_PRESENT_PRODUCTION_KERNEL_PORT_UNAVAILABLE"
+evidence_execution_status = "CURRENT_BINARY_REQUEST_SURFACE_AND_PORT_COMPOSITION_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "AGENT_BRIDGE_EXECUTABLE_EDGE_CANDIDATE_ONLY"
+issue = 77
+kernel_p04_issue = 342
+bounded_input_issue = 977
+activation_parent_issue = 66
+activation_receiver_issue = 1095
+activation_producer_issue = 839
+user_broker_issue = 1098
+operator_issue = 1105
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "surface.agent-bridge-executable-and-kernel-port"
+causal_property = "One bounded versioned host request received by the Agent Bridge is validated as inert untrusted input, bound to the exact bridge process/connection and forwarded once through the authenticated Kernel P-04 client; the bridge preserves request/result/cancellation/reconciliation identity and cannot allocate Session/task authority, interpret domain semantics, access Store credentials or decide completion."
+current_discriminator = "The Agent Bridge binary has a typed request surface and local dispatch abstraction, but production still uses an unavailable KernelHostRequestPort. No real authenticated Kernel client carries invocation, cancellation, status, reconciliation and activation results through the executable path. Bounded stdin acquisition remains separately owned by #977."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/77"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-01-agent-interaction-loop.md#a101-agent-interaction-loop",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md#i71-eliot-bridge-protocol-ebp1",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-02-frame.md#i72-frame",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-03-handshake.md#i73-handshake",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-17-scope-and-task-onboarding.md#i717-scope-and-task-onboarding",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-24-tool-surface-economy-and-cognitive-exposure.md#i724-tool-surface-economy-and-cognitive-exposure",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-13-idle-drain-and-cancellation.md#i1413-idle-drain-and-cancellation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-21-unknown-commit-recovery.md#i1421-unknown-commit-recovery",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-01-input-validation-and-trust-boundaries.md#i151-input-validation-and-trust-boundaries",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-AUTH-01", "ARCH-PORT-01", "ARCH-SEC-01", "ARCH-SEC-02", "ARCH-OBS-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "The package exposes a closed typed request surface for host operations and a KernelHostRequestPort abstraction.",
+  "The executable currently lacks one production authenticated KernelHostRequestPort implementation and cannot reach the current Kernel P-04 owner.",
+  "The bridge parser/dispatch layer is distinct from Kernel authority and must remain so.",
+  "Raw ForwardFrame-style caller authority remains rejected; the bridge should expose only the bounded supported host operations.",
+  "Issue #977 owns pre-allocation input bounds and resynchronization and must be composed before any request reaches this port.",
+  "Issues #839/#1095 own the typed activation producer/receiver; this executable must carry those results without redefining them.",
+  "User Broker and Operator launch/session bindings remain #1098/#1105; the bridge cannot infer them from stdin, environment or process identity.",
+]
+
+[scope]
+primary_paths = [
+  "bins/eliot-agent-bridge/src/main.rs",
+  "bins/eliot-agent-bridge/src/lib.rs",
+  "bins/eliot-agent-bridge/src/** exact KernelHostRequestPort client/composition spans",
+  "crates/surfaces/eliot-mcp/src/host.rs and host_gateway.rs only for a proven shared host-contract defect",
+  "exact local Kernel client/handshake adapter required by #342",
+  "directly relevant tests and finite host-request fixtures",
+]
+serialized_dependencies = [
+  "#977 bounded input",
+  "#342 Kernel P-04",
+  "#66/#839/#1095 activation results",
+  "#1098 User Broker process/session binding",
+  "#1105 Operator",
+  "#11 Product proof",
+]
+forbidden = [
+  "allocating or reconstructing Principal, Session, task, WorkScope, AuthorityEpoch or StateFence in the bridge",
+  "generic operation strings, raw MCP forwarding, unrestricted JSON or caller-defined executable/tool authority",
+  "direct Store, provider, model, filesystem, process or network effect ownership",
+  "retrying semantic/provider work after an uncertain Kernel response",
+  "treating pipe connection, process liveness, same user or handshake success as authorization",
+  "logging credentials, protected context or raw sensitive payloads",
+  "local durable task/session/replay database",
+  "bridge-side semantic error interpretation, task Finish or VERIFIED_COMPLETE",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Implement the authenticated KernelHostRequestPort over the accepted P-04 contract."
+how = [
+  "Construct the client only from an exact admitted bridge launch binding: installation, artifact/process generation and start identity, principal/logon Session, protocol revision, Kernel endpoint identity and User Broker launch receipt where applicable.",
+  "Perform the versioned handshake and require Kernel acknowledgement of the exact bridge process/connection binding before host requests are accepted.",
+  "Expose only the closed P-04 activation, invocation, cancellation, status and reconciliation operations.",
+  "Never derive or override Session/task/scope/fence/capability values from environment, stdin or caller JSON.",
+]
+
+[[waves]]
+id = "B"
+what = "Compose bounded acquisition, typed validation and exactly-once forwarding."
+how = [
+  "Consume only records accepted by #977's bounded acquisition profile and reject malformed/oversized/unknown input before Kernel I/O.",
+  "Validate the exact existing host request schema and field-specific limits without weakening nested MCP/host contracts.",
+  "Forward one valid input exactly once with its request/idempotency/cancellation/correlation identities; invalid input invokes zero Kernel operations.",
+  "Preserve request order and bounded output backpressure; a slow host consumer cannot create an unbounded response queue.",
+]
+
+[[waves]]
+id = "C"
+what = "Carry typed onboarding, invocation and error results without semantic coercion."
+how = [
+  "Render all seven activation-result dispositions exactly and preserve their stable reason/recovery fields.",
+  "Carry invocation accepted/submitted/result/unknown/reconciling/terminal states from #342 without mapping them through human text.",
+  "Keep transport, Kernel admission, semantic owner result, provider/effect outcome and output-delivery acknowledgement distinct.",
+  "Redact protected payloads and credentials while preserving correlation, operation, fence, evidence handle and next-safe-action fields.",
+]
+
+[[waves]]
+id = "D"
+what = "Close cancellation, lost response, reconnect, drain and process cleanup."
+how = [
+  "Send cancellation only for the exact caller request and Kernel operation; reject unknown, foreign or already-terminal cancellation locally without touching another request.",
+  "After a possible Kernel submission with lost response, invoke P-04 reconciliation for the same request/operation before forwarding again.",
+  "On Kernel disconnect, broker logout, permit revocation, fence/epoch change or process replacement, stop new input, drain bounded outputs, close connection-scoped handles and exit with one typed disposition.",
+  "A replacement bridge must obtain a new process/connection admission and owner-issued reconnect result; cached state cannot revive the prior connection.",
+]
+
+[acceptance]
+criteria = [
+  "A real non-test KernelHostRequestPort implementation and production composition caller exist.",
+  "The bridge accepts host work only after an exact current P-04 process/connection admission.",
+  "Caller/environment input cannot choose or widen principal, Session, task, WorkScope, capability, epoch, fence, Kernel endpoint, provider or effect authority.",
+  "Every malformed, oversized, invalid-version, unknown-operation or field-bound violation invokes zero Kernel operations.",
+  "Every valid request is forwarded exactly once with the original request/idempotency/cancellation/correlation identity.",
+  "Raw forwarding, arbitrary operation names and unrestricted JSON authority remain unavailable.",
+  "All seven activation dispositions and all P-04 invocation/reconciliation states remain exact and are not reduced to generic timeout/error strings.",
+  "Transport, Kernel admission, semantic result, effect/provider outcome and host-output acknowledgement remain distinct stages.",
+  "Exact response replay is idempotent; changed response or request under one identity conflicts.",
+  "Lost/unknown Kernel response invokes exact reconciliation before any resend and cannot duplicate semantic/provider/external work.",
+  "Cancellation targets only the exact operation and cannot erase possible/committed effects.",
+  "Kernel/broker/logout/fence/epoch/generation loss stops new input and closes connection-scoped resources without inventing durable Session continuity.",
+  "Replacement bridge process requires new admission and cannot reuse cached connection authority.",
+  "Output buffering is bounded and ordered; slow or closed stdout/host transport cannot cause unbounded memory or semantic recomputation.",
+  "Diagnostics are bounded and redacted and human text never controls behavior.",
+  "The bridge owns no Store/provider/model/process effect, semantic task state, authority, canonical write, Finish or VERIFIED_COMPLETE path.",
+  "Focused parser/port/handshake/invocation/cancel/reconcile/drain tests pass, followed by a real Operator/host-to-Kernel Edge under #11.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-agent-bridge -p eliot-mcp --all-targets",
+  "cargo test --locked -p eliot-agent-bridge -p eliot-mcp --all-targets",
+  "cargo clippy --locked -p eliot-agent-bridge -p eliot-mcp --all-targets -- -D warnings",
+  "python scripts/verify-agent-bridge-protocol.py",
+  "git diff --check",
+]
+edge_proof = "Run the actual bounded host process through Agent Bridge -> authenticated P-04 -> Kernel with onboarding, invocation, cancellation, lost response/reconciliation, broker logout, Kernel restart and bridge replacement."
+product_proof = "This establishes the executable Agent Bridge Edge candidate only; installed Operator/user-session Product proof remains #1105/#11."
