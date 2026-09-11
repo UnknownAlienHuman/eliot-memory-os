@@ -1,0 +1,138 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_AFTER_OWNER_CONTRACTS"
+implementation_support = "STATIC_BUNDLES_WITHOUT_INSTALL_OR_ROUTE_ADMISSION"
+evidence_execution_status = "SOURCE_AND_STATIC_PROFILE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "AGENT_HOST_INTEGRATION_EDGE_CANDIDATE_ONLY"
+issue = 1217
+provider_disposition_issue = 1109
+user_broker_issue = 1098
+registry_issue = 13
+legacy_core_issue = 1189
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "integrations.agent-host-generation"
+causal_property = "One host integration generation binds canonical Skills, plugin/hook/MCP payload, route profile and adapter generation; only the current user-session owner may install it and only exact installed-state plus live probes may admit its route."
+current_discriminator = "Static route and bundle verifiers exist, but materialization does not install or admit; Skill sync is owned by legacy eliot-engine; no current owner reads back actual host-profile state or consumes bundle receipts as route evidence."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1217"
+
+[documentation]
+implementation = [
+  "docs/architecture/I01-03-optional-and-on-demand-processes.md#i13-optional-and-on-demand-processes",
+  "docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
+  "docs/architecture/I03-04-capability-and-route-registry.md#i34-capability-and-route-registry",
+  "docs/architecture/I03-06-model-route-and-portfolio-policy.md#i36-model-route-and-portfolio-policy",
+  "docs/architecture/I07-24-tool-surface-economy-and-cognitive-exposure.md#i724-tool-surface-economy-and-cognitive-exposure",
+  "docs/architecture/I07-25-skill-lifecycle-interaction-and-execution-evidence.md#i725-skill-lifecycle-interaction-and-execution-evidence",
+  "docs/architecture/I10-11-external-model-bridges.md#i1011-external-model-bridges",
+  "docs/architecture/I14-14-module-hot-replacement.md#i1414-module-hot-replacement",
+  "docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+  "docs/architecture/I15-04-secrets.md#i154-secrets",
+]
+anchors = ["ARCH-PORT-01", "ARCH-SKL-01", "ARCH-SWM-02", "ARCH-AUTH-01", "ARCH-SEC-01", "ARCH-MOD-03", "ARCH-OBS-01"]
+
+[current_source]
+confirmed = [
+  "integrations/agent-runtimes defines four static route profiles and one host-bundle manifest.",
+  "verify-agent-route-bundles.py and verify-agent-host-bundles.py prove static shape only.",
+  "agent_host_bundle.py explicitly performs no user-profile install, provider launch, runtime-state copy or route admission.",
+  "Codex, Claude, OpenCode and Antigravity profiles remain target, partial, not executed or unprobed in load-bearing areas.",
+  "host-bundle.manifest.json distributes legacy eliot-governor compatibility surfaces.",
+  "SkillPackService in legacy eliot-engine is the current canonical Skill copy writer/linter.",
+  "No current owner installs, updates, removes and independently reads back one exact host integration generation.",
+]
+
+[scope]
+primary_paths = [
+  "integrations/agent-runtimes/**",
+  "integrations/agent-skills/**",
+  "integrations/antigravity/**",
+  "integrations/claude/**",
+  "integrations/codex/**",
+  "integrations/opencode/**",
+  "plugin/eliot-governor/** and plugin/eliot-antigravity-official/** only for current payload migration/removal",
+  "current Skill/bundle generator and User Broker install adapter",
+  "current Capability/Route Registry consumer and focused host fixtures",
+]
+serialized_dependencies = ["#1109 providers", "#1098 User Broker", "#13 registry", "#1189 legacy core", "#22/#874/#1100 execution", "#11 Product proof"]
+forbidden = [
+  "provider SDKs or credentials in Kernel/Governor core",
+  "arbitrary user-profile writes or recursive deletion",
+  "generic shell execution",
+  "route admission from static files",
+  "second task/swarm/authority/canonical/Finish owner",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Define one versioned host integration generation."
+how = [
+  "Bind host family, manifest/generator version, canonical Skill pack digest/order, every payload path/digest/mode, route profile digest, adapter contract/generation, host/runtime version and invalidation set.",
+  "Move canonical Skill sync/lint into a current low-dependency owner before legacy eliot-engine removal.",
+  "Keep copied Skills generated and byte-identical to one canonical source.",
+]
+
+[[waves]]
+id = "B"
+what = "Separate materialization from owner-bound install/update/remove."
+how = [
+  "Planning/materialization stays read-only and cannot claim installation or support.",
+  "Apply requires exact User Broker, SID/logon Session, destination root, current host identity/version, transaction identity, expected generation and rollback plan.",
+  "Stage and verify a new generation before atomic activation; unknown mutation/readback remains reconciling.",
+]
+
+[[waves]]
+id = "C"
+what = "Prove actual installed host state and route readiness."
+how = [
+  "Independently read back bytes, ACL/owner and host plugin/hook/MCP registration.",
+  "Run declared live schema, event, cancellation, model/account/quota and negative-capability probes under exact executable/account identities.",
+  "Keep installation, registration, hook delivery, executable health, account capability and AgentAttempt success as separate statuses.",
+]
+
+[[waves]]
+id = "D"
+what = "Retire compatibility fallbacks safely."
+how = [
+  "Give every host one live-admitted, explicitly unavailable, bounded-compatibility or removal disposition.",
+  "Keep compatibility routes under distinct route and operation identities with exact consumer, proof ceiling, expiry and removal condition.",
+  "Never cross-transport/provider fail over after a possibly delivered operation; reconcile before removal/update.",
+]
+
+[acceptance]
+criteria = [
+  "Every host has one current integration disposition and at most one active generation per user/session/root.",
+  "Bundle identity covers all Skills/payload/profile/adapter/host/generator inputs.",
+  "Canonical Skill sync/lint no longer depends on legacy eliot-engine and all copies match the manifest.",
+  "Materialization performs no user-profile mutation and cannot claim install or route support.",
+  "Apply/update/remove requires exact User Broker, SID/session, host root, transaction and expected-generation binding.",
+  "Path escape, reparse/symlink substitution, foreign ownership, secret-like payload and stale generation fail before mutation.",
+  "Staged install is verified before activation and crash/unknown outcome resumes or rolls back without deleting foreign files.",
+  "Installed readback proves exact bytes, ACL/owner, host registration and current host/runtime schema.",
+  "Installation, MCP/hook registration, route health, account/model/quota and attempt success remain independent statuses.",
+  "Target, partial, not-executed or unprobed profiles cannot enter the admitted route registry.",
+  "Compatibility bridges have one consumer, proof ceiling, expiry/removal condition and no unsafe cross-transport retry.",
+  "Credentials are absent from bundles, receipts, logs, instructions, Skills and model-visible context.",
+  "Update/remove affects only the exact owned generation and preserves foreign host files.",
+  "Provider/runtime owners consume the same route/adapter identities and integrations create no task, authority, canonical or Finish ownership.",
+]
+
+[verification]
+commands = [
+  "python scripts/verify-agent-route-bundles.py --self-test",
+  "python scripts/verify-agent-route-bundles.py",
+  "python scripts/verify-agent-host-bundles.py --self-test",
+  "python scripts/verify-agent-host-bundles.py",
+  "cargo test --locked -p <current-skill-bundle-owner> -p eliot-user-broker-core -p eliot-agent-contracts --all-targets",
+  "cargo clippy --locked -p <current-skill-bundle-owner> -p eliot-user-broker-core -p eliot-agent-contracts --all-targets -- -D warnings",
+  "cargo metadata --locked --format-version 1",
+  "git diff --check",
+]
+edge_proof = "Install/read back/update/remove one disposable generation for each host and execute every declared current live route probe under exact user/account/runtime identity."
+product_proof = "Static profile and install proof cannot close #11; provider/current-account and Product proof remain separate."
