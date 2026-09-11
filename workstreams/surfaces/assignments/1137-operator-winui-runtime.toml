@@ -1,0 +1,137 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_AFTER_OWNER_CONTRACTS"
+implementation_support = "REAL_WINUI_CLIENT_WITH_RECONNECT_AND_OWNER_MIGRATION_GAPS"
+evidence_execution_status = "SOURCE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "OPERATOR_USER_SESSION_EDGE_CANDIDATE_ONLY"
+issue = 1137
+user_broker_issue = 1098
+controlboard_pr = 1201
+governor_issue = 18
+legacy_retirement_issue = 1189
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "surface.operator-winui-user-session"
+causal_property = "One WinUI Operator is a User Broker-owned child whose initial handoff, reconnects, projections and mutations remain bound to exact user-session, process, endpoint, owner-revision, StateFence and operation identities without UI-created authority."
+current_discriminator = "apps/Eliot.Operator is real, but its consumed environment handoff cannot be renewed after DisconnectAsync clears the endpoint; mutation identity is discarded on an unknown response; reads and commands still use legacy eliot-app operator tools."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1137"
+
+[documentation]
+implementation = [
+  "docs/architecture/I01-03-optional-and-on-demand-processes.md#eliot-uiexe",
+  "docs/architecture/I05-20-read-model-consistency-and-cache.md#i520-read-model-consistency-and-cache",
+  "docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md#i71-eliot-bridge-protocol-ebp1",
+  "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "docs/architecture/I11-04-dreamerwatchdog-conversation-and-operator-intent.md#i114-dreamerwatchdog-conversation-and-operator-intent",
+  "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+  "docs/architecture/I15-04-secrets.md#i154-secrets",
+]
+anchors = ["ARCH-AUTH-01", "ARCH-LIFE-01", "ARCH-SEC-01", "ARCH-SEC-02", "ARCH-RES-04", "ARCH-OBS-01"]
+
+[current_source]
+confirmed = [
+  "The real UI is apps/Eliot.Operator, a net10.0 WinUI 3 application, not bins/eliot-operator.",
+  "RuntimeDiscoveryService consumes and clears ELIOT_OPERATOR_ENDPOINT, then GovernorPipeClient clears its cached endpoint on disconnect.",
+  "The running process has no implemented owner channel to acquire a replacement handoff, and CallToolAsync rethrows IOException rather than retrying.",
+  "MainViewModel creates a new idempotency key per command invocation and retains no unknown-submission reconciliation handle.",
+  "GovernorPipeClient invokes legacy eliot_operator_* tools implemented in crates/eliot-app.",
+  "ReadLineAsync and local JsonDocument.Parse paths have no explicit encoded-record and retained-buffer profile.",
+  "System.Text.Json Web defaults accept unmapped fields unless explicitly disallowed.",
+  "App startup diagnostics write complete exception text and stack traces.",
+  "README states Windows App SDK 2.2.0 while the project references 2.3.1.",
+  "No owned Operator .NET test project was found.",
+]
+
+[scope]
+primary_paths = [
+  "apps/Eliot.Operator/**",
+  "exact eliot ui and User Broker launch/reconnect-handoff spans",
+  "exact current ControlBoard/runtime-status and Governor Operator-intent adapters",
+  "versioned legacy adapter only when a current consumer requires it",
+  "directly relevant Rust and .NET tests/fixtures",
+]
+serialized_dependencies = ["#1098 User Broker", "#1201/#13 status projection", "#18/#1189 current owner and legacy retirement", "#63/#74 operation identity", "#11 Product proof"]
+forbidden = [
+  "unnecessary Agent Bridge dependency",
+  "direct Store/database credentials",
+  "browser or HTTP listener",
+  "shell/process execution",
+  "Session allocation, semantic scheduling or authority issuance",
+  "model/provider policy, canonical writer or Finish owner",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Correct the real WinUI owner and protocol boundary."
+how = [
+  "Treat apps/Eliot.Operator as the only UI implementation and bind it to the accepted User Broker launch contract.",
+  "Map reads to the current owner-neutral ControlBoard/runtime-status projection and mutations to the current typed OperatorIntent owner.",
+  "If legacy eliot_operator_* compatibility is temporarily required, isolate one versioned adapter with one consumer, proof ceiling, expiry and removal condition.",
+]
+
+[[waves]]
+id = "B"
+what = "Replace the consumed-endpoint reconnect dead end."
+how = [
+  "Bind the initial handoff to installation, SID/logon Session, broker registration, UI artifact/process generation, endpoint generation, role/capabilities, nonce, expiry and invalidation.",
+  "Acquire reconnect through a new owner-issued single-use handoff or an authenticated broker channel; never reuse the consumed nonce or infer continuity from PID, user or pipe name.",
+  "If live reconnect is unavailable, return a typed terminal restart-required disposition rather than looping on the cleared environment variable.",
+]
+
+[[waves]]
+id = "C"
+what = "Preserve mutation identity and exact reconciliation."
+how = [
+  "Create the operation/idempotency identity before send and retain it with canonical command bytes, expected revision/fence and phase until terminal receipt.",
+  "Keep submitted, possibly executed, receipted, rejected, cancelled, stale-fence and unknown/reconciling states distinct.",
+  "After pipe loss, reconcile the same operation; UI retry cannot generate another logical mutation.",
+]
+
+[[waves]]
+id = "D"
+what = "Close bounded decoding, cache invalidation and diagnostics."
+how = [
+  "Enforce independent encoded-line, decoded-body, string/container/depth, page/cursor, retained-buffer, timeout and diagnostic limits before allocation.",
+  "Reject unmapped and duplicate protected control fields before trusted use; bounded opaque result data remains untrusted.",
+  "Invalidate records, selected actions, cursors and task context on runtime/generation/revision/fence change.",
+  "Replace full exception logging with bounded typed and redacted diagnostics and derive documented SDK versions from build metadata/evidence.",
+]
+
+[acceptance]
+criteria = [
+  "All source/docs/tests refer to apps/Eliot.Operator and no nonexistent Rust Operator binary.",
+  "eliot ui launches one admitted WinUI artifact as a current User Broker child for exact installation/SID/logon Session.",
+  "Initial and reconnect handoffs are owner-issued, generation-bound, expiring and single-use; old nonce/endpoint replay fails.",
+  "Pipe loss obtains a new valid handoff or returns typed restart-required; it never rereads a permanently consumed endpoint in a loop.",
+  "One mutation retains one stable identity through send, lost response, reconnect and reconciliation.",
+  "Read and mutation contracts have one current owner; every legacy adapter has one consumer and removal condition.",
+  "Encoded/decoded JSON, strings, containers, pages, cursors, buffers, timeouts and diagnostics are bounded independently.",
+  "Protected endpoint/handshake/contract/receipt/control shapes reject unknown and duplicate control fields.",
+  "Runtime/generation/revision/fence changes invalidate all dependent UI state before use.",
+  "Cancellation targets only the exact current operation and preserves possible committed effects for reconciliation.",
+  "Diagnostics contain no nonce, endpoint, credential, command/query body or protected record content.",
+  "README, project metadata and publish evidence agree on .NET and Windows App SDK identity.",
+  "An owned .NET test project covers handoff, bounds, closed decoding, reconnect, unknown mutation reconciliation, cache invalidation and redaction.",
+  "Installed Windows proof covers launch, read, mutation, lost response, rotation, stale handoff rejection and logoff cleanup.",
+  "Operator owns no canonical state, Store access, Session allocator, scheduler, authority or VERIFIED_COMPLETE decision.",
+]
+
+[verification]
+commands = [
+  "dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode",
+  "dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release -r win-x64 --no-restore",
+  "dotnet test apps/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj -c Release -r win-x64 --no-restore",
+  "dotnet publish apps/Eliot.Operator/Eliot.Operator.csproj -c Release -r win-x64 --self-contained true --no-restore -o dist/windows-x64/Eliot.Operator",
+  "cargo test --locked -p eliot-cli -p eliot-user-broker-core -p eliot-runtime-status -p eliot-controlboard --all-targets",
+  "cargo clippy --locked -p eliot-cli -p eliot-user-broker-core -p eliot-runtime-status -p eliot-controlboard --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run installed User Broker -> WinUI Operator -> role-filtered Governor/ControlBoard with endpoint rotation, pipe loss, unknown mutation response, exact reconciliation and logoff cleanup."
+product_proof = "Issue #11 remains open; historical README smoke text is not current Product evidence."
