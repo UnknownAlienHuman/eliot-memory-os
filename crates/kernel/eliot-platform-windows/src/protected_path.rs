@@ -528,11 +528,6 @@ fn test_protected_root() -> Option<PathBuf> {
     crate::TEST_PROTECTED_ROOT.with(|slot| slot.borrow().clone())
 }
 
-#[cfg(not(any(test, feature = "test-support")))]
-fn test_protected_root() -> Option<PathBuf> {
-    None
-}
-
 fn ensure_protected_containment(root: &Path, path: &Path) -> Result<(), ProtectedPathError> {
     if !path.is_absolute() || !path.starts_with(root) {
         return Err(ProtectedPathError::InvalidPath);

@@ -7,8 +7,8 @@ license = "MIT"
 description = "Governed Cargo instrumentation adapter over the production process port"
 
 [dependencies]
-eliot-instrument-api = { path = "../eliot-instrument-api", version = "0.1.0" }
-eliot-process = { path = "../../kernel/eliot-process", version = "0.1.0" }
+eliot-instrument-api.workspace = true
+eliot-process.workspace = true
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"

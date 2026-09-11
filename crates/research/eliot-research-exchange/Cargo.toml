@@ -8,7 +8,7 @@ description = "Governed asynchronous ELIOT Research federation exchange"
 
 [dependencies]
 eliot-contracts.workspace = true
-eliot-research-exchange-api = { path = "../eliot-research-exchange-api", version = "0.1.0" }
+eliot-research-exchange-api.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

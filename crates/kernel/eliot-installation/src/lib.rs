@@ -138,6 +138,8 @@ use installation_registry::{
     LEGACY_REGISTRY_TABLE, REGISTRY_RELATIVE_PATH, REGISTRY_TABLE, installation_registry_path,
 };
 
+#[cfg(feature = "test-support")]
+use approved_generation_registry::validate_approval_against_manifest;
 pub use approved_generation_registry::{
     ActivationCommitFence, ActivationCommitReceipt, ActivePhaseBRebind, ActivePhaseBRebindIntent,
     ActivePhaseBRebindReceipt, ActivePhaseBRebindRecovery, AgentBridgePhaseBBinding,
@@ -149,7 +151,7 @@ pub use approved_generation_registry::{
 use approved_generation_registry::{
     ActiveVerifiedReceiptBinding, PendingActivationTerminal, PendingActivationTerminalDisposition,
     activation_terminal_digest, candidate_manifest_digest, phase_b_scm_digest,
-    registry_projection_identity, validate_approval_against_manifest, validate_phase_b_scm_digest,
+    registry_projection_identity, validate_phase_b_scm_digest,
 };
 #[cfg(test)]
 use approved_generation_registry::{
