@@ -1,0 +1,121 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "CURRENT_GOVERNOR_PRESENT_LEGACY_FACADE_AND_EDGE_CLOSURE_INCOMPLETE"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "GOVERNOR_SEMANTIC_EDGE_CANDIDATE"
+issue = 18
+registry_issue = 13
+kernel_issue = 15
+store_issue = 19
+product_pulse_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A10-01-agent-interaction-loop.md#a101-agent-interaction-loop",
+  "docs/architecture/A12-03-one-governed-write-path.md#a123-one-governed-write-path",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "docs/architecture/I04-04-task-lifecycle.md#i44-task-lifecycle",
+  "docs/architecture/I05-01-store-boundary.md#i51-store-boundary",
+  "docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
+  "docs/architecture/I05-20-read-model-consistency-and-cache.md#i520-read-model-consistency-and-cache",
+  "docs/architecture/I06-04-kernel.md#i64-kernel",
+  "docs/architecture/I06-05-governor.md#i65-governor",
+  "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+]
+anchors = ["ARCH-AUTH-01", "ARCH-MOD-03", "ARCH-SEC-02", "ARCH-FIN-01", "ARCH-OBS-01"]
+
+[confirmed_gap]
+observations = [
+  "bins/eliotd and crates/governor contain a substantial current semantic composition, owner recovery, canonical preparation, task/session/workscope/finish and Kernel transition ports.",
+  "The active activation path still has an open legacy-success consumer gap owned by #839/#1115, demonstrating that typed semantic outcomes are not yet carried through the complete daemon/Kernel/Bridge path.",
+  "crates/eliot-app and its eliot-governor command tree remain workspace members as a legacy migration/regression facade; no complete machine-readable current-consumer/disposition/removal ledger proves that every unique production owner has migrated.",
+  "PreparedTransition, Kernel mechanical validation, Store named-operation execution and WriteReceipt have multiple local implementations/tests, but the exact shared end-to-end identity/class/effect-ceiling Edge and strict Finish Product proof remain open.",
+  "No #13 registry yet binds all Governor cells, mutable-state owners, contracts and proof entrypoints to current runtime generations.",
+]
+discriminator = "Trace one semantic task mutation and strict Finish decision through current daemon, Kernel and Store, then inventory every production consumer of eliot-app/eliot-governor. No complete accepted evidence proves one semantic owner, exact end-to-end transition identity and zero unique legacy production ownership."
+
+[causal_property]
+statement = "eliotd is the sole semantic Governor: it owns admission, WorkScopes, tasks, plans, Context, coordination, application state, module intent and strict Finish; Kernel performs mechanical validation/fencing/order and Store executes only the exact admitted named transition. No legacy facade or adapter becomes a second semantic/state/effect owner."
+
+[scope]
+primary_paths = [
+  "bins/eliotd/src/**",
+  "crates/governor/eliot-governor/src/**",
+  "crates/governor/eliot-canonical/src/**",
+  "crates/governor/eliot-task/src/**",
+  "crates/governor/eliot-workscope/src/**",
+  "crates/governor/eliot-session/src/**",
+  "crates/governor/eliot-finish/src/**",
+  "crates/eliot-app/** only for bounded consumer inventory, migration, compatibility fixture or deletion",
+  "focused shared daemon/Kernel/Store contract and legacy-consumer fixtures",
+]
+serialized_peer_paths = [
+  "crates/kernel/eliot-kernel-service/src/**transition**",
+  "crates/storage/eliot-store-api/src/**",
+  "bins/eliot-store-surreal/src/request_dispatch.rs",
+]
+forbidden_ownership = [
+  "second Governor, task, WorkScope, Finish or semantic state owner",
+  "Kernel-side task/project/policy interpretation",
+  "Store bridge semantic admission or raw query authority",
+  "legacy-facade feature growth",
+  "model/self-report promotion to VERIFIED_COMPLETE",
+]
+
+[what_to_do]
+steps = [
+  "Declare and bind every current eliotd/Governor capability cell and mutable-state owner through #13.",
+  "Close one canonical PreparedTransition contract and exact daemon-to-Kernel-to-Store receipt identity across all consumers.",
+  "Keep task/WorkScope/plan/current-position/Finish meaning exclusively in Governor canonical state and process/generation truth exclusively in Kernel/ORS.",
+  "Prove daemon caches/hot mirrors revision-keyed, rebuildable and non-authoritative.",
+  "Bind strict Finish to the current TaskContract, exact artifacts, executed applicable verifier evidence, State Fence and reconciled effects.",
+  "Inventory every real consumer of crates/eliot-app and eliot-governor and assign migrate, bounded fixture with expiry/removal condition, or delete.",
+  "Remove current packaging/install/runtime/docs dependence on the legacy Governor facade and retire it when its final consumer is gone.",
+]
+
+[how_to_do]
+steps = [
+  "Use one immutable PreparedTransition canonical encoding containing semantic source revisions, admission digest, complete Ordering Scopes/State Fence, Authority Epoch/effect ceiling, named-operation manifest digest, deterministic MutationPlan digest, transition class and proof/approval handles.",
+  "Have Kernel recheck only principal, authority snapshot, epoch, fence, identity, ordering, class/effect ceiling and generation compatibility; it must not reinterpret semantic policy.",
+  "Have Store execute only the closed named operation and exact parameter/transition digest; reject raw query, command widening and mismatch.",
+  "Carry the same admission/transition/mutation/class/effect identity into the final immutable WriteReceipt and exact unknown-outcome reconciliation.",
+  "Persist semantic owner revisions and rebuild daemon caches solely from owner state; cache presence or freshness timestamp cannot create authority.",
+  "Make VERIFIED_COMPLETE impossible without exact current applicable verifier execution, artifact/target binding, scope/fence/freshness/independence and reconciled external effects.",
+  "Generate a current-consumer ledger for eliot-app from actual dependency/call/runtime/package references rather than command names or source presence.",
+  "For each legacy path, migrate to the declared current owner, retain only as an exact bounded regression fixture with consumer/proof/expiry/removal condition, or delete.",
+  "Prohibit new public commands/state/effects in the facade and keep it out of current default/install/runtime roots throughout migration.",
+]
+
+[acceptance]
+criteria = [
+  "Every canonical mutation follows eliotd semantic admission -> Kernel mechanical validation/order/fence -> exact named Store transaction -> immutable receipt.",
+  "Admission digest, semantic revisions, MutationPlan digest, transition class and effect ceiling remain identical across daemon, Kernel, Store and receipt.",
+  "Mismatch returns a typed conflict/contract error and cannot retry as the same semantic decision.",
+  "ORS remains opaque operational state and never answers task/plan/WorkScope/Finish semantic queries.",
+  "Daemon loss leaves Kernel able to fence/cancel/reconcile but unable to mint new semantic authority.",
+  "Daemon caches are revision-keyed, rebuildable and incapable of creating freshness/support/authority.",
+  "Only exact current executed verifier evidence and reconciled effects can produce VERIFIED_COMPLETE.",
+  "Every eliot-app/eliot-governor consumer has one explicit migrate/fixture/delete disposition and no undocumented unique production owner remains.",
+  "Current release/install/runtime routes do not launch or advertise legacy eliot-governor as the production Governor.",
+  "No new feature/state/effect is added to preserve the facade.",
+  "#13 resolves all Governor cells and #11 proves daemon restart, transition/receipt identity, unknown outcome and strict Finish in the Product Pulse.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliotd -p eliot-governor -p eliot-canonical -p eliot-task -p eliot-workscope -p eliot-session -p eliot-finish --all-targets",
+  "cargo test --locked -p eliotd -p eliot-governor -p eliot-canonical -p eliot-task -p eliot-workscope -p eliot-session -p eliot-finish --all-targets",
+  "cargo clippy --locked -p eliotd -p eliot-governor -p eliot-canonical -p eliot-task -p eliot-workscope -p eliot-session -p eliot-finish --all-targets -- -D warnings",
+  "cargo tree --locked -p eliotd --edges normal",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "Run shared daemon/Kernel/Store transition corpus, digest/class/effect mismatch negatives, daemon kill/rebuild, unknown commit reconciliation, strict-Finish forgery/staleness cases and one migrated legacy consumer at a time, then #11 D1 Product Pulse."
