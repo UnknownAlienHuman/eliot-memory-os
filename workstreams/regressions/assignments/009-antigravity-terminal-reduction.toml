@@ -1,0 +1,133 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_REGRESSION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_CURRENT_FINGERPRINT_REPRODUCTION"
+implementation_support = "LEGACY_RUN_STATE_AND_LATEST_REPORT_PRESENT_TERMINAL_REDUCER_UNPROVED"
+evidence_execution_status = "CURRENT_TYPES_STATUS_PATH_AND_EVIDENCE_PROJECTION_INSPECTED_LIVE_RUN_NOT_EXECUTED"
+proof_ceiling = "ANTIGRAVITY_TERMINAL_REDUCTION_EDGE_CANDIDATE_ONLY"
+issue = 9
+provider_disposition_issue = 1109
+process_executor_issue = 100
+governor_issue = 18
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "regression.antigravity-terminal-outcome-reducer"
+causal_property = "One Antigravity operation has one append-only event and receipt history and one deterministic current terminal projection. Recoverable intermediate tool failures remain historical evidence but cannot overwrite a later valid terminal result, canonical receipt/readback or exact unknown/reconciliation state."
+current_discriminator = "AntigravityRun stores one mutable aggregate state/message/completed_at record; AntigravityRunState has Planned, DryRun, Running, Succeeded, Blocked, Failed and TimedOut only. MCP job status loads only the latest run report and returns state/message. Delegation evidence treats Succeeded as both process_exit_success and terminal_marker. No current TerminalOutcomeReducer or complete event/receipt denominator was found."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/9"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-07-acp-antigravity-and-generic-profiles.md#i107-acp-antigravity-and-generic-profiles",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-23-raw-and-normalized-host-events.md#i723-raw-and-normalized-host-events",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-13-idle-drain-and-cancellation.md#i1413-idle-drain-and-cancellation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-21-unknown-commit-recovery.md#i1421-unknown-commit-recovery",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-22-flake-hang-and-recurrence-handling.md#i1822-flake-hang-and-recurrence-handling",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+]
+anchors = ["ARCH-PORT-01", "ARCH-OBS-01", "ARCH-ORD-01", "ARCH-FIN-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "crates/eliot-types/src/antigravity.rs defines AntigravityRunState without Cancelled, UnknownOutcome or ReconciliationRequired variants.",
+  "AntigravityRun combines state, message, completed_at, stdout/stderr/log handles, protocol receipt and optional normalized result in one serializable report.",
+  "crates/eliot-app/src/mcp_stdio/provider_handlers.rs dispatch_antigravity_job_status reads latest_antigravity_mcp_run and returns only run_id, state, dry_run, fixture_runner and message; a requested non-latest run is reported not_found.",
+  "dispatch_antigravity_result also reads only the latest run and returns its normalized_result.",
+  "crates/eliot-app/src/delegation_runtime.rs derives process_exit_success and terminal_marker_or_protocol_status directly from run.state == Succeeded.",
+  "No production TerminalOutcomeReducer symbol or owner was found.",
+  "The historical recoverable-error/stale-terminal observation has not been reproduced on an exact current Antigravity CLI/plugin/model/protocol fingerprint.",
+]
+
+[scope]
+primary_paths = [
+  "the one current Antigravity execution/result owner selected after #1109 disposition",
+  "crates/eliot-types/src/antigravity.rs only if this legacy route remains the accepted current contract",
+  "crates/eliot-engine/src/antigravity.rs and exact process/event parser spans if retained",
+  "crates/eliot-app/src/delegation_runtime.rs and exact MCP status/result spans only while #18 retains the legacy facade",
+  "or the accepted provider-neutral Agent Bridge/native-worker contracts after migration, never both as competing owners",
+  "current-fingerprint terminal-reducer fixtures and exact receipt/readback tests",
+]
+forbidden = [
+  "choosing terminal state from the last text message, latest file timestamp, process exit or highest severity alone",
+  "deleting intermediate failures or rewriting append-only event history",
+  "letting a provider-local run ID replace canonical operation/attempt/effect identity",
+  "treating process exit zero, end_turn, stream close or normalized output as canonical commit or Task Finish",
+  "blind retry after possible provider/tool/write effect",
+  "changing provider output to hide a stale reducer defect",
+  "running legacy and migrated Antigravity result owners in parallel",
+  "storing private prompts, credentials or unredacted provider output in repository fixtures",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze one exact current Antigravity route and append-only event denominator."
+how = [
+  "Record CLI/plugin version, binary/config/protocol/model route, adapter/process generation, installation/principal/Session, task/WorkScope, StateFence, logical decision, physical attempt, operation/effect and output-schema identities.",
+  "Record every admitted event and receipt with sequence/cursor, source, observed time, payload digest/handle and omission state: tool request/result/error, correction, provider stream, process exit, normalized result, candidate write submission, WriteReceipt/readback, cancellation and reconciliation.",
+  "Reject duplicate sequence with changed payload, missing predecessor, stale generation and partial event denominator before terminal reduction.",
+]
+
+[[waves]]
+id = "B"
+what = "Implement a deterministic terminal outcome reducer separate from history."
+how = [
+  "Reduce only from the complete current event/receipt denominator and exact operation state; never mutate or delete historical events.",
+  "Represent Active, RecoverableFailureObserved, CandidateProduced, WriteSubmitting, WriteCommitted, WriteRejected, FailedTerminal, CancelledBeforeEffect, CancelRequestedAfterPossibleEffect, TimedOutUnknown, DeliveryUnknown and ReconciliationRequired as distinct typed states or equivalent owner vocabulary.",
+  "A later valid correction/result may supersede an intermediate recoverable presentation, but the earlier error remains queryable evidence with its own disposition.",
+  "A terminal write-success projection requires exact current WriteReceipt plus independent readback; provider success/process exit is insufficient.",
+]
+
+[[waves]]
+id = "C"
+what = "Separate live status, history, result and recovery projections."
+how = [
+  "Status resolves the requested exact operation/run identity, not only latest.json, and returns current reduced state plus event frontier and blocking recovery action.",
+  "History returns ordered immutable events and receipts; result returns only the current normalized candidate/result bound to exact input/output schema and proof ceiling.",
+  "Cancellation and timeout preserve whether provider/tool/write effects were impossible, possible, observed or unknown.",
+  "After lost acknowledgement or uncertain effect, reconcile the same operation before retry or route/model substitution.",
+]
+
+[[waves]]
+id = "D"
+what = "Reproduce the historical sequence and adversarial orderings on the current route."
+how = [
+  "Run recoverable tool error -> corrected call -> valid candidate -> optional governed write/receipt/readback and require terminal projection to reflect the final owner state while retaining the first error in history.",
+  "Cover duplicate, delayed, reordered and dropped events; provider process success with invalid result; valid result followed by late old error; cancellation races; timeout after possible write; stale latest report; restart/replay and exact reconciliation.",
+  "If current source already reduces correctly, attach refutation evidence and retain only missing status/history/recovery hardening; do not invent a source defect.",
+]
+
+[acceptance]
+criteria = [
+  "One current-fingerprint run reproduces or explicitly refutes the historical stale-terminal sequence with complete event and receipt coverage.",
+  "Every event remains append-only and queryable; recoverable errors are not deleted or silently promoted to terminal failure.",
+  "Current terminal projection is deterministic from exact operation identity and complete event/receipt frontier, not latest timestamp, message text, process exit or severity alone.",
+  "Recoverable error followed by a valid corrected candidate yields a candidate/success projection while preserving the error as historical evidence.",
+  "A governed write is terminally committed only with exact current WriteReceipt and independent readback; provider/local run success is insufficient.",
+  "Requested older run/operation status is resolved by exact identity and cannot become not_found merely because another report became latest.",
+  "Active, failed, cancelled, timed-out, possible-effect, unknown-delivery and reconciliation-required states remain distinct.",
+  "Duplicate/reordered/delayed/late events are idempotent or rejected by identity and cannot overwrite a newer valid terminal state.",
+  "Missing/dropped event coverage produces partial/unknown state rather than a fabricated terminal result.",
+  "Restart/reconnect rebuilds the same terminal projection from durable events/receipts without rerunning provider or tool work.",
+  "Unknown provider/tool/write outcome blocks blind retry and route/model substitution until exact reconciliation.",
+  "Status, history, result and recovery projections remain separate and retain bounded redacted evidence.",
+  "No provider-local state, process exit, model text or UI message can create canonical truth, task completion or VERIFIED_COMPLETE.",
+  "Only one accepted Antigravity result owner remains after #1109/#18 disposition.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-types -p eliot-engine -p eliot-app --all-targets only if the legacy route remains current",
+  "cargo test --locked -p eliot-types -p eliot-engine -p eliot-app --all-targets only if the legacy route remains current",
+  "cargo clippy --locked -p eliot-types -p eliot-engine -p eliot-app --all-targets -- -D warnings only if the legacy route remains current",
+  "git diff --check",
+]
+live_evidence = "Execute the current exact Antigravity route with recoverable-error/correction, late-event, cancellation, timeout, restart and optional governed-write scenarios; attach nonsecret ordered event/receipt and terminal-reduction evidence to the Issue/PR artifact."
+product_proof = "This proves one provider-route terminal reducer only; canonical write, AgentSwarm and Product proof remain #18/#11."
