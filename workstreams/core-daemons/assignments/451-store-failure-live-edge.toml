@@ -1,0 +1,137 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "TYPED_CONTRACT_PRESENT_LIVE_PRODUCER_CONSUMER_PATH_COLLAPSES_TO_STRINGS"
+evidence_execution_status = "CURRENT_CONTRACT_EXCHANGE_AND_CONSUMER_PATHS_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "STORE_FAILURE_KERNEL_GOVERNOR_EDGE_CANDIDATE_ONLY"
+issue = 451
+store_wire_allocation = 76
+kernel_issue = 15
+governor_issue = 18
+store_generation_issue = 19
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "storage.typed-failure-live-producer-consumer-edge"
+causal_property = "Every Store failure crossing provider, Store service, Kernel and Governor retains one validated provider-neutral disposition, mutation state, retry directive, recovery action and exact operation/fence/evidence identity; human prose never controls retry, reconciliation, task state or Product status."
+current_discriminator = "eliot-store-api contains StoreFailure v2 and focused contract tests, but current production exchange still maps StoreResponse::Error(String) to StoreError::Serialization and maps RequestFailure::Unknown back to StoreError::Unavailable. The typed StoreResponse::Failure path is not the sole producer/consumer route, so UNKNOWN_OUTCOME, conflict and recovery semantics are lost before Governor/agent projection."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/451"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-06-error-and-crash-model.md#i26-error-and-crash-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-16-common-durable-fields.md#i516-common-durable-fields",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-identity-and-effect-identity",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-21-unknown-commit-recovery.md#i1421-unknown-commit-recovery",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+]
+anchors = ["ARCH-SEC-02", "ARCH-ORD-01", "ARCH-OBS-01", "ARCH-RES-04", "ARCH-FIN-01"]
+
+[current_source]
+confirmed = [
+  "StoreFailure v2 already separates disposition, reason code, request/operation identity, StateFence, mutation disposition, retry directive, recovery action, conflict evidence and human detail.",
+  "StoreFailure::validate rejects committed-as-failure, unknown-without-operation, reconciliation-without-unknown and same-identity retry after identity conflict.",
+  "StoreResponse still retains legacy Error { error: String } and Unknown { operation_id, reason } compatibility variants.",
+  "EbpCanonicalStoreClient::execute_raw currently converts StoreResponse::Error into StoreError::Serialization and returns legacy Unknown separately.",
+  "RequestFailure::into_store_error currently converts Unknown into StoreError::Unavailable, erasing mutation uncertainty and exact reconciliation identity.",
+  "Current typed-failure usage found by repository search is concentrated in store-api tests rather than one complete live producer-consumer edge.",
+  "workstreams/core-daemons/assignments/076-store-failure-wire.toml already records the legacy compatibility boundary; this Issue owns the remaining live cutover, not another failure contract.",
+]
+
+[scope]
+primary_paths = [
+  "crates/storage/eliot-store-api/src/store_failure.rs only if a proven owning-contract defect remains",
+  "crates/storage/eliot-store-api/src/lib.rs exact StoreResponse/current-version decoder spans",
+  "bins/eliot-store-surreal/src/request_dispatch.rs exact error production spans",
+  "crates/storage/eliot-store-surreal-adapter/src/** exact provider-to-StoreError mapping spans",
+  "crates/kernel/eliot-kernel-service/src/store_exchange.rs",
+  "crates/kernel/eliot-kernel-service/src/store_client.rs exact compatibility/test spans",
+  "exact eliotd/Governor Store caller and agent-facing recovery projection spans",
+  "directly relevant tests and finite failure fixtures",
+]
+serialized_dependencies = ["#15 Kernel", "#18 Governor", "#19 Store generation", "#76 wire allocation", "#11 Product proof"]
+forbidden = [
+  "a second StoreFailure type or provider-specific public error",
+  "string matching, Display text or human_detail driving retry/recovery",
+  "mapping unknown mutation to unavailable/not-attempted",
+  "blind retry after possible write",
+  "claiming committed without WriteReceipt",
+  "Store service or Kernel deciding semantic task/Problem/Finish state",
+  "raw SurrealDB errors crossing the public boundary",
+  "weakening identity, fence or receipt validation",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Make StoreFailure v2 the sole current failure producer and response path."
+how = [
+  "At every Store-service/provider boundary, construct StoreFailure from the exact StoreError/provider observation and available RequestId, OperationId, idempotency digest, StateFence and evidence handle.",
+  "Return StoreResponse::Failure for current protocol traffic and validate it before encoding.",
+  "Keep legacy Error/Unknown decoding only in one explicit versioned compatibility adapter; current producers never emit them.",
+]
+
+[[waves]]
+id = "B"
+what = "Preserve typed failure through Kernel exchange and exact-operation reconciliation."
+how = [
+  "Replace RequestFailure/StoreError collapse with one owning typed failure or lossless wrapper that retains every StoreFailure field.",
+  "Validate response request identity, failure contract revision, operation identity, fence and cross-field invariants before adoption.",
+  "UNKNOWN_OUTCOME remains bound to the exact OperationId and invokes receipt/query/reconcile for that operation before any retry.",
+  "Deterministic rejection, conflict, unavailable, backpressure, deadline, migration, unsupported and internal defect retain distinct control paths.",
+]
+
+[[waves]]
+id = "C"
+what = "Project recovery semantics to Governor and agent surfaces without semantic overreach."
+how = [
+  "Governor consumes typed disposition/retry/recovery and exact identity; it alone decides task/Problem/admission consequences.",
+  "Expose bounded stable reason/disposition, mutation state, retry directive, recovery action and evidence reference to the agent/operator; human_detail remains diagnostic only.",
+  "Committed state requires a verified WriteReceipt; missing receipt envelope and lost response remain unknown/reconciling.",
+  "Provider/version/configuration details remain behind redacted evidence handles unless explicitly safe and required.",
+]
+
+[[waves]]
+id = "D"
+what = "Close compatibility, replay, restart and real Store fault proof."
+how = [
+  "Decode legacy Error/Unknown only under their declared protocol version and map them conservatively; never infer attempted/not-attempted from prose.",
+  "Exact same failure replay is idempotent; changed same-identity failure payload or operation/fence is an identity conflict.",
+  "Persist/recover unknown and reconciliation state through Kernel/ORS restart without changing the directive or operation identity.",
+  "Exercise real pinned SurrealDB failures: deterministic schema rejection, revision/fence conflict, unavailable, backpressure/deadline, malformed provider response, missing receipt and response loss after possible commit.",
+]
+
+[acceptance]
+criteria = [
+  "Current Store producers emit StoreResponse::Failure and do not emit legacy string Error/Unknown variants.",
+  "Every current failure validates against StoreFailure v2 before crossing the Store boundary.",
+  "Kernel preserves disposition, reason, request/operation/idempotency/fence identities, mutation state, retry directive, recovery action, conflict evidence and evidence reference losslessly.",
+  "UNKNOWN_OUTCOME never becomes Unavailable, NotAttempted, success or a new operation and always requires exact-operation reconciliation.",
+  "Committed mutation cannot appear inside StoreFailure and requires an exact current WriteReceipt.",
+  "Identity/fence/revision/order conflicts cannot retry the same identity through backoff.",
+  "Deterministic rejection, unavailable, backpressure, deadline, migration, unsupported and internal defect remain distinct end to end.",
+  "human_detail, Display strings and provider prose cannot control retry, reconciliation, task state or recovery action.",
+  "Legacy variants are accepted only at one explicit versioned compatibility decoder and are never emitted on the current path.",
+  "Exact replay is idempotent; changed failure under the same request/operation identity conflicts.",
+  "Kernel/daemon restart preserves unknown/reconciling state and cannot trigger blind write replay.",
+  "Agent/operator projection is bounded and redacted and retains the stable machine fields and next safe action.",
+  "Real Store fault tests cover rejection, conflict, unavailable, deadline/backpressure, malformed response, missing receipt and possible-commit response loss.",
+  "No provider-specific public error, Store semantic task owner, authority or Finish path is introduced.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-store-api -p eliot-store-surreal-adapter -p eliot-store-surreal -p eliot-kernel-service -p eliotd --all-targets",
+  "cargo test --locked -p eliot-store-api -p eliot-store-surreal-adapter -p eliot-store-surreal -p eliot-kernel-service -p eliotd --all-targets",
+  "cargo clippy --locked -p eliot-store-api -p eliot-store-surreal-adapter -p eliot-store-surreal -p eliot-kernel-service -p eliotd --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run the typed failure matrix through the real Store service and Kernel exchange, including lost response after possible commit and exact receipt reconciliation across restart."
+product_proof = "This establishes the Store-failure Edge candidate only; full Store and Product proof remain #19/#11."
