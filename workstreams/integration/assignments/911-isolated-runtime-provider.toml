@@ -1,0 +1,134 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "BLOCKED_ON_905_907_READY_FOR_PROVIDER_IMPLEMENTATION"
+implementation_support = "CURRENT_RUNTIME_ARTIFACTS_PRESENT_PROVIDER_MODULE_ABSENT"
+evidence_execution_status = "SOURCE_AND_ISSUE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "ISOLATED_WINDOWS_RUNTIME_PROVIDER_EDGE_CANDIDATE_ONLY"
+issue = 911
+inventory_issue = 905
+harness_issue = 907
+containment_issue = 850
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "integration.provider.windows-runtime-topology"
+causal_property = "One exact Runtime-class inventory selection receives one isolated user-scoped Windows topology whose artifacts, processes, endpoints, principal, Session, generation, StateFence, readiness, reset and cleanup are independently owned and completely accounted."
+current_discriminator = "IntegrationHarness.Runtime.psm1 and its test suites are absent on main; the legacy monolithic harness cannot provision the current Host/Kernel/eliotd/Watchdog/Agent Bridge topology through #907's closed provider interface and exact same-source artifact receipts."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/911"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I01-05-demand-start-observable-use-supervision-and-idle-shutdown.md#i15-demand-start-observable-use-supervision-and-idle-shutdown",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I01-06-windows-isolation.md#i16-windows-isolation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I01-10-service-health-state-model.md#i110-service-health-state-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-22-parallel-build-cache-artifact-and-environment-lanes.md#i222-parallel-build-cache-artifact-and-environment-lanes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-08-02-ip0-one-windows-processexecutor.md#i1082-ip0-one-windows-processexecutor",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-03-control-reserve.md#i143-control-reserve",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-21-unknown-commit-recovery.md#i1421-unknown-commit-recovery",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-03-least-privilege-processes.md#i153-least-privilege-processes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-04-secrets.md#i154-secrets",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+]
+anchors = ["ARCH-RES-01", "ARCH-SEC-02", "ARCH-OBS-01", "ARCH-LIFE-01"]
+
+[current_source]
+confirmed = [
+  "scripts/integration/IntegrationHarness.Runtime.psm1 is absent on main.",
+  "The previous implementation PR #924 was closed unmerged.",
+  "The selected Runtime classes depend on same-source current build/artifact receipts and real foreground runtime APIs; missing binaries or APIs cannot be replaced by old releases or fake readiness.",
+  "Store and Git resources remain independently owned by #909 and #913 and cannot be recreated by this provider.",
+]
+
+[scope]
+primary_paths = [
+  "scripts/integration/IntegrationHarness.Runtime.psm1",
+  "scripts/tests/IntegrationHarness.Runtime.Tests.ps1",
+  "scripts/tests/test_integration_harness_runtime.py",
+  "scripts/testdata/integration/runtime-provider/**",
+  ".github/temporary/work-unit-911.md only if present",
+]
+forbidden = [
+  "Core/Model/public entrypoint or shared bridge",
+  "inventory, Store or Git provider implementation",
+  "Rust source/tests, Cargo, lockfile, build/release scripts or artifacts",
+  "workflows, production config or global SCM/firewall/registry/task/ACL/PATH changes",
+  "arbitrary executable, service, command, pipe prefix, ACL or environment authority",
+  "locally minted authoritative generation, StateFence or AuthorityEpoch",
+  "process/name/PID/port-only ownership or readiness",
+  "provider-selected test denominator or semantic pass",
+]
+
+[[waves]]
+id = "A"
+what = "Implement #907's closed Runtime provider and deterministic topology plan."
+how = [
+  "Validate exact runtime requirement classes, target and provider revision from #905.",
+  "Plan derives only the requested component dependency graph and exact Store/Git receipt dependencies without mutation.",
+  "Allocate unique run-owned installation, Session, config, data, log, temp, artifact, pipe namespace and containment identities.",
+]
+
+[[waves]]
+id = "B"
+what = "Verify artifacts and start contained foreground processes."
+how = [
+  "Require one accepted same-source build/artifact receipt and verify every component digest, PE architecture, target and profile before launch.",
+  "Construct all commands and minimal environment internally; caller/inventory/workflow cannot supply executable, service, pipe, ACL or environment authority.",
+  "Enter the exact run-owned Job Object or accepted race-free containment before descendants can escape and bind image/start/containment identity rather than PID alone.",
+]
+
+[[waves]]
+id = "C"
+what = "Prove authenticated component and whole-topology readiness."
+how = [
+  "Keep artifact accepted, launch registered/requested, contained process observed, authenticated peer connected, generation/fence accepted, subsystem ready and whole selected topology ready as separate receipts.",
+  "Obtain authoritative generation, epoch and StateFence from the actual current owner handshake; never mint them in the provider.",
+  "Bind each readiness record to run/component/artifact/process/principal/Session/endpoint/generation/fence/expiry/dependency identities.",
+  "For ELIOT_GOVERNOR_CONFIG rows, generate the exact versioned run-local config and bind path/digest; ambient or production config is forbidden.",
+]
+
+[[waves]]
+id = "D"
+what = "Close reset, evidence, shutdown and cleanup/reconciliation."
+how = [
+  "Reset only through documented owner APIs with exact receipts; unknown state change blocks replacement/reuse.",
+  "Collect bounded redacted component evidence with explicit truncation.",
+  "Stop in reverse dependency order through owner shutdown, then terminate only the exact owned process tree if allowed.",
+  "Verify descendants, Job Objects, pipes, mutexes, ports, handles, locks and roots; repeated cleanup is idempotent.",
+  "Implement exactly WORK_UNIT_CASE: 911/1..29 through #907's fixed bridge under #850 containment, plus real Windows execution for every accepted required runtime class.",
+]
+
+[acceptance]
+criteria = [
+  "Unknown class/component/target/revision is rejected and no unrequested component launches.",
+  "Plan is deterministic and creates no process, pipe, ACL or root.",
+  "All artifacts bind one accepted source/build and exact digest/PE target/profile; stale, mixed-source, missing or substituted artifacts fail before launch.",
+  "Caller-supplied command, executable, service, pipe, ACL and environment authority are unrepresentable.",
+  "Concurrent runs share no installation, Session, root, pipe namespace or containment identity.",
+  "Path/reparse/symlink/reserved-name and foreign-owner collisions fail closed.",
+  "Store/Git receipts cannot be fabricated or locally mutated.",
+  "Launch registration/containment precedes runnable execution; observed process is not authenticated readiness.",
+  "Peer substitution and stale/foreign/expired generation/fence receipts are rejected.",
+  "Whole-topology readiness accounts for every selected component and exact dependency denominator.",
+  "Crash/readiness timeout blocks dependent groups; unknown launch/state change requires reconciliation before replacement.",
+  "Reset cannot delete live/foreign state and contamination remains explicit.",
+  "Shutdown is reverse dependency order and parent exit does not prove descendant/IPC/resource cleanup.",
+  "Forced stop targets only exact owned tree; PID reuse, foreign endpoints and foreign roots survive.",
+  "ELIOT_GOVERNOR_CONFIG comes only from the exact provider receipt; Runtime and Store ownership remain separate.",
+  "Exactly 29 substantive cases execute and every accepted Runtime class completes one real same-source Windows ready→cleanup cycle.",
+]
+
+[verification]
+commands = [
+  "python -m py_compile scripts/tests/test_integration_harness_runtime.py",
+  "python -m unittest scripts.tests.test_integration_harness_runtime -v",
+  "git diff --check",
+]
+contained_proof = "Run all 29 Python-to-PowerShell cases under the accepted #850 descriptor and retain suite/source/case/process/cleanup identities."
+real_proof = "Run each accepted required runtime class through scripts/run-isolated-tests.ps1 using finite #905 rows and same-source artifact receipts; attach authenticated readiness and complete cleanup evidence."
+product_proof = "Provider proof is isolated integration only; installed Product support remains #11."
