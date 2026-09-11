@@ -1,0 +1,124 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+status = "READY_AFTER_CAPABILITY_REGISTRY_AND_EVIDENCE_V2"
+implementation_support = "SURFACE_PACKAGES_PRESENT_CURRENT_REGISTRY_CONSUMER_UNPROVED"
+evidence_execution_status = "SOURCE_AND_OWNER_MAP_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "RUNTIME_STATUS_AND_CONTROLBOARD_PROJECTION_CANDIDATE_ONLY"
+issue = 13
+related_issue_refs = [216, 11, 1105]
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "surface.runtime-status-and-controlboard-read-projection"
+causal_property = "Runtime status derives one owner-neutral immutable projection from the current capability registry and five-domain evidence, while ControlBoard renders that projection without creating lifecycle, authority, support, recovery, canonical or Finish state."
+current_discriminator = "eliot-runtime-status and eliot-controlboard exist, but no accepted production chain proves process generation -> capability cell -> owner observation -> evidence/support axes -> bounded user projection under one current registry identity."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/13"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-05-current-system-evidence-and-source-support-model.md#i05-current-system-evidence-and-source-support-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-20-read-model-consistency-and-cache.md#i520-read-model-consistency-and-cache",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I16-17-instrument-plane-observability.md#i1617-instrument-plane-observability",
+]
+anchors = ["ARCH-OBS-01", "ARCH-MOD-03", "ARCH-RES-04", "ARCH-AUTH-01"]
+
+[current_source]
+confirmed = [
+  "The workspace contains dedicated runtime-status and ControlBoard surface packages.",
+  "Issue #13 requires a real runtime-status consumer of the generated CapabilityCellRegistry.",
+  "Issue #216 owns the exact five-domain observation/support snapshot consumed by status surfaces.",
+  "Package presence and process liveness cannot establish current readiness, implementation support, executed evidence or Product status.",
+  "ControlBoard must remain a presentation and intent surface rather than a parallel runtime-state or recovery owner.",
+]
+
+[scope]
+primary_paths = [
+  "crates/surfaces/eliot-runtime-status/src/**",
+  "crates/surfaces/eliot-controlboard/src/**",
+  "exact CLI/Operator read-only consumers of these public projections",
+  "directly relevant tests and finite fixtures",
+]
+serialized_dependencies = [
+  "#13 generated CapabilityCellRegistry",
+  "#216 five-domain evidence snapshot",
+  "#14/#15/#16/#19 owner observations",
+  "#1105 Operator presentation",
+  "#11 Product Pulse",
+]
+forbidden = [
+  "direct mutation of Host, Kernel, Watchdog, Store, task, Session or module state",
+  "support/readiness inferred from process liveness, package presence or newest timestamp",
+  "parallel lifecycle, authority, recovery, evidence or Product-status ontology",
+  "direct Store vendor, provider/model or secret access",
+  "ControlBoard-issued effects without typed owner intent/admission",
+  "task Finish or VERIFIED_COMPLETE",
+  "automatic GitHub workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Define one immutable owner-neutral runtime-status snapshot."
+how = [
+  "Bind snapshot identity to normative pair, CapabilityCellRegistry digest, five-domain evidence digest, evaluation time, source owner revisions and invalidation set.",
+  "Represent one row per declared capability/process generation and retain owner, lifecycle, mutable-state, contract, runtime-generation and proof references.",
+  "Reject missing/duplicate registry cells, stale source revisions and mixed snapshot boundaries.",
+]
+
+[[waves]]
+id = "B"
+what = "Project independent observation and support axes without promotion."
+how = [
+  "Keep process liveness, semantic readiness, observation state, contract maturity, implementation support, evidence execution, recovery state and Product status separate.",
+  "Preserve NOT_RUNNING, UNAVAILABLE, UNKNOWN, STALE, CONFLICTED, PARTIAL and NOT_APPLICABLE distinctly.",
+  "A missing owner observation or blind boundary remains visible and cannot be replaced by package metadata or cached state.",
+]
+
+[[waves]]
+id = "C"
+what = "Make cache/read behavior rebuildable and currentness-safe."
+how = [
+  "Key projections by complete registry/evidence/source/fence/schema/invalidation identity.",
+  "Reject stale/mismatched cache before return and rebuild only from current owner-neutral inputs.",
+  "Preserve meaningful ordering and canonicalize only true sets; exact replay under the same inputs is deterministic.",
+]
+
+[[waves]]
+id = "D"
+what = "Keep ControlBoard presentation-only and route actions as inert intents."
+how = [
+  "Render exact source, owner, freshness, blind boundary, recovery and proof-ceiling data without inventing green/red conclusions.",
+  "Any user action creates a typed owner-directed intent retaining target, current revision/fence, required authority, effect ceiling and expected verifier; ControlBoard applies nothing.",
+  "Sensitive details, credentials and protected payloads remain redacted while identity and recovery guidance stay machine-readable.",
+]
+
+[acceptance]
+criteria = [
+  "One production runtime-status consumer resolves every displayed row through the exact current #13 registry and #216 evidence snapshot.",
+  "Every row retains capability, process generation, owner, contract, source observation, freshness, invalidation and proof references.",
+  "Process liveness, semantic readiness, observation, maturity, implementation support, evidence execution, recovery and Product status remain independent.",
+  "Package/source presence and successful health checks cannot promote support, executed evidence or Product readiness.",
+  "Missing, stale, conflicted, partial, unavailable and unknown evidence remain visible and prevent a false complete snapshot.",
+  "Projection cache is exact-identity keyed, rebuildable and incapable of creating freshness or authority.",
+  "Equivalent inputs yield byte-equivalent semantic rows; changed registry/evidence/source/fence/schema/invalidation changes identity.",
+  "ControlBoard reads no Store-vendor or owner-private mutable state directly and owns no lifecycle/recovery state.",
+  "ControlBoard actions are inert typed intents routed to the declared owner; no effect occurs from presentation code.",
+  "Diagnostics expose bounded owner/recovery data without secrets or protected payloads.",
+  "No snapshot or UI state can create canonical writes, authority, task Finish, support promotion or VERIFIED_COMPLETE.",
+  "CLI and Operator consume the same public status projection rather than parallel owner lists.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-runtime-status -p eliot-controlboard -p eliot --all-targets",
+  "cargo test --locked -p eliot-runtime-status -p eliot-controlboard -p eliot --all-targets",
+  "cargo clippy --locked -p eliot-runtime-status -p eliot-controlboard -p eliot --all-targets -- -D warnings",
+  "cargo tree --locked -p eliot-runtime-status --edges normal",
+  "cargo tree --locked -p eliot-controlboard --edges normal",
+  "git diff --check",
+]
+edge_proof = "Render one current, one not-running, one stale, one conflicted and one blind-boundary capability row through runtime-status, CLI and ControlBoard; prove identical owner identities and zero direct effects."
+product_proof = "Issue #11 remains open; a status projection cannot prove the Product behavior it reports."
