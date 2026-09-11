@@ -1,0 +1,118 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "PARTIAL_ENGINE_AND_FACADE_PRESENT_BINARY_FAIL_CLOSED"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "WASM_HOST_RUNTIME_EDGE_CANDIDATE"
+issue = 21
+integration_issue_refs = [13, 15, 18, 11]
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A02-03-modular-architecture.md#a23-modular-architecture",
+  "docs/architecture/A12-security-provenance-and-bounded-influence.md#a12-security-provenance-and-bounded-influence",
+  "docs/architecture/A13-03-module-supervision-and-doctor.md#a133-module-supervision-and-doctor",
+]
+implementation = [
+  "docs/architecture/I06-15-capability-grant-lineage-introductions-and-resource-facets.md#i615-capability-grant-lineage-introductions-and-resource-facets",
+  "docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md#i71-eliot-bridge-protocol-ebp1",
+  "docs/architecture/I14-19-wasm-components.md#i1419-wasm-components",
+  "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "docs/architecture/I15-10-sandboxing.md#i1510-sandboxing",
+]
+anchors = ["ARCH-MOD-02", "ARCH-MOD-03", "ARCH-PORT-01", "ARCH-SEC-01", "ARCH-RES-01"]
+
+[confirmed_gap]
+main = "bins/eliot-wasm-host/src/main.rs@69600ec289ffe3320824fe63377bfdb615b80544"
+facade = "bins/eliot-wasm-host/src/lib.rs@0f8aca15b141356ffd72447ade38f7512dde3eec"
+engine = "bins/eliot-wasm-host/src/wasmtime_provider.rs@d4750bbb4c41cfdfa6d787cbd1b39cc7cb1a2dca"
+runtime_core = "crates/modules/eliot-wasm-runtime"
+discriminator = "Run the current binary with a compiled local profile. After CLI validation it always emits KERNEL_ADMISSION_REQUIRED and exits; no authenticated request loop constructs RuntimePorts, WasmtimeComponentEngine or WasmHostRunner."
+reusable_source = [
+  "WasmHostRunner already composes Runtime and WasmRuntime and exposes execute/cancel/reconcile/shutdown.",
+  "WasmtimeComponentEngine already implements the provider mechanics and bounded component invocation surface.",
+  "eliot-wasm-runtime already owns manifest/fence/capability/limit/trap lifecycle validation through injected RuntimePorts.",
+  "CLI rejects remote transport and unsupported profiles before runtime construction.",
+]
+
+[causal_property]
+statement = "One immutable admitted component generation executes under the exact WIT/facet/capability/fence/resource envelope and can be cancelled, reconciled, trapped, drained or replaced without ambient authority or canonical effects outside the introduced facet."
+
+[scope]
+primary_paths = [
+  "bins/eliot-wasm-host/src/main.rs",
+  "bins/eliot-wasm-host/src/lib.rs",
+  "bins/eliot-wasm-host/src/wasmtime_provider.rs",
+  "crates/modules/eliot-wasm-runtime/src/**",
+  "focused package and process-edge tests",
+]
+required_edges = [
+  "authenticated Kernel generation/admission transport",
+  "immutable component artifact and WIT/facet manifest",
+  "RuntimePorts provider set",
+  "Wasmtime engine and resource limiter",
+  "typed result/cancel/reconcile transport",
+]
+forbidden_ownership = [
+  "Module Catalog intent or promotion",
+  "task scheduling or Finish",
+  "canonical Store credentials or writes",
+  "ambient filesystem/network/process/secrets",
+  "generic host-call escape or in-process Rust plugin loading",
+]
+
+[what_to_do]
+steps = [
+  "Replace the unconditional admission-required exit with an authenticated generation-bound request loop.",
+  "Construct complete RuntimePorts only from Kernel/Governor-admitted providers and exact immutable manifests.",
+  "Instantiate WasmtimeComponentEngine and WasmHostRunner for the selected compiled profile.",
+  "Execute, cancel, reconcile, drain and shut down exact invocation identities without local authority or promotion.",
+  "Prove capability denial, resource isolation, trap containment, cache identity and generation cutover.",
+]
+
+[how_to_do]
+steps = [
+  "Obtain artifact hash, WIT world, facet introductions, capability envelope, State Fence, Authority Epoch, limits, deadline and cancellation identity from authenticated Kernel admission; accept none from ambient caller text.",
+  "Validate the complete RuntimePorts set before readiness and keep missing providers as typed PLAN_GAP.",
+  "Build the provider against the exact immutable component bytes and interface digest; reject stale/mismatched generation before instance creation.",
+  "Expose only introduced host resources and methods; configure no broad WASI world, inherited stdio/env/network/filesystem/process or secrets.",
+  "Bind compiled-component caches and instance pools to artifact/interface/provider generation and make them disposable/rebuildable.",
+  "Map trap, fuel/memory/deadline exhaustion, cancellation and cleanup to typed results and quarantine only the affected instance/generation.",
+  "Require a separate exact effect permit for canary effects; shadow execution remains effect-free.",
+]
+
+[acceptance]
+criteria = [
+  "A valid authenticated invocation reaches WasmHostRunner and the Wasmtime engine exactly once.",
+  "Missing/stale/mismatched artifact, interface, facet, generation, epoch or fence performs no component call.",
+  "Unintroduced methods/resources are absent and produce typed capability errors.",
+  "The built component host exposes no ambient filesystem, network, process, environment, clock, random, credential or canonical Store capability unless an exact declared facet requires and introduces it.",
+  "Fuel, memory, deadline, cancellation and trap limits leave no leaked instance or resource handle.",
+  "Shadow execution creates no canonical/external effect; canary effect requires a separate permit.",
+  "Exact replay/reconcile uses one invocation identity; changed same-identity request conflicts.",
+  "Old generation cannot reconnect or publish after cutover; caches do not revive proof or authority.",
+  "Core/native/WASM compatibility claims use the same semantic conformance corpus and report divergence explicitly.",
+  "The binary no longer exits unconditionally when supplied a valid current admission.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-wasm-runtime -p eliot-wasm-host --all-targets",
+  "cargo test --locked -p eliot-wasm-runtime -p eliot-wasm-host --all-targets",
+  "cargo clippy --locked -p eliot-wasm-runtime -p eliot-wasm-host --all-targets -- -D warnings",
+  "python scripts/verify-wasm-toolchain.py",
+  "git diff --check",
+]
+edge_proof = "Run an actual admitted component through execute/cancel/reconcile/trap/resource-exhaustion and generation-cutover cases, and inspect the built import set."
+
+[boundaries]
+non_goals = [
+  "new semantic component algorithms",
+  "dynamic Rust library loading",
+  "automatic workflow trigger",
+  "Product or release promotion from package tests",
+]
