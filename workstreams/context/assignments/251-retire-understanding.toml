@@ -1,0 +1,108 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_AFTER_CONTEXT_INTEGRITY_GATES"
+implementation_support = "UNREFERENCED_DUPLICATE_COMPILER_FACADE"
+evidence_execution_status = "SOURCE_AND_REVERSE_CONSUMER_SEARCH_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "UNDERSTANDING_FACADE_REMOVAL_CANDIDATE_ONLY"
+issue = 251
+parent_issue = 40
+context_integrity_issue = 224
+registry_issue = 13
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "context.duplicate-understanding-facade-removal"
+causal_property = "One admitted Context set is assembled and rendered once by the current Context pipeline; an unreferenced Understanding facade cannot invoke ContextCompiler again, create a second synthesis result or own semantic state."
+current_discriminator = "eliot-understanding has no external Cargo/source/runtime consumer and wraps eliot-context::ContextCompiler into a second UnderstandingRequest-to-CompiledContext path."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/251"
+
+[documentation]
+implementation = [
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions",
+  "docs/architecture/I07-11-context-payload-profiles-and-decision-safety-floor.md#i711-context-payload-profiles-and-decision-safety-floor",
+  "docs/architecture/I12-14-hot-path.md#i1214-hot-path",
+]
+anchors = ["ARCH-MOD-02", "ARCH-MOD-03", "ARCH-GROUND-01", "ARCH-OBS-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "No external Cargo dependency, Rust import or runtime/install manifest consumer of eliot-understanding exists on the audited base.",
+  "The facade calls eliot-context::ContextCompiler::compile and then builds a second Understanding artifact and digest.",
+  "eliot-context-assembly explicitly names repeated ContextCompiler invocation by legacy eliot-understanding as the old failure.",
+  "The facade digest uses incomplete/debug-formatted identity material and patching it would preserve duplicate ownership.",
+]
+
+[scope]
+primary_paths = [
+  "crates/smart/eliot-understanding/**",
+  "the exact root workspace member",
+  "Cargo.lock only if Cargo requires it",
+  "current topology/package-index references that still advertise the facade",
+  "directly relevant context assembly/integration tests",
+]
+serialized_dependencies = ["#224 Context integrity", "#40 donor/edge migration", "#13 registry", "#11 Product proof"]
+forbidden = [
+  "new UnderstandingState store or mutable owner",
+  "compatibility facade that recompiles Context",
+  "digest-only repair that keeps the duplicate path",
+  "changes to accepted Architecture/Implementation",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Revalidate zero current consumers and Context replacement readiness."
+how = [
+  "Run Cargo/source/runtime/install reverse-consumer inventory against the merge base.",
+  "Confirm current Context admission/assembly retains roles, omissions, provenance, unknowns, quality ceilings and exact serialized measurement.",
+  "Block removal if a real current consumer or missing replacement behavior is discovered.",
+]
+
+[[waves]]
+id = "B"
+what = "Remove the duplicate facade as one closed package change."
+how = [
+  "Delete crates/smart/eliot-understanding and its root workspace entry.",
+  "Update Cargo.lock only through locked Cargo if the package entry remains.",
+  "Remove current routing/index claims while retaining explicit historical donor/removal evidence where applicable.",
+]
+
+[[waves]]
+id = "C"
+what = "Prove no Context behavior regresses and no fallback remains."
+how = [
+  "Run the current eliot-context and context assembly package tests plus reverse-consumer checks.",
+  "Exercise one admitted Context assembly/rendering path with the facade unavailable.",
+  "Reject any reintroduction through a convenience wrapper or hidden feature.",
+]
+
+[acceptance]
+criteria = [
+  "Current reverse-consumer inventory proves no external consumer of eliot-understanding.",
+  "The package directory and exact workspace member are removed.",
+  "No current route, feature, package index, runtime/install manifest or generated registry advertises the facade.",
+  "No replacement wrapper invokes ContextCompiler after the accepted admission decision.",
+  "Current Context assembly preserves exact roles, omissions, provenance/source handles, unknowns, quality and serialized-size evidence.",
+  "eliot-context and current assembly tests pass with the facade unavailable.",
+  "No new mutable Understanding state, semantic owner or compatibility compiler path is introduced.",
+  "Cargo metadata/check remain locked and clean; lockfile changes are minimal and package-specific.",
+  "#13 resolves rendering/assembly only to current Context cells and #11 remains runtime/Product proof owner.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo metadata --locked --format-version 1",
+  "cargo check --locked --workspace --all-targets",
+  "cargo test --locked -p eliot-context --all-targets",
+  "cargo test --manifest-path crates/smart/eliot-context-assembly/Cargo.toml --all-targets",
+  "cargo clippy --locked --workspace --all-targets -- -D warnings",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "Execute current Context admission and assembly with eliot-understanding unavailable and verify identical required role/omission/provenance/unknown/quality behavior."
+product_proof = "Issue #11 remains open."
