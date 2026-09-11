@@ -14,10 +14,10 @@ name = "eliot-mod-research"
 path = "src/main.rs"
 
 [dependencies]
-eliot-contracts = { path = "../../crates/foundation/eliot-contracts", version = "0.1.0" }
-eliot-research-exchange = { path = "../../crates/research/eliot-research-exchange", version = "0.1.0" }
-eliot-research-exchange-api = { path = "../../crates/research/eliot-research-exchange-api", version = "0.1.0" }
-eliot-researcher = { path = "../../crates/research/eliot-researcher", version = "0.1.0" }
+eliot-contracts.workspace = true
+eliot-research-exchange.workspace = true
+eliot-research-exchange-api.workspace = true
+eliot-researcher.workspace = true
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 thiserror = "2.0.18"

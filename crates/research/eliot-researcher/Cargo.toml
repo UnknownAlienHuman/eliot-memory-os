@@ -7,8 +7,8 @@ license.workspace = true
 description = "ELIOT Researcher composition over governed acquisition and exchange"
 
 [dependencies]
-eliot-research-exchange-api = { path = "../eliot-research-exchange-api", version = "0.1.0" }
-eliot-research-exchange = { path = "../eliot-research-exchange", version = "0.1.0" }
+eliot-research-exchange-api.workspace = true
+eliot-research-exchange.workspace = true
 eliot-contracts.workspace = true
 
 [lints]

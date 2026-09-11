@@ -106,6 +106,13 @@ pub(super) fn map_activation_snapshot(
 // Wave 2: lossless Governor -> protocol v2 mapping
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "lossless outcome projection is exercised by projection_tests; the daemon still maps through map_activation_snapshot until #839 wires it"
+    )
+)]
 fn map_coverage(coverage: GovernorCandidateCoverage) -> AgentActivationCandidateCoverage {
     match coverage {
         GovernorCandidateCoverage::Complete => AgentActivationCandidateCoverage::Complete,
@@ -114,6 +121,13 @@ fn map_coverage(coverage: GovernorCandidateCoverage) -> AgentActivationCandidate
     }
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "lossless outcome projection is exercised by projection_tests; the daemon still maps through map_activation_snapshot until #839 wires it"
+    )
+)]
 fn map_selection(selection: GovernorSelectionDirective) -> AgentActivationSelectionDirective {
     AgentActivationSelectionDirective {
         candidate_handles: selection.candidate_handles,
@@ -122,6 +136,13 @@ fn map_selection(selection: GovernorSelectionDirective) -> AgentActivationSelect
     }
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "lossless outcome projection is exercised by projection_tests; the daemon still maps through map_activation_snapshot until #839 wires it"
+    )
+)]
 fn map_retry(retry: GovernorRetryDirective) -> AgentActivationRetryDirective {
     AgentActivationRetryDirective {
         dependency_ref: retry.dependency_ref,
@@ -133,6 +154,13 @@ fn map_retry(retry: GovernorRetryDirective) -> AgentActivationRetryDirective {
 /// Lossless mapping from the Governor-internal typed outcome to the wire v2
 /// protocol result. Every variant is preserved 1:1; no error is coerced to
 /// `Resolved` and no error is dropped.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "lossless outcome projection is exercised by projection_tests; the daemon still maps through map_activation_snapshot until #839 wires it"
+    )
+)]
 pub fn map_governor_outcome_to_protocol(
     ticket: &AgentActivationResolutionTicket,
     outcome: GovernorActivationOutcome,
@@ -192,20 +220,6 @@ pub fn map_governor_outcome_to_protocol(
         .map_err(|error| DaemonError::Lifecycle(error.to_string()))
 }
 
-/// Pure snapshot/fence fixture helper: builds a deterministic ticket-bound
-/// v2 result directly from a Governor snapshot for the `Resolved` case.
-pub fn map_resolved_snapshot_to_protocol(
-    ticket: &AgentActivationResolutionTicket,
-    snapshot: eliot_governor::GovernorActivationSnapshot,
-    resolved_at_unix_ms: u64,
-) -> Result<AgentActivationResolutionResult, DaemonError> {
-    map_governor_outcome_to_protocol(
-        ticket,
-        GovernorActivationOutcome::Resolved(snapshot),
-        resolved_at_unix_ms,
-    )
-}
-
 #[cfg(test)]
 mod projection_tests {
     use super::*;
@@ -216,7 +230,7 @@ mod projection_tests {
         fixture_scope_ambiguous, fixture_scope_selection_required, fixture_stale_fence,
         fixture_task_selection_required,
     };
-    use eliot_protocol::{AgentActivationResolutionTicket, ProtocolError};
+    use eliot_protocol::AgentActivationResolutionTicket;
 
     fn test_ticket(deadline: u64) -> AgentActivationResolutionTicket {
         let mut ticket = AgentActivationResolutionTicket {
