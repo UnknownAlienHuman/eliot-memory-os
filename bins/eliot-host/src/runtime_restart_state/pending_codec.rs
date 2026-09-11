@@ -199,7 +199,8 @@ pub(super) fn read_runtime_restart_pending_identity(
     runtime_restart_pending_identity_from_bytes(&bytes, expected_mutation_digest).map(Some)
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 #[allow(
     clippy::expect_used,
     reason = "small pure clock-conversion tests state their impossible fixture states explicitly"
