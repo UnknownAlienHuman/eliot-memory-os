@@ -1,0 +1,147 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_RUNTIME_AND_CANONICAL_CONTRACT_IMPLEMENTATION"
+implementation_support = "PURE_INVOCATION_CONTRACT_PRESENT_PRODUCTION_BINARY_FAILS_CLOSED"
+evidence_execution_status = "CURRENT_BINARY_AND_DOCTOR_CORE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "DOCTOR_DIAGNOSIS_AND_REPAIR_EDGE_CANDIDATE_ONLY"
+issue = 461
+process_executor_issue = 100
+kernel_issue = 15
+governor_issue = 18
+store_issue = 19
+lineaged_epoch_issue = 64
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "recovery.doctor-governed-diagnosis-and-repair"
+causal_property = "One admitted Doctor job diagnoses from exact evidence and may execute only a predeclared bounded repair recipe under current Kernel authority, lineaged epoch/fence, operation/effect identity, attempt budget, verification and rollback contract; unknown effects remain reconciling and Doctor never acquires task, canonical, policy or Finish ownership."
+current_discriminator = "bins/eliot-doctor/src/main.rs unconditionally emits KERNEL_ADMISSION_REQUIRED and exits 78. eliot-doctor-core has a useful pure invoke_once seam, but its KernelDoctorClient has no production implementation; its local StateFence uses scalar authority_epoch/generation, RepairRecipe uses string operation/effect/authority lists, and no authenticated Kernel/ORS/process/recovery composition is reachable."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/461"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-03-module-supervision-and-doctor.md#a133-module-supervision-and-doctor",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-05-bounded-resources-and-control-reserve.md#a135-bounded-resources-and-control-reserve",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-08-restart-and-recovery.md#a138-restart-and-recovery",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I06-15-capability-grant-lineage-introductions-and-resource-facets.md#i615-capability-grant-lineage-introductions-and-resource-facets",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-08-02-ip0-one-windows-processexecutor.md#i1082-ip0-one-windows-processexecutor",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-21-unknown-commit-recovery.md#i1421-unknown-commit-recovery",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-23-safe-shutdown.md#i1423-safe-shutdown",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-DOC-01", "ARCH-SEC-02", "ARCH-RES-01", "ARCH-RES-04", "ARCH-OBS-01", "ARCH-FIN-01"]
+
+[current_source]
+confirmed = [
+  "The production Doctor binary imports the contract/version/error constants only, prints a structured refusal and exits 78 for every invocation.",
+  "eliot-doctor-core already defines RepairClass, DiagnosticBrief, RepairRecipe, RepairRequest, KernelAdmission, EffectIntent, AttemptReceipt, DoctorJob, invoke_once and a provider-neutral KernelDoctorClient test seam.",
+  "No production implementation of KernelDoctorClient or authenticated Doctor request loop is connected.",
+  "The Doctor-local StateFence still carries scalar authority_epoch and generation rather than the accepted lineaged epoch/fence contract owned by #64.",
+  "RepairRecipe currently represents required_authority, allowed_effects, operations, prerequisites, observables, verification and rollback as strings/string sets rather than closed typed operation/capability/artifact contracts.",
+  "invoke_once correctly records intent before execute and preserves EffectOutcome::Unknown as ReconciliationRequired, but durable ORS ownership and restart rehydration are not part of the production path.",
+  "DiagnoseOnly is represented and can be kept effect-free; Guarded repairs require an approval string today but not yet an exact current approval receipt identity.",
+]
+
+[scope]
+primary_paths = [
+  "bins/eliot-doctor/src/main.rs",
+  "bins/eliot-doctor/src/lib.rs if present or one narrow composition module",
+  "crates/meta/eliot-doctor-core/src/** exact contract/state-machine spans",
+  "exact Kernel Doctor request/admission/status/cancel/reconcile adapter",
+  "exact Governor Problem/repair-candidate and verification-result adapter",
+  "exact #100 ProcessExecutor or owner-specific effect adapters required by accepted recipes",
+  "directly relevant tests and finite fault fixtures",
+]
+serialized_dependencies = ["#64 lineaged epoch", "#100 ProcessExecutor", "#15 Kernel/ORS", "#18 Governor", "#19 Store", "#11 Product proof"]
+forbidden = [
+  "generic shell, arbitrary command/argv/path/environment or caller-selected repair operations",
+  "Doctor-local authority, epoch, StateFence, approval, task, Problem, policy or canonical state owner",
+  "direct SurrealDB/canonical Store credentials or raw query",
+  "model-generated recipe executed without an accepted immutable recipe contract",
+  "process/PID/name/port presence treated as ownership or readiness",
+  "blind retry after possible effect",
+  "repair success from process exit, log text or model self-report alone",
+  "automatic broad self-healing or workflow triggers",
+  "Doctor deciding Task Finish or VERIFIED_COMPLETE",
+]
+
+[[waves]]
+id = "A"
+what = "Replace Doctor-local authority and string recipe fields with canonical closed contracts."
+how = [
+  "Reuse the lineaged AuthorityEpoch, StateFence, RequestIdentity, OperationId, EffectIdentity, capability/resource introduction and approval receipt owners; keep explicit legacy decoding only if required.",
+  "Define a closed versioned repair operation vocabulary whose variants reference one exact owner adapter and typed parameters; no Other, shell string or generic JSON command.",
+  "Bind recipe identity/digest to problem class, target component/generation, prerequisites, required authority/capability, exact operations, expected observables, verifier profile, attempt/cooldown budget, stop conditions, rollback/forward repair and invalidation set.",
+  "DiagnoseOnly accepts no effect operation; AutomaticSafe and Guarded remain distinct and Guarded requires an exact current approval receipt.",
+]
+
+[[waves]]
+id = "B"
+what = "Replace unconditional exit with one authenticated Kernel-admitted Doctor lifecycle."
+how = [
+  "Advertise a closed Doctor operation through Kernel and receive exact request/status/cancel/reconcile messages on an authenticated local transport.",
+  "Bind installation, principal/Session, problem, job/attempt, component/generation, recipe/revision/digest, authority epoch/fence, lease, deadline, budgets, approval and evidence handles before diagnosis or effect allocation.",
+  "Persist requested/admitted/diagnosing/ready/running/verifying/terminal or reconciling state in the current Kernel/ORS owner before acknowledgement.",
+  "Missing, stale, expired, revoked, foreign or mismatched admission retains fail-closed behavior and performs no effect.",
+]
+
+[[waves]]
+id = "C"
+what = "Execute only admitted owner-specific effects with exact containment and recovery."
+how = [
+  "Record one durable EffectIntent before every possible effect and bind it to job, attempt, recipe, operation, target generation and effect ceiling.",
+  "Route native process repairs through #100 and other repairs through the existing exact Host/Kernel/Store/User Broker owner; Doctor never constructs a generic executor.",
+  "Keep not-attempted, submitted, applied, rejected, failed, cancelled-before-effect, possible-effect, unknown, cleanup-partial and reconciliation-required distinct.",
+  "On timeout/disconnect/crash after possible effect, reconcile the same EffectIdentity before retry, replacement or rollback.",
+  "Respect attempt/cooldown/stop budgets and quarantine/escalate materially repeated failures rather than looping.",
+]
+
+[[waves]]
+id = "D"
+what = "Verify outcome independently, apply canonical consequences through Governor and prove restart behavior."
+how = [
+  "Collect the recipe-declared expected observables and execute the exact independent verifier after effect or diagnosis.",
+  "Process exit, transport success, log text and Doctor/model assertion are evidence only; they cannot establish repair success.",
+  "Return typed diagnosis/repair candidate, receipts, unknowns, cleanup state, verification and rollback/recovery directive to Governor.",
+  "Governor alone updates Problem/canonical state and decides whether a repair is accepted; Doctor cannot close the Problem or Task.",
+  "Rehydrate requested/running/verifying/unknown jobs across Doctor/Kernel restart without duplicating effects or reviving stale generations.",
+]
+
+[acceptance]
+criteria = [
+  "The production binary no longer exits unconditionally for one exact current admitted Doctor job.",
+  "Invalid, missing, stale, expired, revoked, foreign or mismatched admission performs no diagnosis requiring protected access and no effect.",
+  "Doctor uses the canonical lineaged epoch/fence/operation/effect/approval/capability contracts and does not define a second owner vocabulary.",
+  "Every executable recipe uses a closed typed operation and exact owner adapter; arbitrary shell/command/path/environment and generic JSON operations are unrepresentable.",
+  "DiagnoseOnly executes no effect; Guarded requires the exact current approval; AutomaticSafe cannot exceed its declared capability/effect ceiling.",
+  "Recipe digest covers all authority, operation, target, verifier, budget, stop, rollback and invalidation fields.",
+  "Every possible effect has durable intent before execution and one exact terminal or reconciliation disposition afterward.",
+  "Unknown or possible effect is reconciled before retry and cannot become not-attempted, successful or a new operation.",
+  "Cancellation before effect, cancellation after possible effect, timeout, cleanup failure and verification failure remain distinct.",
+  "Repeated materially identical failed repair exhausts budget and quarantines/escalates rather than looping.",
+  "Repair success requires the declared independent observables/verifier and cannot be inferred from process exit, transport, logs or model self-report.",
+  "Restart rehydrates exact job/effect state and never duplicates an effect or revives stale authority/generation.",
+  "Doctor result is bounded/redacted and preserves evidence, unknowns, receipts, cleanup, verifier and next safe action.",
+  "Governor remains the sole Problem/canonical admission owner; Doctor owns no task state, policy, Store, authority or Finish decision.",
+  "Real Windows tests cover diagnose-only, automatic-safe, guarded approval, cancellation races, process crash, unknown effect, verification failure, rollback/forward repair, restart and quarantine/escalation.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-doctor-core -p eliot-doctor -p eliot-kernel-service -p eliot-ors -p eliot-governor --all-targets",
+  "cargo test --locked -p eliot-doctor-core -p eliot-doctor -p eliot-kernel-service -p eliot-ors -p eliot-governor --all-targets",
+  "cargo clippy --locked -p eliot-doctor-core -p eliot-doctor -p eliot-kernel-service -p eliot-ors -p eliot-governor --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run one real DiagnoseOnly, one AutomaticSafe and one Guarded repair plus cancellation, crash, unknown effect, failed verification, rollback and restart reconciliation on Windows."
+product_proof = "This establishes Doctor diagnosis/repair Edge candidates only; complete Host/Kernel/Governor/Store and Product proof remain #14/#15/#18/#19/#11."
