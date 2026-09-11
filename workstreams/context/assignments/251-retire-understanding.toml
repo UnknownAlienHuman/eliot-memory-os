@@ -7,7 +7,10 @@ evidence_execution_status = "SOURCE_AND_REVERSE_CONSUMER_SEARCH_EXECUTED_TESTS_N
 proof_ceiling = "UNDERSTANDING_FACADE_REMOVAL_CANDIDATE_ONLY"
 issue = 251
 parent_issue = 40
-context_integrity_issue = 224
+topology_issue = 816
+context_contract_issue = 584
+context_admission_issue = 608
+context_assembly_issue = 626
 registry_issue = 13
 parent_product_issue = 11
 base_branch = "main"
@@ -24,6 +27,7 @@ primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues
 implementation = [
   "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions",
   "docs/architecture/I07-11-context-payload-profiles-and-decision-safety-floor.md#i711-context-payload-profiles-and-decision-safety-floor",
+  "docs/architecture/I12-13-context-compiler.md#i1213-context-compiler",
   "docs/architecture/I12-14-hot-path.md#i1214-hot-path",
 ]
 anchors = ["ARCH-MOD-02", "ARCH-MOD-03", "ARCH-GROUND-01", "ARCH-OBS-01", "ARCH-RES-04"]
@@ -34,6 +38,7 @@ confirmed = [
   "The facade calls eliot-context::ContextCompiler::compile and then builds a second Understanding artifact and digest.",
   "eliot-context-assembly explicitly names repeated ContextCompiler invocation by legacy eliot-understanding as the old failure.",
   "The facade digest uses incomplete/debug-formatted identity material and patching it would preserve duplicate ownership.",
+  "Issue #251's original reference to #224 as Context integrity is stale: #224 is a model-routing Issue. Current Context topology/contracts/admission/assembly owners are #816/#584/#608/#626.",
 ]
 
 [scope]
@@ -44,7 +49,15 @@ primary_paths = [
   "current topology/package-index references that still advertise the facade",
   "directly relevant context assembly/integration tests",
 ]
-serialized_dependencies = ["#224 Context integrity", "#40 donor/edge migration", "#13 registry", "#11 Product proof"]
+serialized_dependencies = [
+  "#816 Context/Curation topology",
+  "#584 Context contracts",
+  "#608 Context admission",
+  "#626 Context assembly",
+  "#40 donor/edge migration",
+  "#13 registry",
+  "#11 Product proof",
+]
 forbidden = [
   "new UnderstandingState store or mutable owner",
   "compatibility facade that recompiles Context",
@@ -58,7 +71,7 @@ id = "A"
 what = "Revalidate zero current consumers and Context replacement readiness."
 how = [
   "Run Cargo/source/runtime/install reverse-consumer inventory against the merge base.",
-  "Confirm current Context admission/assembly retains roles, omissions, provenance, unknowns, quality ceilings and exact serialized measurement.",
+  "Confirm #584/#608/#626 and #816 leave one current Context contract, admission and assembly path retaining roles, omissions, provenance, unknowns, quality ceilings and exact serialized measurement.",
   "Block removal if a real current consumer or missing replacement behavior is discovered.",
 ]
 
@@ -90,6 +103,7 @@ criteria = [
   "eliot-context and current assembly tests pass with the facade unavailable.",
   "No new mutable Understanding state, semantic owner or compatibility compiler path is introduced.",
   "Cargo metadata/check remain locked and clean; lockfile changes are minimal and package-specific.",
+  "The dependency map names #816/#584/#608/#626 and contains no stale Context reference to route Issue #224.",
   "#13 resolves rendering/assembly only to current Context cells and #11 remains runtime/Product proof owner.",
 ]
 
@@ -99,6 +113,8 @@ commands = [
   "cargo metadata --locked --format-version 1",
   "cargo check --locked --workspace --all-targets",
   "cargo test --locked -p eliot-context --all-targets",
+  "cargo test --manifest-path crates/smart/eliot-context-contracts/Cargo.toml --all-targets",
+  "cargo test --manifest-path crates/smart/eliot-context-admission/Cargo.toml --all-targets",
   "cargo test --manifest-path crates/smart/eliot-context-assembly/Cargo.toml --all-targets",
   "cargo clippy --locked --workspace --all-targets -- -D warnings",
   "python scripts/audit-architecture-boundaries.py",
