@@ -1,0 +1,125 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "TYPED_PRODUCER_WITH_LOSSY_OR_INCOMPLETE_CONSUMER_EDGE"
+evidence_execution_status = "SOURCE_AND_ISSUE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "STORE_FAILURE_TRANSPORT_EDGE_CANDIDATE_ONLY"
+issue = 451
+store_issue = 19
+kernel_issue = 15
+governor_issue = 18
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "storage.typed-store-failure-producer-consumer"
+causal_property = "Every Store failure crosses the Store bridge, Kernel, ORS, Governor and caller boundary as one closed typed disposition with exact operation, transition, effect, fence, receipt, retry/reconcile and safe-evidence identity; provider text and transport status cannot change its control meaning."
+current_discriminator = "The Store side has typed failure contracts and provider-specific observations, but the complete producer-to-Kernel-to-Governor consumer path does not yet preserve the closed failure semantics, recovery directive and unknown-outcome identity losslessly."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/451"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A12-03-one-governed-write-path.md#a123-one-governed-write-path",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-01-store-boundary.md#i51-store-boundary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+]
+anchors = ["ARCH-SEC-02", "ARCH-ORD-01", "ARCH-OBS-01", "ARCH-RES-03", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "Store execution and public API contain typed failure and receipt concepts.",
+  "The live edge must preserve provider/transport, semantic validation, conflict, unavailable, corruption, cancellation, timeout, partial, and unknown-outcome distinctions without string parsing or default coercion.",
+  "Kernel ORS owns accepted-operation and reconciliation state; Store provider prose cannot decide retry or terminality.",
+  "Package-local producer tests do not prove every real Kernel/Governor/caller consumer handles every closed disposition exhaustively.",
+]
+
+[scope]
+primary_paths = [
+  "crates/storage/eliot-store-api/src/**failure**",
+  "crates/storage/eliot-store-surreal-adapter/src/**failure**",
+  "bins/eliot-store-surreal/src/**response**",
+  "crates/kernel/eliot-kernel-service/src/**store**",
+  "crates/kernel/eliot-ors/src/**",
+  "exact Governor/caller Store result adapters",
+  "directly relevant tests and finite fixtures",
+]
+serialized_dependencies = ["#19 Store boundary", "#15 Kernel/ORS", "#18 Governor", "#63 canonical request identity", "#11 Product proof"]
+forbidden = [
+  "provider-specific database error types on public wires",
+  "control flow based on Display/debug/human detail strings",
+  "mapping UNKNOWN_OUTCOME to unavailable, failed, absent, or safe-to-retry",
+  "blind retry or alternate operation after possible commit",
+  "Kernel reinterpretation of Store semantic policy",
+  "second failure taxonomy or generic catch-all success path",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze one closed public Store failure and recovery envelope."
+how = [
+  "Reuse the existing owner type and add fields only when a proven consumer gap exists; do not define a parallel taxonomy.",
+  "Bind every failure to operation/request identity, PreparedTransition/admission digest, named operation, transition class, StateFence, Ordering Scopes, submission/effect phase, provider observation, retry/reconcile directive, evidence handles, blind boundaries and safe detail.",
+  "Reject unknown versions/variants before adopting control meaning.",
+]
+
+[[waves]]
+id = "B"
+what = "Map provider and bridge failures exhaustively at the owner boundary."
+how = [
+  "Translate Surreal/transport/process observations once inside the Store adapter into the closed provider-neutral disposition.",
+  "Keep transport unavailable, semantic rejection, identity conflict, stale fence/revision, resource exhaustion, cancellation, timeout, corrupt response, partial effect and possible commit distinct.",
+  "Redact provider payloads, raw queries, credentials and private records while preserving immutable evidence identity.",
+]
+
+[[waves]]
+id = "C"
+what = "Preserve exact semantics through Kernel, ORS and Governor."
+how = [
+  "Kernel verifies identities, phase and fence, persists pending/terminal/unknown state and forwards the typed result without semantic string remapping.",
+  "ORS retains the exact original operation and reconciliation key for possible commits/effects.",
+  "Governor consumes typed dispositions to decide external semantic recovery; it never infers from logs, HTTP/pipe status or provider names.",
+]
+
+[[waves]]
+id = "D"
+what = "Close replay, restart and unknown-outcome behavior."
+how = [
+  "Exact replay of one request/failure/receipt returns the same disposition.",
+  "Changed payload, transition, operation, receipt, phase, provider observation or fence under one identity conflicts.",
+  "After possible commit or lost acknowledgement, query/reconcile the exact named Store operation before any retry or alternate route.",
+  "Restart rehydrates the same pending, terminal or reconciling state and cannot downgrade it to not-attempted.",
+]
+
+[acceptance]
+criteria = [
+  "Every closed Store failure disposition has an exhaustive producer mapping and exhaustive Kernel/Governor/caller consumer mapping.",
+  "No public result depends on parsing provider, Display, debug, stderr, log or human-detail text.",
+  "Every result preserves exact request/operation/transition/class/fence/order/phase/receipt and recovery identities.",
+  "Transport failure, semantic rejection, conflict, stale state, exhaustion, cancellation, timeout, corruption, partial work and unknown outcome remain distinct.",
+  "UNKNOWN_OUTCOME cannot become unavailable, ordinary failure, absence, success or safe-to-retry.",
+  "Exact replay is idempotent; changed same-identity failure/result conflicts.",
+  "Possible commit/effect is reconciled under the original operation before retry, route change or new semantic decision.",
+  "Kernel/daemon/Store restart preserves the typed terminal or reconciling state without recomputation.",
+  "Provider types, queries, credentials and private payloads do not leak across the public boundary.",
+  "A typed Store failure cannot create task Finish, support promotion, canonical success or authority.",
+  "A shared producer-consumer fixture corpus executes through Store bridge, Kernel, ORS and Governor for every disposition.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-store-api -p eliot-store-surreal-adapter -p eliot-store-surreal -p eliot-kernel-service -p eliot-ors -p eliotd --all-targets",
+  "cargo test --locked -p eliot-store-api -p eliot-store-surreal-adapter -p eliot-store-surreal -p eliot-kernel-service -p eliot-ors -p eliotd --all-targets",
+  "cargo clippy --locked -p eliot-store-api -p eliot-store-surreal-adapter -p eliot-store-surreal -p eliot-kernel-service -p eliot-ors -p eliotd --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run the shared failure corpus through real Store bridge, Kernel, ORS and Governor, including provider unavailable, semantic rejection, conflict, stale fence, timeout, corrupt response, partial effect, lost acknowledgement, unknown commit and restart reconciliation."
+product_proof = "Issues #19 and #11 remain open; exhaustive typed failure transport alone does not establish Store or Product support."
