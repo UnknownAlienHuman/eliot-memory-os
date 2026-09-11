@@ -1,6 +1,6 @@
 schema = "eliot.active-workstreams.v1"
 authority_branch = "main"
-updated_at = "2026-09-01"
+updated_at = "2026-09-10"
 workflow = "WORKFLOW.md"
 agent_rules = "AGENTS.md"
 
@@ -52,23 +52,3 @@ inventories = [
   "crates/smart/cognitive-edge-map.toml"
 ]
 implementation_rule = "Each cell is implemented in its own issue-numbered branch and PR. Prototype Cargo/module manifests on main create no workspace, runtime, state, authority, or support admission."
-
-[retired_refs]
-status = "non_mutable_aliases_of_main"
-physical_delete_supported = false
-rule = "Visible legacy refs may remain because the connected GitHub surface cannot delete refs. They are forced to current main and are never valid work branches."
-branches = [
-  "audit/core-daemon-conformance-20260828",
-  "chore/28-repository-hygiene",
-  "chore/32-finalize-branch-state",
-  "chore/32-retire-stale-branches",
-  "chore/32-sync-cognitive-authority",
-  "chore/48-control-plane-cleanup",
-  "claude/codex-swarm-audit-p576l9",
-  "claude/eliot-search-architecture-45fdpe",
-  "claude/loving-wozniak-tw3r2s",
-  "cognitive-crates-prototypes-01",
-  "cognitive-materialize-run",
-  "cognitive-micromodules-wave-01",
-  "docs/related-repositories"
-]
