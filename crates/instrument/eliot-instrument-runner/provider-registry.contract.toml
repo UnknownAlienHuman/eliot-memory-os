@@ -1,0 +1,125 @@
+schema = "eliot.instrument-provider-registry.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
+status = "READY_AFTER_TESTD_ADMISSION"
+implementation_support = "PROVIDER_PACKAGES_PRESENT_PRODUCTION_REGISTRY_MISSING"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "INSTRUMENT_PROVIDER_REGISTRY_EDGE_CANDIDATE"
+issue = 1128
+testd_issue = 20
+product_pulse_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A05-05-verification-and-evidence.md#a55-verification-and-evidence",
+  "docs/architecture/A10-08-instrument-plane.md#a108-instrument-plane",
+  "docs/architecture/A13-05-bounded-resources-and-control-reserve.md#a135-bounded-resources-and-control-reserve",
+]
+implementation = [
+  "docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
+  "docs/architecture/I02-22-parallel-build-cache-artifact-and-environment-lanes.md#i222-parallel-build-cache-artifact-and-environment-lanes",
+  "docs/architecture/I10-01-instrument-plane.md#i101-instrument-plane",
+  "docs/architecture/I10-02-typed-instrument-profiles.md#i102-typed-instrument-profiles",
+  "docs/architecture/I10-03-instrument-execution-and-evidence.md#i103-instrument-execution-and-evidence",
+  "docs/architecture/I16-17-instrument-plane-observability.md#i1617-instrument-plane-observability",
+  "docs/architecture/I18-04-test-tiers.md#i184-test-tiers",
+  "docs/architecture/I18-32-stateful-test-environments.md#i1832-stateful-test-environments",
+]
+anchors = ["ARCH-GROUND-01", "ARCH-FIN-01", "ARCH-ORD-01", "ARCH-MOD-02", "ARCH-RES-04", "ARCH-OBS-01"]
+
+[confirmed_gap]
+observations = [
+  "The workspace contains separate Cargo, rustc, rustfmt, nextest, SCIP and .NET Instrument packages plus runner, graph, selection, artifact, parser/evaluation and verification packages.",
+  "eliot-testd still owns an incomplete admission/runtime edge under #20.",
+  "No single production InstrumentProviderRegistry was found that deterministically maps every typed profile to one adapter/factory, executable/environment identity, parser/normalizer and proof entrypoint.",
+  "Package presence therefore does not prove reachability, unambiguous selection, governed execution, raw-output retention or current support.",
+]
+discriminator = "Submit a typed Cargo/rustc/rustfmt/nextest/SCIP/.NET Instrument profile to production Testd and request the exact selected adapter, executable identity, environment contract and parser/verifier proof. No one current registry supplies that closure."
+
+[causal_property]
+statement = "One Kernel-admitted typed Instrument profile resolves through one immutable current registry entry to one adapter/factory, executable/artifact/environment identity, resource/cancellation contract, parser/normalizer and proof ceiling; raw evidence is preserved before reduction and cannot create Task Finish."
+
+[scope]
+primary_paths = [
+  "crates/instrument/eliot-instrument-runner/src/**",
+  "crates/instrument/eliot-instrument-cargo/src/**",
+  "crates/instrument/eliot-instrument-rustc/src/**",
+  "crates/instrument/eliot-instrument-rustfmt/src/**",
+  "crates/instrument/eliot-instrument-nextest/src/**",
+  "crates/instrument/eliot-instrument-scip/src/**",
+  "crates/instrument/eliot-instrument-dotnet/src/**",
+  "crates/instrument/eliot-build-test-graph/src/**",
+  "crates/instrument/eliot-test-selection/src/**",
+  "focused registry/factory/conformance tests",
+]
+serialized_consumer_paths = [
+  "crates/instrument/eliot-testd-core/src/**",
+  "bins/eliot-testd/src/**",
+]
+read_only_contracts = [
+  "crates/instrument/eliot-artifact/src/**",
+  "crates/instrument/eliot-diagnostic/src/**",
+  "crates/instrument/eliot-empirical-profile/src/**",
+  "crates/instrument/eliot-verifier/src/**",
+  "crates/instrument/eliot-observability/src/**",
+]
+forbidden_ownership = [
+  "second Testd, Durable Job, Task, budget or Finish owner",
+  "arbitrary shell/command/profile from caller input",
+  "provider secrets or production machine mutation outside admitted isolation",
+  "support/readiness inferred from package presence",
+]
+
+[what_to_do]
+steps = [
+  "Inventory every current typed Instrument profile and provider adapter implementation.",
+  "Define a versioned deterministic InstrumentProviderRegistry and exact profile-to-factory ownership.",
+  "Reject missing, duplicate, stale, ambiguous and unsupported mappings before process/build allocation.",
+  "Compose the registry behind the #20 Testd admission and dispatch boundary.",
+  "Execute providers only through the shared governed ProcessExecutor and isolated environment owner.",
+  "Preserve raw stdout/stderr/artifacts/process/environment evidence or immutable omission handles before reduction.",
+  "Bind parser, normalizer, evaluator and verifier identities while keeping their statuses independent.",
+  "Run one shared conformance corpus and one real supported fixture per ready provider.",
+]
+
+[how_to_do]
+steps = [
+  "Generate entries from accepted typed profile contracts, package metadata, executable/artifact identities, parser schemas, environment requirements and proof entrypoints; never infer capability from crate names.",
+  "Each entry names exact profile/adapter ID and version, supported target/toolchain, executable/hash/acquisition rule, environment class, resource/isolation/reset/cleanup contract, raw-output schema, parser/normalizer/evaluator/verifier and invalidation set.",
+  "Bind registry identity to normative pair, current source/lock/toolchain, profile contracts and adapter artifacts; reject stale entries.",
+  "Keep selection closed and deterministic; unknown or overlapping predicates fail before worktree/build/process allocation.",
+  "Testd owns active Instrument operational state and Governor/Kernel owns Durable Job/task/budget/finish.",
+  "Use shared ProcessExecutor process identity, Job Object, stream, timeout, cancellation and no-orphan semantics.",
+  "Persist raw material output before parsing; truncation, omission, malformed output or parser failure remains explicit.",
+  "Bind every result to source/build/runtime/environment/artifact identity and exact selected test/target denominator.",
+  "Exact replay/cache requires identical BuildFingerprint/profile/artifact/environment/parser identity; any relevant change invalidates reuse.",
+  "Unavailable environment, unsupported platform or cache corruption stays visible and cannot become PASS or empty success.",
+]
+
+[acceptance]
+criteria = [
+  "One current registry accounts for every advertised Instrument profile and every production adapter.",
+  "Each profile resolves to exactly one factory; missing, duplicate, ambiguous or stale mapping fails before execution.",
+  "Every entry binds executable/artifact/toolchain/environment/resource/parser/verifier identity and invalidation set.",
+  "Testd remains the sole active dispatch owner and providers contain no scheduler/task/budget/Finish authority.",
+  "Every execution uses governed ProcessExecutor/Job Object and leaves no process/worktree/build-root leak.",
+  "Raw output and material artifacts are retained or explicitly omitted before reduction.",
+  "Execution, parsing, evaluation, artifact binding, independence, coverage and cleanup remain independent statuses.",
+  "Zero-selected, skipped, truncated, parser-failed or unavailable execution cannot become complete evidence or PASS.",
+  "Replay/cache is identity-bound and invalidated by source, lock, toolchain, environment, executable, profile or parser changes.",
+  "Ready Cargo, rustc, rustfmt, nextest, SCIP and .NET entries pass shared conformance plus a real supported fixture.",
+  "Unsupported providers remain in the denominator with a typed disposition.",
+  "No adapter result writes canonical state, sets Task acceptance or issues VERIFIED_COMPLETE.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-testd -p eliot-testd-core -p eliot-instrument-runner -p eliot-instrument-cargo -p eliot-instrument-rustc -p eliot-instrument-rustfmt -p eliot-instrument-nextest -p eliot-instrument-scip -p eliot-instrument-dotnet --all-targets",
+  "cargo test --locked -p eliot-testd -p eliot-testd-core -p eliot-instrument-runner -p eliot-instrument-cargo -p eliot-instrument-rustc -p eliot-instrument-rustfmt -p eliot-instrument-nextest -p eliot-instrument-scip -p eliot-instrument-dotnet --all-targets",
+  "cargo clippy --locked -p eliot-testd -p eliot-testd-core -p eliot-instrument-runner -p eliot-instrument-cargo -p eliot-instrument-rustc -p eliot-instrument-rustfmt -p eliot-instrument-nextest -p eliot-instrument-scip -p eliot-instrument-dotnet --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run one real supported fixture per ready provider plus unknown/duplicate/stale mapping, timeout, cancellation, malformed/truncated output, cache corruption and cleanup failure."
