@@ -11,7 +11,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::protocol::{EventAckReceipt, WorkerEventDraft, WorkerEventEnvelope, WorkerHello};
+use crate::WorkerError;
+use crate::protocol::{
+    EventAckReceipt, NativeWorkerClaim, NativeWorkerReadiness, NativeWorkerRegistration,
+    WorkerEventDraft, WorkerEventEnvelope, WorkerHello,
+};
 
 /// A-13's inert post-start binding.  `ProcessRequest` is authority-bearing and
 /// consumed by `ProcessExecutor::start`; this snapshot carries only the
@@ -925,4 +929,118 @@ pub trait DurableReplayPort: Send {
     ) -> Result<Vec<WorkerEventEnvelope>, ProviderFailure>;
 
     fn acknowledge(&mut self, receipt: &EventAckReceipt) -> Result<(), ProviderFailure>;
+}
+
+// ---------------------------------------------------------------------------
+// Wave A (issue #872): claim/readiness port projections.
+//
+// `ClaimAdmissionRequest` presents one claim under one registration to the
+// Kernel admission owner; `ReadinessSubmission` carries one typed
+// ready-or-blocked result for one admitted claim. Both are inert
+// projections: they validate bindings but issue no authority, persist
+// nothing, and select no provider.
+// ---------------------------------------------------------------------------
+
+/// Exact claim presentation submitted to the Kernel admission owner.
+///
+/// Binds one validated registration to one validated claim. The Kernel
+/// persists the claim transition and returns one immutable claim receipt
+/// (Wave B) before the worker may initialize a provider adapter.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimAdmissionRequest {
+    registration: NativeWorkerRegistration,
+    claim: NativeWorkerClaim,
+}
+
+impl ClaimAdmissionRequest {
+    /// Returns the registration the claim is presented under.
+    #[must_use]
+    pub const fn registration(&self) -> &NativeWorkerRegistration {
+        &self.registration
+    }
+
+    /// Returns the presented claim.
+    #[must_use]
+    pub const fn claim(&self) -> &NativeWorkerClaim {
+        &self.claim
+    }
+
+    /// Validates both halves and their cross-binding.
+    ///
+    /// The claim must reference this exact registration, carry the same
+    /// worker generation, and agree on authority epoch and state fence. A
+    /// stale or fenced generation, or a claim rewired onto a different
+    /// registration, fails here before any Kernel admission owner sees it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::InvalidRequest`] for a malformed half or a
+    /// registration/generation mismatch, [`WorkerError::StaleEpoch`] or
+    /// [`WorkerError::StaleFence`] for epoch/fence disagreement.
+    pub fn validate_binding(&self) -> Result<(), WorkerError> {
+        self.registration.validate()?;
+        self.claim.validate()?;
+        if self.claim.registration_id != self.registration.registration_id {
+            return Err(WorkerError::InvalidRequest("registration_binding"));
+        }
+        if self.claim.worker_generation != self.registration.worker_generation {
+            return Err(WorkerError::InvalidRequest("generation_binding"));
+        }
+        if self.claim.authority_epoch != self.registration.authority_epoch {
+            return Err(WorkerError::StaleEpoch);
+        }
+        if self.claim.state_fence != self.registration.state_fence {
+            return Err(WorkerError::StaleFence);
+        }
+        Ok(())
+    }
+}
+
+/// One typed ready-or-blocked submission for one admitted claim.
+///
+/// Carries the worker's readiness verdict to the Kernel admission owner
+/// (Wave B). Transport health alone never satisfies this submission: the
+/// enclosed [`NativeWorkerReadiness`] binds generation, claim digest,
+/// adapter-registry revision, credential references, deadline, and fence.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadinessSubmission {
+    claim: NativeWorkerClaim,
+    readiness: NativeWorkerReadiness,
+}
+
+impl ReadinessSubmission {
+    /// Returns the admitted claim this submission answers.
+    #[must_use]
+    pub const fn claim(&self) -> &NativeWorkerClaim {
+        &self.claim
+    }
+
+    /// Returns the readiness verdict.
+    #[must_use]
+    pub const fn readiness(&self) -> &NativeWorkerReadiness {
+        &self.readiness
+    }
+
+    /// Validates the claim and the readiness verdict bound to it.
+    ///
+    /// Ready reports additionally require the claim deadline to hold at
+    /// `now_unix_ms`; blocked reports never fail on an expired deadline
+    /// because blocking on expiry is itself a legitimate verdict.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying claim or readiness validation failure,
+    /// including [`WorkerError::DeadlineExpired`] for a ready report past
+    /// the claim deadline.
+    pub fn validate_binding(&self, now_unix_ms: u64) -> Result<(), WorkerError> {
+        self.claim.validate()?;
+        match &self.readiness {
+            NativeWorkerReadiness::Ready(report) => {
+                report.validate_for_claim(&self.claim, now_unix_ms)
+            }
+            NativeWorkerReadiness::Blocked(report) => report.validate_for_claim(&self.claim),
+        }
+    }
 }
