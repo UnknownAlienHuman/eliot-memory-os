@@ -25,8 +25,8 @@ use super::super::{
     AuthenticatedKernelReadiness, PublishedSupervisionIdentity, fresh_identity, operation,
 };
 use eliot_host_state::{
-    AppendReceipt, HostStateJournalService, JournalBackend, JournalError,
-    KernelReadinessObservationRecord, ReadinessApprovedContour, ReconcileOutcome,
+    AppendReceipt, HostStateJournalService, JournalBackend, KernelReadinessObservationRecord,
+    ReadinessApprovedContour,
 };
 #[cfg(windows)]
 use eliot_host_state::{HostStateRecord, NonceState, record_checksum};
@@ -43,22 +43,9 @@ fn append_reconciled_readiness<B: JournalBackend>(
     observation: KernelReadinessObservationRecord,
     expected: &ReadinessApprovedContour,
 ) -> Result<AppendReceipt, HostError> {
-    match journal.append_readiness_observation(observation.clone(), expected) {
-        Ok(receipt) => Ok(receipt),
-        Err(JournalError::OutcomeUnknown { transaction_id }) => {
-            match journal.reconcile(&transaction_id)? {
-                ReconcileOutcome::Committed => journal
-                    .append_readiness_observation(observation, expected)
-                    .map_err(HostError::Journal),
-                ReconcileOutcome::NotCommitted | ReconcileOutcome::StillUnknown => {
-                    Err(HostError::Journal(JournalError::OutcomeUnknown {
-                        transaction_id,
-                    }))
-                }
-            }
-        }
-        Err(error) => Err(HostError::Journal(error)),
-    }
+    super::append_with_reconcile(journal, || {
+        journal.append_readiness_observation(observation.clone(), expected)
+    })
 }
 
 #[cfg(windows)]

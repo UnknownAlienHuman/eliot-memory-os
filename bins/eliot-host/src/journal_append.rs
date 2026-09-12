@@ -213,15 +213,27 @@ pub(super) fn transition_activation_record(
     Ok(next)
 }
 
-pub(super) fn append_reconciled<B: JournalBackend>(
+/// Single reconcile choke for every `ProductionHostStateJournal` write.
+///
+/// Both generic `HostStateRecord` appends and readiness-observation appends
+/// funnel their `OutcomeUnknown` reconciliation through this helper so the
+/// retry/fail-closed policy has exactly one owner. The underlying journal
+/// admission stays distinct (`append` rejects readiness observations by
+/// design; `append_readiness_observation` enforces the approved contour), but
+/// the durable-outcome handling does not fork.
+fn append_with_reconcile<B, F>(
     journal: &HostStateJournalService<B>,
-    record: HostStateRecord,
-) -> Result<AppendReceipt, HostError> {
-    match journal.append(record.clone()) {
+    append_once: F,
+) -> Result<AppendReceipt, HostError>
+where
+    B: JournalBackend,
+    F: Fn() -> Result<AppendReceipt, JournalError>,
+{
+    match append_once() {
         Ok(receipt) => Ok(receipt),
         Err(JournalError::OutcomeUnknown { transaction_id }) => {
             match journal.reconcile(&transaction_id)? {
-                ReconcileOutcome::Committed => journal.append(record).map_err(HostError::Journal),
+                ReconcileOutcome::Committed => append_once().map_err(HostError::Journal),
                 ReconcileOutcome::NotCommitted | ReconcileOutcome::StillUnknown => {
                     Err(HostError::Journal(JournalError::OutcomeUnknown {
                         transaction_id,
@@ -231,6 +243,13 @@ pub(super) fn append_reconciled<B: JournalBackend>(
         }
         Err(error) => Err(HostError::Journal(error)),
     }
+}
+
+pub(super) fn append_reconciled<B: JournalBackend>(
+    journal: &HostStateJournalService<B>,
+    record: HostStateRecord,
+) -> Result<AppendReceipt, HostError> {
+    append_with_reconcile(journal, || journal.append(record.clone()))
 }
 
 #[cfg(windows)]
