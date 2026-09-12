@@ -2,8 +2,8 @@ schema = "eliot.agent-work-unit.v1"
 authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
 routing_authority = "owning_issue_and_normative_pair_only"
 status = "READY_AFTER_OWNER_CONTRACTS"
-implementation_support = "REAL_WINUI_CLIENT_WITH_RECONNECT_AND_OWNER_MIGRATION_GAPS"
-evidence_execution_status = "SOURCE_INSPECTED_TESTS_NOT_EXECUTED"
+implementation_support = "REAL_WINUI_CLIENT_WITH_RECONNECT_OWNER_AND_TEST_EXECUTION_GAPS"
+evidence_execution_status = "SOURCE_AND_EXISTING_HARNESS_INSPECTED_TESTS_NOT_EXECUTED"
 proof_ceiling = "OPERATOR_USER_SESSION_EDGE_CANDIDATE_ONLY"
 issue = 1137
 user_broker_issue = 1098
@@ -17,8 +17,8 @@ normative_pair_ref = "docs/normative-pair.toml"
 
 [work_unit]
 cell_id = "surface.operator-winui-user-session"
-causal_property = "One WinUI Operator is a User Broker-owned child whose initial handoff, reconnects, projections and mutations remain bound to exact user-session, process, endpoint, owner-revision, StateFence and operation identities without UI-created authority."
-current_discriminator = "apps/Eliot.Operator is real, but its consumed environment handoff cannot be renewed after DisconnectAsync clears the endpoint; mutation identity is discarded on an unknown response; reads and commands still use legacy eliot-app operator tools."
+causal_property = "One WinUI Operator is a User Broker-owned child whose handoffs, reconnects, projections and mutations remain bound to exact user-session, process, endpoint, owner-revision, StateFence and operation identities without UI-created authority."
+current_discriminator = "apps/Eliot.Operator is real, but its consumed environment handoff cannot be renewed after disconnect; mutation identity is discarded on unknown response; reads/commands use legacy eliot-app tools; the existing tests/Eliot.Operator.Tests console harness is not workflow-invoked or standard test-discoverable."
 primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1137"
 
 [documentation]
@@ -36,27 +36,27 @@ anchors = ["ARCH-AUTH-01", "ARCH-LIFE-01", "ARCH-SEC-01", "ARCH-SEC-02", "ARCH-R
 
 [current_source]
 confirmed = [
-  "The real UI is apps/Eliot.Operator, a net10.0 WinUI 3 application, not bins/eliot-operator.",
-  "RuntimeDiscoveryService consumes and clears ELIOT_OPERATOR_ENDPOINT, then GovernorPipeClient clears its cached endpoint on disconnect.",
-  "The running process has no implemented owner channel to acquire a replacement handoff, and CallToolAsync rethrows IOException rather than retrying.",
+  "The real UI is apps/Eliot.Operator, a net10.0 WinUI 3 application, not a Rust binary.",
+  "RuntimeDiscoveryService consumes and clears ELIOT_OPERATOR_ENDPOINT, while GovernorPipeClient clears its cached endpoint on disconnect and has no owner channel for replacement.",
   "MainViewModel creates a new idempotency key per command invocation and retains no unknown-submission reconciliation handle.",
   "GovernorPipeClient invokes legacy eliot_operator_* tools implemented in crates/eliot-app.",
-  "ReadLineAsync and local JsonDocument.Parse paths have no explicit encoded-record and retained-buffer profile.",
-  "System.Text.Json Web defaults accept unmapped fields unless explicitly disallowed.",
-  "App startup diagnostics write complete exception text and stack traces.",
+  "ReadLineAsync, local JsonDocument.Parse and retained result data lack a complete independent bounds profile; default Web JSON options accept unmapped fields.",
+  "Startup diagnostics write complete exception text and stack traces.",
   "README states Windows App SDK 2.2.0 while the project references 2.3.1.",
-  "No owned Operator .NET test project was found.",
+  "tests/Eliot.Operator.Tests exists and links production source, but is OutputType=Exe with top-level custom assertions, no test SDK/framework and no workflow consumer.",
+  "The current harness covers protocol/auth/paging/view-model/cancellation/basic receipt behavior, but not reconnect, closed decoding/bounds, unknown mutation reconciliation, cache invalidation or redaction.",
 ]
 
 [scope]
 primary_paths = [
   "apps/Eliot.Operator/**",
+  "tests/Eliot.Operator.Tests/**",
   "exact eliot ui and User Broker launch/reconnect-handoff spans",
   "exact current ControlBoard/runtime-status and Governor Operator-intent adapters",
   "versioned legacy adapter only when a current consumer requires it",
-  "directly relevant Rust and .NET tests/fixtures",
+  "directly relevant Rust and .NET fixtures",
 ]
-serialized_dependencies = ["#1098 User Broker", "#1201/#13 status projection", "#18/#1189 current owner and legacy retirement", "#63/#74 operation identity", "#11 Product proof"]
+serialized_dependencies = ["#1098 User Broker", "#1201/#13 status projection", "#18/#1189 current owner and legacy retirement", "#63/#74 operation identity", "#1225 workflow reproducibility", "#11 Product proof"]
 forbidden = [
   "unnecessary Agent Bridge dependency",
   "direct Store/database credentials",
@@ -69,20 +69,20 @@ forbidden = [
 
 [[waves]]
 id = "A"
-what = "Correct the real WinUI owner and protocol boundary."
+what = "Bind the real WinUI owner and migrate protocol ownership."
 how = [
-  "Treat apps/Eliot.Operator as the only UI implementation and bind it to the accepted User Broker launch contract.",
-  "Map reads to the current owner-neutral ControlBoard/runtime-status projection and mutations to the current typed OperatorIntent owner.",
-  "If legacy eliot_operator_* compatibility is temporarily required, isolate one versioned adapter with one consumer, proof ceiling, expiry and removal condition.",
+  "Treat apps/Eliot.Operator as the only UI implementation and bind it to the User Broker launch contract.",
+  "Map reads to current ControlBoard/runtime-status projections and mutations to current typed OperatorIntent ownership.",
+  "If legacy eliot_operator_* compatibility remains, isolate one versioned adapter with one consumer, proof ceiling, expiry and removal condition.",
 ]
 
 [[waves]]
 id = "B"
 what = "Replace the consumed-endpoint reconnect dead end."
 how = [
-  "Bind the initial handoff to installation, SID/logon Session, broker registration, UI artifact/process generation, endpoint generation, role/capabilities, nonce, expiry and invalidation.",
-  "Acquire reconnect through a new owner-issued single-use handoff or an authenticated broker channel; never reuse the consumed nonce or infer continuity from PID, user or pipe name.",
-  "If live reconnect is unavailable, return a typed terminal restart-required disposition rather than looping on the cleared environment variable.",
+  "Bind initial handoff to installation, SID/logon Session, broker registration, UI artifact/process generation, endpoint generation, role/capabilities, nonce, expiry and invalidation.",
+  "Acquire reconnect through a new owner-issued single-use handoff or authenticated broker channel; never infer continuity from PID, user or pipe name.",
+  "If live reconnect is unavailable, return a typed restart-required disposition instead of looping on the cleared environment value.",
 ]
 
 [[waves]]
@@ -91,34 +91,36 @@ what = "Preserve mutation identity and exact reconciliation."
 how = [
   "Create the operation/idempotency identity before send and retain it with canonical command bytes, expected revision/fence and phase until terminal receipt.",
   "Keep submitted, possibly executed, receipted, rejected, cancelled, stale-fence and unknown/reconciling states distinct.",
-  "After pipe loss, reconcile the same operation; UI retry cannot generate another logical mutation.",
+  "After pipe loss, reconcile the same operation; UI retry cannot create another logical mutation.",
 ]
 
 [[waves]]
 id = "D"
-what = "Close bounded decoding, cache invalidation and diagnostics."
+what = "Close bounds, cache invalidation, diagnostics and actual test execution."
 how = [
-  "Enforce independent encoded-line, decoded-body, string/container/depth, page/cursor, retained-buffer, timeout and diagnostic limits before allocation.",
-  "Reject unmapped and duplicate protected control fields before trusted use; bounded opaque result data remains untrusted.",
-  "Invalidate records, selected actions, cursors and task context on runtime/generation/revision/fence change.",
-  "Replace full exception logging with bounded typed and redacted diagnostics and derive documented SDK versions from build metadata/evidence.",
+  "Enforce encoded-line, decoded-body, string/container/depth, page/cursor, retained-buffer, timeout and diagnostic limits before allocation.",
+  "Reject unmapped and duplicate protected fields before trusted use; bounded opaque result data remains untrusted.",
+  "Invalidate records, actions, cursors and task context on runtime/generation/revision/fence change.",
+  "Replace raw exception logging with bounded redacted diagnostics and derive documented SDK versions from build metadata.",
+  "Convert the console harness to a standard discoverable test project or explicitly execute it as a bounded conformance executable; zero discovered/executed cases fail.",
 ]
 
 [acceptance]
 criteria = [
-  "All source/docs/tests refer to apps/Eliot.Operator and no nonexistent Rust Operator binary.",
+  "All current source/docs/tests refer to apps/Eliot.Operator and tests/Eliot.Operator.Tests.",
   "eliot ui launches one admitted WinUI artifact as a current User Broker child for exact installation/SID/logon Session.",
-  "Initial and reconnect handoffs are owner-issued, generation-bound, expiring and single-use; old nonce/endpoint replay fails.",
-  "Pipe loss obtains a new valid handoff or returns typed restart-required; it never rereads a permanently consumed endpoint in a loop.",
-  "One mutation retains one stable identity through send, lost response, reconnect and reconciliation.",
+  "Initial and reconnect handoffs are owner-issued, generation-bound, expiring and single-use; stale replay fails.",
+  "Pipe loss obtains a new handoff or returns typed restart-required; it never loops on a consumed endpoint.",
+  "One mutation retains one identity through send, lost response, reconnect and reconciliation.",
   "Read and mutation contracts have one current owner; every legacy adapter has one consumer and removal condition.",
-  "Encoded/decoded JSON, strings, containers, pages, cursors, buffers, timeouts and diagnostics are bounded independently.",
-  "Protected endpoint/handshake/contract/receipt/control shapes reject unknown and duplicate control fields.",
-  "Runtime/generation/revision/fence changes invalidate all dependent UI state before use.",
-  "Cancellation targets only the exact current operation and preserves possible committed effects for reconciliation.",
+  "Encoded/decoded JSON, strings, containers, pages, cursors, buffers, timeouts and diagnostics are independently bounded.",
+  "Protected endpoint/handshake/contract/receipt/control shapes reject unknown and duplicate fields.",
+  "Runtime/generation/revision/fence changes invalidate dependent UI state before use.",
+  "Cancellation preserves possible committed effects for reconciliation.",
   "Diagnostics contain no nonce, endpoint, credential, command/query body or protected record content.",
-  "README, project metadata and publish evidence agree on .NET and Windows App SDK identity.",
-  "An owned .NET test project covers handoff, bounds, closed decoding, reconnect, unknown mutation reconciliation, cache invalidation and redaction.",
+  "README, project metadata, dependency lock and publish evidence agree on .NET and Windows App SDK identity.",
+  "The existing harness is converted to a discoverable suite or explicitly invoked as a bounded conformance executable; zero execution fails.",
+  "Tests cover handoff, bounds, closed decoding, reconnect, unknown mutation reconciliation, cache invalidation and redaction.",
   "Installed Windows proof covers launch, read, mutation, lost response, rotation, stale handoff rejection and logoff cleanup.",
   "Operator owns no canonical state, Store access, Session allocator, scheduler, authority or VERIFIED_COMPLETE decision.",
 ]
@@ -127,11 +129,12 @@ criteria = [
 commands = [
   "dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode",
   "dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release -r win-x64 --no-restore",
-  "dotnet test apps/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj -c Release -r win-x64 --no-restore",
+  "dotnet test tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj -c Release --no-restore  # after conversion",
+  "dotnet run --project tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj -c Release --no-restore  # while retained as executable harness",
   "dotnet publish apps/Eliot.Operator/Eliot.Operator.csproj -c Release -r win-x64 --self-contained true --no-restore -o dist/windows-x64/Eliot.Operator",
   "cargo test --locked -p eliot-cli -p eliot-user-broker-core -p eliot-runtime-status -p eliot-controlboard --all-targets",
   "cargo clippy --locked -p eliot-cli -p eliot-user-broker-core -p eliot-runtime-status -p eliot-controlboard --all-targets -- -D warnings",
   "git diff --check",
 ]
 edge_proof = "Run installed User Broker -> WinUI Operator -> role-filtered Governor/ControlBoard with endpoint rotation, pipe loss, unknown mutation response, exact reconciliation and logoff cleanup."
-product_proof = "Issue #11 remains open; historical README smoke text is not current Product evidence."
+product_proof = "Issue #11 remains open; historical README smoke and console assertions are not current installed Product evidence."
