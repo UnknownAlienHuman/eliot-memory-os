@@ -1,26 +1,26 @@
 name: Temporary probe-plan documentation and package proof
 
 on:
-  pull_request:
-    branches:
-      - main
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: temporary-probe-plan-${{ github.event.pull_request.number }}
+  group: temporary-probe-plan
   cancel-in-progress: true
 
 jobs:
   probe-plan:
-    if: github.head_ref == 'work/610-dreamer-probe-plan'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - name: Checkout candidate
         uses: actions/checkout@v4
         with:
+          ref: work/610-dreamer-probe-plan
           fetch-depth: 1
       - name: Read routed documentation
         run: |
