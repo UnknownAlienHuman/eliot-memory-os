@@ -142,6 +142,60 @@ fn failure_context_for_operation(
     }
 }
 
+/// Converts an `Apply` receipt into a reconciliation-safe response without
+/// ever emitting the legacy `Unknown` variant.
+///
+/// I5.19: an invalid or envelope-less receipt after `Apply` crossed the
+/// provider boundary is an unknown outcome for the exact admitted operation,
+/// never a success and never a not-attempted claim. The admitted
+/// `operation_id` in `context` is the sole reconciliation key; no
+/// receipt-carried identity is adopted and no provider prose is attached.
+fn response_for_transaction_receipt(
+    receipt: WriteReceipt,
+    context: StoreFailureIdentityContext,
+) -> Response {
+    if receipt.validate().is_ok() && receipt.require_reconciliation_envelope().is_ok() {
+        return Response::Transaction { receipt };
+    }
+    let sanitized = sanitized_identity_context(context);
+    match StoreFailure::from_store_error(StoreError::MissingReceiptEnvelope, sanitized.clone()) {
+        Ok(failure) => Response::Failure { failure },
+        Err(_) => internal_defect_fallback(&sanitized),
+    }
+}
+
+/// Converts an exact-operation receipt lookup into a reconciliation-safe
+/// response without ever emitting the legacy `Unknown` variant.
+///
+/// A missing receipt is a valid empty lookup, not a failure. An invalid or
+/// envelope-less receipt for the admitted operation is an unknown outcome
+/// bound to that exact operation identity, reconciled via receipt query.
+fn response_for_receipt_lookup(
+    receipt: Option<WriteReceipt>,
+    context: StoreFailureIdentityContext,
+) -> Response {
+    match receipt {
+        None => Response::Receipt { receipt: None },
+        Some(receipt)
+            if receipt.validate().is_ok() && receipt.require_reconciliation_envelope().is_ok() =>
+        {
+            Response::Receipt {
+                receipt: Some(receipt),
+            }
+        }
+        Some(_) => {
+            let sanitized = sanitized_identity_context(context);
+            match StoreFailure::from_store_error(
+                StoreError::MissingReceiptEnvelope,
+                sanitized.clone(),
+            ) {
+                Ok(failure) => Response::Failure { failure },
+                Err(_) => internal_defect_fallback(&sanitized),
+            }
+        }
+    }
+}
+
 pub(crate) fn map_recovery_dispatch_result(
     request: &StoreRecoveryRequest,
     result: Result<StoreRecoverySnapshot, StoreError>,
@@ -218,7 +272,7 @@ impl StoreDispatchBackend for StoreComposition {
                     )
                     .await
                 {
-                    Ok(receipt) => Response::from_transaction_receipt(receipt),
+                    Ok(receipt) => response_for_transaction_receipt(receipt, failure_context),
                     Err(error) => map_composition_error(error, failure_context),
                 }
             }
@@ -228,7 +282,7 @@ impl StoreDispatchBackend for StoreComposition {
                     ..StoreFailureIdentityContext::default()
                 };
                 match self.receipt(operation_id).await {
-                    Ok(receipt) => Response::from_receipt(receipt),
+                    Ok(receipt) => response_for_receipt_lookup(receipt, context),
                     Err(error) => map_store_error(error, context),
                 }
             }

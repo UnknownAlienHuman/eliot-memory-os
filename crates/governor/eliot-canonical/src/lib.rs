@@ -19,8 +19,9 @@ use eliot_store_api::{
     CanonicalStoreClient, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
     NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingHead,
     OrderingHeadExpectation, PreparedTransition, ReadConsistency, RevisionHead,
-    RevisionHeadExpectation, ScopeId, ScopeRevisionView, SecurityContext, StoreError, StoreHealth,
-    TransitionClass, WriteReceipt,
+    RevisionHeadExpectation, ScopeId, ScopeRevisionView, SecurityContext, StoreConflictObservation,
+    StoreError, StoreFailure, StoreFailureDisposition, StoreHealth, StoreMutationDisposition,
+    StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -100,6 +101,226 @@ impl From<StoreError> for CanonicalError {
     fn from(error: StoreError) -> Self {
         Self::Store(error)
     }
+}
+
+impl CanonicalError {
+    /// Projects the store boundary failure behind this error into bounded
+    /// recovery semantics. Returns `None` for non-store errors. The projection
+    /// is read-only input for Governor task/Problem/admission derivation; it
+    /// never decides those consequences itself.
+    pub fn store_recovery_projection(&self) -> Option<StoreRecoveryProjection<'static>> {
+        match self {
+            Self::Store(error) => Some(StoreRecoveryProjection::for_store_error(error)),
+            _ => None,
+        }
+    }
+}
+
+/// Bounded Governor-side projection of a store failure's recovery semantics.
+///
+/// The projection carries only stable machine fields — disposition, reason
+/// token, mutation state, retry directive, recovery action, exact operation
+/// identity, bounded evidence handle, bounded retry delay, and conflict
+/// observations — plus `human_detail` as diagnostics. It never decides task,
+/// Problem, admission, or finish consequences: Governor alone owns those and
+/// reads this projection as input data. Provider, version, and configuration
+/// detail stay behind the redacted `evidence_ref` handle; `human_detail` must
+/// never steer retry, reconciliation, task state, or recovery behavior.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreRecoveryProjection<'a> {
+    /// Validated provider-neutral control axis.
+    pub disposition: StoreFailureDisposition,
+    /// Stable reason token: borrowed from the validated typed failure, or a
+    /// file-local literal mirroring the failure contract on the ceiling path.
+    pub reason_code: &'a str,
+    /// What is known about the mutation when the failure was reported.
+    pub mutation: StoreMutationDisposition,
+    /// The next safe retry or reconciliation operation, as data.
+    pub retry: StoreRetryDirective,
+    /// The bounded recovery action, as data. It grants no authority.
+    pub recovery: StoreRecoveryAction,
+    /// Exact operation identity. `None` on the `StoreError`-ceiling path,
+    /// which cannot carry it.
+    pub operation_id: Option<&'a OperationId>,
+    /// Bounded redacted evidence handle. Never provider prose.
+    pub evidence_ref: Option<&'a str>,
+    /// Bounded retry delay, present only for retryable dispositions.
+    pub retry_after_ms: Option<u64>,
+    /// Safe provider-neutral conflict observations, if any.
+    pub conflict: Option<&'a StoreConflictObservation>,
+    /// Diagnostic prose only. Never control input.
+    pub human_detail: Option<&'a str>,
+}
+
+impl<'a> StoreRecoveryProjection<'a> {
+    /// Projects the complete typed failure losslessly. Every machine field
+    /// crosses by reference; nothing is parsed, stringified, or re-inferred.
+    pub fn from_failure(failure: &'a StoreFailure) -> Self {
+        Self {
+            disposition: failure.disposition,
+            reason_code: failure.reason_code.as_str(),
+            mutation: failure.mutation_disposition,
+            retry: failure.retry_directive,
+            recovery: failure.recovery_action,
+            operation_id: failure.operation_id.as_ref(),
+            evidence_ref: failure.evidence_ref.as_deref(),
+            retry_after_ms: failure.retry_after_ms,
+            conflict: failure.conflict.as_ref(),
+            human_detail: failure.human_detail.as_deref(),
+        }
+    }
+
+    /// Projects a `StoreError` at the current contract ceiling. Disposition,
+    /// reason token, mutation state, retry directive, and recovery action
+    /// mirror `StoreFailure::from_store_error` exactly; operation identity,
+    /// evidence, conflict, delay, and diagnostic detail are unrepresentable in
+    /// `StoreError` and stay `None`. Unknown stays unknown
+    /// (`MissingReceiptEnvelope` projects to unknown-outcome reconciliation,
+    /// never to retryable `Unavailable`); capacity collapse
+    /// (Backpressure/Deadline/Migration have no `StoreError` variants) is a
+    /// Contract Challenge remainder, not a silent retry claim.
+    pub fn for_store_error(error: &StoreError) -> StoreRecoveryProjection<'static> {
+        use StoreFailureDisposition::{Unavailable, UnknownOutcome};
+        use StoreMutationDisposition::{NotAttempted, Unknown};
+        use StoreRecoveryAction::{
+            ReconcileUnknownOutcome, RefreshRevisionHeads, RefreshStateFence, ResolveWriteReceipt,
+            RestoreStoreConnectivity,
+        };
+        use StoreRetryDirective::{ReconcileExactOperation, RetrySameIdentityAfterBackoff};
+        let (disposition, reason_code, mutation, retry, recovery) = match error {
+            StoreError::InvalidField { .. } => {
+                deterministic_rejection_parts("INVALID_FIELD", StoreRecoveryAction::None)
+            }
+            StoreError::Empty { .. } => {
+                deterministic_rejection_parts("EMPTY_FIELD", StoreRecoveryAction::None)
+            }
+            StoreError::Duplicate { .. } => {
+                deterministic_rejection_parts("DUPLICATE_IDENTITY", StoreRecoveryAction::None)
+            }
+            StoreError::Foundation(_) => deterministic_rejection_parts(
+                "FOUNDATION_CONTRACT_REJECTED",
+                StoreRecoveryAction::None,
+            ),
+            StoreError::Security(_) => deterministic_rejection_parts(
+                "SECURITY_CONTRACT_REJECTED",
+                StoreRecoveryAction::None,
+            ),
+            StoreError::Receipt(_) => deterministic_rejection_parts(
+                "RECEIPT_CONTRACT_REJECTED",
+                StoreRecoveryAction::None,
+            ),
+            StoreError::UnknownOperation => unsupported_parts("UNKNOWN_NAMED_OPERATION"),
+            StoreError::ManifestMismatch => unsupported_parts("OPERATION_MANIFEST_MISMATCH"),
+            StoreError::TransitionClassExceeded => unsupported_parts("TRANSITION_CLASS_EXCEEDED"),
+            StoreError::EffectCeilingExceeded => unsupported_parts("EFFECT_CEILING_EXCEEDED"),
+            StoreError::FenceMismatch => conflict_parts("STATE_FENCE_MISMATCH", RefreshStateFence),
+            StoreError::RevisionConflict => {
+                conflict_parts("REVISION_CONFLICT", RefreshRevisionHeads)
+            }
+            StoreError::OrderingConflict => {
+                conflict_parts("ORDERING_CONFLICT", RefreshRevisionHeads)
+            }
+            StoreError::InvalidProjection => internal_defect_parts("INVALID_PROJECTION"),
+            StoreError::InvalidOutbox => internal_defect_parts("INVALID_OUTBOX"),
+            StoreError::InvalidReceipt => internal_defect_parts("INVALID_RECEIPT"),
+            StoreError::IdentityConflict => {
+                conflict_parts("IDENTITY_CONFLICT", StoreRecoveryAction::None)
+            }
+            StoreError::ReceiptNotFound => {
+                deterministic_rejection_parts("RECEIPT_NOT_FOUND", ResolveWriteReceipt)
+            }
+            StoreError::MissingReceiptEnvelope => (
+                UnknownOutcome,
+                "RECEIPT_ENVELOPE_MISSING",
+                Unknown,
+                ReconcileExactOperation,
+                ReconcileUnknownOutcome,
+            ),
+            StoreError::PayloadTooLarge => {
+                deterministic_rejection_parts("PAYLOAD_TOO_LARGE", StoreRecoveryAction::None)
+            }
+            StoreError::Unavailable => (
+                Unavailable,
+                "STORE_UNAVAILABLE",
+                NotAttempted,
+                RetrySameIdentityAfterBackoff,
+                RestoreStoreConnectivity,
+            ),
+            StoreError::Serialization(_) => internal_defect_parts("SERIALIZATION_FAILURE"),
+        };
+        StoreRecoveryProjection {
+            disposition,
+            reason_code,
+            mutation,
+            retry,
+            recovery,
+            operation_id: None,
+            evidence_ref: None,
+            retry_after_ms: None,
+            conflict: None,
+            human_detail: None,
+        }
+    }
+}
+
+/// Shared tuple behind every `StoreError` ceiling projection.
+type StoreErrorProjectionParts = (
+    StoreFailureDisposition,
+    &'static str,
+    StoreMutationDisposition,
+    StoreRetryDirective,
+    StoreRecoveryAction,
+);
+
+/// Parts for deterministic rejections: never attempted, never retried.
+fn deterministic_rejection_parts(
+    reason_code: &'static str,
+    recovery: StoreRecoveryAction,
+) -> StoreErrorProjectionParts {
+    (
+        StoreFailureDisposition::DeterministicRejection,
+        reason_code,
+        StoreMutationDisposition::NotAttempted,
+        StoreRetryDirective::DoNotRetry,
+        recovery,
+    )
+}
+
+/// Parts for unsupported operations: never attempted, never retried.
+fn unsupported_parts(reason_code: &'static str) -> StoreErrorProjectionParts {
+    (
+        StoreFailureDisposition::Unsupported,
+        reason_code,
+        StoreMutationDisposition::NotAttempted,
+        StoreRetryDirective::DoNotRetry,
+        StoreRecoveryAction::None,
+    )
+}
+
+/// Parts for conflicts: never attempted, retried only under a new identity
+/// once the stated condition is resolved.
+fn conflict_parts(
+    reason_code: &'static str,
+    recovery: StoreRecoveryAction,
+) -> StoreErrorProjectionParts {
+    (
+        StoreFailureDisposition::Conflict,
+        reason_code,
+        StoreMutationDisposition::NotAttempted,
+        StoreRetryDirective::NewIdentityAfterCondition,
+        recovery,
+    )
+}
+
+/// Parts for internal defects: never attempted, manual recovery only.
+fn internal_defect_parts(reason_code: &'static str) -> StoreErrorProjectionParts {
+    (
+        StoreFailureDisposition::InternalDefect,
+        reason_code,
+        StoreMutationDisposition::NotAttempted,
+        StoreRetryDirective::ManualRecovery,
+        StoreRecoveryAction::EscalateInternalDefect,
+    )
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), CanonicalError> {
