@@ -1,0 +1,109 @@
+schema = "eliot.agent-provider-admission-cutover.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
+issue = 1108
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "PLAN_ONLY_WITH_PRODUCTION_PROVIDER_GAP"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "COORDINATOR_PROVIDER_ADMISSION_EDGE_CANDIDATE"
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+related_issue_refs = [187, 224, 265, 872, 874]
+
+[documentation]
+implementation = [
+  "docs/architecture/I03-06-model-route-and-portfolio-policy.md#i36-model-route-and-portfolio-policy",
+  "docs/architecture/I09-09-agentswarm-launch-and-no-lost-child-contract.md#i99-agentswarm-launch-and-no-lost-child-contract",
+  "docs/architecture/I10-11-external-model-bridges.md#i1011-external-model-bridges",
+  "docs/architecture/I10-15-agent-execution-fabric-and-durable-swarm.md#i1015-agent-execution-fabric-and-durable-swarm",
+  "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+  "docs/architecture/I15-04-secrets.md#i154-secrets",
+]
+architecture_anchors = ["ARCH-AUTH-01", "ARCH-SWM-02", "ARCH-SEC-01", "ARCH-PORT-01", "ARCH-RES-01", "ARCH-OBS-01"]
+
+[confirmed_gap]
+source = "crates/agent/eliot-agent-coordinator/src/core.rs"
+observations = [
+  "ProviderVerifier is crate-private and sealed.",
+  "GapProvider is the only non-test implementation and rejects every verification request with its PlanGap.",
+  "AgentCoordinator::new always installs GapProvider.",
+  "with_provider and restore_with_provider are crate-private.",
+  "ProviderBindingSnapshot::Verified providers occur only in test modules.",
+  "Planning is reachable, but provider admission, cancellation, worker fencing, reassignment, result verification and unknown-outcome reconciliation have no production construction path.",
+]
+discriminator = "Construct AgentCoordinator through every public non-test constructor and submit a structurally valid ProviderAdmissionReceipt. Current source cannot install a Verified provider binding, so the operation always terminates in PLAN_GAP."
+
+[causal_property]
+statement = "Effecting Coordinator state is accepted only after one current authenticated provider-admission owner verifies the exact provider generation, route and capacity revisions, task/attempt/scope/fence, operation identity and canonical payload."
+
+[scope]
+primary_paths = [
+  "crates/agent/eliot-agent-coordinator/src/core.rs",
+  "crates/agent/eliot-agent-coordinator/src/model.rs",
+  "crates/agent/eliot-agent-coordinator/src/lib.rs",
+  "crates/agent/eliot-agent-coordinator/tests/**provider**",
+]
+expected_adapter_path = "an existing justified Kernel/native-worker/G-11 integration package selected after current dependency review"
+read_only_dependencies = [
+  "crates/agent/eliot-agent-api/src/**",
+  "crates/agent/eliot-agent-contracts/src/**",
+  "bins/eliot-native-worker/src/**",
+  "crates/kernel/eliot-kernel-service/src/**",
+]
+forbidden_ownership = [
+  "provider/model SDK or process launch in the pure Coordinator",
+  "credentials or secret material",
+  "route-selection duplication",
+  "task graph or canonical state",
+  "authority minting or WorkLease minting",
+  "Task Finish",
+]
+
+[what_to_do]
+steps = [
+  "Define the closed owner-neutral adapter/factory boundary needed to construct a verified Coordinator without exposing an arbitrary always-verified hook.",
+  "Implement one production provider-admission adapter over the accepted Kernel/native-worker/G-11 receipt owner.",
+  "Keep the plan-only constructor explicit and incapable of effecting operations.",
+  "Add production composition and snapshot restore/recovery for the verified provider binding.",
+  "Preserve exact admission, cancellation, worker-fence, reassignment, result and unknown-outcome receipt verification.",
+]
+
+[how_to_do]
+steps = [
+  "Use a closed admitted provider capability whose own constructor validates installation, principal/session, provider/factory, RouteFingerprint, artifact/protocol generation, capacity identity/revision, Authority Epoch, State Fence, freshness and invalidation.",
+  "Rename or document AgentCoordinator::new as plan-only and add a separate production constructor requiring that admitted capability.",
+  "Do not make ProviderVerifier freely implementable by arbitrary downstream callers and do not accept caller booleans or proof strings.",
+  "Verify each receipt kind against its exact canonical payload, provider/task/attempt/scope/fence and operation identity before mutation.",
+  "Persist the provider binding identity in CoordinatorSnapshot and require current evidence on restore; stale/missing binding restores only blocked/plan-only state.",
+  "On possible provider effect or lost response, reconcile the original operation before retry or route substitution.",
+  "Resolve only credential references through the existing User Broker/provider owner and retain no raw secret in state or diagnostics.",
+  "Consume #265 catalogue/quota/liveness as evidence only; it cannot create provider admission.",
+]
+
+[acceptance]
+criteria = [
+  "A production caller can construct a verified Coordinator only from an authenticated current provider-admission capability.",
+  "A real non-test verified provider adapter and production composition caller exist.",
+  "The plan-only constructor still plans deterministically and every effecting method returns typed PLAN_GAP.",
+  "Caller booleans, names, process liveness and arbitrary proof strings cannot create Verified state.",
+  "Every effecting receipt preserves exact provider/task/attempt/scope/fence/operation identity and canonical payload.",
+  "Exact replay is idempotent and changed same-identity payload conflicts.",
+  "Stale route/capacity/generation/epoch/fence or revoked binding rejects before state mutation.",
+  "Restore without current provider evidence cannot silently regain effecting readiness.",
+  "Possible external outcome blocks blind retry and alternate-route substitution until exact reconciliation.",
+  "Raw credentials and unrestricted provider payloads are absent from Coordinator state and diagnostics.",
+  "No process launch, SDK, canonical writer, task graph owner, authority issuer or Finish decision is added to the pure Coordinator.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-agent-coordinator --all-targets",
+  "cargo test --locked -p eliot-agent-coordinator --all-targets",
+  "cargo clippy --locked -p eliot-agent-coordinator --all-targets -- -D warnings",
+  "cargo tree --locked -p eliot-agent-coordinator --edges normal",
+  "git diff --check",
+]
+edge_proof = "Run one admitted provider attempt through plan, admission, worker result or cancellation, descendant closure, stale/revoked binding and unknown-outcome reconciliation."
