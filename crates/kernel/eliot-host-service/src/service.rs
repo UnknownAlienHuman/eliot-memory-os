@@ -568,7 +568,7 @@ where
     /// gate and without touching the installation-wide owner lease. The gate
     /// proves release before a NEW activation takes over ownership; in a
     /// same-owner restart ownership never transfers, so the subsequent
-    /// `start_kernel` stays legal via DegradedRecovery -> Starting while the
+    /// `start_kernel` stays legal via `DegradedRecovery` -> `Starting` while the
     /// single-owner invariant holds for the whole stop -> start sequence.
     fn stop_kernel_for_restart(
         &mut self,
@@ -591,7 +591,7 @@ where
     /// Shared verified-stop core for `stop_kernel` and the restart path:
     /// Draining gate, pre-stop inspect proving the lineage, platform Stop,
     /// and post-stop Stopped/Absent + process-none verification. Failure
-    /// side effects (fail()/unknown_stop()) are identical for both callers
+    /// side effects (`fail()`/`unknown_stop()`) are identical for both callers
     /// so the two paths cannot drift.
     fn verified_kernel_stop(
         &mut self,
