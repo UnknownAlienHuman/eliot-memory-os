@@ -193,24 +193,74 @@ impl KernelComposition {
             "agent_activation_submit" => {
                 #[cfg(windows)]
                 {
-                    let decision_value = payload
-                        .get("decision")
+                    // Production v2 path: the closed typed submit envelope
+                    // carrying one AgentActivationResolutionResult. Unknown
+                    // envelope versions are rejected before adoption.
+                    if let Some(result_value) = payload.get("result") {
+                        let submit: AgentActivationResultSubmit =
+                            serde_json::from_value(result_value.clone())
+                                .map_err(|_| TransportError::SessionFenced)?;
+                        match self.submit_agent_activation_result(submit) {
+                            Ok(ack) => Ok(Self::activation_result_daemon_response(&ack)),
+                            // Deadline expiry is an expected race at this
+                            // boundary, not a daemon-fatal transport failure.
+                            // Return an explicit known outcome so the caller can
+                            // retain liveness without parsing error strings.
+                            // A retained terminal result never takes this
+                            // path: exact replay stays idempotent across the
+                            // deadline.
+                            Err(TransportError::Timeout) => {
+                                Ok(Self::expired_activation_daemon_response())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else if let Some(decision_value) = payload.get("decision") {
+                        // Legacy v1 compatibility decoder only. The v1
+                        // decision uses a distinct payload key, wire identity,
+                        // and closed shape, so it structurally cannot
+                        // trial-decode v2 result data; production traffic uses
+                        // the v2 arm above.
+                        let decision: AgentActivationResolutionDecision =
+                            serde_json::from_value(decision_value.clone())
+                                .map_err(|_| TransportError::SessionFenced)?;
+                        match self.submit_agent_activation_decision(decision) {
+                            Ok(()) => Ok(Self::accepted_daemon_response()),
+                            // Deadline expiry is an expected race at this
+                            // boundary, not a daemon-fatal transport failure.
+                            // Return an explicit known outcome so the caller can
+                            // retain liveness without parsing error strings.
+                            Err(TransportError::Timeout) => {
+                                Ok(Self::expired_activation_daemon_response())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        Err(TransportError::SessionFenced)
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "agent_activation_reconcile" => {
+                #[cfg(windows)]
+                {
+                    // Lost-acknowledgement reconcile: answered purely from
+                    // the retained per-ticket record, never by recomputing
+                    // semantics or reading the Governor a second time. An
+                    // unknown ticket yields a typed Unknown acknowledgement
+                    // (the daemon then resubmits its retained result); a
+                    // digest mismatch is an identity conflict.
+                    let query_value = payload
+                        .get("reconcile")
                         .cloned()
                         .ok_or(TransportError::SessionFenced)?;
-                    let decision: AgentActivationResolutionDecision =
-                        serde_json::from_value(decision_value)
-                            .map_err(|_| TransportError::SessionFenced)?;
-                    match self.submit_agent_activation_decision(decision) {
-                        Ok(()) => Ok(Self::accepted_daemon_response()),
-                        // Deadline expiry is an expected race at this
-                        // boundary, not a daemon-fatal transport failure.
-                        // Return an explicit known outcome so the caller can
-                        // retain liveness without parsing error strings.
-                        Err(TransportError::Timeout) => {
-                            Ok(Self::expired_activation_daemon_response())
-                        }
-                        Err(error) => Err(error),
-                    }
+                    let query: AgentActivationResultReconcile = serde_json::from_value(query_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    self.reconcile_agent_activation_result(&query)
+                        .map(|ack| Self::reconciled_activation_daemon_response(&ack))
                 }
                 #[cfg(not(windows))]
                 {
@@ -239,6 +289,28 @@ impl KernelComposition {
         serde_json::json!({
             "status": "known",
             "value": { "accepted": false, "expired": true },
+            "recovery": null,
+        })
+    }
+
+    /// Typed acknowledgement for a v2 semantic-result submit: the exact
+    /// retained result (with its full disposition) travels inside `ack`, so
+    /// the daemon leg stays lossless without parsing error strings.
+    fn activation_result_daemon_response(ack: &AgentActivationResultAck) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": { "accepted": true, "ack": ack },
+            "recovery": null,
+        })
+    }
+
+    /// Typed answer for a lost-acknowledgement reconcile query, served from
+    /// retention only. `ack` carries outcome `Reconciled` with the retained
+    /// result, or `Unknown` when nothing is retained for the ticket.
+    fn reconciled_activation_daemon_response(ack: &AgentActivationResultAck) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": { "ack": ack },
             "recovery": null,
         })
     }

@@ -167,7 +167,8 @@ use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{
     AGENT_BRIDGE_ACTIVATION_OPERATION, AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
     AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationResolutionDecision,
-    AgentActivationResolutionTicket, AgentBridgeActivationDenialCode,
+    AgentActivationResolutionResult, AgentActivationResolutionTicket, AgentActivationResultAck,
+    AgentActivationResultReconcile, AgentActivationResultSubmit, AgentBridgeActivationDenialCode,
     AgentBridgeActivationDisposition, AgentBridgeActivationFence, AgentBridgeActivationRequest,
     AgentBridgeActivationResponse, AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration,
     AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge, EncodingProfile, Frame, FrameKind,
@@ -338,6 +339,16 @@ struct AgentActivationPendingState {
     /// Bounded replay ledger. A request identity is never rebound to a new
     /// connection after completion or disconnect.
     replay: BTreeMap<String, String>,
+    /// Bounded durable semantic-result retention, keyed by ticket identity.
+    /// One ticket accepts at most one result identity: the bridge waiter
+    /// consumes the `entries` leg after projecting, but this record is kept
+    /// so an exact replay stays idempotent, a changed same-ticket result
+    /// conflicts, and a lost acknowledgement reconciles without a second
+    /// Governor read. Retention never expires on the ticket deadline; a
+    /// terminal accepted result outlives it.
+    results: BTreeMap<String, AgentActivationResultRecord>,
+    /// Insertion order of `results` for bounded eviction.
+    result_order: VecDeque<String>,
 }
 
 #[cfg(windows)]
@@ -371,12 +382,72 @@ fn classify_activation_decision(
     }
 }
 
+/// Submission phase of one retained v2 semantic result.
+///
+/// Absence of a record means the ticket is still awaiting its result. A
+/// retained record is never re-queued by claim-lease expiry: the lease only
+/// recycles result-less tickets for transient resolver failure. The sole
+/// re-queue path for a deferred ticket is a gated superseding submission on
+/// the submit path, never the lease clock.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentActivationResultPhase {
+    /// Terminal result. Exact replay is idempotent; any changed same-ticket
+    /// result is an identity conflict, even across deadline expiry.
+    AcceptedTerminal,
+    /// `NotReady` deferral. Reconsideration requires due time (the new
+    /// observation must not predate the retained `not_before`) and a changed
+    /// named dependency revision; anything else conflicts.
+    DeferredNotReady,
+}
+
+/// Exact retained semantic result for one Kernel-issued ticket: result
+/// identity, payload digest, full typed disposition, and submission phase.
+#[cfg(windows)]
+#[derive(Clone)]
+struct AgentActivationResultRecord {
+    result: AgentActivationResolutionResult,
+    phase: AgentActivationResultPhase,
+}
+
+/// Pure replay classifier for v2 results, mirroring the v1 decision
+/// classifier. The `NotReady` supersede gate is applied by the submit path
+/// only when this classifier reports `Conflict`.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivationResultDisposition {
+    Commit,
+    ExactReplay,
+    Conflict,
+}
+
+#[cfg(windows)]
+fn classify_activation_result(
+    existing: Option<&AgentActivationResolutionResult>,
+    incoming: &AgentActivationResolutionResult,
+) -> ActivationResultDisposition {
+    match existing {
+        None => ActivationResultDisposition::Commit,
+        Some(existing) if existing.result_sha256 == incoming.result_sha256 => {
+            ActivationResultDisposition::ExactReplay
+        }
+        Some(_) => ActivationResultDisposition::Conflict,
+    }
+}
+
 #[cfg(windows)]
 impl AgentActivationPendingState {
     fn claim_at(&mut self, now: u64) -> Option<AgentActivationResolutionTicket> {
         let queue_len = self.fifo.len();
         for _ in 0..queue_len {
             let ticket_id = self.fifo.pop_front()?;
+            // A retained semantic result (v2) is terminal-or-deferred
+            // durable state: claim-lease expiry is not a semantic delta and
+            // never re-queues it. Only result-less tickets recycle through
+            // the lease for transient resolver failure.
+            if self.results.contains_key(&ticket_id) {
+                continue;
+            }
             let Some(entry) = self.entries.get_mut(&ticket_id) else {
                 continue;
             };
@@ -401,6 +472,26 @@ impl AgentActivationPendingState {
             return Some(ticket);
         }
         None
+    }
+
+    /// Retains one exact result record under its ticket identity, evicting the
+    /// oldest retained ticket when the bounded ledger is full. Eviction only
+    /// affects daemon-leg replay/reconcile memory; the bridge leg for an
+    /// evicted ticket is already projected or gone, and a resubmission for an
+    /// evicted ticket without a pending entry is answered `UnknownRequest`
+    /// rather than fabricated.
+    fn retain_activation_result(&mut self, record: AgentActivationResultRecord) {
+        const MAX_RETAINED_ACTIVATION_RESULTS: usize = 64;
+        let ticket_id = record.result.ticket_id.clone();
+        if !self.results.contains_key(&ticket_id) {
+            self.result_order.push_back(ticket_id.clone());
+            while self.result_order.len() > MAX_RETAINED_ACTIVATION_RESULTS {
+                if let Some(oldest) = self.result_order.pop_front() {
+                    self.results.remove(&oldest);
+                }
+            }
+        }
+        self.results.insert(ticket_id, record);
     }
 }
 
