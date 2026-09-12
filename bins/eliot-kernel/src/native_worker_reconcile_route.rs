@@ -61,27 +61,17 @@ use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
 
 /// Reconciles one exact claim after a lost acknowledgement.
 ///
-/// NOT yet listed in the sibling route's `is_native_worker_operation`: the
-/// integrator wires the 3-line dispatch immediately after this commit. Until
-/// then this constant and [`KernelComposition::dispatch_native_worker_reconcile`]
-/// are the only expected `dead_code` in this change.
+/// Listed in the sibling route's `is_native_worker_operation` and dispatched
+/// from its frame gateway, so every item here is live.
 pub(crate) const NATIVE_WORKER_RECONCILE_OPERATION: &str = "native_worker.reconcile";
 
 /// Maximum length of one reconcile operation identity, in UTF-8 bytes.
 ///
 /// Mirrors the sibling route's operation-identity bound.
-#[allow(
-    dead_code,
-    reason = "Wave-D reconcile bound: live once the integrator wires the dispatch"
-)]
 const MAX_RECONCILE_IDENTITY_LEN: usize = 256;
 /// Maximum length of one reconcile text/digest field, in UTF-8 bytes.
 ///
 /// Mirrors the sibling route's claim-text bound.
-#[allow(
-    dead_code,
-    reason = "Wave-D reconcile bound: live once the integrator wires the dispatch"
-)]
 const MAX_RECONCILE_TEXT_LEN: usize = 1_024;
 
 // ---------------------------------------------------------------------------
@@ -93,10 +83,6 @@ const MAX_RECONCILE_TEXT_LEN: usize = 1_024;
 /// Constructed from the durable binding digest when the same identity is
 /// presented with a changed binding or a mismatched retained receipt.
 #[derive(Clone, Debug)]
-#[allow(
-    dead_code,
-    reason = "Wave-D reconcile path: live once the integrator wires the dispatch"
-)]
 pub(crate) struct NativeWorkerReconcileConflict {
     identity: String,
     expected_digest: String,
@@ -106,10 +92,6 @@ pub(crate) struct NativeWorkerReconcileConflict {
 
 /// Typed failure for one native-worker reconcile operation.
 #[derive(Clone, Debug)]
-#[allow(
-    dead_code,
-    reason = "Wave-D reconcile path: live once the integrator wires the dispatch"
-)]
 pub(crate) enum NativeWorkerReconcileError {
     /// A bounded shape check failed for the named field.
     Shape { field: &'static str },
@@ -142,10 +124,6 @@ impl std::fmt::Display for NativeWorkerReconcileError {
 }
 
 impl NativeWorkerReconcileError {
-    #[allow(
-        dead_code,
-        reason = "Wave-D reconcile path: live once the integrator wires the dispatch"
-    )]
     fn into_transport(self) -> TransportError {
         match self {
             Self::Shape { .. } | Self::Fence { .. } => TransportError::SessionFenced,
@@ -159,6 +137,16 @@ impl NativeWorkerReconcileError {
 // Durable backend: the ORS claim table through its owning API.
 // ---------------------------------------------------------------------------
 
+/// Presented reconcile material: the reconcile identity plus the exact
+/// claim presentation it reconciles.
+struct ReconcilePresentation {
+    reconcile_id: String,
+    claim_id: String,
+    binding_digest: String,
+    worker_generation: u64,
+    authority_epoch: u64,
+}
+
 impl KernelComposition {
     /// Loads one claim record by exact identity. Unknown identities are
     /// `Unknown` (records are never invented here); storage or corruption
@@ -166,10 +154,6 @@ impl KernelComposition {
     ///
     /// Duplicates the sibling route's loader (private to its module) pending
     /// a shared narrow owner; the two must stay identical.
-    #[allow(
-        dead_code,
-        reason = "Wave-D reconcile path: live once the integrator wires the dispatch"
-    )]
     fn load_reconcile_record(
         &self,
         claim_id: &str,
@@ -194,10 +178,6 @@ impl KernelComposition {
     ///
     /// Duplicates the sibling route's advancer (private to its module)
     /// pending a shared narrow owner; the two must stay identical.
-    #[allow(
-        dead_code,
-        reason = "Wave-D reconcile path: live once the integrator wires the dispatch"
-    )]
     fn advance_reconcile_record(
         &self,
         claim_id: &str,
@@ -259,19 +239,7 @@ impl KernelComposition {
             .ok_or(TransportError::SessionFenced)?;
         let identity_value =
             serde_json::to_value(identity).map_err(|_| TransportError::SessionFenced)?;
-        let presented_fence: StateFence = identity_value
-            .get("request")
-            .and_then(|request| request.get("state_fence"))
-            .cloned()
-            .and_then(|fence| serde_json::from_value(fence).ok())
-            .ok_or(TransportError::SessionFenced)?;
-        if !session
-            .module_generation
-            .state_fence
-            .is_compatible_with(&presented_fence)
-        {
-            return Err(TransportError::SessionFenced);
-        }
+        Self::require_session_fence(session, &identity_value)?;
         let payload = match &frame.payload {
             ProtocolPayload::Json(payload) => payload.clone(),
             _ => return Err(TransportError::SessionFenced),
@@ -294,69 +262,38 @@ impl KernelComposition {
         Ok(KernelFrameAction::Reply(frame))
     }
 
-    /// Requires the frame idempotency key to equal the message's distinct
-    /// reconcile identity, binding replay protection to the exact message.
-    #[allow(
-        dead_code,
-        reason = "Wave-D reconcile path: live once the integrator wires the dispatch"
-    )]
-    fn require_reconcile_identity(
-        identity: &serde_json::Value,
-        reconcile_id: &str,
-    ) -> Result<(), NativeWorkerReconcileError> {
-        let key = identity
-            .get("idempotency_key")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(NativeWorkerReconcileError::Shape {
-                field: "idempotency_key",
-            })?;
-        if key != reconcile_id {
-            return Err(NativeWorkerReconcileError::Shape {
-                field: "idempotency_key",
-            });
+    /// Requires the presenting fence to agree with the session fence.
+    ///
+    /// A worker generation presenting under a fence incompatible with its
+    /// session is stale or foreign: it fences the session and is never
+    /// granted authority, admission, or a receipt.
+    fn require_session_fence(
+        session: &Session,
+        identity_value: &serde_json::Value,
+    ) -> Result<(), TransportError> {
+        let presented_fence: StateFence = identity_value
+            .get("request")
+            .and_then(|request| request.get("state_fence"))
+            .cloned()
+            .and_then(|fence| serde_json::from_value(fence).ok())
+            .ok_or(TransportError::SessionFenced)?;
+        if !session
+            .module_generation
+            .state_fence
+            .is_compatible_with(&presented_fence)
+        {
+            return Err(TransportError::SessionFenced);
         }
         Ok(())
     }
 
-    /// Reads one lowercase SHA-256 digest field.
-    #[allow(
-        dead_code,
-        reason = "Wave-D reconcile path: live once the integrator wires the dispatch"
-    )]
-    fn require_reconcile_digest(
-        value: &serde_json::Value,
-        field: &'static str,
-    ) -> Result<String, NativeWorkerReconcileError> {
-        let digest = native_worker_json_str(value, field, MAX_RECONCILE_TEXT_LEN)
-            .map_err(|_| NativeWorkerReconcileError::Shape { field })?;
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
-            return Err(NativeWorkerReconcileError::Shape { field });
-        }
-        Ok(digest)
-    }
-
-    /// Reconciles one exact claim after a lost acknowledgement.
-    ///
-    /// The payload carries the full presented claim plus the retained receipt
-    /// when the worker still holds one. The durable record is loaded by exact
-    /// claim identity; generation and epoch currency are fenced against it; a
-    /// changed binding or a mismatched retained receipt conflicts before any
-    /// effect; `Unknown` advances to `Reconciling` where the ORS table allows
-    /// it while every other state reconciles in place. The sealed receipt
-    /// echoes the durable receipt identity — never a second identity.
-    #[allow(
-        dead_code,
-        reason = "Wave-D reconcile path: live once the integrator wires the dispatch"
-    )]
-    fn handle_native_worker_reconcile(
-        &self,
+    /// Parses one reconcile presentation: the distinct reconcile identity
+    /// (bound to the frame idempotency key) and the exact claim fields the
+    /// durable record is checked against.
+    fn parse_reconcile_presentation(
         identity: &serde_json::Value,
         payload: &serde_json::Value,
-    ) -> Result<serde_json::Value, NativeWorkerReconcileError> {
+    ) -> Result<ReconcilePresentation, NativeWorkerReconcileError> {
         let reconcile_id =
             native_worker_json_str(payload, "reconcile_id", MAX_RECONCILE_IDENTITY_LEN).map_err(
                 |_| NativeWorkerReconcileError::Shape {
@@ -403,6 +340,72 @@ impl KernelComposition {
                 field: "epoch_fence",
             });
         }
+        Ok(ReconcilePresentation {
+            reconcile_id,
+            claim_id,
+            binding_digest,
+            worker_generation,
+            authority_epoch,
+        })
+    }
+
+    /// Requires the frame idempotency key to equal the message's distinct
+    /// reconcile identity, binding replay protection to the exact message.
+    fn require_reconcile_identity(
+        identity: &serde_json::Value,
+        reconcile_id: &str,
+    ) -> Result<(), NativeWorkerReconcileError> {
+        let key = identity
+            .get("idempotency_key")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(NativeWorkerReconcileError::Shape {
+                field: "idempotency_key",
+            })?;
+        if key != reconcile_id {
+            return Err(NativeWorkerReconcileError::Shape {
+                field: "idempotency_key",
+            });
+        }
+        Ok(())
+    }
+
+    /// Reads one lowercase SHA-256 digest field.
+    fn require_reconcile_digest(
+        value: &serde_json::Value,
+        field: &'static str,
+    ) -> Result<String, NativeWorkerReconcileError> {
+        let digest = native_worker_json_str(value, field, MAX_RECONCILE_TEXT_LEN)
+            .map_err(|_| NativeWorkerReconcileError::Shape { field })?;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(NativeWorkerReconcileError::Shape { field });
+        }
+        Ok(digest)
+    }
+
+    /// Reconciles one exact claim after a lost acknowledgement.
+    ///
+    /// The payload carries the full presented claim plus the retained receipt
+    /// when the worker still holds one. The durable record is loaded by exact
+    /// claim identity; generation and epoch currency are fenced against it; a
+    /// changed binding or a mismatched retained receipt conflicts before any
+    /// effect; `Unknown` advances to `Reconciling` where the ORS table allows
+    /// it while every other state reconciles in place. The sealed receipt
+    /// echoes the durable receipt identity — never a second identity.
+    fn handle_native_worker_reconcile(
+        &self,
+        identity: &serde_json::Value,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, NativeWorkerReconcileError> {
+        let presentation = Self::parse_reconcile_presentation(identity, payload)?;
+        let reconcile_id = presentation.reconcile_id;
+        let claim_id = presentation.claim_id;
+        let binding_digest = presentation.binding_digest;
+        let worker_generation = presentation.worker_generation;
+        let authority_epoch = presentation.authority_epoch;
         let staged = self.load_reconcile_record(&claim_id)?;
         if staged.worker_generation == 0 || staged.worker_generation != worker_generation {
             return Err(NativeWorkerReconcileError::Fence {

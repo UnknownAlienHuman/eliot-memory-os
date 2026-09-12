@@ -45,7 +45,8 @@
 
 use super::{
     KernelComposition, KernelFrameAction, KernelServiceState, ProcessExecutionRequest,
-    caller_binding, sha256_json, status_frame, unix_ms,
+    caller_binding, native_worker_reconcile_route::NATIVE_WORKER_RECONCILE_OPERATION, sha256_json,
+    status_frame, unix_ms,
 };
 use eliot_contracts::{AuthorityEpoch, StateFence};
 use eliot_ipc::{Session, TransportError};
@@ -78,7 +79,9 @@ pub(crate) const NATIVE_WORKER_RESULT_SUBMIT_OPERATION: &str = "native_worker.re
 /// Observes cancellation for one exact attempt and fences it.
 pub(crate) const NATIVE_WORKER_CANCEL_OBSERVE_OPERATION: &str = "native_worker.cancel_observe";
 
-/// Returns true for the seven Wave-C native-worker operations.
+/// Returns true for the eight native-worker operations (seven lifecycle
+/// operations owned here plus reconciliation owned by the sibling
+/// `native_worker_reconcile_route` module).
 ///
 /// Paired with the worker-side operation constants in
 /// `bins/eliot-native-worker/src/kernel_admission_client.rs`; both lists must
@@ -93,6 +96,7 @@ pub(crate) fn is_native_worker_operation(operation: &str) -> bool {
             | NATIVE_WORKER_CHECKPOINT_OPERATION
             | NATIVE_WORKER_RESULT_SUBMIT_OPERATION
             | NATIVE_WORKER_CANCEL_OBSERVE_OPERATION
+            | NATIVE_WORKER_RECONCILE_OPERATION
     )
 }
 
@@ -490,6 +494,9 @@ impl KernelComposition {
             .ok_or(TransportError::SessionFenced)?;
         if !is_native_worker_operation(operation) {
             return Err(TransportError::SessionFenced);
+        }
+        if operation == NATIVE_WORKER_RECONCILE_OPERATION {
+            return self.dispatch_native_worker_reconcile(session, frame);
         }
         if operation == NATIVE_WORKER_CANCEL_OBSERVE_OPERATION {
             let (operation_id, session_binding) = self
