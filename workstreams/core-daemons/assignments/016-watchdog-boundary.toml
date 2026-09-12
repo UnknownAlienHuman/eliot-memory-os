@@ -1,0 +1,159 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION_AND_WINDOWS_EDGE_PROOF"
+implementation_support = "SUBSTANTIAL_LOCAL_SUPERVISION_PRESENT_COMPLETE_INDEPENDENCE_AND_RECOVERY_PROOF_MISSING"
+evidence_execution_status = "CURRENT_BINARY_COMPOSITION_SPOOL_REGISTRATION_AND_ISSUE_PATHS_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "WATCHDOG_INDEPENDENT_SUPERVISION_EDGE_CANDIDATE_ONLY"
+issue = 16
+spool_export_issue = 458
+supervision_lease_issue = 88
+host_issue = 14
+kernel_issue = 15
+doctor_issue = 461
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "supervision.watchdog-independent-boundary"
+causal_property = "Watchdog remains an independently started and independently observed supervision process that can detect and contain exact Host/Kernel process-generation failures, preserve bounded local evidence and coverage gaps, and request only predeclared mechanical recovery without depending on the monitored semantic or Store path and without acquiring diagnosis, policy, canonical or Finish ownership."
+current_discriminator = "eliot-watchdog has real SCM/console startup, protected registration/spool state, observation/supervision modules and a WatchdogComposition. The repository still lacks one accepted Windows Edge proving independent SCM startup, exact target-process ownership, supervision lease continuity, control-path availability during Host/Kernel/eliotd/Store faults, spool export/replay and bounded no-orphan containment under current installed identities."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/16"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-03-module-supervision-and-doctor.md#a133-module-supervision-and-doctor",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-05-bounded-resources-and-control-reserve.md#a135-bounded-resources-and-control-reserve",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-08-restart-and-recovery.md#a138-restart-and-recovery",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I01-02-mandatory-runtime-processes.md#i12-mandatory-runtime-processes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I01-04-scm-supervision-tree.md#i14-scm-supervision-tree",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I01-05-demand-start-observable-use-supervision-and-idle-shutdown.md#i15-demand-start-observable-use-supervision-and-idle-shutdown",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I08-02-independent-observation-routes.md#i82-independent-observation-routes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I08-03-deterministic-supervision-loop.md#i83-deterministic-supervision-loop",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I08-10-containment.md#i810-containment",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I08-13-watchdog-failure.md#i813-watchdog-failure",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I08-14-watchdog-observables.md#i814-watchdog-observables",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-23-safe-shutdown.md#i1423-safe-shutdown",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+]
+anchors = ["ARCH-WDG-01", "ARCH-WDG-02", "ARCH-RES-01", "ARCH-RES-04", "ARCH-SEC-02", "ARCH-OBS-01"]
+
+[current_source]
+confirmed = [
+  "The binary supports Windows SCM service mode and a console path and opens WatchdogComposition from protected configuration.",
+  "The package contains independent observation, supervision, registration, local spool and Windows service integration code; it is not an empty or placeholder crate.",
+  "WatchdogSpool already persists bounded heartbeat/gap/recovery evidence and pressure gaps, but downstream export remains #458.",
+  "Supervision lease issue #88 remains separate from source-spool export and must not be conflated with observation delivery.",
+  "Current source/tests do not by themselves prove that Watchdog is independently started, independently observable and usable while Host, Kernel, eliotd or Store are unavailable.",
+  "Current source/tests do not establish exact no-orphan process-generation containment and bounded restart/quarantine behavior on a live Windows installation.",
+  "Doctor owns diagnosis/repair recipes under #461; Watchdog may request or perform only the narrow predeclared mechanical containment assigned by accepted policy.",
+]
+
+[scope]
+primary_paths = [
+  "bins/eliot-watchdog/src/main.rs",
+  "bins/eliot-watchdog/src/lib.rs",
+  "bins/eliot-watchdog/src/observation/**",
+  "bins/eliot-watchdog/src/supervision/**",
+  "bins/eliot-watchdog/src/watchdog_registration/**",
+  "bins/eliot-watchdog/src/watchdog_spool.rs and watchdog_spool/** only where parent lifecycle requires",
+  "crates/supervision/eliot-watchdog-core/src/**",
+  "exact Windows SCM/process/readback adapters",
+  "directly relevant tests and finite fault fixtures",
+]
+serialized_dependencies = ["#14 Host", "#15 Kernel", "#88 supervision lease", "#458 spool export", "#461 Doctor", "#11 Product proof"]
+forbidden = [
+  "project, task, WorkScope, plan, Context or Finish semantics",
+  "canonical Store credentials, raw Store queries or direct canonical writes",
+  "Doctor diagnosis or arbitrary repair recipes",
+  "model/provider clients or semantic severity classification",
+  "process ownership inferred from PID, name, path, port or heartbeat alone",
+  "adopting or terminating a foreign process",
+  "unbounded restart loops or hidden automatic repair widening",
+  "calling liveness, heartbeat or transport success semantic health",
+  "claiming continuous coverage across a spool/lease/observation gap",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Make the process and state ownership boundary explicit and registry-bound."
+how = [
+  "Keep the binary as SCM/console composition only and expose explicit cells for protected registration, independent observation, deterministic supervision, local spool, narrow containment and export handoff.",
+  "Give every mutable state exactly one writer/lifecycle owner and bind each cell through #13 when that registry lands.",
+  "Bind Watchdog installation, service configuration, executable/artifact digest, process start identity, service SID/account, generation, registration revision and protected state root before declaring readiness.",
+  "Reject config/registration/source identities that are missing, stale, malformed, cross-installation or not independently readable.",
+]
+
+[[waves]]
+id = "B"
+what = "Close independent observation and coverage semantics."
+how = [
+  "Use only independent OS/SCM/process/event/readback routes for monitored Host/Kernel generations; the monitored process's own health response is supplementary evidence, not the sole sensor.",
+  "Bind each observation to target installation/service/artifact/process generation/start identity, observation route, monotonic and wall time, source revision, supervision lease and coverage interval.",
+  "Preserve NOT_RUNNING, UNAVAILABLE, UNKNOWN, STALE, CONFLICTED, GAP and RECOVERY separately; lack of an observation is not healthy.",
+  "Persist every material observation or explicit gap into the existing bounded spool before downstream reliance.",
+  "Keep heartbeat/liveness evidence non-semantic and prevent it from certifying Store correctness, task progress or Product readiness.",
+]
+
+[[waves]]
+id = "C"
+what = "Implement deterministic bounded supervision and narrow mechanical containment."
+how = [
+  "Evaluate the current supervision table from immutable registered target identity, exact observations, lease state, retry/cooldown budget and prior disposition.",
+  "Permit only closed mechanical actions already owned by Watchdog policy, such as exact SCM restart/requested Host recovery or containment of one proven owned generation; route diagnosis/repair to #461.",
+  "Before stop/restart/containment, re-read exact service/process/artifact/start identity and refuse changed or foreign ownership.",
+  "Persist intent and branch disposition before a possible containment effect; after timeout/disconnect/partial cleanup, retain UNKNOWN/RECONCILING and do not blindly repeat.",
+  "Exhausted or materially repeated failures enter bounded quarantine/escalation rather than endless restart.",
+  "Preserve Control Reserve and shutdown responsiveness while normal observation/export lanes are saturated.",
+]
+
+[[waves]]
+id = "D"
+what = "Close export, lease, restart, failure independence and installed evidence."
+how = [
+  "Integrate #88 for exact supervision-lease continuity and #458 for replay-stable spool export without changing this parent ownership boundary.",
+  "Prove Watchdog remains startable/observable when Host is stopped and retains local evidence while Kernel/eliotd/Store are unavailable.",
+  "Prove Watchdog crash/restart reopens protected registration/spool, retains sequence/gap/recovery state and cannot claim missed interval coverage.",
+  "Prove Host/Kernel process replacement fences the old generation and leaves no orphan or foreign adoption.",
+  "Verify SCM service state, process image/start identity, protected files, spool/cursor, coverage, containment receipts and recovery outcome through independent Windows readback.",
+]
+
+[acceptance]
+criteria = [
+  "Watchdog is installed and started independently of Host and its readiness does not depend on Host, Kernel, eliotd, Store, model or UI availability.",
+  "The binary is composition-only and every mutable registration/observation/supervision/spool/containment state has one owner.",
+  "Readiness binds exact installation, service, executable/artifact, process start, account/SID, generation, registration and protected-root identity.",
+  "Every target observation binds exact target process generation/start identity, route, times, lease and coverage interval.",
+  "Self-reported health is never the only evidence and cannot certify semantic correctness or Product readiness.",
+  "NOT_RUNNING, UNAVAILABLE, UNKNOWN, STALE, CONFLICTED, GAP and RECOVERY remain distinct and cannot become healthy by default.",
+  "Every material observation/gap is durably spooled before downstream reliance and pressure cannot disappear from coverage.",
+  "Watchdog has no canonical Store credentials, semantic task/Problem state, model client or Finish authority.",
+  "Only closed predeclared mechanical containment is executable; arbitrary repair/command/path/effect is unrepresentable and Doctor remains the repair owner.",
+  "Containment revalidates exact ownership immediately before effect and cannot stop, restart, adopt or kill a foreign/changed process.",
+  "Every possible effect has durable intent and terminal/reconciling state; unknown outcome is reconciled before retry.",
+  "Retry/cooldown budgets are finite and durable; exhaustion enters quarantine/escalation.",
+  "Watchdog remains responsive to stop/control/recovery under normal observation/export saturation.",
+  "Host/Kernel replacement fences the old generation and leaves no orphan descendant or stale observation authority.",
+  "Watchdog restart preserves protected registration/spool/cursor identity and records an observation coverage gap for every unobserved interval.",
+  "Spool export and lease continuity pass #458/#88 without changing source ownership or conflating delivery with supervision.",
+  "Real Windows tests prove independent SCM startup, Host/Kernel/eliotd/Store fault operation, exact containment, restart, no-orphan and bounded recovery.",
+  "Issue #11 independently observes Watchdog startup, failure, recovery and retained evidence on one installed identity.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-watchdog-core -p eliot-watchdog --all-targets",
+  "cargo test --locked -p eliot-watchdog-core -p eliot-watchdog --all-targets",
+  "cargo clippy --locked -p eliot-watchdog-core -p eliot-watchdog --all-targets -- -D warnings",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "On Windows, prove independent Watchdog SCM startup/readback, stop Host, kill/replace Kernel, remove eliotd/Store availability, inject stale/foreign process identities, exhaust restart budget, restart Watchdog and verify spool/lease/coverage/no-orphan state independently."
+product_proof = "Package and Edge proof do not close Product support; installed current-state evidence remains #11."
