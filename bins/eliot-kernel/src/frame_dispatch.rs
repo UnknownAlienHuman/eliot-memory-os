@@ -9,6 +9,7 @@
 //! Forbidden authority: must not fabricate execution success, must not accept peer-owned shutdown authority, must not bypass `ServerHandshakePolicy`, generation poison, or state-fence compatibility.
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::dispatch_frame` plus inseparable dispatch-only helpers with zero external users.
 
+use super::native_worker_lifecycle_route::is_native_worker_operation;
 use super::{
     ACTIVE_DAEMON_CALLER, Frame, FrameKind, KernelComposition, KernelFrameAction,
     KernelServiceState, MessageType, ProcessExecutionRequest, ProtocolPayload, Session,
@@ -127,6 +128,37 @@ impl KernelComposition {
         if (frame.kind == FrameKind::Request && frame.message_type == MessageType::Execute)
             || (frame.kind == FrameKind::Cancel && frame.message_type == MessageType::Cancel)
         {
+            let payload = match &frame.payload {
+                ProtocolPayload::Json(payload) => payload.clone(),
+                _ => return Err(TransportError::SessionFenced),
+            };
+            let native_operation = payload
+                .get("operation")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if is_native_worker_operation(native_operation) {
+                // Native-worker lifecycle operations delegate to the Wave-C
+                // route file. Ready-gating and peer authentication mirror the
+                // Process gate below; per-operation fence checks, exact
+                // generation/binding validation, and persist-before-ack live
+                // in the route. Unknown or stale generations fence the
+                // session there and are never granted authority.
+                if self
+                    .service_state()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    != KernelServiceState::Ready
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                session
+                    .peer
+                    .validate()
+                    .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+                if frame.request_id.is_none() || frame.request_identity.is_none() {
+                    return Err(TransportError::SessionFenced);
+                }
+                return self.dispatch_native_worker_frame(session, frame);
+            }
             if self
                 .service_state()
                 .map_err(|_| TransportError::SessionFenced)?
