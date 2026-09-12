@@ -1692,6 +1692,7 @@ dependencies = [
  "eliot-receipts",
  "eliot-runtime-contracts",
  "eliot-security-contracts",
+ "eliot-store-api",
  "redb",
  "schemars",
  "serde",

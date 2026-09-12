@@ -85,6 +85,8 @@ const SUPERVISION_LEASE_STAGE_RESOLUTIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_stage_resolutions_v1");
 const STORE_REBIND_REPLAY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_rebind_replay_v1");
+const STORE_FAILURE_RETENTION: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_store_failure_retention_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY: &str = "supervision_stage_resolution_schema";
@@ -385,6 +387,14 @@ fn same_store_rebind_binding(
 
 impl persistence_codec::PersistedValue for HostRequestRecord {
     const RECORD_TYPE: &'static str = "host_request";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::StoreFailureRetentionRecord {
+    const RECORD_TYPE: &'static str = "store_failure_retention";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
@@ -794,6 +804,196 @@ impl RedbRecoveryStore {
         for entry in table.iter().map_err(storage)? {
             let (_, value) = entry.map_err(storage)?;
             let record: crate::StoreRebindReplayRecord = decode(value.value())?;
+            record.validate()?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    /// Retains one closed typed Store failure bound to its exact admitted
+    /// operation identity.
+    ///
+    /// The owner envelope is validated by the owner contract and stored
+    /// verbatim; ORS never reinterprets disposition, retry, recovery, or
+    /// provider prose, and never derives control meaning from
+    /// `human_detail`. An exact replay under the same operation/request
+    /// identity returns the durably stored record unchanged; a changed
+    /// failure envelope, binding, or fence under the same identity fails
+    /// with an integrity error. A retained `UNKNOWN_OUTCOME` failure with
+    /// no reconciling receipt is the reconciling state: it is never
+    /// reported as committed, terminal, unavailable, or safe-to-retry.
+    /// There is no removal method: retained failures are terminal or
+    /// reconciling evidence and restart must rehydrate them unchanged.
+    pub fn retain_store_failure(
+        &self,
+        record: &crate::StoreFailureRetentionRecord,
+    ) -> Result<Option<crate::StoreFailureRetentionRecord>, OrsError> {
+        record.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = record.record_key();
+        let stored = {
+            let mut table = write.open_table(STORE_FAILURE_RETENTION).map_err(storage)?;
+            let retained_bytes = table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned());
+            let Some(bytes) = retained_bytes else {
+                let payload = encode(record)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+                drop(table);
+                write.commit().map_err(storage)?;
+                return Ok(None);
+            };
+            let existing: crate::StoreFailureRetentionRecord = decode(&bytes)?;
+            existing.validate()?;
+            if !existing.same_binding(record) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "store_failure_retention",
+                    reason: "existing retained Store failure binding conflicts".to_owned(),
+                });
+            }
+            if existing.failure != record.failure {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "store_failure_retention",
+                    reason: "retained Store failure replacement rejected".to_owned(),
+                });
+            }
+            // Monotonic reconciliation only: an unresolved retention may
+            // bind its exact reconciling receipt, but a reconciled
+            // retention is immutable and can never become unresolved.
+            let mut next = existing.clone();
+            match (&existing.reconciled_receipt, &record.reconciled_receipt) {
+                (None, None) => {}
+                (None, Some(_)) => {
+                    next.reconciled_receipt
+                        .clone_from(&record.reconciled_receipt);
+                }
+                (Some(stored), Some(incoming)) if stored == incoming => {}
+                (Some(_), _) => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "store_failure_retention",
+                        reason: "reconciling receipt replacement rejected".to_owned(),
+                    });
+                }
+            }
+            next.validate()?;
+            if next != existing {
+                let payload = encode(&next)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+            }
+            next
+        };
+        write.commit().map_err(storage)?;
+        Ok(Some(stored))
+    }
+
+    /// Loads one retained Store failure by exact operation/request identity.
+    ///
+    /// The envelope is returned verbatim: disposition, retry directive,
+    /// recovery action, mutation disposition, conflict observations, and
+    /// evidence identity are exactly as retained, including
+    /// `UNKNOWN_OUTCOME` as reconciling while no receipt is bound.
+    pub fn load_store_failure(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<crate::StoreFailureRetentionRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(STORE_FAILURE_RETENTION).map_err(storage)?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        table
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: crate::StoreFailureRetentionRecord = decode(value.value())?;
+                record.validate()?;
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Binds the exact reconciling receipt to a retained unknown-outcome
+    /// Store failure after the original operation was reconciled.
+    ///
+    /// An unknown operation returns `Ok(None)`; this method never invents
+    /// a record, never retries, never reroutes, and never substitutes an
+    /// operation: it only records that the exact retained operation was
+    /// reconciled under the given receipt digest, so a later restart
+    /// rehydrates the reconciled state instead of re-reconciling. A bound
+    /// receipt is immutable, and reconciling a terminal
+    /// (non-unknown-outcome) retention fails: terminal evidence stays
+    /// terminal.
+    pub fn mark_store_failure_reconciled(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        reconciling_receipt: &str,
+    ) -> Result<Option<crate::StoreFailureRetentionRecord>, OrsError> {
+        crate::model::validate_digest(reconciling_receipt, "store_failure_reconciled_receipt")?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let retained = {
+            let mut table = write.open_table(STORE_FAILURE_RETENTION).map_err(storage)?;
+            let retained_bytes = table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned());
+            let Some(bytes) = retained_bytes else {
+                drop(table);
+                write.commit().map_err(storage)?;
+                return Ok(None);
+            };
+            let mut next: crate::StoreFailureRetentionRecord = decode(&bytes)?;
+            next.validate()?;
+            if next.failure.disposition != eliot_store_api::StoreFailureDisposition::UnknownOutcome
+            {
+                return Err(OrsError::InvalidField {
+                    field: "store_failure_reconciled_receipt",
+                    reason: "only unknown-outcome retention reconciles",
+                });
+            }
+            match &next.reconciled_receipt {
+                Some(existing) if existing == reconciling_receipt => {}
+                Some(_) => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "store_failure_retention",
+                        reason: "reconciling receipt replacement rejected".to_owned(),
+                    });
+                }
+                None => {
+                    next.reconciled_receipt = Some(reconciling_receipt.to_owned());
+                }
+            }
+            next.validate()?;
+            let payload = encode(&next)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+            next
+        };
+        write.commit().map_err(storage)?;
+        Ok(Some(retained))
+    }
+
+    /// Loads every retained Store failure for restart rehydration.
+    ///
+    /// Restart restores the same typed terminal or reconciling state
+    /// without recomputation: terminal and unknown-outcome envelopes
+    /// round-trip verbatim, and an unknown outcome never degrades to
+    /// not-attempted, unavailable, or safe-to-retry.
+    pub fn load_all_store_failures(
+        &self,
+    ) -> Result<Vec<crate::StoreFailureRetentionRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(STORE_FAILURE_RETENTION).map_err(storage)?;
+        let mut records = Vec::new();
+        for entry in table.iter().map_err(storage)? {
+            let (_, value) = entry.map_err(storage)?;
+            let record: crate::StoreFailureRetentionRecord = decode(value.value())?;
             record.validate()?;
             records.push(record);
         }
