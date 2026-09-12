@@ -8,6 +8,7 @@ on:
 permissions:
   contents: read
 
+# Branch-only execution probe. Deleted before the implementation PR is merged.
 concurrency:
   group: temporary-651-branch-proof
   cancel-in-progress: true
