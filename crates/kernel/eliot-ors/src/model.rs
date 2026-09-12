@@ -2177,6 +2177,13 @@ pub enum OrsError {
         record_type: &'static str,
         reason: String,
     },
+    #[error(
+        "host request {operation_id} with digest {request_digest} conflicts with durable ORS state: IDENTITY_CONFLICT"
+    )]
+    HostRequestIdentityConflict {
+        operation_id: String,
+        request_digest: String,
+    },
     #[error("durable ORS storage failed: {0}")]
     Storage(String),
     #[error("durable ORS encoding failed: {0}")]
@@ -2262,6 +2269,244 @@ impl StoreRebindReplayRecord {
             return Err(OrsError::InvalidField {
                 field: "store_rebind_commit_order",
                 reason: "pending must not carry a commit order",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Closed P-04 host-request kinds preserved by ORS without interpretation.
+///
+/// The kind is an opaque routing label. ORS never interprets task, scope,
+/// payload, or semantic meaning from it; it only enforces that one operation
+/// identity is never rebound across kinds or bindings.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestKind {
+    Activation,
+    Invocation,
+    Cancellation,
+    Status,
+    Reconciliation,
+}
+
+/// Durable P-04 host-request operation state.
+///
+/// `PossiblyEffected` is the anti-blind-retry fence: once an operation may
+/// have produced an external or canonical effect it can only move forward to
+/// `ResultReceived` through reconciliation evidence, or to `Unknown` /
+/// `Reconciling`. It can never return to `Routed` or `Submitted`.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestState {
+    Requested,
+    Admitted,
+    Routed,
+    Submitted,
+    PossiblyEffected,
+    ResultReceived,
+    Cancelled,
+    Expired,
+    Conflicted,
+    Unknown,
+    Reconciling,
+    Terminal,
+}
+
+impl HostRequestState {
+    /// Returns whether the state closes the operation.
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::ResultReceived
+                | Self::Cancelled
+                | Self::Expired
+                | Self::Conflicted
+                | Self::Terminal
+        )
+    }
+
+    /// Validates one mechanical state advance without interpreting meaning.
+    pub fn transition_to(self, next: Self) -> Result<Self, OrsError> {
+        let legal = matches!(
+            (self, next),
+            (
+                Self::Requested,
+                Self::Admitted | Self::Expired | Self::Conflicted | Self::Unknown
+            ) | (
+                Self::Admitted,
+                Self::Routed | Self::Cancelled | Self::Expired | Self::Conflicted | Self::Unknown
+            ) | (
+                Self::Routed,
+                Self::Submitted
+                    | Self::Cancelled
+                    | Self::Expired
+                    | Self::Conflicted
+                    | Self::Unknown
+            ) | (
+                Self::Submitted,
+                Self::PossiblyEffected
+                    | Self::ResultReceived
+                    | Self::Cancelled
+                    | Self::Expired
+                    | Self::Conflicted
+                    | Self::Unknown
+            ) | (
+                Self::PossiblyEffected,
+                Self::ResultReceived | Self::Unknown | Self::Reconciling
+            ) | (
+                Self::Unknown,
+                Self::Reconciling | Self::ResultReceived | Self::Cancelled | Self::Expired
+            ) | (
+                Self::Reconciling,
+                Self::ResultReceived
+                    | Self::Cancelled
+                    | Self::Expired
+                    | Self::Unknown
+                    | Self::Conflicted
+            ) | (
+                Self::ResultReceived | Self::Cancelled | Self::Expired | Self::Conflicted,
+                Self::Terminal
+            )
+        );
+        legal.then_some(next).ok_or(OrsError::InvalidTransition)
+    }
+}
+
+/// Durable P-04 host-request operation record.
+///
+/// Every identity is opaque to ORS: Session, task, scope, capability, fence,
+/// and payload values are preserved as exact bytes/digests for replay
+/// comparison and are never interpreted. The Kernel admission gate owns fence,
+/// capability, and Session validation; ORS owns durable identity continuity:
+/// an exact replay returns the same state and result, while a changed
+/// payload or binding under the same identity is rejected as
+/// `HostRequestIdentityConflict`.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestRecord {
+    pub contract_version: u16,
+    pub operation_id: OperationIdentity,
+    pub kind: HostRequestKind,
+    pub request_id: OpaqueLabel,
+    pub idempotency_key: OpaqueLabel,
+    pub cancellation_id: OpaqueLabel,
+    pub parent_operation_id: Option<OpaqueLabel>,
+    pub request_digest: String,
+    pub payload_digest: String,
+    pub connection_ref: OpaqueLabel,
+    pub session_ref: Option<OpaqueLabel>,
+    pub task_ref: Option<OpaqueLabel>,
+    pub scope_ref: Option<OpaqueLabel>,
+    pub capability_ref: OpaqueLabel,
+    pub fence_digest: String,
+    pub authority_epoch: u64,
+    pub generation: u64,
+    pub deadline_unix_ms: u64,
+    pub state: HostRequestState,
+    pub result_digest: Option<String>,
+    /// Monotonic ORS order assigned atomically when the operation first
+    /// reaches a terminal state. Zero while non-terminal.
+    #[serde(default)]
+    pub commit_order: u64,
+}
+
+impl HostRequestRecord {
+    /// Returns the durable key binding one operation to one exact request.
+    pub fn record_key(&self) -> String {
+        format!("{}::{}", self.operation_id.as_str(), self.request_digest)
+    }
+
+    /// Returns whether two records carry the exact same request binding.
+    ///
+    /// State, result, and commit order are excluded: they are ORS-owned
+    /// progression, not caller binding.
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.operation_id == other.operation_id
+            && self.kind == other.kind
+            && self.request_id == other.request_id
+            && self.idempotency_key == other.idempotency_key
+            && self.cancellation_id == other.cancellation_id
+            && self.parent_operation_id == other.parent_operation_id
+            && self.request_digest == other.request_digest
+            && self.payload_digest == other.payload_digest
+            && self.connection_ref == other.connection_ref
+            && self.session_ref == other.session_ref
+            && self.task_ref == other.task_ref
+            && self.scope_ref == other.scope_ref
+            && self.capability_ref == other.capability_ref
+            && self.fence_digest == other.fence_digest
+            && self.authority_epoch == other.authority_epoch
+            && self.generation == other.generation
+            && self.deadline_unix_ms == other.deadline_unix_ms
+    }
+
+    /// Validates identity shape and state/result coherence.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        validate_text(self.operation_id.as_str(), "host_request_operation_id")?;
+        validate_text(self.request_id.as_str(), "host_request_request_id")?;
+        validate_text(
+            self.idempotency_key.as_str(),
+            "host_request_idempotency_key",
+        )?;
+        validate_text(
+            self.cancellation_id.as_str(),
+            "host_request_cancellation_id",
+        )?;
+        if let Some(parent) = &self.parent_operation_id {
+            validate_text(parent.as_str(), "host_request_parent_operation_id")?;
+            if parent == &self.operation_id {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_parent_operation_id",
+                    reason: "must not reference the enclosing operation",
+                });
+            }
+        }
+        validate_digest(&self.request_digest, "host_request_request_digest")?;
+        validate_digest(&self.payload_digest, "host_request_payload_digest")?;
+        validate_text(self.connection_ref.as_str(), "host_request_connection_ref")?;
+        for (value, field) in [
+            (self.session_ref.as_ref(), "host_request_session_ref"),
+            (self.task_ref.as_ref(), "host_request_task_ref"),
+            (self.scope_ref.as_ref(), "host_request_scope_ref"),
+        ] {
+            if let Some(identity) = value {
+                validate_text(identity.as_str(), field)?;
+            }
+        }
+        validate_text(self.capability_ref.as_str(), "host_request_capability_ref")?;
+        validate_digest(&self.fence_digest, "host_request_fence_digest")?;
+        if self.authority_epoch == 0 || self.generation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_epoch",
+                reason: "must be non-zero",
+            });
+        }
+        if self.deadline_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_deadline",
+                reason: "must be greater than zero",
+            });
+        }
+        match (&self.state, &self.result_digest) {
+            (HostRequestState::ResultReceived | HostRequestState::Terminal, Some(result)) => {
+                validate_digest(result, "host_request_result_digest")?;
+            }
+            (_, Some(_)) => {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_result_digest",
+                    reason: "result only for received or terminal states",
+                });
+            }
+            (_, None) => {}
+        }
+        if !self.state.is_terminal() && self.commit_order != 0 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_commit_order",
+                reason: "non-terminal states must not carry a commit order",
             });
         }
         Ok(())
