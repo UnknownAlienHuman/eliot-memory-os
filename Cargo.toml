@@ -90,6 +90,7 @@ members = [
   "crates/instrument/eliot-instrument-scip",
   "crates/instrument/eliot-observability",
   "crates/instrument/eliot-product-evaluation",
+  "crates/instrument/eliot-r13-harness",
   "crates/instrument/eliot-reports",
   "crates/instrument/eliot-test-selection",
   "crates/instrument/eliot-testd-core",
