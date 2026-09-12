@@ -14,6 +14,7 @@
 //! responsible for handshake, replay, fence and capability validation).
 
 use eliot_store_api::CanonicalStoreClient;
+use eliot_store_api::MAX_STORE_FAILURE_REFERENCE_LEN;
 use eliot_store_api::RequestMeta;
 use eliot_store_api::StoreError;
 use eliot_store_api::StoreFailure;
@@ -28,12 +29,72 @@ use crate::Response;
 use crate::StoreComposition;
 use crate::StoreCompositionError;
 
+fn sanitized_owned_reference(value: Option<String>) -> Option<String> {
+    let text = value.filter(|text| !text.is_empty())?;
+    if text.len() > MAX_STORE_FAILURE_REFERENCE_LEN || text.chars().any(char::is_control) {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn sanitized_identity_context(context: StoreFailureIdentityContext) -> StoreFailureIdentityContext {
+    let StoreFailureIdentityContext {
+        request_id,
+        operation_id,
+        idempotency_key_ref_or_digest,
+        state_fence_ref_or_exact_safe_projection,
+        evidence_ref,
+        ..
+    } = context;
+    StoreFailureIdentityContext {
+        request_id,
+        operation_id,
+        idempotency_key_ref_or_digest: sanitized_owned_reference(idempotency_key_ref_or_digest),
+        state_fence_ref_or_exact_safe_projection: state_fence_ref_or_exact_safe_projection
+            .filter(|fence| fence.validate().is_ok()),
+        evidence_ref: sanitized_owned_reference(evidence_ref),
+        transport_unavailable: false,
+    }
+}
+
+fn internal_defect_fallback(context: &StoreFailureIdentityContext) -> Response {
+    // Both attempts below take the contract's base+defect path
+    // (`from_store_error` with a defect-class `StoreError` runs
+    // `StoreFailure::base` for the admitted identity plus safe fence
+    // projection, then the defect table for
+    // `InternalDefect`/`ManualRecovery`/`EscalateInternalDefect`).
+    // The sanitized admitted identity always validates, so the first attempt
+    // succeeds for arbitrary refs/fence; the empty default always validates,
+    // so the second attempt covers a missed poisoned field. The terminal
+    // divergence only triggers on an incompatible failure-contract revision
+    // and never re-enters the legacy string error path.
+    if let Ok(failure) = StoreFailure::from_store_error(StoreError::InvalidOutbox, context.clone())
+    {
+        return Response::Failure { failure };
+    }
+    if let Ok(failure) = StoreFailure::from_store_error(
+        StoreError::InvalidOutbox,
+        StoreFailureIdentityContext::default(),
+    ) {
+        return Response::Failure { failure };
+    }
+    unreachable!(
+        "store failure contract rejects the empty internal defect; \
+         incompatible failure-contract revision"
+    );
+}
+
 fn map_store_error(error: StoreError, context: StoreFailureIdentityContext) -> Response {
-    match StoreFailure::from_store_error(error, context) {
+    // Sanitize the admitted identity first so the contract mapping preserves
+    // the original disposition (Unavailable/Conflict/etc.) whenever the
+    // context carries poisoned refs/fence. Only genuinely unmappable cases
+    // escalate to the bounded internal defect above, never to the legacy
+    // string error variant.
+    let sanitized = sanitized_identity_context(context);
+    match StoreFailure::from_store_error(error, sanitized.clone()) {
         Ok(failure) => Response::Failure { failure },
-        Err(error) => Response::Error {
-            error: format!("store failure contract mapping failed: {error}"),
-        },
+        Err(_) => internal_defect_fallback(&sanitized),
     }
 }
 
@@ -45,12 +106,14 @@ pub(crate) fn map_composition_error(
         StoreCompositionError::Store(error) => map_store_error(error, context),
         // The provider-reported identity is diagnostic only. The admitted
         // transition identity in `context` is the sole reconciliation key.
+        // The admitted operation_id is required for UnknownOutcome; a missing
+        // operation or poisoned refs/fence escalates to the bounded internal
+        // defect, never to a string-shaped Unknown or legacy error.
         StoreCompositionError::UnknownOutcome { .. } => {
-            match StoreFailure::from_provider_unknown_outcome(&context) {
+            let sanitized = sanitized_identity_context(context);
+            match StoreFailure::from_provider_unknown_outcome(&sanitized) {
                 Ok(failure) => Response::Failure { failure },
-                Err(error) => Response::Error {
-                    error: format!("store failure contract mapping failed: {error}"),
-                },
+                Err(_) => internal_defect_fallback(&sanitized),
             }
         }
     }

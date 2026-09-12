@@ -71,6 +71,7 @@ mod watchdog_config;
 mod watchdog_publication_readback;
 mod watchdog_spool;
 
+pub use eliot_watchdog_core::{WatchdogSpoolAcknowledgement, WatchdogSpoolExportBatch};
 #[cfg(test)]
 use host_identity_observation::classify_host_error;
 use host_identity_observation::read_host_registration_runtime;
@@ -82,8 +83,10 @@ use watchdog_publication_readback::{
     observe_watchdog_publication, read_manifest_selected_ors_current, scan_watchdog_publications,
     verify_against_durable_current,
 };
-pub(crate) use watchdog_spool::{SpoolAppendOutcome, WatchdogSpool};
-pub use watchdog_spool::{WatchdogSpoolEntry, WatchdogSpoolPayload};
+pub(crate) use watchdog_spool::{
+    SPOOL_EXPORT_CURSOR_SCHEMA_VERSION, SpoolAppendOutcome, WatchdogSpool,
+};
+pub use watchdog_spool::{WatchdogSpoolEntry, WatchdogSpoolExportLimits, WatchdogSpoolPayload};
 
 #[cfg(test)]
 impl WatchdogSpool {
@@ -261,7 +264,7 @@ pub struct GapRecoveryDisposition {
 pub struct IndependentKernelSensor {
     watchdog: Mutex<Option<Watchdog>>,
     spool: WatchdogSpool,
-    _runtime_binding: WatchdogRuntimeBinding,
+    runtime_binding: WatchdogRuntimeBinding,
 }
 
 impl IndependentKernelSensor {
@@ -284,7 +287,7 @@ impl IndependentKernelSensor {
         Ok(Self {
             watchdog: Mutex::new(Some(watchdog)),
             spool,
-            _runtime_binding: binding,
+            runtime_binding: binding,
         })
     }
 
@@ -302,7 +305,7 @@ impl IndependentKernelSensor {
         Ok(Self {
             watchdog: Mutex::new(None),
             spool,
-            _runtime_binding: binding,
+            runtime_binding: binding,
         })
     }
 
@@ -318,6 +321,115 @@ impl IndependentKernelSensor {
         binding: &WatchdogRuntimeBinding,
     ) -> Result<Vec<WatchdogSpoolEntry>, SpoolError> {
         WatchdogSpool::open_existing_runtime_binding(binding)?.readback()
+    }
+
+    /// Exports one bounded immutable spool batch for an exact sink
+    /// acknowledgement.
+    ///
+    /// Every identity is real: the installation id and watchdog generation
+    /// come from the retained binding's selected manifest, the watchdog epoch
+    /// comes from the epoch retained at sensor construction, and only the
+    /// sink id arrives as a parameter because the sensor owns no sink
+    /// identity. The export itself is read-only over the spool; the cursor
+    /// advances only through [`IndependentKernelSensor::apply_spool_acknowledgement`].
+    /// A gap-only sensor without an established epoch fails closed instead
+    /// of inventing one, since a placeholder epoch would poison the stored
+    /// cursor against the first real heartbeat. There is no semantic
+    /// interpretation here and no canonical store write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the epoch is not established, the stored cursor
+    /// or retained records fail validation, or the bounded window cannot be
+    /// covered consecutively.
+    pub fn export_spool_batch(
+        &self,
+        sink_id: &str,
+        limits: WatchdogSpoolExportLimits,
+    ) -> Result<WatchdogSpoolExportBatch, SpoolError> {
+        let installation_id = self
+            .runtime_binding
+            .selected_manifest
+            .runtime_launch
+            .installation_epoch
+            .installation
+            .as_str()
+            .to_owned();
+        let watchdog_generation = self
+            .runtime_binding
+            .selected_manifest
+            .runtime_launch
+            .authority_generation
+            .value();
+        let watchdog_epoch = self
+            .watchdog
+            .lock()
+            .map_err(|_| {
+                SpoolError::Corrupt(
+                    "watchdog spool export cannot read the retained watchdog epoch".to_owned(),
+                )
+            })?
+            .as_ref()
+            .map(|watchdog| watchdog.epoch().0)
+            .ok_or_else(|| {
+                SpoolError::InvalidLease(
+                    "watchdog spool export refuses a gap-only sensor without an established watchdog epoch"
+                        .to_owned(),
+                )
+            })?;
+        let stored = self.spool.read_export_cursor()?;
+        let predecessor = eliot_watchdog_core::WatchdogSpoolCursor {
+            schema_version: SPOOL_EXPORT_CURSOR_SCHEMA_VERSION,
+            acknowledged_sequence: stored.acknowledged_sequence,
+            watchdog_generation,
+            watchdog_epoch,
+            installation_id,
+            sink_id: sink_id.to_owned(),
+        };
+        let high_water = self.spool.high_water_sequence()?;
+        self.spool
+            .export_batch(&predecessor, high_water, limits)
+            .map(|(batch, _raw_entry_bytes)| batch)
+    }
+
+    /// Applies an exact authenticated sink acknowledgement to the export
+    /// cursor and returns the new acknowledged sequence.
+    ///
+    /// Unknown outcomes, timeouts, and disconnects must never reach this
+    /// method; only a complete acknowledgement for one immutable batch is
+    /// applied, and a duplicate acknowledgement returns the stored sequence
+    /// unchanged instead of failing. There is no semantic interpretation
+    /// here and no canonical store write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the batch or acknowledgement fails validation,
+    /// expires, or breaks the stored cursor.
+    pub fn apply_spool_acknowledgement(
+        &self,
+        batch: &WatchdogSpoolExportBatch,
+        ack: &WatchdogSpoolAcknowledgement,
+    ) -> Result<u64, SpoolError> {
+        self.spool.apply_acknowledgement(batch, ack)
+    }
+
+    /// Compacts durably acknowledged spool records below the stored export
+    /// cursor and returns the number of records removed.
+    ///
+    /// This is the Wave C compaction entry point; no production path calls it
+    /// yet. The caller passes the live acknowledged sequence it read from the
+    /// stored cursor, and the spool refuses to compact on any divergence.
+    /// There is no semantic interpretation here and no canonical store write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the caller sequence differs from the stored
+    /// cursor or the retained state fails validation.
+    pub fn compact_spool_below_cursor(
+        &self,
+        stored_cursor_acknowledged: u64,
+    ) -> Result<u64, SpoolError> {
+        self.spool.compact_below_cursor(stored_cursor_acknowledged)
     }
 
     fn record_heartbeat(

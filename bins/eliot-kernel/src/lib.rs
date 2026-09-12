@@ -1136,11 +1136,9 @@ impl KernelComposition {
             .as_ref()
             .map_or_else(
                 || {
-                    struct NoopAttachment;
-                    impl CanonicalStoreAttachmentTransaction for NoopAttachment {
-                        fn commit(self: Box<Self>) {}
-                    }
-                    Ok(Box::new(NoopAttachment) as Box<dyn CanonicalStoreAttachmentTransaction>)
+                    Err(KernelBuildError::Service(
+                        "process authority is required before canonical Store rebind".to_owned(),
+                    ))
                 },
                 |pg| {
                     pg.replace_canonical_store(Arc::clone(&gateway))
