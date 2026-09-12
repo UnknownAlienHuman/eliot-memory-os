@@ -23,6 +23,70 @@ async fn main() {
     }
 }
 
+/// Bounded typed defect for a transport/protocol frame rejected before
+/// dispatch (the `validate_request_frame` Err arm). Correlates via the
+/// frame's `request_id` when present and admits no untrusted
+/// operation/fence identity; the validation detail is additive
+/// `human_detail` only, which the contract excludes from `PartialEq` and
+/// control semantics. Mirrors `StoreFailure::base` + `defect()`:
+/// `InternalDefect` / `INTERNAL_STORE_FAILURE` / `NotAttempted` /
+/// `ManualRecovery` / `EscalateInternalDefect`.
+#[cfg(windows)]
+fn frame_rejection_defect(
+    request_id: Option<eliot_contracts::RequestId>,
+    error: String,
+) -> eliot_store_surreal::Response {
+    let human_detail = if error.is_empty()
+        || error.len() > eliot_store_api::MAX_STORE_FAILURE_DETAIL_LEN
+        || error.chars().any(char::is_control)
+    {
+        None
+    } else {
+        Some(error)
+    };
+    let reason_code = eliot_store_api::StoreReasonCode::new("INTERNAL_STORE_FAILURE")
+        .ok()
+        .or_else(|| eliot_store_api::StoreReasonCode::new("INTERNAL_DEFECT").ok())
+        .or_else(|| eliot_store_api::StoreReasonCode::new("STORE_DEFECT").ok());
+    match reason_code {
+        Some(reason_code) => {
+            let mut failure = eliot_store_api::StoreFailure {
+                contract_revision: eliot_store_api::STORE_FAILURE_CONTRACT_REVISION.to_owned(),
+                disposition: eliot_store_api::StoreFailureDisposition::InternalDefect,
+                reason_code,
+                request_id,
+                operation_id: None,
+                idempotency_key_ref_or_digest: None,
+                state_fence_ref_or_exact_safe_projection: None,
+                mutation_disposition: eliot_store_api::StoreMutationDisposition::NotAttempted,
+                retry_directive: eliot_store_api::StoreRetryDirective::ManualRecovery,
+                recovery_action: eliot_store_api::StoreRecoveryAction::EscalateInternalDefect,
+                conflict: None,
+                retry_after_ms: None,
+                evidence_ref: None,
+                human_detail,
+            };
+            if failure.validate().is_err() {
+                failure.human_detail = None;
+            }
+            if failure.validate().is_ok() {
+                eliot_store_surreal::Response::Failure { failure }
+            } else {
+                unreachable!(
+                    "frame-rejection defect with absent refs/fence must validate; \
+                     incompatible failure-contract revision"
+                );
+            }
+        }
+        None => {
+            unreachable!(
+                "store failure contract rejects static defect tokens; \
+                 incompatible failure-contract revision"
+            );
+        }
+    }
+}
+
 #[cfg(windows)]
 #[allow(clippy::print_stdout)]
 async fn run() -> Result<(), String> {
@@ -102,7 +166,7 @@ async fn run() -> Result<(), String> {
             .map_err(|error| format!("EBP frame rejected: {error}"))?;
         let response = match validate_request_frame(&mut session, &frame) {
             Ok(request) => Box::pin(dispatch(&composition, request)).await,
-            Err(error) => eliot_store_surreal::Response::Error { error },
+            Err(error) => frame_rejection_defect(frame.request_id.clone(), error),
         };
         let response_frame = eliot_store_api::response_frame(
             session.connection_id(),
