@@ -1,0 +1,123 @@
+schema = "eliot.native-agent-adapter-registry.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
+status = "READY_AFTER_PROVIDER_PREREQUISITES"
+implementation_support = "ADAPTER_CONTRACTS_PRESENT_PRODUCTION_REGISTRY_AND_EXECUTION_MISSING"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "NATIVE_AGENT_ADAPTER_REGISTRY_EDGE_CANDIDATE"
+issue = 874
+native_worker_issue = 22
+claude_adapter_issue = 1112
+shared_provider_issue_refs = [361, 368, 369, 370, 371]
+product_pulse_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A10-04-delegation.md#a104-delegation",
+  "docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md#i71-eliot-bridge-protocol-ebp1",
+  "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "docs/architecture/I07-23-raw-and-normalized-host-events.md#i723-raw-and-normalized-host-events",
+  "docs/architecture/I09-09-agentswarm-launch-and-no-lost-child-contract.md#i99-agentswarm-launch-and-no-lost-child-contract",
+  "docs/architecture/I10-11-external-model-bridges.md#i1011-external-model-bridges",
+  "docs/architecture/I10-15-agent-execution-fabric-and-durable-swarm.md#i1015-agent-execution-fabric-and-durable-swarm",
+  "docs/architecture/I14-13-idle-drain-and-cancellation.md#i1413-idle-drain-and-cancellation",
+  "docs/architecture/I14-14-module-hot-replacement.md#i1414-module-hot-replacement",
+  "docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+  "docs/architecture/I15-04-secrets.md#i154-secrets",
+  "docs/architecture/I15-10-sandboxing.md#i1510-sandboxing",
+]
+anchors = ["ARCH-SWM-02", "ARCH-AUTH-01", "ARCH-PORT-01", "ARCH-SEC-01", "ARCH-RES-01", "ARCH-OBS-01"]
+
+[confirmed_gap]
+observations = [
+  "Claude, Codex, OpenCode and ACP crates expose provider-specific contract/client/translation surfaces with uneven implementation depth.",
+  "Codex adapter construction is visible primarily in package tests; Claude is explicitly a contract/native skeleton and is owned by #1112; OpenCode has an admitted bootstrap surface; ACP supplies protocol translation.",
+  "The native-worker executable currently fails closed without a session-bound Kernel process request and no production adapter registry selects, constructs and executes one admitted provider adapter generation.",
+  "No current composition proves duplicate adapter identity rejection, exact factory/config/artifact binding, per-attempt ownership, credential isolation, event normalization, cancellation or hot replacement across all provider families.",
+  "Issue #874 owns registry/factory composition, while incomplete provider-local behavior must remain blocked under its provider issue rather than hidden by a fake registry entry.",
+]
+discriminator = "Submit an authenticated provider-neutral execution unit naming Claude, Codex, OpenCode or ACP to the production native worker. No current registry constructs the exact admitted adapter generation and executes it through one shared lifecycle."
+
+[causal_property]
+statement = "One immutable versioned NativeAgentAdapterRegistry maps an admitted provider-neutral execution unit to exactly one current adapter factory and process generation; provider-specific code cannot select authority, task semantics, credentials, route policy, retries, canonical state or Finish."
+
+[scope]
+primary_paths = [
+  "bins/eliot-native-worker/src/**adapter**",
+  "crates/kernel/eliot-native-worker-core/src/**adapter**",
+  "crates/agent/eliot-agent-claude/src/**",
+  "crates/agent/eliot-agent-codex/src/**",
+  "crates/agent/eliot-agent-opencode/src/**",
+  "crates/agent/eliot-agent-acp/src/**",
+  "focused adapter registry/factory/conformance tests",
+]
+read_only_contracts = [
+  "crates/agent/eliot-agent-contracts/src/**",
+  "crates/agent/eliot-agent-api/src/**",
+  "crates/foundation/eliot-process/src/**",
+  "crates/foundation/eliot-protocol/src/**",
+]
+forbidden_ownership = [
+  "provider-specific Task, WorkScope, Session, authority or Finish owner",
+  "direct provider SDK/model client in Kernel or Governor",
+  "raw secrets, arbitrary executable path or inherited ambient environment",
+  "registry-created support/readiness without a real adapter and proof",
+  "second scheduler, retry ledger or canonical writer",
+]
+
+[what_to_do]
+steps = [
+  "Define one closed versioned NativeAgentAdapterRegistry record and duplicate/stale-entry validation.",
+  "Implement one factory interface shared by Claude, Codex, OpenCode and ACP provider adapters.",
+  "Register only adapters whose local public contract, artifact/config/protocol identity and execution implementation are current and independently testable.",
+  "Construct adapters only inside the admitted native-worker process generation from exact Kernel-supplied route/provider/model/capability/credential/resource bindings.",
+  "Run every provider through one shared attempt, stream, cancellation, cleanup, result and reconciliation lifecycle.",
+  "Normalize provider events/results to shared contracts while retaining immutable raw evidence/omission handles.",
+  "Support drain, generation cutover, rollback and stale-adapter fencing without process or credential leakage.",
+]
+
+[how_to_do]
+steps = [
+  "Give each registry entry exact adapter ID/revision, provider/route classes, artifact/config/protocol digests, supported execution-unit schema, required capability/credential facets, factory symbol and proof entrypoint.",
+  "Bind registry identity to current Module/Capability registry, source/artifact generation and invalidation set; reject stale registry records.",
+  "Reject duplicate adapter IDs, overlapping ambiguous selection and unknown/disabled adapter before any provider process or credential acquisition.",
+  "Factory input is the validated provider-neutral execution unit plus Kernel-issued process/capability/credential bindings; caller strings cannot select executables, secrets or wider tools.",
+  "Keep provider adapters as decode/validate/call/normalize boundaries. Governor owns route/policy/task meaning; Kernel/native worker owns admitted process generation and fencing.",
+  "Use the shared ProcessExecutor/Job Object contour for every native sidecar and retain exact stdout/stderr/event/process lineage.",
+  "Map all provider outcomes to one shared state machine: admitted, started, streaming, terminal candidate, cancelled, timeout, failed, delivery unknown, reconciling.",
+  "Exact replay returns the same attempt/result identity. Changed provider/route/model/config/capability/prompt under one identity conflicts.",
+  "On cancellation, parent loss, credential revocation or generation switch, fence one adapter attempt and close all descendant process/resource/credential leases.",
+  "Do not register Claude as production-ready until #1112 supplies the real sidecar adapter; expose an explicit unavailable/blocked capability rather than a fake factory.",
+]
+
+[acceptance]
+criteria = [
+  "A deterministic registry contains unique validated current entries for every actually implemented provider adapter and explicit blocked state for incomplete adapters.",
+  "Unknown, duplicate, disabled, stale or ambiguously matching adapter entries fail before process/credential acquisition.",
+  "One admitted execution unit selects exactly one factory and process generation.",
+  "Provider adapters cannot choose or widen principal/session/task/scope/fence, route/model, capabilities, credentials, budget, deadline, authority or effect ceiling.",
+  "Claude, Codex, OpenCode and ACP implementations pass one shared conformance corpus for identity, event, cancellation, replay, unknown outcome and candidate-only result behavior where they claim compatibility.",
+  "Raw provider output/process evidence is retained or explicitly omitted before normalization; normalized events preserve lineage.",
+  "Cancellation, timeout, crash, parent loss and credential revocation leave no descendant/process/resource/credential leak.",
+  "Exact replay is idempotent and changed same-identity provider request conflicts.",
+  "Drain/cutover fences the old adapter generation before new work and permits compatible rollback without reviving old authority.",
+  "No adapter result writes canonical state, promotes truth, self-certifies support or decides Task Finish.",
+  "Production native-worker no longer fails solely because no adapter registry/factory path exists when a valid fully implemented adapter is admitted.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-native-worker-core -p eliot-native-worker -p eliot-agent-claude -p eliot-agent-codex -p eliot-agent-opencode -p eliot-agent-acp --all-targets",
+  "cargo test --locked -p eliot-native-worker-core -p eliot-native-worker -p eliot-agent-claude -p eliot-agent-codex -p eliot-agent-opencode -p eliot-agent-acp --all-targets",
+  "cargo clippy --locked -p eliot-native-worker-core -p eliot-native-worker -p eliot-agent-claude -p eliot-agent-codex -p eliot-agent-opencode -p eliot-agent-acp --all-targets -- -D warnings",
+  "cargo tree --locked -p eliot-native-worker --edges normal",
+  "git diff --check",
+]
+edge_proof = "Run one admitted attempt per ready provider plus unknown/duplicate/stale selection, cancellation, timeout, crash, credential revocation, result-delivery loss, drain/cutover and rollback under one real native-worker generation."
