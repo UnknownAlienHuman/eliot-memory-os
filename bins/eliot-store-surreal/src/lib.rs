@@ -111,7 +111,40 @@ fn map_adapter_error(error: AdapterError) -> StoreCompositionError {
             Err(error) => StoreCompositionError::Store(StoreError::Foundation(error)),
         },
         AdapterError::Store(error) => StoreCompositionError::Store(error),
-        other => StoreCompositionError::Store(other.into_store_error()),
+        // Distinct provider-to-typed mappings (mirroring
+        // `AdapterError::into_store_error`): provider compare-and-set
+        // conflict stays `RevisionConflict`; unknown named operations stay
+        // unsupported `UnknownOperation`; partial provider outcomes stay
+        // reconciling `MissingReceiptEnvelope`; configuration and
+        // serialization defects keep deterministic/defect shape with provider
+        // prose dropped. No provider variant collapses to `Unavailable`
+        // except the contract-ceiling remainder below.
+        AdapterError::ProviderConflict => {
+            StoreCompositionError::Store(StoreError::RevisionConflict)
+        }
+        AdapterError::NamedOperationUnavailable { .. } => {
+            StoreCompositionError::Store(StoreError::UnknownOperation)
+        }
+        AdapterError::PartialOutcome => {
+            StoreCompositionError::Store(StoreError::MissingReceiptEnvelope)
+        }
+        AdapterError::Config(_) => StoreCompositionError::Store(StoreError::InvalidField {
+            field: "store.configuration",
+            reason: "invalid store configuration",
+        }),
+        AdapterError::Serialization(_) => StoreCompositionError::Store(StoreError::Serialization(
+            "canonical provider response serialization failed".to_owned(),
+        )),
+        // Contract ceiling (honest stop; see `into_store_error`):
+        // `StoreError` has no Backpressure, Deadline, MigrationRequired or
+        // Partial variants, so transport loss, required migrations and
+        // unknown migration outcomes share `Unavailable` here. Live migration
+        // paths keep their exact outcome via `map_schema_bootstrap_error`.
+        AdapterError::ProviderUnavailable
+        | AdapterError::MigrationRequired
+        | AdapterError::UnknownMigrationOutcome { .. } => {
+            StoreCompositionError::Store(error.into_store_error())
+        }
     }
 }
 

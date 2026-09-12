@@ -2,9 +2,11 @@
 //!
 //! `UnknownOutcome` is deliberately richer than `StoreError::Unavailable`: the
 //! bridge surfaces it through its own methods so a caller can reconcile by
-//! exact operation identity. The [`CanonicalStoreClient`](eliot_store_api::CanonicalStoreClient)
-//! trait collapses it to `StoreError::Unavailable`, which is the signal that a
-//! caller must resolve the durable receipt before retrying.
+//! exact operation identity. Where only a `StoreError` can cross (the
+//! [`CanonicalStoreClient`](eliot_store_api::CanonicalStoreClient) trait), it
+//! maps to `StoreError::MissingReceiptEnvelope`, which preserves the unknown
+//! outcome and exact-operation reconciliation once the dispatch boundary
+//! supplies the admitted operation identity.
 
 use eliot_store_api::StoreError;
 use thiserror::Error;
@@ -35,22 +37,44 @@ pub enum AdapterError {
 }
 
 impl AdapterError {
-    /// Collapses an adapter error to the store boundary. Unknown or provider
-    /// failures become `StoreError::Unavailable` so the caller resolves the
-    /// durable receipt before retrying; deterministic validation failures keep
-    /// their typed store error.
+    /// Maps an adapter error to the store boundary without wildcard collapse.
+    /// Each provider observation keeps a distinct typed `StoreError` so
+    /// `StoreFailure::from_store_error` preserves its disposition:
+    /// transport loss stays retryable `Unavailable`; provider
+    /// compare-and-set conflict stays `RevisionConflict`; unknown or partial
+    /// provider outcomes stay reconciling `MissingReceiptEnvelope` (the
+    /// admitted operation identity at the dispatch boundary is the
+    /// reconciliation key; this variant itself carries no identity);
+    /// unavailable named operations stay unsupported `UnknownOperation`;
+    /// configuration defects stay deterministic `InvalidField` and
+    /// serialization defects stay `Serialization`, both with provider prose
+    /// dropped in favour of bounded static text.
+    /// Contract ceiling (honest stop; extending it needs a Contract Challenge
+    /// owned outside Wave A): `StoreError` has no Backpressure, Deadline,
+    /// MigrationRequired or Partial variants, so `MigrationRequired` and
+    /// `UnknownMigrationOutcome` remain `Unavailable` here and can never
+    /// produce the `MigrationRequired`, `Backpressured` or `DeadlineExceeded`
+    /// dispositions. Live migration paths keep their exact outcome via
+    /// `map_schema_bootstrap_error`, not this function.
     pub fn into_store_error(self) -> StoreError {
         match self {
             Self::Store(error) => error,
-            Self::ProviderUnavailable
-            | Self::MigrationRequired
-            | Self::UnknownOutcome { .. }
-            | Self::UnknownMigrationOutcome { .. }
-            | Self::PartialOutcome
-            | Self::ProviderConflict
-            | Self::NamedOperationUnavailable { .. }
-            | Self::Config(_)
-            | Self::Serialization(_) => StoreError::Unavailable,
+            Self::ProviderUnavailable => StoreError::Unavailable,
+            Self::ProviderConflict => StoreError::RevisionConflict,
+            Self::UnknownOutcome { .. } | Self::PartialOutcome => {
+                StoreError::MissingReceiptEnvelope
+            }
+            Self::NamedOperationUnavailable { .. } => StoreError::UnknownOperation,
+            Self::Config(_) => StoreError::InvalidField {
+                field: "store.configuration",
+                reason: "invalid store configuration",
+            },
+            Self::Serialization(_) => StoreError::Serialization(
+                "canonical provider response serialization failed".to_owned(),
+            ),
+            Self::MigrationRequired | Self::UnknownMigrationOutcome { .. } => {
+                StoreError::Unavailable
+            }
         }
     }
 }
