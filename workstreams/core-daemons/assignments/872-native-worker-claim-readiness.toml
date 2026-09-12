@@ -1,0 +1,126 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "KERNEL_CLIENT_PRESENT_CLAIM_AND_READY_EDGE_UNCLOSED"
+evidence_execution_status = "SOURCE_AND_ISSUE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "NATIVE_WORKER_CLAIM_READINESS_EDGE_CANDIDATE_ONLY"
+issue = 872
+native_worker_issue = 22
+adapter_registry_issue = 874
+kernel_issue = 15
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "kernel.native-worker-claim-readiness-and-fencing"
+causal_property = "One Kernel-admitted native-worker process generation claims exactly one bounded execution unit, proves current readiness before provider work, heartbeats and checkpoints under exact identity, and is fenced or reconciled without losing a claimed attempt or reviving stale authority."
+current_discriminator = "KernelNativeWorkerClient and native-worker contracts exist, but the production executable still treats connection as insufficient and exits because no session-bound claim, admitted execution unit, current-ready transition, or exact result/reconcile lifecycle is available."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/872"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-04-delegation.md#a104-delegation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md#i71-eliot-bridge-protocol-ebp1",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-02-frame.md#i72-frame",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-09-agentswarm-launch-and-no-lost-child-contract.md#i99-agentswarm-launch-and-no-lost-child-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-15-agent-execution-fabric-and-durable-swarm.md#i1015-agent-execution-fabric-and-durable-swarm",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-13-idle-drain-and-cancellation.md#i1413-idle-drain-and-cancellation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-SWM-02", "ARCH-AUTH-01", "ARCH-LIFE-01", "ARCH-PORT-01", "ARCH-RES-01", "ARCH-OBS-01"]
+
+[current_source]
+confirmed = [
+  "The native-worker client can connect to Kernel, but a transport connection is deliberately not treated as execution admission.",
+  "The production main still has no exact claimed execution unit or current-ready state and therefore exits fail-closed.",
+  "Issue #22 owns the complete worker process/runtime implementation, while #874 owns provider-adapter registry/factory dispatch after a valid claim.",
+  "This issue must close only the Kernel claim/readiness/heartbeat/checkpoint/result/fence contour and cannot select or execute a provider adapter itself.",
+]
+
+[scope]
+primary_paths = [
+  "crates/kernel/eliot-native-worker-core/src/**claim**",
+  "crates/kernel/eliot-kernel-service/src/**native_worker**",
+  "bins/eliot-kernel/src/**native_worker**",
+  "exact KernelNativeWorkerClient request/response spans in bins/eliot-native-worker/src/**",
+  "directly relevant tests and finite fixtures",
+]
+serialized_dependencies = ["#15 Kernel", "#22 native-worker runtime", "#874 adapter registry", "#100 ProcessExecutor", "#79 identity separation", "#11 Product proof"]
+forbidden = [
+  "provider/model selection or factory construction",
+  "generic string claim operation or caller-provided execution unit authority",
+  "worker-local durable job/attempt ledger",
+  "transport liveness treated as readiness, authority, or completion",
+  "blind reclaim after possible work or result submission",
+  "task/WorkScope semantics, canonical Store writes, provider credentials, or Finish ownership",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Define one closed native-worker registration, claim, and readiness protocol."
+how = [
+  "Bind installation, worker artifact/config/protocol generation, process/start identity, principal/session, connection, AuthorityEpoch, StateFence, registration lease, supported execution-unit schema, resource envelope, and invalidation set.",
+  "Claim exactly one Kernel-owned execution unit bound to parent Durable Job, task/WorkScope, logical decision, attempt, operation, route/provider class, budget, deadline, cancellation, and expected result schema.",
+  "Reject unknown versions, stale registrations, changed same-ID work, missing owner fields, and transport-only readiness before exposing the execution unit.",
+]
+
+[[waves]]
+id = "B"
+what = "Persist claim intent and prove current-ready state before provider work."
+how = [
+  "Kernel persists the claim transition and returns one immutable claim receipt before the worker can initialize a provider adapter.",
+  "Worker validates exact execution-unit and process-generation binding, required capabilities/resources, adapter-registry revision, credential references, deadline, and fence, then submits one typed ready or blocked result.",
+  "Ready means the exact current generation can accept this unit; process health or pipe connectivity alone is insufficient.",
+]
+
+[[waves]]
+id = "C"
+what = "Close heartbeat, checkpoint, cancellation, and result submission."
+how = [
+  "Use distinct operation identities for registration renewal, claim, ready, heartbeat, checkpoint, cancellation observation, result submission, and terminal acknowledgement.",
+  "Every heartbeat/checkpoint/result binds the exact worker generation, claim, attempt, operation, fence, route/provider class, and predecessor revision.",
+  "Cancellation stops new provider effects, fences the exact attempt, preserves possible work/result state, and drives bounded descendant/resource cleanup through #22/#100.",
+]
+
+[[waves]]
+id = "D"
+what = "Reconcile unknown outcomes, restart, drain, and stale generations."
+how = [
+  "After possible provider work, checkpoint, or result submission with lost acknowledgement, reconcile the same claim/attempt/operation before any reclaim or relaunch.",
+  "Kernel restart and worker restart rehydrate exact claimed, ready, active, cancelling, submitted, unknown, and terminal states from the Kernel/ORS owner.",
+  "Drain stops new claims, accounts for every active/unknown unit, fences the old worker generation, and permits a replacement only after old authority and descendant resources are closed or explicitly reconciling.",
+]
+
+[acceptance]
+criteria = [
+  "A real typed non-test native-worker registration/claim/readiness protocol exists between Kernel and worker.",
+  "A transport connection without an exact current registration and claimed unit cannot become ready or perform provider work.",
+  "Each claimed unit binds exact parent job/task/scope, decision/attempt/operation, worker generation, route/provider class, budget, deadline, cancellation, fence, schema, and resource identities.",
+  "Kernel persists claim before provider initialization and exact replay returns the same claim/ready/result identity.",
+  "Changed work, worker generation, route/provider class, budget, schema, fence, or predecessor under one claim identity conflicts before effect.",
+  "Registration, renewal, claim, ready, heartbeat, checkpoint, cancellation, result submission, and acknowledgement use distinct operation identities.",
+  "Heartbeat and process liveness cannot create task progress, provider success, authority, or completion.",
+  "Cancellation and drain account for every claimed/active/unknown unit and leave no unowned process, credential, resource, or result state.",
+  "Possible work/result submission is reconciled under the original claim before reclaim, retry, route change, or replacement generation.",
+  "Kernel/worker restart cannot forget or downgrade a claimed/unknown unit to unclaimed/not-attempted.",
+  "A stale or fenced worker generation cannot claim, heartbeat, checkpoint, submit results, reconnect, or become current.",
+  "This contour selects no provider adapter, holds no raw credentials, writes no canonical state, and cannot decide Finish or VERIFIED_COMPLETE.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-native-worker-core -p eliot-native-worker -p eliot-kernel-service -p eliot-kernel -p eliot-ors --all-targets",
+  "cargo test --locked -p eliot-native-worker-core -p eliot-native-worker -p eliot-kernel-service -p eliot-kernel -p eliot-ors --all-targets",
+  "cargo clippy --locked -p eliot-native-worker-core -p eliot-native-worker -p eliot-kernel-service -p eliot-kernel -p eliot-ors --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run registration -> claim -> ready -> heartbeat/checkpoint -> result/cancel for one real worker generation, then inject lost claim/result acknowledgement, Kernel restart, worker crash, stale generation, deadline race, drain, replacement, and no-lost-unit reconciliation."
+product_proof = "Issues #22, #874, and #11 remain open; claim/readiness proof alone establishes no provider or Product support."
