@@ -43,4 +43,8 @@ pub fn propose_clarification(
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    include!("tests.rs");
+
+    mod strict_regressions;
+}
