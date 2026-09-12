@@ -542,7 +542,6 @@ impl KernelComposition {
             HostRequestState::Cancelled,
             None,
         ) {
-            Ok(_) => Ok(()),
             Err(OrsError::InvalidTransition) => {
                 let _ = self.generation_gateway.ors.advance_host_request(
                     &parent_operation,
@@ -552,7 +551,7 @@ impl KernelComposition {
                 );
                 Ok(())
             }
-            Err(_) => Ok(()),
+            Ok(_) | Err(_) => Ok(()),
         }
     }
 
@@ -744,13 +743,12 @@ fn fence_one_host_request(
     let Ok(operation_id) = OperationIdentity::new(operation_ref.operation_id.clone()) else {
         return;
     };
-    let current = match composition
+    let Ok(current) = composition
         .generation_gateway
         .ors
         .load_host_request(&operation_id, &operation_ref.request_digest)
-    {
-        Ok(current) => current,
-        Err(_) => return,
+    else {
+        return;
     };
     let Some(record) = current else {
         return;

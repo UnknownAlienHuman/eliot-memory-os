@@ -734,7 +734,7 @@ impl KernelComposition {
         connection_id: &str,
         frame: &Frame,
         ticket_id: &str,
-        result: AgentActivationResolutionResult,
+        result: &AgentActivationResolutionResult,
     ) -> Result<Frame, TransportError> {
         let pending = {
             let pending = self
@@ -786,7 +786,7 @@ impl KernelComposition {
             connection_id,
             frame,
             &pending,
-            &result,
+            result,
             binding,
         )?;
         self.agent_activation_pending
@@ -977,7 +977,7 @@ impl KernelComposition {
                         connection_id,
                         frame,
                         &ticket.ticket_id,
-                        result,
+                        &result,
                     );
                 }
             }
