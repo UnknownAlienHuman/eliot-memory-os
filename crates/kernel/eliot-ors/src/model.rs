@@ -2184,6 +2184,8 @@ pub enum OrsError {
         operation_id: String,
         request_digest: String,
     },
+    #[error("native-worker claim {claim_id} conflicts with durable ORS state: IDENTITY_CONFLICT")]
+    NativeWorkerClaimIdentityConflict { claim_id: String },
     #[error("durable ORS storage failed: {0}")]
     Storage(String),
     #[error("durable ORS encoding failed: {0}")]
@@ -2672,5 +2674,297 @@ fn canonicalize(value: Value) -> Value {
             Value::Object(sorted)
         }
         scalar => scalar,
+    }
+}
+
+/// Durable native-worker claim operation state (Wave B, issue #872).
+///
+/// `Terminal` is absorbing: once a claim is terminal it never leaves that
+/// state, so restart rehydrates the terminal outcome instead of downgrading
+/// the unit to unclaimed. `Unknown` may only move to `Reconciling`, and
+/// neither `Unknown` nor `Reconciling` may return to `Requested`: an
+/// uncertain outcome is reconciled under the original claim, never
+/// blind-retried as new work. `Ready` is reachable only from `Admitted` or
+/// from `Reconciling` as the resolution of previously admitted work; a
+/// direct `Requested -> Ready` or `Unknown -> Ready` skip is forbidden, so
+/// transport liveness alone can never manufacture readiness.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NativeWorkerClaimState {
+    Requested,
+    Admitted,
+    Ready,
+    Active,
+    Cancelling,
+    Submitted,
+    Unknown,
+    Reconciling,
+    Terminal,
+}
+
+impl NativeWorkerClaimState {
+    /// Returns whether the state closes the claim.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Terminal)
+    }
+
+    /// Validates one mechanical state advance without interpreting meaning.
+    pub fn transition_to(self, next: Self) -> Result<Self, OrsError> {
+        let legal = matches!(
+            (self, next),
+            (Self::Requested, Self::Admitted | Self::Unknown)
+                | (
+                    Self::Admitted,
+                    Self::Ready | Self::Cancelling | Self::Unknown
+                )
+                | (Self::Ready, Self::Active | Self::Cancelling | Self::Unknown)
+                | (
+                    Self::Active,
+                    Self::Cancelling | Self::Submitted | Self::Unknown
+                )
+                | (
+                    Self::Cancelling,
+                    Self::Submitted | Self::Unknown | Self::Terminal
+                )
+                | (Self::Submitted, Self::Terminal | Self::Unknown)
+                | (Self::Unknown, Self::Reconciling)
+                | (
+                    Self::Reconciling,
+                    Self::Ready | Self::Active | Self::Submitted | Self::Terminal | Self::Unknown
+                )
+        );
+        legal.then_some(next).ok_or(OrsError::InvalidTransition)
+    }
+}
+
+/// Durable native-worker claim intent and admission record (Wave B, issue
+/// #872).
+///
+/// Every identity is opaque to ORS: the parent Durable-Job, task, scope,
+/// decision, attempt, and operation ids, the route/provider-class label, and
+/// the budget/fence/resource digests are preserved as exact bytes for replay
+/// comparison and are never interpreted. The Kernel admission gate owns
+/// registration currency, epoch/fence, deadline, and readiness validation;
+/// ORS owns durable identity continuity: an exact replay under the same
+/// claim identity returns the same receipt identity, while changed work,
+/// generation, route, budget, schema, fence, or predecessor under one claim
+/// identity is rejected as
+/// [`OrsError::NativeWorkerClaimIdentityConflict`] and never overwrites the
+/// durable binding.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkerClaimRecord {
+    pub contract_version: u16,
+    /// Distinct claim operation identity; the durable key. At most one live
+    /// claim exists per id.
+    pub claim_id: OperationIdentity,
+    /// Registration the claim was presented under; opaque reference only.
+    pub registration_id: OpaqueLabel,
+    /// Claiming worker generation; stale generations cannot claim.
+    pub worker_generation: u64,
+    /// Kernel-owned parent Durable-Job identity; opaque to ORS.
+    pub parent_job_id: OpaqueLabel,
+    /// Governed task identity; opaque to ORS.
+    pub task_id: OpaqueLabel,
+    /// Task WorkScope identity; opaque to ORS.
+    pub work_scope_id: OpaqueLabel,
+    /// Logical decision identity; opaque to ORS.
+    pub decision_id: OpaqueLabel,
+    /// Attempt identity bound to this claim; opaque to ORS.
+    pub attempt_id: OpaqueLabel,
+    /// Exact external-effect operation identity; opaque to ORS.
+    pub operation_id: OpaqueLabel,
+    /// Admitted route/provider-class label. Selection stays with #874; ORS
+    /// compares it byte-wise and never interprets it.
+    pub route_class: OpaqueLabel,
+    /// Opaque digest of the claim budget envelope.
+    pub budget_digest: String,
+    /// Claim deadline in Unix milliseconds.
+    pub deadline_unix_ms: u64,
+    /// Opaque digest of the exact immutable fence paired with the
+    /// generation and epoch.
+    pub fence_digest: String,
+    /// Current authority epoch at admission time.
+    pub authority_epoch: u64,
+    /// Canonical digest over every bound work field.
+    pub binding_digest: String,
+    /// Canonical digest over the presenting request envelope.
+    pub request_digest: String,
+    /// Supported execution-unit schema version.
+    pub execution_unit_schema_version: u16,
+    /// Predecessor revision this claim continues from; opaque to ORS.
+    pub predecessor_revision: OpaqueLabel,
+    /// Opaque digest of the presenting worker generation's resource
+    /// envelope (installation, artifact, and configuration identity).
+    pub resource_envelope_digest: String,
+    /// Durable claim state.
+    pub state: NativeWorkerClaimState,
+    /// Canonical digest of the immutable admission receipt. `None` while
+    /// the intent is only requested; `Some` once Kernel admits the claim.
+    /// The receipt identity never changes afterwards: exact replay returns
+    /// this same digest.
+    pub receipt_digest: Option<String>,
+    /// Admission time in Unix milliseconds. `None` while requested.
+    pub admitted_at_unix_ms: Option<u64>,
+    /// Monotonic ORS order assigned atomically when the claim first reaches
+    /// its terminal state. Zero while non-terminal.
+    #[serde(default)]
+    pub commit_order: u64,
+}
+
+impl NativeWorkerClaimRecord {
+    /// Returns the durable key binding one claim identity to one exact row.
+    pub fn record_key(&self) -> String {
+        self.claim_id.as_str().to_owned()
+    }
+
+    /// Returns whether two records carry the exact same admitted binding.
+    ///
+    /// State, receipt, admission time, and commit order are excluded: they
+    /// are ORS-owned progression, not caller binding. Mirrors
+    /// [`HostRequestRecord::same_binding`].
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.claim_id == other.claim_id
+            && self.registration_id == other.registration_id
+            && self.worker_generation == other.worker_generation
+            && self.parent_job_id == other.parent_job_id
+            && self.task_id == other.task_id
+            && self.work_scope_id == other.work_scope_id
+            && self.decision_id == other.decision_id
+            && self.attempt_id == other.attempt_id
+            && self.operation_id == other.operation_id
+            && self.route_class == other.route_class
+            && self.budget_digest == other.budget_digest
+            && self.deadline_unix_ms == other.deadline_unix_ms
+            && self.fence_digest == other.fence_digest
+            && self.authority_epoch == other.authority_epoch
+            && self.binding_digest == other.binding_digest
+            && self.request_digest == other.request_digest
+            && self.execution_unit_schema_version == other.execution_unit_schema_version
+            && self.predecessor_revision == other.predecessor_revision
+            && self.resource_envelope_digest == other.resource_envelope_digest
+    }
+
+    /// Validates identity shape and state/receipt coherence.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        validate_text(self.claim_id.as_str(), "native_worker_claim_id")?;
+        for (value, field) in [
+            (&self.registration_id, "native_worker_claim_registration_id"),
+            (&self.parent_job_id, "native_worker_claim_parent_job_id"),
+            (&self.task_id, "native_worker_claim_task_id"),
+            (&self.work_scope_id, "native_worker_claim_work_scope_id"),
+            (&self.decision_id, "native_worker_claim_decision_id"),
+            (&self.attempt_id, "native_worker_claim_attempt_id"),
+            (&self.operation_id, "native_worker_claim_operation_id"),
+            (&self.route_class, "native_worker_claim_route_class"),
+            (
+                &self.predecessor_revision,
+                "native_worker_claim_predecessor_revision",
+            ),
+        ] {
+            validate_text(value.as_str(), field)?;
+        }
+        for (value, field) in [
+            (&self.budget_digest, "native_worker_claim_budget_digest"),
+            (&self.fence_digest, "native_worker_claim_fence_digest"),
+            (&self.binding_digest, "native_worker_claim_binding_digest"),
+            (&self.request_digest, "native_worker_claim_request_digest"),
+            (
+                &self.resource_envelope_digest,
+                "native_worker_claim_resource_envelope_digest",
+            ),
+        ] {
+            validate_digest(value, field)?;
+        }
+        if self.worker_generation == 0
+            || self.deadline_unix_ms == 0
+            || self.authority_epoch == 0
+            || self.execution_unit_schema_version == 0
+        {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_bounded_fields",
+                reason: "generation, deadline, epoch, and schema version must be non-zero",
+            });
+        }
+        match (&self.state, &self.receipt_digest, self.admitted_at_unix_ms) {
+            (NativeWorkerClaimState::Requested, None, None) => {}
+            (NativeWorkerClaimState::Requested, _, _) => {
+                return Err(OrsError::InvalidField {
+                    field: "native_worker_claim_receipt",
+                    reason: "a requested intent carries no admission receipt",
+                });
+            }
+            (_, Some(receipt), Some(admitted_at)) => {
+                validate_digest(receipt, "native_worker_claim_receipt_digest")?;
+                if admitted_at == 0 {
+                    return Err(OrsError::InvalidField {
+                        field: "native_worker_claim_admitted_at",
+                        reason: "admission time must be greater than zero",
+                    });
+                }
+            }
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "native_worker_claim_receipt",
+                    reason: "an admitted claim carries its immutable receipt identity",
+                });
+            }
+        }
+        if !self.state.is_terminal() && self.commit_order != 0 {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_commit_order",
+                reason: "non-terminal states must not carry a commit order",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Admission evidence bound when a requested claim becomes admitted.
+///
+/// Carried only by the `Requested -> Admitted` transition (and accepted
+/// unchanged on an exact `Admitted -> Admitted` replay); it is never
+/// overwritten once bound, so one claim identity keeps one receipt identity.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkerClaimAdmission {
+    pub receipt_digest: String,
+    pub admitted_at_unix_ms: u64,
+}
+
+impl NativeWorkerClaimAdmission {
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        validate_digest(&self.receipt_digest, "native_worker_claim_receipt_digest")?;
+        if self.admitted_at_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_admitted_at",
+                reason: "admission time must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Result of the atomic claim-staging write.
+///
+/// `Stored` is a newly persisted intent; `Existing` is an exact replay
+/// carrying the same receipt identity. A changed binding under the same
+/// claim identity is not a variant here: staging fails with
+/// [`OrsError::NativeWorkerClaimIdentityConflict`] and never overwrites.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeWorkerClaimStageOutcome {
+    Stored(NativeWorkerClaimRecord),
+    Existing(NativeWorkerClaimRecord),
+}
+
+impl NativeWorkerClaimStageOutcome {
+    /// Returns the durable record regardless of how the write resolved.
+    pub fn record(&self) -> &NativeWorkerClaimRecord {
+        match self {
+            Self::Stored(record) | Self::Existing(record) => record,
+        }
     }
 }

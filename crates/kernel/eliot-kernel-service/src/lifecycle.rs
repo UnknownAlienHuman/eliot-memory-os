@@ -2,10 +2,16 @@
 
 use std::fmt;
 
-use eliot_contracts::{AuthorityEpoch, ContractId, ResourceGeneration};
+use eliot_contracts::{
+    AuthorityEpoch, ContractId, ResourceGeneration, canonical_json_bytes, sha256_hex,
+};
 use eliot_kernel_core::{
     AuthorityGrantRequest, ControlPermit, FrontDoor, KernelAuthority, KernelAuthorityKey,
     KernelError, RouteScope,
+};
+use eliot_ors::{
+    NativeWorkerClaimAdmission, NativeWorkerClaimRecord, NativeWorkerClaimState, OpaqueLabel,
+    OperationIdentity, OperationalRecoveryStore, OrsError,
 };
 use eliot_protocol::{
     AgentActivationResolutionResult, AgentBridgeProcessBinding, HostRequestAdmissionReceipt,
@@ -19,6 +25,9 @@ use thiserror::Error;
 use crate::protocol::{
     AgentBridgeAdmissionDescriptor, HostKernelCandidateBinding, KernelActivationPermit,
     KernelActivationQuery, KernelActivationReceipt, KernelControlCommand, KernelReadyReceipt,
+    NATIVE_WORKER_CLAIM_WIRE_ID, NativeWorkerClaimConflict, NativeWorkerClaimReceipt,
+    NativeWorkerClaimRejection, NativeWorkerClaimRejectionReason, NativeWorkerClaimRequest,
+    NativeWorkerClaimResponse,
 };
 use crate::validate_text;
 
@@ -1046,6 +1055,726 @@ impl KernelService {
             expiry_ms,
         )?;
         self.authority.issue(request).map_err(Into::into)
+    }
+}
+
+// Wave B (issue #872): native-worker claim persistence and ready gates.
+//
+// Kernel persists the claim transition and returns one immutable claim
+// receipt before the worker can initialize a provider adapter. Ordering is
+// validate → persist → receipt, mirroring `admit_host_request`: the Wave-A
+// request shape and canonical digest are validated, registration/epoch
+// currency and the deadline are checked against live Kernel state, the
+// `Requested` intent is staged durably in ORS, the claim is advanced to
+// `Admitted` with the bound receipt identity, and only then is the receipt
+// returned. Readiness is gated on the persisted `Admitted` record plus a
+// validated ready report; heartbeat or transport liveness alone is
+// insufficient by construction (the ready call carries no liveness field,
+// and readiness without an exact current registration and persisted claimed
+// unit is rejected with `TransportOnlyReadiness`).
+//
+// One claim identity keeps one receipt identity: an exact replay rebuilds
+// the original receipt from the durable admission time instead of
+// manufacturing a second receipt, and changed work under one claim identity
+// reports a `Conflict` before any effect. No provider is selected here, no
+// credential bytes are stored (references only), and no canonical Store
+// write is performed.
+
+/// Maximum credential references admitted in one Wave-B readiness report.
+///
+/// Mirrors the worker-side bound; Kernel checks presence and shape only and
+/// never stores credential material.
+const MAX_NATIVE_WORKER_READY_CREDENTIAL_REFS: usize = 64;
+
+/// Maps one claim-shape validation failure to its typed rejection reason.
+///
+/// Unknown wire, protocol, and execution-unit schema versions each keep
+/// their own reason; epoch/fence disagreement maps to the stale reason for
+/// the disagreeing dimension; a self-inconsistent binding digest maps to
+/// `BindingConflict`; a missing Kernel-owned binding field maps to
+/// `MissingOwnerField`; every other malformed field maps to
+/// `InvalidClaimField`.
+fn native_worker_claim_rejection_reason(
+    error: &KernelServiceError,
+) -> (NativeWorkerClaimRejectionReason, &'static str) {
+    match error {
+        KernelServiceError::InvalidField { field, reason } => {
+            let mapped = match *field {
+                "native_worker_claim.wire" => NativeWorkerClaimRejectionReason::UnknownWireVersion,
+                "native_worker_claim.protocol_version" => {
+                    NativeWorkerClaimRejectionReason::UnknownProtocolVersion
+                }
+                "native_worker_claim.execution_unit_schema_version" => {
+                    NativeWorkerClaimRejectionReason::UnknownSchemaVersion
+                }
+                "native_worker_claim.binding_digest" => {
+                    NativeWorkerClaimRejectionReason::BindingConflict
+                }
+                _ if *reason == "must be non-blank" => {
+                    NativeWorkerClaimRejectionReason::MissingOwnerField
+                }
+                _ => NativeWorkerClaimRejectionReason::InvalidClaimField,
+            };
+            (mapped, field)
+        }
+        KernelServiceError::HandshakeMismatch { field } => {
+            let mapped = match *field {
+                "native_worker_claim.state_fence" => NativeWorkerClaimRejectionReason::StaleFence,
+                "native_worker_claim.epoch_fence" => NativeWorkerClaimRejectionReason::StaleEpoch,
+                _ => NativeWorkerClaimRejectionReason::InvalidClaimField,
+            };
+            (mapped, field)
+        }
+        _ => (
+            NativeWorkerClaimRejectionReason::InvalidClaimField,
+            "native_worker_claim.request",
+        ),
+    }
+}
+
+/// Maps one ORS failure to the Kernel service error surface.
+fn native_worker_claim_store_error(error: OrsError) -> KernelServiceError {
+    KernelServiceError::Platform(error.to_string())
+}
+
+/// Builds the immutable admission receipt for one validated request.
+///
+/// The receipt digest is canonical over the request binding plus the given
+/// admission time, so rebuilding with the durable admission time reproduces
+/// the exact same receipt identity on replay.
+fn native_worker_claim_receipt(
+    request: &NativeWorkerClaimRequest,
+    admitted_at_unix_ms: u64,
+) -> Result<NativeWorkerClaimReceipt, KernelServiceError> {
+    NativeWorkerClaimReceipt {
+        wire_id: NATIVE_WORKER_CLAIM_WIRE_ID.to_owned(),
+        wire_version: NativeWorkerClaimReceipt::CONTRACT_VERSION,
+        claim_id: request.claim_id.clone(),
+        registration_id: request.registration_id.clone(),
+        attempt_id: request.attempt_id.clone(),
+        operation_id: request.operation_id.clone(),
+        worker_generation: request.worker_generation,
+        authority_epoch: request.authority_epoch,
+        state_fence: request.state_fence.clone(),
+        binding_digest: request.binding_digest.clone(),
+        admitted_at_unix_ms,
+        receipt_digest: String::new(),
+    }
+    .with_computed_digest()
+}
+
+/// Computes the opaque budget-envelope digest bound in the ORS record.
+fn native_worker_claim_budget_digest(
+    request: &NativeWorkerClaimRequest,
+) -> Result<String, KernelServiceError> {
+    canonical_json_bytes(&request.budget)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| KernelServiceError::InvalidField {
+            field: "native_worker_claim.budget",
+            reason: "cannot canonicalize budget envelope",
+        })
+}
+
+/// Computes the opaque fence digest bound in the ORS record.
+fn native_worker_claim_fence_digest(
+    request: &NativeWorkerClaimRequest,
+) -> Result<String, KernelServiceError> {
+    canonical_json_bytes(&request.state_fence)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| KernelServiceError::InvalidField {
+            field: "native_worker_claim.state_fence",
+            reason: "cannot canonicalize state fence",
+        })
+}
+
+/// Computes the opaque resource-envelope digest bound in the ORS record.
+///
+/// Covers the presenting worker generation's resource identity —
+/// installation, artifact, and configuration digests — as exact bytes. ORS
+/// compares the digest without interpreting it.
+fn native_worker_claim_resource_envelope_digest(
+    request: &NativeWorkerClaimRequest,
+) -> Result<String, KernelServiceError> {
+    #[derive(serde::Serialize)]
+    struct ResourceEnvelope<'a> {
+        installation_id: &'a str,
+        worker_artifact_digest: &'a str,
+        worker_config_digest: &'a str,
+    }
+    let envelope = ResourceEnvelope {
+        installation_id: &request.installation_id,
+        worker_artifact_digest: &request.worker_artifact_digest,
+        worker_config_digest: &request.worker_config_digest,
+    };
+    canonical_json_bytes(&envelope)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| KernelServiceError::InvalidField {
+            field: "native_worker_claim.resource_envelope",
+            reason: "cannot canonicalize resource envelope",
+        })
+}
+
+/// Binds one ORS identity value, attributing construction failures without
+/// propagating caller text.
+fn native_worker_claim_identity<T>(
+    result: Result<T, OrsError>,
+    field: &'static str,
+) -> Result<T, KernelServiceError> {
+    result.map_err(|_| KernelServiceError::InvalidField {
+        field,
+        reason: "durable claim identity could not be bound",
+    })
+}
+
+/// Builds the `Requested` ORS record for one validated claim request.
+///
+/// Every presented identity is preserved opaquely; digests are recomputed
+/// from the exact presented bytes so replay comparison is byte-exact.
+fn native_worker_claim_staged_record(
+    request: &NativeWorkerClaimRequest,
+) -> Result<NativeWorkerClaimRecord, KernelServiceError> {
+    Ok(NativeWorkerClaimRecord {
+        contract_version: eliot_ors::CONTRACT_VERSION,
+        claim_id: native_worker_claim_identity(
+            OperationIdentity::new(request.claim_id.as_str()),
+            "native_worker_claim.claim_id",
+        )?,
+        registration_id: native_worker_claim_identity(
+            OpaqueLabel::new(request.registration_id.as_str()),
+            "native_worker_claim.registration_id",
+        )?,
+        worker_generation: request.worker_generation,
+        parent_job_id: native_worker_claim_identity(
+            OpaqueLabel::new(request.parent_job_id.as_str()),
+            "native_worker_claim.parent_job_id",
+        )?,
+        task_id: native_worker_claim_identity(
+            OpaqueLabel::new(request.task_id.as_str()),
+            "native_worker_claim.task_id",
+        )?,
+        work_scope_id: native_worker_claim_identity(
+            OpaqueLabel::new(request.work_scope_id.as_str()),
+            "native_worker_claim.work_scope_id",
+        )?,
+        decision_id: native_worker_claim_identity(
+            OpaqueLabel::new(request.decision_id.as_str()),
+            "native_worker_claim.decision_id",
+        )?,
+        attempt_id: native_worker_claim_identity(
+            OpaqueLabel::new(request.attempt_id.as_str()),
+            "native_worker_claim.attempt_id",
+        )?,
+        operation_id: native_worker_claim_identity(
+            OpaqueLabel::new(request.operation_id.as_str()),
+            "native_worker_claim.operation_id",
+        )?,
+        route_class: native_worker_claim_identity(
+            OpaqueLabel::new(request.route_class.as_str()),
+            "native_worker_claim.route_class",
+        )?,
+        budget_digest: native_worker_claim_budget_digest(request)?,
+        deadline_unix_ms: request.deadline_unix_ms,
+        fence_digest: native_worker_claim_fence_digest(request)?,
+        authority_epoch: request.authority_epoch.value(),
+        binding_digest: request.binding_digest.clone(),
+        request_digest: request.request_digest.clone(),
+        execution_unit_schema_version: request.execution_unit_schema_version,
+        predecessor_revision: native_worker_claim_identity(
+            OpaqueLabel::new(request.predecessor_revision.as_str()),
+            "native_worker_claim.predecessor_revision",
+        )?,
+        resource_envelope_digest: native_worker_claim_resource_envelope_digest(request)?,
+        state: NativeWorkerClaimState::Requested,
+        receipt_digest: None,
+        admitted_at_unix_ms: None,
+        commit_order: 0,
+    })
+}
+
+/// Diffs one presented claim against the durable binding in canonical field
+/// order.
+///
+/// Every bound dimension that differs is named; a bare digest mismatch with
+/// otherwise identical work is reported as a conflict on `binding_digest`
+/// itself. Mirrors the worker-side `compare_binding` discipline at the
+/// Kernel boundary.
+fn native_worker_claim_changed_fields(
+    durable: &NativeWorkerClaimRecord,
+    staged: &NativeWorkerClaimRecord,
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    let mut note = |same: bool, field: &'static str| {
+        if !same {
+            changed.push(field.to_owned());
+        }
+    };
+    note(
+        durable.registration_id == staged.registration_id,
+        "registration_id",
+    );
+    note(
+        durable.worker_generation == staged.worker_generation,
+        "worker_generation",
+    );
+    note(
+        durable.parent_job_id == staged.parent_job_id,
+        "parent_job_id",
+    );
+    note(durable.task_id == staged.task_id, "task_id");
+    note(
+        durable.work_scope_id == staged.work_scope_id,
+        "work_scope_id",
+    );
+    note(durable.decision_id == staged.decision_id, "decision_id");
+    note(durable.attempt_id == staged.attempt_id, "attempt_id");
+    note(durable.operation_id == staged.operation_id, "operation_id");
+    note(durable.route_class == staged.route_class, "route_class");
+    note(durable.budget_digest == staged.budget_digest, "budget");
+    note(
+        durable.deadline_unix_ms == staged.deadline_unix_ms,
+        "deadline_unix_ms",
+    );
+    note(
+        durable.predecessor_revision == staged.predecessor_revision,
+        "predecessor_revision",
+    );
+    note(
+        durable.execution_unit_schema_version == staged.execution_unit_schema_version,
+        "expected_result_schema_version",
+    );
+    note(
+        durable.authority_epoch == staged.authority_epoch,
+        "authority_epoch",
+    );
+    note(durable.fence_digest == staged.fence_digest, "state_fence");
+    note(
+        durable.resource_envelope_digest == staged.resource_envelope_digest,
+        "resource_envelope",
+    );
+    note(
+        durable.request_digest == staged.request_digest,
+        "request_digest",
+    );
+    if changed.is_empty() {
+        changed.push("binding_digest".to_owned());
+    }
+    changed
+}
+
+/// Builds the changed-work conflict for one durable claim binding.
+fn native_worker_claim_conflict(
+    durable: &NativeWorkerClaimRecord,
+    request: &NativeWorkerClaimRequest,
+    staged: &NativeWorkerClaimRecord,
+) -> Result<NativeWorkerClaimConflict, KernelServiceError> {
+    let conflict = NativeWorkerClaimConflict {
+        claim_id: request.claim_id.clone(),
+        expected_digest: durable.binding_digest.clone(),
+        observed_digest: request.binding_digest.clone(),
+        changed_fields: native_worker_claim_changed_fields(durable, staged),
+    };
+    conflict.validate().map_err(|_| {
+        KernelServiceError::Platform("conflicting claim identity cannot be reported".to_owned())
+    })?;
+    Ok(conflict)
+}
+
+impl KernelService {
+    /// Admits one native-worker claim for exactly one bounded execution unit.
+    ///
+    /// Validates the Wave-A request shape and canonical digest, checks
+    /// registration/epoch currency against live Kernel authority and the
+    /// deadline against the caller clock, persists the `Requested` intent in
+    /// ORS, advances the claim to `Admitted` with the bound receipt
+    /// identity, and returns the immutable receipt — before any provider
+    /// initialization. A claim bound to a superseded epoch is rejected as
+    /// `StaleRegistration`; a claim carrying a newer-than-live epoch as
+    /// `StaleEpoch`. An exact replay under the same claim identity returns
+    /// the original receipt identity instead of a second receipt and never
+    /// downgrades the durable state; changed work under one claim identity
+    /// returns `Conflict` and takes no effect. Only mechanical failures
+    /// (closed admission, fenced generation, ORS storage) surface as `Err`;
+    /// every typed refusal is an `Ok` response value.
+    pub fn admit_native_worker_claim<S: OperationalRecoveryStore>(
+        &self,
+        store: &S,
+        request: &NativeWorkerClaimRequest,
+        now_unix_ms: u64,
+    ) -> Result<NativeWorkerClaimResponse, KernelServiceError> {
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
+        if self.state != KernelServiceState::Ready {
+            return Err(KernelServiceError::AdmissionClosed(self.state));
+        }
+        if now_unix_ms == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_claim.now",
+                reason: "admission time must be non-zero",
+            });
+        }
+        let rejected = |reason: NativeWorkerClaimRejectionReason, detail: &'static str| {
+            NativeWorkerClaimResponse::Rejected(NativeWorkerClaimRejection {
+                claim_id: request.claim_id.clone(),
+                reason,
+                detail: detail.to_owned(),
+                rejected_at_unix_ms: now_unix_ms,
+            })
+        };
+        if let Err(error) = request.validate() {
+            let (reason, detail) = native_worker_claim_rejection_reason(&error);
+            return Ok(rejected(reason, detail));
+        }
+        if let Err(error) = request.validate_canonical_digest() {
+            let (reason, detail) = native_worker_claim_rejection_reason(&error);
+            return Ok(rejected(reason, detail));
+        }
+        let live_epoch = self.authority_epoch().value();
+        if request.authority_epoch.value() < live_epoch {
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::StaleRegistration,
+                "native_worker_claim.authority_epoch",
+            ));
+        }
+        if request.authority_epoch.value() > live_epoch {
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::StaleEpoch,
+                "native_worker_claim.authority_epoch",
+            ));
+        }
+        if request.deadline_unix_ms <= now_unix_ms {
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::ExpiredDeadline,
+                "native_worker_claim.deadline_unix_ms",
+            ));
+        }
+        let staged = native_worker_claim_staged_record(request)?;
+        let durable = match store.stage_native_worker_claim(&staged) {
+            Ok(outcome) => outcome.record().clone(),
+            Err(OrsError::NativeWorkerClaimIdentityConflict { .. }) => {
+                let claim_id = native_worker_claim_identity(
+                    OperationIdentity::new(request.claim_id.as_str()),
+                    "native_worker_claim.claim_id",
+                )?;
+                let durable = store
+                    .load_native_worker_claim(&claim_id)
+                    .map_err(native_worker_claim_store_error)?
+                    .ok_or_else(|| {
+                        KernelServiceError::Platform(
+                            "conflicting claim disappeared before reconciliation".to_owned(),
+                        )
+                    })?;
+                let conflict = native_worker_claim_conflict(&durable, request, &staged)?;
+                return Ok(NativeWorkerClaimResponse::Conflict(conflict));
+            }
+            Err(error) => return Err(native_worker_claim_store_error(error)),
+        };
+        if durable.state != NativeWorkerClaimState::Requested {
+            // Exact replay: the claim was already admitted (or moved forward
+            // under a later wave). Rebuild the original receipt identity
+            // from the durable admission time instead of manufacturing a
+            // second receipt. No state change, no downgrade, no re-admit.
+            let admitted_at = durable.admitted_at_unix_ms.ok_or_else(|| {
+                KernelServiceError::Platform(
+                    "durable admitted claim has no admission time".to_owned(),
+                )
+            })?;
+            let receipt = native_worker_claim_receipt(request, admitted_at)?;
+            receipt.validate().map_err(|_| {
+                KernelServiceError::Platform(
+                    "durable claim cannot reproduce its receipt identity".to_owned(),
+                )
+            })?;
+            return Ok(NativeWorkerClaimResponse::Admitted(receipt));
+        }
+        // A durable `Requested` row with our exact binding means either our
+        // own fresh intent or an interrupted earlier admit that never issued
+        // a receipt (a receipt is issued only after the advance below, so a
+        // crash before it leaves `Requested`, and a crash after it leaves
+        // `Admitted`). Binding the receipt here is therefore safe: no
+        // second identity can exist for this binding.
+        let receipt = native_worker_claim_receipt(request, now_unix_ms)?;
+        let admission = NativeWorkerClaimAdmission {
+            receipt_digest: receipt.receipt_digest.clone(),
+            admitted_at_unix_ms: now_unix_ms,
+        };
+        match store.advance_native_worker_claim(
+            &durable.claim_id,
+            NativeWorkerClaimState::Admitted,
+            Some(&admission),
+        ) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(KernelServiceError::Platform(
+                    "admitted claim disappeared before acknowledgement".to_owned(),
+                ));
+            }
+            Err(OrsError::NativeWorkerClaimIdentityConflict { .. }) => {
+                // Lost the admission race: another writer bound the receipt
+                // first. Reload the durable truth and return its receipt
+                // identity instead of a second receipt.
+                let current = store
+                    .load_native_worker_claim(&durable.claim_id)
+                    .map_err(native_worker_claim_store_error)?
+                    .ok_or_else(|| {
+                        KernelServiceError::Platform(
+                            "admitted claim disappeared before acknowledgement".to_owned(),
+                        )
+                    })?;
+                if !current.same_binding(&staged) {
+                    let conflict = native_worker_claim_conflict(&current, request, &staged)?;
+                    return Ok(NativeWorkerClaimResponse::Conflict(conflict));
+                }
+                let admitted_at = current.admitted_at_unix_ms.ok_or_else(|| {
+                    KernelServiceError::Platform(
+                        "durable admitted claim has no admission time".to_owned(),
+                    )
+                })?;
+                let receipt = native_worker_claim_receipt(request, admitted_at)?;
+                return Ok(NativeWorkerClaimResponse::Admitted(receipt));
+            }
+            Err(error) => return Err(native_worker_claim_store_error(error)),
+        }
+        receipt.validate().map_err(|_| {
+            KernelServiceError::Platform("issued admission receipt is not well-formed".to_owned())
+        })?;
+        Ok(NativeWorkerClaimResponse::Admitted(receipt))
+    }
+
+    /// Reconciles an unknown claim-admission delivery without admitting again.
+    ///
+    /// This pure receipt↔request check proves only that a retained receipt
+    /// binds the exact presented request. It changes no service state and
+    /// issues no new authority; an unknown delivery whose durable outcome is
+    /// still uncertain remains the responsibility of the ORS claim record.
+    pub fn reconcile_native_worker_claim_admission(
+        &self,
+        receipt: &NativeWorkerClaimReceipt,
+        request: &NativeWorkerClaimRequest,
+    ) -> Result<bool, KernelServiceError> {
+        receipt.validate()?;
+        let binds = receipt.claim_id == request.claim_id
+            && receipt.registration_id == request.registration_id
+            && receipt.attempt_id == request.attempt_id
+            && receipt.operation_id == request.operation_id
+            && receipt.worker_generation == request.worker_generation
+            && receipt.authority_epoch == request.authority_epoch
+            && receipt.state_fence == request.state_fence
+            && receipt.binding_digest == request.binding_digest;
+        if !binds {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "native_worker_claim.receipt",
+            });
+        }
+        Ok(true)
+    }
+
+    /// Marks one admitted claim ready after exact ready-report validation.
+    ///
+    /// Gated on the persisted `Admitted` record plus validation of the
+    /// presented request and the ready report, with Ready-only service
+    /// gating like [`Self::acquire_admission`]. The report carries a
+    /// distinct ready operation identity (never equal to the claim id), the
+    /// presenting registration and generation, the validated
+    /// adapter-registry revision presence, credential references by
+    /// reference only, and the report time; compatibility of the revision
+    /// value itself stays with #874 and credential bytes never cross this
+    /// boundary. Heartbeat or transport liveness alone is insufficient by
+    /// construction: the call carries no liveness field, and readiness
+    /// without an exact current registration and persisted claimed unit is
+    /// rejected with `TransportOnlyReadiness`. A presenting generation that
+    /// is not the admitted generation is rejected as `StaleRegistration`.
+    /// An exact replay on an already-`Ready` claim returns the same receipt
+    /// identity; readiness on a terminal (or otherwise non-admittable)
+    /// claim is refused without touching the durable state. Only mechanical
+    /// failures surface as `Err`; every typed refusal is an `Ok` response
+    /// value. Wave-B readiness is proven by the immutable admission receipt
+    /// plus the durable `Ready` state; a distinct ready-receipt type, ready
+    /// deduplication across ready ids, and blocked-report handling belong to
+    /// later waves.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Wave B passes ready evidence as primitives so no new public contract type is minted"
+    )]
+    pub fn mark_native_worker_ready<S: OperationalRecoveryStore>(
+        &self,
+        store: &S,
+        request: &NativeWorkerClaimRequest,
+        ready_id: &str,
+        ready_registration_id: &str,
+        ready_worker_generation: u64,
+        adapter_registry_revision: &str,
+        credential_refs: &[(&str, &str)],
+        ready_at_unix_ms: u64,
+        now_unix_ms: u64,
+    ) -> Result<NativeWorkerClaimResponse, KernelServiceError> {
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
+        if self.state != KernelServiceState::Ready {
+            return Err(KernelServiceError::AdmissionClosed(self.state));
+        }
+        if now_unix_ms == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_ready.now",
+                reason: "report time must be non-zero",
+            });
+        }
+        let rejected = |reason: NativeWorkerClaimRejectionReason, detail: &'static str| {
+            NativeWorkerClaimResponse::Rejected(NativeWorkerClaimRejection {
+                claim_id: request.claim_id.clone(),
+                reason,
+                detail: detail.to_owned(),
+                rejected_at_unix_ms: now_unix_ms,
+            })
+        };
+        if let Err(error) = request.validate() {
+            let (reason, detail) = native_worker_claim_rejection_reason(&error);
+            return Ok(rejected(reason, detail));
+        }
+        if let Err(error) = request.validate_canonical_digest() {
+            let (reason, detail) = native_worker_claim_rejection_reason(&error);
+            return Ok(rejected(reason, detail));
+        }
+        let mut report_issue: Option<KernelServiceError> = None;
+        if let Err(error) = validate_text(ready_id, "native_worker_ready.ready_id") {
+            report_issue = Some(error);
+        } else if ready_id == request.claim_id {
+            report_issue = Some(KernelServiceError::InvalidField {
+                field: "native_worker_ready.ready_id",
+                reason: "readiness requires a distinct operation identity",
+            });
+        } else if let Err(error) =
+            validate_text(ready_registration_id, "native_worker_ready.registration_id")
+        {
+            report_issue = Some(error);
+        } else if let Err(error) = validate_text(
+            adapter_registry_revision,
+            "native_worker_ready.adapter_registry_revision",
+        ) {
+            report_issue = Some(error);
+        } else if ready_worker_generation == 0 || ready_at_unix_ms == 0 {
+            report_issue = Some(KernelServiceError::InvalidField {
+                field: "native_worker_ready.bounded_fields",
+                reason: "generation and report time must be non-zero",
+            });
+        } else if credential_refs.len() > MAX_NATIVE_WORKER_READY_CREDENTIAL_REFS {
+            report_issue = Some(KernelServiceError::InvalidField {
+                field: "native_worker_ready.credential_refs",
+                reason: "exceeds the bounded credential-reference limit",
+            });
+        } else {
+            for (provider, key) in credential_refs {
+                if let Err(error) = validate_text(provider, "native_worker_ready.credential_refs") {
+                    report_issue = Some(error);
+                    break;
+                }
+                if let Err(error) = validate_text(key, "native_worker_ready.credential_refs") {
+                    report_issue = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = report_issue {
+            let (reason, detail) = native_worker_claim_rejection_reason(&error);
+            return Ok(rejected(reason, detail));
+        }
+        let live_epoch = self.authority_epoch().value();
+        if request.authority_epoch.value() < live_epoch {
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::StaleRegistration,
+                "native_worker_claim.authority_epoch",
+            ));
+        }
+        if request.authority_epoch.value() > live_epoch {
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::StaleEpoch,
+                "native_worker_claim.authority_epoch",
+            ));
+        }
+        if request.deadline_unix_ms <= now_unix_ms || ready_at_unix_ms > request.deadline_unix_ms {
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::ExpiredDeadline,
+                "native_worker_claim.deadline_unix_ms",
+            ));
+        }
+        if ready_at_unix_ms > now_unix_ms {
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::InvalidClaimField,
+                "native_worker_ready.ready_at_unix_ms",
+            ));
+        }
+        let claim_id = native_worker_claim_identity(
+            OperationIdentity::new(request.claim_id.as_str()),
+            "native_worker_claim.claim_id",
+        )?;
+        let durable = store
+            .load_native_worker_claim(&claim_id)
+            .map_err(native_worker_claim_store_error)?;
+        let Some(durable) = durable else {
+            // No exact current registration and claimed unit exists, so no
+            // transport connection, heartbeat, or liveness observation can
+            // make this unit ready.
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::TransportOnlyReadiness,
+                "native_worker_ready.claim",
+            ));
+        };
+        if ready_registration_id != durable.registration_id.as_str()
+            || ready_worker_generation != durable.worker_generation
+        {
+            // The presenting generation is not the admitted current
+            // generation: a stale or fenced generation cannot become ready.
+            // Checked before the binding diff so a generation mismatch keeps
+            // its precise reason instead of a generic conflict.
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::StaleRegistration,
+                "native_worker_ready.generation",
+            ));
+        }
+        let staged = native_worker_claim_staged_record(request)?;
+        if !durable.same_binding(&staged) {
+            // Changed work under one claim identity conflicts before effect,
+            // regardless of the durable state: the admitted binding stands.
+            let conflict = native_worker_claim_conflict(&durable, request, &staged)?;
+            return Ok(NativeWorkerClaimResponse::Conflict(conflict));
+        }
+        if durable.state == NativeWorkerClaimState::Ready {
+            let admitted_at = durable.admitted_at_unix_ms.ok_or_else(|| {
+                KernelServiceError::Platform("durable ready claim has no admission time".to_owned())
+            })?;
+            let receipt = native_worker_claim_receipt(request, admitted_at)?;
+            receipt.validate().map_err(|_| {
+                KernelServiceError::Platform(
+                    "durable claim cannot reproduce its receipt identity".to_owned(),
+                )
+            })?;
+            return Ok(NativeWorkerClaimResponse::Admitted(receipt));
+        }
+        if durable.state != NativeWorkerClaimState::Admitted {
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::InvalidClaimField,
+                "native_worker_claim.state",
+            ));
+        }
+        store
+            .advance_native_worker_claim(&durable.claim_id, NativeWorkerClaimState::Ready, None)
+            .map_err(native_worker_claim_store_error)?
+            .ok_or_else(|| {
+                KernelServiceError::Platform(
+                    "admitted claim disappeared before readiness".to_owned(),
+                )
+            })?;
+        let admitted_at = durable.admitted_at_unix_ms.ok_or_else(|| {
+            KernelServiceError::Platform("durable admitted claim has no admission time".to_owned())
+        })?;
+        let receipt = native_worker_claim_receipt(request, admitted_at)?;
+        receipt.validate().map_err(|_| {
+            KernelServiceError::Platform(
+                "durable claim cannot reproduce its receipt identity".to_owned(),
+            )
+        })?;
+        Ok(NativeWorkerClaimResponse::Admitted(receipt))
     }
 
     fn transition(&mut self, next: KernelServiceState) -> Result<(), KernelServiceError> {

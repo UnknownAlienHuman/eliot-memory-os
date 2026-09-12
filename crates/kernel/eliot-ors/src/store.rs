@@ -35,7 +35,8 @@ use crate::{
     DeliveryAcknowledgement, DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity,
     EpochLineage, GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
     GenerationTransition, GenerationTransitionReceipt, HostRequestRecord, HostRequestState,
-    JobCheckpoint, KernelAuthoritySnapshot, OpaqueLabel, OperationalMutationReceipt,
+    JobCheckpoint, KernelAuthoritySnapshot, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
+    NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationalMutationReceipt,
     OperationalPhase, OperationalRecordContext, OperationalRecordInput, OrsError,
     OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
     ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
@@ -88,6 +89,8 @@ const STORE_REBIND_REPLAY: TableDefinition<&str, &str> =
 const STORE_FAILURE_RETENTION: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_failure_retention_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
+const NATIVE_WORKER_CLAIMS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_native_worker_claims_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY: &str = "supervision_stage_resolution_schema";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1: &str = "eliot.ors.supervision-stage-resolution.v1";
@@ -357,6 +360,32 @@ pub trait OperationalRecoveryStore: Send + Sync {
         operation_id: &crate::OperationIdentity,
         request_digest: &str,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Stages one native-worker claim intent before any acknowledgement.
+    ///
+    /// An exact replay under the same claim identity returns
+    /// [`crate::NativeWorkerClaimStageOutcome::Existing`] with the same
+    /// receipt identity; a changed binding fails with
+    /// [`OrsError::NativeWorkerClaimIdentityConflict`] and never overwrites.
+    fn stage_native_worker_claim(
+        &self,
+        record: &crate::NativeWorkerClaimRecord,
+    ) -> Result<crate::NativeWorkerClaimStageOutcome, OrsError>;
+    /// Advances one staged claim to its next mechanical state.
+    ///
+    /// An exact repeat of an applied advance returns the durable record
+    /// unchanged. An unknown claim returns `Ok(None)`; this method never
+    /// invents a record.
+    fn advance_native_worker_claim(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        target: crate::NativeWorkerClaimState,
+        admission: Option<&crate::NativeWorkerClaimAdmission>,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError>;
+    /// Loads one claim by exact claim identity.
+    fn load_native_worker_claim(
+        &self,
+        claim_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError>;
 }
 
 /// redb-backed ORS implementation. Every mutating method commits one short transaction.
@@ -387,6 +416,14 @@ fn same_store_rebind_binding(
 
 impl persistence_codec::PersistedValue for HostRequestRecord {
     const RECORD_TYPE: &'static str = "host_request";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for NativeWorkerClaimRecord {
+    const RECORD_TYPE: &'static str = "native_worker_claim";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
@@ -1148,6 +1185,187 @@ impl RedbRecoveryStore {
         if next != existing {
             let payload = encode(&next)?;
             let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
+    }
+
+    /// Stages one native-worker claim intent before any acknowledgement.
+    ///
+    /// Persist-before-ack: the record is durably inserted before the caller
+    /// may issue the immutable admission receipt or initialize provider
+    /// work. An exact replay under the same claim identity returns
+    /// [`NativeWorkerClaimStageOutcome::Existing`] carrying the same receipt
+    /// identity; a changed binding under the same identity fails with
+    /// [`OrsError::NativeWorkerClaimIdentityConflict`] and never overwrites
+    /// the durable row. Staging accepts the `Requested` intent entry state
+    /// and the `Admitted` Wave-B admission state; both are validated for
+    /// receipt coherence by the record itself. This table is disjoint from
+    /// the HostRequest and ProcessStart tables: one writer per state.
+    pub fn stage_native_worker_claim(
+        &self,
+        record: &crate::NativeWorkerClaimRecord,
+    ) -> Result<crate::NativeWorkerClaimStageOutcome, OrsError> {
+        record.validate()?;
+        if !matches!(
+            record.state,
+            crate::NativeWorkerClaimState::Requested | crate::NativeWorkerClaimState::Admitted
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_state",
+                reason: "staging requires the requested or admitted state",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing = {
+            let mut table = write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+            let key = record.record_key();
+            if let Some(existing) = table.get(key.as_str()).map_err(storage)? {
+                let existing: crate::NativeWorkerClaimRecord = decode(existing.value())?;
+                existing.validate()?;
+                if !existing.same_binding(record) {
+                    return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                        claim_id: record.claim_id.as_str().to_owned(),
+                    });
+                }
+                Some(existing)
+            } else {
+                let payload = encode(record)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+                None
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(match existing {
+            Some(durable) => crate::NativeWorkerClaimStageOutcome::Existing(durable),
+            None => crate::NativeWorkerClaimStageOutcome::Stored(record.clone()),
+        })
+    }
+
+    /// Loads one native-worker claim by exact claim identity.
+    pub fn load_native_worker_claim(
+        &self,
+        claim_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+        table
+            .get(claim_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: crate::NativeWorkerClaimRecord = decode(value.value())?;
+                record.validate()?;
+                if record.claim_id != *claim_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "native_worker_claim",
+                        reason: "claim record identity does not match its key".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Advances one staged claim to its next mechanical state.
+    ///
+    /// The transition table owns the anti-downgrade fence: `Terminal` is
+    /// absorbing, `Unknown` may only become `Reconciling`, no state returns
+    /// to `Requested`, and `Ready` is reachable only from `Admitted` (or
+    /// from `Reconciling` as the resolution of previously admitted work).
+    /// An exact repeat of an applied advance returns the durable record
+    /// unchanged. An unknown claim returns `Ok(None)`; this method never
+    /// invents a record and never retries blindly. Admission evidence binds
+    /// the receipt identity on `Requested -> Admitted`, is accepted
+    /// unchanged on an exact `Admitted -> Admitted` replay, and can never
+    /// overwrite a bound receipt. The ORS write transaction assigns the
+    /// monotonic commit order atomically when the claim first reaches its
+    /// terminal state; the caller never supplies it.
+    pub fn advance_native_worker_claim(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        target: crate::NativeWorkerClaimState,
+        admission: Option<&crate::NativeWorkerClaimAdmission>,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = claim_id.as_str().to_owned();
+        let existing: Option<crate::NativeWorkerClaimRecord> = {
+            let table = write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        if existing.claim_id != *claim_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "native_worker_claim",
+                reason: "claim record identity does not match its key".to_owned(),
+            });
+        }
+        if existing.state == target {
+            if let Some(admission) = admission {
+                admission.validate()?;
+                if existing.receipt_digest.as_deref() != Some(admission.receipt_digest.as_str())
+                    || existing.admitted_at_unix_ms != Some(admission.admitted_at_unix_ms)
+                {
+                    return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                        claim_id: claim_id.as_str().to_owned(),
+                    });
+                }
+            }
+            return Ok(Some(existing));
+        }
+        existing.state.transition_to(target)?;
+        let mut next = existing.clone();
+        if target == crate::NativeWorkerClaimState::Admitted {
+            match (
+                &existing.receipt_digest,
+                existing.admitted_at_unix_ms,
+                admission,
+            ) {
+                (None, None, Some(admission)) => {
+                    admission.validate()?;
+                    next.receipt_digest = Some(admission.receipt_digest.clone());
+                    next.admitted_at_unix_ms = Some(admission.admitted_at_unix_ms);
+                }
+                (Some(_), Some(_), None) => {}
+                (Some(digest), Some(at), Some(admission))
+                    if digest == &admission.receipt_digest
+                        && at == admission.admitted_at_unix_ms => {}
+                (None, None, None) => {
+                    return Err(OrsError::InvalidField {
+                        field: "native_worker_claim_admission",
+                        reason: "admission requires admission evidence",
+                    });
+                }
+                _ => {
+                    return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                        claim_id: claim_id.as_str().to_owned(),
+                    });
+                }
+            }
+        } else if admission.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_admission",
+                reason: "admission evidence only for the admitted state",
+            });
+        }
+        if target.is_terminal() && next.commit_order == 0 {
+            next.commit_order = Self::next_operational_order(&write)?;
+        }
+        next.validate()?;
+        if next != existing {
+            let payload = encode(&next)?;
+            let mut table = write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
             table
                 .insert(key.as_str(), payload.as_str())
                 .map_err(storage)?;
@@ -2761,6 +2979,7 @@ impl RedbRecoveryStore {
                     .map_err(storage)?,
             );
             drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
+            drop(write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?);
             if initialize_resolution_schema {
                 let mut meta = write.open_table(META).map_err(storage)?;
                 meta.insert(
@@ -4874,6 +5093,29 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
         RedbRecoveryStore::load_host_request(self, operation_id, request_digest)
     }
+
+    fn stage_native_worker_claim(
+        &self,
+        record: &crate::NativeWorkerClaimRecord,
+    ) -> Result<crate::NativeWorkerClaimStageOutcome, OrsError> {
+        RedbRecoveryStore::stage_native_worker_claim(self, record)
+    }
+
+    fn advance_native_worker_claim(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        target: crate::NativeWorkerClaimState,
+        admission: Option<&crate::NativeWorkerClaimAdmission>,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        RedbRecoveryStore::advance_native_worker_claim(self, claim_id, target, admission)
+    }
+
+    fn load_native_worker_claim(
+        &self,
+        claim_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        RedbRecoveryStore::load_native_worker_claim(self, claim_id)
+    }
 }
 
 /// Single coordinator facade. It owns no semantic policy and delegates one durable transition.
@@ -5007,6 +5249,33 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         request_digest: &str,
     ) -> Result<Option<HostRequestRecord>, OrsError> {
         self.store.load_host_request(operation_id, request_digest)
+    }
+
+    /// Stages one native-worker claim intent before any acknowledgement.
+    pub fn stage_native_worker_claim(
+        &self,
+        record: &NativeWorkerClaimRecord,
+    ) -> Result<NativeWorkerClaimStageOutcome, OrsError> {
+        self.store.stage_native_worker_claim(record)
+    }
+
+    /// Advances one staged claim to its next mechanical state.
+    pub fn advance_native_worker_claim(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        target: NativeWorkerClaimState,
+        admission: Option<&NativeWorkerClaimAdmission>,
+    ) -> Result<Option<NativeWorkerClaimRecord>, OrsError> {
+        self.store
+            .advance_native_worker_claim(claim_id, target, admission)
+    }
+
+    /// Loads one claim by exact claim identity.
+    pub fn load_native_worker_claim(
+        &self,
+        claim_id: &crate::OperationIdentity,
+    ) -> Result<Option<NativeWorkerClaimRecord>, OrsError> {
+        self.store.load_native_worker_claim(claim_id)
     }
 }
 
