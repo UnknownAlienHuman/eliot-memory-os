@@ -82,6 +82,7 @@ mod health_view;
 #[cfg(windows)]
 mod host_request_route;
 mod native_worker_lifecycle_route;
+mod native_worker_reconcile_route;
 mod runtime_identity;
 use daemon_session_guard::caller_binding;
 #[cfg(all(windows, test))]
