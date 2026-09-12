@@ -1,0 +1,111 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_AFTER_OBSERVATION_CLASSIFIER_EDGE"
+implementation_support = "FENCED_UNREFERENCED_LEGACY_STATE_OWNER"
+evidence_execution_status = "SOURCE_REVERSE_CONSUMER_SEARCH_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "MEMORY_PLANE_REMOVAL_CANDIDATE_ONLY"
+issue = 244
+parent_issue = 39
+fencing_predecessor_issue = 218
+observation_contract_issue = 217
+observation_classifier_issue = 213
+registry_issue = 13
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "memory.duplicate-memory-plane-removal"
+causal_property = "No Smart crate owns a second mutable memory plane; the unreferenced MemoryPlane package is removed after its only reusable classifier idea is either admitted by the Governor observation owner or explicitly rejected."
+current_discriminator = "eliot-memory declares legacy_disposition=RETIRE and no external Cargo/source/runtime consumer exists, but the package remains a workspace member containing Arc<Mutex<State>>, local IDs/revisions, lifecycle, influence, retrieval, delivery and Understanding state."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/244"
+
+[documentation]
+implementation = [
+  "docs/architecture/I04-08-eliot-self-scope-and-immediate-system-experience-bank.md#i48-eliot-self-scope-and-immediate-system-experience-bank",
+  "docs/architecture/I05-24-operational-control-state-versus-cognitive-inheritance.md#i524-operational-control-state-versus-cognitive-inheritance",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions",
+  "docs/architecture/I12-26-memory-admission-and-retrieval-trace.md#i1226-memory-admission-and-retrieval-trace",
+]
+anchors = ["ARCH-MOD-03", "ARCH-MEM-01", "ARCH-MEM-04", "ARCH-SEC-02", "ARCH-OBS-01"]
+
+[current_source]
+confirmed = [
+  "Package metadata already marks implementation_support=STALE, evidence_execution_status=NOT_EXECUTED, legacy_disposition=RETIRE and new_consumers_forbidden=true.",
+  "Exact source search finds zero external use eliot_memory or eliot_memory:: imports and zero package dependencies outside the root workspace declaration.",
+  "The package still combines local identity/revision allocation, capture, persistence, status/lifecycle mutation, influence, retrieval, delivery dedup, history and UnderstandingView state.",
+  "Issue #218 completed fencing/routing only; open #244 owns physical removal after #217/#213 resolve the only bounded classifier donor idea.",
+]
+
+[scope]
+primary_paths = [
+  "crates/smart/eliot-memory/**",
+  "the exact root workspace member and dependency entry",
+  "Cargo.lock only if locked Cargo requires it",
+  "current donor/topology/package-index references that would otherwise route implementation here",
+  "directly relevant observation and removal tests",
+]
+serialized_dependencies = ["#217 observation family contract", "#213 Governor classifier", "#39 duplicate-state parent", "#13 registry", "#11 Product proof"]
+forbidden = [
+  "replacement MemoryPlane, repository, cache, index or compatibility store",
+  "migration of local IDs/revisions/lifecycle/influence/retrieval/delivery state into another Smart crate",
+  "new package consumer or feature",
+  "canonical data migration from an unproved local owner",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Revalidate the complete current consumer and donor denominator."
+how = [
+  "Run Cargo metadata, reverse dependencies, Rust imports, features, generated/config/Skill/runtime/install references and lockfile inventory.",
+  "Classify every reference as current consumer, bounded compatibility fixture, documentary donor evidence or dead reference.",
+  "Confirm #217/#213 either own the revalidated pure classifier behavior or explicitly reject it; copy no local enums or state.",
+]
+
+[[waves]]
+id = "B"
+what = "Remove the package and current routing as one closed topology change."
+how = [
+  "Delete crates/smart/eliot-memory and its root member/dependency.",
+  "Update Cargo.lock only through locked Cargo and only for the removed package closure.",
+  "Update current donor/topology/index metadata through existing owners/generators to mark retirement without rewriting history.",
+]
+
+[[waves]]
+id = "C"
+what = "Prove no hidden state owner or consumer survives."
+how = [
+  "Run default/all-target workspace checks and the current observation contract/classifier proof.",
+  "Search for MemoryPlane, local memory IDs, revision counters, retrieval/delivery state and removed package names in current routes.",
+  "Execute the affected capture-classification Edge only for behavior actually migrated.",
+]
+
+[acceptance]
+criteria = [
+  "Current Cargo/source/runtime/install inventory proves no live consumer of eliot-memory.",
+  "Every retained classifier idea has one current Governor owner/proof or is explicitly rejected.",
+  "The package directory and exact workspace member/dependency are removed.",
+  "No current route, manifest, feature, index, Skill or generated registry advertises the package.",
+  "No Smart crate receives MemoryPlane, local identity/revision, lifecycle, influence, retrieval, delivery, history or Understanding state.",
+  "No compatibility wrapper or fallback reconstructs the removed owner.",
+  "Locked Cargo metadata/check/test/Clippy pass with minimal package-specific lockfile change.",
+  "Current observation classification still preserves ambiguity and exact record-family evidence required by #217/#213.",
+  "#13 resolves canonical memory and observation only to current owners; #39 remains open until system-experience disposition and affected Edge/Product proof complete.",
+  "Package removal alone is not reported as runtime or Product support.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo metadata --locked --all-features --format-version 1",
+  "cargo check --locked --workspace --all-targets",
+  "cargo test --locked --workspace --all-targets --no-fail-fast",
+  "cargo clippy --locked --workspace --all-targets -- -D warnings",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "Run the current capture producer -> Governor observation classifier edge with eliot-memory unavailable, including ambiguous-family preservation."
+product_proof = "Issue #11 remains open."
