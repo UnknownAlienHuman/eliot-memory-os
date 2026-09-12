@@ -1,0 +1,122 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "SUBSTANTIAL_STORE_PRESENT_OWNER_AND_GENERATION_PROOF_INCOMPLETE"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "STORE_GENERATION_EDGE_CANDIDATE"
+issue = 19
+registry_issue = 13
+host_issue = 14
+kernel_issue = 15
+governor_issue = 18
+typed_failure_issue = 451
+product_pulse_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A12-03-one-governed-write-path.md#a123-one-governed-write-path",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+  "docs/architecture/A13-06-data-durability-and-recovery.md#a136-data-durability-and-recovery",
+]
+implementation = [
+  "docs/architecture/I05-01-store-boundary.md#i51-store-boundary",
+  "docs/architecture/I05-09-blobstore.md#i59-blobstore",
+  "docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
+  "docs/architecture/I05-21-transactional-outbox-and-notifications.md#i521-transactional-outbox-and-notifications",
+  "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+]
+anchors = ["ARCH-SEC-02", "ARCH-RES-03", "ARCH-ORD-01", "ARCH-MOD-03", "ARCH-OBS-01"]
+
+[confirmed_gap]
+observations = [
+  "eliot-store-surreal has a real authenticated named-pipe service, semantic readiness check, operation manifest, dispatch and Surreal composition.",
+  "The complete bridge/Surreal process/blob root ownership and generation-cutover proof remains open; package tests do not prove exclusive live database/blob roots or Host-managed process replacement.",
+  "Typed StoreFailure producer/consumer closure is separately open in #451, so current failure/reconciliation behavior is not yet lossless end-to-end.",
+  "No #13 registry binds Store bridge, external Surreal generation and BlobStore cells to exact owners, contracts, proof entrypoints and replacement boundaries.",
+  "Issue #11 has no current Windows proof for bridge/server independent crash, unknown commit, exclusive root release, schema migration rehearsal and compatible rollback/forward repair.",
+]
+discriminator = "Run two bridge/server/blob-owner candidates against the same production roots, kill bridge or Surreal during an admitted write, and attempt server-generation cutover. Current source contains components but no accepted complete owner/exclusivity/reconciliation/cutover Edge proof."
+
+[causal_property]
+statement = "One closed canonical transition commits atomically and idempotently through the sole credentialed Store bridge, one Host-managed immutable Surreal process generation and one active BlobStore root owner; crashes and cutovers preserve exact operation, fence, root and generation identity without creating a second semantic path."
+
+[scope]
+primary_paths = [
+  "bins/eliot-store-surreal/src/**",
+  "crates/storage/eliot-store-api/src/**",
+  "crates/storage/eliot-store-surreal/src/**",
+  "crates/storage/eliot-store-surreal-adapter/src/**",
+  "crates/storage/eliot-blob-api/src/**",
+  "crates/storage/eliot-blob/src/**",
+  "crates/kernel/eliot-host-service/src/**store**",
+  "crates/kernel/eliot-kernel-service/src/**store**",
+  "focused Store/server/blob/generation tests",
+]
+read_only_dependencies = [
+  "crates/governor/eliot-canonical public PreparedTransition contract",
+  "crates/kernel/eliot-ors operation/reconciliation contract",
+  "crates/kernel/eliot-installation generation manifest contract",
+  "crates/storage/eliot-ecxf and backup contracts",
+]
+forbidden_ownership = [
+  "semantic task/WorkScope/Finish or policy decisions in bridge/server/blob",
+  "SurrealDB SDK or credentials outside the declared bridge closure",
+  "raw SurrealQL or generic query/upsert production operation",
+  "second database/blob root writer",
+  "blind retry after unknown commit/effect",
+]
+
+[what_to_do]
+steps = [
+  "Bind Store bridge, external Surreal process generation and BlobStore owner as separate cells with one state/lifecycle owner each through #13.",
+  "Close and enforce the named-operation manifest, transition class, parameter schema, Ordering Scope and maximum effect ceiling.",
+  "Complete #451 typed failure/recovery propagation and exact unknown-outcome reconciliation.",
+  "Prove exclusive database and blob root ownership across start, crash, restart and generation replacement.",
+  "Implement and exercise isolated server-generation rehearsal, quiesce/reconcile, root release, candidate readiness, resume and rollback/forward repair.",
+  "Keep BlobStore durability/reachability/GC/purge ownership distinct from canonical semantic admission and Surreal DB files.",
+  "Run current ECXF export/restore and migration rehearsal without copying live database files as a backup mechanism.",
+]
+
+[how_to_do]
+steps = [
+  "Confine Surreal SDK and credentials to the Store bridge dependency closure and inject exact credential/root/process bindings from Host/Kernal admission.",
+  "Accept only closed named operations bound to the exact PreparedTransition/admission digest, transition class, effect ceiling, State Fence, revision and Ordering Scope heads.",
+  "Reject raw query, generic command/upsert, unknown operation, parameter widening and manifest/mutation/class/effect mismatch before provider mutation.",
+  "Persist operation intent and uncertain outcome in ORS; return immutable final WriteReceipt or exact UNKNOWN_OUTCOME requiring same-operation receipt/reconciliation.",
+  "Use OS-enforced leases/locks and exact filesystem/process identities so two bridge/server generations cannot open one production DB root and two BlobStore owners cannot write one root.",
+  "During update, rehearse against an isolated copy/export, quiesce new admissions, reconcile pending writes, release old roots, start candidate, prove semantic readiness, then resume or execute compatible rollback/forward repair.",
+  "Keep process liveness, transport availability and semantic readiness as independent observations.",
+  "Bind blob durable-byte receipts to exact privacy/retention/erasure domain and owner/root identity; they never prove semantic admission.",
+  "Prove staged orphan GC, missing key, purge, restore and migration cannot revive revoked influence, purged payloads, stale sessions or epochs.",
+]
+
+[acceptance]
+criteria = [
+  "Only the declared Store bridge closure contains SurrealDB SDK and credentials.",
+  "Every mutation is one closed named operation bound to exact transition/admission/class/effect/fence/order identities.",
+  "Raw SurrealQL/generic mutation and command widening are impossible on the production boundary.",
+  "Final WriteReceipt is immutable/idempotent; unknown outcome remains exact ORS recovery state until reconciled.",
+  "Bridge liveness, Surreal process liveness and semantic Store readiness remain separate observations.",
+  "Two processes cannot open the same production DB root and two BlobStore owners cannot write the same blob root.",
+  "Bridge/server/blob crash or restart cannot revive stale generation, epoch, session, operation or effect authority.",
+  "Generation cutover proves quiesce, pending reconciliation, exclusive root release, candidate readiness and resume/rollback/forward repair.",
+  "Blob receipt proves durable bytes only and remains scoped to privacy/retention/erasure domain.",
+  "ECXF export/restore/migration cannot revive revoked influence or purged/missing-key payloads.",
+  "#13 resolves all cells and #11 executes canonical write/restart/cutover/migration Product scenarios.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-store-api -p eliot-store-surreal -p eliot-store-surreal-adapter -p eliot-blob-api -p eliot-blob -p eliot-kernel-service -p eliot-host-service --all-targets",
+  "cargo test --locked -p eliot-store-api -p eliot-store-surreal -p eliot-store-surreal-adapter -p eliot-blob-api -p eliot-blob -p eliot-kernel-service -p eliot-host-service --all-targets",
+  "cargo clippy --locked -p eliot-store-api -p eliot-store-surreal -p eliot-store-surreal-adapter -p eliot-blob-api -p eliot-blob -p eliot-kernel-service -p eliot-host-service --all-targets -- -D warnings",
+  "cargo tree --locked -p eliot-store-surreal --edges normal",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "On Windows, run named-operation mutation, bridge crash, Surreal crash, unknown commit, independent restart, duplicate-root denial, Blob owner denial, server-generation rehearsal/cutover/rollback and ECXF migration/restore under one exact installation."
