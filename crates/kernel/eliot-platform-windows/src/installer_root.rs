@@ -1339,8 +1339,17 @@ impl<'a, A: PrivilegeApi + ?Sized> ScopedRestorePrivilege<'a, A> {
             if let Some(token) = prior_thread {
                 api.close_token(token);
             }
-            if let Err(_restore_code) = restore {
-                std::process::abort();
+            // The thread was never bound to the elevated duplicate, so
+            // returning here is continuation-safe and needs no fail-stop.
+            // Construction still fails: a failed compensating privilege
+            // restore is reported with its exact RestorePrivilege
+            // stage/code, otherwise the primary BindThreadToken failure is
+            // preserved. Never success after a failed restoration.
+            if let Err(restore_code) = restore {
+                return Err(InstallerRootError::Win32 {
+                    stage: InstallerRootStage::RestorePrivilege,
+                    code: restore_code,
+                });
             }
             return Err(InstallerRootError::Win32 {
                 stage: InstallerRootStage::BindThreadToken,
@@ -1358,32 +1367,69 @@ impl<'a, A: PrivilegeApi + ?Sized> ScopedRestorePrivilege<'a, A> {
         })
     }
 
-    fn restore(&mut self) {
+    /// Explicit normal-path restoration with an exact typed outcome.
+    ///
+    /// Restores the duplicate token privilege first, then rebinds the prior
+    /// thread token, then closes owned handles exactly once and disarms. A
+    /// failed privilege restore does not skip the rebind: unbinding the
+    /// duplicate still reduces elevation. The first cleanup failure wins so
+    /// the primary operation outcome held by the caller is never
+    /// overwritten; the caller reports the error instead of success.
+    fn restore_typed(&mut self) -> Result<(), InstallerRootError> {
         if !self.armed {
-            return;
+            return Ok(());
         }
+        let mut failure: Option<InstallerRootError> = None;
         if self.adjusted
-            && self
+            && let Err(code) = self
                 .api
                 .restore_restore_privilege(self.duplicate, self.prior_privilege)
-                .is_err()
         {
-            std::process::abort();
+            failure = Some(InstallerRootError::Win32 {
+                stage: InstallerRootStage::RestorePrivilege,
+                code,
+            });
         }
-        if let Err(_code) = self.api.bind_thread_token(self.prior_thread) {
-            std::process::abort();
+        if let Err(code) = self.api.bind_thread_token(self.prior_thread)
+            && failure.is_none()
+        {
+            failure = Some(InstallerRootError::Win32 {
+                stage: InstallerRootStage::RestoreThreadToken,
+                code,
+            });
         }
         self.api.close_token(self.duplicate);
         if let Some(token) = self.prior_thread {
             self.api.close_token(token);
         }
         self.armed = false;
+        if let Some(error) = failure {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Drop/test shape only; the normal path must use [`Self::restore_typed`].
+    ///
+    /// Drop cannot report a typed error and no bounded containment-evidence
+    /// channel exists in this crate, so a failed emergency restoration while
+    /// the thread may still be bound to the elevated duplicate
+    /// (`SeRestorePrivilege`) retains fail-stop rather than continuing
+    /// under uncertain OS privilege.
+    fn restore(&mut self) {
+        if self.restore_typed().is_err() {
+            std::process::abort();
+        }
     }
 }
 
 #[cfg(windows)]
 impl<A: PrivilegeApi + ?Sized> Drop for ScopedRestorePrivilege<'_, A> {
     fn drop(&mut self) {
+        // Sole emergency path: explicit restore_typed() always disarms, so
+        // an armed Drop means the normal path never completed. Exactly one
+        // restoration attempt; restore() retains fail-stop only on failure.
         if self.armed {
             self.restore();
         }
@@ -1406,10 +1452,29 @@ where
     F: FnOnce() -> Result<T, E>,
     M: FnOnce(InstallerRootError) -> E,
 {
-    let mut guard = ScopedRestorePrivilege::enter(api).map_err(map)?;
+    let mut guard = match ScopedRestorePrivilege::enter(api) {
+        Ok(guard) => guard,
+        Err(error) => return Err(map(error)),
+    };
     let result = f();
-    guard.restore();
-    result
+    // Explicit restoration runs independently of the primary outcome and
+    // reports its exact typed stage/code; success is never reported after
+    // a failed restoration.
+    let restoration = guard.restore_typed();
+    match (result, restoration) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(restoration)) => Err(map(restoration)),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(_primary), Err(_restoration)) => {
+            // No honest single-slot outcome exists here: reporting the
+            // primary would silently ignore the failed restoration, and
+            // reporting the restoration would overwrite the primary
+            // failure, while the thread remains bound to the elevated
+            // impersonation token. Hidden authority confusion must fail
+            // closed, so fail-stop rather than continue impersonated.
+            std::process::abort();
+        }
+    }
 }
 
 #[allow(clippy::needless_return)]
