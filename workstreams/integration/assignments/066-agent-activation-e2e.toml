@@ -1,0 +1,131 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_INTEGRATION_ALLOCATION"
+status = "READY_AFTER_COMPONENT_SLICES"
+implementation_support = "V2_CONTRACT_AND_PARTIAL_SLICES_PRESENT_END_TO_END_EDGE_OPEN"
+evidence_execution_status = "ISSUE_AND_SOURCE_ROUTING_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "AGENT_ACTIVATION_ONBOARDING_EDGE_CANDIDATE_ONLY"
+issue = 66
+related_issue_refs = [77, 977, 1095, 839, 1105, 15, 18]
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "integration.agent-activation-and-onboarding"
+causal_property = "One bounded host activation request creates one Kernel ticket, one Governor semantic read, one exact typed result and one immediate bridge/user disposition; exact replay causes no second semantic read, changed meaning conflicts, and possible submission is reconciled before retry."
+current_discriminator = "Agent Bridge input, Kernel host port, Kernel result receiver and daemon v2 producer are split across #977, #77, #1095 and #839; no accepted integration proof yet shows all seven outcomes, exact replay, restart and no timeout/reclaim loop across the complete Operator-to-Governor path."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/66"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-01-agent-interaction-loop.md#a101-agent-interaction-loop",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I01-11-startup-algorithm.md#i111-startup-algorithm",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md#i71-eliot-bridge-protocol-ebp1",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-02-frame.md#i72-frame",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-17-scope-and-task-onboarding.md#i717-scope-and-task-onboarding",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-AUTH-01", "ARCH-SWM-02", "ARCH-OBS-01", "ARCH-LIFE-01", "ARCH-RES-04", "ARCH-RES-05"]
+
+[current_source]
+confirmed = [
+  "AgentActivationResolutionResult v2 defines seven closed dispositions.",
+  "The complete path is divided among bounded input #977, real Agent Bridge Kernel port #77, Kernel receiver/replay #1095 and daemon producer #839.",
+  "Operator rendering and reconnect remain #1105; Kernel/Governor ownership remains #15/#18.",
+  "Local completion of one slice cannot prove the absence of dropped results, duplicate Governor reads, claim-expiry loops or identity loss across the full path.",
+]
+
+[scope]
+primary_paths = [
+  "finite cross-package activation/onboarding integration fixtures",
+  "exact integration adapters required to compose #977, #77, #1095 and #839",
+  "Operator/Agent Bridge/Kernel/eliotd test entrypoints only where the live edge is exercised",
+  "installed-Windows proof harness inputs owned by #11",
+]
+serialized_dependencies = [
+  "#977 bounded input before JSON allocation",
+  "#77 real KernelHostRequestPort",
+  "#1095 Kernel result receiver and durable replay",
+  "#839 daemon typed-result producer",
+  "#1105 Operator presentation/reconnect",
+  "#15/#18 Kernel and Governor boundaries",
+]
+forbidden = [
+  "second activation ticket, resolver, Session allocator or replay ledger",
+  "trial decoding between protocol versions",
+  "generic timeout substituted for a typed semantic outcome",
+  "retry caused only by claim-lease expiry",
+  "model/transport/process liveness treated as Session, authority or Finish",
+  "automatic GitHub workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Compose one exact request-to-ticket identity chain."
+how = [
+  "Bind Operator/host request, Agent Bridge connection and peer admission, Kernel ticket, activation request digest, principal, deadline, cancellation and StateFence before semantic resolution.",
+  "Reject malformed, oversized, stale, foreign or changed requests before ticket creation or Governor access.",
+  "Ensure one accepted activation request creates one ticket identity and one finite pending record.",
+]
+
+[[waves]]
+id = "B"
+what = "Execute one Governor read and submit one typed result."
+how = [
+  "Invoke the sole Governor semantic resolver exactly once for a newly admitted ticket.",
+  "Preserve Resolved, TaskSelectionRequired, ScopeSelectionRequired, ScopeAmbiguous, NotReady, StaleFence and FailedInternal losslessly.",
+  "Persist possible-submission/accepted state under the same ticket/result identity before any retry or acknowledgement-dependent action.",
+]
+
+[[waves]]
+id = "C"
+what = "Project immediate user outcomes and exact Session creation."
+how = [
+  "Only an exact current Resolved binding may create a Session after Kernel verifies principal, task, WorkScope, revisions, plan, epoch and fence.",
+  "Every other disposition creates no Session/authority and reaches Agent Bridge/Operator immediately with typed recovery or selection fields.",
+  "Human detail remains diagnostic and cannot control mapping, retry or Session allocation.",
+]
+
+[[waves]]
+id = "D"
+what = "Close replay, restart, deadline and no-progress behavior."
+how = [
+  "Exact request/ticket/result replay returns the same response without another Governor read.",
+  "Changed request or result under one identity is IDENTITY_CONFLICT.",
+  "Lost submission acknowledgement or output delivery is reconciled by exact digest before recomputation.",
+  "NotReady is reconsidered only after not_before and a changed named dependency revision; claim expiry alone cannot cause a loop.",
+  "Restart rehydrates the exact pending, submitted, accepted, expired or reconciling state and cannot revive a stale fence/ticket.",
+]
+
+[acceptance]
+criteria = [
+  "One valid bounded activation request produces one exact Kernel ticket and at most one Governor semantic read.",
+  "Malformed, oversized, stale, expired, foreign or wrong-fence input dispatches no semantic operation.",
+  "All seven v2 dispositions survive daemon, Kernel, Agent Bridge and Operator without coercion, omission or generic timeout.",
+  "Only Resolved may create a Session, and only after exact current-owner binding validation.",
+  "Every non-Resolved result creates no Session, authority, capability or task-completion state.",
+  "Exact replay is idempotent and performs no second Governor read; changed same-identity request/result conflicts.",
+  "Possible submission or lost response is reconciled under the same ticket/result identity before retry.",
+  "NotReady requires due time plus changed named dependency revision; lease expiry alone cannot retry.",
+  "Deadline, cancellation and StateFence races yield one stable terminal or exact reconciling disposition.",
+  "Kernel/daemon/bridge restart preserves exact pending/result state and cannot revive stale tickets or generations.",
+  "Typed reason, owner and recovery fields remain machine-readable; log text does not drive control flow.",
+  "No model output, transport success, process liveness or acknowledgement creates Session, authority, Finish or VERIFIED_COMPLETE.",
+  "The production path exercises #977 bounds, #77 port, #1095 receiver and #839 producer together rather than parallel test doubles.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-agent-bridge -p eliot-mcp -p eliot-kernel-service -p eliot-kernel -p eliotd -p eliot-operator --all-targets",
+  "cargo test --locked -p eliot-agent-bridge -p eliot-mcp -p eliot-kernel-service -p eliot-kernel -p eliotd -p eliot-operator --all-targets",
+  "cargo clippy --locked -p eliot-agent-bridge -p eliot-mcp -p eliot-kernel-service -p eliot-kernel -p eliotd -p eliot-operator --all-targets -- -D warnings",
+  "python scripts/verify-agent-bridge-protocol.py",
+  "git diff --check",
+]
+edge_proof = "Run all seven outcomes through real Operator/Agent Bridge/Kernel/eliotd composition, exact replay, changed-result conflict, lost acknowledgement/output, deadline/cancel/fence races and process restarts."
+product_proof = "Issue #11 remains open until the same installed identity completes the Agent Bridge/Operator Product Pulse."
