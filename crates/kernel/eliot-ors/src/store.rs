@@ -34,21 +34,22 @@ use crate::{
     CapabilityIntroductionActivation, CapabilityIntroductionFence, CapabilityIntroductionReceipt,
     DeliveryAcknowledgement, DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity,
     EpochLineage, GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
-    GenerationTransition, GenerationTransitionReceipt, JobCheckpoint, KernelAuthoritySnapshot,
-    OpaqueLabel, OperationalMutationReceipt, OperationalPhase, OperationalRecordContext,
-    OperationalRecordInput, OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage,
-    ProcessEvidenceRecord, ProcessStartReplayAbort, ProcessStartReplayRecord,
-    ProcessStartReplayState, RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition,
-    RecoveryInboxItem, RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope,
-    ReservationRecord, ReservationRequest, ReservationState, ReservedScope, RetryState,
-    ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt,
-    StagedOperation, StateFenceSnapshot, SupervisionLeaseCommitTicket,
-    SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
-    SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
-    SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
-    SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
-    UserBrokerFence, UserBrokerRegistration, UserBrokerRegistrationReceipt, WriterReservationToken,
-    signed_supervision_lease_from_verified, signed_terminal_supervision_lease_from_verified,
+    GenerationTransition, GenerationTransitionReceipt, HostRequestRecord, HostRequestState,
+    JobCheckpoint, KernelAuthoritySnapshot, OpaqueLabel, OperationalMutationReceipt,
+    OperationalPhase, OperationalRecordContext, OperationalRecordInput, OrsError,
+    OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
+    ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
+    RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
+    RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, ReservationRecord,
+    ReservationRequest, ReservationState, ReservedScope, RetryState, ScopeTerminalReceipt,
+    ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation,
+    StateFenceSnapshot, SupervisionLeaseCommitTicket, SupervisionLeasePrepareRequest,
+    SupervisionLeaseProjection, SupervisionLeaseReceipt, SupervisionLeaseReceiptInput,
+    SupervisionLeaseRecord, SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt,
+    SupervisionLeaseStageResolution, SupervisionLeaseStageResolutionDisposition,
+    SupervisionLeaseTicketReconciliation, UserBrokerFence, UserBrokerRegistration,
+    UserBrokerRegistrationReceipt, WriterReservationToken, signed_supervision_lease_from_verified,
+    signed_terminal_supervision_lease_from_verified,
 };
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("ors_meta_v1");
@@ -84,6 +85,7 @@ const SUPERVISION_LEASE_STAGE_RESOLUTIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_stage_resolutions_v1");
 const STORE_REBIND_REPLAY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_rebind_replay_v1");
+const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY: &str = "supervision_stage_resolution_schema";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1: &str = "eliot.ors.supervision-stage-resolution.v1";
@@ -326,6 +328,33 @@ pub trait OperationalRecoveryStore: Send + Sync {
         scopes: &[crate::OrderingScope],
         successor: &EpochLineage,
     ) -> Result<(), OrsError>;
+    /// Stages one P-04 host-request operation before any acknowledgement.
+    ///
+    /// An exact replay under the same operation/request identity returns the
+    /// durable record unchanged; a changed binding fails with
+    /// [`OrsError::HostRequestIdentityConflict`].
+    fn stage_host_request(
+        &self,
+        record: &crate::HostRequestRecord,
+    ) -> Result<crate::HostRequestRecord, OrsError>;
+    /// Advances one staged host-request operation to its next mechanical state.
+    ///
+    /// An exact repeat of an applied advance returns the durable record
+    /// unchanged. An unknown operation returns `Ok(None)`; the caller stages
+    /// first and this method never invents a record.
+    fn advance_host_request(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        target: crate::HostRequestState,
+        result_digest: Option<&str>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Loads one host-request operation by exact operation/request identity.
+    fn load_host_request(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
 }
 
 /// redb-backed ORS implementation. Every mutating method commits one short transaction.
@@ -352,6 +381,14 @@ fn same_store_rebind_binding(
         && left.job_name == right.job_name
         && left.generation == right.generation
         && left.authority_epoch == right.authority_epoch
+}
+
+impl persistence_codec::PersistedValue for HostRequestRecord {
+    const RECORD_TYPE: &'static str = "host_request";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
 }
 
 impl RedbRecoveryStore {
@@ -761,6 +798,162 @@ impl RedbRecoveryStore {
             records.push(record);
         }
         Ok(records)
+    }
+
+    /// Stages one P-04 host-request operation before any acknowledgement.
+    ///
+    /// Persist-before-ack: the `Requested` record is durably inserted before
+    /// the caller may acknowledge admission or route the request. An exact
+    /// replay under the same operation/request identity returns the durable
+    /// record unchanged with its current state and result; a changed payload
+    /// or binding under the same identity fails with
+    /// [`OrsError::HostRequestIdentityConflict`].
+    pub fn stage_host_request(
+        &self,
+        record: &crate::HostRequestRecord,
+    ) -> Result<crate::HostRequestRecord, OrsError> {
+        record.validate()?;
+        if record.state != crate::HostRequestState::Requested {
+            return Err(OrsError::InvalidField {
+                field: "host_request_state",
+                reason: "staging requires the requested state",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing = {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            let key = record.record_key();
+            if let Some(existing) = table.get(key.as_str()).map_err(storage)? {
+                let existing: crate::HostRequestRecord = decode(existing.value())?;
+                existing.validate()?;
+                if !existing.same_binding(record) {
+                    return Err(OrsError::HostRequestIdentityConflict {
+                        operation_id: record.operation_id.as_str().to_owned(),
+                        request_digest: record.request_digest.clone(),
+                    });
+                }
+                Some(existing)
+            } else {
+                let payload = encode(record)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+                None
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(existing.unwrap_or_else(|| record.clone()))
+    }
+
+    /// Loads one host-request operation by exact operation/request identity.
+    pub fn load_host_request(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(HOST_REQUESTS).map_err(storage)?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        table
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: crate::HostRequestRecord = decode(value.value())?;
+                record.validate()?;
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Advances one staged host-request operation to its next mechanical state.
+    ///
+    /// The transition table owns the anti-blind-retry fence: once an
+    /// operation reaches `PossiblyEffected` it can only move forward to
+    /// `ResultReceived` through reconciliation evidence, or to `Unknown` /
+    /// `Reconciling`. The ORS write transaction assigns the monotonic commit
+    /// order atomically when the operation first reaches a terminal state;
+    /// the caller never supplies it.
+    pub fn advance_host_request(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        target: crate::HostRequestState,
+        result_digest: Option<&str>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        if existing.state == target {
+            let replay_matches = match (&existing.result_digest, result_digest) {
+                (Some(current), Some(replayed)) => current.as_str() == replayed,
+                (None, None) => true,
+                _ => false,
+            };
+            if !replay_matches {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: request_digest.to_owned(),
+                });
+            }
+            return Ok(Some(existing));
+        }
+        existing.state.transition_to(target)?;
+        let effective_result = match (target, &existing.result_digest, result_digest) {
+            (crate::HostRequestState::ResultReceived, _, Some(result)) => Some(result.to_owned()),
+            (crate::HostRequestState::ResultReceived, _, None) => {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_result_digest",
+                    reason: "received requires a result digest",
+                });
+            }
+            (crate::HostRequestState::Terminal, Some(current), None) => Some(current.clone()),
+            (crate::HostRequestState::Terminal, Some(current), Some(replayed))
+                if current.as_str() == replayed =>
+            {
+                Some(current.clone())
+            }
+            (crate::HostRequestState::Terminal, None, None) => None,
+            (crate::HostRequestState::Terminal, _, _) => {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: request_digest.to_owned(),
+                });
+            }
+            (_, _, Some(_)) => {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_result_digest",
+                    reason: "result only for received or terminal states",
+                });
+            }
+            (_, _, None) => None,
+        };
+        let mut next = existing.clone();
+        next.state = target;
+        next.result_digest = effective_result;
+        if target.is_terminal() && next.commit_order == 0 {
+            next.commit_order = Self::next_operational_order(&write)?;
+        }
+        next.validate()?;
+        if next != existing {
+            let payload = encode(&next)?;
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
     }
 
     #[cfg(feature = "test-support")]
@@ -4450,6 +4643,37 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         }
         write.commit().map_err(storage)
     }
+
+    fn stage_host_request(
+        &self,
+        record: &crate::HostRequestRecord,
+    ) -> Result<crate::HostRequestRecord, OrsError> {
+        RedbRecoveryStore::stage_host_request(self, record)
+    }
+
+    fn advance_host_request(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        target: crate::HostRequestState,
+        result_digest: Option<&str>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::advance_host_request(
+            self,
+            operation_id,
+            request_digest,
+            target,
+            result_digest,
+        )
+    }
+
+    fn load_host_request(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::load_host_request(self, operation_id, request_digest)
+    }
 }
 
 /// Single coordinator facade. It owns no semantic policy and delegates one durable transition.
@@ -4554,6 +4778,35 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         writer_epoch: &EpochIdentity,
     ) -> Result<ReservationRecord, OrsError> {
         self.store.release(token, writer_epoch)
+    }
+
+    /// Stages one P-04 host-request operation before any acknowledgement.
+    pub fn stage_host_request(
+        &self,
+        record: &HostRequestRecord,
+    ) -> Result<HostRequestRecord, OrsError> {
+        self.store.stage_host_request(record)
+    }
+
+    /// Advances one staged host-request operation to its next mechanical state.
+    pub fn advance_host_request(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        target: HostRequestState,
+        result_digest: Option<&str>,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store
+            .advance_host_request(operation_id, request_digest, target, result_digest)
+    }
+
+    /// Loads one host-request operation by exact operation/request identity.
+    pub fn load_host_request(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.load_host_request(operation_id, request_digest)
     }
 }
 

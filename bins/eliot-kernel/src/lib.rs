@@ -20,6 +20,7 @@ mod control_plane;
 mod kernel_build_contract;
 mod kernel_config;
 mod process_execution;
+mod process_execution_client;
 mod supervision_lease_authority;
 
 pub(crate) use kernel_build_contract::PreparedAuthorityMaterial;
@@ -40,6 +41,7 @@ use process_execution::{
     ProcessStartGuard, ProcessStartPorts, RESERVED_STORE_SNAPSHOT_HEAD, ValidationContextSlot,
     authorize_process_owner, project_store_snapshot, run_process_start,
 };
+pub use process_execution_client::process_execution_client;
 #[cfg(windows)]
 pub use supervision_lease_authority::{
     KernelSupervisionLeaseAuthority, ProtectedSupervisionLeaseSigner,
@@ -77,6 +79,8 @@ mod front_door_session;
 mod generation_control;
 mod generation_recovery;
 mod health_view;
+#[cfg(windows)]
+mod host_request_route;
 mod runtime_identity;
 use daemon_session_guard::caller_binding;
 #[cfg(all(windows, test))]
@@ -89,6 +93,8 @@ use daemon_supervision::{
 use generation_recovery::OrsGenerationCoordinator;
 #[cfg(test)]
 use generation_recovery::update_handshake_policy;
+#[cfg(windows)]
+use host_request_route::HostRequestOperationRef;
 use runtime_identity::stable_owner_principal_digest;
 #[cfg(windows)]
 use runtime_identity::{
@@ -167,6 +173,7 @@ use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{
     AGENT_BRIDGE_ACTIVATION_OPERATION, AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
     AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationResolutionDecision,
+    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentBridgeActivationDenialCode,
     AgentBridgeActivationDisposition, AgentBridgeActivationFence, AgentBridgeActivationRequest,
     AgentBridgeActivationResponse, AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration,
@@ -309,6 +316,24 @@ pub struct KernelComposition {
     agent_activation_pending: Mutex<AgentActivationPendingState>,
     #[cfg(windows)]
     agent_activation_changed: tokio::sync::Notify,
+    /// Full typed semantic resolution results retained verbatim under their
+    /// exact ticket identities, keyed by ticket id.
+    ///
+    /// Every one of the seven closed dispositions shares one
+    /// exact-replay/conflict ledger here, independent of the legacy
+    /// success-only decision ledger on the pending entry. Only a `Resolved`
+    /// disposition can later yield a transport Session, and that Session is
+    /// created exactly once by the bridge activation path. The map lives
+    /// beside the pending table (rather than inside its entries) so the
+    /// ticket ledger shape stays additive.
+    #[cfg(windows)]
+    agent_activation_results: Mutex<BTreeMap<String, AgentActivationResolutionResult>>,
+    /// Connection-scoped index of staged P-04 host-request operations. The
+    /// durable ORS record is the owner; this index only lets disconnect revoke
+    /// fence the presenting connection's still-uncertain operations to
+    /// `Unknown` without enumerating the store.
+    #[cfg(windows)]
+    host_request_connection_index: Mutex<BTreeMap<String, Vec<HostRequestOperationRef>>>,
 }
 
 #[cfg(windows)]
@@ -1136,11 +1161,9 @@ impl KernelComposition {
             .as_ref()
             .map_or_else(
                 || {
-                    struct NoopAttachment;
-                    impl CanonicalStoreAttachmentTransaction for NoopAttachment {
-                        fn commit(self: Box<Self>) {}
-                    }
-                    Ok(Box::new(NoopAttachment) as Box<dyn CanonicalStoreAttachmentTransaction>)
+                    Err(KernelBuildError::Service(
+                        "process authority is required before canonical Store rebind".to_owned(),
+                    ))
                 },
                 |pg| {
                     pg.replace_canonical_store(Arc::clone(&gateway))

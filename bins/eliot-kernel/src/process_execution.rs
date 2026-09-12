@@ -1440,7 +1440,7 @@ impl KernelComposition {
         })
     }
 
-    fn retain_process_path_proof(
+    pub(crate) fn retain_process_path_proof(
         &self,
         admission: &ProcessExecutionAdmissionRequest,
     ) -> Result<ProcessPathProof, ProcessExecutionError> {
