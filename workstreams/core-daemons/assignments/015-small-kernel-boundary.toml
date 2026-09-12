@@ -1,0 +1,124 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "SUBSTANTIAL_KERNEL_PRESENT_BOUNDARY_AND_RECOVERY_PROOF_INCOMPLETE"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "SMALL_KERNEL_EDGE_CANDIDATE"
+issue = 15
+registry_issue = 13
+host_issue = 14
+governor_issue = 18
+store_issue = 19
+product_pulse_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A02-02-two-level-runtime.md#a22-two-level-runtime",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+  "docs/architecture/A13-03-module-supervision-and-doctor.md#a133-module-supervision-and-doctor",
+  "docs/architecture/A13-05-bounded-resources-and-control-reserve.md#a135-bounded-resources-and-control-reserve",
+]
+implementation = [
+  "docs/architecture/I01-02-mandatory-runtime-processes.md#i12-mandatory-runtime-processes",
+  "docs/architecture/I06-04-kernel.md#i64-kernel",
+  "docs/architecture/I06-05-governor.md#i65-governor",
+  "docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md#i71-eliot-bridge-protocol-ebp1",
+  "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+]
+anchors = ["ARCH-MOD-01", "ARCH-AUTH-01", "ARCH-SEC-02", "ARCH-RES-01", "ARCH-OBS-01"]
+
+[confirmed_gap]
+observations = [
+  "bins/eliot-kernel contains real authenticated transport, Host binding, authority/fence, ORS, generation, daemon/store bootstrap and process-management code.",
+  "The production composition remains broad and co-locates front door, authority projection, ORS, Control Reserve, generation routing, store/daemon/process adapters and large in-package test/harness surfaces.",
+  "Several live child gaps remain open: typed StoreFailure consumption #451, activation-result receiver #1115, P-07 authority lifecycle #1110, Agent Bridge port #77 and Doctor/research/native process edges.",
+  "No #13 registry yet proves exact state/lifecycle owners, public contract digests and independent proof entrypoints for every Kernel cell.",
+  "Issue #11 has no current exact Windows proof that eliotd loss, generation cutover, stale reconnect, unknown commit and Control Reserve saturation preserve one authority owner and recovery path.",
+]
+discriminator = "Kill or replace eliotd during an admitted transition, then replay an old generation and inject Store unknown outcome plus normal-lane saturation. Current source has partial mechanisms but no accepted complete Edge/Product proof demonstrating one surviving Kernel authority/recovery contour."
+
+[causal_property]
+statement = "Kernel is the minimal failure-surviving mechanical owner of authenticated front door, authority epoch/fence, ORS, Control Reserve, generation routing, canonical-transition validation and Recovery View; it never owns task semantics, broad retrieval, provider policy or canonical meaning."
+
+[scope]
+primary_paths = [
+  "bins/eliot-kernel/src/main.rs",
+  "bins/eliot-kernel/src/lib.rs",
+  "bins/eliot-kernel/src/front_door*/**",
+  "bins/eliot-kernel/src/daemon_*/**",
+  "bins/eliot-kernel/src/store_*/**",
+  "crates/kernel/eliot-kernel-core/src/**",
+  "crates/kernel/eliot-kernel-service/src/**",
+  "crates/kernel/eliot-ors/src/**",
+  "crates/kernel/eliot-generation/src/**",
+  "crates/kernel/eliot-control-reserve/src/**",
+  "focused Kernel boundary/recovery tests",
+]
+read_only_dependencies = [
+  "bins/eliot-host public lifecycle contract",
+  "bins/eliotd public semantic/transition contracts",
+  "crates/storage/eliot-store-api public named-operation and receipt contracts",
+  "crates/foundation/eliot-protocol and runtime contracts",
+]
+forbidden_ownership = [
+  "task, WorkScope, Context, plan or Finish semantics",
+  "provider/model/MCP policy or broad retrieval",
+  "SurrealDB SDK/raw query or canonical semantic store client",
+  "testd/instrument execution or generic shell",
+  "second Host, Governor or Store state owner",
+]
+
+[what_to_do]
+steps = [
+  "Make bins/eliot-kernel a thin process/composition root over explicit Kernel capability cells.",
+  "Freeze one state owner for authenticated front door/session binding, Authority Epoch/fencing, ORS, Control Reserve, Generation Registry/cutover, transition mechanical validation, Recovery View and process-generation lifecycle adapter.",
+  "Move test-only R13/OS/process harnesses to Instrument/conformance boundaries where an independent seam exists.",
+  "Complete the open typed producer/consumer edges without absorbing their semantic owners.",
+  "Prove eliotd loss, stale generation, unknown commit, saturation and generation replacement independently from Product self-report.",
+  "Bind every Kernel cell and proof surface through #13.",
+]
+
+[how_to_do]
+steps = [
+  "Inventory every Kernel mutable state and entrypoint; assign one owner and explicit persistence/recovery boundary before extraction.",
+  "Keep one canonical transition path: eliotd supplies one immutable PreparedTransition, Kernel rechecks identity/epoch/fence/order/class/effect ceiling, Store executes one named operation and returns one receipt.",
+  "Persist accepted operations/checkpoints/generation and uncertain outcomes in ORS before acknowledging state transitions.",
+  "On eliotd generation loss, revoke daemon-issued leases and fence the old generation immediately while retaining cancellation, ORS and Recovery View.",
+  "Require old generation/session/process reconnects to prove exact current generation, epoch, artifact, connection and State Fence; reject stale publication/effects.",
+  "Reserve independent bounded Control Reserve capacity for cancellation, fencing, health and recovery; normal-lane saturation cannot consume it.",
+  "Keep Recovery View bounded and usable without eliotd, models, graph, broad canonical reads or provider adapters.",
+  "Treat unknown commit/effect as exact-operation reconciliation state and never blind retry or convert it to unavailable/success.",
+  "Move generic process/test execution out of Kernel production closure and retain only admitted generation lifecycle mechanics.",
+  "Add negative dependency/source guards against semantic, model, MCP, Store SDK/raw-query and Instrument ownership leakage.",
+]
+
+[acceptance]
+criteria = [
+  "The binary composition root owns no hidden semantic mutable state and every Kernel cell has one state/lifecycle owner.",
+  "Hard dependency closure from Kernel outward is acyclic, bounded and excludes task/Context/provider/Store-SDK/Instrument semantics.",
+  "eliotd loss immediately revokes/fences old daemon authority while Kernel retains ORS, cancellation, health and Recovery View.",
+  "Old epoch/generation/session cannot reconnect, publish effects, checkpoint or become current after cutover.",
+  "Every accepted pending operation is enumerable and reconcilable before writer readiness.",
+  "PreparedTransition/admission digest, class and effect ceiling remain exact across daemon, Kernel and Store; mismatch fails closed.",
+  "Unknown commit/effect remains exact-operation recovery state and cannot trigger blind retry.",
+  "Control Reserve remains usable under normal-lane saturation and its own loss is explicit/quarantining.",
+  "Generation replacement closes old process/Job Object lineage before activating the replacement and leaves no orphan.",
+  "Recovery View remains available without eliotd/model/graph/UI broad dependencies.",
+  "#13 resolves each cell to contract/proof/Product Pulse and #11 executes daemon-loss, stale reconnect, saturation, unknown-outcome and cutover scenarios.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-kernel -p eliot-kernel-core -p eliot-kernel-service -p eliot-ors -p eliot-generation -p eliot-control-reserve --all-targets",
+  "cargo test --locked -p eliot-kernel -p eliot-kernel-core -p eliot-kernel-service -p eliot-ors -p eliot-generation -p eliot-control-reserve --all-targets",
+  "cargo clippy --locked -p eliot-kernel -p eliot-kernel-core -p eliot-kernel-service -p eliot-ors -p eliot-generation -p eliot-control-reserve --all-targets -- -D warnings",
+  "python scripts/audit-runtime-source-hygiene.py",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "On Windows, execute eliotd kill/restart, stale generation reconnect/effect, Store unknown commit, Control Reserve saturation, Kernel generation cutover, cancellation and no-orphan reconciliation under one exact Host installation."
