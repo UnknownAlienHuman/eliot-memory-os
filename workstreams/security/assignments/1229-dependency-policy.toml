@@ -1,0 +1,134 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "DOCUMENTED_POLICY_WITHOUT_CURRENT_EXECUTION_OWNER"
+evidence_execution_status = "SOURCE_AND_GATE_INSPECTION_EXECUTED_POLICY_NOT_EXECUTED"
+proof_ceiling = "DEPENDENCY_ADMISSION_AND_ADVISORY_EVIDENCE_CANDIDATE_ONLY"
+issue = 1229
+workflow_issue = 1225
+instrument_issue = 1111
+release_issue = 1227
+registry_issue = 13
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "security.multi-ecosystem-dependency-admission"
+causal_property = "Every admitted third-party dependency has one consumer/owner, exact source/integrity, platform/feature scope, license/advisory disposition, removal/rollback plan and executed evidence; unavailable or stale analysis cannot become PASS."
+current_discriminator = "deny.toml and DEPENDENCY_POLICY.md exist, but verify.ps1, just quick and manual workflows do not execute cargo-deny/audit; the only explicit verifier path remains in legacy eliot-engine."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1229"
+
+[documentation]
+policy = ["docs/DEPENDENCY_POLICY.md"]
+implementation = [
+  "docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
+  "docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
+  "docs/architecture/I15-09-source-admission-and-executable-supply-chain.md#i159-source-admission-and-executable-supply-chain",
+  "docs/architecture/I18-21-local-and-ci-parity.md#i1821-local-and-ci-parity",
+  "docs/architecture/I18-27-oracle-ownership-and-test-change-governance.md#i1827-oracle-ownership-and-test-change-governance",
+]
+anchors = ["ARCH-SEC-01", "ARCH-GROUND-01", "ARCH-MOD-03", "ARCH-OBS-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "verify.ps1 executes documentation/source checks, Cargo metadata, fmt and optional cargo check only.",
+  "just quick and just verify do not execute license, source or current advisory policy.",
+  "manual workflows do not run cargo deny or cargo audit.",
+  "deny.toml allows a closed license set, denies wildcard dependencies and unknown registries/Git sources, and has no advisory ignores.",
+  "cargo deny/audit execution concepts are primarily retained in legacy eliot-engine.",
+  "no current manifest pins scanner executable identity or advisory snapshot/freshness.",
+  "NuGet, Python, Node/MCPB and external executable inputs are owned by separate lock contours but lack one combined admission denominator.",
+]
+
+[scope]
+primary_paths = [
+  "deny.toml and exact dependency-policy tool/input manifests",
+  "scripts/verify.ps1 and Justfile only for explicit profile entrypoints",
+  ".github/workflows/** only in coordination with #1225",
+  "current Rust/NuGet/Python/Node lock and integrity inputs owned by their contours",
+  "docs/DEPENDENCY_POLICY.md only for implemented profile/receipt documentation",
+  "dependency-policy verifier and finite fixtures",
+  "legacy eliot-engine verifier references only for migration/removal",
+]
+serialized_dependencies = ["#1225 workflow inputs", "#1111 Instrument", "#1217 Node/MCPB", "#1137 NuGet", "#1227 release", "#13 registry", "#1189 legacy removal", "#11 Product proof"]
+forbidden = [
+  "automatic workflow triggers",
+  "unpinned latest scanner installation",
+  "broad network access in normal runtime",
+  "committed dated dependency reports",
+  "arbitrary package feeds or hidden exceptions",
+  "support or Product promotion from a policy scan",
+]
+
+[[waves]]
+id = "A"
+what = "Define one current dependency inventory and receipt."
+how = [
+  "Account for direct Rust dependencies, standalone packages, locked NuGet/Python/Node inputs and separately shipped external executables.",
+  "Bind each dependency to current consumer, owner, exact version/source/integrity, platform/features, public-contract exposure, failure, update/removal and rollback.",
+  "Bind each receipt to source tree, locks, policy, scanner/tool identities, advisory source/freshness, selected targets/features/ecosystems, findings and exceptions.",
+]
+
+[[waves]]
+id = "B"
+what = "Make Rust dependency policy executable outside legacy engine."
+how = [
+  "Select one owner for licenses/bans/sources and one explicit advisory verdict owner.",
+  "Pin scanner executable/version/source/digest; PATH presence and cargo install latest are not evidence.",
+  "Execute deny.toml against exact Cargo manifests, Cargo.lock, targets, features, resolver and toolchain, including standalone and release-only packages.",
+]
+
+[[waves]]
+id = "C"
+what = "Integrate other ecosystems without duplicate lock ownership."
+how = [
+  "Consume checked NuGet locks from #1225/#1137, hash-locked Python inputs from #1225, and Node/package integrity/runtime identity from #1217.",
+  "Inventory external executables such as SurrealDB with catalogue/digest/license/advisory/trust/consumer/removal data.",
+  "Keep each ecosystem lock owner authoritative while this cell owns cross-ecosystem admission evidence only.",
+]
+
+[[waves]]
+id = "D"
+what = "Separate offline source checks from current advisory evidence."
+how = [
+  "Keep PASS, FINDINGS, INCOMPLETE, TOOL_UNAVAILABLE, ADVISORY_SOURCE_UNAVAILABLE, STALE, CONFLICTED and NOT_EXECUTED distinct.",
+  "Offline profile may prove available lock/license/source facts but cannot claim current advisory coverage.",
+  "Manual current-advisory profile records exact advisory snapshot/retrieval evidence and emits bounded SBOM/license/advisory artifacts.",
+  "Exceptions are package/version/advisory/target/feature scoped, owned, expiring and invalidated by drift.",
+]
+
+[acceptance]
+criteria = [
+  "One current inventory accounts for every selected Rust, NuGet, Python, Node and external-executable dependency.",
+  "Every dependency has a current consumer/owner, exact identity, platform/feature scope and removal/rollback disposition.",
+  "Rust policy executes outside legacy eliot-engine through one pinned scanner identity.",
+  "Wildcard, unknown source and disallowed-license fixtures fail under deny.toml.",
+  "Tool absence, stale/unavailable advisory data, incomplete target/features and lock drift are explicit non-PASS states.",
+  "Advisory/license/source exceptions are exact, owned, expiring and fail on expiry or identity drift.",
+  "NuGet/Python/Node results consume their existing exact lock/integrity inputs rather than parallel manifests.",
+  "External executables have exact catalogue/digest/license/advisory/trust/consumer/removal records.",
+  "Offline and current-advisory profiles have distinct proof ceilings.",
+  "Canonical receipt binds every selected input, tool, advisory snapshot and denominator.",
+  "just quick remains bounded/offline while an explicit dependency-policy entrypoint exists and is called by the appropriate manual workflow.",
+  "Generated reports are run/release artifacts, not committed status files.",
+  "Legacy engine can be removed without losing the only executable dependency-policy path.",
+  "Policy success cannot create runtime, release-acceptance or Product support.",
+]
+
+[verification]
+commands = [
+  "cargo deny check advisories bans licenses sources --all-features",
+  "python scripts/verify-dependency-policy.py --self-test",
+  "python scripts/verify-dependency-policy.py --root . --profile offline-source",
+  "python scripts/verify-dependency-policy.py --root . --profile current-advisories",
+  "cargo metadata --locked --all-features --format-version 1",
+  "dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode",
+  "python -m pip install --disable-pip-version-check --no-input --require-hashes -r scripts/requirements-verification.txt",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "Execute the current-advisory and release dependency profiles against one exact source/release candidate and preserve the canonical receipt/artifacts."
+product_proof = "Issue #11 remains open; dependency admission cannot establish runtime or Product behavior."
