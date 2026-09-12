@@ -112,6 +112,14 @@ pub enum ClaudeSidecarError {
     UnknownPermission(String),
     #[error("result is candidate-only; task/finish authority not held")]
     NotAuthority,
+    #[error("frame out of order: expected sequence {expected}, got {got}")]
+    OutOfOrder { expected: u64, got: u64 },
+    #[error("bad digest: {0}")]
+    BadDigest(String),
+    #[error("unknown outcome requires reconcile before retry/route-switch: attempt {attempt_id}")]
+    UnknownOutcomeRequiresReconcile { attempt_id: String },
+    #[error("admission denied: {0}")]
+    AdmissionDenied(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +333,12 @@ pub struct ClaudeSidecarRequest {
     /// Launch plan (required for `Query`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_plan: Option<ClaudeSidecarLaunchPlan>,
+    /// Optional monotonic frame sequence. `None` preserves Wave-1 backward
+    /// compatibility (old NDJSON without `sequence` still parses via serde
+    /// default). Ordering across frames is enforced by the caller via
+    /// [`validate_monotonic`]; `validate()` accepts any value in isolation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
 }
 
 impl ClaudeSidecarRequest {
@@ -426,6 +440,10 @@ pub struct ClaudeSidecarResponse {
     /// Error detail (present only for `Error`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Optional monotonic frame sequence (serde default preserves Wave-1
+    /// compatibility; cross-frame order enforced via [`validate_monotonic`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
 }
 
 impl ClaudeSidecarResponse {
@@ -579,6 +597,637 @@ pub fn is_managed_agents_route(route_id: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Local dependency-free 256-bit digest (SHA-256 from scratch)
+// ---------------------------------------------------------------------------
+
+/// Deterministic local 256-bit digest over raw bytes, hex-encoded as 64
+/// lowercase characters.
+///
+/// This is a small self-contained SHA-256 compression implementation kept
+/// inside this crate so evidence lineage, idempotency digests, and
+/// normalization never depend on a new external crate. It computes the real
+/// digest over the input bytes; no value is canned or stored.
+pub fn claude_local_digest_256_hex(bytes: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a_2f98, 0x7137_4491, 0xb5c0_fbcf, 0xe9b5_dba5, 0x3956_c25b, 0x59f1_11f1,
+        0x923f_82a4, 0xab1c_5ed5, 0xd807_aa98, 0x1283_5b01, 0x2431_85be, 0x550c_7dc3,
+        0x72be_5d74, 0x80de_b1fe, 0x9bdc_06a7, 0xc19b_f174, 0xe49b_69c1, 0xefbe_4786,
+        0x0fc1_9dc6, 0x240c_a1cc, 0x2de9_2c6f, 0x4a74_84aa, 0x5cb0_a9dc, 0x76f9_88da,
+        0x983e_5152, 0xa831_c66d, 0xb003_27c8, 0xbf59_7fc7, 0xc6e0_0bf3, 0xd5a7_9147,
+        0x06ca_6351, 0x1429_2967, 0x27b7_0a85, 0x2e1b_2138, 0x4d2c_6dfc, 0x5338_0d13,
+        0x650a_7354, 0x766a_0abb, 0x81c2_c92e, 0x9272_2c85, 0xa2bf_e8a1, 0xa81a_664b,
+        0xc24b_8b70, 0xc76c_51a3, 0xd192_e819, 0xd699_0624, 0xf40e_3585, 0x106a_a070,
+        0x19a4_c116, 0x1e37_6c08, 0x2748_774c, 0x34b0_bcb5, 0x391c_0cb3, 0x4ed8_aa4a,
+        0x5b9c_ca4f, 0x682e_6ff3, 0x748f_82ee, 0x78a5_636f, 0x84c8_7814, 0x8cc7_0208,
+        0x90be_fffa, 0xa450_6ceb, 0xbef9_a3f7, 0xc671_78f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09_e667, 0xbb67_ae85, 0x3c6e_f372, 0xa54f_f53a, 0x510e_527f, 0x9b05_688c,
+        0x1f83_d9ab, 0x5be0_cd19,
+    ];
+    let mut msg = bytes.to_vec();
+    let bit_len = (bytes.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0_u32; 64];
+        for (i, slot) in w.iter_mut().enumerate().take(16) {
+            let j = i * 4;
+            *slot = (u32::from(chunk[j]) << 24)
+                | (u32::from(chunk[j + 1]) << 16)
+                | (u32::from(chunk[j + 2]) << 8)
+                | u32::from(chunk[j + 3]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for v in h {
+        for shift in [28_u32, 24, 20, 16, 12, 8, 4, 0] {
+            let nibble = ((v >> shift) & 0xF) as usize;
+            out.push(HEX[nibble] as char);
+        }
+    }
+    out
+}
+
+/// True iff `s` is exactly 64 lowercase hex characters.
+pub fn is_valid_64_hex_digest(s: &str) -> bool {
+    if s.len() != 64 {
+        return false;
+    }
+    s.bytes().all(|b| {
+        b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Sequence / order validation
+// ---------------------------------------------------------------------------
+
+/// Frame order binding: monotonic sequence plus owning request identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeFrameOrder {
+    pub sequence: u64,
+    pub request_id: String,
+}
+
+impl ClaudeFrameOrder {
+    pub fn validate(&self) -> Result<(), ClaudeSidecarError> {
+        if self.request_id.trim().is_empty() {
+            return Err(ClaudeSidecarError::EmptyField("request_id"));
+        }
+        Ok(())
+    }
+}
+
+/// Enforce strict monotonic order: `next` must be exactly `prev + 1`, or `0`
+/// when `prev` is `None`. Any replay, gap, or reorder is rejected.
+///
+/// `ClaudeSidecarRequest::sequence` and `ClaudeSidecarResponse::sequence` are
+/// optional for Wave-1 NDJSON compatibility; callers track the previous
+/// accepted sequence per stream and apply this helper before allocation or
+/// forwarding. Frame size is still checked first inside `from_ndjson_line`.
+pub fn validate_monotonic(prev: Option<u64>, next: u64) -> Result<(), ClaudeSidecarError> {
+    let expected = match prev {
+        None => 0,
+        Some(p) => match p.checked_add(1) {
+            Some(e) => e,
+            None => {
+                // `prev == u64::MAX` has no valid successor; every `next`
+                // is out of order.
+                return Err(ClaudeSidecarError::OutOfOrder {
+                    expected: 0,
+                    got: next,
+                });
+            }
+        },
+    };
+    if next == expected {
+        Ok(())
+    } else {
+        Err(ClaudeSidecarError::OutOfOrder {
+            expected,
+            got: next,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Raw-evidence preservation (immutable handles, explicit omission)
+// ---------------------------------------------------------------------------
+
+/// Immutable handle over preserved raw bytes: digest plus length. The bytes
+/// themselves live outside this crate; only the digest travels here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawEvidenceHandle {
+    pub digest: String,
+    pub byte_len: u64,
+    pub truncated: bool,
+}
+
+impl RawEvidenceHandle {
+    pub fn validate(&self) -> Result<(), ClaudeSidecarError> {
+        if !is_valid_64_hex_digest(&self.digest) {
+            return Err(ClaudeSidecarError::BadDigest(self.digest.clone()));
+        }
+        Ok(())
+    }
+}
+
+/// Explicit bounded omission: why bytes were not retained plus the digest of
+/// the full bytes so a reconciler can still name what was dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OmissionHandle {
+    pub reason: String,
+    pub manifest_digest: String,
+}
+
+impl OmissionHandle {
+    pub fn validate(&self) -> Result<(), ClaudeSidecarError> {
+        if self.reason.trim().is_empty() {
+            return Err(ClaudeSidecarError::EmptyField("reason"));
+        }
+        if !is_valid_64_hex_digest(&self.manifest_digest) {
+            return Err(ClaudeSidecarError::BadDigest(self.manifest_digest.clone()));
+        }
+        Ok(())
+    }
+}
+
+/// Either preserved evidence or an explicit omission. Never carries raw bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreservedOrOmitted {
+    Preserved(RawEvidenceHandle),
+    Omitted(OmissionHandle),
+}
+
+/// Preserve `output` as a digest handle, or omit it explicitly when it
+/// exceeds `max_bytes`. The digest is always computed over the full bytes
+/// with [`claude_local_digest_256_hex`]; bytes are never stored here.
+pub fn preserve_or_omit(
+    output: &str,
+    max_bytes: usize,
+) -> Result<PreservedOrOmitted, ClaudeSidecarError> {
+    let digest = claude_local_digest_256_hex(output.as_bytes());
+    let byte_len = output.len() as u64;
+    if output.len() > max_bytes {
+        Ok(PreservedOrOmitted::Omitted(OmissionHandle {
+            reason: "output exceeds max_bytes".to_owned(),
+            manifest_digest: digest,
+        }))
+    } else {
+        Ok(PreservedOrOmitted::Preserved(RawEvidenceHandle {
+            digest,
+            byte_len,
+            truncated: false,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation / cleanup model (pure state machine)
+// ---------------------------------------------------------------------------
+
+/// Cancellation request binding one logical attempt to a reason and an
+/// observation timestamp. No thread, process, or lease action happens here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancellationEnvelope {
+    pub attempt_id: String,
+    pub reason: String,
+    pub observed_at_ms: u64,
+}
+
+impl CancellationEnvelope {
+    pub fn validate(&self) -> Result<(), ClaudeSidecarError> {
+        if self.attempt_id.trim().is_empty() {
+            return Err(ClaudeSidecarError::EmptyField("attempt_id"));
+        }
+        if self.reason.trim().is_empty() {
+            return Err(ClaudeSidecarError::EmptyField("reason"));
+        }
+        if self.observed_at_ms == 0 {
+            return Err(ClaudeSidecarError::ZeroField("observed_at_ms"));
+        }
+        Ok(())
+    }
+}
+
+/// Cleanup lifecycle for one cancelled attempt. Pure data; the native-worker
+/// contour owns actual fencing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupState {
+    Requested,
+    Acknowledged,
+    Terminated,
+    UnknownOutcome,
+}
+
+/// Record a cancellation request. Always yields `Requested`; the caller must
+/// have validated the envelope first.
+pub fn request_cancel(_env: &CancellationEnvelope) -> CleanupState {
+    CleanupState::Requested
+}
+
+/// Acknowledge a requested cleanup. `Terminated` and `UnknownOutcome` are
+/// sticky; only `Requested` advances to `Acknowledged`.
+pub fn acknowledge(state: CleanupState) -> CleanupState {
+    match state {
+        CleanupState::Requested => CleanupState::Acknowledged,
+        other => other,
+    }
+}
+
+/// Mark cleanup terminated. Any state terminates; termination is terminal.
+pub fn terminate(_state: CleanupState) -> CleanupState {
+    CleanupState::Terminated
+}
+
+/// Map an acknowledgement timeout to `UnknownOutcome` unless already
+/// `Terminated`. Never silently recovers to a healthy state.
+pub fn on_ack_timeout(state: CleanupState) -> CleanupState {
+    match state {
+        CleanupState::Terminated => CleanupState::Terminated,
+        _ => CleanupState::UnknownOutcome,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Exact replay / idempotency
+// ---------------------------------------------------------------------------
+
+/// Idempotency identity: one request id plus digests over the canonical JSON
+/// of the prompt and of the launch plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdempotencyKey {
+    pub request_id: String,
+    pub prompt_digest: String,
+    pub plan_digest: String,
+}
+
+impl IdempotencyKey {
+    pub fn validate(&self) -> Result<(), ClaudeSidecarError> {
+        if self.request_id.trim().is_empty() {
+            return Err(ClaudeSidecarError::EmptyField("request_id"));
+        }
+        if !is_valid_64_hex_digest(&self.prompt_digest) {
+            return Err(ClaudeSidecarError::BadDigest(self.prompt_digest.clone()));
+        }
+        if !is_valid_64_hex_digest(&self.plan_digest) {
+            return Err(ClaudeSidecarError::BadDigest(self.plan_digest.clone()));
+        }
+        Ok(())
+    }
+}
+
+/// Stored idempotency record: the presented key plus the digest of the result
+/// produced for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredIdempotencyKey {
+    pub key: IdempotencyKey,
+    pub result_digest: String,
+}
+
+impl StoredIdempotencyKey {
+    pub fn validate(&self) -> Result<(), ClaudeSidecarError> {
+        self.key.validate()?;
+        if !is_valid_64_hex_digest(&self.result_digest) {
+            return Err(ClaudeSidecarError::BadDigest(self.result_digest.clone()));
+        }
+        Ok(())
+    }
+}
+
+/// Idempotency outcome for a presented key against at most one stored record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdempotencyDecision {
+    New,
+    Replay { prior_digest: String },
+    Conflict { changed_fields: Vec<String> },
+}
+
+/// Build the idempotency key for a request by digesting the canonical JSON of
+/// `prompt` and `plan` with [`claude_local_digest_256_hex`].
+pub fn idempotency_key_for_request(
+    request_id: &str,
+    prompt: &str,
+    plan: &ClaudeSidecarLaunchPlan,
+) -> Result<IdempotencyKey, ClaudeSidecarError> {
+    let prompt_json =
+        serde_json::to_string(prompt).map_err(|_| ClaudeSidecarError::MalformedFrame("prompt not serializable"))?;
+    let plan_json =
+        serde_json::to_string(plan).map_err(|_| ClaudeSidecarError::MalformedFrame("plan not serializable"))?;
+    Ok(IdempotencyKey {
+        request_id: request_id.to_owned(),
+        prompt_digest: claude_local_digest_256_hex(prompt_json.as_bytes()),
+        plan_digest: claude_local_digest_256_hex(plan_json.as_bytes()),
+    })
+}
+
+/// Decide replay versus conflict versus new.
+///
+/// - `None` prior, or a prior with a different `request_id`, yields `New`.
+/// - Same `request_id` with identical digests yields `Replay` carrying the
+///   stored result digest.
+/// - Same `request_id` with any differing digest field yields `Conflict`
+///   naming each changed field (`prompt_digest`, `plan_digest`).
+pub fn decide_idempotency(
+    prior: Option<&StoredIdempotencyKey>,
+    presented: &IdempotencyKey,
+) -> IdempotencyDecision {
+    match prior {
+        None => IdempotencyDecision::New,
+        Some(stored) => {
+            if stored.key.request_id != presented.request_id {
+                return IdempotencyDecision::New;
+            }
+            let mut changed = Vec::new();
+            if stored.key.prompt_digest != presented.prompt_digest {
+                changed.push("prompt_digest".to_owned());
+            }
+            if stored.key.plan_digest != presented.plan_digest {
+                changed.push("plan_digest".to_owned());
+            }
+            if changed.is_empty() {
+                IdempotencyDecision::Replay {
+                    prior_digest: stored.result_digest.clone(),
+                }
+            } else {
+                IdempotencyDecision::Conflict {
+                    changed_fields: changed,
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unknown-outcome gate (blocks blind retry / route switch)
+// ---------------------------------------------------------------------------
+
+/// Gate that blocks retry or alternate-route substitution while the outcome
+/// of `attempt_id` is unknown. Opens only via exact reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnknownOutcomeGate {
+    pub attempt_id: String,
+    pub reconciled: bool,
+}
+
+impl UnknownOutcomeGate {
+    pub fn new(attempt_id: String) -> Self {
+        Self {
+            attempt_id,
+            reconciled: false,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ClaudeSidecarError> {
+        if self.attempt_id.trim().is_empty() {
+            return Err(ClaudeSidecarError::EmptyField("attempt_id"));
+        }
+        Ok(())
+    }
+
+    /// Fail while unreconciled; succeed once reconciled.
+    pub fn block_retry_or_route_switch(&self) -> Result<(), ClaudeSidecarError> {
+        if self.reconciled {
+            Ok(())
+        } else {
+            Err(ClaudeSidecarError::UnknownOutcomeRequiresReconcile {
+                attempt_id: self.attempt_id.clone(),
+            })
+        }
+    }
+
+    /// Admit a future retry after exact reconciliation. Requires a non-empty
+    /// 64 lowercase-hex reconcile digest; sets `reconciled` to true.
+    pub fn admit_retry(&mut self, reconcile_digest: &str) -> Result<(), ClaudeSidecarError> {
+        if !is_valid_64_hex_digest(reconcile_digest) {
+            return Err(ClaudeSidecarError::BadDigest(reconcile_digest.to_owned()));
+        }
+        self.reconciled = true;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Normalized events with raw lineage
+// ---------------------------------------------------------------------------
+
+/// Version stamp for the normalization mapping in this crate.
+pub const CLAUDE_EVENT_NORMALIZER_VERSION: &str = "claude-event-normalizer/v1";
+
+fn default_normalizer_version() -> &'static str {
+    CLAUDE_EVENT_NORMALIZER_VERSION
+}
+
+fn deserialize_normalizer_version<'de, D>(deserializer: D) -> Result<&'static str, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s == CLAUDE_EVENT_NORMALIZER_VERSION {
+        Ok(CLAUDE_EVENT_NORMALIZER_VERSION)
+    } else {
+        Err(serde::de::Error::unknown_variant(
+            &s,
+            &[CLAUDE_EVENT_NORMALIZER_VERSION],
+        ))
+    }
+}
+
+/// Normalized view of one response frame that retains raw-evidence lineage.
+/// `kind` is always copied from the source frame; normalization never
+/// manufactures progress or completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalizedClaudeEvent {
+    pub sequence: u64,
+    pub kind: ClaudeResponseKind,
+    pub raw_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
+    #[serde(
+        default = "default_normalizer_version",
+        deserialize_with = "deserialize_normalizer_version"
+    )]
+    pub normalizer_version: &'static str,
+}
+
+impl NormalizedClaudeEvent {
+    pub fn validate(&self) -> Result<(), ClaudeSidecarError> {
+        if !is_valid_64_hex_digest(&self.raw_digest) {
+            return Err(ClaudeSidecarError::BadDigest(self.raw_digest.clone()));
+        }
+        if let Some(p) = &self.payload {
+            if p.len() > MAX_OUTPUT_BYTES {
+                return Err(ClaudeSidecarError::OutputTooLarge {
+                    limit: MAX_OUTPUT_BYTES,
+                    actual: p.len(),
+                });
+            }
+        }
+        if self.normalizer_version != CLAUDE_EVENT_NORMALIZER_VERSION {
+            return Err(ClaudeSidecarError::MalformedFrame(
+                "unknown normalizer version",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Normalize one response frame against its raw NDJSON line.
+///
+/// Enforces, in order: raw line size bound, source `validate()`, payload
+/// bound, raw digest over the exact `raw_line` bytes, preserved `kind`, and
+/// the normalizer version stamp. `sequence` defaults to `0` when the source
+/// frame carries none (Wave-1 compatibility).
+pub fn normalize_event(
+    response: &ClaudeSidecarResponse,
+    raw_line: &str,
+) -> Result<NormalizedClaudeEvent, ClaudeSidecarError> {
+    if raw_line.len() > MAX_FRAME_BYTES {
+        return Err(ClaudeSidecarError::FrameTooLarge {
+            limit: MAX_FRAME_BYTES,
+            actual: raw_line.len(),
+        });
+    }
+    response.validate()?;
+    if let Some(p) = &response.payload {
+        if p.len() > MAX_OUTPUT_BYTES {
+            return Err(ClaudeSidecarError::OutputTooLarge {
+                limit: MAX_OUTPUT_BYTES,
+                actual: p.len(),
+            });
+        }
+    }
+    Ok(NormalizedClaudeEvent {
+        sequence: response.sequence.unwrap_or(0),
+        kind: response.kind.clone(),
+        raw_digest: claude_local_digest_256_hex(raw_line.as_bytes()),
+        payload: response.payload.clone(),
+        normalizer_version: CLAUDE_EVENT_NORMALIZER_VERSION,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Candidate-only guard (compile/behavior proof of no promotion path)
+// ---------------------------------------------------------------------------
+
+/// Guard proving no promotion path exists: always fails with `NotAuthority`.
+/// A candidate result can never become a finish decision through this crate.
+pub fn try_promote_to_finish(
+    _candidate: &ClaudeCandidateResult,
+) -> Result<std::convert::Infallible, ClaudeSidecarError> {
+    Err(ClaudeSidecarError::NotAuthority)
+}
+
+// ---------------------------------------------------------------------------
+// Admission-injection port (keeps the launch plan inert)
+// ---------------------------------------------------------------------------
+
+/// Opaque admission receipt: request identity plus the digest of the exact
+/// canonical plan that was admitted. Carries no fence, epoch, or authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedHandle {
+    pub request_id: String,
+    pub plan_digest: String,
+}
+
+impl AdmittedHandle {
+    pub fn validate(&self) -> Result<(), ClaudeSidecarError> {
+        if self.request_id.trim().is_empty() {
+            return Err(ClaudeSidecarError::EmptyField("request_id"));
+        }
+        if !is_valid_64_hex_digest(&self.plan_digest) {
+            return Err(ClaudeSidecarError::BadDigest(self.plan_digest.clone()));
+        }
+        Ok(())
+    }
+}
+
+/// Injection port for native-worker admission. The downstream owner supplies
+/// the real admission check; this crate only validates the request, digests
+/// the canonical plan JSON, and delegates. Denials surface as
+/// `AdmissionDenied`.
+pub trait ClaudeLaunchPort {
+    fn check_admission(
+        &self,
+        request_id: &str,
+        plan_digest: &str,
+    ) -> Result<AdmittedHandle, ClaudeSidecarError>;
+}
+
+/// Validate `request`, digest its canonical plan JSON with
+/// [`claude_local_digest_256_hex`], then delegate to `port`. The launch plan
+/// stays inert here; executable identity and ceilings come from admission.
+pub fn admit_with_port(
+    port: &dyn ClaudeLaunchPort,
+    request: &ClaudeSidecarRequest,
+) -> Result<AdmittedHandle, ClaudeSidecarError> {
+    request.validate()?;
+    let plan = request
+        .launch_plan
+        .as_ref()
+        .ok_or(ClaudeSidecarError::EmptyField("launch_plan"))?;
+    let canonical = serde_json::to_string(plan)
+        .map_err(|_| ClaudeSidecarError::MalformedFrame("plan not serializable"))?;
+    let digest = claude_local_digest_256_hex(canonical.as_bytes());
+    port.check_admission(&request.request_id, &digest)
+}
+
+// ---------------------------------------------------------------------------
 // Tests — deterministic contract / serde / validation
 // ---------------------------------------------------------------------------
 
@@ -611,6 +1260,7 @@ mod tests {
             kind: ClaudeRequestKind::Query,
             prompt: Some("hello claude".into()),
             launch_plan: Some(valid_plan()),
+            sequence: None,
         }
     }
 
@@ -642,6 +1292,7 @@ mod tests {
             kind: ClaudeRequestKind::Close,
             prompt: None,
             launch_plan: None,
+            sequence: None,
         };
         let line2 = close.to_ndjson_line().unwrap();
         let decoded2 = ClaudeSidecarRequest::from_ndjson_line(&line2).unwrap();
@@ -678,6 +1329,7 @@ mod tests {
             payload: Some("o".repeat(MAX_OUTPUT_BYTES + 1)),
             candidate_result: None,
             error: None,
+            sequence: None,
         };
         assert!(matches!(
             resp.validate(),
@@ -786,6 +1438,7 @@ mod tests {
             payload: None,
             candidate_result: None,
             error: None,
+            sequence: None,
         };
         assert!(r.validate().is_err());
 
@@ -797,6 +1450,7 @@ mod tests {
             payload: None,
             candidate_result: None,
             error: None,
+            sequence: None,
         };
         assert!(e.validate().is_err());
 
@@ -814,6 +1468,7 @@ mod tests {
                 truncated: false,
             }),
             error: None,
+            sequence: None,
         };
         assert!(bad.validate().is_err());
     }
@@ -868,6 +1523,7 @@ mod tests {
             payload: None,
             candidate_result: None,
             error: None,
+            sequence: None,
         };
         let rl1 = resp.to_ndjson_line().unwrap();
         let rl2 = resp.to_ndjson_line().unwrap();
