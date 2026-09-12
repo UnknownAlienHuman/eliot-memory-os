@@ -1,0 +1,137 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "BLOCKED_ON_905_907_READY_FOR_PROVIDER_IMPLEMENTATION"
+implementation_support = "PINNED_ARTIFACT_AND_LEGACY_MONOLITH_PRESENT_PROVIDER_MODULE_ABSENT"
+evidence_execution_status = "SOURCE_AND_RELEASE_LOCK_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "ISOLATED_SURREAL_PROVIDER_EDGE_CANDIDATE_ONLY"
+issue = 909
+inventory_issue = 905
+harness_issue = 907
+containment_issue = 850
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[approved_artifact]
+lock_path = "docs/release/SURREALDB_WINDOWS_X64.lock.json"
+schema = "eliot-external-release-artifact-lock-v1"
+artifact = "surreal.exe"
+relative_path = "runtime/surreal.exe"
+version = "3.1.4"
+architecture = "windows-x64"
+pe_machine = "8664"
+sha256 = "13781bc97db9348498bd6b5e0090cf2770e9d296640be8adacf73956e8a568a1"
+
+[work_unit]
+cell_id = "integration.provider.store-surreal-3_1_4"
+causal_property = "One exact Store-class inventory selection receives one isolated authenticated SurrealDB generation with unique owned roots, endpoint, namespace/database, credentials, semantic readiness, reset and cleanup receipts; no ambient production state or foreign resource is touched."
+current_discriminator = "IntegrationHarness.Store.psm1 and its Python/PowerShell tests are absent on main; the legacy run-isolated-tests.ps1 resolves an ambient/caller Surreal executable and owns provisioning inline rather than implementing #907's closed provider contract."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/909"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-32-stateful-test-environments.md#i1832-stateful-test-environments",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-22-parallel-build-cache-artifact-and-environment-lanes.md#i222-parallel-build-cache-artifact-and-environment-lanes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-08-02-ip0-one-windows-processexecutor.md#i1082-ip0-one-windows-processexecutor",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-21-unknown-commit-recovery.md#i1421-unknown-commit-recovery",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-04-secrets.md#i154-secrets",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+]
+anchors = ["ARCH-GROUND-01", "ARCH-SEC-01", "ARCH-RES-04", "ARCH-OBS-01"]
+
+[current_source]
+confirmed = [
+  "The accepted release lock pins SurrealDB 3.1.4 windows-x64 PE machine 8664 and SHA-256 13781bc97db9348498bd6b5e0090cf2770e9d296640be8adacf73956e8a568a1.",
+  "scripts/integration/IntegrationHarness.Store.psm1 is absent on main.",
+  "The legacy harness accepts a Surreal executable parameter/environment value and performs inline acquisition/process/secret cleanup.",
+  "The previous implementation PR #922 was closed unmerged.",
+]
+
+[scope]
+primary_paths = [
+  "scripts/integration/IntegrationHarness.Store.psm1",
+  "scripts/tests/IntegrationHarness.Store.Tests.ps1",
+  "scripts/tests/test_integration_harness_store.py",
+  "scripts/testdata/integration/store-provider/**",
+  ".github/temporary/work-unit-909.md only if present",
+]
+forbidden = [
+  "Core/Model/public entrypoint or shared bridge",
+  "inventory implementation or generated run artifact",
+  "Runtime/Git providers",
+  "Rust source/tests, Cargo, lockfile, release catalog or production config",
+  "workflows or global service/firewall/ACL/environment changes",
+  "arbitrary executable, URL, command, argv, environment or user-trusted hash",
+  "ambient production database, shared namespace, fixed credentials or default profile data roots",
+  "provider-selected test denominator or pass result",
+]
+
+[[waves]]
+id = "A"
+what = "Implement exactly #907's closed Store provider interface."
+how = [
+  "Validate exact Store requirement/class/schema/provider revision and selected-row identity.",
+  "Plan derives finite roots, endpoint, namespace/database, credential channel and cleanup graph without mutation.",
+  "Allocate creates only unique owner-marked run-local data/log/secret roots and an ownership-safe loopback endpoint reservation.",
+]
+
+[[waves]]
+id = "B"
+what = "Verify and launch the exact approved SurrealDB artifact."
+how = [
+  "Resolve only the accepted 3.1.4 windows-x64 artifact and independently verify path, version, PE target, SHA-256 and acquisition provenance, including cached files.",
+  "Construct command and minimal environment internally; caller values cannot influence executable, argv, URL, endpoint policy or credentials.",
+  "Execute through the accepted ProcessExecutor/containment contract and retain process/start/owner identity rather than PID alone.",
+]
+
+[[waves]]
+id = "C"
+what = "Prove authenticated semantic readiness and exact test reset."
+how = [
+  "Keep process observed, TCP open, authenticated protocol, namespace/database selected, schema current and fixture baseline ready as separate receipts.",
+  "Bind readiness to run/provider/binary/config/process/start/endpoint/namespace/database/root/credential-handle identities and expiry.",
+  "Reset only the exact declared fixture and revalidate baseline; failure contaminates the affected group and never marks a test pass.",
+]
+
+[[waves]]
+id = "D"
+what = "Close evidence, stop and cleanup/reconciliation."
+how = [
+  "Collect bounded redacted status/artifact handles with explicit truncation.",
+  "Request bounded graceful shutdown, then terminate only the exact owned process tree when required.",
+  "Verify descendants, port, locks, secrets and mutable roots; repeated cleanup is idempotent.",
+  "Possible launch/stop/cleanup with lost response remains owner-bound and reconciling; no replacement instance until resolved.",
+  "Implement exactly WORK_UNIT_CASE: 909/1..22 through #907's fixed bridge and #850 containment, plus one mandatory real Windows prepare-ready-fixture-cleanup smoke.",
+]
+
+[acceptance]
+criteria = [
+  "Only exact Store class/schema/provider revision activates the provider; unsupported/missing class is typed and nonpassing.",
+  "Plan is deterministic and mutation-free.",
+  "The exact approved 3.1.4 artifact identity is reverified before every launch; latest, wrong version/architecture/hash and caller-only hash fail.",
+  "Arbitrary command, URL, executable, argv and environment authority are unrepresentable.",
+  "Concurrent runs have unique owned roots, endpoint, namespace and database with no race or shared mutable state.",
+  "Path traversal, reparse/symlink escape, reserved alias and foreign owner collision fail before mutation.",
+  "Credentials are ephemeral, protected and absent from command display, receipts, logs and evidence.",
+  "Launch request, observed process, TCP open, authenticated protocol, schema readiness and fixture readiness remain distinct.",
+  "Stale/foreign process, endpoint, namespace, database or config receipt cannot establish readiness.",
+  "Reset failure contaminates only the affected group and never becomes a semantic test result.",
+  "Unknown launch/stop/cleanup is reconciled before retry; foreign resources are never killed/deleted.",
+  "Cleanup proves no owned process, descendant, port, lock, secret or mutable root remains.",
+  "Exactly 22 substantive cases execute against production provider behavior and retain source/suite/case identities.",
+  "One real supported-Windows cycle verifies the locked artifact, authenticated readiness, exact fixture and complete cleanup.",
+]
+
+[verification]
+commands = [
+  "python -m py_compile scripts/tests/test_integration_harness_store.py",
+  "python -m unittest scripts.tests.test_integration_harness_store -v",
+  "git diff --check",
+]
+contained_proof = "Run the accepted #850 descriptor over all 22 Python-to-PowerShell cases and retain exact source/discovery/execution/cleanup records."
+real_smoke = "Run scripts/run-isolated-tests.ps1 through #907 using a finite #905 Store selection and the accepted 3.1.4 artifact; attach nonsecret artifact/process/readiness/fixture/cleanup receipts."
+product_proof = "This proves one isolated Store provider only; Store semantics, full ignored tier and Product support remain #19/#915/#11."
