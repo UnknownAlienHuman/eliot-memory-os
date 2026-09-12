@@ -1,0 +1,157 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_CONTRACT_AND_SPOOL_IMPLEMENTATION"
+implementation_support = "BOUNDED_LOCAL_SPOOL_PRESENT_EXTERNAL_EXPORT_AND_ACK_PATH_ABSENT"
+evidence_execution_status = "CURRENT_SPOOL_READBACK_AND_CONSUMER_SEARCH_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "WATCHDOG_EXPORT_EDGE_CANDIDATE_ONLY"
+issue = 458
+watchdog_boundary_issue = 16
+kernel_issue = 15
+governor_issue = 18
+supervision_lease_issue = 88
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "supervision.watchdog-spool-export-reconciliation"
+causal_property = "A protected Watchdog spool record becomes a canonical system-observation, coverage-gap or Problem candidate only through bounded replay-stable export and the sole Governor transition path; source entries and cursor remain Watchdog-owned until the exact configured sink disposition is durably acknowledged."
+current_discriminator = "WatchdogSpool has a bounded redb owner, sequence/high-water validation, pressure gaps, corruption recovery and full local readback. IndependentKernelSensor exposes readback, but repository search finds no production consumer, bounded export cursor, batch identity, authenticated sink port, per-entry disposition or durable acknowledgement."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/458"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I01-04-scm-supervision-tree.md#i14-scm-supervision-tree",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I01-05-demand-start-observable-use-supervision-and-idle-shutdown.md#i15-demand-start-observable-use-supervision-and-idle-shutdown",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-02-frame.md#i72-frame",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-23-raw-and-normalized-host-events.md#i723-raw-and-normalized-host-events",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I08-02-independent-observation-routes.md#i82-independent-observation-routes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I08-03-deterministic-supervision-loop.md#i83-deterministic-supervision-loop",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I08-10-containment.md#i810-containment",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I08-13-watchdog-failure.md#i813-watchdog-failure",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I08-14-watchdog-observables.md#i814-watchdog-observables",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-21-unknown-commit-recovery.md#i1421-unknown-commit-recovery",
+]
+anchors = ["ARCH-WDG-01", "ARCH-WDG-02", "ARCH-SEC-02", "ARCH-OBS-01", "ARCH-RES-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "WatchdogSpool owns one protected redb file with schema version, monotonic sequence, durable high-water record, record/byte caps, pressure-gap insertion and corruption recovery.",
+  "WatchdogSpool::readback validates header, retained entries and high-water but loads the complete retained vector.",
+  "IndependentKernelSensor::readback exposes only local full readback.",
+  "Repository search finds WatchdogSpoolEntry only in codec, spool and local library readback; no production export consumer or sink acknowledgement path exists.",
+  "The spool payload vocabulary currently includes Heartbeat, Gap and Recovery observations and remains deliberately non-semantic.",
+  "Pressure eviction records a visible Gap locally, but no downstream owner currently receives or acknowledges the reduced coverage.",
+  "Issue #88 owns supervision lease renewal and is not part of this source owner.",
+]
+
+[scope]
+wave_a_paths = [
+  "crates/supervision/eliot-watchdog-core/Cargo.toml only required existing dependency wiring",
+  "crates/supervision/eliot-watchdog-core/src/** exact owner-neutral export contract",
+  "crates/supervision/eliot-watchdog-core/tests/**",
+]
+wave_b_paths = [
+  "bins/eliot-watchdog/src/watchdog_spool.rs",
+  "bins/eliot-watchdog/src/watchdog_spool/**",
+  "bins/eliot-watchdog/src/lib.rs exact export port/composition spans",
+  "bins/eliot-watchdog/tests/**",
+]
+serialized_wave_c_paths = [
+  "exact authenticated Kernel durable-observation adapter after Waves A/B",
+  "exact eliotd/Governor system-observation/coverage candidate adapter after Waves A/B",
+]
+forbidden = [
+  "project/task semantics or canonical Store credentials in Watchdog",
+  "direct Signal severity, Problem or Incident canonical write from Watchdog",
+  "sink mutation/deletion of source spool entries",
+  "new spool store or second cursor owner",
+  "conflation with SupervisionLease renewal #88",
+  "transport acknowledgement treated as semantic application",
+  "model or Watchdog-agent prose controlling canonical disposition",
+  "loading the complete spool for every bounded export",
+  "skipping an unresolved gap, recovery or pressure marker",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Define the owner-neutral cursor, batch, entry, sink disposition, acknowledgement and reconciliation contract."
+how = [
+  "Add versioned closed types for WatchdogSpoolCursor, WatchdogSpoolExportBatch, WatchdogSpoolExportEntry, WatchdogSpoolSinkDisposition, WatchdogSpoolAcknowledgement and WatchdogSpoolReconciliationError.",
+  "Preserve exact source sequence, schema, observed time, payload kind/digest and coverage identity without interpreting project semantics.",
+  "Distinguish RECEIVED, DURABLE, ADMITTED_CANDIDATE, APPLIED, REJECTED, UNKNOWN and GAP_REQUIRES_RECOVERY.",
+  "Declare which terminal phase advances each record class; receipt/transport success alone never advances an application-bound cursor.",
+]
+
+[[waves]]
+id = "B"
+what = "Implement the single-writer Watchdog export cursor and bounded batch producer."
+how = [
+  "Persist cursor schema, last acknowledged sequence, pending batch identity and sink binding beside the existing spool under the same writer/transaction owner.",
+  "Produce bounded item/byte batches from cursor + 1 without returning or buffering the entire retained spool.",
+  "Bind installation, Watchdog artifact/process generation, AuthorityEpoch/StateFence where admitted, spool schema, predecessor cursor, first/last/high-water sequence, payload digests, supervision/coverage identity, sink generation, creation time and expiry.",
+  "Exact retry of the same cursor and source frontier returns byte-equivalent batch output.",
+  "Cursor advances once only after a valid configured-sink acknowledgement with exact batch digest, predecessor and per-entry terminal dispositions.",
+  "UNKNOWN, missing acknowledgement, timeout, disconnect, stale sink or changed acknowledgement keeps the batch replayable and the cursor unchanged.",
+  "Compaction removes only entries strictly below the durable acknowledged cursor and never removes an open gap/recovery boundary.",
+]
+
+[[waves]]
+id = "C"
+what = "Transport batches through Kernel and reconcile them through the sole Governor canonical path."
+how = [
+  "Use one authenticated generation-bound EBP durable-observation operation; no raw database or generic JSON command.",
+  "Kernel validates installation, process/generation, epoch, connection, route, StateFence, batch identity and bounds only.",
+  "Governor converts each entry into a non-semantic system observation or coverage-gap candidate through the existing canonical transition path.",
+  "Heartbeat remains supervision evidence rather than semantic health truth.",
+  "Gap, pressure and recovery records lower the applicable coverage/Governance Profile and may open a Problem candidate; they do not self-certify an Incident.",
+  "Return one exact per-entry sink disposition and batch acknowledgement only after the corresponding durable/admitted/applied stage.",
+  "Store unavailable or uncertain application returns the actual DURABLE/UNKNOWN stage and leaves the Watchdog cursor unchanged.",
+]
+
+[[waves]]
+id = "D"
+what = "Prove at-least-once transport, exact-once semantic adoption and restart reconciliation."
+how = [
+  "Kill/restart Host, Kernel and eliotd independently while Watchdog retains and replays the same pending batch.",
+  "Inject duplicate, reorder, payload mutation, wrong cursor predecessor, stale epoch/fence, wrong generation/sink, gap, pressure, corruption recovery and sink timeout.",
+  "Prove one semantic observation identity per spool sequence despite transport replay.",
+  "Prove independent Watchdog spool read/replay while Kernel/eliotd/Store are unavailable and prove no canonical-write dependency enters Watchdog.",
+]
+
+[acceptance]
+criteria = [
+  "The Watchdog spool remains non-semantic, protected and single-writer.",
+  "Every export entry preserves exact source sequence/schema/payload digest and the batch has a finite item/byte bound.",
+  "Empty spool yields an exact empty batch with cursor/high-water state and no fabricated coverage.",
+  "Exact export retry is byte-equivalent; changed payload under one sequence or changed batch under one idempotency identity conflicts.",
+  "Cursor ownership remains in Watchdog and no sink can mutate/delete source entries directly.",
+  "No acknowledgement is accepted without exact batch digest, predecessor cursor, sink generation and one disposition per entry.",
+  "RECEIVED and DURABLE do not advance an APPLIED-bound cursor.",
+  "UNKNOWN, missing ack, timeout and disconnect never advance the cursor.",
+  "A terminal valid acknowledgement advances exactly once; duplicate acknowledgement is idempotent.",
+  "A later acknowledgement cannot jump an unresolved sequence gap, pressure marker or recovery record.",
+  "Restart preserves cursor, pending batch identity, source entries and replay behavior.",
+  "Spool pressure always produces visible lost-coverage evidence and never appears as full continuous coverage.",
+  "Kernel performs only mechanical identity/fence/transport validation; Governor remains the sole semantic admission and transition owner.",
+  "Heartbeat cannot become semantic health truth and Watchdog/model prose cannot create Signal severity, Problem or Incident authority.",
+  "Transport replay cannot create a second semantic observation for one spool sequence.",
+  "Records outside a valid supervision lease/coverage interval cannot be reinterpreted as continuous coverage.",
+  "Watchdog has no canonical Store credential, direct write dependency or new containment/repair authority.",
+  "Real Host/Kernel/eliotd restart tests retain readable/replayable spool state and exact acknowledgement/reconciliation evidence.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-watchdog-core -p eliot-watchdog --all-targets",
+  "cargo test --locked -p eliot-watchdog-core -p eliot-watchdog --all-targets",
+  "cargo clippy --locked -p eliot-watchdog-core -p eliot-watchdog --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run the authenticated Watchdog -> Kernel -> eliotd observation path across duplicate transport and independent process restarts, including pressure/gap and Store-unavailable reconciliation."
+product_proof = "Package proof establishes a Watchdog export Edge candidate only; supervision and Product proof remain #16/#15/#18/#11."
