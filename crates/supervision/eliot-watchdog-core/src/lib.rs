@@ -385,3 +385,13 @@ impl Watchdog {
 pub fn unix_timestamp(now: SystemTime) -> u64 {
     now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
+
+mod reconciliation;
+
+pub use reconciliation::{
+    WatchdogSpoolAcknowledgement, WatchdogSpoolCursor, WatchdogSpoolEntryDisposition,
+    WatchdogSpoolExportBatch, WatchdogSpoolExportEntry, WatchdogSpoolPayloadKind,
+    WatchdogSpoolReconciliationError, WatchdogSpoolSinkDisposition,
+    acknowledgement_advances_cursor, export_retry_identity_equal, is_duplicate_ack,
+    validate_acknowledgement, validate_batch, validate_batch_freshness, validate_cursor,
+};
