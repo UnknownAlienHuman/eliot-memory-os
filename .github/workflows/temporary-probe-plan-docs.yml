@@ -1,0 +1,35 @@
+name: Temporary probe-plan documentation read
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-probe-plan-docs
+  cancel-in-progress: true
+
+jobs:
+  docs-read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout current main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Read routed documentation
+        run: |
+          mkdir -p .eliot
+          python scripts/docs_read.py read \
+            --path crates/smart/eliot-dreamer-probe-plan \
+            --topic "bounded vector-preserving discriminative probe planning without execution or authority" \
+            --output .eliot/docs-read-bundle.md \
+            --receipt-out .eliot/docs-read-receipt.json
+          echo '=== RECEIPT ==='
+          cat .eliot/docs-read-receipt.json
+          echo '=== BUNDLE ==='
+          cat .eliot/docs-read-bundle.md
