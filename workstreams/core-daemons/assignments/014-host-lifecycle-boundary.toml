@@ -1,0 +1,113 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "SUBSTANTIAL_HOST_PRESENT_BOUNDARY_AND_EDGE_PROOF_INCOMPLETE"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "HOST_LIFECYCLE_EDGE_CANDIDATE"
+issue = 14
+registry_issue = 13
+kernel_issue = 15
+product_pulse_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A02-02-two-level-runtime.md#a22-two-level-runtime",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+  "docs/architecture/A13-08-restart-and-recovery.md#a138-restart-and-recovery",
+]
+implementation = [
+  "docs/architecture/I01-02-mandatory-runtime-processes.md#i12-mandatory-runtime-processes",
+  "docs/architecture/I01-04-scm-supervision-tree.md#i14-scm-supervision-tree",
+  "docs/architecture/I14-23-safe-shutdown.md#i1423-safe-shutdown",
+  "docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+]
+anchors = ["ARCH-MOD-01", "ARCH-RES-01", "ARCH-LIFE-01", "ARCH-OBS-01"]
+
+[confirmed_gap]
+observations = [
+  "bins/eliot-host contains a real SCM/console composition and substantial lifecycle code, but the package still combines service entry, activation, HostStateJournal, managed-dependency lineage, Kernel orchestration, recovery commands and broad tests.",
+  "No generated #13 capability-cell registry currently proves one owner for each Host mutable state or binds those cells to independent proof surfaces.",
+  "Current source gates still report runtime-source-hygiene debt owned by #14/#16; successful compilation does not establish Host crash/restart or no-orphan behavior.",
+  "Issue #11 has no current exact Windows readback proving Host journal, SCM registration, Job Object lineage, restart budget, rollback and independent Watchdog disposition for this main candidate.",
+]
+discriminator = "Kill Host or a managed Kernel/Surreal child at each activation/journal boundary and ask current source evidence for the exact surviving owner, lineage, recovery directive and no-orphan proof. No complete accepted Edge/Product evidence exists."
+
+[causal_property]
+statement = "Host owns only installation identity, approved artifacts, HostStateJournal and external process-generation lifecycle/recovery. Every managed child has exact lineage and bounded restart/rollback, while semantic authority, Store meaning, task state and provider policy remain outside Host."
+
+[scope]
+primary_paths = [
+  "bins/eliot-host/src/main.rs",
+  "bins/eliot-host/src/lib.rs",
+  "bins/eliot-host/src/host_state_journal/**",
+  "bins/eliot-host/src/activation/**",
+  "bins/eliot-host/src/kernel_lifecycle/**",
+  "bins/eliot-host/src/managed_dependency/**",
+  "crates/kernel/eliot-host-service/src/**",
+  "focused Host lifecycle/recovery tests",
+]
+read_only_dependencies = [
+  "crates/kernel/eliot-installation/src/**",
+  "crates/kernel/eliot-platform-windows/src/**process**",
+  "bins/eliot-kernel public launch/status contracts",
+  "bins/eliot-watchdog public admission/publication contracts",
+]
+forbidden_ownership = [
+  "semantic scheduling, task or WorkScope meaning",
+  "SurrealDB SDK or canonical Store credentials",
+  "model/MCP/provider routing",
+  "authority issuance, policy interpretation or Finish",
+  "second Watchdog or Kernel state owner",
+]
+
+[what_to_do]
+steps = [
+  "Make bins/eliot-host a thin SCM/console composition root over explicit Host capability cells.",
+  "Retain exactly one HostStateJournal writer and one source of Host-level artifact/generation approval.",
+  "Separate journal, activation/drain, dependency lineage/restart budget, SCM adapter, Kernel lineage and recovery-command cells behind bounded contracts and proofs.",
+  "Remove or relocate test-only/state-machine harness code only where a real independent seam exists.",
+  "Close process/job-object/restart/rollback/readback behavior with real Windows Edge evidence.",
+  "Bind all Host cells and proof entrypoints through #13 without inferring ownership from crate names.",
+]
+
+[how_to_do]
+steps = [
+  "Inventory every Host-owned mutable object and assign one writer/lifecycle owner before moving code.",
+  "Keep process launch/inspection/termination behind the shared platform ProcessExecutor/Job Object abstractions and exact artifact/process identity.",
+  "Journal intent and generation transition before external SCM/process effects; reconcile unknown outcomes by exact operation/generation identity.",
+  "On unexpected Kernel/dependency exit, fence/close the old Job Object lineage before replacement and record the branch disposition.",
+  "Make restart budgets durable and terminal in quarantine/escalation rather than infinite loops.",
+  "Treat corrupt/unavailable HostStateJournal as a recovery boundary: do not reconstruct authority from directory presence, PID, service name or executable path alone.",
+  "Keep Watchdog independence explicit: Host failure cannot claim Watchdog supervision unless independently observed.",
+  "Preserve one installed-generation activation fence and exact last-known-good rollback receipt; do not self-update the running Host binary.",
+  "Add negative dependency checks preventing semantic, Store SDK, model, MCP and UI crates from entering the Host closure.",
+]
+
+[acceptance]
+criteria = [
+  "The binary entrypoint is composition-only and every Host mutable state/lifecycle cell has one visible owner.",
+  "HostStateJournal has exactly one writer and torn/corrupt/unavailable state fails closed with a recovery directive.",
+  "Kernel and canonical-store dependency lineages can start, stop, restart and roll back independently.",
+  "Unexpected child exit fences the old Job Object lineage before replacement; no descendant/orphan survives an accepted terminal transition.",
+  "Host never adopts or kills a process from PID/name/path presence alone and never reconstructs artifact approval from directory state.",
+  "Restart budgets survive Host restart and terminate in quarantine/escalation.",
+  "Host crash/restart preserves exact installation, generation, process, journal and last-known-good lineage.",
+  "Host reports Watchdog state only from independent observation and does not absorb Watchdog ownership.",
+  "Host dependency closure contains no semantic task/Store-SDK/model/MCP/UI authority leakage.",
+  "#13 resolves every Host cell to contract, proof and Product Pulse; #11 executes the affected D0/D1 scenarios.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-host -p eliot-host-service -p eliot-installation -p eliot-platform-windows --all-targets",
+  "cargo test --locked -p eliot-host -p eliot-host-service -p eliot-installation -p eliot-platform-windows --all-targets",
+  "cargo clippy --locked -p eliot-host -p eliot-host-service -p eliot-installation -p eliot-platform-windows --all-targets -- -D warnings",
+  "python scripts/audit-runtime-source-hygiene.py",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "On Windows, execute journal torn-write/corruption, Host crash/restart, Kernel crash/replacement, Surreal dependency loss, restart-budget exhaustion, no-orphan readback and last-known-good rollback under one exact installation identity."
