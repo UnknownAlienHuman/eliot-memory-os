@@ -124,6 +124,7 @@ impl KernelNativeWorkerClient {
             "binding_digest",
             admission.claim().binding_digest.as_str(),
         )?;
+        require_decision_admitted(&reply)?;
         self.claim = Some(admission.claim().clone());
         self.ready = None;
         Ok(reply)
@@ -141,11 +142,14 @@ impl KernelNativeWorkerClient {
         let reply = self.transact(NATIVE_WORKER_READY_OPERATION, payload)?;
         match submission.readiness() {
             NativeWorkerReadiness::Ready(report) => {
+                require_echo(&reply, "kind", "native_worker_ready")?;
                 require_echo(&reply, "ready_id", report.ready_id.as_str())?;
                 require_echo(&reply, "claim_id", report.claim_id.as_str())?;
+                require_decision_admitted(&reply)?;
                 self.ready = Some(report.clone());
             }
             NativeWorkerReadiness::Blocked(report) => {
+                require_echo(&reply, "kind", "native_worker_blocked")?;
                 require_echo(&reply, "ready_id", report.ready_id.as_str())?;
                 require_echo(&reply, "claim_id", report.claim_id.as_str())?;
                 self.ready = None;
@@ -192,15 +196,27 @@ impl KernelNativeWorkerClient {
     /// Submits one result digest under the exact Ready binding.
     ///
     /// Submission is not acceptance: Kernel reconciles the digest under the
-    /// original claim before any reclaim or retry.
+    /// original claim before any reclaim or retry. The admitted claim travels
+    /// with the envelope so Kernel can prove the submitted schema is the
+    /// admitted schema from the binding digest.
     pub fn submit_result(
         &mut self,
+        claim: &NativeWorkerClaim,
         envelope: &NativeResultEnvelope,
     ) -> Result<serde_json::Value, NativeWorkerError> {
         let ready = self.require_ready_unit()?;
         envelope.validate()?;
         require_lifecycle_binding(&ready, &envelope.binding)?;
-        let payload = serde_json::to_value(envelope)?;
+        claim.validate()?;
+        if claim.claim_id.as_str() != envelope.binding.claim_id.as_str()
+            || claim.claim_id.as_str() != ready.claim_id.as_str()
+        {
+            return Err(NativeWorkerError::KernelAdmissionRequired(
+                "result claim does not match the Ready-bound claimed unit".to_owned(),
+            ));
+        }
+        let mut payload = serde_json::to_value(envelope)?;
+        payload["claim"] = serde_json::to_value(claim)?;
         let reply = self.transact(NATIVE_WORKER_RESULT_SUBMIT_OPERATION, payload)?;
         require_echo(&reply, "kind", "native_worker_result")?;
         require_echo(&reply, "result_id", envelope.result_id.as_str())?;
@@ -222,9 +238,7 @@ impl KernelNativeWorkerClient {
         require_lifecycle_binding(&ready, &envelope.binding)?;
         let payload = serde_json::to_value(envelope)?;
         let reply = self.transact(NATIVE_WORKER_CANCEL_OBSERVE_OPERATION, payload)?;
-        require_echo(&reply, "kind", "native_worker_cancelled")?;
-        require_echo(&reply, "cancellation_id", envelope.cancellation_id.as_str())?;
-        require_echo(&reply, "claim_id", envelope.binding.claim_id.as_str())?;
+        require_process_cancelled(&reply, envelope.binding.operation_id.as_str())?;
         Ok(reply)
     }
 
@@ -335,6 +349,64 @@ fn require_echo(
     if reply.get(field).and_then(serde_json::Value::as_str) != Some(expected) {
         return Err(NativeWorkerError::KernelAdmissionRequired(
             "Kernel reply did not echo the submitted lifecycle identity".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Requires the Kernel decision envelope to be an admission.
+///
+/// A `REJECTED` or `CONFLICT` verdict is a typed refusal, never a transport
+/// failure and never admission: it fails closed carrying the Kernel's
+/// reason instead of a claimed unit.
+fn require_decision_admitted(reply: &serde_json::Value) -> Result<(), NativeWorkerError> {
+    let decision = reply.get("decision").filter(|value| value.is_object());
+    let kind = decision
+        .and_then(|value| value.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if kind == "ADMITTED" {
+        return Ok(());
+    }
+    let detail: String = decision
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_default()
+        .chars()
+        .take(256)
+        .collect();
+    Err(NativeWorkerError::KernelAdmissionRequired(
+        if detail.is_empty() {
+            format!("Kernel refused the presentation (verdict {kind})")
+        } else {
+            format!("Kernel refused the presentation (verdict {kind}): {detail}")
+        },
+    ))
+}
+
+/// Requires the Kernel reply to be the execution owner's typed cancellation
+/// verdict for the exact observed attempt operation.
+///
+/// The observation returns the #100 execution owner's `Cancelled` verdict
+/// (which performed the bounded descendant cleanup), not a route-authored
+/// receipt, so only the exact cancelled operation counts as fenced.
+fn require_process_cancelled(
+    reply: &serde_json::Value,
+    operation_id: &str,
+) -> Result<(), NativeWorkerError> {
+    if reply.get("result").and_then(serde_json::Value::as_str) != Some("Cancelled") {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "Kernel did not return the execution owner's cancellation verdict".to_owned(),
+        ));
+    }
+    let echoed = reply
+        .get("payload")
+        .and_then(|payload| payload.get("binding"))
+        .and_then(|binding| binding.get("operation_id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if echoed != operation_id {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "Kernel cancellation verdict did not bind the observed attempt operation".to_owned(),
         ));
     }
     Ok(())

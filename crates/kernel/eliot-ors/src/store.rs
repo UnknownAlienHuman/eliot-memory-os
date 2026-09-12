@@ -1204,7 +1204,7 @@ impl RedbRecoveryStore {
     /// the durable row. Staging accepts the `Requested` intent entry state
     /// and the `Admitted` Wave-B admission state; both are validated for
     /// receipt coherence by the record itself. This table is disjoint from
-    /// the HostRequest and ProcessStart tables: one writer per state.
+    /// the `HostRequest` and `ProcessStart` tables: one writer per state.
     pub fn stage_native_worker_claim(
         &self,
         record: &crate::NativeWorkerClaimRecord,

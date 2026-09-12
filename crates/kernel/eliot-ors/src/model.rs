@@ -2766,7 +2766,7 @@ pub struct NativeWorkerClaimRecord {
     pub parent_job_id: OpaqueLabel,
     /// Governed task identity; opaque to ORS.
     pub task_id: OpaqueLabel,
-    /// Task WorkScope identity; opaque to ORS.
+    /// Task `WorkScope` identity; opaque to ORS.
     pub work_scope_id: OpaqueLabel,
     /// Logical decision identity; opaque to ORS.
     pub decision_id: OpaqueLabel,

@@ -1133,7 +1133,7 @@ fn native_worker_claim_rejection_reason(
 }
 
 /// Maps one ORS failure to the Kernel service error surface.
-fn native_worker_claim_store_error(error: OrsError) -> KernelServiceError {
+fn native_worker_claim_store_error(error: &OrsError) -> KernelServiceError {
     KernelServiceError::Platform(error.to_string())
 }
 
@@ -1448,6 +1448,23 @@ impl KernelService {
                 "native_worker_claim.deadline_unix_ms",
             ));
         }
+        Self::stage_and_finish_native_worker_claim_admission(store, request, now_unix_ms)
+    }
+
+    /// Stages one validated claim intent and binds its admission receipt.
+    ///
+    /// Persist-before-ack: the intent row is staged before any receipt is
+    /// issued. An exact replay under the same claim identity rebuilds the
+    /// original receipt identity instead of a second receipt and never
+    /// downgrades durable state; changed work under one identity returns
+    /// `Conflict`; a lost admission race reloads the winner's receipt. Only
+    /// mechanical failures (fenced generation, ORS storage) surface as
+    /// `Err`; every typed refusal is an `Ok` response value.
+    fn stage_and_finish_native_worker_claim_admission<S: OperationalRecoveryStore>(
+        store: &S,
+        request: &NativeWorkerClaimRequest,
+        now_unix_ms: u64,
+    ) -> Result<NativeWorkerClaimResponse, KernelServiceError> {
         let staged = native_worker_claim_staged_record(request)?;
         let durable = match store.stage_native_worker_claim(&staged) {
             Ok(outcome) => outcome.record().clone(),
@@ -1458,7 +1475,7 @@ impl KernelService {
                 )?;
                 let durable = store
                     .load_native_worker_claim(&claim_id)
-                    .map_err(native_worker_claim_store_error)?
+                    .map_err(|error| native_worker_claim_store_error(&error))?
                     .ok_or_else(|| {
                         KernelServiceError::Platform(
                             "conflicting claim disappeared before reconciliation".to_owned(),
@@ -1467,7 +1484,7 @@ impl KernelService {
                 let conflict = native_worker_claim_conflict(&durable, request, &staged)?;
                 return Ok(NativeWorkerClaimResponse::Conflict(conflict));
             }
-            Err(error) => return Err(native_worker_claim_store_error(error)),
+            Err(error) => return Err(native_worker_claim_store_error(&error)),
         };
         if durable.state != NativeWorkerClaimState::Requested {
             // Exact replay: the claim was already admitted (or moved forward
@@ -1515,7 +1532,7 @@ impl KernelService {
                 // identity instead of a second receipt.
                 let current = store
                     .load_native_worker_claim(&durable.claim_id)
-                    .map_err(native_worker_claim_store_error)?
+                    .map_err(|error| native_worker_claim_store_error(&error))?
                     .ok_or_else(|| {
                         KernelServiceError::Platform(
                             "admitted claim disappeared before acknowledgement".to_owned(),
@@ -1533,7 +1550,7 @@ impl KernelService {
                 let receipt = native_worker_claim_receipt(request, admitted_at)?;
                 return Ok(NativeWorkerClaimResponse::Admitted(receipt));
             }
-            Err(error) => return Err(native_worker_claim_store_error(error)),
+            Err(error) => return Err(native_worker_claim_store_error(&error)),
         }
         receipt.validate().map_err(|_| {
             KernelServiceError::Platform("issued admission receipt is not well-formed".to_owned())
@@ -1567,6 +1584,53 @@ impl KernelService {
             });
         }
         Ok(true)
+    }
+
+    /// Validates one ready report's own fields without touching durable state.
+    ///
+    /// Checks the ready identity is readable and distinct from the claim
+    /// identity, the registration and adapter-registry-revision texts are
+    /// readable, generation and report time are nonzero, the
+    /// credential-reference list is bounded with readable provider/key pairs.
+    /// Deadline, epoch, and durable checks stay with the caller.
+    fn check_native_worker_ready_report(
+        ready_id: &str,
+        request: &NativeWorkerClaimRequest,
+        ready_registration_id: &str,
+        adapter_registry_revision: &str,
+        ready_worker_generation: u64,
+        credential_refs: &[(&str, &str)],
+        ready_at_unix_ms: u64,
+    ) -> Result<(), KernelServiceError> {
+        validate_text(ready_id, "native_worker_ready.ready_id")?;
+        if ready_id == request.claim_id {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_ready.ready_id",
+                reason: "readiness requires a distinct operation identity",
+            });
+        }
+        validate_text(ready_registration_id, "native_worker_ready.registration_id")?;
+        validate_text(
+            adapter_registry_revision,
+            "native_worker_ready.adapter_registry_revision",
+        )?;
+        if ready_worker_generation == 0 || ready_at_unix_ms == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_ready.bounded_fields",
+                reason: "generation and report time must be non-zero",
+            });
+        }
+        if credential_refs.len() > MAX_NATIVE_WORKER_READY_CREDENTIAL_REFS {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_ready.credential_refs",
+                reason: "exceeds the bounded credential-reference limit",
+            });
+        }
+        for (provider, key) in credential_refs {
+            validate_text(provider, "native_worker_ready.credential_refs")?;
+            validate_text(key, "native_worker_ready.credential_refs")?;
+        }
+        Ok(())
     }
 
     /// Marks one admitted claim ready after exact ready-report validation.
@@ -1636,46 +1700,15 @@ impl KernelService {
             let (reason, detail) = native_worker_claim_rejection_reason(&error);
             return Ok(rejected(reason, detail));
         }
-        let mut report_issue: Option<KernelServiceError> = None;
-        if let Err(error) = validate_text(ready_id, "native_worker_ready.ready_id") {
-            report_issue = Some(error);
-        } else if ready_id == request.claim_id {
-            report_issue = Some(KernelServiceError::InvalidField {
-                field: "native_worker_ready.ready_id",
-                reason: "readiness requires a distinct operation identity",
-            });
-        } else if let Err(error) =
-            validate_text(ready_registration_id, "native_worker_ready.registration_id")
-        {
-            report_issue = Some(error);
-        } else if let Err(error) = validate_text(
+        if let Err(error) = Self::check_native_worker_ready_report(
+            ready_id,
+            request,
+            ready_registration_id,
             adapter_registry_revision,
-            "native_worker_ready.adapter_registry_revision",
+            ready_worker_generation,
+            credential_refs,
+            ready_at_unix_ms,
         ) {
-            report_issue = Some(error);
-        } else if ready_worker_generation == 0 || ready_at_unix_ms == 0 {
-            report_issue = Some(KernelServiceError::InvalidField {
-                field: "native_worker_ready.bounded_fields",
-                reason: "generation and report time must be non-zero",
-            });
-        } else if credential_refs.len() > MAX_NATIVE_WORKER_READY_CREDENTIAL_REFS {
-            report_issue = Some(KernelServiceError::InvalidField {
-                field: "native_worker_ready.credential_refs",
-                reason: "exceeds the bounded credential-reference limit",
-            });
-        } else {
-            for (provider, key) in credential_refs {
-                if let Err(error) = validate_text(provider, "native_worker_ready.credential_refs") {
-                    report_issue = Some(error);
-                    break;
-                }
-                if let Err(error) = validate_text(key, "native_worker_ready.credential_refs") {
-                    report_issue = Some(error);
-                    break;
-                }
-            }
-        }
-        if let Some(error) = report_issue {
             let (reason, detail) = native_worker_claim_rejection_reason(&error);
             return Ok(rejected(reason, detail));
         }
@@ -1704,13 +1737,45 @@ impl KernelService {
                 "native_worker_ready.ready_at_unix_ms",
             ));
         }
+        Self::finish_native_worker_ready_transition(
+            store,
+            request,
+            ready_registration_id,
+            ready_worker_generation,
+            now_unix_ms,
+        )
+    }
+
+    /// Applies the durable readiness transition for one validated report.
+    ///
+    /// Loads the persisted claim, refuses transport-only readiness (no exact
+    /// current registration and claimed unit) and stale generations,
+    /// conflicts on changed work under the claim identity, replays the
+    /// receipt identity on an already-`Ready` claim, and advances `Admitted`
+    /// to `Ready`. Every typed refusal is an `Ok` response value; only
+    /// mechanical failures surface as `Err`.
+    fn finish_native_worker_ready_transition<S: OperationalRecoveryStore>(
+        store: &S,
+        request: &NativeWorkerClaimRequest,
+        ready_registration_id: &str,
+        ready_worker_generation: u64,
+        now_unix_ms: u64,
+    ) -> Result<NativeWorkerClaimResponse, KernelServiceError> {
+        let rejected = |reason: NativeWorkerClaimRejectionReason, detail: &'static str| {
+            NativeWorkerClaimResponse::Rejected(NativeWorkerClaimRejection {
+                claim_id: request.claim_id.clone(),
+                reason,
+                detail: detail.to_owned(),
+                rejected_at_unix_ms: now_unix_ms,
+            })
+        };
         let claim_id = native_worker_claim_identity(
             OperationIdentity::new(request.claim_id.as_str()),
             "native_worker_claim.claim_id",
         )?;
         let durable = store
             .load_native_worker_claim(&claim_id)
-            .map_err(native_worker_claim_store_error)?;
+            .map_err(|error| native_worker_claim_store_error(&error))?;
         let Some(durable) = durable else {
             // No exact current registration and claimed unit exists, so no
             // transport connection, heartbeat, or liveness observation can
@@ -1759,7 +1824,7 @@ impl KernelService {
         }
         store
             .advance_native_worker_claim(&durable.claim_id, NativeWorkerClaimState::Ready, None)
-            .map_err(native_worker_claim_store_error)?
+            .map_err(|error| native_worker_claim_store_error(&error))?
             .ok_or_else(|| {
                 KernelServiceError::Platform(
                     "admitted claim disappeared before readiness".to_owned(),

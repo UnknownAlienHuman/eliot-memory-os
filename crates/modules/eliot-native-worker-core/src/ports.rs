@@ -954,17 +954,6 @@ pub struct ClaimAdmissionRequest {
 }
 
 impl ClaimAdmissionRequest {
-    /// Binds a registration to the claim presented under it.
-    pub(crate) fn from_parts(
-        registration: NativeWorkerRegistration,
-        claim: NativeWorkerClaim,
-    ) -> Self {
-        Self {
-            registration,
-            claim,
-        }
-    }
-
     /// Returns the registration the claim is presented under.
     #[must_use]
     pub const fn registration(&self) -> &NativeWorkerRegistration {
@@ -1022,11 +1011,6 @@ pub struct ReadinessSubmission {
 }
 
 impl ReadinessSubmission {
-    /// Binds a readiness verdict to the exact admitted claim it answers.
-    pub(crate) fn from_parts(claim: NativeWorkerClaim, readiness: NativeWorkerReadiness) -> Self {
-        Self { claim, readiness }
-    }
-
     /// Returns the admitted claim this submission answers.
     #[must_use]
     pub const fn claim(&self) -> &NativeWorkerClaim {
