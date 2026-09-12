@@ -2,8 +2,8 @@ schema = "eliot.agent-work-unit.v1"
 authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
 routing_authority = "owning_issue_and_normative_pair_only"
 status = "READY_FOR_IMPLEMENTATION"
-implementation_support = "MANUAL_WORKFLOWS_PRESENT_INPUT_CLOSURE_AND_POLICY_CURRENTNESS_INCOMPLETE"
-evidence_execution_status = "WORKFLOW_SOURCE_INSPECTED_RUNS_NOT_EXECUTED"
+implementation_support = "MANUAL_WORKFLOWS_PRESENT_INPUT_CLOSURE_POLICY_CURRENTNESS_AND_TEST_EXECUTION_INCOMPLETE"
+evidence_execution_status = "WORKFLOW_AND_EXISTING_OPERATOR_HARNESS_INSPECTED_RUNS_NOT_EXECUTED"
 proof_ceiling = "MANUAL_WORKFLOW_INPUT_AND_POLICY_CONFORMANCE_ONLY"
 issue = 1225
 registry_issue = 13
@@ -19,8 +19,8 @@ normative_pair_ref = "docs/normative-pair.toml"
 
 [work_unit]
 cell_id = "github.manual-workflow-input-and-policy-conformance"
-causal_property = "A manually dispatched workflow verifies one exact source revision under immutable third-party action, dependency, toolchain and oracle identities while repository policy follows current owner/disposition records rather than historical package or Issue literals."
-current_discriminator = "All workflows are correctly manual-only, but Actions use mutable major tags, Python and NuGet inputs are not fully locked, and repository-policy.yml hardcodes historical Issue sets plus required legacy eliot-app/cognitive files."
+causal_property = "A manually dispatched workflow verifies one exact source revision under immutable action, dependency, toolchain, test and oracle identities while policy follows current owner/disposition records rather than historical literals."
+current_discriminator = "Workflows are correctly manual-only, but Actions use mutable tags, Python/NuGet inputs are not fully locked, repository policy hardcodes historical Issue/package files, and the existing Operator console harness is not executed."
 primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1225"
 
 [documentation]
@@ -40,22 +40,23 @@ anchors = ["ARCH-MOD-03", "ARCH-GROUND-01", "ARCH-FIN-01", "ARCH-SEC-01", "ARCH-
 
 [current_source]
 confirmed = [
-  "ci.yml, repository-policy.yml and source-candidate.yml use workflow_dispatch only; this trigger policy is intentional and must remain.",
-  "Third-party actions are referenced through mutable actions/checkout@v4 and actions/cache@v4 tags.",
-  "requirements-verification.txt pins only the top-level jsonschema version and does not bind transitive wheel hashes.",
-  "Operator is built without a checked NuGet lock or dotnet restore --locked-mode, and no Operator tests execute.",
-  "repository-policy.yml hardcodes historical Issue sets and requires crates/eliot-app plus old cognitive map files to remain present.",
-  "No one run manifest binds workflow bytes, Action SHAs, Python/NuGet/Cargo/toolchain locks, selected checks and proof ceiling.",
+  "ci.yml, repository-policy.yml and source-candidate.yml use workflow_dispatch only; this must remain.",
+  "Third-party actions use mutable actions/checkout@v4 and actions/cache@v4 references.",
+  "requirements-verification.txt pins only top-level jsonschema and not the complete distribution/hash closure.",
+  "Operator builds without checked NuGet lock state or dotnet restore --locked-mode.",
+  "tests/Eliot.Operator.Tests exists, but it is OutputType=Exe with custom top-level assertions, no test SDK/framework and no workflow invocation.",
+  "repository-policy.yml hardcodes historical Issue sets and requires crates/eliot-app plus old cognitive map files.",
+  "No run manifest binds workflow bytes, Action SHAs, Python/NuGet/Cargo/toolchain locks, selected checks and proof ceiling.",
 ]
 
 [scope]
 primary_paths = [
   ".github/workflows/*.yml",
   ".github/README.md and templates only where manual naming/proof text changes",
-  "scripts/requirements-verification.txt and exact generated dependency locks",
+  "scripts/requirements-verification.txt and exact dependency locks",
+  "tests/Eliot.Operator.Tests/** only for execution/discovery integration coordinated with #1137",
   "workflow verifier and finite fixtures",
-  "the current #13 registry/disposition consumer used by repository policy",
-  "Operator test invocation after #1137 lands",
+  "the #13 registry/disposition consumer used by repository policy",
 ]
 forbidden = [
   "automatic push, pull_request, schedule, release or merge triggers",
@@ -71,53 +72,53 @@ forbidden = [
 id = "A"
 what = "Lock every external workflow input."
 how = [
-  "Replace every third-party uses reference with a reviewed full commit SHA and retain the release name only as non-authoritative metadata.",
-  "Hash-lock the complete Python distribution closure and install with --require-hashes under one supported runner/Python identity.",
-  "Check in applicable NuGet lock state, use dotnet restore --locked-mode and bind SDK/Windows App SDK identities.",
+  "Replace third-party uses references with reviewed full commit SHAs and keep release names only as metadata.",
+  "Hash-lock the complete Python distribution closure and install under one supported runner/Python identity.",
+  "Check in applicable NuGet lock state, use dotnet restore --locked-mode and bind .NET/Windows App SDK identities.",
 ]
 
 [[waves]]
 id = "B"
 what = "Replace historical policy literals with current owner records."
 how = [
-  "Consume the accepted #13 capability registry and explicit package/disposition records rather than Issue prose and fixed numeric sets.",
-  "Validate a package as present, migrating or retired from its current record; never require a retired package merely to prove it is legacy.",
-  "Remove permanent dependence on crates/eliot-app and historical cognitive maps so #1189/#1117 can complete without bypassing policy.",
+  "Consume the accepted #13 registry and explicit package/disposition records rather than Issue prose and fixed numeric sets.",
+  "Validate packages as present, migrating or retired from current records; never require a retired package merely to call it legacy.",
+  "Remove permanent dependence on crates/eliot-app and historical cognitive maps so #1189/#1117 can finish without bypassing policy.",
 ]
 
 [[waves]]
 id = "C"
 what = "Make manual scope and proof inputs explicit."
 how = [
-  "Rename workflows and summaries so MANUAL and the exact source-only ceiling are unambiguous.",
-  "Record source SHA, workflow digest, Action SHAs, Python/NuGet/Cargo/toolchain lock digests and selected tests/checks in one bounded run manifest.",
+  "Rename workflows/summaries so MANUAL and exact source-only ceilings are unambiguous.",
+  "Record source SHA, workflow digest, Action SHAs, Python/NuGet/Cargo/toolchain lock digests and selected tests/checks in one bounded manifest.",
   "Keep current minimal permissions and deliberate concurrency/cancellation behavior.",
 ]
 
 [[waves]]
 id = "D"
-what = "Add policy self-tests and current Operator coverage."
+what = "Execute the existing Operator checks honestly and add policy self-tests."
 how = [
+  "Coordinate with #1137 to convert tests/Eliot.Operator.Tests to a standard discoverable project or invoke it explicitly with dotnet run and require its terminal success.",
+  "Reject zero discovered/executed Operator checks; build-only output cannot count as test evidence.",
   "Reject automatic triggers, mutable Action refs, unapproved owners, overbroad permissions, unlocked dependencies, stale legacy assertions and secret interpolation.",
-  "Run the owned Operator test project after #1137 creates it; build-only output cannot count as test evidence.",
-  "Attach manifests/summaries as run artifacts rather than committing dated reports.",
 ]
 
 [acceptance]
 criteria = [
   "All repository workflows remain workflow_dispatch only.",
-  "Every third-party Action uses an approved immutable full commit SHA and mutable refs fail verification.",
-  "Python dependency resolution is fully version/hash locked and cannot change under one source/lock identity.",
-  ".NET restore uses checked lock state and --locked-mode and fails on dependency graph drift.",
-  "Operator tests execute when the #1137 project exists; build-only evidence is not counted as tests.",
+  "Every third-party Action uses an approved full commit SHA and mutable refs fail verification.",
+  "Python dependency resolution is fully version/hash locked.",
+  ".NET restore uses checked lock state and --locked-mode and fails on graph drift.",
+  "The existing Operator harness is converted to a discoverable suite or explicitly executed as a conformance executable; zero execution fails.",
   "Repository policy contains no fixed Issue-set authority and does not require legacy eliot-app or cognitive maps to exist.",
-  "Current present, migrating and retired package states are checked through #13 and explicit disposition records.",
+  "Current present, migrating and retired package states are checked through #13 and explicit dispositions.",
   "Legacy removal under #1189/#1117 requires no policy weakening or bypass.",
-  "Workflow names and summaries explicitly identify manual invocation and exact proof ceiling.",
+  "Workflow names and summaries identify manual invocation and exact proof ceiling.",
   "Each run binds source, workflow, Actions, Python, NuGet, Cargo, toolchain and selected test/check identities.",
   "Success remains source/repository evidence only and cannot create runtime, Store, release or Product status.",
   "Permissions remain minimal and secrets are absent from arguments, summaries, caches and artifacts.",
-  "Static self-tests fail automatic triggers, mutable refs, overbroad permissions, unlocked inputs and stale legacy assertions.",
+  "Static self-tests fail automatic triggers, mutable refs, overbroad permissions, unlocked inputs, zero test execution and stale legacy assertions.",
 ]
 
 [verification]
@@ -126,10 +127,11 @@ commands = [
   "python scripts/verify-github-workflows.py",
   "python -m pip install --disable-pip-version-check --no-input --require-hashes -r scripts/requirements-verification.txt",
   "dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode",
-  "dotnet test apps/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj -c Release -r win-x64 --no-restore",
+  "dotnet test tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj -c Release --no-restore  # after conversion",
+  "dotnet run --project tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj -c Release --no-restore  # while executable harness",
   "cargo metadata --locked --all-features --format-version 1",
   "python scripts/audit-architecture-boundaries.py",
   "git diff --check",
 ]
-edge_proof = "Manually dispatch every workflow on one exact candidate and retain the generated input/proof manifest; source workflows do not establish installed runtime support."
+edge_proof = "Manually dispatch every workflow on one exact candidate and retain its input/proof manifest; source workflows do not establish installed runtime support."
 product_proof = "Issue #11 remains open."
