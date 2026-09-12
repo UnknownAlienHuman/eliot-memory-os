@@ -20,6 +20,15 @@ use eliot_store_api::{CONTRACT_VERSION, StoreError, StoreHealth, StoreHealthStat
 /// confirms both the expected schema generation and the canonical fence. A
 /// reachable provider with missing/mismatched schema remains unavailable to
 /// Store callers.
+///
+/// Bridge-transport liveness is observed independently of the semantic probe:
+/// every `Ok` arm below already re-proved the retained child and its exact
+/// loopback listener owner inside `probe_readiness` (through
+/// `validate_liveness`), and the `Err` arm re-proves liveness through the same
+/// transport validation instead of inferring provider death from a failed
+/// query. Health therefore keeps reporting a live bridge when the database is
+/// semantically unready or unobservable, while readiness keeps its exact
+/// existing semantics.
 pub(crate) async fn adapter_health(adapter: &SurrealStoreAdapter) -> AdapterHealth {
     match probe_readiness(adapter).await {
         Ok(SemanticReadiness::Ready { generation }) => AdapterHealth {
@@ -37,15 +46,33 @@ pub(crate) async fn adapter_health(adapter: &SurrealStoreAdapter) -> AdapterHeal
         Ok(SemanticReadiness::Unavailable) => AdapterHealth {
             protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
             availability: AdapterAvailability::Unavailable,
-            provider: ProviderHealth::Unknown,
+            // Transport liveness was just re-proven by the successful client
+            // acquisition inside `probe_readiness`; only the semantic position
+            // is unknown.
+            provider: ProviderHealth::Reachable,
             schema_generation: None,
         },
-        Err(_) => AdapterHealth {
-            protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
-            availability: AdapterAvailability::ProviderUnavailable,
-            provider: ProviderHealth::Unavailable,
-            schema_generation: None,
-        },
+        Err(_) => {
+            // The semantic probe failed. Re-prove bridge-transport liveness
+            // independently — retained child plus exact listener owner, never
+            // socket or query success alone — so a live bridge with an
+            // unobservable database reports `Unavailable`/`Reachable` instead
+            // of collapsing into `ProviderUnavailable`.
+            match super::client(adapter).await {
+                Ok(_) => AdapterHealth {
+                    protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
+                    availability: AdapterAvailability::Unavailable,
+                    provider: ProviderHealth::Reachable,
+                    schema_generation: None,
+                },
+                Err(_) => AdapterHealth {
+                    protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
+                    availability: AdapterAvailability::ProviderUnavailable,
+                    provider: ProviderHealth::Unavailable,
+                    schema_generation: None,
+                },
+            }
+        }
     }
 }
 

@@ -30,7 +30,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use uuid::Uuid;
 
-use crate::config::SurrealAdapterConfig;
+use crate::config::{StoreDataRootLease, SurrealAdapterConfig};
 use crate::error::AdapterError;
 use eliot_platform_windows::{
     ProcessIdentity, RetainedProcessPathLease, is_eliot_governor_running,
@@ -57,6 +57,12 @@ pub(crate) struct RpcTransport {
     /// liveness authority.
     provider_process_id: u32,
     provider_process_identity: ProcessIdentity,
+    /// Exclusive OS-backed claim on the canonical `SurrealKV` data root, acquired
+    /// before the endpoint-occupancy probe and held for the transport lifetime.
+    /// Holding it across the probe-to-spawn-to-bind gap closes the TOCTOU in
+    /// which two generations could each observe a free endpoint and spawn a
+    /// provider against one data root.
+    data_root_lease: StoreDataRootLease,
 }
 
 impl fmt::Debug for RpcTransport {
@@ -68,6 +74,7 @@ impl fmt::Debug for RpcTransport {
             .field("provider_child", &"retained")
             .field("provider_process_id", &self.provider_process_id)
             .field("provider_process_identity", &self.provider_process_identity)
+            .field("data_root_lease", &self.data_root_lease)
             .finish()
     }
 }
@@ -144,6 +151,11 @@ impl RpcTransport {
         config
             .validate()
             .map_err(|error| AdapterError::Config(error.to_string()))?;
+        // Exclusive data-root ownership is acquired before any endpoint
+        // observation: a second generation sharing this data root fails here
+        // with a typed denial instead of racing through the probe-to-spawn gap.
+        let data_root_lease = StoreDataRootLease::claim(&config.store_data_root)?;
+        config.validate_data_root_lease(&data_root_lease)?;
         let connect_timeout = millis(config.connect_timeout_ms);
         provider_process_lease
             .validate(
@@ -170,6 +182,9 @@ impl RpcTransport {
                 )));
             }
         }
+        // The data-root lease above is held across this probe-to-spawn-to-bind
+        // gap, closing the TOCTOU in which two generations could each observe a
+        // free endpoint and spawn a provider against one data root.
         reject_occupied_endpoint(config, connect_timeout).await?;
         let mut provider_child = spawn_provider(config)?;
         let provider_process_id = provider_child.id().ok_or_else(|| {
@@ -198,6 +213,7 @@ impl RpcTransport {
             provider_child: Mutex::new(provider_child),
             provider_process_id,
             provider_process_identity: identity_before_auth.clone(),
+            data_root_lease,
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         timeout(remaining, authenticate_provider(&transport, config))
@@ -231,6 +247,9 @@ impl RpcTransport {
         config: &SurrealAdapterConfig,
         provider_process_lease: &RetainedProcessPathLease,
     ) -> Result<(), AdapterError> {
+        // The retained data-root lease must still be bound to this
+        // configuration's root before any child or listener proof is trusted.
+        config.validate_data_root_lease(&self.data_root_lease)?;
         let mut child = self.provider_child.lock().await;
         let identity_before_listener = validate_child_process(
             config,
