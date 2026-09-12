@@ -25,3 +25,6 @@ pub use model::{
     HARD_MAX_OPTIONS, HARD_MAX_OUTPUT_BYTES, HARD_MAX_TEXT_BYTES,
 };
 pub use select::propose_clarification;
+
+#[cfg(test)]
+mod tests;
