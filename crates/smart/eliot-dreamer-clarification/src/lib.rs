@@ -11,6 +11,7 @@
 mod error;
 mod model;
 mod select;
+mod strict;
 
 pub use error::ClarificationError;
 pub use model::{
@@ -24,7 +25,22 @@ pub use model::{
     CLARIFICATION_PROOF_CEILING, CLARIFICATION_SCHEMA_VERSION, HARD_MAX_AMBIGUITIES,
     HARD_MAX_OPTIONS, HARD_MAX_OUTPUT_BYTES, HARD_MAX_TEXT_BYTES,
 };
-pub use select::propose_clarification;
+pub use strict::validate_clarification_decision;
+
+/// Selects and renders zero or one inert atomic clarification candidate.
+///
+/// Cross-envelope identity, routing, lineage and serialized-size invariants are
+/// checked before the result leaves this owner.
+pub fn propose_clarification(
+    admitted_job: &AdmittedClarificationJob,
+    validated_draft: &eliot_dreamer_contracts::ValidatedDreamDraft,
+    boundary: &ActiveAgentOrHumanBoundary,
+    policy: &ClarificationPolicy,
+) -> Result<ClarificationDecision, ClarificationError> {
+    let decision = select::propose_clarification(admitted_job, validated_draft, boundary, policy)?;
+    validate_clarification_decision(&decision, policy)?;
+    Ok(decision)
+}
 
 #[cfg(test)]
 mod tests;
