@@ -1,37 +1,43 @@
-name: Temporary probe-plan documentation read
+name: Temporary probe-plan documentation and package proof
 
 on:
-  issue_comment:
-    types:
-      - created
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
 
 concurrency:
-  group: temporary-probe-plan-docs
+  group: temporary-probe-plan-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  docs-read:
-    if: github.event.issue.number == 610 && github.event.comment.body == '/run-probe-plan-docs'
+  probe-plan:
+    if: github.head_ref == 'work/610-dreamer-probe-plan'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - name: Checkout candidate
         uses: actions/checkout@v4
         with:
-          ref: work/610-dreamer-probe-plan
           fetch-depth: 1
       - name: Read routed documentation
         run: |
           mkdir -p .eliot
           python scripts/docs_read.py read \
             --path crates/smart/eliot-dreamer-probe-plan \
-            --topic "bounded vector-preserving discriminative probe planning without execution or authority" \
+            --path crates/smart/eliot-dreamer-contracts \
+            --path crates/smart/eliot-dreamer-rival-model \
+            --topic "bounded vector-preserving discriminative probe planning and owner-neutral rival projection" \
             --output .eliot/docs-read-bundle.md \
             --receipt-out .eliot/docs-read-receipt.json
-          echo '=== RECEIPT ==='
           cat .eliot/docs-read-receipt.json
-          echo '=== BUNDLE ==='
           cat .eliot/docs-read-bundle.md
+      - name: Verify package
+        run: |
+          cargo fmt --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml -- --check
+          cargo test --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml --all-targets
+          cargo clippy --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml --all-targets -- -D warnings
+          cargo doc --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml --no-deps
+          git diff --check
