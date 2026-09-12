@@ -1,0 +1,127 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_TEST_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_ACCEPTANCE_IMPLEMENTATION"
+implementation_support = "CORE_INGRESS_IMPLEMENTED_ACCEPTANCE_INCOMPLETE"
+evidence_execution_status = "CURRENT_SOURCE_AND_MERGED_PR_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "MCP_SOURCE_ASSURANCE_MODULE_AND_INGRESS_EDGE_CANDIDATE_ONLY"
+issue = 692
+implemented_predecessor_pr = 714
+agent_bridge_issue = 77
+kernel_port_issue = 342
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "mcp.source-assurance-ingress-acceptance"
+causal_property = "Every externally originated MCP request reaches semantic dispatch only after exact owner-authenticated source assurance and structural instruction/data separation are validated, with all refusal, limitation, staleness and recovery states preserved losslessly."
+current_discriminator = "Merged PR #714 wires owner evidence and assurance into ForwardedRequest, but #692 remains open because the full 31-case raw-ingress, policy, compatibility, I7.20 error and live-owner acceptance contract was explicitly deferred."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/692"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A12-04-source-assurance-and-injection.md#a124-source-assurance-and-injection",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-05-source-assurance.md#i155-source-assurance",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-06-instructiondata-separation.md#i156-instructiondata-separation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I12-37-governed-sessionepisode-and-typed-source-ingestion.md#i1237-governed-sessionepisode-and-typed-source-ingestion",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-06-mcp-surface.md#i76-mcp-surface",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-16-common-durable-fields.md#i516-common-durable-fields",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-04-secrets.md#i154-secrets",
+]
+anchors = ["ARCH-SEC-01", "ARCH-AUTH-01", "ARCH-GROUND-01", "ARCH-PORT-01", "ARCH-OBS-01"]
+
+[current_source]
+confirmed = [
+  "eliot-mcp now depends on eliot-source-assurance.",
+  "ForwardedRequest retains original request, separate original/canonical request and payload digests, active session binding and ForwardedSourceAssurance.",
+  "KernelGovernorPort resolves owner evidence separately and its safe default returns PLAN_GAP.",
+  "Current tests cover contract, host gateway, host request and four source-assurance ingress cases.",
+  "PR #714 explicitly deferred the complete 31-case matrix, protected raw decoder coverage, raw-byte/transformation receipts, complete external owner/freshness proof, configurable policy coverage and full I7.20 error/recovery adaptation.",
+]
+
+[scope]
+primary_paths = [
+  "crates/security/eliot-source-assurance/tests/mcp_assurance_contract.rs",
+  "crates/surfaces/eliot-mcp/tests/source_assurance_ingress.rs",
+  "crates/surfaces/eliot-mcp/tests/data/source_assurance_ingress.json",
+  "exact source-assurance/MCP source spans only when a failing acceptance case proves a contract defect",
+]
+serialized_dependencies = ["#977 bounded Agent Bridge raw input", "#77/#342 live Agent Bridge/Kernel port", "#710/#929 decoder inventory", "#11 Product proof"]
+forbidden = [
+  "reimplementing PR #714 under a parallel envelope",
+  "transport listener, model/provider or Governor implementation",
+  "caller-authored trusted assurance or policy",
+  "scalar trust score or collapsed twelve-field vocabulary",
+  "generic JSON authority, canonical writes, external effects or Finish",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Complete the twelve-field/eight-profile acceptance denominator."
+how = [
+  "Map identity/provenance, integrity, freshness, competence, incentives, independence, privacy, instruction taint, threat, allowed use, allowed effects and verifier/quarantine to exact current owner types and evidence.",
+  "Test every field independently as verified, failed, unknown, stale or unavailable where the field vocabulary permits.",
+  "Reject missing, duplicate, renamed and eight-only incomplete representations without collapsing privacy/use/effect/verifier into profile assessments.",
+]
+
+[[waves]]
+id = "B"
+what = "Close the actual raw ingress and structural role boundary."
+how = [
+  "Drive raw bytes through the real protected decoder before Value/map normalization and reject duplicate or escape-equivalent control keys.",
+  "Prove nested JSON/XML/YAML/Markdown/code, encoded text, bidi/zero-width content and tool-result text remain data and cannot replace selector, identity, policy, authority, effects or Finish.",
+  "Keep opaque admitted tool data bounded and inert rather than banning arbitrary external content by text heuristics.",
+]
+
+[[waves]]
+id = "C"
+what = "Complete policy, compatibility and error/recovery semantics."
+how = [
+  "Exercise exact supplied policy revisions, limited/quarantined/rejected/incomplete/stale outcomes and per-field verifier requirements.",
+  "Map refusal and limitation into the typed I7.20 response/recovery vocabulary without losing pure evaluator findings or echoing protected data.",
+  "Keep current and named legacy decoding explicit; transformed content retains original assurance identity and adds provenance rather than copying trust.",
+]
+
+[[waves]]
+id = "D"
+what = "Prove production guard reachability and no semantic bypass."
+how = [
+  "Use semantic-port spies to prove refused or unknown-required requests make zero calls and admitted requests make exactly one call with the full immutable envelope.",
+  "Bind exact replay and changed source/payload/context/policy conflict or invalidation.",
+  "Add a mutation fixture that bypasses owner evidence or the assurance call and require the acceptance suite to fail.",
+]
+
+[acceptance]
+criteria = [
+  "All 31 WORK_UNIT_CASE: 692/1..31 tests exist once, are discovered and execute against production code.",
+  "The twelve normative fields remain complete while the eight SourceTrustProfile assessments stay a separate subset.",
+  "Each required field can fail, become unknown, stale or unavailable independently without compensation by another field.",
+  "Caller security labels, trusted/system strings, embedded assurance objects and model/provider prose cannot create owner evidence.",
+  "Raw duplicate protected keys and wrong kind/payload fail before trusted construction or semantic dispatch.",
+  "Nested/encoded/Unicode request-like data cannot alter tool selector, authenticated context, policy, authority, effect ceiling or Finish.",
+  "Rejected, unknown-required, stale and incomplete assurance invoke zero semantic calls; an admitted request invokes exactly one.",
+  "ForwardedRequest preserves original typed request, all distinct digests, current session/fence binding, owner evidence, policy, verifier requirement and assurance digest.",
+  "Limited, quarantined, rejected, incomplete, stale and internal-contract outcomes remain distinct and carry bounded recovery guidance.",
+  "Exact replay is deterministic; changed same-identity source, payload, context or policy conflicts or invalidates reuse.",
+  "Transformations preserve original assurance/provenance lineage and cannot increase source grade or instruction authority.",
+  "Diagnostics and fixtures contain no raw credential, secret or protected body canary.",
+  "No transport, provider/model, Governor, canonical write, external effect, authority or VERIFIED_COMPLETE path is added.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --package eliot-source-assurance --package eliot-mcp -- --check",
+  "cargo test --locked -p eliot-source-assurance --test mcp_assurance_contract",
+  "cargo test --locked -p eliot-mcp --test source_assurance_ingress",
+  "cargo test --locked -p eliot-source-assurance -p eliot-mcp --all-targets",
+  "cargo clippy --locked -p eliot-source-assurance -p eliot-mcp --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run the real bounded Agent Bridge raw ingress through the current MCP guard and authenticated #342 port after #977/#77 land; package spies alone do not prove transport or owner authentication."
+product_proof = "Issue #11 remains open; this work cannot prove live model/tool/Governor or Product behavior."
