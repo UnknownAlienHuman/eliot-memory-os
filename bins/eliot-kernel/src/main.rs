@@ -514,9 +514,12 @@ async fn serve_connection(
                 request,
                 session_binding,
             } => {
-                let response = kernel
-                    .execute_process_request(&session, session_binding, request)
-                    .await;
+                use eliot_kernel::process_execution_client;
+                use eliot_kernel_service::{ProcessExecutionClient, ProcessExecutionResponse};
+                let response = match process_execution_client(&kernel, &session, &session_binding) {
+                    Ok(client) => client.execute(request).await,
+                    Err(rejection) => ProcessExecutionResponse::Rejected(rejection),
+                };
                 let reply = kernel.process_response_frame(&session, request_id, &response)?;
                 if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
                     session.fence();

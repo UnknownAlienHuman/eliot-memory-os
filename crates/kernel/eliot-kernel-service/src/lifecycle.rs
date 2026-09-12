@@ -7,14 +7,18 @@ use eliot_kernel_core::{
     AuthorityGrantRequest, ControlPermit, FrontDoor, KernelAuthority, KernelAuthorityKey,
     KernelError, RouteScope,
 };
+use eliot_protocol::{
+    AgentActivationResolutionResult, AgentBridgeProcessBinding, HostRequestAdmissionReceipt,
+    HostRequestEnvelope, HostRequestKind,
+};
 use eliot_receipts::{EffectClass, ProofCeiling};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::protocol::{
-    HostKernelCandidateBinding, KernelActivationPermit, KernelActivationQuery,
-    KernelActivationReceipt, KernelControlCommand, KernelReadyReceipt,
+    AgentBridgeAdmissionDescriptor, HostKernelCandidateBinding, KernelActivationPermit,
+    KernelActivationQuery, KernelActivationReceipt, KernelControlCommand, KernelReadyReceipt,
 };
 use crate::validate_text;
 
@@ -483,6 +487,110 @@ impl KernelService {
                 field: "activation_query",
             }),
         }
+    }
+
+    /// Admits one versioned P-04 host request for routing after exact binding checks.
+    ///
+    /// This gate mirrors [`Self::activate_permit`] and [`Self::rebind_store`]:
+    /// it validates the envelope, the immutable admission descriptor, and the
+    /// live bridge process/connection binding, then validates the
+    /// process/connection/principal/Session/task/scope/fence/capability/
+    /// deadline/payload-digest continuity before routing. It performs no Frame
+    /// ingress, selects no Governor route, maps no resolution disposition, and
+    /// creates no Session, task, capability, or result authority. Activation
+    /// consumes the typed [`AgentActivationResolutionResult`] path: only a
+    /// `Resolved` result satisfies the gate, and every other disposition fails
+    /// without yielding a binding.
+    pub fn admit_host_request(
+        &self,
+        envelope: &HostRequestEnvelope,
+        descriptor: &AgentBridgeAdmissionDescriptor,
+        binding: &AgentBridgeProcessBinding,
+        resolution: Option<&AgentActivationResolutionResult>,
+    ) -> Result<HostRequestAdmissionReceipt, KernelServiceError> {
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
+        let degraded_admitted = matches!(
+            envelope.kind,
+            HostRequestKind::Cancellation
+                | HostRequestKind::Status
+                | HostRequestKind::Reconciliation
+        );
+        let state_admits = if degraded_admitted {
+            matches!(
+                self.state,
+                KernelServiceState::Ready | KernelServiceState::Degraded
+            )
+        } else {
+            self.state == KernelServiceState::Ready
+        };
+        if !state_admits {
+            return Err(KernelServiceError::AdmissionClosed(self.state));
+        }
+        descriptor.validate_host_request_binding(envelope)?;
+        descriptor.validate_process_binding(binding)?;
+        if envelope.connection_id != binding.connection_id {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "host_request.connection",
+            });
+        }
+        match envelope.kind {
+            HostRequestKind::Activation => {
+                let result = resolution.ok_or(KernelServiceError::InvalidField {
+                    field: "host_request.resolution",
+                    reason: "activation requires the exact typed resolution result",
+                })?;
+                envelope.validate_resolution(result).map_err(|_| {
+                    KernelServiceError::HandshakeMismatch {
+                        field: "host_request.resolution",
+                    }
+                })?;
+            }
+            HostRequestKind::Invocation
+            | HostRequestKind::Cancellation
+            | HostRequestKind::Status
+            | HostRequestKind::Reconciliation => {
+                if resolution.is_some() {
+                    return Err(KernelServiceError::InvalidField {
+                        field: "host_request.resolution",
+                        reason: "only activation carries a resolution result",
+                    });
+                }
+            }
+        }
+        let receipt = HostRequestAdmissionReceipt::issue(envelope).map_err(|_| {
+            KernelServiceError::InvalidField {
+                field: "host_request.envelope",
+                reason: "cannot issue an admission receipt",
+            }
+        })?;
+        receipt
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "host_request.receipt",
+                reason: "issued admission receipt is not well-formed",
+            })?;
+        Ok(receipt)
+    }
+
+    /// Reconciles an unknown host-request admission delivery without admitting again.
+    ///
+    /// This pure check proves only that a retained receipt binds the exact
+    /// envelope. It changes no service state and issues no new authority; an
+    /// unknown delivery whose durable outcome is still uncertain remains the
+    /// responsibility of the ORS host-request record.
+    pub fn reconcile_host_request_admission(
+        &self,
+        receipt: &HostRequestAdmissionReceipt,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<bool, KernelServiceError> {
+        receipt
+            .validate_envelope(envelope)
+            .map_err(|_| KernelServiceError::HandshakeMismatch {
+                field: "host_request.receipt",
+            })?;
+        Ok(true)
     }
 
     /// Admits a Store-only same-lineage rebind without restarting Kernel.

@@ -754,6 +754,10 @@ impl KernelComposition {
             agent_activation_pending: Mutex::new(AgentActivationPendingState::default()),
             #[cfg(windows)]
             agent_activation_changed: tokio::sync::Notify::new(),
+            #[cfg(windows)]
+            agent_activation_results: Mutex::new(BTreeMap::new()),
+            #[cfg(windows)]
+            host_request_connection_index: Mutex::new(BTreeMap::new()),
         })
     }
 }

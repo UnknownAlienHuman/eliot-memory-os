@@ -193,49 +193,84 @@ impl KernelComposition {
             "agent_activation_submit" => {
                 #[cfg(windows)]
                 {
-                    // Production v2 path: the closed typed submit envelope
-                    // carrying one AgentActivationResolutionResult. Unknown
-                    // envelope versions are rejected before adoption.
-                    if let Some(result_value) = payload.get("result") {
-                        let submit: AgentActivationResultSubmit =
-                            serde_json::from_value(result_value.clone())
-                                .map_err(|_| TransportError::SessionFenced)?;
-                        match self.submit_agent_activation_result(submit) {
-                            Ok(ack) => Ok(Self::activation_result_daemon_response(&ack)),
-                            // Deadline expiry is an expected race at this
-                            // boundary, not a daemon-fatal transport failure.
-                            // Return an explicit known outcome so the caller can
-                            // retain liveness without parsing error strings.
-                            // A retained terminal result never takes this
-                            // path: exact replay stays idempotent across the
-                            // deadline.
-                            Err(TransportError::Timeout) => {
-                                Ok(Self::expired_activation_daemon_response())
+                    // The closed submit operation carries exactly one resolver
+                    // outcome in one of two result shapes: the production v2
+                    // typed submit envelope carrying one
+                    // AgentActivationResolutionResult (unknown envelope
+                    // versions are rejected before adoption), or the
+                    // unenveloped P-04 typed result shape covering the same
+                    // seven closed dispositions, or the legacy success-only
+                    // decision. The v2 envelope is trial-decoded first so
+                    // production traffic keeps its typed acknowledgement and
+                    // reconcile support; the two result shapes share the
+                    // ticket ledger but keep independent
+                    // exact-replay/conflict accounting. A payload carrying
+                    // both keys or neither is fail-closed.
+                    let has_decision = payload
+                        .get("decision")
+                        .is_some_and(|value| !value.is_null());
+                    let has_result = payload.get("result").is_some_and(|value| !value.is_null());
+                    match (has_decision, has_result) {
+                        (true, false) => {
+                            let decision_value = payload
+                                .get("decision")
+                                .cloned()
+                                .ok_or(TransportError::SessionFenced)?;
+                            let decision: AgentActivationResolutionDecision =
+                                serde_json::from_value(decision_value)
+                                    .map_err(|_| TransportError::SessionFenced)?;
+                            match self.submit_agent_activation_decision(decision) {
+                                Ok(()) => Ok(Self::accepted_daemon_response()),
+                                // Deadline expiry is an expected race at this
+                                // boundary, not a daemon-fatal transport failure.
+                                // Return an explicit known outcome so the caller can
+                                // retain liveness without parsing error strings.
+                                Err(TransportError::Timeout) => {
+                                    Ok(Self::expired_activation_daemon_response())
+                                }
+                                Err(error) => Err(error),
                             }
-                            Err(error) => Err(error),
                         }
-                    } else if let Some(decision_value) = payload.get("decision") {
-                        // Legacy v1 compatibility decoder only. The v1
-                        // decision uses a distinct payload key, wire identity,
-                        // and closed shape, so it structurally cannot
-                        // trial-decode v2 result data; production traffic uses
-                        // the v2 arm above.
-                        let decision: AgentActivationResolutionDecision =
-                            serde_json::from_value(decision_value.clone())
-                                .map_err(|_| TransportError::SessionFenced)?;
-                        match self.submit_agent_activation_decision(decision) {
-                            Ok(()) => Ok(Self::accepted_daemon_response()),
-                            // Deadline expiry is an expected race at this
-                            // boundary, not a daemon-fatal transport failure.
-                            // Return an explicit known outcome so the caller can
-                            // retain liveness without parsing error strings.
-                            Err(TransportError::Timeout) => {
-                                Ok(Self::expired_activation_daemon_response())
+                        (false, true) => {
+                            let result_value = payload
+                                .get("result")
+                                .cloned()
+                                .ok_or(TransportError::SessionFenced)?;
+                            if let Ok(submit) = serde_json::from_value::<AgentActivationResultSubmit>(
+                                result_value.clone(),
+                            ) {
+                                match self.submit_agent_activation_result(submit) {
+                                    Ok(ack) => Ok(Self::activation_result_daemon_response(&ack)),
+                                    // Deadline expiry is an expected race at this
+                                    // boundary, not a daemon-fatal transport failure.
+                                    // Return an explicit known outcome so the caller can
+                                    // retain liveness without parsing error strings.
+                                    // A retained terminal result never takes this
+                                    // path: exact replay stays idempotent across the
+                                    // deadline.
+                                    Err(TransportError::Timeout) => {
+                                        Ok(Self::expired_activation_daemon_response())
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            } else {
+                                let result: AgentActivationResolutionResult =
+                                    serde_json::from_value(result_value)
+                                        .map_err(|_| TransportError::SessionFenced)?;
+                                match self.submit_agent_activation_resolution_result(result) {
+                                    Ok(()) => Ok(Self::accepted_daemon_response()),
+                                    // Same deadline-expiry race as the legacy path:
+                                    // the ticket lapsed before the typed result
+                                    // arrived, so the caller observes expiry without
+                                    // losing daemon liveness.
+                                    Err(TransportError::Timeout) => {
+                                        Ok(Self::expired_activation_daemon_response())
+                                    }
+                                    Err(error) => Err(error),
+                                }
                             }
-                            Err(error) => Err(error),
                         }
-                    } else {
-                        Err(TransportError::SessionFenced)
+                        _ => Err(TransportError::SessionFenced),
                     }
                 }
                 #[cfg(not(windows))]
