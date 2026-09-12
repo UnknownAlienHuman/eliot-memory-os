@@ -420,7 +420,13 @@ where
                     | HostServiceState::DegradedRecovery
                     | HostServiceState::Failed
             ) {
-                let _ = self.stop_kernel(context, prior_service.clone());
+                // Same-owner restart: verified platform stop without minting
+                // the durable pending-release ownership-transfer gate (which
+                // would block the start below via transition()'s gate) and
+                // without releasing the installation-wide owner lease (which
+                // would open a split-brain window with a kernel running and
+                // no lease held). Ownership never transfers mid-restart.
+                let _ = self.stop_kernel_for_restart(context, &prior_service);
             }
             match self.start_kernel(
                 context,
@@ -530,6 +536,68 @@ where
     ) -> Result<ServiceStopReceipt, HostServiceError> {
         validate_context(context)?;
         validate_handle(&service, "kernel.service")?;
+        let prior_process = self.verified_kernel_stop(context, &service)?;
+        let marker = HostShutdownMarker {
+            context: derived_context(context, "kernel-clean-stop")?,
+            installation: self.installation.clone(),
+            process: prior_process.clone(),
+        };
+        let token = match self.state_store.prepare_release_pending(marker) {
+            Ok(token) => token,
+            Err(error) => {
+                self.fail(HostFailure::StateStore(error.to_string()));
+                return Err(HostServiceError::StateStore(error));
+            }
+        };
+        self.pending_release = Some(token);
+        self.durable_finalized = false;
+        // The platform process is stopped, but the owner-release proof has not
+        // completed yet. Keep Host in recovery until the caller proves release
+        // and invokes `finalize_clean_shutdown`.
+        self.state = HostServiceState::DegradedRecovery;
+        self.failure = None;
+        Ok(ServiceStopReceipt {
+            service,
+            prior_process,
+        })
+    }
+
+    /// Restart-scoped stop: same verified platform stop as `stop_kernel`
+    /// (inspect -> Stop -> Stopped/Absent + process none, same fencing),
+    /// but without minting the durable pending-release ownership-transfer
+    /// gate and without touching the installation-wide owner lease. The gate
+    /// proves release before a NEW activation takes over ownership; in a
+    /// same-owner restart ownership never transfers, so the subsequent
+    /// `start_kernel` stays legal via `DegradedRecovery` -> `Starting` while the
+    /// single-owner invariant holds for the whole stop -> start sequence.
+    fn stop_kernel_for_restart(
+        &mut self,
+        context: &RequestMetadata,
+        service: &PlatformHandle,
+    ) -> Result<ServiceStopReceipt, HostServiceError> {
+        validate_handle(service, "kernel.service")?;
+        let prior_process = self.verified_kernel_stop(context, service)?;
+        // Platform process is verified stopped under the still-held owner
+        // lease. No pending-release token is minted, so the restart start is
+        // not fenced out by transition()'s pending-release gate.
+        self.state = HostServiceState::DegradedRecovery;
+        self.failure = None;
+        Ok(ServiceStopReceipt {
+            service: service.clone(),
+            prior_process,
+        })
+    }
+
+    /// Shared verified-stop core for `stop_kernel` and the restart path:
+    /// Draining gate, pre-stop inspect proving the lineage, platform Stop,
+    /// and post-stop Stopped/Absent + process-none verification. Failure
+    /// side effects (`fail()`/`unknown_stop()`) are identical for both callers
+    /// so the two paths cannot drift.
+    fn verified_kernel_stop(
+        &mut self,
+        context: &RequestMetadata,
+        service: &PlatformHandle,
+    ) -> Result<ServiceProcessRecord, HostServiceError> {
         if !matches!(
             self.state,
             HostServiceState::ControlReady
@@ -571,7 +639,7 @@ where
         )?;
         match stopped {
             PortOutcome::Known(observation)
-                if observation.service == service
+                if observation.service == *service
                     && matches!(
                         observation.state,
                         ServiceState::Stopped | ServiceState::Absent
@@ -587,29 +655,7 @@ where
                 return Err(HostServiceError::Platform(error));
             }
         }
-        let marker = HostShutdownMarker {
-            context: derived_context(context, "kernel-clean-stop")?,
-            installation: self.installation.clone(),
-            process: prior_process.clone(),
-        };
-        let token = match self.state_store.prepare_release_pending(marker) {
-            Ok(token) => token,
-            Err(error) => {
-                self.fail(HostFailure::StateStore(error.to_string()));
-                return Err(HostServiceError::StateStore(error));
-            }
-        };
-        self.pending_release = Some(token);
-        self.durable_finalized = false;
-        // The platform process is stopped, but the owner-release proof has not
-        // completed yet. Keep Host in recovery until the caller proves release
-        // and invokes `finalize_clean_shutdown`.
-        self.state = HostServiceState::DegradedRecovery;
-        self.failure = None;
-        Ok(ServiceStopReceipt {
-            service,
-            prior_process,
-        })
+        Ok(prior_process)
     }
 
     /// Releases this service's installation-wide owner capability and then
@@ -707,7 +753,7 @@ where
         Ok(self.platform.execute(&request))
     }
 
-    fn unknown_stop(&mut self) -> Result<ServiceStopReceipt, HostServiceError> {
+    fn unknown_stop<T>(&mut self) -> Result<T, HostServiceError> {
         self.fail(HostFailure::UnknownOutcome);
         Err(HostServiceError::UnknownOutcome)
     }

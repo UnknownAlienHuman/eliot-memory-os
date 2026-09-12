@@ -33,6 +33,8 @@ use eliot_receipts::RequestBinding;
 use eliot_store_api::OperationId;
 use eliot_store_api::RequestMeta;
 use eliot_store_api::StoreError;
+use eliot_store_api::StoreFailure;
+use eliot_store_api::StoreFailureDisposition;
 use eliot_store_api::StoreRequest;
 use eliot_store_api::StoreResponse;
 use eliot_store_api::WriteReceipt;
@@ -44,6 +46,10 @@ use super::StoreClientError;
 #[derive(Debug)]
 pub(super) enum RequestFailure {
     Store(StoreError),
+    /// Verified typed store failure as a lossless owning projection. Retains
+    /// the complete `StoreFailure` without flattening and without parsing
+    /// `human_detail` prose; the box keeps the error enum inline size small.
+    Failure(Box<StoreFailure>),
     Contract(StoreClientError),
     Unknown {
         operation_id: OperationId,
@@ -68,12 +74,84 @@ impl RequestFailure {
     pub(super) fn into_store_error(self) -> StoreError {
         match self {
             Self::Store(error) => error,
+            Self::Failure(failure) => failure_into_store_error(&failure),
             Self::Contract(error) => StoreError::Serialization(error.to_string()),
             Self::Unknown { reason, .. } => {
                 let _ = reason;
                 StoreError::Unavailable
             }
         }
+    }
+
+    /// Reports whether this failure is a typed unknown-outcome failure bound
+    /// to the admitted operation. Callers reconcile exactly that operation via
+    /// `receipt_exact`/`reconcile_genesis` and never adopt a peer identity.
+    pub(super) fn is_unknown_outcome_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Failure(failure)
+                if failure.disposition == StoreFailureDisposition::UnknownOutcome
+        )
+    }
+}
+
+/// Projects a verified typed failure onto the `StoreError` boundary without
+/// parsing prose. Only the typed `disposition` and the closed `reason_code`
+/// token set produced by `StoreFailure::from_store_error` steer the mapping;
+/// `human_detail` never does. Deterministic rejections never project to the
+/// retryable `Unavailable` signal, and unknown outcomes never claim
+/// non-application.
+fn failure_into_store_error(failure: &StoreFailure) -> StoreError {
+    match failure.disposition {
+        StoreFailureDisposition::Conflict => match failure.reason_code.as_str() {
+            "STATE_FENCE_MISMATCH" => StoreError::FenceMismatch,
+            "REVISION_CONFLICT" => StoreError::RevisionConflict,
+            "ORDERING_CONFLICT" => StoreError::OrderingConflict,
+            _ => StoreError::IdentityConflict,
+        },
+        StoreFailureDisposition::DeterministicRejection => match failure.reason_code.as_str() {
+            "RECEIPT_NOT_FOUND" => StoreError::ReceiptNotFound,
+            "PAYLOAD_TOO_LARGE" => StoreError::PayloadTooLarge,
+            _ => StoreError::InvalidField {
+                field: "store.operation",
+                reason: "deterministic store rejection",
+            },
+        },
+        StoreFailureDisposition::Unavailable
+        | StoreFailureDisposition::Backpressured
+        | StoreFailureDisposition::DeadlineExceeded
+        | StoreFailureDisposition::MigrationRequired => StoreError::Unavailable,
+        StoreFailureDisposition::Unsupported => match failure.reason_code.as_str() {
+            "OPERATION_MANIFEST_MISMATCH" => StoreError::ManifestMismatch,
+            "TRANSITION_CLASS_EXCEEDED" => StoreError::TransitionClassExceeded,
+            "EFFECT_CEILING_EXCEEDED" => StoreError::EffectCeilingExceeded,
+            _ => StoreError::UnknownOperation,
+        },
+        StoreFailureDisposition::UnknownOutcome => StoreError::MissingReceiptEnvelope,
+        StoreFailureDisposition::InternalDefect => match failure.reason_code.as_str() {
+            "INVALID_PROJECTION" => StoreError::InvalidProjection,
+            "INVALID_OUTBOX" => StoreError::InvalidOutbox,
+            "INVALID_RECEIPT" => StoreError::InvalidReceipt,
+            _ => StoreError::Serialization("store reported an internal defect".to_owned()),
+        },
+    }
+}
+
+/// Surfaces a protocol defect for a failure that cannot be bound to the
+/// admitted request. When the admitted write may have crossed the effect
+/// boundary the outcome stays unknown for the admitted operation so callers
+/// reconcile it; reads cross no effect boundary and surface an identity
+/// conflict instead of claiming anything about a peer identity.
+fn failure_defect(
+    admitted_operation: Option<&OperationId>,
+    reason: &'static str,
+) -> RequestFailure {
+    match admitted_operation {
+        Some(operation_id) => RequestFailure::Unknown {
+            operation_id: operation_id.clone(),
+            reason: reason.to_owned(),
+        },
+        None => RequestFailure::Store(StoreError::IdentityConflict),
     }
 }
 
@@ -163,9 +241,40 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         response
             .validate()
             .map_err(|error| RequestFailure::Contract(error.into()))?;
+        self.classify_response(
+            response,
+            &request_id,
+            operation_id.as_ref(),
+            idempotency_key,
+        )
+    }
+
+    /// Binds one validated response to the admitted request. A typed failure
+    /// is verified against the admitted request/operation/fence/idempotency
+    /// identity before it is retained; anything misbound is a protocol defect
+    /// that retains the unknown outcome for an admitted write.
+    fn classify_response(
+        &self,
+        response: StoreResponse,
+        request_id: &RequestId,
+        admitted_operation: Option<&OperationId>,
+        idempotency_key: &str,
+    ) -> Result<StoreResponse, RequestFailure> {
         match response {
+            StoreResponse::Failure { failure } => {
+                Err(self.bind_failure(failure, request_id, admitted_operation, idempotency_key))
+            }
+            // Legacy v1 `Error` is a protocol defect on the current v2
+            // session. The peer prose is discarded, never classified: the
+            // transport demonstrably delivered this frame, so the
+            // compatibility classification is always the internal-defect
+            // branch, and an admitted write keeps its unknown outcome.
             StoreResponse::Error { error } => {
-                Err(RequestFailure::Store(StoreError::Serialization(error)))
+                let _ = error;
+                Err(failure_defect(
+                    admitted_operation,
+                    "store returned legacy v1 Error on a current v2 session",
+                ))
             }
             StoreResponse::Unknown {
                 operation_id,
@@ -176,6 +285,71 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             }),
             response => Ok(response),
         }
+    }
+
+    /// Verifies a typed failure against the admitted identity without parsing
+    /// prose. `StoreFailure::validate` already checked the wire shape and
+    /// cross-field invariants during `response.validate()`; this binding step
+    /// additionally pins request, operation, fence, and idempotency key to
+    /// the exact values this call admitted. Operation B's failure never
+    /// reconciles operation A.
+    fn bind_failure(
+        &self,
+        failure: StoreFailure,
+        request_id: &RequestId,
+        admitted_operation: Option<&OperationId>,
+        idempotency_key: &str,
+    ) -> RequestFailure {
+        if failure.validate().is_err() {
+            return failure_defect(
+                admitted_operation,
+                "store failure violates the typed failure contract",
+            );
+        }
+        if let Some(observed) = failure.request_id.as_ref()
+            && observed != request_id
+        {
+            return failure_defect(
+                admitted_operation,
+                "store failure request_id does not match the admitted request",
+            );
+        }
+        match (admitted_operation, failure.operation_id.as_ref()) {
+            (Some(admitted), Some(observed)) if observed != admitted => {
+                return failure_defect(
+                    admitted_operation,
+                    "store failure operation_id does not match the admitted operation",
+                );
+            }
+            (None, Some(_)) => {
+                return failure_defect(
+                    admitted_operation,
+                    "store failure carries an operation identity the read never admitted",
+                );
+            }
+            _ => {}
+        }
+        if let Some(observed) = failure.state_fence_ref_or_exact_safe_projection.as_ref()
+            && observed != &self.requirement.state_fence
+        {
+            return failure_defect(
+                admitted_operation,
+                "store failure fence does not match the admitted state fence",
+            );
+        }
+        // The binding accepts an exact echo of the admitted key or its
+        // canonical digest form; anything else cannot be bound to this call.
+        let idempotency_digest = eliot_store_api::sha256_hex(idempotency_key.as_bytes());
+        if let Some(observed) = failure.idempotency_key_ref_or_digest.as_deref()
+            && observed != idempotency_key
+            && observed != idempotency_digest.as_str()
+        {
+            return failure_defect(
+                admitted_operation,
+                "store failure idempotency binding does not match the admitted key",
+            );
+        }
+        RequestFailure::Failure(Box::new(failure))
     }
 
     pub(super) async fn receipt_exact(

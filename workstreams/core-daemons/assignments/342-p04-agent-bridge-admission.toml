@@ -1,0 +1,154 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_KERNEL_STATE_MACHINE_IMPLEMENTATION"
+implementation_support = "HOST_REQUEST_CONTRACT_PRESENT_KERNEL_P04_PRODUCTION_OWNER_UNREACHABLE"
+evidence_execution_status = "CURRENT_BRIDGE_PORT_KERNEL_AND_ACTIVATION_DEPENDENCIES_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "P04_AGENT_BRIDGE_ADMISSION_EDGE_CANDIDATE_ONLY"
+issue = 342
+agent_bridge_runtime_issue = 77
+activation_parent_issue = 66
+activation_receiver_issue = 1095
+activation_producer_issue = 839
+kernel_issue = 15
+governor_issue = 18
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "kernel.p04-agent-bridge-admission-and-request-state"
+causal_property = "Kernel accepts one Agent Bridge host request only from an authenticated current bridge process and connection bound to exact installation, principal, Session, task/WorkScope, RequestIdentity, operation, capability, deadline, cancellation, AuthorityEpoch and StateFence; it owns durable request/replay/cancel/reconcile state but never interprets MCP/domain semantics or lets transport success create authority, completion or canonical truth."
+current_discriminator = "The Agent Bridge exposes typed host invocation and cancellation surfaces, but its production KernelHostRequestPort is unavailable. The current Kernel path does not expose one complete P-04 owner that admits, persists, routes, cancels and reconciles the exact host request while preserving activation v2 outcomes and session/fence lineage."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/342"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-01-agent-interaction-loop.md#a101-agent-interaction-loop",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-identity-and-effect-identity",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I06-15-capability-grant-lineage-introductions-and-resource-facets.md#i615-capability-grant-lineage-introductions-and-resource-facets",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md#i71-eliot-bridge-protocol-ebp1",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-02-frame.md#i72-frame",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-17-scope-and-task-onboarding.md#i717-scope-and-task-onboarding",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-24-tool-surface-economy-and-cognitive-exposure.md#i724-tool-surface-economy-and-cognitive-exposure",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-21-unknown-commit-recovery.md#i1421-unknown-commit-recovery",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-AUTH-01", "ARCH-PORT-01", "ARCH-SEC-02", "ARCH-ORD-01", "ARCH-OBS-01", "ARCH-RES-04", "ARCH-FIN-01"]
+
+[current_source]
+confirmed = [
+  "The Agent Bridge package exposes a typed host request/cancellation surface and delegates through a KernelHostRequestPort abstraction.",
+  "The production bridge composition currently installs an unavailable Kernel port rather than one authenticated current Kernel P-04 client.",
+  "Bounded input acquisition remains separately owned by #977 and cannot create Kernel admission or Session authority.",
+  "Typed activation result production and Kernel receipt/replay remain separately allocated under #839 and #1095.",
+  "Kernel must own bridge process/connection admission, current Session/fence binding, request replay/cancellation and durable reconciliation; the bridge remains an inert adapter.",
+  "No open PR was found that tracks #342 as the complete current Kernel P-04 owner.",
+]
+
+[scope]
+primary_paths = [
+  "crates/kernel/eliot-kernel-service/src/** exact Agent Bridge P-04 admission/request spans",
+  "crates/kernel/eliot-ors/src/** exact host-request operation/reconciliation spans",
+  "bins/eliot-kernel/src/agent_bridge.rs",
+  "bins/eliot-kernel/src/daemon_request_dispatch.rs only where activation/onboarding result crosses the exact owner boundary",
+  "crates/foundation/eliot-protocol/src/** exact host-request envelope/response contracts only if a proven contract gap exists",
+  "directly relevant tests and finite fixtures",
+]
+serialized_dependencies = [
+  "#15 Kernel boundary",
+  "#66/#839/#1095 activation resolution",
+  "#77 Agent Bridge executable/client",
+  "#18 Governor semantic operation owner",
+  "#23/#1098 User Broker and user-session process binding where applicable",
+  "#11 Product proof",
+]
+forbidden = [
+  "MCP/domain semantic interpretation in Kernel",
+  "caller-selected principal, Session, task, WorkScope, capability, authority, epoch or StateFence",
+  "bridge process liveness or successful handshake treated as capability",
+  "generic JSON command, raw MCP payload or arbitrary operation name creating authority",
+  "Kernel minting task meaning, provider policy, canonical result or Finish",
+  "blind retry after a possibly submitted/effected request",
+  "same request identity reused for onboarding, host invocation, cancellation and reconciliation",
+  "human error text or log strings driving control behavior",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Define one closed versioned P-04 bridge admission and host-request contract."
+how = [
+  "Bind bridge artifact/process generation, process start identity, principal/logon Session, connection, protocol generation, User Broker launch receipt where applicable, installation, AuthorityEpoch and StateFence before accepting requests.",
+  "Define closed request kinds for activation/onboarding, host invocation, cancellation, status and reconciliation; no arbitrary operation string or permissive fallback.",
+  "Require exact request, idempotency, cancellation, parent operation, deadline, capability/resource introduction, task/WorkScope/Session and payload-schema identities for every request.",
+  "Keep bridge connection identity, durable Session identity, task/work-unit identity and physical operation identity distinct.",
+]
+
+[[waves]]
+id = "B"
+what = "Persist and validate the Kernel-owned request state machine."
+how = [
+  "Persist requested, admitted, routed, submitted, possibly-effected, result-received, cancelled, expired, conflicted, unknown/reconciling and terminal states in the current ORS owner before acknowledgement where required.",
+  "Validate process/connection/principal/session/task/scope/fence/capability/deadline and canonical payload digest before routing to any semantic owner.",
+  "Exact replay returns the same state/result; changed payload or binding under one request/idempotency identity returns IDENTITY_CONFLICT.",
+  "Do not infer durable Session continuity or request ownership from a reconnecting process, same user, same pipe or cached token.",
+]
+
+[[waves]]
+id = "C"
+what = "Route semantic work and typed outcomes without absorbing ownership."
+how = [
+  "For onboarding, use the exact activation ticket/result path from #66/#839/#1095 and preserve all seven typed dispositions without coercion.",
+  "For admitted host calls, route the exact provider-neutral operation to the owning Governor/MCP capability and retain operation/effect lineage.",
+  "Kernel performs only identity, authority, fence, ordering, budget, cancellation and mechanical route checks; semantic validation/result meaning remains with the declared owner.",
+  "A response or transport acknowledgement cannot create task completion, canonical truth, capability grant or VERIFIED_COMPLETE.",
+]
+
+[[waves]]
+id = "D"
+what = "Close cancellation, reconnect, unknown outcome and restart recovery."
+how = [
+  "Bind cancellation to the exact still-cancellable request/operation and reject foreign, stale or already-terminal cancellation without touching another operation.",
+  "After possible semantic/provider/external effect or lost acknowledgement, reconcile the same operation/result identity before retry or route replacement.",
+  "On bridge disconnect, broker/logout, fence/epoch/generation change or permit revocation, revoke connection-scoped capabilities and retain durable Session/operation state only according to owner-issued continuation rules.",
+  "Rehydrate pending/unknown requests after Kernel restart without rerunning semantic resolution or provider work and without reviving stale bridge generations.",
+]
+
+[acceptance]
+criteria = [
+  "One current bridge process/connection is admitted only under exact installation, artifact, process-start, principal/session, protocol, epoch and fence identity.",
+  "Successful transport, process liveness, same SID, same executable or cached token cannot create capability or durable Session continuity.",
+  "Every activation, invocation, cancellation, status and reconciliation request has its own exact request/idempotency/cancellation/operation identity.",
+  "Request identity binds task/WorkScope/Session, capability/resource introduction, deadline, fence and canonical payload schema/digest before routing.",
+  "Missing, stale, expired, revoked, foreign, over-capability, wrong-scope or wrong-fence input performs no semantic/provider/external effect.",
+  "Exact replay is idempotent; changed payload or binding under one identity conflicts before work.",
+  "All seven activation dispositions remain exact and immediate; non-Resolved outcomes create no Session or authority.",
+  "Kernel does not interpret MCP/domain semantics and cannot decide canonical truth, task meaning, provider policy or Finish.",
+  "Cancellation targets only the exact operation and cannot erase a possible or committed effect.",
+  "Unknown/potential effect remains reconciling and blocks blind retry or route substitution.",
+  "Bridge disconnect/logout/fence/epoch/generation loss revokes connection-scoped authority without deleting owner-authorized durable Session/operation state.",
+  "Kernel restart rehydrates exact request/reconciliation state and cannot repeat semantic resolution, provider work or an external effect.",
+  "Agent/operator errors expose stable typed reason, state and next safe action without protected payloads or human-string control logic.",
+  "No generic operation, raw Store/MCP authority, second Session/task owner, canonical write or VERIFIED_COMPLETE path is introduced.",
+  "Focused P-04 contract/state/replay/cancel/restart tests pass and the real bridge client is proven separately under #77.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-protocol -p eliot-kernel-service -p eliot-ors -p eliot-kernel --all-targets",
+  "cargo test --locked -p eliot-protocol -p eliot-kernel-service -p eliot-ors -p eliot-kernel --all-targets",
+  "cargo clippy --locked -p eliot-protocol -p eliot-kernel-service -p eliot-ors -p eliot-kernel --all-targets -- -D warnings",
+  "python scripts/verify-agent-bridge-protocol.py",
+  "git diff --check",
+]
+edge_proof = "Drive activation, invocation, cancellation, reconnect and unknown-result cases through one authenticated current bridge process, restart Kernel and prove exact rehydration with no duplicated semantic/provider work."
+product_proof = "This establishes the Kernel P-04 Edge candidate only; executable bridge and installed Product proof remain #77/#11."

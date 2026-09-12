@@ -10,8 +10,8 @@ use eliot_process::{
 };
 pub use eliot_protocol::AGENT_BRIDGE_MODULE_ID;
 use eliot_protocol::{
-    AgentBridgeClientDeclaration, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
-    ProtocolVersion,
+    AgentBridgeClientDeclaration, AgentBridgeProcessBinding, EncodingProfile, Frame, FrameKind,
+    HostRequestEnvelope, MessageType, ProtocolPayload, ProtocolVersion,
 };
 use eliot_runtime_contracts::{
     HealthVector, ServiceProcessState, SupervisionLeaseIncarnationBinding,
@@ -352,6 +352,100 @@ impl AgentBridgeAdmissionDescriptor {
             return Err(KernelServiceError::InvalidField {
                 field: "agent_bridge.descriptor_sha256",
                 reason: "descriptor digest mismatch",
+            });
+        }
+        Ok(())
+    }
+    /// Validates one live bridge process binding against this descriptor.
+    ///
+    /// The binding extends this descriptor span with the live bridge-artifact,
+    /// process-generation, and process-start observations. The descriptor wire
+    /// version and semantics are unchanged; this method only compares the
+    /// binding against the already validated descriptor and rejects any
+    /// substitution of artifact, generation, fence, principal, or image path.
+    pub fn validate_process_binding(
+        &self,
+        binding: &AgentBridgeProcessBinding,
+    ) -> Result<(), KernelServiceError> {
+        self.validate()?;
+        binding
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "agent_bridge.process_binding",
+                reason: "invalid bridge process binding",
+            })?;
+        if binding.module_id != self.module_id
+            || binding.profile_id != self.profile_id.as_str()
+            || binding.descriptor_sha256 != self.descriptor_sha256
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "agent_bridge.process_binding.descriptor",
+            });
+        }
+        if binding.executable_sha256 != self.executable_sha256
+            || binding.executable_volume_serial != self.executable_identity.volume_serial_number
+            || binding.executable_file_index != self.executable_identity.file_index
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "agent_bridge.process_binding.executable",
+            });
+        }
+        if binding.bridge_generation != self.generation
+            || binding.state_fence != self.state_fence
+            || binding.state_fence.authority_epoch != self.authority_epoch
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "agent_bridge.process_binding.generation",
+            });
+        }
+        if binding.observed_sid != self.approved_user_sid {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "agent_bridge.process_binding.sid",
+            });
+        }
+        if binding.observed_image_path != self.executable.as_str() {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "agent_bridge.process_binding.image_path",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates one host-request envelope against the static admission span.
+    ///
+    /// This checks descriptor binding, capability admission membership, and
+    /// generation/epoch continuity. It performs no transport authentication,
+    /// issues no Session or authority, and interprets no payload meaning.
+    pub fn validate_host_request_binding(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<(), KernelServiceError> {
+        self.validate()?;
+        envelope
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "host_request.envelope",
+                reason: "invalid host-request envelope",
+            })?;
+        if envelope.descriptor_sha256 != self.descriptor_sha256 {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "host_request.descriptor",
+            });
+        }
+        if !self
+            .allowed_capabilities
+            .iter()
+            .any(|capability| capability == &envelope.identity.capability)
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "host_request.capability",
+            });
+        }
+        if envelope.state_fence.authority_epoch != self.authority_epoch
+            || envelope.state_fence.resource_generation != self.generation
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "host_request.state_fence",
             });
         }
         Ok(())

@@ -17,6 +17,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 mod lifecycle;
+mod process_execution_client;
 mod protocol;
 mod store_client;
 #[cfg(windows)]
@@ -29,6 +30,10 @@ pub use eliot_protocol::{
 };
 pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
+};
+pub use process_execution_client::{
+    KernelProcessExecutionClient, ProcessOperationFuture, ProcessOperationPort, ProcessStarter,
+    ProcessStarterFuture,
 };
 pub use protocol::{
     AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID, AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_VERSION,

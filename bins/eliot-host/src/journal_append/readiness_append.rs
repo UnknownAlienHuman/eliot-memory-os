@@ -26,7 +26,7 @@ use super::super::{
 };
 use eliot_host_state::{
     AppendReceipt, HostStateJournalService, JournalBackend, JournalError,
-    KernelReadinessObservationRecord, ReadinessApprovedContour, ReconcileOutcome,
+    KernelReadinessObservationRecord, ReadinessApprovedContour,
 };
 #[cfg(windows)]
 use eliot_host_state::{HostStateRecord, NonceState, record_checksum};
@@ -46,15 +46,17 @@ fn append_reconciled_readiness<B: JournalBackend>(
     match journal.append_readiness_observation(observation.clone(), expected) {
         Ok(receipt) => Ok(receipt),
         Err(JournalError::OutcomeUnknown { transaction_id }) => {
-            match journal.reconcile(&transaction_id)? {
-                ReconcileOutcome::Committed => journal
+            if super::reconcile_unknown_outcome(journal, &transaction_id)? {
+                journal
                     .append_readiness_observation(observation, expected)
-                    .map_err(HostError::Journal),
-                ReconcileOutcome::NotCommitted | ReconcileOutcome::StillUnknown => {
-                    Err(HostError::Journal(JournalError::OutcomeUnknown {
-                        transaction_id,
-                    }))
-                }
+                    .map_err(HostError::Journal)
+            } else {
+                // Unreachable today: the choke fails closed instead of returning
+                // `Ok(false)`. Retained fail-closed so semantics stay identical
+                // if the policy ever evolves.
+                Err(HostError::Journal(JournalError::OutcomeUnknown {
+                    transaction_id,
+                }))
             }
         }
         Err(error) => Err(HostError::Journal(error)),
