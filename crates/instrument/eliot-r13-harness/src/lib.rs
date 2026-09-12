@@ -7,22 +7,35 @@
 
 #![allow(clippy::print_stderr)]
 
+#[cfg(feature = "r13-os-harness")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "r13-os-harness")]
 use std::io::Write;
+#[cfg(feature = "r13-os-harness")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "r13-os-harness")]
 use std::time::Duration;
 
-const SERVICE_NAME: &str = "EliotR13DeniedHarness";
+#[cfg(feature = "r13-os-harness")]
+const HARNESS_SERVICE_NAME: &str = "EliotR13DeniedHarness";
+#[cfg(feature = "r13-os-harness")]
 const SERVICE_DISPLAY_NAME: &str = "ELIOT R13 two-token denied harness";
+#[cfg(feature = "r13-os-harness")]
 const LOCAL_SERVICE_SID: &str = "S-1-5-19";
+#[cfg(feature = "r13-os-harness")]
 const MAX_STAGE_BYTES: u64 = 2 * 1024 * 1024;
+#[cfg(feature = "r13-os-harness")]
 const STAGE_TIMEOUT: Duration = Duration::from_secs(45);
+#[cfg(feature = "r13-os-harness")]
 const BRIDGE_TIMEOUT: Duration = Duration::from_secs(40);
+#[cfg(feature = "r13-os-harness")]
 const FRONT_DOOR_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 // Pre-provisioned with the bounded LocalService + approved-interactive-user
 // mailbox ACL. The harness never creates this directory or changes its DACL.
+#[cfg(feature = "r13-os-harness")]
 const EVIDENCE_ROOT: &str = r"C:\ProgramData\Eliot\R13\harness";
 
+#[cfg(feature = "r13-os-harness")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ControllerArgs {
     bridge_exe: PathBuf,
@@ -30,6 +43,7 @@ struct ControllerArgs {
     evidence_root: PathBuf,
 }
 
+#[cfg(feature = "r13-os-harness")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WorkerArgs {
     bridge_exe: PathBuf,
@@ -38,12 +52,14 @@ struct WorkerArgs {
     approved_user_sid: String,
 }
 
+#[cfg(feature = "r13-os-harness")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct FileIdentityWire {
     volume_serial_number: u32,
     file_index: u64,
 }
 
+#[cfg(feature = "r13-os-harness")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SecurityReceiptWire {
@@ -57,6 +73,7 @@ struct SecurityReceiptWire {
     declaration_descriptor_sha256: String,
 }
 
+#[cfg(feature = "r13-os-harness")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProcessEvidenceWire {
@@ -68,6 +85,7 @@ struct ProcessEvidenceWire {
     image_file_identity: Option<FileIdentityWire>,
 }
 
+#[cfg(feature = "r13-os-harness")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerReadyStage {
@@ -84,6 +102,7 @@ struct WorkerReadyStage {
     security_receipt: SecurityReceiptWire,
 }
 
+#[cfg(feature = "r13-os-harness")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TransportReadyStage {
@@ -96,6 +115,7 @@ struct TransportReadyStage {
     admission_receipt_sha256: String,
 }
 
+#[cfg(feature = "r13-os-harness")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FinalResultStage {
@@ -107,6 +127,7 @@ struct FinalResultStage {
     cleanup: Option<CleanupOutcome>,
 }
 
+#[cfg(feature = "r13-os-harness")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CleanupOutcome {
@@ -115,6 +136,7 @@ struct CleanupOutcome {
     absent_after_cleanup: bool,
 }
 
+#[cfg(feature = "r13-os-harness")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CleanupReceipt {
@@ -123,6 +145,7 @@ struct CleanupReceipt {
     outcome: CleanupOutcome,
 }
 
+#[cfg(feature = "r13-os-harness")]
 fn managed_attach_line(connection_id: &str) -> Result<String, String> {
     let attach = serde_json::json!({
         "op": "attach",
@@ -138,14 +161,17 @@ fn managed_attach_line(connection_id: &str) -> Result<String, String> {
         .map_err(|error| format!("encode managed attach request: {error}"))
 }
 
+#[cfg(feature = "r13-os-harness")]
 fn cleanup_succeeded(outcome: &CleanupOutcome) -> bool {
     outcome.stopped && outcome.deleted && outcome.absent_after_cleanup
 }
 
+#[cfg(feature = "r13-os-harness")]
 fn service_absent_code(raw_os_error: Option<i32>) -> bool {
     raw_os_error == Some(1060)
 }
 
+#[cfg(feature = "r13-os-harness")]
 fn parse_controller_args<I>(args: I) -> Result<ControllerArgs, String>
 where
     I: IntoIterator<Item = String>,
@@ -196,6 +222,7 @@ where
     })
 }
 
+#[cfg(feature = "r13-os-harness")]
 fn parse_worker_args<I>(args: I) -> Result<WorkerArgs, String>
 where
     I: IntoIterator<Item = String>,
@@ -251,6 +278,7 @@ where
     })
 }
 
+#[cfg(feature = "r13-os-harness")]
 fn validate_absolute_path(path: &Path, label: &str) -> Result<(), String> {
     if !path.is_absolute()
         || path.as_os_str().is_empty()
@@ -269,6 +297,7 @@ fn validate_absolute_path(path: &Path, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "r13-os-harness")]
 fn validate_protected_control_root(path: &Path) -> Result<(), String> {
     let text = path.to_string_lossy();
     let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
@@ -283,6 +312,7 @@ fn validate_protected_control_root(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "r13-os-harness")]
 fn validate_evidence_root(path: &Path, material_root: &Path) -> Result<(), String> {
     validate_absolute_path(path, "evidence root")?;
     if path == material_root
@@ -296,6 +326,7 @@ fn validate_evidence_root(path: &Path, material_root: &Path) -> Result<(), Strin
     Ok(())
 }
 
+#[cfg(feature = "r13-os-harness")]
 fn is_sid(value: &str) -> bool {
     let mut parts = value.split('-');
     matches!(parts.next(), Some("S"))
@@ -304,10 +335,12 @@ fn is_sid(value: &str) -> bool {
         && parts.all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
+#[cfg(feature = "r13-os-harness")]
 fn stage_path(root: &Path, name: &str) -> PathBuf {
     root.join(name)
 }
 
+#[cfg(feature = "r13-os-harness")]
 const STAGE_NAMES: &[&str] = &[
     "security-receipt.json",
     "security-receipt.json.tmp",
@@ -321,6 +354,7 @@ const STAGE_NAMES: &[&str] = &[
     "cleanup-result.json.tmp",
 ];
 
+#[cfg(feature = "r13-os-harness")]
 fn stale_stage_name(root: &Path) -> Option<&'static str> {
     STAGE_NAMES
         .iter()
@@ -328,6 +362,7 @@ fn stale_stage_name(root: &Path) -> Option<&'static str> {
         .find(|name| stage_path(root, name).exists())
 }
 
+#[cfg(feature = "r13-os-harness")]
 fn write_atomic<T: Serialize>(root: &Path, name: &str, value: &T) -> Result<(), String> {
     let path = stage_path(root, name);
     let temporary = path.with_extension("json.tmp");
@@ -346,6 +381,7 @@ fn write_atomic<T: Serialize>(root: &Path, name: &str, value: &T) -> Result<(), 
     std::fs::rename(&temporary, &path).map_err(|error| format!("publish atomic stage: {error}"))
 }
 
+#[cfg(feature = "r13-os-harness")]
 fn read_stage<T: for<'de> Deserialize<'de>>(root: &Path, name: &str) -> Result<T, String> {
     let path = stage_path(root, name);
     let metadata =
@@ -360,13 +396,15 @@ fn read_stage<T: for<'de> Deserialize<'de>>(root: &Path, name: &str) -> Result<T
     serde_json::from_slice(&bytes).map_err(|error| format!("decode stage: {error}"))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(all(windows, feature = "r13-os-harness")))]
 pub fn run() -> i32 {
-    eprintln!("R13 two-token harness is unavailable off Windows; no mutation performed");
+    eprintln!(
+        "R13 two-token harness requires Windows with the r13-os-harness feature; no mutation performed"
+    );
     1
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "r13-os-harness"))]
 pub fn run() -> i32 {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--service-worker")) {
         match run_dispatcher() {
@@ -388,7 +426,7 @@ pub fn run() -> i32 {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "r13-os-harness"))]
 #[allow(clippy::too_many_lines)]
 fn run_controller(args: &ControllerArgs) -> Result<(), String> {
     use std::ffi::OsString;
@@ -437,7 +475,7 @@ fn run_controller(args: &ControllerArgs) -> Result<(), String> {
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )
     .map_err(|error| format!("open SCM: {error}"))?;
-    match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+    match manager.open_service(HARNESS_SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
         Ok(_) => return Err("fixed harness service already exists; refusing collision".to_owned()),
         Err(error) if !service_absent(&error) => {
             return Err(format!("query fixed service: {error}"));
@@ -447,7 +485,7 @@ fn run_controller(args: &ControllerArgs) -> Result<(), String> {
     let executable =
         std::env::current_exe().map_err(|error| format!("current harness path: {error}"))?;
     let service_info = ServiceInfo {
-        name: OsString::from(SERVICE_NAME),
+        name: OsString::from(HARNESS_SERVICE_NAME),
         display_name: OsString::from(SERVICE_DISPLAY_NAME),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::OnDemand,
@@ -582,7 +620,7 @@ fn run_controller(args: &ControllerArgs) -> Result<(), String> {
     };
     let cleanup_receipt = CleanupReceipt {
         stage: "cleanup_result".to_owned(),
-        service_name: SERVICE_NAME.to_owned(),
+        service_name: HARNESS_SERVICE_NAME.to_owned(),
         outcome: cleanup.clone(),
     };
     let cleanup_receipt_result =
@@ -632,7 +670,7 @@ fn run_controller(args: &ControllerArgs) -> Result<(), String> {
     result
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "r13-os-harness"))]
 fn cleanup_service(
     service: windows_service::service::Service,
     manager: &windows_service::service_manager::ServiceManager,
@@ -675,7 +713,7 @@ fn cleanup_service(
     drop(service);
     let deadline = std::time::Instant::now() + STAGE_TIMEOUT;
     let absent_after_cleanup = loop {
-        match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+        match manager.open_service(HARNESS_SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
             Err(error) if service_absent(&error) => break true,
             Ok(_) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -702,7 +740,7 @@ fn cleanup_service(
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "r13-os-harness"))]
 fn wait_for_stage<T: for<'de> Deserialize<'de>>(
     root: &Path,
     name: &str,
@@ -720,7 +758,7 @@ fn wait_for_stage<T: for<'de> Deserialize<'de>>(
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "r13-os-harness"))]
 async fn wait_for_stage_async<T: for<'de> Deserialize<'de>>(
     root: &Path,
     name: &str,
@@ -738,7 +776,7 @@ async fn wait_for_stage_async<T: for<'de> Deserialize<'de>>(
     .map_err(|_| format!("timed out waiting for {name}"))?
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "r13-os-harness"))]
 fn wait_for_service_state(
     service: &windows_service::service::Service,
     state: windows_service::service::ServiceState,
@@ -761,12 +799,12 @@ fn wait_for_service_state(
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "r13-os-harness"))]
 fn service_absent(error: &windows_service::Error) -> bool {
     matches!(error, windows_service::Error::Winapi(io) if service_absent_code(io.raw_os_error()))
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "r13-os-harness"))]
 fn security_receipt_wire(
     receipt: &eliot_platform_windows::AgentBridgeSecurityConvergenceReceipt,
 ) -> SecurityReceiptWire {
@@ -786,7 +824,7 @@ fn security_receipt_wire(
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "r13-os-harness"))]
 fn admission_descriptor(
     profile: &eliot_installation::AgentBridgeInstallationProfile,
     declaration: &eliot_protocol::AgentBridgeClientDeclaration,
@@ -839,7 +877,7 @@ fn admission_descriptor(
     Ok(descriptor)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "r13-os-harness"))]
 fn harness_candidate(
     admission: &eliot_kernel_service::AgentBridgeAdmissionDescriptor,
     worker: &eliot_platform_windows::NamedPipePeerProcessBinding,
@@ -876,7 +914,7 @@ fn harness_candidate(
             sequence: 1,
         },
         observation_scope: eliot_runtime_contracts::SupervisionObservationScope {
-            targets: vec![crate::SERVICE_NAME.to_owned()],
+            targets: vec![eliot_kernel::SERVICE_NAME.to_owned()],
             sensor_profile: "eliot-runtime-live-v3".to_owned(),
             claimed_coverage: vec!["process".to_owned(), "job".to_owned()],
             governance_axis: "runtime-live-v3".to_owned(),
@@ -935,7 +973,7 @@ fn harness_candidate(
     })
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "r13-os-harness"))]
 fn run_dispatcher() -> windows_service::Result<()> {
     use std::ffi::OsString;
     use windows_service::define_windows_service;
@@ -947,10 +985,10 @@ fn run_dispatcher() -> windows_service::Result<()> {
         // process command line is the one authoritative, fixed worker vector.
         let _ = run_service();
     }
-    service_dispatcher::start(SERVICE_NAME, ffi_service_main)
+    service_dispatcher::start(HARNESS_SERVICE_NAME, ffi_service_main)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "r13-os-harness"))]
 fn run_service() -> windows_service::Result<()> {
     use std::sync::{
         Arc,
@@ -971,7 +1009,7 @@ fn run_service() -> windows_service::Result<()> {
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
         _ => ServiceControlHandlerResult::NotImplemented,
     };
-    let status = service_control_handler::register(SERVICE_NAME, handler)?;
+    let status = service_control_handler::register(HARNESS_SERVICE_NAME, handler)?;
     status.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Running,
@@ -998,7 +1036,7 @@ fn run_service() -> windows_service::Result<()> {
     result.map_err(|error| windows_service::Error::Winapi(std::io::Error::other(error)))
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "r13-os-harness"))]
 #[allow(clippy::too_many_lines)]
 fn run_worker(
     args: &WorkerArgs,
@@ -1094,126 +1132,48 @@ fn run_worker(
     };
 
     let admission = admission_descriptor(&profile, &declaration)?;
-    let kernel = crate::KernelComposition::new(
-        crate::KernelConfig::new(&root)
+    let kernel = eliot_kernel::KernelComposition::new(
+        eliot_kernel::KernelConfig::new(&root)
             .with_kernel_artifact_sha256(declaration.expected_kernel_artifact_sha256.clone())
             .with_agent_bridge_admission(admission.clone()),
     )
     .map_err(|error| format!("construct Kernel composition: {error}"))?;
-    let policy = kernel
-        .front_door_policy
-        .lock()
-        .map_err(|_| "Kernel policy lock poisoned".to_owned())?
-        .clone();
-    let policy_artifact = policy
-        .config_snapshot
-        .get("artifact_digest")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "Kernel policy artifact digest is absent".to_owned())?;
-    let policy_config_digest = crate::sha256_json(&policy.config_snapshot)
-        .map_err(|error| format!("compute Kernel policy digest: {error}"))?;
-    if policy.session_principal_binding != declaration.expected_kernel_principal_binding
-        || policy.module_generation.state_fence.authority_epoch
-            != declaration.expected_kernel_authority_epoch
-        || policy.module_generation.generation != declaration.expected_kernel_generation
-        || policy_artifact != declaration.expected_kernel_artifact_sha256
-        || policy_config_digest != declaration.expected_kernel_config_snapshot_sha256
-    {
-        return Err(
-            "retained declaration does not bind the actual LocalService Kernel policy".to_owned(),
-        );
-    }
-    *kernel
-        .agent_bridge_profile
-        .lock()
-        .map_err(|_| "bridge profile lock poisoned".to_owned())? =
-        Some(crate::AgentBridgeProfile {
-            admission: admission.clone(),
-            declaration: declaration.clone(),
-        });
+    kernel.verify_harness_kernel_policy(&declaration)?;
+    kernel.install_harness_bridge_profile(admission.clone(), declaration.clone())?;
     let candidate = harness_candidate(&admission, &worker_binding)?;
-    {
-        let mut service = kernel
-            .service
-            .lock()
-            .map_err(|_| "Kernel service lock poisoned".to_owned())?;
-        service
-            .reconcile(candidate.clone())
-            .map_err(|error| format!("reconcile Kernel candidate: {error}"))?;
-        service
-            .apply(eliot_kernel_service::KernelControlCommand::Shadow)
-            .map_err(|error| format!("shadow Kernel candidate: {error}"))?;
-        service
-            .apply(eliot_kernel_service::KernelControlCommand::PrepareHandoff)
-            .map_err(|error| format!("prepare Kernel handoff: {error}"))?;
-        let permit = eliot_kernel_service::KernelActivationPermit {
-            operation_id: eliot_platform::PlatformHandle::new(format!(
-                "r13-two-token-activation:{}",
-                std::process::id()
-            ))
+    let permit = eliot_kernel_service::KernelActivationPermit {
+        operation_id: eliot_platform::PlatformHandle::new(format!(
+            "r13-two-token-activation:{}",
+            std::process::id()
+        ))
+        .map_err(|error| error.to_string())?,
+        candidate_binding_digest: candidate
+            .compute_digest()
             .map_err(|error| error.to_string())?,
-            candidate_binding_digest: candidate
-                .compute_digest()
-                .map_err(|error| error.to_string())?,
-            prior_kernel_disposition_digest: "b".repeat(64),
-            journal_transaction_id: eliot_platform::PlatformHandle::new(format!(
-                "r13-two-token-transaction:{}",
-                std::process::id()
-            ))
-            .map_err(|error| error.to_string())?,
-            journal_sequence: 1,
-            generation: admission.generation,
-            authority_epoch: admission.authority_epoch,
-            activation_nonce: eliot_platform::KernelActivationNonce::new(
-                eliot_platform::PlatformHandle::new(
-                    eliot_platform_windows::fresh_activation_nonce_material()
-                        .map_err(|error| error.to_string())?
-                        .to_string(),
-                )
-                .map_err(|error| error.to_string())?,
+        prior_kernel_disposition_digest: "b".repeat(64),
+        journal_transaction_id: eliot_platform::PlatformHandle::new(format!(
+            "r13-two-token-transaction:{}",
+            std::process::id()
+        ))
+        .map_err(|error| error.to_string())?,
+        journal_sequence: 1,
+        generation: admission.generation,
+        authority_epoch: admission.authority_epoch,
+        activation_nonce: eliot_platform::KernelActivationNonce::new(
+            eliot_platform::PlatformHandle::new(
+                eliot_platform_windows::fresh_activation_nonce_material()
+                    .map_err(|error| error.to_string())?
+                    .to_string(),
             )
             .map_err(|error| error.to_string())?,
-        };
-        service
-            .activate_permit(
-                &permit,
-                admission.generation,
-                declaration.expected_kernel_config_snapshot_sha256.clone(),
-            )
-            .map_err(|error| format!("activate Kernel candidate: {error}"))?;
-        let activation_nonce_digest = service
-            .activation_receipt()
-            .ok_or_else(|| "Kernel activation receipt missing".to_owned())?
-            .activation_nonce_digest
-            .clone();
-        service
-            .publish_ready(eliot_kernel_service::KernelReadyReceipt {
-                activation_id: candidate.activation_id.clone(),
-                activation_operation_id: permit.operation_id,
-                activation_nonce_digest,
-                process: eliot_kernel_service::ProcessObservation {
-                    process_id: eliot_platform::PlatformHandle::new(format!(
-                        "pid:{}:start:{}",
-                        worker_binding.process_id(),
-                        worker_binding.start_time_100ns()
-                    ))
-                    .map_err(|error| error.to_string())?,
-                    job_object_id: candidate.job_object_id.clone(),
-                    state: eliot_runtime_contracts::ServiceProcessState::Ready,
-                    health: eliot_runtime_contracts::HealthVector::healthy(),
-                    evidence_refs: vec![
-                        eliot_platform::PlatformHandle::new("r13-two-token-worker-evidence")
-                            .map_err(|error| error.to_string())?,
-                    ],
-                },
-                health: eliot_runtime_contracts::HealthVector::healthy(),
-                evidence_refs: vec![
-                    eliot_platform::PlatformHandle::new("r13-two-token-worker-evidence")
-                        .map_err(|error| error.to_string())?,
-                ],
-            })
-            .map_err(|error| format!("publish Kernel Ready state: {error}"))?;
-    }
+        )
+        .map_err(|error| error.to_string())?,
+    };
+    kernel.activate_harness_candidate(
+        &candidate,
+        &permit,
+        &declaration.expected_kernel_config_snapshot_sha256,
+    )?;
     kernel.note_agent_bridge_peer_set_change();
     write_atomic(
         &evidence_root,
@@ -1355,13 +1315,7 @@ fn run_worker(
                 "production Kernel did not return the typed semantic-resolution denial".to_owned(),
             );
         }
-        if kernel
-            .agent_bridge_connections
-            .lock()
-            .map_err(|_| "bridge connection lock poisoned".to_owned())?
-            .values()
-            .any(|state| state.session.is_some() || state.activation_completed)
-        {
+        if kernel.harness_has_agent_bridge_session()? {
             return Err("typed denial unexpectedly minted a session or auth binding".to_owned());
         }
         tokio::time::timeout(STAGE_TIMEOUT, server.send_frame(&response_frame, limits))
@@ -1383,7 +1337,7 @@ fn run_worker(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "r13-os-harness"))]
 mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
@@ -1457,7 +1411,7 @@ mod tests {
         assert!(cleanup_succeeded(&complete));
         let receipt = CleanupReceipt {
             stage: "cleanup_result".to_owned(),
-            service_name: SERVICE_NAME.to_owned(),
+            service_name: HARNESS_SERVICE_NAME.to_owned(),
             outcome: complete,
         };
         let encoded = serde_json::to_string(&receipt).expect("cleanup receipt JSON");

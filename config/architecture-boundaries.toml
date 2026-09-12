@@ -81,7 +81,7 @@ reason = "Windows process, Job Object, service, resource, and ownership mechanic
 
 [[tracked_debt]]
 kind = "direct_process_launch"
-path = "bins/eliot-kernel/src/r13_os_harness.rs"
+path = "crates/instrument/eliot-r13-harness/src/lib.rs"
 issue = 15
 reason = "Kernel's legacy R13 OS harness still launches native helpers directly instead of using the admitted process-generation adapter."
 remove_when = "The R13 harness is moved to the Instrument/conformance boundary or uses the shared ProcessExecutor contract with an independent edge proof."

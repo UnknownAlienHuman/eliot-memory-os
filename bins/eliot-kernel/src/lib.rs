@@ -63,9 +63,6 @@ use eliot_kernel_core::{
     ProcessExecutionReplayRecord, ProcessExecutionReplayState, process_admission_digest,
 };
 
-#[cfg(feature = "r13-os-harness")]
-pub mod r13_os_harness;
-
 mod daemon_live_receipt;
 #[cfg(windows)]
 mod daemon_process_launch;
@@ -125,10 +122,11 @@ pub use eliot_kernel_service::KernelStoreGateway;
 use eliot_kernel_service::StoreRebindQuery;
 use eliot_kernel_service::{
     AgentBridgeAdmissionDescriptor, EliotdLaunchDescriptor, HostKernelCandidateBinding,
-    HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KernelActivationReceipt,
-    KernelControlCommand, KernelControlRequest, KernelControlResponse, KernelReadyReceipt,
-    KernelService, KernelServiceError, KernelServiceState, ProcessAuthorityHandoffDescriptor,
-    ProcessExecutionRequest, ProcessExecutionResponse, ProcessObservation, StoreBootstrapHandoff,
+    HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KernelActivationPermit,
+    KernelActivationReceipt, KernelControlCommand, KernelControlRequest, KernelControlResponse,
+    KernelReadyReceipt, KernelService, KernelServiceError, KernelServiceState,
+    ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest, ProcessExecutionResponse,
+    ProcessObservation, StoreBootstrapHandoff,
 };
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
@@ -933,12 +931,151 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
-    fn note_agent_bridge_peer_set_change(&self) {
+    pub fn note_agent_bridge_peer_set_change(&self) {
         self.agent_bridge_peer_set_revision
             .fetch_add(1, Ordering::AcqRel);
         // `notify_one` retains a permit if the listener changes state in the
         // check-to-await gap; `notify_waiters` would lose that wake.
         self.agent_bridge_peer_set_changed.notify_one();
+    }
+
+    /// Verifies that the retained bridge declaration binds the live Kernel
+    /// front-door policy, and returns the exact config-snapshot digest.
+    ///
+    /// Narrow S1 seam for the Instrument R13 conformance harness: the policy
+    /// lock and its snapshot never leave this composition.
+    #[cfg(windows)]
+    pub fn verify_harness_kernel_policy(
+        &self,
+        declaration: &AgentBridgeClientDeclaration,
+    ) -> Result<String, String> {
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| "Kernel policy lock poisoned".to_owned())?
+            .clone();
+        let policy_artifact = policy
+            .config_snapshot
+            .get("artifact_digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "Kernel policy artifact digest is absent".to_owned())?;
+        let policy_config_digest = sha256_json(&policy.config_snapshot)
+            .map_err(|error| format!("compute Kernel policy digest: {error}"))?;
+        if policy.session_principal_binding != declaration.expected_kernel_principal_binding
+            || policy.module_generation.state_fence.authority_epoch
+                != declaration.expected_kernel_authority_epoch
+            || policy.module_generation.generation != declaration.expected_kernel_generation
+            || policy_artifact != declaration.expected_kernel_artifact_sha256
+            || policy_config_digest != declaration.expected_kernel_config_snapshot_sha256
+        {
+            return Err(
+                "retained declaration does not bind the actual LocalService Kernel policy"
+                    .to_owned(),
+            );
+        }
+        Ok(policy_config_digest)
+    }
+
+    /// Installs the retained Host-approved bridge profile and declaration.
+    ///
+    /// Narrow S2 seam for the Instrument R13 conformance harness: the profile
+    /// lock never leaves this composition.
+    #[cfg(windows)]
+    pub fn install_harness_bridge_profile(
+        &self,
+        admission: AgentBridgeAdmissionDescriptor,
+        declaration: AgentBridgeClientDeclaration,
+    ) -> Result<(), String> {
+        *self
+            .agent_bridge_profile
+            .lock()
+            .map_err(|_| "bridge profile lock poisoned".to_owned())? = Some(AgentBridgeProfile {
+            admission,
+            declaration,
+        });
+        Ok(())
+    }
+
+    /// Runs the exact harness candidate lifecycle through the single Kernel
+    /// transition boundary: `reconcile`, `Shadow`, `PrepareHandoff`, permit
+    /// activation, receipt, and `Ready` publication.
+    ///
+    /// Narrow S3 seam for the Instrument R13 conformance harness: the service
+    /// handle never leaves this composition.
+    #[cfg(windows)]
+    pub fn activate_harness_candidate(
+        &self,
+        candidate: &HostKernelCandidateBinding,
+        permit: &KernelActivationPermit,
+        expected_config_snapshot_sha256: &str,
+    ) -> Result<KernelActivationReceipt, String> {
+        let mut service = self
+            .service
+            .lock()
+            .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+        service
+            .reconcile(candidate.clone())
+            .map_err(|error| format!("reconcile Kernel candidate: {error}"))?;
+        service
+            .apply(KernelControlCommand::Shadow)
+            .map_err(|error| format!("shadow Kernel candidate: {error}"))?;
+        service
+            .apply(KernelControlCommand::PrepareHandoff)
+            .map_err(|error| format!("prepare Kernel handoff: {error}"))?;
+        let receipt = service
+            .activate_permit(
+                permit,
+                permit.generation,
+                expected_config_snapshot_sha256.to_owned(),
+            )
+            .map_err(|error| format!("activate Kernel candidate: {error}"))?;
+        let activation_nonce_digest = service
+            .activation_receipt()
+            .ok_or_else(|| "Kernel activation receipt missing".to_owned())?
+            .activation_nonce_digest
+            .clone();
+        service
+            .publish_ready(KernelReadyReceipt {
+                activation_id: candidate.activation_id.clone(),
+                activation_operation_id: permit.operation_id.clone(),
+                activation_nonce_digest,
+                process: ProcessObservation {
+                    process_id: PlatformHandle::new(format!(
+                        "pid:{}:start:{}",
+                        candidate.host_process.process_id, candidate.host_process.start_time_100ns
+                    ))
+                    .map_err(|error| error.to_string())?,
+                    job_object_id: candidate.job_object_id.clone(),
+                    state: eliot_runtime_contracts::ServiceProcessState::Ready,
+                    health: HealthVector::healthy(),
+                    evidence_refs: vec![
+                        PlatformHandle::new("r13-two-token-worker-evidence")
+                            .map_err(|error| error.to_string())?,
+                    ],
+                },
+                health: HealthVector::healthy(),
+                evidence_refs: vec![
+                    PlatformHandle::new("r13-two-token-worker-evidence")
+                        .map_err(|error| error.to_string())?,
+                ],
+            })
+            .map_err(|error| format!("publish Kernel Ready state: {error}"))?;
+        Ok(receipt)
+    }
+
+    /// Reports whether the typed denial path unexpectedly minted a transport
+    /// session or auth binding.
+    ///
+    /// Narrow S5 seam for the Instrument R13 conformance harness: the
+    /// connection table never leaves this composition.
+    #[cfg(windows)]
+    pub fn harness_has_agent_bridge_session(&self) -> Result<bool, String> {
+        Ok(self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| "bridge connection lock poisoned".to_owned())?
+            .values()
+            .any(|state| state.session.is_some() || state.activation_completed))
     }
 
     #[cfg(windows)]

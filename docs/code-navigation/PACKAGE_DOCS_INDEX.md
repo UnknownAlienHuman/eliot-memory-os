@@ -15,7 +15,7 @@ python scripts/code_navigation.py check --root .
 
 ## Coverage
 
-- Workspace members: **127**.
+- Workspace members: **128**.
 - Default members: **6**.
 - Logical responsibility blocks: **15**.
 - Inherited package-family contracts: **3**.
@@ -126,6 +126,7 @@ python scripts/code_navigation.py check --root .
 | [`crates/instrument/eliot-observability`](../../crates/instrument/eliot-observability/Cargo.toml) | `workspace` | `instrument-code-intelligence` |
 | [`crates/instrument/eliot-process-executor`](../../crates/instrument/eliot-process-executor/Cargo.toml) | `workspace` | `instrument-code-intelligence` |
 | [`crates/instrument/eliot-product-evaluation`](../../crates/instrument/eliot-product-evaluation/Cargo.toml) | `workspace` | `instrument-code-intelligence` |
+| [`crates/instrument/eliot-r13-harness`](../../crates/instrument/eliot-r13-harness/Cargo.toml) | `workspace` | `instrument-code-intelligence` |
 | [`crates/instrument/eliot-reports`](../../crates/instrument/eliot-reports/Cargo.toml) | `workspace` | `instrument-code-intelligence` |
 | [`crates/instrument/eliot-test-selection`](../../crates/instrument/eliot-test-selection/Cargo.toml) | `workspace` | `instrument-code-intelligence` |
 | [`crates/instrument/eliot-testd-core`](../../crates/instrument/eliot-testd-core/Cargo.toml) | `workspace` | `instrument-code-intelligence` |

@@ -1447,7 +1447,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
- "windows-service",
 ]
 
 [[package]]
@@ -1796,6 +1795,25 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "eliot-r13-harness"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-installation",
+ "eliot-ipc",
+ "eliot-kernel",
+ "eliot-kernel-service",
+ "eliot-platform",
+ "eliot-platform-windows",
+ "eliot-protocol",
+ "eliot-runtime-contracts",
+ "serde",
+ "serde_json",
+ "tokio",
+ "windows-service",
 ]
 
 [[package]]
