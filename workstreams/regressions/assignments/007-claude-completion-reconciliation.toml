@@ -1,0 +1,129 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_REGRESSION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_CURRENT_FINGERPRINT_REPRODUCTION"
+implementation_support = "HISTORICAL_FAILURE_RECORDED_CURRENT_MECHANISM_UNVERIFIED"
+evidence_execution_status = "CURRENT_MANIFEST_AND_ENTRYPOINT_INSPECTED_LIVE_RUN_NOT_EXECUTED"
+proof_ceiling = "CLAUDE_DESKTOP_CURRENT_ROUTE_EDGE_CANDIDATE_ONLY"
+issue = 7
+governor_migration_issue = 18
+agent_bridge_issue = 77
+activation_receiver_issue = 1095
+activation_producer_issue = 839
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "regression.claude-desktop-mcp-completion-reconciliation"
+causal_property = "One current Claude Desktop MCP invocation preserves one exact request and operation correlation through server receive, response construction, stdio delivery, host completion, UI terminal projection and canonical receipt/readback; no intermediate host state can impersonate or overwrite the final owner state."
+current_discriminator = "The current MCPB manifest version 0.3, extension version 0.1.6 and integration guide still launch server/eliot-governor.exe mcp stdio --host claude-desktop --instance default. The historical timeout/stale-responding defect has not been reproduced or refuted on this exact current route, and the newer Agent Bridge route remains separately incomplete under #77/#1095/#839."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/7"
+
+[documentation]
+integration = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/integrations/claude/CLAUDE_DESKTOP_MCPB.md",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/integrations/claude/CLAUDE_INTEGRATION_SECURITY.md",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md#i71-eliot-bridge-protocol-ebp1",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-02-frame.md#i72-frame",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-23-raw-and-normalized-host-events.md#i723-raw-and-normalized-host-events",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-PORT-01", "ARCH-OBS-01", "ARCH-ORD-01", "ARCH-AUTH-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "integrations/claude/claude-desktop/mcpb/manifest.json declares manifest_version 0.3, extension version 0.1.6 and a binary server entry point server/eliot-governor.exe.",
+  "The manifest launches mcp stdio with host claude-desktop and instance default and passes no environment values.",
+  "CLAUDE_DESKTOP_MCPB.md documents the same legacy eliot-governor executable and build path through package eliot-app.",
+  "crates/eliot-app/src/mcp_stdio.rs remains a large legacy MCP implementation with direct engine/store/runtime responsibilities; #18 owns its migration or retirement.",
+  "A separate current Agent Bridge/MCP surface exists but the real Kernel host port and activation result path remain incomplete under #77/#1095/#839.",
+  "No fresh current Claude Desktop run evidence binds server response delivery to host/UI terminal state and canonical write/readback.",
+]
+
+[scope]
+primary_paths = [
+  "the exact currently declared Claude Desktop MCP route selected at implementation start",
+  "integrations/claude/claude-desktop/mcpb/manifest.json only if exact correlation/version metadata changes",
+  "crates/eliot-app/src/mcp_stdio.rs and exact tests if the declared legacy route remains current",
+  "or crates/surfaces/eliot-mcp and bins/eliot-agent-bridge exact spans if #18/#77 has already migrated the current route, but never both as parallel owners",
+  "current-fingerprint integration fixtures and bounded host-event normalization tests",
+]
+forbidden = [
+  "changing Claude Desktop UI semantics or claiming control of external UI state",
+  "preserving an old plugin/runtime version as current without exact fingerprint evidence",
+  "weakening canonical write/readback, task Finish, receipt or authority requirements",
+  "running both legacy eliot-governor and Agent Bridge as competing production MCP owners",
+  "inventing a commit from a UI-displayed ID or a completion from end_turn/stdio exit alone",
+  "storing private Claude content, credentials or raw protected payloads in repository fixtures",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze and verify one exact current Claude Desktop route fingerprint."
+how = [
+  "Record Desktop application/build, MCPB CLI/schema, extension version/digest, embedded server artifact/source, current manifest, protocol profile, host/instance, installation, principal/Session, WorkScope/task, route fingerprint and StateFence.",
+  "Select the one current server path declared by accepted installation/runtime ownership; if migration has landed, explicitly retire the legacy path before using the new one.",
+  "Treat missing external-host observability as an explicit coverage ceiling, not proof of success or failure.",
+]
+
+[[waves]]
+id = "B"
+what = "Add end-to-end immutable correlation and stage receipts."
+how = [
+  "Bind MCP request ID to canonical RequestIdentity/OperationId and carry it through server receive, handler start/result, JSON-RPC response construction, encoded bytes, stdout write, flush, process disposition, host invocation completion, Desktop-visible terminal observation and canonical WriteSubmission/WriteReceipt/readback where applicable.",
+  "Keep constructed, written, flushed, host-acknowledged, UI-observed and canonically committed stages separate.",
+  "Preserve event sequence/cursor denominator, omissions, timestamps, source handles and normalization lineage.",
+]
+
+[[waves]]
+id = "C"
+what = "Reproduce both read-only completion and governed candidate write."
+how = [
+  "A read-only invocation must terminate the visible host call after one exact response without any canonical-write inference.",
+  "A candidate write must retain proposal, submission, Store receipt, exact readback and UI projection as separate stages and may be called committed only after current canonical receipt/readback.",
+  "Inject duplicate, delayed, dropped and reordered completion/response events, late response, disconnect, timeout and end_turn and require exact deterministic reduction.",
+]
+
+[[waves]]
+id = "D"
+what = "Repair only the proven owner and expose external-route degradation honestly."
+how = [
+  "If ELIOT correlation/write/flush/bridge projection is defective, change only that current owner and prove exact replay/reconnect behavior.",
+  "If ELIOT emits and flushes a valid exact response but Claude Desktop fails to terminate or misclassifies it, retain the external-host unknown/defect boundary, emit a typed route degradation and provide a bounded recovery action such as reconnect/refresh/status query.",
+  "Do not convert external UI observation into canonical outcome or rewrite canonical semantics to match one provider.",
+]
+
+[acceptance]
+criteria = [
+  "One fresh exact current-fingerprint run binds MCP request, server receive, response bytes, stdout write/flush, host completion and Desktop terminal observation.",
+  "A completed ELIOT response cannot become an internal timeout because its correlation or terminal stage was lost.",
+  "Constructed, emitted, flushed, host-acknowledged, UI-terminal, end_turn, disconnected, timed-out and late-response states remain distinct.",
+  "The read-only case terminates exactly once and creates no write/commit inference.",
+  "The candidate-write case is called committed only with the exact current WriteReceipt and independent readback; a UI-displayed identifier is insufficient.",
+  "Duplicate, delayed, dropped and reordered response/completion events are idempotent or remain explicit partial/unknown and never create a second operation.",
+  "Reconnect replays or reconciles the same operation identity rather than rerunning semantic work blindly.",
+  "Missing host/UI events remain explicit coverage gaps and cannot prove either ELIOT failure or success.",
+  "If the remaining defect is external to ELIOT, the route reports typed degradation and a usable recovery directive without fabricated canonical outcome.",
+  "Legacy and new MCP routes cannot both claim production ownership for the same installed extension/profile.",
+  "Private host content and credentials are absent from committed fixtures/evidence; retained events are bounded and redacted.",
+  "No canonical-write, task-Finish, authority, receipt or external-UI semantic is weakened.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-app -p eliot-mcp -p eliot-agent-bridge --all-targets for only packages present in the selected current route",
+  "cargo test --locked -p eliot-app -p eliot-mcp -p eliot-agent-bridge --all-targets for only packages present in the selected current route",
+  "cargo clippy --locked -p eliot-app -p eliot-mcp -p eliot-agent-bridge --all-targets -- -D warnings for only packages present in the selected current route",
+  "git diff --check",
+]
+live_evidence = "Run one current read-only and one governed candidate-write invocation in current Claude Desktop; attach exact nonsecret fingerprints, stage receipts, event coverage, WriteReceipt/readback and Desktop terminal observations to the Issue/PR artifact, not repository documentation."
+product_proof = "A provider-specific regression pass does not establish general MCP, Agent Bridge, Store or Product support; #11 remains separate."
