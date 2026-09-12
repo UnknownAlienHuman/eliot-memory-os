@@ -1,25 +1,27 @@
 name: Temporary probe-plan documentation read
 
 on:
-  pull_request:
-    branches:
-      - main
+  issue_comment:
+    types:
+      - created
 
 permissions:
   contents: read
 
 concurrency:
-  group: temporary-probe-plan-docs-${{ github.event.pull_request.number }}
+  group: temporary-probe-plan-docs
   cancel-in-progress: true
 
 jobs:
   docs-read:
+    if: github.event.issue.number == 610 && github.event.comment.body == '/run-probe-plan-docs'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout candidate
         uses: actions/checkout@v4
         with:
+          ref: work/610-dreamer-probe-plan
           fetch-depth: 1
       - name: Read routed documentation
         run: |
