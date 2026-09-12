@@ -183,7 +183,7 @@ impl AdmittedClarificationJob {
             schema_version: u32,
             job: &'a DreamJobInput,
             ambiguities: Vec<ClarificationAmbiguity>,
-            source_denominator: &'a SourceDenominator,
+            source_denominator: SourceDenominator,
         }
         let mut ambiguities: Vec<_> = self
             .ambiguities
@@ -191,11 +191,14 @@ impl AdmittedClarificationJob {
             .map(normalize_ambiguity)
             .collect();
         ambiguities.sort_by(|left, right| left.ambiguity_id.cmp(&right.ambiguity_id));
+        let mut source_denominator = self.source_denominator.clone();
+        source_denominator.material_handles.sort();
+        source_denominator.omission_handles.sort();
         canonical_digest(&Preimage {
             schema_version: self.schema_version,
             job: &self.job,
             ambiguities,
-            source_denominator: &self.source_denominator,
+            source_denominator,
         })
     }
 
