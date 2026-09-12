@@ -69,6 +69,12 @@ use windows_sys::Win32::System::Threading::{
 };
 
 const MAX_PROCESS_IMAGE_CHARS: usize = 32_768;
+/// Maximum UTF-16 units (including the trailing NUL) accepted by
+/// `nul_terminated_wide`. Every legitimate input in this crate (job names,
+/// credential targets, SDDL text, watch paths, canonicalized file paths)
+/// fits the Windows 32_767-character limit; anything larger would expand a
+/// corrupt `OsStr` into an unbounded allocation, so it fails closed.
+const MAX_WIDE_UNITS_INCL_NUL: usize = 32_768;
 const MAX_JOB_PROCESS_IDS: usize = 4_096;
 const JOB_COMPLETION_KEY: usize = 0x454c_494f;
 const JOB_OBSERVER_SHUTDOWN_KEY: usize = 0x454e_4421;
@@ -228,9 +234,12 @@ pub struct DirectoryOplockGuard {
     _output: Box<REQUEST_OPLOCK_OUTPUT_BUFFER>,
 }
 
-// SAFETY: all pointers submitted to Windows refer to boxed allocations whose
-// addresses do not change. Moving the guard transfers unique ownership while
-// the kernel operation remains bound to the same handle/event/buffers.
+// SAFETY: transfer across threads moves unique ownership of the directory
+// `File`, the `OwnedHandle` event (exactly-once `CloseHandle`), and the
+// boxed `OVERLAPPED`/op-lock buffers whose heap addresses never change, so
+// the pending kernel request stays bound to the same allocations. The guard
+// is only moved, never shared (`Sync` is deliberately not implemented), and
+// `Drop` cancels and drains the request before the boxes drop.
 unsafe impl Send for DirectoryOplockGuard {}
 
 impl DirectoryOplockGuard {
@@ -646,13 +655,24 @@ impl Drop for ProcessTreeGuard {
 
 struct OwnedHandle(HANDLE);
 
-// SAFETY: Windows kernel handles are valid across threads. Ownership remains
-// unique in this wrapper and CloseHandle is called exactly once in Drop.
+// SAFETY: a Windows kernel handle value is usable from any thread. This
+// wrapper keeps unique ownership of its single `HANDLE` field: it is created
+// only via `new` (both failure sentinels, null and `INVALID_HANDLE_VALUE`,
+// rejected), closed exactly once in `Drop`, or moved exactly once into
+// `File` via `into_file` (`mem::forget` prevents a double close). `Send`
+// therefore transfers only the unique owner. `Sync` is deliberately not
+// implemented: concurrent shared access is not established.
 unsafe impl Send for OwnedHandle {}
 
 impl OwnedHandle {
+    /// Takes ownership of a live kernel handle, rejecting both failure
+    /// sentinels: null (e.g. `CreateEventW`, `CreateJobObjectW`,
+    /// `CreateIoCompletionPort`, `OpenProcess` failures) and
+    /// `INVALID_HANDLE_VALUE` (e.g. `FindFirstChangeNotificationW`
+    /// failures; see also the explicit dual check in
+    /// `DirectoryMutationGuard::watch`).
     fn new(handle: HANDLE) -> io::Result<Self> {
-        if handle.is_null() {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             Err(io::Error::last_os_error())
         } else {
             Ok(Self(handle))
@@ -669,8 +689,11 @@ impl OwnedHandle {
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: the wrapper uniquely owns the handle until this Drop.
+        if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+            // SAFETY: the wrapper uniquely owns the handle until this Drop;
+            // both failure sentinels (null and `INVALID_HANDLE_VALUE`) were
+            // rejected by `new` and are re-checked here so neither sentinel
+            // can ever reach `CloseHandle`.
             unsafe { CloseHandle(self.0) };
         }
     }
@@ -1874,6 +1897,12 @@ fn nul_terminated_wide(value: &OsStr) -> io::Result<Vec<u16>> {
             "Windows path contains an embedded NUL",
         ));
     }
+    if wide.len() >= MAX_WIDE_UNITS_INCL_NUL {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows string exceeds the bounded wide-input length",
+        ));
+    }
     Ok(wide.into_iter().chain(std::iter::once(0)).collect())
 }
 
@@ -2440,10 +2469,11 @@ struct SecurityDescriptor {
 
 impl SecurityDescriptor {
     fn from_sddl(sddl: &str) -> io::Result<Self> {
-        let wide = sddl
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
+        // Routed through `nul_terminated_wide` so an embedded NUL (which
+        // would silently truncate the DACL text) and an oversize SDDL fail
+        // closed before reaching the conversion API. Both live callers pass
+        // short constant or SID-bound strings far below the bound.
+        let wide = nul_terminated_wide(OsStr::new(sddl))?;
         let mut raw = ptr::null_mut();
         // SAFETY: `wide` is NUL-terminated and valid for the duration of the
         // call; `raw` is an out pointer initialized by the Win32 API.
