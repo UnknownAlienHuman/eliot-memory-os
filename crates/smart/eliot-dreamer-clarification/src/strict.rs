@@ -11,15 +11,20 @@ use crate::ClarificationError;
 
 /// Validates the context-free integrity of a clarification decision.
 ///
-/// This complements the type-local validators by checking relationships that
-/// cross the decision and candidate envelopes. It does not authenticate a
+/// This complements the owner-bound input validation by checking relationships
+/// that cross the decision and candidate envelopes. It does not authenticate a
 /// responder, validate an answer, deliver a question, or grant authority.
 pub fn validate_clarification_decision(
     decision: &ClarificationDecision,
     policy: &ClarificationPolicy,
 ) -> Result<(), ClarificationError> {
-    decision.validate(policy)?;
+    decision.validate(policy)
+}
 
+pub(crate) fn validate_decision_cross_envelope(
+    decision: &ClarificationDecision,
+    policy: &ClarificationPolicy,
+) -> Result<(), ClarificationError> {
     let encoded = canonical_json_bytes(decision).map_err(|_| ClarificationError::Canonicalization)?;
     if encoded.len() > policy.max_output_bytes {
         return Err(ClarificationError::limit(
