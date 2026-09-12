@@ -148,9 +148,8 @@ impl CurrentEvidenceTarget {
 ///
 /// The owner-neutral support row remains in `ConformanceContractSet`; this
 /// record binds it to the Implementation denominator without duplicating the
-/// support vocabulary. `expected_target_digest` is the admitted target identity
-/// against which the observed target is evaluated; it is not recomputed from
-/// the observation after the fact.
+/// support vocabulary. Compatibility verdicts are supplied by the exact
+/// evidence owner and all target identity fields remain visible in the output.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImplementationEvidence {
@@ -161,7 +160,6 @@ pub struct ImplementationEvidence {
     pub stage: ProofStage,
     pub support_claim_ref: String,
     pub target: CurrentEvidenceTarget,
-    pub expected_target_digest: String,
     pub verdict: EvidenceVerdict,
     pub detail: String,
     pub evidence_digest: String,
@@ -176,7 +174,6 @@ struct EvidenceDigestPreimage<'a> {
     stage: ProofStage,
     support_claim_ref: &'a str,
     target: &'a CurrentEvidenceTarget,
-    expected_target_digest: &'a str,
     verdict: EvidenceVerdict,
     detail: &'a str,
 }
@@ -191,7 +188,6 @@ impl ImplementationEvidence {
             stage: self.stage,
             support_claim_ref: &self.support_claim_ref,
             target: &self.target,
-            expected_target_digest: &self.expected_target_digest,
             verdict: self.verdict,
             detail: &self.detail,
         }
@@ -218,10 +214,6 @@ impl ImplementationEvidence {
         check_id(&self.obligation_id, "evidence.obligation_id")?;
         check_id(&self.support_claim_ref, "evidence.support_claim_ref")?;
         self.target.validate()?;
-        check_digest(
-            &self.expected_target_digest,
-            "evidence.expected_target_digest",
-        )?;
         check_text(&self.detail, "evidence.detail", MAX_TEXT_BYTES)?;
         check_digest(&self.evidence_digest, "evidence.evidence_digest")?;
         if self.evidence_digest
@@ -242,8 +234,6 @@ pub struct EvidenceAxisSnapshot {
     pub evidence_id: String,
     pub stage: ProofStage,
     pub target: CurrentEvidenceTarget,
-    pub expected_target_digest: String,
-    pub target_compatible: bool,
     pub verdict: EvidenceVerdict,
     pub contract_ref: String,
     pub support_claim_ref: String,
@@ -273,8 +263,6 @@ impl EvidenceAxisSnapshot {
             evidence_id: evidence.evidence_id.clone(),
             stage: evidence.stage,
             target: evidence.target.clone(),
-            expected_target_digest: evidence.expected_target_digest.clone(),
-            target_compatible: evidence.expected_target_digest == evidence.target.target_digest,
             verdict: evidence.verdict,
             contract_ref: row.contract_ref.clone(),
             support_claim_ref: row.support_claim_ref.clone(),
