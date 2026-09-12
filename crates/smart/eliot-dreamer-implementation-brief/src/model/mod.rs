@@ -4,20 +4,21 @@ mod output;
 mod source;
 
 pub use evidence::{
-    CurrentEvidenceTarget, EvidenceVerdict, ImplementationEvidence, ProofStage,
+    CurrentEvidenceTarget, EvidenceAxisSnapshot, EvidenceVerdict, ImplementationEvidence,
+    ProofStage,
 };
 pub use input::{
     ImplementationBriefInput, ImplementationDenominator, ImplementationMechanism,
     ImplementationObligation,
 };
 pub use output::{
-    EvidenceAxisSnapshot, ImplementationBriefDisposition, ImplementationBriefProjection,
-    ImplementationGap, ImplementationGapClass, ImplementationOmission, MechanismAssessment,
-    MechanismDisposition, ObligationAssessment,
+    ImplementationBriefDisposition, ImplementationBriefProjection, ImplementationGap,
+    ImplementationGapClass, ImplementationOmission, MechanismAssessment, MechanismDisposition,
+    ObligationAssessment, StageAssessment, StageDisposition,
 };
 pub use source::{
-    ImplementationSourceSnapshot, ImplementationSourceStatus, ImplementationStatement,
-    ImplementationStatementKind,
+    ArchitectureAlignment, ImplementationSourceSnapshot, ImplementationSourceStatus,
+    ImplementationStatement, ImplementationStatementKind,
 };
 
 /// Current wire revision of the Implementation-brief package contracts.
