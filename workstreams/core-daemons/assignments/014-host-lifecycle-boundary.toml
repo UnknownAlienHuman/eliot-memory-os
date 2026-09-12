@@ -14,13 +14,13 @@ normative_pair_ref = "docs/normative-pair.toml"
 
 [documentation]
 architecture = [
-  "docs/architecture/A02-02-two-level-runtime.md#a22-two-level-runtime",
+  "docs/architecture/A02-02-roles.md#a22-roles",
   "docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
-  "docs/architecture/A13-08-restart-and-recovery.md#a138-restart-and-recovery",
+  "docs/architecture/A13-08-integrity.md#a138-integrity",
 ]
 implementation = [
-  "docs/architecture/I01-02-mandatory-runtime-processes.md#i12-mandatory-runtime-processes",
-  "docs/architecture/I01-04-scm-supervision-tree.md#i14-scm-supervision-tree",
+  "docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md#i12-required-processes-of-the-first-complete-runtime",
+  "docs/architecture/I01-04-supervision-tree.md#i14-supervision-tree",
   "docs/architecture/I14-23-safe-shutdown.md#i1423-safe-shutdown",
   "docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
 ]

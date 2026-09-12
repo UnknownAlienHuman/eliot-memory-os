@@ -19,7 +19,7 @@ primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues
 
 [documentation]
 implementation = [
-  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-01-store-boundary.md#i51-store-boundary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-01-storage-boundary.md#i51-storage-boundary",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-20-read-model-consistency-and-cache.md#i520-read-model-consistency-and-cache",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",

@@ -1,14 +1,40 @@
 # `eliot-dreamer-clarification` implementation contract
 
+<!-- eliot-doc-routing:start -->
+## Mandatory documentation routing
+
+Before changing code, configuration, tests, workflows, or normative prose, run
+from the repository root:
+
+```text
+python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+```
+
+Repeat `--path` for every mutable path family, or use `--changed-from
+origin/main` for the complete branch delta, including deletions. Open the
+verified bundle and read every required item before mutation. A route alone is
+navigation, not reading evidence.
+
+Record the route receipt ID, read receipt ID, matched routes, required handles,
+fragment paths and SHA-256 values, verified bundle SHA-256, and explicit reading
+attestation in the work unit or pull request. Optional fragments are loaded only
+when the current decision crosses their stated boundary. A legacy `ELIOT_*`
+compatibility map is never an acceptable read receipt.
+
+If no non-baseline route matches, a required item is stale or missing, or scope
+expands beyond the receipt, stop and rerun or repair the route; silence is not
+permission. See [`docs/architecture/READING_PROTOCOL.md`](../../../docs/architecture/READING_PROTOCOL.md).
+<!-- eliot-doc-routing:end -->
+
 Owning issue: [#630 — A-07 single discriminative clarification candidate](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/630).
 
 Current state on `main@8ebf8b41847391c340393d56aeb14dd4f2b5e37b`: `Cargo.toml` declares `source_status = "NOT_IMPLEMENTED"`; `src/lib.rs` is a literal capability-cell placeholder. `module.toml` is target metadata only.
 
 ## Mandatory documentation
 
-Read through `scripts/docs_read.py`, then directly:
+Read through `python scripts/docs_read.py read --path crates/smart/eliot-dreamer-clarification --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json` to verify the bundle and read receipt before mutation. A route alone is navigation, not reading evidence. Open the verified bundle.
 
-- [`A9.2 — Dreamer, Researcher and Memory Curator`](../../../docs/architecture/A09-02-dreamer-researcher-and-memory-curator.md#a92-dreamer-researcher-and-memory-curator)
+- [`A9.2 — Primary modes`](../../../docs/architecture/A09-02-primary-modes.md#a92-primary-modes)
 - [`I9.3 — Job classes`](../../../docs/architecture/I09-03-job-classes.md#i93-job-classes)
 - [`I9.11 — Clarification routing`](../../../docs/architecture/I09-11-clarification-routing.md#i911-clarification-routing)
 - [`I13.7 — Critical Attention`](../../../docs/architecture/I13-07-critical-attention.md#i137-critical-attention)
