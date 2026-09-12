@@ -1,0 +1,139 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "RUNTIME_CONTRACTS_PRESENT_PURE_CONTROLLER_EDGE_OPEN"
+evidence_execution_status = "ISSUE_AND_PIPELINE_ROUTING_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "DREAMER_PURE_CONTROLLER_MODULE_CANDIDATE_ONLY"
+issue = 806
+dreamer_runtime_issue = 1100
+composition_issue = 702
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "dreamer.pure-job-controller"
+causal_property = "One immutable Dreamer controller state and one validated event produce one deterministic next state plus a finite closed set of owner-directed commands; all clock, I/O, model, Store, provider, authority, effect and acknowledgement outcomes enter only as exact receipts."
+current_discriminator = "The intended Dreamer pipeline is split across job ports, bundle, screen, model, grounding, validation, semantic handlers and result submission. Without one pure controller, phase ownership, cancellation, unknown outcome, replay and restart decisions can be duplicated across the daemon and adapters."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/806"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A09-dreamer.md#a9-dreamer",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-identity-and-effect-identity",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-01-process-model.md#i91-process-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-02-dreamer-service-responsibilities.md#i92-dreamer-service-responsibilities",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-03-job-classes.md#i93-job-classes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-04-dreamer-input-bundle.md#i94-dreamer-input-bundle",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-05-dream-packet.md#i95-dream-packet",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-07-memory-transformation-validation.md#i97-memory-transformation-validation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-08-background-policy.md#i98-background-policy",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-15-dreamer-failure.md#i915-dreamer-failure",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-29-stage-local-recovery-progress-clocks-and-parkable-resources.md#i1429-stage-local-recovery-progress-clocks-and-parkable-resources",
+]
+anchors = ["ARCH-DRM-01", "ARCH-DRM-02", "ARCH-DRM-03", "ARCH-AUTH-01", "ARCH-LIFE-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "Dreamer runtime composition requires a pure controller before any production job port can safely coordinate stages.",
+  "Bundle, Curation screening, model invocation, grounding, common validation, semantic handlers and result submission remain distinct owners.",
+  "The controller must decide only state transitions and owner-directed commands from supplied immutable evidence; adapters own all effects and observations.",
+  "Unknown provider or result-submission outcomes must park and reconcile the same operation instead of recomputing or changing route.",
+]
+
+[scope]
+primary_paths = [
+  "the exact pure Dreamer controller package identified by issue #806",
+  "shared Dreamer job/controller state contracts only when the owning defect is proven",
+  "focused transition-table, replay, cancellation and recovery fixtures",
+  "the #1100 composition adapter only after the controller contract is accepted",
+]
+serialized_dependencies = [
+  "#593 frozen input bundle",
+  "#588 Curation screen",
+  "#602 grounding",
+  "#595 pre-handler validation",
+  "native semantic handler Issues",
+  "#1100 Dreamer runtime composition",
+  "#702 governed daemon composition",
+]
+forbidden = [
+  "clock, randomness, filesystem, network, process, Store, provider, model or tool access",
+  "source acquisition, grounding, semantic validation or handler logic inside the controller",
+  "authority, route, credential or capability issuance",
+  "candidate application, canonical write, external effect or task Finish",
+  "generic string phases, Other variants or prose-driven retry",
+  "automatic GitHub workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze one closed controller state, event and command vocabulary."
+how = [
+  "Bind state to exact job/request/task/attempt/scope/fence, job class, controller revision, current phase, phase operation identity, immutable input/receipt references, budgets, deadlines, cancellation and proof ceiling.",
+  "Represent phases explicitly: admitted, bundle requested/ready, Curation screen requested/ready or not-applicable, model requested/possible/ready, grounding requested/ready, common validation requested/ready, semantic dispatch requested/ready, result submission requested/possible/committed, output delivery, acknowledgement, cancelled, failed, blocked and reconciling.",
+  "Reject unknown phase/event/command variants and same-ID changed state before transition evaluation.",
+]
+
+[[waves]]
+id = "B"
+what = "Implement deterministic one-event transitions and stage ordering."
+how = [
+  "For each state/event pair return exactly one next state and a finite canonical command set, or one typed invalid-transition result.",
+  "Allow each stage command at most once per owning operation identity and only after all exact predecessor receipts are present.",
+  "Curation screening occurs only for the applicable job class; grounding and common validation occur exactly once before one semantic handler dispatch.",
+  "Never infer a receipt from process liveness, elapsed time, log text, model output or adapter return detail.",
+]
+
+[[waves]]
+id = "C"
+what = "Close cancellation, deadline, unknown outcome and restart semantics."
+how = [
+  "Cancellation/deadline input targets the exact current job and phase operation and produces only owner-directed cancel/park/reconcile commands permitted by effect possibility.",
+  "After a stage may have executed or a result may have been submitted, enter an exact reconciling state and request readback for the same operation identity before retry.",
+  "Rehydrate from persisted controller state plus exact durable receipts; do not choose the latest event, infer ownership from process state or replay already committed stages.",
+  "Unknown, partial, stale, conflicted and unavailable receipts remain explicit and cannot become absent or successful.",
+]
+
+[[waves]]
+id = "D"
+what = "Prove progress, terminality and authority ceilings."
+how = [
+  "Define a monotone progress measure over phase and terminal/reconciliation obligations so equivalent no-progress events cannot loop indefinitely.",
+  "A terminal controller result requires every started or possibly started phase operation to have one terminal or explicit reconciling disposition.",
+  "Output delivery/acknowledgement remains separate from durable result commit and from user-task Finish.",
+  "Commands name external owners and immutable inputs only; the controller executes nothing and cannot promote a candidate or support claim.",
+]
+
+[acceptance]
+criteria = [
+  "The controller API is pure, deterministic and total over the closed valid state/event vocabulary.",
+  "Every state binds exact job/request/task/attempt/scope/fence, class, controller revision, phase operation, deadlines, budgets, cancellation and proof ceiling.",
+  "Every valid transition emits one canonical next state and finite command set; invalid transitions fail typed without mutation.",
+  "Bundle, applicable Curation screen, model, grounding, common validation, semantic dispatch and result submission follow the mandated order and execute at most once per operation identity.",
+  "Exactly one semantic handler dispatch is possible after one successful common validation; no fallback or sibling dispatch exists.",
+  "Process liveness, log text, elapsed time, model output and adapter prose cannot manufacture a stage receipt or progress.",
+  "Cancellation/deadline behavior distinguishes pre-effect, possible-effect and committed stages and never erases an uncertain operation.",
+  "Possible provider or result-submission outcome enters exact reconciliation before retry or route substitution.",
+  "Exact replay is idempotent; changed same-identity state/event/receipt conflicts.",
+  "Restart rehydrates exact state and receipts and cannot rerun a committed stage or revive a stale fence/job.",
+  "Unknown, partial, stale, conflicted and unavailable remain explicit and block false terminal success.",
+  "No-progress cycles terminate in blocked/review/escalation rather than infinite commands.",
+  "Durable result commit, output delivery, acknowledgement and task Finish remain distinct; the controller owns none of the effects.",
+  "No clock, I/O, Store, provider/model/tool, authority, candidate application, canonical write, external effect or Finish API exists.",
+  "A transition-table corpus covers every phase/event pair, restart point, cancellation race, deadline race, unknown outcome and same-ID conflict.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p <dreamer-controller-owner> --all-targets",
+  "cargo test --locked -p <dreamer-controller-owner> --all-targets",
+  "cargo clippy --locked -p <dreamer-controller-owner> --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Compose the accepted pure controller into #1100 and inject cancellation, deadline, provider-unknown, result-submit-unknown, restart and stale-fence events at every stage without duplicate execution."
+product_proof = "Issue #11 remains open; pure transition proof cannot establish the live daemon or Product behavior."
