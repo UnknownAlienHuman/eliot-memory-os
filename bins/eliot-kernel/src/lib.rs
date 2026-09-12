@@ -20,6 +20,7 @@ mod control_plane;
 mod kernel_build_contract;
 mod kernel_config;
 mod process_execution;
+mod process_execution_client;
 mod supervision_lease_authority;
 
 pub(crate) use kernel_build_contract::PreparedAuthorityMaterial;
@@ -40,6 +41,7 @@ use process_execution::{
     ProcessStartGuard, ProcessStartPorts, RESERVED_STORE_SNAPSHOT_HEAD, ValidationContextSlot,
     authorize_process_owner, project_store_snapshot, run_process_start,
 };
+pub use process_execution_client::process_execution_client;
 #[cfg(windows)]
 pub use supervision_lease_authority::{
     KernelSupervisionLeaseAuthority, ProtectedSupervisionLeaseSigner,
