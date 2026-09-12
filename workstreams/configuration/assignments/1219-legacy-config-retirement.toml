@@ -1,0 +1,124 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_CONSUMER_DISPOSITION_AND_MIGRATION"
+implementation_support = "LEGACY_CONFIG_PRESENT_CURRENT_CONSUMERS_UNPROVED"
+evidence_execution_status = "SOURCE_AND_CONSUMER_SEARCH_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "CURRENT_CONFIGURATION_MIGRATION_CANDIDATE_ONLY"
+issue = 1219
+legacy_core_issue = 1189
+configuration_intent_issue = 679
+registry_issue = 13
+parent_product_issue = 11
+audited_source_base = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "configuration.legacy-root-retirement"
+causal_property = "Every shipped or developer-visible configuration has one current schema owner, exact consumer, layer, immutable snapshot identity, secret-reference policy, runtime generation and invalidation boundary; legacy files cannot be auto-selected or packaged as current support."
+current_discriminator = "config/eliot.local.toml selects dev-single-process and .eliot-governor roots, config/eliot-governor.toml points to legacy eliot-store/RocksDB/root-user/password-file behavior, and config/modules carries pre-split in-process manifests without a current filename consumer."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1219"
+
+[documentation]
+implementation = [
+  "docs/architecture/I01-02-mandatory-runtime-processes.md#i12-mandatory-runtime-processes",
+  "docs/architecture/I01-03-optional-and-on-demand-processes.md#i13-optional-and-on-demand-processes",
+  "docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
+  "docs/architecture/I03-09-configuration-layers.md#i39-configuration-layers",
+  "docs/architecture/I03-10-immutable-config-and-policy-snapshots.md#i310-immutable-config-and-policy-snapshots",
+  "docs/architecture/I05-01-store-boundary.md#i51-store-boundary",
+  "docs/architecture/I14-14-module-hot-replacement.md#i1414-module-hot-replacement",
+  "docs/architecture/I15-04-secrets.md#i154-secrets",
+]
+anchors = ["ARCH-MOD-01", "ARCH-MOD-03", "ARCH-SEC-01", "ARCH-SEC-02", "ARCH-RES-03", "ARCH-OBS-01"]
+
+[current_source]
+confirmed = [
+  "config/eliot.local.toml selects dev-single-process, .eliot-governor roots, disabled IPC and config/modules.",
+  "dev-single-process consumers found are legacy eliot-engine and eliot-app, not current Host/Kernel/eliotd.",
+  "config/eliot-governor.toml resolves surreal by executable name, uses a fixed loopback endpoint, RocksDB legacy root, root DB user, credential ID plus migration password_file, redb WAL and legacy blob root.",
+  "Store schema and migration paths target legacy crates/eliot-store.",
+  "config/modules declares pre-split in-process memory, mailbox, CodeCortex and verifier modules; no current individual filename consumer was found.",
+]
+
+[scope]
+primary_paths = [
+  "config/**",
+  "exact current configuration, installation, Store, Module/Capability registry and secret-reference consumers",
+  "exact launch, release, documentation and test references required for migration or deletion",
+  "focused schema, packaging and compatibility fixtures",
+]
+serialized_dependencies = ["#1189 legacy core", "#14/#15/#18/#19 current runtime owners", "#679 configuration intent", "#13 registry", "#11 Product proof"]
+forbidden = [
+  "raw secrets or normal-runtime password files",
+  "broad mutable global configuration",
+  "PATH or ambient executable authority",
+  "second Module/Capability registry",
+  "direct Store SDK or runtime behavior owned by config text",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Inventory every config file, consumer and packaging path."
+how = [
+  "Trace source call sites, CLI defaults, installation manifests, release scripts, docs and tests.",
+  "Assign each file one current schema/consumer, bounded legacy fixture with expiry/removal condition, or deletion.",
+  "Do not treat repository presence as a consumer or supported default.",
+]
+
+[[waves]]
+id = "B"
+what = "Move current settings into immutable owner-specific layers."
+how = [
+  "Separate machine/service/user/project/session/attempt layers and preserve one schema owner per layer.",
+  "Bind each retained snapshot to exact base digest, precedence, allowed fields, impact graph, expiry/invalidation and apply/rollback owner.",
+  "Reject unknown, removed, read-only, wrong-owner, stale-base and cross-layer-widening fields.",
+]
+
+[[waves]]
+id = "C"
+what = "Remove legacy runtime, Store and secret semantics."
+how = [
+  "Resolve executable identity from approved artifact/generation manifests rather than PATH or caller text.",
+  "Use opaque Store/User Broker secret references; exclude raw password and migration-file values from normal snapshots, logs and model context.",
+  "Remove or explicitly isolate dev-single-process, .eliot-governor, legacy EliotGovernor, legacy Store paths and in-process module manifests.",
+]
+
+[[waves]]
+id = "D"
+what = "Close compatibility and packaging."
+how = [
+  "If a real migration consumer remains, decode legacy_dev_single_process_v1 explicitly with source digest, non-production proof ceiling, expiry and removal condition.",
+  "Block current launch/install/release paths from implicitly loading or packaging legacy files.",
+  "Generate docs/examples from accepted current schemas and add a regression verifier for legacy modes, roots and password-file fields.",
+]
+
+[acceptance]
+criteria = [
+  "Every config file has one current consumer/schema owner, bounded legacy-fixture disposition, or is deleted.",
+  "No current launch/install/release path implicitly selects dev-single-process, .eliot-governor, legacy EliotGovernor, legacy eliot-store paths or config/modules.",
+  "Current configuration is split by declared owner/layer and bound to immutable snapshot identity and invalidation.",
+  "Executable identity comes from an approved artifact/generation manifest, never PATH lookup or caller text.",
+  "Credentials remain opaque references; raw password values and normal-runtime password files are absent from snapshots, logs and packages.",
+  "Any migration password-file use is one-shot, authorized, redacted, receipted and invalidated after migration.",
+  "Unknown, removed, read-only, wrong-owner, stale-base and cross-layer-widening fields fail closed.",
+  "Legacy import is explicit, non-production and cannot silently become current support.",
+  "Legacy in-process manifests cannot register a current module/capability by file presence.",
+  "Current docs, help and samples agree with actual accepted schemas and consumers.",
+  "Packaging/source checks reject legacy filenames, modes and roots in current defaults.",
+  "Deletion leaves no source, script, docs, release, fixture or generated-index residue.",
+  "Legacy aggregate removal #1189 requires no hidden config fallback.",
+]
+
+[verification]
+commands = [
+  "cargo metadata --locked --all-features --format-version 1",
+  "cargo test --locked -p eliot-config -p eliot-installation -p eliot-kernel-service -p eliot-store-api --all-targets",
+  "cargo clippy --locked -p eliot-config -p eliot-installation -p eliot-kernel-service -p eliot-store-api --all-targets -- -D warnings",
+  "python scripts/audit-architecture-boundaries.py",
+  "python scripts/audit-runtime-source-hygiene.py",
+  "git diff --check",
+]
+edge_proof = "Exercise current snapshot derivation, explicit legacy import, stale-base conflict, secret-reference resolution, packaging exclusion and legacy-core removal with no fallback load."
+product_proof = "Issue #11 remains open; source/config migration alone does not prove installed runtime support."
