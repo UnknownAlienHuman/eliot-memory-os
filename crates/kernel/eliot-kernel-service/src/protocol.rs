@@ -23,7 +23,15 @@ use std::path::Path;
 
 use crate::{KernelServiceError, KernelServiceState, validate_text};
 
+mod native_worker_claim;
 mod process_authority_handoff;
+pub use native_worker_claim::{
+    NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
+    NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_PROTOCOL_VERSION,
+    NativeWorkerClaimBudget, NativeWorkerClaimConflict, NativeWorkerClaimReceipt,
+    NativeWorkerClaimRejection, NativeWorkerClaimRejectionReason, NativeWorkerClaimRequest,
+    NativeWorkerClaimResponse,
+};
 pub use process_authority_handoff::ProcessAuthorityHandoffDescriptor;
 
 fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServiceError> {

@@ -27,14 +27,21 @@ pub use ports::{
     AdmissionLivenessFacts, AdmissionLivenessOutcome, CapabilityAdmissionFacts,
     CapabilityAdmissionOutcome, CapabilityAdmissionPort, CapabilityAdmissionRequest,
     CapabilityLivenessRequest, CheckpointProviderOutcome, CheckpointReceiptFacts,
-    DurableCheckpointPort, DurableCheckpointRequest, DurableReplayPort, DurableRequestDecision,
-    EffectAdmissionFacts, EffectAdmissionOutcome, EffectAdmissionRequest, ProviderFailure,
+    ClaimAdmissionRequest, DurableCheckpointPort, DurableCheckpointRequest, DurableReplayPort,
+    DurableRequestDecision, EffectAdmissionFacts, EffectAdmissionOutcome, EffectAdmissionRequest,
+    ProviderFailure, ReadinessSubmission,
 };
 pub use protocol::{
-    AckPhase, CancelRequest, CheckpointRequest, DeliveryClass, EventAckReceipt,
-    JSON_ENCODING_PROFILE, PROTOCOL_VERSION, ReconnectRequest, WorkerEventDraft,
-    WorkerEventEnvelope, WorkerEventPayload, WorkerFrame, WorkerFrameBody, WorkerHello,
-    WorkerLifecycle, WorkerReady, WorkerRecovery, WorkerRequest,
+    AckPhase, CancelRequest, CheckpointRequest, ClaimBindingDecision, ClaimConflict, DeliveryClass,
+    EXECUTION_UNIT_SCHEMA_VERSION, EventAckReceipt, JSON_ENCODING_PROFILE, MAX_CLAIM_TEXT_LEN,
+    MAX_CREDENTIAL_REFERENCES, MAX_INVALIDATION_ENTRIES, MAX_OPERATION_IDENTITY_LEN, NativeAckId,
+    NativeAckRecord, NativeBlockedReport, NativeCancellationEnvelope, NativeCancellationId,
+    NativeCheckpointEnvelope, NativeCheckpointId, NativeClaimId, NativeHeartbeatEnvelope,
+    NativeHeartbeatId, NativeLifecycleBinding, NativeReadyId, NativeReadyReport,
+    NativeRegistrationId, NativeRenewalId, NativeResultEnvelope, NativeResultId, NativeWorkerClaim,
+    NativeWorkerReadiness, NativeWorkerRegistration, PROTOCOL_VERSION, ReadinessBlockDimension,
+    ReconnectRequest, WorkerEventDraft, WorkerEventEnvelope, WorkerEventPayload, WorkerFrame,
+    WorkerFrameBody, WorkerHello, WorkerLifecycle, WorkerReady, WorkerRecovery, WorkerRequest,
 };
 
 pub const PROCESS_CONTRACT_VERSION: &str = PROCESS_CONTRACT_SCHEMA_VERSION;
