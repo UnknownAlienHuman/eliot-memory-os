@@ -22,7 +22,7 @@ struct WorkMeter {
 }
 
 impl WorkMeter {
-    fn new(maximum: u64) -> Self {
+    const fn new(maximum: u64) -> Self {
         Self { used: 0, maximum }
     }
 
@@ -40,10 +40,10 @@ impl WorkMeter {
     }
 }
 
-/// Produces the pure, candidate-only Implementation self-query projection.
+/// Produces the pure candidate-only Implementation self-query projection.
 #[expect(
     clippy::too_many_lines,
-    reason = "explicit accounting keeps source, denominator, evidence, gaps, and proof stages auditable"
+    reason = "all denominator, source, evidence, and gap joins stay explicit"
 )]
 pub fn project_implementation_brief(
     input: &ImplementationBriefInput,
@@ -66,21 +66,21 @@ pub fn project_implementation_brief(
     let mechanisms = input
         .mechanisms
         .iter()
-        .map(|mechanism| (mechanism.mechanism_id.as_str(), mechanism))
+        .map(|value| (value.mechanism_id.as_str(), value))
         .collect::<BTreeMap<_, _>>();
     let obligations = input
         .obligations
         .iter()
-        .map(|obligation| (obligation.obligation_id.as_str(), obligation))
+        .map(|value| (value.obligation_id.as_str(), value))
         .collect::<BTreeMap<_, _>>();
-    let statement_map = input
+    let statements = input
         .implementation_source
         .as_ref()
         .map(|source| {
             source
                 .statements
                 .iter()
-                .map(|statement| (statement.statement_id.as_str(), statement))
+                .map(|value| (value.statement_id.as_str(), value))
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
@@ -91,7 +91,7 @@ pub fn project_implementation_brief(
         .map(|anchor| anchor.anchor_id.as_str())
         .collect::<BTreeSet<_>>();
 
-    let mut gaps = BTreeMap::<String, ImplementationGap>::new();
+    let mut gaps = BTreeMap::new();
     let mut assessments = Vec::with_capacity(input.denominator.mechanism_ids.len());
     for mechanism_id in &input.denominator.mechanism_ids {
         meter.charge()?;
@@ -101,59 +101,17 @@ pub fn project_implementation_brief(
             mechanisms.get(mechanism_id.as_str()).copied(),
             &obligations,
             &support_rows,
-            &statement_map,
+            &statements,
             &architecture_ids,
             &mut gaps,
             &mut meter,
         )?);
     }
 
-    let actual_obligations = input
-        .obligations
-        .iter()
-        .map(|value| value.obligation_id.as_str())
-        .collect::<BTreeSet<_>>();
-    for obligation_id in &input.denominator.obligation_ids {
-        meter.charge()?;
-        if !actual_obligations.contains(obligation_id.as_str()) {
-            insert_gap(
-                &mut gaps,
-                ImplementationGap {
-                    gap_id: format!("gap:obligation:{obligation_id}"),
-                    class: ImplementationGapClass::Coverage,
-                    owner: "implementation-denominator".to_owned(),
-                    mechanism_id: None,
-                    obligation_id: Some(obligation_id.clone()),
-                    stage: None,
-                    detail: "expected obligation is absent from the supplied closure".to_owned(),
-                    evidence_refs: Vec::new(),
-                },
-            );
-        }
-    }
-    let actual_evidence = input
-        .evidence
-        .iter()
-        .map(|value| value.evidence_id.as_str())
-        .collect::<BTreeSet<_>>();
-    for evidence_id in &input.denominator.evidence_ids {
-        meter.charge()?;
-        if !actual_evidence.contains(evidence_id.as_str()) {
-            insert_gap(
-                &mut gaps,
-                ImplementationGap {
-                    gap_id: format!("gap:evidence:{evidence_id}"),
-                    class: ImplementationGapClass::Coverage,
-                    owner: "implementation-denominator".to_owned(),
-                    mechanism_id: None,
-                    obligation_id: None,
-                    stage: None,
-                    detail: "expected evidence is absent from the supplied closure".to_owned(),
-                    evidence_refs: Vec::new(),
-                },
-            );
-        }
-    }
+    account_missing_denominator_members(input, &mut gaps, &mut meter)?;
+    assessments.sort_by(|left, right| left.mechanism_id.cmp(&right.mechanism_id));
+    let mut gaps = gaps.into_values().collect::<Vec<_>>();
+    gaps.sort_by(|left, right| left.gap_id.cmp(&right.gap_id));
 
     let mut omissions = input
         .self_query
@@ -181,40 +139,13 @@ pub fn project_implementation_brief(
     }
     omissions.sort_by(|left, right| left.omission_id.cmp(&right.omission_id));
 
-    let mut gaps = gaps.into_values().collect::<Vec<_>>();
-    gaps.sort_by(|left, right| left.gap_id.cmp(&right.gap_id));
-    assessments.sort_by(|left, right| left.mechanism_id.cmp(&right.mechanism_id));
-
-    let disposition = projection_disposition(input, &assessments, &gaps);
     let job = &input.self_query.validated_candidate.job;
     let state_fence_digest = canonical_json_bytes(&job.state_fence)
         .map(|bytes| sha256_hex(&bytes))
         .map_err(|_| ImplementationBriefError::Encoding {
             field: "projection.state_fence_digest",
         })?;
-    let architecture_source_handle = input
-        .self_query
-        .source
-        .as_ref()
-        .map(|source| source.source_handle.as_str().to_owned());
-    let architecture_source_digest = input
-        .self_query
-        .source
-        .as_ref()
-        .map(|source| source.digest.clone());
-    let implementation_source_handle = input
-        .implementation_source
-        .as_ref()
-        .map(|source| source.source_handle.clone());
-    let implementation_source_digest = input
-        .implementation_source
-        .as_ref()
-        .map(|source| source.source_digest.clone());
-    let implementation_source_status = input
-        .implementation_source
-        .as_ref()
-        .map(|source| source.status);
-
+    let disposition = projection_disposition(input, &assessments, &gaps);
     meter.charge()?;
     let mut projection = ImplementationBriefProjection {
         schema_version: IMPLEMENTATION_BRIEF_SCHEMA_VERSION,
@@ -228,11 +159,28 @@ pub fn project_implementation_brief(
         attempt: input.self_query.attempt.clone(),
         state_fence_digest,
         question: input.self_query.question.clone(),
-        architecture_source_handle,
-        architecture_source_digest,
-        implementation_source_handle,
-        implementation_source_digest,
-        implementation_source_status,
+        architecture_source_handle: input
+            .self_query
+            .source
+            .as_ref()
+            .map(|source| source.source_handle.as_str().to_owned()),
+        architecture_source_digest: input
+            .self_query
+            .source
+            .as_ref()
+            .map(|source| source.digest.clone()),
+        implementation_source_handle: input
+            .implementation_source
+            .as_ref()
+            .map(|source| source.source_handle.clone()),
+        implementation_source_digest: input
+            .implementation_source
+            .as_ref()
+            .map(|source| source.source_digest.clone()),
+        implementation_source_status: input
+            .implementation_source
+            .as_ref()
+            .map(|source| source.status),
         mechanisms: assessments,
         gaps,
         omissions,
@@ -245,51 +193,19 @@ pub fn project_implementation_brief(
         input_digest: input.input_digest.clone(),
         output_digest: "0".repeat(64),
     };
-
-    let maximum = usize::try_from(
-        input
-            .self_query
-            .policy
-            .max_output_bytes
-            .min(MAX_WIRE_BYTES as u64),
-    )
-    .unwrap_or(MAX_WIRE_BYTES);
-    let mut stable = false;
-    for _ in 0..16 {
-        projection.output_digest = projection.compute_output_digest()?;
-        let measured = bounded_canonical_size(&projection, maximum, "projection.output_wire")?;
-        let measured = u64::try_from(measured).unwrap_or(u64::MAX);
-        if projection.total_output_bytes == measured {
-            stable = true;
-            break;
-        }
-        projection.total_output_bytes = measured;
-    }
-    if !stable {
-        return Err(ImplementationBriefError::BindingMismatch {
-            field: "projection.total_output_bytes",
-        });
-    }
-    projection.output_digest = projection.compute_output_digest()?;
-    let final_size = bounded_canonical_size(&projection, maximum, "projection.output_wire")?;
-    if u64::try_from(final_size).unwrap_or(u64::MAX) != projection.total_output_bytes {
-        return Err(ImplementationBriefError::BindingMismatch {
-            field: "projection.total_output_bytes",
-        });
-    }
+    seal_output_size(input, &mut projection)?;
     projection.validate()?;
     Ok(projection)
 }
 
 impl ImplementationBriefProjection {
-    /// Reprojects the exact input and rejects every changed same-identity field.
+    /// Reprojects the exact closure and rejects every changed same-identity field.
     pub fn validate_against(
         &self,
         input: &ImplementationBriefInput,
     ) -> Result<(), ImplementationBriefError> {
         self.validate()?;
-        let expected = project_implementation_brief(input)?;
-        if &expected != self {
+        if project_implementation_brief(input)? != *self {
             return Err(ImplementationBriefError::BindingMismatch {
                 field: "projection.input_binding",
             });
@@ -298,9 +214,40 @@ impl ImplementationBriefProjection {
     }
 }
 
+fn seal_output_size(
+    input: &ImplementationBriefInput,
+    projection: &mut ImplementationBriefProjection,
+) -> Result<(), ImplementationBriefError> {
+    let maximum = usize::try_from(
+        input
+            .self_query
+            .policy
+            .max_output_bytes
+            .min(MAX_WIRE_BYTES as u64),
+    )
+    .unwrap_or(MAX_WIRE_BYTES);
+    for _ in 0..16 {
+        projection.output_digest = projection.compute_output_digest()?;
+        let measured = u64::try_from(bounded_canonical_size(
+            projection,
+            maximum,
+            "projection.output_wire",
+        )?)
+        .unwrap_or(u64::MAX);
+        if projection.total_output_bytes == measured {
+            projection.output_digest = projection.compute_output_digest()?;
+            return Ok(());
+        }
+        projection.total_output_bytes = measured;
+    }
+    Err(ImplementationBriefError::BindingMismatch {
+        field: "projection.total_output_bytes",
+    })
+}
+
 #[expect(
     clippy::too_many_arguments,
-    reason = "all authority-separated indexes are explicit projection inputs"
+    reason = "authority-separated source and evidence indexes remain explicit"
 )]
 fn assess_mechanism(
     input: &ImplementationBriefInput,
@@ -323,7 +270,8 @@ fn assess_mechanism(
                 mechanism_id: Some(mechanism_id.to_owned()),
                 obligation_id: None,
                 stage: None,
-                detail: "expected mechanism is absent from the supplied closure".to_owned(),
+                detail: "expected mechanism is unspecified in the supplied Implementation source"
+                    .to_owned(),
                 evidence_refs: Vec::new(),
             },
         );
@@ -335,22 +283,19 @@ fn assess_mechanism(
             obligation_ids: Vec::new(),
             dependency_refs: Vec::new(),
             obligations: Vec::new(),
-            disposition: MechanismDisposition::Absent,
+            disposition: MechanismDisposition::Unknown,
         });
     };
 
-    let initial_gap_count = gaps.len();
+    let gap_count = gaps.len();
     let mut architecture_conflict = false;
-    for architecture_ref in &mechanism.architecture_refs {
+    for reference in &mechanism.architecture_refs {
         meter.charge()?;
-        if !architecture_ids.contains(architecture_ref.as_str()) {
+        if !architecture_ids.contains(reference.as_str()) {
             insert_gap(
                 gaps,
                 ImplementationGap {
-                    gap_id: format!(
-                        "gap:{}:architecture:{}",
-                        mechanism.mechanism_id, architecture_ref
-                    ),
+                    gap_id: format!("gap:{}:architecture:{reference}", mechanism.mechanism_id),
                     class: ImplementationGapClass::Source,
                     owner: "architecture-source-owner".to_owned(),
                     mechanism_id: Some(mechanism.mechanism_id.clone()),
@@ -362,16 +307,13 @@ fn assess_mechanism(
             );
         }
     }
-    for statement_ref in &mechanism.statement_refs {
+    for reference in &mechanism.statement_refs {
         meter.charge()?;
-        match statements.get(statement_ref.as_str()) {
+        match statements.get(reference.as_str()) {
             None => insert_gap(
                 gaps,
                 ImplementationGap {
-                    gap_id: format!(
-                        "gap:{}:statement:{}",
-                        mechanism.mechanism_id, statement_ref
-                    ),
+                    gap_id: format!("gap:{}:statement:{reference}", mechanism.mechanism_id),
                     class: ImplementationGapClass::Source,
                     owner: "implementation-source-owner".to_owned(),
                     mechanism_id: Some(mechanism.mechanism_id.clone()),
@@ -387,16 +329,15 @@ fn assess_mechanism(
                     gaps,
                     ImplementationGap {
                         gap_id: format!(
-                            "gap:{}:architecture-conflict:{}",
-                            mechanism.mechanism_id, statement_ref
+                            "gap:{}:architecture-conflict:{reference}",
+                            mechanism.mechanism_id
                         ),
                         class: ImplementationGapClass::ArchitectureConflict,
                         owner: "architecture-precedence-owner".to_owned(),
                         mechanism_id: Some(mechanism.mechanism_id.clone()),
                         obligation_id: None,
                         stage: None,
-                        detail: "Implementation statement conflicts with governing Architecture"
-                            .to_owned(),
+                        detail: "Implementation conflicts with governing Architecture".to_owned(),
                         evidence_refs: Vec::new(),
                     },
                 );
@@ -406,15 +347,15 @@ fn assess_mechanism(
                     gaps,
                     ImplementationGap {
                         gap_id: format!(
-                            "gap:{}:architecture-unknown:{}",
-                            mechanism.mechanism_id, statement_ref
+                            "gap:{}:architecture-unknown:{reference}",
+                            mechanism.mechanism_id
                         ),
                         class: ImplementationGapClass::Unknown,
                         owner: "architecture-precedence-owner".to_owned(),
                         mechanism_id: Some(mechanism.mechanism_id.clone()),
                         obligation_id: None,
                         stage: None,
-                        detail: "Architecture alignment is unknown".to_owned(),
+                        detail: "Architecture alignment remains unknown".to_owned(),
                         evidence_refs: Vec::new(),
                     },
                 );
@@ -437,11 +378,9 @@ fn assess_mechanism(
         )?);
     }
     obligation_assessments.sort_by(|left, right| left.obligation_id.cmp(&right.obligation_id));
-
-    let new_gaps = gaps.len() > initial_gap_count;
     let disposition = mechanism_disposition(
         architecture_conflict,
-        new_gaps,
+        gaps.len() > gap_count,
         &obligation_assessments,
     );
     Ok(MechanismAssessment {
@@ -456,10 +395,6 @@ fn assess_mechanism(
     })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the obligation assessment keeps all evidence and owner joins explicit"
-)]
 fn assess_obligation(
     input: &ImplementationBriefInput,
     mechanism: &ImplementationMechanism,
@@ -470,10 +405,7 @@ fn assess_obligation(
     meter: &mut WorkMeter,
 ) -> Result<ObligationAssessment, ImplementationBriefError> {
     let Some(obligation) = obligation else {
-        let gap_id = format!(
-            "gap:{}:obligation:{}",
-            mechanism.mechanism_id, obligation_id
-        );
+        let gap_id = format!("gap:{}:obligation:{obligation_id}", mechanism.mechanism_id);
         insert_gap(
             gaps,
             ImplementationGap {
@@ -498,50 +430,31 @@ fn assess_obligation(
         });
     };
 
-    let mut stage_assessments = Vec::with_capacity(obligation.required_stages.len());
-    let mut obligation_gap_ids = Vec::new();
+    let mut stages = Vec::with_capacity(obligation.required_stages.len());
+    let mut gap_ids = Vec::new();
     for stage in &obligation.required_stages {
         meter.charge()?;
         let mut matching = input
             .evidence
             .iter()
-            .filter(|evidence| {
-                evidence.obligation_id == obligation.obligation_id && evidence.stage == *stage
+            .filter(|item| {
+                item.obligation_id == obligation.obligation_id && item.stage == *stage
             })
             .collect::<Vec<_>>();
         matching.sort_by(|left, right| left.evidence_id.cmp(&right.evidence_id));
-        let mut snapshots = Vec::new();
-        let mut dispositions = Vec::new();
+        let mut snapshots = Vec::with_capacity(matching.len());
+        let mut dispositions = Vec::with_capacity(matching.len().max(1));
         if matching.is_empty() {
             dispositions.push(StageDisposition::Missing);
         }
         for evidence in matching {
             meter.charge()?;
-            let Some(row) = support_rows.get(evidence.support_claim_ref.as_str()).copied() else {
-                let gap_id = format!(
-                    "gap:{}:{}:{stage:?}:support-row",
-                    mechanism.mechanism_id, obligation.obligation_id
-                )
-                .to_ascii_lowercase();
-                obligation_gap_ids.push(gap_id.clone());
-                insert_gap(
-                    gaps,
-                    ImplementationGap {
-                        gap_id,
-                        class: ImplementationGapClass::Contract,
-                        owner: obligation.owner.clone(),
-                        mechanism_id: Some(mechanism.mechanism_id.clone()),
-                        obligation_id: Some(obligation.obligation_id.clone()),
-                        stage: Some(*stage),
-                        detail: "evidence references a missing support claim".to_owned(),
-                        evidence_refs: vec![evidence.evidence_id.clone()],
-                    },
-                );
+            if let Some(row) = support_rows.get(evidence.support_claim_ref.as_str()).copied() {
+                snapshots.push(EvidenceAxisSnapshot::from_parts(evidence, row));
+                dispositions.push(evidence_disposition(evidence, row));
+            } else {
                 dispositions.push(StageDisposition::Missing);
-                continue;
-            };
-            snapshots.push(EvidenceAxisSnapshot::from_parts(evidence, row));
-            dispositions.push(evidence_disposition(evidence, row));
+            }
         }
         snapshots.sort_by(|left, right| left.evidence_id.cmp(&right.evidence_id));
         let disposition = dispositions
@@ -554,11 +467,7 @@ fn assess_obligation(
                 mechanism.mechanism_id, obligation.obligation_id
             )
             .to_ascii_lowercase();
-            obligation_gap_ids.push(gap_id.clone());
-            let evidence_refs = snapshots
-                .iter()
-                .map(|snapshot| snapshot.evidence_id.clone())
-                .collect();
+            gap_ids.push(gap_id.clone());
             insert_gap(
                 gaps,
                 ImplementationGap {
@@ -569,31 +478,88 @@ fn assess_obligation(
                     obligation_id: Some(obligation.obligation_id.clone()),
                     stage: Some(*stage),
                     detail: format!("required {stage:?} evidence is {disposition:?}"),
-                    evidence_refs,
+                    evidence_refs: snapshots
+                        .iter()
+                        .map(|snapshot| snapshot.evidence_id.clone())
+                        .collect(),
                 },
             );
         }
-        stage_assessments.push(StageAssessment {
+        stages.push(StageAssessment {
             stage: *stage,
             disposition,
             evidence: snapshots,
         });
     }
-    obligation_gap_ids.sort();
-    obligation_gap_ids.dedup();
-    let complete = stage_assessments
+    gap_ids.sort();
+    gap_ids.dedup();
+    let complete = stages
         .iter()
         .all(|stage| stage_is_complete(stage.disposition))
-        && obligation_gap_ids.is_empty();
+        && gap_ids.is_empty();
     Ok(ObligationAssessment {
         obligation_id: obligation.obligation_id.clone(),
         mechanism_id: obligation.mechanism_id.clone(),
         owner: obligation.owner.clone(),
         required_domains: obligation.required_domains.clone(),
-        stages: stage_assessments,
-        gap_ids: obligation_gap_ids,
+        stages,
+        gap_ids,
         complete,
     })
+}
+
+fn account_missing_denominator_members(
+    input: &ImplementationBriefInput,
+    gaps: &mut BTreeMap<String, ImplementationGap>,
+    meter: &mut WorkMeter,
+) -> Result<(), ImplementationBriefError> {
+    let actual_obligations = input
+        .obligations
+        .iter()
+        .map(|value| value.obligation_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for id in &input.denominator.obligation_ids {
+        meter.charge()?;
+        if !actual_obligations.contains(id.as_str()) {
+            insert_gap(
+                gaps,
+                ImplementationGap {
+                    gap_id: format!("gap:obligation:{id}"),
+                    class: ImplementationGapClass::Coverage,
+                    owner: "implementation-denominator".to_owned(),
+                    mechanism_id: None,
+                    obligation_id: Some(id.clone()),
+                    stage: None,
+                    detail: "expected obligation is absent".to_owned(),
+                    evidence_refs: Vec::new(),
+                },
+            );
+        }
+    }
+    let actual_evidence = input
+        .evidence
+        .iter()
+        .map(|value| value.evidence_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for id in &input.denominator.evidence_ids {
+        meter.charge()?;
+        if !actual_evidence.contains(id.as_str()) {
+            insert_gap(
+                gaps,
+                ImplementationGap {
+                    gap_id: format!("gap:evidence:{id}"),
+                    class: ImplementationGapClass::Coverage,
+                    owner: "implementation-denominator".to_owned(),
+                    mechanism_id: None,
+                    obligation_id: None,
+                    stage: None,
+                    detail: "expected evidence is absent".to_owned(),
+                    evidence_refs: Vec::new(),
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 fn evidence_disposition(
@@ -619,7 +585,7 @@ fn evidence_disposition(
         EvidenceVerdict::Unavailable => return StageDisposition::Unavailable,
         EvidenceVerdict::Unknown => return StageDisposition::Unknown,
         EvidenceVerdict::NotApplicable => return StageDisposition::NotApplicable,
-        EvidenceVerdict::Conflicted | EvidenceVerdict::Passed => {}
+        EvidenceVerdict::Passed | EvidenceVerdict::Conflicted => {}
     }
     match row.support_observation_state {
         SupportObservationState::NotRunning | SupportObservationState::Unavailable => {
@@ -707,9 +673,10 @@ fn mechanism_disposition(
     }
     if !obligations.is_empty()
         && obligations.iter().all(|obligation| {
-            obligation.stages.iter().all(|stage| {
-                stage.disposition == StageDisposition::NotApplicable
-            })
+            obligation
+                .stages
+                .iter()
+                .all(|stage| stage.disposition == StageDisposition::NotApplicable)
         })
     {
         return MechanismDisposition::NotApplicable;
@@ -799,7 +766,9 @@ const fn gap_class_for_stage(
     match stage {
         ProofStage::Source => ImplementationGapClass::Source,
         ProofStage::Compile => ImplementationGapClass::Compile,
-        ProofStage::Package => ImplementationGapClass::Package,
+        ProofStage::Unit | ProofStage::Property | ProofStage::Package => {
+            ImplementationGapClass::Package
+        }
         ProofStage::Integration => ImplementationGapClass::Integration,
         ProofStage::Edge => ImplementationGapClass::Edge,
         ProofStage::Runtime => ImplementationGapClass::Runtime,
