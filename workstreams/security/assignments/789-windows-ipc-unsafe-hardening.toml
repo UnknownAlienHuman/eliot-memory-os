@@ -1,0 +1,128 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "BLOCKED_ON_728_AND_754_READY_FOR_SITE_INVENTORY"
+implementation_support = "UNSAFE_BOUNDARY_PRESENT_COMPLETE_FAMILY_PROOF_ABSENT"
+evidence_execution_status = "MANIFEST_AND_SOURCE_SET_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "ELIOT_WINDOWS_IPC_UNSAFE_WRAPPER_MODULE_PROOF_ONLY"
+issue = 789
+unsafe_adr_issue = 728
+source_oracle_issue = 754
+pipe_name_issue = 726
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "security.windows-ipc-unsafe-family-boundaries"
+causal_property = "Every production unsafe family in eliot-windows-ipc is reachable only through one enforceable safe wrapper with exact pointer, buffer, handle, callback, cancellation, peer and cleanup invariants; unresolved ownership remains MigrationRequired rather than documented-away."
+current_discriminator = "eliot-windows-ipc explicitly allows unsafe code and exposes one library plus process-guardian and test-support credential-guard binaries, but no accepted complete per-site/family inventory and 42-case Windows proof currently closes its wrappers, asynchronous lifetimes, handle ownership and cancellation semantics."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/789"
+
+[documentation]
+architecture = ["https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A00-03-hard-boundaries.md#a03-hard-boundaries"]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-05-named-pipes.md#i75-named-pipes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-04-secrets.md#i154-secrets",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-16-common-durable-fields.md#i516-common-durable-fields",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-identity-and-effect-identity",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-22-flake-hang-and-recurrence-handling.md#i1822-flake-hang-and-recurrence-handling",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-05-unsafe-policy.md#i25-unsafe-policy",
+]
+anchors = ["ARCH-SEC-01", "ARCH-PORT-01", "ARCH-OBS-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "Cargo.toml sets autobins = false, default features empty, test-support explicit, unsafe_code = allow and unsafe_op_in_unsafe_fn = deny.",
+  "Production targets are the library and explicit eliot-process-guardian; eliot-credential-suite-guard exists only with test-support.",
+  "The package source set contains unsafe operations in lib.rs; file count is not the unsafe-site denominator.",
+  "No current unsafe_family_boundaries.rs or finite family fixture closes all sites and target/feature distinctions.",
+  "The accepted #728 ADR does not yet exist and is a hard prerequisite rather than a broken link to delete.",
+]
+
+[scope]
+primary_paths = [
+  "crates/eliot-windows-ipc/src/lib.rs",
+  "crates/eliot-windows-ipc/src/bin/eliot-process-guardian.rs",
+  "crates/eliot-windows-ipc/src/bin/eliot-credential-suite-guard.rs",
+  "crates/eliot-windows-ipc/tests/unsafe_family_boundaries.rs",
+  "crates/eliot-windows-ipc/tests/data/unsafe_family_cases.json",
+  ".github/temporary/work-unit-789.md only if present",
+]
+forbidden = [
+  "Cargo, lockfile, features, package/root manifests or #728 ADR",
+  "other packages, #754 oracle, workflows, shared inventory/registry or normative docs",
+  "new raw Windows API family, process owner, IPC framing, namespace, ACL or authority redesign",
+  "generic SAFETY prose without executable invariant",
+  "deliberate undefined-behavior pointer tests",
+  "new executor, broad lint suppression or public visibility widened solely for tests",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze the complete current unsafe site/family denominator."
+how = [
+  "Consume #754 and record path/item/span/form/digest, target/cfg/feature, raw signature, wrapper/callers, pointer/layout/initialization/length, UTF-16, handle state, aliasing/thread affinity, callback/OVERLAPPED residency, cancellation/late completion, peer/ACL assumptions, cleanup, ADR disposition and fixture for every site.",
+  "Retain exact zero-site evidence for files without unsafe and distinguish production from test-support targets.",
+  "Unknown parsing, ownership or migration is incomplete; source moves/additions require a revised allocation.",
+]
+
+[[waves]]
+id = "B"
+what = "Make invalid raw state unconstructible through safe wrappers."
+how = [
+  "Validate null/dangling/misaligned pointers, layout, length/capacity overflow/truncation, initialized output range, UTF-16 termination/lifetime, handle sentinel/ownership and callback/OVERLAPPED lifetime before unsafe use.",
+  "Keep borrowed, owned, duplicated, transferred, close-requested, closed and unknown handles distinct with one close/transfer owner on every path.",
+  "Remove or block unjustified unsafe Send/Sync/thread-affinity witnesses rather than documenting them broadly.",
+]
+
+[[waves]]
+id = "C"
+what = "Close asynchronous I/O, cancellation and frame semantics."
+how = [
+  "Model prepared, rejected-before-submit, submitted, synchronous-complete, pending, unknown-submit, cancel-requested, observed-cancel/complete and unresolved states separately.",
+  "Release/reuse OS-visible buffers and callback state only after exact terminal ownership proof; CancelIoEx, timeout or disconnect alone is insufficient.",
+  "Prevent late/duplicate completion from touching reused request/frame/Session state and reconcile the same operation before retry.",
+  "Preserve exact transferred-byte counts and keep zero/EOF/broken-pipe/partial/complete distinctions; partial I/O cannot become a full frame or semantic success.",
+]
+
+[[waves]]
+id = "D"
+what = "Add operation-specific SAFETY evidence and 42-case proof."
+how = [
+  "Place one adjacent explanation per retained operation tied to concrete checked values and the exact raw API contract; reject generic/copied/detached coverage.",
+  "Use deterministic barriers/fault hooks for acquisition, submission, completion, cancellation, late completion, result validation and cleanup.",
+  "Run fatal/panic fixtures only in existing contained subprocess facilities.",
+  "Implement exactly WORK_UNIT_CASE: 789/1..42 plus complete per-site/family fixture binding and actual applicable Windows evidence.",
+]
+
+[acceptance]
+criteria = [
+  "The complete default/test-support/cfg unsafe denominator reconciles with #754 and every site has one #728 ADR disposition and wrapper owner.",
+  "Every retained site has adjacent operation-specific SAFETY evidence backed by enforceable code checks.",
+  "Null, alignment/layout, capacity/overflow, uninitialized output, UTF-16 and invalid-handle states cannot enter unsafe use.",
+  "Every acquisition/error/panic/cancel path has one-close/no-leak/no-use-after-close ownership or explicit unresolved ownership.",
+  "Prepared, synchronous, pending, unknown-submit, cancel-requested, observed terminal and unresolved states remain distinct.",
+  "Cancel result, timeout or disconnect cannot release buffers/OVERLAPPED or trigger blind retry.",
+  "Late completion cannot affect a new frame, Session or reused buffer.",
+  "Partial/zero/EOF/broken-pipe I/O preserves exact remainder and cannot become complete semantic success.",
+  "Connected handles and successful API queries cannot authenticate an ambiguous or wrong principal/Session/ACL peer.",
+  "Unsafe Send/Sync/thread/callback/unwind witnesses are explicit and enforceable or removed/blocked.",
+  "No raw unsafe entrypoint bypasses the safe wrapper and no new raw API/process/authority owner is introduced.",
+  "Exactly 42 substantive cases execute for default and test-support target sets; simulated-only or unavailable Windows cases remain unverified.",
+  "Diff excludes Cargo/protocol/namespace/authority redesign, broad lint suppression and unrelated semantics.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --package eliot-windows-ipc -- --check",
+  "cargo test --locked -p eliot-windows-ipc --all-targets",
+  "cargo test --locked -p eliot-windows-ipc --all-targets --features test-support",
+  "cargo clippy --locked -p eliot-windows-ipc --all-targets --features test-support -- -D warnings",
+  "cargo doc --locked -p eliot-windows-ipc --no-deps --features test-support",
+  "git diff --check",
+]
+semantic_review = "Review every retained wrapper against the exact Windows API lifetime, handle, cancellation, callback, peer and cleanup contract; unresolved migrations block completion."
+product_proof = "This establishes package wrapper/FFI proof only, not universal UB absence, hostile-peer service proof or Product support."
