@@ -1,0 +1,157 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_PARENT_INTEGRATION_AFTER_CHILD_CONTRACTS"
+implementation_support = "SUBSTANTIAL_BROKER_PRESENT_COMPLETE_USER_SESSION_BOUNDARY_UNPROVED"
+evidence_execution_status = "CURRENT_CLI_BROKER_KERNEL_OPERATOR_AND_CHILD_ISSUES_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "USER_BROKER_BOUNDARY_EDGE_CANDIDATE_ONLY"
+issue = 23
+operation_identity_issue = 74
+live_session_issue = 1098
+operator_issue = 1105
+notification_issue = 78
+native_worker_issue = 22
+kernel_issue = 15
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "runtime.user-broker-complete-boundary"
+causal_property = "One user-logon Session owns exactly one current User Broker generation that mediates user-token, credential and interactive-resource introduction through Kernel-issued grants and exact child operations; broker loss, logout, permit revocation or generation replacement fences every owned resource/process without exposing secrets or granting task, semantic, provider-policy, canonical or Finish authority."
+current_discriminator = "eliot-user-broker contains a real protected-root process, Kernel registration, heartbeat and Launch/Cancel/Reconcile loop, and the root CLI exposes broker-mediated UI startup. The parent boundary is not closed while per-operation identities #74, live SID/session/resource proof #1098, Operator attach #1105 and downstream notification/native-worker consumers remain separate and no one current integration proves exact startup, credential introduction, revocation, restart and no-orphan behavior."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/23"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I01-03-optional-and-on-demand-processes.md#i13-optional-and-on-demand-processes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-identity-and-effect-identity",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I06-15-capability-grant-lineage-introductions-and-resource-facets.md#i615-capability-grant-lineage-introductions-and-resource-facets",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-14-user-broker.md#i714-user-broker",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-13-idle-drain-and-cancellation.md#i1413-idle-drain-and-cancellation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-04-secrets.md#i154-secrets",
+]
+anchors = ["ARCH-AUTH-01", "ARCH-SEC-01", "ARCH-SEC-02", "ARCH-LIFE-01", "ARCH-PORT-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "The broker executable opens a protected per-installation root, constructs BrokerComposition with Kernel, self-registers, emits readiness, refreshes a heartbeat and handles Launch, Cancel, Reconcile, Status and Stop.",
+  "The root CLI and Operator flow expect User Broker to mediate launch into the interactive user Session.",
+  "Issue #74 owns separate register/heartbeat/launch/cancel/reconcile/fence operation identities.",
+  "Issue #1098 owns exact live SID/logon-Session registration, resource/credential leases, restart and revocation.",
+  "Issue #1105 owns Operator launch/attach/reconnect through this boundary; #78 and #22 are downstream notification/native-worker consumers where user-session resources are required.",
+  "No open PR was found that tracks #23 as the complete parent user-session boundary and installed Edge proof.",
+]
+
+[scope]
+primary_paths = [
+  "bins/eliot-user-broker/src/** parent composition and lifecycle spans",
+  "crates/surfaces/eliot-user-broker-core/src/** owner contracts",
+  "exact root CLI broker discovery/start/reuse spans in bins/eliot/src/**",
+  "exact Kernel registration/resource-introduction/fencing adapters",
+  "exact Windows SID/logon-session/token/process/Job Object adapters",
+  "directly relevant integration tests and finite fixtures",
+]
+serialized_dependencies = [
+  "#74 operation identities",
+  "#1098 live registration/resource edge",
+  "#15 Kernel authority/fencing",
+  "#100 ProcessExecutor",
+  "#1105 Operator",
+  "#78 notification",
+  "#22 native worker",
+  "#11 Product proof",
+]
+forbidden = [
+  "User Broker as a generic shell/process launcher",
+  "caller-selected executable, command, environment, token, credential, SID, Session, endpoint or authority",
+  "ambient token/credential inheritance",
+  "raw secrets in argv, environment dumps, logs, state, diagnostics or model context",
+  "broker-local task, WorkScope, Session, provider-route, retry-policy, canonical or Finish ownership",
+  "authority inferred from process liveness, same user, same executable or possession of a token-shaped value",
+  "blind retry after possible process/resource/provider effect",
+  "foreign-process adoption or cancellation",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Close installed discovery, startup and one-current-broker ownership."
+how = [
+  "Resolve the current installed manifest, protected broker config and exact admitted artifact from installation state; no PATH search, caller executable or arbitrary endpoint.",
+  "Bind broker process to installation, user SID, logon Session, executable/config/protocol digest, process start identity, generation, Kernel registration, AuthorityEpoch and StateFence.",
+  "Enforce exactly one current broker generation per installation/SID/logon Session and reject stale or foreign registration/reconnect.",
+  "Keep the root CLI as a bounded discover/start/reuse client; it cannot mint broker authority or reconstruct state from PID/name/path presence.",
+]
+
+[[waves]]
+id = "B"
+what = "Integrate exact operation identities, resource grants and effect containment."
+how = [
+  "Adopt #74's distinct register, heartbeat, launch, cancel, reconcile and fence identities and preserve exact parent/predecessor lineage.",
+  "Adopt #1098's opaque user-token/credential/resource leases with principal, purpose, target, operation, deadline, disclosure, revocation and StateFence bindings.",
+  "Launch only immutable Kernel-admitted child manifests through #100 with exact Job Object/process ownership and finite resource limits.",
+  "No child may inherit ambient credentials, environment or capabilities beyond the exact introduced facets.",
+]
+
+[[waves]]
+id = "C"
+what = "Close cancellation, logout, broker loss, restart and unknown-outcome recovery."
+how = [
+  "Cancellation targets one exact owned child operation and cannot affect a foreign process or erase a possibly committed external effect.",
+  "On broker process loss, heartbeat lease expiry, user logout, Kernel fence/epoch/generation change or grant revocation, stop new launches, revoke leases and close every owned handle/process lineage.",
+  "Persist authoritative registration and open-operation state outside process-local memory and rehydrate it on restart without reviving stale authority.",
+  "After a possible launch/resource/provider effect or lost acknowledgement, reconcile the same operation/effect identity before retry.",
+  "Retain unknown, cleanup-partial and reconciliation-required states until independently terminal.",
+]
+
+[[waves]]
+id = "D"
+what = "Prove downstream user-session consumers and independent installed cleanup."
+how = [
+  "Run Operator #1105 through broker start/reuse, artifact launch, Agent Bridge attach, reconnect and logout.",
+  "Run one notification or native-worker use of an exact user-session resource without exposing its secret/token material.",
+  "Independently read back SID/logon Session, process image/start identity, Job Object descendants, registration/lease state, protected files and handle cleanup.",
+  "Prove another SID or logon Session cannot discover, use, cancel, adopt or inherit the broker resources/processes.",
+]
+
+[acceptance]
+criteria = [
+  "Exactly one current broker generation is admitted for one installation/SID/logon-Session tuple.",
+  "Broker startup/reuse resolves only the exact installed artifact/config/endpoint and never trusts PATH, caller paths, PID/name or environment authority.",
+  "Registration binds exact executable, process-start, SID, logon Session, installation, generation, protocol, epoch and fence identities.",
+  "Register, heartbeat, launch, cancel, reconcile and fence use distinct exact operation identities and preserve replay/conflict semantics from #74.",
+  "Every resource/credential is an opaque exact lease under one current grant and is absent from argv, logs, diagnostics, persisted state and model-visible context.",
+  "Only an immutable admitted child manifest may launch, under one governed ProcessExecutor/Job Object lineage and bounded resources.",
+  "A wrong/stale/expired/revoked/foreign SID, Session, artifact, generation, registration, grant, lease, epoch or fence performs no launch or resource introduction.",
+  "Cancellation targets only the exact owned operation and cannot adopt or terminate foreign processes.",
+  "Logout, broker loss, heartbeat expiry, Kernel fencing or permit revocation stops new work and closes all owned resources and descendants.",
+  "Broker restart rehydrates authoritative state without reviving historical request identities, stale leases or old process authority.",
+  "Unknown/potential effects remain reconciling and block blind retry or route substitution.",
+  "Another SID/logon Session cannot access, inherit, cancel or adopt the broker's resources or process lineage.",
+  "Operator and one resource-consuming downstream contour execute through the same broker boundary without a bypass.",
+  "Broker heartbeat/liveness cannot extend task, Session, resource, capability or effect authority.",
+  "User Broker owns no task scheduler, WorkScope, semantic policy, provider route, canonical Store, authority issuer or Finish decision.",
+  "Real supported-Windows tests prove startup/reuse, exact launch, resource redaction, cancellation, broker restart, unknown outcome, logout/revocation and no-orphan cleanup.",
+  "Issue #11 independently proves the complete user-session path on one installed identity before #23 closes.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-user-broker-core -p eliot-user-broker -p eliot --all-targets",
+  "cargo test --locked -p eliot-user-broker-core -p eliot-user-broker -p eliot --all-targets",
+  "cargo clippy --locked -p eliot-user-broker-core -p eliot-user-broker -p eliot --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "On Windows, execute CLI broker discovery/start/reuse, exact child launch, opaque resource introduction, cancellation, lost acknowledgement, broker restart, foreign SID/Session denial and logout/lease-revocation cleanup with independent process/handle readback."
+product_proof = "This parent PR closes the source/Edge composition only after #74/#1098; installed user-session Product proof remains #11."
