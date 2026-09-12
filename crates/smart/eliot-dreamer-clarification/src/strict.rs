@@ -18,7 +18,8 @@ pub fn validate_clarification_decision(
     decision: &ClarificationDecision,
     policy: &ClarificationPolicy,
 ) -> Result<(), ClarificationError> {
-    decision.validate(policy)
+    decision.validate(policy)?;
+    validate_decision_cross_envelope(decision, policy)
 }
 
 pub(crate) fn validate_decision_cross_envelope(
