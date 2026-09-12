@@ -1,0 +1,131 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "SUBSTANTIAL_SOURCE_WITH_UNCLOSED_INDEPENDENCE_EDGE"
+evidence_execution_status = "SOURCE_AND_ISSUE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "WATCHDOG_INDEPENDENT_OBSERVATION_EDGE_CANDIDATE_ONLY"
+issue = 16
+host_issue = 14
+kernel_issue = 15
+notification_issue = 78
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "runtime.watchdog-independent-observer"
+causal_property = "Watchdog observes and escalates the mandatory runtime through an installation-, artifact-, process-, and generation-independent route, so Host/Kernel/daemon failure cannot erase the only observation, notification, or recovery trigger and Watchdog cannot become a second lifecycle, authority, semantic, or canonical owner."
+current_discriminator = "The Watchdog package contains service, self-admission, observation, and fallback surfaces, but current source and package tests do not establish one independently installed Windows service/task identity, independent observation route, protected notification fallback, restart continuity, or installed failure evidence for issue #16."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/16"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A08-01-purpose.md#a81-purpose",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I01-04-scm-supervision-tree.md#i14-scm-supervision-tree",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I08-02-independent-observation-routes.md#i82-independent-observation-routes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-23-safe-shutdown.md#i1423-safe-shutdown",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-RES-01", "ARCH-RES-04", "ARCH-OBS-01", "ARCH-SEC-02", "ARCH-LIFE-01"]
+
+[current_source]
+confirmed = [
+  "Watchdog has first-party service and self-admission source rather than an empty package.",
+  "Source comments still contain stale documentation provenance, separately owned by issue #1125; that cleanup cannot substitute for runtime proof.",
+  "Host and Kernel cannot prove Watchdog independence by reporting their own child/process state.",
+  "Package-local tests cannot establish Windows SCM/scheduled-task identity, protected installation separation, process-generation independence, notification fallback, or behavior after Host/Kernel loss.",
+]
+
+[scope]
+primary_paths = [
+  "bins/eliot-watchdog/src/**",
+  "crates/supervision/eliot-watchdog-core/src/**",
+  "exact installation/SCM/task registration and protected-state adapters",
+  "exact independent notification fallback adapter",
+  "directly relevant tests and finite fixtures",
+]
+serialized_dependencies = [
+  "#14 Host lifecycle",
+  "#15 Kernel recovery/status",
+  "#78 notification operation identity",
+  "#1125 current documentation references",
+  "#13 capability-cell registry",
+  "#11 installed Product proof",
+]
+forbidden = [
+  "Watchdog launched only as a Host or Kernel child and then described as independent",
+  "shared mutable journal, process tree, authority state, credential store, or failure domain with the observed runtime",
+  "process adoption, health, or kill decisions from PID, name, port, path, or liveness alone",
+  "semantic task, WorkScope, Governor, Store, model, provider, or Finish ownership",
+  "caller-selected services, tasks, paths, processes, notification payloads, or recovery commands",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Bind one independently installed Watchdog identity and observation route."
+how = [
+  "Bind exact installation, Watchdog artifact/config/protocol digest, Windows service or protected scheduled-task identity, service account/principal, process generation, process start identity, registration receipt, observation profile, and invalidation set.",
+  "Prove the registration and launch route remain available when Host, Kernel, eliotd, Store, and the normal user-session broker are absent.",
+  "Reject any self-admission derived from executable path, process name, parent PID, service display name, directory presence, or historical receipt alone.",
+]
+
+[[waves]]
+id = "B"
+what = "Observe mandatory runtime through independent bounded evidence."
+how = [
+  "Use exact owner-neutral health/status contracts and independent OS/SCM/process/filesystem readback rather than Host/Kernel self-report alone.",
+  "Bind every observation to target installation, artifact/process generation, service identity, AuthorityEpoch/StateFence when available, observed-at, expiry, source handles, blind boundaries, and invalidation.",
+  "Keep healthy, degraded, not-running, unavailable, stale, conflicted, unknown, and foreign-generation states distinct.",
+]
+
+[[waves]]
+id = "C"
+what = "Escalate and notify without absorbing lifecycle or semantic ownership."
+how = [
+  "Emit one typed observation/escalation record to the exact owning Host/Kernel recovery surface; Watchdog recommends or requests recovery but does not reconstruct authority or mutate canonical state.",
+  "Use the protected fallback notification contour from #78 with its own operation identity, signed scheduler/registration evidence, bounded payload, exact replay, and unknown-delivery reconciliation.",
+  "Apply finite escalation/backoff/repetition rules keyed by unchanged evidence; repeated identical observations cannot create an unbounded restart or notification storm.",
+]
+
+[[waves]]
+id = "D"
+what = "Close Watchdog restart, update, and no-common-mode-failure behavior."
+how = [
+  "Persist only the minimal independent observation/escalation ledger under one Watchdog owner and recover exact nonterminal notification/escalation identities after restart.",
+  "Update/replace Watchdog through a generation distinct from the observed Host runtime, fence the old generation, preserve last-known-good rollback, and never let both generations own the same protected state concurrently.",
+  "Prove behavior under Host kill, Kernel kill, daemon/Store loss, normal notification-path loss, user logout, disk pressure, stale service registration, Watchdog crash, and machine restart.",
+]
+
+[acceptance]
+criteria = [
+  "Watchdog has one independently registered Windows service/task identity and process generation not owned by the observed Host/Kernel process tree.",
+  "Independent observation and protected notification fallback remain available when Host, Kernel, eliotd, Store, and User Broker are unavailable, or expose an exact typed blind boundary rather than claiming coverage.",
+  "Host/Kernel self-report, process liveness, PID/name/path/port, directory presence, and historical receipts cannot establish current Watchdog or target ownership by themselves.",
+  "Every observation binds exact target installation/service/artifact/process generation, time/expiry, source, blind boundary, and invalidation identity.",
+  "Healthy, degraded, not-running, unavailable, stale, conflicted, unknown, and foreign-generation states remain distinct and non-promoting.",
+  "Escalation and notification have separate exact operation identities, bounded repetition/backoff, exact replay, and unknown-outcome reconciliation.",
+  "Watchdog cannot directly restart arbitrary processes, mutate canonical state, issue authority, choose task semantics, access provider credentials, or decide Finish.",
+  "Loss/restart of Watchdog rehydrates its minimal ledger without duplicating notifications or forgetting unknown delivery/escalation outcomes.",
+  "Watchdog generation cutover fences the predecessor, preserves protected-state single ownership, and supports exact last-known-good rollback.",
+  "A real Windows failure matrix proves Host/Kernel/daemon/Store loss, normal notification-path loss, user logout, machine restart, Watchdog crash, and no common-mode process-tree/orphan failure.",
+  "#13 resolves Watchdog cells and proof entrypoints; #11 retains installed Product acceptance ownership.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-watchdog -p eliot-watchdog-core --all-targets",
+  "cargo test --locked -p eliot-watchdog -p eliot-watchdog-core --all-targets",
+  "cargo clippy --locked -p eliot-watchdog -p eliot-watchdog-core --all-targets -- -D warnings",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "On Windows, independently read and notify across Host/Kernel/daemon/Store loss, normal notification-path failure, user logout, machine restart, stale/foreign process identity, Watchdog crash/restart, duplicate observation replay, generation cutover, and rollback."
+product_proof = "Issue #11 remains open; package and Watchdog Edge proof do not by themselves establish whole-product support."
