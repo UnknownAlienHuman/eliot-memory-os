@@ -1,0 +1,119 @@
+schema = "eliot.user-broker.request-identity-migration.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "STATIC_REQUEST_IDENTITY_REUSED_ACROSS_OPERATIONS"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "USER_BROKER_OPERATION_IDENTITY_EDGE_CANDIDATE"
+issue = 74
+parent_issue_refs = [23, 15]
+lineaged_epoch_issue = 64
+product_pulse_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+  "docs/architecture/A12-03-one-governed-write-path.md#a123-one-governed-write-path",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "docs/architecture/I01-03-optional-and-on-demand-processes.md#i13-optional-and-on-demand-processes",
+  "docs/architecture/I03-04-capability-and-route-registry.md#i34-capability-and-route-registry",
+  "docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-identity-and-effect-identity",
+  "docs/architecture/I06-10-authority-records.md#i610-authority-records",
+  "docs/architecture/I07-02-frame.md#i72-frame",
+  "docs/architecture/I07-03-handshake.md#i73-handshake",
+  "docs/architecture/I07-14-user-broker.md#i714-user-broker",
+  "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+]
+anchors = ["ARCH-AUTH-01", "ARCH-LIFE-01", "ARCH-SEC-02", "ARCH-RES-04"]
+
+[confirmed_gap]
+launch_config_source = "bins/eliot-user-broker/src/protected_launch_config.rs"
+composition_source = "bins/eliot-user-broker/src/lib.rs@584e3d6c6dfbe00dc82da45a9522fe95b50554ef"
+authority_port_source = "bins/eliot-user-broker/src/kernel_authority_port.rs@6a4442e5a9f6aae545f9ab6d7cab4ac63bdfdc70"
+observations = [
+  "BrokerLaunchConfig retains one complete RequestIdentity as protected launch configuration.",
+  "BrokerComposition::self_register installs that identity once through KernelClient::set_request_identity.",
+  "register, every heartbeat, authorize-launch and fence/logoff all call transact_json through the same mutable client identity.",
+  "launch performs heartbeat and authorize-launch sequentially without installing distinct operation identities.",
+  "the static absolute deadline eventually expires while the installation/SID/session/artifact binding may remain valid.",
+  "KernelAuthorityPort receives only operation name and payload, so request/idempotency/deadline/cancellation identity is ambient client state.",
+]
+discriminator = "Register once, issue two heartbeat revisions, authorize two distinct launches and fence. Current code reuses the protected launch RequestIdentity across every operation kind and payload."
+
+[causal_property]
+statement = "The protected launch object authenticates one stable broker caller/generation, while each register, heartbeat revision, launch authorization and fence/logoff transition owns a fresh exact request, idempotency, deadline and cancellation identity with explicit lineage."
+
+[scope]
+primary_paths = [
+  "bins/eliot-user-broker/src/protected_launch_config.rs",
+  "bins/eliot-user-broker/src/lib.rs",
+  "bins/eliot-user-broker/src/kernel_authority_port.rs",
+  "bins/eliot-user-broker/tests/**identity**",
+]
+serialized_kernel_paths = [
+  "crates/surfaces/eliot-cli/src/kernel_client.rs",
+  "crates/kernel/eliot-kernel-service/src/**user_broker**",
+  "crates/kernel/eliot-ors/src/**user_broker**",
+]
+read_only_contracts = [
+  "crates/kernel/eliot-user-broker-core/src/**",
+  "crates/foundation/eliot-protocol/src/**request**",
+  "workstreams/core-daemons/assignments/074-user-broker-operation-identity.toml",
+]
+forbidden_ownership = [
+  "private User Broker request-identity ontology",
+  "scalar epoch workaround instead of #64",
+  "provider credentials or raw process handles",
+  "task, route, budget, approval or Finish ownership",
+]
+
+[what_to_do]
+steps = [
+  "Version the protected launch schema as a stable BrokerLaunchBinding without per-operation RequestIdentity fields.",
+  "Add one shared provider-neutral operation identity builder or Kernel issuer for REGISTER, HEARTBEAT_RENEWAL, AUTHORIZE_LAUNCH and FENCE_LOGOFF.",
+  "Change KernelClient/KernelAuthorityPort to supply an explicit identity per transaction rather than mutable client-global ambient state.",
+  "Persist and reconcile each exact operation identity through existing BrokerSnapshot and Kernel ORS owners.",
+  "Migrate the old protected object explicitly without reviving its historical request authority.",
+  "Preserve launch authorization to ProcessIntent/ProcessRequest lineage without collapsing those identities.",
+]
+
+[how_to_do]
+steps = [
+  "Define BrokerLaunchBinding v2 with installation, SID, interactive session, broker artifact/generation, launch nonce/challenge and stable policy/root references only.",
+  "Remove request_id, idempotency_key, cancellation_id, absolute operation deadline and payload identity from the stable protected launch object.",
+  "For every Kernel call, derive or obtain a RequestIdentity bound to operation kind, canonical payload digest, stable binding digest, current registration/epoch/fence, fresh deadline and exact retry rule.",
+  "Use a new operation identity for each heartbeat revision; exact retry of one revision reuses only that revision identity.",
+  "Use distinct identities for caller LaunchRequest, Kernel authorize-launch, LaunchGrant and P-03 ProcessIntent/ProcessRequest/effect while retaining explicit parent lineage.",
+  "Give fence/logoff its own protected-control operation identity and reconcile unknown outcome before retry.",
+  "Reject cross-operation request/cancellation/idempotency reuse and changed canonical bytes under one identity.",
+  "Import v1 only through an explicit compatibility migrator: preserve old digest as evidence, extract independently valid stable fields, write v2 atomically, and create a new registration operation.",
+  "Align Authority Epoch migration with #64 rather than copying scalar fields into another broker-local type.",
+]
+
+[acceptance]
+criteria = [
+  "Register, two heartbeat revisions, two launch authorizations and fence carry distinct request and cancellation identities.",
+  "Exact retry of one operation returns the same result; changed operation kind or payload under one idempotency identity conflicts before effect.",
+  "Expiry of one operation does not invalidate the stable installation/SID/session/artifact binding or future correctly admitted operations.",
+  "Broker restart creates a new registration operation and cannot revive a historical RequestIdentity.",
+  "Heartbeat and fence races resolve against exact registration/epoch predecessors; stale heartbeat cannot reopen a fenced registration.",
+  "Unknown authorize-launch, process or fence outcome is reconciled by its own exact operation identity without blind retry.",
+  "Launch config v1 is never silently interpreted as v2 and old operation fields are not copied into new authority.",
+  "Kernel rejects cross-operation request_id, cancellation_id and idempotency reuse.",
+  "SID/session/artifact/nonce and protected-file identity validation remain fail-closed.",
+  "No raw credential, task, route, budget, approval, canonical or Finish ownership is introduced.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-user-broker-core -p eliot-user-broker -p eliot-cli -p eliot-kernel-service -p eliot-ors --all-targets",
+  "cargo test --locked -p eliot-user-broker-core -p eliot-user-broker -p eliot-cli -p eliot-kernel-service -p eliot-ors --all-targets",
+  "cargo clippy --locked -p eliot-user-broker-core -p eliot-user-broker -p eliot-cli -p eliot-kernel-service -p eliot-ors --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run register, two heartbeat revisions, two launch authorizations, process unknown outcome, fence race, restart and v1-to-v2 protected-config migration under a real Windows broker/Kernel boundary."
