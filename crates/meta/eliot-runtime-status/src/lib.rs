@@ -42,6 +42,13 @@ use store_live_status::store_tcp_endpoint_exact;
 pub use store_live_status::{ProductionStoreLiveObserver, StoreLiveObserver, StoreLiveSnapshot};
 use store_live_status::{inspect_store_live, production_store_observer};
 
+mod store_failure_status;
+pub use store_failure_status::{
+    MAX_BLOCKING_OPERATION_REFS, StoreFailureStatusError, StoreFailureStatusProjection,
+    WriterReadinessDenominator, component_state_for, project_store_failure,
+    writer_readiness_denominator,
+};
+
 mod eliotd_live;
 pub use eliotd_live::{EliotdLiveObserver, EliotdLiveSnapshot, ProductionEliotdLiveObserver};
 use eliotd_live::{eliotd_live_gap, inspect_eliotd_live};
