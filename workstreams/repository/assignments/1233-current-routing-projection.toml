@@ -1,0 +1,126 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_AFTER_CAPABILITY_REGISTRY_CONTRACT"
+implementation_support = "STALE_HAND_MAINTAINED_ROUTING_DATABASES"
+evidence_execution_status = "ACTIVE_AND_PROJECT_MAP_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "CURRENT_WORK_ROUTING_PROJECTION_CANDIDATE_ONLY"
+issue = 1233
+registry_issue = 13
+workflow_issue = 1225
+legacy_core_issue = 1189
+legacy_cognitive_issue = 1117
+onboarding_issue = 1231
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "repository.current-work-routing-projection"
+causal_property = "Stable files define routing policy and programme identities while current Issue, PR, branch, owner and disposition observations are generated from one registry-bound, freshness-complete snapshot and cannot grant support."
+current_discriminator = "ACTIVE.toml hardcodes old issue/branch/status sets and PROJECT_MAP calls an August source snapshot current while routing multiple capabilities to obsolete Issues and baseline statuses."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1233"
+
+[documentation]
+repository = ["AGENTS.md#authority", "WORKFLOW.md#one-authority-surface", "workstreams/ACTIVE.toml", "docs/PROJECT_MAP.md"]
+implementation = [
+  "docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
+  "docs/architecture/I02-20-local-source-and-test-projections.md#i220-local-source-and-test-projections",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions",
+  "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+]
+anchors = ["ARCH-MOD-01", "ARCH-MOD-02", "ARCH-MOD-03", "ARCH-OBS-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "ACTIVE.toml is dated 2026-09-01 and has no bound source/GitHub/registry digest or expiry.",
+  "It hardcodes open, completed, merged and forbidden Issue sets and a historical branch list.",
+  "Its cognitive routing stops at old #38-#45 wave files and omits current #94/#1100 and cell work.",
+  "PROJECT_MAP claims current main but records audit SHA 0f2c947 from 2026-08-31.",
+  "PROJECT_MAP routes Doctor, Watchdog, User Broker, Dreamer, notification, Agent Bridge and legacy facades through stale baseline/generic owners.",
+  "Neither map represents current installation/release, integrations/providers, evidence, dependency, config/schema, Operator, harness and retirement programmes.",
+]
+
+[scope]
+primary_paths = [
+  "workstreams/ACTIVE.toml and its schema/verifier",
+  "docs/PROJECT_MAP.md and current-map generator",
+  "#13 registry projection consumer",
+  "repository-policy/onboarding/routing consumers only in coordination with #1225/#1231",
+  "focused stale/incomplete/conflict/orphan fixtures",
+]
+forbidden = [
+  "editing normative books to fit GitHub state",
+  "committed dated status reports",
+  "automatic workflows",
+  "support inferred from Issue or PR state",
+  "second capability registry",
+]
+
+[[waves]]
+id = "A"
+what = "Separate stable workstream policy from mutable observations."
+how = [
+  "Keep programme IDs, branch/scope rules, registry selectors, forbidden relationships and explicit temporary exceptions.",
+  "Remove hand-maintained observed_at, open/closed/merged Issue sets and historical branch inventories from stable policy.",
+  "Represent ref cleanup as an operational observation rather than permanent authority data.",
+]
+
+[[waves]]
+id = "B"
+what = "Generate one current owner/work snapshot."
+how = [
+  "Consume #13 for capability, lifecycle/state owner, contracts, proof, Product Pulse and replacement/disposition data.",
+  "Consume one exact GitHub snapshot with repository/ref/SHA, query/page completeness, Issue/PR states, observed time, expiry and response digest.",
+  "Join work observations to explicit owner/disposition records and fail on orphaned items.",
+]
+
+[[waves]]
+id = "C"
+what = "Replace stale routing tables and consumers."
+how = [
+  "Make PROJECT_MAP stable plane/ownership prose plus generated current tables or links with explicit freshness.",
+  "Route current core, Dreamer, Agent/provider, Instrument, installation/release, integration, configuration/schema, documentation/evidence and retirement programmes.",
+  "Migrate repository policy, onboarding and routing tools to the same projection.",
+]
+
+[[waves]]
+id = "D"
+what = "Validate completeness, freshness and contradictions."
+how = [
+  "Fail stale/incomplete snapshot, duplicate/multiple writer, closed-but-active, open-without-owner, current-package-without-disposition and map/registry disagreement.",
+  "Keep declared programme, active work, blocked, completed source candidate, migrating/retired, runtime evidence and Product evidence as separate states.",
+  "Generate deterministic canonical output; timestamps/expiry remain non-identity observations.",
+]
+
+[acceptance]
+criteria = [
+  "ACTIVE.toml contains stable policy/selector/exception data only, with no manual lifecycle or branch-status database.",
+  "Mutable observations bind repository/ref/SHA, query/page completeness, response digest, observed time, expiry and generator identity.",
+  "Every current capability/package/workstream resolves one owner/disposition through #13 and explicit migration records.",
+  "All current programme families are represented or explicitly excluded with an owner.",
+  "Historical Issues route no current writes by themselves.",
+  "Doctor, Watchdog, User Broker, Agent Bridge, Dreamer, notification and legacy facades resolve current owners.",
+  "Stale/incomplete snapshot, duplicate writer, orphan item, closed-active state or map/registry contradiction fails.",
+  "PROJECT_MAP no longer calls an old SHA/date current and separates stable maps from generated work status.",
+  "Repository policy, onboarding and routing tools contain no parallel hardcoded status sets.",
+  "Equivalent semantic inputs produce byte-identical canonical projection; observation time is non-identity metadata.",
+  "Routing status cannot promote implementation, runtime or Product support.",
+  "No generated status snapshot is committed; outputs stay in .eliot, stdout or bounded run artifacts.",
+]
+
+[verification]
+commands = [
+  "python scripts/verify-workstream-routing.py --self-test",
+  "python scripts/verify-workstream-routing.py --root . --snapshot <current-github-snapshot>",
+  "python scripts/verify-core-daemon-inventory.py --self-test",
+  "python scripts/verify-core-daemon-inventory.py",
+  "python scripts/docs_router.py check --root .",
+  "python scripts/verify-agent-guardrails.py --root .",
+  "python scripts/verify-github-workflows.py",
+  "cargo test --locked -p <capability-registry-owner> --all-targets",
+  "git diff --check",
+]
+edge_proof = "Run stale, incomplete, duplicate-writer, orphan package/Issue, closed-active and legacy-removal fixtures against one exact current snapshot."
+product_proof = "Not applicable; this establishes repository work-routing conformance only."
