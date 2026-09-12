@@ -14,63 +14,60 @@ hot_path = false
 lifecycle_owner = "smart.dreamer.implementation_brief"
 loc_soft_ceiling = 10000
 loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
-product_objective = "ELIOT self-query exposes accepted implementation intent and current conformance evidence without upgrading TARGET prose to CURRENT support."
-causal_property = "ImplementationBrief projection"
-old_failure_or_missing_capability = "Implementation projection was treated as an optional Orientation section and could silently reinterpret Architecture or certify prose as runtime support."
-discriminator = "The brief keeps accepted Implementation contracts and observed conformance evidence separate and opens an explicit gap when they disagree."
-primary_responsibility = "Produce an ImplementationBrief candidate from exact accepted Implementation handles plus current conformance evidence, preserving status and Architecture precedence."
+product_objective = "ELIOT self-query exposes accepted Implementation intent and separately qualified current conformance evidence without upgrading prose or lower-level tests into higher-level support."
+causal_property = "evidence-bound ArchitectureSelfQuery Implementation-profile projection"
+old_failure_or_missing_capability = "Implementation projection was treated as an optional Orientation section and could silently reinterpret Architecture or certify prose/package tests as runtime support."
+discriminator = "The brief keeps accepted Implementation, governing Architecture, exact evidence targets and independent conformance axes separate and opens an owned gap for every missing or contradictory obligation."
+primary_responsibility = "Project one candidate-only ImplementationBrief from the exact A-03 ArchitectureSelfQuery Implementation profile, accepted Implementation source, governing Architecture and immutable current evidence."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["DreamJobInput class=ArchitectureSelfQuery", "ValidatedDreamDraft", "accepted Implementation handles", "CurrentSystemEvidenceSnapshot handles"]
-outputs = ["ImplementationBriefCandidate", "support and gap matrix", "invalidation conditions"]
-depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
-providers = ["Governor-admitted accepted Implementation handles", "current conformance evidence projections"]
+inputs = ["ArchitectureSelfQuery with output_profile=ImplementationBrief", "A-05 ValidatedCandidate and preservation receipt", "accepted Implementation source snapshot", "governing Architecture source and anchors", "I0.5 ConformanceContractSet", "complete-or-partial mechanism/obligation/evidence denominator"]
+outputs = ["ImplementationBriefProjection", "mechanism and owner assessments", "independent proof-stage/status vectors", "owned gap and omission records", "invalidation conditions"]
+depends_on = ["eliot-contracts", "eliot-conformance-contracts", "eliot-dreamer-contracts"]
+providers = ["Governor-admitted accepted normative pair and Implementation source", "owner-neutral current conformance evidence"]
 consumers = ["Dreamer self-query surface", "ELIOT self-scope Edge proof"]
-non_goals = ["Architecture reinterpretation", "support promotion from prose", "runtime probe execution", "source acquisition", "basic Orientation"]
-invariants = ["TARGET is not CURRENT", "Architecture precedence remains explicit", "accepted Implementation and current conformance evidence retain separate handles", "unknown or stale runtime evidence stays unknown or stale"]
-failure_behavior = "Return partial or unsupported ImplementationBrief with exact source, conformance or status gaps; never certify unsupported mechanisms."
-proof_surface = ["mixed digest", "prose-only support claim", "stale conformance evidence", "Architecture conflict"]
-proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+non_goals = ["new ImplementationSelfQuery job", "Architecture reinterpretation", "support promotion from prose", "runtime probe or test execution", "source acquisition", "task/issue/work-plan generation", "provider, Store, authority, effect or Finish"]
+invariants = ["Architecture remains constitutional", "TARGET is not CURRENT", "all proof stages are independent", "contract maturity, implementation support, evidence execution, observation state and evidence domain are independent axes", "accepted Implementation and current evidence retain exact distinct identities", "unknown, stale, skipped, simulated, partial, missing and failed remain distinct", "candidate-only proof ceiling and zero effects"]
+failure_behavior = "Return exact unsupported, mismatch, conflict, partial, missing, failed, skipped, stale, cancelled or bound evidence/gap state; never invent source, infer a higher proof stage or mutate support."
+proof_surface = ["wrong A-03 profile/job", "pair/revision/digest mismatch", "Architecture conflict", "duplicate same-ID evidence", "partial denominator", "compile/package/Edge/runtime/Product/release separation", "target/status/proof-axis compatibility", "bounds and replay"]
+proof_ceiling = "Module/package proof only; real provider/consumer Edge proof, current collection and Product Pulse remain separate"
 product_pulse = "D3A_SELF_QUERY_EDGE_01"
-replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+replacement_boundary = "pure projector behind the declared public contract; package ownership creates no discovery, execution, semantic authority or runtime state"
 merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
 split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
 
 [[donor]]
-path = "ELIOT_IMPLEMENTATION I9.3 Architecture/self query"
-disposition = "authoritative contract"
+path = "docs/architecture/I09-03-job-classes.md and accepted A-03 self-query contracts"
+disposition = "reuse exact ArchitectureSelfQuery job with ImplementationBrief output profile; no new job discriminator"
 
 [[donor]]
-path = "ELIOT_IMPLEMENTATION I0.5"
-disposition = "current support and evidence-status boundary"
+path = "docs/architecture/I00-05-current-system-evidence-and-source-support-model.md and eliot-conformance-contracts"
+disposition = "reuse exact independent maturity/support/execution/observation/domain vocabulary"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-architecture-brief"
+disposition = "reuse bounded pure-projection structure only; do not import ArchitectureBrief authority or semantics"
 
 [agent_task]
-objective = "Implement the Implementation side of self-query separately from Architecture meaning and runtime proof."
+objective = "Implement the Implementation side of A-03 self-query separately from Architecture meaning and observed runtime proof."
 write_scope = ["crates/smart/eliot-dreamer-implementation-brief/**"]
-deliverables = ["typed ImplementationBrief projection", "status/conformance/precedence fixtures", "self-query Edge fixtures"]
-acceptance = ["candidate-only output", "exact accepted Implementation lineage", "TARGET and CURRENT never conflated"]
-forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
-stop_condition = "Stop if the requested result requires Architecture reinterpretation, source acquisition, runtime probe execution or support promotion."
+deliverables = ["typed accepted Implementation source and evidence closure", "deterministic candidate-only projector", "39-case exact profile/source/evidence/gap acceptance suite"]
+acceptance = ["candidate-only output", "exact accepted Implementation and governing Architecture lineage", "complete independent proof-stage/status accounting", "all expected identities receive a disposition", "TARGET and CURRENT never conflated"]
+forbidden = ["new Dreamer job", "canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs", "source or test execution", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge if exact accepted Implementation source, governing Architecture or owner-neutral conformance contracts are unavailable."
 challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
 integration_owner = "cognitive-wave-integrator"
 implementation_language = "Rust 2024"
-required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
+required_verification = ["standalone fmt/test/clippy/doc", "all 39 Issue #651 cases discovered and passed", "independent profile/normative/evidence-axis review", "workspace admission remains separate under #968"]
 writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
-workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review under #968"
 
-# Machine-checked completion gate, read by `scripts/verify-work-unit.py`.
-# `cargo fmt|test|clippy` all pass on an empty crate, so they cannot tell a
-# finished cell from an unstarted one. This table can.
-#
-# These are the floors every cell shares. The owning work unit tightens them
-# with `required_exports` and `required_tests` taken from its own brief, so a
-# reviewer decides on one exit code instead of reading prose criteria.
 [acceptance]
-min_source_lines = 200
-min_public_items = 6
-min_tests = 5
+min_source_lines = 1200
+min_public_items = 24
+min_tests = 39
 require_deny_unknown_fields = true
 forbid_unsafe = true
-required_exports = []
-required_tests = []
-forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
+required_exports = ["project_implementation_brief", "ImplementationBriefInput", "ImplementationBriefProjection", "ImplementationSourceSnapshot", "ImplementationStatement", "ImplementationMechanism", "ImplementationObligation", "ImplementationEvidence", "ImplementationDenominator", "EvidenceAxisSnapshot", "ProofStage", "ImplementationGap", "ImplementationBriefDisposition"]
+required_tests = ["minimal_implementation_brief", "exact_job_and_output_profile_only", "support_axes_are_independent_not_a_total_ladder", "mechanism_binds_accepted_implementation_and_architecture", "projector_has_no_io_effect_status_mutation_or_finish"]
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!', 'std::process', 'std::fs', 'tokio', 'reqwest', 'surrealdb']
