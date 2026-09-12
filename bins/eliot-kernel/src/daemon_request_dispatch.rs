@@ -193,23 +193,58 @@ impl KernelComposition {
             "agent_activation_submit" => {
                 #[cfg(windows)]
                 {
-                    let decision_value = payload
+                    // The closed submit operation carries exactly one resolver
+                    // outcome: either the legacy success-only decision or one
+                    // full typed resolution result covering all seven closed
+                    // dispositions. The two shapes share the ticket ledger but
+                    // keep independent exact-replay/conflict accounting; a
+                    // payload carrying both or neither is fail-closed.
+                    let has_decision = payload
                         .get("decision")
-                        .cloned()
-                        .ok_or(TransportError::SessionFenced)?;
-                    let decision: AgentActivationResolutionDecision =
-                        serde_json::from_value(decision_value)
-                            .map_err(|_| TransportError::SessionFenced)?;
-                    match self.submit_agent_activation_decision(decision) {
-                        Ok(()) => Ok(Self::accepted_daemon_response()),
-                        // Deadline expiry is an expected race at this
-                        // boundary, not a daemon-fatal transport failure.
-                        // Return an explicit known outcome so the caller can
-                        // retain liveness without parsing error strings.
-                        Err(TransportError::Timeout) => {
-                            Ok(Self::expired_activation_daemon_response())
+                        .is_some_and(|value| !value.is_null());
+                    let has_result = payload.get("result").is_some_and(|value| !value.is_null());
+                    match (has_decision, has_result) {
+                        (true, false) => {
+                            let decision_value = payload
+                                .get("decision")
+                                .cloned()
+                                .ok_or(TransportError::SessionFenced)?;
+                            let decision: AgentActivationResolutionDecision =
+                                serde_json::from_value(decision_value)
+                                    .map_err(|_| TransportError::SessionFenced)?;
+                            match self.submit_agent_activation_decision(decision) {
+                                Ok(()) => Ok(Self::accepted_daemon_response()),
+                                // Deadline expiry is an expected race at this
+                                // boundary, not a daemon-fatal transport failure.
+                                // Return an explicit known outcome so the caller can
+                                // retain liveness without parsing error strings.
+                                Err(TransportError::Timeout) => {
+                                    Ok(Self::expired_activation_daemon_response())
+                                }
+                                Err(error) => Err(error),
+                            }
                         }
-                        Err(error) => Err(error),
+                        (false, true) => {
+                            let result_value = payload
+                                .get("result")
+                                .cloned()
+                                .ok_or(TransportError::SessionFenced)?;
+                            let result: AgentActivationResolutionResult =
+                                serde_json::from_value(result_value)
+                                    .map_err(|_| TransportError::SessionFenced)?;
+                            match self.submit_agent_activation_resolution_result(result) {
+                                Ok(()) => Ok(Self::accepted_daemon_response()),
+                                // Same deadline-expiry race as the legacy path:
+                                // the ticket lapsed before the typed result
+                                // arrived, so the caller observes expiry without
+                                // losing daemon liveness.
+                                Err(TransportError::Timeout) => {
+                                    Ok(Self::expired_activation_daemon_response())
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                        _ => Err(TransportError::SessionFenced),
                     }
                 }
                 #[cfg(not(windows))]
