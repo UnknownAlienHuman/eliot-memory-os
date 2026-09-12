@@ -1,0 +1,130 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_INTEGRATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "BLOCKED_ON_COMPONENT_EDGES_READY_FOR_INTEGRATION"
+implementation_support = "INERT_CONTRACT_AND_PARTIAL_PROCESS_WITH_UNCLOSED_RUNTIME_EDGE"
+evidence_execution_status = "SOURCE_AND_ISSUE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "AGENT_BRIDGE_RUNTIME_EDGE_CANDIDATE_ONLY"
+issue = 77
+input_issue = 977
+kernel_port_issue = 342
+activation_issue = 66
+user_broker_issue = 1098
+operator_issue = 1105
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "surface.agent-bridge-complete-runtime-edge"
+causal_property = "One admitted Agent Bridge process accepts only bounded versioned host requests from the exact user/agent peer, dispatches each valid request to exactly one closed operation through the authenticated Kernel port, preserves ordered bounded responses and exact cancel/reconcile state, and cannot become a Session, semantic, authority, provider, canonical, or Finish owner."
+current_discriminator = "Agent Bridge has an inert host contract and request handlers, while #977 and #342 separately own bounded ingress and the real Kernel port. No accepted parent edge proves all declared host operations, output backpressure, peer/session binding, cancellation, reconnect, process replacement, and installed attach behavior together."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/77"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-01-agent-interaction-loop.md#a101-agent-interaction-loop",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md#i71-eliot-bridge-protocol-ebp1",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-02-frame.md#i72-frame",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-17-scope-and-task-onboarding.md#i717-scope-and-task-onboarding",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-23-raw-and-normalized-host-events.md#i723-raw-and-normalized-host-events",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-24-tool-surface-economy-and-cognitive-exposure.md#i724-tool-surface-economy-and-cognitive-exposure",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-13-idle-drain-and-cancellation.md#i1413-idle-drain-and-cancellation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-PORT-01", "ARCH-AUTH-01", "ARCH-SEC-02", "ARCH-SWM-02", "ARCH-RES-04", "ARCH-OBS-01"]
+
+[current_source]
+confirmed = [
+  "The bridge exposes a closed finite request surface and deliberately rejects raw ForwardFrame input.",
+  "The current stdin acquisition is separately bounded by #977 and cannot be bypassed by this parent integration.",
+  "The production KernelHostRequestPort is separately owned by #342 and activation onboarding by #66.",
+  "Package-local request tests cannot prove user-session launch, authenticated peer binding, response backpressure, process replacement, lost acknowledgement, or installed reconnect behavior.",
+]
+
+[scope]
+primary_paths = [
+  "bins/eliot-agent-bridge/src/**",
+  "crates/surfaces/eliot-mcp/src/host.rs",
+  "crates/surfaces/eliot-mcp/src/host_gateway.rs",
+  "exact User Broker/Operator launch and process-binding adapters required for the bridge",
+  "cross-process Agent Bridge integration tests and finite fixtures",
+]
+serialized_dependencies = ["#977 bounded input", "#342 Kernel port", "#66 activation edge", "#1098 User Broker", "#1105 Operator", "#15/#18 Kernel/Governor", "#11 Product proof"]
+forbidden = [
+  "raw frame forwarding or arbitrary operation names",
+  "caller-selected pipe, executable, peer, principal, Session, task, WorkScope, StateFence, capability, authority, or effect ceiling",
+  "bridge-local durable Session/task/operation ledger, retry scheduler, provider client, Store client, or Finish owner",
+  "unbounded input/output buffering or one slow consumer blocking protected control indefinitely",
+  "blind retry after possible request/effect submission",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Bind the bridge process and peer to exact installed user-session identity."
+how = [
+  "Launch the exact admitted Agent Bridge artifact through the current User Broker/Operator contour and bind installation, SID/logon Session, process generation/start, executable/config/protocol digest, peer identity, connection, AuthorityEpoch, StateFence, deadline, and invalidation.",
+  "Reject arbitrary endpoints and all authority inferred from process identity, same user, environment, cached token, or successful handshake alone.",
+  "Keep process/connection identity distinct from Kernel Session, task/WorkScope, request, operation, physical attempt, and effect identity.",
+]
+
+[[waves]]
+id = "B"
+what = "Compose bounded ingress, exact validation, and one-operation dispatch."
+how = [
+  "Apply #977 encoded-record, UTF-8, JSON complexity, request-count, idle/lifetime, malformed-record, and resynchronization bounds before typed deserialization.",
+  "Validate the closed current host request schema, correlation, identity, deadline, cancellation, capability, privacy/effect ceiling, and nested operation-specific bounds before #342 is invoked.",
+  "Every valid request invokes exactly one declared handler and one exact Kernel operation; malformed, unknown, oversized, unauthorized, stale, expired, or foreign requests invoke zero handlers and zero Kernel operations.",
+]
+
+[[waves]]
+id = "C"
+what = "Close response ordering, backpressure, cancellation, and reconciliation."
+how = [
+  "Emit one bounded versioned response for each accepted request and one typed rejection for each rejected bounded record, preserving correlation and request order where the protocol requires it.",
+  "Bound response serialization, output queue, per-client outstanding operations, total bytes, write timeout, and slow-consumer behavior without dropping committed/reconciling results silently.",
+  "Cancellation targets only the exact still-cancellable operation; possible request/effect/result submission remains reconciling under the original identity and is never blindly retried.",
+]
+
+[[waves]]
+id = "D"
+what = "Prove every operation, activation result, restart, reconnect, and drain path."
+how = [
+  "Run one valid fixture for every declared host operation, all seven activation dispositions through #66, and every operation-specific malformed/unauthorized/stale/expired negative.",
+  "Restart or disconnect Agent Bridge, User Broker, Operator, Kernel, and daemon before and after each durable boundary; require one stable terminal or exact reconciling result and no duplicate external effect.",
+  "Drain stops new input, accounts for pending output and unknown operations, closes the exact process/connection lineage, and permits a replacement generation only after stale authority is fenced.",
+]
+
+[acceptance]
+criteria = [
+  "One exact admitted Agent Bridge process and peer binding is required before any host operation; arbitrary endpoints or caller identity cannot be trusted.",
+  "The production bridge uses #977 bounded acquisition and #342 authenticated Kernel port; no parallel parser, raw ForwardFrame path, generic operation path, or unavailable fallback remains in a ready profile.",
+  "Every declared host operation has one production handler, one Kernel operation mapping, one positive fixture, and bounded malformed/unauthorized/stale/expired negatives.",
+  "A valid request invokes exactly one handler/Kernel operation; every invalid request invokes zero.",
+  "Connection/request, Kernel Session, task/WorkScope, logical decision, physical attempt, effect, response, and acknowledgement identities remain distinct and exact.",
+  "Responses preserve correlation, required ordering, typed semantic/effect/recovery state, and bounded output; slow consumers cannot create unbounded memory or silently lose committed results.",
+  "Exact replay is idempotent; changed same-identity payload, operation, owner, deadline, fence, capability, or effect ceiling conflicts.",
+  "Cancellation affects only the exact operation and cannot erase or relabel a possible external effect.",
+  "All seven activation results remain immediate and lossless; only exact Resolved onboarding may create a Session through Kernel.",
+  "Bridge/User Broker/Operator/Kernel/daemon loss and replacement preserve one terminal or exact reconciling state and leave no orphan process, handle, request, response, or effect.",
+  "Drain/restart cannot accept new work under a stale generation or duplicate a delivered/committed result.",
+  "Agent Bridge owns no task semantics, durable Session, authority, provider/model route, canonical Store state, external-effect policy, or VERIFIED_COMPLETE decision.",
+  "#11 executes installed attach/onboarding and representative host-operation Product Pulses after this Edge proof; package tests alone are insufficient.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-mcp -p eliot-agent-bridge -p eliot-kernel-service -p eliot-kernel -p eliotd --all-targets",
+  "cargo test --locked -p eliot-mcp -p eliot-agent-bridge -p eliot-kernel-service -p eliot-kernel -p eliotd --all-targets",
+  "cargo clippy --locked -p eliot-mcp -p eliot-agent-bridge -p eliot-kernel-service -p eliot-kernel -p eliotd --all-targets -- -D warnings",
+  "python scripts/verify-agent-bridge-protocol.py",
+  "git diff --check",
+]
+edge_proof = "Run every declared host operation, all activation outcomes, malformed/oversized/unauthorized inputs, output backpressure, replay/conflict, cancellation, lost acknowledgement, process disconnect/restart, stale generation, drain, and no-orphan cleanup through the production composition."
+product_proof = "Issue #11 remains the sole installed Product acceptance owner."
