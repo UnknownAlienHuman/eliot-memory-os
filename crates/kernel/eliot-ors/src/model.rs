@@ -2275,6 +2275,105 @@ impl StoreRebindReplayRecord {
     }
 }
 
+/// Durable retention of one closed typed Store failure bound to the exact
+/// admitted Store operation it reports on.
+///
+/// ORS preserves the owner `eliot_store_api::StoreFailure` envelope
+/// opaquely: the envelope is validated by the owner contract, pinned to the
+/// exact operation/request/fence/binding identity, and returned verbatim on
+/// readback. ORS never interprets disposition, retry, recovery, or
+/// human-detail prose for control decisions, and never re-derives retry or
+/// terminality from provider text: the retained typed envelope alone carries
+/// control meaning.
+///
+/// A retained `UNKNOWN_OUTCOME` failure with no reconciling receipt is the
+/// reconciling state: it is neither committed nor terminal, it is never
+/// reported as unavailable, failed, absent, or safe-to-retry, and only
+/// `crate::RedbRecoveryStore::mark_store_failure_reconciled` may bind the
+/// exact reconciling receipt afterwards. Terminal dispositions are retained
+/// as terminal evidence and can never become reconciled.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreFailureRetentionRecord {
+    pub operation_id: OperationIdentity,
+    pub request_digest: String,
+    pub store_fence: String,
+    pub candidate_binding_digest: String,
+    pub requirement_digest: String,
+    pub failure: eliot_store_api::StoreFailure,
+    /// Digest of the reconciling `WriteReceipt` bound after the exact
+    /// retained operation was reconciled following a possible
+    /// commit/effect. `None` while the retained failure is unresolved.
+    pub reconciled_receipt: Option<String>,
+}
+
+impl StoreFailureRetentionRecord {
+    /// Returns the durable key binding one operation to one exact request.
+    pub fn record_key(&self) -> String {
+        format!("{}::{}", self.operation_id.as_str(), self.request_digest)
+    }
+
+    /// Returns whether two records carry the exact same admitted binding.
+    ///
+    /// The retained failure envelope and the reconciling receipt are
+    /// excluded: they are retained Store evidence and ORS-owned
+    /// reconciliation progression, not caller binding.
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.operation_id == other.operation_id
+            && self.request_digest == other.request_digest
+            && self.store_fence == other.store_fence
+            && self.candidate_binding_digest == other.candidate_binding_digest
+            && self.requirement_digest == other.requirement_digest
+    }
+
+    /// Validates shape, owner envelope, and identity binding without
+    /// interpreting Store semantic policy.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(self.operation_id.as_str(), "store_failure_operation_id")?;
+        validate_digest(&self.request_digest, "store_failure_request_digest")?;
+        validate_digest(&self.store_fence, "store_failure_store_fence")?;
+        validate_digest(
+            &self.candidate_binding_digest,
+            "store_failure_candidate_digest",
+        )?;
+        validate_digest(&self.requirement_digest, "store_failure_requirement_digest")?;
+        // The owner contract alone decides envelope validity. Owner prose
+        // is never propagated: ORS reports a fixed field/reason pair so
+        // provider text cannot change control meaning.
+        self.failure
+            .validate()
+            .map_err(|_| OrsError::InvalidField {
+                field: "store_failure_envelope",
+                reason: "owner contract rejected the retained Store failure",
+            })?;
+        // The retained disposition must report on this exact operation. A
+        // failure carrying another operation identity is a binding
+        // mismatch, never a candidate for quiet adoption.
+        if let Some(operation_id) = self.failure.operation_id.as_ref()
+            && operation_id.as_str() != self.operation_id.as_str()
+        {
+            return Err(OrsError::InvalidField {
+                field: "store_failure_operation_id",
+                reason: "retained failure must bind the exact retained operation",
+            });
+        }
+        if let Some(receipt) = &self.reconciled_receipt {
+            validate_digest(receipt, "store_failure_reconciled_receipt")?;
+            // Only a possible commit/effect reconciles: terminal
+            // dispositions are retained as terminal evidence and can never
+            // become reconciled.
+            if self.failure.disposition != eliot_store_api::StoreFailureDisposition::UnknownOutcome
+            {
+                return Err(OrsError::InvalidField {
+                    field: "store_failure_reconciled_receipt",
+                    reason: "only unknown-outcome retention reconciles",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Closed P-04 host-request kinds preserved by ORS without interpretation.
 ///
 /// The kind is an opaque routing label. ORS never interprets task, scope,

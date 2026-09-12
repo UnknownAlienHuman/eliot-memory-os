@@ -36,6 +36,7 @@ mod daemon_kernel_client;
 mod daemon_kernel_port_adapters;
 mod kernel_recovery_client;
 mod kernel_transition_client;
+mod store_failure_projection;
 
 pub use activation_projection::AgentActivationResolver;
 
@@ -52,6 +53,7 @@ pub(crate) use daemon_kernel_client::{
     is_pre_admission_pending_rejection, retry_pre_admission, validate_server_hello,
 };
 pub(crate) use daemon_kernel_port_adapters::kind_value;
+pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
 
 /// Stable daemon identity.
 pub const SERVICE_NAME: &str = "eliotd";
