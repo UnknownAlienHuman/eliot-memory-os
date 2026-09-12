@@ -61,7 +61,10 @@ fn next_safe_action_for(
         (StoreRetryDirective::ReconcileExactOperation, _) => {
             "reconcile exact operation by receipt before any retry"
         }
-        (StoreRetryDirective::QueryReceipt, _) => "query write receipt for the exact operation",
+        (StoreRetryDirective::QueryReceipt, _)
+        | (StoreRetryDirective::DoNotRetry, StoreRecoveryAction::ResolveWriteReceipt) => {
+            "query write receipt for the exact operation"
+        }
         (StoreRetryDirective::RetrySameIdentityAfterBackoff, _) => {
             "retry same identity after backoff"
         }
@@ -71,14 +74,11 @@ fn next_safe_action_for(
         (StoreRetryDirective::MigrateThenRetryNewIdentity, _) => {
             "migrate then retry with new identity"
         }
-        (StoreRetryDirective::ManualRecovery, _) => "enter manual recovery",
-        (
+        (StoreRetryDirective::ManualRecovery, _)
+        | (
             StoreRetryDirective::DoNotRetry,
             StoreRecoveryAction::EnterManualRecovery | StoreRecoveryAction::EscalateInternalDefect,
         ) => "enter manual recovery",
-        (StoreRetryDirective::DoNotRetry, StoreRecoveryAction::ResolveWriteReceipt) => {
-            "query write receipt for the exact operation"
-        }
         (StoreRetryDirective::DoNotRetry, _) => "do not retry without operator review",
     }
 }
