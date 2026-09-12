@@ -1,4 +1,4 @@
-name: Temporary probe-plan documentation and package proof
+name: Temporary probe input contract proof
 
 on:
   schedule:
@@ -9,35 +9,36 @@ permissions:
   contents: read
 
 concurrency:
-  group: temporary-probe-plan
+  group: temporary-probe-input-contracts
   cancel-in-progress: true
 
 jobs:
-  probe-plan:
+  contracts:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout candidate
         uses: actions/checkout@v4
         with:
-          ref: work/610-dreamer-probe-plan
+          ref: work/1236-probe-input-contracts
           fetch-depth: 1
       - name: Read routed documentation
         run: |
           mkdir -p .eliot
           python scripts/docs_read.py read \
-            --path crates/smart/eliot-dreamer-probe-plan \
             --path crates/smart/eliot-dreamer-contracts \
             --path crates/smart/eliot-dreamer-rival-model \
-            --topic "bounded vector-preserving discriminative probe planning and owner-neutral rival projection" \
+            --topic "owner-neutral rival-model projection and inquiry-affordance contracts" \
             --output .eliot/docs-read-bundle.md \
             --receipt-out .eliot/docs-read-receipt.json
           cat .eliot/docs-read-receipt.json
           cat .eliot/docs-read-bundle.md
-      - name: Verify package
+      - name: Verify contracts and producer
         run: |
-          cargo fmt --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml -- --check
-          cargo test --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml --all-targets
-          cargo clippy --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml --all-targets -- -D warnings
-          cargo doc --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml --no-deps
+          cargo fmt --manifest-path crates/smart/eliot-dreamer-contracts/Cargo.toml -- --check
+          cargo test --manifest-path crates/smart/eliot-dreamer-contracts/Cargo.toml --all-targets
+          cargo clippy --manifest-path crates/smart/eliot-dreamer-contracts/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path crates/smart/eliot-dreamer-rival-model/Cargo.toml --all-targets
+          cargo clippy --manifest-path crates/smart/eliot-dreamer-rival-model/Cargo.toml --all-targets -- -D warnings
+          cargo doc --manifest-path crates/smart/eliot-dreamer-contracts/Cargo.toml --no-deps
           git diff --check
