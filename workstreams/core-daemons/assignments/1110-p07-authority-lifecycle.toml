@@ -1,0 +1,105 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "PURE_G01_PRESENT_LIVE_P07_PORT_MISSING"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "AUTHORITY_P07_EDGE_CANDIDATE"
+issue = 1110
+parent_issue_refs = [15, 18]
+product_pulse_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "docs/architecture/I06-10-authority-records.md#i610-authority-records",
+  "docs/architecture/I06-11-gate-and-decision-mapping.md#i611-gate-and-decision-mapping",
+  "docs/architecture/I06-15-capability-grant-lineage-introductions-and-resource-facets.md#i615-capability-grant-lineage-introductions-and-resource-facets",
+  "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-AUTH-01", "ARCH-SEC-02", "ARCH-LIFE-01", "ARCH-RES-01", "ARCH-OBS-01"]
+
+[confirmed_gap]
+source = "crates/governor/eliot-authority/src/activation.rs"
+observations = [
+  "P07AuthorityPort defines grant and introduction activation/revocation.",
+  "UnavailableP07AuthorityPort is the only repository implementation.",
+  "activate_grant, revoke_grant, activate_introduction and revoke_introduction have no production callers.",
+  "Kernel owns P-07 decision, dispatch and ORS contours but no adapter binds this G-01 lifecycle surface to them.",
+]
+discriminator = "Attempt any non-test GrantActivationRequest or IntroductionActivationRequest through current production composition; no real P07AuthorityPort can be constructed or called."
+
+[causal_property]
+statement = "Live grant/introduction activation and revocation occur only through the one current P-07 owner under exact principal/session/scope, lineaged epoch, State Fence, graph revision, operation identity, effect ceiling, expiry and receipt obligations."
+
+[scope]
+primary_paths = [
+  "crates/kernel/eliot-kernel-core/src/**authority**",
+  "crates/kernel/eliot-kernel-service/src/**authority**",
+  "crates/kernel/eliot-ors/src/**authority**",
+  "bins/eliot-kernel/src/**authority**",
+  "focused integration tests",
+]
+read_only_contracts = [
+  "crates/governor/eliot-authority/src/activation.rs",
+  "crates/governor/eliot-authority/src/grants.rs",
+  "crates/governor/eliot-authority/src/leases.rs",
+  "crates/foundation/eliot-runtime-contracts/src/**authority**",
+]
+forbidden_ownership = [
+  "Kernel or ORS dependency inside pure eliot-authority",
+  "second GrantGraph, epoch, receipt or lifecycle owner",
+  "provider credentials or secret payloads",
+  "semantic task policy or Finish",
+]
+
+[what_to_do]
+steps = [
+  "Define the narrow owner-neutral request/receipt adapter contract at the Kernel P-07 boundary.",
+  "Implement one non-test P07AuthorityPort outside the pure G-01 crate.",
+  "Bind activation/revocation intent and terminal or reconciling outcome to the current Kernel/ORS authority state.",
+  "Add production composition wiring and retain the unavailable port only for explicit pure/pre-admission profiles.",
+  "Prove descendant fencing, replay, expiry and restart recovery.",
+]
+
+[how_to_do]
+steps = [
+  "Validate exact grant/introduction/snapshot IDs, GrantGraph revision, principal/session/scope, State Fence, lineaged Authority Epoch, operation/resources, effect ceiling, expiry and receipt obligations before mutation.",
+  "Persist intent before changing live authority and persist the exact receipt or unknown/reconciling disposition before acknowledgement.",
+  "Return canonical AuthorityActivationReceipt or AuthorityRevocationReceipt; human detail never controls behavior.",
+  "Exact replay returns the same receipt; changed payload under one idempotency identity is IDENTITY_CONFLICT.",
+  "Revocation fences the declared descendant grants, introductions, tokens, leases and pending effects; possible effects require exact reconciliation.",
+  "Reject stale, future and cross-lineage epoch/fence requests before mutation.",
+  "Preserve the pure G-01 dependency boundary and inject the adapter from Kernel composition.",
+]
+
+[acceptance]
+criteria = [
+  "A real non-test P07AuthorityPort implementation and production caller exist.",
+  "Valid activation/revocation produces one durable exact receipt and exact replay is idempotent.",
+  "Changed IDs, graph revision, binding, fence or epoch under one identity conflict.",
+  "Expired, revoked, stale, cross-principal/session/scope and over-ceiling requests fail before mutation.",
+  "Revocation accounts for the complete declared dependent closure and preserves unknown effect outcomes as reconciling.",
+  "Restart cannot revive stale grants, introductions, tokens or leases.",
+  "UnavailableP07AuthorityPort cannot appear in a production-ready composition.",
+  "eliot-authority gains no Kernel, ORS, IPC, platform, Store or provider dependency.",
+  "No secret/provider payload or human prose drives authority decisions.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-authority -p eliot-kernel-core -p eliot-kernel-service -p eliot-ors --all-targets",
+  "cargo test --locked -p eliot-authority -p eliot-kernel-core -p eliot-kernel-service -p eliot-ors --all-targets",
+  "cargo clippy --locked -p eliot-authority -p eliot-kernel-core -p eliot-kernel-service -p eliot-ors --all-targets -- -D warnings",
+  "cargo tree --locked -p eliot-authority --edges normal",
+  "git diff --check",
+]
+edge_proof = "Run authenticated grant and introduction activation/revocation across Kernel restart, stale epoch, descendant closure and unknown-effect reconciliation."
