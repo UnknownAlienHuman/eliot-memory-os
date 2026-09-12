@@ -22,14 +22,14 @@ primary_responsibility = "Select and render one concise discriminative clarifica
 owned_mutable_state = []
 allowed_effects = []
 inputs = ["DreamJobInput class=Clarification", "ValidatedDreamDraft", "active-agent or Human-boundary projection"]
-outputs = ["ClarificationCandidate", "delivery-target recommendation", "safe fallback and expiry"]
-depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
-providers = ["Governor-admitted Dreamer bundle", "active attention boundary"]
+outputs = ["ClarificationDecision", "ClarificationCandidate", "routing recommendation", "safe fallback and expiry"]
+depends_on = ["eliot-contracts", "eliot-dreamer-contracts"]
+providers = ["Governor-admitted Dreamer bundle", "active agent or Human boundary owner"]
 consumers = ["agent mailbox compiler", "Human attention proposal"]
-non_goals = ["notification delivery", "attention ownership", "task decision", "inventing an answer", "basic Orientation synthesis"]
-invariants = ["exactly one question", "the answer would change a material classification, scope, outcome or reuse decision", "Human interruption is only recommended at a Human-owned boundary", "unanswered state preserves the unknown and declared fallback"]
-failure_behavior = "Return no-question or inconclusive with the original ambiguity; never generate a questionnaire or assume an answer."
-proof_surface = ["one-question cardinality", "task-local versus Human routing", "unanswered fallback", "no dependency from basic Orientation"]
+non_goals = ["notification delivery", "attention ownership", "answer validation", "task decision", "inventing an answer", "basic Orientation synthesis"]
+invariants = ["zero or one atomic question", "the answer changes a material branch or satisfies a hard owner boundary", "Human routing only at an explicit Human-owned boundary", "unanswered state preserves the unknown and declared fallback", "candidate-only proof and zero effects"]
+failure_behavior = "Return an explicit typed no-question, blocked, partial, decomposition, unauthorized, cancelled or expired disposition; never generate a questionnaire or assume an answer."
+proof_surface = ["atomicity and materiality", "task-local versus Human routing", "complete answer branch mapping", "unanswered fallback and invalidation", "no transport, answer, mutation, authority or Finish path"]
 proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
 product_pulse = "D3A_CLARIFICATION_EDGE_01"
 replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
@@ -38,39 +38,32 @@ split_trigger = "a second causal responsibility, mutable owner, independent proo
 
 [[donor]]
 path = "crates/smart/eliot-dreamer-core/src/lib.rs"
-disposition = "reuse bounded clarification contract only"
+disposition = "rewrite only bounded candidate vocabulary; reject delivery, answer handling and state mutation"
 
 [[donor]]
-path = "ELIOT_IMPLEMENTATION I9.3 and I9.11-I9.12"
+path = "docs/architecture/I09-03-job-classes.md and docs/architecture/I09-11-clarification-routing.md"
 disposition = "authoritative question and routing boundary"
 
 [agent_task]
-objective = "Implement Clarification as one independent handler, leaving mailbox and attention delivery to their owners."
+objective = "Implement Clarification as one independent pure handler, leaving mailbox, authentication, answer validation and attention delivery to their owners."
 write_scope = ["crates/smart/eliot-dreamer-clarification/**"]
-deliverables = ["question selector and renderer", "routing recommendation", "cardinality and fallback tests"]
-acceptance = ["one concise question only", "no state mutation or delivery side effect", "safe fallback remains explicit"]
+deliverables = ["closed candidate/decision contracts", "deterministic selector and renderer", "39-case atomicity/routing/fallback acceptance suite"]
+acceptance = ["zero or one concise question", "no state mutation or delivery side effect", "complete branch and ambiguity accounting", "safe fallback and invalidation remain explicit"]
 forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
 stop_condition = "Stop if selecting a question requires deciding the underlying fact; retain the ambiguity and return no selection."
 challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
 integration_owner = "cognitive-wave-integrator"
 implementation_language = "Rust 2024"
-required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
+required_verification = ["standalone fmt/test/clippy/doc", "all 39 Issue #630 cases discovered and passed", "independent atomicity/materiality/Human-boundary review", "workspace admission remains separate under #968"]
 writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
 workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"
 
-# Machine-checked completion gate, read by `scripts/verify-work-unit.py`.
-# `cargo fmt|test|clippy` all pass on an empty crate, so they cannot tell a
-# finished cell from an unstarted one. This table can.
-#
-# These are the floors every cell shares. The owning work unit tightens them
-# with `required_exports` and `required_tests` taken from its own brief, so a
-# reviewer decides on one exit code instead of reading prose criteria.
 [acceptance]
-min_source_lines = 200
-min_public_items = 6
-min_tests = 5
+min_source_lines = 500
+min_public_items = 20
+min_tests = 39
 require_deny_unknown_fields = true
 forbid_unsafe = true
-required_exports = []
-required_tests = []
-forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
+required_exports = ["propose_clarification", "AdmittedClarificationJob", "ClarificationPolicy", "ActiveAgentOrHumanBoundary", "ClarificationDecision", "ClarificationCandidate", "ClarificationDisposition", "AnswerSchema", "UnansweredFallback"]
+required_tests = ["valid_atomic_choice_question", "crate_has_no_transport_provider_store_mutation_or_finish_path"]
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!', 'std::process', 'std::fs', 'tokio', 'reqwest', 'surrealdb']

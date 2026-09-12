@@ -149,7 +149,6 @@ table cannot grant authority by itself.
 Dreamer remains outside the core/daemon workstream. Its source/build presence is
 not runtime or Product support.
 
-There is no shared long-lived implementation branch. Visible legacy refs are
-non-mutable aliases of `main` until they can be physically deleted. Current
+There is no shared long-lived implementation branch. `main` is the sole persistent authority branch; any other visible branch is a temporary issue-numbered branch with an open pull request and is deleted after merge, rejection, or supersession. Current
 support still requires exact source/build/runtime/store evidence and the
 applicable Product Pulse; committed prose does not substitute for that proof.
