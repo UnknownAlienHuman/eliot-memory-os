@@ -1,0 +1,122 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "CURRENT_ROOT_GUIDE_CONFLICTS_WITH_HIGHER_AUTHORITY"
+evidence_execution_status = "SOURCE_CONFLICT_INSPECTION_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "ROOT_ONBOARDING_AUTHORITY_CONFORMANCE_ONLY"
+issue = 1231
+source_reference_issue = 1125
+workflow_issue = 1225
+dependency_issue = 1229
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "documentation.root-onboarding-projection"
+causal_property = "The cold-start guide is a concise projection of current authority with no mutable status claims, worker ref mutation/self-merge, weaker documentation path or unlocked evidence commands."
+current_discriminator = "START.md hardcodes mutable counts, instructs worker git fetch and self-merge, weakens mandatory docs_read, defers required negative proof by project phase and uses unlocked Cargo commands."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1231"
+
+[documentation]
+repository = [
+  "AGENTS.md",
+  "WORKFLOW.md",
+  "docs/architecture/READING_PROTOCOL.md",
+]
+implementation = [
+  "docs/architecture/I02-20-local-source-and-test-projections.md#i220-local-source-and-test-projections",
+  "docs/architecture/I18-21-local-and-ci-parity.md#i1821-local-and-ci-parity",
+  "docs/architecture/I18-27-oracle-ownership-and-test-change-governance.md#i1827-oracle-ownership-and-test-change-governance",
+]
+anchors = ["ARCH-MOD-03", "ARCH-GROUND-01", "ARCH-FIN-01", "ARCH-OBS-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "START.md contains literal counts for cells, implementations, open Issues/PRs and ignored tests.",
+  "It tells workers to git fetch origin --prune, contrary to controller-owned synchronization in AGENTS.md.",
+  "It describes verified reading as expensive/contract-only, contrary to mandatory docs_read before every mutation.",
+  "It says implementation takes priority over exhaustive proof and that some tests are deferred by project phase, potentially contradicting Issue acceptance.",
+  "It instructs the worker to merge its own PR.",
+  "Its evidence commands omit --locked and applicable owner-specific proof.",
+  "README development metadata command likewise omits --locked.",
+]
+
+[scope]
+primary_paths = [
+  "START.md",
+  "README.md only for the development command consistency fix",
+  "existing documentation/agent-guardrail verifier and finite fixtures",
+]
+forbidden = [
+  "runtime code or normative semantic changes",
+  "automatic workflow triggers",
+  "committed generated counts or dated status reports",
+  "new parallel authority document",
+]
+
+[[waves]]
+id = "A"
+what = "Reduce START.md to a current authority projection."
+how = [
+  "Link to AGENTS, WORKFLOW and reading protocol instead of copying policy bodies.",
+  "Remove hand-maintained status counts and phase-based proof heuristics.",
+  "State explicitly that owning-Issue acceptance controls required proof and merge eligibility.",
+]
+
+[[waves]]
+id = "B"
+what = "Correct cold-start and ownership commands."
+how = [
+  "Validate the published authority receipt, exact base SHA and clean provisioned branch/worktree without worker fetch/pull/ref mutation.",
+  "Keep one Issue/branch/PR and allowed branch kinds, but remove worker self-merge instructions.",
+  "Distinguish worker implementation from reviewer/integrator merge ownership.",
+]
+
+[[waves]]
+id = "C"
+what = "Restore mandatory documentation and reproducible proof semantics."
+how = [
+  "Require root-to-leaf AGENTS and docs_read bundle/receipt for every mutable path family.",
+  "Use locked Cargo source/build commands and owner-specific package/edge tests.",
+  "Separate iteration checks from completion gates and do not call a skipped check automatically mergeable.",
+]
+
+[[waves]]
+id = "D"
+what = "Prevent future onboarding drift."
+how = [
+  "Extend an existing guardrail/doc-code verifier to reject literal mutable counts, worker fetch/pull/reset, self-merge, weakened docs routing and unlocked evidence commands.",
+  "Allow current observations only through commands writing stdout or .eliot with an explicit non-authoritative ceiling.",
+]
+
+[acceptance]
+criteria = [
+  "START.md contains no literal mutable cell, implementation, Issue, PR or ignored-test counts.",
+  "Worker instructions contain no git fetch, pull, authority-ref mutation, reset or self-merge.",
+  "Cold start validates exact published authority receipt/base SHA and clean provisioned scope.",
+  "docs_read routing is mandatory for every mutation class.",
+  "Owning-Issue acceptance governs proof; security, negative and edge tests are not deferred by project phase.",
+  "Iteration checks and completion gates are distinct.",
+  "Cargo evidence commands use --locked or stronger accepted mode.",
+  "Skipped/unavailable checks are reported but not automatically deemed mergeable.",
+  "README and START use consistent source/verification commands.",
+  "Worker and merger/integrator roles are distinct.",
+  "Focused verifier fixtures fail stale counts, forbidden sync/self-merge, weakened routing and unlocked evidence commands.",
+  "No generated status snapshot or dated report is committed.",
+]
+
+[verification]
+commands = [
+  "python scripts/docs_shards.py verify --root .",
+  "python scripts/docs_router.py check --root .",
+  "python scripts/docs_read.py self-test",
+  "python scripts/verify-agent-guardrails.py --self-test",
+  "python scripts/verify-agent-guardrails.py --root .",
+  "python scripts/verify-doc-code-conformance.py --self-test",
+  "python scripts/verify-doc-code-conformance.py --root .",
+  "just quick",
+  "git diff --check",
+]
+product_proof = "Not applicable; this is root onboarding authority conformance only."
