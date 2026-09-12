@@ -18,6 +18,8 @@ use crate::{
 pub enum ProofStage {
     Source,
     Compile,
+    Unit,
+    Property,
     Package,
     Integration,
     Edge,
@@ -28,7 +30,7 @@ pub enum ProofStage {
 
 impl ProofStage {
     /// Number of closed proof-stage variants.
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 10;
 }
 
 /// Observation/evaluation result retained separately from support axes.
