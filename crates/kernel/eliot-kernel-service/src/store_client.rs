@@ -282,6 +282,11 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                 let _ = observed;
                 self.receipt_exact(operation_id).await
             }
+            // A typed unknown-outcome failure was already bound to the
+            // admitted operation in `execute_raw`; reconcile exactly it.
+            Err(error) if error.is_unknown_outcome_failure() => {
+                self.receipt_exact(operation_id).await
+            }
             Err(error) => Err(error.into_store_error()),
         }
     }
@@ -334,6 +339,11 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                 Ok(receipt)
             }
             Ok(_) | Err(RequestFailure::Unknown { .. }) => {
+                self.reconcile_genesis(context, &request).await
+            }
+            // A typed unknown-outcome failure was already bound to the
+            // admitted operation in `execute_raw`; reconcile exactly it.
+            Err(error) if error.is_unknown_outcome_failure() => {
                 self.reconcile_genesis(context, &request).await
             }
             Err(error) => Err(error.into_store_error()),
