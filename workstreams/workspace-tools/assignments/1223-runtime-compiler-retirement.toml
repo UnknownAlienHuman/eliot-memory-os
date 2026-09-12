@@ -1,0 +1,128 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_CONSUMER_DISPOSITION_AND_MIGRATION"
+implementation_support = "HARDCODED_D01_VERIFIER_WITH_ONE_LEGACY_CONSUMER"
+evidence_execution_status = "SOURCE_AND_CONSUMER_SEARCH_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "D01_RUNTIME_COMPILER_RETIREMENT_CANDIDATE_ONLY"
+issue = 1223
+campaign_issue = 1193
+process_issue = 100
+registry_issue = 13
+evidence_issue = 216
+parent_product_issue = 11
+audited_source_base = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "workspace.runtime-compiler-disposition"
+causal_property = "Every retained runtime/build projection is verified from current normative, source, Cargo, registry, manifest and proof identities; historical D-01 state cannot act as a current registry or support oracle."
+current_discriminator = "eliot-runtime-compiler hardcodes D-01:plan-v2, multiple expected hashes, legacy monolithic book filenames and private projection/profile semantics; its only discovered code consumer is the legacy D-02 campaign executor."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1223"
+
+[documentation]
+implementation = [
+  "docs/architecture/I00-05-current-system-evidence-and-source-support-model.md#i05-current-system-evidence-and-source-support-model",
+  "docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
+  "docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
+  "docs/architecture/I02-20-local-source-and-test-projections.md#i220-local-source-and-test-projections",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions",
+  "docs/architecture/I17-08-delivery-depth-d0-replaceable-runtime-and-process-grounding-skeleton.md#i178-delivery-depth-d0-replaceable-runtime-and-process-grounding-skeleton",
+  "docs/architecture/I18-27-oracle-ownership-and-test-change-governance.md#i1827-oracle-ownership-and-test-change-governance",
+]
+anchors = ["ARCH-MOD-01", "ARCH-MOD-03", "ARCH-GROUND-01", "ARCH-OBS-01", "ARCH-FIN-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "PLAN_ID is fixed to D-01:plan-v2.",
+  "Expected manifest, payload-root, runtime, template and work-graph SHA-256 values are compiled into the binary.",
+  "The CLI expects Eliot_Runtime_BundleManifest.json plus monolithic ELIOT_ARCHITECTURE.md and ELIOT_IMPLEMENTATION.md roots.",
+  "The only discovered code consumer is eliot-campaign-executor, already tracked as legacy D-02 under #1193.",
+  "The package maintains private profile/port/work-graph semantics and invokes processes through private Command debt tracked by #100.",
+]
+
+[scope]
+primary_paths = [
+  "workspace/tools/eliot-runtime-compiler/**",
+  "exact current registry, evidence, documentation and build validators receiving migrated checks",
+  "workspace/tools/eliot-campaign-executor/** only for consumer removal/migration",
+  "config/architecture-boundaries.toml only after debt removal/reclassification",
+  "root Cargo, lock and package index only in final serialized removal",
+  "focused current and LEGACY_D01 fixtures",
+]
+serialized_dependencies = ["#1193 campaign", "#100 ProcessExecutor", "#13 registry", "#216 evidence", "#1125 docs references", "#11 Product proof"]
+forbidden = [
+  "second capability/runtime registry",
+  "support inferred from static projections",
+  "source/runtime mutation",
+  "arbitrary shell, network or credentials",
+  "weakening normative routing",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Inventory every D-01 input, check, hash, profile and consumer."
+how = [
+  "Record each filename, compiled hash, profile/port/work-graph concept, process call, report field, consumer and artifact.",
+  "Map useful current checks to #13, #216, current documentation/build/install validators.",
+  "Assign each item to current migration, bounded LEGACY_D01 verification or deletion.",
+]
+
+[[waves]]
+id = "B"
+what = "Remove historical authority from current verification."
+how = [
+  "Consume accepted sharded normative-pair identities rather than monolithic filenames.",
+  "Replace compiled fixed hashes with exact current input manifests or explicit legacy fixture values.",
+  "Reuse current registries and support/evidence vocabularies instead of private global profiles and port/work graphs.",
+]
+
+[[waves]]
+id = "C"
+what = "Close path, resource, process and report safety."
+how = [
+  "Bind canonical repository/artifact roots, resolve reparse/symlink escape and digest every input.",
+  "Bound file count/size, JSON depth/container/string, retained bytes, process output/time and report size before allocation.",
+  "Make every parse/canonicalization/process/digest/write failure typed and non-PASS; no panic/default/empty value can pass.",
+  "Move retained process/Git inspection behind #100 or a fixed read-only repository-tool exception.",
+]
+
+[[waves]]
+id = "D"
+what = "Retain a read-only legacy verifier or delete the package."
+how = [
+  "A retained LEGACY_D01 profile validates supplied immutable history only, with no mutation, provider, credential, route or support authority.",
+  "Migrate preserved checks with differential fixtures and explicit corrected divergences.",
+  "Delete only after Cargo, lock, docs index, campaign, scripts, fixtures and tracked debt are closed.",
+]
+
+[acceptance]
+criteria = [
+  "Every input/hash/profile/port/graph/process/report item has a current owner, bounded legacy role or deletion disposition.",
+  "No current tool/runtime uses D-01:plan-v2, fixed D-01 hashes or monolithic book filenames as current authority.",
+  "Any LEGACY_D01 role is read-only, versioned, identity-bound, explicitly non-current and expiring.",
+  "Current checks reuse #13/#216/docs/build owners with no private competing registry/profile graph.",
+  "Caller paths cannot escape or substitute bound roots.",
+  "File/JSON/process/time/output/report resources are bounded before allocation.",
+  "Parse, canonicalization, process, digest and write failure cannot yield PASS.",
+  "Exact immutable-input replay is deterministic and changed same-identity bytes conflict.",
+  "PASS declares only exact static/document scope and cannot promote runtime/Product/release support.",
+  "No private process/Git bypass remains.",
+  "Deletion leaves no Cargo, lock, index, campaign, docs, fixture, script or debt residue.",
+  "Current registry/evidence/build validation works with this package unavailable.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-runtime-compiler --all-targets",
+  "cargo test --locked -p eliot-runtime-compiler --all-targets",
+  "cargo clippy --locked -p eliot-runtime-compiler --all-targets -- -D warnings",
+  "cargo metadata --locked --all-features --format-version 1",
+  "python scripts/docs_shards.py verify --root .",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "Run current registry/evidence/build validation with the package unavailable and deterministic LEGACY_D01 fixtures only if retained."
+product_proof = "Issue #11 remains open; this tool cannot establish runtime or Product support."
