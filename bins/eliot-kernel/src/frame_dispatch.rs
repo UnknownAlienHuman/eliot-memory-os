@@ -92,6 +92,7 @@ impl KernelComposition {
                         | "daemon_fatal"
                         | "agent_activation_claim"
                         | "agent_activation_submit"
+                        | "agent_activation_reconcile"
                         | "store_recovery"
                         | "store_initialize_genesis"
                         | "apply_prepared"
