@@ -1,0 +1,123 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "LOCAL_AUDIT_EXISTS_REPOSITORY_EXECUTABLE_INVENTORY_MISSING"
+evidence_execution_status = "SOURCE_AND_ISSUE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "CRATE_REACHABILITY_AND_SOURCE_SHAPE_EVIDENCE_ONLY"
+issue = 1133
+registry_issue = 13
+baseline_issue = 750
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "repository.crate-reachability-and-implementation-support-inventory"
+causal_property = "Every tracked Cargo package and target has one reproducible current row separating source presence, contract maturity, implementation support, production reachability, test reachability, runtime evidence, replacement status, and Product support; indicators never promote or condemn a package without contextual evidence."
+current_discriminator = "The repository has Cargo metadata, package-local metadata, source scanners, issue allocations, and an external audit export, but no checked-in deterministic executable that accounts for every manifest, target, dependency edge, reverse consumer, fail-closed entrypoint, contract-only package, placeholder, legacy facade, and unresolved owner."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1133"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A02-03-modular-architecture.md#a23-modular-architecture",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-04-delegation.md#a104-delegation",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-05-current-system-evidence-and-source-support-model.md#i05-current-system-evidence-and-source-support-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-03-workspace-topology-and-dependency-direction.md#i23-workspace-topology-and-dependency-direction",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-20-local-source-and-test-projections.md#i220-local-source-and-test-projections",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-04-test-tiers.md#i184-test-tiers",
+]
+anchors = ["ARCH-MOD-01", "ARCH-MOD-02", "ARCH-MOD-03", "ARCH-GROUND-01", "ARCH-OBS-01"]
+
+[current_source]
+confirmed = [
+  "Workspace and standalone packages, binaries, tests, examples, build scripts, and target-specific dependencies form different reachability classes.",
+  "Dependency declaration, workspace membership, public types, LOC, package tests, or successful compilation cannot prove a production construction site or runtime support.",
+  "Signals such as NOT_IMPLEMENTED, KERNEL_ADMISSION_REQUIRED, PLAN_GAP, Unavailable, Noop, placeholder, skeleton, todo!, unimplemented!, direct Command, unsafe, and dead-code suppression require contextual classification.",
+  "Test fixtures, deliberate fail-closed adapters, unsupported-platform guards, pure contracts, legacy facades, and actual missing production implementations must remain distinguishable.",
+]
+
+[scope]
+primary_paths = [
+  "scripts/crate_reachability_inventory.py",
+  "scripts/tests/test_crate_reachability_inventory.py",
+  "existing package/source ownership metadata only when a proven missing field blocks exact classification",
+  "finite synthetic Cargo/source fixtures",
+]
+serialized_dependencies = ["#13 capability registry", "#750 ordinary test baseline", "current Cargo.lock/toolchain metadata", "current package AGENTS/module/service manifests"]
+forbidden = [
+  "automatic Issue or PR creation/closure",
+  "automatic support promotion or deletion decisions",
+  "runtime, provider, Store, network, credential, build, or test execution beyond fixed cargo metadata",
+  "caller-selected commands, package exclusions, network acquisition, or arbitrary roots",
+  "dated generated reports committed to Git",
+  "classification from package names or one text pattern alone",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Close the Cargo manifest, package, target, and dependency denominator."
+how = [
+  "Discover every tracked Cargo.toml below the repository root with bounded non-symlink traversal and classify it as workspace root, workspace member, local non-member dependency, excluded package, or standalone package.",
+  "Use fixed cargo metadata --locked --all-features --format-version 1 and record exact package ID/version/source, manifest, targets, crate types, editions, target cfg, normal/build/dev edges, workspace/default-member status, Cargo.lock, toolchain, and source identity.",
+  "Fail nonzero and incomplete on malformed/unreadable manifests, duplicate package/target identity, path escape, metadata failure, or an unaccounted manifest.",
+]
+
+[[waves]]
+id = "B"
+what = "Derive reverse consumers and source-level reachability without overclaiming."
+how = [
+  "Separate normal, build, dev, test, bench, example, doctest, cfg(test), target-specific, standalone, and binary-entrypoint consumers.",
+  "Reconcile dependency edges with bounded Rust token/symbol construction or invocation evidence; a manifest edge alone is not a production call site.",
+  "Record production source mentions/construction evidence, test-only mentions, no consumer, unresolved dynamic registration, and generated-code blind boundaries separately.",
+]
+
+[[waves]]
+id = "C"
+what = "Inventory implementation-shape and risk evidence contextually."
+how = [
+  "Enumerate production/test source files, public API, owned tests, binaries, unsafe/effect/process/provider/Store surfaces, direct process launch, permissive JSON/generic operation surfaces, and relevant package metadata.",
+  "Preserve exact path, line, token class, source digest, containing cfg/target, test/production scope, nearest AGENTS/module contract, and contextual disposition for each indicator.",
+  "Distinguish legitimate negative adapters and fixtures from unconditional production stubs, unreachable effect owners, empty crates, dormant packages, duplicate semantic owners, and legacy facades.",
+]
+
+[[waves]]
+id = "D"
+what = "Emit deterministic support-neutral rows and current owner gaps."
+how = [
+  "Record ContractMaturity, ImplementationSupport, EvidenceExecutionStatus, production/test reachability, runtime evidence, Product status, owner Issue/cell, contract/proof entrypoint, replacement/removal boundary, blind boundaries, expiry, and invalidation independently.",
+  "Canonicalize semantic sets only and bind aggregate identity to source tree, Cargo.lock/toolchain/metadata, manifests, owner maps, instructions, scanner version, and every row.",
+  "Write create-new canonical JSON only below .eliot; no committed dated report and no source mutation.",
+]
+
+[acceptance]
+criteria = [
+  "Every tracked Cargo.toml is accounted exactly once as root/member/local non-member/excluded/standalone.",
+  "Every package target and dependency edge has exact kind, cfg, source, package, and target identity.",
+  "Every package distinguishes production consumers, build consumers, test-only consumers, binary entrypoints, unresolved dynamic consumers, and no consumer.",
+  "A Cargo edge, public API, tests, LOC, source presence, compile success, or package name cannot become production implementation or runtime support.",
+  "Every TODO/unimplemented/unavailable/noop/fail-closed/placeholder/skeleton/unsafe/direct-process/dead-code indicator retains exact source evidence and contextual disposition.",
+  "Test fixtures, pure contracts, unsupported-platform guards, and deliberate fail-closed paths are not misclassified as missing implementations.",
+  "Packages with no production consumer, missing effect adapter, unconditional production refusal, duplicate semantic owner, or unresolved replacement remain explicit with an owning Issue or unresolved-owner result.",
+  "Legacy facades preserve every actual consumer and one migrate/fixture/delete disposition rather than name-based deletion.",
+  "Equivalent semantic inputs produce byte-identical rows and aggregate digest; source/lock/toolchain/manifest/owner-map/scanner changes invalidate affected evidence.",
+  "Malformed or incomplete metadata/source produces nonzero incomplete output and never an empty clean inventory.",
+  "Generated output cannot mutate source, branches, Issues, workflows, support state, or Product status.",
+  "A reviewed inventory can reconcile the entire crate denominator against #13 and #750 without a second handwritten package list.",
+]
+
+[verification]
+commands = [
+  "python -m py_compile scripts/crate_reachability_inventory.py scripts/tests/test_crate_reachability_inventory.py",
+  "python -m unittest scripts.tests.test_crate_reachability_inventory -v",
+  "python scripts/crate_reachability_inventory.py --repo-root . --output .eliot/crate-reachability.json",
+  "cargo metadata --locked --all-features --format-version 1",
+  "git diff --check",
+]
+edge_proof = "Run twice against one source identity and prove identical semantic rows/digest; inject malformed manifest, duplicate target, source bound, test-only dependency, fail-closed binary, legitimate unavailable fixture, dormant package, legacy facade, dynamic-registration blind boundary, and changed owner-map cases."
+product_proof = "Not applicable: this inventory establishes source/reachability evidence only and cannot prove runtime or Product support."
