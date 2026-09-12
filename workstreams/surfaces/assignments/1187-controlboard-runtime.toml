@@ -1,0 +1,123 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_AFTER_USER_SESSION_AND_BRIDGE_EDGES"
+implementation_support = "SUBSTANTIAL_CONTRACT_TEST_ONLY_COMPOSITION"
+evidence_execution_status = "SOURCE_AND_CONSUMER_SEARCH_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "CONTROLBOARD_USER_SESSION_EDGE_CANDIDATE_ONLY"
+issue = 1187
+surface_predecessor_issue = 288
+operator_issue = 1105
+user_broker_issue = 1098
+registry_issue = 13
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "surface.controlboard-production-composition"
+causal_property = "One authenticated request receives one role-filtered immutable ControlBoardView assembled from exact current owners at one declared consistency boundary; each command is bound to that exact view and forwarded to one owner without local state or authority."
+current_discriminator = "ControlBoard::new is constructed only in package tests; CLI exposes CONTROLBOARD_PLAN_GAP and no production composition binds the required providers."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1187"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I11-01-first-ui.md#i111-first-ui",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I11-02-controlboardview.md#i112-controlboardview",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I11-03-human-actions-and-role-authority.md#i113-human-actions-and-role-authority",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-AUTH-01", "ARCH-SEC-02", "ARCH-OBS-01", "ARCH-RES-04", "ARCH-FIN-01"]
+
+[current_source]
+confirmed = [
+  "eliot-controlboard is a substantial provider-neutral contract with role filtering and typed commands.",
+  "Repository search finds ControlBoard::new only in eliot-controlboard package tests.",
+  "eliot-cli exposes CONTROLBOARD_PLAN_GAP while admitted providers remain uninjected.",
+  "No production owner composes AccessResolver, CanonicalState, OperatorCommand, SwarmProjection, review projection and report projection.",
+  "Closed issue #288 explicitly excluded WinUI/User Broker/provider correctness and Product proof.",
+]
+
+[scope]
+primary_paths = [
+  "crates/surfaces/eliot-controlboard/** only for proven contract/factory defects",
+  "exact Operator and CLI composition adapters",
+  "exact Governor, Kernel, User Broker, Swarm, review and report adapters",
+  "directly relevant tests and finite fixtures",
+]
+serialized_dependencies = ["#1098 User Broker", "#1105 Operator", "#15/#18 Kernel/Governor", "#13 registry", "#11 Product proof"]
+forbidden = [
+  "second UI DTO, command ontology, role table, fence or support vocabulary",
+  "canonical Store credentials or raw Store queries",
+  "direct provider/model/process calls",
+  "second settings/review/task store",
+  "authority issuance, task scheduling or Finish ownership",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Implement one production provider composition."
+how = [
+  "Construct providers only from authenticated User Broker, Operator and Kernel admission.",
+  "Bind installation, principal, logon and durable Session, connection, credential/challenge, request, process generation, AuthorityEpoch, StateFence, deadline and privacy/effect ceilings.",
+  "Return exact PLAN_GAP naming each missing owner rather than an empty healthy view.",
+]
+
+[[waves]]
+id = "B"
+what = "Assemble one canonical consistency-bound view."
+how = [
+  "Resolve every section from its exact owner with provider/source revision, observed time, freshness, coverage, omissions, blind boundaries and invalidation set.",
+  "Declare one snapshot boundary; mixed revisions remain PARTIAL or CONFLICTED.",
+  "Apply role/privacy filtering before serialization and prevent hidden-content/count/order leakage.",
+]
+
+[[waves]]
+id = "C"
+what = "Forward lawful commands exactly once."
+how = [
+  "Compile only from a current authenticated view and exact visible target.",
+  "Revalidate capability, target, expected revision/fence, payload digest, deadline and operation identity.",
+  "Map each closed command variant to one owner; unsupported or invalid requests invoke zero effecting ports.",
+]
+
+[[waves]]
+id = "D"
+what = "Close replay, reconnect and non-authority boundaries."
+how = [
+  "Exact replay returns the same command receipt; changed same-identity command conflicts.",
+  "Possible submission/result remains UNKNOWN or RECONCILING and reconnect queries the original operation.",
+  "Keep UI/cache state rebuildable, revision-keyed and incapable of creating currentness, authority, support or task completion.",
+]
+
+[acceptance]
+criteria = [
+  "A real non-test caller constructs ControlBoard with current providers or returns a typed provider-specific PLAN_GAP.",
+  "One authenticated request produces one bounded role-filtered view with exact revision, fence, source identities, freshness, coverage, omissions and invalidation closure.",
+  "Mixed, stale, conflicted or partial state never becomes a current complete view.",
+  "Privacy/role filtering occurs before serialization and leaks no hidden content or unauthorized aggregate detail.",
+  "Every supported command maps to exactly one owner; invalid, hidden, stale, unauthorized or foreign requests invoke zero effecting ports.",
+  "Commands bind exact view, target, capability, payload, deadline and operation identities.",
+  "Exact replay is idempotent and changed same-identity command conflicts.",
+  "Possible submission remains reconciling and cannot be blindly repeated after reconnect.",
+  "Operator and CLI/dashboard consume the same canonical view and cannot widen authority differently.",
+  "Cache/view state is rebuildable and cannot create authority, freshness, support, canonical state or Finish.",
+  "ControlBoard owns no Store, provider/model, process, scheduler, policy, authority or Finish state.",
+  "Real user-session tests cover role filtering, mixed revisions, stale fence, hidden targets, replay/conflict, lost acknowledgement, reconnect and PLAN_GAP.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-controlboard -p eliot-operator -p eliot-cli --all-targets",
+  "cargo test --locked -p eliot-controlboard -p eliot-operator -p eliot-cli --all-targets",
+  "cargo clippy --locked -p eliot-controlboard -p eliot-operator -p eliot-cli --all-targets -- -D warnings",
+  "cargo tree --locked -p eliot-controlboard --edges normal",
+  "git diff --check",
+]
+edge_proof = "Execute User Broker -> Operator -> ControlBoard read and one lawful command plus denial, stale/mixed view, lost acknowledgement and reconnect reconciliation."
+product_proof = "Issue #11 remains open."
