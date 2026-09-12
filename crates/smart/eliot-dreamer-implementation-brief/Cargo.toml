@@ -26,7 +26,11 @@ eliot-conformance-contracts = { path = "../../foundation/eliot-conformance-contr
 eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-thiserror = "2.0.17"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts" }
+eliot-receipts = { path = "../../foundation/eliot-receipts" }
 
 [lints]
 workspace = true
