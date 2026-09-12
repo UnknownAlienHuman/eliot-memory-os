@@ -1,13 +1,13 @@
-//! Owner-neutral inquiry affordance declarations consumed by the pure probe planner.
+//! Owner-neutral inquiry-affordance declarations for the pure probe planner.
 //!
-//! These records describe what an external owner could make available. They do
-//! not reserve capacity, authorize an effect, execute a provider, or attest that
-//! the declared result schema will be observed.
+//! These records describe externally owned opportunities. They never reserve
+//! capacity, grant authority, execute a provider, or attest an observation.
 
 use std::collections::BTreeSet;
 
 use eliot_contracts::{ArtifactId, StateFence, TaskId};
 use eliot_epistemic_contracts::ValidityBounds;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{ContractViolation, rival::ConditionAssumptionRef};
@@ -21,26 +21,19 @@ use super::{
 
 /// Wire revision for one inquiry-affordance descriptor.
 pub const INQUIRY_AFFORDANCE_SCHEMA_VERSION: u32 = 1;
-/// Wire revision for one complete affordance-set carrier.
+/// Wire revision for one complete inquiry-affordance set.
 pub const INQUIRY_AFFORDANCE_SET_SCHEMA_VERSION: u32 = 1;
 
-/// One bounded quantitative planning dimension.
-///
-/// Units are dimension-owned and compared only with the same field. `Unknown`
-/// is never interpreted as zero, free, immediate, or safe.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// One independently interpreted non-negative planning dimension.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum ProbeEstimate {
-    /// Exact non-negative owner-supplied quantity.
     Known { units: u64 },
-    /// The quantity is relevant but unavailable.
     Unknown { reason: String },
-    /// The quantity does not apply to this affordance.
     NotApplicable { reason: String },
 }
 
 impl ProbeEstimate {
-    /// Validates the closed estimate without interpreting its units.
     pub fn validate(&self, field: &'static str) -> Result<(), ContractViolation> {
         match self {
             Self::Known { .. } => Ok(()),
@@ -50,7 +43,6 @@ impl ProbeEstimate {
         }
     }
 
-    /// Returns the exact quantity only when the owner supplied one.
     pub fn known_units(&self) -> Option<u64> {
         match self {
             Self::Known { units } => Some(*units),
@@ -60,29 +52,23 @@ impl ProbeEstimate {
 }
 
 /// Independent permission or protection state for one affordance dimension.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum ProbeRequirementState {
-    /// No external grant is required for this exact dimension.
     NotRequired,
-    /// An external owner supplied an immutable evidence handle.
     Satisfied { evidence: ArtifactId },
-    /// The dimension requires an external decision that has not been supplied.
     Required { owner: ProbeOwnerRef, reason: String },
-    /// Required state could not be established.
     Unknown { reason: String },
-    /// The owner explicitly refused or invalidated this dimension.
     Failed { reason: String },
 }
 
 impl ProbeRequirementState {
-    /// Validates shape only; it does not authenticate the evidence owner.
     pub fn validate(&self, field: &'static str) -> Result<(), ContractViolation> {
         match self {
             Self::NotRequired => Ok(()),
             Self::Satisfied { evidence } => validation::text(evidence.as_str(), field),
             Self::Required { owner, reason } => {
-                owner.validate()?;
+                validate_owner(owner)?;
                 validation::text(reason, field)
             }
             Self::Unknown { reason } | Self::Failed { reason } => {
@@ -91,14 +77,13 @@ impl ProbeRequirementState {
         }
     }
 
-    /// Whether the exact requirement is already satisfied for planning.
     pub fn is_satisfied(&self) -> bool {
         matches!(self, Self::NotRequired | Self::Satisfied { .. })
     }
 }
 
-/// External-effect ceiling declared by an affordance owner.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// External-effect ceiling declared by the affordance owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProbeEffectClass {
     None,
@@ -108,8 +93,8 @@ pub enum ProbeEffectClass {
     Unknown,
 }
 
-/// Reversibility of the described effect. This is not a rollback receipt.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Reversibility declaration; never an applied rollback receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum ProbeReversibility {
     NotApplicable,
@@ -138,8 +123,8 @@ impl ProbeReversibility {
     }
 }
 
-/// Descriptive availability of the affordance. It carries no permission.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Descriptive availability. Availability never implies permission.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum ProbeFeasibility {
     Available,
@@ -158,14 +143,14 @@ impl ProbeFeasibility {
     }
 }
 
-/// One immutable inquiry affordance. It is descriptive and inert.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// One immutable, inert inquiry affordance.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InquiryAffordanceDescriptor {
     pub schema_version: u32,
     pub affordance_id: ArtifactId,
     pub revision: u64,
-    /// Canonically ordered objective origins this affordance can address.
+    /// Unique canonical-order objective kinds this affordance can address.
     pub objective_origins: Vec<ProbeObjectiveOrigin>,
     pub owner: ProbeOwnerRef,
     pub applicability: ValidityBounds,
@@ -188,8 +173,7 @@ pub struct InquiryAffordanceDescriptor {
 }
 
 impl InquiryAffordanceDescriptor {
-    /// Constructs and canonically seals one affordance descriptor.
-    #[allow(clippy::too_many_arguments, reason = "constructor mirrors independent planning dimensions")]
+    #[allow(clippy::too_many_arguments, reason = "mirrors independent planning dimensions")]
     pub fn new(
         affordance_id: ArtifactId,
         revision: u64,
@@ -212,7 +196,7 @@ impl InquiryAffordanceDescriptor {
         source_refs: BTreeSet<ArtifactId>,
         invalidation_conditions: Vec<ConditionAssumptionRef>,
     ) -> Result<Self, ContractViolation> {
-        let mut descriptor = Self {
+        let mut value = Self {
             schema_version: INQUIRY_AFFORDANCE_SCHEMA_VERSION,
             affordance_id,
             revision,
@@ -236,12 +220,11 @@ impl InquiryAffordanceDescriptor {
             invalidation_conditions,
             digest: String::new(),
         };
-        descriptor.validate_shape()?;
-        descriptor.digest = descriptor.compute_digest()?;
-        Ok(descriptor)
+        value.validate_shape()?;
+        value.digest = value.compute_digest()?;
+        Ok(value)
     }
 
-    /// Validates shape, internal consistency, and canonical digest.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         validation::preflight(self)?;
         self.validate_shape()?;
@@ -249,13 +232,12 @@ impl InquiryAffordanceDescriptor {
         if self.digest != self.compute_digest()? {
             return Err(ContractViolation::BindingMismatch {
                 field: "probe.affordance.digest",
-                reason: "affordance digest does not match its declaration".to_owned(),
+                reason: "digest does not match the affordance declaration".to_owned(),
             });
         }
         Ok(())
     }
 
-    /// Computes the canonical digest excluding the digest field itself.
     pub fn compute_digest(&self) -> Result<String, ContractViolation> {
         validation::canonical_digest(&(
             self.schema_version,
@@ -284,10 +266,7 @@ impl InquiryAffordanceDescriptor {
 
     fn validate_shape(&self) -> Result<(), ContractViolation> {
         if self.schema_version != INQUIRY_AFFORDANCE_SCHEMA_VERSION {
-            return Err(ContractViolation::BindingMismatch {
-                field: "probe.affordance.schema_version",
-                reason: "unsupported affordance schema".to_owned(),
-            });
+            return binding("probe.affordance.schema_version", "unsupported schema version");
         }
         validation::text(self.affordance_id.as_str(), "probe.affordance.affordance_id")?;
         if self.revision == 0 {
@@ -306,18 +285,18 @@ impl InquiryAffordanceDescriptor {
                 got: crate::error::len_i64(self.objective_origins.len()),
             });
         }
-        let mut previous = None;
+        let mut prior_rank = None;
         for origin in &self.objective_origins {
             let rank = origin_rank(*origin);
-            if previous.is_some_and(|prior| prior >= rank) {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "probe.affordance.objective_origins",
-                    reason: "origins must be unique and canonically ordered".to_owned(),
-                });
+            if prior_rank.is_some_and(|prior| prior >= rank) {
+                return binding(
+                    "probe.affordance.objective_origins",
+                    "origins must be unique and canonically ordered",
+                );
             }
-            previous = Some(rank);
+            prior_rank = Some(rank);
         }
-        self.owner.validate()?;
+        validate_owner(&self.owner)?;
         self.applicability
             .validate()
             .map_err(|error| ContractViolation::BindingMismatch {
@@ -356,10 +335,10 @@ impl InquiryAffordanceDescriptor {
         for condition in &self.invalidation_conditions {
             condition.validate()?;
             if !assumptions.insert(condition.assumption_id.clone()) {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "probe.affordance.invalidation_conditions",
-                    reason: "duplicate assumption identity".to_owned(),
-                });
+                return binding(
+                    "probe.affordance.invalidation_conditions",
+                    "duplicate assumption identity",
+                );
             }
         }
         Ok(())
@@ -367,7 +346,7 @@ impl InquiryAffordanceDescriptor {
 }
 
 /// Completeness of the externally supplied affordance denominator.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AffordanceSetStatus {
     Complete,
@@ -376,7 +355,7 @@ pub enum AffordanceSetStatus {
 }
 
 /// Exact immutable set supplied to the probe planner.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InquiryAffordanceSet {
     pub schema_version: u32,
@@ -391,7 +370,6 @@ pub struct InquiryAffordanceSet {
 }
 
 impl InquiryAffordanceSet {
-    /// Constructs a canonically ordered set. Descriptor order is by stable ID.
     pub fn new(
         set_id: ArtifactId,
         task_id: TaskId,
@@ -403,7 +381,7 @@ impl InquiryAffordanceSet {
     ) -> Result<Self, ContractViolation> {
         descriptors.sort_by(|left, right| left.affordance_id.cmp(&right.affordance_id));
         omissions.sort();
-        let mut set = Self {
+        let mut value = Self {
             schema_version: INQUIRY_AFFORDANCE_SET_SCHEMA_VERSION,
             set_id,
             task_id,
@@ -414,26 +392,24 @@ impl InquiryAffordanceSet {
             omissions,
             digest: String::new(),
         };
-        set.validate_shape()?;
-        set.digest = set.compute_digest()?;
-        Ok(set)
+        value.validate_shape()?;
+        value.digest = value.compute_digest()?;
+        Ok(value)
     }
 
-    /// Validates the complete set and canonical digest.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         validation::preflight(self)?;
         self.validate_shape()?;
         validation::digest(&self.digest, "probe.affordance_set.digest")?;
         if self.digest != self.compute_digest()? {
-            return Err(ContractViolation::BindingMismatch {
-                field: "probe.affordance_set.digest",
-                reason: "affordance-set digest does not match its declaration".to_owned(),
-            });
+            return binding(
+                "probe.affordance_set.digest",
+                "digest does not match the affordance set",
+            );
         }
         Ok(())
     }
 
-    /// Computes the canonical digest excluding the digest field.
     pub fn compute_digest(&self) -> Result<String, ContractViolation> {
         validation::canonical_digest(&(
             self.schema_version,
@@ -449,10 +425,10 @@ impl InquiryAffordanceSet {
 
     fn validate_shape(&self) -> Result<(), ContractViolation> {
         if self.schema_version != INQUIRY_AFFORDANCE_SET_SCHEMA_VERSION {
-            return Err(ContractViolation::BindingMismatch {
-                field: "probe.affordance_set.schema_version",
-                reason: "unsupported affordance-set schema".to_owned(),
-            });
+            return binding(
+                "probe.affordance_set.schema_version",
+                "unsupported schema version",
+            );
         }
         validation::text(self.set_id.as_str(), "probe.affordance_set.set_id")?;
         validation::text(self.task_id.as_str(), "probe.affordance_set.task_id")?;
@@ -463,20 +439,17 @@ impl InquiryAffordanceSet {
                 field: "probe.affordance_set.state_fence",
                 reason: error.to_string(),
             })?;
-        check_sequence(
-            self.descriptors.len(),
-            "probe.affordance_set.descriptors",
-        )?;
-        let mut previous = None;
+        check_sequence(self.descriptors.len(), "probe.affordance_set.descriptors")?;
+        let mut previous_id: Option<&ArtifactId> = None;
         for descriptor in &self.descriptors {
             descriptor.validate()?;
-            if previous.as_ref().is_some_and(|prior| prior >= &descriptor.affordance_id) {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "probe.affordance_set.descriptors",
-                    reason: "descriptor identities must be unique and canonically ordered".to_owned(),
-                });
+            if previous_id.is_some_and(|prior| prior >= &descriptor.affordance_id) {
+                return binding(
+                    "probe.affordance_set.descriptors",
+                    "descriptor identities must be unique and canonically ordered",
+                );
             }
-            previous = Some(descriptor.affordance_id.clone());
+            previous_id = Some(&descriptor.affordance_id);
         }
         if self.omissions.len() > MAX_PROBE_ITEMS {
             return Err(ContractViolation::OutOfBounds {
@@ -486,24 +459,38 @@ impl InquiryAffordanceSet {
                 got: crate::error::len_i64(self.omissions.len()),
             });
         }
-        let mut prior = None;
+        let mut previous_omission: Option<&String> = None;
         for omission in &self.omissions {
             validation::text(omission, "probe.affordance_set.omission")?;
-            if prior.as_ref().is_some_and(|value| value >= omission) {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "probe.affordance_set.omissions",
-                    reason: "omissions must be unique and canonically ordered".to_owned(),
-                });
+            if previous_omission.is_some_and(|prior| prior >= omission) {
+                return binding(
+                    "probe.affordance_set.omissions",
+                    "omissions must be unique and canonically ordered",
+                );
             }
-            prior = Some(omission.clone());
+            previous_omission = Some(omission);
         }
         if matches!(self.status, AffordanceSetStatus::Complete) && !self.omissions.is_empty() {
-            return Err(ContractViolation::BindingMismatch {
-                field: "probe.affordance_set.status",
-                reason: "a complete set cannot retain omissions".to_owned(),
-            });
+            return binding(
+                "probe.affordance_set.status",
+                "a complete set cannot retain omissions",
+            );
         }
         Ok(())
+    }
+}
+
+fn validate_owner(owner: &ProbeOwnerRef) -> Result<(), ContractViolation> {
+    match owner {
+        ProbeOwnerRef::Source { owner } => {
+            validation::text(owner.as_str(), "probe.owner.source")
+        }
+        ProbeOwnerRef::Verifier { verifier_id } => {
+            validation::text(verifier_id.as_str(), "probe.owner.verifier")
+        }
+        ProbeOwnerRef::Unavailable { reason } => {
+            validation::text(reason, "probe.owner.reason")
+        }
     }
 }
 
@@ -521,20 +508,31 @@ fn validate_effect_reversibility(
     effects: ProbeEffectClass,
     reversibility: &ProbeReversibility,
 ) -> Result<(), ContractViolation> {
-    let valid = matches!(
+    if matches!(
         (effects, reversibility),
-        (ProbeEffectClass::None | ProbeEffectClass::ReadOnly, ProbeReversibility::NotApplicable)
-            | (ProbeEffectClass::ReversibleExternal, ProbeReversibility::Reversible { .. })
-            | (ProbeEffectClass::ReversibleExternal, ProbeReversibility::Compensatable { .. })
-            | (ProbeEffectClass::IrreversibleExternal, ProbeReversibility::Irreversible { .. })
-            | (ProbeEffectClass::Unknown, ProbeReversibility::Unknown { .. })
-    );
-    if valid {
+        (
+            ProbeEffectClass::None | ProbeEffectClass::ReadOnly,
+            ProbeReversibility::NotApplicable
+        ) | (
+            ProbeEffectClass::ReversibleExternal,
+            ProbeReversibility::Reversible { .. } | ProbeReversibility::Compensatable { .. }
+        ) | (
+            ProbeEffectClass::IrreversibleExternal,
+            ProbeReversibility::Irreversible { .. }
+        ) | (ProbeEffectClass::Unknown, ProbeReversibility::Unknown { .. })
+    ) {
         Ok(())
     } else {
-        Err(ContractViolation::BindingMismatch {
-            field: "probe.affordance.effect_reversibility",
-            reason: "effect class and reversibility declaration differ".to_owned(),
-        })
+        binding(
+            "probe.affordance.effect_reversibility",
+            "effect class and reversibility declaration differ",
+        )
     }
+}
+
+fn binding<T>(field: &'static str, reason: &str) -> Result<T, ContractViolation> {
+    Err(ContractViolation::BindingMismatch {
+        field,
+        reason: reason.to_owned(),
+    })
 }
