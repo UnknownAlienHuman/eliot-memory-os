@@ -1,0 +1,149 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "PROVIDER_ACCOUNT_AND_CAPACITY_EVIDENCE_FRAGMENTED_NO_CURRENT_CATALOGUE_OWNER"
+evidence_execution_status = "CURRENT_PROVIDER_ROUTE_ACCOUNT_AND_PORTFOLIO_DEPENDENCIES_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "PROVIDER_ACCOUNT_CATALOGUE_SOURCE_AND_EDGE_CANDIDATE_ONLY"
+issue = 265
+model_portfolio_issue = 69
+provider_adapter_issue = 1109
+native_worker_issue = 22
+dreamer_runtime_issue = 1100
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "agent.provider-account-catalogue-and-capacity-observation"
+causal_property = "One immutable current ProviderAccountCatalogue snapshot records provider-neutral account, model, quota, pricing, rate-limit, region/privacy, credential-reference, adapter and liveness observations with exact freshness and invalidation; the catalogue supplies evidence to Model Portfolio selection but cannot mint route authority, expose secrets, execute a model or infer availability from configuration presence."
+current_discriminator = "Provider/account/model information is distributed across route contracts, adapter packages, configuration and provider-specific observations. No accepted current owner produces one complete provider-neutral catalogue with exact observation time, expiry, source, account identity, quota/rate-limit/pricing/capability fields and invalidation closure for #69."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/265"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-04-delegation.md#a104-delegation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-05-current-system-evidence-and-source-support-model.md#i05-current-system-evidence-and-source-support-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I03-04-capability-and-route-registry.md#i34-capability-and-route-registry",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I03-06-model-route-and-portfolio-policy.md#i36-model-route-and-portfolio-policy",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-11-external-model-bridges.md#i1011-external-model-bridges",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-04-secrets.md#i154-secrets",
+]
+anchors = ["ARCH-OBS-01", "ARCH-PORT-01", "ARCH-SEC-01", "ARCH-RES-04", "ARCH-MOD-03"]
+
+[current_source]
+confirmed = [
+  "Current route/provider/coordinator code has provider and model identities but no one current provider-neutral account catalogue owner with complete freshness and source evidence.",
+  "Issue #69 requires current account, quota, cost, capability, privacy and adapter observations before route selection can be enforced.",
+  "Provider-specific packages remain under #1109 and native process execution under #22; catalogue collection must not become a model-execution or credential owner.",
+  "Configuration, provider name, model alias, credential-reference presence and successful process startup cannot prove current account usability, quota or support.",
+  "No open PR was found that tracks #265 as the complete current catalogue and observation boundary.",
+]
+
+[scope]
+primary_paths = [
+  "the existing lowest-dependency provider-neutral catalogue/route contract package selected after dependency review",
+  "exact provider-specific catalogue observation adapters for retained providers",
+  "crates/agent/eliot-agent-coordinator/src/** only at the read-only catalogue consumer boundary",
+  "exact configuration/credential-reference projection required to identify accounts without resolving secrets",
+  "directly relevant tests and finite provider response fixtures",
+]
+serialized_dependencies = [
+  "#69 Model Portfolio",
+  "#1109 provider adapter dispositions",
+  "#22 native-worker adapter generation",
+  "#1100 Dreamer runtime",
+  "#11 Product proof",
+]
+forbidden = [
+  "raw API keys, cookies, OAuth tokens, account secrets or unrestricted provider response payloads in catalogue state",
+  "provider SDK types in public owner-neutral contracts",
+  "catalogue presence, configuration or credential reference treated as route admission",
+  "executing model prompts or provider tools during catalogue observation",
+  "silent network fallback, hidden paid calls or automatic subscription changes",
+  "guessing quotas, prices, model capability or account tier from marketing names",
+  "merging unknown, unavailable, rate-limited, exhausted, stale and unsupported states",
+  "catalogue owner selecting routes, widening budgets/privacy/capabilities or deciding Finish",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Define one closed provider-neutral catalogue and observation vocabulary."
+how = [
+  "Add versioned ProviderAccountCatalogue, ProviderAccountObservation, ModelOfferingObservation, CapacityObservation, QuotaObservation, PricingObservation and CatalogueCoverage types in one owner-neutral package.",
+  "Bind provider, account-reference, organization/tenant when applicable, region/data boundary, route/model/config revision, adapter artifact/protocol generation, credential-reference class, observation source, observed-at, expiry and invalidation set.",
+  "Keep configured, credential-reference-present, authenticated, reachable, model-listed, capability-verified, quota-observed, price-observed, rate-limited, exhausted, suspended, unavailable, unsupported, stale, conflicted and unknown as independent fields/dispositions.",
+  "Represent absent, not-observed and provider-does-not-expose separately; never synthesize zero or unlimited quota from missing data.",
+]
+
+[[waves]]
+id = "B"
+what = "Implement bounded provider-specific observation adapters without secret or execution ownership."
+how = [
+  "Construct each adapter only from an admitted provider/account binding and opaque credential reference; resolve secrets through the existing owner and retain no raw secret in catalogue output or diagnostics.",
+  "Use the least-effect provider endpoint or local installed metadata needed to observe identity, offerings, capacity/quota, pricing and liveness; do not send user/model prompts or invoke tools.",
+  "Bound response bytes, item counts, nesting, duration, retries and cost; reject unknown fields/versions or retain them only as bounded opaque evidence handles according to the owning contract.",
+  "Record request/response source identity, provider request ID where safe, HTTP/protocol status class, observation time, coverage and omissions without leaking private payloads.",
+  "Provider unavailable, authentication failure, permission denial, rate limit, malformed response and timeout remain distinct observations.",
+]
+
+[[waves]]
+id = "C"
+what = "Canonicalize, validate and publish immutable current snapshots."
+how = [
+  "Validate every account/model/capacity/pricing row before inclusion and require exactly one disposition for each declared account/route/model denominator member.",
+  "Canonicalize semantic sets only; preserve meaningful provider priority, tier and fallback ordering as source observations rather than policy.",
+  "Digest the complete catalogue, coverage, source, freshness, expiry, omissions, conflicts and invalidation closure.",
+  "Exact same inputs produce byte-equivalent snapshot and digest; changed provider/account/model/config/source/freshness/capability/quota/price/coverage data changes identity.",
+  "Publish through a bounded read-only current-snapshot port; no consumer can mutate observations or extend expiry.",
+]
+
+[[waves]]
+id = "D"
+what = "Bind Model Portfolio consumption, invalidation and operational refresh."
+how = [
+  "#69 consumes one exact current catalogue snapshot and independently applies route policy; this package emits evidence only.",
+  "Credential/account/adapter/config/provider response changes invalidate only dependent rows and trigger explicit stale/refresh-needed status, not optimistic continuation.",
+  "Refresh scheduling, network budget and backoff remain owned by the admitted maintenance/runtime scheduler; the catalogue operation itself is one bounded observation attempt.",
+  "After timeout or uncertain provider response, record UNKNOWN/partial evidence and never retry invisibly or report old data as current.",
+  "Expose bounded operator diagnostics with stale rows, missing denominators, source handles and next safe refresh action.",
+]
+
+[acceptance]
+criteria = [
+  "One versioned provider-neutral catalogue owner exists and every retained provider/account/model row uses its closed vocabulary.",
+  "Every row binds exact provider/account/region/model/config/adapter/credential-reference/source/freshness/expiry/invalidation identity.",
+  "Configured, credential-present, authenticated, reachable, listed, capability-verified, quota-observed, price-observed and usable are independent and cannot imply one another.",
+  "Unknown, unavailable, rate-limited, exhausted, suspended, unsupported, stale and conflicted remain distinct and non-promoting.",
+  "Missing quota/price/capability data is not converted to zero, unlimited, supported or current.",
+  "Public contracts and persisted snapshots contain no vendor SDK type, raw credential, private token, unrestricted response body or protected account secret.",
+  "Catalogue observation invokes no user/model prompt, tool, external effect, subscription change or paid fallback outside the exact admitted observation endpoint.",
+  "Every provider adapter has finite response, item, depth, duration, retry and cost bounds and typed malformed/timeout/auth/rate-limit outcomes.",
+  "The complete declared account/route/model denominator has one explicit row/disposition or the snapshot is partial/incomplete.",
+  "Canonical snapshot/digest is deterministic and covers source, coverage, omissions, conflicts, freshness and invalidation.",
+  "Consumers cannot mutate a snapshot, extend expiry or reinterpret stale data as current.",
+  "#69 consumes the exact snapshot as evidence and remains the sole route-selection owner.",
+  "Provider/account/config/credential/adapter changes invalidate dependent rows before a new route selection.",
+  "An uncertain refresh remains unknown/partial and cannot silently fall back to the last observation as current.",
+  "Operator diagnostics are bounded/redacted and include exact stale/missing coverage and next safe refresh action.",
+  "Catalogue owns no route admission, model execution, task policy, budget widening, canonical write, authority or VERIFIED_COMPLETE decision.",
+  "Focused provider-neutral and retained-provider fixture tests pass, followed by one real bounded catalogue observation used by #69 under #11.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-agent-coordinator -p eliot-agent-contracts --all-targets plus the accepted catalogue owner and retained provider adapter packages",
+  "cargo test --locked -p eliot-agent-coordinator -p eliot-agent-contracts --all-targets plus the accepted catalogue owner and retained provider adapter packages",
+  "cargo clippy --locked -p eliot-agent-coordinator -p eliot-agent-contracts --all-targets -- -D warnings plus the accepted catalogue owner and retained provider adapter packages",
+  "git diff --check",
+]
+edge_proof = "Observe one retained provider/account catalogue with redacted credentials and exact source/freshness evidence, then inject auth failure, timeout, malformed response, rate limit, quota exhaustion, stale price/model revision and incomplete denominator before #69 selection."
+product_proof = "This establishes provider-account catalogue evidence only; route execution and Product support remain #69/#11."
