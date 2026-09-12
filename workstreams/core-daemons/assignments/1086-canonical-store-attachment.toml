@@ -1,0 +1,107 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "PARTIAL_WITH_UNSAFE_NOOP_FALLBACK"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "KERNEL_STORE_ATTACHMENT_SOURCE_CANDIDATE"
+issue = 1086
+parent_issue_refs = [15, 19]
+product_pulse_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A12-03-one-governed-write-path.md#a123-one-governed-write-path",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "docs/architecture/I05-09-surrealdb-implementation.md#i59-surrealdb-implementation",
+  "docs/architecture/I05-11-storage-replacement.md#i511-storage-replacement",
+  "docs/architecture/I14-11-canonical-store-outage.md#i1411-canonical-store-outage",
+  "docs/architecture/I15-03-least-privilege-processes.md#i153-least-privilege-processes",
+]
+anchors = ["ARCH-SEC-02", "ARCH-RES-01", "ARCH-ORD-01"]
+
+[confirmed_gap]
+source = "bins/eliot-kernel/src/canonical_store_runtime.rs"
+entrypoint = "KernelComposition::connect_canonical_store_inner"
+discriminator = "Construct KernelComposition through KernelComposition::new so process_gateway is None, install an otherwise valid Store handoff, then attempt canonical Store connection. Current code creates NoopAttachment, retains the Store gateway and returns success without ProcessExecutionGateway attachment."
+observations = [
+  "KernelComposition::new calls assemble with process_gateway=None.",
+  "connect_canonical_store is callable on that composition.",
+  "missing process_gateway selects a CanonicalStoreAttachmentTransaction whose commit is empty.",
+  "attach_then_retain_canonical_store retains the gateway before the no-op commit and reports success.",
+  "the protected authority constructors do create ProcessExecutionGateway, so the defect is an alternate-constructor/API invariant and promotion hazard rather than proof of the current executable taking that path.",
+]
+
+[causal_property]
+statement = "Successful canonical Store attachment proves that the exact authenticated gateway was accepted and retained by the one admitted Kernel process-execution/lifecycle owner; missing process authority is a typed failure, never a successful no-op."
+
+[scope]
+primary_paths = [
+  "bins/eliot-kernel/src/canonical_store_runtime.rs",
+  "bins/eliot-kernel/src/tests.rs",
+]
+read_only_dependencies = [
+  "bins/eliot-kernel/src/composition_bootstrap.rs",
+  "bins/eliot-kernel/src/process_execution.rs",
+  "crates/kernel/eliot-kernel-service/src/store_gateway.rs",
+]
+forbidden_paths = [
+  "crates/storage/**",
+  "crates/governor/**",
+  "docs/architecture/**",
+  ".github/workflows/**",
+]
+
+[what_to_do]
+steps = [
+  "Remove every successful NoopAttachment fallback from the canonical Store connection contour.",
+  "Reject missing ProcessExecutionGateway before retaining the canonical Store gateway.",
+  "Preserve claim rollback so a failed weak attempt cannot poison a later correctly admitted attachment.",
+  "Retain the existing exact peer process, Job Object, generation, route and bootstrap validation.",
+  "Prove all constructors and reconnect/rebind paths share the same attachment invariant.",
+]
+
+[how_to_do]
+steps = [
+  "Require self.process_gateway.as_ref() and return a stable typed KernelBuildError when absent.",
+  "Do not substitute a dummy transaction, unit success, test-only bypass or compatibility fallback.",
+  "Keep attach_then_retain_canonical_store ordered as prepare attachment, retain gateway, then commit attachment.",
+  "On preparation failure retain neither the process-side nor Kernel-side gateway and release canonical_store_claimed.",
+  "Add a regression test using the low-authority constructor and a valid-looking Store handoff to prove the effect path remains closed.",
+  "Preserve exact replay behavior: one admitted attachment, no duplicate writer, and no changed-gateway adoption.",
+]
+
+[acceptance]
+criteria = [
+  "No production CanonicalStoreAttachmentTransaction has an empty commit implementation.",
+  "A composition without ProcessExecutionGateway cannot return success or retain a canonical Store gateway.",
+  "The failed claim is released and a later properly admitted attempt can proceed.",
+  "A valid ProcessExecutionGateway receives exactly one attachment transaction.",
+  "Attachment preparation failure leaves both retained slots unchanged.",
+  "Exact reconnect is idempotent and changed identity conflicts.",
+  "No raw SurrealDB type, credential, semantic admission or second Store lifecycle owner is introduced.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-kernel --all-targets",
+  "cargo test --locked -p eliot-kernel --all-targets",
+  "cargo clippy --locked -p eliot-kernel --all-targets -- -D warnings",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "Run the Windows canonical Store attach/reconnect profile with absent gateway, valid gateway, preparation failure and exact replay."
+
+[boundaries]
+non_goals = [
+  "Store protocol or schema redesign",
+  "PreparedTransition semantic change",
+  "Host lifecycle redesign",
+  "automatic workflow trigger",
+  "runtime or Product support promotion from package tests",
+]
