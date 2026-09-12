@@ -1,0 +1,138 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_REGRESSION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_AFTER_ACTIVATION_AND_HOST_PORT_EDGES"
+implementation_support = "ATTACH_TRANSPORT_PRESENT_ONBOARDING_BOOTSTRAP_AND_TYPED_AMBIGUITY_EDGE_INCOMPLETE"
+evidence_execution_status = "SOURCE_AND_CONTRACT_INSPECTED_LIVE_ROUTE_NOT_EXECUTED"
+proof_ceiling = "TASK_BOUND_ONBOARDING_EDGE_CANDIDATE_ONLY"
+issue = 8
+agent_bridge_issue = 77
+activation_parent_issue = 66
+activation_receiver_issue = 1095
+activation_producer_issue = 839
+operator_issue = 1105
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "regression.agent-attach-task-and-context-bootstrap"
+causal_property = "One fresh attach returns either one exact authenticated current WorkScope/task binding or a typed bounded selection/ambiguity disposition, plus a route-qualified Decision Safety Floor and reversible expansion handles; stale or ambiguous state cannot receive Material task-bound authority."
+current_discriminator = "Architecture defines OnboardingReadinessReceipt and UnderstandingBootstrap, but source search finds no implementation of either type. AgentBridgeCore AttachRequest carries only demand, connection, attach kind and blind interval; ActivationPortResult and AttachBinding require one already-resolved TaskBinding and cannot represent no-task or multi-task ambiguity. The production host request port remains PlanGap under #77."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/8"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I04-02-resolution-order.md#i42-resolution-order",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I04-02-01-scopebindingguard-and-mid-task-revalidation.md#i421-scopebindingguard-and-mid-task-revalidation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I04-03-bootstrapscanner.md#i43-bootstrapscanner",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I04-03-01-authenticated-workscope-proposal-and-scan-boundary.md#i431-authenticated-workscope-proposal-and-scan-boundary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I04-04-progressive-onboarding.md#i44-progressive-onboarding",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I04-04-01-cold-start-taskdocument-readiness-and-first-useful-work.md#i441-cold-start-taskdocument-readiness-and-first-useful-work",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-08-agent-interaction-loop.md#i78-agent-interaction-loop",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-11-context-payload-profiles-and-decision-safety-floor.md#i711-context-payload-profiles-and-decision-safety-floor",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-17-convenience-surfaces.md#i717-convenience-surfaces",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-26-reversible-payload-budget-and-omission-handles.md#i726-reversible-payload-budget-and-omission-handles",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-05-write-envelope.md#i55-write-envelope",
+]
+anchors = ["ARCH-AUTH-01", "ARCH-GROUND-01", "ARCH-RES-04", "ARCH-OBS-01", "ARCH-FIN-01"]
+
+[current_source]
+confirmed = [
+  "crates/surfaces/eliot-agent-bridge-core defines AttachRequest with demand_id, connection_id, attach_kind and optional pre-attach blind interval only.",
+  "ActivationPortResult and AttachBinding carry exactly one sealed TaskBinding with task, work unit, WorkScope, task revision and plan identity.",
+  "AttachView exposes that one binding plus reconciliation-required and candidate-only pre-attach proof ceiling; it cannot carry task candidate sets, no-task, ambiguity, projection freshness or payload omission handles.",
+  "AgentBridgeCore correctly treats external blind intervals and outstanding delivery reconciliation separately, but its current trusted activation outcome is only Authenticated or Denied.",
+  "Governor activation outcome already has TaskSelectionRequired, ScopeSelectionRequired and ScopeAmbiguous, but live daemon/Kernel/Bridge projection remains #839/#1095/#66.",
+  "UnderstandingBootstrap and GetUnderstandingBootstrap currently appear only in Architecture documentation, not production source.",
+  "bins/eliot-agent-bridge currently exposes Attach/Invoke/Cancel but the KernelHostRequestPort is an explicit PlanGap under #77.",
+]
+
+[scope]
+primary_paths = [
+  "the current Governor/WorkScopeResolver owner of OnboardingReadinessReceipt",
+  "the current provider-neutral UnderstandingBootstrap projection owner",
+  "crates/surfaces/eliot-agent-bridge-core only for exact attach outcome/projection compatibility",
+  "bins/eliot-agent-bridge only after #77/#1095/#839 owner contracts are accepted",
+  "current Context Compiler/payload budget consumer required for bootstrap rendering",
+  "directly relevant tests and route-profile fixtures",
+]
+forbidden = [
+  "auto-selecting newest, last-active, highest-ranked, semantically similar or historical task",
+  "making Agent Bridge the WorkScope/task or onboarding readiness owner",
+  "collapsing Session, WorkspaceInstance, WorkScope, task, plan, projection revision or StateFence identity",
+  "turning stale/partial projection into current support or Material authority",
+  "silent truncation of goal, scope, authority, task selection, unknowns, verifier or recovery directive",
+  "filesystem discovery as a hidden substitute when ELIOT claims sufficient onboarding",
+  "task-bound reusable write without exact current TaskSelectionEvidence",
+  "model/Dreamer-selected task authority, canonical Store access or Finish ownership",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Implement the canonical owner result and exhaustive attach projection."
+how = [
+  "Create/reuse OnboardingReadinessReceipt at the Governor/WorkScopeResolver owner with exact principal/Session, Product/WorkspaceInstance, WorkScope proposal/resolution, candidate denominator, task selection, TaskContract revision/acceptance digest, governing sources, StateFence, source/projection revisions, coverage/freshness, GovernanceProfile and limiting IntegrationCoverageProfile.",
+  "Represent bound/unique, no-task, task-selection-required, scope-selection-required and multi-candidate ambiguity as closed typed dispositions; do not encode them as denial prose.",
+  "Project the receipt through UnderstandingBootstrap without granting stronger readiness or semantic authority.",
+]
+
+[[waves]]
+id = "B"
+what = "Bind attach, reconciliation and mid-task revalidation to exact current owners."
+how = [
+  "Agent Bridge forwards one exact AttachRequest and receives the typed owner result through #66/#839/#1095; it may seal only an exact Resolved binding.",
+  "Selection/ambiguity/not-ready/stale-fence results remain agent-visible and create no AttachBinding or Material authority.",
+  "Revalidate WorkspaceInstance, WorkScope, task revision, plan identity, StateFence and projection dependencies on attach, reconnect/resume and first scope-sensitive operation.",
+  "External pre-attach blind interval and event reconciliation remain separate from task/projection freshness.",
+]
+
+[[waves]]
+id = "C"
+what = "Compile a bounded Decision-Safety-Floor bootstrap with reversible omission."
+how = [
+  "Preserve goal/task selection, scope, authority/effect ceiling, StateFence, material unknowns/conflicts, verifier/acceptance, freshness/coverage and next recovery action in every qualified route profile.",
+  "Move large evidence bodies, historical tasks, rank traces and source text behind exact OmittedPayloadRef handles with source identity, reason, byte/token measurements, expansion operation and invalidation.",
+  "Measure the exact serialized envelope with actual serializer/tokenizer/route identity for at least one constrained route and one normal route; nominal context size or character estimates are insufficient.",
+  "If the Safety Floor cannot fit, return an explicit incompatible-route/selection result rather than silently dropping it.",
+]
+
+[[waves]]
+id = "D"
+what = "Close write safety and blind-agent regression proof."
+how = [
+  "Allow capture-first only as a cold unbound candidate with exact provenance and no task-relative influence.",
+  "Require current TaskSelectionEvidence, compatible TaskContract revision/acceptance digest, WorkScope and StateFence for reusable task memory, Material action/control, verification and Finish.",
+  "Add deterministic multiple-open-task, historical-task, no-task, stale-projection, changed-worktree/WorkspaceInstance, reconnect, oversized-evidence and unavailable-expansion fixtures.",
+  "Run one constrained-route blind attach where the agent obtains the intended task or correctly stops for selection without filesystem search, plus one normal-route measurement.",
+]
+
+[acceptance]
+criteria = [
+  "A fresh attach produces exactly one current task binding or one typed selection/ambiguity/no-task/not-ready/stale-fence disposition; no historical/newest/similar task is silently selected.",
+  "Every bound result preserves exact principal, Session, Product, WorkspaceInstance, WorkScope, task, task revision, acceptance digest, plan, StateFence and owner-source identities.",
+  "AttachBinding is created only from an exact Resolved owner result; selection/ambiguity creates no task authority.",
+  "Reconnect/resume and first scope-sensitive operation revalidate WorkspaceInstance, task revision, plan and StateFence and reject stale inheritance.",
+  "Each delivered projection is current, explicitly stale/partial/conflicted, unavailable or not applicable with exact revisions, coverage and next action.",
+  "Default constrained and normal outputs preserve the full Decision Safety Floor; omitted material has exact reversible handles and silent truncation is impossible.",
+  "Measured bytes/tokens bind the actual serializer, tokenizer, route/model profile and rendered envelope; estimates cannot qualify the profile alone.",
+  "If the Safety Floor cannot fit, the route is rejected/degraded rather than dropping task/scope/authority/proof distinctions.",
+  "Wrong/ambiguous task or stale WorkspaceInstance cannot receive reusable task memory, Material action/control, verification or Finish.",
+  "Capture-first without selection remains a cold unbound candidate and cannot contaminate a historical task.",
+  "Multiple-task, no-task, stale projection, wrong worktree, reconnect, oversized evidence and unavailable expansion fixtures pass.",
+  "A constrained blind agent identifies the intended task or stops for typed selection without filesystem search when ELIOT claims sufficient onboarding.",
+  "Context Compiler/Dreamer remain candidate/rendering owners only; Governor remains WorkScope/task/admission owner and Agent Bridge remains transport/projection only.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-agent-bridge-core -p eliot-agent-bridge -p eliot-governor -p eliot-context --all-targets for packages selected by the accepted implementation split",
+  "cargo test --locked -p eliot-agent-bridge-core -p eliot-agent-bridge -p eliot-governor -p eliot-context --all-targets for packages selected by the accepted implementation split",
+  "cargo clippy --locked -p eliot-agent-bridge-core -p eliot-agent-bridge -p eliot-governor -p eliot-context --all-targets -- -D warnings for packages selected by the accepted implementation split",
+  "git diff --check",
+]
+live_evidence = "Run one current constrained-route and one normal-route fresh attach with multiple/no tasks, exact payload measurements and a task-bound write denial/acceptance pair; attach nonsecret receipts and expansion evidence to the Issue/PR artifact."
+product_proof = "This regression proves attach/bootstrap behavior only; complete Operator, Agent Bridge and Product support remain #1105/#77/#11."
