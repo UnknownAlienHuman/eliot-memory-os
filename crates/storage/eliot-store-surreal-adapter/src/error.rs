@@ -51,7 +51,7 @@ impl AdapterError {
     /// dropped in favour of bounded static text.
     /// Contract ceiling (honest stop; extending it needs a Contract Challenge
     /// owned outside Wave A): `StoreError` has no Backpressure, Deadline,
-    /// MigrationRequired or Partial variants, so `MigrationRequired` and
+    /// `MigrationRequired` or `Partial` variants, so `MigrationRequired` and
     /// `UnknownMigrationOutcome` remain `Unavailable` here and can never
     /// produce the `MigrationRequired`, `Backpressured` or `DeadlineExceeded`
     /// dispositions. Live migration paths keep their exact outcome via

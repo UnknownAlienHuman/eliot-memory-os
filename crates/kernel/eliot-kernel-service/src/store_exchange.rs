@@ -88,11 +88,10 @@ impl RequestFailure {
 
     pub(super) fn into_store_error(self) -> StoreError {
         match self {
-            Self::Store(error) => error,
-            Self::Failure(failure) => failure_into_store_error(&failure),
-            // A typed store error wrapped as a contract defect is already
+            // A typed store error, directly or as a contract defect, is already
             // lossless: return it unchanged instead of re-wrapping it in prose.
-            Self::Contract(StoreClientError::Store(error)) => error,
+            Self::Store(error) | Self::Contract(StoreClientError::Store(error)) => error,
+            Self::Failure(failure) => failure_into_store_error(&failure),
             // A local framing/contract defect never carries peer prose into
             // the boundary. The `StoreError` ceiling has no NotAttempted
             // variant, so this stays a fixed serialization signal; see the
@@ -304,7 +303,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             // conservatively through the typed contract and still pass
             // `bind_failure` pinning before adoption.
             StoreResponse::Error { error } => Err(self.decode_legacy_compat(
-                LegacyStoreFailureV1::Error { error },
+                &LegacyStoreFailureV1::Error { error },
                 request_id,
                 admitted_operation,
                 idempotency_key,
@@ -313,7 +312,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 operation_id,
                 reason,
             } => Err(self.decode_legacy_compat(
-                LegacyStoreFailureV1::Unknown {
+                &LegacyStoreFailureV1::Unknown {
                     operation_id,
                     reason,
                 },
@@ -341,7 +340,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     /// decoded failure still passes `bind_failure` pinning before adoption.
     fn decode_legacy_compat(
         &self,
-        legacy: LegacyStoreFailureV1,
+        legacy: &LegacyStoreFailureV1,
         request_id: &RequestId,
         admitted_operation: Option<&OperationId>,
         idempotency_key: &str,
@@ -357,11 +356,8 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             evidence_ref: None,
             transport_unavailable: false,
         };
-        let legacy_value = match serde_json::to_value(&legacy) {
-            Ok(value) => value,
-            Err(_) => {
-                return failure_defect(admitted_operation);
-            }
+        let Ok(legacy_value) = serde_json::to_value(legacy) else {
+            return failure_defect(admitted_operation);
         };
         match decode_legacy_store_failure_v1(&legacy_value, &context) {
             Ok(failure) => {
