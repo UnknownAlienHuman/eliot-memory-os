@@ -31,6 +31,7 @@ pub mod authority;
 pub mod authority_controller;
 mod authority_snapshot;
 pub mod error;
+pub mod grant_activation_port;
 pub mod module;
 
 pub use authority::{
@@ -43,6 +44,10 @@ pub use authority_controller::{
     process_admission_digest,
 };
 pub use error::{KernelError, KernelResult};
+pub use grant_activation_port::{
+    CommittedReceipt, GrantActivationIntent, GrantActivationPort, GrantRevocationIntent,
+    IntentDisposition, IntroductionActivationIntent, IntroductionRevocationIntent,
+};
 pub use module::control_reserve_front_door::{
     AuthorityDecision, ControlPermit, ControlReserve, DecisionDenialReason, FrontDoor,
     IdempotencyDisposition, IdempotencyLedger,
