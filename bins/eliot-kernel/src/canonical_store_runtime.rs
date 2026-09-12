@@ -4,11 +4,18 @@
 //! Implementation: I1.2 Obligatory processes; I5.1 Canonical store bootstrap; I5.9 Store client attachment; I5.11 Store gateway ownership; I15.3 Store composition binding.
 //! Forbidden authority: must not embed raw `SurrealQL`, must not handle credentials, must not claim semantic ownership, must not create a second store writer — forbidden raw `SurrealQL`, credentials, semantic ownership, second store writer.
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition` canonical-store bootstrap/attachment closure plus inseparable helper with zero external users.
+//! Capability cells (§15 req.1): cell 8 canonical-store attachment runtime plus
+//! the pure cell 3/6 store-rebind predicates moved here from `lib` without
+//! touching the `rebind_store` transaction body, which stays whole in `lib`.
 
 use super::HostStoreBootstrapRequirement;
 use super::KernelBuildError;
 use super::KernelComposition;
 use super::STORE_BRIDGE_ROUTE;
+#[cfg(windows)]
+use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+#[cfg(windows)]
+use eliot_platform::PlatformHandle;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -222,4 +229,144 @@ impl KernelComposition {
             .map(|_| ())
             .map_err(|_| KernelBuildError::StoreAlreadyConnected)
     }
+}
+
+/// Pure cell 3/6 store-rebind predicates over `eliot_ors` replay records and
+/// `eliot_kernel_service` handoffs. No `self`, no composition privates; the
+/// `rebind_store` transaction body stays whole in `lib`.
+#[cfg(windows)]
+pub(crate) fn store_rebind_record_matches(
+    record: &eliot_ors::StoreRebindReplayRecord,
+    handoff: &eliot_kernel_service::StoreRebindHandoff,
+    request_digest: &str,
+    requirement_digest: &str,
+) -> bool {
+    record.operation_id.as_str() == handoff.operation_id.as_str()
+        && record.request_digest == request_digest
+        && record.candidate_binding_digest == handoff.candidate_binding_digest
+        && record.store_fence == handoff.store_fence
+        && record.requirement_digest == requirement_digest
+        && record.process_id == handoff.process_binding.process.process_id
+        && record.process_start_time_100ns == handoff.process_binding.process.start_time_100ns
+        && record.process_image_path == handoff.process_binding.process.image_path
+        && record.job_name == handoff.process_binding.job.as_str()
+        && record.generation == handoff.generation.value()
+        && record.authority_epoch == handoff.authority_epoch.value()
+}
+
+#[cfg(windows)]
+pub(crate) fn store_rebind_record_is_committed(
+    record: &eliot_ors::StoreRebindReplayRecord,
+    handoff: &eliot_kernel_service::StoreRebindHandoff,
+    request_digest: &str,
+    requirement_digest: &str,
+) -> bool {
+    store_rebind_record_matches(record, handoff, request_digest, requirement_digest)
+        && record.state == eliot_ors::StoreRebindReplayState::Committed
+        && record.receipt.as_deref() == Some(request_digest)
+}
+
+#[cfg(windows)]
+pub(crate) fn store_rebind_record_is_pending(
+    record: &eliot_ors::StoreRebindReplayRecord,
+    handoff: &eliot_kernel_service::StoreRebindHandoff,
+    request_digest: &str,
+    requirement_digest: &str,
+) -> bool {
+    store_rebind_record_matches(record, handoff, request_digest, requirement_digest)
+        && record.state == eliot_ors::StoreRebindReplayState::Pending
+        && record.receipt.is_none()
+}
+
+#[cfg(windows)]
+pub(crate) fn store_rebind_receipt_from_ors_record(
+    record: &eliot_ors::StoreRebindReplayRecord,
+) -> Result<eliot_kernel_service::StoreRebindReceipt, KernelBuildError> {
+    if record.state != eliot_ors::StoreRebindReplayState::Committed
+        || record.receipt.as_deref() != Some(record.request_digest.as_str())
+    {
+        return Err(KernelBuildError::Service(
+            "ORS Store rebind record is not an exact committed receipt".to_owned(),
+        ));
+    }
+    let receipt = eliot_kernel_service::StoreRebindReceipt {
+        operation_id: PlatformHandle::new(record.operation_id.as_str())
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+        request_digest: record.request_digest.clone(),
+        requirement_digest: record.requirement_digest.clone(),
+        process_binding: eliot_kernel_service::StoreProcessBinding {
+            process: eliot_kernel_service::HostProcessBinding {
+                process_id: record.process_id,
+                start_time_100ns: record.process_start_time_100ns,
+                image_path: record.process_image_path.clone(),
+            },
+            job: PlatformHandle::new(record.job_name.clone())
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+        },
+        candidate_binding_digest: record.candidate_binding_digest.clone(),
+        generation: ResourceGeneration::new(record.generation)
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+        authority_epoch: AuthorityEpoch::new(record.authority_epoch)
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+        store_fence: record.store_fence.clone(),
+    };
+    receipt
+        .validate()
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+    Ok(receipt)
+}
+
+#[cfg(windows)]
+#[allow(clippy::unwrap_used)]
+pub(crate) fn is_store_rebind_latest_committed(
+    ors: &eliot_ors::RedbRecoveryStore,
+    record: &eliot_ors::StoreRebindReplayRecord,
+) -> Result<bool, KernelBuildError> {
+    let all = ors
+        .load_all_store_rebinds()
+        .map_err(|e| KernelBuildError::Service(e.to_string()))?;
+    let committed: Vec<_> = all
+        .iter()
+        .filter(|r| r.state == eliot_ors::StoreRebindReplayState::Committed)
+        .collect();
+    if committed.is_empty() {
+        return Ok(true);
+    }
+    let same_lineage_zeros = committed
+        .iter()
+        .filter(|r| {
+            r.commit_order == 0
+                && r.requirement_digest == record.requirement_digest
+                && r.generation == record.generation
+                && r.authority_epoch == record.authority_epoch
+        })
+        .count();
+    if same_lineage_zeros > 1 {
+        return Err(KernelBuildError::Service(
+            "Store rebind legacy commit order requires migration/recovery".to_owned(),
+        ));
+    }
+    let legacy_zeros = committed.iter().filter(|r| r.commit_order == 0).count();
+    if legacy_zeros > 1 && record.commit_order == 0 {
+        return Ok(false);
+    }
+    if record.commit_order == 0 {
+        let max_order = committed.iter().map(|r| r.commit_order).max().unwrap_or(0);
+        if max_order > 0 {
+            return Ok(false);
+        }
+    }
+    let latest = committed
+        .iter()
+        .max_by_key(|r| {
+            (
+                r.commit_order,
+                r.operation_id.as_str().to_owned(),
+                r.request_digest.clone(),
+            )
+        })
+        .unwrap();
+    Ok(latest.commit_order == record.commit_order
+        && latest.operation_id == record.operation_id
+        && latest.request_digest == record.request_digest)
 }

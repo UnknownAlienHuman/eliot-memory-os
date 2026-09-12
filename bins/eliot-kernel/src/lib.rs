@@ -9,6 +9,31 @@
 //! Implementation: I6.4, I6.5, I7.1, I7.2, I7.3, I7.4, I7.5, I7.14, I1.4, I1.5, I2.2, I2.23, I8.1, I8.2, I8.3, I8.4, I14.10, I14.15
 //! Neutral Kernel admission/transport only; no Governor semantics, Store SDK, or default success.
 //! Forbidden authority: no semantic oracle, alternate lease authority, unbounded restart, or daemon-owned canonical transition.
+//!
+//! Capability cells (§15 req.1; I01-02; #13 thin bridge surface):
+//! cell 1 front-door/IPC admission — `agent_bridge`, `front_door_listener`,
+//!   `front_door_session`, `frame_dispatch` (+6), `host_request_route` (+6),
+//!   `daemon_session_guard` (+2), `runtime_identity` (+8);
+//! cell 2 epochs/fencing/leases — `supervision_lease_authority`,
+//!   `daemon_session_guard` (+1), `daemon_supervision` (+8);
+//! cell 3 ORS/generation state — `generation_recovery` (+5);
+//! cell 4 control reserve/lifecycle gateway — `control_plane` (+6);
+//! cell 5 generation routing — `generation_control`, `generation_recovery` (+3);
+//! cell 6 daemon/store-rebind dispatch — `daemon_request_dispatch` (+7),
+//!   `store_receipt_dispatch`, `control_plane` (+4), `frame_dispatch` (+1),
+//!   `host_request_route` (+1);
+//! cell 7 health/readiness view — `health_view`, `daemon_request_dispatch` (+6);
+//! cell 8 process/daemon/store runtime — `process_execution`,
+//!   `process_execution_client`, `daemon_runtime`, `daemon_process_launch`,
+//!   `daemon_live_receipt`, `daemon_supervision` (+2), `runtime_identity` (+1),
+//!   `canonical_store_runtime`;
+//! ROOT composition/entry — this `lib` (`KernelComposition`), the
+//!   `eliot-kernel` binary `main` plus `startup_binding` and
+//!   `front_door_driver`, `composition_bootstrap`, `kernel_build_contract`,
+//!   `kernel_config`;
+//! debt/out-of-scope for #15 — `r13_os_harness`, `r13_two_token_harness`,
+//!   `tests`, `tests/`; agent-bridge admission honors the #13 thin-surface
+//!   boundary, and process ownership follows I01-02.
 
 #![forbid(unsafe_code)]
 
@@ -141,7 +166,6 @@ use eliot_ors::{
 pub use eliot_ors::{SupervisionLeaseCommitTicket, SupervisionLeaseStageReceipt};
 #[cfg(test)]
 use eliot_platform::ClockObservation;
-use eliot_platform::PlatformHandle;
 #[cfg(windows)]
 use eliot_platform_windows::{
     FileIdentity as WindowsFileIdentity, NamedPipePeerKind, NamedPipePeerProfile, NamedPipePeerSet,
@@ -205,6 +229,11 @@ use sha2::{Digest as _, Sha256};
 
 #[cfg(all(test, windows))]
 use canonical_store_runtime::attach_then_retain_canonical_store;
+#[cfg(windows)]
+pub(crate) use canonical_store_runtime::{
+    is_store_rebind_latest_committed, store_rebind_receipt_from_ors_record,
+    store_rebind_record_is_committed, store_rebind_record_is_pending, store_rebind_record_matches,
+};
 #[cfg(all(test, windows))]
 use eliot_ipc::NamedPipeServer;
 #[cfg(all(test, windows))]
@@ -592,143 +621,6 @@ fn load_agent_bridge_declaration(
         .validate_client_declaration(&declaration)
         .map_err(|error| KernelBuildError::Service(error.to_string()))?;
     Ok(declaration)
-}
-
-#[cfg(windows)]
-fn store_rebind_record_matches(
-    record: &eliot_ors::StoreRebindReplayRecord,
-    handoff: &eliot_kernel_service::StoreRebindHandoff,
-    request_digest: &str,
-    requirement_digest: &str,
-) -> bool {
-    record.operation_id.as_str() == handoff.operation_id.as_str()
-        && record.request_digest == request_digest
-        && record.candidate_binding_digest == handoff.candidate_binding_digest
-        && record.store_fence == handoff.store_fence
-        && record.requirement_digest == requirement_digest
-        && record.process_id == handoff.process_binding.process.process_id
-        && record.process_start_time_100ns == handoff.process_binding.process.start_time_100ns
-        && record.process_image_path == handoff.process_binding.process.image_path
-        && record.job_name == handoff.process_binding.job.as_str()
-        && record.generation == handoff.generation.value()
-        && record.authority_epoch == handoff.authority_epoch.value()
-}
-
-#[cfg(windows)]
-fn store_rebind_record_is_committed(
-    record: &eliot_ors::StoreRebindReplayRecord,
-    handoff: &eliot_kernel_service::StoreRebindHandoff,
-    request_digest: &str,
-    requirement_digest: &str,
-) -> bool {
-    store_rebind_record_matches(record, handoff, request_digest, requirement_digest)
-        && record.state == eliot_ors::StoreRebindReplayState::Committed
-        && record.receipt.as_deref() == Some(request_digest)
-}
-
-#[cfg(windows)]
-fn store_rebind_record_is_pending(
-    record: &eliot_ors::StoreRebindReplayRecord,
-    handoff: &eliot_kernel_service::StoreRebindHandoff,
-    request_digest: &str,
-    requirement_digest: &str,
-) -> bool {
-    store_rebind_record_matches(record, handoff, request_digest, requirement_digest)
-        && record.state == eliot_ors::StoreRebindReplayState::Pending
-        && record.receipt.is_none()
-}
-
-#[cfg(windows)]
-fn store_rebind_receipt_from_ors_record(
-    record: &eliot_ors::StoreRebindReplayRecord,
-) -> Result<eliot_kernel_service::StoreRebindReceipt, KernelBuildError> {
-    if record.state != eliot_ors::StoreRebindReplayState::Committed
-        || record.receipt.as_deref() != Some(record.request_digest.as_str())
-    {
-        return Err(KernelBuildError::Service(
-            "ORS Store rebind record is not an exact committed receipt".to_owned(),
-        ));
-    }
-    let receipt = eliot_kernel_service::StoreRebindReceipt {
-        operation_id: PlatformHandle::new(record.operation_id.as_str())
-            .map_err(|error| KernelBuildError::Service(error.to_string()))?,
-        request_digest: record.request_digest.clone(),
-        requirement_digest: record.requirement_digest.clone(),
-        process_binding: eliot_kernel_service::StoreProcessBinding {
-            process: eliot_kernel_service::HostProcessBinding {
-                process_id: record.process_id,
-                start_time_100ns: record.process_start_time_100ns,
-                image_path: record.process_image_path.clone(),
-            },
-            job: PlatformHandle::new(record.job_name.clone())
-                .map_err(|error| KernelBuildError::Service(error.to_string()))?,
-        },
-        candidate_binding_digest: record.candidate_binding_digest.clone(),
-        generation: ResourceGeneration::new(record.generation)
-            .map_err(|error| KernelBuildError::Service(error.to_string()))?,
-        authority_epoch: AuthorityEpoch::new(record.authority_epoch)
-            .map_err(|error| KernelBuildError::Service(error.to_string()))?,
-        store_fence: record.store_fence.clone(),
-    };
-    receipt
-        .validate()
-        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-    Ok(receipt)
-}
-
-#[cfg(windows)]
-#[allow(clippy::unwrap_used)]
-fn is_store_rebind_latest_committed(
-    ors: &eliot_ors::RedbRecoveryStore,
-    record: &eliot_ors::StoreRebindReplayRecord,
-) -> Result<bool, KernelBuildError> {
-    let all = ors
-        .load_all_store_rebinds()
-        .map_err(|e| KernelBuildError::Service(e.to_string()))?;
-    let committed: Vec<_> = all
-        .iter()
-        .filter(|r| r.state == eliot_ors::StoreRebindReplayState::Committed)
-        .collect();
-    if committed.is_empty() {
-        return Ok(true);
-    }
-    let same_lineage_zeros = committed
-        .iter()
-        .filter(|r| {
-            r.commit_order == 0
-                && r.requirement_digest == record.requirement_digest
-                && r.generation == record.generation
-                && r.authority_epoch == record.authority_epoch
-        })
-        .count();
-    if same_lineage_zeros > 1 {
-        return Err(KernelBuildError::Service(
-            "Store rebind legacy commit order requires migration/recovery".to_owned(),
-        ));
-    }
-    let legacy_zeros = committed.iter().filter(|r| r.commit_order == 0).count();
-    if legacy_zeros > 1 && record.commit_order == 0 {
-        return Ok(false);
-    }
-    if record.commit_order == 0 {
-        let max_order = committed.iter().map(|r| r.commit_order).max().unwrap_or(0);
-        if max_order > 0 {
-            return Ok(false);
-        }
-    }
-    let latest = committed
-        .iter()
-        .max_by_key(|r| {
-            (
-                r.commit_order,
-                r.operation_id.as_str().to_owned(),
-                r.request_digest.clone(),
-            )
-        })
-        .unwrap();
-    Ok(latest.commit_order == record.commit_order
-        && latest.operation_id == record.operation_id
-        && latest.request_digest == record.request_digest)
 }
 
 #[cfg(windows)]
