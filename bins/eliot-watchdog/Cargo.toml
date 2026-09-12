@@ -34,6 +34,7 @@ eliot-platform-windows = { workspace = true, features = ["test-support"] }
 eliot-runtime-contracts.workspace = true
 
 [lints.rust]
+# SAFETY-OWNERSHIP: SCM-entry exception, see docs/ADR/0014-unsafe-ownership-and-exceptions.md#row-eliot-watchdog (canonical owner eliot-platform-windows).
 unsafe_code = "allow"
 
 [lints.clippy]

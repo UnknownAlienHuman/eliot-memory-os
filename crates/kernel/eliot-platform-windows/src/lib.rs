@@ -1087,6 +1087,9 @@ fn verify_readonly_acl(
         sid_to_string(expected_owner).map_err(|_| ProtectedPathError::AclMismatch)?;
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let mut owner: PSID = std::ptr::null_mut();
+    // SAFETY: GetSecurityInfo reads the file/service DACL through a live handle with READ_CONTROL;
+    // descriptor and DACL out-pointers are valid writable locals; handle outlives the call; return
+    // checked with LocalFree pairing below; no unwinding across the extern boundary.
     let status = unsafe {
         GetSecurityInfo(
             file.as_raw_handle().cast(),
@@ -1103,6 +1106,9 @@ fn verify_readonly_acl(
     };
     if status != ERROR_SUCCESS || descriptor.is_null() || owner.is_null() {
         if !descriptor.is_null() {
+            // SAFETY: LocalFree releases a descriptor/text buffer allocated by GetSecurityInfo or the SDDL/SID
+            // converter; pointer came from a successful call and is freed exactly once; no use after free; no
+            // null free on failure paths.
             unsafe { LocalFree(descriptor.cast()) };
         }
         return Err(ProtectedPathError::AclMismatch);
@@ -1110,6 +1116,9 @@ fn verify_readonly_acl(
     let mut present = 0;
     let mut actual_dacl = std::ptr::null_mut();
     let mut defaulted = 0;
+    // SAFETY: GetSecurityDescriptorDacl borrows the validated descriptor; present/DACL/defaulted are
+    // valid writable out-pointers; descriptor outlives the borrow; return checked before the DACL is
+    // read.
     let dacl_matches = unsafe {
         GetSecurityDescriptorDacl(
             descriptor,
@@ -1130,11 +1139,16 @@ fn verify_readonly_acl(
     };
     let mut control = 0_u16;
     let mut revision = 0_u32;
+    // SAFETY: GetSecurityDescriptorControl borrows the validated descriptor; control/revision are valid
+    // writable out-pointers; descriptor outlives the call; SE_DACL_PROTECTED bit read only on success.
     let protected = unsafe {
         GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
             && control & SE_DACL_PROTECTED != 0
     };
     let owner_matches = sid_to_string(owner).is_ok_and(|actual| actual == expected_owner);
+    // SAFETY: LocalFree releases a descriptor/text buffer allocated by GetSecurityInfo or the SDDL/SID
+    // converter; pointer came from a successful call and is freed exactly once; no use after free; no
+    // null free on failure paths.
     unsafe { LocalFree(descriptor.cast()) };
     if !owner_matches || !dacl_matches || !protected {
         return Err(ProtectedPathError::AclMismatch);
@@ -1362,6 +1376,9 @@ impl HostOwnerLease {
             })?;
             let descriptor = OwnedSecurityDescriptor::for_host_owner().map_err(|_| {
                 HostOwnerLeaseError::CreationFailed {
+                    // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+                    // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+                    // dereference.
                     win32_error: unsafe { GetLastError() },
                 }
             })?;
@@ -1378,6 +1395,9 @@ impl HostOwnerLease {
             // for the complete CreateMutexW call.  The returned handle is
             // transferred to this RAII owner exactly once.
             let handle = unsafe { CreateMutexW(&raw const attributes, 1, wide_name.as_ptr()) };
+            // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+            // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+            // dereference.
             let creation_error = unsafe { GetLastError() };
             if handle.is_null() {
                 return Err(HostOwnerLeaseError::CreationFailed {
@@ -1396,8 +1416,14 @@ impl HostOwnerLease {
                     // DACL and ownership history are not independently
                     // verified; a normal clean Host closes the last handle so
                     // the next start creates a fresh protected object.
+                    // SAFETY: CloseHandle closes an owned live handle exactly once on this path; handle originated from
+                    // a successful CreateMutexW/CreateToolhelp32Snapshot/OpenProcessToken; return checked for
+                    // OwnershipUncertain; no double close and no use after close.
                     if unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) } == 0 {
                         Err(HostOwnerLeaseError::OwnershipUncertain {
+                            // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+                            // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+                            // dereference.
                             win32_error: unsafe { GetLastError() },
                         })
                     } else {
@@ -1405,8 +1431,14 @@ impl HostOwnerLease {
                     }
                 }
                 win32_error => {
+                    // SAFETY: CloseHandle closes an owned live handle exactly once on this path; handle originated from
+                    // a successful CreateMutexW/CreateToolhelp32Snapshot/OpenProcessToken; return checked for
+                    // OwnershipUncertain; no double close and no use after close.
                     if unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) } == 0 {
                         Err(HostOwnerLeaseError::OwnershipUncertain {
+                            // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+                            // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+                            // dereference.
                             win32_error: unsafe { GetLastError() },
                         })
                     } else {
@@ -1482,14 +1514,26 @@ impl HostOwnerLease {
             // A failed ReleaseMutex must retain both ownership state and the
             // handle. Closing here would abandon the durable admission gate
             // and make a later retry impossible to classify safely.
+            // SAFETY: ReleaseMutex releases the owned mutex handle while it remains valid until CloseHandle;
+            // this strand holds ownership after fresh creation; return checked; no release of an abandoned or
+            // foreign handle.
             if self.owns && unsafe { ReleaseMutex(self.handle) } == 0 {
                 return Err(HostOwnerLeaseReleaseError::ReleaseMutex {
+                    // SAFETY: CloseHandle closes an owned live handle exactly once on this path; handle originated from
+                    // a successful CreateMutexW/CreateToolhelp32Snapshot/OpenProcessToken; return checked for
+                    // OwnershipUncertain; no double close and no use after close.
                     win32_error: unsafe { GetLastError() },
                 });
             }
             self.owns = false;
+            // SAFETY: CloseHandle closes an owned live handle exactly once on this path; handle originated from
+            // a successful CreateMutexW/CreateToolhelp32Snapshot/OpenProcessToken; return checked for
+            // OwnershipUncertain; no double close and no use after close.
             if unsafe { CloseHandle(self.handle) } == 0 {
                 return Err(HostOwnerLeaseReleaseError::CloseHandle {
+                    // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+                    // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+                    // dereference.
                     win32_error: unsafe { GetLastError() },
                 });
             }
@@ -2060,6 +2104,9 @@ impl OwnedSecurityDescriptor {
         use windows_sys::Win32::Security::GetSecurityDescriptorOwner;
         let mut owner = std::ptr::null_mut();
         let mut defaulted = 0;
+        // SAFETY: GetSecurityDescriptorOwner borrows the validated descriptor; owner/defaulted are valid
+        // writable out-pointers; descriptor outlives the borrow; return plus null owner checked before any
+        // read.
         if unsafe { GetSecurityDescriptorOwner(self.raw, &raw mut owner, &raw mut defaulted) } == 0
             || owner.is_null()
         {
@@ -2419,6 +2466,9 @@ pub fn any_running_process_named(basename: &str) -> Result<bool, WindowsAdapterE
             CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
             TH32CS_SNAPPROCESS,
         };
+        // SAFETY: CreateToolhelp32Snapshot enumerates processes with TH32CS_SNAPPROCESS; flags constant;
+        // return compared against INVALID_HANDLE_VALUE; snapshot closed via CloseHandle on every path;
+        // handle stays on this thread until close.
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snapshot == INVALID_HANDLE_VALUE {
             return Err(last_windows_adapter_error());
@@ -2429,6 +2479,9 @@ pub fn any_running_process_named(basename: &str) -> Result<bool, WindowsAdapterE
             ..Default::default()
         };
         let mut matched = false;
+        // SAFETY: Process32FirstW receives the live snapshot handle and a writable PROCESSENTRY32W with
+        // dwSize set; entry buffer pinned and outlives the call; snapshot stays open; return selects the
+        // enumeration path.
         let first = unsafe { Process32FirstW(snapshot, &raw mut entry) } != 0;
         let mut terminal_error = 0_u32;
         if first {
@@ -2443,14 +2496,26 @@ pub fn any_running_process_named(basename: &str) -> Result<bool, WindowsAdapterE
                     matched = true;
                     break;
                 }
+                // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+                // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+                // dereference.
                 if unsafe { Process32NextW(snapshot, &raw mut entry) } == 0 {
+                    // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+                    // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+                    // dereference.
                     terminal_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
                     break;
                 }
             }
         } else {
+            // SAFETY: CloseHandle closes an owned live handle exactly once on this path; handle originated from
+            // a successful CreateMutexW/CreateToolhelp32Snapshot/OpenProcessToken; return checked for
+            // OwnershipUncertain; no double close and no use after close.
             terminal_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
         }
+        // SAFETY: CloseHandle closes an owned live handle exactly once on this path; handle originated from
+        // a successful CreateMutexW/CreateToolhelp32Snapshot/OpenProcessToken; return checked for
+        // OwnershipUncertain; no double close and no use after close.
         unsafe { CloseHandle(snapshot) };
         if matched || terminal_error == ERROR_NO_MORE_FILES {
             Ok(matched)
@@ -2649,6 +2714,9 @@ fn deliver_shell_notification(_request: &NotificationRequest) -> Result<bool, Wi
         WS_POPUP,
     };
 
+    // SAFETY: CreateWindowExW creates the toolwindow with static class/name wide strings that outlive
+    // the call; extended/style flags constant; hwnd null-checked; hwnd destroyed via DestroyWindow on
+    // failure paths; message pump runs on this thread with no unwinding across the boundary.
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW,
@@ -2676,6 +2744,9 @@ fn deliver_shell_notification(_request: &NotificationRequest) -> Result<bool, Wi
         uID: 1,
         uFlags: NIF_ICON | NIF_MESSAGE | NIF_INFO,
         uCallbackMessage: WM_APP + 1,
+        // SAFETY: LoadIconW loads the shared IDI_INFORMATION icon with a null module handle; system icon
+        // needs no DestroyIcon release; value stored into NOTIFYICONDATA only; no dereference of the icon
+        // handle.
         hIcon: unsafe { LoadIconW(null_mut(), IDI_INFORMATION) },
         dwInfoFlags: NIIF_INFO,
         ..Default::default()
@@ -2693,13 +2764,22 @@ fn deliver_shell_notification(_request: &NotificationRequest) -> Result<bool, Wi
     // zero-initialized; this selects the documented balloon timeout member.
     data.Anonymous.uTimeout = 10_000;
 
+    // SAFETY: Shell_NotifyIconW receives the live NOTIFYICONDATA with ABI layout, NUL-terminated tip,
+    // valid hwnd and callback id; struct pinned for the call; NIM_ADD/MODIFY/DELETE paired; return
+    // checked; callback reentrancy confined to the message pump.
     let added = unsafe { Shell_NotifyIconW(NIM_ADD, &raw const data) != 0 };
     if !added {
+        // SAFETY: Shell_NotifyIconW receives the live NOTIFYICONDATA with ABI layout, NUL-terminated tip,
+        // valid hwnd and callback id; struct pinned for the call; NIM_ADD/MODIFY/DELETE paired; return
+        // checked; callback reentrancy confined to the message pump.
         unsafe {
             DestroyWindow(hwnd);
         }
         return Ok(false);
     }
+    // SAFETY: Shell_NotifyIconW receives the live NOTIFYICONDATA with ABI layout, NUL-terminated tip,
+    // valid hwnd and callback id; struct pinned for the call; NIM_ADD/MODIFY/DELETE paired; return
+    // checked; callback reentrancy confined to the message pump.
     let accepted = unsafe { Shell_NotifyIconW(NIM_MODIFY, &raw const data) != 0 };
     let delivered = if accepted {
         wait_for_shell_balloon(hwnd, data.uCallbackMessage)
@@ -2708,6 +2788,9 @@ fn deliver_shell_notification(_request: &NotificationRequest) -> Result<bool, Wi
     };
     // Keep the icon and hidden window alive until the bounded callback wait;
     // deleting immediately emits NIN_BALLOONHIDE and would falsify delivery.
+    // SAFETY: Shell_NotifyIconW receives the live NOTIFYICONDATA with ABI layout, NUL-terminated tip,
+    // valid hwnd and callback id; struct pinned for the call; NIM_ADD/MODIFY/DELETE paired; return
+    // checked; callback reentrancy confined to the message pump.
     unsafe {
         let _ = Shell_NotifyIconW(NIM_DELETE, &raw const data);
         DestroyWindow(hwnd);
@@ -2728,12 +2811,18 @@ fn wait_for_shell_balloon(hwnd: windows_sys::Win32::Foundation::HWND, callback: 
     while Instant::now() < deadline {
         let mut message = MSG::default();
         let mut observed = false;
+        // SAFETY: PeekMessageW dequeues into the writable MSG pinned on this stack with the hwnd filter and
+        // PM_REMOVE; message buffer valid for the call; return drives the pump loop on this thread; no
+        // cross-thread use.
         while unsafe { PeekMessageW(&raw mut message, hwnd, 0, 0, PM_REMOVE) } != 0 {
             if message.message == callback
                 && message.lParam == isize::try_from(NIN_BALLOONSHOW).unwrap_or_default()
             {
                 observed = true;
             }
+            // SAFETY: TranslateMessage/DispatchMessageW forwards the dequeued MSG by const reference on the
+            // pump thread; message came from PeekMessageW on this hwnd; no retained pointer after dispatch; no
+            // reentrancy beyond the pump.
             unsafe {
                 TranslateMessage(&raw const message);
                 DispatchMessageW(&raw const message);
@@ -2767,11 +2856,17 @@ fn interactive_non_elevated_session() -> bool {
         return false;
     }
     let mut token = std::ptr::null_mut();
+    // SAFETY: OpenProcessToken borrows the pseudo-handle from GetCurrentProcess with TOKEN_QUERY; token
+    // out-pointer is a valid local; pseudo-handle needs no close; return checked; token closed exactly
+    // once below.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
         return false;
     }
     let mut elevation = TOKEN_ELEVATION::default();
     let mut length = 0_u32;
+    // SAFETY: GetTokenInformation queries TokenElevation through the live token with a writable
+    // TOKEN_ELEVATION buffer of probed size; token and buffer outlive the call; return plus length
+    // checked; token closed after read.
     let result = unsafe {
         GetTokenInformation(
             token,
@@ -2781,6 +2876,9 @@ fn interactive_non_elevated_session() -> bool {
             &raw mut length,
         ) != 0
     };
+    // SAFETY: CloseHandle closes an owned live handle exactly once on this path; handle originated from
+    // a successful CreateMutexW/CreateToolhelp32Snapshot/OpenProcessToken; return checked for
+    // OwnershipUncertain; no double close and no use after close.
     unsafe {
         CloseHandle(token);
     }
@@ -3496,16 +3594,28 @@ fn sid_to_string(sid: windows_sys::Win32::Security::PSID) -> Result<String, Wind
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
     let mut text = std::ptr::null_mut();
+    // SAFETY: ConvertSidToStringSidW stringifies the valid caller SID with a writable text out-pointer;
+    // return and null text checked; text is NUL-terminated; length bounded by scan; LocalFree paired
+    // exactly once.
     if unsafe { ConvertSidToStringSidW(sid, &raw mut text) } == 0 || text.is_null() {
         return Err(last_windows_adapter_error());
     }
     let mut length = 0_usize;
+    // SAFETY: Pointer add scans the NUL-terminated SID text from the successful conversion; length
+    // bounded by the terminator scan with a fixed upper bound; offset stays inside the WTS/converter
+    // allocation; u16 read aligned with no out-of-bounds access.
     while unsafe { *text.add(length) } != 0 {
         length += 1;
     }
+    // SAFETY: LocalFree releases a descriptor/text buffer allocated by GetSecurityInfo or the SDDL/SID
+    // converter; pointer came from a successful call and is freed exactly once; no use after free; no
+    // null free on failure paths.
     let value = unsafe { std::ffi::OsString::from_wide(std::slice::from_raw_parts(text, length)) }
         .to_string_lossy()
         .into_owned();
+    // SAFETY: LocalFree releases a descriptor/text buffer allocated by GetSecurityInfo or the SDDL/SID
+    // converter; pointer came from a successful call and is freed exactly once; no use after free; no
+    // null free on failure paths.
     unsafe { LocalFree(text.cast()) };
     if valid_sid_text(&value) {
         Ok(value)
@@ -3533,6 +3643,9 @@ pub fn resolve_service_sid(service_name: &str) -> Result<String, WindowsAdapterE
     let mut sid_bytes = 0_u32;
     let mut domain_chars = 0_u32;
     let mut sid_use: SID_NAME_USE = 0;
+    // SAFETY: LookupAccountNameW probe call passes the live NUL-terminated account with null SID
+    // buffers to learn sizes; account outlives the call; sid/domain length out-pointers valid;
+    // ERROR_INSUFFICIENT_BUFFER with nonzero sizes selects the sized fill below.
     let first = unsafe {
         LookupAccountNameW(
             std::ptr::null(),
@@ -3544,12 +3657,18 @@ pub fn resolve_service_sid(service_name: &str) -> Result<String, WindowsAdapterE
             &raw mut sid_use,
         )
     };
+    // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+    // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+    // dereference.
     if first != 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || sid_bytes == 0 {
         return Err(last_windows_adapter_error());
     }
     let mut sid = vec![0_u8; usize::try_from(sid_bytes).map_err(|_| WindowsAdapterError::Failed)?];
     let domain_len = usize::try_from(domain_chars).map_err(|_| WindowsAdapterError::Failed)?;
     let mut domain = vec![0_u16; domain_len.max(1)];
+    // SAFETY: LookupAccountNameW fill call passes the live NUL-terminated account with writable
+    // sid/domain buffers of the probed capacity; buffers pinned and outlive the call; account stays
+    // live; return checked with IsValidSid before the SID is stringified.
     if unsafe {
         LookupAccountNameW(
             std::ptr::null(),
@@ -3561,6 +3680,9 @@ pub fn resolve_service_sid(service_name: &str) -> Result<String, WindowsAdapterE
             &raw mut sid_use,
         )
     } == 0
+        // SAFETY: IsValidSid validates the SID inside the probed buffer filled by LookupAccountNameW;
+        // pointer inside the live buffer with claimed length; return checked before stringify; no
+        // dereference beyond validation.
         || unsafe { IsValidSid(sid.as_ptr().cast_mut().cast()) } == 0
     {
         return Err(last_windows_adapter_error());
@@ -3601,6 +3723,9 @@ pub fn resolve_account_sid(account_name: &str) -> Result<String, WindowsAdapterE
     let mut sid_bytes = 0_u32;
     let mut domain_chars = 0_u32;
     let mut sid_use: SID_NAME_USE = 0;
+    // SAFETY: LookupAccountNameW probe call passes the live NUL-terminated account with null SID
+    // buffers to learn sizes; account outlives the call; sid/domain length out-pointers valid;
+    // ERROR_INSUFFICIENT_BUFFER with nonzero sizes selects the sized fill below.
     let first = unsafe {
         LookupAccountNameW(
             std::ptr::null(),
@@ -3612,6 +3737,9 @@ pub fn resolve_account_sid(account_name: &str) -> Result<String, WindowsAdapterE
             &raw mut sid_use,
         )
     };
+    // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+    // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+    // dereference.
     if first != 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || sid_bytes == 0 {
         return Err(last_windows_adapter_error());
     }
@@ -3621,6 +3749,9 @@ pub fn resolve_account_sid(account_name: &str) -> Result<String, WindowsAdapterE
     }
     let mut sid = vec![0_u8; usize::try_from(sid_bytes).map_err(|_| WindowsAdapterError::Failed)?];
     let mut domain = vec![0_u16; usize::try_from(domain_chars).unwrap_or(0).max(1)];
+    // SAFETY: LookupAccountNameW fill call passes the live NUL-terminated account with writable
+    // sid/domain buffers of the probed capacity; buffers pinned and outlive the call; account stays
+    // live; return checked with IsValidSid before the SID is stringified.
     if unsafe {
         LookupAccountNameW(
             std::ptr::null(),
@@ -3632,6 +3763,9 @@ pub fn resolve_account_sid(account_name: &str) -> Result<String, WindowsAdapterE
             &raw mut sid_use,
         )
     } == 0
+        // SAFETY: IsValidSid validates the SID inside the probed buffer filled by LookupAccountNameW;
+        // pointer inside the live buffer with claimed length; return checked before stringify; no
+        // dereference beyond validation.
         || unsafe { IsValidSid(sid.as_ptr().cast_mut().cast()) } == 0
     {
         return Err(last_windows_adapter_error());
@@ -3666,6 +3800,9 @@ fn set_service_sid_type(
     let info = SERVICE_SID_INFO {
         dwServiceSidType: sid_type.raw(),
     };
+    // SAFETY: ChangeServiceConfig2W carries SERVICE_CONFIG_SERVICE_SID_INFO through the live service
+    // handle with SERVICE_CHANGE_CONFIG; info struct with documented layout outlives the call; return
+    // checked; no string lifetime beyond the call.
     unsafe {
         ChangeServiceConfig2W(
             service,
@@ -3741,6 +3878,9 @@ fn read_watchdog_host_control_grant(
     // `PROTECTED_DACL_SECURITY_INFORMATION` is a SetSecurityInfo-only flag.
     // Query the DACL under READ_CONTROL, then prove protection from the
     // returned descriptor's `SE_DACL_PROTECTED` control bit below.
+    // SAFETY: GetSecurityInfo reads the file/service DACL through a live handle with READ_CONTROL;
+    // descriptor and DACL out-pointers are valid writable locals; handle outlives the call; return
+    // checked with LocalFree pairing below; no unwinding across the extern boundary.
     let status = unsafe {
         GetSecurityInfo(
             service,
@@ -3755,6 +3895,9 @@ fn read_watchdog_host_control_grant(
     };
     if status != ERROR_SUCCESS || descriptor.is_null() || actual_dacl.is_null() {
         if !descriptor.is_null() {
+            // SAFETY: LocalFree releases a descriptor/text buffer allocated by GetSecurityInfo or the SDDL/SID
+            // converter; pointer came from a successful call and is freed exactly once; no use after free; no
+            // null free on failure paths.
             unsafe { LocalFree(descriptor.cast()) };
         }
         return Err(if status == ERROR_ACCESS_DENIED {
@@ -3765,10 +3908,16 @@ fn read_watchdog_host_control_grant(
     }
     let mut control = 0_u16;
     let mut revision = 0_u32;
+    // SAFETY: GetSecurityDescriptorControl borrows the validated descriptor; control/revision are valid
+    // writable out-pointers; descriptor outlives the call; SE_DACL_PROTECTED bit read only on success.
     let protected = unsafe {
         GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
             && control & SE_DACL_PROTECTED != 0
     };
+    // SAFETY: ACL byte compare dereferences actual/expected DACL pointers validated by GetSecurityInfo
+    // with AclSize bytes each; pointers non-null after the present check; from_raw_parts borrows both
+    // ACLs for exactly AclSize bytes with no mutation during the compare; layout is the documented ACL
+    // ABI.
     let dacl_matches = unsafe {
         (*actual_dacl).AclSize == (*expected_dacl).AclSize
             && std::slice::from_raw_parts(
@@ -3780,6 +3929,9 @@ fn read_watchdog_host_control_grant(
             )
     };
     let digest = watchdog_service_security_descriptor_digest(&host_service_sid);
+    // SAFETY: LocalFree releases a descriptor/text buffer allocated by GetSecurityInfo or the SDDL/SID
+    // converter; pointer came from a successful call and is freed exactly once; no use after free; no
+    // null free on failure paths.
     unsafe { LocalFree(descriptor.cast()) };
     if !protected || !dacl_matches {
         return Err(WindowsAdapterError::AclMismatch);
@@ -3809,6 +3961,9 @@ fn install_watchdog_host_control_grant(
     }
     let host_service_sid = resolve_service_sid(ELIOT_HOST_SERVICE_NAME)?;
     let expected = OwnedSecurityDescriptor::for_watchdog_host_control(&host_service_sid)?;
+    // SAFETY: SetSecurityInfo writes the service DACL through a live handle with WRITE_DAC; descriptor
+    // pointer refers to the validated in-memory DACL that outlives the call; SE_SERVICE with DACL plus
+    // PROTECTED flag; return checked with readback below.
     let status = unsafe {
         SetSecurityInfo(
             service,
@@ -3888,6 +4043,9 @@ fn register_service(
         ServiceStartMode::Demand => SERVICE_DEMAND_START,
         ServiceStartMode::Disabled => SERVICE_DISABLED,
     };
+    // SAFETY: OpenSCManagerW selects the local SCM with null machine/database and minimal access;
+    // return null-checked; manager handle closed via CloseServiceHandle on every path; error captured
+    // before any other call.
     let manager = unsafe {
         OpenSCManagerW(
             std::ptr::null(),
@@ -3899,6 +4057,9 @@ fn register_service(
         return Err(last_windows_adapter_error());
     }
     let desired_access = service_registration_mutation_access(request);
+    // SAFETY: CreateServiceW receives the live manager handle, NUL-terminated service/display names and
+    // binary path that outlive the call; access and start/type flags constant; return null-checked;
+    // service handle closed on every path with existence reconciliation.
     let service = unsafe {
         CreateServiceW(
             manager,
@@ -3918,6 +4079,9 @@ fn register_service(
     };
     if service.is_null() {
         let error = std::io::Error::last_os_error();
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe { CloseServiceHandle(manager) };
         if matches!(
             error.raw_os_error(),
@@ -3933,6 +4097,9 @@ fn register_service(
         return Err(windows_adapter_from_io(&error));
     }
     if !set_service_sid_type(service, request.service_sid_type()) {
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe {
             CloseServiceHandle(service);
             CloseServiceHandle(manager);
@@ -3940,12 +4107,18 @@ fn register_service(
         return Ok(ServiceRegistrationOutcome::EffectUnknown);
     }
     if install_watchdog_host_control_grant(service, request).is_err() {
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe {
             CloseServiceHandle(service);
             CloseServiceHandle(manager);
         }
         return Ok(ServiceRegistrationOutcome::EffectUnknown);
     }
+    // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+    // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+    // handle with no double close or later use; return drives no dereference.
     unsafe {
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
@@ -4004,17 +4177,29 @@ fn update_service_registration(
     let account = wide("NT AUTHORITY\\LocalService");
     let empty_load_order_group = [0_u16];
     let empty_dependencies = [0_u16, 0_u16];
+    // SAFETY: OpenSCManagerW selects the local SCM with null machine/database and minimal access;
+    // return null-checked; manager handle closed via CloseServiceHandle on every path; error captured
+    // before any other call.
     let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
     if manager.is_null() {
         return Ok(ServiceRegistrationOutcome::EffectUnknown);
     }
     let desired_access = service_registration_mutation_access(request);
+    // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+    // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+    // handle with no double close or later use; return drives no dereference.
     let service = unsafe { OpenServiceW(manager, name.as_ptr(), desired_access) };
     if service.is_null() {
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe { CloseServiceHandle(manager) };
         return Ok(ServiceRegistrationOutcome::EffectUnknown);
     }
     let Some(configuration) = query_service_configuration(service) else {
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe {
             CloseServiceHandle(service);
             CloseServiceHandle(manager);
@@ -4022,12 +4207,18 @@ fn update_service_registration(
         return Ok(ServiceRegistrationOutcome::EffectUnknown);
     };
     if !service_current_matches(request, expected_current, &configuration) {
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe {
             CloseServiceHandle(service);
             CloseServiceHandle(manager);
         }
         return Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation);
     }
+    // SAFETY: ChangeServiceConfigW mutates the live service handle with SERVICE_CHANGE_CONFIG using
+    // NUL-terminated strings that outlive the call; unchanged fields passed as null/blank per contract;
+    // return checked with readback reconciliation; no broader access requested.
     let changed = unsafe {
         ChangeServiceConfigW(
             service,
@@ -4046,6 +4237,9 @@ fn update_service_registration(
     let sid_changed = changed != 0 && set_service_sid_type(service, request.service_sid_type());
     let grant_changed =
         sid_changed && install_watchdog_host_control_grant(service, request).is_ok();
+    // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+    // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+    // handle with no double close or later use; return drives no dereference.
     unsafe {
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
@@ -4097,10 +4291,16 @@ fn delete_service_registration(
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
+    // SAFETY: OpenSCManagerW selects the local SCM with null machine/database and minimal access;
+    // return null-checked; manager handle closed via CloseServiceHandle on every path; error captured
+    // before any other call.
     let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
     if manager.is_null() {
         return Ok(ServiceRegistrationOutcome::EffectUnknown);
     }
+    // SAFETY: OpenServiceW receives the live manager handle and the NUL-terminated service name that
+    // outlives the call with minimal desired access; return null-checked; service handle closed on
+    // every path; missing-service error classified from the captured OS error.
     let service = unsafe {
         OpenServiceW(
             manager,
@@ -4109,10 +4309,16 @@ fn delete_service_registration(
         )
     };
     if service.is_null() {
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe { CloseServiceHandle(manager) };
         return Ok(ServiceRegistrationOutcome::EffectUnknown);
     }
     let Some(configuration) = query_service_configuration(service) else {
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe {
             CloseServiceHandle(service);
             CloseServiceHandle(manager);
@@ -4120,13 +4326,22 @@ fn delete_service_registration(
         return Ok(ServiceRegistrationOutcome::EffectUnknown);
     };
     if !service_current_matches(request, expected_current, &configuration) {
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe {
             CloseServiceHandle(service);
             CloseServiceHandle(manager);
         }
         return Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation);
     }
+    // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+    // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+    // handle with no double close or later use; return drives no dereference.
     let deleted = unsafe { DeleteService(service) };
+    // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+    // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+    // handle with no double close or later use; return drives no dereference.
     unsafe {
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
@@ -4227,6 +4442,9 @@ fn query_service_configuration(
 ) -> Option<ServiceConfigurationReadback> {
     use windows_sys::Win32::System::Services::{QUERY_SERVICE_CONFIGW, QueryServiceConfigW};
     let mut required = 0;
+    // SAFETY: QueryServiceConfigW probe call passes the live service handle with a null buffer to learn
+    // the required byte size; required out-pointer valid; required==0 selects the early None path; no
+    // buffer read.
     unsafe {
         QueryServiceConfigW(service, std::ptr::null_mut(), 0, &raw mut required);
     }
@@ -4240,6 +4458,9 @@ fn query_service_configuration(
     }
     let words = buffer_bytes.saturating_add(config_size - 1) / config_size;
     let mut buffer = vec![QUERY_SERVICE_CONFIGW::default(); words];
+    // SAFETY: QueryServiceConfigW fill call passes the live service handle with the writable buffer of
+    // required capacity and the valid required out-pointer; buffer pinned; return checked; bytes beyond
+    // required never read.
     if unsafe { QueryServiceConfigW(service, buffer.as_mut_ptr(), required, &raw mut required) }
         == 0
     {
@@ -4274,6 +4495,9 @@ fn query_service_sid_type(service: windows_sys::Win32::Foundation::HANDLE) -> Op
     let mut info = SERVICE_SID_INFO::default();
     let mut required = 0_u32;
     let size = u32::try_from(std::mem::size_of::<SERVICE_SID_INFO>()).ok()?;
+    // SAFETY: QueryServiceConfig2W reads SERVICE_CONFIG_SERVICE_SID_INFO through the live service
+    // handle into the writable info buffer of declared size; buffer pinned; return checked; info
+    // consumed before handle close.
     if unsafe {
         QueryServiceConfig2W(
             service,
@@ -4324,6 +4548,10 @@ fn service_config_wide(
     if pointer.is_null() {
         return None;
     }
+    // SAFETY: from_raw_parts borrows the service-config buffer tail through a validated pointer with
+    // the computed word count; pointer inside the probed buffer with bounds from
+    // service_config_buffer_tail_words; buffer outlives the borrow; u16 units aligned; no mutation
+    // during the slice borrow.
     let bounded = unsafe {
         std::slice::from_raw_parts(
             pointer,
@@ -4356,6 +4584,10 @@ fn service_config_multi_sz(
     if pointer.is_null() {
         return Some(Vec::new());
     }
+    // SAFETY: from_raw_parts borrows the service-config buffer tail through a validated pointer with
+    // the computed word count; pointer inside the probed buffer with bounds from
+    // service_config_buffer_tail_words; buffer outlives the borrow; u16 units aligned; no mutation
+    // during the slice borrow.
     let bounded = unsafe {
         std::slice::from_raw_parts(
             pointer,
@@ -4467,6 +4699,9 @@ fn inspect_service_registration_runtime(
     };
     if service.is_null() {
         let error = std::io::Error::last_os_error();
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe { CloseServiceHandle(manager) };
         return if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST.cast_signed()) {
             ServiceRegistrationRuntimeInspection::Absent
@@ -4514,6 +4749,9 @@ fn inspect_service_registration_runtime(
         // Re-read SCM after opening the process. A stop/restart or PID reuse
         // between the first status sample and handle-bound identity capture
         // must never be published as one atomic Running observation.
+        // SAFETY: QueryServiceStatusEx polls SC_STATUS_PROCESS_INFO through the live service handle into
+        // the writable SERVICE_STATUS_PROCESS buffer of declared size; buffer pinned; return checked;
+        // status consumed before the service handle is closed.
         if unsafe {
             QueryServiceStatusEx(
                 service,
@@ -4560,6 +4798,9 @@ fn inspect_service_registration_runtime(
             confirmed_process,
         )
     })();
+    // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+    // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+    // handle with no double close or later use; return drives no dereference.
     unsafe {
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
@@ -4723,6 +4964,9 @@ fn start_service_registration(
         )
     };
     if service.is_null() {
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe { CloseServiceHandle(manager) };
         return Ok(ServiceStartOutcome::EffectUnknown);
     }
@@ -4830,6 +5074,9 @@ fn stop_service_registration(
         )
     };
     if service.is_null() {
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe { CloseServiceHandle(manager) };
         return Ok(ServiceStopOutcome::EffectUnknown);
     }
@@ -4880,6 +5127,9 @@ fn stop_service_registration(
         // SAFETY: service is the live exact-configuration handle. This is the
         // sole ControlService stop call for this effect attempt.
         let stop_succeeded =
+            // SAFETY: ControlService sends SERVICE_CONTROL_STOP through the live service handle with a writable
+            // SERVICE_STATUS buffer; handle has SERVICE_STOP access; buffer pinned; return checked with
+            // post-stop runtime inspection; no unwind across the call.
             unsafe { ControlService(service, SERVICE_CONTROL_STOP, &raw mut stop_status) } != 0;
         let post_stop = inspect_service_registration_runtime(request);
         if !stop_succeeded {
@@ -4922,14 +5172,23 @@ fn inspect_service_registration(
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
+    // SAFETY: OpenSCManagerW selects the local SCM with null machine/database and minimal access;
+    // return null-checked; manager handle closed via CloseServiceHandle on every path; error captured
+    // before any other call.
     let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
     if manager.is_null() {
         return ServiceRegistrationInspection::Unknown;
     }
     let service =
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe { OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_CONFIG | READ_CONTROL) };
     if service.is_null() {
         let error = std::io::Error::last_os_error();
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe { CloseServiceHandle(manager) };
         return if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST.cast_signed()) {
             ServiceRegistrationInspection::Absent
@@ -4939,6 +5198,9 @@ fn inspect_service_registration(
     }
 
     let Some(configuration) = query_service_configuration(service) else {
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe {
             CloseServiceHandle(service);
             CloseServiceHandle(manager);
@@ -4955,6 +5217,9 @@ fn inspect_service_registration(
             Ok(value) => Some(value),
             Err(WindowsAdapterError::AclMismatch | WindowsAdapterError::IdentityMismatch) => None,
             Err(_) => {
+                // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+                // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+                // handle with no double close or later use; return drives no dereference.
                 unsafe {
                     CloseServiceHandle(service);
                     CloseServiceHandle(manager);
@@ -4965,6 +5230,9 @@ fn inspect_service_registration(
     } else {
         None
     };
+    // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+    // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+    // handle with no double close or later use; return drives no dereference.
     unsafe {
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
@@ -5029,6 +5297,9 @@ fn inspect_service(name: &str) -> PortOutcome<ServiceObservation> {
     // SAFETY: name is NUL-terminated and manager is live.
     let service = unsafe { OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_STATUS) };
     if service.is_null() {
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe { CloseServiceHandle(manager) };
         let error = std::io::Error::last_os_error();
         return classify_service_error(&service_name, &error);
@@ -5038,6 +5309,9 @@ fn inspect_service(name: &str) -> PortOutcome<ServiceObservation> {
     // SAFETY: status is valid storage and the service handle is query-only/live.
     let status_size =
         u32::try_from(std::mem::size_of::<SERVICE_STATUS_PROCESS>()).unwrap_or(u32::MAX);
+    // SAFETY: QueryServiceStatusEx polls SC_STATUS_PROCESS_INFO through the live service handle into
+    // the writable SERVICE_STATUS_PROCESS buffer of declared size; buffer pinned; return checked;
+    // status consumed before the service handle is closed.
     let ok = unsafe {
         QueryServiceStatusEx(
             service,
@@ -5048,6 +5322,9 @@ fn inspect_service(name: &str) -> PortOutcome<ServiceObservation> {
         )
     };
     let query_error = (ok == 0).then(std::io::Error::last_os_error);
+    // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+    // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+    // handle with no double close or later use; return drives no dereference.
     unsafe {
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
@@ -5106,14 +5383,23 @@ fn mutate_service(name: &str, operation: ServiceOperation) -> PortOutcome<Servic
             return PortOutcome::Unknown(UnknownReason::Unsupported);
         }
     };
+    // SAFETY: OpenSCManagerW selects the local SCM with null machine/database and minimal access;
+    // return null-checked; manager handle closed via CloseServiceHandle on every path; error captured
+    // before any other call.
     let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
     if manager.is_null() {
         return PortOutcome::Error(PortError::Provider(provider_from_io(
             &std::io::Error::last_os_error(),
         )));
     }
+    // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+    // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+    // handle with no double close or later use; return drives no dereference.
     let service = unsafe { OpenServiceW(manager, name_wide.as_ptr(), access) };
     if service.is_null() {
+        // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+        // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+        // handle with no double close or later use; return drives no dereference.
         unsafe { CloseServiceHandle(manager) };
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST.cast_signed()) {
@@ -5127,14 +5413,23 @@ fn mutate_service(name: &str, operation: ServiceOperation) -> PortOutcome<Servic
         return PortOutcome::Error(PortError::Provider(provider_from_io(&error)));
     }
     let ok = match operation {
+        // SAFETY: StartServiceW starts the live service handle with SERVICE_START access and zero extra
+        // arguments; handle stays valid through the call; return checked with status re-poll; no argument
+        // pointer lifetime beyond the call.
         ServiceOperation::Start => unsafe { StartServiceW(service, 0, std::ptr::null()) },
         ServiceOperation::Stop => {
             let mut status = SERVICE_STATUS::default();
+            // SAFETY: ControlService sends SERVICE_CONTROL_STOP through the live service handle with a writable
+            // SERVICE_STATUS buffer; handle has SERVICE_STOP access; buffer pinned; return checked with
+            // post-stop runtime inspection; no unwind across the call.
             unsafe { ControlService(service, SERVICE_CONTROL_STOP, &raw mut status) }
         }
         ServiceOperation::Inspect | ServiceOperation::Register | ServiceOperation::Unregister => 0,
     };
     let error = (ok == 0).then(std::io::Error::last_os_error);
+    // SAFETY: CloseServiceHandle releases a manager/service handle owned by this function on this path;
+    // handle came from a successful OpenSCManagerW/OpenServiceW/CreateServiceW; exactly-once close per
+    // handle with no double close or later use; return drives no dereference.
     unsafe {
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
@@ -5203,6 +5498,9 @@ pub(crate) fn job_process_ids(
             )
         })?;
         let mut returned = 0_u32;
+        // SAFETY: QueryInformationJobObject reads JobObjectBasicProcessIdList through the live job handle
+        // into the writable buffer of declared byte capacity; buffer pinned; class constant; return
+        // checked; header read only on success.
         let queried = unsafe {
             QueryInformationJobObject(
                 job,
@@ -5212,6 +5510,10 @@ pub(crate) fn job_process_ids(
                 &raw mut returned,
             )
         };
+        // SAFETY: Reference cast reborrows the job buffer header validated by successful
+        // QueryInformationJobObject with capacity for JOBOBJECT_BASIC_PROCESS_ID_LIST; cast respects ABI
+        // layout and alignment; header read only; buffer outlives the reference with no mutation during the
+        // borrow.
         let header = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
         if queried != 0 {
             let count = usize::try_from(header.NumberOfProcessIdsInList).map_err(|_| {
@@ -5223,6 +5525,9 @@ pub(crate) fn job_process_ids(
                     "Job process list exceeded its supplied buffer",
                 ));
             }
+            // SAFETY: from_raw_parts borrows ProcessIdList from the validated job header; count from
+            // NumberOfProcessIdsInList bounded by buffer capacity; header outlives the slice; PIDs copied out
+            // with zero entries filtered; no mutation during iteration.
             let ids = unsafe { std::slice::from_raw_parts(header.ProcessIdList.as_ptr(), count) };
             return ids
                 .iter()

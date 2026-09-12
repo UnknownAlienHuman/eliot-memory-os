@@ -1,0 +1,197 @@
+{
+  "schema": "eliot.safety-coverage-cases.v1",
+  "issue": 728,
+  "note": "Finite inert lexical/policy mutations for the eliot-platform-windows source-coverage oracle. All sources are inert snippets, never executed.",
+  "cases": [
+    {
+      "id": "lexical-string",
+      "kind": "lexical",
+      "description": "unsafe inside an ordinary string literal is not a site",
+      "source": "fn f() {\n    let s = \"unsafe { not code\";\n    let _ = s.len();\n}\n",
+      "expect_sites": 0
+    },
+    {
+      "id": "lexical-line-comment",
+      "kind": "lexical",
+      "description": "unsafe inside a line comment is not a site",
+      "source": "// unsafe { not code\nfn f() {}\n",
+      "expect_sites": 0
+    },
+    {
+      "id": "lexical-block-comment",
+      "kind": "lexical",
+      "description": "unsafe inside a block comment is not a site",
+      "source": "/* unsafe { still not code } */\nfn f() {}\n",
+      "expect_sites": 0
+    },
+    {
+      "id": "lexical-nested-block-comment",
+      "kind": "lexical",
+      "description": "unsafe inside nested block comments is not a site",
+      "source": "/* outer /* unsafe { inner */ still comment */\nfn f() {}\n",
+      "expect_sites": 0
+    },
+    {
+      "id": "lexical-raw-string",
+      "kind": "lexical",
+      "description": "unsafe inside a raw string is not a site",
+      "source": "fn f() {\n    let s = r#\"unsafe { raw }\"#;\n    let _ = s.len();\n}\n",
+      "expect_sites": 0
+    },
+    {
+      "id": "lexical-char",
+      "kind": "lexical",
+      "description": "byte string and char literals do not create sites",
+      "source": "fn f() {\n    let b = b\"x\";\n    let c = 'x';\n    let _ = (b, c);\n}\n",
+      "expect_sites": 0
+    },
+    {
+      "id": "form-block",
+      "kind": "form",
+      "description": "single unsafe block is detected",
+      "source": "fn f() {\n    // SAFETY: probe buffer is writable for the declared length and the handle stays live.\n    unsafe { probe(); }\n}\n",
+      "expect_sites": 1,
+      "expect_form": "block"
+    },
+    {
+      "id": "form-all-five",
+      "kind": "form",
+      "description": "all five unsafe forms are detected",
+      "source": "unsafe fn uf() {}\nunsafe impl Send for G {}\nunsafe trait T {}\nunsafe extern \"system\" fn ef() {}\nfn f() {\n    // SAFETY: probe buffer is writable for the declared length and the handle stays live.\n    unsafe { probe(); }\n}\nstruct G;\n",
+      "expect_sites": 5
+    },
+    {
+      "id": "coverage-missing",
+      "kind": "coverage",
+      "description": "block without any SAFETY is rejected",
+      "source": "fn f() {\n    unsafe { probe(); }\n}\n",
+      "expect_pass": false,
+      "reason": "missing"
+    },
+    {
+      "id": "coverage-detached",
+      "kind": "coverage",
+      "description": "SAFETY with a blank-line gap is detached",
+      "source": "// SAFETY: probe buffer is writable for the declared length and the handle stays live.\n\nfn f() {\n    unsafe { probe(); }\n}\n",
+      "expect_pass": false,
+      "reason": "detached"
+    },
+    {
+      "id": "coverage-following-only",
+      "kind": "coverage",
+      "description": "SAFETY after the block is following-only",
+      "source": "fn f() {\n    unsafe { probe(); }\n    // SAFETY: probe buffer is writable for the declared length and the handle stays live.\n}\n",
+      "expect_pass": false,
+      "reason": "following-only"
+    },
+    {
+      "id": "coverage-duplicate",
+      "kind": "coverage",
+      "description": "preceding plus interior-leading is a duplicate",
+      "source": "fn f() {\n    // SAFETY: probe buffer is writable for the declared length and the handle stays live.\n    unsafe {\n        // SAFETY: probe buffer is writable for the declared length and the handle stays live.\n        probe();\n    }\n}\n",
+      "expect_pass": false,
+      "reason": "duplicate"
+    },
+    {
+      "id": "coverage-broad",
+      "kind": "coverage",
+      "description": "one preceding comment cannot cover two consecutive blocks",
+      "source": "fn f() {\n    // SAFETY: probe buffer is writable for the declared length and this covers both blocks.\n    unsafe { first(); }\n    unsafe { second(); }\n}\n",
+      "expect_pass": false,
+      "reason": "broad"
+    },
+    {
+      "id": "coverage-generic-windows",
+      "kind": "coverage",
+      "description": "generic Windows rationale is rejected",
+      "source": "fn f() {\n    // SAFETY: Windows requires unsafe\n    unsafe { probe(); }\n}\n",
+      "expect_pass": false,
+      "reason": "generic"
+    },
+    {
+      "id": "coverage-generic-params",
+      "kind": "coverage",
+      "description": "generic parameters-valid prose is rejected",
+      "source": "fn f() {\n    // SAFETY: parameters valid\n    unsafe { probe(); }\n}\n",
+      "expect_pass": false,
+      "reason": "generic"
+    },
+    {
+      "id": "coverage-generic-checked-above",
+      "kind": "coverage",
+      "description": "generic checked-above prose is rejected",
+      "source": "fn f() {\n    // SAFETY: checked above\n    unsafe { probe(); }\n}\n",
+      "expect_pass": false,
+      "reason": "generic"
+    },
+    {
+      "id": "coverage-valid-preceding",
+      "kind": "coverage",
+      "description": "adjacent specific preceding obligation passes",
+      "source": "fn f() {\n    // SAFETY: probe buffer is writable for the declared length and the handle stays live.\n    unsafe { probe(); }\n}\n",
+      "expect_pass": true
+    },
+    {
+      "id": "coverage-valid-interior",
+      "kind": "coverage",
+      "description": "leading-interior specific obligation passes",
+      "source": "fn f() {\n    unsafe {\n        // SAFETY: probe buffer is writable for the declared length and the handle stays live.\n        probe();\n    }\n}\n",
+      "expect_pass": true
+    },
+    {
+      "id": "policy-new-site",
+      "kind": "policy",
+      "description": "added block without coverage fails",
+      "source": "fn f() {\n    // SAFETY: probe buffer is writable for the declared length and the handle stays live.\n    unsafe { probe(); }\n    unsafe { added(); }\n}\n",
+      "expect_pass": false,
+      "reason": "missing"
+    },
+    {
+      "id": "policy-stale-digest",
+      "kind": "policy",
+      "description": "digest mismatch fails closed",
+      "source": "fn f() {\n    // SAFETY: probe buffer is writable for the declared length and the handle stays live.\n    unsafe { probe(); }\n}\n",
+      "expect_pass": false,
+      "reason": "stale-digest",
+      "mutated_digest": "0000000000000000"
+    },
+    {
+      "id": "malformed-unclosed-string",
+      "kind": "malformed",
+      "description": "unclosed string fails closed",
+      "source": "fn f() {\n    let s = \"oops;\n    unsafe { probe(); }\n}\n",
+      "expect_error": true
+    },
+    {
+      "id": "malformed-unclosed-block",
+      "kind": "malformed",
+      "description": "unclosed block comment fails closed",
+      "source": "fn f() {\n    /* oops\n    unsafe { probe(); }\n}\n",
+      "expect_error": true
+    },
+    {
+      "id": "token-identical",
+      "kind": "token",
+      "description": "identical sources are token-equal",
+      "base": "fn f() {\n    unsafe { probe(); }\n}\n",
+      "candidate": "fn f() {\n    unsafe { probe(); }\n}\n",
+      "expect_equal": true
+    },
+    {
+      "id": "token-comment-only",
+      "kind": "token",
+      "description": "comment-only delta is token-equal",
+      "base": "fn f() {\n    unsafe { probe(); }\n}\n",
+      "candidate": "fn f() {\n    // SAFETY: probe buffer is writable for the declared length.\n    unsafe { probe(); }\n}\n",
+      "expect_equal": true
+    },
+    {
+      "id": "token-mutation",
+      "kind": "token",
+      "description": "executable token change is not equal",
+      "base": "fn f() {\n    unsafe { probe(); }\n}\n",
+      "candidate": "fn f() {\n    unsafe { other(); }\n}\n",
+      "expect_equal": false
+    }
+  ]
+}
