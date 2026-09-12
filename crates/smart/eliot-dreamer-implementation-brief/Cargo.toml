@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [package.metadata.eliot]
 prototype = true
-source_status = "NOT_IMPLEMENTED"
+source_status = "IMPLEMENTED"
 workspace_admission = "pending_agent_implementation_and_proof"
 functional_cell = "smart.dreamer.implementation_brief"
 source_layer = "C1"
@@ -22,9 +22,11 @@ agent_order = 9
 
 [dependencies]
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
-eliot-evidence = { path = "../../foundation/eliot-evidence" }
+eliot-conformance-contracts = { path = "../../foundation/eliot-conformance-contracts" }
 eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
-eliot-dreamer-candidate-validation = { path = "../eliot-dreamer-candidate-validation" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.17"
 
 [lints]
 workspace = true
@@ -34,6 +36,7 @@ workspace = true
 # per-crate `cargo check|test|clippy` fails before it starts. Remove this
 # table when the cell is promoted into the root workspace `members`.
 [workspace]
+resolver = "3"
 
 # Mirrors the root `[workspace.lints]` verbatim so an excluded cell is linted
 # exactly like an admitted one. Keep in sync; the promotion commit drops this
