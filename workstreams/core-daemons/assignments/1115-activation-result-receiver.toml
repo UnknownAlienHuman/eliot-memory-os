@@ -23,7 +23,7 @@ implementation = [
   "docs/architecture/I05-16-common-durable-fields.md#i516-common-durable-fields",
   "docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
   "docs/architecture/I07-02-frame.md#i72-frame",
-  "docs/architecture/I07-17-scope-and-task-onboarding.md#i717-scope-and-task-onboarding",
+  "docs/architecture/I07-17-convenience-surfaces.md#i717-convenience-surfaces",
   "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
   "docs/architecture/I13-02-conflict-set.md#i132-conflict-set",
   "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
