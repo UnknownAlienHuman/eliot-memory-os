@@ -1,0 +1,123 @@
+schema = "eliot.bootstrap.snapshot-v2-migration.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "FLAT_SNAPSHOT_PRESENT_FIVE_DOMAIN_CLOSURE_MISSING"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "BOOTSTRAP_FIVE_DOMAIN_COMPILER_CANDIDATE"
+issue = 216
+parent_issue = 207
+contract_owner_issue = 263
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+implementation = [
+  "docs/architecture/I00-05-conformance-support-and-evidence-status.md#i05-conformance-support-and-evidence-status",
+  "docs/architecture/I00-13-current-support-conformance-and-product-status.md#i013-current-support-conformance-and-product-status",
+  "docs/architecture/I02-06-error-and-crash-model.md#i26-error-and-crash-model",
+  "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "docs/architecture/I17-08-delivery-depth-d0-replaceable-runtime-and-process-grounding-skeleton.md#i178-delivery-depth-d0-replaceable-runtime-and-process-grounding-skeleton",
+  "docs/architecture/I19-02-current-forensic-baseline-and-refresh-rule.md#i192-current-forensic-baseline-and-refresh-rule",
+]
+anchors = ["ARCH-OBS-01", "ARCH-RES-04", "ARCH-GROUND-01", "ARCH-MOD-03"]
+
+[confirmed_gap]
+compiler_source = "crates/foundation/eliot-bootstrap/src/lib.rs@da68734dedf54951ebbb27f203be4cefad9830ee"
+capture_source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+contract_source = "crates/foundation/eliot-conformance-contracts/src/lib.rs@fd54901892c2c710588a0b5ee4c9e2643781cbde"
+observations = [
+  "CurrentSystemEvidenceSource and CurrentSystemEvidenceSnapshot still carry flat EvidenceRecord lists plus Vec<String> unavailable_domains.",
+  "EvidenceEvaluation is a bootstrap-local observation label and does not represent ContractMaturity, ImplementationSupport, EvidenceExecutionStatus or SupportObservationState.",
+  "capture.rs currently writes source records and literal unavailable domain strings for build, runtime, store and integrations.",
+  "eliot-conformance-contracts already implements the owner-neutral five-domain vocabulary, DomainCoverage, CapabilitySupportRow and contract-set validators required by I0.5.",
+  "Current serialized consumers include capture artifacts, bootstrap brief compilation and bins/eliot CLI/bootstrap code; compatibility must be inventoried before changing the public wire.",
+]
+discriminator = "Compile a source-only snapshot and inspect its wire shape. Current output cannot express exactly one typed row for every evidence domain, capability support axes, blind boundaries, expiry or invalidation closure."
+
+[causal_property]
+statement = "The pure D0 compiler emits one deterministic snapshot with exactly one typed disposition for each evidence domain and independently validated capability-support rows; no missing, stale, conflicted or unexecuted evidence can be serialized as stronger support."
+
+[scope]
+primary_paths = [
+  "crates/foundation/eliot-bootstrap/Cargo.toml",
+  "crates/foundation/eliot-bootstrap/src/lib.rs",
+  "crates/foundation/eliot-bootstrap/src/capture.rs",
+  "crates/foundation/eliot-bootstrap/tests/**",
+]
+serialized_consumers_to_inventory = [
+  "bins/eliot/src/main.rs",
+  "bins/eliot/src/bootstrap_draft.rs",
+  "every repository use of CurrentSystemEvidenceSnapshot, EvidenceRecord, EvidenceEvaluation and unavailable_domains",
+]
+read_only_contracts = [
+  "crates/foundation/eliot-conformance-contracts/src/lib.rs",
+  "crates/foundation/eliot-conformance-contracts/src/validation.rs",
+]
+forbidden_ownership = [
+  "runtime, Store or integration probing in the pure compiler",
+  "second conformance/status vocabulary",
+  "support promotion or Product acceptance",
+  "canonical writes, task meaning, authority or Finish",
+]
+
+[what_to_do]
+steps = [
+  "Replace flat unavailable-domain strings with exactly five typed DomainCoverage rows from eliot-conformance-contracts.",
+  "Add typed CapabilitySupportRow closure to the snapshot and validate every row against the exact same five-domain evaluation boundary.",
+  "Migrate capture.rs to supply attributed observations only; it cannot set support/maturity/execution by prose or convenience.",
+  "Define explicit legacy-flat import as partial/unknown and preserve old artifact bytes and identity for replay/forensics.",
+  "Inventory and migrate or explicitly block every serialized producer and consumer before changing the public schema.",
+  "Make the snapshot digest cover complete domain, support, expiry, blind-boundary and invalidation closure.",
+]
+
+[how_to_do]
+steps = [
+  "Add the existing eliot-conformance-contracts package as the sole status/domain dependency; delete no status axis by mapping it onto EvidenceEvaluation or SourceStatus.",
+  "Canonicalize source ordering through the owner-neutral canonicalizers, then require strict canonical serialized order and duplicate-free identities.",
+  "Require one row for SOURCE, BUILD, RUNTIME, STORE and INTEGRATIONS; missing or duplicate domains fail closed.",
+  "Validate support rows with validate_capability_support_row_against_coverage and validate_conformance_contract_set at one evaluated_at boundary.",
+  "Allow OBSERVED without EXECUTED/CURRENT_VERIFIED; require exact unblinded current domain dependencies, proof profile, source/evidence handles and nonempty invalidation set for CURRENT_VERIFIED.",
+  "Represent NOT_RUNNING as a valid runtime/store observation distinct from UNAVAILABLE, UNKNOWN, STALE and CONFLICTED.",
+  "Import flat v1/v2-shaped legacy artifacts through an explicit LegacyFlatPartial disposition; all unrepresented domains become UNKNOWN and no VerifierBacked label is promoted to EXECUTED.",
+  "Keep capture observation code in capture.rs and the compiler stateless/effect-free in lib.rs.",
+  "Version the new wire additively or provide an explicit decoder boundary; never reinterpret existing bytes under stronger v2 semantics.",
+]
+
+[acceptance]
+criteria = [
+  "Exactly one canonical DomainCoverage row exists for every closed EvidenceDomain.",
+  "Observation state, contract maturity, implementation support and evidence execution remain independent serialized axes.",
+  "Source-only evidence cannot claim current runtime, Store or integration support.",
+  "OBSERVED plus NOT_EXECUTED cannot become CURRENT_VERIFIED.",
+  "NOT_RUNNING, UNAVAILABLE, UNKNOWN, STALE and CONFLICTED remain distinct and non-promoting.",
+  "CURRENT_VERIFIED forgery, missing proof profile, blind dependency, expired evidence or empty invalidation set fails closed.",
+  "Stale/invalidation changes affect only dependent support rows and change the snapshot digest.",
+  "Conflicting product/source identities remain conflicted rather than selecting one by order or recency.",
+  "Legacy flat artifacts import explicitly as partial/unknown with original byte identity retained.",
+  "Equivalent set ordering yields the same canonical snapshot; meaningful ordered evidence preserves order.",
+  "Every serialized producer/consumer is migrated or returns an explicit unsupported-version error.",
+  "No runtime probe, Store client, support promotion, canonical write, authority or Finish path enters the pure compiler.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --manifest-path crates/foundation/eliot-conformance-contracts/Cargo.toml --all-targets",
+  "cargo test --manifest-path crates/foundation/eliot-conformance-contracts/Cargo.toml",
+  "cargo clippy --manifest-path crates/foundation/eliot-conformance-contracts/Cargo.toml --all-targets -- -D warnings",
+  "cargo check --locked -p eliot-bootstrap --all-targets",
+  "cargo test --locked -p eliot-bootstrap --all-targets",
+  "cargo clippy --locked -p eliot-bootstrap --all-targets -- -D warnings",
+  "cargo test --locked -p eliot --all-targets",
+  "git diff --check",
+]
+edge_proof = "Run the exact bins/eliot snapshot producer and bootstrap-brief consumer over full five-domain, source-only, not-running, stale, conflicted and legacy-flat fixtures."
+
+[boundaries]
+non_goals = [
+  "live runtime, Store or integration probe implementation",
+  "ControlBoard/report rendering",
+  "canonical admission or Product acceptance",
+  "automatic workflow trigger",
+]
