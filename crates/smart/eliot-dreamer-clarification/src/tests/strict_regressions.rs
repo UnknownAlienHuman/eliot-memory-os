@@ -103,6 +103,43 @@ fn materiality_evidence_must_be_retained_in_candidate_sources() {
 }
 
 #[test]
+fn source_denominator_permutation_preserves_admission_identity() {
+    let policy = policy();
+    let mut first_denominator = denominator();
+    first_denominator
+        .material_handles
+        .push("source-2".to_owned());
+    first_denominator
+        .omission_handles
+        .extend(["omission-1".to_owned(), "omission-2".to_owned()]);
+    first_denominator.denominator_digest = must(first_denominator.identity_digest());
+
+    let mut second_denominator = first_denominator.clone();
+    second_denominator.material_handles.reverse();
+    second_denominator.omission_handles.reverse();
+    second_denominator.denominator_digest = must(second_denominator.identity_digest());
+
+    let mut first = AdmittedClarificationJob {
+        schema_version: CLARIFICATION_SCHEMA_VERSION,
+        job: job(),
+        ambiguities: vec![ambiguity(DecisionOwner::TaskLocalAgent)],
+        source_denominator: first_denominator,
+        admission_digest: String::new(),
+    };
+    let mut second = AdmittedClarificationJob {
+        schema_version: CLARIFICATION_SCHEMA_VERSION,
+        job: job(),
+        ambiguities: vec![ambiguity(DecisionOwner::TaskLocalAgent)],
+        source_denominator: second_denominator,
+        admission_digest: String::new(),
+    };
+    must(first.seal(&policy));
+    must(second.seal(&policy));
+
+    assert_eq!(first.admission_digest, second.admission_digest);
+}
+
+#[test]
 fn serialized_wire_size_is_bounded_not_only_semantic_preimage() {
     let (base_policy, admitted, draft, boundary) = valid_inputs();
     let decision = decide(&base_policy, &admitted, &draft, &boundary);
