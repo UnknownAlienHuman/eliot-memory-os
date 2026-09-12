@@ -1,0 +1,122 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "PARTIAL_PROVIDER_METADATA_WITHOUT_CURRENT_ACCOUNT_CLOSURE"
+evidence_execution_status = "SOURCE_AND_ISSUE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "PROVIDER_CATALOGUE_OBSERVATION_EDGE_CANDIDATE_ONLY"
+issue = 265
+coordinator_issue = 1108
+adapter_registry_issue = 874
+provider_disposition_issue = 1109
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "agent.provider-catalogue-quota-liveness-observation"
+causal_property = "One current provider/account catalogue snapshot describes exact configured adapters, authenticated account bindings, supported capabilities, route/model generations, quota/usage, price policy, reachability and health observations with freshness/invalidation, while never selecting a route, minting admission, acquiring credentials, or claiming provider readiness from metadata alone."
+current_discriminator = "Provider adapter metadata and route policies exist, but the exact current-account catalogue, quota, usage, liveness, capability and freshness denominator needed by Coordinator and native-worker is not closed as one provider-neutral observation surface."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/265"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-04-delegation.md#a104-delegation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-05-bounded-resources-and-control-reserve.md#a135-bounded-resources-and-control-reserve",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I03-04-capability-and-route-registry.md#i34-capability-and-route-registry",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I03-06-model-route-and-portfolio-policy.md#i36-model-route-and-portfolio-policy",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-11-external-model-bridges.md#i1011-external-model-bridges",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-15-agent-execution-fabric-and-durable-swarm.md#i1015-agent-execution-fabric-and-durable-swarm",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-04-secrets.md#i154-secrets",
+]
+anchors = ["ARCH-PORT-01", "ARCH-SEC-01", "ARCH-RES-04", "ARCH-OBS-01", "ARCH-SWM-02"]
+
+[current_source]
+confirmed = [
+  "Provider adapters, route policies and account/credential references are distributed across several packages and lifecycle owners.",
+  "Coordinator provider admission remains separately owned by #1108; catalogue evidence cannot create a Verified provider binding.",
+  "Native adapter selection/execution remains #874 and provider package disposition remains #1109.",
+  "Configuration, authentication, capability, reachability, liveness, quota, usage, price, rate-limit and admitted capacity are independent observations and authorities.",
+]
+
+[scope]
+primary_paths = [
+  "the existing lowest-dependency provider-neutral catalogue/route owner selected after current dependency review",
+  "crates/agent/eliot-agent-contracts/src/**provider**",
+  "crates/agent/eliot-agent-coordinator/src/**provider** only for consumption",
+  "crates/kernel/eliot-native-worker-core/src/**provider** only for consumption",
+  "provider adapter metadata/status adapters without raw credentials",
+  "directly relevant tests and finite fixtures",
+]
+serialized_dependencies = ["#1108 Coordinator admission", "#874 adapter registry", "#1109 provider dispositions", "#15 Kernel", "#11 Product proof"]
+forbidden = [
+  "raw credentials, tokens, cookies, API keys, billing secrets, or unrestricted provider payloads",
+  "route selection, provider admission, capacity reservation, model invocation, retry, or fallback policy",
+  "provider readiness inferred from package/config presence or process liveness",
+  "one scalar availability/confidence/health score",
+  "silent disappearance of unknown, unauthenticated, exhausted, rate-limited, disabled, or stale accounts",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze one provider-neutral current catalogue snapshot."
+how = [
+  "Represent the complete expected adapter/account/model/route denominator with one typed disposition per member.",
+  "Bind each row to provider/adapter/factory/artifact/config/protocol/model/route/account-reference identities, source handles, observed-at, expiry, invalidation and proof ceiling.",
+  "Reject duplicate identities, same-ID changed meaning, mixed evaluation boundaries and incomplete expected denominators.",
+]
+
+[[waves]]
+id = "B"
+what = "Separate account, capability, quota, liveness and capacity axes."
+how = [
+  "Keep configured, installed, authenticated, authorized, reachable, healthy, model-capable, quota-known, quota-remaining, rate-limited, price-known, capacity-admitted and executable as independent fields.",
+  "Represent not configured, missing adapter, unauthenticated, revoked, disabled, unavailable, stale, exhausted, rate-limited, unknown and conflicted explicitly.",
+  "Process health or successful metadata request cannot establish admitted model execution capacity.",
+]
+
+[[waves]]
+id = "C"
+what = "Acquire observations through bounded owner-specific adapters."
+how = [
+  "Read static adapter/model capabilities from immutable manifests and current-account observations from authenticated owner ports without exposing raw credentials.",
+  "Bind usage/quota/price to provider-reported period, units, account, model/route scope, reset/expiry and observation receipt.",
+  "Preserve unsupported or unavailable quota/price endpoints as unknown, not unlimited or zero.",
+]
+
+[[waves]]
+id = "D"
+what = "Bind consumers without moving admission or route policy."
+how = [
+  "Coordinator consumes catalogue rows as selection evidence but still requires #1108 provider admission before effects.",
+  "The #874 registry consumes exact adapter/artifact/capability identity but cannot infer account readiness from metadata.",
+  "Route policy may exclude or rank using current observations, while every actual attempt remains bound to a fresh owner-issued admission/capacity receipt.",
+]
+
+[acceptance]
+criteria = [
+  "Every expected provider adapter, account reference, route and model has one explicit current disposition; unavailable/unknown members cannot disappear.",
+  "Configured, installed, authenticated, authorized, reachable, healthy, capable, quota-known, remaining, rate-limited, price-known, capacity-admitted and executable remain independent.",
+  "Package/config/process presence cannot create provider readiness or admitted capacity.",
+  "Unknown quota/price cannot become unlimited, zero, free or exhausted by default.",
+  "Every observation binds exact account reference, provider/adapter/model/route, period/units, observed-at, expiry, source and invalidation identity.",
+  "Raw credentials, billing details and unrestricted provider responses never enter the catalogue, logs, model context or diagnostics.",
+  "Exact replay is deterministic; changed same-identity manifest, account binding, quota period, route/model revision, observation or invalidation conflicts or produces a new snapshot.",
+  "Stale, revoked, unauthenticated, rate-limited, exhausted, unavailable and conflicted rows remain typed and cannot be selected as ready without new evidence.",
+  "Coordinator and native-worker consumers cannot turn catalogue evidence into admission, reservation, route authority or retry/fallback policy.",
+  "Focused tests cover duplicate accounts, shared account across routes, unknown quota, reset boundary, stale health, revoked credential, rate limit, model removal, conflicting price units and exact invalidation.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-agent-contracts -p eliot-agent-coordinator -p eliot-native-worker-core --all-targets",
+  "cargo test --locked -p eliot-agent-contracts -p eliot-agent-coordinator -p eliot-native-worker-core --all-targets",
+  "cargo clippy --locked -p eliot-agent-contracts -p eliot-agent-coordinator -p eliot-native-worker-core --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Build one mixed-provider current-account snapshot with authenticated, revoked, unknown-quota, rate-limited, exhausted, stale-health and unavailable-adapter rows, then prove Coordinator still requires independent admission and native-worker still requires an exact registry/factory generation."
+product_proof = "Issue #11 remains open; catalogue observation alone establishes no provider execution or Product support."
