@@ -117,6 +117,11 @@ impl KernelComposition {
         &self,
         timeout: Duration,
     ) -> Result<Arc<KernelStoreGateway>, KernelBuildError> {
+        self.process_gateway.as_ref().ok_or_else(|| {
+            KernelBuildError::Service(
+                "process authority is required before canonical Store attachment".to_owned(),
+            )
+        })?;
         let requirement = self
             .store_bootstrap
             .clone()
@@ -193,12 +198,10 @@ impl KernelComposition {
             |gateway| {
                 self.process_gateway.as_ref().map_or_else(
                     || {
-                        struct NoopAttachment;
-                        impl CanonicalStoreAttachmentTransaction for NoopAttachment {
-                            fn commit(self: Box<Self>) {}
-                        }
-                        Ok(Box::new(NoopAttachment)
-                            as Box<dyn CanonicalStoreAttachmentTransaction>)
+                        Err(KernelBuildError::Service(
+                            "process authority is required before canonical Store attachment"
+                                .to_owned(),
+                        ))
                     },
                     |process_gateway| {
                         process_gateway
