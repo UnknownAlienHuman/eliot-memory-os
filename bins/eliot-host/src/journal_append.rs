@@ -2,13 +2,13 @@ mod readiness_append;
 #[cfg(windows)]
 pub(super) use readiness_append::append_authenticated_kernel_readiness;
 
-use super::{HostError, fresh_identity, operation, record_fence, sha256_json};
+use super::{HostError, fresh_identity, fresh_lineage_id, operation, record_fence, sha256_json};
 use eliot_host_state::{
-    ActivationState, AppendReceipt, CleanMarker, EliotActivationRecord, EpochIdentity,
-    EpochTransition, HostInstallationEpoch, HostKernelStoreLineage, HostState,
-    HostStateJournalService, HostStateRecord, JOURNAL_VERSION, JournalBackend, JournalError,
-    JournalManifest, KernelJobBinding, KernelRecord, LifecycleTimestamps, PriorKernelDisposition,
-    PriorKernelSource, ReadinessEvidence, ReconcileOutcome,
+    ActivationState, AppendReceipt, CleanMarker, EliotActivationRecord, EpochTransition,
+    HostInstallationEpoch, HostKernelStoreLineage, HostState, HostStateJournalService,
+    HostStateRecord, JOURNAL_VERSION, JournalBackend, JournalError, JournalManifest,
+    KernelJobBinding, KernelRecord, LifecycleTimestamps, PriorKernelDisposition, PriorKernelSource,
+    ReadinessEvidence, ReconcileOutcome,
 };
 #[cfg(windows)]
 use eliot_host_state::{StoreRebindRecord, StoreRebindState};
@@ -129,18 +129,9 @@ pub(super) fn initial_activation_record(
         drain_generation,
         lineage: HostKernelStoreLineage {
             host_epoch: host.epoch.current.clone(),
-            kernel_epoch: EpochIdentity {
-                lineage: fresh_identity("kernel-lineage")?,
-                sequence: 1,
-            },
-            watchdog_epoch: EpochIdentity {
-                lineage: fresh_identity("watchdog-lineage")?,
-                sequence: 1,
-            },
-            store_generation: EpochIdentity {
-                lineage: fresh_identity("store-lineage")?,
-                sequence: 1,
-            },
+            kernel_epoch: EpochTransition::genesis(fresh_lineage_id()?).current,
+            watchdog_epoch: EpochTransition::genesis(fresh_lineage_id()?).current,
+            store_generation: EpochTransition::genesis(fresh_lineage_id()?).current,
         },
         readiness: ReadinessEvidence {
             supervision_ready: ready,

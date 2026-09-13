@@ -6,7 +6,8 @@ use super::{
     JournalError, PendingActivationState, PlatformHandle, ProductionHostStateJournal,
     ReconcileOutcome, RedbInstallationRegistry, RedbJournalBackend, StoreRecoveryReopenFence,
     StoreRecoveryStartupFence, active_phase_b_rebind_recovery_kind, append_reconciled,
-    child_host_epoch, fresh_host_epoch, fresh_identity, initial_activation_record, root_epoch,
+    child_host_epoch, epoch_contract_error, fresh_host_epoch, fresh_identity, fresh_lineage_id,
+    initial_activation_record, root_epoch,
 };
 
 pub(super) fn reopen_existing_epoch<B: JournalBackend>(
@@ -85,9 +86,12 @@ pub(super) fn reopen_existing_epoch<B: JournalBackend>(
         replayed
             .activation
             .as_ref()
-            .map(|activation| activation.fence.activation_generation.direct_child())
+            .map(|activation| {
+                EpochTransition::direct_child(&activation.fence.activation_generation.current)
+                    .map_err(|error| epoch_contract_error(&error))
+            })
             .transpose()?
-            .unwrap_or(root_epoch(fresh_identity("activation-lineage")?))
+            .unwrap_or(root_epoch(fresh_lineage_id()?))
     };
     let host = if store_recovery_startup_fence.is_fenced()
         || pending.is_some_and(|pending| pending.phase_b_prepared.is_some())
@@ -272,7 +276,7 @@ pub(super) fn open_production_epoch_from_backend(
         (
             HostStateJournalService::from_backend(backend, host.clone())?,
             host,
-            root_epoch(fresh_identity("activation-lineage")?),
+            root_epoch(fresh_lineage_id()?),
             fresh_identity("activation")?,
             StoreRecoveryStartupFence::Clear,
             ActivePhaseBRebindRecoveryKind::None,

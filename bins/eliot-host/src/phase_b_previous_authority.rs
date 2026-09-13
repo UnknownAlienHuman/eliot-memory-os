@@ -1,5 +1,6 @@
 use std::{
     io,
+    num::NonZeroU64,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -7,8 +8,8 @@ use std::{
 use sha2::Digest;
 
 use super::{
-    CandidateManifest, EpochIdentity, EpochTransition, HostError, HostInstallationEpoch,
-    InstallationProfile, LaunchLease, PhaseBLiveBinding, PlatformHandle,
+    CandidateManifest, EpochIdentity, EpochLineageId, EpochTransition, HostError,
+    HostInstallationEpoch, InstallationProfile, LaunchLease, PhaseBLiveBinding, PlatformHandle,
     ProcessAuthorityHandoffDescriptor, ResourceGeneration, Sha256, UserOwnedRootLease,
     open_launch_lease, phase_b_authority_marker, phase_b_bytes_digest, phase_b_lease_bytes,
     phase_b_manifest_digest,
@@ -38,18 +39,19 @@ fn phase_b_parse_authority_marker(
     {
         return None;
     }
-    let host_sequence = fields[2].parse::<u64>().ok().filter(|value| *value > 0)?;
-    let activation_sequence = fields[6].parse::<u64>().ok().filter(|value| *value > 0)?;
+    let host_sequence = fields[2].parse::<u64>().ok().and_then(NonZeroU64::new)?;
+    let activation_sequence = fields[6].parse::<u64>().ok().and_then(NonZeroU64::new)?;
+    // Strict canonical lineage spelling: a marker carrying a non-UUID
+    // lineage yields no binding (hence explicit recovery), never an
+    // implicit current-lineage fallback.
     Some((
-        EpochIdentity {
-            lineage: PlatformHandle::new(fields[1].clone()).ok()?,
-            sequence: host_sequence,
-        },
+        EpochIdentity::new(EpochLineageId::new(fields[1].clone()).ok()?, host_sequence).ok()?,
         PlatformHandle::new(fields[3].clone()).ok()?,
-        EpochIdentity {
-            lineage: PlatformHandle::new(fields[5].clone()).ok()?,
-            sequence: activation_sequence,
-        },
+        EpochIdentity::new(
+            EpochLineageId::new(fields[5].clone()).ok()?,
+            activation_sequence,
+        )
+        .ok()?,
     ))
 }
 
@@ -136,8 +138,8 @@ pub(super) fn phase_b_validate_durable_previous_binding(
 ) -> Result<(), HostError> {
     let observed_nonce_digest = phase_b_bytes_digest(observed.host.nonce.as_str().as_bytes())?;
     if observed.authority_digest != durable.authority_descriptor_digest
-        || observed.host.epoch.current.lineage != durable.host_epoch_lineage
-        || observed.host.epoch.current.sequence != durable.host_epoch_sequence
+        || observed.host.epoch.current.lineage_id.as_str() != durable.host_epoch_lineage.as_str()
+        || observed.host.epoch.current.sequence.get() != durable.host_epoch_sequence
         || observed_nonce_digest != durable.host_process_nonce_digest
     {
         return Err(HostError::RecoveryRequired(
@@ -195,7 +197,7 @@ pub(super) fn phase_b_validate_authority(
             ))
         })?;
     }
-    if descriptor.state_fence.authority_epoch.value() != host.epoch.current.sequence
+    if descriptor.state_fence.authority_epoch.value() != host.epoch.current.sequence.get()
         || descriptor.state_fence.resource_generation != descriptor.generation
     {
         return Err(HostError::RecoveryRequired(

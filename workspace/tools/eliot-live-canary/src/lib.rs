@@ -2789,8 +2789,8 @@ fn contour_from_state(state: &HostState) -> Result<ContourSnapshot, CanaryError>
     let activation_generation = state.activation.as_ref().map(|record| {
         format!(
             "{}:{}",
-            record.fence.activation_generation.current.lineage.as_str(),
-            record.fence.activation_generation.current.sequence
+            record.fence.activation_generation.current.lineage_id.as_str(),
+            record.fence.activation_generation.current.sequence.get()
         )
     });
     let activation_state = state
@@ -2825,8 +2825,8 @@ fn contour_from_state(state: &HostState) -> Result<ContourSnapshot, CanaryError>
         .map(|record| {
             let label = format!(
                 "{}:{}",
-                record.kernel_generation.current.lineage.as_str(),
-                record.kernel_generation.current.sequence
+                record.kernel_generation.current.lineage_id.as_str(),
+                record.kernel_generation.current.sequence.get()
             );
             let digest = digest_json(&record.kernel_generation)?;
             Ok::<_, CanaryError>((Some(label), Some(digest)))
@@ -2874,20 +2874,20 @@ fn contour_from_state(state: &HostState) -> Result<ContourSnapshot, CanaryError>
         integrity_gaps.push("no retained Kernel ProbeReady observation".to_owned());
     }
     Ok(ContourSnapshot {
-        host_epoch_lineage: state.host.epoch.current.lineage.as_str().to_owned(),
-        host_epoch_sequence: state.host.epoch.current.sequence,
+        host_epoch_lineage: state.host.epoch.current.lineage_id.as_str().to_owned(),
+        host_epoch_sequence: state.host.epoch.current.sequence.get(),
         host_epoch_parent_lineage: state
             .host
             .epoch
             .parent
             .as_ref()
-            .map(|parent| parent.lineage.as_str().to_owned()),
+            .map(|parent| parent.lineage_id.as_str().to_owned()),
         host_epoch_parent_sequence: state
             .host
             .epoch
             .parent
             .as_ref()
-            .map(|parent| parent.sequence),
+            .map(|parent| parent.sequence.get()),
         host_process_nonce_digest,
         activation_id,
         activation_generation,

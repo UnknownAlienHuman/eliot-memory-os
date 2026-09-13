@@ -316,8 +316,8 @@ fn store_recovery_pending_identity(
         request_id: request.request_id.as_str().to_owned(),
         mutation_digest: request.mutation_digest.as_str().to_owned(),
         request_digest: request.request_digest.as_str().to_owned(),
-        host_epoch: host.epoch.current.sequence,
-        host_lineage: host.epoch.current.lineage.as_str().to_owned(),
+        host_epoch: host.epoch.current.sequence.get(),
+        host_lineage: host.epoch.current.lineage_id.as_str().to_owned(),
     }
 }
 
@@ -461,7 +461,7 @@ pub(super) fn persist_store_recovery_pending(
             "store recovery pending records are reserved for RecoverStore".to_owned(),
         ));
     }
-    if host.epoch.current.sequence == 0 {
+    if host.epoch.current.sequence.get() == 0 {
         return Err(HostError::RecoveryRequired(
             "store recovery pending records require a non-zero host epoch".to_owned(),
         ));
@@ -594,8 +594,8 @@ pub(super) fn persist_store_recovery_termination_evidence(
         request_id: request.request_id.as_str().to_owned(),
         mutation_digest: request.mutation_digest.as_str().to_owned(),
         request_digest: request.request_digest.as_str().to_owned(),
-        host_epoch: host.epoch.current.sequence,
-        host_lineage: host.epoch.current.lineage.as_str().to_owned(),
+        host_epoch: host.epoch.current.sequence.get(),
+        host_lineage: host.epoch.current.lineage_id.as_str().to_owned(),
         process_id: process.process_id,
         process_start_time_100ns: process.start_time_100ns,
         process_image_path: process.image_path.clone(),
@@ -751,8 +751,8 @@ pub(super) fn persist_store_recovery_inner_binding(
         request_id: request.request_id.as_str().to_owned(),
         external_control_mutation_digest: request.mutation_digest.as_str().to_owned(),
         external_control_request_digest: request.request_digest.as_str().to_owned(),
-        host_epoch: host.epoch.current.sequence,
-        host_lineage: host.epoch.current.lineage.as_str().to_owned(),
+        host_epoch: host.epoch.current.sequence.get(),
+        host_lineage: host.epoch.current.lineage_id.as_str().to_owned(),
         terminated_store_evidence_digest: sha256_json(&termination)?,
         store_rebind_operation_id: handoff.operation_id.as_str().to_owned(),
         store_rebind_request_digest: handoff.request_digest.clone(),

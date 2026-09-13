@@ -1279,6 +1279,7 @@ dependencies = [
 name = "eliot-host-state"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-observation-contracts",
  "eliot-platform",
  "eliot-platform-windows",
@@ -1288,6 +1289,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]

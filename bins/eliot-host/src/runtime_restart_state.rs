@@ -179,7 +179,7 @@ pub(super) fn persist_runtime_restart_pending(
             "runtime restart pending records are reserved for RestartKernel".to_owned(),
         ));
     }
-    if host.epoch.current.sequence == 0 {
+    if host.epoch.current.sequence.get() == 0 {
         return Err(HostError::RecoveryRequired(
             "runtime restart pending records require a non-zero host epoch".to_owned(),
         ));

@@ -571,10 +571,16 @@ impl HostComposition {
                         .as_str()
                         .as_bytes(),
                 )?,
-                host_epoch_lineage: self.host.epoch.current.lineage.clone(),
-                host_epoch_sequence: self.host.epoch.current.sequence,
-                activation_generation_lineage: self.activation_generation.current.lineage.clone(),
-                activation_generation_sequence: self.activation_generation.current.sequence,
+                host_epoch_lineage: PlatformHandle::new(
+                    self.host.epoch.current.lineage_id.as_str(),
+                )
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+                host_epoch_sequence: self.host.epoch.current.sequence.get(),
+                activation_generation_lineage: PlatformHandle::new(
+                    self.activation_generation.current.lineage_id.as_str(),
+                )
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+                activation_generation_sequence: self.activation_generation.current.sequence.get(),
                 authority_descriptor_digest: authority_descriptor_digest.clone(),
                 config_file_digest: config_file_digest.clone(),
                 store_bootstrap_descriptor_digest: store_bootstrap_descriptor_digest.clone(),
@@ -627,10 +633,16 @@ impl HostComposition {
                         .as_str()
                         .as_bytes(),
                 )?,
-                host_epoch_lineage: self.host.epoch.current.lineage.clone(),
-                host_epoch_sequence: self.host.epoch.current.sequence,
-                activation_generation_lineage: self.activation_generation.current.lineage.clone(),
-                activation_generation_sequence: self.activation_generation.current.sequence,
+                host_epoch_lineage: PlatformHandle::new(
+                    self.host.epoch.current.lineage_id.as_str(),
+                )
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+                host_epoch_sequence: self.host.epoch.current.sequence.get(),
+                activation_generation_lineage: PlatformHandle::new(
+                    self.activation_generation.current.lineage_id.as_str(),
+                )
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+                activation_generation_sequence: self.activation_generation.current.sequence.get(),
                 authority_descriptor_digest: authority_descriptor_digest.clone(),
                 config_file_digest: config_file_digest.clone(),
                 store_bootstrap_descriptor_digest: store_bootstrap_descriptor_digest.clone(),
@@ -890,10 +902,12 @@ impl HostComposition {
             host_owner_epoch,
             host_process_identity,
             host_process_nonce_digest,
-            self.host.epoch.current.lineage.clone(),
-            self.host.epoch.current.sequence,
-            self.activation_generation.current.lineage.clone(),
-            self.activation_generation.current.sequence,
+            PlatformHandle::new(self.host.epoch.current.lineage_id.as_str())
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+            self.host.epoch.current.sequence.get(),
+            PlatformHandle::new(self.activation_generation.current.lineage_id.as_str())
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+            self.activation_generation.current.sequence.get(),
             static_template,
         )
         .map_err(HostError::Installation)?;
@@ -1055,8 +1069,8 @@ impl HostComposition {
                 .as_bytes(),
         )?;
         if prepared.host_process_nonce_digest != nonce_digest
-            || prepared.host_epoch_lineage != self.host.epoch.current.lineage
-            || prepared.host_epoch_sequence != self.host.epoch.current.sequence
+            || prepared.host_epoch_lineage.as_str() != self.host.epoch.current.lineage_id.as_str()
+            || prepared.host_epoch_sequence != self.host.epoch.current.sequence.get()
         {
             return Err(HostError::RecoveryRequired(
                 "Phase-B prepared record belongs to a different Host epoch/process contour"

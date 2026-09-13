@@ -54,7 +54,7 @@ pub(super) fn host_process_identity_digest_for_host(
                 format!(
                     "eliot.host.test-support-process.v1\0{}\0{}\0{}",
                     image.to_string_lossy(),
-                    host.epoch.current.lineage,
+                    host.epoch.current.lineage_id,
                     host.epoch.current.sequence,
                 )
                 .as_bytes(),
@@ -315,20 +315,21 @@ pub(super) fn phase_b_build_authority_descriptor(
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let record_id = OperationIdentity::new(intent.static_template.record_id.as_str())
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-    let lineage_id = OpaqueLabel::new(host.epoch.current.lineage.as_str())
+    let lineage_id = OpaqueLabel::new(host.epoch.current.lineage_id.as_str())
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let authority_epoch = EpochLineage {
         current: OrsEpochIdentity {
             lineage_id,
-            epoch: host.epoch.current.sequence,
+            epoch: host.epoch.current.sequence.get(),
         },
         predecessor: None,
     };
-    let authority = AuthorityEpoch::new(host.epoch.current.sequence)
+    let authority = AuthorityEpoch::new(host.epoch.current.sequence.get())
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let state_fence = StateFence::new(authority, runtime.authority_generation);
-    let snapshot_fence = StateFenceSnapshot::capture(&state_fence, host.epoch.current.sequence)
-        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let snapshot_fence =
+        StateFenceSnapshot::capture(&state_fence, host.epoch.current.sequence.get())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| HostError::ProcessContour(error.to_string()))?
@@ -397,20 +398,21 @@ pub(super) fn phase_b_build_authority_descriptor_for_rebind(
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let record_id = OperationIdentity::new(intent.static_template.record_id.as_str())
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-    let lineage_id = OpaqueLabel::new(host.epoch.current.lineage.as_str())
+    let lineage_id = OpaqueLabel::new(host.epoch.current.lineage_id.as_str())
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let authority_epoch = EpochLineage {
         current: OrsEpochIdentity {
             lineage_id,
-            epoch: host.epoch.current.sequence,
+            epoch: host.epoch.current.sequence.get(),
         },
         predecessor: None,
     };
-    let authority = AuthorityEpoch::new(host.epoch.current.sequence)
+    let authority = AuthorityEpoch::new(host.epoch.current.sequence.get())
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let state_fence = StateFence::new(authority, runtime.authority_generation);
-    let snapshot_fence = StateFenceSnapshot::capture(&state_fence, host.epoch.current.sequence)
-        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let snapshot_fence =
+        StateFenceSnapshot::capture(&state_fence, host.epoch.current.sequence.get())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| HostError::ProcessContour(error.to_string()))?
@@ -475,11 +477,11 @@ pub(super) fn phase_b_authority_marker(
 ) -> Result<PlatformHandle, HostError> {
     let fields = [
         host.installation.as_str().to_owned(),
-        host.epoch.current.lineage.as_str().to_owned(),
+        host.epoch.current.lineage_id.as_str().to_owned(),
         host.epoch.current.sequence.to_string(),
         host.nonce.as_str().to_owned(),
         manifest_digest.as_str().to_owned(),
-        activation_generation.lineage.as_str().to_owned(),
+        activation_generation.lineage_id.as_str().to_owned(),
         activation_generation.sequence.to_string(),
         descriptor.generation.value().to_string(),
     ];

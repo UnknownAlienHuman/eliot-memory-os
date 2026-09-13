@@ -890,27 +890,27 @@ mod tests {
 
     #[test]
     fn credential_owner_binding_is_bound_to_exact_child_host_epoch() {
+        use std::num::NonZeroU64;
+
+        use eliot_host_state::{EpochId, EpochLineageId};
+
         let installation = handle("installation:test");
-        let lineage = handle("lineage:test");
+        let lineage_id = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440030")
+            .unwrap_or_else(|_| panic!("test lineage"));
         let parent = HostInstallationEpoch {
             installation: installation.clone(),
-            epoch: eliot_host_state::EpochTransition {
-                current: eliot_host_state::EpochIdentity {
-                    lineage: lineage.clone(),
-                    sequence: 1,
-                },
-                parent: None,
-            },
+            epoch: eliot_host_state::EpochTransition::genesis(lineage_id.clone()),
             nonce: handle("nonce:one"),
             recovery: None,
         };
         let child = HostInstallationEpoch {
             installation,
             epoch: eliot_host_state::EpochTransition {
-                current: eliot_host_state::EpochIdentity {
-                    lineage,
-                    sequence: 2,
-                },
+                current: EpochId::new(
+                    lineage_id,
+                    NonZeroU64::new(2).unwrap_or_else(|| panic!("test sequence")),
+                )
+                .unwrap_or_else(|error| panic!("test epoch: {error}")),
                 parent: Some(parent.epoch.current.clone()),
             },
             nonce: handle("nonce:two"),

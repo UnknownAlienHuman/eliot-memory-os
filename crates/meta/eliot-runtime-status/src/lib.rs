@@ -3455,6 +3455,30 @@ mod store_currentness_production_tests {
     fn h(v: &str) -> PlatformHandle {
         PlatformHandle::new(v).unwrap_or_else(|e| panic!("handle failed for {v:?}: {e:?}"))
     }
+    fn test_lineage_id(name: &str) -> eliot_host_state::EpochLineageId {
+        // Deterministic test-only lineage namespace: distinct names map to
+        // distinct canonical UUIDs. Production mints fresh random UUIDs at
+        // the Host/recovery owner boundary instead.
+        use sha2::Digest as _;
+        use std::fmt::Write as _;
+        let digest = sha2::Sha256::digest(name.as_bytes());
+        let mut hex = String::with_capacity(32);
+        for byte in digest.iter().take(16) {
+            write!(hex, "{byte:02x}").unwrap_or_else(|_| unreachable!());
+        }
+        let text = format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        );
+        eliot_host_state::EpochLineageId::new(text).unwrap_or_else(|_| unreachable!())
+    }
+    fn genesis(lineage: &str) -> eliot_host_state::EpochTransition {
+        eliot_host_state::EpochTransition::genesis(test_lineage_id(lineage))
+    }
     fn dh(c: char) -> PlatformHandle {
         PlatformHandle::new(c.to_string().repeat(64)).expect("digest")
     }
@@ -3467,26 +3491,14 @@ mod store_currentness_production_tests {
     fn make_fence() -> eliot_host_state::RecordFence {
         let host = HostInstallationEpoch {
             installation: h("install-1"),
-            epoch: eliot_host_state::EpochTransition {
-                current: eliot_host_state::EpochIdentity {
-                    lineage: h("lineage-1"),
-                    sequence: 1,
-                },
-                parent: None,
-            },
+            epoch: genesis("lineage-1"),
             nonce: h("nonce-1"),
             recovery: None,
         };
         eliot_host_state::RecordFence {
             host,
             activation_id: h("activation-1"),
-            activation_generation: eliot_host_state::EpochTransition {
-                current: eliot_host_state::EpochIdentity {
-                    lineage: h("act-lineage-1"),
-                    sequence: 1,
-                },
-                parent: None,
-            },
+            activation_generation: genesis("act-lineage-1"),
         }
     }
     fn store_record(
@@ -3536,13 +3548,7 @@ mod store_currentness_production_tests {
     ) -> HostState {
         let host = HostInstallationEpoch {
             installation: h("install-1"),
-            epoch: eliot_host_state::EpochTransition {
-                current: eliot_host_state::EpochIdentity {
-                    lineage: h("lineage-1"),
-                    sequence: 1,
-                },
-                parent: None,
-            },
+            epoch: genesis("lineage-1"),
             nonce: h("nonce-1"),
             recovery: None,
         };
@@ -3830,9 +3836,9 @@ mod store_currentness_production_tests {
 mod live_production_observer_tests {
     use super::*;
     use eliot_host_state::{
-        EpochIdentity, EpochTransition, HostInstallationEpoch, HostState, HostStateRecord,
-        KernelJobBinding, KernelReadinessObservationRecord, OneTimeNonceState,
-        PriorKernelDisposition, StoreRebindRecord, StoreRebindState,
+        EpochTransition, HostInstallationEpoch, HostState, HostStateRecord, KernelJobBinding,
+        KernelReadinessObservationRecord, OneTimeNonceState, PriorKernelDisposition,
+        StoreRebindRecord, StoreRebindState,
     };
     use eliot_platform::PlatformHandle;
     use eliot_runtime_contracts::{KernelActivationState, ServiceProcessRecord};
@@ -3840,6 +3846,30 @@ mod live_production_observer_tests {
 
     fn h(v: &str) -> PlatformHandle {
         PlatformHandle::new(v).expect("handle")
+    }
+    fn test_lineage_id(name: &str) -> eliot_host_state::EpochLineageId {
+        // Deterministic test-only lineage namespace: distinct names map to
+        // distinct canonical UUIDs. Production mints fresh random UUIDs at
+        // the Host/recovery owner boundary instead.
+        use sha2::Digest as _;
+        use std::fmt::Write as _;
+        let digest = sha2::Sha256::digest(name.as_bytes());
+        let mut hex = String::with_capacity(32);
+        for byte in digest.iter().take(16) {
+            write!(hex, "{byte:02x}").unwrap_or_else(|_| unreachable!());
+        }
+        let text = format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        );
+        eliot_host_state::EpochLineageId::new(text).unwrap_or_else(|_| unreachable!())
+    }
+    fn genesis(lineage: &str) -> EpochTransition {
+        EpochTransition::genesis(test_lineage_id(lineage))
     }
     fn dh(c: char) -> PlatformHandle {
         PlatformHandle::new(c.to_string().repeat(64)).expect("digest")
@@ -3856,13 +3886,7 @@ mod live_production_observer_tests {
     fn make_host() -> HostInstallationEpoch {
         HostInstallationEpoch {
             installation: h("install-1"),
-            epoch: EpochTransition {
-                current: EpochIdentity {
-                    lineage: h("lineage-1"),
-                    sequence: 1,
-                },
-                parent: None,
-            },
+            epoch: genesis("lineage-1"),
             nonce: h("nonce-1"),
             recovery: None,
         }
@@ -3871,13 +3895,7 @@ mod live_production_observer_tests {
         eliot_host_state::RecordFence {
             host: host.clone(),
             activation_id: h("activation-1"),
-            activation_generation: EpochTransition {
-                current: EpochIdentity {
-                    lineage: h("act-lineage-1"),
-                    sequence: 1,
-                },
-                parent: None,
-            },
+            activation_generation: genesis("act-lineage-1"),
         }
     }
     fn ready_process() -> ServiceProcessRecord {
@@ -3920,13 +3938,7 @@ mod live_production_observer_tests {
             candidate_pipe_identity: Some(h("kernel-candidate-pipe")),
             candidate_job_binding: Some(job.clone()),
             prior_kernel_disposition: PriorKernelDisposition::NoPriorKernel,
-            kernel_generation: EpochTransition {
-                current: EpochIdentity {
-                    lineage: h("kernel-lineage"),
-                    sequence: 1,
-                },
-                parent: None,
-            },
+            kernel_generation: genesis("kernel-lineage"),
             one_time_nonce: OneTimeNonceState::issued(
                 eliot_platform::KernelActivationNonce::new(dh('a')).expect("nonce"),
             )
@@ -4027,22 +4039,10 @@ mod live_production_observer_tests {
                 state: eliot_host_state::ActivationState::Active,
                 drain_generation: None,
                 lineage: eliot_host_state::HostKernelStoreLineage {
-                    host_epoch: EpochIdentity {
-                        lineage: h("lineage-1"),
-                        sequence: 1,
-                    },
-                    kernel_epoch: EpochIdentity {
-                        lineage: h("kernel-lineage"),
-                        sequence: 1,
-                    },
-                    watchdog_epoch: EpochIdentity {
-                        lineage: h("watchdog-lineage"),
-                        sequence: 1,
-                    },
-                    store_generation: EpochIdentity {
-                        lineage: h("store-lineage"),
-                        sequence: 1,
-                    },
+                    host_epoch: genesis("lineage-1").current,
+                    kernel_epoch: genesis("kernel-lineage").current,
+                    watchdog_epoch: genesis("watchdog-lineage").current,
+                    store_generation: genesis("store-lineage").current,
                 },
                 readiness: eliot_host_state::ReadinessEvidence {
                     supervision_ready: true,
@@ -5083,11 +5083,34 @@ mod host_journal_projection_tests {
         h(&byte.to_string().repeat(64))
     }
 
-    fn epoch(lineage: &str, seq: u64) -> EpochIdentity {
-        EpochIdentity {
-            lineage: h(lineage),
-            sequence: seq,
+    fn test_lineage_id(name: &str) -> eliot_host_state::EpochLineageId {
+        // Deterministic test-only lineage namespace: distinct names map to
+        // distinct canonical UUIDs. Production mints fresh random UUIDs at
+        // the Host/recovery owner boundary instead.
+        use sha2::Digest as _;
+        use std::fmt::Write as _;
+        let digest = sha2::Sha256::digest(name.as_bytes());
+        let mut hex = String::with_capacity(32);
+        for byte in digest.iter().take(16) {
+            write!(hex, "{byte:02x}").unwrap_or_else(|_| unreachable!());
         }
+        let text = format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        );
+        eliot_host_state::EpochLineageId::new(text).expect("test lineage")
+    }
+
+    fn epoch(lineage: &str, seq: u64) -> EpochIdentity {
+        EpochIdentity::new(
+            test_lineage_id(lineage),
+            std::num::NonZeroU64::new(seq).expect("test sequence"),
+        )
+        .expect("test epoch")
     }
 
     fn step(lineage: &str, seq: u64) -> EpochTransition {
@@ -5243,12 +5266,7 @@ mod host_journal_projection_tests {
                 state,
                 ActivationState::Draining | ActivationState::StoppedClean
             )
-            .then(|| {
-                step(
-                    generation.current.lineage.as_str(),
-                    generation.current.sequence,
-                )
-            }),
+            .then(|| generation.clone()),
             lineage: eliot_host_state::HostKernelStoreLineage {
                 host_epoch: host.epoch.current.clone(),
                 kernel_epoch: epoch("kernel-lineage", 1),

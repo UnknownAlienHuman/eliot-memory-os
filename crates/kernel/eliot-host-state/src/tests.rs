@@ -1,3 +1,4 @@
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use eliot_observation_contracts::{
@@ -41,11 +42,34 @@ fn raw_frame(sequence: u64, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn epoch(lineage: &str, sequence: u64) -> EpochIdentity {
-    EpochIdentity {
-        lineage: h(lineage),
-        sequence,
+fn test_lineage_id(lineage: &str) -> EpochLineageId {
+    // Deterministic test-only lineage namespace: distinct names map to
+    // distinct canonical UUIDs, and the same name always maps to the same
+    // UUID. Production mints fresh random UUIDs at the Host/recovery owner
+    // boundary instead.
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(lineage.as_bytes());
+    let mut hex = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        write!(hex, "{byte:02x}").unwrap_or_else(|_| unreachable!());
     }
+    let text = format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    );
+    EpochLineageId::new(text).unwrap_or_else(|_| unreachable!())
+}
+
+fn epoch(lineage: &str, sequence: u64) -> EpochIdentity {
+    EpochId::new(
+        test_lineage_id(lineage),
+        NonZeroU64::new(sequence).unwrap_or_else(|| unreachable!()),
+    )
+    .unwrap_or_else(|_| unreachable!())
 }
 
 fn step(lineage: &str, sequence: u64) -> EpochTransition {
@@ -379,12 +403,7 @@ fn activation(
             state,
             ActivationState::Draining | ActivationState::StoppedClean
         )
-        .then(|| {
-            step(
-                generation.current.lineage.as_str(),
-                generation.current.sequence,
-            )
-        }),
+        .then(|| generation.clone()),
         lineage: HostKernelStoreLineage {
             host_epoch: host.epoch.current.clone(),
             kernel_epoch: epoch("kernel-lineage", 1),
@@ -1240,23 +1259,37 @@ fn replay_rejects_torn_checksum_version_and_sequence_frames() -> TestResult {
         Err(JournalError::Checksum { .. } | JournalError::Invalid(_))
     ));
 
-    let mut legacy_version = bytes.clone();
-    let legacy_version_field = legacy_version
+    let mut retired_wire = bytes.clone();
+    let retired_wire_field = retired_wire
         .windows(11)
-        .position(|window| window == br#""version":2"#)
+        .position(|window| window == br#""version":3"#)
         .map_or_else(|| unreachable!(), |offset| offset + 10);
-    legacy_version[legacy_version_field] = b'1';
+    retired_wire[retired_wire_field] = b'1';
     assert!(matches!(
-        HostStateJournal::<MemoryBackend>::replay_bytes(&legacy_version, host.clone()),
+        HostStateJournal::<MemoryBackend>::replay_bytes(&retired_wire, host.clone()),
         Err(JournalError::UnknownVersion { version: 1 })
+    ));
+
+    // The retired version 2 wire shape (Host-local lineage spelling) is
+    // rejected explicitly and never silently rewritten into a version 3
+    // journal.
+    let mut previous_wire = bytes.clone();
+    let previous_wire_field = previous_wire
+        .windows(11)
+        .position(|window| window == br#""version":3"#)
+        .map_or_else(|| unreachable!(), |offset| offset + 10);
+    previous_wire[previous_wire_field] = b'2';
+    assert!(matches!(
+        HostStateJournal::<MemoryBackend>::replay_bytes(&previous_wire, host.clone()),
+        Err(JournalError::UnknownVersion { version: 2 })
     ));
 
     let mut version = bytes.clone();
     let version_field = version
         .windows(11)
-        .position(|window| window == br#""version":2"#)
+        .position(|window| window == br#""version":3"#)
         .map_or_else(|| unreachable!(), |offset| offset + 10);
-    version[version_field] = b'3';
+    version[version_field] = b'4';
     assert!(matches!(
         HostStateJournal::<MemoryBackend>::replay_bytes(&version, host.clone()),
         Err(JournalError::UnknownVersion { .. } | JournalError::Invalid(_))
@@ -2490,22 +2523,17 @@ fn opaque_legacy_nonce_is_rejected_by_live_append_but_accepted_during_replay() {
 #[test]
 fn direct_child_generation_is_exact_and_overflow_safe() -> TestResult {
     let parent = step("kernel-direct-child", 9);
-    let child = parent.direct_child()?;
-    assert_eq!(child.current.sequence, 10);
-    assert_eq!(child.current.lineage, parent.current.lineage);
+    let child =
+        EpochTransition::direct_child(&parent.current).map_err(|_| JournalError::Sequence)?;
+    assert_eq!(child.current.sequence.get(), 10);
+    assert_eq!(child.current.lineage_id, parent.current.lineage_id);
     assert_eq!(child.parent.as_ref(), Some(&parent.current));
 
-    let overflow = EpochTransition {
-        current: EpochIdentity {
-            lineage: h("kernel-direct-child"),
-            sequence: u64::MAX,
-        },
-        parent: Some(EpochIdentity {
-            lineage: h("kernel-direct-child"),
-            sequence: u64::MAX - 1,
-        }),
-    };
-    assert_eq!(overflow.direct_child(), Err(JournalError::Sequence));
+    let overflow_parent = epoch("kernel-overflow", u64::MAX);
+    assert_eq!(
+        EpochTransition::direct_child(&overflow_parent).map_err(|_| JournalError::Sequence),
+        Err(JournalError::Sequence)
+    );
     Ok(())
 }
 
@@ -2598,7 +2626,8 @@ fn failed_kernel_restart_requires_exact_direct_child_and_terminated_prior() -> T
         "restart-skipped-generation",
         KernelActivationState::ShadowNoAuthority,
     );
-    skipped.kernel_generation = direct_child.direct_child()?;
+    skipped.kernel_generation =
+        EpochTransition::direct_child(&direct_child.current).map_err(|_| JournalError::Sequence)?;
     skipped.prior_kernel_disposition = prior.clone();
     rebind_candidate(&mut skipped, "kernel-job-skipped", 3003, 30, 2);
     assert_eq!(
@@ -2873,8 +2902,8 @@ fn expected_supervision_incarnation(
         scope_ref_digest: String::new(),
         installation_id: state.host.installation.as_str().to_owned(),
         host_epoch: SupervisionJournalEpoch {
-            lineage_id: state.host.epoch.current.lineage.as_str().to_owned(),
-            sequence: state.host.epoch.current.sequence,
+            lineage_id: state.host.epoch.current.lineage_id.as_str().to_owned(),
+            sequence: state.host.epoch.current.sequence.get(),
         },
         activation_id: activation.activation_id.as_str().to_owned(),
         activation_generation: SupervisionJournalEpoch {
@@ -2882,23 +2911,33 @@ fn expected_supervision_incarnation(
                 .fence
                 .activation_generation
                 .current
-                .lineage
+                .lineage_id
                 .as_str()
                 .to_owned(),
-            sequence: activation.fence.activation_generation.current.sequence,
+            sequence: activation
+                .fence
+                .activation_generation
+                .current
+                .sequence
+                .get(),
         },
         kernel_generation: SupervisionJournalEpoch {
-            lineage_id: kernel.kernel_generation.current.lineage.as_str().to_owned(),
-            sequence: kernel.kernel_generation.current.sequence,
+            lineage_id: kernel
+                .kernel_generation
+                .current
+                .lineage_id
+                .as_str()
+                .to_owned(),
+            sequence: kernel.kernel_generation.current.sequence.get(),
         },
         watchdog_epoch: SupervisionJournalEpoch {
             lineage_id: activation
                 .lineage
                 .watchdog_epoch
-                .lineage
+                .lineage_id
                 .as_str()
                 .to_owned(),
-            sequence: activation.lineage.watchdog_epoch.sequence,
+            sequence: activation.lineage.watchdog_epoch.sequence.get(),
         },
         observation_scope: canonical_observation_scope(),
         wake_policy: canonical_wake_policy(),
@@ -2950,13 +2989,22 @@ fn supervision_reconstruction_uses_observation_before_first_current_kernel_readi
     assert_eq!(current.ors_receipt_sha256, "c".repeat(64));
 
     let mut substituted = state.clone();
+    let substituted_watchdog = substituted
+        .activation
+        .as_mut()
+        .unwrap_or_else(|| unreachable!())
+        .lineage
+        .watchdog_epoch
+        .sequence
+        .checked_add(1)
+        .unwrap_or_else(|| unreachable!());
     substituted
         .activation
         .as_mut()
         .unwrap_or_else(|| unreachable!())
         .lineage
         .watchdog_epoch
-        .sequence += 1;
+        .sequence = substituted_watchdog;
     assert!(
         reconstruct_current_supervision_incarnation(
             &substituted,
@@ -3091,4 +3139,68 @@ fn store_rebind_pending_has_durable_terminal_dispositions_and_exact_commit_recov
     assert!(store_rebind_transition(Some(&unknown), &committed).is_ok());
     assert!(store_rebind_transition(Some(&committed), &unknown).is_err());
     assert!(store_rebind_transition(None, &aborted).is_err());
+}
+
+#[test]
+fn equal_sequence_foreign_lineage_has_no_current_lineage_fallback() -> TestResult {
+    let old_host = host(1);
+    let generation = step("activation-lineage", 1);
+    let old = HostStateJournal::open(MemoryBackend::default(), old_host.clone())?;
+    old.append(activation(
+        &old_host,
+        &generation,
+        "fallback-old",
+        ActivationState::Starting,
+    ))?;
+    let backend = old.into_backend()?;
+    // The same numeric sequence in another lineage is unrelated authority:
+    // it must not open as a genesis, a child, or an implicit recovery.
+    let foreign = HostInstallationEpoch {
+        installation: old_host.installation.clone(),
+        epoch: EpochTransition::genesis(test_lineage_id("foreign-fallback-lineage")),
+        nonce: h("foreign-fallback-nonce"),
+        recovery: None,
+    };
+    assert!(matches!(
+        HostStateJournal::open(backend, foreign),
+        Err(JournalError::RecoveryRequiresNewEpoch)
+    ));
+    Ok(())
+}
+
+#[test]
+fn legacy_scalar_without_mapping_never_becomes_active() {
+    use eliot_contracts::{
+        LegacyEpochEvidence, LegacyEpochImport, LegacyScalarEpoch, import_legacy_scalar_epoch,
+    };
+
+    let legacy = LegacyScalarEpoch::new(7, "host-record-7", "host-wire-v2")
+        .unwrap_or_else(|_| unreachable!());
+    // Missing, ambiguous, and conflicted lineage evidence all stay out of
+    // authority; only an exact bound migration receipt activates once.
+    assert!(matches!(
+        import_legacy_scalar_epoch(legacy.clone(), LegacyEpochEvidence::Missing),
+        Ok(LegacyEpochImport::HistoricalSuspended { .. })
+    ));
+    assert!(matches!(
+        import_legacy_scalar_epoch(legacy.clone(), LegacyEpochEvidence::Ambiguous),
+        Ok(LegacyEpochImport::ManualRecoveryRequired { .. })
+    ));
+    assert!(matches!(
+        import_legacy_scalar_epoch(legacy.clone(), LegacyEpochEvidence::Conflicted),
+        Ok(LegacyEpochImport::ManualRecoveryRequired { .. })
+    ));
+    let bound = LegacyEpochEvidence::Bound {
+        installation_identity: "install-acceptance".to_owned(),
+        host_lineage: test_lineage_id("legacy-bound-lineage"),
+        source_record_identity: "host-record-7".to_owned(),
+        migration_receipt: "receipt-acceptance-7".to_owned(),
+    };
+    let active = import_legacy_scalar_epoch(legacy, bound).unwrap_or_else(|_| unreachable!());
+    assert!(matches!(
+        active,
+        LegacyEpochImport::EvidenceBoundActive { ref epoch_id, .. }
+        if epoch_id.lineage_id == test_lineage_id("legacy-bound-lineage")
+            && epoch_id.sequence.get() == 7
+    ));
 }

@@ -81,8 +81,8 @@ impl HostComposition {
             return Ok(None);
         };
         pending.validate_current_request(request)?;
-        if pending.host_epoch != self.host.epoch.current.sequence
-            || pending.host_lineage != self.host.epoch.current.lineage.as_str()
+        if pending.host_epoch != self.host.epoch.current.sequence.get()
+            || pending.host_lineage != self.host.epoch.current.lineage_id.as_str()
         {
             return Err(HostError::RecoveryRequired(
                 "Store recovery pending identity belongs to another live Host epoch".to_owned(),
