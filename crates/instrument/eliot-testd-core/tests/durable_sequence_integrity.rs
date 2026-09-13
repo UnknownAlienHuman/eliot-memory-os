@@ -15,6 +15,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const TEST_LINEAGE_A: &str = "11111111-1111-4111-8111-111111111111";
+
+fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
+    eliot_contracts::EpochId::new(
+        eliot_contracts::EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
 const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_jobs_v1");
 const EVENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_events_v1");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_meta_v1");
@@ -135,7 +145,8 @@ fn fixture_process(
             PermitIssuance::new(
                 eliot_process::ActionLeaseRef::new(format!("lease-{job_id}"))
                     .expect("fixture lease"),
-                FencingToken::new(7, generation, format!("fence-{job_id}")).expect("fixture fence"),
+                FencingToken::new(test_epoch(7), generation, format!("fence-{job_id}"))
+                    .expect("fixture fence"),
                 BTreeMap::from([
                     ("authority".to_owned(), "a".repeat(64)),
                     ("state".to_owned(), "b".repeat(64)),
@@ -242,7 +253,10 @@ fn job_bytes(job_id: &str, project_id: &str, project_sequence: u64) -> Vec<u8> {
             "operation_id": "operation-1",
             "process_tree_id": "tree-1",
             "generation": 1,
-            "authority_epoch": 7,
+            "authority_epoch": {
+                "lineage_id": "11111111-1111-4111-8111-111111111111",
+                "sequence": 7
+            },
             "invocation_digest": "digest"
         },
         "target_roots": {

@@ -129,9 +129,18 @@ fn generation(value: u64) -> Result<Generation, Box<dyn std::error::Error>> {
     Ok(Generation::new(value)?)
 }
 
+const TEST_LINEAGE_A: &str = "11111111-1111-4111-8111-111111111111";
+
+fn test_epoch(value: u64) -> Result<eliot_contracts::EpochId, Box<dyn std::error::Error>> {
+    Ok(eliot_contracts::EpochId::new(
+        eliot_contracts::EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        std::num::NonZeroU64::new(value).ok_or("nonzero test sequence")?,
+    )?)
+}
+
 fn fence(value: u64) -> Result<FencingToken, Box<dyn std::error::Error>> {
     Ok(FencingToken::new(
-        value,
+        test_epoch(value)?,
         generation(value)?,
         format!("fence-{value}"),
     )?)
@@ -278,7 +287,7 @@ fn attach_binds_authenticated_connection_session_generation_and_fence()
     assert_eq!(binding.session_id().as_str(), "session-1");
     assert_eq!(binding.connection_id().as_str(), "connection-1");
     assert_eq!(binding.activation_generation().get(), 1);
-    assert_eq!(binding.state_fence().authority_epoch(), 1);
+    assert_eq!(binding.state_fence().authority_epoch(), &test_epoch(1)?);
     assert_eq!(binding.state_fence().generation().get(), 1);
     assert_eq!(binding.task_binding().task_id().as_str(), "task-1");
     assert_eq!(

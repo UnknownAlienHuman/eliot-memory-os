@@ -653,6 +653,7 @@ name = "eliot-agent-bridge-core"
 version = "0.1.0"
 dependencies = [
  "eliot-agent-api",
+ "eliot-contracts",
  "eliot-observation-contracts",
  "eliot-process",
  "eliot-protocol",
@@ -2190,6 +2191,7 @@ dependencies = [
 name = "eliot-testd"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-instrument-api",
  "eliot-platform-windows",
  "eliot-process",
