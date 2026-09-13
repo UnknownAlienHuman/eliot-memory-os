@@ -211,11 +211,66 @@ where
 
     /// Admits an exact route/capability envelope, invokes P-03, and becomes
     /// ready only after the returned start receipt binds the exact request.
-    #[allow(clippy::too_many_lines)]
     pub async fn demand_start(
         &mut self,
         hello: WorkerHello,
         process: ProcessRequest,
+    ) -> Result<WorkerReady, WorkerError> {
+        let admission_request = CapabilityAdmissionRequest::from_start(&hello, &process);
+        self.demand_start_inner(hello, process, admission_request)
+            .await
+    }
+
+    /// Binds the existing start path to one exact claim presentation,
+    /// validation only; mints nothing.
+    ///
+    /// First validates the claim/registration cross-binding, then performs
+    /// the checked join of the claim with the owner-supplied `hello` and
+    /// `process` via `CapabilityAdmissionRequest::from_claim`. Any mismatch
+    /// fails here, before the admission owner is consulted and before P-03
+    /// starts anything. On a match the call delegates to the same
+    /// downstream path as [`WorkerCore::demand_start`] (admit, grant
+    /// validation including the claim echo, executable-binding gate, P-03
+    /// start, receipt/proof validation, ready). No `ProcessRequest` is
+    /// minted and no grant is sealed by the join itself: only the supplied
+    /// `claim`, `hello`, and `process` are reused.
+    ///
+    /// The executable-binding gate (`U1`) still fails closed: the Wave-A
+    /// claim contour carries no verifiable route fingerprint, adapter /
+    /// config / facet revisions, introduction references, replay stream,
+    /// claim-bound launch nonce, or effective capability projection, so a
+    /// fully matching projection reaches the real admission call and then
+    /// reports the first absent input instead of starting execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `from_claim` join failure (`InvalidRequest`,
+    /// `StaleEpoch`, `StaleFence`, or `DeadlineExpired`), the downstream
+    /// admission/start/proof failure, or `InvalidRequest("u1_missing_*")`
+    /// for the first absent executable-binding input.
+    pub async fn demand_start_claimed(
+        &mut self,
+        claim: ClaimAdmissionRequest,
+        hello: WorkerHello,
+        process: ProcessRequest,
+    ) -> Result<WorkerReady, WorkerError> {
+        claim.validate_binding()?;
+        let admission_request = CapabilityAdmissionRequest::from_claim(&claim, &hello, &process)?;
+        self.demand_start_inner(hello, process, admission_request)
+            .await
+    }
+
+    /// Shared downstream start path for [`WorkerCore::demand_start`] and
+    /// [`WorkerCore::demand_start_claimed`]: lifecycle gate, owner
+    /// validation, admission, grant checks (including the claim echo when
+    /// the request carries one), the U1 executable-binding gate, P-03
+    /// start, and receipt/proof validation.
+    #[allow(clippy::too_many_lines)]
+    async fn demand_start_inner(
+        &mut self,
+        hello: WorkerHello,
+        process: ProcessRequest,
+        admission_request: CapabilityAdmissionRequest,
     ) -> Result<WorkerReady, WorkerError> {
         if !matches!(
             self.lifecycle,
@@ -236,7 +291,6 @@ where
             detail: "P-03 evidence sink was not injected",
         })?;
 
-        let admission_request = CapabilityAdmissionRequest::from_start(&hello, &process);
         let admission_outcome = self
             .admission
             .as_mut()
@@ -255,7 +309,10 @@ where
                 return Err(WorkerError::Revoked(revision));
             }
         };
-        validate_grant(&grant, &hello, &process)?;
+        validate_grant(&grant, &hello, &process, admission_request.claim())?;
+        if let Some(presented) = admission_request.claim() {
+            require_claim_executable_binding(presented, &hello)?;
+        }
         let process_binding = ProcessBindingSnapshot::from_request(&process);
 
         self.transition(WorkerLifecycle::Starting)?;
@@ -421,7 +478,7 @@ where
                 return Err(WorkerError::Revoked(revision));
             }
         };
-        validate_grant(&grant, &hello, &process)?;
+        validate_grant(&grant, &hello, &process, None)?;
         let process_binding = ProcessBindingSnapshot::from_request(&process);
         let view = self
             .executor
@@ -1230,6 +1287,7 @@ fn validate_grant(
     grant: &CapabilityGrant,
     hello: &WorkerHello,
     process: &ProcessRequest,
+    claim: Option<&ClaimAdmissionRequest>,
 ) -> Result<(), WorkerError> {
     grant
         .authority()
@@ -1287,7 +1345,77 @@ fn validate_grant(
     {
         return Err(WorkerError::AdmissionMismatch("capabilities"));
     }
+    if let Some(presented) = claim {
+        validate_grant_claim_binding(grant, presented)?;
+    }
     Ok(())
+}
+
+/// Re-checks the presented claim against the owner-admitted grant.
+///
+/// Binds the claim digest (recomputed at admission time), the claimed
+/// operation/generation, and the owner's echo of the exact claim
+/// digest/attempt/operation. A missing or disagreeing echo fails closed:
+/// the echo is inert data, never authority by itself.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::InvalidRequest`] for a digest that no longer
+/// recomputes, or [`WorkerError::AdmissionMismatch`] when the admitted
+/// grant or its claim echo does not name the presented claim.
+fn validate_grant_claim_binding(
+    grant: &CapabilityGrant,
+    claim: &ClaimAdmissionRequest,
+) -> Result<(), WorkerError> {
+    let presented = claim.claim();
+    if presented.compute_binding_digest()? != presented.binding_digest {
+        return Err(WorkerError::InvalidRequest("binding_digest"));
+    }
+    if grant.operation_id() != &presented.operation_id {
+        return Err(WorkerError::AdmissionMismatch("claim_operation"));
+    }
+    if grant.worker_generation() != presented.worker_generation {
+        return Err(WorkerError::AdmissionMismatch("claim_generation"));
+    }
+    if grant.claim_binding_digest() != Some(presented.binding_digest.as_str()) {
+        return Err(WorkerError::AdmissionMismatch("claim_binding"));
+    }
+    if grant.claim_attempt_id() != Some(&presented.attempt_id) {
+        return Err(WorkerError::AdmissionMismatch("claim_attempt"));
+    }
+    if grant.claim_operation_id() != Some(&presented.operation_id) {
+        return Err(WorkerError::AdmissionMismatch("claim_operation"));
+    }
+    Ok(())
+}
+
+/// U1 executable-binding gate: exposes the missing owner-produced join
+/// instead of starting execution without it.
+///
+/// The Wave-A claim contour structurally lacks every executable-binding
+/// input the start path needs, so the claimed path fails closed here,
+/// after admission and grant validation but before P-03 start. Absent
+/// inputs, in canonical order with evidence:
+/// full `RouteFingerprint` (`route_class` at protocol.rs:777 is an admitted
+/// label only, never equated with a fingerprint); adapter revision and
+/// config revision (registration carries only artifact/config digests,
+/// protocol.rs:638-639); facet revisions; introduction references; replay
+/// stream (lives on `CapabilityAdmissionFacts` at ports.rs:256-257, not on
+/// the claim); claim-bound launch nonce (present only on `WorkerHello` at
+/// protocol.rs:93, unbound to any claim field); effective capability
+/// projection (the claim carries only the `budget` ceiling at
+/// protocol.rs:779). The first absent input is reported; later inputs stay
+/// unreachable until U1 supplies the versioned owner-produced join.
+///
+/// # Errors
+///
+/// Always returns [`WorkerError::InvalidRequest`] naming the first absent
+/// executable-binding input until U1 lands.
+fn require_claim_executable_binding(
+    _claim: &ClaimAdmissionRequest,
+    _hello: &WorkerHello,
+) -> Result<(), WorkerError> {
+    Err(WorkerError::InvalidRequest("u1_missing_route_fingerprint"))
 }
 
 fn validate_start_receipt(

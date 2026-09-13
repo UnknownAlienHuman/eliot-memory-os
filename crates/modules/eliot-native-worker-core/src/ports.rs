@@ -97,6 +97,14 @@ pub struct CapabilityAdmissionRequest {
     process_fence: FencingToken,
     process_request_digest: String,
     resource_limits: ResourceLimits,
+    /// Exact claim presentation this launch is bound to, when the claimed
+    /// start path is used.
+    ///
+    /// `None` preserves the pre-claim wire shape: `skip_serializing_if`
+    /// keeps `from_start` projections byte-identical on the wire, while
+    /// `default` still accepts older payloads that carry no claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim: Option<ClaimAdmissionRequest>,
 }
 
 impl CapabilityAdmissionRequest {
@@ -109,7 +117,73 @@ impl CapabilityAdmissionRequest {
             process_fence: process.fence().clone(),
             process_request_digest: process.invocation_digest().to_owned(),
             resource_limits: *process.resource_limits(),
+            claim: None,
         }
+    }
+
+    /// Checked join of one exact claim presentation with the owner-supplied
+    /// handshake and process request. Verifies the claim halves against each
+    /// other and then against `hello`/`process`, and carries the claim into
+    /// the admission projection. Invents nothing: no `ProcessRequest` is
+    /// minted, no grant is sealed, `route_class` is never equated with a
+    /// full route fingerprint, and no defaults are fabricated for
+    /// `WorkerHello` fields. The claim's `attempt_id` has no start-time
+    /// counterpart, so it is carried digest-bound rather than equated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::InvalidRequest`] for a malformed half or an
+    /// identity/generation/operation mismatch, [`WorkerError::StaleEpoch`]
+    /// or [`WorkerError::StaleFence`] for epoch/fence disagreement, and
+    /// [`WorkerError::DeadlineExpired`] when the handshake outlives the
+    /// claim deadline.
+    pub fn from_claim(
+        claim: &ClaimAdmissionRequest,
+        hello: &WorkerHello,
+        process: &ProcessRequest,
+    ) -> Result<Self, WorkerError> {
+        claim.validate_binding()?;
+        let presented = claim.claim();
+        let registration = claim.registration();
+        if presented.registration_id != registration.registration_id {
+            return Err(WorkerError::InvalidRequest("registration_binding"));
+        }
+        if presented.worker_generation != registration.worker_generation {
+            return Err(WorkerError::InvalidRequest("generation_binding"));
+        }
+        if presented.authority_epoch != registration.authority_epoch {
+            return Err(WorkerError::StaleEpoch);
+        }
+        if presented.state_fence != registration.state_fence {
+            return Err(WorkerError::StaleFence);
+        }
+        if presented.worker_generation != hello.worker_generation
+            || presented.worker_generation != process.generation().get()
+        {
+            return Err(WorkerError::InvalidRequest("generation_binding"));
+        }
+        if presented.authority_epoch != hello.authority_epoch {
+            return Err(WorkerError::StaleEpoch);
+        }
+        if presented.state_fence != hello.state_fence {
+            return Err(WorkerError::StaleFence);
+        }
+        if presented.operation_id != *process.operation_id() {
+            return Err(WorkerError::InvalidRequest("claim_operation"));
+        }
+        if hello.deadline_unix_ms > presented.deadline_unix_ms {
+            return Err(WorkerError::DeadlineExpired);
+        }
+        Ok(Self {
+            hello: hello.clone(),
+            operation_id: process.operation_id().clone(),
+            process_tree_id: process.process_tree_id().clone(),
+            process_generation: process.generation(),
+            process_fence: process.fence().clone(),
+            process_request_digest: process.invocation_digest().to_owned(),
+            resource_limits: *process.resource_limits(),
+            claim: Some(claim.clone()),
+        })
     }
 
     #[must_use]
@@ -145,6 +219,16 @@ impl CapabilityAdmissionRequest {
     #[must_use]
     pub const fn resource_limits(&self) -> &ResourceLimits {
         &self.resource_limits
+    }
+
+    /// Returns the exact claim presentation this launch is bound to, if any.
+    ///
+    /// `None` marks the pre-claim start path; `Some` marks a `from_claim`
+    /// join that the admission owner must validate against current owner
+    /// state before any process start.
+    #[must_use]
+    pub const fn claim(&self) -> Option<&ClaimAdmissionRequest> {
+        self.claim.as_ref()
     }
 }
 
@@ -182,6 +266,20 @@ pub struct CapabilityAdmissionFacts {
     process_fence: FencingToken,
     process_request_digest: String,
     resource_limits: ResourceLimits,
+    /// Echo of the exact claim binding digest the owner admitted, when the
+    /// launch was presented under a claim.
+    ///
+    /// `None` preserves the pre-claim wire shape. A present claim echo
+    /// carries no authority by itself: `WorkerCore` re-checks it against
+    /// the presented claim before any process start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claim_binding_digest: Option<String>,
+    /// Echo of the exact attempt bound to the admitted claim, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claim_attempt_id: Option<AttemptId>,
+    /// Echo of the exact operation bound to the admitted claim, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claim_operation_id: Option<OperationId>,
 }
 
 impl CapabilityAdmissionFacts {
@@ -225,7 +323,23 @@ impl CapabilityAdmissionFacts {
             process_fence,
             process_request_digest: process_request_digest.into(),
             resource_limits,
+            claim_binding_digest: None,
+            claim_attempt_id: None,
+            claim_operation_id: None,
         }
+    }
+
+    /// Attaches the owner's echo of the exact admitted claim binding.
+    ///
+    /// Records the claim digest, attempt, and operation the owner admitted
+    /// alongside this launch. The echo is inert data: a missing or
+    /// disagreeing echo fails closed at grant validation.
+    #[must_use]
+    pub fn with_claim_binding(mut self, claim: &NativeWorkerClaim) -> Self {
+        self.claim_binding_digest = Some(claim.binding_digest.clone());
+        self.claim_attempt_id = Some(claim.attempt_id.clone());
+        self.claim_operation_id = Some(claim.operation_id.clone());
+        self
     }
 
     #[must_use]
@@ -316,6 +430,24 @@ impl CapabilityAdmissionFacts {
     #[must_use]
     pub const fn resource_limits(&self) -> &ResourceLimits {
         &self.resource_limits
+    }
+
+    /// Returns the owner's echo of the admitted claim binding digest, if any.
+    #[must_use]
+    pub fn claim_binding_digest(&self) -> Option<&str> {
+        self.claim_binding_digest.as_deref()
+    }
+
+    /// Returns the owner's echo of the attempt bound to the admitted claim.
+    #[must_use]
+    pub const fn claim_attempt_id(&self) -> Option<&AttemptId> {
+        self.claim_attempt_id.as_ref()
+    }
+
+    /// Returns the owner's echo of the operation bound to the admitted claim.
+    #[must_use]
+    pub const fn claim_operation_id(&self) -> Option<&OperationId> {
+        self.claim_operation_id.as_ref()
     }
 }
 
