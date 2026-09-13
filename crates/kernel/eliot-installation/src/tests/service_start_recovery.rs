@@ -42,11 +42,11 @@ use crate::TransactionVersion;
 use crate::effect_request;
 use crate::transaction_store_private;
 
-/// s33.3 (#1313): snapshot-carrying StartService `Absent` for drive mocks.
+/// s33.3 (#1313): snapshot-carrying `StartService` `Absent` for drive mocks.
 ///
 /// Production `service_start_inspect`/`reconcile` now attach a live OS
-/// snapshot (the StartService analogue of #1308 `service_absent_from_live_
-/// inspection`). The drive gate requires `os_some` for StartService and the
+/// snapshot (the `StartService` analogue of #1308 `service_absent_from_live_
+/// inspection`). The drive gate requires `os_some` for `StartService` and the
 /// strict rollback gate requires os/credential/package, so the old empty
 /// `start_absent` mock (no snapshot) fails closed in both. This helper keeps
 /// the exact `start_absent` evidence shape (`{reason}:{service_name}`) and

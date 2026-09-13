@@ -7148,12 +7148,6 @@ where
                             && observed_precondition.os_snapshot.is_none()
                             && observed_precondition.package_snapshot.is_none()
                     }
-                    InstallerEffectPlan::RegisterService { .. }
-                    | InstallerEffectPlan::StartService { .. } => {
-                        observed_precondition.os_snapshot.is_some()
-                            && observed_precondition.credential_snapshot.is_none()
-                            && observed_precondition.package_snapshot.is_none()
-                    }
                     InstallerEffectPlan::StagePackage { .. } => {
                         observed_precondition.package_snapshot.is_some()
                             && observed_precondition.os_snapshot.is_none()
@@ -7163,6 +7157,8 @@ where
                         observed_precondition.os_snapshot.is_none()
                             && observed_precondition.credential_snapshot.is_none()
                     }
+                    // Register/Start carry a live OS snapshot and roots carry
+                    // OS: both require os_some with the other snapshots absent.
                     _ => {
                         observed_precondition.os_snapshot.is_some()
                             && observed_precondition.credential_snapshot.is_none()

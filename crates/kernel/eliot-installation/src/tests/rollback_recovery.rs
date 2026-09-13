@@ -431,10 +431,10 @@ fn interrupted_service_rollback_resumes_after_first_delete() {
 ///
 /// Extends `interrupted_service_rollback_resumes_after_first_delete` (services
 /// + package) with the remaining production `Absent` shapes that blocked rc6
-/// recover on rc4 with `INSTALLATION_RECOVER_ERROR absence snapshot`:
+///   recover on rc4 with `INSTALLATION_RECOVER_ERROR absence snapshot`:
 ///
 /// - `StartService` stopped `Absent` now carries a live OS snapshot (the
-///   StartService analogue of #1308); strict `validate()` requires
+///   `StartService` analogue of #1308); strict `validate()` requires
 ///   os/credential/package.
 /// - `StagePackage` `Absent` carries its `package_snapshot`; strict accepts
 ///   it after the s33.3 `validate()` fix (previously only os/credential).
