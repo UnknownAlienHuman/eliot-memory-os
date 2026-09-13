@@ -590,7 +590,6 @@ dependencies = [
  "eliot-runtime-contracts",
  "eliot-runtime-status",
  "eliot-store-surreal",
- "eliot-types",
  "serde",
  "serde_json",
  "sha2 0.10.9",
