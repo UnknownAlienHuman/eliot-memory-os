@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from collections import defaultdict
@@ -198,6 +199,10 @@ PUBLIC_ITEM_RE: Final = re.compile(
 )
 TEST_ATTRIBUTE_RE: Final = re.compile(r"#\s*\[\s*(?:tokio\s*::\s*)?test(?:\s*\([^]]*\))?\s*\]")
 IDENTIFIER_RE: Final = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+_CHAR_PATTERN: Final = re.compile(
+    r"^(?:b)?'(?:\\x[0-9a-fA-F]{2}|\\u\{[0-9a-fA-F_]{1,6}\}|\\[\\'\"0ntre]|[^\\'\n\r])'"
+)
+_LIFETIME_PATTERN: Final = re.compile(r"^'[a-zA-Z_][a-zA-Z0-9_]*")
 
 
 def _sha256(data: bytes) -> str:
@@ -241,13 +246,13 @@ def _relative(root: Path, path: Path) -> str:
     return _inside(root, path).relative_to(root).as_posix()
 
 
-def _safe_output(root: Path, output: Path) -> Path:
+def _safe_output(root: Path, output: Path, overwrite: bool = False) -> Path:
     candidate = output if output.is_absolute() else root / output
     parent = _inside(root, candidate.parent, must_exist=True)
     relative = parent.relative_to(root)
     if not relative.parts or relative.parts[0] != OUTPUT_ROOT:
         raise InventoryError("UNSAFE_OUTPUT", "output must be below the repository .eliot directory")
-    if candidate.exists():
+    if candidate.exists() and not overwrite:
         raise InventoryError("OUTPUT_EXISTS", f"refusing to overwrite existing output: {candidate}")
     return candidate
 
@@ -295,7 +300,12 @@ def _tracked_manifests(root: Path, runner: Runner) -> tuple[str, ...]:
 
 
 def _metadata(root: Path, runner: Runner, manifest: str | None = None) -> MetadataGraph:
-    argv: list[str] = ["cargo", "metadata", "--locked", "--all-features", "--format-version", "1"]
+    manifest_dir = (root / manifest).parent if manifest is not None else root
+    lockfile_exists = (manifest_dir / "Cargo.lock").exists()
+    argv: list[str] = ["cargo", "metadata"]
+    if lockfile_exists:
+        argv.append("--locked")
+    argv.extend(("--offline", "--all-features", "--format-version", "1"))
     if manifest is not None:
         argv.extend(("--manifest-path", manifest))
     raw = runner.run(root, tuple(argv))
@@ -503,10 +513,19 @@ def _mask_rust(text: str) -> str:
             blank(index, end)
             index = end
             continue
-        prefix = 1 if text[index:index + 1] in {"b", "c"} and text[index + 1:index + 2] in {'"', "'"} else 0
+        if text.startswith("'", index) or text.startswith("b'", index):
+            cm = _CHAR_PATTERN.match(text[index:])
+            if cm:
+                blank(index, index + cm.end())
+                index += cm.end()
+                continue
+            lm = _LIFETIME_PATTERN.match(text[index:])
+            if lm:
+                index += lm.end()
+                continue
+        prefix = 1 if text[index:index + 1] in {"b", "c"} and text[index + 1:index + 2] == '"' else 0
         quote_pos = index + prefix
-        if quote_pos < length and text[quote_pos] in {'"', "'"}:
-            quote = text[quote_pos]
+        if quote_pos < length and text[quote_pos] == '"':
             cursor = quote_pos + 1
             escaped = False
             while cursor < length:
@@ -516,10 +535,10 @@ def _mask_rust(text: str) -> str:
                     escaped = False
                 elif current == "\\":
                     escaped = True
-                elif current == quote:
+                elif current == '"':
                     break
             else:
-                raise InventoryError("MALFORMED_RUST_SOURCE", "unterminated string/character literal")
+                raise InventoryError("MALFORMED_RUST_SOURCE", "unterminated string literal")
             blank(index, cursor)
             index = cursor
             continue
@@ -805,7 +824,7 @@ def _package_rows(
             reachability = Reachability.BUILD_ONLY
         elif dev_consumers:
             reachability = Reachability.TEST_ONLY
-        elif package.get("links") or package.get("metadata", {}).get("eliot", {}).get("dynamic_registration"):
+        elif package.get("links") or ((package.get("metadata") or {}).get("eliot") or {}).get("dynamic_registration"):
             reachability = Reachability.UNRESOLVED_DYNAMIC
         else:
             reachability = Reachability.NO_CONSUMER
@@ -959,20 +978,102 @@ def build_inventory(root: Path, runner: Runner | None = None) -> dict[str, Any]:
     return semantic
 
 
+def run_self_tests() -> int:
+    """Run internal unit/fixture self-tests without spawning slow external tools."""
+    sample = """
+    // single line comment
+    /* block
+       comment */
+    fn foo<'a>(x: &'static str) -> char {
+        let c = 'a';
+        let byte_c = b'\\n';
+        let quote = '"';
+        let s = "hello \\"world\\"";
+        let raw = r#"raw "string" here"#;
+        todo!();
+        c
+    }
+    """
+    masked = _mask_rust(sample)
+    assert "// single line comment" not in masked
+    assert "/* block" not in masked
+    assert "hello" not in masked
+    assert 'raw "string"' not in masked
+    assert "'a'" not in masked
+    assert "fn foo" in masked
+    assert "todo!" in masked
+
+    try:
+        _mask_rust("/* unclosed")
+        assert False, "should fail on unclosed comment"
+    except InventoryError as exc:
+        assert exc.code == "MALFORMED_RUST_SOURCE"
+
+    try:
+        _mask_rust('let s = "unclosed;')
+        assert False, "should fail on unclosed string"
+    except InventoryError as exc:
+        assert exc.code == "MALFORMED_RUST_SOURCE"
+
+    h1 = _sha256(_canonical_bytes({"b": 2, "a": [1, 2, 3]}))
+    h2 = _sha256(_canonical_bytes({"a": [1, 2, 3], "b": 2}))
+    assert h1 == h2, "canonical bytes must sort keys deterministically"
+
+    with tempfile.TemporaryDirectory() as td:
+        troot = Path(td).resolve()
+        (troot / ".eliot").mkdir()
+        try:
+            _safe_output(troot, troot / "unsafe.json")
+            assert False, "should reject output outside .eliot"
+        except InventoryError as exc:
+            assert exc.code == "UNSAFE_OUTPUT"
+
+        safe_out = _safe_output(troot, troot / ".eliot" / "out.json")
+        assert safe_out == troot / ".eliot" / "out.json"
+
+        safe_out.write_text("existing", encoding="utf-8")
+        try:
+            _safe_output(troot, troot / ".eliot" / "out.json", overwrite=False)
+            assert False, "should reject existing output"
+        except InventoryError as exc:
+            assert exc.code == "OUTPUT_EXISTS"
+
+        safe_out_ow = _safe_output(troot, troot / ".eliot" / "out.json", overwrite=True)
+        assert safe_out_ow == safe_out
+
+    print("PASS: crate_reachability_inventory self-tests completed successfully")
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo-root", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--repo-root", type=Path, default=Path("."))
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--overwrite", action="store_true", help="allow overwriting existing output")
+    parser.add_argument("--self-test", action="store_true", help="run internal self-tests")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.self_test:
+        return run_self_tests()
+    if args.output is None:
+        print(
+            json.dumps(
+                {"status": "error", "code": "MISSING_OUTPUT", "detail": "--output is required when not running --self-test"},
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 2
     try:
         root = _root(args.repo_root)
-        output = _safe_output(root, args.output)
+        output = _safe_output(root, args.output, overwrite=args.overwrite)
         inventory = build_inventory(root)
         output.parent.mkdir(parents=True, exist_ok=True)
+        if args.overwrite and output.exists():
+            output.unlink()
         with output.open("xb") as handle:
             handle.write(_canonical_bytes(inventory))
             handle.write(b"\n")
