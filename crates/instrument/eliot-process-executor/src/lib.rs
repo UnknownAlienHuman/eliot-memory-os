@@ -1752,7 +1752,8 @@ mod tests {
         stdout_limit: u64,
         stderr_limit: u64,
         sink: Arc<dyn ProcessEvidenceSink>,
-    ) -> Result<ProcessEvidence, Box<dyn std::error::Error>> {        let executable = r"C:\Windows\System32\cmd.exe";
+    ) -> Result<ProcessEvidence, Box<dyn std::error::Error>> {
+        let executable = r"C:\Windows\System32\cmd.exe";
         let digest = super::sha256_file(std::path::Path::new(executable))?;
         let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
         let operation_id = OperationId::new(format!("op-t2-s03-{op_tag}"))?;
