@@ -12,5 +12,8 @@ eliot-platform-windows.workspace = true
 eliot-process.workspace = true
 sha2.workspace = true
 
+[dev-dependencies]
+eliot-platform.workspace = true
+
 [lints]
 workspace = true
