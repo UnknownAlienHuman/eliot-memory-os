@@ -13,11 +13,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
 use eliot_governor::{
-    CompositionError, CompositionReadiness, GovernorComposition, GovernorLaunchConfig,
-    KernelGenerationPort, QueueLimits,
+    CompositionError, CompositionReadiness, GovernorActivationOutcome, GovernorComposition,
+    GovernorLaunchConfig, KernelGenerationPort, QueueLimits,
 };
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
-use eliot_protocol::{AgentActivationResolutionDecision, AgentActivationResolutionTicket};
+use eliot_protocol::{
+    AgentActivationResolutionDecision, AgentActivationResolutionResult,
+    AgentActivationResolutionTicket,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -247,6 +250,10 @@ impl DaemonComposition {
     }
 
     /// Resolves one Kernel-issued semantic ticket through the sole Governor.
+    ///
+    /// The Governor typed outcome is the sole discriminator: only `Resolved`
+    /// produces a decision. Every other outcome is surfaced as an error and is
+    /// never coerced to success.
     pub fn resolve_agent_activation(
         &self,
         ticket: &AgentActivationResolutionTicket,
@@ -265,13 +272,62 @@ impl DaemonComposition {
                 "semantic activation ticket deadline has expired".to_owned(),
             ));
         }
-        let snapshot = self.governor.read_unique_agent_activation(now)?;
-        if snapshot.state_fence != ticket.state_fence {
+        match self.governor.resolve_activation_outcome(now) {
+            GovernorActivationOutcome::Resolved(snapshot) => {
+                if snapshot.state_fence != ticket.state_fence {
+                    return Err(DaemonError::Lifecycle(
+                        "semantic activation ticket fence does not match the Governor snapshot"
+                            .to_owned(),
+                    ));
+                }
+                activation_projection::map_activation_snapshot(ticket, snapshot)
+            }
+            outcome => Err(DaemonError::Lifecycle(format!(
+                "semantic activation did not resolve: {}",
+                outcome.kind_str()
+            ))),
+        }
+    }
+
+    /// Resolves one Kernel-issued semantic ticket to the canonical v2 typed
+    /// result. Every `GovernorActivationOutcome` variant maps 1:1 to its
+    /// protocol disposition without coercion to success.
+    pub fn resolve_agent_activation_v2(
+        &self,
+        ticket: &AgentActivationResolutionTicket,
+        now: u64,
+    ) -> Result<AgentActivationResolutionResult, DaemonError> {
+        ticket
+            .validate()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        if self.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Lifecycle(
-                "semantic activation ticket fence does not match the Governor snapshot".to_owned(),
+                "semantic activation resolution requires a ready Governor".to_owned(),
             ));
         }
-        activation_projection::map_activation_snapshot(ticket, snapshot)
+        if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
+            return Err(DaemonError::Lifecycle(
+                "semantic activation ticket deadline has expired".to_owned(),
+            ));
+        }
+        match self.governor.resolve_activation_outcome(now) {
+            GovernorActivationOutcome::Resolved(snapshot) => {
+                if snapshot.state_fence != ticket.state_fence {
+                    return Err(DaemonError::Lifecycle(
+                        "semantic activation ticket fence does not match the Governor snapshot"
+                            .to_owned(),
+                    ));
+                }
+                activation_projection::map_governor_outcome_to_protocol(
+                    ticket,
+                    GovernorActivationOutcome::Resolved(snapshot),
+                    now.max(1),
+                )
+            }
+            outcome => {
+                activation_projection::map_governor_outcome_to_protocol(ticket, outcome, now.max(1))
+            }
+        }
     }
 
     /// Stops the one daemon owner and releases protected handles together.
@@ -299,6 +355,14 @@ impl AgentActivationResolver for DaemonComposition {
         now: u64,
     ) -> Result<AgentActivationResolutionDecision, DaemonError> {
         DaemonComposition::resolve_agent_activation(self, ticket, now)
+    }
+
+    fn resolve_agent_activation_v2(
+        &self,
+        ticket: &AgentActivationResolutionTicket,
+        now: u64,
+    ) -> Result<AgentActivationResolutionResult, DaemonError> {
+        DaemonComposition::resolve_agent_activation_v2(self, ticket, now)
     }
 }
 

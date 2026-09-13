@@ -10,7 +10,7 @@
 //! - **I1.11 Startup algorithm** — resolution is available only after Governor/Kernel admission; no startup authority issuance here.
 //! - **I2.2 When a capability becomes a separate crate** — pure contract/test seam justifies isolated module; no placeholder proliferation.
 //! - **I2.23 Capability-family topology and crate extraction decisions** — Governor task/authority/canonical-transition family; validated via `CrateExtractionDecision`.
-//! - **Semantic-grant handle: `eliot_governor::GovernorActivationSnapshot` / `eliot_protocol::AgentActivationResolutionTicket` -> `eliot_protocol::AgentActivationResolutionDecision` via `GovernorComposition::read_unique_agent_activation`** — Kernel-issued ticket resolved against the current Governor owner set.
+//! - **Semantic-grant handle: `eliot_governor::GovernorActivationOutcome` / `eliot_protocol::AgentActivationResolutionTicket` -> `eliot_protocol::AgentActivationResolutionDecision` via `GovernorComposition::resolve_activation_outcome`** — Kernel-issued ticket resolved against the current Governor owner set.
 //! - **Wave 2 Governor-internal outcome -> protocol v2**: `eliot_governor::GovernorActivationOutcome` -> `eliot_protocol::AgentActivationResolutionResult` is a lossless, exhaustive mapping; no resolver error is coerced to success or dropped.
 //!
 //! This is a read-only activation resolution projection and owns no authority issuance, write/effect, fence, default, retry, Kernel, Store, or lifecycle semantics.
@@ -106,13 +106,6 @@ pub(super) fn map_activation_snapshot(
 // Wave 2: lossless Governor -> protocol v2 mapping
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "lossless outcome projection is exercised by projection_tests; the daemon still maps through map_activation_snapshot until #839 wires it"
-    )
-)]
 fn map_coverage(coverage: GovernorCandidateCoverage) -> AgentActivationCandidateCoverage {
     match coverage {
         GovernorCandidateCoverage::Complete => AgentActivationCandidateCoverage::Complete,
@@ -121,13 +114,6 @@ fn map_coverage(coverage: GovernorCandidateCoverage) -> AgentActivationCandidate
     }
 }
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "lossless outcome projection is exercised by projection_tests; the daemon still maps through map_activation_snapshot until #839 wires it"
-    )
-)]
 fn map_selection(selection: GovernorSelectionDirective) -> AgentActivationSelectionDirective {
     AgentActivationSelectionDirective {
         candidate_handles: selection.candidate_handles,
@@ -136,13 +122,6 @@ fn map_selection(selection: GovernorSelectionDirective) -> AgentActivationSelect
     }
 }
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "lossless outcome projection is exercised by projection_tests; the daemon still maps through map_activation_snapshot until #839 wires it"
-    )
-)]
 fn map_retry(retry: GovernorRetryDirective) -> AgentActivationRetryDirective {
     AgentActivationRetryDirective {
         dependency_ref: retry.dependency_ref,
@@ -154,13 +133,6 @@ fn map_retry(retry: GovernorRetryDirective) -> AgentActivationRetryDirective {
 /// Lossless mapping from the Governor-internal typed outcome to the wire v2
 /// protocol result. Every variant is preserved 1:1; no error is coerced to
 /// `Resolved` and no error is dropped.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "lossless outcome projection is exercised by projection_tests; the daemon still maps through map_activation_snapshot until #839 wires it"
-    )
-)]
 pub fn map_governor_outcome_to_protocol(
     ticket: &AgentActivationResolutionTicket,
     outcome: GovernorActivationOutcome,
