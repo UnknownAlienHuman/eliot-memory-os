@@ -38,7 +38,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard};
 
-use eliot_contracts::{AuthorityEpoch, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{AuthorityEpoch, EpochId, canonical_json_bytes, sha256_hex};
 use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
 use eliot_runtime_contracts::{
     AuthorityActivationReceipt, AuthorityRevocationReceipt, AuthorityState,
@@ -858,6 +858,28 @@ fn check_binding(
     Ok(())
 }
 
+/// Validates one canonical epoch binding without any scalar coercion.
+///
+/// The fence epoch authorizes only on exact lineage-plus-sequence equality
+/// with the active epoch. Cross-lineage same-sequence inputs and any other
+/// mismatch fail closed as [`KernelError::FenceMismatch`]; no numeric epoch is
+/// extracted or compared across lineages.
+///
+/// # Errors
+///
+/// Returns [`KernelError::FenceMismatch`] when the canonical tuple does not
+/// exactly match.
+pub fn check_canonical_epoch_binding(
+    fence_epoch: &EpochId,
+    active_epoch: &EpochId,
+) -> Result<(), KernelError> {
+    if fence_epoch.is_same_authority(active_epoch) {
+        Ok(())
+    } else {
+        Err(KernelError::FenceMismatch)
+    }
+}
+
 /// Rejects a requested effect or proof claim above the binding ceiling.
 fn check_ceiling(
     allowed_effect: EffectClass,
@@ -1539,5 +1561,42 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
             // snapshot.
             P07PortError::Unavailable
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_contracts::EpochLineageId;
+    use std::num::NonZeroU64;
+
+    fn canonical_epoch(lineage: &str, sequence: u64) -> Result<EpochId, KernelError> {
+        let lineage_id =
+            EpochLineageId::new(lineage).map_err(|_| KernelError::InvalidField {
+                field: "lineage_id",
+                reason: "must be a canonical UUID lineage",
+            })?;
+        let sequence = NonZeroU64::new(sequence).ok_or(KernelError::InvalidField {
+            field: "sequence",
+            reason: "must be greater than zero",
+        })?;
+        EpochId::new(lineage_id, sequence).map_err(|_| KernelError::InvalidField {
+            field: "epoch_id",
+            reason: "invalid canonical epoch",
+        })
+    }
+
+    #[test]
+    fn canonical_binding_rejects_cross_lineage_same_sequence() -> Result<(), KernelError> {
+        let active = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
+        let same = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
+        let cross_lineage_same_sequence =
+            canonical_epoch("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 7)?;
+        assert!(check_canonical_epoch_binding(&same, &active).is_ok());
+        assert!(matches!(
+            check_canonical_epoch_binding(&cross_lineage_same_sequence, &active),
+            Err(KernelError::FenceMismatch)
+        ));
+        Ok(())
     }
 }
