@@ -6626,19 +6626,37 @@ fn current_state_memory_free_control_excludes_all_memory_content() -> TestResult
 fn recall_l0_mcp_matches_cli() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = seed_with_writer_smoke()?;
-    let cli = run_json(&[
+    let cli_args = [
         "memory",
         "recall-l0",
         "--project",
         &project_id,
         "--query",
         "writer smoke",
-    ])?;
+    ];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut cli = run_json(&cli_args)?;
+    loop {
+        let published =
+            cli.get("projection_state").and_then(Value::as_str) == Some("published");
+        let has_handles = cli
+            .get("handles")
+            .and_then(Value::as_array)
+            .is_some_and(|handles| !handles.is_empty());
+        if published || has_handles {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+        cli = run_json(&cli_args)?;
+    }
     let mut client = McpClient::start()?;
     let mcp = client.tool_call(
         2,
         "eliot_recall_l0",
-        &json!({ "project_id": project_id, "query": "writer smoke", "scope": null, "limit": 50 }),
+        &json!({ "project_id": project_id, "query": "writer smoke", "scope": null, "limit": null }),
     )?;
 
     assert_eq!(mcp, cli);
