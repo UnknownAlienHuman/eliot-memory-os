@@ -40,6 +40,12 @@ confirmed = [
   "no complete inventory maps every legacy table/index/field and migration byte to one current owner or retirement disposition.",
 ]
 
+[disposition]
+orphan_root = "deleted-as-orphan"
+deleted = "2026-09-13"
+consumers_found = 0
+removal_condition = "satisfied; waves B/C/D deferred"
+
 [scope]
 primary_paths = [
   "migrations/**",
