@@ -1,4 +1,6 @@
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, canonical_json_bytes};
+use eliot_contracts::{
+    AuthorityEpoch, EpochId, ResourceGeneration, StateFence, canonical_json_bytes,
+};
 use eliot_platform::{PlatformHandle, SecretReference};
 use eliot_receipts::ReceiptEnvelope;
 use eliot_runtime_contracts::{
@@ -911,7 +913,7 @@ impl ProcessStartReplayRecord {
         eliot_process::ProcessOwnerBinding::new(
             self.owner.module_id(),
             self.owner.principal_digest(),
-            self.owner.authority_epoch(),
+            self.owner.authority_epoch().clone(),
             self.owner.generation(),
         )
         .map_err(|error| OrsError::IntegrityProblem {
@@ -1085,7 +1087,7 @@ pub struct ProcessEvidenceRecord {
     pub image_id: OpaqueLabel,
     pub session_id: OpaqueLabel,
     pub owner: eliot_process::ProcessOwnerBinding,
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub generation: u64,
     pub state_fence_digest: String,
     pub binding_digest: String,
@@ -1126,7 +1128,7 @@ impl ProcessEvidenceRecord {
             job_id: OpaqueLabel::new(binding.job_id().as_str())?,
             image_id: OpaqueLabel::new(binding.image_id().as_str())?,
             session_id: OpaqueLabel::new(binding.session_id().as_str())?,
-            authority_epoch: owner.authority_epoch(),
+            authority_epoch: owner.authority_epoch().clone(),
             generation: owner.generation().get(),
             owner,
             state_fence_digest: sha256_hex(&state_fence_bytes),
@@ -1184,7 +1186,7 @@ impl ProcessEvidenceRecord {
         )?;
         validate_digest(&self.binding_digest, "process_evidence_binding_digest")?;
         validate_digest(&self.evidence_digest, "process_evidence_digest")?;
-        if self.authority_epoch == 0 || self.generation == 0 || self.observed_at_ms <= 0 {
+        if self.generation == 0 || self.observed_at_ms <= 0 {
             return Err(OrsError::InvalidField {
                 field: "process_evidence_identity",
                 reason: "epoch, generation, and observation time must be positive",
@@ -1211,7 +1213,7 @@ impl ProcessEvidenceRecord {
         let owner = eliot_process::ProcessOwnerBinding::new(
             self.owner.module_id(),
             self.owner.principal_digest(),
-            self.owner.authority_epoch(),
+            self.owner.authority_epoch().clone(),
             self.owner.generation(),
         )
         .map_err(|error| OrsError::IntegrityProblem {
@@ -1219,7 +1221,9 @@ impl ProcessEvidenceRecord {
             reason: error.to_string(),
         })?;
         if owner != self.owner
-            || self.authority_epoch != self.owner.authority_epoch()
+            || !self
+                .authority_epoch
+                .is_same_authority(self.owner.authority_epoch())
             || self.generation != self.owner.generation().get()
             || self.operation_id.as_str() != self.evidence.operation_id().as_str()
             || self.request_digest != self.evidence.request_digest()
@@ -1254,10 +1258,13 @@ impl ProcessEvidenceRecord {
         }
         let fence: Value = serde_json::from_slice(&state_fence_bytes)
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
-        let fence_epoch = fence
-            .get("authority_epoch")
-            .and_then(Value::as_u64)
-            .ok_or(OrsError::FenceMismatch)?;
+        let fence_epoch: EpochId = serde_json::from_value(
+            fence
+                .get("authority_epoch")
+                .cloned()
+                .ok_or(OrsError::FenceMismatch)?,
+        )
+        .map_err(|_| OrsError::FenceMismatch)?;
         let fence_generation = fence
             .get("generation")
             .and_then(Value::as_u64)

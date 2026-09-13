@@ -5398,7 +5398,21 @@ fn storage(error: impl std::fmt::Display) -> OrsError {
 mod process_start_abort_tests {
     use super::*;
     use crate::OperationIdentity;
+    use eliot_contracts::{EpochId, EpochLineageId};
     use serde_json::json;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn test_epoch(sequence: u64) -> Result<EpochId, OrsError> {
+        let lineage = EpochLineageId::new(TEST_LINEAGE)
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let sequence = NonZeroU64::new(sequence).ok_or(OrsError::InvalidField {
+            field: "test_epoch",
+            reason: "sequence must be non-zero",
+        })?;
+        EpochId::new(lineage, sequence).map_err(|error| OrsError::Contract(error.to_string()))
+    }
 
     fn process_start_receipt(
         operation_id: &str,
@@ -5414,9 +5428,15 @@ mod process_start_abort_tests {
                 "generation": 1,
                 "action_lease_ref": "lease-1",
                 "authority_id": "authority-1",
-                "authority_epoch": 1,
+                "authority_epoch": {
+                    "lineage_id": "11111111-1111-4111-8111-111111111111",
+                    "sequence": 1
+                },
                 "state_fence": {
-                    "authority_epoch": 1,
+                    "authority_epoch": {
+                        "lineage_id": "11111111-1111-4111-8111-111111111111",
+                        "sequence": 1
+                    },
                     "generation": 1,
                     "nonce": "fence-1"
                 },
@@ -5465,7 +5485,7 @@ mod process_start_abort_tests {
         let owner = eliot_process::ProcessOwnerBinding::new(
             "testd",
             "a".repeat(64),
-            1,
+            test_epoch(1)?,
             eliot_process::Generation::new(1).map_err(|error| OrsError::IntegrityProblem {
                 record_type: "test",
                 reason: error.to_string(),
@@ -5488,7 +5508,7 @@ mod process_start_abort_tests {
         let wrong_owner = eliot_process::ProcessOwnerBinding::new(
             "testd",
             "b".repeat(64),
-            1,
+            test_epoch(1)?,
             eliot_process::Generation::new(1).map_err(|error| OrsError::IntegrityProblem {
                 record_type: "test",
                 reason: error.to_string(),

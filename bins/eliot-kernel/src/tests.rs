@@ -13,7 +13,7 @@
 //! This module owns no runtime authority and exercises only the Kernel composition
 //! boundary via `super::*`. It is an ordinary module kept under 10k LOC.
 use super::*;
-use eliot_contracts::ContractVersion;
+use eliot_contracts::{ContractVersion, EpochId, EpochLineageId};
 use eliot_kernel_core::{KernelError, KernelResult, SealedAuthoritySnapshot};
 use eliot_ors::{
     EpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity, RecoveryPayload,
@@ -31,6 +31,7 @@ use eliot_runtime_contracts::{
     SupervisionSealedKeyFileIdentity,
 };
 use eliot_store_api::{RevisionHead, RevisionKey};
+use std::num::NonZeroU64;
 use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -121,8 +122,8 @@ impl RealExecutorTestAuthority {
     fn new(authority_id: DispatchAuthorityId) -> Self {
         let issued_at_ms = unix_ms();
         let generation = Generation::new(1).expect("generation");
-        let fence =
-            FencingToken::new(1, generation, "real-executor-test-fence").expect("test fence");
+        let fence = FencingToken::new(test_epoch_a(1), generation, "real-executor-test-fence")
+            .expect("test fence");
         let revision_heads = BTreeMap::from([("real-executor".to_owned(), "a".repeat(64))]);
         let context = DispatchValidationContext::new(
             ClockObservation {
@@ -132,7 +133,7 @@ impl RealExecutorTestAuthority {
                 monotonic_ns: None,
             },
             fence.clone(),
-            1,
+            test_epoch_a(1),
             revision_heads.clone(),
             1,
         )
@@ -268,8 +269,12 @@ fn real_executor_admission(
         ACTIVE_DAEMON_CALLER,
         intent,
         ActionLeaseRef::new(format!("real-executor-lease-{operation}")).expect("action lease"),
-        FencingToken::new(1, generation, format!("real-executor-fence-{operation}"))
-            .expect("state fence"),
+        FencingToken::new(
+            test_epoch_a(1),
+            generation,
+            format!("real-executor-fence-{operation}"),
+        )
+        .expect("state fence"),
         unix_ms().saturating_add(60_000),
     )
     .expect("real executor admission")
@@ -1591,9 +1596,15 @@ fn test_process_start_receipt_with_physical(
             "generation": 1,
             "action_lease_ref": "eliotd-ready-test-lease",
             "authority_id": "eliotd",
-            "authority_epoch": 1,
+            "authority_epoch": {
+                "lineage_id": TEST_LINEAGE_A,
+                "sequence": 1
+            },
             "state_fence": {
-                "authority_epoch": 1,
+                "authority_epoch": {
+                    "lineage_id": TEST_LINEAGE_A,
+                    "sequence": 1
+                },
                 "generation": 1,
                 "nonce": "eliotd-ready-test-fence"
             },
@@ -2184,10 +2195,24 @@ impl DispatchSnapshotCodec for JsonSnapshotCodec {
     }
 }
 
+const TEST_LINEAGE_A: &str = "11111111-1111-4111-8111-111111111111";
+
+fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(lineage).expect("valid test lineage"),
+        NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
+fn test_epoch_a(sequence: u64) -> EpochId {
+    test_epoch(TEST_LINEAGE_A, sequence)
+}
+
 fn authority_binding(authority_id: &DispatchAuthorityId) -> AuthoritySnapshotBinding {
     let epoch = EpochLineage {
         current: EpochIdentity {
-            lineage_id: OpaqueLabel::new("kernel-test-lineage").expect("lineage"),
+            lineage_id: OpaqueLabel::new(TEST_LINEAGE_A).expect("lineage"),
             epoch: 1,
         },
         predecessor: None,
@@ -2233,9 +2258,13 @@ fn test_validation_context(seed: &str) -> DispatchValidationContext {
             transaction_sequence: None,
             monotonic_ns: None,
         },
-        FencingToken::new(1, Generation::new(1).expect("generation"), "context-fence")
-            .expect("fence"),
-        1,
+        FencingToken::new(
+            test_epoch_a(1),
+            Generation::new(1).expect("generation"),
+            "context-fence",
+        )
+        .expect("fence"),
+        test_epoch_a(1),
         BTreeMap::from([(seed.to_owned(), "a".repeat(64))]),
         1,
     )
@@ -2246,7 +2275,7 @@ fn gateway_test_owner() -> ProcessOwnerBinding {
     ProcessOwnerBinding::new(
         "eliotd",
         "a".repeat(64),
-        1,
+        test_epoch_a(1),
         Generation::new(1).expect("generation"),
     )
     .expect("owner")
@@ -2274,7 +2303,7 @@ fn gateway_test_admission(operation: &str) -> ProcessExecutionAdmissionRequest {
         intent,
         ActionLeaseRef::new(format!("lease-{operation}")).expect("lease"),
         FencingToken::new(
-            1,
+            test_epoch_a(1),
             Generation::new(1).expect("generation"),
             format!("fence-{operation}"),
         )
@@ -2930,7 +2959,7 @@ async fn daemon_recovery_closes_exact_prior_tree_and_rejects_stale_receipt() {
             launch.authority_epoch.value(),
             generation,
         ),
-        launch.authority_epoch.value(),
+        test_epoch_a(1),
         generation,
     )
     .expect("daemon owner");
@@ -2995,9 +3024,10 @@ fn store_projection_is_deterministic_and_binds_empty_and_full_fence_state() {
     };
     let mut reordered = first.clone();
     reordered.observed_at_unix_ms = 2_000;
-    let (first_fence, first_heads) = project_store_snapshot(&first).expect("projection");
+    let (first_fence, first_heads) =
+        project_store_snapshot(&first, &test_epoch_a(3)).expect("projection");
     let (reordered_fence, reordered_heads) =
-        project_store_snapshot(&reordered).expect("projection");
+        project_store_snapshot(&reordered, &test_epoch_a(3)).expect("projection");
     assert_eq!(first_fence, reordered_fence);
     assert_eq!(first_heads, reordered_heads);
     assert!(first_heads.contains_key(RESERVED_STORE_SNAPSHOT_HEAD));
@@ -3009,7 +3039,8 @@ fn store_projection_is_deterministic_and_binds_empty_and_full_fence_state() {
         validation_revision: 1,
         observed_at_unix_ms: 1_000,
     };
-    let (_, empty_heads) = project_store_snapshot(&empty).expect("empty projection");
+    let (_, empty_heads) =
+        project_store_snapshot(&empty, &test_epoch_a(3)).expect("empty projection");
     assert_eq!(empty_heads.len(), 1);
     assert!(empty_heads.contains_key(RESERVED_STORE_SNAPSHOT_HEAD));
 
@@ -3019,18 +3050,21 @@ fn store_projection_is_deterministic_and_binds_empty_and_full_fence_state() {
     for head in &mut changed.revision_heads {
         head.state_fence = changed.state_fence.clone();
     }
-    let (changed_fence, changed_heads) = project_store_snapshot(&changed).expect("changed");
+    let (changed_fence, changed_heads) =
+        project_store_snapshot(&changed, &test_epoch_a(3)).expect("changed");
     assert_ne!(first_fence, changed_fence);
     assert_ne!(first_heads, changed_heads);
 
     let mut changed_head = first.clone();
     changed_head.revision_heads[0].revision += 1;
-    let (_, changed_head_projection) = project_store_snapshot(&changed_head).expect("changed head");
+    let (_, changed_head_projection) =
+        project_store_snapshot(&changed_head, &test_epoch_a(3)).expect("changed head");
     assert_ne!(first_heads, changed_head_projection);
     let mut changed_validation_revision = first;
     changed_validation_revision.validation_revision += 1;
     let (_, changed_revision_projection) =
-        project_store_snapshot(&changed_validation_revision).expect("changed revision");
+        project_store_snapshot(&changed_validation_revision, &test_epoch_a(3))
+            .expect("changed revision");
     assert_ne!(first_heads, changed_revision_projection);
 }
 
@@ -3055,8 +3089,12 @@ fn process_authority_first_issue_is_versioned_and_stale_controller_fails_closed(
     let issuance = |nonce: &str| {
         PermitIssuance::new(
             ActionLeaseRef::new("cas-lease").expect("lease"),
-            FencingToken::new(1, Generation::new(1).expect("generation"), "cas-fence")
-                .expect("fence"),
+            FencingToken::new(
+                test_epoch_a(1),
+                Generation::new(1).expect("generation"),
+                "cas-fence",
+            )
+            .expect("fence"),
             BTreeMap::from([("authority".to_owned(), "a".repeat(64))]),
             1,
             2,
@@ -3146,8 +3184,12 @@ fn process_authority_constructor_reuses_one_real_ors_store() {
         seed_store,
         Arc::clone(&codec),
     );
-    let seed_fence = FencingToken::new(1, Generation::new(1).expect("generation"), "seed-fence")
-        .expect("seed fence");
+    let seed_fence = FencingToken::new(
+        test_epoch_a(1),
+        Generation::new(1).expect("generation"),
+        "seed-fence",
+    )
+    .expect("seed fence");
     seeder
         .issue(
             &seed_intent(),
@@ -3233,19 +3275,23 @@ fn process_authority_constructor_reuses_one_real_ors_store() {
 #[test]
 fn process_owner_survives_reconnect_but_rejects_cross_owner() {
     let generation = Generation::new(7).expect("generation");
-    let owner = ProcessOwnerBinding::new("testd", "a".repeat(64), 3, generation).expect("owner");
+    let owner = ProcessOwnerBinding::new("testd", "a".repeat(64), test_epoch_a(3), generation)
+        .expect("owner");
     let reconnected =
-        ProcessOwnerBinding::new("testd", "a".repeat(64), 3, generation).expect("owner");
+        ProcessOwnerBinding::new("testd", "a".repeat(64), test_epoch_a(3), generation)
+            .expect("owner");
     assert!(authorize_process_owner(&owner, &reconnected).is_ok());
 
     let wrong_module =
-        ProcessOwnerBinding::new("native", "a".repeat(64), 3, generation).expect("owner");
+        ProcessOwnerBinding::new("native", "a".repeat(64), test_epoch_a(3), generation)
+            .expect("owner");
     let wrong_principal =
-        ProcessOwnerBinding::new("testd", "b".repeat(64), 3, generation).expect("owner");
+        ProcessOwnerBinding::new("testd", "b".repeat(64), test_epoch_a(3), generation)
+            .expect("owner");
     let wrong_generation = ProcessOwnerBinding::new(
         "testd",
         "a".repeat(64),
-        3,
+        test_epoch_a(3),
         Generation::new(8).expect("generation"),
     )
     .expect("owner");
@@ -3856,9 +3902,11 @@ fn stable_sid_owner_digest_ignores_process_and_session_replacement() {
     let first_digest = stable_owner_principal_digest("S-1-5-18", "testd", 3, generation);
     let restarted_digest = stable_owner_principal_digest("S-1-5-18", "testd", 3, generation);
     assert_eq!(first_digest, restarted_digest);
-    let first = ProcessOwnerBinding::new("testd", first_digest, 3, generation).expect("owner");
+    let first = ProcessOwnerBinding::new("testd", first_digest, test_epoch_a(3), generation)
+        .expect("owner");
     let restarted =
-        ProcessOwnerBinding::new("testd", restarted_digest, 3, generation).expect("owner");
+        ProcessOwnerBinding::new("testd", restarted_digest, test_epoch_a(3), generation)
+            .expect("owner");
     let first_session = ProcessSessionBinding::new("connection-a", 1).expect("session");
     let restarted_session = ProcessSessionBinding::new("connection-b", 2).expect("session");
     assert_ne!(first_session, restarted_session);
@@ -3876,8 +3924,13 @@ fn stable_sid_owner_digest_ignores_process_and_session_replacement() {
         ),
     ] {
         let digest = stable_owner_principal_digest(sid, module, authority, candidate_generation);
-        let candidate = ProcessOwnerBinding::new(module, digest, authority, candidate_generation)
-            .expect("owner");
+        let candidate = ProcessOwnerBinding::new(
+            module,
+            digest,
+            test_epoch_a(authority),
+            candidate_generation,
+        )
+        .expect("owner");
         assert!(authorize_process_owner(&first, &candidate).is_err());
     }
 }

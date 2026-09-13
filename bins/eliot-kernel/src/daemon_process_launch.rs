@@ -116,8 +116,17 @@ impl KernelComposition {
                 .map_err(|error| KernelBuildError::Service(error.to_string()))?,
         )
         .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-        let state_fence = FencingToken::new(
+        // The fence and owner below carry the gateway's retained EpochId pair
+        // (T2.md:177-206), resolved by `retained_owner_epoch` from the
+        // snapshot lineage and gated on the approved launch scalar: no lineage
+        // is reconstructed from the descriptor scalar here.
+        let owner_epoch = super::daemon_session_guard::retained_owner_epoch(
+            gateway,
             launch.authority_epoch.value(),
+        )
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let state_fence = FencingToken::new(
+            owner_epoch.clone(),
             generation,
             format!("eliotd-launch-fence-{launch_identity}"),
         )
@@ -141,7 +150,7 @@ impl KernelComposition {
                 launch.authority_epoch.value(),
                 generation,
             ),
-            launch.authority_epoch.value(),
+            owner_epoch,
             generation,
         )
         .map_err(|error| KernelBuildError::Service(error.to_string()))?;

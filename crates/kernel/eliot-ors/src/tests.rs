@@ -5,7 +5,11 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, sha256_hex};
+use std::num::NonZeroU64;
+
+use eliot_contracts::{
+    AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex,
+};
 use eliot_platform::SecretReference;
 use eliot_receipts::{ReceiptCore, ReceiptEnvelope};
 use eliot_runtime_contracts::{
@@ -504,7 +508,7 @@ fn process_start_replay_has_one_atomic_winner_and_rejects_substitution() -> Test
     let owner = eliot_process::ProcessOwnerBinding::new(
         "testd",
         "a".repeat(64),
-        1,
+        test_epoch(1)?,
         eliot_process::Generation::new(1)?,
     )?;
     let record = ProcessStartReplayRecord {
@@ -1545,6 +1549,17 @@ fn handoff_record(state: AuthorityHandoffState) -> Result<AuthorityHandoffRecord
     })
 }
 
+const TEST_LINEAGE: &str = "11111111-1111-4111-8111-111111111111";
+
+fn test_epoch(sequence: u64) -> TestResult<EpochId> {
+    let lineage = EpochLineageId::new(TEST_LINEAGE)?;
+    let sequence = NonZeroU64::new(sequence).ok_or(OrsError::InvalidField {
+        field: "test_epoch",
+        reason: "sequence must be non-zero",
+    })?;
+    Ok(EpochId::new(lineage, sequence)?)
+}
+
 fn process_evidence(
     operation_id: &str,
     lifecycle: &str,
@@ -1560,9 +1575,15 @@ fn process_evidence(
                 "generation": 1,
                 "action_lease_ref": "lease-1",
                 "authority_id": "authority-1",
-                "authority_epoch": 1,
+                "authority_epoch": {
+                    "lineage_id": TEST_LINEAGE,
+                    "sequence": 1
+                },
                 "state_fence": {
-                    "authority_epoch": 1,
+                    "authority_epoch": {
+                        "lineage_id": TEST_LINEAGE,
+                        "sequence": 1
+                    },
                     "generation": 1,
                     "nonce": "fence-1"
                 },
@@ -1603,7 +1624,7 @@ fn process_evidence_record(
     let owner = eliot_process::ProcessOwnerBinding::new(
         "testd",
         "aa".repeat(32),
-        1,
+        test_epoch(1)?,
         eliot_process::Generation::new(1)?,
     )?;
     Ok(ProcessEvidenceRecord::from_evidence(
@@ -1627,9 +1648,15 @@ fn process_start_receipt(
             "generation": 1,
             "action_lease_ref": "lease-1",
             "authority_id": "authority-1",
-            "authority_epoch": 1,
+            "authority_epoch": {
+                "lineage_id": TEST_LINEAGE,
+                "sequence": 1
+            },
             "state_fence": {
-                "authority_epoch": 1,
+                "authority_epoch": {
+                    "lineage_id": TEST_LINEAGE,
+                    "sequence": 1
+                },
                 "generation": 1,
                 "nonce": "fence-1"
             },
@@ -1682,7 +1709,7 @@ fn process_evidence_appends_history_idempotently_and_recovers_in_order() -> Test
     conflicting.owner = eliot_process::ProcessOwnerBinding::new(
         "native",
         conflicting.owner.principal_digest(),
-        conflicting.owner.authority_epoch(),
+        conflicting.owner.authority_epoch().clone(),
         conflicting.owner.generation(),
     )?;
     assert_eq!(conflicting.record_key()?, first.record_key()?);
@@ -1757,6 +1784,25 @@ fn process_evidence_appends_history_idempotently_and_recovers_in_order() -> Test
         vec![first, second]
     );
     cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn process_evidence_rejects_cross_lineage_epoch_with_same_sequence() -> TestResult {
+    let record = process_evidence_record("process-evidence-cross-lineage", "running", 100)?;
+    record.validate()?;
+    let other_lineage = EpochLineageId::new("22222222-2222-4222-8222-222222222222")?;
+    let crossed_sequence =
+        NonZeroU64::new(record.authority_epoch.sequence.get()).ok_or(OrsError::InvalidField {
+            field: "test_epoch",
+            reason: "sequence must be non-zero",
+        })?;
+    let mut crossed = record.clone();
+    crossed.authority_epoch = EpochId::new(other_lineage, crossed_sequence)?;
+    assert!(matches!(
+        crossed.validate(),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
     Ok(())
 }
 

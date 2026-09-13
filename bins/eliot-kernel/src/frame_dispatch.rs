@@ -9,11 +9,12 @@
 //! Forbidden authority: must not fabricate execution success, must not accept peer-owned shutdown authority, must not bypass `ServerHandshakePolicy`, generation poison, or state-fence compatibility.
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::dispatch_frame` plus inseparable dispatch-only helpers with zero external users.
 
+use super::daemon_session_guard::session_binding;
 use super::native_worker_lifecycle_route::is_native_worker_operation;
 use super::{
     ACTIVE_DAEMON_CALLER, Frame, FrameKind, KernelComposition, KernelFrameAction,
     KernelServiceState, MessageType, ProcessExecutionRequest, ProtocolPayload, Session,
-    TransportError, caller_binding, probe_ready_state_admitted, status_frame,
+    TransportError, probe_ready_state_admitted, status_frame,
 };
 
 impl KernelComposition {
@@ -227,7 +228,7 @@ impl KernelComposition {
                 }
                 if identity.deadline_unix_ms != admission.deadline_unix_ms()
                     || identity.request.state_fence.authority_epoch.value()
-                        != admission.state_fence().authority_epoch()
+                        != admission.state_fence().authority_epoch().sequence.get()
                     || identity.request.state_fence.resource_generation.value()
                         != admission.state_fence().generation().get()
                 {
@@ -241,7 +242,7 @@ impl KernelComposition {
                 // `ProcessIntent.session_id` no longer grants launch authority.
                 return Err(TransportError::SessionFenced);
             }
-            let (_, session_binding) = caller_binding(session)?;
+            let session_binding = session_binding(session)?;
             return Ok(KernelFrameAction::Process {
                 request_id,
                 request,

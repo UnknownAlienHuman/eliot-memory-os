@@ -43,10 +43,11 @@
 //! under a known identity is `IdentityConflict`; an unknown claim identity is
 //! `UnknownRequest`; an elapsed absolute deadline is `Timeout`.
 
+use super::daemon_session_guard::session_binding;
 use super::{
     KernelComposition, KernelFrameAction, KernelServiceState, ProcessExecutionRequest,
-    caller_binding, native_worker_reconcile_route::NATIVE_WORKER_RECONCILE_OPERATION, sha256_json,
-    status_frame, unix_ms,
+    native_worker_reconcile_route::NATIVE_WORKER_RECONCILE_OPERATION, sha256_json, status_frame,
+    unix_ms,
 };
 use eliot_contracts::{AuthorityEpoch, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ipc::{Session, TransportError};
@@ -1648,8 +1649,8 @@ impl KernelComposition {
             OperationId::new(binding.operation_id).map_err(|_| NativeWorkerRouteError::Shape {
                 field: "operation_id",
             })?;
-        let (_, session_binding) =
-            caller_binding(session).map_err(|_| NativeWorkerRouteError::Fence {
+        let session_binding =
+            session_binding(session).map_err(|_| NativeWorkerRouteError::Fence {
                 field: "session_binding",
             })?;
         Ok((operation_id, session_binding))

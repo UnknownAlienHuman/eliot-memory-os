@@ -149,9 +149,20 @@ impl KernelComposition {
             kernel_process.image_path(),
         )?;
         let expected_operation = eliotd_operation_id(generation, &launch_identity)?;
+        // Scalar-sequence staleness gate against the approved launch contour:
+        // the receipt fence carries the full EpochId pair (lineage proven at
+        // admission), while the launch descriptor retains only the scalar
+        // contour, so the contour join is on the sequence component. Lineage
+        // itself is never re-derived from this scalar.
         if receipt.operation_id() != &expected_operation
             || receipt.accepted_generation().get() != launch.generation.value()
-            || receipt.binding().state_fence().authority_epoch() != launch.authority_epoch.value()
+            || receipt
+                .binding()
+                .state_fence()
+                .authority_epoch()
+                .sequence
+                .get()
+                != launch.authority_epoch.value()
             || receipt.binding().state_fence().generation() != generation
             || receipt.identity().executable_sha256() != launch.executable_sha256
             || !receipt
@@ -166,6 +177,14 @@ impl KernelComposition {
         }
         let kernel_expectation = current_process_named_pipe_expectation()
             .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+        // The recovery owner carries the gateway's retained EpochId pair
+        // (T2.md:177-206), gated on the approved launch scalar by
+        // `retained_owner_epoch`; no lineage is reconstructed here.
+        let owner_epoch = super::daemon_session_guard::retained_owner_epoch(
+            gateway,
+            launch.authority_epoch.value(),
+        )
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let owner = ProcessOwnerBinding::new(
             ACTIVE_DAEMON_CALLER,
             stable_owner_principal_digest(
@@ -174,7 +193,7 @@ impl KernelComposition {
                 launch.authority_epoch.value(),
                 generation,
             ),
-            launch.authority_epoch.value(),
+            owner_epoch,
             generation,
         )
         .map_err(|error| KernelBuildError::Service(error.to_string()))?;

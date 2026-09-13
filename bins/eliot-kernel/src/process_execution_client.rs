@@ -19,8 +19,9 @@ use eliot_process::{
     ProcessExecutionView, ProcessOwnerBinding, ProcessSessionBinding, ProcessStartReceipt,
 };
 
+use super::daemon_session_guard::{caller_binding, retained_owner_epoch};
 use super::native_worker_lifecycle_route::{native_worker_json_str, native_worker_json_u64};
-use super::{KernelComposition, ProcessExecutionGateway, caller_binding};
+use super::{KernelComposition, ProcessExecutionGateway, TransportError};
 
 /// Operation port delegating to the gateway under one bound owner.
 ///
@@ -90,7 +91,22 @@ pub fn process_execution_client(
     session: &Session,
     session_binding: &ProcessSessionBinding,
 ) -> Result<KernelProcessExecutionClient, ProcessExecutionRejection> {
-    let Ok((owner, expected_session_binding)) = caller_binding(session) else {
+    // The process authority must be configured before the caller owner can be
+    // bound: the owner carries the gateway's retained EpochId pair
+    // (T2.md:177-206), resolved against the session scalar contour.
+    let Some(gateway) = kernel.process_gateway.as_ref() else {
+        return Err(ProcessExecutionRejection {
+            code: "PROCESS_AUTHORITY_CONFIGURATION_REQUIRED".to_owned(),
+            detail: "external process authority key, snapshot, replay, and evidence bindings are required".to_owned(),
+        });
+    };
+    let owner_epoch = retained_owner_epoch(gateway, session.authority_epoch).map_err(|_| {
+        ProcessExecutionRejection {
+            code: "AUTHENTICATED_CALLER_REQUIRED".to_owned(),
+            detail: "the established authenticated session binding is unavailable".to_owned(),
+        }
+    })?;
+    let Ok((owner, expected_session_binding)) = caller_binding(session, &owner_epoch) else {
         return Err(ProcessExecutionRejection {
             code: "AUTHENTICATED_CALLER_REQUIRED".to_owned(),
             detail: "the established authenticated session binding is unavailable".to_owned(),
@@ -102,12 +118,6 @@ pub fn process_execution_client(
             detail: "process operation session binding does not match the established authenticated session".to_owned(),
         });
     }
-    let Some(gateway) = kernel.process_gateway.as_ref() else {
-        return Err(ProcessExecutionRejection {
-            code: "PROCESS_AUTHORITY_CONFIGURATION_REQUIRED".to_owned(),
-            detail: "external process authority key, snapshot, replay, and evidence bindings are required".to_owned(),
-        });
-    };
     let gateway = Arc::clone(gateway);
     let starter: Arc<dyn ProcessStarter> = Arc::new(GatewayProcessStarter {
         kernel: Arc::clone(kernel),
@@ -212,7 +222,15 @@ pub async fn start_admitted_native_worker_claim(
             "native-worker claim receipt does not echo the admitted claim",
         ));
     }
-    let Ok((owner, _)) = caller_binding(session) else {
+    let Ok((owner, _)) = kernel
+        .process_gateway
+        .as_ref()
+        .map(|gateway| {
+            retained_owner_epoch(gateway, session.authority_epoch)
+                .and_then(|epoch| caller_binding(session, &epoch))
+        })
+        .unwrap_or(Err(TransportError::SessionFenced))
+    else {
         return Err(reject(
             "AUTHENTICATED_CALLER_REQUIRED",
             "the established authenticated session binding is unavailable",
@@ -236,7 +254,7 @@ pub async fn start_admitted_native_worker_claim(
             "native-worker claim admission deadline does not match the admitted claim",
         ));
     }
-    if admission.state_fence().authority_epoch() != claim_epoch
+    if admission.state_fence().authority_epoch().sequence.get() != claim_epoch
         || admission.state_fence().generation().get() != claim_generation
     {
         return Err(reject(

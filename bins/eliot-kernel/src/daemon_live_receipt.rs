@@ -404,9 +404,18 @@ impl KernelComposition {
                 self.reject_daemon_process_readiness("eliotd launch operation identity is invalid")
             })?;
         let physical = receipt.identity().physical();
+        // Scalar-sequence contour join: the receipt fence carries the full
+        // EpochId pair (lineage proven at admission) while the approved launch
+        // descriptor retains only the scalar contour.
         if receipt.operation_id() != &expected_operation
             || receipt.accepted_generation().get() != launch.generation.value()
-            || receipt.binding().state_fence().authority_epoch() != launch.authority_epoch.value()
+            || receipt
+                .binding()
+                .state_fence()
+                .authority_epoch()
+                .sequence
+                .get()
+                != launch.authority_epoch.value()
             || receipt.binding().state_fence().generation() != generation
             || receipt.identity().executable_sha256() != launch.executable_sha256
             || !physical
