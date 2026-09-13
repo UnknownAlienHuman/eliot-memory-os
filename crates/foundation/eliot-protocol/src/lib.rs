@@ -3524,7 +3524,7 @@ mod tests {
             bridge_generation: declaration.module_generation.generation,
             state_fence: declaration.module_generation.state_fence.clone(),
             kernel_principal_binding: declaration.expected_kernel_principal_binding.clone(),
-            kernel_authority_epoch: declaration.expected_kernel_authority_epoch,
+            kernel_authority_epoch: declaration.expected_kernel_authority_epoch.clone(),
             kernel_generation: declaration.expected_kernel_generation,
             kernel_artifact_sha256: declaration.expected_kernel_artifact_sha256.clone(),
             kernel_config_snapshot_sha256: declaration
