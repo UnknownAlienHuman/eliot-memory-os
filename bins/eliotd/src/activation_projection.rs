@@ -34,48 +34,37 @@ use crate::DaemonError;
 /// accept caller-selected semantic IDs and does not issue transport sessions,
 /// fences, capabilities, or effects.
 pub trait AgentActivationResolver {
-    /// Resolves one exact ticket against the current Governor owner set.
+    /// v1 compatibility projection: resolves one exact ticket to the legacy
+    /// `AgentActivationResolutionDecision` shape.
+    ///
+    /// v1-compat only. This method must not consume v2 typed-result data
+    /// (`AgentActivationResolutionResult` / `AgentActivationResolutionDisposition`);
+    /// v2 (`resolve_agent_activation_v2`) is the single production resolver
+    /// spine. Callers on the typed-outcome path must call v2.
+    ///
+    /// Removal is owned separately by the #839 follow-up (Slice 2 migrates the
+    /// daemon runtime call site to v2) with final v1 retirement tracked by #66;
+    /// this method is not removed as opportunistic cleanup.
     fn resolve_agent_activation(
         &self,
         ticket: &AgentActivationResolutionTicket,
         now: u64,
     ) -> Result<AgentActivationResolutionDecision, DaemonError>;
 
-    /// Resolves one exact ticket to the canonical v2 typed result. This is the
-    /// lossless projection for wave 2; every `GovernorActivationOutcome`
-    /// variant maps to exactly one `AgentActivationResolutionDisposition`
-    /// without silent coercion.
+    /// Canonical v2 production spine: resolves one exact ticket to the typed
+    /// v2 result. This is the lossless projection for wave 2; every
+    /// `GovernorActivationOutcome` variant maps to exactly one
+    /// `AgentActivationResolutionDisposition` without silent coercion.
+    ///
+    /// No default body is provided on purpose: every concrete resolver must
+    /// supply the exhaustive typed-outcome projection, so a resolver that has
+    /// not moved to the typed outcome fails closed at build time instead of
+    /// silently inheriting a synthesized `Resolved` binding.
     fn resolve_agent_activation_v2(
         &self,
         ticket: &AgentActivationResolutionTicket,
         now: u64,
-    ) -> Result<AgentActivationResolutionResult, DaemonError> {
-        // Default implementation falls back to mapping the legacy decision as
-        // Resolved. Implementations that own a typed Governor outcome should
-        // override this to provide the exhaustive variant coverage.
-        let decision = self.resolve_agent_activation(ticket, now)?;
-        // This path is only used when a concrete resolver has not yet moved to
-        // the typed Governor outcome; it synthesizes a Resolved binding from
-        // the legacy decision to preserve lossless mapping for that single path.
-        let binding = AgentActivationResolvedBinding {
-            principal_id: decision.principal_id,
-            session_id: decision.session_id,
-            task_id: decision.task_id,
-            work_unit_id: decision.work_unit_id,
-            work_scope_id: decision.work_scope_id,
-            task_revision: decision.task_revision,
-            plan_id: decision.plan_id,
-            plan_revision: decision.plan_revision,
-        };
-        AgentActivationResolutionResult::new(
-            ticket,
-            now.max(1),
-            AgentActivationResolutionDisposition::Resolved {
-                binding: Box::new(binding),
-            },
-        )
-        .map_err(|error| DaemonError::Lifecycle(error.to_string()))
-    }
+    ) -> Result<AgentActivationResolutionResult, DaemonError>;
 }
 
 pub(super) fn map_activation_snapshot(

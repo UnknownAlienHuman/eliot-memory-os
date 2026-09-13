@@ -249,7 +249,18 @@ impl DaemonComposition {
         }
     }
 
-    /// Resolves one Kernel-issued semantic ticket through the sole Governor.
+    /// v1 compatibility projection: resolves one Kernel-issued semantic ticket
+    /// to the legacy decision shape through the sole Governor.
+    ///
+    /// v1-compat only. This method must not consume v2 typed-result data;
+    /// `resolve_agent_activation_v2` is the single production resolver spine.
+    /// Behavior is preserved (only `Resolved` maps; every other outcome is an
+    /// error, never coerced to success) so the current runtime call site keeps
+    /// working until Slice 2 migrates it to v2.
+    ///
+    /// Removal is owned separately by the #839 follow-up (Slice 2 migrates the
+    /// daemon runtime call site to v2) with final v1 retirement tracked by #66;
+    /// this method is not removed as opportunistic cleanup.
     ///
     /// The Governor typed outcome is the sole discriminator: only `Resolved`
     /// produces a decision. Every other outcome is surfaced as an error and is
@@ -289,8 +300,9 @@ impl DaemonComposition {
         }
     }
 
-    /// Resolves one Kernel-issued semantic ticket to the canonical v2 typed
-    /// result. Every `GovernorActivationOutcome` variant maps 1:1 to its
+    /// Single production resolver spine: resolves one Kernel-issued semantic
+    /// ticket to the canonical v2 typed result. Every
+    /// `GovernorActivationOutcome` variant maps 1:1 to its
     /// protocol disposition without coercion to success.
     pub fn resolve_agent_activation_v2(
         &self,
