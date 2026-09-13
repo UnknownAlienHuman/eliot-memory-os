@@ -152,8 +152,13 @@ impl RedbInstallationRegistry {
                 "installation registry path is not the retained canonical Host child".to_owned(),
             ));
         }
-        let database = Database::create(file.path())
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        // A13.9 short-lived writer: bounded AlreadyOpen retry only
+        // (sole-owner contract above, lines 6-13). The installer drops this
+        // handle before any SCM start or convergence wait
+        // (bins/eliot/src/main.rs:2228), so contention with the Watchdog poll
+        // reader is transient; non-contention errors return immediately with
+        // their cause preserved.
+        let database = crate::redb_state::open_registry_writer_create_with_retry(file.path())?;
         file.verify_path_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         Ok(Self {
@@ -198,8 +203,11 @@ impl RedbInstallationRegistry {
         }
         file.verify_path_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        let database = Database::open(file.path())
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        // A13.9 short-lived terminal-reconcile writer
+        // (bins/eliot/src/main.rs:2416): bounded AlreadyOpen retry only
+        // against live Watchdog poll readers; nothing is held across a wait,
+        // and non-contention errors return immediately with cause preserved.
+        let database = crate::redb_state::open_registry_writer_with_retry(file.path())?;
         file.verify_path_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         Ok(Some(Self {
