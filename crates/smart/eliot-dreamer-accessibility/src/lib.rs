@@ -14,7 +14,7 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
-use eliot_dreamer_candidate_validation::RejectionCode;
+use eliot_dreamer_contracts::CurationRejectionCode;
 use eliot_dreamer_contracts::{
     CurationKind, GroundedDreamDraft, PreservationReport, TargetDenominator, ValidatedCurationItem,
     ValidationReceipt, is_hex64_lower,
@@ -2168,15 +2168,15 @@ pub fn propose_accessibility_or_influence_adjustment(
 /// maps to the rejection class a downstream gate would most likely record.
 /// The mapping is diagnostic only and never executes validation.
 #[must_use]
-pub fn outcome_rejection_hint(outcome: &AdjustmentOutcome) -> Option<RejectionCode> {
+pub fn outcome_rejection_hint(outcome: &AdjustmentOutcome) -> Option<CurationRejectionCode> {
     match outcome {
         AdjustmentOutcome::Complete => None,
         AdjustmentOutcome::Partial | AdjustmentOutcome::Blocked => {
-            Some(RejectionCode::PreservationFailed)
+            Some(CurationRejectionCode::PreservationFailed)
         }
-        AdjustmentOutcome::Abstention => Some(RejectionCode::LineageMismatch),
+        AdjustmentOutcome::Abstention => Some(CurationRejectionCode::LineageMismatch),
         AdjustmentOutcome::Stale | AdjustmentOutcome::Rejected => {
-            Some(RejectionCode::IdentityMismatch)
+            Some(CurationRejectionCode::IdentityMismatch)
         }
     }
 }
