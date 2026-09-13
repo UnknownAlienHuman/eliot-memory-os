@@ -828,18 +828,8 @@ pub enum BridgeError {
     #[error("RESOURCE_BINDING_MISMATCH: resource does not bind canonical content bytes")]
     ResourceBindingMismatch,
     /// Owner source evidence was absent, invalid, stale, or policy-rejected.
-    ///
-    /// `reason` is a redacted static string; `findings` preserves the typed
-    /// evaluator findings without echoing protected bodies.
-    #[error("SOURCE_ASSURANCE_REJECTED[{code:?}]: {reason}")]
-    SourceAssuranceRejected {
-        /// Redacted recovery reason.
-        reason: String,
-        /// Bounded typed recovery code.
-        code: AssuranceRecoveryCode,
-        /// Typed evaluator findings preserved without protected bodies.
-        findings: Vec<AssuranceFinding>,
-    },
+    #[error("SOURCE_ASSURANCE_REJECTED: {reason}")]
+    SourceAssuranceRejected { reason: String },
 }
 
 impl BridgeError {
@@ -973,29 +963,23 @@ fn validate_owner_evidence(
     binding: &ActiveSessionBinding,
 ) -> Result<ForwardedSourceAssurance, BridgeError> {
     evidence.validate().map_err(|error| {
-        let code = assurance_error_code(&error);
-        BridgeError::SourceAssuranceRejected {
-            reason: safe_assurance_error_reason(&error),
-            code,
-            findings: Vec::new(),
-        }
+        assurance_rejection(
+            assurance_error_code(&error),
+            &safe_assurance_error_reason(&error),
+        )
     })?;
     if evidence.owner_principal_ref != binding.principal_ref {
-        return Err(BridgeError::SourceAssuranceRejected {
-            reason: "owner evidence principal must match the authenticated active binding"
-                .to_owned(),
-            code: AssuranceRecoveryCode::Rejected,
-            findings: Vec::new(),
-        });
+        return Err(assurance_rejection(
+            AssuranceRecoveryCode::Rejected,
+            "owner evidence principal must match the authenticated active binding",
+        ));
     }
     let state_fence_digest =
         canonical_digest(&resolution.claimed_session.state_fence).map_err(|error| {
-            let code = assurance_error_code(&error);
-            BridgeError::SourceAssuranceRejected {
-                reason: safe_assurance_error_reason(&error),
-                code,
-                findings: Vec::new(),
-            }
+            assurance_rejection(
+                assurance_error_code(&error),
+                &safe_assurance_error_reason(&error),
+            )
         })?;
     if evidence.request_id != resolution.request_id
         || evidence.original_request_sha256 != resolution.original_request_sha256
@@ -1005,37 +989,31 @@ fn validate_owner_evidence(
         || evidence.state_fence_digest != state_fence_digest
         || evidence.canonical_request_sha256 != resolution.canonical_request_sha256
     {
-        return Err(BridgeError::SourceAssuranceRejected {
-            reason: "owner evidence must bind the resolver's exact canonical request".to_owned(),
-            code: AssuranceRecoveryCode::Rejected,
-            findings: Vec::new(),
-        });
+        return Err(assurance_rejection(
+            AssuranceRecoveryCode::Rejected,
+            "owner evidence must bind the resolver's exact canonical request",
+        ));
     }
     let outcome = evidence
         .assurance
         .admit_with_policy(&evidence.policy)
         .map_err(|error| {
-            let code = assurance_error_code(&error);
-            BridgeError::SourceAssuranceRejected {
-                reason: safe_assurance_error_reason(&error),
-                code,
-                findings: Vec::new(),
-            }
+            assurance_rejection(
+                assurance_error_code(&error),
+                &safe_assurance_error_reason(&error),
+            )
         })?;
     let AdmissionOutcome::Admitted { assurance_digest } = outcome else {
-        let (code, reason, findings) = admission_outcome_recovery(&outcome);
+        let (_, reason, _) = admission_outcome_recovery(&outcome);
         return Err(BridgeError::SourceAssuranceRejected {
             reason: reason.to_owned(),
-            code,
-            findings,
         });
     };
     if evidence.verifier_ref != evidence.policy.required_verifier {
-        return Err(BridgeError::SourceAssuranceRejected {
-            reason: "owner evidence does not satisfy the policy verifier requirement".to_owned(),
-            code: AssuranceRecoveryCode::Rejected,
-            findings: Vec::new(),
-        });
+        return Err(assurance_rejection(
+            AssuranceRecoveryCode::Rejected,
+            "owner evidence does not satisfy the policy verifier requirement",
+        ));
     }
     Ok(ForwardedSourceAssurance {
         owner_principal_ref: evidence.owner_principal_ref.clone(),
@@ -1056,19 +1034,26 @@ fn validate_owner_evidence(
 
 fn admission_outcome_reason(outcome: &AdmissionOutcome) -> &'static str {
     match outcome {
-        AdmissionOutcome::Admitted { .. } => "source assurance admitted",
-        AdmissionOutcome::NeedsRevalidation { .. } => "source assurance needs revalidation",
-        AdmissionOutcome::Missing { .. } => "source assurance is incomplete",
-        AdmissionOutcome::Conflicted { .. } => "source assurance has conflicting identities",
-        AdmissionOutcome::WrongScope { .. } => "source assurance scope does not match",
-        AdmissionOutcome::Quarantined { .. } => "source assurance is quarantined",
+        AdmissionOutcome::Admitted { .. } => "REJECTED: source assurance admitted",
+        AdmissionOutcome::NeedsRevalidation { .. } => "STALE: source assurance needs revalidation",
+        AdmissionOutcome::Missing { .. } => "INCOMPLETE: source assurance is incomplete",
+        AdmissionOutcome::Conflicted { .. } => {
+            "REJECTED: source assurance has conflicting identities"
+        }
+        AdmissionOutcome::WrongScope { .. } => "REJECTED: source assurance scope does not match",
+        AdmissionOutcome::Quarantined { .. } => "QUARANTINED: source assurance is quarantined",
     }
 }
 
 /// Maps a non-admitted outcome to its bounded recovery code, redacted reason,
-/// and preserved evaluator findings. Findings are typed and never echo
+/// and preserved evaluator findings.
+///
+/// The error itself carries only the distinct single-field reason below; the
+/// returned findings vec preserves the full typed evaluator detail without
+/// protected bodies for callers that need it. Diagnostics never echo
 /// protected bodies.
-fn admission_outcome_recovery(
+#[must_use]
+pub fn admission_outcome_recovery(
     outcome: &AdmissionOutcome,
 ) -> (AssuranceRecoveryCode, &'static str, Vec<AssuranceFinding>) {
     match outcome {
@@ -1087,12 +1072,7 @@ fn admission_outcome_recovery(
             admission_outcome_reason(outcome),
             findings.clone(),
         ),
-        AdmissionOutcome::Conflicted { findings } => (
-            AssuranceRecoveryCode::Rejected,
-            admission_outcome_reason(outcome),
-            findings.clone(),
-        ),
-        AdmissionOutcome::WrongScope { findings } => (
+        AdmissionOutcome::Conflicted { findings } | AdmissionOutcome::WrongScope { findings } => (
             AssuranceRecoveryCode::Rejected,
             admission_outcome_reason(outcome),
             findings.clone(),
@@ -1126,6 +1106,23 @@ fn safe_assurance_error_reason(error: &SourceAssuranceError) -> String {
         SourceAssuranceError::NonCanonicalSourceSet => "source set is not canonical".to_owned(),
         SourceAssuranceError::UnsupportedSchema(_) => "unsupported assurance schema".to_owned(),
         SourceAssuranceError::Json(_) => "assurance encoding failed".to_owned(),
+    }
+}
+
+/// Builds the single-field assurance rejection with the recovery-code name
+/// embedded as a `CODE: detail` prefix, keeping stale, incomplete, rejected,
+/// quarantined, and internal-defect outcomes distinct without structured
+/// fields. `detail` is already redacted; protected bodies are never echoed.
+fn assurance_rejection(code: AssuranceRecoveryCode, detail: &str) -> BridgeError {
+    let prefix = match code {
+        AssuranceRecoveryCode::Rejected => "REJECTED",
+        AssuranceRecoveryCode::Quarantined => "QUARANTINED",
+        AssuranceRecoveryCode::Incomplete => "INCOMPLETE",
+        AssuranceRecoveryCode::Stale => "STALE",
+        AssuranceRecoveryCode::InternalDefect => "INTERNAL_DEFECT",
+    };
+    BridgeError::SourceAssuranceRejected {
+        reason: format!("{prefix}: {detail}"),
     }
 }
 
@@ -1327,11 +1324,10 @@ pub fn derive_transformed_lineage(
     }
     let derived_digest =
         canonical_digest(&(original_lineage_digest, transform_ref)).map_err(|error| {
-            BridgeError::SourceAssuranceRejected {
-                reason: safe_assurance_error_reason(&error),
-                code: assurance_error_code(&error),
-                findings: Vec::new(),
-            }
+            assurance_rejection(
+                assurance_error_code(&error),
+                &safe_assurance_error_reason(&error),
+            )
         })?;
     Ok(TransformedLineage {
         original_lineage_digest: original_lineage_digest.to_owned(),

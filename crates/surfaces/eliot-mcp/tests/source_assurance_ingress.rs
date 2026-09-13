@@ -8,15 +8,17 @@ use std::{
 use eliot_mcp::{
     ActiveSessionBinding, ApplicationRequest, AssuranceRecoveryCode, BindingResolutionRequest,
     KernelGovernorPort, McpCore, PortFailure, PortProjection, ProjectionKind, ReplayDisposition,
-    TransportProfile, TransportRequestContext, TypedRejection, decode_protected_request_bytes,
-    derive_transformed_lineage, envelope_authority, is_exact_replay, replay_disposition,
+    TransportProfile, TransportRequestContext, TypedRejection, admission_outcome_recovery,
+    decode_protected_request_bytes, derive_transformed_lineage, envelope_authority,
+    is_exact_replay, replay_disposition,
 };
 use eliot_receipts::ProofCeiling;
 use eliot_source_assurance::{
-    AdmissibleUse, AdmissionExpectation, AxisStatus, EffectCeiling, GoverningSourceIdentity,
-    GoverningSourceSet, InstructionTaint, OwnerSourceEvidence, PrivacyClass, QuarantineStatus,
-    ScopeBindingProof, SourceAssurance, SourceAssurancePolicy, SourceFrontierBinding,
-    SourceProvenance, SourceSnapshotBinding, SourceTrustProfile, ThreatStatus, canonical_digest,
+    AdmissibleUse, AdmissionExpectation, AdmissionOutcome, AssuranceFinding, AxisStatus,
+    EffectCeiling, GoverningSourceIdentity, GoverningSourceSet, InstructionTaint,
+    OwnerSourceEvidence, PrivacyClass, QuarantineStatus, ScopeBindingProof, SourceAssurance,
+    SourceAssurancePolicy, SourceFrontierBinding, SourceProvenance, SourceSnapshotBinding,
+    SourceTrustProfile, ThreatStatus, canonical_digest,
 };
 use serde_json::json;
 
@@ -542,18 +544,16 @@ fn stale_incomplete_typed_recovery_zero_calls_and_replay_conflicts() -> Result<(
     let stale_port = SpyPort::default();
     let mut stale_evidence = source_evidence("request-1", &"0".repeat(64));
     stale_evidence.policy.expectation.frontier.generation = 2;
+    let stale_probe = stale_evidence.clone();
     *stale_port.evidence.borrow_mut() = stale_evidence;
     let stale_request = fixture_request("stale_binding");
     let stale_result = McpCore.execute(&stale_port, transport(), stale_request);
     match stale_result {
-        Err(eliot_mcp::BridgeError::SourceAssuranceRejected {
-            code,
-            findings,
-            reason,
-        }) => {
-            assert_eq!(code, AssuranceRecoveryCode::Stale);
-            assert!(!findings.is_empty(), "evaluator findings must be preserved");
-            assert!(!reason.is_empty());
+        Err(eliot_mcp::BridgeError::SourceAssuranceRejected { reason }) => {
+            assert!(
+                reason.starts_with("STALE: "),
+                "stale reason must carry its prefix, got {reason}"
+            );
             assert!(
                 !reason.contains("revision-1") || reason.contains("revalidation"),
                 "reason must stay redacted"
@@ -562,6 +562,18 @@ fn stale_incomplete_typed_recovery_zero_calls_and_replay_conflicts() -> Result<(
         other => panic!("stale evidence must be a typed rejection, got {other:?}"),
     }
     assert_eq!(stale_port.dispatches.get(), 0);
+    // The typed code and findings stay available through the recovery helper.
+    let stale_outcome = stale_probe
+        .assurance
+        .admit_with_policy(&stale_probe.policy)
+        .expect("stale evidence must produce an outcome");
+    let (code, reason, findings) = admission_outcome_recovery(&stale_outcome);
+    assert_eq!(code, AssuranceRecoveryCode::Stale);
+    assert!(
+        reason.starts_with("STALE: "),
+        "helper reason must carry its prefix, got {reason}"
+    );
+    assert!(!findings.is_empty(), "evaluator findings must be preserved");
 
     let incomplete_port = SpyPort::default();
     let mut incomplete = source_evidence("request-1", &"0".repeat(64));
@@ -569,12 +581,16 @@ fn stale_incomplete_typed_recovery_zero_calls_and_replay_conflicts() -> Result<(
     *incomplete_port.evidence.borrow_mut() = incomplete;
     let incomplete_result = McpCore.execute(&incomplete_port, transport(), request());
     match incomplete_result {
-        Err(eliot_mcp::BridgeError::SourceAssuranceRejected { code, .. }) => {
-            assert_eq!(code, AssuranceRecoveryCode::Incomplete);
+        Err(eliot_mcp::BridgeError::SourceAssuranceRejected { reason }) => {
+            assert!(
+                reason.starts_with("INCOMPLETE: "),
+                "incomplete reason must carry its prefix, got {reason}"
+            );
         }
         other => panic!("incomplete evidence must be typed, got {other:?}"),
     }
     assert_eq!(incomplete_port.dispatches.get(), 0);
+    assert_distinct_recovery_mapping();
 
     let first_port = SpyPort::default();
     let second_port = SpyPort::default();
@@ -596,4 +612,61 @@ fn stale_incomplete_typed_recovery_zero_calls_and_replay_conflicts() -> Result<(
     assert_eq!(first_port.dispatches.get(), 1);
     assert_eq!(second_port.dispatches.get(), 1);
     Ok(())
+}
+
+/// Every outcome keeps a distinct prefix, code, and preserved findings.
+/// `Conflicted` and `WrongScope` share the `REJECTED` code but never conflate.
+fn assert_distinct_recovery_mapping() {
+    for (outcome, expected_code, prefix) in [
+        (
+            AdmissionOutcome::Missing {
+                findings: vec![AssuranceFinding::MissingSource],
+            },
+            AssuranceRecoveryCode::Incomplete,
+            "INCOMPLETE: ",
+        ),
+        (
+            AdmissionOutcome::NeedsRevalidation {
+                findings: vec![AssuranceFinding::StaleFrontier],
+            },
+            AssuranceRecoveryCode::Stale,
+            "STALE: ",
+        ),
+        (
+            AdmissionOutcome::Conflicted {
+                findings: vec![AssuranceFinding::ConflictingSources],
+            },
+            AssuranceRecoveryCode::Rejected,
+            "REJECTED: ",
+        ),
+        (
+            AdmissionOutcome::WrongScope {
+                findings: vec![AssuranceFinding::WrongScope],
+            },
+            AssuranceRecoveryCode::Rejected,
+            "REJECTED: ",
+        ),
+        (
+            AdmissionOutcome::Quarantined {
+                findings: vec![AssuranceFinding::Quarantined],
+            },
+            AssuranceRecoveryCode::Quarantined,
+            "QUARANTINED: ",
+        ),
+    ] {
+        let (code, reason, findings) = admission_outcome_recovery(&outcome);
+        assert_eq!(code, expected_code);
+        assert!(
+            reason.starts_with(prefix),
+            "outcome reason must carry its prefix, got {reason}"
+        );
+        assert!(!findings.is_empty(), "findings must be preserved");
+    }
+    let (_, conflicted_reason, _) = admission_outcome_recovery(&AdmissionOutcome::Conflicted {
+        findings: vec![AssuranceFinding::ConflictingSources],
+    });
+    let (_, wrong_scope_reason, _) = admission_outcome_recovery(&AdmissionOutcome::WrongScope {
+        findings: vec![AssuranceFinding::WrongScope],
+    });
+    assert_ne!(conflicted_reason, wrong_scope_reason);
 }

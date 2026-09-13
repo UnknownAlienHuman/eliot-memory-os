@@ -875,12 +875,12 @@ pub fn decode_protected_request_bytes(bytes: &[u8]) -> Result<ApplicationRequest
     let value: Value = serde_json::from_slice(bytes).map_err(|_| TypedRejection::Malformed {
         reason: "request is not well-formed JSON",
     })?;
-    if let Some(variant) = tool_variant_name(&value) {
-        if !ADMITTED_TOOL_NAMES.contains(&variant.as_str()) {
-            return Err(TypedRejection::UnknownVariant {
-                variant: bound_control_name(&variant),
-            });
-        }
+    if let Some(variant) = tool_variant_name(&value)
+        && !ADMITTED_TOOL_NAMES.contains(&variant.as_str())
+    {
+        return Err(TypedRejection::UnknownVariant {
+            variant: bound_control_name(&variant),
+        });
     }
     serde_json::from_slice::<ApplicationRequest>(bytes).map_err(|error| {
         let message = error.to_string();
