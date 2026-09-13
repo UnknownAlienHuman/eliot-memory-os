@@ -19,6 +19,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Validate branch identity, issue, and current-main ancestry
@@ -211,3 +212,141 @@ jobs:
             echo 'Stale authority/reference detected in a current routing surface.'
             exit 1
           fi
+
+      - name: Verify manual-only policy, profile wiring, least privilege, cache safety, source-candidate identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import pathlib
+          import re
+
+          failures = []
+
+          def fail(area, detail):
+              failures.append(f'POLICY_{area}_FAILURE: {detail}')
+
+          def on_children(text):
+              # Top-level `on:` mapping children by indentation (stdlib only).
+              lines = text.splitlines()
+              for i, line in enumerate(lines):
+                  if re.fullmatch(r'on:\s*(#.*)?', line):
+                      base = len(line) - len(line.lstrip(' '))
+                      children = []
+                      for follow in lines[i + 1:]:
+                          if not follow.strip() or follow.strip().startswith('#'):
+                              continue
+                          indent = len(follow) - len(follow.lstrip(' '))
+                          if indent <= base:
+                              break
+                          if indent == base + 2:
+                              key = follow.strip().split(':')[0].strip()
+                              if key:
+                                  children.append(key)
+                      return children
+              return []
+
+          workflow_dir = pathlib.Path('.github/workflows')
+          workflows = sorted(workflow_dir.glob('*.yml'))
+          if not workflows:
+              fail('TRIGGER', 'no workflow files found')
+
+          # Manual-only policy: every repository workflow dispatches by hand.
+          for path in workflows:
+              text = path.read_text(encoding='utf-8')
+              children = on_children(text)
+              if children != ['workflow_dispatch']:
+                  fail('TRIGGER', f'{path.as_posix()} on-children={children}')
+
+          ci = pathlib.Path('.github/workflows/ci.yml').read_text(encoding='utf-8')
+          policy_text = pathlib.Path('.github/workflows/repository-policy.yml').read_text(encoding='utf-8')
+          just = pathlib.Path('Justfile').read_text(encoding='utf-8')
+          verify = pathlib.Path('scripts/verify.ps1').read_text(encoding='utf-8')
+
+          # Exact wiring: one identical Review invocation, closed profiles only.
+          review_invocation = 'pwsh -NoProfile -File scripts/verify.ps1 -Profile Review'
+          if ci.count(review_invocation) != 1:
+              fail('WIRING', 'ci.yml must invoke the Review profile exactly once')
+          for occurrence in re.finditer(r'scripts/verify\.ps1[^\n]*', ci):
+              if '-Profile Review' not in occurrence.group(0):
+                  fail('WIRING', 'ci.yml has a verify.ps1 reference outside -Profile Review')
+          for recipe, marker in (('verify', '-Profile Review'), ('verify-review', '-Profile Review'), ('verify-list', '-List')):
+              block = re.search(rf'(?m)^{recipe}:\s*\n((?:[ \t]+[^\n]*\n?)+)', just)
+              if not block or marker not in block.group(1):
+                  fail('WIRING', f'Justfile {recipe} must select {marker}')
+          verify_body = re.search(r'(?m)^verify:\s*\n((?:[ \t]+[^\n]*\n?)+)', just)
+          if verify_body and '-Profile Quick' in verify_body.group(1):
+              fail('WIRING', 'Justfile verify must not select the Quick profile')
+
+          # Retained bounded baseline: just quick keeps its pinned oracle deps
+          # (mirrors scripts/docs_closure_audit.py DOC-GATE-JUST) and never
+          # carries Review-only markers.
+          quick_match = re.search(r'(?m)^quick:\s*(.+)$', just)
+          if not quick_match:
+              fail('WIRING', 'Justfile has no quick recipe line')
+          else:
+              quick_deps = quick_match.group(1)
+              for target in ('doc-code-conformance-self-test', 'doc-code-conformance'):
+                  if target not in quick_deps:
+                      fail('WIRING', f'just quick lost retained baseline target {target}')
+              for banned in ('cargo-clippy-workspace', 'cargo-test-workspace', 'cargo-deny', '-Profile Review'):
+                  if banned in quick_deps:
+                      fail('WIRING', f'just quick must not carry Review-only marker {banned}')
+
+          # verify.ps1 owns the closed profiles; retired skips stay rejected.
+          if "[ValidateSet('Quick', 'Review')]" not in verify:
+              fail('WIRING', 'verify.ps1 must own the closed Quick/Review profiles')
+          if 'SkipCargoCheck' not in verify or 'VERIFY_REJECTED' not in verify:
+              fail('WIRING', 'verify.ps1 must explicitly reject the retired skip switch')
+          if 'SkipCargoCheck' in just or 'SkipCargoCheck' in ci:
+              fail('WIRING', 'retired skip switch must not be wired in Justfile/ci.yml')
+
+          # Review cargo tail order inside the single gate-definition owner.
+          tail = [
+              'cargo metadata --locked --no-deps --format-version 1',
+              'cargo fmt --all -- --check',
+              'cargo check --locked --workspace --all-targets',
+              'cargo clippy --locked --workspace --all-targets -- -D warnings',
+              'cargo test --locked --workspace',
+              'cargo deny check',
+          ]
+          positions = [verify.find(anchor) for anchor in tail]
+          if any(pos < 0 for pos in positions):
+              fail('WIRING', 'Review cargo tail has a missing gate definition')
+          elif any(later <= earlier for earlier, later in zip(positions, positions[1:])):
+              fail('WIRING', 'Review cargo tail is out of order')
+
+          # Least privilege on both owned workflows (checks run against file
+          # content, so this step's own source must also stay clean).
+          for name, text in (('ci.yml', ci), ('repository-policy.yml', policy_text)):
+              if re.search(r':\s*write\b', text) or re.search(r':\s*admin\b', text):
+                  fail('PRIVILEGE', f'{name} grants elevated capability')
+              if 'persist-credentials: false' not in text:
+                  fail('PRIVILEGE', f'{name} checkout must not persist credentials')
+              if 'secret' + 's.' in text:
+                  fail('PRIVILEGE', f'{name} references secret material')
+              if 'id-' + 'token:' in text:
+                  fail('PRIVILEGE', f'{name} requests OIDC authority')
+              if 'continue-' + 'on-error' in text:
+                  fail('WIRING', f'{name} must not soften gate failure')
+
+          # Cache safety: key binds OS, lockfile, and profile; one ungated run.
+          key_lines = [line for line in ci.splitlines() if 'hashFiles' in line and 'Cargo.lock' in line]
+          if len(key_lines) != 1 or 'runner.os' not in key_lines[0] or 'review' not in key_lines[0].lower():
+              fail('CACHE', 'ci cache key must bind OS, lockfile, and profile')
+
+          # Source-candidate identity: hash and trigger identity unchanged.
+          sc_path = pathlib.Path('.github/workflows/source-candidate.yml')
+          sc_hash = hashlib.sha256(sc_path.read_bytes()).hexdigest()
+          if sc_hash != '6a8aeacb02551762321bf2ee498952f46bebeb8ba56fcbd0a166e47f282ca82c':
+              fail('CANDIDATE', 'source-candidate.yml hash changed')
+          if on_children(sc_path.read_text(encoding='utf-8')) != ['workflow_dispatch']:
+              fail('CANDIDATE', 'source-candidate.yml trigger identity changed')
+
+          if failures:
+              for item in failures:
+                  print(item)
+              raise SystemExit(1)
+          print(f'REPOSITORY_POLICY_WIRING: PASS workflows={len(workflows)} candidate={sc_hash[:12]}')
+          PY

@@ -122,10 +122,19 @@ claude-package:
 sync-skills:
     cargo run --quiet -p eliot-app -- host skill-sync
 
+# Bounded Quick profile as ordered by scripts/verify.ps1 -Profile Quick. Quick
+# success is never Review/release proof. The dependency list below is the
+# retained just-quick baseline pinned by scripts/docs_closure_audit.py
+# (DOC-GATE-JUST); it runs each bounded gate once.
 quick: docs-shards-self-test docs-shards docs-router-self-test docs-router docs-read-self-test doc-code-conformance-self-test doc-code-conformance code-navigation-self-test code-navigation docs-closure-audit standalone-crates core-daemon-inventory-self-test core-daemon-inventory normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails agent-route-bundles-self-test agent-route-bundles runtime-source-hygiene-self-test runtime-source-hygiene agent-bridge-protocol-self-test agent-bridge-protocol metadata fmt-check check
 
+# Complete locked Review profile, sole definition in scripts/verify.ps1.
 verify:
-    pwsh -NoProfile -File scripts/verify.ps1
+    pwsh -NoProfile -File scripts/verify.ps1 -Profile Review
+
+# Explicit Review alias; identical single Review invocation as `verify`.
+verify-review:
+    pwsh -NoProfile -File scripts/verify.ps1 -Profile Review
 
 verify-list:
     pwsh -NoProfile -File scripts/verify.ps1 -List
