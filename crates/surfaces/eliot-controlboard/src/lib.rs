@@ -15,11 +15,13 @@ pub use swarm_read::*;
 use std::collections::BTreeSet;
 use std::fmt;
 
+use eliot_contracts::{OperationId, SessionId};
 use eliot_evaluation_contracts::ObjectiveStatus;
 use eliot_evidence::{EpistemicStatus, EvidenceFreshness};
 use eliot_observation_contracts::ObservationKind;
+use eliot_protocol::RequestIdentity;
 use eliot_receipts::ProofCeiling;
-use eliot_security_contracts::{EffectCeiling, PrivacyClass};
+pub use eliot_security_contracts::{EffectCeiling, PrivacyClass};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -66,41 +68,16 @@ impl<'de> Deserialize<'de> for ViewRevision {
     }
 }
 
-/// A state fence carried by every read and command boundary.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StateFence {
-    /// Monotonic authority epoch from the owning state boundary.
-    pub authority_epoch: u64,
-    /// Revision at which this fence was observed.
-    pub revision: ViewRevision,
-    /// Opaque owner-issued fence identity.
-    pub fence_id: String,
-}
-
-impl StateFence {
-    /// Creates a validated fence; it does not grant authority.
-    pub fn new(
-        authority_epoch: u64,
-        revision: ViewRevision,
-        fence_id: impl Into<String>,
-    ) -> Result<Self, ControlBoardError> {
-        let fence = Self {
-            authority_epoch,
-            revision,
-            fence_id: fence_id.into(),
-        };
-        fence.validate()?;
-        Ok(fence)
-    }
-
-    fn validate(&self) -> Result<(), ControlBoardError> {
-        if self.authority_epoch == 0 {
-            return Err(ControlBoardError::InvalidField("authority_epoch"));
-        }
-        text(&self.fence_id, "fence_id")
-    }
-}
+/// Shared Governor state fence carried by every read and command boundary.
+///
+/// T1.4 migration: the former local scalar fence
+/// (`authority_epoch`/`revision`/`fence_id`) is replaced by the migrated
+/// [`StateFence`](eliot_contracts::StateFence) contract. The exact board
+/// revision stays separate as [`ViewRevision`]; an exact view is pinned by
+/// the `(revision, fence)` pair, compared with full-fence equality at every
+/// boundary. There is no scalar-to-canonical coercion and no lineage
+/// invention here; full epoch-lineage migration remains owned by T6/#64.
+pub use eliot_contracts::StateFence;
 
 /// Authenticated role resolved by the session owner.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -211,7 +188,9 @@ impl ReadRequest {
             return Err(ControlBoardError::InvalidField("generation"));
         }
         if let Some(fence) = &self.expected_fence {
-            fence.validate()?;
+            fence
+                .validate()
+                .map_err(|_| ControlBoardError::InvalidField("expected_fence"))?;
         }
         Ok(())
     }
@@ -241,8 +220,10 @@ pub struct AccessBinding {
     pub observed_at_unix_ms: u64,
     pub expires_at_unix_ms: u64,
     pub access_revision: ViewRevision,
-    pub authority_epoch: u64,
-    pub access_fence_id: String,
+    /// Complete shared fence observed with the access binding. This replaces
+    /// the former scalar `authority_epoch`/`access_fence_id` surrogate; the
+    /// exact board revision stays separate as [`ViewRevision`].
+    pub access_fence: StateFence,
 }
 
 impl AccessBinding {
@@ -254,7 +235,6 @@ impl AccessBinding {
         text(&self.credential_binding, "credential_binding")?;
         text(&self.challenge, "challenge")?;
         text(&self.request_id, "request_id")?;
-        text(&self.access_fence_id, "access_fence_id")?;
         if self.session_id != request.session_id
             || self.connection_id != request.connection_id
             || self.credential_binding != request.credential_binding
@@ -262,10 +242,12 @@ impl AccessBinding {
             || self.request_id != request.request_id
             || self.generation != request.generation
             || self.admitted_privacy.is_empty()
-            || self.authority_epoch == 0
         {
             return Err(ControlBoardError::Unauthorized);
         }
+        self.access_fence
+            .validate()
+            .map_err(|_| ControlBoardError::Unauthorized)?;
         if self.issued_at_unix_ms == 0
             || self.observed_at_unix_ms < self.issued_at_unix_ms
             || self.observed_at_unix_ms >= self.expires_at_unix_ms
@@ -275,11 +257,10 @@ impl AccessBinding {
         if request
             .expected_revision
             .is_some_and(|revision| revision != self.access_revision)
-            || request.expected_fence.as_ref().is_some_and(|fence| {
-                fence.revision != self.access_revision
-                    || fence.authority_epoch != self.authority_epoch
-                    || fence.fence_id != self.access_fence_id
-            })
+            || request
+                .expected_fence
+                .as_ref()
+                .is_some_and(|fence| fence != &self.access_fence)
         {
             return Err(ControlBoardError::StaleAccess);
         }
@@ -329,8 +310,7 @@ fn access_digest(access: &AccessBinding) -> Result<String, ControlBoardError> {
             access.observed_at_unix_ms,
             access.expires_at_unix_ms,
             access.access_revision,
-            access.authority_epoch,
-            &access.access_fence_id,
+            &access.access_fence,
         ),
     ))
     .map_err(|error| ControlBoardError::Provider(error.to_string()))?;
@@ -565,11 +545,14 @@ pub struct CanonicalState {
 
 impl CanonicalState {
     /// Validates exact identity and rejects duplicate projection records.
+    ///
+    /// The shared fence carries no per-view revision; the exact view is
+    /// pinned by the `(revision, fence)` pair, whose equality is enforced at
+    /// every read/command boundary rather than inside this shape check.
     pub fn validate(&self) -> Result<(), ControlBoardError> {
-        if self.fence.revision != self.revision {
-            return Err(ControlBoardError::FenceMismatch);
-        }
-        self.fence.validate()?;
+        self.fence
+            .validate()
+            .map_err(|error| ControlBoardError::Provider(error.to_string()))?;
         self.completeness.validate(self.revision, &self.fence)?;
         let mut ids = BTreeSet::new();
         for item in &self.items {
@@ -834,10 +817,23 @@ impl OperatorAction {
 }
 
 /// Command request bound to the exact view revision and fence observed.
+///
+/// The caller submits inert intent; the authenticated owner supplies and
+/// verifies the operation binding. `identity` is the owner-issued
+/// [`RequestIdentity`](eliot_protocol::RequestIdentity) whose fence must
+/// equal `expected_fence`, and `operation_id` is the owner-issued
+/// [`OperationId`] for this exact action. Payloads in the pre-T1.4 shape
+/// (scalar session-only binding without `identity`/`operation_id`) are
+/// rejected by construction and by deserialization before any effect.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandRequest {
+    /// Session bound at construction from the owner-issued identity.
     pub session_id: String,
+    /// Owner-issued operation identity for this exact action.
+    pub operation_id: OperationId,
+    /// Owner-issued request identity binding session, fence, and lifecycle.
+    pub identity: RequestIdentity,
     /// Set only by A-08 after the resolver seals the access binding.
     pub access_digest: String,
     pub expected_revision: ViewRevision,
@@ -852,21 +848,40 @@ pub struct CommandRequest {
 
 impl CommandRequest {
     /// Creates a request with no implicit authority.
+    ///
+    /// The owner-issued `identity` must already bind the same fence and the
+    /// session this command is submitted under; otherwise construction fails
+    /// closed and nothing is effecting.
     pub fn new(
-        session_id: impl Into<String>,
+        identity: RequestIdentity,
+        operation_id: OperationId,
         revision: ViewRevision,
         fence: StateFence,
         action: OperatorAction,
     ) -> Result<Self, ControlBoardError> {
-        if fence.revision != revision {
+        identity
+            .validate()
+            .map_err(|_| ControlBoardError::InvalidField("identity"))?;
+        fence
+            .validate()
+            .map_err(|_| ControlBoardError::InvalidField("expected_fence"))?;
+        if identity.request.state_fence != fence {
             return Err(ControlBoardError::FenceMismatch);
         }
+        let session_id = identity
+            .request
+            .metadata
+            .session_id
+            .clone()
+            .map(SessionId::into_string)
+            .filter(|session| !session.trim().is_empty())
+            .ok_or(ControlBoardError::InvalidField("identity.session_id"))?;
         action.validate()?;
-        let session_id = session_id.into();
-        text(&session_id, "session_id")?;
         let action_digest = action_digest(&action)?;
         Ok(Self {
             session_id,
+            operation_id,
+            identity,
             access_digest: String::new(),
             expected_revision: revision,
             expected_fence: fence,
@@ -882,12 +897,29 @@ impl CommandRequest {
         request: &ReadRequest,
         access: &ResolvedAccess,
     ) -> Result<Self, ControlBoardError> {
-        self.expected_fence.validate()?;
+        self.expected_fence
+            .validate()
+            .map_err(|_| ControlBoardError::InvalidField("expected_fence"))?;
+        self.identity
+            .validate()
+            .map_err(|_| ControlBoardError::InvalidField("identity"))?;
         self.action.validate()?;
-        if self.session_id != request.session_id
-            || self.expected_fence.revision != self.expected_revision
-        {
+        if self.session_id != request.session_id {
             return Err(ControlBoardError::StaleView);
+        }
+        if self.identity.request.state_fence != self.expected_fence {
+            return Err(ControlBoardError::FenceMismatch);
+        }
+        let identity_session = self
+            .identity
+            .request
+            .metadata
+            .session_id
+            .clone()
+            .map(SessionId::into_string)
+            .unwrap_or_default();
+        if identity_session != self.session_id {
+            return Err(ControlBoardError::ActionBindingMismatch);
         }
         if self.proof_ceiling != ProofCeiling::Observation {
             return Err(ControlBoardError::InvalidField("proof_ceiling"));
@@ -1055,8 +1087,7 @@ impl ControlBoard {
             })?;
         state.validate()?;
         if state.revision != access.binding.access_revision
-            || state.fence.authority_epoch != access.binding.authority_epoch
-            || state.fence.fence_id != access.binding.access_fence_id
+            || state.fence != access.binding.access_fence
         {
             return Err(ControlBoardError::StaleAccess);
         }
@@ -1326,6 +1357,11 @@ impl fmt::Display for RequiredProvider {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use eliot_contracts::{
+        AuthorityEpoch, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
+        SourceId,
+    };
+    use eliot_receipts::RequestBinding;
 
     struct FakeRead {
         state: CanonicalState,
@@ -1406,7 +1442,53 @@ mod tests {
     }
 
     fn fence() -> StateFence {
-        StateFence::new(1, ViewRevision::new(7).expect("revision"), "fence-7").expect("fence")
+        StateFence::new(
+            AuthorityEpoch::new(1).expect("epoch"),
+            ResourceGeneration::new(7).expect("generation"),
+        )
+    }
+
+    fn fence_at_generation(generation: u64) -> StateFence {
+        StateFence::new(
+            AuthorityEpoch::new(1).expect("epoch"),
+            ResourceGeneration::new(generation).expect("generation"),
+        )
+    }
+
+    fn identity_for(fence: &StateFence) -> RequestIdentity {
+        RequestIdentity {
+            request: RequestBinding {
+                metadata: RequestMetadata {
+                    request_id: RequestId::new("request-1").expect("request id"),
+                    session_id: Some(SessionId::new("session").expect("session id")),
+                    task_id: None,
+                    product_id: ProductId::new("product").expect("product id"),
+                    source_id: SourceId::new("source").expect("source id"),
+                    state_fence: fence.clone(),
+                    clock: ClockReading::default(),
+                },
+                state_fence: fence.clone(),
+            },
+            idempotency_key: "idem-1".to_owned(),
+            deadline_unix_ms: 1_000,
+            cancellation_id: "cancel-1".to_owned(),
+        }
+    }
+
+    fn operation_id() -> OperationId {
+        OperationId::new("operation-1").expect("operation id")
+    }
+
+    fn command(action: OperatorAction) -> CommandRequest {
+        let fence = fence();
+        CommandRequest::new(
+            identity_for(&fence),
+            operation_id(),
+            ViewRevision::new(7).expect("revision"),
+            fence,
+            action,
+        )
+        .expect("command")
     }
 
     fn state() -> CanonicalState {
@@ -1539,8 +1621,7 @@ mod tests {
                 observed_at_unix_ms: 1_100,
                 expires_at_unix_ms: 2_000,
                 access_revision: ViewRevision::new(7).expect("revision"),
-                authority_epoch: 1,
-                access_fence_id: "fence-7".to_owned(),
+                access_fence: fence(),
             },
         }
     }
@@ -1582,15 +1663,9 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             None,
         );
-        let command = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::PauseTask {
-                task_id: "public".to_owned(),
-            },
-        )
-        .expect("command");
+        let command = command(OperatorAction::PauseTask {
+            task_id: "public".to_owned(),
+        });
         assert_eq!(
             board.submit(&read_request(Role::HumanRequester), command),
             Err(ControlBoardError::PlanGap(
@@ -1610,12 +1685,13 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             Some(Box::new(FakeCommand)),
         );
-        let stale =
-            StateFence::new(1, ViewRevision::new(6).expect("revision"), "fence-6").expect("fence");
+        let stale_fence = fence_at_generation(6);
+        let stale_identity = identity_for(&stale_fence);
         let command = CommandRequest::new(
-            "session",
+            stale_identity,
+            operation_id(),
             ViewRevision::new(6).expect("revision"),
-            stale,
+            stale_fence,
             OperatorAction::AcknowledgeAttention {
                 item_id: "public".to_owned(),
             },
@@ -1640,16 +1716,10 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             Some(Box::new(FakeCommand)),
         );
-        let command = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::AnswerReview {
-                review_item_id: "review-1".to_owned(),
-                answer: "addressed".to_owned(),
-            },
-        )
-        .expect("command");
+        let command = command(OperatorAction::AnswerReview {
+            review_item_id: "review-1".to_owned(),
+            answer: "addressed".to_owned(),
+        });
         let receipt = board
             .submit(&read_request(Role::HumanRequester), command)
             .expect("receipt");
@@ -1665,7 +1735,7 @@ mod tests {
             duplicate.validate(),
             Err(ControlBoardError::DuplicateId(_))
         ));
-        let json = r#"{"revision":7,"fence":{"authority_epoch":1,"revision":7,"fence_id":"f"},"completeness":{"g11_coordination":{"provider":"G11","work_id":"G-11","binding_id":"g11","binding_revision":7,"binding_fence":{"authority_epoch":1,"revision":7,"fence_id":"f"},"binding_digest":"d1","receipt_ref":"r1"},"i12_report_projection":{"provider":"I12","work_id":"I-12","binding_id":"i12","binding_revision":7,"binding_fence":{"authority_epoch":1,"revision":7,"fence_id":"f"},"binding_digest":"d2","receipt_ref":"r2"}},"items":[],"reviews":[],"provenance":[],"extra":true}"#;
+        let json = r#"{"revision":7,"fence":{"authority_epoch":1,"resource_generation":7},"completeness":{"g11_coordination":{"provider":"G11","work_id":"G-11","binding_id":"g11","binding_revision":7,"binding_fence":{"authority_epoch":1,"resource_generation":7},"binding_digest":"d1","receipt_ref":"r1"},"i12_report_projection":{"provider":"I12","work_id":"I-12","binding_id":"i12","binding_revision":7,"binding_fence":{"authority_epoch":1,"resource_generation":7},"binding_digest":"d2","receipt_ref":"r2"}},"items":[],"reviews":[],"provenance":[],"extra":true}"#;
         let parsed = serde_json::from_str::<CanonicalState>(json);
         assert!(parsed.is_err());
     }
@@ -1681,15 +1751,9 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             Some(Box::new(FakeCommand)),
         );
-        let command = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::PauseTask {
-                task_id: "task-1".to_owned(),
-            },
-        )
-        .expect("command");
+        let command = command(OperatorAction::PauseTask {
+            task_id: "task-1".to_owned(),
+        });
         assert_eq!(
             board.submit(&read_request(Role::ReadOnlyApi), command),
             Err(ControlBoardError::Unauthorized)
@@ -1698,16 +1762,10 @@ mod tests {
 
     #[test]
     fn exact_human_roles_and_capabilities_are_required() {
-        let command = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::Approve {
-                item_id: "public".to_owned(),
-                approval_digest: "approval".to_owned(),
-            },
-        )
-        .expect("command");
+        let command = command(OperatorAction::Approve {
+            item_id: "public".to_owned(),
+            approval_digest: "approval".to_owned(),
+        });
         let mut board = ControlBoard::new(
             Some(Box::new(access(
                 Role::HumanRequester,
@@ -1747,30 +1805,18 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             Some(Box::new(FakeCommand)),
         );
-        let hidden = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::ResolveReview {
-                review_item_id: "human-only".to_owned(),
-                reason: "no".to_owned(),
-            },
-        )
-        .expect("command");
+        let hidden = command(OperatorAction::ResolveReview {
+            review_item_id: "human-only".to_owned(),
+            reason: "no".to_owned(),
+        });
         assert_eq!(
             board.submit(&read_request(Role::HumanRequester), hidden),
             Err(ControlBoardError::HiddenOrMissingTarget)
         );
-        let illegal = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::ResolveReview {
-                review_item_id: "review-1".to_owned(),
-                reason: "no".to_owned(),
-            },
-        )
-        .expect("command");
+        let illegal = command(OperatorAction::ResolveReview {
+            review_item_id: "review-1".to_owned(),
+            reason: "no".to_owned(),
+        });
         assert_eq!(
             board.submit(&read_request(Role::HumanRequester), illegal),
             Err(ControlBoardError::InvalidReviewTransition)
@@ -1788,15 +1834,9 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             Some(Box::new(BadCommand)),
         );
-        let command = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::PauseTask {
-                task_id: "public".to_owned(),
-            },
-        )
-        .expect("command");
+        let command = command(OperatorAction::PauseTask {
+            task_id: "public".to_owned(),
+        });
         assert_eq!(
             board.submit(&read_request(Role::HumanRequester), command),
             Err(ControlBoardError::InvalidField("receipt_ref"))
@@ -1822,7 +1862,7 @@ mod tests {
 
     #[test]
     fn zero_revision_duplicate_grants_and_references_are_rejected() {
-        let zero = r#"{"revision":0,"fence":{"authority_epoch":1,"revision":0,"fence_id":"f"},"completeness":{"g11_coordination":{"provider":"G11","work_id":"G-11","binding_id":"g11","binding_revision":0,"binding_fence":{"authority_epoch":1,"revision":0,"fence_id":"f"},"binding_digest":"d1","receipt_ref":"r1"},"i12_report_projection":{"provider":"I12","work_id":"I-12","binding_id":"i12","binding_revision":0,"binding_fence":{"authority_epoch":1,"revision":0,"fence_id":"f"},"binding_digest":"d2","receipt_ref":"r2"}},"items":[],"reviews":[],"provenance":[]}"#;
+        let zero = r#"{"revision":0,"fence":{"authority_epoch":1,"resource_generation":7},"completeness":{"g11_coordination":{"provider":"G11","work_id":"G-11","binding_id":"g11","binding_revision":0,"binding_fence":{"authority_epoch":1,"resource_generation":7},"binding_digest":"d1","receipt_ref":"r1"},"i12_report_projection":{"provider":"I12","work_id":"I-12","binding_id":"i12","binding_revision":0,"binding_fence":{"authority_epoch":1,"resource_generation":7},"binding_digest":"d2","receipt_ref":"r2"}},"items":[],"reviews":[],"provenance":[]}"#;
         assert!(serde_json::from_str::<CanonicalState>(zero).is_err());
         let mut duplicate_privacy = access(
             Role::ReadOnlyApi,
@@ -1922,15 +1962,9 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             Some(Box::new(WrongAccessCommand)),
         );
-        let command = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::PauseTask {
-                task_id: "public".to_owned(),
-            },
-        )
-        .expect("command");
+        let command = command(OperatorAction::PauseTask {
+            task_id: "public".to_owned(),
+        });
         assert_eq!(
             board.submit(&read_request(Role::HumanRequester), command),
             Err(ControlBoardError::ReceiptBindingMismatch)
@@ -1948,31 +1982,19 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             Some(Box::new(FakeCommand)),
         );
-        let wrong = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::ChallengeRule {
-                rule_id: "public".to_owned(),
-                rationale: "wrong kind".to_owned(),
-            },
-        )
-        .expect("command");
+        let wrong = command(OperatorAction::ChallengeRule {
+            rule_id: "public".to_owned(),
+            rationale: "wrong kind".to_owned(),
+        });
         assert_eq!(
             wrong_kind.submit(&read_request(Role::HumanRequester), wrong),
             Err(ControlBoardError::WrongTargetKind)
         );
 
-        let approval = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::Approve {
-                item_id: "public".to_owned(),
-                approval_digest: "critical-action-digest".to_owned(),
-            },
-        )
-        .expect("command");
+        let approval = command(OperatorAction::Approve {
+            item_id: "public".to_owned(),
+            approval_digest: "critical-action-digest".to_owned(),
+        });
         let mut task_target = ControlBoard::new(
             Some(Box::new(access(
                 Role::HumanApprover,
@@ -2016,15 +2038,9 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             Some(Box::new(FakeCommand)),
         );
-        let command = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::StartQuery {
-                query_kind: "semantic-search".to_owned(),
-            },
-        )
-        .expect("command");
+        let command = command(OperatorAction::StartQuery {
+            query_kind: "semantic-search".to_owned(),
+        });
         assert_eq!(
             query
                 .submit(&read_request(Role::HumanRequester), command)
@@ -2036,15 +2052,9 @@ mod tests {
 
     #[test]
     fn deserialized_ceiling_widening_and_unknown_enums_fail_closed() {
-        let command = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::PauseTask {
-                task_id: "public".to_owned(),
-            },
-        )
-        .expect("command");
+        let command = command(OperatorAction::PauseTask {
+            task_id: "public".to_owned(),
+        });
         let mut widened = serde_json::to_value(&command).expect("json");
         widened["proof_ceiling"] = serde_json::json!("SCOPED_VERIFICATION");
         let widened = serde_json::from_value::<CommandRequest>(widened).expect("command json");
@@ -2091,6 +2101,94 @@ mod tests {
             Err(ControlBoardError::PlanGap(
                 RequiredProvider::G11ReviewProjection
             ))
+        );
+    }
+
+    #[test]
+    fn owner_identity_and_fence_must_bind_the_command() {
+        let fence = fence();
+        let foreign_fence = fence_at_generation(6);
+        let foreign_identity = identity_for(&foreign_fence);
+        assert_eq!(
+            CommandRequest::new(
+                foreign_identity,
+                operation_id(),
+                ViewRevision::new(7).expect("revision"),
+                fence.clone(),
+                OperatorAction::StartQuery {
+                    query_kind: "semantic-search".to_owned(),
+                },
+            ),
+            Err(ControlBoardError::FenceMismatch)
+        );
+
+        let mut no_session = identity_for(&fence);
+        no_session.request.metadata.session_id = None;
+        assert_eq!(
+            CommandRequest::new(
+                no_session,
+                operation_id(),
+                ViewRevision::new(7).expect("revision"),
+                fence.clone(),
+                OperatorAction::StartQuery {
+                    query_kind: "semantic-search".to_owned(),
+                },
+            ),
+            Err(ControlBoardError::InvalidField("identity.session_id"))
+        );
+
+        let mut substituted = command(OperatorAction::StartQuery {
+            query_kind: "semantic-search".to_owned(),
+        });
+        substituted.identity.request.metadata.session_id =
+            Some(SessionId::new("other-session").expect("session id"));
+        let mut board = ControlBoard::new(
+            Some(Box::new(access(
+                Role::HumanRequester,
+                &[ActionCapability::StartQuery],
+                &[PrivacyClass::Public],
+            ))),
+            Some(Box::new(FakeRead { state: state() })),
+            Some(Box::new(FakeCommand)),
+        );
+        assert_eq!(
+            board.submit(&read_request(Role::HumanRequester), substituted),
+            Err(ControlBoardError::ActionBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn pre_t1_4_mutation_payloads_are_rejected_before_effects() {
+        let command = command(OperatorAction::PauseTask {
+            task_id: "public".to_owned(),
+        });
+        let wire = serde_json::to_value(&command).expect("json");
+        let mut legacy = wire.clone();
+        for field in ["identity", "operation_id"] {
+            legacy
+                .as_object_mut()
+                .expect("command object")
+                .remove(field);
+        }
+        assert!(serde_json::from_value::<CommandRequest>(legacy).is_err());
+
+        let mut rebound = wire;
+        let foreign_fence = serde_json::to_value(fence_at_generation(6)).expect("fence json");
+        rebound["identity"]["request"]["state_fence"] = foreign_fence.clone();
+        rebound["identity"]["request"]["metadata"]["state_fence"] = foreign_fence;
+        let rebound = serde_json::from_value::<CommandRequest>(rebound).expect("command json");
+        let mut board = ControlBoard::new(
+            Some(Box::new(access(
+                Role::HumanRequester,
+                &[ActionCapability::PauseTask],
+                &[PrivacyClass::Public],
+            ))),
+            Some(Box::new(FakeRead { state: state() })),
+            Some(Box::new(FakeCommand)),
+        );
+        assert_eq!(
+            board.submit(&read_request(Role::HumanRequester), rebound),
+            Err(ControlBoardError::FenceMismatch)
         );
     }
 }

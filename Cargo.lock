@@ -982,9 +982,11 @@ name = "eliot-controlboard"
 version = "0.1.0"
 dependencies = [
  "eliot-agent-coordinator",
+ "eliot-contracts",
  "eliot-evaluation-contracts",
  "eliot-evidence",
  "eliot-observation-contracts",
+ "eliot-protocol",
  "eliot-receipts",
  "eliot-security-contracts",
  "serde",
@@ -2365,7 +2367,9 @@ dependencies = [
 name = "eliotd"
 version = "0.1.0"
 dependencies = [
+ "eliot-authority",
  "eliot-contracts",
+ "eliot-controlboard",
  "eliot-governor",
  "eliot-ipc",
  "eliot-maintenance",

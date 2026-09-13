@@ -34,6 +34,7 @@ use eliot_protocol::{ProtocolVersion, ServerHello};
 use std::sync::atomic::Ordering;
 
 mod activation_projection;
+mod controlboard_adapters;
 mod daemon_config;
 mod daemon_kernel_client;
 mod daemon_kernel_port_adapters;
@@ -412,6 +413,21 @@ impl DaemonComposition {
                 activation_projection::map_governor_outcome_to_protocol(ticket, outcome, now.max(1))
             }
         }
+    }
+
+    /// Builds one provider-neutral `ControlBoard` over the current Governor
+    /// projection snapshot.
+    ///
+    /// The board reads one immutable snapshot taken here; every port call in
+    /// the returned value observes the same revision and fence. Callers take
+    /// a fresh board per operation so a Governor refresh surfaces as an
+    /// exact-view mismatch instead of silent divergence. Access resolution
+    /// and the Swarm projection remain typed provider gaps until their
+    /// owning slices land; reads serve a coherent empty-items view over real
+    /// G-11/I-12 bindings and submission admits candidate-only intents.
+    pub fn controlboard(&self) -> Result<eliot_controlboard::ControlBoard, DaemonError> {
+        let snapshot = self.governor.controlboard_snapshot()?;
+        Ok(controlboard_adapters::controlboard_over_snapshot(snapshot))
     }
 
     /// Stops the one daemon owner and releases protected handles together.
