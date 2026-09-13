@@ -33,7 +33,11 @@
 //! - Full typed claim validation stays with the admission path: the durable
 //!   record is the authority, and reconcile never re-admits. This handler
 //!   validates only the identity/binding/fence subset its decision depends
-//!   on, plus the retained-receipt echo when one is presented.
+//!   on, plus the retained-receipt echo when one is presented. A retained
+//!   receipt echoing a stale generation/epoch fences; one echoing a changed
+//!   registration/binding/attempt/operation conflicts. An optional
+//!   `claim.registration_id`, when presented, must equal the durable
+//!   registration or the reconcile conflicts before any effect.
 //!
 //! Transport error mapping is mechanical: shape, digest, fence, service-gate,
 //! and storage failures fail closed as `SessionFenced`; a changed binding
@@ -139,12 +143,18 @@ impl NativeWorkerReconcileError {
 
 /// Presented reconcile material: the reconcile identity plus the exact
 /// claim presentation it reconciles.
+///
+/// `registration_id` is optional for wire compatibility: callers that still
+/// present only the claim subset omit it and are checked exactly as before;
+/// callers that present it must match the durable registration or conflict
+/// before any effect, so a stale or foreign registration cannot reconcile.
 struct ReconcilePresentation {
     reconcile_id: String,
     claim_id: String,
     binding_digest: String,
     worker_generation: u64,
     authority_epoch: u64,
+    registration_id: Option<String>,
 }
 
 impl KernelComposition {
@@ -324,6 +334,11 @@ impl KernelComposition {
                 field: "authority_epoch",
             }
         })?;
+        if authority_epoch == 0 {
+            return Err(NativeWorkerReconcileError::Shape {
+                field: "authority_epoch",
+            });
+        }
         let fence_value =
             claim
                 .get("state_fence")
@@ -340,12 +355,22 @@ impl KernelComposition {
                 field: "epoch_fence",
             });
         }
+        let registration_id = match claim.get("registration_id") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(_) => Some(
+                native_worker_json_str(claim, "registration_id", MAX_RECONCILE_IDENTITY_LEN)
+                    .map_err(|_| NativeWorkerReconcileError::Shape {
+                        field: "registration_id",
+                    })?,
+            ),
+        };
         Ok(ReconcilePresentation {
             reconcile_id,
             claim_id,
             binding_digest,
             worker_generation,
             authority_epoch,
+            registration_id,
         })
     }
 
@@ -386,6 +411,202 @@ impl KernelComposition {
         Ok(digest)
     }
 
+    /// Checks an optional retained receipt echo against the durable record.
+    ///
+    /// Absent or explicit-null `receipt` means the worker holds no receipt
+    /// (lost acknowledgement without retained identity) and is accepted so
+    /// the durable identity can be rehydrated. A present non-object receipt
+    /// is malformed and fails closed as `Shape`. A present object must echo
+    /// the exact claim identity and the durable receipt digest; any other
+    /// echoed field it carries (generation, epoch, registration, binding,
+    /// attempt, operation, fence) must also agree with the durable record:
+    /// stale generation/epoch/fence fences the session while changed
+    /// registration/binding/attempt/operation conflicts before any effect.
+    /// The durable record stays the authority; this echo never re-admits.
+    fn check_retained_receipt(
+        payload: &serde_json::Value,
+        claim_id: &str,
+        staged: &NativeWorkerClaimRecord,
+    ) -> Result<(), NativeWorkerReconcileError> {
+        let raw = match payload.get("receipt") {
+            None | Some(serde_json::Value::Null) => return Ok(()),
+            Some(raw) => raw,
+        };
+        let retained = match raw {
+            serde_json::Value::Object(_) => raw,
+            _ => {
+                return Err(NativeWorkerReconcileError::Shape { field: "receipt" });
+            }
+        };
+        let retained_claim =
+            native_worker_json_str(retained, "claim_id", MAX_RECONCILE_IDENTITY_LEN).map_err(
+                |_| NativeWorkerReconcileError::Shape {
+                    field: "receipt.claim_id",
+                },
+            )?;
+        if retained_claim != claim_id {
+            return Err(NativeWorkerReconcileError::Shape {
+                field: "receipt.claim_id",
+            });
+        }
+        let retained_digest = Self::require_reconcile_digest(retained, "receipt_digest")?;
+        if staged.receipt_digest.as_deref() != Some(retained_digest.as_str()) {
+            return Err(NativeWorkerReconcileError::Conflict(
+                NativeWorkerReconcileConflict {
+                    identity: claim_id.to_owned(),
+                    expected_digest: staged.receipt_digest.clone().unwrap_or_default(),
+                    observed_digest: retained_digest,
+                    changed_fields: vec!["receipt_digest".to_owned()],
+                },
+            ));
+        }
+        Self::check_retained_binding_echo(retained, claim_id, staged)
+    }
+
+    /// Checks the optional binding fields a retained receipt may echo.
+    ///
+    /// Only fields the worker actually presents are compared; absent fields
+    /// keep the previous wire shape working. Stale generation/epoch/fence
+    /// fences while changed registration/binding/attempt/operation
+    /// conflicts, both before any effect.
+    fn check_retained_binding_echo(
+        retained: &serde_json::Value,
+        claim_id: &str,
+        staged: &NativeWorkerClaimRecord,
+    ) -> Result<(), NativeWorkerReconcileError> {
+        if retained
+            .get("worker_generation")
+            .is_some_and(|v| !v.is_null())
+        {
+            let generation =
+                native_worker_json_u64(retained, "worker_generation").map_err(|_| {
+                    NativeWorkerReconcileError::Shape {
+                        field: "receipt.worker_generation",
+                    }
+                })?;
+            if generation != staged.worker_generation {
+                return Err(NativeWorkerReconcileError::Fence {
+                    field: "receipt.worker_generation",
+                });
+            }
+        }
+        if retained
+            .get("authority_epoch")
+            .is_some_and(|v| !v.is_null())
+        {
+            let epoch = native_worker_json_u64(retained, "authority_epoch").map_err(|_| {
+                NativeWorkerReconcileError::Shape {
+                    field: "receipt.authority_epoch",
+                }
+            })?;
+            if epoch != staged.authority_epoch {
+                return Err(NativeWorkerReconcileError::Fence {
+                    field: "receipt.authority_epoch",
+                });
+            }
+        }
+        Self::check_retained_changed_fields(retained, claim_id, staged)?;
+        if let Some(fence_value) = retained.get("state_fence").filter(|v| !v.is_null()) {
+            let fence: StateFence = serde_json::from_value(fence_value.clone()).map_err(|_| {
+                NativeWorkerReconcileError::Shape {
+                    field: "receipt.state_fence",
+                }
+            })?;
+            if fence.authority_epoch.value() != staged.authority_epoch {
+                return Err(NativeWorkerReconcileError::Fence {
+                    field: "receipt.epoch_fence",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks the changed-binding fields a retained receipt may echo.
+    ///
+    /// A retained registration, binding digest, attempt, or operation that
+    /// disagrees with the durable record conflicts before any effect; the
+    /// receipt digest check above already covers the common case, and these
+    /// per-field checks close the digest-copying smuggle.
+    fn check_retained_changed_fields(
+        retained: &serde_json::Value,
+        claim_id: &str,
+        staged: &NativeWorkerClaimRecord,
+    ) -> Result<(), NativeWorkerReconcileError> {
+        if retained
+            .get("registration_id")
+            .is_some_and(|v| !v.is_null())
+        {
+            let registration =
+                native_worker_json_str(retained, "registration_id", MAX_RECONCILE_IDENTITY_LEN)
+                    .map_err(|_| NativeWorkerReconcileError::Shape {
+                        field: "receipt.registration_id",
+                    })?;
+            if registration != staged.registration_id.as_str() {
+                return Err(NativeWorkerReconcileError::Conflict(
+                    NativeWorkerReconcileConflict {
+                        identity: claim_id.to_owned(),
+                        expected_digest: staged.binding_digest.clone(),
+                        observed_digest: staged.binding_digest.clone(),
+                        changed_fields: vec!["receipt.registration_id".to_owned()],
+                    },
+                ));
+            }
+        }
+        if retained.get("binding_digest").is_some_and(|v| !v.is_null()) {
+            let binding =
+                Self::require_reconcile_digest(retained, "binding_digest").map_err(|_| {
+                    NativeWorkerReconcileError::Shape {
+                        field: "receipt.binding_digest",
+                    }
+                })?;
+            if binding != staged.binding_digest {
+                return Err(NativeWorkerReconcileError::Conflict(
+                    NativeWorkerReconcileConflict {
+                        identity: claim_id.to_owned(),
+                        expected_digest: staged.binding_digest.clone(),
+                        observed_digest: binding,
+                        changed_fields: vec!["receipt.binding_digest".to_owned()],
+                    },
+                ));
+            }
+        }
+        if retained.get("attempt_id").is_some_and(|v| !v.is_null()) {
+            let presented =
+                native_worker_json_str(retained, "attempt_id", MAX_RECONCILE_IDENTITY_LEN)
+                    .map_err(|_| NativeWorkerReconcileError::Shape {
+                        field: "receipt.attempt_id",
+                    })?;
+            if presented != staged.attempt_id.as_str() {
+                return Err(NativeWorkerReconcileError::Conflict(
+                    NativeWorkerReconcileConflict {
+                        identity: claim_id.to_owned(),
+                        expected_digest: staged.binding_digest.clone(),
+                        observed_digest: staged.binding_digest.clone(),
+                        changed_fields: vec!["receipt.attempt_id".to_owned()],
+                    },
+                ));
+            }
+        }
+        if retained.get("operation_id").is_some_and(|v| !v.is_null()) {
+            let presented =
+                native_worker_json_str(retained, "operation_id", MAX_RECONCILE_IDENTITY_LEN)
+                    .map_err(|_| NativeWorkerReconcileError::Shape {
+                        field: "receipt.operation_id",
+                    })?;
+            if presented != staged.operation_id.as_str() {
+                return Err(NativeWorkerReconcileError::Conflict(
+                    NativeWorkerReconcileConflict {
+                        identity: claim_id.to_owned(),
+                        expected_digest: staged.binding_digest.clone(),
+                        observed_digest: staged.binding_digest.clone(),
+                        changed_fields: vec!["receipt.operation_id".to_owned()],
+                    },
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Reconciles one exact claim after a lost acknowledgement.
     ///
     /// The payload carries the full presented claim plus the retained receipt
@@ -417,6 +638,18 @@ impl KernelComposition {
                 field: "authority_epoch",
             });
         }
+        if let Some(presented_registration) = presentation.registration_id.as_deref()
+            && presented_registration != staged.registration_id.as_str()
+        {
+            return Err(NativeWorkerReconcileError::Conflict(
+                NativeWorkerReconcileConflict {
+                    identity: claim_id.clone(),
+                    expected_digest: staged.binding_digest.clone(),
+                    observed_digest: binding_digest.clone(),
+                    changed_fields: vec!["registration_id".to_owned()],
+                },
+            ));
+        }
         if staged.binding_digest != binding_digest {
             return Err(NativeWorkerReconcileError::Conflict(
                 NativeWorkerReconcileConflict {
@@ -427,30 +660,7 @@ impl KernelComposition {
                 },
             ));
         }
-        if let Some(retained) = payload.get("receipt").filter(|receipt| receipt.is_object()) {
-            let retained_claim =
-                native_worker_json_str(retained, "claim_id", MAX_RECONCILE_IDENTITY_LEN).map_err(
-                    |_| NativeWorkerReconcileError::Shape {
-                        field: "receipt.claim_id",
-                    },
-                )?;
-            if retained_claim != claim_id {
-                return Err(NativeWorkerReconcileError::Shape {
-                    field: "receipt.claim_id",
-                });
-            }
-            let retained_digest = Self::require_reconcile_digest(retained, "receipt_digest")?;
-            if staged.receipt_digest.as_deref() != Some(retained_digest.as_str()) {
-                return Err(NativeWorkerReconcileError::Conflict(
-                    NativeWorkerReconcileConflict {
-                        identity: claim_id.clone(),
-                        expected_digest: staged.receipt_digest.clone().unwrap_or_default(),
-                        observed_digest: retained_digest,
-                        changed_fields: vec!["receipt_digest".to_owned()],
-                    },
-                ));
-            }
-        }
+        Self::check_retained_receipt(payload, &claim_id, &staged)?;
         let durable_state = if staged.state == NativeWorkerClaimState::Unknown {
             self.advance_reconcile_record(&claim_id, NativeWorkerClaimState::Reconciling)?
                 .state
@@ -479,3 +689,12 @@ impl KernelComposition {
         Ok(body)
     }
 }
+
+// Slice B focused tests live in `tests/native_worker_reconcile_plumbing.rs`
+// but are hooked here (not in `tests.rs`) so this slice stays disjoint from
+// Slice A and the T2/T6 serializer: no shared wiring file is touched. The
+// manager may rewire that file under `tests.rs` on integration and remove
+// this one-line hook.
+#[cfg(test)]
+#[path = "tests/native_worker_reconcile_plumbing.rs"]
+mod native_worker_reconcile_plumbing;
