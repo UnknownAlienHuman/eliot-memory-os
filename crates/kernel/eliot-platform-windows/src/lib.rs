@@ -1014,7 +1014,7 @@ fn open_runtime_file_with_share(
         .share_mode(share_mode)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     let file = if create {
-        options.create_new(true).open(path).or_else(|error| {
+        create_new_runtime_file(path, share_mode).or_else(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
                 let mut existing = std::fs::OpenOptions::new();
                 existing
@@ -1052,6 +1052,89 @@ fn open_runtime_file_with_share(
         .map_err(|_| ProtectedPathError::AclMismatch)?;
     verify_readonly_acl(&file, &descriptor)?;
     Ok(file)
+}
+
+#[cfg(windows)]
+fn create_new_runtime_file(path: &Path, share_mode: u32) -> std::io::Result<std::fs::File> {
+    #[cfg(any(test, feature = "test-support"))]
+    if test_protected_root().is_some() {
+        // Historical test-lease contour: plain create-only open. The ACL
+        // verification below is bypassed for this contour, so no installer
+        // descriptor is minted here. Existing tests keep their exact
+        // behavior; production never takes this branch.
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        return std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .access_mode(runtime_file_access_mode(true))
+            .share_mode(share_mode)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .create_new(true)
+            .open(path);
+    }
+    // Production contour: the owner-SYSTEM bit requires SeRestorePrivilege,
+    // so the create runs under the same mapped restore-privilege scope the
+    // installer staging path uses.
+    installer_root::with_system_restore_privilege_mapped(
+        InstallerRootProfile::SystemService,
+        || create_runtime_file_with_installer_descriptor(path, share_mode),
+        |_| std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+    )
+}
+
+/// Creates one runtime state file with
+/// `OwnedSecurityDescriptor::for_installer_system_object(false)` applied AT
+/// CREATION (`SECURITY_ATTRIBUTES` + `CREATE_NEW`/`CreateFileW`), mirroring
+/// `package_staging::create_destination_file`. A create collision surfaces as
+/// `AlreadyExists` so the caller keeps failing closed on a wrong-ACL file via
+/// the unchanged `verify_readonly_acl` readback; nothing is ever re-ACL'd.
+#[cfg(windows)]
+fn create_runtime_file_with_installer_descriptor(
+    path: &Path,
+    share_mode: u32,
+) -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::FromRawHandle as _;
+    use windows_sys::Win32::Foundation::{
+        ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, GetLastError, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let descriptor = OwnedSecurityDescriptor::for_installer_system_object(false)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::PermissionDenied))?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?,
+        lpSecurityDescriptor: descriptor.raw,
+        bInheritHandle: 0,
+    };
+    let wide = wide(path);
+    // SAFETY: `wide` and `descriptor` remain live for the call; CREATE_NEW is
+    // create-only and the retained handle keeps the caller's share mode.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            runtime_file_access_mode(true),
+            share_mode,
+            &raw const attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        // SAFETY: captured immediately after the failed CreateFileW call.
+        let code = unsafe { GetLastError() };
+        if code == ERROR_ALREADY_EXISTS || code == ERROR_FILE_EXISTS {
+            return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+        }
+        return Err(std::io::Error::from_raw_os_error(code.cast_signed()));
+    }
+    // SAFETY: CreateFileW returned a uniquely owned new file handle.
+    Ok(unsafe { std::fs::File::from_raw_handle(handle.cast()) })
 }
 
 #[cfg(windows)]
