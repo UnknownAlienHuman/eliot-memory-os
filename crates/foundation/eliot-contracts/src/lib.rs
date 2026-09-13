@@ -522,6 +522,75 @@ impl StateFence {
     }
 }
 
+impl StateFence {
+    /// Canonical exact-tuple authorization for one fence/active epoch pair.
+    ///
+    /// Returns true only when `fence_epoch` and `active_epoch` are the exact
+    /// same `(lineage_id, sequence)` tuple via `EpochId::is_same_authority`
+    /// (`epoch_identity.rs:146`). Equal sequences from different lineages are
+    /// unrelated and return false; a numerically larger sequence from another
+    /// lineage never authorizes (contract `epoch-id.contract.toml`
+    /// `[types.EpochId]` exact-tuple rule and `[types.EpochRelation]`
+    /// `UNRELATED_LINEAGE never authorizes`).
+    ///
+    /// Additive prep only: the scalar `StateFence` fields above are unchanged
+    /// (migration wave 1 must not touch `StateFence` consumers), and this
+    /// function takes explicit `EpochId` values without any
+    /// scalar-to-canonical coercion.
+    #[must_use]
+    pub fn authorizes_canonical(fence_epoch: &EpochId, active_epoch: &EpochId) -> bool {
+        fence_epoch.is_same_authority(active_epoch)
+    }
+
+    /// Canonical direct-child check for one candidate/parent epoch pair.
+    ///
+    /// Returns true only when both epochs share `lineage_id` and
+    /// `candidate.sequence == parent.sequence + 1` via
+    /// `EpochId::is_direct_child_of` (`epoch_identity.rs:156`; contract
+    /// `[types.EpochTransition]` one-step rule). Cross-lineage pairs return
+    /// false; no numeric ordering across lineages is performed (contract
+    /// `[functions] forbidden`: no cross-lineage sequence/timestamp/UUID
+    /// comparison, no `Ord` on `EpochId`).
+    #[must_use]
+    pub fn canonical_is_direct_child(candidate: &EpochId, parent: &EpochId) -> bool {
+        candidate.is_direct_child_of(parent)
+    }
+
+    /// Fail-closed validation that `candidate` is the direct child of `parent`.
+    ///
+    /// Returns `Ok(())` only for the exact one-step transition in one lineage.
+    /// Otherwise returns the closed typed error that distinguishes the failure
+    /// without manufacturing authority: `ParentLineageMismatch` when the
+    /// lineages differ, `NotDirectChild` when the lineage matches but the
+    /// sequence delta is not exactly one (contract `[errors]` closed values;
+    /// `[types.EpochTransition]` genesis/direct-child/lineage rules). No stub
+    /// or `Unavailable` path exists.
+    pub fn validate_canonical_epoch(
+        candidate: &EpochId,
+        parent: &EpochId,
+    ) -> Result<(), EpochContractError> {
+        if candidate.is_direct_child_of(parent) {
+            Ok(())
+        } else if candidate.lineage_id != parent.lineage_id {
+            Err(EpochContractError::ParentLineageMismatch)
+        } else {
+            Err(EpochContractError::NotDirectChild)
+        }
+    }
+
+    /// Lineage-bound canonical digest for one epoch value.
+    ///
+    /// Delegates to `epoch_identity_digest` (`epoch_identity.rs:566`), whose
+    /// input is the domain separator plus `lineage_id` plus `sequence`
+    /// (contract `[types.EpochId]` digest invariant and `[wire]`
+    /// `canonical_digest_domain_separator`). Equal sequences in different
+    /// lineages therefore digest differently; the scalar fence value never
+    /// enters the digest.
+    pub fn canonical_epoch_digest(epoch: &EpochId) -> Result<LowercaseSha256, EpochContractError> {
+        epoch_identity_digest(epoch)
+    }
+}
+
 /// Metadata attached to every request crossing a contract boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -989,6 +1058,85 @@ mod tests {
         assert_eq!(wire["revision"], WORK_LEASE_WIRE_REVISION);
         assert!(serde_json::from_value::<WorkLeaseId>(serde_json::json!(uuid)).is_err());
         // The namespace tag, not UUID spelling, determines this distinct identity.
+        Ok(())
+    }
+
+    const CANONICAL_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const CANONICAL_LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+    #[allow(clippy::expect_used)]
+    fn canonical_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid lineage"),
+            std::num::NonZeroU64::new(sequence).expect("nonzero sequence"),
+        )
+        .expect("valid epoch")
+    }
+
+    #[test]
+    fn state_fence_canonical_same_tuple_authorizes() {
+        let fence = canonical_epoch(CANONICAL_LINEAGE_A, 3);
+        let active = canonical_epoch(CANONICAL_LINEAGE_A, 3);
+        assert!(StateFence::authorizes_canonical(&fence, &active));
+        assert_eq!(fence.relation_to(&active), EpochRelation::Same);
+    }
+
+    #[test]
+    fn state_fence_canonical_cross_lineage_same_sequence_rejected() {
+        let fence = canonical_epoch(CANONICAL_LINEAGE_A, 3);
+        let active = canonical_epoch(CANONICAL_LINEAGE_B, 3);
+        assert!(!StateFence::authorizes_canonical(&fence, &active));
+        assert_eq!(fence.relation_to(&active), EpochRelation::UnrelatedLineage);
+        assert!(!StateFence::canonical_is_direct_child(&active, &fence));
+        assert_eq!(
+            StateFence::validate_canonical_epoch(&active, &fence),
+            Err(EpochContractError::ParentLineageMismatch)
+        );
+    }
+
+    #[test]
+    fn state_fence_canonical_direct_child_accepted() {
+        let parent = canonical_epoch(CANONICAL_LINEAGE_A, 1);
+        let child = canonical_epoch(CANONICAL_LINEAGE_A, 2);
+        assert!(StateFence::canonical_is_direct_child(&child, &parent));
+        assert!(StateFence::validate_canonical_epoch(&child, &parent).is_ok());
+        // Same tuple is authorization, not advancement.
+        assert!(!StateFence::canonical_is_direct_child(&parent, &parent));
+    }
+
+    #[test]
+    fn state_fence_canonical_non_child_rejected() {
+        let parent = canonical_epoch(CANONICAL_LINEAGE_A, 1);
+        let skipped = canonical_epoch(CANONICAL_LINEAGE_A, 3);
+        assert!(!StateFence::canonical_is_direct_child(&skipped, &parent));
+        assert_eq!(
+            StateFence::validate_canonical_epoch(&skipped, &parent),
+            Err(EpochContractError::NotDirectChild)
+        );
+        // Larger sequence from another lineage is unrelated, never newer.
+        let foreign_larger = canonical_epoch(CANONICAL_LINEAGE_B, 9);
+        assert!(!StateFence::authorizes_canonical(
+            &canonical_epoch(CANONICAL_LINEAGE_A, 3),
+            &foreign_larger
+        ));
+        assert_eq!(
+            foreign_larger.relation_to(&canonical_epoch(CANONICAL_LINEAGE_A, 3)),
+            EpochRelation::UnrelatedLineage
+        );
+    }
+
+    #[test]
+    fn state_fence_canonical_digest_binds_lineage() -> TestResult {
+        let same_a = canonical_epoch(CANONICAL_LINEAGE_A, 1);
+        let same_a_again = canonical_epoch(CANONICAL_LINEAGE_A, 1);
+        let other_lineage = canonical_epoch(CANONICAL_LINEAGE_B, 1);
+        let other_sequence = canonical_epoch(CANONICAL_LINEAGE_A, 2);
+        let first = StateFence::canonical_epoch_digest(&same_a)?;
+        let second = StateFence::canonical_epoch_digest(&same_a_again)?;
+        assert_eq!(first, second);
+        assert_eq!(first.as_str(), epoch_identity_digest(&same_a)?.as_str());
+        assert_ne!(first, StateFence::canonical_epoch_digest(&other_lineage)?);
+        assert_ne!(first, StateFence::canonical_epoch_digest(&other_sequence)?);
         Ok(())
     }
 }
