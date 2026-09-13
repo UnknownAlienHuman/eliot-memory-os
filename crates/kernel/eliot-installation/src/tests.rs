@@ -21,6 +21,7 @@ use super::*;
 use eliot_platform_windows::UserOwnedRootLease;
 use eliot_platform_windows::{HostOwnerEpochCapability, HostOwnerLease};
 
+mod registry_concurrent_read;
 mod registry_wire_launch;
 mod rollback_recovery;
 mod service_start_recovery;

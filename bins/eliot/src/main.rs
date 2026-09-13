@@ -2218,6 +2218,14 @@ fn run_installation_effect(
                     );
                     return Ok(INVALID_REQUEST_EXIT);
                 }
+                // INSTALL-WATCHDOG-APPROVAL: the staged `registry` is the sole
+                // redb writer for the installation registry. Release it (with
+                // its retained root/file leases) before the unbounded SCM
+                // start + convergence wait so the Watchdog approval reader
+                // (`inspect_existing_at`, a short-lived ReadOnlyDatabase) can
+                // open the same file. Terminal reconcile re-opens short-lived
+                // handles via `open_existing_at`.
+                drop(registry);
                 coordinator.drive_all_effects_until_blocked(&transaction_id)
             }
             outcome => outcome,
