@@ -24,9 +24,10 @@
 //! `ServiceSidType`, service constants, `ServiceControlGrantReadback`,
 //! `ServiceBootstrapArguments`, `ServiceRegistrationCurrent`,
 //! `ServiceRegistrationRequest`, `ServiceRegistrationOutcome`,
-//! `ServiceRegistrationInspection`, `ServiceRuntimeObservation`,
-//! `ServiceRegistrationRuntimeInspection`, `ServiceStartOutcome`,
-//! `ServiceStopOutcome` — and their proven closure-owned private helpers.
+//! `ServiceAbsentProof`, `ServiceRegistrationInspection`,
+//! `ServiceRuntimeObservation`, `ServiceRegistrationRuntimeInspection`,
+//! `ServiceStartOutcome`, `ServiceStopOutcome` — and their proven closure-owned
+//! private helpers.
 //! Physical SCM register, update, delete, start, stop and inspect operations
 //! remain root-owned in `lib.rs` and must not be duplicated here. It does not
 //! own and must not duplicate or broaden: Kernel generation/fencing,
@@ -683,6 +684,54 @@ impl ServiceRegistrationRequest {
     }
 }
 
+/// Independently observed SCM proof that one canonical service name is absent.
+///
+/// The proof is constructed only on the live `OpenServiceW` path that returns
+/// `ERROR_SERVICE_DOES_NOT_EXIST` for the validated request's canonical name.
+/// It carries the queried name and the admitted configuration digest so an
+/// absence observation can be bound to the exact effect without trusting plan
+/// data alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceAbsentProof {
+    service_name: String,
+    configuration_digest: String,
+}
+
+impl ServiceAbsentProof {
+    /// Binds a live `ERROR_SERVICE_DOES_NOT_EXIST` outcome to its query.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for a non-canonical service name or digest.
+    pub(super) fn new(
+        service_name: impl Into<String>,
+        configuration_digest: impl Into<String>,
+    ) -> Result<Self, WindowsAdapterError> {
+        let service_name = service_name.into();
+        let configuration_digest = configuration_digest.into();
+        if !crate::canonical_runtime_service_name(&service_name)
+            || !crate::valid_sha256_hex(&configuration_digest)
+        {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self {
+            service_name,
+            configuration_digest,
+        })
+    }
+
+    /// Returns the canonical SCM service name that was queried and found absent.
+    #[must_use]
+    pub fn service_name(&self) -> &str {
+        &self.service_name
+    }
+
+    /// Returns the admitted configuration digest bound to the absent query.
+    #[must_use]
+    pub fn configuration_digest(&self) -> &str {
+        &self.configuration_digest
+    }
+}
+
 /// Registration result preserving whether an external SCM effect requires
 /// reconciliation before it can be called successful.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -728,7 +777,14 @@ pub enum ServiceRegistrationInspection {
         control_grant: Option<ServiceControlGrantReadback>,
     },
     /// The canonical service name is not registered.
-    Absent,
+    ///
+    /// The proof carries the live `ERROR_SERVICE_DOES_NOT_EXIST` observation
+    /// (queried name plus admitted configuration digest) so callers bind the
+    /// absence to their exact effect instead of trusting plan data alone.
+    Absent {
+        /// Independently observed SCM absence proof for the queried service.
+        proof: ServiceAbsentProof,
+    },
     /// A service exists at the canonical name with different configuration.
     Mismatched,
     /// SCM could not provide authoritative configuration and state readback.

@@ -43,7 +43,7 @@ use eliot_platform_windows::{
     InstallerRootPrimitiveCreate, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
     InstallerRootProfile, InstallerRootStage, InstallerSecretCreateDisposition,
     InstallerSecretObservation, ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
-    ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationCurrent,
+    ServiceAbsentProof, ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationCurrent,
     ServiceRegistrationInspection, ServiceRegistrationOutcome, ServiceRegistrationRequest,
     ServiceRegistrationRuntimeInspection, ServiceStartMode, ServiceStartOutcome,
     ServiceStopOutcome, StagingReceipt, SupervisionAuthorityKeyError,
@@ -4042,11 +4042,17 @@ impl WindowsInstallationEffectPort {
         let (platform, registration, spec) = Self::service_context(request)?;
         let service_name = registration.service_name().to_owned();
         match platform.inspect_service_registration(&registration) {
-            ServiceRegistrationInspection::Absent => {
+            ServiceRegistrationInspection::Absent { proof } => {
                 if std::fs::symlink_metadata(service_marker_path(request)).is_ok() {
                     return Ok(root_mismatch("service-marker-before-intent"));
                 }
-                service_absent_observation(request)
+                service_absent_from_live_inspection(
+                    request,
+                    &registration,
+                    &proof,
+                    &self.primitive,
+                    &spec,
+                )
             }
             ServiceRegistrationInspection::Matching { control_grant, .. } => {
                 let digest = registration.expected_configuration_digest();
@@ -4087,7 +4093,13 @@ impl WindowsInstallationEffectPort {
         let service_name = registration.service_name().to_owned();
         let digest = registration.expected_configuration_digest();
         match platform.inspect_service_registration(&registration) {
-            ServiceRegistrationInspection::Absent => service_absent_observation(request),
+            ServiceRegistrationInspection::Absent { proof } => service_absent_from_live_inspection(
+                request,
+                &registration,
+                &proof,
+                &self.primitive,
+                &spec,
+            ),
             ServiceRegistrationInspection::Matching { control_grant, .. } => {
                 let control_grant = control_grant
                     .as_ref()
@@ -5970,17 +5982,34 @@ fn service_marker_read(
     Ok(Some((readback.object, marker)))
 }
 
+/// Builds a rollback-valid `Absent` observation bound to the live SCM proof.
+///
+/// The proof must bind this exact validated registration; a proof for any
+/// other name or configuration digest is a provider/readback substitution and
+/// fails closed. Evidence binds the effect, plan, observed service identity,
+/// and the `DOES_NOT_EXIST` outcome, mirroring the service-matching-v2
+/// binding. The precondition is cloned unchanged so an admitted snapshot is
+/// preserved verbatim.
 fn service_absent_observation(
     request: &InstallationEffectRequest,
+    registration: &ServiceRegistrationRequest,
+    proof: &ServiceAbsentProof,
 ) -> Result<InstallationEffectObservation, PortError> {
+    if proof.service_name() != registration.service_name()
+        || proof.configuration_digest() != registration.expected_configuration_digest()
+    {
+        return Err(PortError::InvalidRequestMetadata);
+    }
     Ok(InstallationEffectObservation::Absent {
         observed_precondition: request.precondition.clone(),
         evidence: vec![
             PlatformHandle::new(sha256_hex(
                 format!(
-                    "service-absent-v1\0{}\0{}",
+                    "service-absent-v2\0{}\0{}\0{}\0{}\0DOES_NOT_EXIST",
                     request.effect_id.as_str(),
-                    request.plan_digest.as_str()
+                    request.plan_digest.as_str(),
+                    proof.service_name(),
+                    proof.configuration_digest(),
                 )
                 .as_bytes(),
             ))
@@ -5988,6 +6017,73 @@ fn service_absent_observation(
         ],
         service_runtime_lineage: None,
     })
+}
+
+/// Attaches a platform-observed absence snapshot to a live SCM absence, the
+/// service analogue of `package_absent_with_snapshot`.
+fn service_absent_with_snapshot(
+    request: &InstallationEffectRequest,
+    registration: &ServiceRegistrationRequest,
+    proof: &ServiceAbsentProof,
+    snapshot: InstallerRootAbsentSnapshot,
+) -> Result<InstallationEffectObservation, PortError> {
+    let snapshot = installation_absent_snapshot(snapshot)?;
+    let precondition = request
+        .precondition
+        .with_os_snapshot(snapshot)
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    service_absent_observation(
+        &InstallationEffectRequest {
+            precondition,
+            ..request.clone()
+        },
+        registration,
+        proof,
+    )
+}
+
+/// Builds the `Absent` observation for a just-observed SCM absence.
+///
+/// A precondition that already carries the admitted OS snapshot (rollback
+/// reconcile after a fixed inspect) is preserved by cloning it. Otherwise the
+/// snapshot is observed now through the installer-root owner: a genuinely
+/// absent root yields its retained absence snapshot, while a present root
+/// contributes its live retained-handle readback as the parent contour under
+/// the independently observed SCM `DOES_NOT_EXIST` proof carried as the
+/// snapshot target. Nothing is derived from the plan alone: the target digest
+/// covers the live SCM outcome and the parents are the handles just read back
+/// in this call.
+fn service_absent_from_live_inspection(
+    request: &InstallationEffectRequest,
+    registration: &ServiceRegistrationRequest,
+    proof: &ServiceAbsentProof,
+    primitive: &WindowsInstallerRootPrimitive,
+    spec: &InstallerRootPrimitiveSpec,
+) -> Result<InstallationEffectObservation, PortError> {
+    if request.precondition.os_snapshot.is_some() {
+        return service_absent_observation(request, registration, proof);
+    }
+    let snapshot = match primitive.inspect(spec).map_err(root_port_error)? {
+        InstallerRootPrimitiveObservation::Absent(snapshot) => snapshot,
+        InstallerRootPrimitiveObservation::Matching(root) => InstallerRootAbsentSnapshot {
+            target_path_digest: sha256_hex(
+                format!(
+                    "service-absent-target-v1\0{}\0{}\0DOES_NOT_EXIST",
+                    proof.service_name(),
+                    proof.configuration_digest(),
+                )
+                .as_bytes(),
+            ),
+            profile_anchor: root.clone(),
+            ancestors: vec![root.clone()],
+            parent: root,
+            root_absent: true,
+        },
+        InstallerRootPrimitiveObservation::Mismatch => {
+            return Ok(root_mismatch("service-root-readback"));
+        }
+    };
+    service_absent_with_snapshot(request, registration, proof, snapshot)
 }
 
 fn service_matching_observation(
