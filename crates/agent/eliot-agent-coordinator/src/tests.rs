@@ -2,13 +2,17 @@ use std::collections::BTreeSet;
 
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentLaunchRequest, AgentResult, AgentWorkUnitBrief, ArtifactId,
-    AttemptId, AuthorityEpoch, BudgetEnvelope, CONTRACT_VERSION, ClockReading, ContractError,
-    DecisionId, EffectCeiling, EffectKind, EventCursor, ExecutionOutcome, ExecutionUnit,
-    LaunchRequestId, LowercaseSha256, NativeSession, NativeSessionLocator,
-    PhysicalRouteObservationReceipt, ProposedEffect, ProviderExecutionBinding, QuotaKnowledge,
-    RequestId, ResourceGeneration, ResultDisposition, RouteFingerprint, RouteObservationState,
-    RouteSelectionCandidate, StateFence, TaskId, UsageReceipt, WorkLeaseId, WorkUnitId,
-    candidate_digest_for,
+    AssistantDeltaObservation, AttemptId, AuthorityEpoch, BudgetEnvelope, CONTRACT_VERSION,
+    ClockReading, ContractError, DecisionId, EffectCeiling, EffectKind, EventCursor, EventId,
+    ExecutionOutcome, ExecutionUnit, ExecutionUnitObservation, HOST_EVENT_CONTRACT_VERSION,
+    HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition, HostEventNormalizationReceipt,
+    HostEventPrivacyClass, LaunchRequestId, LowercaseSha256, NativeSession, NativeSessionLocator,
+    NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
+    PhysicalRouteObservationReceipt, ProposedEffect, ProviderExecutionBinding,
+    ProviderObservationLineage, QualifiedSourceDigest, QuotaKnowledge, RawSourceRecord, RequestId,
+    ResourceGeneration, RestrictedRawSourceHandle, ResultDisposition, RouteFingerprint,
+    RouteObservationState, RouteSelectionCandidate, StateFence, TaskId, UnsupportedDisposition,
+    UsageReceipt, WorkLeaseId, WorkUnitId, candidate_digest_for,
 };
 use eliot_agent_contracts::{
     DeliveryPolicy, DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, RevisionId,
@@ -2899,5 +2903,166 @@ fn s5_forged_lane_admission_rejects_at_admit() -> TestResult {
         coord.admit(bad_digest).err(),
         Some(CoordinatorError::ProviderContract(_))
     ));
+    Ok(())
+}
+
+fn host_event_envelope(
+    lane: &AdmittedLaneReceipt,
+    binding: &ProviderExecutionBinding,
+    sequence: u64,
+    cursor_tag: &str,
+    event_tag: &str,
+) -> TestResult<NormalizedHostEventEnvelope> {
+    let cursor = EventCursor::new(format!("cursor-{cursor_tag}"))?;
+    let raw_bytes = format!("host-event-source-{event_tag}").into_bytes();
+    let raw = RawSourceRecord {
+        handle: RestrictedRawSourceHandle::new(format!("restricted-test:{event_tag}"))?,
+        digest: QualifiedSourceDigest {
+            algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+            digest: serde_json::from_value(serde_json::json!(sha256_hex(&raw_bytes)))?,
+        },
+    };
+    let stored = lane
+        .admitted_route
+        .as_ref()
+        .ok_or("lane must carry the stored admission")?;
+    let mut envelope = NormalizedHostEventEnvelope {
+        schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+        event_id: EventId::new(format!("evt-{event_tag}"))?,
+        cursor: cursor.clone(),
+        lineage: ProviderObservationLineage::ExecutionUnitObservation(Box::new(
+            ExecutionUnitObservation {
+                binding: binding.clone(),
+                cursor,
+                sequence,
+            },
+        )),
+        producer_adapter_identity: "test-adapter".into(),
+        adapter_contract_version: "test-adapter/v1".into(),
+        sequence,
+        causal_predecessors: Vec::new(),
+        payload: NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
+            delta_chars: 4,
+            truncated: false,
+        }),
+        admitted_route_digest: Some(stored.self_digest.clone()),
+        raw_source: raw.clone(),
+        normalization: HostEventNormalizationReceipt {
+            normalizer_identity: "test-adapter".into(),
+            normalizer_version: "test-adapter/v1".into(),
+            input_handle: raw.handle.clone(),
+            input_digest: raw.digest.clone(),
+            output_schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+            output_digest: zero_digest()?,
+            omitted_fields: Vec::new(),
+            warnings: Vec::new(),
+            unsupported_disposition: UnsupportedDisposition::None,
+            privacy_class: HostEventPrivacyClass::RedactedSummary,
+            coverage: NormalizationCoverage::Complete,
+            proof_ceiling: eliot_receipts::ProofCeiling::Observation,
+        },
+        observed_at: ClockReading {
+            valid_time_ms: Some(1_700_000_000_000),
+            known_time_ms: Some(1_700_000_000_001),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        delivery: HostEventDeliveryDisposition::DurableOrdered,
+    };
+    envelope
+        .seal()
+        .map_err(|error| format!("envelope must seal: {error}"))?;
+    Ok(envelope)
+}
+
+fn bound_observe_setup() -> TestResult<(
+    AgentCoordinator,
+    ExecutionContext,
+    AdmittedLaneReceipt,
+    ProviderExecutionBinding,
+)> {
+    let proofs = ["proof-admission-observe", "proof-bind-observe"];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "observe",
+        &[bind_lane_spec("work-observe", "reader-observe", "a")],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let stored = coordinator.bind_provider_execution(
+        context.clone(),
+        binding_submission("observe", &lane, "unit-observe", "scope-observe")?,
+    )?;
+    Ok((coordinator, context, lane, stored))
+}
+
+#[test]
+fn observe_accepts_exact_binding_and_replays_without_duplicate_effects() -> TestResult {
+    let (mut coordinator, context, lane, stored) = bound_observe_setup()?;
+    let envelope = host_event_envelope(&lane, &stored, 1, "observe-1", "observe-1")?;
+    let receipt = envelope.normalization.clone();
+    let events_before = coordinator.events().len();
+    coordinator.observe_provider_event(context.clone(), envelope.clone(), receipt.clone())?;
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    // Exact replay is idempotent: no new event, no duplicate effects.
+    coordinator.observe_provider_event(context.clone(), envelope.clone(), receipt.clone())?;
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    // Conflicting same-identity replay is quarantined without mutation.
+    let mut conflict = envelope.clone();
+    conflict.payload = NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
+        delta_chars: 5,
+        truncated: false,
+    });
+    conflict
+        .seal()
+        .map_err(|error| format!("conflict must seal: {error}"))?;
+    let conflict_receipt = conflict.normalization.clone();
+    assert_eq!(
+        coordinator.observe_provider_event(context, conflict, conflict_receipt),
+        Err(CoordinatorError::IdempotencyConflict)
+    );
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    Ok(())
+}
+
+#[test]
+fn observe_rejects_foreign_turn_and_unknown_attempt_before_mutation() -> TestResult {
+    let (mut coordinator, context, lane, _stored) = bound_observe_setup()?;
+    let events_before = coordinator.events().len();
+    // Same thread, different provider turn: the foreign unit cannot enter the
+    // recorded attempt even though the attempt identity matches.
+    let foreign = binding_submission("observe-f", &lane, "unit-foreign", "scope-observe")?.binding;
+    let foreign_event = host_event_envelope(&lane, &foreign, 1, "observe-f-1", "observe-f-1")?;
+    let foreign_receipt = foreign_event.normalization.clone();
+    assert_eq!(
+        coordinator.observe_provider_event(context.clone(), foreign_event, foreign_receipt),
+        Err(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    assert_eq!(coordinator.events().len(), events_before);
+    // A caller-selected identity for an unknown attempt resolves to nothing.
+    let mut ghost = host_event_envelope(
+        &lane,
+        &binding_submission("observe", &lane, "unit-observe", "scope-observe")?.binding,
+        1,
+        "observe-g-1",
+        "observe-g-1",
+    )?;
+    if let ProviderObservationLineage::ExecutionUnitObservation(observation) = &mut ghost.lineage {
+        observation.binding.attempt_id = AttemptId::new("attempt-ghost")?;
+    } else {
+        panic!("envelope must carry execution-unit lineage");
+    }
+    ghost
+        .seal()
+        .map_err(|error| format!("ghost must seal: {error}"))?;
+    let ghost_receipt = ghost.normalization.clone();
+    assert_eq!(
+        coordinator.observe_provider_event(context, ghost, ghost_receipt),
+        Err(CoordinatorError::UnknownAttempt)
+    );
+    assert_eq!(coordinator.events().len(), events_before);
     Ok(())
 }

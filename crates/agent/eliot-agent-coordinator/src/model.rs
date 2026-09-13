@@ -1,8 +1,9 @@
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentLaunchRequest, AgentResult, AttemptId, AuthorityEpoch,
-    BudgetEnvelope, CancelReason, LaunchRequestId, PhysicalRouteObservationReceipt,
-    ProviderExecutionBinding, ResultDisposition, RouteFingerprint, RouteSelectionCandidate,
-    StateFence, TaskId, WorkLeaseId, WorkUnitId,
+    BudgetEnvelope, CancelReason, EventId, HostEventNormalizationReceipt, LaunchRequestId,
+    NormalizedHostEventEnvelope, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
+    ResultDisposition, RouteFingerprint, RouteSelectionCandidate, StateFence, TaskId, WorkLeaseId,
+    WorkUnitId,
 };
 use eliot_agent_contracts::{
     DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, MessageId,
@@ -627,7 +628,46 @@ pub enum CoordinatorEvent {
         context: ExecutionContext,
         submission: Box<ProviderExecutionBindingSubmission>,
     },
+    /// A closed v7 provider host event was observed under exact recorded
+    /// lineage (issue #371 S7-partial). The envelope carries the attempt
+    /// identity via its execution-unit lineage (or no attempt identity for
+    /// session-only observations); replay re-validates the exact canonical
+    /// input and rebuilds the observation index plus per-attempt sequencing
+    /// without duplicating effects. Gap markers carry no independent
+    /// mutation and rebuild deterministically from the observed stream.
+    ProviderHostEventObserved {
+        context: ExecutionContext,
+        event: Box<NormalizedHostEventEnvelope>,
+        normalization: Box<HostEventNormalizationReceipt>,
+    },
+    /// An explicit sequence gap precedes one observed host event. Ordering
+    /// evidence only: it advances no cursor and synthesizes nothing.
+    ProviderHostEventGap {
+        context: ExecutionContext,
+        attempt_id: AttemptId,
+        event_id: EventId,
+        expected_sequence: u64,
+        observed_sequence: u64,
+    },
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedHostEventSummary {
+    /// Observed event identity.
+    pub event_id: EventId,
+    /// Attempt scope for execution-unit observations; `None` for
+    /// session-only observations, which mutate no attempt state.
+    pub attempt_id: Option<AttemptId>,
+    /// Observed sequence within the attempt scope.
+    pub sequence: u64,
+    /// Canonical output digest of the accepted envelope.
+    pub output_digest: LowercaseSha256,
+}
+
+/// Stored summary of one observed v7 provider host event (issue #371
+/// S7-partial). The canonical input binds the exact envelope plus receipt
+/// bytes for idempotent replay; the summary carries the attempt scope (when
+/// any), sequence, and output digest for ordering and conflict checks.
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

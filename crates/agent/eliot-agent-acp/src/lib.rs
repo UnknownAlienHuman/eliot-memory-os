@@ -15,9 +15,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentAttempt, AgentResult, AttemptId, AuthorityEnvelope,
     CONTRACT_VERSION, CancellationState, ClockReading, EffectKind, EventCursor, EventId,
-    ExecutionOutcome, HostEventKind, LowercaseSha256, PhysicalRouteObservationReceipt,
-    ProviderExecutionBinding, QuotaKnowledge, ResultDisposition, RouteFingerprint,
-    RouteObservationState, TaskId, UsageReceipt,
+    ExecutionOutcome, HostEventDeliveryDisposition, HostEventKind, HostEventNormalizationReceipt,
+    HostEventPrivacyClass, LowercaseSha256, NormalizationCoverage, NormalizedHostEventEnvelope,
+    NormalizedHostEventPayload, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
+    ProviderObservationLineage, QuotaKnowledge, RestrictedRawSourceHandle, ResultDisposition,
+    RouteFingerprint, RouteObservationState, TaskId, UnsupportedDisposition, UsageReceipt,
 };
 use eliot_process::{
     ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest,
@@ -972,6 +974,166 @@ impl AcpEvent {
             .map_err(AcpAdapterError::ContractValidation)?;
         Ok(event)
     }
+}
+
+/// Typed ACP host-event normalization input (issue #371 S7-partial).
+///
+/// Every field is typed: the exact execution lineage travels as
+/// [`ProviderObservationLineage`] (never parsed from provider locators), the
+/// public payload is the closed [`NormalizedHostEventPayload`] (never an
+/// arbitrary `serde_json::Value`), digests are computed inside from
+/// `raw_source_bytes` (never caller-supplied strings), and observation time
+/// is a typed [`ClockReading`] (never a wall-clock string). The legacy
+/// [`AcpEvent`] with `payload: Value` plus [`AcpEvent::into_host_event`] is
+/// untouched for existing consumers.
+#[derive(Clone, Debug)]
+pub struct AcpHostEventInput<'a> {
+    /// Event identity from the post-R1 owner.
+    pub event_id: EventId,
+    /// Resume cursor from the post-R1 owner.
+    pub cursor: EventCursor,
+    /// Monotonic sequence supplied by the adapter. Must be nonzero.
+    pub sequence: u64,
+    /// Causal predecessor event identities.
+    pub predecessors: Vec<EventId>,
+    /// Exact session or execution-unit lineage. No string/JSON parsing, no
+    /// new attempt invention.
+    pub lineage: ProviderObservationLineage,
+    /// Raw ACP frame bytes. Digested inside; never copied into the public
+    /// normalized payload.
+    pub raw_source_bytes: &'a [u8],
+    /// Restricted handle addressing the immutable raw source record.
+    pub raw_source_handle: RestrictedRawSourceHandle,
+    /// Closed typed payload: a bounded summary, never raw provider content.
+    pub payload: NormalizedHostEventPayload,
+    /// Declared omitted/lost source fields. Empty exactly when `coverage` is
+    /// complete.
+    pub omitted_source_fields: Vec<String>,
+    /// Normalization warnings. Bounded; never raw provider content.
+    pub warnings: Vec<String>,
+    /// Privacy/redaction/disclosure class of the normalized payload.
+    pub privacy_class: HostEventPrivacyClass,
+    /// Coverage/gap disposition of the normalization.
+    pub coverage: NormalizationCoverage,
+    /// Typed observation time.
+    pub observed_at: ClockReading,
+    /// Delivery/coverage disposition of this observation.
+    pub delivery: HostEventDeliveryDisposition,
+    /// Recorded #369 admission. Required for execution-unit lineage (the
+    /// envelope references it by digest); forbidden for session-only lineage,
+    /// which carries no admission reference.
+    pub admission: Option<&'a AdmittedRouteReceipt>,
+}
+
+/// Adapter identity bound by [`normalize_acp_event`]. Callers never supply
+/// their own producer identity.
+pub const ACP_NORMALIZER_IDENTITY: &str = "eliot-agent-acp";
+
+/// Normalizes one typed ACP observation into the closed v7 host-event schema
+/// (issue #371 S7-partial).
+///
+/// The adapter identity/version (`eliot-agent-acp` / [`ACP_SCHEMA_VERSION`])
+/// is bound by this function, never supplied by the caller; the input source
+/// digest is computed from `raw_source_bytes`; and the sealed envelope is
+/// validated before return (execution-unit lineage against the exact binding
+/// plus the #369 admission, session lineage on the session path). Raw bytes
+/// stay behind the restricted handle; the public payload holds the bounded
+/// typed summary only.
+pub fn normalize_acp_event(
+    input: AcpHostEventInput<'_>,
+) -> Result<(NormalizedHostEventEnvelope, HostEventNormalizationReceipt), AcpAdapterError> {
+    if input.sequence == 0 {
+        return Err(AcpAdapterError::InvalidInput("sequence"));
+    }
+    if input.raw_source_bytes.is_empty() || input.raw_source_bytes.len() > DEFAULT_MAX_FRAME_BYTES {
+        return Err(AcpAdapterError::InvalidInput("raw_source_bytes"));
+    }
+    if let ProviderObservationLineage::ExecutionUnitObservation(_) = &input.lineage {
+        match input.admission {
+            Some(admission) => admission
+                .validate()
+                .map_err(AcpAdapterError::ContractValidation)?,
+            None => return Err(AcpAdapterError::InvalidInput("admission/lineage")),
+        }
+    } else if input.admission.is_some() {
+        return Err(AcpAdapterError::InvalidInput("admission/lineage"));
+    }
+    let input_digest = serde_json::from_value(Value::String(eliot_contracts::sha256_hex(
+        input.raw_source_bytes,
+    )))
+    .map_err(|_| {
+        AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::DigestMismatch)
+    })?;
+    let unsupported_disposition = match &input.payload {
+        NormalizedHostEventPayload::UnsupportedQuarantined(_) => {
+            UnsupportedDisposition::UnsupportedMethodQuarantined
+        }
+        _ => UnsupportedDisposition::None,
+    };
+    let receipt = HostEventNormalizationReceipt {
+        normalizer_identity: ACP_NORMALIZER_IDENTITY.to_owned(),
+        normalizer_version: ACP_SCHEMA_VERSION.to_owned(),
+        input_handle: input.raw_source_handle.clone(),
+        input_digest: eliot_agent_api::QualifiedSourceDigest {
+            algorithm: eliot_agent_api::HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+            digest: input_digest,
+        },
+        output_schema_version: eliot_agent_api::HOST_EVENT_CONTRACT_VERSION.to_owned(),
+        output_digest: serde_json::from_value(Value::String(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+        ))
+        .map_err(|_| {
+            AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::DigestMismatch)
+        })?,
+        omitted_fields: input.omitted_source_fields.clone(),
+        warnings: input.warnings.clone(),
+        unsupported_disposition,
+        privacy_class: input.privacy_class,
+        coverage: input.coverage,
+        proof_ceiling: eliot_agent_api::ProofCeiling::Observation,
+    };
+    let admitted_route_digest = input
+        .admission
+        .map(|admission| admission.self_digest.clone());
+    let mut envelope = NormalizedHostEventEnvelope {
+        schema_version: eliot_agent_api::HOST_EVENT_CONTRACT_VERSION.to_owned(),
+        event_id: input.event_id,
+        cursor: input.cursor,
+        lineage: input.lineage,
+        producer_adapter_identity: ACP_NORMALIZER_IDENTITY.to_owned(),
+        adapter_contract_version: ACP_SCHEMA_VERSION.to_owned(),
+        sequence: input.sequence,
+        causal_predecessors: input.predecessors,
+        payload: input.payload,
+        admitted_route_digest,
+        raw_source: eliot_agent_api::RawSourceRecord {
+            handle: input.raw_source_handle,
+            digest: receipt.input_digest.clone(),
+        },
+        normalization: receipt,
+        observed_at: input.observed_at,
+        delivery: input.delivery,
+    };
+    envelope.seal().map_err(|error| {
+        AcpAdapterError::Protocol(AcpProtocolError::InvalidJson(error.to_string()))
+    })?;
+    match envelope.lineage.attributable_binding() {
+        Ok(binding) => {
+            let admission = input
+                .admission
+                .ok_or(AcpAdapterError::InvalidInput("admission/lineage"))?;
+            envelope
+                .validate_for_lineage(binding, admission)
+                .map_err(AcpAdapterError::ContractValidation)?;
+        }
+        Err(_) => {
+            envelope
+                .validate_as_session_observation()
+                .map_err(AcpAdapterError::ContractValidation)?;
+        }
+    }
+    let receipt = envelope.normalization.clone();
+    Ok((envelope, receipt))
 }
 
 /// Normalized result projection.  A provider completion remains only an
@@ -1964,6 +2126,167 @@ mod tests {
             }
         });
         assert!(serde_json::from_value::<AcpCancelRequest>(zero_wire).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn typed_normalizer_roundtrip_with_exact_binding() -> Result<(), Box<dyn std::error::Error>> {
+        use eliot_agent_api::{
+            AssistantDeltaObservation, ExecutionUnitObservation, HostEventDeliveryDisposition,
+        };
+        let route = route();
+        let binding = binding_for(&route)?;
+        let admission = admission_for(&binding)?;
+        let raw = br#"{"jsonrpc":"2.0","method":"session/update","params":{"delta":"hi"}}"#;
+        let cursor = EventCursor::new("cursor-acp-typed-1")?;
+        let input = AcpHostEventInput {
+            event_id: EventId::new("evt-acp-typed-1")?,
+            cursor: cursor.clone(),
+            sequence: 1,
+            predecessors: Vec::new(),
+            lineage: ProviderObservationLineage::ExecutionUnitObservation(Box::new(
+                ExecutionUnitObservation {
+                    binding: binding.clone(),
+                    cursor: cursor.clone(),
+                    sequence: 1,
+                },
+            )),
+            raw_source_bytes: raw,
+            raw_source_handle: RestrictedRawSourceHandle::new("restricted-acp:frame-1")?,
+            payload: NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
+                delta_chars: 2,
+                truncated: false,
+            }),
+            omitted_source_fields: Vec::new(),
+            warnings: Vec::new(),
+            privacy_class: HostEventPrivacyClass::RedactedSummary,
+            coverage: NormalizationCoverage::Complete,
+            observed_at: ClockReading {
+                valid_time_ms: Some(1_700_000_000_000),
+                known_time_ms: Some(1_700_000_000_001),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+            delivery: HostEventDeliveryDisposition::DurableOrdered,
+            admission: Some(&admission),
+        };
+        let (envelope, receipt) = normalize_acp_event(input)?;
+        assert_eq!(envelope.normalization, receipt);
+        envelope.validate_for_lineage(&binding, &admission)?;
+        // The producer identity is bound by the normalizer, never the caller.
+        assert_eq!(envelope.producer_adapter_identity, ACP_NORMALIZER_IDENTITY);
+        assert_eq!(envelope.adapter_contract_version, ACP_SCHEMA_VERSION);
+        // Raw provider bytes never enter the public normalized payload.
+        assert_eq!(
+            serde_json::to_value(&envelope)?
+                .to_string()
+                .contains("session/update"),
+            false
+        );
+        // Determinism: the same typed input reproduces the same digest.
+        let cursor = EventCursor::new("cursor-acp-typed-1")?;
+        let (rebuilt, _) = normalize_acp_event(AcpHostEventInput {
+            event_id: EventId::new("evt-acp-typed-1")?,
+            cursor: cursor.clone(),
+            sequence: 1,
+            predecessors: Vec::new(),
+            lineage: ProviderObservationLineage::ExecutionUnitObservation(Box::new(
+                ExecutionUnitObservation {
+                    binding: binding.clone(),
+                    cursor,
+                    sequence: 1,
+                },
+            )),
+            raw_source_bytes: raw,
+            raw_source_handle: RestrictedRawSourceHandle::new("restricted-acp:frame-1")?,
+            payload: NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
+                delta_chars: 2,
+                truncated: false,
+            }),
+            omitted_source_fields: Vec::new(),
+            warnings: Vec::new(),
+            privacy_class: HostEventPrivacyClass::RedactedSummary,
+            coverage: NormalizationCoverage::Complete,
+            observed_at: ClockReading {
+                valid_time_ms: Some(1_700_000_000_000),
+                known_time_ms: Some(1_700_000_000_001),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+            delivery: HostEventDeliveryDisposition::DurableOrdered,
+            admission: Some(&admission),
+        })?;
+        assert_eq!(rebuilt.compute_digest()?, envelope.compute_digest()?);
+        Ok(())
+    }
+
+    #[test]
+    fn arbitrary_json_and_caller_digests_cannot_enter_typed_schema()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use eliot_agent_api::{
+            AssistantDeltaObservation, ExecutionUnitObservation, HostEventDeliveryDisposition,
+        };
+        // A legacy generic wire (arbitrary JSON payload, caller time string)
+        // never deserializes as the closed typed schema.
+        let legacy = serde_json::json!({
+            "event_id": "evt-acp-legacy",
+            "attempt_id": "attempt",
+            "sequence": 1,
+            "cursor": "cursor-acp-legacy",
+            "kind": "assistant_delta",
+            "route": serde_json::to_value(route())?,
+            "raw_payload_digest": eliot_contracts::sha256_hex(b"legacy"),
+            "normalized_payload": {"delta": "raw provider text"},
+            "parent_event_id": null,
+            "observed_at": "2026-09-13T00:00:00Z",
+        });
+        assert!(serde_json::from_value::<NormalizedHostEventEnvelope>(legacy).is_err());
+        // A caller wall-clock string is not a typed observation time.
+        assert!(serde_json::from_value::<ClockReading>(serde_json::json!("tomorrow")).is_err());
+        // A forged caller-supplied output digest fails closed at validation.
+        let route = route();
+        let binding = binding_for(&route)?;
+        let admission = admission_for(&binding)?;
+        let raw = br#"{"jsonrpc":"2.0","method":"session/update","params":{}}"#;
+        let cursor = EventCursor::new("cursor-acp-forged-1")?;
+        let (mut envelope, _) = normalize_acp_event(AcpHostEventInput {
+            event_id: EventId::new("evt-acp-forged-1")?,
+            cursor: cursor.clone(),
+            sequence: 1,
+            predecessors: Vec::new(),
+            lineage: ProviderObservationLineage::ExecutionUnitObservation(Box::new(
+                ExecutionUnitObservation {
+                    binding: binding.clone(),
+                    cursor,
+                    sequence: 1,
+                },
+            )),
+            raw_source_bytes: raw,
+            raw_source_handle: RestrictedRawSourceHandle::new("restricted-acp:frame-2")?,
+            payload: NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
+                delta_chars: 0,
+                truncated: false,
+            }),
+            omitted_source_fields: Vec::new(),
+            warnings: Vec::new(),
+            privacy_class: HostEventPrivacyClass::RedactedSummary,
+            coverage: NormalizationCoverage::Complete,
+            observed_at: ClockReading {
+                valid_time_ms: Some(1_700_000_000_000),
+                known_time_ms: Some(1_700_000_000_001),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+            delivery: HostEventDeliveryDisposition::DurableOrdered,
+            admission: Some(&admission),
+        })?;
+        envelope.normalization.output_digest = serde_json::from_value(serde_json::json!(
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        ))?;
+        assert_eq!(
+            envelope.validate_for_lineage(&binding, &admission),
+            Err(eliot_agent_api::ContractError::DigestMismatch)
+        );
         Ok(())
     }
 
