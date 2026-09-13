@@ -77,8 +77,10 @@ pub(crate) fn approved_service_registration(
         .ok_or_else(|| {
             SpoolError::InvalidLease("installer SCM registration approval is missing".to_owned())
         })?;
-    let request = approval.service_registration_request().map_err(|_| {
-        SpoolError::InvalidLease("installer SCM registration approval is invalid".to_owned())
+    let request = approval.service_registration_request().map_err(|error| {
+        SpoolError::InvalidLease(format!(
+            "installer SCM registration approval is invalid: {error}"
+        ))
     })?;
     if !service_approval_matches_manifest(approval, &request, manifest, role) {
         return Err(SpoolError::InvalidLease(

@@ -126,7 +126,9 @@ pub(crate) fn approved_host_artifact_path(
     let (path, _) = manifest
         .runtime_launch
         .host_artifact_binding()
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+        .map_err(|error| {
+            SpoolError::InvalidLease(format!("approved Host artifact binding failed: {error}"))
+        })?;
     Ok(PathBuf::from(path.as_str()))
 }
 
@@ -143,7 +145,9 @@ pub(crate) fn read_registry_for_bootstrap(
             SpoolError::InvalidLease(format!("Host state root open failed: {error}"))
         })?,
     )
-    .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
+    .map_err(|error| {
+        SpoolError::InvalidLease(format!("installation registry open failed: {error}"))
+    })?
     .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
     let manifest = select_runtime_manifest(&registry, bootstrap)?;
     Ok((registry, manifest))
