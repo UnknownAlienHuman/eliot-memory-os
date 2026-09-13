@@ -1,0 +1,2 @@
+{"reason":"compiler-artifact","package_id":"sample-package 0.1.0 (path+file:///crates/sample-package)","target":{"name":"sample_package","kind":["lib"]},"profile":{"test":true},"executable":"target/debug/deps/sample_package-1111111111111111"}
+{"reason":"compiler-artifact","package_id":"sample-package 0.1.0 (path+file:///crates/sample-package)","target":{"name":"sample_integration","kind":["test"]},"profile":{"test":true},"executable":"target/debug/deps/sample_integration-2222222222222222"}

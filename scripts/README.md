@@ -134,6 +134,20 @@ storage/process authority.
 | `test-claude-connector.ps1` | Run the bounded Claude connector probe/fixture path | Exact integration-fingerprint evidence only |
 | `eliot-mcp-reference-client.ps1` | Reference MCP client for protocol/bridge diagnostics | Diagnostic/client evidence only |
 | `run-isolated-tests.ps1` | Provision an owned Windows/Surreal test namespace and run one selected package/test profile | Exact selected Module/Edge evidence only |
+| `scripts/integration/ignored_test_inventory.py` | Derive the exact ignored-test denominator and environment classification (#905) | Ignored-test identity and environment classification only |
+
+The ignored-test inventory entrypoint (`scripts/integration/ignored_test_inventory.py`)
+derives the exact bounded denominator of ignored Rust tests across workspace packages,
+reconciling admitted test sources with compiled libtest listings, and classifying each
+item against required environments (Store, Runtime, Git, External credentials). Its
+proof ceiling is `IGNORED_TEST_IDENTITY_AND_ENVIRONMENT_CLASSIFICATION_ONLY`; it performs
+no test execution, provisions no background state, and touches no credentials.
+
+Run its internal self-tests locally:
+
+```powershell
+python scripts/integration/ignored_test_inventory.py --self-test
+```
 
 Provider versions, accounts, routes, and host behavior are requalified per issue;
 an old successful probe is not current support. An in-memory/fake test is not

@@ -33,10 +33,11 @@ OUTPUT_ROOT: Final = ".eliot"
 class InventoryError(RuntimeError):
     """Stable public failure with a machine-readable reason code."""
 
-    def __init__(self, code: str, detail: str) -> None:
+    def __init__(self, code: str, detail: str, owner: str = "build-test-graph-owner") -> None:
         super().__init__(detail)
         self.code = code
         self.detail = detail
+        self.owner = owner
 
 
 @dataclasses.dataclass(frozen=True)
@@ -70,6 +71,16 @@ class Requirement(str, enum.Enum):
     GIT = "GIT"
     EXTERNAL_CREDENTIALED_MANUAL_ONLY = "EXTERNAL_CREDENTIALED_MANUAL_ONLY"
     UNKNOWN = "UNKNOWN"
+
+
+DEFAULT_REMEDIATION_OWNERS: Final = {
+    RowState.CLASSIFIED: "declared-environment-owner",
+    RowState.UNCLASSIFIED: "test-declaration-owner",
+    RowState.SOURCE_ONLY: "test-target-owner",
+    RowState.COMPILED_ONLY: "build-test-graph-owner",
+    RowState.DUPLICATE: "test-source-owner",
+    RowState.COMPILED_GRAPH_UNAVAILABLE: "build-test-graph-owner",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -177,7 +188,8 @@ def _canonical_bytes(value: Any) -> bytes:
 def _repo_path(root: Path, path: Path) -> Path:
     try:
         resolved_root = root.resolve(strict=True)
-        resolved = path.resolve(strict=True)
+        candidate = path if path.is_absolute() else root / path
+        resolved = candidate.resolve(strict=True)
         resolved.relative_to(resolved_root)
     except (OSError, ValueError) as exc:
         raise InventoryError("PATH_ESCAPE", f"path is outside repository root: {path}") from exc
@@ -188,17 +200,17 @@ def _relative(root: Path, path: Path) -> str:
     return _repo_path(root, path).relative_to(root.resolve(strict=True)).as_posix()
 
 
-def _safe_output(root: Path, output: Path) -> Path:
+def _safe_output(root: Path, output: Path, overwrite: bool = False) -> Path:
     root = root.resolve(strict=True)
     candidate = output if output.is_absolute() else root / output
-    parent = candidate.parent.resolve(strict=True)
     try:
-        relative = parent.relative_to(root)
-    except ValueError as exc:
-        raise InventoryError("UNSAFE_OUTPUT", "output parent is outside repository root") from exc
+        resolved_candidate = candidate.resolve(strict=False)
+        relative = resolved_candidate.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise InventoryError("UNSAFE_OUTPUT", f"output parent is outside repository root: {output}") from exc
     if not relative.parts or relative.parts[0] != OUTPUT_ROOT:
         raise InventoryError("UNSAFE_OUTPUT", "output must be below the repository .eliot directory")
-    if candidate.exists():
+    if candidate.exists() and not overwrite:
         raise InventoryError("OUTPUT_EXISTS", f"refusing to overwrite {candidate}")
     return candidate
 
@@ -210,7 +222,25 @@ def _bounded_read(path: Path) -> bytes:
     return path.read_bytes()
 
 
+def _validate_command(argv: Sequence[str]) -> None:
+    if not argv:
+        raise InventoryError("COMMAND_NOT_ALLOWED", "empty command is not allowed")
+    t = tuple(argv)
+    if t in {
+        ("cargo", "metadata", "--locked", "--format-version", "1"),
+        ("cargo", "test", "--workspace", "--all-targets", "--locked", "--no-run", "--message-format=json"),
+        ("git", "rev-parse", "HEAD"),
+        ("git", "status", "--porcelain=v1", "--untracked-files=no"),
+    }:
+        return
+    if len(argv) == 5 and tuple(argv[1:]) == ("--list", "--ignored", "--format", "terse"):
+        if argv[0] and not argv[0].startswith("-"):
+            return
+    raise InventoryError("COMMAND_NOT_ALLOWED", f"command is not fixed/allowed: {argv!r}")
+
+
 def _run_fixed(root: Path, argv: Sequence[str], timeout: int | None = None) -> CommandResult:
+    _validate_command(argv)
     env = {
         "PATH": os.environ.get("PATH", ""),
         "HOME": os.environ.get("HOME", ""),
@@ -221,6 +251,7 @@ def _run_fixed(root: Path, argv: Sequence[str], timeout: int | None = None) -> C
         "TMP": os.environ.get("TMP", os.environ.get("TEMP", "")),
         "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", ""),
         "CARGO_HOME": os.environ.get("CARGO_HOME", ""),
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", ""),
         "CARGO_TERM_COLOR": "never",
         "RUST_BACKTRACE": "0",
     }
@@ -247,8 +278,17 @@ def _run_fixed(root: Path, argv: Sequence[str], timeout: int | None = None) -> C
     return CommandResult(completed.stdout, completed.stderr)
 
 
-def _cargo_metadata(root: Path) -> dict[str, Any]:
-    result = _run_fixed(root, ("cargo", "metadata", "--locked", "--format-version", "1"))
+def _run_cmd(runner: Any, root: Path, argv: Sequence[str], timeout: int | None = None) -> CommandResult:
+    if runner is not None:
+        try:
+            return runner(root, argv, timeout=timeout)
+        except TypeError:
+            return runner(root, argv)
+    return _run_fixed(root, argv, timeout=timeout)
+
+
+def _cargo_metadata(root: Path, runner: Any = None) -> dict[str, Any]:
+    result = _run_cmd(runner, root, ("cargo", "metadata", "--locked", "--format-version", "1"))
     try:
         value = json.loads(result.stdout)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -379,7 +419,7 @@ def _lex_rust(text: str) -> list[Token]:
             continue
         if char.isdigit():
             end = index + 1
-            while end < length and (text[end].isalnum() or text[end] in "_\."):
+            while end < length and (text[end].isalnum() or text[end] in r"_\."):
                 end += 1
             tokens.append(Token("number", text[index:end], index, end, line))
             index = end
@@ -393,10 +433,43 @@ def _lex_rust(text: str) -> list[Token]:
     return tokens
 
 
+def _unescape_rust_str(s: str) -> str:
+    def repl(m: re.Match[str]) -> str:
+        esc = m.group(1)
+        if esc == "n":
+            return "\n"
+        if esc == "r":
+            return "\r"
+        if esc == "t":
+            return "\t"
+        if esc == "\\":
+            return "\\"
+        if esc == "0":
+            return "\0"
+        if esc == '"':
+            return '"'
+        if esc == "'":
+            return "'"
+        return esc
+    return re.sub(r"\\(.)", repl, s)
+
+
 def _decode_reason(raw: str) -> str | None:
-    matches = re.findall(r'(?:b|c)?r#{0,16}"(.*?)"#{0,16}|(?:b|c)?"((?:\\.|[^"\\])*)"', raw, re.DOTALL)
-    for raw_value, escaped_value in matches:
-        value = raw_value or escaped_value
+    # First look for strings specifically attached to ignore or disabled attributes
+    targeted = re.findall(
+        r'(?:ignore|disabled[a-z_]*|test_disabled)\b[^(="]*[=(]\s*(?:(?:note|reason)\s*=\s*)?(?:(?:b|c)?r(#{0,16})"(.*?)"\1|(?:b|c)?"((?:\\.|[^"\\])*)")',
+        raw,
+        re.DOTALL,
+    )
+    for _h, raw_val, esc_val in targeted:
+        value = raw_val if raw_val else _unescape_rust_str(esc_val)
+        if value.strip():
+            return value.strip()[:1024]
+
+    # Fallback to any string in the attribute
+    general = re.findall(r'(?:b|c)?r(#{0,16})"(.*?)"\1|(?:b|c)?"((?:\\.|[^"\\])*)"', raw, re.DOTALL)
+    for _h, raw_val, esc_val in general:
+        value = raw_val if raw_val else _unescape_rust_str(esc_val)
         if value.strip():
             return value.strip()[:1024]
     return None
@@ -404,12 +477,13 @@ def _decode_reason(raw: str) -> str | None:
 
 def _attribute_flags(raw: str) -> tuple[bool, bool, bool, str | None, str | None]:
     compact = re.sub(r"\s+", "", raw)
-    is_test = bool(re.search(r"(?:^|[:\[,])(?:test|tokio::test|async_std::test)(?:$|[\],(])", compact))
+    disabled = any(marker in compact for marker in ("disabled_test", "eliot_disabled_test", "test_disabled"))
+    is_test = bool(re.search(r"(?:^|[:\[,])(?:test|tokio::test|async_std::test)(?:$|[\],(])", compact)) or disabled
     direct_ignore = bool(re.search(r"(?:^|[:\[,])ignore(?:=|$|[\],(])", compact))
     cfg_ignore = "cfg_attr" in compact and "ignore" in compact
-    disabled = any(marker in compact for marker in ("disabled_test", "eliot_disabled_test", "test_disabled"))
+    is_ignored = direct_ignore or cfg_ignore or disabled
     cfg = raw if "cfg" in compact else None
-    return is_test, direct_ignore or cfg_ignore or disabled, cfg_ignore or disabled, _decode_reason(raw), cfg
+    return is_test, is_ignored, cfg_ignore or disabled, _decode_reason(raw), cfg
 
 
 def _file_module_prefix(target: PackageTarget, path: Path) -> tuple[str, ...]:
@@ -545,11 +619,18 @@ def _requirements(text: str) -> tuple[str, ...]:
     result: set[Requirement] = set()
     if any(token in value for token in ("surreal", "store", "database", "schema migration", "authenticated db")):
         result.add(Requirement.STORE)
-    if any(token in value for token in ("kernel", "governor", "host", "watchdog", "agent bridge", "named pipe", "acl", "session", "installation", "eliot_governor_config", "windows runtime")):
+    if any(token in value for token in (
+        "kernel", "governor", "host", "watchdog", "agent bridge",
+        "named pipe", "windows pipe", "pipe", "acl", "session",
+        "installation", "configuration", "config", "eliot_governor_config", "windows runtime",
+    )):
         result.add(Requirement.RUNTIME)
     if any(token in value for token in ("git", "repository", "worktree", "commit identity")):
         result.add(Requirement.GIT)
-    if any(token in value for token in ("personal credential", "paid", "external credential", "api key", "oauth")):
+    if any(token in value for token in (
+        "personal credential", "external credential", "credential",
+        "paid", "api key", "oauth", "manual-only", "manual only",
+    )):
         result.add(Requirement.EXTERNAL_CREDENTIALED_MANUAL_ONLY)
     if not result:
         result.add(Requirement.UNKNOWN)
@@ -575,7 +656,7 @@ def discover_source(root: Path, targets: Sequence[PackageTarget]) -> list[Source
     return sorted(result, key=lambda item: item.identity() + (item.source_path, item.line))
 
 
-def _build_test_artifacts(root: Path) -> list[Artifact]:
+def _build_test_artifacts(root: Path, runner: Any = None) -> list[Artifact]:
     argv = (
         "cargo",
         "test",
@@ -585,7 +666,7 @@ def _build_test_artifacts(root: Path) -> list[Artifact]:
         "--no-run",
         "--message-format=json",
     )
-    result = _run_fixed(root, argv)
+    result = _run_cmd(runner, root, argv)
     artifacts: list[Artifact] = []
     for raw_line in result.stdout.splitlines():
         if not raw_line.strip():
@@ -605,7 +686,10 @@ def _build_test_artifacts(root: Path) -> list[Artifact]:
         kinds = target.get("kind")
         if not isinstance(target_name, str) or not isinstance(kinds, list) or not kinds:
             continue
-        executable_path = Path(executable).resolve(strict=True)
+        try:
+            executable_path = Path(executable).resolve(strict=True)
+        except OSError as exc:
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", f"compiled test binary not found: {executable}") from exc
         artifacts.append(
             Artifact(
                 package_id=package_id,
@@ -622,15 +706,19 @@ def _build_test_artifacts(root: Path) -> list[Artifact]:
     return sorted(unique.values(), key=lambda item: (item.package_id, item.target_kind, item.target_name, str(item.executable)))
 
 
-def discover_compiled(root: Path, targets: Sequence[PackageTarget]) -> list[CompiledTest]:
+def discover_compiled(root: Path, targets: Sequence[PackageTarget], runner: Any = None) -> list[CompiledTest]:
     target_map = {(item.package_id, item.target_kind, item.target_name): item for item in targets}
     result: list[CompiledTest] = []
-    for artifact in _build_test_artifacts(root):
+    for artifact in _build_test_artifacts(root, runner=runner):
         target = target_map.get((artifact.package_id, artifact.target_kind, artifact.target_name))
         if target is None:
             raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", f"compiled artifact has no metadata target: {artifact}")
-        executable_digest = _sha256(artifact.executable.read_bytes())
-        listing = _run_fixed(
+        try:
+            executable_digest = _sha256(artifact.executable.read_bytes())
+        except OSError as exc:
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", f"cannot read compiled test binary: {artifact.executable}") from exc
+        listing = _run_cmd(
+            runner,
             root,
             (str(artifact.executable), "--list", "--ignored", "--format", "terse"),
         )
@@ -715,36 +803,38 @@ def reconcile(source: Sequence[SourceTest], compiled: Sequence[CompiledTest]) ->
     return sorted(rows, key=lambda item: (item.package_id, item.target_kind, item.target_name, item.test_name, item.row_digest))
 
 
-def _git_identity(root: Path) -> dict[str, Any]:
-    head = _run_fixed(root, ("git", "rev-parse", "HEAD")).stdout.decode("ascii", errors="strict").strip()
-    status = _run_fixed(root, ("git", "status", "--porcelain=v1", "--untracked-files=no")).stdout
+def _git_identity(root: Path, runner: Any = None) -> dict[str, Any]:
+    head = _run_cmd(runner, root, ("git", "rev-parse", "HEAD")).stdout.decode("ascii", errors="strict").strip()
+    status = _run_cmd(runner, root, ("git", "status", "--porcelain=v1", "--untracked-files=no")).stdout
     if not re.fullmatch(r"[0-9a-f]{40}", head):
         raise InventoryError("SOURCE_IDENTITY_INVALID", "git HEAD is not a SHA-1 commit identity")
     return {"head": head, "tracked_tree_clean": not bool(status)}
 
 
-def build_inventory(root: Path) -> dict[str, Any]:
+def build_inventory(root: Path, runner: Any = None) -> dict[str, Any]:
     started = time.monotonic()
-    metadata = _cargo_metadata(root)
+    metadata = _cargo_metadata(root, runner=runner)
     targets = _targets(root, metadata)
     source = discover_source(root, targets)
-    compiled = discover_compiled(root, targets)
+    compiled = discover_compiled(root, targets, runner=runner)
     rows = reconcile(source, compiled)
     counts: dict[str, int] = {}
     for row in rows:
         counts[row.state] = counts.get(row.state, 0) + 1
     denominator = [dataclasses.asdict(row) for row in rows]
+    lock_file = root / "Cargo.lock"
+    cargo_lock_sha256 = _sha256(_bounded_read(lock_file)) if lock_file.is_file() else "0" * 64
     header = {
         "schema": SCHEMA,
         "tool_version": TOOL_VERSION,
-        "source_identity": _git_identity(root),
-        "cargo_lock_sha256": _sha256(_bounded_read(root / "Cargo.lock")),
+        "source_identity": _git_identity(root, runner=runner),
+        "cargo_lock_sha256": cargo_lock_sha256,
         "source_count": len(source),
         "compiled_count": len(compiled),
         "row_count": len(rows),
         "counts_by_state": dict(sorted(counts.items())),
         "proof_ceiling": "IGNORED_TEST_IDENTITY_AND_ENVIRONMENT_CLASSIFICATION_ONLY",
-        "complete": all(row.state == RowState.CLASSIFIED.value for row in rows),
+        "complete": bool(rows) and all(row.state == RowState.CLASSIFIED.value for row in rows),
     }
     aggregate_input = {"header": header, "rows": denominator}
     header["aggregate_sha256"] = _sha256(_canonical_bytes(aggregate_input))
@@ -752,25 +842,139 @@ def build_inventory(root: Path) -> dict[str, Any]:
     return {"header": header, "rows": denominator}
 
 
+def self_test() -> None:
+    """Run internal unit self-tests without requiring external tools or repository mutations."""
+    # 1. Canonical bytes deterministic sorting
+    c1 = _canonical_bytes({"b": 1, "a": [2, 3]})
+    c2 = _canonical_bytes({"a": [2, 3], "b": 1})
+    assert c1 == c2, "canonical bytes must sort keys deterministically"
+    assert _sha256(c1) == _sha256(c2)
+
+    # 2. Command validation
+    _validate_command(("cargo", "metadata", "--locked", "--format-version", "1"))
+    _validate_command(("cargo", "test", "--workspace", "--all-targets", "--locked", "--no-run", "--message-format=json"))
+    _validate_command(("git", "rev-parse", "HEAD"))
+    _validate_command(("git", "status", "--porcelain=v1", "--untracked-files=no"))
+    _validate_command(("target/debug/deps/test.exe", "--list", "--ignored", "--format", "terse"))
+    try:
+        _validate_command(("cargo", "run"))
+        assert False, "arbitrary command must be rejected"
+    except InventoryError as exc:
+        assert exc.code == "COMMAND_NOT_ALLOWED"
+
+    # 3. Attribute flags & reason decoding
+    is_t, is_i, is_cfg, reason, cfg = _attribute_flags('#[test]\n#[ignore = "requires store database"]')
+    assert is_t and is_i and not is_cfg and reason == "requires store database" and cfg is None
+
+    is_t, is_i, is_cfg, reason, cfg = _attribute_flags('#[tokio::test]\n#[ignore = r#"requires "raw" host"#]')
+    assert is_t and is_i and not is_cfg and reason == 'requires "raw" host' and cfg is None
+
+    is_t, is_i, is_cfg, reason, cfg = _attribute_flags('#[disabled_test = "requires kernel"]')
+    assert is_t and is_i and is_cfg and reason == "requires kernel"
+
+    is_t, is_i, is_cfg, reason, cfg = _attribute_flags('#[cfg_attr(windows, ignore = "requires windows pipe")]')
+    assert not is_t and is_i and is_cfg and reason == "requires windows pipe" and cfg is not None
+
+    # 4. Reason unescaping
+    assert _decode_reason(r'#[ignore = "foo \"bar\" baz"]') == 'foo "bar" baz'
+    assert _decode_reason(r'#[ignore = r#"raw "quotes" inside"#]') == 'raw "quotes" inside'
+
+    # 5. Requirements mapping and composition
+    assert _requirements("requires local authenticated surrealdb") == (Requirement.STORE.value,)
+    assert _requirements("governor host runtime") == (Requirement.RUNTIME.value,)
+    assert _requirements("windows pipe acl session") == (Requirement.RUNTIME.value,)
+    assert _requirements("git repository worktree") == (Requirement.GIT.value,)
+    assert _requirements("external personal credential api key") == (Requirement.EXTERNAL_CREDENTIALED_MANUAL_ONLY.value,)
+    assert _requirements("requires local surrealdb and governor runtime") == (Requirement.RUNTIME.value, Requirement.STORE.value)
+    assert _requirements("just a random test failure") == (Requirement.UNKNOWN.value,)
+
+    # 6. Safe output validation
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        troot = Path(td).resolve()
+        (troot / ".eliot").mkdir()
+        safe_candidate = troot / ".eliot" / "sub" / "inventory.json"
+        assert _safe_output(troot, safe_candidate) == safe_candidate
+
+        try:
+            _safe_output(troot, troot / "unsafe.json")
+            assert False, "output outside .eliot must fail"
+        except InventoryError as exc:
+            assert exc.code == "UNSAFE_OUTPUT"
+
+        existing = troot / ".eliot" / "existing.json"
+        existing.write_bytes(b"{}")
+        try:
+            _safe_output(troot, existing, overwrite=False)
+            assert False, "existing output without overwrite must fail"
+        except InventoryError as exc:
+            assert exc.code == "OUTPUT_EXISTS"
+        assert _safe_output(troot, existing, overwrite=True) == existing
+
+    # 7. Reconciliation state logic
+    s1 = SourceTest("p1", "pname", "tname", "lib", "test_one", "src/lib.rs", 10, "#[test]", "h1", "requires store", (), ("STORE",), "sd1")
+    c1 = CompiledTest("p1", "pname", "tname", "lib", "bin/test.exe", "ed1", "test_one")
+    rows = reconcile([s1], [c1])
+    assert len(rows) == 1 and rows[0].state == RowState.CLASSIFIED.value and rows[0].remediation_owner == "declared-environment-owner"
+
+    rows_s = reconcile([s1], [])
+    assert len(rows_s) == 1 and rows_s[0].state == RowState.SOURCE_ONLY.value and rows_s[0].remediation_owner == "test-target-owner"
+
+    rows_c = reconcile([], [c1])
+    assert len(rows_c) == 1 and rows_c[0].state == RowState.COMPILED_ONLY.value and rows_c[0].remediation_owner == "build-test-graph-owner"
+
+    s_dup = SourceTest("p1", "pname", "tname", "lib", "test_one", "src/lib.rs", 20, "#[test]", "h2", "requires store", (), ("STORE",), "sd2")
+    rows_dup = reconcile([s1, s_dup], [c1])
+    assert all(r.state == RowState.DUPLICATE.value for r in rows_dup)
+
+
+def run_self_tests() -> int:
+    try:
+        self_test()
+    except Exception as exc:
+        print(f"FAIL: ignored_test_inventory self-tests failed: {exc}", file=sys.stderr)
+        return 1
+    print("PASS: ignored_test_inventory self-tests passed")
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo-root", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--repo-root", type=Path, default=None, help="Path to repository root")
+    parser.add_argument("--output", type=Path, default=None, help="Path to output JSON file (must be under .eliot)")
+    parser.add_argument("--overwrite", action="store_true", help="Allow overwriting existing output")
+    parser.add_argument("--self-test", action="store_true", help="Run internal self-tests and exit")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.self_test:
+        return run_self_tests()
+    if args.repo_root is None or args.output is None:
+        print(
+            json.dumps(
+                {"status": "error", "code": "INVALID_ARGUMENTS", "detail": "--repo-root and --output are required when not running --self-test"},
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 2
     try:
         root = args.repo_root.resolve(strict=True)
-        output = _safe_output(root, args.output)
+        output = _safe_output(root, args.output, overwrite=args.overwrite)
         inventory = build_inventory(root)
         output.parent.mkdir(parents=True, exist_ok=True)
+        if args.overwrite and output.exists():
+            output.unlink()
         with output.open("xb") as handle:
             handle.write(_canonical_bytes(inventory))
             handle.write(b"\n")
     except InventoryError as exc:
-        print(json.dumps({"status": "error", "code": exc.code, "detail": exc.detail}, sort_keys=True), file=sys.stderr)
+        payload = {"status": "error", "code": exc.code, "detail": exc.detail}
+        if hasattr(exc, "owner") and exc.owner:
+            payload["owner"] = exc.owner
+        print(json.dumps(payload, sort_keys=True), file=sys.stderr)
         return 2
     print(
         json.dumps(
