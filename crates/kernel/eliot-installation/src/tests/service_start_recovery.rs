@@ -23,6 +23,8 @@ use super::pending_start_precondition;
 use super::pending_system_service_start_transaction;
 use super::registering_system_service_start_transaction;
 use super::test_handle;
+use super::test_host_service_control_grant;
+use super::test_watchdog_control_grant;
 use crate::InstallationCoordinator;
 use crate::InstallationEffectAction;
 use crate::InstallationEffectDisposition;
@@ -245,7 +247,22 @@ fn race_rollback_inputs(
                 external_identity: external_identity.clone(),
                 evidence: vec![test_handle(format!("evidence:rollback-match:{index}"))],
                 postcondition_digest: test_handle(format!("{index:064x}")),
-                service_control_grant: None,
+                // s38 (#1345): rollback reconciliations mirror production
+                // readback: RegisterService effects carry their
+                // installer-policy DACL grant, every other effect carries
+                // none. A Host registration without its grant fails closed
+                // and can never roll back through `Matching` ownership.
+                service_control_grant: match &saved.installer_effects[index] {
+                    InstallerEffectPlan::RegisterService {
+                        role: InstallerServiceRole::Host,
+                        ..
+                    } => Some(Box::new(test_host_service_control_grant())),
+                    InstallerEffectPlan::RegisterService {
+                        role: InstallerServiceRole::Watchdog,
+                        ..
+                    } => Some(Box::new(test_watchdog_control_grant())),
+                    _ => None,
+                },
                 credential_receipt: None,
                 staging_receipt: None,
                 phase_b_receipt: None,

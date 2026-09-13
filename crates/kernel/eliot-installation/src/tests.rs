@@ -1271,6 +1271,26 @@ fn test_watchdog_control_grant() -> InstallerServiceControlGrantReceipt {
     receipt
 }
 
+// s38 (#1345): the installer-policy service DACL grant read back for the
+// Host registration itself. The receipt reuses the exact installer-policy
+// DACL shape (principal Host SID, installer mask, policy digest computed by
+// the real platform digest authority for a distinct valid Host SID), so the
+// Host proof round-trips through the same marker/evidence/approval gates as
+// the Watchdog proof without canned digests.
+fn test_host_service_control_grant() -> InstallerServiceControlGrantReceipt {
+    let principal_sid = "S-1-5-80-9-8-7-6-5";
+    let receipt = InstallerServiceControlGrantReceipt {
+        principal_service: test_handle(ELIOT_HOST_SERVICE_NAME),
+        principal_sid: test_handle(principal_sid),
+        access_mask: ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+        security_descriptor_digest: test_handle(must(watchdog_service_security_descriptor_digest(
+            principal_sid,
+        ))),
+    };
+    must(receipt.validate());
+    receipt
+}
+
 fn test_activation_approval(
     manifest: &CandidateManifest,
     transaction_id: PlatformHandle,
@@ -2103,8 +2123,13 @@ fn system_registration_transaction() -> InstallationTransaction {
         ));
         let configuration_digest = test_handle(request.expected_configuration_digest());
         progress.registration_nonce = Some(nonce);
-        let service_control_grant =
-            (*role == InstallerServiceRole::Watchdog).then(test_watchdog_control_grant);
+        // s38 (#1345): Host and Watchdog registrations both persist their
+        // installer-policy DACL grant; an `Applied` service effect without
+        // its receipt fails closed and can never report DACL ownership.
+        let service_control_grant = match role {
+            InstallerServiceRole::Host => Some(test_host_service_control_grant()),
+            InstallerServiceRole::Watchdog => Some(test_watchdog_control_grant()),
+        };
         progress.service_control_grant = service_control_grant.clone();
         let mut evidence = vec![test_handle(format!("evidence:service:{role:?}"))];
         if let Some(receipt) = &service_control_grant {
@@ -2635,14 +2660,17 @@ fn matching_for(
     index: usize,
     disposition: InstallationEffectDisposition,
 ) -> InstallationEffectObservation {
-    let service_control_grant = matches!(
-        effect,
+    let service_control_grant = match effect {
+        InstallerEffectPlan::RegisterService {
+            role: InstallerServiceRole::Host,
+            ..
+        } => Some(test_host_service_control_grant()),
         InstallerEffectPlan::RegisterService {
             role: InstallerServiceRole::Watchdog,
             ..
-        }
-    )
-    .then(test_watchdog_control_grant);
+        } => Some(test_watchdog_control_grant()),
+        _ => None,
+    };
     InstallationEffectObservation::Matching {
         disposition,
         external_identity: test_handle(format!("external:matching-{index}")),
@@ -3617,6 +3645,119 @@ fn service_marker_requires_exact_transaction_nonce_and_configuration() {
         &"e".repeat(64),
         Some(&substituted_grant),
     ));
+}
+
+// s38 (#1345): a Host service whose DACL is not the installer policy must
+// never be reported `Applied` / `CREATED_BY_TRANSACTION`. Production
+// `inspect_service`/`reconcile_service` map a Host readback without the
+// installer-policy DACL proof to `Mismatch(service-config)`; this
+// pure/durable-level test proves the rest of the lifecycle gate: a Host
+// `Matching` observation without (or with a forged) grant can never
+// validate, while the policy DACL grant validates and round-trips through
+// the ownership marker and the matching evidence binding. No live SCM.
+#[test]
+fn host_service_registration_requires_installer_policy_dacl_proof() {
+    let effect = InstallerEffectPlan::RegisterService {
+        effect_id: test_handle("effect:service:EliotHost"),
+        role: InstallerServiceRole::Host,
+        service_name: test_handle(ELIOT_HOST_SERVICE_NAME),
+        executable_path: test_handle(r"C:\ProgramData\Eliot\packages\canary\eliot-host.exe"),
+        account: InstallerServiceAccount::LocalService,
+        automatic_start: true,
+    };
+    let matching_with = |service_control_grant: Option<InstallerServiceControlGrantReceipt>| {
+        InstallationEffectObservation::Matching {
+            disposition: InstallationEffectDisposition::CreatedByTransaction,
+            external_identity: test_handle("b".repeat(64)),
+            evidence: vec![test_handle("evidence:host-service")],
+            postcondition_digest: test_handle("c".repeat(64)),
+            service_control_grant: service_control_grant.map(Box::new),
+            credential_receipt: None,
+            staging_receipt: None,
+            phase_b_receipt: None,
+            service_runtime_lineage: None,
+        }
+    };
+    // A default-DACL readback carries no grant proof: the observation fails
+    // the Host parity gate and can never become `Applied`.
+    assert!(matches!(
+        matching_with(None).validate_for_effect(&effect),
+        Err(InstallationError::IncompleteObservation(_))
+    ));
+    // A non-policy (forged) DACL digest fails the exact receipt check.
+    let mut forged_grant = test_host_service_control_grant();
+    forged_grant.security_descriptor_digest = test_handle("f".repeat(64));
+    assert!(matches!(
+        matching_with(Some(forged_grant)).validate_for_effect(&effect),
+        Err(InstallationError::IdentityConflict)
+    ));
+    // The policy DACL grant validates as a Host `Matching` observation.
+    let grant = test_host_service_control_grant();
+    must(matching_with(Some(grant.clone())).validate_for_effect(&effect));
+    // The grant digest round-trips through the durable ownership marker: a
+    // policy-DACL marker matches only its own grant proof, never a
+    // default-DACL (`None`) or substituted-digest readback.
+    let transaction = planned_transaction();
+    let mut request = must(effect_request(
+        &transaction,
+        0,
+        1,
+        InstallationEffectAction::Apply,
+        None,
+    ));
+    request.registration_nonce = Some(test_handle("a".repeat(64)));
+    let configuration_digest = "b".repeat(64);
+    let marker = must(WindowsServiceOwnershipMarker::new(
+        &request,
+        ELIOT_HOST_SERVICE_NAME,
+        &configuration_digest,
+        Some(&grant),
+    ));
+    assert!(marker.matches(
+        &request,
+        ELIOT_HOST_SERVICE_NAME,
+        &configuration_digest,
+        Some(&grant),
+    ));
+    assert!(!marker.matches(
+        &request,
+        ELIOT_HOST_SERVICE_NAME,
+        &configuration_digest,
+        None,
+    ));
+    let mut substituted_grant = grant.clone();
+    substituted_grant.security_descriptor_digest = test_handle("f".repeat(64));
+    assert!(!marker.matches(
+        &request,
+        ELIOT_HOST_SERVICE_NAME,
+        &configuration_digest,
+        Some(&substituted_grant),
+    ));
+    // The matching observation carries the typed grant and binds its digest
+    // in evidence, so the Host DACL proof survives into durable `Applied`
+    // state instead of only the configuration digest.
+    let marker_digest = must(marker.digest());
+    let observation = must(service_matching_observation(
+        &request,
+        InstallationEffectDisposition::CreatedByTransaction,
+        &configuration_digest,
+        &marker_digest,
+        Some(grant.clone()),
+    ));
+    let InstallationEffectObservation::Matching {
+        evidence,
+        service_control_grant,
+        ..
+    } = observation
+    else {
+        unreachable!()
+    };
+    assert_eq!(service_control_grant.as_deref(), Some(&grant));
+    assert!(
+        evidence
+            .iter()
+            .any(|handle| handle.as_str() == must(grant.canonical_digest()).as_str())
+    );
 }
 
 #[cfg(windows)]
@@ -6061,7 +6202,23 @@ fn service_registration_projection_is_durable_and_exact() {
         approvals[0].configuration_digest,
         approvals[1].configuration_digest
     );
-    assert!(approvals[0].service_control_grant().is_none());
+    // s38 (#1345): the Host approval carries its own installer-policy DACL
+    // grant exactly like the Watchdog approval; a grant-less Host approval
+    // fails `validate()` and can never authorize `Applied` state.
+    let host_grant = approvals[0]
+        .service_control_grant()
+        .unwrap_or_else(|| unreachable!());
+    must(host_grant.validate());
+    assert_eq!(
+        host_grant.principal_service().as_str(),
+        ELIOT_HOST_SERVICE_NAME
+    );
+    assert_eq!(
+        host_grant.security_descriptor_digest().as_str(),
+        must(watchdog_service_security_descriptor_digest(
+            host_grant.principal_sid().as_str()
+        ))
+    );
     let watchdog_grant = approvals[1]
         .service_control_grant()
         .unwrap_or_else(|| unreachable!());

@@ -182,7 +182,11 @@ pub struct InstallerServiceRegistrationApproval {
     pub(super) registration_nonce: PlatformHandle,
     /// Authoritative SCM configuration digest returned by readback.
     pub(super) configuration_digest: PlatformHandle,
-    /// Exact Host service-SID grant required only by the Watchdog service.
+    /// Exact installer-policy service DACL grant read back from SCM for
+    /// this registration's service. Both Host and Watchdog registrations
+    /// carry the grant: a service whose security descriptor is not the
+    /// installer policy must never be reported `Applied`. The receipt always
+    /// names the Host service SID authorized by the installer policy.
     pub(super) service_control_grant: Option<InstallerServiceControlGrantReceipt>,
 }
 
@@ -205,8 +209,9 @@ impl InstallerServiceRegistrationApproval {
         &self.configuration_digest
     }
 
-    /// Returns the authoritative Host control grant for the Watchdog
-    /// registration. Host registrations deliberately return `None`.
+    /// Returns the authoritative installer-policy service DACL grant read
+    /// back from SCM for this registration. Both Host and Watchdog
+    /// registrations carry `Some` after authoritative readback.
     #[must_use]
     pub fn service_control_grant(&self) -> Option<&InstallerServiceControlGrantReceipt> {
         self.service_control_grant.as_ref()
@@ -263,10 +268,16 @@ impl InstallerServiceRegistrationApproval {
                 .to_owned(),
             ));
         }
+        // s38 (#1345): Host and Watchdog registrations both require the
+        // exact installer-policy service DACL grant. A Host service whose
+        // security descriptor is not the installer policy must never be
+        // reported `Applied`, so a Host approval without its grant receipt
+        // fails closed exactly like a Watchdog approval without its own.
         match (self.role, &self.service_control_grant) {
-            (InstallerServiceRole::Host, None) => {}
-            (InstallerServiceRole::Watchdog, Some(receipt)) => receipt.validate()?,
-            (InstallerServiceRole::Host, Some(_)) | (InstallerServiceRole::Watchdog, None) => {
+            (InstallerServiceRole::Host | InstallerServiceRole::Watchdog, Some(receipt)) => {
+                receipt.validate()?
+            }
+            (InstallerServiceRole::Host | InstallerServiceRole::Watchdog, None) => {
                 return Err(InstallationError::IdentityConflict);
             }
         }
@@ -317,8 +328,25 @@ impl InstallerServiceRegistrationApproval {
         if request.expected_configuration_digest() != self.configuration_digest.as_str() {
             return Err(InstallationError::IdentityConflict);
         }
-        if request.requires_host_service_control_grant() != self.service_control_grant.is_some() {
-            return Err(InstallationError::IdentityConflict);
+        // s38 (#1345): both roles prove the installer-policy service DACL
+        // with `Some` grant. The platform flag is still authoritative for the
+        // Watchdog grant install/read; for Host it is advisory across the
+        // platform generalization (older builds report `false` while newer
+        // builds report `true`), so Host requires its own proof under either
+        // flag value while Watchdog keeps the exact flag coupling.
+        match self.role {
+            InstallerServiceRole::Watchdog => {
+                if !request.requires_host_service_control_grant()
+                    || self.service_control_grant.is_none()
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+            InstallerServiceRole::Host => {
+                if self.service_control_grant.is_none() {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
         }
         Ok(request)
     }

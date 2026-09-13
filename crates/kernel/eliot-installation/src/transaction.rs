@@ -365,9 +365,12 @@ pub struct InstallationEffectProgress {
     pub ownership_secret: Option<InstallationOwnershipSecret>,
     /// Unpredictable public nonce retained for one SCM registration effect.
     pub registration_nonce: Option<PlatformHandle>,
-    /// Typed authoritative SCM DACL receipt for the Watchdog registration.
-    /// This member is mandatory on the current wire and is `None` for every
-    /// non-Watchdog-registration effect.
+    /// Typed authoritative SCM DACL receipt for Host and Watchdog
+    /// registrations. This member is mandatory on the current wire and is
+    /// `None` for every non-service-registration effect. An `Applied` Host
+    /// registration requires its receipt exactly like an `Applied` Watchdog
+    /// registration: a Host service whose DACL is not the installer policy
+    /// must never be reported `Applied`.
     pub service_control_grant: Option<InstallerServiceControlGrantReceipt>,
     /// Absolute injected-clock deadline for one bounded SCM start
     /// convergence window.  The deadline is created before the start intent
@@ -1311,6 +1314,32 @@ impl InstallationTransaction {
                 ) => {
                     return Err(InstallationError::IncompleteObservation(
                         "applied Watchdog registration requires its exact Host control grant receipt"
+                            .to_owned(),
+                    ));
+                }
+                // s38 (#1345): Host parity with the Watchdog arms above. An
+                // `Applied` Host registration without its installer-policy
+                // DACL receipt is not evidence of a policy DACL; it fails
+                // closed instead of reporting a default-DACL service as
+                // transaction-owned.
+                (
+                    InstallerEffectPlan::RegisterService {
+                        role: InstallerServiceRole::Host,
+                        ..
+                    },
+                    InstallationEffectProgressState::Applied { .. },
+                    Some(receipt),
+                ) => receipt.validate()?,
+                (
+                    InstallerEffectPlan::RegisterService {
+                        role: InstallerServiceRole::Host,
+                        ..
+                    },
+                    InstallationEffectProgressState::Applied { .. },
+                    None,
+                ) => {
+                    return Err(InstallationError::IncompleteObservation(
+                        "applied Host registration requires its exact installer-policy service-control grant receipt"
                             .to_owned(),
                     ));
                 }
