@@ -37,15 +37,41 @@ pub struct IntroductionRevocationRequest {
     pub binding: AuthorityBinding,
 }
 
-/// Errors at the typed P-07 port. The pure fragment exposes only unavailable.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Errors at the typed P-07 port.
+///
+/// `Unavailable` stays first for wire compatibility with the pure G-01
+/// fragment. `NotAdmitted` reports a Kernel-side admission refusal (fenced or
+/// epoch-gated authority, transport admission refusal, or a missing P-07
+/// route — never a receipt). `InvalidBinding` reports a caller-side binding
+/// that is internally inconsistent (owner/fence/epoch/receipt mismatch).
+/// `UnknownOutcome` reports a possible commit with a lost acknowledgement and
+/// must never be collapsed to unavailable/non-executed: the exact request is
+/// retained under its snapshot until exact reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum P07PortError {
     Unavailable,
+    NotAdmitted,
+    InvalidBinding,
+    UnknownOutcome { snapshot_id: SnapshotId },
 }
 
 impl fmt::Display for P07PortError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("P-07 authority activation is unavailable in the pure G-01 fragment")
+        match self {
+            Self::Unavailable => formatter
+                .write_str("P-07 authority activation is unavailable in the pure G-01 fragment"),
+            Self::NotAdmitted => {
+                formatter.write_str("P-07 authority refused the presented activation")
+            }
+            Self::InvalidBinding => {
+                formatter.write_str("P-07 activation binding is internally inconsistent")
+            }
+            Self::UnknownOutcome { snapshot_id } => write!(
+                formatter,
+                "P-07 activation outcome is unknown for snapshot {snapshot_id}; \
+                 the exact request is retained for reconciliation"
+            ),
+        }
     }
 }
 
