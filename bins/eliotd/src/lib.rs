@@ -151,6 +151,10 @@ pub struct DaemonComposition {
     config_path: PathBuf,
     state_root: PathBuf,
     started: bool,
+    /// Set when a post-commit refresh fails after the write receipt was
+    /// already durable. The dependent view is stale/pending until the caller
+    /// drops this composition and re-runs authenticated connect+start.
+    view_stale: bool,
 }
 
 impl DaemonComposition {
@@ -192,7 +196,42 @@ impl DaemonComposition {
             config_path: config.config_path,
             state_root: config.state_root,
             started: true,
+            view_stale: false,
         })
+    }
+
+    /// Commits one Canonical-admitted transition under the exact admitted
+    /// request identity, then publishes the resulting owner change.
+    ///
+    /// The identity comes from admitted ingress and must agree with the
+    /// envelope; substitution fails closed inside `commit_canonical` without
+    /// a local rehash. No Store client or second ledger is involved: the
+    /// only write path is the retained neutral Kernel port.
+    ///
+    /// Post-commit behavior:
+    /// - The refresh runs before a receipt is returned. A failed refresh
+    ///   keeps the already durable receipt, marks this composition's
+    ///   dependent view stale/pending (see `status`), and still returns the
+    ///   receipt: a committed operation is never reported as non-executed.
+    /// - Any `Err` from `commit_canonical` — including epoch/generation
+    ///   `Recovery` — propagates unchanged so the caller drops this
+    ///   composition and re-runs authenticated connect+start. A stale view
+    ///   observed after a returned receipt requires the same drop and
+    ///   reconnect before the projections can be trusted again.
+    pub async fn commit_canonical_and_refresh(
+        &mut self,
+        identity: &eliot_protocol::RequestIdentity,
+        envelope: eliot_governor::CanonicalWriteEnvelope,
+    ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
+        let receipt = self
+            .governor
+            .commit_canonical(identity, envelope)
+            .await
+            .map_err(DaemonError::Composition)?;
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+        Ok(receipt)
     }
 
     /// Returns the admitted Kernel snapshot.
@@ -237,15 +276,21 @@ impl DaemonComposition {
             protocol: PROTOCOL_VERSION.to_owned(),
             generation: snapshot.generation.value(),
             authority_epoch: snapshot.authority_epoch.value(),
-            ready: self.started && self.readiness() == CompositionReadiness::Ready,
+            ready: self.started
+                && !self.view_stale
+                && self.readiness() == CompositionReadiness::Ready,
             health: if !self.started {
                 "stopped".to_owned()
+            } else if self.view_stale {
+                "stale".to_owned()
             } else if self.readiness() == CompositionReadiness::Ready {
                 "healthy".to_owned()
             } else {
                 "degraded".to_owned()
             },
-            degraded: !self.started || self.readiness() != CompositionReadiness::Ready,
+            degraded: !self.started
+                || self.view_stale
+                || self.readiness() != CompositionReadiness::Ready,
         }
     }
 

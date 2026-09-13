@@ -1192,6 +1192,7 @@ dependencies = [
  "eliot-observation",
  "eliot-observation-contracts",
  "eliot-problem",
+ "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime-contracts",
  "eliot-session",

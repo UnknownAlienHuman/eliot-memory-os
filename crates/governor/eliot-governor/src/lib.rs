@@ -38,6 +38,10 @@ mod owner_projection_refresh;
 
 pub use activation_outcome::*;
 pub use composition::*;
+/// Canonical write envelope admitted by `commit_canonical`. Re-exported so
+/// the daemon composition root can name the exact envelope type without a
+/// second canonical dependency path.
+pub use eliot_canonical::CanonicalWriteEnvelope;
 
 use std::collections::BTreeMap;
 
