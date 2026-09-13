@@ -4,10 +4,11 @@ use eliot_agent_bridge::{
     BridgeRunner, CliError, Profile, kernel_ports_with_declaration, parse_args,
 };
 use eliot_agent_bridge_core::{AttachRequest, BridgeError, HostEventEnvelope};
+#[cfg(test)]
+use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome, PortFailure};
 use eliot_mcp::{
-    HostCancellationPortOutcome, HostCancellationRequest, HostCancellationResult, HostGatewayError,
-    HostInvocationPortOutcome, HostInvocationRequest, HostInvocationResult, HostRequestGateway,
-    KernelHostRequestPort, PortFailure,
+    HostCancellationRequest, HostCancellationResult, HostGatewayError, HostInvocationRequest,
+    HostInvocationResult, HostRequestGateway, KernelHostRequestPort,
 };
 use eliot_protocol::EventEnvelope;
 use serde::{Deserialize, Serialize};
@@ -56,13 +57,16 @@ enum Response {
     },
 }
 
-/// Fail-closed placeholder until #77 installs the real Kernel bind/dispatch port.
+/// Fail-closed placeholder retained for unit tests only.
 ///
-/// It returns a typed capability gap through the #112 gateway. It never creates
-/// an operation handle, request identity, authority, success, or completion.
+/// Production wiring uses the shared-transport `KernelHostRequestClient`
+/// built beside the activation port; this type keeps the gateway correlation
+/// proofs compiling without a live Kernel.
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct UnavailableKernelHostRequestPort;
 
+#[cfg(test)]
 impl KernelHostRequestPort for UnavailableKernelHostRequestPort {
     fn invoke(
         &mut self,
@@ -109,7 +113,7 @@ fn main() {
             std::process::exit(INVALID_ARGUMENT_EXIT);
         }
     };
-    let (host_activation, mcp_forwarding) =
+    let (host_activation, mut host_request_port, mcp_forwarding) =
         match kernel_ports_with_declaration(&config.client_declaration) {
             Ok(ports) => ports,
             Err(error) => {
@@ -130,7 +134,6 @@ fn main() {
         }
     };
     let host_gateway = HostRequestGateway;
-    let mut host_request_port = UnavailableKernelHostRequestPort;
     let mut provider_failure = false;
     for line in io::stdin().lock().lines() {
         let response = match line {
@@ -144,10 +147,10 @@ fn main() {
                     }
                 },
                 Ok(Request::Invoke { request }) => {
-                    handle_invocation(&host_gateway, &mut host_request_port, &request)
+                    handle_invocation(&host_gateway, &mut *host_request_port, &request)
                 }
                 Ok(Request::Cancel { request }) => {
-                    handle_cancellation(&host_gateway, &mut host_request_port, &request)
+                    handle_cancellation(&host_gateway, &mut *host_request_port, &request)
                 }
                 Ok(Request::ForwardHook { event }) => match runner.forward_hook(&event) {
                     Ok(()) => Response::Forwarded,
@@ -174,7 +177,7 @@ fn main() {
                     profile: Profile::as_str(config.profile),
                     control_capacity: runner.control_capacity(),
                     activation_port: "observed after Kernel admission",
-                    host_request_port: "typed ingress active; Kernel bind/dispatch unavailable",
+                    host_request_port: "typed ingress active; shared transport live after Kernel activation",
                     observation_forwarding_port: "unavailable: Kernel observation route not admitted",
                 },
                 Ok(Request::Stop) => Response::Stopped,

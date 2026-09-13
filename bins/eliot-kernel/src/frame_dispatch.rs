@@ -159,6 +159,34 @@ impl KernelComposition {
                 }
                 return self.dispatch_native_worker_frame(session, frame);
             }
+            #[cfg(windows)]
+            if super::host_request_route::is_host_request_operation(native_operation) {
+                // P-04 admitted host-request envelopes ride the same admitted
+                // transport through this closed gateway. `Ready` admits every
+                // kind, while `Degraded` still routes Cancellation, Status,
+                // and Reconciliation through the exact per-kind service gate
+                // inside the admit path. Peer, correlation, and fence joins
+                // mirror the native-worker gate above; envelope
+                // digest/connection/generation joins live in the route. Off
+                // Windows the payload falls through to the typed process
+                // operation below, which rejects the unknown operation and
+                // fences.
+                if !matches!(
+                    self.service_state()
+                        .map_err(|_| TransportError::SessionFenced)?,
+                    KernelServiceState::Ready | KernelServiceState::Degraded
+                ) {
+                    return Err(TransportError::SessionFenced);
+                }
+                session
+                    .peer
+                    .validate()
+                    .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+                if frame.request_id.is_none() || frame.request_identity.is_none() {
+                    return Err(TransportError::SessionFenced);
+                }
+                return self.dispatch_host_request_frame(session, frame);
+            }
             if self
                 .service_state()
                 .map_err(|_| TransportError::SessionFenced)?

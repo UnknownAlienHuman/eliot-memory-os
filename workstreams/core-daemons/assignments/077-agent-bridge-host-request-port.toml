@@ -1,0 +1,126 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_SWARM_IMPLEMENTATION"
+implementation_support = "PARTIAL"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "AGENT_HANDOFF_ONLY"
+parent_issue = 77
+handoff_issue = 342
+issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/342"
+integration_issue_refs = [77, 23, 15, 18, 11]
+base_branch = "main"
+# retry-1084: supersedes docs/342-agent-bridge-host-port; reconciled to work/342-host-request-cutover at 7d11f601
+base_sha = "7d11f601302cb156ad9678d4201b1063bda5acc1"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "surface.agent-bridge-kernel-host-request-port"
+causal_property = "One validated inert host invocation or cancellation is bound by the trusted Kernel to exact principal, Session, WorkScope, task, fence, deadline and operation identity, then returns a result correlated to the original host request without accepting authority from the host."
+old_path_discriminator = "The binary already parses typed Invoke and Cancel requests and calls HostRequestGateway, but composes UnavailableKernelHostRequestPort; every request returns a typed PlanGap for kernel.host-request.bind-dispatch or kernel.host-request.cancel."
+result = "finite implementation allocation for parent #77; no live Edge or Product claim"
+
+[documentation]
+architecture_sections = [
+  "docs/architecture/A10-01-agent-interaction-loop.md#a101-agent-interaction-loop",
+  "docs/architecture/A10-02-impact-and-authority.md#a102-impact-and-authority",
+]
+implementation_sections = [
+  "docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md#i71-eliot-bridge-protocol-ebp1",
+  "docs/architecture/I07-02-frame.md#i72-frame",
+  "docs/architecture/I07-03-handshake.md#i73-handshake",
+  "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+]
+decision_anchors = ["ARCH-AUTH-01", "ARCH-SEC-02", "ARCH-LIFE-01", "ARCH-OBS-01"]
+
+[current_source]
+bridge_binary = "bins/eliot-agent-bridge/src/main.rs"
+host_gateway = "crates/surfaces/eliot-mcp/src/host_gateway.rs"
+confirmed_facts = [
+  "The public Request enum contains Attach, Invoke, Cancel, ForwardHook, ForwardEvent, ReconcileExternal, Status and Stop.",
+  "Raw ForwardFrame is absent from the production request surface and an inline regression test rejects it.",
+  "HostInvocationRequest, HostCancellationRequest, HostRequestGateway and KernelHostRequestPort already exist and must be reused.",
+  "The production binary constructs UnavailableKernelHostRequestPort.",
+  "Invoke and Cancel currently return correlated typed REJECTED outcomes with missing Kernel capabilities; no real Kernel operation is reached.",
+  "Bounded stdin acquisition is a separate source owner under issue #977 and must not be reimplemented here.",
+]
+
+[decomposition]
+wave_1_kernel_contract = [
+  "Define or adopt one closed Kernel host-request bind/dispatch/cancel operation using existing host DTOs only at the inert boundary.",
+  "Kernel derives RequestIdentity, principal, Session, WorkScope, task, authority epoch, StateFence, absolute deadline, idempotency identity and cancellation target from authenticated current state.",
+  "Host correlation is data for response routing only and never becomes Kernel authority or operation identity.",
+]
+wave_2_bridge_adapter = [
+  "Implement a production KernelHostRequestPort adapter in the Agent Bridge composition.",
+  "Replace only the UnavailableKernelHostRequestPort composition after the real authenticated port is available.",
+  "Preserve HostRequestGateway as the sole validation/correlation layer and preserve #977 bounded input when it lands.",
+]
+wave_3_governor_operation = [
+  "Route each allowed logical operation to its existing Governor/MCP owner; do not create a second dispatcher or generic JSON command.",
+  "Return typed success, rejection, pending or unknown outcome with exact operation handle and original host correlation.",
+]
+wave_4_replay_cancel_reconnect = [
+  "Bind exact replay to canonical payload digest and operation scope.",
+  "Reject same host correlation with changed payload.",
+  "Cancel only the exact operation handle owned by the authenticated current Session.",
+  "After unknown delivery/submission, reconcile the same operation before any retry.",
+  "Reconnect or detach cannot infer durable Session continuity from process identity alone.",
+]
+wave_5_edge = [
+  "Execute one real host -> Bridge -> Kernel -> Governor/MCP operation -> correlated response path.",
+  "Execute its exact cancellation and reconnect/reconciliation cases.",
+  "Record readiness only after the real operation probe succeeds.",
+]
+
+[worker_allocations]
+contract_owner = [
+  "existing Kernel front-door/host-request contract module selected after reverse-consumer inspection",
+  "focused contract tests",
+]
+bridge_owner = [
+  "bins/eliot-agent-bridge/src/main.rs exact composition span",
+  "new private production adapter module under bins/eliot-agent-bridge/src/ when justified",
+  "focused package tests",
+]
+governor_owner = [
+  "existing owning MCP/Governor operation adapter only",
+  "focused operation/replay tests",
+]
+serialized_paths = [
+  "Any file shared with issue #977 must wait for its accepted input-profile/parser turn and rerun that boundary suite.",
+  "Kernel and Governor shared contracts land before the Bridge adapter consumes them.",
+]
+forbidden = [
+  "public raw Frame request/cancel ingress",
+  "host-supplied RequestIdentity, principal, Session, task, fence, lease or effect ceiling",
+  "generic JSON or shell dispatch",
+  "Bridge-owned durable retry ledger",
+  "process identity treated as durable Session identity",
+  "new unbounded stdin parser",
+]
+
+[acceptance]
+criteria = [
+  "One typed host invocation reaches one real admitted Kernel/Governor operation and returns the same host correlation.",
+  "One cancellation reaches only the exact current operation handle and cannot redirect to another request.",
+  "No host field can supply or widen principal, Session, task, WorkScope, epoch, fence, deadline, effect ceiling, completion or proof.",
+  "Same correlation with changed canonical payload is rejected; exact replay follows the owner idempotency contract without duplicate effect.",
+  "Wrong or stale connection, Session, fence, generation and cancellation target return typed recovery guidance.",
+  "Unknown outcome is reconciled by exact operation identity before retry.",
+  "Raw ForwardFrame remains absent from all production host request/cancel paths while durable EventEnvelope forwarding remains intact.",
+  "The production binary no longer constructs UnavailableKernelHostRequestPort after all required contracts and adapters exist.",
+  "Forwarding readiness is not advertised until an actual operation probe succeeds.",
+  "Parser-only, mock-port or source-construction tests cannot close parent #77 or Product issue #11.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-mcp -p eliot-agent-bridge -p eliot-kernel-service --all-targets",
+  "cargo test --locked -p eliot-mcp -p eliot-agent-bridge -p eliot-kernel-service --all-targets",
+  "cargo clippy --locked -p eliot-mcp -p eliot-agent-bridge -p eliot-kernel-service --all-targets -- -D warnings",
+  "python scripts/verify-agent-bridge-protocol.py",
+  "git diff --check",
+]
+edge_proof = "Required by parent #77 after all serialized waves; one real invoke, cancel, replay-conflict and reconnect/reconciliation path."
+product_pulse = "Owned by issue #11 and remains NOT_EXECUTED."

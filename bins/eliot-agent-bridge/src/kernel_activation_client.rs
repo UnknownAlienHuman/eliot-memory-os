@@ -34,8 +34,8 @@ use eliot_protocol::FrameKind;
 use eliot_protocol::MessageType;
 use eliot_protocol::ProtocolPayload;
 
-use crate::AdmittedConnection;
-use crate::LoadedAgentBridgeDeclaration;
+use crate::KernelTransportOwner;
+use crate::SharedTransport;
 
 fn provider_failure() -> ProviderFailure {
     ProviderFailure::new(
@@ -246,16 +246,29 @@ pub(super) fn decode_activation_response(
     Ok(response)
 }
 
+/// Runner-side face of the single retained transport owner.
+///
+/// Holds no transport of its own: every activation call borrows the shared
+/// owner, so the one-shot guard, the runtime, and the admitted transport stay
+/// singular while the host-request face serves envelopes beside it.
 pub(super) struct KernelHostActivationPort {
-    pub(super) admitted: AdmittedConnection,
-    pub(super) runtime: tokio::runtime::Runtime,
-    pub(super) _loaded: LoadedAgentBridgeDeclaration,
-    pub(super) activation_used: bool,
-    pub(super) limits: eliot_ipc::TransportLimits,
+    pub(super) shared: SharedTransport,
 }
 
 impl HostActivationPort for KernelHostActivationPort {
     fn activate(
+        &mut self,
+        request: &AttachRequest,
+    ) -> Result<ActivationPortOutcome, ProviderFailure> {
+        self.shared
+            .try_borrow_mut()
+            .map_err(|_| provider_failure())?
+            .activate_inner(request)
+    }
+}
+
+impl KernelTransportOwner {
+    fn activate_inner(
         &mut self,
         request: &AttachRequest,
     ) -> Result<ActivationPortOutcome, ProviderFailure> {
@@ -295,6 +308,7 @@ impl HostActivationPort for KernelHostActivationPort {
             }
             eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } => {
                 let b = *binding;
+                self.activated_session = Some(b.session_id.clone());
                 let principal_id =
                     PrincipalId::new(b.principal_id).map_err(|_| provider_failure())?;
                 let session_id = SessionId::new(b.session_id).map_err(|_| provider_failure())?;
