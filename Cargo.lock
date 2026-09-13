@@ -2003,7 +2003,9 @@ name = "eliot-skill"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-protocol",
  "eliot-skills",
+ "eliot-store-api",
  "serde",
  "sha2 0.10.9",
  "thiserror",
@@ -2378,6 +2380,7 @@ dependencies = [
  "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-skill",
  "eliot-store-api",
  "serde",
  "serde_json",

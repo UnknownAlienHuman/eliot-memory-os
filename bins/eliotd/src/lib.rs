@@ -41,6 +41,7 @@ mod daemon_kernel_port_adapters;
 mod kernel_authority_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
+mod skill_lifecycle_adapters;
 mod store_failure_projection;
 
 pub use activation_projection::AgentActivationResolver;
@@ -428,6 +429,29 @@ impl DaemonComposition {
     pub fn controlboard(&self) -> Result<eliot_controlboard::ControlBoard, DaemonError> {
         let snapshot = self.governor.controlboard_snapshot()?;
         Ok(controlboard_adapters::controlboard_over_snapshot(snapshot))
+    }
+
+    /// Borrows the single Governor Skill lifecycle owner as a forwarding
+    /// [`SkillLifecycleApi`](eliot_skill::SkillLifecycleApi).
+    ///
+    /// The adapter forwards the exact admitted identity, operation identity,
+    /// candidate, gate and promoted view to the Governor canonical promotion
+    /// path and returns only typed results. No policy, admission, or semantic
+    /// rules live here; a stale fence or changed base fails closed in the
+    /// Governor owner. Callers take a fresh adapter per operation so a
+    /// Governor refresh surfaces as an exact-view mismatch instead of silent
+    /// divergence.
+    pub fn skill_lifecycle(
+        &self,
+    ) -> Result<impl eliot_skill::SkillLifecycleApi + '_, DaemonError> {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(
+                eliot_governor::CompositionError::NotReady,
+            ));
+        }
+        Ok(skill_lifecycle_adapters::ForwardingSkillLifecycle::new(
+            self.governor.skill_lifecycle(),
+        ))
     }
 
     /// Stops the one daemon owner and releases protected handles together.
