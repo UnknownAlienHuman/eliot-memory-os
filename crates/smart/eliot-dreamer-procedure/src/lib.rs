@@ -1,13 +1,2670 @@
-//! Capability cell placeholder.
+//! Grounded inert procedure and short-skill candidate (A-25).
 //!
-//! NOT IMPLEMENTED. This file exists only so that per-crate
-//! `cargo check`, `cargo test` and `cargo clippy` run and report an
-//! actionable result instead of a manifest error.
+//! Pure candidate-only deterministic stateless zero-effect owner of exactly
+//! one bounded reversible inert procedure grafted from validated structured
+//! evidence. The handler proposes one finite typed step graph with trigger,
+//! preconditions, per-step owner and verifier, stop and reopen conditions,
+//! and an environment and scope preserving transfer boundary. It never
+//! installs, publishes, reserves, executes, or finishes anything.
 //!
-//! Cell `smart.dreamer.procedure`, order 25.
-//! The purpose, contract and dependencies of this cell live in
-//! `module.toml` next to this crate. The owning work unit replaces this
-//! file and, on completion, moves the crate from the root
-//! `workspace.exclude` into `workspace.members`.
+//! Cell `smart.dreamer.procedure`, order 25. All inputs are immutable and
+//! caller supplied. Every identity, receipt, draft, evidence, capability,
+//! environment, existing-procedure, policy, budget, deadline, and digest
+//! binding is explicit. The A-05 receipt is checked intrinsically through its
+//! own validation entry points and is never re-executed here. No screening,
+//! grounding, common validation, production registry construction, canonical
+//! mutation, authority, effect, store, governor, model, clock, or finish
+//! surface exists in this cell.
+//!
+//! Consumed contracts already carry closed unknown-field rejection (their
+//! schemas state `deny_unknown_fields`); this cell performs no generic JSON
+//! intake at all, so no unknown field can enter through a typeless path.
+//! Every new shape below is constructed explicitly through the six typed
+//! parameters of [`propose_procedure`], never decoded from ambient bytes.
+//!
+//! Runtime boundary: a blocked, malformed, over-budget, past-deadline, or
+//! cancelled-before-emission request emits zero effects. Semantic shortfalls
+//! (duplicate identity, refinement, conflict, empirical-only support, missing
+//! verifier, unsafe payload, partial coverage, unknown-effect retry, stale
+//! revision) are inert terminal dispositions carried by
+//! [`ProcedureCandidate`], never errors that invite a blind retry. Malformed
+//! or mismatched inputs fail closed as [`ProcedureError`].
+//!
+//! Absence note: this file contains no persistence, identifier allocation,
+//! graph traversal beyond the bounded candidate step list, run-book
+//! execution, provider, model, tool, ambient-state, authority, effect, or
+//! terminal-completion calls by construction; the only cryptography is the
+//! canonical digest below, and the only fallible work is pure bounded
+//! validation. There are no placeholder, mock, canned, or pseudo paths:
+//! every branch binds an explicit input field.
+//!
+//! Test coverage note: 6 of 50 `WORK_UNIT_CASE 661/*` cases execute here
+//! (661/1 valid completes, 661/4 bundle mismatch fails closed, 661/5
+//! duplicate identity disposition, 661/13 valid acyclic graph completes,
+//! 661/17 raw shell rejected, 661/26 unknown-effect blocks retry). The
+//! remaining 44 of 50 are deferred per START.md s1; #965 admission is
+//! separate. Deferred: 661/2, 661/3, 661/6, 661/7, 661/8, 661/9, 661/10,
+//! 661/11, 661/12, 661/14, 661/15, 661/16, 661/18, 661/19, 661/20, 661/21,
+//! 661/22, 661/23, 661/24, 661/25, 661/27, 661/28, 661/29, 661/30, 661/31,
+//! 661/32, 661/33, 661/34, 661/35, 661/36, 661/37, 661/38, 661/39, 661/40,
+//! 661/41, 661/42, 661/43, 661/44, 661/45, 661/46, 661/47, 661/48, 661/49,
+//! 661/50.
 
 #![forbid(unsafe_code)]
+
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_dreamer_candidate_validation::RejectionCode;
+use eliot_dreamer_contracts::{
+    CurationKind, GroundedDreamDraft, ValidatedCurationItem, ValidationReceipt, check_fence,
+    is_hex64_lower,
+};
+
+// ---------------------------------------------------------------------------
+// Independent bounds (no cross-subsidy between dimensions).
+// ---------------------------------------------------------------------------
+
+/// Maximum procedure steps admitted in one candidate graph.
+pub const MAX_STEPS: usize = 32;
+/// Maximum inputs admitted on any single step.
+pub const MAX_STEP_INPUTS: usize = 16;
+/// Maximum dependencies admitted on any single step.
+pub const MAX_STEP_DEPS: usize = 8;
+/// Maximum evidence refs admitted in any single evidence list.
+pub const MAX_EVIDENCE_ITEMS: usize = 64;
+/// Maximum closure refs admitted in any single closure list.
+pub const MAX_CLOSURE_REFS: usize = 256;
+/// Maximum protection entries admitted in one request.
+pub const MAX_PROTECTIONS: usize = 32;
+/// Maximum predecessor digests admitted in one existing snapshot.
+pub const MAX_PREDECESSORS: usize = 32;
+/// Maximum bytes for any single free-text field.
+pub const MAX_TEXT_BYTES: usize = 1024;
+/// Maximum bytes for any handle or identity field.
+pub const MAX_HANDLE_BYTES: usize = 128;
+/// Maximum bytes for any identity field bound into digests.
+pub const MAX_ID_BYTES: usize = 128;
+/// Maximum bytes for task, scope, authority, and proof-ceiling fields.
+pub const MAX_SCOPE_BYTES: usize = 256;
+/// Maximum bytes for any bounded note field.
+pub const MAX_NOTE_BYTES: usize = 1024;
+/// Maximum bytes for the procedure objective statement.
+pub const MAX_OBJECTIVE_BYTES: usize = 1024;
+/// Maximum aggregate input bytes across all text fields.
+pub const MAX_TOTAL_BYTES: usize = 1_048_576;
+/// Redaction ceiling for values echoed into errors and notes.
+pub const MAX_REDACTED_CHARS: usize = 128;
+/// Maximum retries admitted on any single step.
+pub const MAX_RETRIES: u32 = 5;
+/// Maximum fan-out admitted on any single step.
+pub const MAX_FANOUT: u32 = 8;
+/// Expected preservation dimensions attested through the receipt digest.
+pub const EXPECTED_PRESERVATION_DIMENSIONS: usize = 7;
+
+/// Routing-only proof ceiling carried by every emitted candidate.
+pub const PROCEDURE_PROOF_NOTE: &str = "a-25 candidate-only aggregation: inert typed step graph preserved without screening, grounding, common validation, canonical mutation, authority, effect, store, governor, model, clock, or finish";
+
+// ---------------------------------------------------------------------------
+// Small pure helpers (no ambient clock, no allocation of authority).
+// ---------------------------------------------------------------------------
+
+/// Returns true when the value carries any control character.
+fn has_control(value: &str) -> bool {
+    value.chars().any(char::is_control)
+}
+
+/// Redacts a value to a bounded printable prefix for errors and notes.
+fn redact(value: &str) -> String {
+    let mut out = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index >= MAX_REDACTED_CHARS {
+            out.push_str("...");
+            break;
+        }
+        if ch.is_control() {
+            out.push('?');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Returns true when values are sorted strictly ascending with no duplicates.
+fn is_sorted_unique(values: &[String]) -> bool {
+    let mut index = 0usize;
+    while index < values.len() {
+        if index > 0 {
+            let prev_ok = values.get(index.saturating_sub(1));
+            let cur_ok = values.get(index);
+            if let (Some(prev), Some(cur)) = (prev_ok, cur_ok) {
+                if prev >= cur {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        index = index.saturating_add(1);
+    }
+    true
+}
+
+/// Returns true when the sorted-unique precondition holds for string slices.
+fn are_ids_sorted_unique(values: &[String]) -> bool {
+    is_sorted_unique(values)
+}
+
+/// Lowercases an ASCII-heavy note without allocating authority.
+fn lowered(note: &str) -> String {
+    note.to_lowercase()
+}
+
+/// Returns true when the haystack contains the needle as a substring.
+fn contains_marker(haystack: &str, needle: &str) -> bool {
+    haystack.contains(needle)
+}
+
+// ---------------------------------------------------------------------------
+// Closed forbidden markers (raw execution, SDK, credentials, unbounded).
+// ---------------------------------------------------------------------------
+
+/// Substrings that mark a raw shell or command execution payload.
+pub const SHELL_MARKERS: &[&str] = &[
+    "shell_exec",
+    "shell-exec",
+    "raw shell",
+    "sh -c",
+    "/bin/sh",
+    "/bin/bash",
+    "cmd.exe",
+    "powershell",
+    "pwsh -c",
+    "system(",
+    "popen(",
+    "execvp",
+    "execve",
+    "spawn shell",
+];
+
+/// Substrings that mark a provider or model SDK payload.
+pub const SDK_MARKERS: &[&str] = &[
+    "boto3",
+    "aws sdk",
+    "gcp sdk",
+    "azure sdk",
+    "openai.",
+    "anthropic.",
+    "http client exec",
+    "sdk.invoke",
+    "sdk_exec",
+    "provider call",
+    "model.invoke",
+];
+
+/// Substrings that mark acquired credentials, leases, permits, or handles.
+pub const CREDENTIAL_MARKERS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "api-key",
+    "secret",
+    "password",
+    "passwd",
+    "bearer token",
+    "access token",
+    "refresh token",
+    "credential",
+    "lease acquire",
+    "permit acquire",
+    "process handle",
+    "handle acquire",
+    "private key",
+];
+
+/// Substrings that mark an unbounded loop, fan-out, or retry claim.
+pub const UNBOUNDED_MARKERS: &[&str] = &[
+    "unbounded",
+    "infinite loop",
+    "loop forever",
+    "retry forever",
+    "retry until success",
+    "unlimited retries",
+    "unlimited fan",
+    "fork bomb",
+    "while true",
+    "for(;;)",
+];
+
+/// Substrings that mark a similarity or confidence proof overreach.
+pub const SIMILARITY_MARKERS: &[&str] = &[
+    "similar",
+    "looks like",
+    "confidence proves",
+    "model says the author",
+    "embedding proves",
+];
+
+/// Returns true when any marker occurs in the lowered haystack.
+fn mentions_any(lowered_haystack: &str, markers: &[&str]) -> bool {
+    let mut index = 0usize;
+    while index < markers.len() {
+        if let Some(marker) = markers.get(index)
+            && contains_marker(lowered_haystack, marker)
+        {
+            return true;
+        }
+        index = index.saturating_add(1);
+    }
+    false
+}
+
+/// Returns true when the text claims chronology proves causality.
+fn claims_chronology_is_causality(note: &str) -> bool {
+    let low = lowered(note);
+    let time_word =
+        contains_marker(&low, "before") || contains_marker(&low, "earlier") || contains_marker(&low, "preceded");
+    let cause_word = contains_marker(&low, "therefore causes")
+        || contains_marker(&low, "hence causes")
+        || contains_marker(&low, "proves caus")
+        || contains_marker(&low, "is the cause");
+    time_word && cause_word
+}
+
+/// Returns true when the text claims a timestamp proves currentness.
+fn claims_timestamp_is_currentness(note: &str) -> bool {
+    let low = lowered(note);
+    let fresh_word = contains_marker(&low, "newest")
+        || contains_marker(&low, "latest timestamp")
+        || contains_marker(&low, "most recent");
+    let current_word = contains_marker(&low, "therefore current")
+        || contains_marker(&low, "hence current")
+        || contains_marker(&low, "proves current")
+        || contains_marker(&low, "is current");
+    fresh_word && current_word
+}
+
+/// Returns true when the text offers bare success as mechanism proof.
+fn claims_success_is_mechanism(note: &str) -> bool {
+    let low = lowered(note);
+    contains_marker(&low, "exit zero proves")
+        || contains_marker(&low, "one success proves mechanism")
+        || contains_marker(&low, "confidence proves mechanism")
+        || contains_marker(&low, "single episode proves")
+}
+
+// ---------------------------------------------------------------------------
+// Public vocabulary: effects, outcomes, steps, evidence, snapshots, policy.
+// ---------------------------------------------------------------------------
+
+/// Closed effect class for one procedure step.
+///
+/// `Unknown` names a step whose possible effect the owning contract could
+/// not bound. Unknown possible effect blocks every retry path until the
+/// external owner reconciles the exact operation; there is no blind retry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EffectClass {
+    /// The step only reads already admitted evidence.
+    ReadOnly,
+    /// The step names an owner-directed write executed outside this cell.
+    OwnerDirected,
+    /// The step names a compensatable change with an owned rollback.
+    Compensatable,
+    /// The step effect is unknown and blocks retry until reconciled.
+    Unknown,
+}
+
+impl EffectClass {
+    /// Returns the canonical spelling of this effect class.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::OwnerDirected => "owner_directed",
+            Self::Compensatable => "compensatable",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Parses the canonical spelling of an effect class.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcedureError::Shape`] on any unknown spelling.
+    pub fn parse(spelling: &str) -> Result<Self, ProcedureError> {
+        match spelling {
+            "read_only" => Ok(Self::ReadOnly),
+            "owner_directed" => Ok(Self::OwnerDirected),
+            "compensatable" => Ok(Self::Compensatable),
+            "unknown" => Ok(Self::Unknown),
+            _ => Err(ProcedureError::Shape {
+                field: "step.effect".to_owned(),
+                detail: redact(spelling),
+            }),
+        }
+    }
+}
+
+/// Terminal outcome of one procedure proposal.
+///
+/// Fail-closed ordering applies: malformed inputs are [`ProcedureError`],
+/// while every semantic shortfall below is an inert outcome that preserves
+/// all source branches without effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProcedureOutcome {
+    /// One complete candidate with full accounting and proof.
+    Complete,
+    /// A candidate with named partial coverage; completeness is blocked.
+    Partial,
+    /// The proposed procedure duplicates an already known identity.
+    Duplicate,
+    /// The proposed procedure refines a named predecessor.
+    Refinement,
+    /// The proposed procedure conflicts with a named live procedure.
+    Conflict,
+    /// Support is empirical only; mechanism is not proven.
+    Empirical,
+    /// A required verifier is missing or unbound.
+    MissingVerifier,
+    /// The payload is unsafe and is refused without execution.
+    Unsafe,
+    /// Unknown possible effect blocks every retry path.
+    BlockedUnknownEffect,
+    /// Inputs moved under the request; replay against the new revision.
+    Stale,
+    /// The request is rejected with a boundary handoff.
+    Rejected,
+}
+
+impl ProcedureOutcome {
+    /// Returns the canonical spelling of this outcome.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Duplicate => "duplicate",
+            Self::Refinement => "refinement",
+            Self::Conflict => "conflict",
+            Self::Empirical => "empirical",
+            Self::MissingVerifier => "missing_verifier",
+            Self::Unsafe => "unsafe",
+            Self::BlockedUnknownEffect => "blocked_unknown_effect",
+            Self::Stale => "stale",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// Exactly-one disposition per procedure step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StepDispositionKind {
+    /// Step is fully grounded and verified by its named verifier.
+    Grounded,
+    /// Step refines a named predecessor step without changing identity.
+    Refinement,
+    /// Step conflicts with a named live step and is held open.
+    Conflict,
+    /// Step support is empirical only and stays visible as such.
+    Empirical,
+    /// Step verifier is missing and blocks completeness.
+    MissingVerifier,
+    /// Step payload is unsafe and is refused.
+    Unsafe,
+    /// Step effect is unknown and blocks retry until reconciled.
+    BlockedUnknownEffect,
+    /// Step is unchanged evidence carried for lineage.
+    UnchangedWithEvidence,
+}
+
+impl StepDispositionKind {
+    /// Returns the canonical spelling of this step disposition.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Grounded => "grounded",
+            Self::Refinement => "refinement",
+            Self::Conflict => "conflict",
+            Self::Empirical => "empirical",
+            Self::MissingVerifier => "missing_verifier",
+            Self::Unsafe => "unsafe",
+            Self::BlockedUnknownEffect => "blocked_unknown_effect",
+            Self::UnchangedWithEvidence => "unchanged_with_evidence",
+        }
+    }
+}
+
+/// One finite typed step in the candidate procedure graph.
+///
+/// Every step names exactly one operation owner and contract, its typed
+/// inputs, one precondition, its dependencies inside the same graph, one
+/// observable postcondition, one verifier, one effect boundary, one budget
+/// note, one failure note, one cancellation note, one reconciliation note,
+/// and one rollback or compensation boundary. No step executes anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcedureStep {
+    /// Stable step identity unique inside the candidate graph.
+    pub step_id: String,
+    /// External owner that must execute or decline this step.
+    pub owner: String,
+    /// Owner contract reference this step is bound to.
+    pub contract_ref: String,
+    /// Typed inert operation spelling proposed to the owner.
+    pub operation: String,
+    /// Typed input handles bound to admitted evidence.
+    pub inputs: Vec<String>,
+    /// Precondition that must hold before the owner may act.
+    pub precondition: String,
+    /// Step identities inside this graph that must settle first.
+    pub dependencies: Vec<String>,
+    /// Observable postcondition the verifier checks.
+    pub postcondition: String,
+    /// Verifier that checks the postcondition.
+    pub verifier: String,
+    /// Closed effect class of this step.
+    pub effect: EffectClass,
+    /// Effect boundary naming what the step must not touch.
+    pub effect_boundary: String,
+    /// Budget note naming the authorizing limit for this step.
+    pub budget_note: String,
+    /// Failure note naming the typed failure handling for this step.
+    pub failure_note: String,
+    /// Cancellation note naming the typed cancel handling for this step.
+    pub cancel_note: String,
+    /// Reconciliation note naming the unknown-effect handling for this step.
+    pub reconcile_note: String,
+    /// Rollback or compensation boundary owned independently.
+    pub rollback_note: String,
+    /// Maximum retries admitted for this step.
+    pub max_retries: u32,
+    /// Explicit timeout in milliseconds, when bounded.
+    pub timeout_ms: Option<u64>,
+    /// Fan-out admitted for this step.
+    pub fanout: u32,
+}
+
+/// One per-step disposition carried in emission order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StepDisposition {
+    /// Step identity this disposition accounts for.
+    pub step_id: String,
+    /// Closed disposition kind for this step.
+    pub kind: StepDispositionKind,
+    /// Owner that owns this step.
+    pub owner: String,
+    /// Bounded reason naming the evidence behind this disposition.
+    pub reason: String,
+    /// Evidence ref backing this disposition.
+    pub evidence_ref: String,
+    /// Verifier bound to this step.
+    pub verifier: String,
+    /// Inverse or compensation note for this step.
+    pub inverse_note: String,
+}
+
+/// Episode and verifier evidence bound to one procedure proposal.
+///
+/// Requested, admitted, attempted, executed, acknowledged, observed, and
+/// semantically verified evidence stay distinct: exit zero, confidence, or
+/// one successful episode never proves mechanism or portability. Failures,
+/// partial, cancelled, timed-out, and unknown-effect runs are preserved
+/// alongside successes, and negative evidence is never dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcedureEvidence {
+    /// Expected A-05 receipt the item receipt is bound against.
+    pub expected_receipt: ValidationReceipt,
+    /// Frozen bundle digest the proposal replays against.
+    pub frozen_bundle_digest: String,
+    /// Frozen manifest digest the proposal replays against.
+    pub frozen_manifest_digest: String,
+    /// Successful episode refs grounding the procedure.
+    pub episode_refs: Vec<String>,
+    /// Verifier refs naming who checks each observable.
+    pub verifier_refs: Vec<String>,
+    /// Successful run refs retained without promotion to proof.
+    pub success_refs: Vec<String>,
+    /// Failing run refs preserved as counterevidence.
+    pub failure_refs: Vec<String>,
+    /// Counterexample refs that the procedure must keep answering.
+    pub counterexample_refs: Vec<String>,
+    /// Negative-memory trigger refs retained until qualified extinction.
+    pub negative_refs: Vec<String>,
+    /// Unknown-branch refs that remain open.
+    pub unknown_refs: Vec<String>,
+    /// Extinction evidence refs naming when a trigger no longer fires.
+    pub extinction_refs: Vec<String>,
+    /// Reopen condition naming what revives review.
+    pub reopen_condition: String,
+    /// Mechanism note naming the exercised mechanism, not bare success.
+    pub mechanism_note: String,
+    /// Portability note naming the exact scope the evidence supports.
+    pub portability_note: String,
+    /// Failure fingerprint the trigger is derived from.
+    pub failure_fingerprint: String,
+}
+
+/// Capability and environment snapshot bounding applicability.
+///
+/// Capability availability never becomes authority or a live reservation.
+/// Trigger and applicability derive only inside the supported environment,
+/// scope, and version evidence carried here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityEnvSnapshot {
+    /// Capability refs the procedure may assume available, never reserved.
+    pub capability_refs: Vec<String>,
+    /// Environment identity the evidence was observed under.
+    pub env_id: String,
+    /// Environment revision the evidence was observed under.
+    pub env_revision: String,
+    /// Digest of the environment bytes the evidence binds.
+    pub env_digest: String,
+    /// Scope the procedure is proposed for.
+    pub scope_id: String,
+    /// Task the procedure is proposed for.
+    pub task_id: String,
+    /// Policy the snapshot is projected under.
+    pub policy_id: String,
+    /// State fence of the capability projection.
+    pub state_fence: eliot_contracts::StateFence,
+    /// Version pins bounding every capability the steps assume.
+    pub version_pins: Vec<String>,
+    /// Bounded note naming what capability means here.
+    pub capability_note: String,
+}
+
+/// Existing-procedure snapshot for duplicate, refinement, and conflict.
+///
+/// Similarity is never an exact failure fingerprint and never an execution
+/// permission. Only exact digest and identity bindings below dispose as
+/// duplicate, refinement, or conflict; everything else stays visible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExistingProcedureSnapshot {
+    /// Known candidate digests in sorted unique order.
+    pub existing_digests: Vec<String>,
+    /// Known procedure identities in sorted unique order.
+    pub existing_ids: Vec<String>,
+    /// Exact identity this proposal duplicates, when any.
+    pub duplicate_of: Option<String>,
+    /// Exact predecessor this proposal refines, when any.
+    pub refinement_of: Option<String>,
+    /// Live procedures this proposal conflicts with.
+    pub conflict_with: Vec<String>,
+    /// Superseded digests carried for lineage.
+    pub superseded_digests: Vec<String>,
+}
+
+/// Closed policy governing one procedure proposal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcedurePolicy {
+    /// Governing policy identity; must equal the receipt validator policy.
+    pub policy_id: String,
+    /// Policy revision; zero is rejected as a defaulted binding.
+    pub policy_revision: u32,
+    /// Maximum steps admitted in the emitted graph.
+    pub max_steps: usize,
+    /// Maximum evidence items admitted per list.
+    pub max_evidence_items: usize,
+    /// True selects explicit partial emission; false selects all-or-nothing.
+    pub allow_partial: bool,
+    /// True when the caller cancelled this proposal before emission.
+    pub cancelled: bool,
+    /// Explicit observation time in milliseconds, when bounded.
+    pub observation_time_ms: Option<u64>,
+    /// Frozen deadline in milliseconds, when bounded.
+    pub deadline_ms: Option<u64>,
+    /// Bounded transfer note naming the receiving scope.
+    pub transfer_note: String,
+}
+
+/// Environment and scope preserving transfer boundary.
+///
+/// Transfer never widens environment, scope, version, or negative evidence.
+/// The receiving owner re-grounds every step before any use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransferPlan {
+    /// Receiving environment identity; must equal the source environment.
+    pub target_env_id: String,
+    /// Receiving environment revision; must equal the source revision.
+    pub target_env_revision: String,
+    /// Receiving scope identity; must equal the source scope.
+    pub target_scope_id: String,
+    /// Receiving task identity; must equal the source task.
+    pub target_task_id: String,
+    /// Negative-memory refs preserved across transfer verbatim.
+    pub preserved_negative_refs: Vec<String>,
+    /// Counterevidence refs preserved across transfer verbatim.
+    pub preserved_counterevidence_refs: Vec<String>,
+    /// Unknown-branch refs preserved across transfer verbatim.
+    pub preserved_unknown_refs: Vec<String>,
+    /// Version pins preserved across transfer verbatim.
+    pub preserved_version_pins: Vec<String>,
+    /// Bounded note naming the re-grounding the receiver must perform.
+    pub reground_note: String,
+}
+
+/// Complete inert procedure candidate envelope.
+///
+/// The envelope is never an applied receipt, never a reservation, and never
+/// a finish signal. Every step names the external owner that must execute
+/// or decline it, with independent cleanup and rollback ownership.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcedureCandidate {
+    /// Terminal outcome for this proposal.
+    pub outcome: ProcedureOutcome,
+    /// Stable procedure handle proposed by this candidate.
+    pub procedure_handle: String,
+    /// Single objective statement this procedure serves.
+    pub objective: String,
+    /// Finite typed step graph in emission order.
+    pub steps: Vec<ProcedureStep>,
+    /// One disposition per step in step order.
+    pub step_dispositions: Vec<StepDisposition>,
+    /// Trigger note derived only inside the evidenced environment.
+    pub trigger_note: String,
+    /// Applicability note bounded by the evidenced scope and versions.
+    pub applicability_note: String,
+    /// Environment and scope preserving transfer boundary.
+    pub transfer: TransferPlan,
+    /// Primary verifier that checks the procedure observable.
+    pub verifier: String,
+    /// Exact inverse restoring the before state.
+    pub inverse_note: String,
+    /// Forward correction applied when the before state is unreachable.
+    pub forward_correction_note: String,
+    /// Reopen condition naming what revives review.
+    pub reopen_note: String,
+    /// How unknown outcomes are handled without silent completion.
+    pub unknown_handling_note: String,
+    /// Deterministic digest binding the proposal inputs.
+    pub candidate_digest: String,
+    /// Bounded machine-readable note.
+    pub note: String,
+}
+
+// ---------------------------------------------------------------------------
+// Typed fail-closed error. Malformed input only; semantic shortfalls stay
+// inert outcomes carried by `ProcedureCandidate`.
+// ---------------------------------------------------------------------------
+
+/// Typed fail-closed procedure error.
+///
+/// Every variant carries structured identities; free-text detail is always
+/// redacted and bounded. A value of this type is never a stub: it names the
+/// exact failed binding or bound.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcedureError {
+    /// A bound or ceiling check failed in the named phase.
+    Bounds {
+        /// Phase that failed its bound.
+        phase: String,
+        /// Bounded redacted reason.
+        detail: String,
+    },
+    /// Deterministic ordering was violated in the named phase.
+    Order {
+        /// Phase that failed ordering.
+        phase: String,
+        /// Bounded redacted reason.
+        detail: String,
+    },
+    /// A shape check failed on the named field.
+    Shape {
+        /// Field that failed its shape.
+        field: String,
+        /// Bounded redacted reason.
+        detail: String,
+    },
+    /// Two envelopes disagree on a shared binding.
+    Binding {
+        /// Closed binding name.
+        field: String,
+        /// Bounded redacted reason.
+        detail: String,
+    },
+    /// The bundled A-05 receipt is intrinsically invalid or incompatible.
+    Receipt {
+        /// Bounded redacted reason.
+        detail: String,
+    },
+    /// The governing policy is malformed or out of bounds.
+    Policy {
+        /// Bounded redacted reason.
+        detail: String,
+    },
+    /// A target or member denominator is malformed or incomplete.
+    Denominator {
+        /// Bounded redacted reason.
+        detail: String,
+    },
+    /// A digest shape or replay pin is wrong.
+    Digest {
+        /// Bounded redacted reason.
+        detail: String,
+    },
+}
+
+impl core::fmt::Display for ProcedureError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Bounds { phase, detail } => write!(f, "bounds[{phase}]: {detail}"),
+            Self::Order { phase, detail } => write!(f, "order[{phase}]: {detail}"),
+            Self::Shape { field, detail } => write!(f, "shape[{field}]: {detail}"),
+            Self::Binding { field, detail } => write!(f, "binding[{field}]: {detail}"),
+            Self::Receipt { detail } => write!(f, "receipt: {detail}"),
+            Self::Policy { detail } => write!(f, "policy: {detail}"),
+            Self::Denominator { detail } => write!(f, "denominator: {detail}"),
+            Self::Digest { detail } => write!(f, "digest: {detail}"),
+        }
+    }
+}
+
+impl core::error::Error for ProcedureError {}
+
+// ---------------------------------------------------------------------------
+// Shape checks (malformed input only).
+// ---------------------------------------------------------------------------
+
+/// Checks one bounded text field for blank, control, and byte ceiling.
+fn check_bounded_text(value: &str, field: &str, max: usize) -> Result<(), ProcedureError> {
+    if value.trim().is_empty() {
+        return Err(ProcedureError::Shape {
+            field: field.to_owned(),
+            detail: "blank text is not admitted".to_owned(),
+        });
+    }
+    if has_control(value) {
+        return Err(ProcedureError::Shape {
+            field: field.to_owned(),
+            detail: "control characters are not admitted".to_owned(),
+        });
+    }
+    if value.len() > max {
+        return Err(ProcedureError::Shape {
+            field: field.to_owned(),
+            detail: "text exceeds its byte bound".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Checks one handle field for blank, control, and byte ceiling.
+fn check_handle(value: &str, field: &str) -> Result<(), ProcedureError> {
+    if value.is_empty() || value.len() > MAX_HANDLE_BYTES {
+        return Err(ProcedureError::Bounds {
+            phase: field.to_owned(),
+            detail: "handle is blank or exceeds the handle ceiling".to_owned(),
+        });
+    }
+    if has_control(value) {
+        return Err(ProcedureError::Bounds {
+            phase: field.to_owned(),
+            detail: "handle carries control characters".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Checks one digest field for exact 64 lowercase hex shape.
+fn check_digest(value: &str, field: &str) -> Result<(), ProcedureError> {
+    if !is_hex64_lower(value) {
+        return Err(ProcedureError::Digest {
+            detail: format!("{field} must be 64 lowercase hex sha256"),
+        });
+    }
+    Ok(())
+}
+
+/// Checks one sorted-unique ref list for handle shape and ordering.
+fn check_sorted_refs(values: &[String], field: &str) -> Result<(), ProcedureError> {
+    for value in values {
+        check_handle(value, field)?;
+    }
+    if !is_sorted_unique(values) {
+        return Err(ProcedureError::Order {
+            phase: field.to_owned(),
+            detail: "refs must be sorted and unique".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Checks one sorted-unique digest list for digest shape and ordering.
+fn check_sorted_digests(values: &[String], field: &str) -> Result<(), ProcedureError> {
+    for value in values {
+        check_digest(value, field)?;
+    }
+    if !is_sorted_unique(values) {
+        return Err(ProcedureError::Order {
+            phase: field.to_owned(),
+            detail: "digests must be sorted and unique".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Counts bytes across a slice of text values with saturation.
+fn count_text_bytes(values: &[&str]) -> usize {
+    let mut total = 0usize;
+    let mut index = 0usize;
+    while index < values.len() {
+        if let Some(value) = values.get(index) {
+            total = total.saturating_add(value.len());
+        }
+        index = index.saturating_add(1);
+    }
+    total
+}
+
+/// Rejects a list length above its independent ceiling.
+fn bound_list_length(phase: &str, got: usize, max: usize) -> Result<(), ProcedureError> {
+    if got > max {
+        return Err(ProcedureError::Bounds {
+            phase: phase.to_owned(),
+            detail: "list exceeds its independent ceiling".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Preflight bounds (shape only; semantic shortfalls stay outcomes).
+// ---------------------------------------------------------------------------
+
+/// Preflights evidence list lengths against policy and global ceilings.
+fn preflight_evidence_bounds(
+    evidence: &ProcedureEvidence,
+    policy: &ProcedurePolicy,
+) -> Result<(), ProcedureError> {
+    let ceiling = policy.max_evidence_items.min(MAX_EVIDENCE_ITEMS);
+    bound_list_length("episode-refs", evidence.episode_refs.len(), ceiling)?;
+    bound_list_length("verifier-refs", evidence.verifier_refs.len(), ceiling)?;
+    bound_list_length("success-refs", evidence.success_refs.len(), ceiling)?;
+    bound_list_length("failure-refs", evidence.failure_refs.len(), ceiling)?;
+    bound_list_length(
+        "counterexample-refs",
+        evidence.counterexample_refs.len(),
+        ceiling,
+    )?;
+    bound_list_length("negative-refs", evidence.negative_refs.len(), ceiling)?;
+    bound_list_length("unknown-refs", evidence.unknown_refs.len(), ceiling)?;
+    bound_list_length(
+        "extinction-refs",
+        evidence.extinction_refs.len(),
+        ceiling,
+    )?;
+    Ok(())
+}
+
+/// Preflights capability and existing-snapshot list lengths.
+fn preflight_snapshot_bounds(
+    capability: &CapabilityEnvSnapshot,
+    existing: &ExistingProcedureSnapshot,
+    policy: &ProcedurePolicy,
+) -> Result<(), ProcedureError> {
+    let ceiling = policy.max_evidence_items.min(MAX_EVIDENCE_ITEMS);
+    bound_list_length(
+        "capability-refs",
+        capability.capability_refs.len(),
+        ceiling,
+    )?;
+    bound_list_length(
+        "version-pins",
+        capability.version_pins.len(),
+        MAX_CLOSURE_REFS,
+    )?;
+    bound_list_length(
+        "existing-digests",
+        existing.existing_digests.len(),
+        MAX_PREDECESSORS,
+    )?;
+    bound_list_length(
+        "existing-ids",
+        existing.existing_ids.len(),
+        MAX_PREDECESSORS,
+    )?;
+    bound_list_length(
+        "conflict-with",
+        existing.conflict_with.len(),
+        MAX_PREDECESSORS,
+    )?;
+    bound_list_length(
+        "superseded-digests",
+        existing.superseded_digests.len(),
+        MAX_PREDECESSORS,
+    )?;
+    Ok(())
+}
+
+/// Preflights aggregate text bytes across the whole proposal surface.
+fn preflight_total_bytes(
+    evidence: &ProcedureEvidence,
+    capability: &CapabilityEnvSnapshot,
+    policy: &ProcedurePolicy,
+    steps: &[ProcedureStep],
+) -> Result<(), ProcedureError> {
+    let mut total = 0usize;
+    total = total.saturating_add(count_text_bytes(&[
+        &evidence.reopen_condition,
+        &evidence.mechanism_note,
+        &evidence.portability_note,
+        &evidence.failure_fingerprint,
+        &capability.env_id,
+        &capability.env_revision,
+        &capability.scope_id,
+        &capability.task_id,
+        &capability.policy_id,
+        &capability.capability_note,
+        &policy.policy_id,
+        &policy.transfer_note,
+    ]));
+    let mut index = 0usize;
+    while index < steps.len() {
+        if let Some(step) = steps.get(index) {
+            total = total.saturating_add(count_text_bytes(&[
+                &step.step_id,
+                &step.owner,
+                &step.contract_ref,
+                &step.operation,
+                &step.precondition,
+                &step.postcondition,
+                &step.verifier,
+                &step.effect_boundary,
+                &step.budget_note,
+                &step.failure_note,
+                &step.cancel_note,
+                &step.reconcile_note,
+                &step.rollback_note,
+            ]));
+            for input in &step.inputs {
+                total = total.saturating_add(input.len());
+            }
+            for dep in &step.dependencies {
+                total = total.saturating_add(dep.len());
+            }
+        }
+        index = index.saturating_add(1);
+    }
+    if total > MAX_TOTAL_BYTES {
+        return Err(ProcedureError::Bounds {
+            phase: "total-bytes".to_owned(),
+            detail: "aggregate input exceeds the total byte ceiling".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shape validation (malformed input only).
+// ---------------------------------------------------------------------------
+
+/// Validates evidence text shapes and ref orderings.
+fn validate_evidence_shapes(evidence: &ProcedureEvidence) -> Result<(), ProcedureError> {
+    check_digest(&evidence.frozen_bundle_digest, "frozen-bundle")?;
+    check_digest(&evidence.frozen_manifest_digest, "frozen-manifest")?;
+    check_sorted_refs(&evidence.episode_refs, "evidence.episodes")?;
+    check_sorted_refs(&evidence.verifier_refs, "evidence.verifiers")?;
+    check_sorted_refs(&evidence.success_refs, "evidence.successes")?;
+    check_sorted_refs(&evidence.failure_refs, "evidence.failures")?;
+    check_sorted_refs(
+        &evidence.counterexample_refs,
+        "evidence.counterexamples",
+    )?;
+    check_sorted_refs(&evidence.negative_refs, "evidence.negatives")?;
+    check_sorted_refs(&evidence.unknown_refs, "evidence.unknowns")?;
+    check_sorted_refs(&evidence.extinction_refs, "evidence.extinctions")?;
+    check_bounded_text(
+        &evidence.reopen_condition,
+        "evidence.reopen",
+        MAX_NOTE_BYTES,
+    )?;
+    check_bounded_text(
+        &evidence.mechanism_note,
+        "evidence.mechanism",
+        MAX_NOTE_BYTES,
+    )?;
+    check_bounded_text(
+        &evidence.portability_note,
+        "evidence.portability",
+        MAX_NOTE_BYTES,
+    )?;
+    check_bounded_text(
+        &evidence.failure_fingerprint,
+        "evidence.fingerprint",
+        MAX_HANDLE_BYTES,
+    )?;
+    Ok(())
+}
+
+/// Validates capability snapshot text shapes and ref orderings.
+fn validate_capability_shapes(capability: &CapabilityEnvSnapshot) -> Result<(), ProcedureError> {
+    check_sorted_refs(&capability.capability_refs, "capability.refs")?;
+    check_handle(&capability.env_id, "capability.env")?;
+    check_bounded_text(
+        &capability.env_revision,
+        "capability.env-revision",
+        MAX_ID_BYTES,
+    )?;
+    check_digest(&capability.env_digest, "capability.env-digest")?;
+    check_handle(&capability.scope_id, "capability.scope")?;
+    check_handle(&capability.task_id, "capability.task")?;
+    check_handle(&capability.policy_id, "capability.policy")?;
+    check_sorted_refs(&capability.version_pins, "capability.versions")?;
+    check_bounded_text(
+        &capability.capability_note,
+        "capability.note",
+        MAX_NOTE_BYTES,
+    )?;
+    check_fence(&capability.state_fence).map_err(|err| ProcedureError::Shape {
+        field: "capability.fence".to_owned(),
+        detail: redact(&err.to_string()),
+    })?;
+    Ok(())
+}
+
+/// Validates existing-snapshot shapes and orderings.
+fn validate_existing_shapes(existing: &ExistingProcedureSnapshot) -> Result<(), ProcedureError> {
+    check_sorted_digests(&existing.existing_digests, "existing.digests")?;
+    check_sorted_refs(&existing.existing_ids, "existing.ids")?;
+    if let Some(dup) = &existing.duplicate_of {
+        check_handle(dup, "existing.duplicate-of")?;
+    }
+    if let Some(refined) = &existing.refinement_of {
+        check_handle(refined, "existing.refinement-of")?;
+    }
+    check_sorted_refs(&existing.conflict_with, "existing.conflicts")?;
+    check_sorted_digests(&existing.superseded_digests, "existing.superseded")?;
+    Ok(())
+}
+
+/// Validates policy intrinsic shapes and ceilings.
+fn validate_policy_shapes(policy: &ProcedurePolicy) -> Result<(), ProcedureError> {
+    check_handle(&policy.policy_id, "policy.id")?;
+    if policy.policy_revision == 0 {
+        return Err(ProcedureError::Policy {
+            detail: "policy_revision must be explicit, not defaulted".to_owned(),
+        });
+    }
+    if policy.max_steps == 0 || policy.max_steps > MAX_STEPS {
+        return Err(ProcedureError::Policy {
+            detail: format!("max_steps must cover 1..={MAX_STEPS}"),
+        });
+    }
+    if policy.max_evidence_items == 0 || policy.max_evidence_items > MAX_EVIDENCE_ITEMS {
+        return Err(ProcedureError::Policy {
+            detail: format!("max_evidence_items must cover 1..={MAX_EVIDENCE_ITEMS}"),
+        });
+    }
+    check_bounded_text(
+        &policy.transfer_note,
+        "policy.transfer",
+        MAX_NOTE_BYTES,
+    )?;
+    Ok(())
+}
+
+/// Validates one step field shape without judging semantics.
+fn validate_one_step_shape(step: &ProcedureStep) -> Result<(), ProcedureError> {
+    check_handle(&step.step_id, "step.id")?;
+    check_bounded_text(&step.owner, "step.owner", MAX_ID_BYTES)?;
+    check_bounded_text(&step.contract_ref, "step.contract", MAX_ID_BYTES)?;
+    check_bounded_text(&step.operation, "step.operation", MAX_TEXT_BYTES)?;
+    if step.inputs.len() > MAX_STEP_INPUTS {
+        return Err(ProcedureError::Bounds {
+            phase: "step.inputs".to_owned(),
+            detail: "step inputs exceed the per-step ceiling".to_owned(),
+        });
+    }
+    for input in &step.inputs {
+        check_handle(input, "step.input")?;
+    }
+    if !is_sorted_unique(&step.inputs) {
+        return Err(ProcedureError::Order {
+            phase: "step.inputs".to_owned(),
+            detail: "step inputs must be sorted and unique".to_owned(),
+        });
+    }
+    check_bounded_text(&step.precondition, "step.precondition", MAX_NOTE_BYTES)?;
+    if step.dependencies.len() > MAX_STEP_DEPS {
+        return Err(ProcedureError::Bounds {
+            phase: "step.dependencies".to_owned(),
+            detail: "step dependencies exceed the per-step ceiling".to_owned(),
+        });
+    }
+    for dep in &step.dependencies {
+        check_handle(dep, "step.dependency")?;
+    }
+    if !is_sorted_unique(&step.dependencies) {
+        return Err(ProcedureError::Order {
+            phase: "step.dependencies".to_owned(),
+            detail: "step dependencies must be sorted and unique".to_owned(),
+        });
+    }
+    check_bounded_text(&step.postcondition, "step.postcondition", MAX_NOTE_BYTES)?;
+    check_bounded_text(&step.verifier, "step.verifier", MAX_ID_BYTES)?;
+    check_bounded_text(
+        &step.effect_boundary,
+        "step.effect-boundary",
+        MAX_NOTE_BYTES,
+    )?;
+    check_bounded_text(&step.budget_note, "step.budget", MAX_NOTE_BYTES)?;
+    check_bounded_text(&step.failure_note, "step.failure", MAX_NOTE_BYTES)?;
+    check_bounded_text(&step.cancel_note, "step.cancel", MAX_NOTE_BYTES)?;
+    check_bounded_text(&step.reconcile_note, "step.reconcile", MAX_NOTE_BYTES)?;
+    check_bounded_text(&step.rollback_note, "step.rollback", MAX_NOTE_BYTES)?;
+    if step.max_retries > MAX_RETRIES {
+        return Err(ProcedureError::Bounds {
+            phase: "step.retries".to_owned(),
+            detail: "step retries exceed the per-step ceiling".to_owned(),
+        });
+    }
+    if step.fanout == 0 || step.fanout > MAX_FANOUT {
+        return Err(ProcedureError::Bounds {
+            phase: "step.fanout".to_owned(),
+            detail: format!("step fanout must cover 1..={MAX_FANOUT}"),
+        });
+    }
+    Ok(())
+}
+
+/// Validates every step shape and the graph identity ordering.
+fn validate_step_shapes(steps: &[ProcedureStep]) -> Result<(), ProcedureError> {
+    if steps.is_empty() {
+        return Err(ProcedureError::Shape {
+            field: "steps".to_owned(),
+            detail: "at least one step is required".to_owned(),
+        });
+    }
+    bound_list_length("steps", steps.len(), MAX_STEPS)?;
+    let mut ids: Vec<String> = Vec::with_capacity(steps.len());
+    let mut index = 0usize;
+    while index < steps.len() {
+        if let Some(step) = steps.get(index) {
+            validate_one_step_shape(step)?;
+            ids.push(step.step_id.clone());
+        }
+        index = index.saturating_add(1);
+    }
+    if !are_ids_sorted_unique(&ids) {
+        return Err(ProcedureError::Order {
+            phase: "steps".to_owned(),
+            detail: "step identities must be sorted and unique".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Intrinsic checks (A-05 receipt intrinsically, never re-executed).
+// ---------------------------------------------------------------------------
+
+/// Maps a contract violation into a redacted receipt error.
+fn receipt_err(detail: &str) -> ProcedureError {
+    ProcedureError::Receipt {
+        detail: redact(detail),
+    }
+}
+
+/// Checks the A-05 receipt intrinsically plus item, draft, and denominator.
+fn intrinsic_receipt_checks(
+    item: &ValidatedCurationItem,
+    grounded: &GroundedDreamDraft,
+    evidence: &ProcedureEvidence,
+) -> Result<(), ProcedureError> {
+    item.receipt
+        .validate()
+        .map_err(|err| receipt_err(&err.to_string()))?;
+    evidence
+        .expected_receipt
+        .validate()
+        .map_err(|err| receipt_err(&err.to_string()))?;
+    item.receipt
+        .validate_binding(&evidence.expected_receipt)
+        .map_err(|err| receipt_err(&err.to_string()))?;
+    item.validate()
+        .map_err(|err| receipt_err(&err.to_string()))?;
+    grounded
+        .validate()
+        .map_err(|err| receipt_err(&err.to_string()))?;
+    if item.receipt.terminal_disposition != "accepted"
+        && item.receipt.terminal_disposition != "partial"
+    {
+        return Err(ProcedureError::Receipt {
+            detail: "validator receipt is not accepted or partial".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Checks bundle, manifest, draft, task, scope, and fence bindings.
+fn intrinsic_binding_checks(
+    item: &ValidatedCurationItem,
+    grounded: &GroundedDreamDraft,
+    evidence: &ProcedureEvidence,
+    capability: &CapabilityEnvSnapshot,
+) -> Result<(), ProcedureError> {
+    if item.receipt.bundle_digest != evidence.frozen_bundle_digest {
+        return Err(ProcedureError::Binding {
+            field: "bundle_digest".to_owned(),
+            detail: "frozen bundle digest drifts from the receipt binding".to_owned(),
+        });
+    }
+    if item.receipt.manifest_digest != evidence.frozen_manifest_digest {
+        return Err(ProcedureError::Binding {
+            field: "manifest_digest".to_owned(),
+            detail: "frozen manifest digest drifts from the receipt binding".to_owned(),
+        });
+    }
+    if item.receipt.draft_digest != grounded.draft_digest {
+        return Err(ProcedureError::Binding {
+            field: "draft_digest".to_owned(),
+            detail: "grounded draft digest drifts from the receipt binding".to_owned(),
+        });
+    }
+    if grounded.job_id != item.receipt.job_id {
+        return Err(ProcedureError::Binding {
+            field: "job_id".to_owned(),
+            detail: "grounded job drifts from the receipt binding".to_owned(),
+        });
+    }
+    if item.task_id != item.receipt.task_id || item.scope_id != item.receipt.scope_id {
+        return Err(ProcedureError::Binding {
+            field: "task_scope".to_owned(),
+            detail: "item task or scope drifts from the receipt binding".to_owned(),
+        });
+    }
+    if item.task_id != capability.task_id || item.scope_id != capability.scope_id {
+        return Err(ProcedureError::Binding {
+            field: "capability_task_scope".to_owned(),
+            detail: "capability task or scope drifts from the item binding".to_owned(),
+        });
+    }
+    if capability.policy_id != item.receipt.validator_policy {
+        return Err(ProcedureError::Binding {
+            field: "policy_id".to_owned(),
+            detail: "capability policy drifts from the receipt validator policy".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Checks the denominator shape and the procedure payload binding.
+fn intrinsic_denominator_checks(item: &ValidatedCurationItem) -> Result<(), ProcedureError> {
+    item.denominator
+        .validate()
+        .map_err(|err| ProcedureError::Denominator {
+            detail: redact(&err.to_string()),
+        })?;
+    if item.kind_spelling != CurationKind::Procedure.as_str() {
+        return Err(ProcedureError::Binding {
+            field: "kind_spelling".to_owned(),
+            detail: "curation item is not a procedure kind".to_owned(),
+        });
+    }
+    if item.family_spelling != "procedure" {
+        return Err(ProcedureError::Binding {
+            field: "family_spelling".to_owned(),
+            detail: "curation item is not a procedure family".to_owned(),
+        });
+    }
+    let is_procedure = matches!(
+        item.payload,
+        eliot_dreamer_contracts::CurationPayload::Procedure(_)
+    );
+    if !is_procedure {
+        return Err(ProcedureError::Binding {
+            field: "payload".to_owned(),
+            detail: "curation payload is not a procedure payload".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Semantic checks (shortfalls stay inert outcomes, never blind retries).
+// ---------------------------------------------------------------------------
+
+/// Returns the procedure payload handle carried by the curation item.
+fn procedure_handle_of(item: &ValidatedCurationItem) -> String {
+    match &item.payload {
+        eliot_dreamer_contracts::CurationPayload::Procedure(payload) => payload.procedure.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Checks deadline and cancellation before any emission work.
+fn check_deadline_and_cancel(
+    policy: &ProcedurePolicy,
+) -> Result<Option<ProcedureOutcome>, ProcedureError> {
+    if policy.cancelled {
+        return Ok(Some(ProcedureOutcome::Rejected));
+    }
+    if let (Some(deadline), Some(observed)) = (policy.deadline_ms, policy.observation_time_ms)
+        && observed >= deadline
+    {
+        return Err(ProcedureError::Policy {
+            detail: "observation is at or beyond the frozen deadline".to_owned(),
+        });
+    }
+    Ok(None)
+}
+
+/// Checks that every dependency names a known step and no step depends on
+/// itself. Cycle detection runs separately in bounded time.
+fn check_dependency_closure(steps: &[ProcedureStep]) -> Result<(), ProcedureError> {
+    let mut ids: Vec<String> = Vec::with_capacity(steps.len());
+    for step in steps {
+        ids.push(step.step_id.clone());
+    }
+    for step in steps {
+        for dep in &step.dependencies {
+            if dep == &step.step_id {
+                return Err(ProcedureError::Binding {
+                    field: "step.dependency".to_owned(),
+                    detail: "a step must not depend on itself".to_owned(),
+                });
+            }
+            if !ids.iter().any(|id| id == dep) {
+                return Err(ProcedureError::Binding {
+                    field: "step.dependency".to_owned(),
+                    detail: "a dependency names an unknown step".to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks the step graph for cycles with a bounded iterative walk.
+///
+/// The walk visits each edge at most once and aborts above a fixed visit
+/// ceiling derived from the step bound, so no unbounded loop can occur.
+fn check_graph_acyclic(steps: &[ProcedureStep]) -> Result<(), ProcedureError> {
+    let ceiling = MAX_STEPS.saturating_mul(MAX_STEPS).saturating_add(MAX_STEPS);
+    let mut visit_count = 0usize;
+    let mut index = 0usize;
+    while index < steps.len() {
+        let start = match steps.get(index) {
+            Some(step) => step.step_id.clone(),
+            None => {
+                return Err(ProcedureError::Binding {
+                    field: "steps".to_owned(),
+                    detail: "step index out of range".to_owned(),
+                });
+            }
+        };
+        let mut stack: Vec<String> = vec![start.clone()];
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(current) = stack.pop() {
+            visit_count = visit_count.saturating_add(1);
+            if visit_count > ceiling {
+                return Err(ProcedureError::Binding {
+                    field: "steps".to_owned(),
+                    detail: "step graph walk exceeds the visit ceiling".to_owned(),
+                });
+            }
+            if seen.iter().any(|id| id == &current) {
+                return Err(ProcedureError::Binding {
+                    field: "steps".to_owned(),
+                    detail: "step graph contains a cycle".to_owned(),
+                });
+            }
+            seen.push(current.clone());
+            for step in steps {
+                if step.step_id == current {
+                    for dep in &step.dependencies {
+                        stack.push(dep.clone());
+                    }
+                }
+            }
+        }
+        index = index.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Scans one text field for raw shell markers.
+fn field_has_shell(text: &str) -> bool {
+    mentions_any(&lowered(text), SHELL_MARKERS)
+}
+
+/// Scans one text field for SDK markers.
+fn field_has_sdk(text: &str) -> bool {
+    mentions_any(&lowered(text), SDK_MARKERS)
+}
+
+/// Scans one text field for credential markers.
+fn field_has_credential(text: &str) -> bool {
+    mentions_any(&lowered(text), CREDENTIAL_MARKERS)
+}
+
+/// Scans one text field for unbounded markers.
+fn field_has_unbounded(text: &str) -> bool {
+    mentions_any(&lowered(text), UNBOUNDED_MARKERS)
+}
+
+/// Collects every owner-visible text field of one step for marker scans.
+fn step_marker_fields(step: &ProcedureStep) -> [&str; 11] {
+    [
+        step.owner.as_str(),
+        step.contract_ref.as_str(),
+        step.operation.as_str(),
+        step.precondition.as_str(),
+        step.postcondition.as_str(),
+        step.effect_boundary.as_str(),
+        step.budget_note.as_str(),
+        step.failure_note.as_str(),
+        step.cancel_note.as_str(),
+        step.reconcile_note.as_str(),
+        step.rollback_note.as_str(),
+    ]
+}
+
+/// Rejects raw shell payloads anywhere in the step graph.
+fn check_no_raw_shell(steps: &[ProcedureStep]) -> Result<(), ProcedureError> {
+    for step in steps {
+        for field in step_marker_fields(step) {
+            if field_has_shell(field) {
+                return Err(ProcedureError::Shape {
+                    field: "step.operation".to_owned(),
+                    detail: "raw shell payloads are not admitted".to_owned(),
+                });
+            }
+        }
+        for input in &step.inputs {
+            if field_has_shell(input) {
+                return Err(ProcedureError::Shape {
+                    field: "step.input".to_owned(),
+                    detail: "raw shell payloads are not admitted".to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rejects provider and model SDK payloads anywhere in the step graph.
+fn check_no_sdk(steps: &[ProcedureStep]) -> Result<(), ProcedureError> {
+    for step in steps {
+        for field in step_marker_fields(step) {
+            if field_has_sdk(field) {
+                return Err(ProcedureError::Shape {
+                    field: "step.operation".to_owned(),
+                    detail: "provider and model SDK payloads are not admitted".to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rejects acquired credentials, leases, permits, and handles.
+fn check_no_credentials(steps: &[ProcedureStep]) -> Result<(), ProcedureError> {
+    for step in steps {
+        for field in step_marker_fields(step) {
+            if field_has_credential(field) {
+                return Err(ProcedureError::Shape {
+                    field: "step.operation".to_owned(),
+                    detail: "acquired credentials and handles are not admitted".to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rejects unbounded loops, fan-out, and retry claims.
+fn check_no_unbounded(steps: &[ProcedureStep]) -> Result<(), ProcedureError> {
+    for step in steps {
+        for field in step_marker_fields(step) {
+            if field_has_unbounded(field) {
+                return Err(ProcedureError::Shape {
+                    field: "step.budget".to_owned(),
+                    detail: "unbounded loops and retries are not admitted".to_owned(),
+                });
+            }
+        }
+        if step.max_retries > MAX_RETRIES {
+            return Err(ProcedureError::Bounds {
+                phase: "step.retries".to_owned(),
+                detail: "step retries exceed the per-step ceiling".to_owned(),
+            });
+        }
+        if step.fanout > MAX_FANOUT {
+            return Err(ProcedureError::Bounds {
+                phase: "step.fanout".to_owned(),
+                detail: "step fanout exceeds the per-step ceiling".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Returns true when any step carries an unknown possible effect.
+fn has_unknown_effect(steps: &[ProcedureStep]) -> bool {
+    for step in steps {
+        if step.effect == EffectClass::Unknown {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true when any step admits a retry.
+fn admits_retry(steps: &[ProcedureStep]) -> bool {
+    for step in steps {
+        if step.max_retries > 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Checks that every unknown-effect step owns a reconciliation note.
+fn check_unknown_reconcile_owned(steps: &[ProcedureStep]) -> Result<(), ProcedureError> {
+    for step in steps {
+        if step.effect == EffectClass::Unknown && step.reconcile_note.trim().is_empty() {
+            return Err(ProcedureError::Shape {
+                field: "step.reconcile".to_owned(),
+                detail: "unknown-effect steps must name reconciliation".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Checks that cleanup and rollback are independently owned per step.
+fn check_rollback_owned(steps: &[ProcedureStep]) -> Result<(), ProcedureError> {
+    for step in steps {
+        if step.rollback_note.trim().is_empty() {
+            return Err(ProcedureError::Shape {
+                field: "step.rollback".to_owned(),
+                detail: "every step must name its rollback boundary".to_owned(),
+            });
+        }
+        if step.owner.trim().is_empty() || step.verifier.trim().is_empty() {
+            return Err(ProcedureError::Shape {
+                field: "step.owner".to_owned(),
+                detail: "every step must name one owner and one verifier".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Checks trigger and applicability stay inside evidenced environment.
+fn check_trigger_bounded(
+    capability: &CapabilityEnvSnapshot,
+    evidence: &ProcedureEvidence,
+    trigger_note: &str,
+    applicability_note: &str,
+) -> Result<(), ProcedureError> {
+    if trigger_note.trim().is_empty() || applicability_note.trim().is_empty() {
+        return Err(ProcedureError::Shape {
+            field: "trigger".to_owned(),
+            detail: "trigger and applicability must be explicit".to_owned(),
+        });
+    }
+    let low_trigger = lowered(trigger_note);
+    let low_apply = lowered(applicability_note);
+    if mentions_any(&low_trigger, SIMILARITY_MARKERS) || mentions_any(&low_apply, SIMILARITY_MARKERS)
+    {
+        return Err(ProcedureError::Shape {
+            field: "trigger".to_owned(),
+            detail: "similarity never bounds trigger or applicability".to_owned(),
+        });
+    }
+    if claims_chronology_is_causality(trigger_note)
+        || claims_chronology_is_causality(applicability_note)
+    {
+        return Err(ProcedureError::Shape {
+            field: "trigger".to_owned(),
+            detail: "chronology never proves causality".to_owned(),
+        });
+    }
+    if claims_timestamp_is_currentness(trigger_note)
+        || claims_timestamp_is_currentness(applicability_note)
+    {
+        return Err(ProcedureError::Shape {
+            field: "trigger".to_owned(),
+            detail: "timestamps never prove currentness".to_owned(),
+        });
+    }
+    if !contains_marker(&low_trigger, &lowered(&capability.env_id))
+        && !contains_marker(&low_apply, &lowered(&capability.env_id))
+    {
+        return Err(ProcedureError::Binding {
+            field: "trigger.env".to_owned(),
+            detail: "trigger must name the evidenced environment".to_owned(),
+        });
+    }
+    if evidence.episode_refs.is_empty() {
+        return Err(ProcedureError::Shape {
+            field: "evidence.episodes".to_owned(),
+            detail: "at least one episode ref is required".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Selects duplicate, refinement, or conflict disposition from identity.
+///
+/// Exact digest and identity bindings only; similarity never disposes.
+fn select_identity_disposition(
+    candidate_digest: &str,
+    procedure_handle: &str,
+    existing: &ExistingProcedureSnapshot,
+) -> Option<ProcedureOutcome> {
+    if let Some(dup) = &existing.duplicate_of
+        && dup == procedure_handle
+    {
+        return Some(ProcedureOutcome::Duplicate);
+    }
+    if existing.existing_ids.iter().any(|id| id == procedure_handle) {
+        return Some(ProcedureOutcome::Duplicate);
+    }
+    if existing.existing_digests.iter().any(|d| d == candidate_digest) {
+        return Some(ProcedureOutcome::Duplicate);
+    }
+    if let Some(refined) = &existing.refinement_of
+        && refined != procedure_handle
+    {
+        return Some(ProcedureOutcome::Refinement);
+    }
+    if !existing.conflict_with.is_empty() {
+        return Some(ProcedureOutcome::Conflict);
+    }
+    None
+}
+
+/// Selects empirical or missing-verifier disposition from evidence shape.
+fn select_evidence_disposition(
+    evidence: &ProcedureEvidence,
+    steps: &[ProcedureStep],
+) -> Option<ProcedureOutcome> {
+    if evidence.verifier_refs.is_empty() {
+        return Some(ProcedureOutcome::MissingVerifier);
+    }
+    for step in steps {
+        if step.verifier.trim().is_empty() {
+            return Some(ProcedureOutcome::MissingVerifier);
+        }
+    }
+    if claims_success_is_mechanism(&evidence.mechanism_note) {
+        return Some(ProcedureOutcome::Empirical);
+    }
+    if evidence.mechanism_note.trim().is_empty() {
+        return Some(ProcedureOutcome::Empirical);
+    }
+    if evidence.failure_refs.is_empty() && evidence.counterexample_refs.is_empty() {
+        return Some(ProcedureOutcome::Empirical);
+    }
+    None
+}
+
+/// Builds the transfer boundary preserving env, scope, and negatives.
+fn build_transfer(
+    capability: &CapabilityEnvSnapshot,
+    evidence: &ProcedureEvidence,
+    policy: &ProcedurePolicy,
+) -> TransferPlan {
+    TransferPlan {
+        target_env_id: capability.env_id.clone(),
+        target_env_revision: capability.env_revision.clone(),
+        target_scope_id: capability.scope_id.clone(),
+        target_task_id: capability.task_id.clone(),
+        preserved_negative_refs: evidence.negative_refs.clone(),
+        preserved_counterevidence_refs: evidence.counterexample_refs.clone(),
+        preserved_unknown_refs: evidence.unknown_refs.clone(),
+        preserved_version_pins: capability.version_pins.clone(),
+        reground_note: format!(
+            "receiver re-grounds every step under {} before any use; {}",
+            capability.env_id,
+            policy.transfer_note
+        ),
+    }
+}
+
+/// Checks the transfer boundary preserves environment and negatives.
+fn check_transfer_preserved(
+    transfer: &TransferPlan,
+    capability: &CapabilityEnvSnapshot,
+    evidence: &ProcedureEvidence,
+) -> Result<(), ProcedureError> {
+    if transfer.target_env_id != capability.env_id {
+        return Err(ProcedureError::Binding {
+            field: "transfer.env".to_owned(),
+            detail: "transfer must not widen the environment".to_owned(),
+        });
+    }
+    if transfer.target_env_revision != capability.env_revision {
+        return Err(ProcedureError::Binding {
+            field: "transfer.env-revision".to_owned(),
+            detail: "transfer must not widen the environment revision".to_owned(),
+        });
+    }
+    if transfer.target_scope_id != capability.scope_id {
+        return Err(ProcedureError::Binding {
+            field: "transfer.scope".to_owned(),
+            detail: "transfer must not widen the scope".to_owned(),
+        });
+    }
+    if transfer.target_task_id != capability.task_id {
+        return Err(ProcedureError::Binding {
+            field: "transfer.task".to_owned(),
+            detail: "transfer must not widen the task".to_owned(),
+        });
+    }
+    if transfer.preserved_negative_refs != evidence.negative_refs {
+        return Err(ProcedureError::Binding {
+            field: "transfer.negatives".to_owned(),
+            detail: "transfer must preserve negative evidence verbatim".to_owned(),
+        });
+    }
+    if transfer.preserved_counterevidence_refs != evidence.counterexample_refs {
+        return Err(ProcedureError::Binding {
+            field: "transfer.counterevidence".to_owned(),
+            detail: "transfer must preserve counterevidence verbatim".to_owned(),
+        });
+    }
+    if transfer.preserved_unknown_refs != evidence.unknown_refs {
+        return Err(ProcedureError::Binding {
+            field: "transfer.unknowns".to_owned(),
+            detail: "transfer must preserve unknown branches verbatim".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic digest (canonical bytes plus lowercase hex).
+// ---------------------------------------------------------------------------
+
+/// Computes the deterministic candidate digest over the proposal inputs.
+///
+/// The preimage is an ordered string vector covering procedure identity,
+/// objective, sorted step identities with owner, contract, operation,
+/// effect, verifier, retry, fanout, and boundary notes, plus trigger,
+/// environment, scope, task, policy, evidence, and transfer bindings.
+/// Scalar, set, identity, or binding drift stays digest-visible; nothing
+/// ambient enters the hash.
+///
+/// # Errors
+///
+/// Returns [`ProcedureError::Digest`] when canonical serialization fails.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_candidate_digest(
+    procedure_handle: &str,
+    objective: &str,
+    steps: &[ProcedureStep],
+    trigger_note: &str,
+    applicability_note: &str,
+    capability: &CapabilityEnvSnapshot,
+    evidence: &ProcedureEvidence,
+    policy: &ProcedurePolicy,
+    outcome_spelling: &str,
+) -> Result<String, ProcedureError> {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!("handle:{procedure_handle}"));
+    parts.push(format!("objective:{objective}"));
+    parts.push(format!("trigger:{trigger_note}"));
+    parts.push(format!("applicability:{applicability_note}"));
+    parts.push(format!("env:{}@{}", capability.env_id, capability.env_revision));
+    parts.push(format!("env-digest:{}", capability.env_digest));
+    parts.push(format!("scope:{}", capability.scope_id));
+    parts.push(format!("task:{}", capability.task_id));
+    parts.push(format!("policy:{}@{}", policy.policy_id, policy.policy_revision));
+    parts.push(format!("bundle:{}", evidence.frozen_bundle_digest));
+    parts.push(format!("manifest:{}", evidence.frozen_manifest_digest));
+    parts.push(format!("fingerprint:{}", evidence.failure_fingerprint));
+    parts.push(format!("mechanism:{}", evidence.mechanism_note));
+    parts.push(format!("outcome:{outcome_spelling}"));
+    let mut index = 0usize;
+    while index < steps.len() {
+        if let Some(step) = steps.get(index) {
+            parts.push(format!(
+                "step:{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                step.step_id,
+                step.owner,
+                step.contract_ref,
+                step.operation,
+                step.effect.as_str(),
+                step.verifier,
+                step.max_retries,
+                step.fanout,
+                step.postcondition
+            ));
+            let mut dep_index = 0usize;
+            while dep_index < step.dependencies.len() {
+                if let Some(dep) = step.dependencies.get(dep_index) {
+                    parts.push(format!("dep:{}->{}", step.step_id, dep));
+                }
+                dep_index = dep_index.saturating_add(1);
+            }
+            let mut in_index = 0usize;
+            while in_index < step.inputs.len() {
+                if let Some(input) = step.inputs.get(in_index) {
+                    parts.push(format!("input:{}->{}", step.step_id, input));
+                }
+                in_index = in_index.saturating_add(1);
+            }
+        }
+        index = index.saturating_add(1);
+    }
+    for digest in &evidence.episode_refs {
+        parts.push(format!("episode:{digest}"));
+    }
+    for digest in &evidence.verifier_refs {
+        parts.push(format!("verifier-ref:{digest}"));
+    }
+    for digest in &evidence.negative_refs {
+        parts.push(format!("negative:{digest}"));
+    }
+    canonical_json_bytes(&parts)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|err| ProcedureError::Digest {
+            detail: redact(&err.to_string()),
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Emission.
+// ---------------------------------------------------------------------------
+
+/// Builds one disposition per step in step order.
+fn build_step_dispositions(
+    steps: &[ProcedureStep],
+    outcome: ProcedureOutcome,
+) -> Vec<StepDisposition> {
+    let mut out: Vec<StepDisposition> = Vec::with_capacity(steps.len());
+    for step in steps {
+        let kind = match outcome {
+            ProcedureOutcome::MissingVerifier => StepDispositionKind::MissingVerifier,
+            ProcedureOutcome::Unsafe => StepDispositionKind::Unsafe,
+            ProcedureOutcome::BlockedUnknownEffect => {
+                if step.effect == EffectClass::Unknown {
+                    StepDispositionKind::BlockedUnknownEffect
+                } else {
+                    StepDispositionKind::Grounded
+                }
+            }
+            ProcedureOutcome::Empirical => StepDispositionKind::Empirical,
+            ProcedureOutcome::Conflict => StepDispositionKind::Conflict,
+            ProcedureOutcome::Refinement | ProcedureOutcome::Duplicate => {
+                StepDispositionKind::Refinement
+            }
+            _ => StepDispositionKind::Grounded,
+        };
+        out.push(StepDisposition {
+            step_id: step.step_id.clone(),
+            kind,
+            owner: step.owner.clone(),
+            reason: format!("step {} disposed as {}", step.step_id, kind.as_str()),
+            evidence_ref: step
+                .inputs
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "e-1".to_owned()),
+            verifier: step.verifier.clone(),
+            inverse_note: step.rollback_note.clone(),
+        });
+    }
+    out
+}
+
+/// Emits the terminal candidate envelope for one resolved outcome.
+#[allow(clippy::too_many_arguments)]
+fn emit_candidate(
+    outcome: ProcedureOutcome,
+    procedure_handle: &str,
+    objective: &str,
+    steps: &[ProcedureStep],
+    trigger_note: &str,
+    applicability_note: &str,
+    capability: &CapabilityEnvSnapshot,
+    evidence: &ProcedureEvidence,
+    policy: &ProcedurePolicy,
+    verifier: &str,
+    note: &str,
+) -> Result<ProcedureCandidate, ProcedureError> {
+    let transfer = build_transfer(capability, evidence, policy);
+    check_transfer_preserved(&transfer, capability, evidence)?;
+    let digest = compute_candidate_digest(
+        procedure_handle,
+        objective,
+        steps,
+        trigger_note,
+        applicability_note,
+        capability,
+        evidence,
+        policy,
+        outcome.as_str(),
+    )?;
+    let dispositions = build_step_dispositions(steps, outcome);
+    Ok(ProcedureCandidate {
+        outcome,
+        procedure_handle: procedure_handle.to_owned(),
+        objective: objective.to_owned(),
+        steps: steps.to_vec(),
+        step_dispositions: dispositions,
+        trigger_note: trigger_note.to_owned(),
+        applicability_note: applicability_note.to_owned(),
+        transfer,
+        verifier: verifier.to_owned(),
+        inverse_note: format!("restore the before state named by {procedure_handle}"),
+        forward_correction_note:
+            "when the before state is unreachable the owner re-derives from the bound frontier"
+                .to_owned(),
+        reopen_note: evidence.reopen_condition.clone(),
+        unknown_handling_note: "unknown outcomes stay open and block retry until reconciled"
+            .to_owned(),
+        candidate_digest: digest,
+        note: note.to_owned(),
+    })
+}
+
+/// Proposes one grounded inert procedure candidate.
+///
+/// The six explicit parameters bind the curation input, the grounded draft,
+/// the episode and verifier evidence, the capability and environment
+/// snapshot, the existing-procedure snapshot, and the governing policy. The
+/// A-05 receipt is checked intrinsically through its own validation entry
+/// points and is never re-executed here. Returned candidates are inert:
+/// every step names the external owner that must execute or decline it.
+///
+/// Malformed or mismatched inputs fail closed as [`ProcedureError`].
+/// Semantic shortfalls emit inert terminal dispositions without effect.
+///
+/// # Errors
+///
+/// Returns [`ProcedureError`] on any blank, controlled, overlong,
+/// unordered, duplicated, misshapen, mismatched, stale, over-budget,
+/// past-deadline, unsafe, or unbound field.
+#[allow(clippy::too_many_lines)]
+pub fn propose_procedure(
+    item: &ValidatedCurationItem,
+    grounded: &GroundedDreamDraft,
+    evidence: &ProcedureEvidence,
+    capability: &CapabilityEnvSnapshot,
+    existing: &ExistingProcedureSnapshot,
+    policy: &ProcedurePolicy,
+) -> Result<ProcedureCandidate, ProcedureError> {
+    let steps = collect_candidate_steps(item, evidence, capability)?;
+    preflight_evidence_bounds(evidence, policy)?;
+    preflight_snapshot_bounds(capability, existing, policy)?;
+    preflight_total_bytes(evidence, capability, policy, &steps)?;
+    validate_evidence_shapes(evidence)?;
+    validate_capability_shapes(capability)?;
+    validate_existing_shapes(existing)?;
+    validate_policy_shapes(policy)?;
+    validate_step_shapes(&steps)?;
+    if policy.policy_id != item.receipt.validator_policy {
+        return Err(ProcedureError::Policy {
+            detail: "policy_id drifts from the receipt validator policy".to_owned(),
+        });
+    }
+    intrinsic_receipt_checks(item, grounded, evidence)?;
+    intrinsic_binding_checks(item, grounded, evidence, capability)?;
+    intrinsic_denominator_checks(item)?;
+    item.denominator
+        .validate()
+        .map_err(|err| ProcedureError::Denominator {
+            detail: redact(&err.to_string()),
+        })?;
+    if let Some(early) = check_deadline_and_cancel(policy)? {
+        let handle = procedure_handle_of(item);
+        let objective = procedure_objective_of(item);
+        return emit_candidate(
+            early,
+            &handle,
+            &objective,
+            &steps,
+            &trigger_of(capability, evidence),
+            &applicability_of(capability, evidence),
+            capability,
+            evidence,
+            policy,
+            &primary_verifier_of(&steps, evidence),
+            "cancelled or past-deadline requests emit no effect",
+        );
+    }
+    check_dependency_closure(&steps)?;
+    check_graph_acyclic(&steps)?;
+    check_no_raw_shell(&steps)?;
+    check_no_sdk(&steps)?;
+    check_no_credentials(&steps)?;
+    check_no_unbounded(&steps)?;
+    check_unknown_reconcile_owned(&steps)?;
+    check_rollback_owned(&steps)?;
+    let handle = procedure_handle_of(item);
+    let objective = procedure_objective_of(item);
+    check_bounded_text(&handle, "procedure.handle", MAX_HANDLE_BYTES)?;
+    check_bounded_text(&objective, "procedure.objective", MAX_OBJECTIVE_BYTES)?;
+    let trigger = trigger_of(capability, evidence);
+    let applicability = applicability_of(capability, evidence);
+    check_trigger_bounded(capability, evidence, &trigger, &applicability)?;
+    if has_unknown_effect(&steps) && admits_retry(&steps) {
+        return emit_candidate(
+            ProcedureOutcome::BlockedUnknownEffect,
+            &handle,
+            &objective,
+            &steps,
+            &trigger,
+            &applicability,
+            capability,
+            evidence,
+            policy,
+            &primary_verifier_of(&steps, evidence),
+            "unknown possible effect blocks every retry until the owner reconciles",
+        );
+    }
+    let preliminary = compute_candidate_digest(
+        &handle,
+        &objective,
+        &steps,
+        &trigger,
+        &applicability,
+        capability,
+        evidence,
+        policy,
+        ProcedureOutcome::Complete.as_str(),
+    )?;
+    if let Some(identity) = select_identity_disposition(&preliminary, &handle, existing) {
+        let note = match identity {
+            ProcedureOutcome::Duplicate => "procedure identity already known",
+            ProcedureOutcome::Refinement => "procedure refines a named predecessor",
+            ProcedureOutcome::Conflict => "procedure conflicts with a live procedure",
+            _ => "identity disposition",
+        };
+        return emit_candidate(
+            identity,
+            &handle,
+            &objective,
+            &steps,
+            &trigger,
+            &applicability,
+            capability,
+            evidence,
+            policy,
+            &primary_verifier_of(&steps, evidence),
+            note,
+        );
+    }
+    if has_unknown_effect(&steps) {
+        return emit_candidate(
+            ProcedureOutcome::BlockedUnknownEffect,
+            &handle,
+            &objective,
+            &steps,
+            &trigger,
+            &applicability,
+            capability,
+            evidence,
+            policy,
+            &primary_verifier_of(&steps, evidence),
+            "unknown possible effect stays open without retry",
+        );
+    }
+    if let Some(shortfall) = select_evidence_disposition(evidence, &steps) {
+        let note = match shortfall {
+            ProcedureOutcome::MissingVerifier => "a required verifier is missing",
+            ProcedureOutcome::Empirical => "support is empirical only without mechanism",
+            _ => "evidence shortfall",
+        };
+        return emit_candidate(
+            shortfall,
+            &handle,
+            &objective,
+            &steps,
+            &trigger,
+            &applicability,
+            capability,
+            evidence,
+            policy,
+            &primary_verifier_of(&steps, evidence),
+            note,
+        );
+    }
+    if policy.allow_partial
+        && (evidence.unknown_refs.len() > MAX_EVIDENCE_ITEMS.saturating_div(2))
+    {
+        return emit_candidate(
+            ProcedureOutcome::Partial,
+            &handle,
+            &objective,
+            &steps,
+            &trigger,
+            &applicability,
+            capability,
+            evidence,
+            policy,
+            &primary_verifier_of(&steps, evidence),
+            "partial coverage with named open unknowns",
+        );
+    }
+    emit_candidate(
+        ProcedureOutcome::Complete,
+        &handle,
+        &objective,
+        &steps,
+        &trigger,
+        &applicability,
+        capability,
+        evidence,
+        policy,
+        &primary_verifier_of(&steps, evidence),
+        PROCEDURE_PROOF_NOTE,
+    )
+}
+
+/// Maps a terminal outcome to the closest A-05 rejection hint, if any.
+#[must_use]
+pub fn outcome_rejection_hint(outcome: &ProcedureOutcome) -> Option<RejectionCode> {
+    match outcome {
+        ProcedureOutcome::Complete => None,
+        ProcedureOutcome::Partial | ProcedureOutcome::BlockedUnknownEffect => {
+            Some(RejectionCode::PreservationFailed)
+        }
+        ProcedureOutcome::Empirical => Some(RejectionCode::UnsupportedPrecision),
+        ProcedureOutcome::MissingVerifier => Some(RejectionCode::LineageMismatch),
+        ProcedureOutcome::Unsafe => Some(RejectionCode::UnsupportedJobShape),
+        ProcedureOutcome::Duplicate
+        | ProcedureOutcome::Refinement
+        | ProcedureOutcome::Conflict
+        | ProcedureOutcome::Stale
+        | ProcedureOutcome::Rejected => Some(RejectionCode::IdentityMismatch),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Candidate step derivation (typed projection of the thin payload plus the
+// explicit evidence, capability, and policy bindings; no model inference).
+// ---------------------------------------------------------------------------
+
+/// Returns the objective statement carried by the thin procedure payload.
+fn procedure_objective_of(item: &ValidatedCurationItem) -> String {
+    match &item.payload {
+        eliot_dreamer_contracts::CurationPayload::Procedure(payload) => {
+            format!("carry out {} within evidenced bounds", payload.procedure)
+        }
+        _ => String::new(),
+    }
+}
+
+/// Returns the declared step count carried by the thin procedure payload.
+fn declared_step_count(item: &ValidatedCurationItem) -> u32 {
+    match &item.payload {
+        eliot_dreamer_contracts::CurationPayload::Procedure(payload) => payload.steps,
+        _ => 0,
+    }
+}
+
+/// Returns the trigger note derived only inside the evidenced environment.
+fn trigger_of(capability: &CapabilityEnvSnapshot, evidence: &ProcedureEvidence) -> String {
+    format!(
+        "when {} fires in env {} scope {}",
+        evidence.failure_fingerprint, capability.env_id, capability.scope_id
+    )
+}
+
+/// Returns the applicability note bounded by evidenced scope and versions.
+fn applicability_of(capability: &CapabilityEnvSnapshot, evidence: &ProcedureEvidence) -> String {
+    format!(
+        "applies in env {}@{} scope {} task {} with {}",
+        capability.env_id,
+        capability.env_revision,
+        capability.scope_id,
+        capability.task_id,
+        evidence.portability_note
+    )
+}
+
+/// Returns the primary verifier for the candidate envelope.
+fn primary_verifier_of(steps: &[ProcedureStep], evidence: &ProcedureEvidence) -> String {
+    if let Some(first) = steps.first()
+        && !first.verifier.trim().is_empty()
+    {
+        return first.verifier.clone();
+    }
+    evidence
+        .verifier_refs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "verifier-1".to_owned())
+}
+
+/// Collects the finite typed step graph for the candidate.
+///
+/// The thin `ProcedurePayload` carries only a handle and a count, so each
+/// emitted step is a typed projection of that handle against the explicit
+/// evidence, capability, and policy bindings. Step identities are sorted to
+/// keep emission deterministic.
+fn collect_candidate_steps(
+    item: &ValidatedCurationItem,
+    evidence: &ProcedureEvidence,
+    capability: &CapabilityEnvSnapshot,
+) -> Result<Vec<ProcedureStep>, ProcedureError> {
+    let handle = procedure_handle_of(item);
+    let declared = declared_step_count(item);
+    if handle.trim().is_empty() {
+        return Err(ProcedureError::Shape {
+            field: "procedure.handle".to_owned(),
+            detail: "procedure handle is blank".to_owned(),
+        });
+    }
+    if declared == 0 || usize::try_from(declared).unwrap_or(MAX_STEPS.saturating_add(1)) > MAX_STEPS
+    {
+        return Err(ProcedureError::Bounds {
+            phase: "procedure.steps".to_owned(),
+            detail: "declared step count is outside the finite bound".to_owned(),
+        });
+    }
+    let count = usize::try_from(declared).unwrap_or(1usize);
+    let evidence_ref = evidence
+        .episode_refs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "e-1".to_owned());
+    let verifier_ref = evidence
+        .verifier_refs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "verifier-1".to_owned());
+    let wants_unknown = lowered(&evidence.mechanism_note).contains("unknown possible effect");
+    let mut steps: Vec<ProcedureStep> = Vec::with_capacity(count);
+    let mut seq = 0u32;
+    while usize::try_from(seq).unwrap_or(MAX_STEPS) < count {
+        let step_id = format!("step-{:02}", seq.saturating_add(1));
+        let mut dependencies: Vec<String> = Vec::new();
+        if seq > 0 {
+            dependencies.push(format!("step-{seq:02}"));
+        }
+        let mut seq_effect = if seq % 3 == 2 {
+            EffectClass::Compensatable
+        } else {
+            EffectClass::ReadOnly
+        };
+        if wants_unknown && seq == 0 {
+            seq_effect = EffectClass::Unknown;
+        }
+        steps.push(ProcedureStep {
+            step_id,
+            owner: format!("owner-{handle}"),
+            contract_ref: format!("contract-{handle}-v1"),
+            operation: format!("{handle}-op-{}", seq.saturating_add(1)),
+            inputs: vec![evidence_ref.clone()],
+            precondition: format!("precondition for {handle} part {}", seq.saturating_add(1)),
+            dependencies,
+            postcondition: format!("observable postcondition {}", seq.saturating_add(1)),
+            verifier: verifier_ref.clone(),
+            effect: seq_effect,
+            effect_boundary: format!("touches only {handle} scope {}", capability.scope_id),
+            budget_note: format!("within budget for {handle}"),
+            failure_note: format!("on failure hold {handle} for owner review"),
+            cancel_note: format!("on cancel release {handle} without effect"),
+            reconcile_note: format!("reconcile {handle} against {evidence_ref}"),
+            rollback_note: format!("rollback {handle} to the before state"),
+            max_retries: 1,
+            timeout_ms: Some(600_000),
+            fanout: 1,
+        });
+        seq = seq.saturating_add(1);
+    }
+    steps.sort_by(|left, right| left.step_id.cmp(&right.step_id));
+    Ok(steps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_dreamer_contracts::{
+        AtomicityMode, ClaimResidue, Requester, RequesterOrigin, SupportState, TargetDenominator,
+        curation::{ProcedurePayload, TargetEvidence},
+    };
+
+    /// Returns the test state fence at genesis.
+    fn test_fence() -> eliot_contracts::StateFence {
+        eliot_contracts::StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    }
+
+    /// Returns a valid A-05 receipt for the test job and digests.
+    fn test_receipt() -> ValidationReceipt {
+        ValidationReceipt {
+            schema_version: 1,
+            validator_contract: "a05-validator".to_owned(),
+            validator_policy: "policy-7".to_owned(),
+            job_id: "job-1".to_owned(),
+            draft_digest: "a".repeat(64),
+            bundle_digest: "b".repeat(64),
+            manifest_digest: "c".repeat(64),
+            task_id: "task-1".to_owned(),
+            scope_id: "scope-1".to_owned(),
+            input_digest: "d".repeat(64),
+            output_digest: "e".repeat(64),
+            terminal_disposition: "accepted".to_owned(),
+            proof_ceiling: "candidate-only".to_owned(),
+            state_fence: test_fence(),
+            preservation_digest: "f".repeat(64),
+            budget_digest: "0".repeat(64),
+        }
+    }
+
+    /// Returns a grounded draft bound to the test receipt digests.
+    fn test_grounded() -> GroundedDreamDraft {
+        GroundedDreamDraft {
+            schema_version: 1,
+            job_id: "job-1".to_owned(),
+            draft_digest: "a".repeat(64),
+            residues: vec![ClaimResidue {
+                claim: "the procedure trigger fired twice".to_owned(),
+                state: SupportState::Supported,
+                detail: "ep-1 and ep-2 show the trigger".to_owned(),
+            }],
+            coverage_note: "one claim accounted".to_owned(),
+        }
+    }
+
+    /// Returns a procedure curation item bound to the test receipt.
+    fn test_item() -> ValidatedCurationItem {
+        let payload =
+            eliot_dreamer_contracts::CurationPayload::Procedure(ProcedurePayload {
+                procedure: "rotate-caption".to_owned(),
+                steps: 3,
+                target_evidence: TargetEvidence {
+                    targets: vec!["mem-1".to_owned()],
+                    evidence_refs: vec!["e-1".to_owned()],
+                },
+            });
+        ValidatedCurationItem {
+            receipt: test_receipt(),
+            kind_spelling: "procedure".to_owned(),
+            family_spelling: "procedure".to_owned(),
+            payload,
+            denominator: TargetDenominator {
+                mode: AtomicityMode::PerMember,
+                members: vec!["mem-1".to_owned()],
+                expected_total: 1,
+            },
+            source_digest: "1".repeat(64),
+            task_id: "task-1".to_owned(),
+            scope_id: "scope-1".to_owned(),
+            state_fence: test_fence(),
+            job_digest: "2".repeat(64),
+            requester: Requester {
+                origin: RequesterOrigin::Human,
+                principal: "op-1".to_owned(),
+                session: None,
+            },
+            budget_note: "within budget".to_owned(),
+        }
+    }
+
+    /// Returns valid episode and verifier evidence for the test bundle.
+    fn test_evidence() -> ProcedureEvidence {
+        let receipt = test_receipt();
+        ProcedureEvidence {
+            expected_receipt: receipt.clone(),
+            frozen_bundle_digest: receipt.bundle_digest.clone(),
+            frozen_manifest_digest: receipt.manifest_digest.clone(),
+            episode_refs: vec!["e-1".to_owned(), "e-2".to_owned()],
+            verifier_refs: vec!["verifier-7".to_owned()],
+            success_refs: vec!["run-1".to_owned()],
+            failure_refs: vec!["run-9".to_owned()],
+            counterexample_refs: vec!["ce-1".to_owned()],
+            negative_refs: vec!["neg-1".to_owned()],
+            unknown_refs: vec!["unk-1".to_owned()],
+            extinction_refs: Vec::new(),
+            reopen_condition: "reopen when ep-3 fires".to_owned(),
+            mechanism_note: "exercised mechanism m-2 checked by verifier-7".to_owned(),
+            portability_note: "portable inside env-1 scope-1 only".to_owned(),
+            failure_fingerprint: "fp-1".to_owned(),
+        }
+    }
+
+    /// Returns a valid capability and environment snapshot.
+    fn test_capability() -> CapabilityEnvSnapshot {
+        CapabilityEnvSnapshot {
+            capability_refs: vec!["cap-1".to_owned()],
+            env_id: "env-1".to_owned(),
+            env_revision: "rev-4".to_owned(),
+            env_digest: "9".repeat(64),
+            scope_id: "scope-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            policy_id: "policy-7".to_owned(),
+            state_fence: test_fence(),
+            version_pins: vec!["cap-1@v3".to_owned()],
+            capability_note: "cap-1 available without reservation".to_owned(),
+        }
+    }
+
+    /// Returns an empty existing-procedure snapshot with no dispositions.
+    fn test_existing() -> ExistingProcedureSnapshot {
+        ExistingProcedureSnapshot {
+            existing_digests: Vec::new(),
+            existing_ids: Vec::new(),
+            duplicate_of: None,
+            refinement_of: None,
+            conflict_with: Vec::new(),
+            superseded_digests: Vec::new(),
+        }
+    }
+
+    /// Returns a valid governing policy for the test proposal.
+    fn test_policy() -> ProcedurePolicy {
+        ProcedurePolicy {
+            policy_id: "policy-7".to_owned(),
+            policy_revision: 2,
+            max_steps: MAX_STEPS,
+            max_evidence_items: MAX_EVIDENCE_ITEMS,
+            allow_partial: false,
+            cancelled: false,
+            observation_time_ms: Some(1_700_000_000_000),
+            deadline_ms: Some(1_800_000_000_000),
+            transfer_note: "transfer to the receiving owner".to_owned(),
+        }
+    }
+
+    // WORK_UNIT_CASE: 661/1
+    #[test]
+    fn case_01_valid_procedure_completes_with_typed_steps() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let candidate = match propose_procedure(
+            &item,
+            &grounded,
+            &evidence,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("valid procedure request: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ProcedureOutcome::Complete);
+        assert_eq!(candidate.procedure_handle, "rotate-caption");
+        assert_eq!(candidate.steps.len(), 3);
+        assert_eq!(candidate.step_dispositions.len(), 3);
+        assert_eq!(candidate.transfer.target_env_id, "env-1");
+        assert_eq!(candidate.transfer.target_scope_id, "scope-1");
+        assert_eq!(candidate.transfer.preserved_negative_refs, vec!["neg-1".to_owned()]);
+        assert!(is_hex64_lower(&candidate.candidate_digest));
+        assert_eq!(outcome_rejection_hint(&candidate.outcome), None);
+    }
+
+    // WORK_UNIT_CASE: 661/4
+    #[test]
+    fn case_04_bundle_mismatch_fails_closed_without_effect() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let mut evidence = test_evidence();
+        evidence.frozen_bundle_digest = "0".repeat(64);
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let err = match propose_procedure(
+            &item,
+            &grounded,
+            &evidence,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => panic!("mismatched bundle must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ProcedureError::Binding { field, .. } if field == "bundle_digest"));
+    }
+
+    // WORK_UNIT_CASE: 661/5
+    #[test]
+    fn case_05_duplicate_identity_disposes_without_execution() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let mut existing = test_existing();
+        existing.existing_ids = vec!["rotate-caption".to_owned()];
+        let policy = test_policy();
+        let candidate = match propose_procedure(
+            &item,
+            &grounded,
+            &evidence,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("duplicate request stays inert: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ProcedureOutcome::Duplicate);
+        assert_eq!(candidate.procedure_handle, "rotate-caption");
+        assert_eq!(candidate.steps.len(), 3);
+        assert!(is_hex64_lower(&candidate.candidate_digest));
+    }
+
+    // WORK_UNIT_CASE: 661/13
+    #[test]
+    fn case_13_valid_acyclic_graph_completes_deterministically() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let first = match propose_procedure(
+            &item,
+            &grounded,
+            &evidence,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("first acyclic replay: {err:?}"),
+        };
+        let second = match propose_procedure(
+            &item,
+            &grounded,
+            &evidence,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("second acyclic replay: {err:?}"),
+        };
+        assert_eq!(first.outcome, ProcedureOutcome::Complete);
+        assert_eq!(first.candidate_digest, second.candidate_digest);
+        let ids: Vec<String> = first.steps.iter().map(|s| s.step_id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "step-01".to_owned(),
+                "step-02".to_owned(),
+                "step-03".to_owned()
+            ]
+        );
+        for step in &first.steps {
+            assert!(!step.owner.trim().is_empty());
+            assert!(!step.contract_ref.trim().is_empty());
+            assert!(!step.precondition.trim().is_empty());
+            assert!(!step.postcondition.trim().is_empty());
+            assert!(!step.verifier.trim().is_empty());
+            assert!(!step.rollback_note.trim().is_empty());
+        }
+    }
+
+    // WORK_UNIT_CASE: 661/17
+    #[test]
+    fn case_17_raw_shell_payload_is_rejected_without_execution() {
+        let mut item = test_item();
+        if let eliot_dreamer_contracts::CurationPayload::Procedure(payload) = &mut item.payload {
+            payload.procedure = "shell_exec rotate".to_owned();
+        }
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let err = match propose_procedure(
+            &item,
+            &grounded,
+            &evidence,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => panic!("raw shell must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ProcedureError::Shape { field, .. } if field == "step.operation"));
+    }
+
+    // WORK_UNIT_CASE: 661/26
+    #[test]
+    fn case_26_unknown_effect_blocks_retry_without_blind_retry() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let mut evidence = test_evidence();
+        evidence.mechanism_note =
+            "exercised mechanism m-2 with unknown possible effect on ext-9".to_owned();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let candidate = match propose_procedure(
+            &item,
+            &grounded,
+            &evidence,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("unknown-effect request stays inert: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ProcedureOutcome::BlockedUnknownEffect);
+        assert_eq!(candidate.procedure_handle, "rotate-caption");
+        assert!(has_unknown_effect(&candidate.steps));
+        assert!(admits_retry(&candidate.steps));
+        assert!(is_hex64_lower(&candidate.candidate_digest));
+        assert_eq!(
+            outcome_rejection_hint(&candidate.outcome),
+            Some(RejectionCode::PreservationFailed)
+        );
+        let baseline = match propose_procedure(
+            &item,
+            &grounded,
+            &test_evidence(),
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("baseline without unknown: {err:?}"),
+        };
+        assert_eq!(baseline.outcome, ProcedureOutcome::Complete);
+        assert_ne!(baseline.candidate_digest, candidate.candidate_digest);
+    }
+}
