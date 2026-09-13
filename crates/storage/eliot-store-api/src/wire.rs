@@ -16,10 +16,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    CanonicalValidationSnapshot, MAX_STORE_FAILURE_DETAIL_LEN, NamedReadRequest, NamedReadResponse,
-    OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
-    RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey, StoreError,
-    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    CanonicalValidationSnapshot, ExactJsonBytes, MAX_STORE_FAILURE_DETAIL_LEN, NamedReadRequest,
+    NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
+    PreparedTransition, RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey,
+    StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot,
+    WriteReceipt, json_shape_name,
 };
 use schemars::JsonSchema;
 
@@ -531,6 +532,77 @@ pub fn request_frame(
         .validate()
         .map_err(|error| StoreWireError::Protocol(error.to_string()))?;
     Ok(frame)
+}
+
+/// Builds one authenticated Execute request frame with payload-authority
+/// binding (issue #10, Wave B/C).
+///
+/// Each entry of `authorities` must be the [`ExactJsonBytes`] authority for
+/// the named operation at the same index of an `Apply` transition: it is
+/// revalidated and its decoded parameters must equal the operation's
+/// queryable parameters byte-for-byte at the `Value` level. A mismatch is a
+/// corrupt or substituted payload and fails closed here, before the JsonV1
+/// codec can collapse anything. The frame codec itself is unchanged; the
+/// authority travels with the caller and is persisted opaquely by the store.
+/// Any other request shape must carry no authorities.
+pub fn request_frame_with_payload_authority(
+    connection_id: impl Into<String>,
+    protocol_version: ProtocolVersion,
+    request_id: RequestId,
+    identity: RequestIdentity,
+    request: StoreRequest,
+    authorities: &[ExactJsonBytes],
+) -> Result<Frame, StoreWireError> {
+    bind_payload_authorities(&request, authorities)?;
+    request_frame(
+        connection_id,
+        protocol_version,
+        request_id,
+        identity,
+        request,
+    )
+}
+
+/// Verifies that payload authorities exactly cover one `Apply` transition.
+fn bind_payload_authorities(
+    request: &StoreRequest,
+    authorities: &[ExactJsonBytes],
+) -> Result<(), StoreWireError> {
+    match request {
+        StoreRequest::Apply { transition, .. } => {
+            if authorities.len() != transition.named_operations.len() {
+                return Err(StoreWireError::Payload(
+                    "payload authority count does not match named operations".to_owned(),
+                ));
+            }
+            for (operation, authority) in transition.named_operations.iter().zip(authorities.iter())
+            {
+                authority.validate().map_err(StoreWireError::Store)?;
+                let expected = authority
+                    .decode_object_parameters()
+                    .map_err(StoreWireError::Store)?;
+                if expected != operation.parameters {
+                    let shape = authority
+                        .projection_value()
+                        .map(|value| json_shape_name(&value))
+                        .unwrap_or("undecodable");
+                    return Err(StoreWireError::Payload(format!(
+                        "payload authority ({shape}) does not match named-operation parameters"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        _ => {
+            if authorities.is_empty() {
+                Ok(())
+            } else {
+                Err(StoreWireError::Payload(
+                    "payload authority requires an Apply transition".to_owned(),
+                ))
+            }
+        }
+    }
 }
 
 /// Decodes and validates one authenticated Execute request frame.

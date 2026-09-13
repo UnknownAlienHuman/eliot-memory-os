@@ -32,8 +32,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod payload_authority;
 mod store_failure;
 mod wire;
+
+pub use payload_authority::{
+    CONTROL_FIELD_DENYLIST, CanonicalJson, ExactJsonBytes, MAX_EXACT_JSON_BYTES,
+    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, json_shape_name,
+    number_token_would_narrow, reject_control_parameter_name,
+};
 
 pub use store_failure::{
     LegacyStoreFailureV1, MAX_STORE_FAILURE_DETAIL_LEN, MAX_STORE_FAILURE_REFERENCE_LEN,
@@ -48,7 +55,8 @@ pub use wire::{
     CAPABILITY_NAMED_READ, CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT,
     CAPABILITY_RECOVERY, CAPABILITY_REVISION_HEADS, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS,
     ReadinessReceipt, ReadinessStatus, StoreRequest, StoreResponse, StoreWireError,
-    decode_request_frame, decode_response_frame, request_frame, response_frame,
+    decode_request_frame, decode_response_frame, request_frame,
+    request_frame_with_payload_authority, response_frame,
 };
 
 /// Stable identity of this contract surface.
