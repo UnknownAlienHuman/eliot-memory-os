@@ -1,16 +1,18 @@
 use std::collections::BTreeSet;
 
 use eliot_agent_api::{
-    AgentLaunchRequest, AgentWorkUnitBrief, AllowedMode, AuthorityEpoch, BudgetEnvelope,
-    EffectCeiling, EffectKind, LaunchRequestId, ResourceGeneration, RouteFingerprint, StateFence,
-    TaskId, WorkUnitId,
+    AgentLaunchRequest, AgentWorkUnitBrief, AllowedMode, AttemptId, AuthorityEpoch, BudgetEnvelope,
+    EffectCeiling, EffectKind, ExecutionUnit, LaunchRequestId, NativeSession,
+    ProviderExecutionBinding, RequestId, ResourceGeneration, RouteFingerprint, StateFence, TaskId,
+    WorkLeaseId, WorkUnitId,
 };
 use eliot_agent_contracts::RevisionId;
 use eliot_agent_coordinator::{
     AdmissionId, AdmittedLaneReceipt, AgentCoordinator, CandidateId, CoordinatorConfig,
-    CoordinatorError, PlanGap, ProviderAdmissionReceipt, ProviderIdentity, RecipeId,
-    RecipeManifest, RoleProfileId, RoleProfileManifest, RouteCandidateEvidence,
-    StaffingLaneRequest, StaffingPlanRequest, WorkerId,
+    CoordinatorError, CoordinatorEvent, ExecutionContext, PlanGap, ProviderAdmissionReceipt,
+    ProviderExecutionBindingSubmission, ProviderIdentity, RecipeId, RecipeManifest, RoleProfileId,
+    RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanRequest,
+    WorkerId,
 };
 use eliot_evaluation_contracts::BudgetEvidence;
 use eliot_security_contracts::PrivacyClass;
@@ -261,6 +263,70 @@ fn absent_g11_is_a_typed_non_bypassable_gap() -> TestResult {
     )?;
     let candidate = coordinator.plan(request()?)?;
     assert_eq!(candidate.lanes.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn execution_binding_submission_wire_is_additive_and_snapshot_stays_v4() -> TestResult {
+    // S2 stays additive: no snapshot schema bump.
+    assert_eq!(
+        eliot_agent_coordinator::SNAPSHOT_SCHEMA_VERSION,
+        "eliot-agent-coordinator/snapshot-v4"
+    );
+    let submission = ProviderExecutionBindingSubmission {
+        binding: ProviderExecutionBinding {
+            attempt_id: AttemptId::new("attempt-bind-wire")?,
+            lease_id: serde_json::from_value::<WorkLeaseId>(
+                serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-bind-wire"}),
+            )?,
+            state_fence: fence(),
+            runtime_generation: ResourceGeneration::genesis(),
+            route: route("a"),
+            session_id: None,
+            provider_scope_ref: "provider-scope-wire".to_owned(),
+            native_session: NativeSession::Sessionless,
+            execution_unit: ExecutionUnit::new("test-turn", "turn-wire")?,
+            start_request_id: RequestId::new("start-wire")?,
+            start_request_sha256: "ab".repeat(32),
+        },
+        provider_identity: ProviderIdentity {
+            verifier_identity: "sealed-test-verifier".to_owned(),
+            a01_acceptance_receipt_ref: "a01-accepted-proof".to_owned(),
+            a01_contract_revision: "a01-rev-1".to_owned(),
+            g11_provider_revision: "g11-rev-1".to_owned(),
+            capacity_identity: "capacity-a".to_owned(),
+            capacity_revision: RevisionId::new("capacity-rev-1")?,
+        },
+        provider_start_receipt_ref: "proof-bind-wire".to_owned(),
+    };
+    let wire = serde_json::to_value(&submission)?;
+    assert_eq!(
+        serde_json::from_value::<ProviderExecutionBindingSubmission>(wire.clone())?,
+        submission
+    );
+    let mut with_unknown = wire;
+    with_unknown["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<ProviderExecutionBindingSubmission>(with_unknown).is_err());
+    let context = ExecutionContext {
+        admission_id: AdmissionId::new("admission-wire")?,
+        task_revision: "task-rev-1".to_owned(),
+        plan_revision: RevisionId::new("plan-rev-1")?,
+        state_fence: fence(),
+        controller_epoch: AuthorityEpoch::new(1)?,
+        coordinator_lease: serde_json::from_value::<WorkLeaseId>(
+            serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "coordinator-lease-wire"}),
+        )?,
+    };
+    let event = CoordinatorEvent::ProviderExecutionBound {
+        context,
+        submission: Box::new(submission),
+    };
+    let event_wire = serde_json::to_value(&event)?;
+    assert_eq!(event_wire["kind"], "PROVIDER_EXECUTION_BOUND");
+    assert_eq!(
+        serde_json::from_value::<CoordinatorEvent>(event_wire)?,
+        event
+    );
     Ok(())
 }
 

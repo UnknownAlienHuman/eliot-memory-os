@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{
-    AttemptId, ContractError, EffectCeiling, EffectKind, ResultDisposition, WorkLeaseId,
+    AgentAttempt, AttemptId, AttemptState, AuthorityEnvelope, CancellationState, ContinuityKind,
+    ContractError, EffectCeiling, EffectKind, ProviderExecutionBinding, ResultDisposition,
+    WorkLeaseId, validate_execution_binding,
 };
 use eliot_agent_contracts::{
     AgentAttemptId, CoordinationEntry, CoordinationMapView, DescendantTerminalState,
@@ -19,11 +21,12 @@ use crate::model::{
     DeliveryBoundaryReceipt, DescendantClosureCandidateReceipt, DescendantClosureSubmission,
     ExecutionContext, LostWorkerReceipt, OperationId, OutcomeReconciliationId, PeerMessageReceipt,
     PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot, ProviderCancellationReconciliation,
-    ProviderIdentity, ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation,
-    ProviderWorkerFenceReceipt, ReassignmentId, ReassignmentReceipt, RejectedRoute,
-    ResultSubmission, RoleProfileManifest, RouteCandidateEvidence, RouteRejectionReason,
-    RoutingReceipt, StaffingLaneCandidate, StaffingPlanCandidate, StaffingPlanRequest,
-    SubmissionId, UnknownOutcomeFinalReceipt, WorkerId, validate_text,
+    ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
+    ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReassignmentId,
+    ReassignmentReceipt, RejectedRoute, ResultSubmission, RoleProfileManifest,
+    RouteCandidateEvidence, RouteRejectionReason, RoutingReceipt, StaffingLaneCandidate,
+    StaffingPlanCandidate, StaffingPlanRequest, SubmissionId, UnknownOutcomeFinalReceipt, WorkerId,
+    validate_text,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -34,6 +37,14 @@ pub(crate) enum ProviderProofKind {
     Reassignment,
     Result,
     UnknownOutcome,
+    /// Authenticates the exact start correlation of one provider execution
+    /// unit before it is bound to an admitted attempt (issue #361 S2). This
+    /// is a sealed extension of the same verifier path: no public trait, no
+    /// caller-implementable or always-verified verifier. The public
+    /// constructor still installs only the typed `PLAN_GAP` verifier, so live
+    /// production binding stays unavailable until an accepted A-01/G-11
+    /// adapter exists.
+    Binding,
 }
 
 /// Sealed inside this crate so callers cannot implement an "always verified"
@@ -113,6 +124,7 @@ pub struct AgentCoordinator {
     reassignments: BTreeMap<ReassignmentId, IdempotentRecord<ReassignmentReceipt>>,
     submissions: BTreeMap<SubmissionId, IdempotentRecord<CandidateResultReceipt>>,
     result_by_attempt: BTreeMap<AttemptId, SubmissionId>,
+    bindings: BTreeMap<AttemptId, IdempotentRecord<ProviderExecutionBinding>>,
     outcome_reconciliations:
         BTreeMap<OutcomeReconciliationId, IdempotentRecord<UnknownOutcomeFinalReceipt>>,
     descendant_closures: BTreeMap<AttemptId, IdempotentRecord<DescendantClosureCandidateReceipt>>,
@@ -155,6 +167,7 @@ impl AgentCoordinator {
             reassignments: BTreeMap::new(),
             submissions: BTreeMap::new(),
             result_by_attempt: BTreeMap::new(),
+            bindings: BTreeMap::new(),
             outcome_reconciliations: BTreeMap::new(),
             descendant_closures: BTreeMap::new(),
             peer_messages: BTreeMap::new(),
@@ -495,6 +508,7 @@ impl AgentCoordinator {
                 mutation_scope: lane.mutation_scope.clone(),
                 state: CoordinatedAttemptState::Admitted,
                 superseded_by: None,
+                provider_binding: None,
             };
             if let Some(scope) = &record.mutation_scope {
                 self.writer_holders
@@ -568,6 +582,188 @@ impl AgentCoordinator {
             attempt_id,
         });
         Ok(record)
+    }
+
+    /// Binds exactly one provider execution unit to an existing externally
+    /// admitted attempt (issue #361 S2).
+    ///
+    /// Enforced, in order:
+    /// - the context names a known admission with exact fence/epoch/lease
+    ///   agreement (`validate_context`);
+    /// - the sealed provider verifier authenticates the exact start
+    ///   correlation (`ProviderProofKind::Binding` over the canonical
+    ///   submission); there is no `verified = true` shortcut and the public
+    ///   constructor still installs only the typed `PLAN_GAP` verifier, so
+    ///   production binding stays unavailable until an accepted A-01/G-11
+    ///   adapter exists;
+    /// - exact canonical-input replay returns the stored binding without a
+    ///   new event; the same attempt identity with different canonical bytes
+    ///   (a second unit rebound to the same attempt) is an
+    ///   `IdempotencyConflict`;
+    /// - the attempt exists, belongs to this admission, and is pre-execution
+    ///   (`Admitted` or `Running`; anything later is `InvalidAttemptState`);
+    /// - the shared S1 validator (`eliot_agent_api::validate_execution_binding`)
+    ///   checks binding shape plus exact typed attempt/lease/route agreement,
+    ///   complete fence equality, and exact runtime-generation equality. The
+    ///   coordinator's current generation view is the admitted fence's typed
+    ///   `resource_generation` (threaded by value, no numeric casts, no
+    ///   process-generation bridging): a live generation feed distinct from
+    ///   the fence has no entry point in `ExecutionContext` or
+    ///   `ProviderAdmissionReceipt` and stays T1/T5-owned. The coordinator
+    ///   likewise admits no session, so the projected attempt session is
+    ///   `None` and a sessionful binding fails closed here until T1/T5 supply
+    ///   session admission;
+    /// - a physical unit already bound to another attempt under the same
+    ///   authenticated provider scope and generation is a
+    ///   `DuplicateIdentity("execution_unit")` (a new turn, including
+    ///   resume/fork, is a new attempt but never reuses a live unit);
+    /// - the binding is persisted via `CoordinatorEvent::ProviderExecutionBound`
+    ///   before the bound value is returned for attribution, so restart
+    ///   replay reconstructs it and a missing event leaves the attempt
+    ///   unresolved (`None`, attribution fails closed). Map insertion alone
+    ///   is never treated as admission.
+    pub fn bind_provider_execution(
+        &mut self,
+        context: ExecutionContext,
+        submission: ProviderExecutionBindingSubmission,
+    ) -> Result<ProviderExecutionBinding, CoordinatorError> {
+        self.validate_context(&context)?;
+        validate_text(
+            &submission.provider_start_receipt_ref,
+            "provider_start_receipt_ref",
+        )?;
+        let canonical_input = canonical(&submission)?;
+        self.provider.verify(
+            ProviderProofKind::Binding,
+            &submission.provider_identity,
+            &submission.provider_start_receipt_ref,
+            &canonical_input,
+        )?;
+        self.validate_provider_identity(&submission.provider_identity)?;
+        let attempt_id = submission.binding.attempt_id.clone();
+        if let Some(existing) = self.bindings.get(&attempt_id) {
+            return idempotent(existing, &canonical_input);
+        }
+        let current = self
+            .attempts
+            .get(&attempt_id)
+            .cloned()
+            .ok_or(CoordinatorError::UnknownAttempt)?;
+        if current.admission_id != context.admission_id {
+            return Err(CoordinatorError::StaleController);
+        }
+        if current.provider_binding.is_some() {
+            // The idempotency index above is the only writer of the record
+            // field; a present field without an index entry is corruption, so
+            // fail closed instead of overwriting an immutable binding.
+            return Err(CoordinatorError::IdentityConflict("execution_binding"));
+        }
+        let admitted = self.binding_subject(&attempt_id)?;
+        validate_execution_binding(
+            &submission.binding,
+            &admitted,
+            &context.state_fence,
+            context.state_fence.resource_generation,
+        )
+        .map_err(binding_contract)?;
+        if self.attempts.values().any(|other| {
+            other.provider_binding.as_ref().is_some_and(|bound| {
+                bound.provider_scope_ref == submission.binding.provider_scope_ref
+                    && bound.execution_unit == submission.binding.execution_unit
+                    && bound.runtime_generation == submission.binding.runtime_generation
+            })
+        }) {
+            return Err(CoordinatorError::DuplicateIdentity("execution_unit"));
+        }
+        let binding = submission.binding.clone();
+        self.bindings.insert(
+            attempt_id.clone(),
+            IdempotentRecord {
+                canonical_input,
+                receipt: binding.clone(),
+            },
+        );
+        self.attempts
+            .get_mut(&attempt_id)
+            .ok_or(CoordinatorError::UnknownAttempt)?
+            .provider_binding = Some(binding.clone());
+        self.events.push(CoordinatorEvent::ProviderExecutionBound {
+            context,
+            submission: Box::new(submission),
+        });
+        Ok(binding)
+    }
+
+    /// Projects an admitted attempt for S1 binding validation and
+    /// attribution checks. Only identity fields participate in
+    /// `validate_execution_binding`; authority/continuity/cancellation
+    /// crossings are inert carriers documented below.
+    pub(crate) fn binding_subject(
+        &self,
+        attempt_id: &AttemptId,
+    ) -> Result<AgentAttempt, CoordinatorError> {
+        let attempt = self
+            .attempts
+            .get(attempt_id)
+            .ok_or(CoordinatorError::UnknownAttempt)?;
+        let admission = self
+            .admissions
+            .get(&attempt.admission_id)
+            .ok_or(CoordinatorError::UnknownAdmission)?;
+        self.binding_subject_inner(attempt, &admission.receipt)
+    }
+
+    fn binding_subject_inner(
+        &self,
+        attempt: &AttemptRecord,
+        admission: &ProviderAdmissionReceipt,
+    ) -> Result<AgentAttempt, CoordinatorError> {
+        // Binding pins the unit before execution: only pre-execution states
+        // project. Later states keep their stored binding read-only.
+        let state = match attempt.state {
+            CoordinatedAttemptState::Admitted => AttemptState::Admitted,
+            CoordinatedAttemptState::Running => AttemptState::Running,
+            other => return Err(CoordinatorError::InvalidAttemptState(other)),
+        };
+        let work_unit = self.work_unit_for(attempt)?;
+        Ok(AgentAttempt {
+            id: attempt.attempt_id.clone(),
+            launch_request_id: attempt.launch_request_id.clone(),
+            task_id: attempt.task_id.clone(),
+            parent_attempt: attempt.parent_attempt_id.clone(),
+            work_unit: work_unit.clone(),
+            // The coordinator admits no session: the projected session is
+            // `None`, so a sessionful binding fails closed in S1 until T1/T5
+            // supply session admission.
+            session: None,
+            lease: attempt.lease_id.clone(),
+            state,
+            // Inert for binding validation: the coordinator tracks lineage
+            // via `parent_attempt_id`, not this projection field.
+            continuity: ContinuityKind::Fresh,
+            route: attempt.route.clone(),
+            budget: attempt.budget.clone(),
+            // Inert for binding validation (never read by
+            // `validate_execution_binding`): epoch/lease/fence/ceiling are
+            // the real admitted values; `scope_ref` reuses the admitted
+            // work-unit ceiling scope for internal consistency;
+            // `valid_until` is left empty so this projection can never be
+            // mistaken for Governor-minted authority.
+            authority: AuthorityEnvelope {
+                epoch: admission.controller_epoch,
+                scope_ref: work_unit.effect_ceiling.scope_ref.clone(),
+                effect_ceiling: work_unit.effect_ceiling.clone(),
+                lease: attempt.lease_id.clone(),
+                state_fence: attempt.state_fence.clone(),
+                valid_until: String::new(),
+            },
+            // Factual: only `Admitted`/`Running` attempts project, and
+            // cancellation is never requested in those states.
+            cancellation: CancellationState::NotRequested,
+            event_cursor: None,
+            continuation: None,
+            provider_binding: attempt.provider_binding.clone(),
+        })
     }
 
     pub fn request_cancellation(
@@ -832,6 +1028,7 @@ impl AgentCoordinator {
             mutation_scope: old.mutation_scope.clone(),
             state: CoordinatedAttemptState::Admitted,
             superseded_by: None,
+            provider_binding: None,
         };
         if let Some(scope) = &new_record.mutation_scope {
             self.writer_holders
@@ -1357,6 +1554,18 @@ impl AgentCoordinator {
                 } => {
                     coordinator.deliver_message(context, recipient_attempt_id, message_id)?;
                 }
+                CoordinatorEvent::ProviderExecutionBound {
+                    context,
+                    submission,
+                } => {
+                    // Replay re-verifies the exact canonical input through
+                    // the sealed verifier and rebuilds the binding index plus
+                    // the record field together. Events without a binding
+                    // event leave the attempt unresolved (`None`); a binding
+                    // is never invented on restore, so attribution of an
+                    // unbound attempt fails closed.
+                    coordinator.bind_provider_execution(context, *submission)?;
+                }
             }
         }
         if coordinator.events != expected_events {
@@ -1783,6 +1992,17 @@ fn validate_attempt_binding(
 
 fn provider_contract(error: impl std::fmt::Display) -> CoordinatorError {
     CoordinatorError::ProviderContract(error.to_string())
+}
+
+fn binding_contract(error: ContractError) -> CoordinatorError {
+    match error {
+        // S1 reports every binding-identity disagreement (attempt, lease,
+        // fence, generation, route, session, stored unit) as one closed
+        // mismatch; the coordinator surfaces it on the existing identity
+        // conflict variant without inventing a binding-specific error.
+        ContractError::BindingMismatch => CoordinatorError::IdentityConflict("execution_binding"),
+        other => CoordinatorError::ProviderContract(other.to_string()),
+    }
 }
 
 fn validate_effect_ceiling(

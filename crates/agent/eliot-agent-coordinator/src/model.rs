@@ -1,7 +1,7 @@
 use eliot_agent_api::{
     ActualRouteReceipt, AgentLaunchRequest, AgentResult, AttemptId, AuthorityEpoch, BudgetEnvelope,
-    CancelReason, LaunchRequestId, ResultDisposition, RouteFingerprint, StateFence, TaskId,
-    WorkLeaseId, WorkUnitId,
+    CancelReason, LaunchRequestId, ProviderExecutionBinding, ResultDisposition, RouteFingerprint,
+    StateFence, TaskId, WorkLeaseId, WorkUnitId,
 };
 use eliot_agent_contracts::{
     DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, MessageId,
@@ -380,6 +380,12 @@ pub struct AttemptRecord {
     pub mutation_scope: Option<String>,
     pub state: CoordinatedAttemptState,
     pub superseded_by: Option<AttemptId>,
+    /// Immutable provider-execution binding for this attempt (issue #361 S2).
+    /// Set once by `bind_provider_execution`; `None` is an unresolved or
+    /// legacy launch and is rejected for attribution (fail-closed). The
+    /// `#[serde(default)]` keeps pre-S2 wire readable (additive).
+    #[serde(default)]
+    pub provider_binding: Option<ProviderExecutionBinding>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -472,6 +478,20 @@ pub struct ResultSubmission {
     pub provider_identity: ProviderIdentity,
     pub provider_result_receipt_ref: String,
     pub result: AgentResult,
+}
+
+/// Provider-execution binding submission for one admitted attempt (issue #361
+/// S2). It carries the shared `eliot_agent_api::ProviderExecutionBinding` plus
+/// the existing provider identity/proof-reference pattern from
+/// [`ResultSubmission`]: the sealed verifier authenticates the exact start
+/// correlation (`provider_start_receipt_ref` over the canonical submission).
+/// No credential, catalogue-as-admission, or session/login bridge is carried.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderExecutionBindingSubmission {
+    pub binding: ProviderExecutionBinding,
+    pub provider_identity: ProviderIdentity,
+    pub provider_start_receipt_ref: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -596,6 +616,15 @@ pub enum CoordinatorEvent {
         context: ExecutionContext,
         recipient_attempt_id: AttemptId,
         message_id: MessageId,
+    },
+    /// A provider-execution binding was bound to an admitted attempt. The
+    /// submission carries the attempt identity (via `binding.attempt_id`) and
+    /// the canonical provider identity/proof, so replay re-verifies the exact
+    /// canonical input and reconstructs the binding; a missing event leaves
+    /// the attempt unresolved and attribution fails closed.
+    ProviderExecutionBound {
+        context: ExecutionContext,
+        submission: Box<ProviderExecutionBindingSubmission>,
     },
 }
 

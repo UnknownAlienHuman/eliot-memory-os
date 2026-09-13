@@ -2,15 +2,16 @@ use std::collections::BTreeSet;
 
 use eliot_agent_api::{
     ActualRouteReceipt, AgentLaunchRequest, AgentResult, AgentWorkUnitBrief, ArtifactId, AttemptId,
-    AuthorityEpoch, BudgetEnvelope, EffectCeiling, EffectKind, LaunchRequestId, QuotaKnowledge,
-    ResourceGeneration, ResultDisposition, RouteFingerprint, RouteFingerprintId, StateFence,
-    TaskId, UsageReceipt, WorkLeaseId, WorkUnitId,
+    AuthorityEpoch, BudgetEnvelope, ContractError, EffectCeiling, EffectKind, ExecutionUnit,
+    LaunchRequestId, NativeSession, NativeSessionLocator, ProviderExecutionBinding, QuotaKnowledge,
+    RequestId, ResourceGeneration, ResultDisposition, RouteFingerprint, RouteFingerprintId,
+    StateFence, TaskId, UsageReceipt, WorkLeaseId, WorkUnitId,
 };
 use eliot_agent_contracts::{
     DeliveryPolicy, DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, RevisionId,
     contract_shape_digest,
 };
-use eliot_contracts::{IntegrationRevision, PolicyRevision, TaskRevision};
+use eliot_contracts::{IntegrationRevision, PolicyRevision, TaskRevision, sha256_hex};
 use eliot_evaluation_contracts::BudgetEvidence;
 use eliot_security_contracts::PrivacyClass;
 
@@ -19,10 +20,11 @@ use crate::{
     AdmissionId, AdmittedLaneReceipt, AgentCoordinator, CandidateId, CoordinatorConfig,
     CoordinatorError, DescendantClosureSubmission, ExecutionContext, ObservationId, OperationId,
     OutcomeReconciliationId, PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot,
-    ProviderIdentity, ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation,
-    ProviderWorkerFenceReceipt, ReassignmentId, RecipeId, RecipeManifest, ResultSubmission,
-    RoleProfileId, RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest,
-    StaffingPlanCandidate, StaffingPlanRequest, SubmissionId, UnknownOutcomeResolution, WorkerId,
+    ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
+    ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReassignmentId, RecipeId,
+    RecipeManifest, ResultSubmission, RoleProfileId, RoleProfileManifest, RouteCandidateEvidence,
+    StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest, SubmissionId,
+    UnknownOutcomeResolution, WorkerId,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -1752,5 +1754,225 @@ fn plan_same_identity_changed_bytes_fails_identity_conflict_before_ready_backpre
             limit: 1
         })
     );
+    Ok(())
+}
+
+fn binding_submission(
+    tag: &str,
+    lane: &AdmittedLaneReceipt,
+    unit: &str,
+    scope: &str,
+) -> TestResult<ProviderExecutionBindingSubmission> {
+    Ok(ProviderExecutionBindingSubmission {
+        binding: ProviderExecutionBinding {
+            attempt_id: lane.attempt_id.clone(),
+            lease_id: lane.lease_id.clone(),
+            state_fence: fence(),
+            runtime_generation: ResourceGeneration::genesis(),
+            route: lane.route.clone(),
+            session_id: None,
+            provider_scope_ref: format!("provider-scope-{scope}"),
+            native_session: NativeSession::Native(NativeSessionLocator::new(format!(
+                "thread-{tag}"
+            ))?),
+            execution_unit: ExecutionUnit::new("test-turn", format!("turn-{unit}"))?,
+            start_request_id: RequestId::new(format!("start-{tag}"))?,
+            start_request_sha256: sha256_hex(format!("start-{tag}").as_bytes()),
+        },
+        provider_identity: provider_identity(),
+        provider_start_receipt_ref: format!("proof-bind-{tag}"),
+    })
+}
+
+fn bind_lane_spec<'a>(work: &'a str, role: &'a str, route: &'a str) -> LaneSpec<'a> {
+    LaneSpec {
+        work,
+        role,
+        route,
+        scope: None,
+        write: false,
+        priority: 1,
+    }
+}
+
+#[test]
+fn binding_identical_replay_returns_existing_without_new_event() -> TestResult {
+    let proofs = ["proof-admission-bind-a", "proof-bind-bind-a"];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "bind-a",
+        &[bind_lane_spec("work-bind-a", "reader-bind-a", "a")],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let submission = binding_submission("bind-a", &lane, "unit-a", "scope-a")?;
+    let events_before = coordinator.events().len();
+    let first = coordinator.bind_provider_execution(context.clone(), submission.clone())?;
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    assert_eq!(
+        coordinator
+            .attempt(&lane.attempt_id)
+            .unwrap_or_else(|| panic!("bound attempt must exist"))
+            .provider_binding,
+        Some(first.clone())
+    );
+    let replayed = coordinator.bind_provider_execution(context, submission)?;
+    assert_eq!(replayed, first);
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    Ok(())
+}
+
+#[test]
+fn binding_second_unit_rebind_conflicts_and_preserves_stored() -> TestResult {
+    let proofs = [
+        "proof-admission-bind-b",
+        "proof-bind-bind-b",
+        "proof-bind-bind-b-re",
+    ];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "bind-b",
+        &[bind_lane_spec("work-bind-b", "reader-bind-b", "a")],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    coordinator.bind_provider_execution(
+        context.clone(),
+        binding_submission("bind-b", &lane, "unit-b1", "scope-b")?,
+    )?;
+    let events_after_bind = coordinator.events().len();
+    assert_eq!(
+        coordinator.bind_provider_execution(
+            context,
+            binding_submission("bind-b-re", &lane, "unit-b2", "scope-b")?
+        ),
+        Err(CoordinatorError::IdempotencyConflict)
+    );
+    assert_eq!(coordinator.events().len(), events_after_bind);
+    assert_eq!(
+        coordinator
+            .attempt(&lane.attempt_id)
+            .unwrap_or_else(|| panic!("bound attempt must exist"))
+            .provider_binding
+            .as_ref()
+            .unwrap_or_else(|| panic!("stored binding must survive a rebind conflict"))
+            .execution_unit
+            .unit_id,
+        "turn-unit-b1"
+    );
+    Ok(())
+}
+
+#[test]
+fn binding_duplicate_unit_reuse_conflicts_across_attempts() -> TestResult {
+    let proofs = [
+        "proof-admission-bind-c",
+        "proof-bind-bind-c-0",
+        "proof-bind-bind-c-1",
+    ];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "bind-c",
+        &[
+            bind_lane_spec("work-bind-c-0", "reader-bind-c-0", "a"),
+            bind_lane_spec("work-bind-c-1", "reader-bind-c-1", "b"),
+        ],
+        None,
+    )?;
+    let first = admitted.admitted_lanes[0].clone();
+    let second = admitted.admitted_lanes[1].clone();
+    coordinator.start_attempt(ExecutionContext::from(&admitted), first.attempt_id.clone())?;
+    coordinator.start_attempt(ExecutionContext::from(&admitted), second.attempt_id.clone())?;
+    coordinator.bind_provider_execution(
+        ExecutionContext::from(&admitted),
+        binding_submission("bind-c-0", &first, "unit-shared", "scope-shared")?,
+    )?;
+    let events_after_first = coordinator.events().len();
+    assert_eq!(
+        coordinator.bind_provider_execution(
+            ExecutionContext::from(&admitted),
+            binding_submission("bind-c-1", &second, "unit-shared", "scope-shared")?
+        ),
+        Err(CoordinatorError::DuplicateIdentity("execution_unit"))
+    );
+    assert_eq!(coordinator.events().len(), events_after_first);
+    assert_eq!(
+        coordinator
+            .attempt(&second.attempt_id)
+            .unwrap_or_else(|| panic!("second attempt must exist"))
+            .provider_binding,
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn binding_snapshot_restore_preserves_binding_and_absent_stays_unresolved() -> TestResult {
+    let proofs = ["proof-admission-bind-d", "proof-bind-bind-d"];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "bind-d",
+        &[bind_lane_spec("work-bind-d", "reader-bind-d", "a")],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let pre_binding = coordinator.snapshot()?;
+    let bound = coordinator.bind_provider_execution(
+        context,
+        binding_submission("bind-d", &lane, "unit-d", "scope-d")?,
+    )?;
+    let post_binding = coordinator.snapshot()?;
+    // Restore without the binding event: the attempt stays unresolved and
+    // attribution fails closed; no binding is invented.
+    let restored_pre = AgentCoordinator::restore_with_provider(
+        pre_binding.clone(),
+        config(4, 4),
+        Box::new(verifier(&proofs, pre_binding.event_sequence)),
+    )?;
+    assert_eq!(
+        restored_pre
+            .attempt(&lane.attempt_id)
+            .unwrap_or_else(|| panic!("restored attempt must exist"))
+            .provider_binding,
+        None
+    );
+    assert_eq!(
+        restored_pre
+            .binding_subject(&lane.attempt_id)?
+            .attributable_binding()
+            .err(),
+        Some(ContractError::BindingMismatch)
+    );
+    // Restore with the binding event: the binding is preserved and
+    // attributable, and the journal matches exactly.
+    let restored_post = AgentCoordinator::restore_with_provider(
+        post_binding.clone(),
+        config(4, 4),
+        Box::new(verifier(&proofs, post_binding.event_sequence)),
+    )?;
+    assert_eq!(
+        restored_post
+            .attempt(&lane.attempt_id)
+            .unwrap_or_else(|| panic!("restored attempt must exist"))
+            .provider_binding,
+        Some(bound.clone())
+    );
+    assert_eq!(
+        restored_post
+            .binding_subject(&lane.attempt_id)?
+            .attributable_binding()?,
+        &bound
+    );
+    assert_eq!(restored_post.events(), coordinator.events());
     Ok(())
 }
