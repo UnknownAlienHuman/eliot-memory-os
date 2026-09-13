@@ -307,15 +307,12 @@ impl StdioWriteReceipt {
 }
 
 fn write_response(response: &Response) -> StdioWriteReceipt {
-    let mut framed = match serde_json::to_vec(response) {
-        Ok(framed) => framed,
-        Err(_) => {
-            return StdioWriteReceipt {
-                bytes: 0,
-                flushed: false,
-                cause: StdioBreakCause::SerializeFailed,
-            };
-        }
+    let Ok(mut framed) = serde_json::to_vec(response) else {
+        return StdioWriteReceipt {
+            bytes: 0,
+            flushed: false,
+            cause: StdioBreakCause::SerializeFailed,
+        };
     };
     framed.push(b'\n');
     let bytes = framed.len();
