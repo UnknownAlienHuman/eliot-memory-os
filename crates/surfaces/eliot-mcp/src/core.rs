@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 use eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
 use eliot_receipts::{ArtifactBinding, ProofCeiling, SessionBinding};
 use eliot_source_assurance::{
-    AdmissionOutcome, OwnerSourceEvidence, SourceAssurance, SourceAssuranceError, canonical_digest,
+    AdmissionOutcome, AssuranceFinding, OwnerSourceEvidence, SourceAssurance, SourceAssuranceError,
+    canonical_digest,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    ApplicationRequest, ContractViolation, McpProtocolVersion, ToolRequest, validate_proof_ceiling,
+    ApplicationRequest, ContractViolation, McpProtocolVersion, ToolRequest, TypedRejection,
+    decode_protected_request_bytes, validate_proof_ceiling,
 };
 
 /// Default and optional local transport profiles. This is validation only.
@@ -552,6 +554,36 @@ impl McpCore {
         Self::execute_inner(port, transport, request, correlation.transport_session_hint)
     }
 
+    /// Validates raw request bytes through the protected decoder before any
+    /// trusted construction or semantic dispatch.
+    ///
+    /// Raw duplicate protected keys (including escape-equivalent forms) and
+    /// unknown protected variants fail here with zero port calls. Supported
+    /// compatibility is admitted explicitly; no trial decoding is performed.
+    pub fn execute_raw<P: KernelGovernorPort + ?Sized>(
+        &self,
+        port: &P,
+        transport: TransportRequestContext,
+        request_bytes: &[u8],
+    ) -> Result<McpResponse, BridgeError> {
+        let request =
+            decode_protected_request_bytes(request_bytes).map_err(raw_rejection_to_bridge)?;
+        self.execute(port, transport, request)
+    }
+
+    /// Raw-bytes form of the isolated 2025-11-25 adapter.
+    pub fn execute_compat_raw<P: KernelGovernorPort + ?Sized>(
+        &self,
+        port: &P,
+        transport: TransportRequestContext,
+        request_bytes: &[u8],
+        correlation: CompatibilityCorrelation,
+    ) -> Result<McpResponse, BridgeError> {
+        let request =
+            decode_protected_request_bytes(request_bytes).map_err(raw_rejection_to_bridge)?;
+        self.execute_compat(port, transport, request, correlation)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn execute_inner<P: KernelGovernorPort + ?Sized>(
         port: &P,
@@ -746,6 +778,27 @@ fn negative_response(
     })
 }
 
+/// Bounded typed recovery code for source-assurance admission failures.
+///
+/// `Rejected` covers conflicting or policy-rejected evidence,
+/// `Quarantined` covers quarantined sources, `Incomplete` covers missing or
+/// incomplete evidence, `Stale` covers needs-revalidation, and
+/// `InternalDefect` covers encoding defects that are never caller recovery.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AssuranceRecoveryCode {
+    /// Conflicting, wrong-scope, or policy-rejected evidence.
+    Rejected,
+    /// Quarantined source; retained as evidence but excluded from admission.
+    Quarantined,
+    /// Missing or incomplete evidence.
+    Incomplete,
+    /// Stale snapshot/frontier/scope requiring revalidation.
+    Stale,
+    /// Internal encoding defect, not caller recovery.
+    InternalDefect,
+}
+
 /// Pure bridge validation/forwarding failure.
 #[derive(Debug, Error)]
 pub enum BridgeError {
@@ -775,8 +828,18 @@ pub enum BridgeError {
     #[error("RESOURCE_BINDING_MISMATCH: resource does not bind canonical content bytes")]
     ResourceBindingMismatch,
     /// Owner source evidence was absent, invalid, stale, or policy-rejected.
-    #[error("SOURCE_ASSURANCE_REJECTED: {reason}")]
-    SourceAssuranceRejected { reason: String },
+    ///
+    /// `reason` is a redacted static string; `findings` preserves the typed
+    /// evaluator findings without echoing protected bodies.
+    #[error("SOURCE_ASSURANCE_REJECTED[{code:?}]: {reason}")]
+    SourceAssuranceRejected {
+        /// Redacted recovery reason.
+        reason: String,
+        /// Bounded typed recovery code.
+        code: AssuranceRecoveryCode,
+        /// Typed evaluator findings preserved without protected bodies.
+        findings: Vec<AssuranceFinding>,
+    },
 }
 
 impl BridgeError {
@@ -909,21 +972,29 @@ fn validate_owner_evidence(
     resolution: &BindingResolutionRequest,
     binding: &ActiveSessionBinding,
 ) -> Result<ForwardedSourceAssurance, BridgeError> {
-    evidence
-        .validate()
-        .map_err(|error| BridgeError::SourceAssuranceRejected {
+    evidence.validate().map_err(|error| {
+        let code = assurance_error_code(&error);
+        BridgeError::SourceAssuranceRejected {
             reason: safe_assurance_error_reason(&error),
-        })?;
+            code,
+            findings: Vec::new(),
+        }
+    })?;
     if evidence.owner_principal_ref != binding.principal_ref {
         return Err(BridgeError::SourceAssuranceRejected {
             reason: "owner evidence principal must match the authenticated active binding"
                 .to_owned(),
+            code: AssuranceRecoveryCode::Rejected,
+            findings: Vec::new(),
         });
     }
     let state_fence_digest =
         canonical_digest(&resolution.claimed_session.state_fence).map_err(|error| {
+            let code = assurance_error_code(&error);
             BridgeError::SourceAssuranceRejected {
                 reason: safe_assurance_error_reason(&error),
+                code,
+                findings: Vec::new(),
             }
         })?;
     if evidence.request_id != resolution.request_id
@@ -936,22 +1007,34 @@ fn validate_owner_evidence(
     {
         return Err(BridgeError::SourceAssuranceRejected {
             reason: "owner evidence must bind the resolver's exact canonical request".to_owned(),
+            code: AssuranceRecoveryCode::Rejected,
+            findings: Vec::new(),
         });
     }
     let outcome = evidence
         .assurance
         .admit_with_policy(&evidence.policy)
-        .map_err(|error| BridgeError::SourceAssuranceRejected {
-            reason: safe_assurance_error_reason(&error),
+        .map_err(|error| {
+            let code = assurance_error_code(&error);
+            BridgeError::SourceAssuranceRejected {
+                reason: safe_assurance_error_reason(&error),
+                code,
+                findings: Vec::new(),
+            }
         })?;
     let AdmissionOutcome::Admitted { assurance_digest } = outcome else {
+        let (code, reason, findings) = admission_outcome_recovery(&outcome);
         return Err(BridgeError::SourceAssuranceRejected {
-            reason: admission_outcome_reason(&outcome).to_owned(),
+            reason: reason.to_owned(),
+            code,
+            findings,
         });
     };
     if evidence.verifier_ref != evidence.policy.required_verifier {
         return Err(BridgeError::SourceAssuranceRejected {
             reason: "owner evidence does not satisfy the policy verifier requirement".to_owned(),
+            code: AssuranceRecoveryCode::Rejected,
+            findings: Vec::new(),
         });
     }
     Ok(ForwardedSourceAssurance {
@@ -982,6 +1065,57 @@ fn admission_outcome_reason(outcome: &AdmissionOutcome) -> &'static str {
     }
 }
 
+/// Maps a non-admitted outcome to its bounded recovery code, redacted reason,
+/// and preserved evaluator findings. Findings are typed and never echo
+/// protected bodies.
+fn admission_outcome_recovery(
+    outcome: &AdmissionOutcome,
+) -> (AssuranceRecoveryCode, &'static str, Vec<AssuranceFinding>) {
+    match outcome {
+        AdmissionOutcome::Admitted { .. } => (
+            AssuranceRecoveryCode::Rejected,
+            admission_outcome_reason(outcome),
+            Vec::new(),
+        ),
+        AdmissionOutcome::NeedsRevalidation { findings } => (
+            AssuranceRecoveryCode::Stale,
+            admission_outcome_reason(outcome),
+            findings.clone(),
+        ),
+        AdmissionOutcome::Missing { findings } => (
+            AssuranceRecoveryCode::Incomplete,
+            admission_outcome_reason(outcome),
+            findings.clone(),
+        ),
+        AdmissionOutcome::Conflicted { findings } => (
+            AssuranceRecoveryCode::Rejected,
+            admission_outcome_reason(outcome),
+            findings.clone(),
+        ),
+        AdmissionOutcome::WrongScope { findings } => (
+            AssuranceRecoveryCode::Rejected,
+            admission_outcome_reason(outcome),
+            findings.clone(),
+        ),
+        AdmissionOutcome::Quarantined { findings } => (
+            AssuranceRecoveryCode::Quarantined,
+            admission_outcome_reason(outcome),
+            findings.clone(),
+        ),
+    }
+}
+
+fn assurance_error_code(error: &SourceAssuranceError) -> AssuranceRecoveryCode {
+    match error {
+        SourceAssuranceError::MissingField(_) => AssuranceRecoveryCode::Incomplete,
+        SourceAssuranceError::Json(_) => AssuranceRecoveryCode::InternalDefect,
+        SourceAssuranceError::InvalidDigest(_)
+        | SourceAssuranceError::DuplicateSourceId(_)
+        | SourceAssuranceError::NonCanonicalSourceSet
+        | SourceAssuranceError::UnsupportedSchema(_) => AssuranceRecoveryCode::Rejected,
+    }
+}
+
 fn safe_assurance_error_reason(error: &SourceAssuranceError) -> String {
     match error {
         SourceAssuranceError::MissingField(field) => {
@@ -993,6 +1127,217 @@ fn safe_assurance_error_reason(error: &SourceAssuranceError) -> String {
         SourceAssuranceError::UnsupportedSchema(_) => "unsupported assurance schema".to_owned(),
         SourceAssuranceError::Json(_) => "assurance encoding failed".to_owned(),
     }
+}
+
+/// Maps a raw protected rejection to a redacted bridge error.
+///
+/// Only bounded control names and static reasons are echoed; raw bodies,
+/// secrets, and protected payloads are never included.
+fn raw_rejection_to_bridge(rejection: TypedRejection) -> BridgeError {
+    match rejection {
+        TypedRejection::DuplicateKey { key } => {
+            BridgeError::invalid("request", format!("duplicate protected key: {key}"))
+        }
+        TypedRejection::UnknownVariant { variant } => {
+            BridgeError::invalid("tool.name", format!("unsupported tool variant: {variant}"))
+        }
+        TypedRejection::Malformed { reason } => BridgeError::invalid("request", reason),
+        TypedRejection::Oversized { actual, maximum } => {
+            BridgeError::ResourceRequired { actual, maximum }
+        }
+    }
+}
+
+/// Trusted routing authority taken strictly from the envelope, the active
+/// binding, and owner evidence. Nested JSON/XML/YAML/Markdown/code payloads,
+/// encoded strings, and bidi/zero-width text remain inert data: this struct
+/// never reads selector, identity, policy, authority, effect-ceiling, or
+/// `Finish` routing from data prose.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EnvelopeAuthority {
+    /// Canonical tool selector from the typed envelope.
+    pub selector: String,
+    /// Exact request identity from the envelope.
+    pub request_id: String,
+    /// Exact retry identity from the envelope.
+    pub idempotency_key: String,
+    /// Exact cancellation identity from the envelope.
+    pub cancellation_id: String,
+    /// Exact session identity from the envelope and binding.
+    pub session_id: String,
+    /// Authenticated principal from the active binding.
+    pub principal_ref: String,
+    /// Owner policy version from the assurance envelope.
+    pub policy_version: String,
+    /// Required verifier from the owner policy, when present.
+    pub verifier_ref: Option<String>,
+    /// Canonical assurance digest from the forwarding envelope.
+    pub assurance_digest: String,
+}
+
+/// Extracts the trusted routing authority strictly from the envelope,
+/// binding, and assurance. Data payloads are never consulted.
+#[must_use]
+pub fn envelope_authority(
+    request: &ApplicationRequest,
+    binding: &ActiveSessionBinding,
+    assurance: &ForwardedSourceAssurance,
+) -> EnvelopeAuthority {
+    EnvelopeAuthority {
+        selector: request.tool.canonical_name().to_owned(),
+        request_id: request
+            .identity
+            .request
+            .metadata
+            .request_id
+            .as_str()
+            .to_owned(),
+        idempotency_key: request.identity.idempotency_key.clone(),
+        cancellation_id: request.identity.cancellation_id.clone(),
+        session_id: request.session.session_id.to_string(),
+        principal_ref: binding.principal_ref.clone(),
+        policy_version: assurance.policy.policy_version.clone(),
+        verifier_ref: assurance.verifier_ref.clone(),
+        assurance_digest: assurance.assurance_digest.clone(),
+    }
+}
+
+/// How a candidate forwarded request relates to an original under one retry
+/// identity. Pure comparison over `ForwardedRequest` fields and the
+/// assurance digest; no store and no I/O.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReplayConflictKind {
+    /// Canonical payload or request bytes changed.
+    PayloadChanged,
+    /// Owner source evidence or assurance digest changed.
+    SourceChanged,
+    /// Owner policy changed.
+    PolicyChanged,
+    /// Active session binding changed.
+    BindingChanged,
+}
+
+/// Replay disposition for two forwarded requests sharing a retry identity.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReplayDisposition {
+    /// Every digest, binding, source, and policy field matches.
+    ExactReplay,
+    /// Same retry identity but a protected field changed.
+    Conflict(ReplayConflictKind),
+    /// Different retry identities; not a replay comparison.
+    DifferentIdentity,
+}
+
+/// Compares two forwarded requests for exact replay or invalidation.
+///
+/// Exact replay requires identical retry identity plus identical payload
+/// digests, canonical request digests, active binding, source assurance
+/// (including the assurance digest), and policy. Any protected change under
+/// one identity conflicts and invalidates reuse.
+#[must_use]
+pub fn replay_disposition(
+    original: &ForwardedRequest,
+    candidate: &ForwardedRequest,
+) -> ReplayDisposition {
+    if original.source_assurance.idempotency_key != candidate.source_assurance.idempotency_key
+        || original.request.identity.idempotency_key != candidate.request.identity.idempotency_key
+    {
+        return ReplayDisposition::DifferentIdentity;
+    }
+    if original.original_request_sha256 != candidate.original_request_sha256
+        || original.original_payload_sha256 != candidate.original_payload_sha256
+        || original.canonical_payload_sha256 != candidate.canonical_payload_sha256
+        || original.canonical_request_sha256 != candidate.canonical_request_sha256
+        || original.request != candidate.request
+        || original.original_request != candidate.original_request
+    {
+        return ReplayDisposition::Conflict(ReplayConflictKind::PayloadChanged);
+    }
+    if original.source_assurance.assurance_digest != candidate.source_assurance.assurance_digest
+        || original.source_assurance.assurance != candidate.source_assurance.assurance
+        || original.source_assurance.evidence_ref != candidate.source_assurance.evidence_ref
+        || original.source_assurance.owner_principal_ref
+            != candidate.source_assurance.owner_principal_ref
+    {
+        return ReplayDisposition::Conflict(ReplayConflictKind::SourceChanged);
+    }
+    if original.source_assurance.policy != candidate.source_assurance.policy {
+        return ReplayDisposition::Conflict(ReplayConflictKind::PolicyChanged);
+    }
+    if original.active_session_binding != candidate.active_session_binding
+        || original.source_assurance.session_id != candidate.source_assurance.session_id
+        || original.source_assurance.state_fence_digest
+            != candidate.source_assurance.state_fence_digest
+        || original.source_assurance.canonical_request_sha256
+            != candidate.source_assurance.canonical_request_sha256
+    {
+        return ReplayDisposition::Conflict(ReplayConflictKind::BindingChanged);
+    }
+    if original.compatibility_correlation_hint != candidate.compatibility_correlation_hint {
+        return ReplayDisposition::Conflict(ReplayConflictKind::BindingChanged);
+    }
+    ReplayDisposition::ExactReplay
+}
+
+/// Returns true only for a deterministic exact replay.
+#[must_use]
+pub fn is_exact_replay(original: &ForwardedRequest, candidate: &ForwardedRequest) -> bool {
+    matches!(
+        replay_disposition(original, candidate),
+        ReplayDisposition::ExactReplay
+    )
+}
+
+/// Lineage derived by a transformation. The original digest is preserved
+/// unchanged; the derived digest adds provenance for the transform.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TransformedLineage {
+    /// Original lineage digest, preserved exactly.
+    pub original_lineage_digest: String,
+    /// Bounded transform reference that produced the derivation.
+    pub transform_ref: String,
+    /// Canonical digest over the original digest plus the transform.
+    pub derived_digest: String,
+}
+
+/// Derives transformed lineage while preserving the original digest.
+///
+/// The derived digest is computed through the assurance crate's canonical
+/// `blake3` helper (`canonical_digest`), not by duplicating digest logic.
+/// No store and no I/O are performed.
+pub fn derive_transformed_lineage(
+    original_lineage_digest: &str,
+    transform_ref: &str,
+) -> Result<TransformedLineage, BridgeError> {
+    if !is_sha256(original_lineage_digest) {
+        return Err(BridgeError::invalid(
+            "provenance.lineage_digest",
+            "must be a lowercase hex digest",
+        ));
+    }
+    if transform_ref.trim().is_empty() || transform_ref.chars().any(char::is_control) {
+        return Err(BridgeError::invalid(
+            "provenance.transform_ref",
+            "must be non-blank and contain no control characters",
+        ));
+    }
+    let derived_digest =
+        canonical_digest(&(original_lineage_digest, transform_ref)).map_err(|error| {
+            BridgeError::SourceAssuranceRejected {
+                reason: safe_assurance_error_reason(&error),
+                code: assurance_error_code(&error),
+                findings: Vec::new(),
+            }
+        })?;
+    Ok(TransformedLineage {
+        original_lineage_digest: original_lineage_digest.to_owned(),
+        transform_ref: transform_ref.to_owned(),
+        derived_digest,
+    })
 }
 
 fn validate_projection(
