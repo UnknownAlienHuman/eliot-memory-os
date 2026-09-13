@@ -55,7 +55,8 @@ use eliot_platform_windows::{
 };
 #[cfg(test)]
 use eliot_platform_windows::{
-    ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK, watchdog_service_security_descriptor_digest,
+    ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+    host_service_security_descriptor_digest, watchdog_service_security_descriptor_digest,
 };
 pub use eliot_runtime_contracts::ProvisionedSupervisionAuthority;
 use eliot_runtime_contracts::{
