@@ -24,7 +24,6 @@ agent_order = 25
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
 eliot-evidence = { path = "../../foundation/eliot-evidence" }
 eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
-eliot-dreamer-candidate-validation = { path = "../eliot-dreamer-candidate-validation" }
 
 [lints]
 workspace = true
