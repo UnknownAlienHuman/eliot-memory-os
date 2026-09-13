@@ -1757,35 +1757,21 @@ fn validate_deletion_receipt(
     Ok(())
 }
 
-/// T3-B residency scope (I05-12 `ObjectResidencyKey` shim).
+/// T3-B residency scope (I05-12 `ObjectResidencyKey`, s-04-v2 integrated).
 ///
-/// The base `eliot-blob-api` wire still carries the 3-field locator
-/// (`hash` + generations) while I05-12 requires identity over six residency
-/// domains plus the versioned content digest. This service crate — which must
-/// not redefine API identity types — derives the scope digest from the full
-/// caller-supplied request identity instead.
+/// The scope digest is the canonical [`ObjectResidencyKey::key_digest`] carried
+/// by the locator itself. The on-disk `residency_sha256` field keeps its meaning
+/// (the residency digest); s-04-v2 only changes its computation from the former
+/// (locator, policy, crypto) shim to the versioned contract key. No default
+/// domain is ever substituted: a locator without a well-formed residency key is
+/// rejected by [`BlobLocator::validate`].
 ///
-///
-/// Scope inputs, all caller-supplied or durably stored, never defaulted:
-/// - content identity: `locator.hash` as BLAKE3 (format version 1);
-/// - policy binding: privacy class, retention class, policy ref,
-///   instruction taint, effect ceiling (the base representation of the
-///   scope/access/confidentiality/retention/erasure domains);
-/// - key lineage: AEAD algorithm/version plus key lineage/generation (the
-///   base representation of the encryption-key domain).
-///
-/// Scope, access and confidentiality domain separation beyond these fields
-/// has no base representation; that is an honest gap owned by the API
-/// contract wave, not a silent default here.
-///
-/// INTEGRATION POINT for the final rebase: when `eliot-blob-api` publishes
-/// `ObjectResidencyKey` (6 domain ids + algorithm/version digest), replace
-/// the [`residency_scope`] input tuple with that type and thread the key
-/// through `BlobStageRequest`/receipt/reachability/GC types. Every call site
-/// below is already keyed on the full (locator, policy, crypto) triple, so
-/// the migration is input substitution, not a layout change: the on-disk
-/// `residency_sha256` field keeps its meaning (the residency digest) and
-/// only its computation changes.
+/// The caller-supplied policy and the converged service key are still validated
+/// at every call site, and the key lineage must equal the residency
+/// `encryption_key_domain_id` (the permitted key-lineage binding). Policy and
+/// residency travel together via
+/// [`BlobPolicyBinding::validate_for_residency`]; their cryptographic linkage
+/// lives in the API receipt binding, not in this path digest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResidencyScope {
     digest: String,
@@ -1797,27 +1783,16 @@ fn residency_scope(
     crypto: &CryptoDescriptor,
 ) -> Result<ResidencyScope, BlobError> {
     locator.validate()?;
-    policy.validate()?;
+    policy.validate_for_residency(locator.residency())?;
     crypto.validate()?;
-    let bytes = serde_json::to_vec(&(
-        "eliot-blob-residency/v1",
-        locator.hash.as_str(),
-        "BLAKE3",
-        1_u32,
-        &policy.privacy_class,
-        &policy.retention_class,
-        policy.policy_ref.as_str(),
-        &policy.instruction_taint,
-        &policy.effect_ceiling,
-        crypto.algorithm.as_str(),
-        crypto.version,
-        crypto.key_lineage.as_str(),
-        crypto.key_generation,
-    ))
-    .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
-    Ok(ResidencyScope {
-        digest: sha256_hex(&bytes),
-    })
+    if crypto.key_lineage != locator.residency().encryption_key_domain_id {
+        return Err(BlobError::InvalidField {
+            field: "crypto.key_lineage",
+            reason: "must equal residency encryption_key_domain_id",
+        });
+    }
+    let digest = locator.residency_key_digest()?;
+    Ok(ResidencyScope { digest })
 }
 
 /// Residency-scoped payload path. Equal bytes in different residency domains
@@ -1857,19 +1832,18 @@ fn scoped_metadata_path(
 }
 
 /// Prefix that enumerates every residency scope stored for one locator.
+///
+/// s-04-v2 places objects under residency-scoped directories
+/// (`objects/g{R}/{rd[..2]}/{rd}/`), so scopes for one content hash spread
+/// across residency dirs. Enumeration lists the whole generation root and lets
+/// [`parse_scoped_path`] admit only byte-exact placements for the locator.
 /// Enumeration is physical scope discovery for a caller-supplied locator; it
 /// is never semantic-root discovery (liveness still comes only from the
 /// caller-supplied live-set union).
 fn scope_list_prefix(locator: &BlobLocator) -> Result<WorkScopePath, BlobError> {
     locator.validate()?;
-    let hash = locator.hash.as_str();
-    WorkScopePath::new(format!(
-        "objects/g{}/{}/{}.r",
-        locator.root_generation,
-        &hash[..2],
-        hash
-    ))
-    .map_err(|error| BlobError::InvalidContract(error.to_string()))
+    WorkScopePath::new(format!("objects/g{}/", locator.root_generation))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))
 }
 
 /// One durably stored residency scope of a locator: both files exist as a
@@ -1882,18 +1856,30 @@ struct ScopedObject {
 
 /// Parses the residency digest out of a scoped path and proves the path is
 /// exactly the derived placement for `(locator, digest)`. A transplanted
-/// path (right digest, wrong locator, or hand-built name) is rejected.
+/// path (right digest, wrong directory, or hand-built name) is rejected.
+///
+/// s-04-v2 layout: `objects/g{R}/{rd[..2]}/{rd}/{hash}.r{digest}.{p|m}{gen}`.
+/// The digest in the filename must reproduce the exact canonical path when
+/// rebuilt; anything else is not an object of this locator in that scope.
 fn parse_scoped_path(
     path: &WorkScopePath,
     locator: &BlobLocator,
     kind: char,
 ) -> Result<ResidencyScope, BlobError> {
     let hash = locator.hash.as_str();
-    let dir = format!("objects/g{}/{}/", locator.root_generation, &hash[..2]);
-    let file = path
+    let root_prefix = format!("objects/g{}/", locator.root_generation);
+    let rest = path
         .normalized_identity()
-        .strip_prefix(dir.as_str())
+        .strip_prefix(root_prefix.as_str())
         .ok_or(BlobError::MetadataPayloadMismatch)?;
+    let mut parts = rest.splitn(3, '/');
+    let shard = parts.next().ok_or(BlobError::MetadataPayloadMismatch)?;
+    let residency_dir = parts.next().ok_or(BlobError::MetadataPayloadMismatch)?;
+    let file = parts.next().ok_or(BlobError::MetadataPayloadMismatch)?;
+    if shard.len() != 2 || residency_dir.len() != 64 {
+        return Err(BlobError::MetadataPayloadMismatch);
+    }
+    validate_sha256(residency_dir, "residency_sha256")?;
     let stem = file
         .strip_prefix(format!("{hash}.r").as_str())
         .ok_or(BlobError::MetadataPayloadMismatch)?;
@@ -2535,12 +2521,36 @@ where
     fn enumerate_scopes(&self, locator: &BlobLocator) -> Result<Vec<ScopedObject>, BlobError> {
         let prefix = scope_list_prefix(locator)?;
         self.contained(&prefix)?;
+        // s-04-v2 generation-wide listing also returns other hashes' objects.
+        // Only filenames of this content hash can belong to this locator;
+        // anything else is skipped before the strict placement proof below.
+        // A same-hash file that fails the proof is still a hard error.
+        let file_marker = format!("/{}.r", locator.hash.as_str());
+        // s-04-v2: the locator pins one residency key, so only its own digest
+        // can yield a scope here. Same-hash files of other domains are other
+        // objects, not errors; a same-digest file at a non-canonical placement
+        // still fails the strict proof inside parse_scoped_path.
+        let own_digest = locator.residency_key_digest()?;
         let mut payloads: BTreeMap<String, WorkScopePath> = BTreeMap::new();
         let mut metadatas: BTreeMap<String, WorkScopePath> = BTreeMap::new();
         for path in self.platform_list(&prefix)? {
+            let identity = path.normalized_identity().to_owned();
+            if !identity.contains(&file_marker) {
+                continue;
+            }
+            if !identity.contains(own_digest.as_str()) {
+                // Same content hash, another residency domain: another object,
+                // not an error. Only our own digest admits the strict proof.
+                continue;
+            }
+            // Claims our scope: strict placement proof, so a transplanted
+            // same-digest file is a hard error, never a silent skip.
             let scope = parse_scoped_path(&path, locator, 'p')
                 .or_else(|_| parse_scoped_path(&path, locator, 'm'))
                 .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+            if scope.digest != own_digest {
+                return Err(BlobError::MetadataPayloadMismatch);
+            }
             let rebuilt_payload = scoped_payload_path(locator, &scope)?;
             let rebuilt_metadata = scoped_metadata_path(locator, &scope)?;
             if path.normalized_identity() == rebuilt_payload.normalized_identity() {
@@ -3235,14 +3245,17 @@ where
     ) -> Result<BlobReadyReceipt, BlobError> {
         let locator = BlobLocator {
             hash,
+            residency: request.residency.clone(),
             root_generation: request.root_lease.root_generation,
             path_generation: PATH_GENERATION,
         };
+        locator.validate()?;
         // One key observation per stage call. The residency scope — and with
-        // it the physical object identity — is derived from the
-        // caller-supplied policy plus this lineage. No default domain is ever
-        // invented; a rotated lineage simply addresses a different scope,
-        // while a converged operation below resolves to its committed scope.
+        // it the physical object identity — is the s-04-v2 contract key carried
+        // by the request. No default domain is ever invented; a rotated key
+        // lineage that disagrees with the residency encryption domain is
+        // rejected, while a converged operation below resolves to its committed
+        // scope.
         let key = self.keys_current().map_err(|error| match error {
             BlobError::ProviderUnavailable(_) | BlobError::NotFound => BlobError::KeyUnavailable {
                 operation: BlobKeyOperation::Stage,
@@ -3408,6 +3421,7 @@ where
 
         let sealed_sha256 = sha256_hex(&sealed);
         let format = BlobId::new(FORMAT_ID)?;
+        let residency_digest = locator.residency_key_digest()?;
         let receipt_binding_sha256 = eliot_blob_api::receipt_binding_sha256(
             &format,
             FORMAT_VERSION,
@@ -3438,11 +3452,12 @@ where
             sha256: receipt_binding_sha256.clone(),
             role: ReceiptKind::Artifact,
             source_revision: Some(format!(
-                "{};format-version:{};stored-length:{};sealed-sha256:{}",
+                "{};format-version:{};stored-length:{};sealed-sha256:{};residency:{}",
                 eliot_blob_api::CONTRACT_VERSION,
                 FORMAT_VERSION,
                 sealed.len(),
-                sealed_sha256
+                sealed_sha256,
+                residency_digest
             )),
         };
         let verified_receipt = self.issue_receipt(
@@ -3713,6 +3728,7 @@ where
         let content_idx = content_shard(&request.locator.hash);
         let _guard = self.lock_shards(&[content_idx])?;
         let (ready, bytes) = self.read_verified(request)?;
+        let read_residency_digest = request.locator.residency_key_digest()?;
         let artifact = ArtifactBinding {
             artifact_id: format!("blob-read-{}", request.locator.hash)
                 .parse()
@@ -3720,10 +3736,11 @@ where
             sha256: ready.plaintext_sha256().to_owned(),
             role: ReceiptKind::Artifact,
             source_revision: Some(format!(
-                "{};root-generation:{};path-generation:{}",
+                "{};root-generation:{};path-generation:{};residency:{}",
                 ready.metadata_sha256(),
                 ready.root_generation(),
-                ready.path_generation()
+                ready.path_generation(),
+                read_residency_digest
             )),
         };
         let verified_receipt = self.issue_receipt(
@@ -4553,6 +4570,7 @@ fn map_resolve_key_error(
 mod tests {
     use super::*;
     use eliot_blob_api::LiveSetCompleteness;
+    use eliot_blob_api::{ObjectResidencyKey, VersionedContentDigest};
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::pin::Pin;
@@ -5151,12 +5169,39 @@ mod tests {
         root: &str,
         policy_ref: &str,
     ) -> BlobStageRequest {
+        stage_request_with_scope(operation, bytes, root, policy_ref, "scope-test")
+    }
+
+    fn stage_request_with_scope(
+        operation: &str,
+        bytes: &[u8],
+        root: &str,
+        policy_ref: &str,
+        scope_domain: &str,
+    ) -> BlobStageRequest {
         let context: BlobReceiptContext = serde_json::from_str(&context_json(
             "REVERSIBLE_MUTATION",
             operation,
             &format!("request-{operation}"),
         ))
         .expect("context");
+        // s-04-v2: the request carries the full residency key whose content
+        // digest must equal BLAKE3(bytes). Test lineage matches TestKeys.
+        let digest = BlobHash::new(blake3::hash(bytes).to_hex().to_string()).expect("hash");
+        let residency = ObjectResidencyKey {
+            scope_domain_id: BlobId::new(scope_domain).expect("scope domain"),
+            access_domain_id: BlobId::new("access-test").expect("access domain"),
+            confidentiality_domain_id: BlobId::new("conf-test").expect("conf domain"),
+            encryption_key_domain_id: BlobId::new("test-lineage").expect("key domain"),
+            retention_domain_id: BlobId::new("retention-test").expect("retention domain"),
+            erasure_domain_id: BlobId::new("erasure-test").expect("erasure domain"),
+            content_digest: VersionedContentDigest {
+                algorithm: BlobId::new("blake3").expect("algorithm"),
+                version: 1,
+                digest,
+            },
+        };
+        residency.validate().expect("residency");
         BlobStageRequest {
             root_lease: lease_on(&context, root),
             context,
@@ -5168,6 +5213,7 @@ mod tests {
                 instruction_taint: eliot_security_contracts::InstructionTaint::DataOnly,
                 effect_ceiling: eliot_security_contracts::EffectCeiling::CandidateOnly,
             },
+            residency,
         }
     }
 
@@ -5938,27 +5984,47 @@ mod tests {
         let root = unique_test_root();
         let store = gc_store(TestGcMode::NotApplied, false, &root);
         let bytes = b"shared-bytes-across-domains";
-        let first =
-            block_on(store.stage(stage_request_with_policy("xdom-a", bytes, &root, "policy-a")))
-                .expect("domain a");
-        let second =
-            block_on(store.stage(stage_request_with_policy("xdom-b", bytes, &root, "policy-b")))
-                .expect("domain b");
-        assert_eq!(first.locator(), second.locator());
+        // s-04-v2: residency is caller-supplied contract identity. Same bytes
+        // under the same policy but different scope domains are different
+        // locators and different physical objects by construction.
+        let first = block_on(store.stage(stage_request_with_scope(
+            "xdom-a", bytes, &root, "policy-xdom", "scope-a",
+        )))
+        .expect("domain a");
+        let second = block_on(store.stage(stage_request_with_scope(
+            "xdom-b", bytes, &root, "policy-xdom", "scope-b",
+        )))
+        .expect("domain b");
+        assert_ne!(first.locator(), second.locator());
+        assert_ne!(
+            first.locator().residency_key_digest(),
+            second.locator().residency_key_digest()
+        );
         assert_ne!(first.metadata_sha256(), second.metadata_sha256());
-        // Two physical scopes at two placements — never one shared object.
-        let scopes = store
+        // One physical scope per locator at distinct placements — never one
+        // shared object.
+        for ready in [&first, &second] {
+            let scopes = store
+                .core
+                .enumerate_scopes(ready.locator())
+                .expect("enumerate scopes");
+            assert_eq!(scopes.len(), 1);
+        }
+        let scopes_a = store
             .core
             .enumerate_scopes(first.locator())
-            .expect("enumerate scopes");
-        assert_eq!(scopes.len(), 2);
+            .expect("enumerate a");
+        let scopes_b = store
+            .core
+            .enumerate_scopes(second.locator())
+            .expect("enumerate b");
         assert_ne!(
-            scopes[0].payload.normalized_identity(),
-            scopes[1].payload.normalized_identity()
+            scopes_a[0].payload.normalized_identity(),
+            scopes_b[0].payload.normalized_identity()
         );
         assert_ne!(
-            scopes[0].metadata.normalized_identity(),
-            scopes[1].metadata.normalized_identity()
+            scopes_a[0].metadata.normalized_identity(),
+            scopes_b[0].metadata.normalized_identity()
         );
         // Both domains read back their exact bytes under their own receipts.
         let chunk_a =
@@ -5967,14 +6033,15 @@ mod tests {
             block_on(store.read(read_request(&second, "xdom-read-b", &root))).expect("read b");
         assert_eq!(chunk_a.bytes(), bytes);
         assert_eq!(chunk_b.bytes(), bytes);
-        // GC collects both scopes independently through one locator.
+        // GC collects both scopes independently through both locators.
         let receipt = block_on(store.gc(gc_request(
             Vec::new(),
-            vec![first.locator().clone()],
+            vec![first.locator().clone(), second.locator().clone()],
             &root,
         )))
         .expect("gc both scopes");
         assert!(receipt.deleted().contains(first.locator()));
+        assert!(receipt.deleted().contains(second.locator()));
         assert!(matches!(
             block_on(store.read(read_request(&first, "xdom-read-a2", &root))),
             Err(BlobError::NotFound)
@@ -6027,6 +6094,19 @@ mod tests {
         // A locator with no stored scope reports missing without failing.
         let absent = BlobLocator {
             hash: BlobHash::new("b".repeat(64)).expect("hash"),
+            residency: ObjectResidencyKey {
+                scope_domain_id: BlobId::new("scope-absent").expect("scope domain"),
+                access_domain_id: BlobId::new("access-absent").expect("access domain"),
+                confidentiality_domain_id: BlobId::new("conf-absent").expect("conf domain"),
+                encryption_key_domain_id: BlobId::new("test-lineage").expect("key domain"),
+                retention_domain_id: BlobId::new("retention-absent").expect("retention domain"),
+                erasure_domain_id: BlobId::new("erasure-absent").expect("erasure domain"),
+                content_digest: VersionedContentDigest {
+                    algorithm: BlobId::new("blake3").expect("algorithm"),
+                    version: 1,
+                    digest: BlobHash::new("b".repeat(64)).expect("hash"),
+                },
+            },
             root_generation: 7,
             path_generation: 1,
         };
