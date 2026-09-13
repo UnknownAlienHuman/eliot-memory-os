@@ -1,5 +1,31 @@
 # `eliot-dreamer-accessibility` implementation contract
 
+<!-- eliot-doc-routing:start -->
+## Mandatory documentation routing
+
+Before changing code, configuration, tests, workflows, or normative prose, run
+from the repository root:
+
+```text
+python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+```
+
+Repeat `--path` for every mutable path family, or use `--changed-from
+origin/main` for the complete branch delta, including deletions. Open the
+verified bundle and read every required item before mutation. A route alone is
+navigation, not reading evidence.
+
+Record the route receipt ID, read receipt ID, matched routes, required handles,
+fragment paths and SHA-256 values, verified bundle SHA-256, and explicit reading
+attestation in the work unit or pull request. Optional fragments are loaded only
+when the current decision crosses their stated boundary. A legacy `ELIOT_*`
+compatibility map is never an acceptable read receipt.
+
+If no non-baseline route matches, a required item is stale or missing, or scope
+expands beyond the receipt, stop and rerun or repair the route; silence is not
+permission. See [`../../../docs/architecture/READING_PROTOCOL.md`](../../../docs/architecture/READING_PROTOCOL.md).
+<!-- eliot-doc-routing:end -->
+
 Owning issue: [#669 — A-29 accessibility or allowed-influence adjustment](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/669).
 
 Current state on `main@8ebf8b41847391c340393d56aeb14dd4f2b5e37b`: `Cargo.toml` declares `source_status = "NOT_IMPLEMENTED"`; `src/lib.rs` is a literal placeholder. `module.toml` is target metadata only.
@@ -9,7 +35,7 @@ Current state on `main@8ebf8b41847391c340393d56aeb14dd4f2b5e37b`: `Cargo.toml` d
 Read through `scripts/docs_read.py`, then directly:
 
 - [`A4.7 — Accessibility, Support, Influence, and Erasure`](../../../docs/architecture/A04-07-accessibility-support-influence-and-erasure.md#a47-accessibility-support-influence-and-erasure)
-- [`I9.6 — Candidate kinds`](../../../docs/architecture/I09-06-candidate-kinds.md#i96-candidate-kinds)
+- [`I9.6 — Curation candidate`](../../../docs/architecture/I09-06-curation-candidate.md#i96-curation-candidate)
 - [`I9.7 — Memory transformation validation`](../../../docs/architecture/I09-07-memory-transformation-validation.md#i97-memory-transformation-validation)
 - [`I12.19 — Negative memory`](../../../docs/architecture/I12-19-negative-memory.md#i1219-negative-memory)
 - [`I12.20 — Influence revocation`](../../../docs/architecture/I12-20-influence-revocation.md#i1220-influence-revocation)
