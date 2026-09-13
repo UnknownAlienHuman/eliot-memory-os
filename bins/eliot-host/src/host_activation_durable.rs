@@ -860,8 +860,9 @@ impl HostComposition {
                 config_file_digest: phase_b.config_file_digest.clone(),
                 eliotd_descriptor_digest: phase_b.eliotd_descriptor_digest.clone(),
                 semantic_config_hash: phase_b.semantic_config_hash.clone(),
-                host_epoch_lineage: phase_b.host_epoch.lineage.clone(),
-                host_epoch_sequence: phase_b.host_epoch.sequence,
+                host_epoch_lineage: PlatformHandle::new(phase_b.host_epoch.lineage_id.as_str())
+                    .map_err(|error| HostError::Platform(error.to_string()))?,
+                host_epoch_sequence: phase_b.host_epoch.sequence.get(),
                 host_process_nonce_digest: PlatformHandle::new(format!(
                     "{:x}",
                     Sha256::digest(phase_b.host_process_nonce.as_str().as_bytes())

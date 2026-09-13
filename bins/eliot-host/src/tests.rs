@@ -804,7 +804,7 @@ fn generic_reconcile_rejects_dead_store_without_durable_host_authority() -> Test
 fn scm_store_recovery_request_identity_is_stable_and_contour_bound() -> TestResult {
     let host = fresh_host_epoch(PlatformHandle::new("scm-store-recovery-identity")?, None)?;
     let activation_id = PlatformHandle::new("activation-id")?;
-    let activation_generation = super::root_epoch(PlatformHandle::new("activation")?);
+    let activation_generation = super::root_epoch(super::fresh_lineage_id()?);
     let generation = PlatformHandle::new("generation")?;
     let config = PlatformHandle::new("config")?;
     let first = host_owned_store_recovery_request(
@@ -833,7 +833,8 @@ fn scm_store_recovery_request_identity_is_stable_and_contour_bound() -> TestResu
     )?;
     assert_ne!(first.mutation_digest, changed_config.mutation_digest);
     let mut next_host = host.clone();
-    next_host.epoch = host.epoch.direct_child()?;
+    next_host.epoch = eliot_host_state::EpochTransition::direct_child(&host.epoch.current)
+        .map_err(|error| super::epoch_contract_error(&error))?;
     let changed_epoch = host_owned_store_recovery_request(
         &next_host,
         &activation_id,
@@ -1011,7 +1012,7 @@ fn store_recovery_reconciles_only_canonical_committed_inner_rebind() -> TestResu
 
     let host = super::fresh_host_epoch(PlatformHandle::new("inner-rebind-test")?, None)?;
     let activation_id = super::fresh_identity("inner-rebind-activation")?;
-    let activation_generation = super::root_epoch(super::fresh_identity("inner-rebind-lineage")?);
+    let activation_generation = super::root_epoch(super::fresh_lineage_id()?);
     let authority_epoch = AuthorityEpoch::new(7)?;
     let generation = ResourceGeneration::new(3)?;
     let requirement = HostStoreBootstrapRequirement {
@@ -1100,8 +1101,7 @@ fn store_recovery_changes_only_store_identity_kernel_fence_invariants_hold() -> 
         eliot_host_state::MemoryBackend::default(),
         host.clone(),
     )?;
-    let activation_generation =
-        super::root_epoch(super::fresh_identity("store-recovery-activation")?);
+    let activation_generation = super::root_epoch(super::fresh_lineage_id()?);
     let activation_id = super::fresh_identity("store-recovery-activation-id")?;
     super::append_reconciled(
         &journal,
@@ -1198,8 +1198,7 @@ fn store_recovery_same_host_response_loss_preserves_commit_and_idempotent_replay
         eliot_host_state::MemoryBackend::default(),
         host.clone(),
     )?;
-    let activation_generation =
-        super::root_epoch(super::fresh_identity("crash-reopen-activation")?);
+    let activation_generation = super::root_epoch(super::fresh_lineage_id()?);
     let activation_id = super::fresh_identity("crash-reopen-activation-id")?;
     super::append_reconciled(
         &journal,

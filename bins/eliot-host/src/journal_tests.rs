@@ -239,7 +239,7 @@ struct ReadinessFixture {
 )]
 fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
     let host = test_host();
-    let activation_generation = root_epoch(fresh_identity("readiness-activation-lineage")?);
+    let activation_generation = root_epoch(fresh_lineage_id()?);
     let activation_id = fresh_identity("readiness-activation")?;
     let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())?;
     append_reconciled(
@@ -259,7 +259,7 @@ fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
     let image = "C:\\eliot\\eliot-kernel.exe".to_owned();
     let candidate = HostKernelCandidateBinding {
         installation_id: host.installation.clone(),
-        host_epoch: AuthorityEpoch::new(host.epoch.current.sequence)?,
+        host_epoch: AuthorityEpoch::new(host.epoch.current.sequence.get())?,
         kernel_epoch: AuthorityEpoch::new(2)?,
         activation_id: activation_id.clone(),
         artifact_hash: kernel_artifact.clone(),
@@ -290,7 +290,7 @@ fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
         supervision_incarnation: test_supervision_incarnation(
             host.installation.as_str(),
             activation_id.as_str(),
-            host.epoch.current.lineage.as_str(),
+            host.epoch.current.lineage_id.as_str(),
             "readiness-kernel-lineage",
         ),
         restart_budget: RestartBudget::new(1, 1)?,
@@ -315,7 +315,7 @@ fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
         candidate.pipe_identity.clone(),
         durable_job,
         PriorKernelDisposition::NoPriorKernel,
-        root_epoch(fresh_identity("readiness-kernel-lineage")?),
+        root_epoch(fresh_lineage_id()?),
         ServiceProcessRecord {
             process_id: "pid:42:start:10".to_owned(),
             owner: "Kernel".to_owned(),
@@ -1140,8 +1140,11 @@ fn phase_b_live_epoch_and_manifest_digest_are_observed_not_synthesized() -> Test
     let host = test_host();
     let live = phase_b_live_installation_epoch(&host);
     assert_eq!(live.installation, host.installation);
-    assert_eq!(live.lineage_id, host.epoch.current.lineage);
-    assert_eq!(live.sequence, host.epoch.current.sequence);
+    assert_eq!(
+        live.lineage_id.as_str(),
+        host.epoch.current.lineage_id.as_str()
+    );
+    assert_eq!(live.sequence, host.epoch.current.sequence.get());
 
     let (manifest, root) = liveness_manifest_with_distinct_store_digests()?;
     let expected = manifest.compute_digest()?;
@@ -2166,7 +2169,11 @@ fn activation_reopen_starts_a_fresh_child_after_historical_active() -> TestResul
         reopened_host.epoch.parent,
         Some(last_host.epoch.current.clone())
     );
-    assert_eq!(reopened_generation, prior_generation.direct_child()?);
+    assert_eq!(
+        reopened_generation,
+        EpochTransition::direct_child(&prior_generation.current)
+            .map_err(|error| epoch_contract_error(&error))?
+    );
     let recovered = reopened.snapshot()?;
     assert!(recovered.activation.is_none());
     assert!(recovered.prior_kernel.is_some());
@@ -2381,16 +2388,20 @@ fn host_owner_epoch_digest_is_bound_to_exact_direct_child_sequence() -> TestResu
     let installation = handle("owner-digest-sequence-installation")?;
     let parent = fresh_host_epoch(installation, None)?;
     let child = child_host_epoch(&parent)?;
-    assert_eq!(parent.epoch.current.lineage, child.epoch.current.lineage);
-    assert_eq!(parent.epoch.current.sequence, 1);
-    assert_eq!(child.epoch.current.sequence, 2);
+    assert_eq!(
+        parent.epoch.current.lineage_id,
+        child.epoch.current.lineage_id
+    );
+    assert_eq!(parent.epoch.current.sequence.get(), 1);
+    assert_eq!(child.epoch.current.sequence.get(), 2);
     assert_ne!(
         host_owner_epoch_digest(&parent)?,
         host_owner_epoch_digest(&child)?,
         "owner proof must not collapse same-lineage parent and direct child"
     );
     let mut overflow = parent;
-    overflow.epoch.current.sequence = u64::MAX;
+    overflow.epoch.current.sequence =
+        std::num::NonZeroU64::new(u64::MAX).unwrap_or_else(|| unreachable!());
     assert!(
         child_host_epoch(&overflow).is_err(),
         "direct-child owner epoch minting must fail closed on sequence overflow"
@@ -2417,7 +2428,7 @@ fn host_composition_production_field_is_the_redb_journal_service() {
 #[test]
 fn open_activation_clean_stop_and_child_reopen_replay() -> TestResult {
     let host = test_host();
-    let generation = root_epoch(fresh_identity("test-activation-lineage")?);
+    let generation = root_epoch(fresh_lineage_id()?);
     let activation_id = fresh_identity("test-activation")?;
     let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())
         .unwrap_or_else(|_| unreachable!());
@@ -2437,7 +2448,8 @@ fn open_activation_clean_stop_and_child_reopen_replay() -> TestResult {
     let child = child_host_epoch(&host)?;
     let reopened = HostStateJournalService::from_backend(backend, child.clone())?;
     assert_eq!(reopened.snapshot()?.retained_epochs.len(), 1);
-    let child_generation = generation.direct_child()?;
+    let child_generation = EpochTransition::direct_child(&generation.current)
+        .map_err(|error| epoch_contract_error(&error))?;
     let child_activation = fresh_identity("test-child-activation")?;
     append_reconciled(
         &reopened,
@@ -2457,7 +2469,7 @@ fn open_activation_clean_stop_and_child_reopen_replay() -> TestResult {
 #[test]
 fn unknown_commit_is_reconciled_by_transaction_identity() -> TestResult {
     let host = test_host();
-    let generation = root_epoch(fresh_identity("unknown-lineage")?);
+    let generation = root_epoch(fresh_lineage_id()?);
     let activation_id = fresh_identity("unknown-activation")?;
     let journal = HostStateJournalService::from_backend(
         MemoryBackend::with_fault(FaultPoint::CommitAfterUnknown),
@@ -2480,7 +2492,7 @@ fn unknown_commit_is_reconciled_by_transaction_identity() -> TestResult {
 #[test]
 fn torn_current_epoch_fails_closed() -> TestResult {
     let host = test_host();
-    let generation = root_epoch(fresh_identity("torn-lineage")?);
+    let generation = root_epoch(fresh_lineage_id()?);
     let activation_id = fresh_identity("torn-activation")?;
     let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())?;
     append_reconciled(
@@ -2544,7 +2556,7 @@ fn activation_failure_nonce_discriminator_revokes_only_pre_active_issuance() {
 )]
 fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> TestResult {
     let host = test_host();
-    let activation_generation = root_epoch(fresh_identity("reconcile-activation-lineage")?);
+    let activation_generation = root_epoch(fresh_lineage_id()?);
     let activation_id = fresh_identity("reconcile-activation")?;
     let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())?;
     append_reconciled(
@@ -2562,7 +2574,7 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
     let kernel_image = "C:\\eliot\\eliot-kernel.exe".to_owned();
     let candidate = HostKernelCandidateBinding {
         installation_id: host.installation.clone(),
-        host_epoch: AuthorityEpoch::new(host.epoch.current.sequence)?,
+        host_epoch: AuthorityEpoch::new(host.epoch.current.sequence.get())?,
         kernel_epoch: AuthorityEpoch::new(2)?,
         activation_id: activation_id.clone(),
         artifact_hash: PlatformHandle::new("a".repeat(64))?,
@@ -2593,7 +2605,7 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
         supervision_incarnation: test_supervision_incarnation(
             host.installation.as_str(),
             activation_id.as_str(),
-            host.epoch.current.lineage.as_str(),
+            host.epoch.current.lineage_id.as_str(),
             "reconcile-kernel-lineage",
         ),
         restart_budget: RestartBudget::new(1, 1)?,
@@ -2609,7 +2621,7 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
         root_volume_serial_number: 1,
         root_file_index: 2,
     };
-    let kernel_generation = root_epoch(fresh_identity("reconcile-kernel-lineage")?);
+    let kernel_generation = root_epoch(fresh_lineage_id()?);
     let mut driver = DurableKernelActivationDriver::bind_candidate(
         &journal,
         &host,
@@ -2787,7 +2799,7 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
 #[test]
 fn store_rebind_disposition_uses_exact_operation_and_request_identity() -> TestResult {
     let host = test_host();
-    let activation_generation = root_epoch(fresh_identity("store-rebind-disposition")?);
+    let activation_generation = root_epoch(fresh_lineage_id()?);
     let activation_id = fresh_identity("store-rebind-disposition-activation")?;
     let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())?;
     append_reconciled(
@@ -3187,7 +3199,7 @@ fn store_recovery_committed_inner_crash_reopens_as_fenced_unknown_without_child_
         PlatformHandle::new("store-recovery-physical-installation")?,
         None,
     )?;
-    let activation_generation = root_epoch(fresh_identity("store-recovery-physical-generation")?);
+    let activation_generation = root_epoch(fresh_lineage_id()?);
     let activation_id = fresh_identity("store-recovery-physical-activation")?;
     let backend = RedbJournalBackend::open_unprotected_for_test(&journal_path)?;
     let journal = HostStateJournalService::from_backend(backend, host.clone())?;
@@ -3218,8 +3230,8 @@ fn store_recovery_committed_inner_crash_reopens_as_fenced_unknown_without_child_
         request_id: request.request_id.as_str().to_owned(),
         mutation_digest: request.mutation_digest.as_str().to_owned(),
         request_digest: request.request_digest.as_str().to_owned(),
-        host_epoch: host.epoch.current.sequence,
-        host_lineage: host.epoch.current.lineage.as_str().to_owned(),
+        host_epoch: host.epoch.current.sequence.get(),
+        host_lineage: host.epoch.current.lineage_id.as_str().to_owned(),
         process_id: 4_101,
         process_start_time_100ns: 41_010,
         process_image_path: r"C:\Eliot\store-old.exe".to_owned(),
@@ -3437,10 +3449,11 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
     manifest.validate()?;
 
     let handle = |value: String| PlatformHandle::new(value).unwrap_or_else(|_| unreachable!());
+    let prior_lineage = handle(first_host.epoch.current.lineage_id.as_str().to_owned());
     let mut prior = active_startup_prior_binding(
         &manifest,
-        &first_host.epoch.current.lineage,
-        first_host.epoch.current.sequence - 1,
+        &prior_lineage,
+        first_host.epoch.current.sequence.get() - 1,
     );
     prior.authority_descriptor_digest = handle("9".repeat(64));
     prior.store_bootstrap_descriptor_digest = handle("8".repeat(64));

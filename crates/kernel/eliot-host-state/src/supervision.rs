@@ -129,8 +129,8 @@ pub fn reconstruct_current_supervision_incarnation(
         scope_ref_digest: String::new(),
         installation_id: state.host.installation.as_str().to_owned(),
         host_epoch: SupervisionJournalEpoch {
-            lineage_id: state.host.epoch.current.lineage.as_str().to_owned(),
-            sequence: state.host.epoch.current.sequence,
+            lineage_id: state.host.epoch.current.lineage_id.as_str().to_owned(),
+            sequence: state.host.epoch.current.sequence.get(),
         },
         activation_id: activation.activation_id.as_str().to_owned(),
         activation_generation: SupervisionJournalEpoch {
@@ -138,23 +138,33 @@ pub fn reconstruct_current_supervision_incarnation(
                 .fence
                 .activation_generation
                 .current
-                .lineage
+                .lineage_id
                 .as_str()
                 .to_owned(),
-            sequence: activation.fence.activation_generation.current.sequence,
+            sequence: activation
+                .fence
+                .activation_generation
+                .current
+                .sequence
+                .get(),
         },
         kernel_generation: SupervisionJournalEpoch {
-            lineage_id: kernel.kernel_generation.current.lineage.as_str().to_owned(),
-            sequence: kernel.kernel_generation.current.sequence,
+            lineage_id: kernel
+                .kernel_generation
+                .current
+                .lineage_id
+                .as_str()
+                .to_owned(),
+            sequence: kernel.kernel_generation.current.sequence.get(),
         },
         watchdog_epoch: SupervisionJournalEpoch {
             lineage_id: activation
                 .lineage
                 .watchdog_epoch
-                .lineage
+                .lineage_id
                 .as_str()
                 .to_owned(),
-            sequence: activation.lineage.watchdog_epoch.sequence,
+            sequence: activation.lineage.watchdog_epoch.sequence.get(),
         },
         observation_scope: observation_scope.clone(),
         wake_policy: wake_policy.clone(),

@@ -86,7 +86,7 @@ pub(crate) fn append_authenticated_kernel_readiness<B: JournalBackend>(
     if active.state != KernelActivationState::Active
         || active.one_time_nonce.state() != NonceState::Consumed
         || candidate.installation_id != snapshot.host.installation
-        || candidate.host_epoch.value() != snapshot.host.epoch.current.sequence
+        || candidate.host_epoch.value() != snapshot.host.epoch.current.sequence.get()
         || active.activation_identity != candidate.activation_id
         || active.approved_artifact_hash != *approved_kernel_artifact
         || candidate.artifact_hash != *approved_kernel_artifact

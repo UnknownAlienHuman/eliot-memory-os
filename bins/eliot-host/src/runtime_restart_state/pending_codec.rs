@@ -65,8 +65,8 @@ pub(super) fn runtime_restart_pending_identity(
         request_id: request.request_id.as_str().to_owned(),
         mutation_digest: request.mutation_digest.as_str().to_owned(),
         request_digest: request.request_digest.as_str().to_owned(),
-        host_epoch: host.epoch.current.sequence,
-        host_lineage: host.epoch.current.lineage.as_str().to_owned(),
+        host_epoch: host.epoch.current.sequence.get(),
+        host_lineage: host.epoch.current.lineage_id.as_str().to_owned(),
     }
 }
 

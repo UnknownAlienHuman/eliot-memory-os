@@ -80,8 +80,8 @@ impl StoreRecoveryReopenFence {
         last_host: &HostInstallationEpoch,
         replayed: &HostState,
     ) -> Result<(), HostError> {
-        if self.host_epoch != last_host.epoch.current.sequence
-            || self.host_lineage != last_host.epoch.current.lineage.as_str()
+        if self.host_epoch != last_host.epoch.current.sequence.get()
+            || self.host_lineage != last_host.epoch.current.lineage_id.as_str()
             || replayed.host != *last_host
         {
             return Err(HostError::RecoveryRequired(

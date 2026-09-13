@@ -66,12 +66,12 @@ type Duration = std::time::Duration;
 #[cfg(windows)]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+use eliot_contracts::{AuthorityEpoch, EpochContractError, ResourceGeneration};
 #[cfg(windows)]
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_host_state::{
     ActivationState, AppendReceipt, DrainCommitRecord, DrainRecord, DrainState, EpochIdentity,
-    EpochTransition, HostInstallationEpoch, HostObservationRecord, HostState,
+    EpochLineageId, EpochTransition, HostInstallationEpoch, HostObservationRecord, HostState,
     HostStateJournalService, HostStateRecord, IdempotencyIdentity, JournalBackend, JournalError,
     KernelJobBinding, KernelRecord, NonceState, OneTimeNonceState, PriorKernelDisposition,
     ProductionHostStateJournal, ReconcileOutcome, RecordFence, RecoveryLineageEvidence,
@@ -863,7 +863,7 @@ impl HostJobBranches {
     pub fn new(host: &HostInstallationEpoch) -> Result<Self, WindowsAdapterError> {
         let suffix = format!(
             "{}-{}",
-            host.epoch.current.lineage.as_str(),
+            host.epoch.current.lineage_id.as_str(),
             host.epoch.current.sequence
         );
         let kernel_identity = JobObjectIdentity::new(format!("Local\\Eliot-Host-Kernel-{suffix}"))?;
@@ -933,7 +933,7 @@ impl HostJobBranches {
     pub fn new_fenced(host: &HostInstallationEpoch) -> Result<Self, WindowsAdapterError> {
         let suffix = format!(
             "{}-{}",
-            host.epoch.current.lineage.as_str(),
+            host.epoch.current.lineage_id.as_str(),
             host.epoch.current.sequence
         );
         Ok(Self {
@@ -1167,7 +1167,7 @@ impl HostJobBranches {
             .as_ref()
             .ok_or_else(|| HostError::ProcessContour("Kernel image is missing".to_owned()))?
             .clone();
-        let authority_epoch = AuthorityEpoch::new(host.epoch.current.sequence)
+        let authority_epoch = AuthorityEpoch::new(host.epoch.current.sequence.get())
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         // Kernel authenticates the connected Host peer against this exact
         // value, so it is read from the live current-process handle. A PID
@@ -1245,26 +1245,26 @@ impl HostJobBranches {
             scope_ref_digest: String::new(),
             installation_id: host.installation.as_str().to_owned(),
             host_epoch: SupervisionJournalEpoch {
-                lineage_id: host.epoch.current.lineage.as_str().to_owned(),
-                sequence: host.epoch.current.sequence,
+                lineage_id: host.epoch.current.lineage_id.as_str().to_owned(),
+                sequence: host.epoch.current.sequence.get(),
             },
             activation_id: activation_id.as_str().to_owned(),
             activation_generation: SupervisionJournalEpoch {
-                lineage_id: activation_generation.current.lineage.as_str().to_owned(),
-                sequence: activation_generation.current.sequence,
+                lineage_id: activation_generation.current.lineage_id.as_str().to_owned(),
+                sequence: activation_generation.current.sequence.get(),
             },
             kernel_generation: SupervisionJournalEpoch {
-                lineage_id: kernel_generation.current.lineage.as_str().to_owned(),
-                sequence: kernel_generation.current.sequence,
+                lineage_id: kernel_generation.current.lineage_id.as_str().to_owned(),
+                sequence: kernel_generation.current.sequence.get(),
             },
             watchdog_epoch: SupervisionJournalEpoch {
                 lineage_id: activation_record
                     .lineage
                     .watchdog_epoch
-                    .lineage
+                    .lineage_id
                     .as_str()
                     .to_owned(),
-                sequence: activation_record.lineage.watchdog_epoch.sequence,
+                sequence: activation_record.lineage.watchdog_epoch.sequence.get(),
             },
             observation_scope: approved_template.observation_scope.clone(),
             wake_policy: approved_template.wake_policy.clone(),
@@ -3187,6 +3187,23 @@ fn fresh_identity(prefix: &str) -> Result<PlatformHandle, HostError> {
         .map_err(|error| HostError::Platform(error.to_string()))
 }
 
+/// Mints a fresh canonical epoch lineage. Only this Host owner boundary (and
+/// explicit recovery callers) mints lineages; deserializers and reporters
+/// never do.
+fn fresh_lineage_id() -> Result<EpochLineageId, HostError> {
+    EpochLineageId::new(Uuid::new_v4().to_string())
+        .map_err(|error| HostError::Platform(error.to_string()))
+}
+
+/// Maps a canonical epoch-contract failure onto the Host journal taxonomy
+/// without inventing lineage or sequence authority.
+fn epoch_contract_error(error: &EpochContractError) -> JournalError {
+    match error {
+        EpochContractError::SequenceOverflow => JournalError::Sequence,
+        _ => JournalError::EpochLineageConflict,
+    }
+}
+
 #[cfg(windows)]
 mod watchdog_service_start;
 #[cfg(all(test, windows))]
@@ -3254,14 +3271,8 @@ fn phase_b_unknown_ref(
     .unwrap_or_else(|_| unreachable!())
 }
 
-fn root_epoch(lineage: PlatformHandle) -> EpochTransition {
-    EpochTransition {
-        current: EpochIdentity {
-            lineage,
-            sequence: 1,
-        },
-        parent: None,
-    }
+fn root_epoch(lineage_id: EpochLineageId) -> EpochTransition {
+    EpochTransition::genesis(lineage_id)
 }
 
 fn fresh_host_epoch(
@@ -3270,7 +3281,7 @@ fn fresh_host_epoch(
 ) -> Result<HostInstallationEpoch, HostError> {
     Ok(HostInstallationEpoch {
         installation,
-        epoch: root_epoch(fresh_identity("host-lineage")?),
+        epoch: root_epoch(fresh_lineage_id()?),
         nonce: fresh_identity("host-process-nonce")?,
         recovery,
     })
@@ -3279,7 +3290,8 @@ fn fresh_host_epoch(
 fn child_host_epoch(parent: &HostInstallationEpoch) -> Result<HostInstallationEpoch, HostError> {
     Ok(HostInstallationEpoch {
         installation: parent.installation.clone(),
-        epoch: parent.epoch.direct_child()?,
+        epoch: EpochTransition::direct_child(&parent.epoch.current)
+            .map_err(|error| epoch_contract_error(&error))?,
         nonce: fresh_identity("host-process-nonce")?,
         recovery: None,
     })
@@ -4672,7 +4684,7 @@ impl HostComposition {
             Err(HostError::Journal(JournalError::OutcomeUnknown { transaction_id })) => {
                 let query = KernelActivationQuery {
                     operation_id: PlatformHandle::new(
-                        kernel_generation.current.lineage.as_str().to_owned(),
+                        kernel_generation.current.lineage_id.as_str().to_owned(),
                     )
                     .map_err(|error| HostError::Platform(error.to_string()))?,
                     activate_request_digest: transaction_id.as_str().to_owned(),
@@ -4731,7 +4743,7 @@ impl HostComposition {
             Sha256::digest(
                 format!(
                     "{}:{}",
-                    old_generation.current.lineage.as_str(),
+                    old_generation.current.lineage_id.as_str(),
                     old_generation.current.sequence
                 )
                 .as_bytes()
@@ -4743,7 +4755,7 @@ impl HostComposition {
             Sha256::digest(
                 format!(
                     "{}:{}",
-                    kernel_generation.current.lineage.as_str(),
+                    kernel_generation.current.lineage_id.as_str(),
                     kernel_generation.current.sequence
                 )
                 .as_bytes()
@@ -6325,13 +6337,13 @@ fn lifecycle_context(
 ) -> Result<RequestMetadata, HostError> {
     let request_id = RequestId::new(format!(
         "host:{}:{}:{}:{}",
-        host.epoch.current.lineage,
+        host.epoch.current.lineage_id,
         host.epoch.current.sequence,
         operation,
         std::process::id()
     ))
     .map_err(|error| HostError::Platform(error.to_string()))?;
-    let authority_epoch = AuthorityEpoch::new(host.epoch.current.sequence)
+    let authority_epoch = AuthorityEpoch::new(host.epoch.current.sequence.get())
         .map_err(|error| HostError::Platform(error.to_string()))?;
     Ok(RequestMetadata {
         request_id,

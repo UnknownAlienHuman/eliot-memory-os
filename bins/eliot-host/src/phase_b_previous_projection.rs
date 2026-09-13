@@ -14,8 +14,9 @@ use super::{
 pub(super) fn phase_b_live_installation_epoch(host: &HostInstallationEpoch) -> InstallationEpoch {
     InstallationEpoch {
         installation: host.installation.clone(),
-        lineage_id: host.epoch.current.lineage.clone(),
-        sequence: host.epoch.current.sequence,
+        lineage_id: PlatformHandle::new(host.epoch.current.lineage_id.as_str())
+            .unwrap_or_else(|_| unreachable!()),
+        sequence: host.epoch.current.sequence.get(),
     }
 }
 
