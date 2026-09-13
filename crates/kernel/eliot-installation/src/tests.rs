@@ -2422,43 +2422,6 @@ fn pending_start_precondition(
 }
 
 #[cfg(windows)]
-fn start_absent(
-    transaction: &InstallationTransaction,
-    index: usize,
-    reason: &str,
-) -> InstallationEffectObservation {
-    InstallationEffectObservation::Absent {
-        observed_precondition: pending_start_precondition(transaction, index),
-        evidence: vec![test_handle(format!(
-            "{reason}:{}",
-            match &transaction.installer_effects[index] {
-                InstallerEffectPlan::StartService { service_name, .. } => service_name,
-                _ => unreachable!(),
-            }
-        ))],
-        service_runtime_lineage: None,
-    }
-}
-
-#[cfg(windows)]
-fn start_absent_with_lineage(
-    transaction: &InstallationTransaction,
-    index: usize,
-    reason: &str,
-    lineage: InstallationServiceProcessLineage,
-) -> InstallationEffectObservation {
-    let mut observation = start_absent(transaction, index, reason);
-    if let InstallationEffectObservation::Absent {
-        service_runtime_lineage,
-        ..
-    } = &mut observation
-    {
-        *service_runtime_lineage = Some(lineage);
-    }
-    observation
-}
-
-#[cfg(windows)]
 fn configure_start_runtime_receipt(port: &mut FakeEffectPort, external_identity: &str) {
     port.execute_outcomes
         .push_back(PortOutcome::Known(InstallationEffectExecution {
