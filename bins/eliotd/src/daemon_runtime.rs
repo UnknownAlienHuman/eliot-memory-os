@@ -17,6 +17,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_governor::KernelTransitionPort;
+use eliot_protocol::{
+    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
+    AgentActivationResolutionTicket, AgentActivationResultAckOutcome,
+    AgentActivationResultReconcile,
+};
 use eliotd::{
     DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus, PROTOCOL_VERSION,
     SERVICE_NAME,
@@ -206,17 +211,24 @@ async fn run_loop(
                     let now = unix_ms(SystemTime::now())?;
                     if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
                         // Kernel owns the typed expiry outcome.  Do not call
-                        // the resolver at or after its exact deadline.
+                        // the resolver at or after its exact deadline, and do
+                        // not submit or reconcile an expired ticket.
                         continue;
                     }
-                    if let Ok(decision) = composition.resolve_agent_activation(&ticket, now)
-                        && let Err(error) = kernel.submit_agent_activation_decision(&decision).await
-                    {
-                        // Kernel projects the expected deadline race as an
-                        // explicit known outcome. Any remaining transport
-                        // error is a real daemon-loop failure.
-                        return Err(format!("Kernel activation decision submit: {error}"));
-                    }
+                    // Single v2 resolution per newly admitted ticket.  The v2
+                    // resolver maps all seven Governor outcomes to typed
+                    // results; any Err is a real validation/readiness failure
+                    // and must fail closed rather than silently discarding a
+                    // disposition.
+                    let result = composition
+                        .resolve_agent_activation_v2(&ticket, now)
+                        .map_err(|error| {
+                            format!(
+                                "daemon activation resolve ticket {}: {error}",
+                                ticket.ticket_id
+                            )
+                        })?;
+                    dispatch_agent_activation_result(&kernel, &ticket, result).await?;
                 }
             }
             _ = cadence.health_heartbeat.tick() => {
@@ -225,6 +237,114 @@ async fn run_loop(
                     .map_err(|error| format!("Kernel health heartbeat: {error}"))?;
             }
         }
+    }
+}
+
+/// Submits one already-resolved v2 result through the existing authenticated
+/// transport. Every valid disposition is submitted; no disposition is coerced
+/// to success and none is silently discarded.
+///
+/// On a possible submission ambiguity (unknown outcome / reconnect) the exact
+/// retained ticket/result identity is reconciled before any second Governor
+/// read: the retained result is reused verbatim, never recomputed, and no
+/// local replay cache or timer is introduced. The typed acknowledgement
+/// creates no Session, authority, or Finish; only bounded ticket identity is
+/// carried in diagnostics.
+async fn dispatch_agent_activation_result(
+    kernel: &DaemonKernelClient,
+    ticket: &AgentActivationResolutionTicket,
+    result: AgentActivationResolutionResult,
+) -> Result<(), String> {
+    observe_transient_deferral(&result);
+    match kernel.submit_agent_activation_result(&result).await {
+        Ok(ack) => {
+            if ack.ticket_id != ticket.ticket_id
+                || ack.ticket_id != result.ticket_id
+                || ack.result_sha256 != result.result_sha256
+            {
+                return Err(format!(
+                    "Kernel activation result ack ticket {} binding mismatch",
+                    ticket.ticket_id
+                ));
+            }
+            match ack.outcome {
+                AgentActivationResultAckOutcome::Accepted
+                | AgentActivationResultAckOutcome::ExactReplay
+                | AgentActivationResultAckOutcome::Reconciled => Ok(()),
+                AgentActivationResultAckOutcome::Unknown => Err(format!(
+                    "Kernel activation result ack ticket {} unknown without retention",
+                    ticket.ticket_id
+                )),
+            }
+        }
+        Err(submit_error) => {
+            // The submit may have committed before the acknowledgement was
+            // lost. Retain the exact ticket/result identity and reconcile
+            // from Kernel retention before any second Governor read. Do not
+            // recompute a different result here.
+            let query = AgentActivationResultReconcile::new(
+                ticket.ticket_id.clone(),
+                result.result_sha256.clone(),
+            )
+            .map_err(|error| {
+                format!(
+                    "daemon activation reconcile ticket {} query: {error}",
+                    ticket.ticket_id
+                )
+            })?;
+            let ack = kernel
+                .reconcile_agent_activation_result(&query)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Kernel activation result reconcile ticket {}: {error}; submit: {submit_error}",
+                        ticket.ticket_id
+                    )
+                })?;
+            match ack.outcome {
+                AgentActivationResultAckOutcome::Accepted
+                | AgentActivationResultAckOutcome::ExactReplay
+                | AgentActivationResultAckOutcome::Reconciled => {
+                    if ack.ticket_id != ticket.ticket_id
+                        || ack.result_sha256 != result.result_sha256
+                    {
+                        return Err(format!(
+                            "Kernel activation result reconcile ticket {} binding mismatch",
+                            ticket.ticket_id
+                        ));
+                    }
+                    Ok(())
+                }
+                AgentActivationResultAckOutcome::Unknown => Err(format!(
+                    "Kernel activation result submit ticket {} failed without retention: {submit_error}",
+                    ticket.ticket_id
+                )),
+            }
+        }
+    }
+}
+
+/// Observes the transient `NotReady` deferral coupling without adding retry
+/// policy. Reconsideration requires the declared due time (`not_before`) plus
+/// fresh Governor evidence (changed named dependency revision); Kernel owns
+/// that gate (`bins/eliot-kernel/src/agent_bridge.rs::not_ready_supersede_allowed`,
+/// `bins/eliot-kernel/src/lib.rs::AgentActivationResultPhase::DeferredNotReady`).
+/// Claim-lease expiry alone never triggers a daemon retry, and this loop keeps
+/// no cache or timer for it: the next Kernel-issued claim drives any gated
+/// supersede, and a changed same-ticket result that misses the gate conflicts
+/// on the submit path.
+fn observe_transient_deferral(result: &AgentActivationResolutionResult) {
+    if result.is_transient_retry() {
+        let _ = transient_not_before(result);
+    }
+}
+
+fn transient_not_before(result: &AgentActivationResolutionResult) -> Option<u64> {
+    match &result.disposition {
+        AgentActivationResolutionDisposition::NotReady { retry, .. } => {
+            Some(retry.not_before_unix_ms)
+        }
+        _ => None,
     }
 }
 
