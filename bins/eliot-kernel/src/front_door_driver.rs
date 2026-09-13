@@ -370,21 +370,85 @@ async fn serve_agent_bridge_connection(
         kernel.revoke_agent_bridge(&connection_id);
         return Err(error);
     }
-    // Keep the Kernel-owned Session retained until the bridge disconnects or
-    // the owner explicitly revokes it. A successful response is not a
-    // disconnect boundary.
-    match receive_frame_or_shutdown(&mut front_door, limits, &mut shutdown).await {
-        Ok(None) => {
+    // The admitted bridge Session stays alive across host-request frames on
+    // this same transport: a successful activation response is not a
+    // disconnect boundary. The post-activation loop below serves every
+    // further frame through the closed Kernel gateway against the retained
+    // admitted Session.
+    Box::pin(serve_admitted_bridge_host_requests(
+        kernel,
+        front_door,
+        shutdown,
+        connection_id,
+    ))
+    .await
+}
+
+/// Serves host-request frames on one admitted bridge transport until detach.
+///
+/// Each frame is dispatched through the closed Kernel gateway
+/// ([`KernelComposition::dispatch_frame`]) against the retained admitted
+/// Session snapshot, so durable Session continuity comes from the
+/// Kernel-owned admission — never from process identity or caller-supplied
+/// bindings. Only typed host-request replies continue the loop. Orderly
+/// detach revokes and closes clean; an unknown operation returns its typed
+/// rejection before revocation; any other violation (unexpected
+/// process/daemon actions, failed dispatch, failed send) revokes and fences.
+/// Connections without a retained admitted Session — including typed
+/// activation denials — serve no further frames: their next frame fences
+/// exactly as before, and their disconnect still closes clean.
+#[cfg(windows)]
+async fn serve_admitted_bridge_host_requests(
+    kernel: Arc<KernelComposition>,
+    mut front_door: NamedPipeServer,
+    mut shutdown: watch::Receiver<bool>,
+    connection_id: String,
+) -> Result<(), TransportError> {
+    let limits = kernel.ipc_limits();
+    loop {
+        let received = match receive_frame_or_shutdown(&mut front_door, limits, &mut shutdown).await
+        {
+            Err(error) => {
+                kernel.revoke_agent_bridge(&connection_id);
+                return Err(error);
+            }
+            Ok(received) => received,
+        };
+        let Some(frame) = received else {
             kernel.revoke_agent_bridge(&connection_id);
-            Ok(())
-        }
-        Ok(Some(_)) => {
-            kernel.revoke_agent_bridge(&connection_id);
-            Err(TransportError::SessionFenced)
-        }
-        Err(error) => {
-            kernel.revoke_agent_bridge(&connection_id);
-            Err(error)
+            return Ok(());
+        };
+        let session = match kernel.host_request_bridge_session(&connection_id) {
+            Ok(session) => session,
+            Err(error) => {
+                kernel.revoke_agent_bridge(&connection_id);
+                return Err(error);
+            }
+        };
+        let action = match kernel.dispatch_frame(&session, &frame) {
+            Ok(action) => action,
+            Err(error) => {
+                kernel.revoke_agent_bridge(&connection_id);
+                return Err(error);
+            }
+        };
+        match action {
+            KernelFrameAction::Reply(reply) => {
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    kernel.revoke_agent_bridge(&connection_id);
+                    return Err(error);
+                }
+            }
+            KernelFrameAction::Fence(rejection) => {
+                let result = send_checked(&mut front_door, &rejection, limits).await;
+                kernel.revoke_agent_bridge(&connection_id);
+                result?;
+                return Ok(());
+            }
+            KernelFrameAction::Process { .. } | KernelFrameAction::Daemon { .. } => {
+                kernel.revoke_agent_bridge(&connection_id);
+                return Err(TransportError::SessionFenced);
+            }
         }
     }
 }

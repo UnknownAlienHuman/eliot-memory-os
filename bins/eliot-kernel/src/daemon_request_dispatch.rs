@@ -303,6 +303,44 @@ impl KernelComposition {
                     Err(TransportError::SessionFenced)
                 }
             }
+            #[cfg(windows)]
+            "agent_host_request_submit" => {
+                // Typed P-04 host-request envelopes through the same closed
+                // daemon dispatcher. The admit path owns every
+                // connection/descriptor/fence/generation/durability join; a
+                // changed binding under a known identity conflicts, an unknown
+                // parent is unknown, and an elapsed deadline times out there.
+                let envelope = host_request_route::host_request_envelope_from_payload(&payload)?;
+                let (receipt, record) = self.admit_host_request_envelope(&envelope)?;
+                Ok(host_request_route::host_request_admitted_response(
+                    &receipt, &record,
+                ))
+            }
+            #[cfg(windows)]
+            "agent_host_request_cancel" => {
+                let envelope = host_request_route::host_request_envelope_from_payload(&payload)?;
+                let (receipt, record) = self.cancel_host_request(&envelope)?;
+                Ok(host_request_route::host_request_admitted_response(
+                    &receipt, &record,
+                ))
+            }
+            #[cfg(windows)]
+            "agent_host_request_reconcile" => {
+                let envelope = host_request_route::host_request_envelope_from_payload(&payload)?;
+                let (receipt, record) = self.reconcile_host_request(&envelope)?;
+                Ok(host_request_route::host_request_admitted_response(
+                    &receipt, &record,
+                ))
+            }
+            #[cfg(windows)]
+            "agent_host_request_rehydrate" => {
+                let envelope = host_request_route::host_request_envelope_from_payload(&payload)?;
+                let receipt = host_request_route::host_request_receipt_from_payload(&payload)?;
+                let record = self.rehydrate_host_request(&envelope, &receipt)?;
+                Ok(host_request_route::host_request_rehydrated_response(
+                    &record,
+                ))
+            }
             _ => return Err(TransportError::SessionFenced),
         };
         let value = result.map_err(|_| TransportError::SessionFenced)?;

@@ -41,7 +41,10 @@
 //! ticket, parent, or operation is `UnknownRequest`; an elapsed absolute
 //! deadline is `Timeout`. No error prose drives routing.
 
-use super::{KernelComposition, TransportError, activation_deadline_expired, sha256_json, unix_ms};
+use super::{
+    Frame, FrameKind, KernelComposition, KernelFrameAction, MessageType, ProtocolPayload, Session,
+    TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
+};
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind as OrsHostRequestKind,
@@ -59,6 +62,32 @@ use eliot_protocol::{
 /// lowercase SHA-256 before any store lookup, so a malformed reference is an
 /// unknown operation rather than a fence failure.
 const HOST_REQUEST_OPERATION_ID_PREFIX: &str = "hostreq:";
+
+/// Typed frame operations carrying one [`HostRequestEnvelope`] through the
+/// closed frame gateway.
+///
+/// Names follow the `agent_activation_*` daemon-operation style. The payload
+/// carries the exact envelope under `envelope` (plus the exact admission
+/// receipt under `receipt` for rehydrate); the operation string only selects
+/// which closed entry — admit, cancel, reconcile, or rehydrate — consumes it.
+/// There is no generic JSON command dispatch: the envelope is decoded as the
+/// typed [`HostRequestEnvelope`] (with its canonical digest check) and the
+/// envelope kind is re-enforced by the callee.
+pub(crate) const AGENT_HOST_REQUEST_SUBMIT_OPERATION: &str = "agent_host_request_submit";
+pub(crate) const AGENT_HOST_REQUEST_CANCEL_OPERATION: &str = "agent_host_request_cancel";
+pub(crate) const AGENT_HOST_REQUEST_RECONCILE_OPERATION: &str = "agent_host_request_reconcile";
+pub(crate) const AGENT_HOST_REQUEST_REHYDRATE_OPERATION: &str = "agent_host_request_rehydrate";
+
+/// Returns whether the operation string selects the P-04 host-request route.
+pub(crate) fn is_host_request_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        AGENT_HOST_REQUEST_SUBMIT_OPERATION
+            | AGENT_HOST_REQUEST_CANCEL_OPERATION
+            | AGENT_HOST_REQUEST_RECONCILE_OPERATION
+            | AGENT_HOST_REQUEST_REHYDRATE_OPERATION
+    )
+}
 
 /// Connection-scoped reference to one staged host-request operation.
 ///
@@ -780,4 +809,197 @@ fn require_current_generation_parent(
         return Err(TransportError::SessionFenced);
     }
     Ok(())
+}
+
+impl KernelComposition {
+    /// Dispatches one typed host-request frame from the admitted bridge transport.
+    ///
+    /// The caller ([`crate::KernelComposition::dispatch_frame`]) has already
+    /// run the closed gateway gates (generation poison, session/frame
+    /// identity, daemon-session currency); those joins are re-checked here so
+    /// direct callers cannot bypass them. The envelope must ride the same
+    /// connection as the presenting admitted Session, and the frame
+    /// correlation identity must equal the envelope request identity,
+    /// mirroring the activation decode. Digest, descriptor, fence,
+    /// generation, deadline, and durability joins live in the admit path
+    /// ([`Self::admit_host_request_envelope`] and its kind-specific entries),
+    /// which remains the single owner of ORS staging and receipts. Unknown
+    /// operations and mismatched joins fence; nothing is ever retried blindly.
+    pub(crate) fn dispatch_host_request_frame(
+        &self,
+        session: &Session,
+        frame: &Frame,
+    ) -> Result<KernelFrameAction, TransportError> {
+        if !matches!(
+            self.service_state()
+                .map_err(|_| TransportError::SessionFenced)?,
+            KernelServiceState::Ready | KernelServiceState::Degraded
+        ) {
+            return Err(TransportError::SessionFenced);
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let request_id = frame
+            .request_id
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        let identity = frame
+            .request_identity
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        if !session
+            .module_generation
+            .state_fence
+            .is_compatible_with(&identity.request.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let payload = match &frame.payload {
+            ProtocolPayload::Json(payload) => payload.clone(),
+            _ => return Err(TransportError::SessionFenced),
+        };
+        let operation = payload
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        if !is_host_request_operation(operation) {
+            return Err(TransportError::SessionFenced);
+        }
+        let envelope = host_request_envelope_from_payload(&payload)?;
+        if envelope.connection_id != session.connection_id
+            || frame.connection_id != session.connection_id
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if frame.request_id.as_ref() != Some(&envelope.identity.request_id) {
+            return Err(TransportError::SessionFenced);
+        }
+        let value = match operation {
+            AGENT_HOST_REQUEST_SUBMIT_OPERATION => {
+                let (receipt, record) = self.admit_host_request_envelope(&envelope)?;
+                host_request_admitted_response(&receipt, &record)
+            }
+            AGENT_HOST_REQUEST_CANCEL_OPERATION => {
+                let (receipt, record) = self.cancel_host_request(&envelope)?;
+                host_request_admitted_response(&receipt, &record)
+            }
+            AGENT_HOST_REQUEST_RECONCILE_OPERATION => {
+                let (receipt, record) = self.reconcile_host_request(&envelope)?;
+                host_request_admitted_response(&receipt, &record)
+            }
+            AGENT_HOST_REQUEST_REHYDRATE_OPERATION => {
+                let receipt = host_request_receipt_from_payload(&payload)?;
+                let record = self.rehydrate_host_request(&envelope, &receipt)?;
+                host_request_rehydrated_response(&record)
+            }
+            _ => return Err(TransportError::SessionFenced),
+        };
+        let mut reply = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+        reply.request_id = Some(request_id);
+        reply
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(KernelFrameAction::Reply(reply))
+    }
+
+    /// Returns a snapshot of the retained admitted bridge transport Session.
+    ///
+    /// The front-door post-activation loop drives every host-request frame
+    /// through [`Self::dispatch_frame`] against this retained Session, so
+    /// durable Session continuity comes from the Kernel-owned admission —
+    /// never from process identity or caller-supplied bindings. Connections
+    /// without a completed activation and a retained Session (including typed
+    /// activation denials) fail closed here; the caller revokes them without
+    /// serving further frames.
+    pub fn host_request_bridge_session(
+        &self,
+        connection_id: &str,
+    ) -> Result<Session, TransportError> {
+        let connections = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let state = connections
+            .get(connection_id)
+            .ok_or(TransportError::SessionFenced)?;
+        if !state.activation_completed {
+            return Err(TransportError::SessionFenced);
+        }
+        state.session.clone().ok_or(TransportError::SessionFenced)
+    }
+}
+
+/// Decodes the exact typed envelope from a host-request frame payload.
+///
+/// The payload carries the closed operation string plus the full typed
+/// envelope; the envelope shape (including its canonical digest) is
+/// re-validated here, so this is typed dispatch, not generic JSON routing.
+pub(crate) fn host_request_envelope_from_payload(
+    payload: &serde_json::Value,
+) -> Result<HostRequestEnvelope, TransportError> {
+    let envelope_value = payload
+        .get("envelope")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let envelope: HostRequestEnvelope =
+        serde_json::from_value(envelope_value).map_err(|_| TransportError::SessionFenced)?;
+    envelope
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    Ok(envelope)
+}
+
+/// Decodes the exact typed admission receipt from a rehydrate payload.
+///
+/// The receipt is re-validated against the presenting envelope by
+/// [`KernelComposition::rehydrate_host_request`]; it is never authority here.
+pub(crate) fn host_request_receipt_from_payload(
+    payload: &serde_json::Value,
+) -> Result<HostRequestAdmissionReceipt, TransportError> {
+    let receipt_value = payload
+        .get("receipt")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let receipt: HostRequestAdmissionReceipt =
+        serde_json::from_value(receipt_value).map_err(|_| TransportError::SessionFenced)?;
+    receipt
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    Ok(receipt)
+}
+
+/// Typed acknowledgement for an admitted host-request envelope: the exact
+/// Kernel-issued admission receipt plus the durable ORS record staged before
+/// acknowledgement. The `known`/`accepted` shape reuses the daemon accepted
+/// response vocabulary; no new status string is introduced here.
+pub(crate) fn host_request_admitted_response(
+    receipt: &HostRequestAdmissionReceipt,
+    record: &HostRequestRecord,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "known",
+        "value": {
+            "accepted": true,
+            "operation_id": receipt.operation_id,
+            "receipt": receipt,
+            "record": record,
+        },
+        "recovery": null,
+    })
+}
+
+/// Typed answer for a rehydrated host request, served from the durable ORS
+/// record without advancing lifecycle state. No new receipt is issued.
+pub(crate) fn host_request_rehydrated_response(record: &HostRequestRecord) -> serde_json::Value {
+    serde_json::json!({
+        "status": "known",
+        "value": {
+            "accepted": true,
+            "operation_id": record.operation_id.as_str(),
+            "record": record,
+        },
+        "recovery": null,
+    })
 }
