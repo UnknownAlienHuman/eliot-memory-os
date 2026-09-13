@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 use blake3::Hash;
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{Assertability, EvidenceAxes, EvidenceStatus};
 use eliot_platform::ClockObservation;
 use schemars::JsonSchema;
@@ -36,7 +36,20 @@ pub use execution_evidence::{
 };
 
 /// Current provider-neutral process contract revision.
-pub const PROCESS_CONTRACT_SCHEMA_VERSION: &str = "eliot-process-contract-v3";
+///
+/// P-03 v4 seals the complete authority-bearing binding on the canonical
+/// `eliot_contracts::EpochId` (lineage, sequence) pair (T2.md:177-206).
+/// v4 is free: the reader proved zero `eliot-process-contract-v4` literals in
+/// code and #64 assigned no P-03 revision (its revision is foundation
+/// epoch-identity v1 / `1.0.0` in `epoch-id.contract.toml`). Migration is one
+/// active version: old v3 scalar records are read-only through #64's explicit
+/// migration/recovery rules (T2.md:203-205; `epoch-id.contract.toml:94-120`
+/// `LegacyScalarEpoch`/`LegacyEpochImport`); unproved lineage stays
+/// quarantined/unknown, old evidence is never discarded, and fresh authority is
+/// never issued from a scalar. `PROCESS_IMPLEMENTATION_ID` is unchanged and
+/// nested DTOs (e.g. `execution_evidence.rs:30` evidence-v2) keep their own
+/// revisions (T2.md:58).
+pub const PROCESS_CONTRACT_SCHEMA_VERSION: &str = "eliot-process-contract-v4";
 /// The sole admitted Windows semantic implementation identifier.
 pub const PROCESS_IMPLEMENTATION_ID: &str = "eliot.process.windows.v1";
 
@@ -168,27 +181,34 @@ impl Generation {
 }
 
 /// A state-fence snapshot. It is inert data and never grants dispatch authority.
+///
+/// `authority_epoch` is the canonical `eliot_contracts::EpochId`
+/// `(lineage_id, sequence)` pair. Old v3 scalar records are read-only through
+/// #64's explicit migration/recovery rules; unproved lineage stays
+/// quarantined/unknown and fresh authority is never issued from a scalar
+/// (T2.md:203-205; `epoch-id.contract.toml:94-120`). A v3 JSON object with a
+/// numeric `authority_epoch` fails to deserialize here by type change plus
+/// `deny_unknown_fields` (quarantine, not silent promotion); no lossy
+/// numeric-to-`EpochId` shim exists.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FencingToken {
-    authority_epoch: u64,
+    authority_epoch: EpochId,
     generation: Generation,
     nonce: String,
 }
 
 impl FencingToken {
     /// Creates inert fence data. A valid [`DispatchPermit`] must authenticate it.
+    ///
+    /// `authority_epoch` validity is enforced by the canonical `EpochId` type
+    /// itself (validated lineage plus non-zero sequence); no scalar zero-check
+    /// of our own exists here.
     pub fn new(
-        authority_epoch: u64,
+        authority_epoch: EpochId,
         generation: Generation,
         nonce: impl Into<String>,
     ) -> Result<Self, ContractError> {
-        if authority_epoch == 0 {
-            return Err(ContractError::InvalidValue {
-                field: "authority_epoch",
-                reason: "must be non-zero",
-            });
-        }
         Ok(Self {
             authority_epoch,
             generation,
@@ -196,9 +216,9 @@ impl FencingToken {
         })
     }
 
-    /// Returns the authority epoch.
-    pub const fn authority_epoch(&self) -> u64 {
-        self.authority_epoch
+    /// Returns the canonical authority epoch.
+    pub fn authority_epoch(&self) -> &EpochId {
+        &self.authority_epoch
     }
 
     /// Returns the generation covered by this fence.
@@ -599,24 +619,21 @@ pub struct ProcessExecutionAdmissionRequest {
 pub struct ProcessOwnerBinding {
     module_id: String,
     principal_digest: String,
-    authority_epoch: u64,
+    authority_epoch: EpochId,
     generation: Generation,
 }
 
 impl ProcessOwnerBinding {
     /// Creates a validated stable owner binding.
+    ///
+    /// `authority_epoch` validity is enforced by the canonical `EpochId` type
+    /// itself; no scalar zero-check of our own exists here.
     pub fn new(
         module_id: impl Into<String>,
         principal_digest: impl Into<String>,
-        authority_epoch: u64,
+        authority_epoch: EpochId,
         generation: Generation,
     ) -> Result<Self, ContractError> {
-        if authority_epoch == 0 {
-            return Err(ContractError::InvalidValue {
-                field: "owner_authority_epoch",
-                reason: "authority epoch must be non-zero",
-            });
-        }
         let binding = Self {
             module_id: validate_opaque_id("owner_module_id", module_id.into())?,
             principal_digest: principal_digest.into(),
@@ -635,9 +652,9 @@ impl ProcessOwnerBinding {
     pub fn principal_digest(&self) -> &str {
         &self.principal_digest
     }
-    /// Returns the bound authority epoch.
-    pub const fn authority_epoch(&self) -> u64 {
-        self.authority_epoch
+    /// Returns the bound canonical authority epoch.
+    pub fn authority_epoch(&self) -> &EpochId {
+        &self.authority_epoch
     }
     /// Returns the bound generation.
     pub const fn generation(&self) -> Generation {
@@ -984,7 +1001,7 @@ pub type ProcessSpec = ProcessRequest;
 pub struct DispatchValidationContext {
     clock: ClockObservation,
     state_fence: FencingToken,
-    authority_epoch: u64,
+    authority_epoch: EpochId,
     revision_heads: BTreeMap<String, String>,
     validation_revision: u64,
 }
@@ -994,7 +1011,7 @@ impl DispatchValidationContext {
     pub fn new(
         clock: ClockObservation,
         state_fence: FencingToken,
-        authority_epoch: u64,
+        authority_epoch: EpochId,
         revision_heads: BTreeMap<String, String>,
         validation_revision: u64,
     ) -> Result<Self, ContractError> {
@@ -1017,12 +1034,16 @@ impl DispatchValidationContext {
                 reason: "P-01 clock observation is invalid",
             })?;
         let _ = self.now_unix_ms()?;
-        if self.authority_epoch == 0 || self.validation_revision == 0 {
+        // `authority_epoch` validity is enforced by the canonical `EpochId`
+        // type itself; only the scalar validation revision needs a zero-check.
+        if self.validation_revision == 0 {
             return Err(ContractError::InvalidValue {
                 field: "validation_context",
-                reason: "authority epoch and validation revision must be non-zero",
+                reason: "validation revision must be non-zero",
             });
         }
+        // Full-pair `EpochId` equality: equal sequences from different
+        // lineages are unrelated and never match here.
         if self.state_fence.authority_epoch != self.authority_epoch {
             return Err(ContractError::FenceMismatch);
         }
@@ -1056,7 +1077,7 @@ pub struct ProcessExecutionBinding {
     generation: Generation,
     action_lease_ref: ActionLeaseRef,
     authority_id: DispatchAuthorityId,
-    authority_epoch: u64,
+    authority_epoch: EpochId,
     state_fence: FencingToken,
     request_digest: String,
     permit_digest: String,
@@ -1073,15 +1094,19 @@ impl ProcessExecutionBinding {
         self.session_id.validate()?;
         self.action_lease_ref.validate()?;
         self.authority_id.validate()?;
-        if self.authority_epoch == 0 || self.validation_revision == 0 {
+        // `authority_epoch` validity is enforced by the canonical `EpochId`
+        // type itself; only the scalar validation revision needs a zero-check.
+        if self.validation_revision == 0 {
             return Err(ContractError::InvalidValue {
                 field: "process_execution_binding",
-                reason: "authority epoch and validation revision must be non-zero",
+                reason: "validation revision must be non-zero",
             });
         }
         validate_hex_digest("request_digest", &self.request_digest)?;
         validate_hex_digest("permit_digest", &self.permit_digest)?;
         validate_hex_digest("effect_digest", &self.effect_digest)?;
+        // Full-pair `EpochId` equality on (lineage, sequence); never sequence
+        // alone.
         if self.state_fence.authority_epoch != self.authority_epoch
             || self.state_fence.generation != self.generation
         {
@@ -2456,10 +2481,27 @@ impl fmt::Display for Generation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_contracts::EpochLineageId;
     use eliot_instrument_api::{Accessibility, Influence, PhysicalState, TaintState};
     use std::error::Error;
+    use std::num::NonZeroU64;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+    const TEST_LINEAGE_A: &str = "11111111-1111-4111-8111-111111111111";
+    const TEST_LINEAGE_B: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    fn test_epoch_a(sequence: u64) -> EpochId {
+        test_epoch(TEST_LINEAGE_A, sequence)
+    }
 
     fn revisions() -> BTreeMap<String, String> {
         BTreeMap::from([
@@ -2490,7 +2532,7 @@ mod tests {
     }
 
     fn fence() -> Result<FencingToken, ContractError> {
-        FencingToken::new(7, Generation::new(1)?, "fence-7-1")
+        FencingToken::new(test_epoch_a(7), Generation::new(1)?, "fence-7-1")
     }
 
     fn authority() -> Result<DispatchPermitAuthority, ContractError> {
@@ -2520,7 +2562,7 @@ mod tests {
                 monotonic_ns: Some(1),
             },
             fence()?,
-            7,
+            test_epoch_a(7),
             revisions(),
             41,
         )
@@ -2601,7 +2643,7 @@ mod tests {
 
     #[test]
     fn cross_process_admission_rejects_stale_generation_fence() -> TestResult {
-        let stale = FencingToken::new(7, Generation::new(2)?, "fence-7-2")?;
+        let stale = FencingToken::new(test_epoch_a(7), Generation::new(2)?, "fence-7-2")?;
         let Err(error) = ProcessExecutionAdmissionRequest::new(
             "eliotd",
             intent()?,
@@ -2781,7 +2823,7 @@ mod tests {
             )?,
         )?;
         let request = ProcessRequest::new(intent.clone(), permit)?;
-        let changed_fence = FencingToken::new(8, Generation::new(1)?, "other-fence")?;
+        let changed_fence = FencingToken::new(test_epoch_a(8), Generation::new(1)?, "other-fence")?;
         let changed_context = DispatchValidationContext::new(
             ClockObservation {
                 valid_time_ms: Some(150),
@@ -2790,7 +2832,7 @@ mod tests {
                 monotonic_ns: Some(1),
             },
             changed_fence,
-            8,
+            test_epoch_a(8),
             revisions(),
             41,
         )?;
@@ -3130,6 +3172,111 @@ mod tests {
             authority.issue(&intent, issuance("duplicate")?),
             Err(ContractError::DuplicateValue { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn fencing_token_carries_full_epoch_lineage() -> TestResult {
+        let left = FencingToken::new(
+            test_epoch(TEST_LINEAGE_A, 7),
+            Generation::new(1)?,
+            "same-nonce",
+        )?;
+        let right = FencingToken::new(
+            test_epoch(TEST_LINEAGE_B, 7),
+            Generation::new(1)?,
+            "same-nonce",
+        )?;
+        assert_ne!(left, right);
+        assert!(!left.matches(&right));
+        assert_eq!(left.authority_epoch(), &test_epoch(TEST_LINEAGE_A, 7));
+        assert_eq!(right.authority_epoch(), &test_epoch(TEST_LINEAGE_B, 7));
+        let owner_left = ProcessOwnerBinding::new(
+            "mod-1",
+            "a".repeat(64),
+            test_epoch(TEST_LINEAGE_A, 7),
+            Generation::new(1)?,
+        )?;
+        let owner_right = ProcessOwnerBinding::new(
+            "mod-1",
+            "a".repeat(64),
+            test_epoch(TEST_LINEAGE_B, 7),
+            Generation::new(1)?,
+        )?;
+        assert_ne!(owner_left, owner_right);
+        assert_ne!(owner_left.authority_epoch(), owner_right.authority_epoch());
+        Ok(())
+    }
+
+    #[test]
+    fn v4_schema_gate_rejects_v3_stamped_request() -> TestResult {
+        let mut authority = authority()?;
+        let intent = intent()?;
+        let permit = authority.issue(&intent, issuance("v4-gate")?)?;
+        let mut request = ProcessRequest::new(intent, permit)?;
+        request.schema_version = "eliot-process-contract-v3".to_owned();
+        match request.validate() {
+            Err(ContractError::SchemaVersion { expected, observed }) => {
+                assert_eq!(expected, PROCESS_CONTRACT_SCHEMA_VERSION);
+                assert_eq!(observed, "eliot-process-contract-v3");
+            }
+            other => {
+                return Err(format!("v3-stamped request must fail closed, got {other:?}").into());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stale_authority_epoch_rejected_before_consumption() -> TestResult {
+        let mut authority = authority()?;
+        let intent = intent()?;
+        let permit = authority.issue(&intent, issuance("stale-epoch-lineage")?)?;
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        // Same sequence, different lineage: unrelated authority, never newer.
+        let foreign_fence = FencingToken::new(
+            test_epoch(TEST_LINEAGE_B, 7),
+            Generation::new(1)?,
+            "fence-7-1",
+        )?;
+        let foreign_context = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            foreign_fence,
+            test_epoch(TEST_LINEAGE_B, 7),
+            revisions(),
+            41,
+        )?;
+        let result = authority.validate_and_consume(request, observed(&intent)?, &foreign_context);
+        assert!(matches!(
+            result,
+            Err(ContractError::StaleStateFence | ContractError::StaleAuthorityEpoch)
+        ));
+        assert_eq!(authority.consumed_permit_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn v3_numeric_epoch_json_fails_to_deserialize_as_v4_fencing_token() -> TestResult {
+        let v3_wire = serde_json::json!({
+            "authority_epoch": 7,
+            "generation": 1,
+            "nonce": "fence-7-1",
+        });
+        assert!(serde_json::from_value::<FencingToken>(v3_wire).is_err());
+        let fenced = fence()?;
+        let wire = serde_json::to_value(&fenced)?;
+        assert!(
+            wire.get("authority_epoch")
+                .and_then(|epoch| epoch.get("lineage_id"))
+                .is_some()
+        );
+        let restored: FencingToken = serde_json::from_value(wire)?;
+        assert_eq!(restored, fenced);
         Ok(())
     }
 }

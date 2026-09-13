@@ -346,7 +346,14 @@ impl DispatchPermitAuthority {
         if !permit.state_fence.matches(&current.state_fence) {
             return Err(ContractError::StaleStateFence);
         }
-        if permit.state_fence.authority_epoch != current.authority_epoch {
+        // Full-pair (lineage_id, sequence) authority match via the canonical
+        // type; equal sequences from different lineages are unrelated and never
+        // authorize here.
+        if !permit
+            .state_fence
+            .authority_epoch
+            .is_same_authority(&current.authority_epoch)
+        {
             return Err(ContractError::StaleAuthorityEpoch);
         }
         if permit.expected_revision_heads != current.revision_heads {
@@ -381,7 +388,7 @@ impl DispatchPermitAuthority {
             generation: request.intent.generation,
             action_lease_ref: permit.action_lease_ref.clone(),
             authority_id: permit.authority_id.clone(),
-            authority_epoch: permit.state_fence.authority_epoch,
+            authority_epoch: permit.state_fence.authority_epoch.clone(),
             state_fence: permit.state_fence.clone(),
             request_digest: request.invocation_digest.clone(),
             permit_digest: permit.permit_digest.clone(),
@@ -425,9 +432,13 @@ impl DispatchPermitAuthority {
     ) -> Result<RecoveryCapability, ContractError> {
         current.validate()?;
         binding.validate()?;
+        // Full-pair (lineage_id, sequence) equality on the canonical EpochId;
+        // never sequence alone.
         if binding.authority_id != self.authority_id
             || binding.state_fence != current.state_fence
-            || binding.authority_epoch != current.authority_epoch
+            || !binding
+                .authority_epoch
+                .is_same_authority(&current.authority_epoch)
         {
             return Err(ContractError::RecoveryCapabilityMismatch);
         }
