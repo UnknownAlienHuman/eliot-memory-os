@@ -78,7 +78,42 @@ $allGates = @(
     # locked dependency resolution is still enforced by the --locked cargo
     # check/clippy/test gates plus the dependency-policy offline-source gate.
     [pscustomobject]@{ Name = 'cargo-metadata'; Profiles = @('Quick', 'Review'); Command = { $script:verifyMetadataJson = (cargo metadata --locked --no-deps --format-version 1 | Out-String) } },
-    [pscustomobject]@{ Name = 'cargo-fmt'; Profiles = @('Quick', 'Review'); Command = { cargo fmt --all -- --check } },
+    # To prevent Windows command-line limit failures (os error 206) when
+    # cargo fmt passes all workspace files to rustfmt on deep worktree paths,
+    # workspace packages are formatted in bounded batches with -p.
+    [pscustomobject]@{
+        Name = 'cargo-fmt'
+        Profiles = @('Quick', 'Review')
+        Command = {
+            if ([string]::IsNullOrWhiteSpace($script:verifyMetadataJson)) {
+                $script:verifyMetadataJson = (cargo metadata --locked --no-deps --format-version 1 | Out-String)
+            }
+            $metadata = $script:verifyMetadataJson | ConvertFrom-Json
+            $packages = @($metadata.packages | ForEach-Object { $_.name })
+            if ($packages.Count -eq 0) {
+                cargo fmt --check
+                return
+            }
+            $batchSize = 16
+            $fmtExit = 0
+            for ($i = 0; $i -lt $packages.Count; $i += $batchSize) {
+                $end = [Math]::Min($i + $batchSize - 1, $packages.Count - 1)
+                $batch = @($packages[$i..$end])
+                $pkgArgs = @()
+                foreach ($p in $batch) {
+                    $pkgArgs += '-p'
+                    $pkgArgs += $p
+                }
+                cargo fmt --check @pkgArgs
+                if ($LASTEXITCODE -ne 0) {
+                    $fmtExit = $LASTEXITCODE
+                }
+            }
+            if ($fmtExit -ne 0) {
+                $global:LASTEXITCODE = $fmtExit
+            }
+        }
+    },
     [pscustomobject]@{ Name = 'cargo-check-workspace'; Profiles = @('Quick', 'Review'); Command = { cargo check --locked --workspace --all-targets } },
     [pscustomobject]@{ Name = 'cargo-clippy-workspace'; Profiles = @('Review'); Command = { cargo clippy --locked --workspace --all-targets -- -D warnings } },
     [pscustomobject]@{ Name = 'cargo-test-workspace'; Profiles = @('Review'); Command = { cargo test --locked --workspace } },
