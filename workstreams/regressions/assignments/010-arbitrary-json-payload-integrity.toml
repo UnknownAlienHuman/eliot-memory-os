@@ -30,14 +30,14 @@ primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues
 
 [documentation]
 implementation = [
-  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-01-store-boundary.md#i51-store-boundary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-01-storage-boundary.md#i51-storage-boundary",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-20-read-model-consistency-and-cache.md#i520-read-model-consistency-and-cache",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-identity-and-effect-identity",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-02-frame.md#i72-frame",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-21-unknown-commit-recovery.md#i1421-unknown-commit-recovery",
-  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-01-input-validation-and-trust-boundaries.md#i151-input-validation-and-trust-boundaries",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-01-threat-model.md#i151-threat-model",
 ]
 anchors = ["ARCH-SEC-02", "ARCH-ORD-01", "ARCH-OBS-01", "ARCH-RES-03", "ARCH-RES-04"]
 
