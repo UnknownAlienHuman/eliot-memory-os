@@ -6626,9 +6626,14 @@ fn current_state_memory_free_control_excludes_all_memory_content() -> TestResult
 fn recall_l0_mcp_matches_cli() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = seed_with_writer_smoke()?;
+    let mut client = McpClient::start()?;
+    let config_path = test_config_path();
+    let config_str = config_path.to_string_lossy().into_owned();
     let cli_args = [
         "memory",
         "recall-l0",
+        "--config",
+        config_str.as_str(),
         "--project",
         &project_id,
         "--query",
@@ -6652,7 +6657,6 @@ fn recall_l0_mcp_matches_cli() -> TestResult {
         thread::sleep(Duration::from_millis(250));
         cli = run_json(&cli_args)?;
     }
-    let mut client = McpClient::start()?;
     let mcp = client.tool_call(
         2,
         "eliot_recall_l0",
