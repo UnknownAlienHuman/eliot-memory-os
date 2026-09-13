@@ -1780,6 +1780,7 @@ name = "eliot-process-executor"
 version = "0.1.0"
 dependencies = [
  "eliot-instrument-api",
+ "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
  "sha2 0.10.9",
