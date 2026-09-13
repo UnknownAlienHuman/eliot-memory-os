@@ -13,16 +13,16 @@ normative_pair_ref = "docs/normative-pair.toml"
 
 [documentation]
 architecture = [
-  "docs/architecture/A05-05-verification-and-evidence.md#a55-verification-and-evidence",
-  "docs/architecture/A10-08-instrument-plane.md#a108-instrument-plane",
+  "docs/architecture/A05-05-verifier-and-evaluation-contract.md#a55-verifier-and-evaluation-contract",
+  "docs/architecture/A10-08-verification-and-finish.md#a108-verification-and-finish",
   "docs/architecture/A13-05-bounded-resources-and-control-reserve.md#a135-bounded-resources-and-control-reserve",
 ]
 implementation = [
   "docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
   "docs/architecture/I02-22-parallel-build-cache-artifact-and-environment-lanes.md#i222-parallel-build-cache-artifact-and-environment-lanes",
-  "docs/architecture/I10-01-instrument-plane.md#i101-instrument-plane",
-  "docs/architecture/I10-02-typed-instrument-profiles.md#i102-typed-instrument-profiles",
-  "docs/architecture/I10-03-instrument-execution-and-evidence.md#i103-instrument-execution-and-evidence",
+  "docs/architecture/I10-08-instrument-plane-canonical-verification-and-code-intelligence.md#i108-instrument-plane-canonical-verification-and-code-intelligence",
+  "docs/architecture/I10-08-07-ip4-instrument-profiles.md#i1087-ip4--instrument-profiles",
+  "docs/architecture/I10-08-05-ip3-streaming-evidence-and-normalization.md#i1085-ip3--streaming-evidence-and-normalization",
   "docs/architecture/I16-17-instrument-plane-observability.md#i1617-instrument-plane-observability",
   "docs/architecture/I18-04-test-tiers.md#i184-test-tiers",
   "docs/architecture/I18-32-stateful-test-environments.md#i1832-stateful-test-environments",
