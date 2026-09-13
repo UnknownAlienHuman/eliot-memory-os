@@ -624,6 +624,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-agent-contracts",
  "eliot-contracts",
+ "eliot-receipts",
  "schemars",
  "serde",
  "serde_json",
