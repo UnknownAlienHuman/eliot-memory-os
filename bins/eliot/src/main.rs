@@ -12,8 +12,8 @@ use eliot_installation::{
     InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
     InstallationTransactionStore, PlatformHandle, RedbInstallationRegistry,
     RedbInstallationTransactionStore, WindowsInstallationCoordinator,
-    parse_installation_transaction_id, require_published_source_bundle_journal,
-    validate_installation_transaction_json,
+    parse_installation_transaction_id, registry_projection_pending_ref,
+    require_published_source_bundle_journal, validate_installation_transaction_json,
 };
 use eliot_live_canary::{
     CANARY_COMPLETION_SCHEMA, CanaryConfig, CanaryError, ProductionCanary,
@@ -2151,6 +2151,15 @@ fn run_installation_effect(
                 let registry = match RedbInstallationRegistry::open_at(host_root) {
                     Ok(registry) => registry,
                     Err(error) => {
+                        // E4: persist a durable typed rejection so a later
+                        // recover/rollback reaches RolledBack and removes exactly
+                        // the CreatedByTransaction service registrations.
+                        if let Ok(pending_ref) =
+                            registry_projection_pending_ref(&transaction_id)
+                        {
+                            let _ = coordinator
+                                .persist_non_effect_rejection(&transaction_id, pending_ref);
+                        }
                         write_installation_error(
                             "INSTALLATION_APPLY_ERROR",
                             &format!("pending registry could not be opened: {error}"),
@@ -2161,6 +2170,14 @@ fn run_installation_effect(
                 let expected_revision = match registry.load() {
                     Ok(registry) => registry.revision(),
                     Err(error) => {
+                        // E5: same durable rejection as E4 (registry unreadable
+                        // after open is UNKNOWN_OUTCOME/ROLLBACK_REQUIRED).
+                        if let Ok(pending_ref) =
+                            registry_projection_pending_ref(&transaction_id)
+                        {
+                            let _ = coordinator
+                                .persist_non_effect_rejection(&transaction_id, pending_ref);
+                        }
                         write_installation_error(
                             "INSTALLATION_APPLY_ERROR",
                             &format!("pending registry preflight failed: {error}"),
@@ -2173,6 +2190,26 @@ fn run_installation_effect(
                     &transaction_id,
                     expected_revision,
                 ) {
+                    // E6: reload first. If an activation projection intent is now
+                    // present (Activating) do NOT persist — mark_unknown is
+                    // refused in Activating — and resume via the existing
+                    // Activating reconcile / terminal query path. Only persist
+                    // while still Registering (CAS never happened).
+                    let still_registering = match coordinator.store().load(&transaction_id) {
+                        Ok(Some(current)) => {
+                            current.stage() == InstallationStage::Registering
+                                && !current.has_activation_projection_intent()
+                        }
+                        Ok(None) | Err(_) => false,
+                    };
+                    if still_registering {
+                        if let Ok(pending_ref) =
+                            registry_projection_pending_ref(&transaction_id)
+                        {
+                            let _ = coordinator
+                                .persist_non_effect_rejection(&transaction_id, pending_ref);
+                        }
+                    }
                     write_installation_error(
                         "INSTALLATION_APPLY_ERROR",
                         &format!("pending registry projection failed: {error}"),

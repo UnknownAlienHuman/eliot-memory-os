@@ -8721,6 +8721,93 @@ fn rollback_registering_with_durable_pending_evidence_succeeds() {
     );
 }
 
+#[test]
+fn rollback_registering_with_cli_persisted_registry_rejection_succeeds() {
+    // Post-bootstrap shape: Registering, one Applied CreatedByTransaction
+    // effect, empty unknowns, empty pending (the E4/E5 pre-fix shape that
+    // recover rejects with IllegalTransition). The CLI-persisted typed
+    // rejection must make recover/rollback reach RolledBack.
+    let mut transaction = planned_transaction();
+    transaction.effect_progress[0].admitted_precondition =
+        Some(admitted_precondition(&transaction));
+    transaction.effect_progress[0].ownership_secret = Some(test_ownership_secret(
+        InstallationCreateDisposition::Created,
+        InstallationSecretLifecycle::Active,
+    ));
+    transaction.effect_progress[0].state = InstallationEffectProgressState::Applied {
+        disposition: InstallationEffectDisposition::CreatedByTransaction,
+        external_identity: test_handle("external:effect-0"),
+        evidence: vec![test_handle("evidence:recover-registering")],
+        postcondition_digest: test_handle("a".repeat(64)),
+    };
+    transaction.stage = InstallationStage::Registering;
+    transaction.pending_external_changes.clear();
+    transaction.revision = 4;
+    must(transaction.validate());
+    let transaction_id = transaction.transaction_id.clone();
+    let store = SharedStore {
+        state: Arc::new(Mutex::new(Some(transaction.clone()))),
+        ..SharedStore::default()
+    };
+    let execute_count = Arc::new(Mutex::new(0usize));
+    let mut port = fake_port(
+        store.clone(),
+        Vec::new(),
+        vec![
+            PortOutcome::Known(matching(
+                InstallationEffectDisposition::CreatedByTransaction,
+            )),
+            PortOutcome::Known(absent(&transaction)),
+        ],
+        execute_count.clone(),
+    );
+    port.secret_absence = vec![PortOutcome::Known(true)].into();
+    let mut coordinator = InstallationCoordinator::new(port, store.clone());
+    // CLI-persisted typed rejection (E4/E5 seam).
+    let pending_ref = must(registry_projection_pending_ref(&transaction_id));
+    assert_eq!(
+        pending_ref.as_str(),
+        format!(
+            "pending:registry-projection:{}",
+            transaction_id.as_str()
+        )
+    );
+    let persisted = must(
+        coordinator.persist_non_effect_rejection(&transaction_id, pending_ref.clone()),
+    );
+    assert!(matches!(
+        persisted,
+        InstallationStepOutcome::RollbackRequired { ref pending_refs }
+            if pending_refs == &vec![pending_ref.clone()]
+    ));
+    let persisted_state = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+    assert_eq!(persisted_state.stage(), InstallationStage::RollbackRequired);
+    assert_eq!(
+        persisted_state.pending_external_changes,
+        vec![pending_ref]
+    );
+    assert!(!persisted_state.has_activation_projection_intent());
+    // Later recover/rollback reaches RolledBack with registration rollback executed.
+    let outcome = must(coordinator.rollback(&transaction_id));
+    assert!(matches!(
+        outcome,
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::RolledBack,
+            ..
+        }
+    ));
+    assert!(*execute_count.lock().unwrap_or_else(|_| unreachable!()) > 0);
+    let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+    assert_eq!(saved.stage(), InstallationStage::RolledBack);
+    assert!(saved.pending_external_changes.is_empty());
+    assert!(
+        saved
+            .completed_stage_refs
+            .iter()
+            .all(|r| !r.as_str().contains("recovery:rejected-to-rollback"))
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn rollback_with_live_phase_b_authority_quarantines_without_external_effects() {

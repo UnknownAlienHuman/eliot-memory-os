@@ -6328,6 +6328,25 @@ pub enum InstallationStepOutcome {
     Rejected,
 }
 
+/// Builds the durable typed rejection reference for a registry-projection
+/// failure observed after the Host bootstrap prefix (`E4`/`E5` and the
+/// still-`Registering` branch of `E6`).
+///
+/// The reference binds the exact transaction (`pending:registry-projection:<tx>`)
+/// so a later `recover`/`rollback` promotes through the existing
+/// `Registering → RollbackRequired → RolledBack` gate and removes exactly the
+/// `CreatedByTransaction` service registrations. It never deletes the
+/// registry file itself (no documented owner).
+pub fn registry_projection_pending_ref(
+    transaction_id: &PlatformHandle,
+) -> Result<PlatformHandle, InstallationError> {
+    PlatformHandle::new(format!(
+        "pending:registry-projection:{}",
+        transaction_id.as_str()
+    ))
+    .map_err(|error| platform_error(&error))
+}
+
 /// Coordinates one durable installation transaction without owning platform mechanics.
 pub(crate) struct InstallationCoordinator<P, S> {
     port: P,
@@ -8279,6 +8298,36 @@ where
         })
     }
 
+    /// Persists a durable typed rejection for a non-effect failure observed
+    /// after the Host bootstrap prefix (registry projection open/load).
+    ///
+    /// This is the `mark_unknown`-equivalent coordinator-owned CAS seam: it
+    /// sets `pending_external_changes=[pending_ref]` and advances
+    /// `Registering → RollbackRequired` via [`InstallationTransaction::mark_unknown`]
+    /// plus a version-checked `compare_and_save`. It is refused in `Activating`
+    /// or when an activation projection intent is present (mirroring
+    /// `mark_unknown`), so `E6` callers must reload and only persist while
+    /// still `Registering`. The `rollback()` gate itself is unchanged.
+    pub fn persist_non_effect_rejection(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        pending_ref: PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let mut transaction =
+            self.store.load(transaction_id)?.ok_or_else(|| {
+                InstallationError::TransactionNotFound {
+                    transaction_id: transaction_id.as_str().to_owned(),
+                }
+            })?;
+        transaction.validate()?;
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.mark_unknown(vec![pending_ref.clone()])?;
+        self.store.compare_and_save(expected, &transaction)?;
+        Ok(InstallationStepOutcome::RollbackRequired {
+            pending_refs: vec![pending_ref],
+        })
+    }
+
     fn persist_quarantined(
         &mut self,
         mut transaction: InstallationTransaction,
@@ -8453,6 +8502,24 @@ where
         transaction_id: &PlatformHandle,
     ) -> Result<InstallationStepOutcome, InstallationError> {
         self.inner.rollback(transaction_id)
+    }
+
+    /// Persists a durable typed rejection for a post-bootstrap non-effect
+    /// failure (registry projection open/load, `E4`/`E5` and the
+    /// still-`Registering` branch of `E6`).
+    ///
+    /// Coordinator-owned `mark_unknown`-equivalent CAS:
+    /// `pending_external_changes=[pending_ref]` + `Registering → RollbackRequired`.
+    /// Refused in `Activating` or with an activation intent (mirroring
+    /// `mark_unknown`); `E6` must reload first and only call this while still
+    /// `Registering`. The `rollback()` gate is unchanged.
+    pub fn persist_non_effect_rejection(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        pending_ref: PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        self.inner
+            .persist_non_effect_rejection(transaction_id, pending_ref)
     }
 
     /// Borrows only the durable store; the mutating port remains sealed.
