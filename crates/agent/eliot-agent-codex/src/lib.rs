@@ -11,9 +11,11 @@ use std::sync::Arc;
 use eliot_agent_api::{
     ActualRouteReceipt, AgentAttempt, AgentLaunchRequest, AgentResult, AgentWorkUnitBrief,
     AttemptId, AttemptState, AuthorityEnvelope, CancelReason, ContinuityKind, EffectCeiling,
-    EventCursor, EventId, HostEventEnvelope, HostEventKind, ResultDisposition,
+    EventId, ExecutionUnitObservation, HostEventEnvelope, HostEventKind, NativeSession,
+    ProviderExecutionBinding, ProviderObservationLineage, ResultDisposition,
     RouteContinuationLocator, RouteFingerprint, SessionId, UsageReceipt, WorkLeaseId,
 };
+use eliot_contracts::ClockReading;
 use eliot_process::{
     CancellationReceipt, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
     ProcessExecutor, ProcessRequest, ProcessStartReceipt,
@@ -769,43 +771,158 @@ fn event_kind(method: &str, params: &Value) -> HostEventKind {
     }
 }
 
-fn validate_event_session(
+/// Namespace of the exact Codex execution unit: the turn ID. Matches the S1
+/// owner fixture (`crates/agent/eliot-agent-api/tests/execution_binding.rs`).
+const CODEX_EXECUTION_UNIT_NAMESPACE: &str = "codex";
+
+/// Render a host observation timestamp into the legacy envelope string without
+/// fabricating causal order. Only `valid_time_ms` (wall-clock time observed by
+/// the host, `crates/foundation/eliot-contracts/src/lib.rs:452-461`) is
+/// rendered; the Governor-assigned causal sequence and monotonic readings are
+/// never consulted, and unknown stays `"unknown"` per `workstreams/T4.md:140`.
+/// The string exists only because `HostEventEnvelope.observed_at`
+/// (`crates/agent/eliot-agent-api/src/lib.rs:691`) is a read-only `String`
+/// for S3; every other owner keeps typed `ClockReading`, so no canonical
+/// renderer exists in-repo and none is invented here.
+fn observed_at_string(reading: &ClockReading) -> String {
+    match reading.valid_time_ms {
+        Some(millis) => millis.to_string(),
+        None => "unknown".to_owned(),
+    }
+}
+
+/// Resolve the attributable execution-unit observation, failing closed for
+/// session-only lineage: a `SessionObservation` carries no attempt authority
+/// and can never validate as execution-unit evidence (same fail-closed as S1
+/// `ProviderObservationLineage::attributable_binding`,
+/// `crates/agent/eliot-agent-api/src/execution_binding.rs:279-284`). The
+/// caller retains the raw thread event without attributing it.
+fn execution_observation(
+    lineage: &ProviderObservationLineage,
+) -> Result<&ExecutionUnitObservation, CodexAdapterError> {
+    match lineage {
+        ProviderObservationLineage::ExecutionUnitObservation(observation) => Ok(observation),
+        ProviderObservationLineage::SessionObservation(_) => Err(CodexAdapterError::Contract(
+            eliot_agent_api::ContractError::BindingMismatch,
+        )),
+    }
+}
+
+/// Validate that a recorded binding belongs to this adapter family before use:
+/// shape, exact Codex route, and the Codex turn namespace. A foreign-family
+/// binding quarantines as a binding mismatch, never as attributed output.
+fn validate_binding_for_codex(binding: &ProviderExecutionBinding) -> Result<(), CodexAdapterError> {
+    binding.validate_internal()?;
+    validate_codex_route(&binding.route)?;
+    if binding.execution_unit.namespace != CODEX_EXECUTION_UNIT_NAMESPACE {
+        return Err(CodexAdapterError::Contract(
+            eliot_agent_api::ContractError::BindingMismatch,
+        ));
+    }
+    Ok(())
+}
+
+/// Extract the exact opaque turn ID with the real JSON parser: only
+/// `params.turn.id` as a string counts as turn evidence. Absent, null, or
+/// non-string turn identity is missing evidence, never a guessed turn.
+fn wire_turn_id(params: &Value) -> Option<&str> {
+    params
+        .get("turn")
+        .and_then(Value::as_object)
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+}
+
+fn validate_wire_session_against_binding(
     params: &Value,
-    session: &CodexSessionBinding,
+    binding: &ProviderExecutionBinding,
 ) -> Result<(), CodexAdapterError> {
     let Some(object) = params.as_object() else {
         return Ok(());
     };
+    let expected_thread: Option<&str> = match &binding.native_session {
+        NativeSession::Native(locator) => Some(locator.locator.as_str()),
+        // Codex always records a thread locator; a sessionless binding cannot
+        // corroborate a Codex thread event.
+        NativeSession::Sessionless => None,
+    };
     for key in ["threadId", "thread_id"] {
-        if let Some(value) = object.get(key)
-            && value.as_str() != Some(session.thread_id.as_str())
-        {
-            return Err(CodexAdapterError::SessionMismatch);
+        if let Some(value) = object.get(key) {
+            let matches = match (value.as_str(), expected_thread) {
+                (Some(actual), Some(expected)) => actual == expected,
+                _ => false,
+            };
+            if !matches {
+                return Err(CodexAdapterError::SessionMismatch);
+            }
         }
     }
-    for key in ["sessionId", "session_id"] {
-        if let Some(value) = object.get(key)
-            && value.as_str() != Some(session.session_id.as_str())
-        {
-            return Err(CodexAdapterError::SessionMismatch);
+    // ELIOT session agreement only where the binding carries an admitted
+    // session. Coordinator S2 admits no session yet
+    // (`crates/agent/eliot-agent-coordinator/src/core.rs:613-615`), so an
+    // unadmitted binding cannot corroborate — and never invents — session
+    // identity.
+    if let Some(expected) = binding.session_id.as_ref() {
+        for key in ["sessionId", "session_id"] {
+            if let Some(value) = object.get(key)
+                && value.as_str() != Some(expected.as_str())
+            {
+                return Err(CodexAdapterError::SessionMismatch);
+            }
         }
     }
     Ok(())
 }
 
-/// Translate one provider event into an A-01 event. `previous_sequence` is
-/// supplied by the owner, avoiding a hidden local cursor/state assumption.
+/// Session-locator agreement for result input: the Codex thread must equal the
+/// bound native locator, and an admitted bound session must equal the locator
+/// session. An unadmitted (`None`) bound session is skipped, never invented.
+fn validate_session_locator_against_binding(
+    session: &CodexSessionBinding,
+    binding: &ProviderExecutionBinding,
+) -> Result<(), CodexAdapterError> {
+    match &binding.native_session {
+        NativeSession::Native(locator) if session.thread_id == locator.locator => {}
+        _ => return Err(CodexAdapterError::SessionMismatch),
+    }
+    if let Some(expected) = binding.session_id.as_ref()
+        && session.session_id != *expected
+    {
+        return Err(CodexAdapterError::SessionMismatch);
+    }
+    Ok(())
+}
+
+/// Translate one provider event into an A-01 event bound to its exact turn.
+///
+/// The recorded `lineage` carries the attribution: only an
+/// `ExecutionUnitObservation` yields attempt output, with the envelope's
+/// legacy attempt identity, route, cursor, and sequence taken from that
+/// recorded binding — never from an ambient parameter or a synthesized
+/// `codex:{sequence}` cursor. The wire turn must exactly equal the bound unit
+/// (real-parser correlation over `params.turn.id`); a missing or foreign turn
+/// fails closed for quarantine without advancing another attempt, and a
+/// session-only lineage fails closed without inventing attempt identity.
+/// `previous_sequence` is supplied by the owner, avoiding a hidden local
+/// cursor/state assumption; the recorded observation sequence must agree with
+/// the claimed stream position.
 pub fn translate_host_event(
     message: &CodexWireMessage,
-    attempt_id: AttemptId,
-    route: &RouteFingerprint,
-    session: &CodexSessionBinding,
+    lineage: &ProviderObservationLineage,
     sequence: u64,
     previous_sequence: Option<u64>,
-    observed_at: impl Into<String>,
+    observed_at: &ClockReading,
 ) -> Result<HostEventEnvelope, CodexAdapterError> {
-    validate_codex_route(route)?;
-    session.validate(route)?;
+    let observation = execution_observation(lineage)?;
+    observation.validate()?;
+    validate_binding_for_codex(&observation.binding)?;
+    if observation.sequence != sequence {
+        // The recorded observation does not belong to the claimed stream
+        // position; never reassign it to the active attempt.
+        return Err(CodexAdapterError::Contract(
+            eliot_agent_api::ContractError::BindingMismatch,
+        ));
+    }
     if sequence == 0 || previous_sequence.is_some_and(|previous| sequence <= previous) {
         return Err(CodexAdapterError::Contract(
             eliot_agent_api::ContractError::NonMonotonicEvent,
@@ -821,39 +938,49 @@ pub fn translate_host_event(
         ));
     }
     let params = message.params.clone().unwrap_or(Value::Null);
-    validate_event_session(&params, session)?;
+    validate_wire_session_against_binding(&params, &observation.binding)?;
+    let bound_turn = observation.binding.execution_unit.unit_id.as_str();
+    if wire_turn_id(&params) != Some(bound_turn) {
+        // Missing or foreign turn: quarantine (the caller retains raw
+        // evidence); never attribute turn B output to attempt A.
+        return Err(CodexAdapterError::Contract(
+            eliot_agent_api::ContractError::BindingMismatch,
+        ));
+    }
     let bytes = serde_json::to_vec(&message)
         .map_err(|_| CodexAdapterError::MalformedWire("event serialization"))?;
     if bytes.len() > MAX_EVENT_BYTES {
         return Err(CodexAdapterError::WireTooLarge);
     }
-    let cursor = EventCursor::new(format!("codex:{sequence}"))?;
+    let binding = &observation.binding;
     let envelope = HostEventEnvelope {
-        event_id: EventId::new(format!("codex:{sequence}"))?,
-        attempt_id,
+        event_id: EventId::new(observation.cursor.as_str())?,
+        attempt_id: binding.attempt_id.clone(),
         sequence,
-        cursor,
+        cursor: observation.cursor.clone(),
         kind: event_kind(method, &params),
-        route: route.clone(),
+        route: binding.route.clone(),
         raw_payload_digest: blake3::hash(&bytes).to_hex().to_string(),
         normalized_payload: params,
         parent_event_id: None,
-        observed_at: observed_at.into(),
-        lineage: None, // S1: S3 binds exact turn; legacy attempt_id carries attribution until then
+        observed_at: observed_at_string(observed_at),
+        lineage: Some(lineage.clone()),
     };
     envelope.validate()?;
     Ok(envelope)
 }
 
 /// Result input owned by the caller, assembled from a complete event stream.
-/// The adapter refuses to infer completion from an incomplete stream.
+/// The adapter refuses to infer completion from an incomplete stream: the
+/// terminal observation is the exact bound envelope from the validated stream,
+/// not a boolean completion claim. `None` means no terminal observation was
+/// recorded and yields unknown outcome.
 #[derive(Clone, Debug)]
 pub struct CodexResultInput {
-    pub attempt_id: AttemptId,
     pub route: RouteFingerprint,
     pub session: CodexSessionBinding,
     pub output: Option<String>,
-    pub completed_event_seen: bool,
+    pub terminal_observation: Option<HostEventEnvelope>,
     pub cancelled: bool,
     pub unknown_reason: Option<String>,
     pub usage: UsageReceipt,
@@ -864,18 +991,67 @@ pub struct CodexResultInput {
     pub proposed_effects: Vec<eliot_agent_api::ProposedEffect>,
 }
 
+fn is_terminal_observation(kind: HostEventKind) -> bool {
+    matches!(kind, HostEventKind::Completed | HostEventKind::Failed)
+}
+
+/// Validate a supplied terminal observation against the recorded binding: the
+/// envelope must carry attributable execution-unit lineage for exactly this
+/// binding (a same-thread turn B observation never yields attempt A output)
+/// and must be terminal. Provider-effect/attempt linkage beyond this stays
+/// with S5 (`AgentResult::validate_for_binding`).
+fn validate_terminal_observation(
+    terminal: &HostEventEnvelope,
+    binding: &ProviderExecutionBinding,
+) -> Result<(), CodexAdapterError> {
+    terminal.validate()?;
+    let observed_binding = terminal
+        .lineage
+        .as_ref()
+        .ok_or(eliot_agent_api::ContractError::BindingMismatch)?
+        .attributable_binding()
+        .map_err(CodexAdapterError::Contract)?;
+    if observed_binding != binding {
+        return Err(CodexAdapterError::Contract(
+            eliot_agent_api::ContractError::BindingMismatch,
+        ));
+    }
+    if !is_terminal_observation(terminal.kind) {
+        return Err(CodexAdapterError::MalformedWire(
+            "result terminal observation is not terminal",
+        ));
+    }
+    Ok(())
+}
+
 /// Translate a complete Codex result into the neutral result contract.
+///
+/// Attempt identity comes from the recorded `binding`, never from an ambient
+/// parameter. Session/route inputs must agree with that binding, and the
+/// observed route is never defaulted from the requested route: physical-route
+/// observation belongs to S4, so unobserved stays `None`.
 pub fn translate_result(
     input: CodexResultInput,
+    binding: &ProviderExecutionBinding,
     authority: &EffectCeiling,
 ) -> Result<AgentResult, CodexAdapterError> {
     validate_codex_route(&input.route)?;
     input.session.validate(&input.route)?;
+    validate_binding_for_codex(binding)?;
+    if input.route != binding.route {
+        return Err(CodexAdapterError::Contract(
+            eliot_agent_api::ContractError::BindingMismatch,
+        ));
+    }
+    validate_session_locator_against_binding(&input.session, binding)?;
     if let Some(locator) = &input.continuation {
         if locator.route != input.route {
             return Err(CodexAdapterError::RouteMismatch);
         }
         locator.validate()?;
+    }
+    if let Some(terminal) = &input.terminal_observation {
+        validate_terminal_observation(terminal, binding)?;
     }
     let output_digest = input
         .output
@@ -885,25 +1061,27 @@ pub fn translate_result(
         .into_iter()
         .map(|digest| format!("codex-output:{digest}"))
         .collect::<Vec<_>>();
-    if evidence_refs.is_empty() && input.completed_event_seen {
-        evidence_refs.push("codex-event:completed".into());
+    if evidence_refs.is_empty()
+        && let Some(terminal) = &input.terminal_observation
+    {
+        evidence_refs.push(format!("codex-terminal:{}", terminal.event_id.as_str()));
     }
     let (disposition, unknown_reason) = if input.cancelled {
         (ResultDisposition::CancelledObserved, input.unknown_reason)
-    } else if !input.completed_event_seen {
+    } else if input.terminal_observation.is_none() {
         (
             ResultDisposition::UnknownOutcome,
             Some(
                 input
                     .unknown_reason
-                    .unwrap_or_else(|| "completion event absent".into()),
+                    .unwrap_or_else(|| "terminal observation absent".into()),
             ),
         )
     } else {
         (ResultDisposition::Partial, input.unknown_reason)
     };
     let result = AgentResult {
-        attempt_id: input.attempt_id,
+        attempt_id: binding.attempt_id.clone(),
         disposition,
         artifacts: Vec::new(),
         evidence_refs,
@@ -912,7 +1090,7 @@ pub fn translate_result(
         usage: input.usage.clone(),
         actual_route: ActualRouteReceipt {
             requested: input.route.clone(),
-            observed: Some(input.route),
+            observed: None,
             route_id: input.route_id,
             usage: input.usage,
             started_at: input.started_at,
@@ -922,6 +1100,30 @@ pub fn translate_result(
     };
     result.validate(authority)?;
     Ok(result)
+}
+
+/// Checked interrupt construction: targets the exact bound turn on the exact
+/// bound thread. A sessionless binding cannot address a Codex turn and fails
+/// closed; the request ID follows the validated wire-ID shape so the later
+/// start/interrupt reply correlates with the real parser.
+pub fn turn_interrupt_bound(
+    request_id: &str,
+    binding: &ProviderExecutionBinding,
+) -> Result<CodexWireMessage, CodexAdapterError> {
+    if !valid_wire_id_text(request_id) {
+        return Err(CodexAdapterError::MalformedWire(
+            "id must be a supported string",
+        ));
+    }
+    validate_binding_for_codex(binding)?;
+    let NativeSession::Native(locator) = &binding.native_session else {
+        return Err(CodexAdapterError::SessionMismatch);
+    };
+    Ok(CodexWireMessage::turn_interrupt(
+        request_id,
+        locator.locator.as_str(),
+        binding.execution_unit.unit_id.as_str(),
+    ))
 }
 
 /// Translate a provider continuation locator into A-01 continuation state.
@@ -969,6 +1171,7 @@ pub fn wire_schema() -> Value {
 )]
 mod tests {
     use super::*;
+    use eliot_agent_api::{EventCursor, ExecutionUnit, NativeSessionLocator, SessionObservation};
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1482,22 +1685,96 @@ mod tests {
         Ok(())
     }
 
+    fn bound_binding() -> TestResult<ProviderExecutionBinding> {
+        Ok(ProviderExecutionBinding {
+            attempt_id: AttemptId::new("attempt-1")?,
+            lease_id: serde_json::from_value::<WorkLeaseId>(
+                serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
+            )?,
+            state_fence: eliot_contracts::StateFence::new(
+                eliot_contracts::AuthorityEpoch::new(1)?,
+                eliot_contracts::ResourceGeneration::new(1)?,
+            ),
+            runtime_generation: eliot_contracts::ResourceGeneration::new(1)?,
+            route: route(),
+            session_id: Some(SessionId::new("session-1")?),
+            provider_scope_ref: "scope-1".into(),
+            native_session: NativeSession::Native(NativeSessionLocator::new("thread-1")?),
+            execution_unit: ExecutionUnit::new("codex", "turn-1")?,
+            start_request_id: eliot_contracts::RequestId::new("req-1")?,
+            start_request_sha256: eliot_contracts::sha256_hex(b"req-1"),
+        })
+    }
+
+    fn bound_lineage(
+        binding: &ProviderExecutionBinding,
+        sequence: u64,
+    ) -> TestResult<ProviderObservationLineage> {
+        Ok(ProviderObservationLineage::ExecutionUnitObservation(
+            Box::new(ExecutionUnitObservation {
+                binding: binding.clone(),
+                cursor: EventCursor::new(format!("turn-1:{sequence}"))?,
+                sequence,
+            }),
+        ))
+    }
+
+    fn clock_at(valid_time_ms: Option<i64>) -> ClockReading {
+        ClockReading {
+            valid_time_ms,
+            known_time_ms: valid_time_ms,
+            transaction_sequence: None,
+            monotonic_ns: Some(1),
+        }
+    }
+
+    fn translate_bound(
+        method: &str,
+        params: Value,
+        binding: &ProviderExecutionBinding,
+        sequence: u64,
+        previous_sequence: Option<u64>,
+    ) -> Result<HostEventEnvelope, CodexAdapterError> {
+        let message = CodexWireMessage::notification(method, Some(params));
+        translate_host_event(
+            &message,
+            &bound_lineage(binding, sequence).expect("fixture lineage"),
+            sequence,
+            previous_sequence,
+            &clock_at(Some(1_786_000_000_000)),
+        )
+    }
+
+    fn completed_params(thread: &str, turn: &str, status: &str) -> Value {
+        serde_json::json!({
+            "threadId": thread,
+            "turn": {"id": turn, "status": status},
+        })
+    }
+
+    fn is_binding_mismatch<T>(result: Result<T, CodexAdapterError>) -> bool {
+        matches!(
+            result,
+            Err(CodexAdapterError::Contract(
+                eliot_agent_api::ContractError::BindingMismatch
+            ))
+        )
+    }
+
     #[test]
     fn event_from_wrong_session_is_rejected() -> TestResult {
-        let a = attached()?;
+        let binding = bound_binding()?;
         let message = CodexWireMessage::notification(
             "turn/completed",
-            Some(serde_json::json!({ "threadId": "other-thread" })),
+            Some(completed_params("other-thread", "turn-1", "completed")),
         );
         assert!(matches!(
             translate_host_event(
                 &message,
-                AttemptId::new("attempt-1")?,
-                &a.route,
-                &a.session,
+                &bound_lineage(&binding, 1)?,
                 1,
                 None,
-                "now",
+                &clock_at(Some(1_786_000_000_000)),
             ),
             Err(CodexAdapterError::SessionMismatch)
         ));
@@ -1506,7 +1783,7 @@ mod tests {
 
     #[test]
     fn event_session_fields_are_typed_and_event_shape_is_notification_only() -> TestResult {
-        let a = attached()?;
+        let binding = bound_binding()?;
         let wrong_type = CodexWireMessage::notification(
             "turn/completed",
             Some(serde_json::json!({ "threadId": 42 })),
@@ -1514,12 +1791,10 @@ mod tests {
         assert!(matches!(
             translate_host_event(
                 &wrong_type,
-                AttemptId::new("attempt-1")?,
-                &a.route,
-                &a.session,
+                &bound_lineage(&binding, 1)?,
                 1,
                 None,
-                "now",
+                &clock_at(Some(1_786_000_000_000)),
             ),
             Err(CodexAdapterError::SessionMismatch)
         ));
@@ -1527,17 +1802,15 @@ mod tests {
         let request = CodexWireMessage::request(
             "event-1",
             "turn/completed",
-            serde_json::json!({ "threadId": "thread-1" }),
+            completed_params("thread-1", "turn-1", "completed"),
         );
         assert!(matches!(
             translate_host_event(
                 &request,
-                AttemptId::new("attempt-1")?,
-                &a.route,
-                &a.session,
+                &bound_lineage(&binding, 1)?,
                 1,
                 None,
-                "now",
+                &clock_at(Some(1_786_000_000_000)),
             ),
             Err(CodexAdapterError::MalformedWire(_))
         ));
@@ -1545,39 +1818,125 @@ mod tests {
     }
 
     #[test]
-    fn event_envelope_rejects_missing_observation_time() -> TestResult {
-        let a = attached()?;
-        let message = CodexWireMessage::notification("turn/completed", None);
-        assert!(matches!(
-            translate_host_event(
-                &message,
-                AttemptId::new("attempt-1")?,
-                &a.route,
-                &a.session,
-                1,
-                None,
-                " ",
+    fn session_only_lineage_carries_no_attempt_authority() -> TestResult {
+        let binding = bound_binding()?;
+        let session_only = ProviderObservationLineage::SessionObservation(SessionObservation {
+            session_id: binding.session_id.clone(),
+            native: binding.native_session.clone(),
+        });
+        let message = CodexWireMessage::notification(
+            "thread/started",
+            Some(serde_json::json!({ "threadId": "thread-1" })),
+        );
+        // Thread lifecycle stays session-only: no attempt identity is invented.
+        assert!(is_binding_mismatch(translate_host_event(
+            &message,
+            &session_only,
+            1,
+            None,
+            &clock_at(Some(1_786_000_000_000)),
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_and_foreign_turns_quarantine_without_advancing() -> TestResult {
+        let binding = bound_binding()?;
+        // Same thread, foreign turn: never attempt A output.
+        assert!(is_binding_mismatch(translate_bound(
+            "turn/completed",
+            completed_params("thread-1", "turn-2", "completed"),
+            &binding,
+            1,
+            None,
+        )));
+        // Same thread, missing turn: retained/quarantined, never guessed.
+        assert!(is_binding_mismatch(translate_bound(
+            "turn/completed",
+            serde_json::json!({ "threadId": "thread-1" }),
+            &binding,
+            1,
+            None,
+        )));
+        // Same-turn steer keeps the same binding across the stream.
+        let first = translate_bound(
+            "turn/started",
+            completed_params("thread-1", "turn-1", "inProgress"),
+            &binding,
+            1,
+            None,
+        )?;
+        let second = translate_bound(
+            "turn/completed",
+            completed_params("thread-1", "turn-1", "completed"),
+            &binding,
+            2,
+            Some(1),
+        )?;
+        assert_eq!(first.attempt_id, binding.attempt_id);
+        assert_eq!(second.attempt_id, binding.attempt_id);
+        assert_eq!(second.kind, HostEventKind::Completed);
+        Ok(())
+    }
+
+    #[test]
+    fn recorded_cursor_and_clock_are_preserved_without_synthesis() -> TestResult {
+        let binding = bound_binding()?;
+        let envelope = translate_bound(
+            "turn/completed",
+            completed_params("thread-1", "turn-1", "completed"),
+            &binding,
+            3,
+            Some(2),
+        )?;
+        // No synthesized `codex:{sequence}` identity: the recorded cursor is
+        // preserved end-to-end for both cursor and event identity.
+        assert_eq!(envelope.cursor.as_str(), "turn-1:3");
+        assert_eq!(envelope.event_id.as_str(), "turn-1:3");
+        assert_eq!(envelope.sequence, 3);
+        assert_eq!(envelope.attempt_id, binding.attempt_id);
+        assert_eq!(envelope.route, binding.route);
+        assert_eq!(envelope.observed_at, "1786000000000");
+        let lineage = envelope.lineage.expect("bound lineage");
+        assert_eq!(lineage.attributable_binding()?, &binding);
+        // Unknown time stays unknown; causal order is never fabricated.
+        let unknown = translate_host_event(
+            &CodexWireMessage::notification(
+                "turn/completed",
+                Some(completed_params("thread-1", "turn-1", "completed")),
             ),
-            Err(CodexAdapterError::Contract(
-                eliot_agent_api::ContractError::EmptyField("observed_at")
-            ))
-        ));
+            &bound_lineage(&binding, 4)?,
+            4,
+            Some(3),
+            &clock_at(None),
+        )?;
+        assert_eq!(unknown.observed_at, "unknown");
+        // The recorded observation must agree with the claimed stream position.
+        assert!(is_binding_mismatch(translate_host_event(
+            &CodexWireMessage::notification(
+                "turn/completed",
+                Some(completed_params("thread-1", "turn-1", "completed")),
+            ),
+            &bound_lineage(&binding, 9)?,
+            4,
+            Some(3),
+            &clock_at(Some(1_786_000_000_000)),
+        )));
         Ok(())
     }
 
     fn result_input(
         attached: &CodexAttachReceipt,
         output: Option<&str>,
-        completed_event_seen: bool,
+        terminal_observation: Option<HostEventEnvelope>,
         cancelled: bool,
         unknown_reason: Option<&str>,
     ) -> TestResult<CodexResultInput> {
         Ok(CodexResultInput {
-            attempt_id: AttemptId::new("attempt-1")?,
             route: attached.route.clone(),
             session: attached.session.clone(),
             output: output.map(str::to_owned),
-            completed_event_seen,
+            terminal_observation,
             cancelled,
             unknown_reason: unknown_reason.map(str::to_owned),
             usage: UsageReceipt {
@@ -1594,28 +1953,138 @@ mod tests {
         })
     }
 
+    fn terminal_envelope(binding: &ProviderExecutionBinding) -> TestResult<HostEventEnvelope> {
+        translate_bound(
+            "turn/completed",
+            completed_params("thread-1", "turn-1", "completed"),
+            binding,
+            1,
+            None,
+        )
+        .map_err(Into::into)
+    }
+
     #[test]
     fn provider_success_stays_candidate_and_terminal_mappings_are_preserved() -> TestResult {
         let a = attached()?;
+        let binding = bound_binding()?;
         let success = translate_result(
-            result_input(&a, Some("provider output"), true, false, None)?,
+            result_input(
+                &a,
+                Some("provider output"),
+                Some(terminal_envelope(&binding)?),
+                false,
+                None,
+            )?,
+            &binding,
             &a.authority.effect_ceiling,
         )?;
         assert_eq!(success.disposition, ResultDisposition::Partial);
         assert_ne!(success.disposition, ResultDisposition::CandidateSucceeded);
+        assert_eq!(success.attempt_id, binding.attempt_id);
+        // Observed route is never defaulted from the requested route.
+        assert_eq!(success.actual_route.observed, None);
+        assert_eq!(success.actual_route.requested, binding.route);
 
         let cancelled = translate_result(
-            result_input(&a, Some("provider output"), true, true, None)?,
+            result_input(
+                &a,
+                Some("provider output"),
+                Some(terminal_envelope(&binding)?),
+                true,
+                None,
+            )?,
+            &binding,
             &a.authority.effect_ceiling,
         )?;
         assert_eq!(cancelled.disposition, ResultDisposition::CancelledObserved);
 
         let unknown = translate_result(
-            result_input(&a, None, false, false, None)?,
+            result_input(&a, None, None, false, None)?,
+            &binding,
             &a.authority.effect_ceiling,
         )?;
         assert_eq!(unknown.disposition, ResultDisposition::UnknownOutcome);
         assert!(unknown.unknown_reason.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_or_nonterminal_observations_never_become_results() -> TestResult {
+        let a = attached()?;
+        let binding = bound_binding()?;
+        // Same-thread turn B observation presented for attempt A quarantines.
+        let mut foreign_binding = binding.clone();
+        foreign_binding.execution_unit = ExecutionUnit::new("codex", "turn-2")?;
+        let foreign_terminal = translate_bound(
+            "turn/completed",
+            completed_params("thread-1", "turn-2", "completed"),
+            &foreign_binding,
+            1,
+            None,
+        )?;
+        assert!(is_binding_mismatch(translate_result(
+            result_input(&a, Some("output"), Some(foreign_terminal), false, None)?,
+            &binding,
+            &a.authority.effect_ceiling,
+        )));
+        // A non-terminal observation cannot stand in as terminal evidence.
+        let nonterminal = translate_bound(
+            "turn/started",
+            completed_params("thread-1", "turn-1", "inProgress"),
+            &binding,
+            1,
+            None,
+        )?;
+        assert!(matches!(
+            translate_result(
+                result_input(&a, Some("output"), Some(nonterminal), false, None)?,
+                &binding,
+                &a.authority.effect_ceiling,
+            ),
+            Err(CodexAdapterError::MalformedWire(_))
+        ));
+        // Session locator agreement is enforced against the binding.
+        let mut wrong_session = a.session.clone();
+        wrong_session.thread_id = "other-thread".into();
+        let mut mismatched = result_input(
+            &a,
+            Some("output"),
+            Some(terminal_envelope(&binding)?),
+            false,
+            None,
+        )?;
+        mismatched.session = wrong_session;
+        assert!(matches!(
+            translate_result(mismatched, &binding, &a.authority.effect_ceiling,),
+            Err(CodexAdapterError::SessionMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn interrupt_targets_the_exact_bound_turn() -> TestResult {
+        let binding = bound_binding()?;
+        let message = turn_interrupt_bound("req-interrupt-1", &binding)?;
+        let params = message.params.expect("interrupt params");
+        assert_eq!(message.method.as_deref(), Some("turn/interrupt"));
+        assert_eq!(
+            params.get("threadId").and_then(Value::as_str),
+            Some("thread-1")
+        );
+        assert_eq!(params.get("turnId").and_then(Value::as_str), Some("turn-1"));
+        assert!(matches!(
+            turn_interrupt_bound("bad id", &binding),
+            Err(CodexAdapterError::MalformedWire(_))
+        ));
+        let sessionless = ProviderExecutionBinding {
+            native_session: NativeSession::Sessionless,
+            ..binding.clone()
+        };
+        assert!(matches!(
+            turn_interrupt_bound("req-interrupt-1", &sessionless),
+            Err(CodexAdapterError::SessionMismatch)
+        ));
         Ok(())
     }
 

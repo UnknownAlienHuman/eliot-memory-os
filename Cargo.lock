@@ -678,6 +678,7 @@ dependencies = [
  "blake3",
  "eliot-agent-api",
  "eliot-agent-coordinator",
+ "eliot-contracts",
  "eliot-process",
  "eliot-receipts",
  "eliot-source-assurance",
