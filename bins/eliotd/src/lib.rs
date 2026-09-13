@@ -41,6 +41,7 @@ mod daemon_kernel_port_adapters;
 mod kernel_authority_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
+mod observation_adapters;
 mod skill_lifecycle_adapters;
 mod store_failure_projection;
 
@@ -451,6 +452,35 @@ impl DaemonComposition {
         }
         Ok(skill_lifecycle_adapters::ForwardingSkillLifecycle::new(
             self.governor.skill_lifecycle(),
+        ))
+    }
+
+    /// Borrows the single Governor observation/verified-repair reconciliation
+    /// owner as a forwarding adapter.
+    ///
+    /// The adapter forwards the exact admitted identity, operation identity,
+    /// and verification report to the Governor canonical path and returns
+    /// only typed results. No policy, admission, or semantic rules live here;
+    /// fence agreement, verifier endorsement, problem binding, and the two
+    /// canonical commits stay with the Governor owner. Watchdog export
+    /// acknowledgement mapping is pure and terminal-only: canonical receipts
+    /// map to cursor-advancing sink dispositions while unknown outcomes never
+    /// advance the cursor. Callers take a fresh adapter per operation so a
+    /// Governor refresh surfaces as an exact-view mismatch instead of silent
+    /// divergence.
+    pub fn observation_reconciliation(
+        &self,
+    ) -> Result<
+        observation_adapters::ForwardingObservationReconciliation<'_, dyn KernelGenerationPort>,
+        DaemonError,
+    > {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(
+                eliot_governor::CompositionError::NotReady,
+            ));
+        }
+        Ok(observation_adapters::ForwardingObservationReconciliation::new(
+            self.governor.observation_reconciliation(),
         ))
     }
 
