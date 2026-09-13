@@ -540,7 +540,32 @@ async fn run_daemon_instance(config_path: &Path, instance: &RuntimeInstance) -> 
     let config = load_config(config_path)?;
     let root = instance.publication_root().to_path_buf();
     let lifecycle = LifecycleService::new(&root);
-    let lock = lifecycle.acquire_single_instance()?;
+    let lock = match lifecycle.acquire_single_instance() {
+        Ok(lock) => lock,
+        Err(acquire_error) => {
+            let single_instance_contention = matches!(
+                &acquire_error,
+                eliot_engine::EngineError::ServiceNotReady { service, reason }
+                    if service == "lifecycle"
+                        && reason.starts_with("single-instance lock already exists")
+            );
+            if !single_instance_contention {
+                return Err(acquire_error.into());
+            }
+            let stale_recovered = crate::runtime_bootstrap::recover_stale_runtime(
+                instance,
+                crate::named_pipe_ipc::IPC_PROTOCOL_VERSION,
+            )
+            .unwrap_or(false);
+            if !stale_recovered {
+                return Err(acquire_error.into());
+            }
+            match lifecycle.acquire_single_instance() {
+                Ok(lock) => lock,
+                Err(_) => return Err(acquire_error.into()),
+            }
+        }
+    };
     let stop_marker = instance.stop_marker();
     if stop_marker.is_file() {
         std::fs::remove_file(&stop_marker)?;
