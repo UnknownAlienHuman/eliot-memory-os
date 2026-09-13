@@ -963,6 +963,7 @@ impl AcpEvent {
             normalized_payload: self.payload,
             parent_event_id: None,
             observed_at,
+            lineage: None, // S1: S3 binds exact turn; legacy attempt_id carries attribution until then
         };
         event
             .validate()

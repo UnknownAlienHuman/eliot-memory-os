@@ -9,13 +9,28 @@ use std::collections::BTreeSet;
 
 pub use eliot_agent_contracts::AgentAttemptId;
 pub use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ResourceGeneration, SessionId, StateFence, TaskId, WorkLeaseId,
+    ArtifactId, AuthorityEpoch, RequestId, ResourceGeneration, SessionId, StateFence, TaskId,
+    WorkLeaseId,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTRACT_VERSION: &str = "eliot-agent-api/v4";
+pub mod execution_binding;
+pub use execution_binding::{
+    ExecutionUnit, ExecutionUnitObservation, NativeSession, NativeSessionLocator,
+    ProviderExecutionBinding, ProviderObservationLineage, SessionObservation,
+    validate_execution_binding,
+};
+
+/// Wire revision v5 adds the S1 provider-execution binding
+/// (`AgentAttempt::provider_binding`) and observation lineage
+/// (`HostEventEnvelope::lineage`) from issue #361 under owner freeze
+/// `A01_PROVIDER_EXECUTION_BINDING_V1`. Additive: absent fields default to
+/// `None` (unresolved launch / legacy thread-only wire). A thread-only wire
+/// without binding/lineage is rejected for attribution at validation, never
+/// silently accepted as execution-unit evidence.
+pub const CONTRACT_VERSION: &str = "eliot-agent-api/v5";
 
 /// Compatibility spelling retained as an exact alias of the canonical owner.
 pub type AttemptId = AgentAttemptId;
@@ -120,6 +135,8 @@ pub enum ContractError {
     NonMonotonicEvent,
     #[error("state fence is invalid")]
     InvalidStateFence,
+    #[error("provider execution binding does not match the admitted attempt")]
+    BindingMismatch,
 }
 
 /// Whether an admission may expose only safe observations or material work.
@@ -662,6 +679,7 @@ pub enum HostEventKind {
 #[serde(deny_unknown_fields)]
 pub struct HostEventEnvelope {
     pub event_id: EventId,
+    #[deprecated(note = "use lineage; attempt_id is legacy and rejected for attribution")]
     pub attempt_id: AttemptId,
     pub sequence: u64,
     pub cursor: EventCursor,
@@ -671,6 +689,11 @@ pub struct HostEventEnvelope {
     pub normalized_payload: serde_json::Value,
     pub parent_event_id: Option<EventId>,
     pub observed_at: String,
+    /// Provenance lineage for this observation. `None` is a legacy
+    /// thread-only wire: session observation only, rejected for attribution
+    /// (see [`ProviderObservationLineage::attributable_binding`]).
+    #[serde(default)]
+    pub lineage: Option<ProviderObservationLineage>,
 }
 
 impl HostEventEnvelope {
@@ -747,6 +770,12 @@ pub struct AgentAttempt {
     pub cancellation: CancellationState,
     pub event_cursor: Option<EventCursor>,
     pub continuation: Option<RouteContinuationLocator>,
+    /// Exact provider-execution binding for this attempt (issue #361 S1).
+    /// `None` is an unresolved launch: representable, but never an
+    /// attribution bypass — attribution requires a validated binding (see
+    /// [`AgentAttempt::attributable_binding`]).
+    #[serde(default)]
+    pub provider_binding: Option<ProviderExecutionBinding>,
 }
 
 impl AgentAttempt {
@@ -761,7 +790,21 @@ impl AgentAttempt {
                 return Err(ContractError::ContinuationRouteMismatch);
             }
         }
+        if let Some(binding) = &self.provider_binding {
+            binding.validate_against_attempt(self)?;
+        }
         Ok(())
+    }
+
+    /// Returns the attributable provider-execution binding, failing closed
+    /// when the launch is unresolved (`None`): a missing binding yields no
+    /// attributable output. Fence/generation freshness against the current
+    /// runtime context needs [`validate_execution_binding`], which takes the
+    /// admitted attempt plus the current fence and generation explicitly.
+    pub fn attributable_binding(&self) -> Result<&ProviderExecutionBinding, ContractError> {
+        self.provider_binding
+            .as_ref()
+            .ok_or(ContractError::BindingMismatch)
     }
 
     pub fn transition(&mut self, next: AttemptState) -> Result<(), ContractError> {
@@ -1186,6 +1229,7 @@ mod tests {
             cancellation: CancellationState::NotRequested,
             event_cursor: None,
             continuation: None,
+            provider_binding: None,
         };
         assert!(attempt.transition(AttemptState::Running).is_err());
         Ok(())
