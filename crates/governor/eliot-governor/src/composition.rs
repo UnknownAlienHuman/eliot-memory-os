@@ -14,6 +14,7 @@ use crate::activation_outcome::{
     GovernorActivationOutcome, GovernorCandidateCoverage, GovernorRetryDirective,
     GovernorSelectionDirective,
 };
+use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::{
     Governor, GovernorConfig, GovernorState, QueueLimits, STARTUP_ORDER, ServiceId,
     ServiceObservation,
@@ -1482,6 +1483,82 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .await
     }
 
+    /// Re-reads Kernel-owned owner projections and publishes a coherent live
+    /// update without a daemon restart.
+    ///
+    /// This closes the `commit_canonical` publication gap: owner state
+    /// committed through the canonical path becomes visible to Governor
+    /// readers after one successful refresh instead of only after a restart.
+    ///
+    /// Fail-closed behavior:
+    /// - The retained generation/epoch/identity is re-admitted through
+    ///   `KernelGenerationExpectation::admits`; any change is
+    ///   `CompositionError::Recovery` telling the daemon to drop this
+    ///   composition and re-run authenticated connect+start. A new generation
+    ///   is never inferred locally.
+    /// - Owner reads re-run the exact authenticated `recover_from_kernel`
+    ///   path under the retained fence and protected-snapshot digest,
+    ///   including the all-empty genesis branch. Partial state is an error;
+    ///   no default is manufactured.
+    /// - A post-read canonical scope must agree with the recovered heads on
+    ///   scope identity, fence, and every revision/ordering head; mid-read
+    ///   revision churn blocks publication.
+    /// - Service observations are re-validated and owners are rebuilt through
+    ///   `GovernorOwners::from_recovery`. Only a fully coherent result swaps
+    ///   `owners`, `recovery`, and `service_observations`. On any failure the
+    ///   previous projection and receipts are kept untouched; callers observe
+    ///   `Err`, never a false success.
+    /// - The orchestration lifecycle object is retained: re-validated
+    ///   observations still satisfy the required-base admission proved at
+    ///   construction under the same fence.
+    pub fn refresh_from_kernel(&mut self) -> Result<(), CompositionError> {
+        let observed = self.kernel.snapshot().clone();
+        let expected =
+            KernelGenerationExpectation::from_snapshot(&self.snapshot).map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "retained Kernel snapshot is no longer well-formed: {error}"
+                ))
+            })?;
+        expected.admits(&observed).map_err(|error| {
+            CompositionError::Recovery(format!(
+                "Kernel generation changed; drop this composition and re-run authenticated \
+                 connect+start before publishing projections: {error}"
+            ))
+        })?;
+        let state_fence = self.snapshot.state_fence();
+        let protected_snapshot_digest = self.snapshot.protected_snapshot_digest.clone();
+        let recovery = recover_from_kernel(
+            self.kernel.as_ref(),
+            &state_fence,
+            &protected_snapshot_digest,
+        )?;
+        recovery.validate(&state_fence, &protected_snapshot_digest)?;
+        let post_scope = self
+            .kernel
+            .canonical_scope(&state_fence, &protected_snapshot_digest)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        coherence_result(compare_scope_heads(
+            &recovery.canonical_scope,
+            &post_scope,
+            &state_fence,
+        ))?;
+        let service_observations = self
+            .kernel
+            .services(&state_fence, &protected_snapshot_digest)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        validate_service_observations(&service_observations, &state_fence)?;
+        let owners = GovernorOwners::from_recovery(
+            self.kernel.clone(),
+            &state_fence,
+            protected_snapshot_digest.clone(),
+            &recovery,
+        )?;
+        self.owners = owners;
+        self.recovery = recovery;
+        self.service_observations = service_observations;
+        Ok(())
+    }
+
     /// Reads one coherent semantic activation from all required owner records.
     ///
     /// No semantic identity is accepted from the caller: coordination first
@@ -1912,13 +1989,28 @@ mod tests {
     use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
     use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
     use eliot_session::{RegisterSession, SessionCommand, SessionCommandContext};
-    use eliot_store_api::ScopeId;
+    use eliot_store_api::{
+        CommitId, OperationManifestDigest, OrderingHead, OrderingScopeId, Resubmission,
+        RevisionHead, RevisionKey, ScopeId, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    };
     use eliot_task::{TaskCommandContext, TaskLifecycleEvent, TaskProposal, TaskRecord};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct FakeKernel {
         snapshot: KernelGenerationSnapshot,
         payloads: BTreeMap<RecoveryOwner, Vec<u8>>,
+        /// Post-construction owner overrides keyed by owner. `Some(bytes)`
+        /// replaces the seeded payload; `None` drops the read to simulate
+        /// partial recovery. Checked before `payloads`/`missing`.
+        live_reads: Mutex<BTreeMap<RecoveryOwner, Option<Vec<u8>>>>,
+        /// Staged canonical scope views. While more than one view is staged,
+        /// calls consume them in order (simulating heads moving between
+        /// reads); a single remaining view is served stably; empty falls back
+        /// to the default empty view.
+        staged_scopes: Mutex<Vec<ScopeRevisionView>>,
+        /// Terminal receipts served by the receipts route.
+        receipts: Vec<WriteReceipt>,
         missing: Option<RecoveryOwner>,
         genesis_all_absent: bool,
         genesis_seeded: Arc<AtomicBool>,
@@ -1960,6 +2052,25 @@ mod tests {
             &self,
             request: KernelNamedReadRequest,
         ) -> Result<Option<KernelNamedReadReply>, KernelPortError> {
+            let live = self
+                .live_reads
+                .lock()
+                .expect("live read lock")
+                .get(&request.owner)
+                .cloned();
+            if let Some(live) = live {
+                return match live {
+                    Some(payload) => Ok(Some(KernelNamedReadReply {
+                        owner: request.owner,
+                        state_fence: request.state_fence,
+                        revision: 1,
+                        schema: OWNER_SNAPSHOT_SCHEMA.to_owned(),
+                        value_digest: sha256_hex(&payload),
+                        payload,
+                    })),
+                    None => Ok(None),
+                };
+            }
             if self.missing == Some(request.owner) {
                 return Ok(None);
             }
@@ -2000,6 +2111,13 @@ mod tests {
             state_fence: &StateFence,
             _protected_snapshot_digest: &str,
         ) -> Result<ScopeRevisionView, KernelPortError> {
+            let mut staged = self.staged_scopes.lock().expect("staged scope lock");
+            if staged.len() > 1 {
+                return Ok(staged.remove(0));
+            }
+            if let Some(view) = staged.first() {
+                return Ok(view.clone());
+            }
             Ok(ScopeRevisionView {
                 scope_id: ScopeId::new("governor").expect("scope"),
                 revision_heads: Vec::new(),
@@ -2013,7 +2131,7 @@ mod tests {
             _state_fence: &StateFence,
             _protected_snapshot_digest: &str,
         ) -> Result<Vec<WriteReceipt>, KernelPortError> {
-            Ok(Vec::new())
+            Ok(self.receipts.clone())
         }
 
         fn durable_jobs(
@@ -2073,6 +2191,9 @@ mod tests {
         FakeKernel {
             snapshot,
             payloads: BTreeMap::new(),
+            live_reads: Mutex::new(BTreeMap::new()),
+            staged_scopes: Mutex::new(Vec::new()),
+            receipts: Vec::new(),
             missing: None,
             genesis_all_absent: false,
             genesis_seeded: Arc::new(AtomicBool::new(false)),
@@ -3254,5 +3375,188 @@ mod tests {
         // internal defects are not downgraded to user ambiguity.
         assert_eq!(failed.kind_str(), "FAILED_INTERNAL");
         assert!(!failed.is_resolved());
+    }
+
+    fn refresh_task_snapshot(fence: &StateFence, goal: &str) -> TaskLifecycleSnapshot {
+        let mut task = TaskLifecycleOwner::new(fence.authority_epoch, fence.clone()).expect("task");
+        task.propose(TaskProposal {
+            task_id: TaskId::new("task-1").expect("task id"),
+            project_ref: "project-1".to_owned(),
+            goal: goal.to_owned(),
+            context: TaskCommandContext {
+                request_id: "task-request-1".to_owned(),
+                event_id: "task-event-1".to_owned(),
+                actor_ref: "actor-1".to_owned(),
+                state_fence: fence.clone(),
+                authority_epoch: fence.authority_epoch,
+                observed_at: ClockReading::default(),
+            },
+        })
+        .expect("task proposal");
+        task.snapshot()
+    }
+
+    fn refresh_heads(
+        fence: &StateFence,
+        task_revision: u64,
+        ordering_sequence: u64,
+    ) -> ScopeRevisionView {
+        ScopeRevisionView {
+            scope_id: ScopeId::new("governor").expect("scope"),
+            revision_heads: vec![RevisionHead {
+                key: RevisionKey::new("task:task-1").expect("revision key"),
+                revision: task_revision,
+                state_fence: fence.clone(),
+            }],
+            ordering_heads: vec![OrderingHead {
+                scope: OrderingScopeId::new("scope:governor").expect("ordering scope"),
+                sequence: ordering_sequence,
+                state_fence: fence.clone(),
+            }],
+            state_fence: fence.clone(),
+        }
+    }
+
+    #[test]
+    fn refresh_publishes_committed_owner_change_across_restart() {
+        let observed = snapshot();
+        let fence = observed.state_fence();
+        let task_id = TaskId::new("task-1").expect("task id");
+        let mut fake = fake_kernel(observed.clone());
+        fake.payloads.insert(
+            RecoveryOwner::Task,
+            canonical_json_bytes(&refresh_task_snapshot(&fence, "goal before refresh"))
+                .expect("task bytes"),
+        );
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let kernel = Arc::new(fake);
+        let mut composition =
+            GovernorComposition::new(kernel.clone(), &expected, QueueLimits::default())
+                .expect("composition");
+        assert_eq!(
+            composition.owners().task.task(&task_id).expect("task").goal,
+            "goal before refresh"
+        );
+        // The Kernel commits a new task revision plus a new stable canonical
+        // head set; both reads of one refresh observe the same heads.
+        kernel.live_reads.lock().expect("live read lock").insert(
+            RecoveryOwner::Task,
+            Some(
+                canonical_json_bytes(&refresh_task_snapshot(&fence, "goal after refresh"))
+                    .expect("task bytes"),
+            ),
+        );
+        let moved_heads = refresh_heads(&fence, 2, 2);
+        kernel
+            .staged_scopes
+            .lock()
+            .expect("staged scope lock")
+            .push(moved_heads.clone());
+        composition
+            .refresh_from_kernel()
+            .expect("refresh publishes the committed change");
+        assert_eq!(
+            composition.owners().task.task(&task_id).expect("task").goal,
+            "goal after refresh"
+        );
+        assert_eq!(composition.recovery().canonical_scope, moved_heads);
+        // A restart rehydrates the same committed state, proving the refreshed
+        // projection was Kernel-owned rather than locally fabricated.
+        let restarted = GovernorComposition::new(kernel.clone(), &expected, QueueLimits::default())
+            .expect("restart");
+        assert_eq!(
+            restarted.owners().task.task(&task_id).expect("task").goal,
+            "goal after refresh"
+        );
+        assert_eq!(restarted.recovery().canonical_scope, moved_heads);
+    }
+
+    #[test]
+    fn refresh_rejects_changed_heads_and_partial_recovery() {
+        let observed = snapshot();
+        let fence = observed.state_fence();
+        let task_id = TaskId::new("task-1").expect("task id");
+        let receipt = WriteReceipt {
+            operation_id: OperationId::new("op-refresh-1").expect("operation id"),
+            idempotency_key: "refresh-retry-1".to_owned(),
+            canonical_request_hash: "d".repeat(64),
+            transition_class: TransitionClass::TaskControl,
+            status: WriteReceiptStatus::Committed,
+            commit_id: Some(CommitId::new("commit-refresh-1").expect("commit id")),
+            state_fence: fence.clone(),
+            ordering_sequences: Vec::new(),
+            revision_before_after: Vec::new(),
+            applied_command_ids: vec!["cmd-1".to_owned()],
+            emitted_event_ids: Vec::new(),
+            projection_refs: Vec::new(),
+            outbox_refs: Vec::new(),
+            operation_manifest_digest: OperationManifestDigest::new("manifest")
+                .expect("manifest digest"),
+            error_code: None,
+            resubmission: Resubmission::None,
+            committed_at: Some("commit-sequence-0000000000000001".to_owned()),
+            envelope: None,
+        };
+        receipt.validate().expect("seeded receipt is valid");
+        let mut fake = fake_kernel(observed.clone());
+        fake.payloads.insert(
+            RecoveryOwner::Task,
+            canonical_json_bytes(&refresh_task_snapshot(&fence, "stable goal"))
+                .expect("task bytes"),
+        );
+        fake.receipts.push(receipt.clone());
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let kernel = Arc::new(fake);
+        let mut composition =
+            GovernorComposition::new(kernel.clone(), &expected, QueueLimits::default())
+                .expect("composition");
+        assert_eq!(composition.recovery().receipts, vec![receipt.clone()]);
+        let retained = composition.recovery().clone();
+
+        // Heads move between the recovery reads and the post-read: publication
+        // is blocked and the previous projection is kept.
+        kernel
+            .staged_scopes
+            .lock()
+            .expect("staged scope lock")
+            .extend([refresh_heads(&fence, 2, 2), refresh_heads(&fence, 3, 2)]);
+        let churned = composition.refresh_from_kernel();
+        assert!(
+            matches!(
+                churned,
+                Err(CompositionError::Recovery(ref message)) if message.contains("moved mid-read")
+            ),
+            "refresh accepted heads that moved mid-read: {churned:?}"
+        );
+        assert_eq!(composition.readiness(), CompositionReadiness::Ready);
+        assert_eq!(*composition.recovery(), retained);
+        assert_eq!(composition.recovery().receipts, vec![receipt.clone()]);
+        assert_eq!(
+            composition.owners().task.task(&task_id).expect("task").goal,
+            "stable goal"
+        );
+
+        // One owner read goes missing: partial recovery fails closed without
+        // manufacturing a default, preserving projection and receipt.
+        kernel
+            .live_reads
+            .lock()
+            .expect("live read lock")
+            .insert(RecoveryOwner::Task, None);
+        let partial = composition.refresh_from_kernel();
+        assert!(
+            matches!(
+                partial,
+                Err(CompositionError::Recovery(ref message)) if message.contains("partial")
+            ),
+            "refresh accepted partial recovery: {partial:?}"
+        );
+        assert_eq!(composition.readiness(), CompositionReadiness::Ready);
+        assert_eq!(*composition.recovery(), retained);
+        assert_eq!(composition.recovery().receipts, vec![receipt]);
+        assert_eq!(
+            composition.owners().task.task(&task_id).expect("task").goal,
+            "stable goal"
+        );
     }
 }

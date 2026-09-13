@@ -34,6 +34,7 @@
 
 mod activation_outcome;
 mod composition;
+mod owner_projection_refresh;
 
 pub use activation_outcome::*;
 pub use composition::*;
