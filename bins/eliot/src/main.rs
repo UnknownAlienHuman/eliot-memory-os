@@ -2400,20 +2400,70 @@ fn run_installation_effect(
 /// terminal is the expected fenced first-install state and remains pending;
 /// this query never starts services, rewrites descriptors, or retries a
 /// credential/SCM effect.
+///
+/// The terminal-reconcile writer open below is short-lived and bounded: it
+/// retries only redb exclusive-lock contention with backoff, then fails
+/// typed with the preserved cause (A13.9:14 no exclusive owner across an
+/// unbounded wait; `crates/kernel/eliot-installation/src/installation_registry.rs:8-13`
+/// bounded-hold contract; prior `drop(registry)` fix at main.rs:2221-2228;
+/// redb `Database::open` takes an exclusive file lock while the Watchdog
+/// 250ms poll may hold the file).
+fn is_redb_exclusive_lock_contention(error: &InstallationError) -> bool {
+    match error {
+        InstallationError::Platform(reason) => {
+            let normalized = reason.to_lowercase();
+            normalized.contains("already open") || normalized.contains("cannot acquire lock")
+        }
+        _ => false,
+    }
+}
+
+/// Opens the existing registry for terminal reconcile with bounded
+/// lock-contention retry. Absent stays `Ok(None)`; non-lock failures fail
+/// fast with the preserved cause. Total sleep is bounded well below 5s so
+/// this second-apply query-reconcile never becomes an unbounded wait.
+fn open_existing_registry_for_terminal_reconcile(
+    host_state_root: &Path,
+) -> Result<Option<RedbInstallationRegistry>, InstallationError> {
+    // NOTE: Writer-A may add a shared retry primitive in the registry crate;
+    // writers run in parallel from the same base, so this file keeps a small
+    // local loop. The integrator may dedupe to the shared helper on merge.
+    const MAX_ATTEMPTS: usize = 6;
+    // 100+200+400+800+1600 = 3100ms total sleep, strictly below the 5s bound.
+    const BACKOFF_MS: [u64; 5] = [100, 200, 400, 800, 1600];
+    let mut last_contention: Option<InstallationError> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let host_root = ProtectedRootLease::open_existing(host_state_root)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        match RedbInstallationRegistry::open_existing_at(host_root) {
+            Ok(registry) => return Ok(registry),
+            Err(error) if is_redb_exclusive_lock_contention(&error) => {
+                last_contention = Some(error);
+                if attempt + 1 < MAX_ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(BACKOFF_MS[attempt]));
+                    continue;
+                }
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_contention.expect("lock-contention loop must retain its cause"))
+}
+
 fn reconcile_host_activation_terminal(
     store_path: &Path,
     transaction: &InstallationTransaction,
 ) -> Result<Option<InstallationStepOutcome>, InstallationError> {
-    let host_root = ProtectedRootLease::open_existing(Path::new(
+    let host_state_root = Path::new(
         transaction
             .candidate_manifest
             .runtime_launch
             .runtime_state_roots
             .host_state_root
             .as_str(),
-    ))
-    .map_err(|error| InstallationError::Platform(error.to_string()))?;
-    let Some(registry) = RedbInstallationRegistry::open_existing_at(host_root)? else {
+    );
+    let Some(registry) = open_existing_registry_for_terminal_reconcile(host_state_root)? else {
         return Ok(None);
     };
     let receipt = match registry.read_committed_activation_receipt(
