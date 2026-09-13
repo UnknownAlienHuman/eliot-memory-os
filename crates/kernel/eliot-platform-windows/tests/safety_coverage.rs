@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-const EXPECTED_SITES: usize = 144;
-const EXPECTED_BLOCK: usize = 143;
+const EXPECTED_SITES: usize = 147;
+const EXPECTED_BLOCK: usize = 146;
 const EXPECTED_IMPL: usize = 1;
 const EXPECTED_ALLOWS: usize = 5;
 const MAX_SOURCE_BYTES: usize = 5_000_000;
