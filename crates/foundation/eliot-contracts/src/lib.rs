@@ -15,8 +15,10 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod capability_cell_registry;
 mod epoch_identity;
 
+pub use capability_cell_registry::*;
 pub use epoch_identity::*;
 
 /// The current wire revision of this foundation surface.
