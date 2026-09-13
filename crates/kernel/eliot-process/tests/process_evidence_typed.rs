@@ -10,6 +10,13 @@ use serde_json::{Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+const LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+const LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+fn epoch(lineage: &str, sequence: u64) -> Value {
+    json!({"lineage_id": lineage, "sequence": sequence})
+}
+
 fn binding(operation_id: &str) -> TestResult<ProcessExecutionBinding> {
     Ok(serde_json::from_value(json!({
         "operation_id": operation_id,
@@ -20,9 +27,9 @@ fn binding(operation_id: &str) -> TestResult<ProcessExecutionBinding> {
         "generation": 3,
         "action_lease_ref": "lease-1",
         "authority_id": "authority-1",
-        "authority_epoch": 7,
+        "authority_epoch": epoch(LINEAGE_A, 7),
         "state_fence": {
-            "authority_epoch": 7,
+            "authority_epoch": epoch(LINEAGE_A, 7),
             "generation": 3,
             "nonce": "fence-1"
         },
@@ -156,7 +163,9 @@ fn typed_stream_identity_and_version_are_strict() -> TestResult {
         EvidenceAxes::observed(),
     )?;
     let mut invalid_binding = serde_json::to_value(empty)?;
-    invalid_binding["view"]["binding"]["authority_epoch"] = json!(0);
+    // Same sequence in another lineage is unrelated authority and must fail
+    // closed against the lineage-A fence.
+    invalid_binding["view"]["binding"]["authority_epoch"] = epoch(LINEAGE_B, 7);
     assert!(serde_json::from_value::<ProcessEvidence>(invalid_binding).is_err());
 
     let null_schema_binding = crate::binding("operation-3")?;
