@@ -251,7 +251,7 @@ pub use secret_store::{
 pub use service_registration::{
     ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME,
     ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK, ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
-    ELIOT_WATCHDOG_SERVICE_NAME, ServiceAccount, ServiceBootstrapArguments,
+    ELIOT_WATCHDOG_SERVICE_NAME, ServiceAbsentProof, ServiceAccount, ServiceBootstrapArguments,
     ServiceControlGrantReadback, ServiceRegistrationCurrent, ServiceRegistrationInspection,
     ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
     ServiceRuntimeObservation, ServiceSidType, ServiceStartMode, ServiceStartOutcome,
@@ -4101,7 +4101,7 @@ fn register_service(
         ServiceRegistrationInspection::Unknown => {
             return Ok(ServiceRegistrationOutcome::EffectUnknown);
         }
-        ServiceRegistrationInspection::Absent => {}
+        ServiceRegistrationInspection::Absent { .. } => {}
     }
     let wide_text = |value: &OsStr| value.encode_wide().chain(Some(0)).collect::<Vec<_>>();
     let service_name = wide_text(OsStr::new(request.service_name()));
@@ -4214,7 +4214,7 @@ fn register_service(
             observation,
             control_grant,
         }),
-        ServiceRegistrationInspection::Absent
+        ServiceRegistrationInspection::Absent { .. }
         | ServiceRegistrationInspection::Mismatched
         | ServiceRegistrationInspection::Unknown => Ok(ServiceRegistrationOutcome::EffectUnknown),
     }
@@ -4338,7 +4338,7 @@ fn update_service_registration(
             observation,
             control_grant,
         }),
-        ServiceRegistrationInspection::Absent
+        ServiceRegistrationInspection::Absent { .. }
         | ServiceRegistrationInspection::Mismatched
         | ServiceRegistrationInspection::Unknown => Ok(ServiceRegistrationOutcome::EffectUnknown),
     }
@@ -4433,7 +4433,7 @@ fn delete_service_registration(
         return Ok(ServiceRegistrationOutcome::EffectUnknown);
     }
     match inspect_service_registration(request) {
-        ServiceRegistrationInspection::Absent => Ok(ServiceRegistrationOutcome::Deleted),
+        ServiceRegistrationInspection::Absent { .. } => Ok(ServiceRegistrationOutcome::Deleted),
         ServiceRegistrationInspection::Matching { .. }
         | ServiceRegistrationInspection::Mismatched
         | ServiceRegistrationInspection::Unknown => Ok(ServiceRegistrationOutcome::EffectUnknown),
@@ -5274,7 +5274,16 @@ fn inspect_service_registration(
         // handle with no double close or later use; return drives no dereference.
         unsafe { CloseServiceHandle(manager) };
         return if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST.cast_signed()) {
-            ServiceRegistrationInspection::Absent
+            // Bind the live SCM outcome to the exact query so absence callers
+            // observe proof instead of inferring absence from plan data. A
+            // proof that cannot be constructed is never reported as absence.
+            match ServiceAbsentProof::new(
+                request.service_name(),
+                request.expected_configuration_digest(),
+            ) {
+                Ok(proof) => ServiceRegistrationInspection::Absent { proof },
+                Err(_) => ServiceRegistrationInspection::Unknown,
+            }
         } else {
             ServiceRegistrationInspection::Unknown
         };
