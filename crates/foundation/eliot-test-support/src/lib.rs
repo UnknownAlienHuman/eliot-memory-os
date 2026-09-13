@@ -16,7 +16,7 @@ use std::{
 };
 
 use eliot_contracts::{
-    AuthorityEpoch, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
+    ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
     SourceId, StateFence, TransactionSequence,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -153,6 +153,13 @@ pub enum IdError {
     Contract(#[from] eliot_contracts::ContractError),
 }
 
+fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
+    use eliot_contracts::{EpochId, EpochLineageId};
+    use std::num::NonZeroU64;
+    let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("canonical test lineage-A");
+    EpochId::new(lineage, NonZeroU64::new(sequence).expect("non-zero test sequence")).expect("valid test epoch")
+}
+
 /// A valid request fixture composed only from C0-01 primitives.
 pub fn valid_request_fixture(
     ids: &mut DeterministicIds,
@@ -164,7 +171,7 @@ pub fn valid_request_fixture(
         task_id: None,
         product_id: ids.product_id()?,
         source_id: ids.source_id()?,
-        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         clock: clock.reading(),
     };
     request.validate()?;
@@ -504,7 +511,7 @@ mod tests {
             "request_id": 7,
             "product_id": "p",
             "source_id": "s",
-            "state_fence": {"authority_epoch": 1, "resource_generation": 1},
+            "state_fence": {"authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 1}, "resource_generation": 1},
             "clock": {}
         });
         assert!(serde_json::from_value::<RequestMetadata>(malformed).is_err());

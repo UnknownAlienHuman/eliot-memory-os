@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use eliot_contracts::{
-    AuthorityEpoch, StateFence, WORK_LEASE_NAMESPACE, WORK_LEASE_WIRE_REVISION,
+    EpochId, StateFence, WORK_LEASE_NAMESPACE, WORK_LEASE_WIRE_REVISION,
     WorkLeaseId as CanonicalWorkLeaseId, canonical_json_bytes, sha256_hex,
 };
 use schemars::JsonSchema;
@@ -230,7 +230,7 @@ impl super::CoordinationOwner {
             if lease.lease_id != decision.lease.lease_id
                 || lease.work_item_id != decision.lease.work_item_id
                 || lease.holder_session_id != decision.lease.holder_session_id
-                || lease.authority_epoch != decision.lease.authority_epoch
+                || !lease.authority_epoch.is_same_authority(&decision.lease.authority_epoch)
                 || lease.state_fence != decision.lease.state_fence
                 || lease.issued_at != decision.lease.issued_at
                 || lease.expires_at == 0
@@ -245,7 +245,7 @@ impl super::CoordinationOwner {
                 .get(&request.session_id)
                 .ok_or(super::CoordinationError::InvalidState)?;
             if session.session_id != request.session_id
-                || session.authority_epoch != request.authority_epoch
+                || !session.authority_epoch.is_same_authority(&request.authority_epoch.clone())
                 || session.state_fence != request.state_fence
             {
                 return Err(super::CoordinationError::InvalidState);
@@ -264,7 +264,7 @@ impl super::CoordinationOwner {
 
     pub(crate) fn validate_current_bindings(
         &self,
-        authority_epoch: AuthorityEpoch,
+        authority_epoch: EpochId,
         state_fence: &StateFence,
     ) -> Result<(), super::CoordinationError> {
         for session in self
@@ -272,7 +272,11 @@ impl super::CoordinationOwner {
             .values()
             .filter(|session| session.state == super::SessionState::Active)
         {
-            if session.authority_epoch != authority_epoch || session.state_fence != *state_fence {
+            if !session
+                .authority_epoch
+                .is_same_authority(&authority_epoch.clone())
+                || session.state_fence != *state_fence
+            {
                 return Err(super::CoordinationError::FenceMismatch);
             }
             super::validate_active_session_heartbeat(session, None)?;
@@ -306,12 +310,12 @@ impl super::CoordinationOwner {
                 .get(lease_id)
                 .ok_or(super::CoordinationError::InvalidState)?;
             if session.state != super::SessionState::Active
-                || session.authority_epoch != authority_epoch
+                || !session.authority_epoch.is_same_authority(&authority_epoch.clone())
                 || session.state_fence != *state_fence
                 || lease.lease_id != lease_id
                 || lease.work_item_id != item.work_item_id
                 || lease.holder_session_id != session_id
-                || lease.authority_epoch != authority_epoch
+                || !lease.authority_epoch.is_same_authority(&authority_epoch.clone())
                 || lease.state_fence != *state_fence
                 || lease.retired_at.is_some()
                 || lease.issued_at == 0
@@ -339,7 +343,7 @@ fn validate_fresh_request(
     ] {
         super::text(value, field)?;
     }
-    owner.common(request.authority_epoch, &request.state_fence)?;
+    owner.common(request.authority_epoch.clone(), &request.state_fence)?;
     super::nonzero(request.now, "now")?;
     if request.lease_duration == 0 || request.now.checked_add(request.lease_duration).is_none() {
         return Err(super::CoordinationError::InvalidField("lease_duration"));
@@ -347,7 +351,7 @@ fn validate_fresh_request(
     let session = owner.read_active_session(
         &request.session_id,
         request.now,
-        request.authority_epoch,
+        request.authority_epoch.clone(),
         &request.state_fence,
     )?;
     if session.state_fence != request.state_fence {
@@ -393,7 +397,7 @@ fn validate_candidate_records(
         .get(&request.lease_id)
         .ok_or(WorkLeaseIssuanceError::InconsistentOwnerEvidence)?;
     if session.state != super::SessionState::Active
-        || session.authority_epoch != request.authority_epoch
+        || !session.authority_epoch.is_same_authority(&request.authority_epoch.clone())
         || session.state_fence != request.state_fence
         || item.state != super::WorkState::Claimed
         || item.owner_session_id.as_deref() != Some(request.session_id.as_str())
@@ -415,7 +419,7 @@ fn event_matches_request(
         && event.event_id == format!("claim:{}", request.lease_id)
         && event.subject_id == request.work_item_id
         && event.actor_id == request.session_id
-        && event.authority_epoch == request.authority_epoch
+        && event.authority_epoch.is_same_authority(&request.authority_epoch.clone())
         && event.state_fence == request.state_fence
         && event.payload_digest == request.lease_id
 }
@@ -432,7 +436,7 @@ fn validate_request_binding(
     if lease.lease_id != request.lease_id
         || lease.work_item_id != request.work_item_id
         || lease.holder_session_id != request.session_id
-        || lease.authority_epoch != request.authority_epoch
+        || !lease.authority_epoch.is_same_authority(&request.authority_epoch.clone())
         || lease.state_fence != request.state_fence
         || lease.issued_at != request.now
         || lease.expires_at != expires_at
@@ -490,12 +494,25 @@ fn canonical_work_lease_id(value: &str) -> Result<CanonicalWorkLeaseId, WorkLeas
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use eliot_contracts::{ClockReading, ResourceGeneration};
+    use eliot_contracts::{ClockReading, EpochId, ResourceGeneration};
 
     use super::*;
 
+    fn test_epoch(sequence: u64) -> EpochId {
+        use eliot_contracts::EpochLineageId;
+        use std::num::NonZeroU64;
+        let lineage =
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
     fn fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(test_epoch(1), ResourceGeneration::genesis())
     }
 
     fn ready_owner() -> (super::super::CoordinationOwner, StateFence) {
@@ -507,7 +524,7 @@ mod tests {
                 session_id: "session-1".to_owned(),
                 principal_id: "principal-1".to_owned(),
                 route_ref: "route-1".to_owned(),
-                authority_epoch: AuthorityEpoch::genesis(),
+                authority_epoch: test_epoch(1),
                 state_fence: state_fence.clone(),
                 now: 10,
                 heartbeat_deadline: 100,
@@ -540,7 +557,7 @@ mod tests {
             lease_id: "lease-1".to_owned(),
             work_item_id: "work-1".to_owned(),
             session_id: "session-1".to_owned(),
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(1),
             state_fence: state_fence.clone(),
             now: 20,
             lease_duration: 40,
@@ -618,7 +635,7 @@ mod tests {
                 request_id: "heartbeat-work".to_owned(),
                 session_id: "session-1".to_owned(),
                 lease_id: "lease-1".to_owned(),
-                authority_epoch: AuthorityEpoch::genesis(),
+                authority_epoch: test_epoch(1),
                 state_fence: state_fence.clone(),
                 now: 25,
                 extend_to: 80,
