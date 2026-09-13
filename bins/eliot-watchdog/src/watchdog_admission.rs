@@ -11,21 +11,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eliot_installation::{
-    CandidateManifest, InstallationProfile, RedbInstallationRegistry, RuntimeStateRoots,
+    verify_file_digest, verify_file_digest_with_lease, CandidateManifest, InstallationProfile,
+    PendingActivationState, RedbInstallationRegistry, RuntimeStateRoots,
     ValidatedRuntimeRootLeases, WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider,
-    verify_file_digest, verify_file_digest_with_lease,
 };
 use eliot_platform_windows::{
-    ProtectedPathLease, ProtectedRootLease, ServiceBootstrapArguments, ServiceRegistrationRequest,
-    windows_paths_equal,
+    windows_paths_equal, ProtectedPathLease, ProtectedRootLease, ServiceBootstrapArguments,
+    ServiceRegistrationRequest,
 };
 use eliot_runtime_contracts::ProvisionedSupervisionAuthority;
 
 use super::runtime_manifest_selection::{approved_host_artifact_path, select_runtime_manifest};
 use super::service_registration_projection::load_approved_service_registrations;
 use super::{
-    ApprovedHostRegistration, INSTALLATION_REGISTRY_FILE_NAME, SpoolError,
-    VerifiedWatchdogAdmission, WatchdogAdmissionSource, supervision_lease_load,
+    supervision_lease_load, ApprovedHostRegistration, SpoolError, VerifiedWatchdogAdmission,
+    WatchdogAdmissionSource, WatchdogAuthorityState, WatchdogConfig, WatchdogReadiness,
+    INSTALLATION_REGISTRY_FILE_NAME, PROTOCOL_VERSION, SERVICE_NAME,
 };
 
 /// Registry- and ORS-backed admission source for the immutable Host
@@ -109,6 +110,116 @@ impl FileWatchdogAdmission {
         bootstrap: ServiceBootstrapArguments,
     ) -> Result<Self, SpoolError> {
         Self::from_registry(registry_path, bootstrap)
+    }
+
+    /// Proves a pre-Phase-B pending fence without requiring durable authority.
+    ///
+    /// s33.2: the first-install dependency contour starts Watchdog before Host,
+    /// credential provisioning, and Phase-B materialization by design
+    /// (`package_planner.rs:1555-1557`; enforced through activation by
+    /// `transaction.rs:795-805,870-882`), so the selected pending generation
+    /// has no intent+prepared+receipt triple yet and
+    /// `provisioned_supervision_authority_for_generation` returns `None`
+    /// (`approved_generation_registry.rs:2798-2804`). Authority absence there
+    /// is not corruption: I8.1 keeps the minimal sensor alive on demand with
+    /// no coverage claimed, and I1.11 step 11 admits Watchdog coverage only
+    /// after the supervision evidence exists.
+    ///
+    /// Returns the observable fenced readiness (`RunningNoAuthority`, no
+    /// coverage claimed) if and only if every bootstrap-selected contour check
+    /// that `from_registry` performs passes except the durable-authority gate:
+    /// exact retained Host root, exact registry child, manifest selection,
+    /// installer SCM registration approvals, and the `SystemService` profile.
+    /// Retained image digests, root leases, and the authority template stay
+    /// enforced by `from_registry` before any composition starts; they are
+    /// never dropped, only deferred until the Phase-B receipt exists.
+    ///
+    /// Every other registry state (substituted contour, recovery-required
+    /// pending, active generation without a committed fence, or an already
+    /// provisioned authority) returns an error so the caller keeps failing
+    /// closed instead of fencing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry is missing, invalid, has no exact
+    /// bootstrap-selected contour, or is not a pre-Phase-B pending activation
+    /// without durable supervision authority.
+    pub fn pending_phase_b_fence_readiness(
+        registry_path: impl Into<PathBuf>,
+        bootstrap: ServiceBootstrapArguments,
+    ) -> Result<WatchdogReadiness, SpoolError> {
+        let registry_path = registry_path.into();
+        let declared_host_root = bootstrap.host_state_root().ok_or_else(|| {
+            SpoolError::InvalidLease(
+                "Watchdog SCM bootstrap omitted the installer-approved Host state root".to_owned(),
+            )
+        })?;
+        let host_state_root_lease =
+            ProtectedRootLease::open_existing(declared_host_root).map_err(|error| {
+                SpoolError::InvalidLease(format!("Host state root open failed: {error}"))
+            })?;
+        let canonical_host_root = host_state_root_lease.canonical_path().map_err(|error| {
+            SpoolError::InvalidLease(format!("Host state root resolve failed: {error}"))
+        })?;
+        if !windows_paths_equal(&canonical_host_root, declared_host_root) {
+            return Err(SpoolError::InvalidLease(
+                "SCM Host state root is not the exact retained installation root".to_owned(),
+            ));
+        }
+        let expected_registry_path = canonical_host_root.join(INSTALLATION_REGISTRY_FILE_NAME);
+        if !windows_paths_equal(&registry_path, &expected_registry_path) {
+            return Err(SpoolError::InvalidLease(
+                "Watchdog registry path is not the exact approved Host child".to_owned(),
+            ));
+        }
+        let registry = RedbInstallationRegistry::inspect_existing_at(
+            ProtectedRootLease::open_existing(&canonical_host_root).map_err(|error| {
+                SpoolError::InvalidLease(format!("Host state root reopen failed: {error}"))
+            })?,
+        )
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
+        .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
+        let selected_manifest = select_runtime_manifest(&registry, &bootstrap)?;
+        let authority = registry
+            .provisioned_supervision_authority_for_generation(&selected_manifest.generation)
+            .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+        if authority.is_some() {
+            return Err(SpoolError::InvalidLease(
+                "durable provisioned supervision authority already exists; pre-Phase-B fence is not applicable"
+                    .to_owned(),
+            ));
+        }
+        let pending = registry.pending_activation().ok_or_else(|| {
+            SpoolError::InvalidLease(
+                "selected generation without durable authority is not a pending pre-Phase-B activation"
+                    .to_owned(),
+            )
+        })?;
+        if !matches!(pending.state, PendingActivationState::Pending)
+            || pending.manifest.generation != selected_manifest.generation
+        {
+            return Err(SpoolError::InvalidLease(
+                "selected generation without durable authority is not a pending pre-Phase-B activation"
+                    .to_owned(),
+            ));
+        }
+        let _ = load_approved_service_registrations(&registry, &selected_manifest, &bootstrap)?;
+        if selected_manifest.runtime_launch.runtime_state_roots.profile
+            != InstallationProfile::SystemService
+        {
+            return Err(SpoolError::InvalidLease(
+                "watchdog has no retained file adapter for this installation profile".to_owned(),
+            ));
+        }
+        Ok(WatchdogReadiness {
+            service: SERVICE_NAME,
+            protocol: PROTOCOL_VERSION,
+            authority_state: WatchdogAuthorityState::RunningNoAuthority,
+            coverage_claimed: false,
+            kernel_epoch: 0,
+            watchdog_epoch: 0,
+            tick_interval_ms: WatchdogConfig::default().tick_interval.as_millis(),
+        })
     }
 
     #[must_use]
@@ -283,4 +394,59 @@ pub(super) fn validate_runtime_binding(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry_fixture::RegistryFixture;
+
+    #[test]
+    fn pre_phase_b_pending_registry_yields_fenced_readiness_not_admission() {
+        let fixture = RegistryFixture::new();
+        fixture.write_registry(&fixture.pending_only());
+        let bootstrap = fixture.base_bootstrap();
+        let registry_path = fixture.host_root().join(INSTALLATION_REGISTRY_FILE_NAME);
+        // s33.2 reader lead: the crash cause is exactly the missing durable
+        // authority for a pending generation without the Phase-B triple.
+        let error =
+            match FileWatchdogAdmission::from_registry(registry_path.clone(), bootstrap.clone()) {
+                Ok(_) => panic!(
+                    "pending-only first install unexpectedly admitted without Phase-B authority"
+                ),
+                Err(error) => error,
+            };
+        assert!(
+            error
+                .to_string()
+                .contains("no durable provisioned supervision authority"),
+            "unexpected admission error: {error}"
+        );
+        let fence = FileWatchdogAdmission::pending_phase_b_fence_readiness(
+            registry_path.clone(),
+            bootstrap.clone(),
+        )
+        .unwrap_or_else(|error| panic!("pre-Phase-B fence was rejected: {error}"));
+        assert_eq!(
+            fence.authority_state,
+            WatchdogAuthorityState::RunningNoAuthority
+        );
+        assert!(!fence.coverage_claimed);
+        assert_eq!(fence.kernel_epoch, 0);
+        assert_eq!(fence.watchdog_epoch, 0);
+        // Recovery-required pending must stay fail-closed, never fenced.
+        fixture.write_registry(&fixture.recovery_required());
+        assert!(FileWatchdogAdmission::pending_phase_b_fence_readiness(
+            registry_path.clone(),
+            bootstrap.clone()
+        )
+        .is_err());
+        // An active generation without a committed Phase-B fence is corruption,
+        // not an awaitable bootstrap state, so it must also stay fail-closed.
+        fixture.write_registry(&fixture.active_only());
+        assert!(
+            FileWatchdogAdmission::pending_phase_b_fence_readiness(registry_path, bootstrap)
+                .is_err()
+        );
+    }
 }

@@ -14,24 +14,27 @@
 //! self-admission probes, and status publication.
 
 use std::io::{self, Write};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 #[cfg(windows)]
 use std::time::Instant;
 
+use eliot_platform_windows::ServiceBootstrapArguments;
 #[cfg(windows)]
 use eliot_platform_windows::WindowsPlatform;
 use eliot_watchdog::{
-    FileWatchdogAdmission, INSTALLATION_REGISTRY_FILE_NAME, IndependentKernelSensor,
+    inspect_approved_host_registration, FileWatchdogAdmission, IndependentKernelSensor,
     LiveHostObservationSource, WatchdogAdmissionSource, WatchdogComposition, WatchdogConfig,
-    inspect_approved_host_registration,
+    INSTALLATION_REGISTRY_FILE_NAME,
 };
 
 #[cfg(windows)]
 use super::{
-    ScmWatchdogSelfAdmissionStatus, WindowsWatchdogSelfAdmissionProbe, set_service_status_running,
-    set_service_status_stopped,
+    set_service_status_running, set_service_status_stopped, ScmWatchdogSelfAdmissionStatus,
+    WindowsWatchdogSelfAdmissionProbe,
 };
 
 pub(super) fn run_watchdog(
@@ -51,10 +54,11 @@ pub(super) fn run_watchdog(
     // bounded observation; the sensor gains heartbeat authority only after a
     // later, freshly verified lease.  The source is retained by the
     // composition and reloaded before every observation.
-    let admission_source = Arc::new(
-        FileWatchdogAdmission::from_registry(registry_path, bootstrap)
-            .map_err(|error| error.to_string())?,
-    );
+    let admission_source = match wait_for_durable_admission(registry_path, bootstrap, &stop_signal)?
+    {
+        Some(admission) => Arc::new(admission),
+        None => return Ok(()),
+    };
     let binding = admission_source.runtime_binding();
     inspect_approved_host_registration(&binding).map_err(|error| error.to_string())?;
     let initial_admission = admission_source.reload().ok();
@@ -110,4 +114,64 @@ pub(super) fn run_watchdog(
     #[cfg(windows)]
     set_service_status_stopped();
     Ok(())
+}
+
+/// Delay between durable-admission probes while fenced pre-Phase-B.
+const PENDING_PHASE_B_FENCE_POLL: Duration = Duration::from_millis(250);
+
+/// Resolves the durable installer-bound admission, awaiting the Phase-B
+/// receipt when the selected generation is fenced pre-Phase-B.
+///
+/// s33.2: first install starts Watchdog before credential provisioning and
+/// Phase-B materialization by design, so `from_registry` fails on the durable
+/// authority gate while every other contour check passes. That state returns
+/// the observable fenced readiness (`RunningNoAuthority`, no coverage claimed)
+/// and reports SCM running so the installation drive can advance to Host
+/// start, credential provisioning, and Phase-B materialization; the existing
+/// reconcile path (`from_registry` re-read per probe) then admits the durable
+/// authority without a new stage. Any registry state that is not a provable
+/// pre-Phase-B pending fence keeps the original error so the process still
+/// fails closed with `STOPPED`, and an SCM stop during the wait exits cleanly.
+fn wait_for_durable_admission(
+    registry_path: PathBuf,
+    bootstrap: ServiceBootstrapArguments,
+    stop_signal: &AtomicBool,
+) -> Result<Option<FileWatchdogAdmission>, String> {
+    match FileWatchdogAdmission::from_registry(registry_path.clone(), bootstrap.clone()) {
+        Ok(admission) => Ok(Some(admission)),
+        Err(error) => {
+            let fence = FileWatchdogAdmission::pending_phase_b_fence_readiness(
+                registry_path.clone(),
+                bootstrap.clone(),
+            )
+            .map_err(|_| error.to_string())?;
+            serde_json::to_writer(&mut io::stdout().lock(), &fence)
+                .map_err(|error| format!("{error:?}"))?;
+            writeln!(io::stdout().lock()).map_err(|error| error.to_string())?;
+            #[cfg(windows)]
+            set_service_status_running();
+            loop {
+                if stop_signal.load(Ordering::Acquire) {
+                    #[cfg(windows)]
+                    set_service_status_stopped();
+                    return Ok(None);
+                }
+                match FileWatchdogAdmission::from_registry(registry_path.clone(), bootstrap.clone())
+                {
+                    Ok(admission) => return Ok(Some(admission)),
+                    Err(retry) => {
+                        if FileWatchdogAdmission::pending_phase_b_fence_readiness(
+                            registry_path.clone(),
+                            bootstrap.clone(),
+                        )
+                        .is_err()
+                        {
+                            return Err(retry.to_string());
+                        }
+                        std::thread::sleep(PENDING_PHASE_B_FENCE_POLL);
+                    }
+                }
+            }
+        }
+    }
 }
