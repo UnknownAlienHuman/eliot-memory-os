@@ -5,6 +5,10 @@
 //!
 //! Watchdog is an independent failure domain. SCM bootstrap validates approved
 //! identity and never becomes a semantic oracle.
+//!
+//! Concurrent-reader diagnosis: `ApprovalUnavailable` carries the bounded
+//! installer-registry cause (host-root open, registry open, approval binding)
+//! so the start-failure capsule names the gap instead of erasing it.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -34,10 +38,29 @@ pub enum WatchdogScmLaunchError {
     PlatformRoot(String),
     #[error("Watchdog SCM registration is not an exact read-only runtime match: {0:?}")]
     Registration(WatchdogRuntimeReadback),
-    #[error("Watchdog SCM installer approval is unavailable or invalid")]
-    ApprovalUnavailable,
+    #[error("Watchdog SCM installer approval is unavailable or invalid: {0}")]
+    ApprovalUnavailable(String),
     #[error("Watchdog SCM bootstrap does not match the installer-approved registration")]
     ApprovalMismatch,
+}
+
+/// Per-field ceiling for the approval-unavailable cause carried into the
+/// start-failure capsule detail. Mirrors the capsule detail bound so the typed
+/// class stays stable while the cause survives truncation secret-free.
+pub(crate) const APPROVAL_DETAIL_MAX_CHARS: usize = 512;
+
+fn truncate_approval_detail(value: &str) -> String {
+    if value.chars().count() > APPROVAL_DETAIL_MAX_CHARS {
+        value.chars().take(APPROVAL_DETAIL_MAX_CHARS).collect()
+    } else {
+        value.to_owned()
+    }
+}
+
+impl From<SpoolError> for WatchdogScmLaunchError {
+    fn from(error: SpoolError) -> Self {
+        Self::ApprovalUnavailable(truncate_approval_detail(&error.to_string()))
+    }
 }
 
 /// Exact, read-only launch evidence accepted from the Windows Service Control
@@ -87,8 +110,8 @@ impl ApprovedHostRegistration {
                 "installer SCM approval is not a Host registration".to_owned(),
             ));
         }
-        let request = approval.service_registration_request().map_err(|_| {
-            SpoolError::InvalidLease("installer Host SCM approval is invalid".to_owned())
+        let request = approval.service_registration_request().map_err(|error| {
+            SpoolError::InvalidLease(format!("installer Host SCM approval is invalid: {error}"))
         })?;
         if request.service_name() != eliot_platform_windows::ELIOT_HOST_SERVICE_NAME {
             return Err(SpoolError::InvalidLease(
@@ -284,7 +307,7 @@ pub fn validate_watchdog_scm_bootstrap(
 ) -> Result<ValidatedWatchdogScmLaunch, WatchdogScmLaunchError> {
     let (_, _, registration) =
         read_approved_service_registration(bootstrap, InstallerServiceRole::Watchdog)
-            .map_err(|_| WatchdogScmLaunchError::ApprovalUnavailable)?;
+            .map_err(WatchdogScmLaunchError::from)?;
     let executable = std::env::current_exe().map_err(WatchdogScmLaunchError::Executable)?;
     if registration.service_name() != SERVICE_NAME
         || registration.bootstrap() != Some(bootstrap)

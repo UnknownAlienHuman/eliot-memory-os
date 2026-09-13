@@ -146,7 +146,7 @@ impl WatchdogStopCode {
 pub(super) fn classify_bootstrap_launch_error(error: &WatchdogScmLaunchError) -> WatchdogStopCode {
     match error {
         WatchdogScmLaunchError::InvalidArgv(_) => WatchdogStopCode::InvalidProcessBootstrap,
-        WatchdogScmLaunchError::ApprovalUnavailable => WatchdogStopCode::ApprovalUnavailable,
+        WatchdogScmLaunchError::ApprovalUnavailable(_) => WatchdogStopCode::ApprovalUnavailable,
         WatchdogScmLaunchError::ApprovalMismatch => WatchdogStopCode::ApprovalMismatch,
         WatchdogScmLaunchError::Registration(_) => WatchdogStopCode::RegistrationMismatch,
         WatchdogScmLaunchError::Executable(_)
@@ -394,7 +394,9 @@ mod tests {
             WatchdogStopCode::InvalidProcessBootstrap
         );
         assert_eq!(
-            classify_bootstrap_launch_error(&WatchdogScmLaunchError::ApprovalUnavailable),
+            classify_bootstrap_launch_error(&WatchdogScmLaunchError::ApprovalUnavailable(
+                "Host state root open failed".to_owned()
+            )),
             WatchdogStopCode::ApprovalUnavailable
         );
         assert_eq!(
@@ -425,6 +427,192 @@ mod tests {
             )),
             WatchdogStopCode::PlatformInspection
         );
+    }
+
+    #[test]
+    fn approval_unavailable_preserves_bootstrap_failure_cause_in_capsule() {
+        use eliot_installation::InstallerServiceRegistrationApproval;
+        use eliot_platform_windows::ServiceBootstrapArguments;
+        use eliot_platform_windows::test_support::override_protected_root;
+        use eliot_watchdog::{SpoolError, validate_watchdog_scm_bootstrap};
+        use std::path::{Path, PathBuf};
+
+        fn bootstrap_with_host_root(
+            host_state_root: &Path,
+            nonce: &str,
+        ) -> ServiceBootstrapArguments {
+            let descriptor = std::env::temp_dir().join(format!(
+                "eliot-watchdog-approval-descriptor-{}",
+                std::process::id()
+            ));
+            ServiceBootstrapArguments::new(
+                descriptor,
+                "a".repeat(64),
+                "installation-7",
+                7,
+                std::iter::empty::<String>(),
+            )
+            .and_then(|value| value.with_host_state_root(host_state_root))
+            .and_then(|value| value.with_registration_nonce(nonce))
+            .unwrap_or_else(|error| panic!("approval-cause bootstrap fixture: {error}"))
+        }
+
+        fn unavailable_detail(error: &WatchdogScmLaunchError) -> &str {
+            match error {
+                WatchdogScmLaunchError::ApprovalUnavailable(detail) => detail,
+                other => panic!("expected ApprovalUnavailable, got {other}"),
+            }
+        }
+
+        // (a) Host-state-root open failed: the bootstrap names a root that does
+        // not exist, so the protected open is a real failure, not canned text.
+        let missing_root: PathBuf = std::env::temp_dir().join(format!(
+            "eliot-watchdog-approval-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&missing_root);
+        let nonce_a = "e".repeat(64);
+        let error_a = match validate_watchdog_scm_bootstrap(&bootstrap_with_host_root(
+            &missing_root,
+            &nonce_a,
+        )) {
+            Ok(_) => panic!("missing Host root unexpectedly validated"),
+            Err(error) => error,
+        };
+
+        // (b) Registry/redb open failed: a retained Host root whose registry
+        // child is not a database, so the redb open is a real failure.
+        let probe_root: PathBuf = std::env::temp_dir().join(format!(
+            "eliot-watchdog-approval-probe-{}",
+            std::process::id()
+        ));
+        let host_root = probe_root.join("host");
+        std::fs::create_dir_all(&host_root)
+            .unwrap_or_else(|error| panic!("approval-cause probe root: {error}"));
+        let _protected_root = override_protected_root(&probe_root);
+        std::fs::write(
+            host_root.join(eliot_watchdog::INSTALLATION_REGISTRY_FILE_NAME),
+            b"not-a-redb-database",
+        )
+        .unwrap_or_else(|error| panic!("approval-cause corrupt registry: {error}"));
+        let nonce_b = "f".repeat(64);
+        let error_b = match validate_watchdog_scm_bootstrap(&bootstrap_with_host_root(
+            &host_root, &nonce_b,
+        )) {
+            Ok(_) => panic!("corrupt registry unexpectedly validated"),
+            Err(error) => error,
+        };
+
+        // (c) Approval invalid: a real installer approval whose configuration
+        // digest does not match the reconstructed request, so
+        // `service_registration_request` returns a real `InstallationError`.
+        // The wrapping mirrors the production prefix in
+        // `service_registration_projection.rs`.
+        let image =
+            std::env::current_exe().unwrap_or_else(|error| panic!("approval-cause image: {error}"));
+        let grant_digest = eliot_platform_windows::watchdog_service_security_descriptor_digest(
+            "S-1-5-80-1-2-3-4-5",
+        )
+        .unwrap_or_else(|error| panic!("approval-cause grant digest: {error}"));
+        let wire = serde_json::json!({
+            "transaction_id": "transaction-fixture",
+            "generation": "generation-7",
+            "effect_id": "effect-EliotWatchdog",
+            "role": "WATCHDOG",
+            "service_name": "EliotWatchdog",
+            "executable_path": image.to_string_lossy(),
+            "account": "LOCAL_SERVICE",
+            "automatic_start": true,
+            "service_bootstrap": {
+                "descriptor_path": std::env::temp_dir().join("watchdog.json").to_string_lossy(),
+                "descriptor_digest": "a".repeat(64),
+                "installation_id": "installation-7",
+                "plan_generation": 7,
+                "host_state_root": std::env::temp_dir().join("host").to_string_lossy(),
+            },
+            "registration_nonce": "b".repeat(64),
+            "configuration_digest": "0".repeat(64),
+            "service_control_grant": {
+                "principal_service": "EliotHost",
+                "principal_sid": "S-1-5-80-1-2-3-4-5",
+                "access_mask": eliot_platform_windows::ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+                "security_descriptor_digest": grant_digest,
+            },
+        });
+        let approval: InstallerServiceRegistrationApproval = serde_json::from_value(wire)
+            .unwrap_or_else(|error| panic!("approval-cause wire: {error}"));
+        let request_error = match approval.service_registration_request() {
+            Ok(_) => panic!("substituted approval unexpectedly reconstructed"),
+            Err(error) => error,
+        };
+        let error_c = WatchdogScmLaunchError::from(SpoolError::InvalidLease(format!(
+            "installer SCM registration approval is invalid: {request_error}"
+        )));
+        assert!(
+            unavailable_detail(&error_c).contains(&request_error.to_string()),
+            "the typed inner cause must survive, not just the outer marker"
+        );
+
+        let nonce_c = "b".repeat(64);
+        let cases = [
+            (&error_a, "Host state root open failed", nonce_a.as_str()),
+            (
+                &error_b,
+                "installation registry open failed",
+                nonce_b.as_str(),
+            ),
+            (
+                &error_c,
+                "installer SCM registration approval is invalid",
+                nonce_c.as_str(),
+            ),
+        ];
+        let mut details = Vec::new();
+        for (error, marker, nonce) in cases {
+            assert_eq!(
+                classify_bootstrap_launch_error(error),
+                WatchdogStopCode::ApprovalUnavailable
+            );
+            let code = classify_bootstrap_launch_error(error);
+            assert_eq!(code.specific(), 4);
+            assert_eq!(code.failure_class(), "approval_unavailable");
+            let detail = unavailable_detail(error);
+            assert!(!detail.is_empty(), "cause detail must not be empty");
+            assert!(
+                detail.contains(marker),
+                "cause detail must name its failure site: {detail}"
+            );
+            assert!(
+                detail.chars().count() <= START_FAILURE_DETAIL_MAX_CHARS,
+                "cause detail must stay bounded"
+            );
+            // Production stderr/capsule formatting from `main.rs`.
+            let stderr_detail = format!("invalid SCM launch registration: {error}");
+            let capsule =
+                build_start_failure_capsule(code, &stderr_detail, Some("installation-7"), Some(7));
+            assert!(
+                capsule.contains(marker),
+                "capsule must preserve the cause: {capsule}"
+            );
+            assert!(
+                !capsule.contains(nonce),
+                "the registration nonce must never be persisted"
+            );
+            assert!(
+                capsule.len() <= START_FAILURE_CAPSULE_MAX_BYTES,
+                "capsule must stay bounded"
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&capsule)
+                .unwrap_or_else(|error| panic!("capsule JSON: {error}"));
+            assert_eq!(parsed["failure_class"], "approval_unavailable");
+            assert_eq!(parsed["win32_exit_code"], 1066);
+            assert_eq!(parsed["service_specific_exit_code"], 4);
+            details.push(detail.to_owned());
+        }
+        assert_ne!(details[0], details[1]);
+        assert_ne!(details[0], details[2]);
+        assert_ne!(details[1], details[2]);
+        let _ = std::fs::remove_dir_all(&probe_root);
     }
 
     #[test]
