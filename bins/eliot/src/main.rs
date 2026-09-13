@@ -2202,13 +2202,12 @@ fn run_installation_effect(
                         }
                         Ok(None) | Err(_) => false,
                     };
-                    if still_registering {
-                        if let Ok(pending_ref) =
+                    if still_registering
+                        && let Ok(pending_ref) =
                             registry_projection_pending_ref(&transaction_id)
-                        {
-                            let _ = coordinator
-                                .persist_non_effect_rejection(&transaction_id, pending_ref);
-                        }
+                    {
+                        let _ = coordinator
+                            .persist_non_effect_rejection(&transaction_id, pending_ref);
                     }
                     write_installation_error(
                         "INSTALLATION_APPLY_ERROR",
