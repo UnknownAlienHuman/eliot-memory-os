@@ -7,8 +7,8 @@ use eliot_agent_bridge_core::{AttachRequest, BridgeError, HostEventEnvelope};
 #[cfg(test)]
 use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome, PortFailure};
 use eliot_mcp::{
-    HostCancellationRequest, HostCancellationResult, HostGatewayError, HostInvocationRequest,
-    HostInvocationResult, HostRequestGateway, KernelHostRequestPort,
+    HostCancellationRequest, HostCancellationResult, HostCorrelationReceipt, HostGatewayError,
+    HostInvocationRequest, HostInvocationResult, HostRequestGateway, KernelHostRequestPort,
 };
 use eliot_protocol::EventEnvelope;
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,7 @@ enum Response {
     Attached,
     Invocation {
         result: HostInvocationResult,
+        completion: HostCorrelationReceipt,
     },
     Cancellation {
         result: HostCancellationResult,
@@ -192,7 +193,10 @@ fn main() {
             },
         };
         let stop = matches!(response, Response::Stopped);
-        if !write_response(&response) || stop {
+        let receipt = write_response(&response);
+        // A zero-byte emission proves nothing reached the host, so the loop
+        // must not continue as if the correlation had been delivered.
+        if receipt.bytes_written() == 0 || receipt.should_break() || stop {
             break;
         }
     }
@@ -206,8 +210,11 @@ fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
     port: &mut P,
     request: &HostInvocationRequest,
 ) -> Response {
-    match gateway.invoke(port, request) {
-        Ok(result) => Response::Invocation { result },
+    match gateway.invoke_with_receipt(port, request) {
+        Ok((result, completion)) => Response::Invocation {
+            result,
+            completion,
+        },
         Err(error) => host_gateway_error(&error),
     }
 }
@@ -259,12 +266,80 @@ fn emit_error(code: &str, detail: &str) {
     let _ = writeln!(stderr, "{{\"error\":{code:?},\"detail\":{detail:?}}}");
 }
 
-fn write_response(response: &Response) -> bool {
+/// Immutable disposition of one stdio response emission.
+///
+/// Populated at the exact write/flush stage with the real framed byte count
+/// and the real flush outcome. `bytes` counts only fully placed frames; a
+/// failed emission carries zero bytes even if the transport accepted a prefix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StdioWriteReceipt {
+    /// Exact bytes placed on stdout, including the framing newline.
+    bytes: usize,
+    /// Whether the stream flush succeeded after the bytes were written.
+    flushed: bool,
+    /// Terminal cause of this emission; decides loop continuation.
+    cause: StdioBreakCause,
+}
+
+/// Terminal cause of one stdio response emission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StdioBreakCause {
+    /// Bytes were written and flushed; continue unless the peer asked to stop.
+    Emitted,
+    /// Response serialization failed; nothing was written.
+    SerializeFailed,
+    /// Framed bytes were not fully written.
+    WriteFailed,
+    /// Bytes were written but the flush failed, so host delivery is unconfirmed.
+    FlushFailed,
+}
+
+impl StdioWriteReceipt {
+    /// Exact bytes placed on stdout for this emission.
+    const fn bytes_written(&self) -> usize {
+        self.bytes
+    }
+
+    /// Whether the main loop must break after this emission.
+    const fn should_break(&self) -> bool {
+        !self.flushed || !matches!(self.cause, StdioBreakCause::Emitted)
+    }
+}
+
+fn write_response(response: &Response) -> StdioWriteReceipt {
+    let mut framed = match serde_json::to_vec(response) {
+        Ok(framed) => framed,
+        Err(_) => {
+            return StdioWriteReceipt {
+                bytes: 0,
+                flushed: false,
+                cause: StdioBreakCause::SerializeFailed,
+            };
+        }
+    };
+    framed.push(b'\n');
+    let bytes = framed.len();
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    serde_json::to_writer(&mut output, response).is_ok()
-        && output.write_all(b"\n").is_ok()
-        && output.flush().is_ok()
+    if output.write_all(&framed).is_err() {
+        return StdioWriteReceipt {
+            bytes: 0,
+            flushed: false,
+            cause: StdioBreakCause::WriteFailed,
+        };
+    }
+    if output.flush().is_err() {
+        return StdioWriteReceipt {
+            bytes,
+            flushed: false,
+            cause: StdioBreakCause::FlushFailed,
+        };
+    }
+    StdioWriteReceipt {
+        bytes,
+        flushed: true,
+        cause: StdioBreakCause::Emitted,
+    }
 }
 
 #[cfg(test)]

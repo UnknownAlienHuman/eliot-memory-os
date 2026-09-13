@@ -462,6 +462,36 @@ pub struct McpResponse {
     pub compatibility_correlation_hint: Option<String>,
 }
 
+/// Immutable identity binding one bounded MCP response to its request.
+///
+/// Built once at server receive from the validated request identity and
+/// carried end-to-end through the host gateway to the bridge stdio span, so a
+/// completed response is never mistaken for a timeout when host/UI
+/// observability is missing. It carries correlation only; it mints no
+/// principal, Session, task, fence, or authority identity.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestCorrelation {
+    /// Exact request identity echoed for correlation.
+    pub request_id: String,
+    /// Exact idempotency identity echoed for retry correlation.
+    pub idempotency_key: String,
+    /// SHA-256 of canonical request bytes.
+    pub canonical_request_sha256: String,
+}
+
+impl McpResponse {
+    /// Returns the immutable request binding echoed by this response.
+    #[must_use]
+    pub fn correlation(&self) -> RequestCorrelation {
+        RequestCorrelation {
+            request_id: self.request_id.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+            canonical_request_sha256: self.canonical_request_sha256.clone(),
+        }
+    }
+}
+
 /// Pure stateless MCP core. It stores neither a port nor application state.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct McpCore;
@@ -536,34 +566,36 @@ impl McpCore {
         let original_payload_sha256 = canonical_sha256(&original_request.tool)?;
         request.tool = request.tool.canonicalized();
         let canonical_payload_sha256 = canonical_sha256(&request.tool)?;
-        let request_id = request
-            .identity
-            .request
-            .metadata
-            .request_id
-            .as_str()
-            .to_owned();
-        let idempotency_key = request.identity.idempotency_key.clone();
+        let correlation = RequestCorrelation {
+            request_id: request
+                .identity
+                .request
+                .metadata
+                .request_id
+                .as_str()
+                .to_owned(),
+            idempotency_key: request.identity.idempotency_key.clone(),
+            canonical_request_sha256: canonical_sha256(&request)?,
+        };
         let canonical_tool_name = request.tool.canonical_name().to_owned();
-        let canonical_request_sha256 = canonical_sha256(&request)?;
         let client_capabilities = request.client_capabilities;
         let resolution_request = BindingResolutionRequest {
             transport,
             claimed_session: request.session.clone(),
-            request_id: request_id.clone(),
+            request_id: correlation.request_id.clone(),
             original_request_sha256: original_request_sha256.clone(),
-            idempotency_key: idempotency_key.clone(),
+            idempotency_key: correlation.idempotency_key.clone(),
             cancellation_id: request.identity.cancellation_id.clone(),
-            canonical_request_sha256: canonical_request_sha256.clone(),
+            canonical_request_sha256: correlation.canonical_request_sha256.clone(),
             deadline_unix_ms: request.identity.deadline_unix_ms,
         };
         let active_session_binding = match port.resolve_active_session(&resolution_request) {
             Ok(binding) => binding,
             Err(failure @ (PortFailure::PlanGap { .. } | PortFailure::Unsupported { .. })) => {
                 return negative_response(
-                    &request_id,
-                    &idempotency_key,
-                    &canonical_request_sha256,
+                    &correlation.request_id,
+                    &correlation.idempotency_key,
+                    &correlation.canonical_request_sha256,
                     &canonical_tool_name,
                     compatibility_hint,
                     failure,
@@ -577,9 +609,9 @@ impl McpCore {
                 Ok(evidence) => evidence,
                 Err(failure @ (PortFailure::PlanGap { .. } | PortFailure::Unsupported { .. })) => {
                     return negative_response(
-                        &request_id,
-                        &idempotency_key,
-                        &canonical_request_sha256,
+                        &correlation.request_id,
+                        &correlation.idempotency_key,
+                        &correlation.canonical_request_sha256,
                         &canonical_tool_name,
                         compatibility_hint,
                         failure,
@@ -598,7 +630,7 @@ impl McpCore {
             original_request_sha256,
             original_payload_sha256,
             canonical_payload_sha256,
-            canonical_request_sha256: canonical_request_sha256.clone(),
+            canonical_request_sha256: correlation.canonical_request_sha256.clone(),
             active_session_binding,
             compatibility_correlation_hint: compatibility_hint.clone(),
             source_assurance,
@@ -607,9 +639,9 @@ impl McpCore {
             Ok(value) => value,
             Err(failure @ (PortFailure::PlanGap { .. } | PortFailure::Unsupported { .. })) => {
                 return negative_response(
-                    &request_id,
-                    &idempotency_key,
-                    &canonical_request_sha256,
+                    &correlation.request_id,
+                    &correlation.idempotency_key,
+                    &correlation.canonical_request_sha256,
                     &canonical_tool_name,
                     compatibility_hint,
                     failure,
@@ -630,9 +662,9 @@ impl McpCore {
             }
         });
         let response = McpResponse {
-            request_id,
-            idempotency_key,
-            canonical_request_sha256,
+            request_id: correlation.request_id.clone(),
+            idempotency_key: correlation.idempotency_key.clone(),
+            canonical_request_sha256: correlation.canonical_request_sha256.clone(),
             kind,
             canonical_tool_name,
             content: projection.content,
