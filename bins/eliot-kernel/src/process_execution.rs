@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{KernelComposition, KernelStoreGateway};
+use eliot_contracts::EpochId;
 use eliot_ipc::Session;
 use eliot_kernel_core::{
     AuthoritySnapshotBinding, AuthoritySnapshotBindingWire, DispatchSnapshotCodec,
@@ -296,8 +297,19 @@ struct CanonicalStoreSnapshot<'a> {
     validation_revision: u64,
 }
 
+/// Projects the canonical store snapshot into the process-contract fence shape.
+///
+/// The projected fence carries the admitted owner's canonical `EpochId`
+/// `(lineage_id, sequence)` pair (T2.md:177-206): the caller passes the
+/// retained owner epoch, already proven full-pair-equal to the admission fence
+/// by `validate_admission`, and the fence clones that pair verbatim. No
+/// lineage is reconstructed from the store snapshot's scalar sequence and no
+/// fresh authority is issued from a scalar. A persisted v3 scalar that drifted
+/// from the admitted pair is rejected at the stale-state-fence gate in
+/// `run_process_start`, never coerced here.
 pub(crate) fn project_store_snapshot(
     snapshot: &CanonicalValidationSnapshot,
+    authority_epoch: &EpochId,
 ) -> Result<(FencingToken, BTreeMap<String, String>), ProcessExecutionError> {
     snapshot
         .validate()
@@ -342,7 +354,7 @@ pub(crate) fn project_store_snapshot(
         snapshot_digest.clone(),
     );
     let fence = FencingToken::new(
-        snapshot.state_fence.authority_epoch.value(),
+        authority_epoch.clone(),
         Generation::new(snapshot.state_fence.resource_generation.value())
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
         format!("store-snapshot-{snapshot_digest}"),
@@ -352,6 +364,11 @@ pub(crate) fn project_store_snapshot(
 }
 
 pub(crate) struct ValidationContextSlot {
+    // The `u64` beside each context is a locally-minted guard-owner nonce from
+    // `next_owner`, not authority material: it pairs one
+    // `ValidationContextGuard` with its own slot entry so a stale guard cannot
+    // release another insert's context. It is never compared against an epoch
+    // and is intentionally not an `EpochId`.
     contexts: Mutex<BTreeMap<eliot_process::OperationId, (u64, DispatchValidationContext)>>,
     next_owner: AtomicU64,
 }
@@ -585,7 +602,7 @@ pub(crate) trait ProcessStartPorts {
         &self,
         clock: ClockObservation,
         store_fence: FencingToken,
-        authority_epoch: u64,
+        authority_epoch: EpochId,
         revision_heads: BTreeMap<String, String>,
         validation_revision: u64,
     ) -> Result<DispatchValidationContext, ProcessExecutionError>;
@@ -1037,7 +1054,13 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
             Err(_) => ProcessExecutionError::UnknownOutcome,
         });
     }
-    if admission.state_fence().authority_epoch() != snapshot.state_fence.authority_epoch.value()
+    // Scalar-sequence staleness gate against the persisted store snapshot
+    // (wave 1 leaves the store `StateFence` scalar-only): drift in either
+    // component rejects as stale. Same-authority itself is proven only by the
+    // full-pair admission/owner binding check, never by this sequence
+    // comparison alone.
+    if admission.state_fence().authority_epoch().sequence.get()
+        != snapshot.state_fence.authority_epoch.value()
         || admission.state_fence().generation().get()
             != snapshot.state_fence.resource_generation.value()
     {
@@ -1048,15 +1071,16 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
             Err(_) => ProcessExecutionError::UnknownOutcome,
         });
     }
-    let (store_fence, revision_heads) = match project_store_snapshot(&snapshot) {
-        Ok(projected) => projected,
-        Err(error) => {
-            return Err(match reservation.release() {
-                Ok(()) => error,
-                Err(_) => ProcessExecutionError::UnknownOutcome,
-            });
-        }
-    };
+    let (store_fence, revision_heads) =
+        match project_store_snapshot(&snapshot, owner.authority_epoch()) {
+            Ok(projected) => projected,
+            Err(error) => {
+                return Err(match reservation.release() {
+                    Ok(()) => error,
+                    Err(_) => ProcessExecutionError::UnknownOutcome,
+                });
+            }
+        };
     let context = match ports.build_context(
         ClockObservation {
             valid_time_ms: Some(snapshot.observed_at_unix_ms),
@@ -1065,7 +1089,7 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
             monotonic_ns: None,
         },
         store_fence.clone(),
-        snapshot.state_fence.authority_epoch.value(),
+        owner.authority_epoch().clone(),
         revision_heads.clone(),
         snapshot.validation_revision,
     ) {
@@ -1148,20 +1172,30 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         owner: &ProcessOwnerBinding,
     ) -> Result<(), ProcessExecutionError> {
         if admission.recipient_module_id() != owner.module_id()
-            || admission.state_fence().authority_epoch() != owner.authority_epoch()
-            || admission.state_fence().generation().get() != owner.generation().get()
+            || !admission
+                .state_fence()
+                .authority_epoch()
+                .is_same_authority(owner.authority_epoch())
+            || admission.state_fence().generation() != owner.generation()
         {
             return Err(ProcessExecutionError::Contract(
                 eliot_process::ContractError::DispatchBindingMismatch,
             ));
         }
-        if admission.state_fence().authority_epoch()
-            != self.snapshot_binding.authority_epoch().current.epoch
-            || admission.state_fence().generation() != admission.intent().generation()
+        // The admitted pair must exactly match the retained ORS epoch lineage
+        // (lineage spelling plus sequence); the fence generation must match
+        // the admitted intent. Anything else is stale, never promoted.
         {
-            return Err(ProcessExecutionError::Contract(
-                eliot_process::ContractError::StaleStateFence,
-            ));
+            let presented = admission.state_fence().authority_epoch();
+            let active = &self.snapshot_binding.authority_epoch().current;
+            if presented.lineage_id.as_str() != active.lineage_id.as_str()
+                || presented.sequence.get() != active.epoch
+                || admission.state_fence().generation() != admission.intent().generation()
+            {
+                return Err(ProcessExecutionError::Contract(
+                    eliot_process::ContractError::StaleStateFence,
+                ));
+            }
         }
         Ok(())
     }
@@ -1239,7 +1273,7 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         &self,
         clock: ClockObservation,
         store_fence: FencingToken,
-        authority_epoch: u64,
+        authority_epoch: EpochId,
         revision_heads: BTreeMap<String, String>,
         validation_revision: u64,
     ) -> Result<DispatchValidationContext, ProcessExecutionError> {

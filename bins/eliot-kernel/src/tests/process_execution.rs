@@ -7,6 +7,8 @@
 //! This module is test-oracle only with no process, authority, Store or daemon ownership and exercises only the Kernel composition boundary via `super::*`.
 
 use super::*;
+use eliot_contracts::{EpochId, EpochLineageId};
+use std::num::NonZeroU64;
 
 #[derive(Clone)]
 struct GatewayTestPorts {
@@ -78,6 +80,88 @@ fn gateway_test_snapshot() -> CanonicalValidationSnapshot {
         validation_revision: 9,
         observed_at_unix_ms: 1_000,
     }
+}
+
+const TEST_LINEAGE_A: &str = "11111111-1111-4111-8111-111111111111";
+const TEST_LINEAGE_B: &str = "22222222-2222-4222-8222-222222222222";
+
+fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(lineage).expect("valid test lineage"),
+        NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
+fn test_epoch_a(sequence: u64) -> EpochId {
+    test_epoch(TEST_LINEAGE_A, sequence)
+}
+
+fn test_epoch_b(sequence: u64) -> EpochId {
+    test_epoch(TEST_LINEAGE_B, sequence)
+}
+
+// Local EpochId revisions of the `super` gateway fixtures: the parent copies
+// still construct v3 scalar fences (residual for the integrator), so this
+// module shadows them with the sealed v4 binding. Sequence 1 on lineage A
+// matches `gateway_test_snapshot`'s scalar store epoch.
+fn gateway_test_owner() -> ProcessOwnerBinding {
+    ProcessOwnerBinding::new(
+        "eliotd",
+        "a".repeat(64),
+        test_epoch_a(1),
+        Generation::new(1).expect("generation"),
+    )
+    .expect("owner")
+}
+
+fn gateway_test_owner_b() -> ProcessOwnerBinding {
+    ProcessOwnerBinding::new(
+        "eliotd",
+        "a".repeat(64),
+        test_epoch_b(1),
+        Generation::new(1).expect("generation"),
+    )
+    .expect("owner")
+}
+
+fn gateway_test_admission(operation: &str) -> ProcessExecutionAdmissionRequest {
+    gateway_test_admission_with_epoch(operation, test_epoch_a(1))
+}
+
+fn gateway_test_admission_with_epoch(
+    operation: &str,
+    authority_epoch: EpochId,
+) -> ProcessExecutionAdmissionRequest {
+    let mut intent = seed_intent();
+    intent = ProcessIntent::new(
+        OperationId::new(operation).expect("operation"),
+        intent.process_tree_id().clone(),
+        intent.job_id().clone(),
+        intent.image_id().clone(),
+        intent.session_id().clone(),
+        intent.generation(),
+        intent.executable(),
+        intent.executable_sha256(),
+        intent.argv().to_vec(),
+        intent.working_directory(),
+        intent.environment().clone(),
+        *intent.resource_limits(),
+    )
+    .expect("unique intent");
+    ProcessExecutionAdmissionRequest::new(
+        "eliotd",
+        intent,
+        ActionLeaseRef::new(format!("lease-{operation}")).expect("lease"),
+        FencingToken::new(
+            authority_epoch,
+            Generation::new(1).expect("generation"),
+            format!("fence-{operation}"),
+        )
+        .expect("fence"),
+        unix_ms().saturating_add(60_000),
+    )
+    .expect("admission")
 }
 
 impl GatewayTestPorts {
@@ -168,7 +252,10 @@ impl ProcessStartPorts for GatewayTestPorts {
         owner: &ProcessOwnerBinding,
     ) -> Result<(), ProcessExecutionError> {
         if admission.recipient_module_id() != owner.module_id()
-            || admission.state_fence().authority_epoch() != owner.authority_epoch()
+            || !admission
+                .state_fence()
+                .authority_epoch()
+                .is_same_authority(owner.authority_epoch())
             || admission.state_fence().generation() != owner.generation()
         {
             return Err(ProcessExecutionError::Contract(
@@ -230,7 +317,7 @@ impl ProcessStartPorts for GatewayTestPorts {
         &self,
         clock: ClockObservation,
         store_fence: FencingToken,
-        authority_epoch: u64,
+        authority_epoch: EpochId,
         revision_heads: BTreeMap<String, String>,
         validation_revision: u64,
     ) -> Result<DispatchValidationContext, ProcessExecutionError> {
@@ -262,11 +349,18 @@ impl ProcessStartPorts for GatewayTestPorts {
                 ));
             }
             let _ = context;
+            // Slot-reservation placeholder, always overwritten by `issue`
+            // before any comparison in `execute`; it carries the module's
+            // canonical test pair, never invented per-call material.
             state.retained_contexts.insert(
                 operation_id.clone(),
                 (
-                    FencingToken::new(1, Generation::new(1).expect("generation"), "pending")
-                        .expect("pending fence"),
+                    FencingToken::new(
+                        test_epoch_a(1),
+                        Generation::new(1).expect("generation"),
+                        "pending",
+                    )
+                    .expect("pending fence"),
                     BTreeMap::new(),
                     0,
                 ),
@@ -686,4 +780,89 @@ async fn actual_process_start_orchestration_abort_cleans_exact_context_path_and_
         .is_ok()
     );
     assert_eq!(retry.counts(), (1, 1, 1, 1, 1));
+}
+
+#[tokio::test]
+async fn process_start_valid_launch_retains_sealed_owner_binding() {
+    let ports = GatewayTestPorts::new(Ok(gateway_test_snapshot()));
+    let owner = gateway_test_owner();
+    let admission = gateway_test_admission("gateway-sealed-binding");
+    let receipt = run_process_start(&ports, &owner, admission.clone(), ())
+        .await
+        .expect("sealed start");
+    assert_eq!(receipt.operation_id.as_str(), "gateway-sealed-binding");
+    assert_eq!(ports.counts(), (1, 1, 1, 1, 1));
+    assert_eq!(ports.retained(), (0, 0));
+    let state = ports.state.lock().expect("test state");
+    let record = state
+        .replay
+        .get(&OperationId::new("gateway-sealed-binding").expect("operation"))
+        .expect("completed replay");
+    assert_eq!(record.state, ProcessExecutionReplayState::Completed);
+    // The retained owner is the whole sealed binding, never selected fields:
+    // module, digest, full epoch pair, and generation all survive admission.
+    assert_eq!(record.owner, owner);
+    assert!(
+        record
+            .owner
+            .authority_epoch()
+            .is_same_authority(admission.state_fence().authority_epoch())
+    );
+    assert_eq!(
+        record.owner.authority_epoch().lineage_id.as_str(),
+        TEST_LINEAGE_A
+    );
+    assert_eq!(record.owner.authority_epoch().sequence.get(), 1);
+}
+
+#[tokio::test]
+async fn process_start_stale_binding_never_creates_a_second_child() {
+    let ports = GatewayTestPorts::new(Ok(gateway_test_snapshot()));
+    let owner = gateway_test_owner();
+    let admission = gateway_test_admission("gateway-stale-binding");
+    run_process_start(&ports, &owner, admission.clone(), ())
+        .await
+        .expect("first start");
+    assert_eq!(ports.counts().2, 1);
+
+    // Same operation, changed epoch lineage: the retained reservation still
+    // names the original owner and digest, so resume is prevented.
+    let foreign_owner = gateway_test_owner_b();
+    let foreign_admission =
+        gateway_test_admission_with_epoch("gateway-stale-binding", test_epoch_b(1));
+    assert!(matches!(
+        run_process_start(&ports, &foreign_owner, foreign_admission, ()).await,
+        Err(ProcessExecutionError::Contract(
+            eliot_process::ContractError::DispatchBindingMismatch
+        ))
+    ));
+    // Same operation and digest, changed presenter: the whole-binding owner
+    // check rejects before any new child.
+    assert!(matches!(
+        run_process_start(&ports, &foreign_owner, admission, ()).await,
+        Err(ProcessExecutionError::Contract(
+            eliot_process::ContractError::DispatchBindingMismatch
+        ))
+    ));
+    assert_eq!(ports.counts().2, 1);
+    assert_eq!(ports.retained(), (0, 0));
+}
+
+#[tokio::test]
+async fn process_start_replay_never_consumes_a_second_child() {
+    let ports = GatewayTestPorts::new(Ok(gateway_test_snapshot()));
+    let owner = gateway_test_owner();
+    let admission = gateway_test_admission("gateway-single-use");
+    run_process_start(&ports, &owner, admission.clone(), ())
+        .await
+        .expect("first start");
+    assert_eq!(ports.counts().2, 1);
+    // Exact replay of the consumed operation: the single-use reservation is
+    // already completed, so no second child is ever executed.
+    assert!(matches!(
+        run_process_start(&ports, &owner, admission, ()).await,
+        Err(ProcessExecutionError::UnknownOutcome)
+    ));
+    assert_eq!(ports.counts().2, 1);
+    assert_eq!(ports.retained(), (0, 0));
 }
