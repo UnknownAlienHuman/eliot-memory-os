@@ -55,7 +55,8 @@ use eliot_platform_windows::{
 };
 #[cfg(test)]
 use eliot_platform_windows::{
-    ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK, watchdog_service_security_descriptor_digest,
+    ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+    host_service_security_descriptor_digest, watchdog_service_security_descriptor_digest,
 };
 pub use eliot_runtime_contracts::ProvisionedSupervisionAuthority;
 use eliot_runtime_contracts::{
@@ -2763,8 +2764,11 @@ pub enum InstallationEffectObservation {
         evidence: Vec<PlatformHandle>,
         /// Digest of the authoritative postcondition.
         postcondition_digest: PlatformHandle,
-        /// Exact service-object DACL receipt, present only for the Watchdog
-        /// registration effect.
+        /// Exact installer-policy service DACL receipt, present for Host and
+        /// Watchdog registration effects. A Host service whose security
+        /// descriptor is not the installer policy must never be reported
+        /// `Applied`, so Host registrations prove their DACL exactly like
+        /// Watchdog registrations.
         service_control_grant: Option<Box<InstallerServiceControlGrantReceipt>>,
         /// Typed credential receipt, only for the Store credential effect.
         credential_receipt: Option<CredentialAccessReceipt>,
@@ -2821,13 +2825,21 @@ impl InstallationEffectObservation {
                     )
                 })?;
             }
+            // s38 (#1345): Host parity with the Watchdog rule above. A Host
+            // service whose DACL is not the installer policy must never be
+            // reported `Applied` / `CREATED_BY_TRANSACTION`, so a Host
+            // `Matching` observation without its grant receipt fails closed
+            // here before it can reach durable `Applied` state.
             InstallerEffectPlan::RegisterService {
                 role: InstallerServiceRole::Host,
                 ..
-            } => {
-                if matching_control_grant.is_some() {
-                    return Err(InstallationError::IdentityConflict);
-                }
+            } if matches!(self, Self::Matching { .. }) => {
+                matching_control_grant.ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "Host registration requires exact installer-policy service-control grant readback"
+                            .to_owned(),
+                    )
+                })?;
             }
             _ if matching_control_grant.is_some() => {
                 return Err(InstallationError::IdentityConflict);
@@ -4098,6 +4110,22 @@ impl WindowsInstallationEffectPort {
                     .map(InstallerServiceControlGrantReceipt::from_readback)
                     .transpose()
                     .map_err(|_| PortError::InvalidRequestMetadata)?;
+                // s38 (#1345): a Host service whose DACL is not the installer
+                // policy must never be reported `Applied`. The platform only
+                // reports `Matching` with `Some` grant once it has proven the
+                // installer-policy DACL; without that proof the registration
+                // is a configuration mismatch even when the SCM configuration
+                // digest already matches.
+                if matches!(
+                    &request.plan,
+                    InstallerEffectPlan::RegisterService {
+                        role: InstallerServiceRole::Host,
+                        ..
+                    }
+                ) && control_grant.is_none()
+                {
+                    return Ok(root_mismatch("service-config"));
+                }
                 match service_marker_read(
                     &self.primitive,
                     &spec,
@@ -4143,6 +4171,20 @@ impl WindowsInstallationEffectPort {
                     .map(InstallerServiceControlGrantReceipt::from_readback)
                     .transpose()
                     .map_err(|_| PortError::InvalidRequestMetadata)?;
+                // s38 (#1345): same fail-closed gate as `inspect_service`
+                // above. The ownership marker must never be minted and the
+                // effect must never be reported `CREATED_BY_TRANSACTION`
+                // without the installer-policy DACL proof.
+                if matches!(
+                    &request.plan,
+                    InstallerEffectPlan::RegisterService {
+                        role: InstallerServiceRole::Host,
+                        ..
+                    }
+                ) && control_grant.is_none()
+                {
+                    return Ok(root_mismatch("service-config"));
+                }
                 let marker = if let Some(marker) = service_marker_read(
                     &self.primitive,
                     &spec,
@@ -5406,6 +5448,17 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         let Ok(control_grant) = control_grant else {
             return PortOutcome::Error(PortError::InvalidRequestMetadata);
         };
+        // s38 (#1345): Host and Watchdog creations both require the
+        // installer-policy DACL proof before the ownership marker may be
+        // minted. Older platform builds never return a Host grant, so Host
+        // creation honestly stays `Unknown` until the platform generalizes
+        // the grant install/read (WRITER-A); it can never be reported
+        // `Created` with a default DACL. The Watchdog outcome is unchanged:
+        // a missing Watchdog grant already took this `Unknown` path through
+        // the flag comparison below.
+        if control_grant.is_none() {
+            return PortOutcome::Unknown(UnknownReason::Indeterminate);
+        }
         if registration.requires_host_service_control_grant() != control_grant.is_some() {
             return PortOutcome::Unknown(UnknownReason::Indeterminate);
         }
@@ -8463,20 +8516,14 @@ where
             &transaction.installer_effects[index],
             &service_control_grant,
         ) {
-            (
-                InstallerEffectPlan::RegisterService {
-                    role: InstallerServiceRole::Watchdog,
-                    ..
-                },
-                Some(receipt),
-            ) => receipt.validate()?,
-            (
-                InstallerEffectPlan::RegisterService {
-                    role: InstallerServiceRole::Host,
-                    ..
-                },
-                None,
-            ) => {}
+            // s38 (#1345): Host and Watchdog service effects both persist
+            // `Applied` only with a validated installer-policy DACL grant
+            // receipt. The digest is already bound into the ownership marker
+            // and the matching evidence; persisting without the receipt
+            // would let a default-DACL service read as transaction-owned.
+            (InstallerEffectPlan::RegisterService { .. }, Some(receipt)) => {
+                receipt.validate()?;
+            }
             (InstallerEffectPlan::RegisterService { .. }, _) | (_, Some(_)) => {
                 return Err(InstallationError::IdentityConflict);
             }

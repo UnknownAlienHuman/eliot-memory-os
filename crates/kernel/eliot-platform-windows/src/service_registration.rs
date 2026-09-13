@@ -95,8 +95,33 @@ pub const ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME: &str = "Eliot Watchdog";
 pub const ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK: u32 =
     0x0000_0001 | 0x0000_0004 | 0x0000_0010 | 0x0000_0020 | 0x0002_0000;
 
-/// Authoritative readback of the one narrow service-object grant installed by
-/// the privileged installer for the non-elevated Host service.
+/// Exact service-object rights granted to the `EliotHost` service SID on the
+/// canonical `EliotHost` registration.
+///
+/// This mirrors the Watchdog installer pattern (protected DACL, `SY`/`BA`
+/// full, least-privilege service-SID grantee) for the Host's own service
+/// object. The mask follows `docs/architecture/I03-01-installation-form.md:23`:
+/// query-config plus query-status plus demand-start plus `READ_CONTROL` for
+/// DACL reverification. It deliberately excludes `SERVICE_STOP` (SCM stop is
+/// recovery-only per I03-01:23; normal stop flows through authenticated ELIOT
+/// control), change-config, delete, write-DACL, write-owner, pause/continue
+/// and user-defined control rights.
+///
+/// DOC GAP: I03-01:23 states "authorized local users may query and
+/// demand-start" but does not name the exact user SID(s) (`AU`/`IU`/`BU`
+/// versus the explicit broker allow-list at I03-01:27). Until that allow-list
+/// is typed, the installer DACL grants only the deterministic Host service
+/// SID (the sole concrete least-privilege SID available to the platform
+/// adapter); an ordinary-user ACE remains a follow-up once the SID set is
+/// specified.
+pub const ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK: u32 =
+    0x0000_0001 | 0x0000_0004 | 0x0000_0010 | 0x0002_0000;
+
+/// Authoritative readback of one narrow per-service grant installed by the
+/// privileged installer: the `EliotHost` self-grant on the canonical
+/// `EliotHost` registration, or the `EliotHost` service-SID grant on the
+/// canonical `EliotWatchdog` registration. Both carry the deterministic Host
+/// SID as principal and differ only in mask/descriptor digest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceControlGrantReadback {
     principal_service: String,
@@ -152,19 +177,31 @@ impl ServiceControlGrantReadback {
     /// # Errors
     ///
     /// Returns [`WindowsAdapterError::IdentityMismatch`] when the principal,
-    /// concrete access mask, or descriptor digest differs from the canonical
-    /// Host-to-Watchdog control grant.
+    /// concrete access mask, or descriptor digest differs from both canonical
+    /// per-service grants (Host self-grant and Host-to-Watchdog grant).
     pub fn validate(&self) -> Result<(), WindowsAdapterError> {
         if self.principal_service != ELIOT_HOST_SERVICE_NAME
             || !crate::valid_service_sid_text(&self.principal_sid)
-            || self.access_mask != ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK
             || !crate::valid_sha256_hex(&self.security_descriptor_digest)
-            || !crate::watchdog_service_security_descriptor_digest(&self.principal_sid)
-                .is_ok_and(|expected| expected == self.security_descriptor_digest)
         {
             return Err(WindowsAdapterError::IdentityMismatch);
         }
-        Ok(())
+        // Watchdog grant path (byte-identical legacy behavior).
+        if self.access_mask == ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK
+            && crate::watchdog_service_security_descriptor_digest(&self.principal_sid)
+                .is_ok_and(|expected| expected == self.security_descriptor_digest)
+        {
+            return Ok(());
+        }
+        // Host self-grant path (per-service generalization; Watchdog path
+        // above unchanged).
+        if self.access_mask == ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK
+            && crate::host_service_security_descriptor_digest(&self.principal_sid)
+                .is_ok_and(|expected| expected == self.security_descriptor_digest)
+        {
+            return Ok(());
+        }
+        Err(WindowsAdapterError::IdentityMismatch)
     }
 }
 
@@ -595,10 +632,21 @@ impl ServiceRegistrationRequest {
     }
 
     /// Returns whether this registration requires the installer-owned
-    /// `EliotHost` service-control grant and exact DACL readback.
+    /// protected service DACL and exact readback.
+    ///
+    /// Both canonical services require it: `EliotWatchdog` carries the
+    /// `EliotHost` service-SID grant, and `EliotHost` carries its own
+    /// `EliotHost` service-SID self-grant (same SID, Host-specific mask; see
+    /// `ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK`). This predicate remains the
+    /// sole gate for `WRITE_DAC` mutation access and for the install/readback
+    /// helpers; per-service helpers branch on `service_name` so Watchdog
+    /// bytes stay identical.
     #[must_use]
     pub fn requires_host_service_control_grant(&self) -> bool {
-        self.service_name == ELIOT_WATCHDOG_SERVICE_NAME
+        matches!(
+            self.service_name.as_str(),
+            ELIOT_HOST_SERVICE_NAME | ELIOT_WATCHDOG_SERVICE_NAME
+        )
     }
 
     #[must_use]

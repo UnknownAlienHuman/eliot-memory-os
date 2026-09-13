@@ -1283,10 +1283,33 @@ mod tests {
             .unwrap_or_else(|| panic!("fixture nonce"))
             .as_str()
             .to_owned();
+        // Typed self-check contract (s38 item 2): a default-DACL (Mismatched
+        // SD) observation projects through the same pure host projection the
+        // bootstrap path uses, and the capsule carries that exact typed
+        // detail — never the old collapsed string.
+        let cause = eliot_host::classify_host_scm_inspection(
+            &eliot_platform_windows::ServiceRegistrationInspection::Mismatched,
+        )
+        .unwrap_or_else(|| panic!("mismatched inspection must classify"));
+        assert_eq!(
+            cause,
+            eliot_host::HostScmRegistrationCause::Mismatched {
+                inspection_debug: "Mismatched".to_owned(),
+            }
+        );
+        let detail = cause.detail();
+        assert_eq!(
+            detail,
+            "host-scm-registration-mismatched: service 'EliotHost' exists but its SCM configuration, service-SID type, or service-object security descriptor does not exactly match the canonical request (platform inspection reports Mismatched without field-level detail; inspection: Mismatched)"
+        );
+        assert!(
+            !detail.contains("is not an exact read-only match"),
+            "the old collapsed string must be gone"
+        );
         persist_host_start_failure(
             HostStopCode::InvalidRegistration,
             "platform",
-            "Host SCM registration is not an exact read-only match",
+            &detail,
             Some(&options),
         );
         let stored = std::fs::read_to_string(root.join(HOST_START_FAILURE_CAPSULE_FILE_NAME))
@@ -1296,7 +1319,13 @@ mod tests {
             "the nonce must never be persisted"
         );
         assert!(stored.contains("invalid_scm_registration"));
+        assert!(stored.contains("host-scm-registration-mismatched"));
         assert!(stored.contains("installation-host-test"));
+        assert_eq!(
+            HostStopCode::InvalidRegistration.specific(),
+            3,
+            "the typed cause must not renumber the stop class"
+        );
         assert!(stored.len() <= HOST_START_FAILURE_CAPSULE_MAX_BYTES);
         let _ = std::fs::remove_file(root.join(HOST_START_FAILURE_CAPSULE_FILE_NAME));
         let _ = std::fs::remove_dir(&root);
