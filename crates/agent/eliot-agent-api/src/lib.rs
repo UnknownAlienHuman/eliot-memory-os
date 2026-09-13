@@ -18,11 +18,26 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod execution_binding;
+pub mod host_event;
 pub mod route_receipts;
 pub use execution_binding::{
     ExecutionUnit, ExecutionUnitObservation, NativeSession, NativeSessionLocator,
     ProviderExecutionBinding, ProviderObservationLineage, SessionObservation,
     validate_execution_binding,
+};
+pub use host_event::{
+    AssistantDeltaObservation, CancellationObservation, CandidateResultReference,
+    CheckpointObservation, ErrorObservation, ExecutionStartedObservation,
+    HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
+    HostEventNormalizationReceipt, HostEventPrivacyClass, HostEventQuarantineReason,
+    HostEventReplayDisposition, MAX_HOST_EVENT_OMITTED_FIELDS, MAX_HOST_EVENT_PREDECESSORS,
+    MAX_HOST_EVENT_SAFE_TEXT_CHARS, MAX_HOST_EVENT_TEXT_CHARS, MAX_HOST_EVENT_WARNINGS,
+    NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
+    ProviderTerminalObservation, ProviderTerminalStatus, QualifiedSourceDigest, RawSourceRecord,
+    ReasoningSummaryObservation, RestrictedRawSourceHandle, SessionLifecycleObservation,
+    SessionLifecycleTransition, ToolInvocationObservation, ToolOutcomeClass,
+    ToolOutcomeObservation, UnsupportedDisposition, UnsupportedEventObservation,
+    UnsupportedEventReason, WarningObservation, candidate_result_digest_for,
 };
 pub use route_receipts::{
     AdmittedRouteReceipt, CandidateSelectionDisposition, ExecutionOutcome,
@@ -689,6 +704,16 @@ impl CancelRequest {
 }
 
 /// A normalized event from a host/provider adapter.
+///
+/// Legacy quarantine boundary (issue #371, T4 S6): the generic
+/// `normalized_payload: serde_json::Value` wire is not a closed normalized
+/// contract and must not gain new policy, authority, completion, or
+/// capability consumers. New producers and consumers use the closed,
+/// versioned owner in [`host_event::NormalizedHostEventEnvelope`]
+/// (`eliot-agent-api/host-event-v7`); old wires never deserialize as that
+/// schema. This enum and [`HostEventEnvelope`] are intentionally untouched
+/// (no rename, no Serde change) so existing codex/bridge consumers keep
+/// compiling.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostEventKind {
@@ -708,6 +733,12 @@ pub enum HostEventKind {
     Unknown,
 }
 
+/// Legacy host-event wire retained as the quarantine boundary (issue #371,
+/// T4 S6). Intentionally untouched: no rename, no Serde change, so existing
+/// codex/bridge consumers keep compiling. New observations use
+/// [`host_event::NormalizedHostEventEnvelope`]; a legacy wire carrying
+/// `normalized_payload: serde_json::Value` never deserializes as that closed
+/// schema.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostEventEnvelope {

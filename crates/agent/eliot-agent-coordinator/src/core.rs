@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_agent_api::{
     AgentAttempt, AttemptId, AttemptState, AuthorityEnvelope, CancellationState,
     CandidateSelectionDisposition, ContinuityKind, ContractError, EffectCeiling, EffectKind,
-    ProviderExecutionBinding, RejectedRouteCandidate, ResultDisposition, RouteSelectionCandidate,
+    HostEventNormalizationReceipt, NormalizedHostEventEnvelope, ProviderExecutionBinding,
+    ProviderObservationLineage, RejectedRouteCandidate, ResultDisposition, RouteSelectionCandidate,
     WorkLeaseId, candidate_digest_for, validate_execution_binding,
 };
 use eliot_agent_contracts::{
@@ -21,8 +22,9 @@ use crate::model::{
     CancellationReconciliationId, CandidateId, CandidateResultReceipt, CoordinatedAttemptState,
     CoordinatorConfig, CoordinatorError, CoordinatorEvent, CoordinatorSnapshot,
     DeliveryBoundaryReceipt, DescendantClosureCandidateReceipt, DescendantClosureSubmission,
-    ExecutionContext, LostWorkerReceipt, OperationId, OutcomeReconciliationId, PeerMessageReceipt,
-    PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot, ProviderCancellationReconciliation,
+    ExecutionContext, LostWorkerReceipt, ObservedHostEventSummary, OperationId,
+    OutcomeReconciliationId, PeerMessageReceipt, PlanGap, ProviderAdmissionReceipt,
+    ProviderBindingSnapshot, ProviderCancellationReconciliation,
     ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
     ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReassignmentId,
     ReassignmentReceipt, ResultSubmission, RoleProfileManifest, RouteCandidateEvidence,
@@ -126,6 +128,14 @@ pub struct AgentCoordinator {
     submissions: BTreeMap<SubmissionId, IdempotentRecord<CandidateResultReceipt>>,
     result_by_attempt: BTreeMap<AttemptId, SubmissionId>,
     bindings: BTreeMap<AttemptId, IdempotentRecord<ProviderExecutionBinding>>,
+    /// Accepted v7 provider host events by event identity (issue #371
+    /// S7-partial). The canonical input binds the exact envelope plus receipt
+    /// bytes: an identical replay is idempotent without duplicate effects,
+    /// while a conflicting same-identity replay is an idempotency conflict.
+    observed_host_events: BTreeMap<String, IdempotentRecord<ObservedHostEventSummary>>,
+    /// Last accepted host-event sequence per attempt. A new identity with a
+    /// nonmonotonic sequence rejects; a forward jump records an explicit gap.
+    last_host_sequence: BTreeMap<AttemptId, u64>,
     outcome_reconciliations:
         BTreeMap<OutcomeReconciliationId, IdempotentRecord<UnknownOutcomeFinalReceipt>>,
     descendant_closures: BTreeMap<AttemptId, IdempotentRecord<DescendantClosureCandidateReceipt>>,
@@ -169,6 +179,8 @@ impl AgentCoordinator {
             submissions: BTreeMap::new(),
             result_by_attempt: BTreeMap::new(),
             bindings: BTreeMap::new(),
+            observed_host_events: BTreeMap::new(),
+            last_host_sequence: BTreeMap::new(),
             outcome_reconciliations: BTreeMap::new(),
             descendant_closures: BTreeMap::new(),
             peer_messages: BTreeMap::new(),
@@ -1223,6 +1235,124 @@ impl AgentCoordinator {
         Ok(receipt)
     }
 
+    /// Observes one closed v7 provider host event under the exact recorded
+    /// lineage (issue #371 S7-partial).
+    ///
+    /// Enforced, in order:
+    /// - the context names a known admission with exact fence/epoch/lease
+    ///   agreement (`validate_context`);
+    /// - the presented normalization receipt must equal the envelope's
+    ///   embedded receipt: a caller-selected receipt never substitutes for
+    ///   the sealed one;
+    /// - an already-accepted event identity replays idempotently: the exact
+    ///   canonical input returns `Ok` without a new event or duplicate
+    ///   effects, while the same identity with different canonical bytes is
+    ///   an `IdempotencyConflict` (conflicting duplicate quarantined);
+    /// - the attempt and admission resolve from recorded state, never from
+    ///   caller-selected identity: the lineage binding's attempt must exist
+    ///   under this admission, the stored [`ProviderExecutionBinding`] must
+    ///   equal the presented binding exactly, and the stored #369 admitted
+    ///   route must exist. The envelope then closes through the shared S6
+    ///   validator
+    ///   (`eliot_agent_api::NormalizedHostEventEnvelope::validate_for_lineage`),
+    ///   which rejects a wrong binding/route-ref/fence/generation/cursor/
+    ///   parent before any mutation. Session-only observations validate on
+    ///   the session path and mutate no attempt state;
+    /// - per-attempt sequencing is explicit: a new identity with a
+    ///   nonmonotonic sequence rejects as stale, while a forward jump
+    ///   records an explicit [`CoordinatorEvent::ProviderHostEventGap`]
+    ///   before the observation.
+    ///
+    /// Observations never synthesize a candidate result or a Finish: usage,
+    /// terminality, results, and completion are untouched here.
+    pub fn observe_provider_event(
+        &mut self,
+        context: ExecutionContext,
+        event: NormalizedHostEventEnvelope,
+        normalization: HostEventNormalizationReceipt,
+    ) -> Result<(), CoordinatorError> {
+        self.validate_context(&context)?;
+        if event.normalization != normalization {
+            return Err(CoordinatorError::IdentityConflict("normalization_receipt"));
+        }
+        let canonical_input = canonical(&(&event, &normalization))?;
+        let event_key = event.event_id.as_str().to_owned();
+        if let Some(existing) = self.observed_host_events.get(&event_key) {
+            return match idempotent(existing, &canonical_input) {
+                Ok(_) => Ok(()),
+                Err(_) => Err(CoordinatorError::IdempotencyConflict),
+            };
+        }
+        let attempt_id = match &event.lineage {
+            ProviderObservationLineage::SessionObservation(observation) => {
+                observation.validate().map_err(binding_contract)?;
+                event
+                    .validate_as_session_observation()
+                    .map_err(binding_contract)?;
+                None
+            }
+            ProviderObservationLineage::ExecutionUnitObservation(unit) => {
+                let current = self
+                    .attempts
+                    .get(&unit.binding.attempt_id)
+                    .cloned()
+                    .ok_or(CoordinatorError::UnknownAttempt)?;
+                if current.admission_id != context.admission_id {
+                    return Err(CoordinatorError::StaleController);
+                }
+                let stored_binding = current
+                    .provider_binding
+                    .clone()
+                    .ok_or(CoordinatorError::IdentityConflict("execution_binding"))?;
+                let stored_admission = current
+                    .admitted_route
+                    .clone()
+                    .ok_or(CoordinatorError::IdentityConflict("admitted_route"))?;
+                event
+                    .validate_for_lineage(&stored_binding, &stored_admission)
+                    .map_err(binding_contract)?;
+                Some(current.attempt_id.clone())
+            }
+        };
+        if let Some(attempt) = &attempt_id {
+            let last = self.last_host_sequence.get(attempt).copied().unwrap_or(0);
+            if event.sequence <= last {
+                return Err(CoordinatorError::StaleResult);
+            }
+            if event.sequence > last + 1 {
+                self.events.push(CoordinatorEvent::ProviderHostEventGap {
+                    context: context.clone(),
+                    attempt_id: attempt.clone(),
+                    event_id: event.event_id.clone(),
+                    expected_sequence: last + 1,
+                    observed_sequence: event.sequence,
+                });
+            }
+            self.last_host_sequence
+                .insert(attempt.clone(), event.sequence);
+        }
+        let summary = ObservedHostEventSummary {
+            event_id: event.event_id.clone(),
+            attempt_id,
+            sequence: event.sequence,
+            output_digest: event.normalization.output_digest.clone(),
+        };
+        self.observed_host_events.insert(
+            event_key,
+            IdempotentRecord {
+                canonical_input,
+                receipt: summary,
+            },
+        );
+        self.events
+            .push(CoordinatorEvent::ProviderHostEventObserved {
+                context,
+                event: Box::new(event),
+                normalization: Box::new(normalization),
+            });
+        Ok(())
+    }
+
     pub fn reconcile_unknown_outcome(
         &mut self,
         context: ExecutionContext,
@@ -1638,6 +1768,22 @@ impl AgentCoordinator {
                     // is never invented on restore, so attribution of an
                     // unbound attempt fails closed.
                     coordinator.bind_provider_execution(context, *submission)?;
+                }
+                CoordinatorEvent::ProviderHostEventObserved {
+                    context,
+                    event,
+                    normalization,
+                } => {
+                    // Replay re-validates the exact canonical input against
+                    // the restored binding/admission and rebuilds the
+                    // observation index plus per-attempt sequencing. Gap
+                    // markers regenerate deterministically inside the call,
+                    // so the trailing equality check still holds.
+                    coordinator.observe_provider_event(context, *event, *normalization)?;
+                }
+                CoordinatorEvent::ProviderHostEventGap { .. } => {
+                    // Ordering evidence only: no independent mutation, and
+                    // the observed stream regenerates the identical marker.
                 }
             }
         }
