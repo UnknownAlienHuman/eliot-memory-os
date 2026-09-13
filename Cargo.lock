@@ -1031,6 +1031,12 @@ name = "eliot-doctor"
 version = "0.1.0"
 dependencies = [
  "eliot-doctor-core",
+ "eliot-process",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "tokio",
 ]
 
 [[package]]
@@ -1038,6 +1044,7 @@ name = "eliot-doctor-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-contracts",
  "serde",
  "thiserror",
  "time",
@@ -1473,6 +1480,7 @@ name = "eliot-kernel-service"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-doctor-core",
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-mcp",

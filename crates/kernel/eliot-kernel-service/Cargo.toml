@@ -15,6 +15,7 @@ proof_entrypoint = "cargo test -p eliot-kernel-service"
 
 [dependencies]
 eliot-contracts.workspace = true
+eliot-doctor-core.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-core.workspace = true
 eliot-mcp.workspace = true
