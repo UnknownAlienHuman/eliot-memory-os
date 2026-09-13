@@ -983,66 +983,25 @@ fn count_text_bytes(values: &[&str]) -> usize {
     total
 }
 
-fn preflight_bounds(request: &MemoryRepairRequest) -> Result<(), RepairError> {
-    let bound = |phase: &str, got: usize, max: usize| -> Result<(), RepairError> {
-        if got > max {
-            return Err(RepairError::Bounds {
-                phase: phase.to_owned(),
-                detail: "list exceeds its independent ceiling".to_owned(),
-            });
-        }
-        Ok(())
-    };
-    bound(
-        "affected",
-        request.affected.len(),
-        request.policy.max_affected.min(MAX_AFFECTED),
-    )?;
-    bound(
-        "dispositions",
-        request.dispositions.len(),
-        request.policy.max_affected.min(MAX_AFFECTED),
-    )?;
-    bound(
-        "closure-denominator",
-        request.closure_denominator.members.len(),
-        MAX_CLOSURE_REFS,
-    )?;
-    bound(
-        "protection",
-        request.projection.protection_refs.len(),
-        MAX_PROTECTIONS,
-    )?;
+fn bound_list_length(phase: &str, got: usize, max: usize) -> Result<(), RepairError> {
+    if got > max {
+        return Err(RepairError::Bounds {
+            phase: phase.to_owned(),
+            detail: "list exceeds its independent ceiling".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn preflight_spec_bounds(request: &MemoryRepairRequest) -> Result<(), RepairError> {
     let evidence_ceiling = request.policy.max_evidence_items.min(MAX_EVIDENCE_ITEMS);
-    bound(
-        "trajectory",
-        request
-            .projection
-            .trajectory
-            .false_positive_refs
-            .len()
-            .saturating_add(request.projection.trajectory.rival_refs.len())
-            .saturating_add(request.projection.trajectory.unknown_refs.len()),
-        evidence_ceiling,
-    )?;
-    bound(
-        "threat",
-        request
-            .projection
-            .threat
-            .threat_lineage_refs
-            .len()
-            .saturating_add(request.projection.threat.revocation_refs.len())
-            .saturating_add(request.projection.threat.taint_refs.len()),
-        evidence_ceiling,
-    )?;
     if let Some(spec) = &request.provenance {
-        bound(
+        bound_list_length(
             "provenance-lineage",
             spec.expected_lineage.len(),
             MAX_CLOSURE_REFS,
         )?;
-        bound(
+        bound_list_length(
             "provenance-conflicts",
             spec.conflicting_lineage_refs
                 .len()
@@ -1051,17 +1010,17 @@ fn preflight_bounds(request: &MemoryRepairRequest) -> Result<(), RepairError> {
         )?;
     }
     if let Some(spec) = &request.contamination {
-        bound(
+        bound_list_length(
             "contamination-closure",
             spec.closure.dependent_refs.len(),
             MAX_CLOSURE_REFS,
         )?;
-        bound(
+        bound_list_length(
             "contamination-gaps",
             spec.closure.unknown_gaps.len(),
             evidence_ceiling,
         )?;
-        bound(
+        bound_list_length(
             "contamination-lineage",
             spec.taint_lineage_refs
                 .len()
@@ -1070,43 +1029,47 @@ fn preflight_bounds(request: &MemoryRepairRequest) -> Result<(), RepairError> {
         )?;
     }
     if let Some(spec) = &request.relation {
-        bound(
+        bound_list_length(
             "relation-evidence",
             spec.original_source_refs
                 .len()
                 .saturating_add(spec.contradictory_evidence_refs.len()),
             evidence_ceiling,
         )?;
-        bound(
+        bound_list_length(
             "relation-dependents",
             spec.dependent_refs.len(),
             MAX_CLOSURE_REFS,
         )?;
     }
     if let Some(spec) = &request.stale_view {
-        bound(
+        bound_list_length(
             "stale-frontier",
             spec.source_frontier.len(),
             MAX_CLOSURE_REFS,
         )?;
-        bound(
+        bound_list_length(
             "stale-consumers",
             spec.consumer_refs.len(),
             MAX_CLOSURE_REFS,
         )?;
     }
     if let Some(spec) = &request.representation {
-        bound(
+        bound_list_length(
             "representation-coverage",
             spec.source_coverage_refs.len(),
             MAX_CLOSURE_REFS,
         )?;
-        bound(
+        bound_list_length(
             "representation-consumers",
             spec.consumer_refs.len(),
             MAX_CLOSURE_REFS,
         )?;
     }
+    Ok(())
+}
+
+fn preflight_text_and_order(request: &MemoryRepairRequest) -> Result<(), RepairError> {
     let mut total = 0usize;
     total = total.saturating_add(count_text_bytes(&[
         &request.projection.subject_handle,
@@ -1158,6 +1121,55 @@ fn preflight_bounds(request: &MemoryRepairRequest) -> Result<(), RepairError> {
             detail: "disposition handles must be sorted and unique".to_owned(),
         });
     }
+    Ok(())
+}
+
+fn preflight_bounds(request: &MemoryRepairRequest) -> Result<(), RepairError> {
+    bound_list_length(
+        "affected",
+        request.affected.len(),
+        request.policy.max_affected.min(MAX_AFFECTED),
+    )?;
+    bound_list_length(
+        "dispositions",
+        request.dispositions.len(),
+        request.policy.max_affected.min(MAX_AFFECTED),
+    )?;
+    bound_list_length(
+        "closure-denominator",
+        request.closure_denominator.members.len(),
+        MAX_CLOSURE_REFS,
+    )?;
+    bound_list_length(
+        "protection",
+        request.projection.protection_refs.len(),
+        MAX_PROTECTIONS,
+    )?;
+    let evidence_ceiling = request.policy.max_evidence_items.min(MAX_EVIDENCE_ITEMS);
+    bound_list_length(
+        "trajectory",
+        request
+            .projection
+            .trajectory
+            .false_positive_refs
+            .len()
+            .saturating_add(request.projection.trajectory.rival_refs.len())
+            .saturating_add(request.projection.trajectory.unknown_refs.len()),
+        evidence_ceiling,
+    )?;
+    bound_list_length(
+        "threat",
+        request
+            .projection
+            .threat
+            .threat_lineage_refs
+            .len()
+            .saturating_add(request.projection.threat.revocation_refs.len())
+            .saturating_add(request.projection.threat.taint_refs.len()),
+        evidence_ceiling,
+    )?;
+    preflight_spec_bounds(request)?;
+    preflight_text_and_order(request)?;
     Ok(())
 }
 
@@ -1306,16 +1318,17 @@ fn unchanged_candidate(
     note: &str,
 ) -> Result<MemoryRepairCandidate, RepairError> {
     let dispositions = request.dispositions.clone();
-    let digest = candidate_digest(
+    let digest_inputs = CandidateDigestInputs {
         request,
-        &[],
-        &request.projection.subject_handle,
-        &request.projection.subject_revision,
-        note,
-        &request.policy.verifier,
-        &request.policy.inverse_note,
-        request.policy.expiry_ms,
-    )?;
+        operations: &[],
+        subject_handle: &request.projection.subject_handle,
+        subject_revision: &request.projection.subject_revision,
+        hypothesis: note,
+        verifier: &request.policy.verifier,
+        inverse_note: &request.policy.inverse_note,
+        expiry_ms: request.policy.expiry_ms,
+    };
+    let digest = candidate_digest(&digest_inputs)?;
     Ok(MemoryRepairCandidate {
         outcome,
         defect_kind: request.defect_kind,
@@ -1355,7 +1368,7 @@ fn repair_spelling_family(spelling: &str) -> Option<RepairDefectKind> {
     }
 }
 
-fn intrinsic_checks(
+fn intrinsic_receipt_binding(
     request: &MemoryRepairRequest,
 ) -> Result<Option<MemoryRepairCandidate>, RepairError> {
     request
@@ -1399,18 +1412,13 @@ fn intrinsic_checks(
             "curation item is not the repair kind",
         )?));
     }
-    let (payload_target, payload_repair) =
-        if let eliot_dreamer_contracts::curation::CurationPayload::Repair(payload) =
-            &request.item.payload
-        {
-            (payload.target.clone(), payload.repair.clone())
-        } else {
-            return Ok(Some(unchanged_candidate(
-                request,
-                RepairOutcome::Rejected,
-                "curation payload does not carry a repair target",
-            )?));
-        };
+    Ok(None)
+}
+
+fn intrinsic_subject_binding(
+    request: &MemoryRepairRequest,
+    payload_target: &str,
+) -> Result<Option<MemoryRepairCandidate>, RepairError> {
     if payload_target != request.projection.subject_handle {
         return Ok(Some(unchanged_candidate(
             request,
@@ -1460,14 +1468,13 @@ fn intrinsic_checks(
     if let (Some(observed), Some(deadline)) = (
         request.policy.observation_time_ms,
         request.policy.deadline_ms,
-    ) {
-        if observed >= deadline {
-            return Ok(Some(unchanged_candidate(
-                request,
-                RepairOutcome::Stale,
-                "observation is at or beyond the frozen deadline",
-            )?));
-        }
+    ) && observed >= deadline
+    {
+        return Ok(Some(unchanged_candidate(
+            request,
+            RepairOutcome::Stale,
+            "observation is at or beyond the frozen deadline",
+        )?));
     }
     if request.projection.subject_kind == SubjectKind::RawEpisode {
         return Ok(Some(unchanged_candidate(
@@ -1476,29 +1483,36 @@ fn intrinsic_checks(
             "raw episode history is preserved verbatim and never repaired here",
         )?));
     }
+    Ok(None)
+}
+
+fn intrinsic_routing(
+    request: &MemoryRepairRequest,
+    payload_repair: &str,
+) -> Result<Option<MemoryRepairCandidate>, RepairError> {
     // Closed-spelling boundary routing before any kind work.
-    if IDENTITY_SURGERY_REPAIRS.contains(&payload_repair.as_str()) {
+    if IDENTITY_SURGERY_REPAIRS.contains(&payload_repair) {
         return Ok(Some(unchanged_candidate(
             request,
             RepairOutcome::Rejected,
             "merge or split identity repair routes to a-27 (#665)",
         )?));
     }
-    if RECONSOLIDATION_REPAIRS.contains(&payload_repair.as_str()) {
+    if RECONSOLIDATION_REPAIRS.contains(&payload_repair) {
         return Ok(Some(unchanged_candidate(
             request,
             RepairOutcome::Rejected,
             "derived-content reconsolidation routes to a-28 (#667)",
         )?));
     }
-    if AXIS_TUNING_REPAIRS.contains(&payload_repair.as_str()) {
+    if AXIS_TUNING_REPAIRS.contains(&payload_repair) {
         return Ok(Some(unchanged_candidate(
             request,
             RepairOutcome::Rejected,
             "pure axis tuning routes to a-29 (#669)",
         )?));
     }
-    let Some(spelling_family) = repair_spelling_family(payload_repair.as_str()) else {
+    let Some(spelling_family) = repair_spelling_family(payload_repair) else {
         return Ok(Some(unchanged_candidate(
             request,
             RepairOutcome::Rejected,
@@ -1513,11 +1527,11 @@ fn intrinsic_checks(
         )?));
     }
     // Exactly one spec must be present and it must match the selection.
-    let present = request.provenance.is_some() as u8
-        + request.contamination.is_some() as u8
-        + request.relation.is_some() as u8
-        + request.stale_view.is_some() as u8
-        + request.representation.is_some() as u8;
+    let present = u8::from(request.provenance.is_some())
+        + u8::from(request.contamination.is_some())
+        + u8::from(request.relation.is_some())
+        + u8::from(request.stale_view.is_some())
+        + u8::from(request.representation.is_some());
     if present == 0 {
         return Ok(Some(unchanged_candidate(
             request,
@@ -1545,6 +1559,34 @@ fn intrinsic_checks(
             RepairOutcome::Rejected,
             "defect specification does not match the selected kind",
         )?));
+    }
+    Ok(None)
+}
+
+fn intrinsic_checks(
+    request: &MemoryRepairRequest,
+) -> Result<Option<MemoryRepairCandidate>, RepairError> {
+    if let Some(early) = intrinsic_receipt_binding(request)? {
+        return Ok(Some(early));
+    }
+    let (payload_target, payload_repair) =
+        if let eliot_dreamer_contracts::curation::CurationPayload::Repair(payload) =
+            &request.item.payload
+        {
+            (payload.target.clone(), payload.repair.clone())
+        } else {
+            return Ok(Some(unchanged_candidate(
+                request,
+                RepairOutcome::Rejected,
+                "curation payload does not carry a repair target",
+            )?));
+        };
+    if let Some(early) = intrinsic_subject_binding(request, &payload_target)? {
+        return Ok(Some(early));
+    }
+    // Closed-spelling boundary routing before any kind work.
+    if let Some(early) = intrinsic_routing(request, &payload_repair)? {
+        return Ok(Some(early));
     }
     Ok(None)
 }
@@ -1729,8 +1771,9 @@ fn evaluate_contamination(
     }
     let inert = match spec.action {
         ContaminationAction::QuarantineDependents => RepairOperationKind::QuarantineForRevalidation,
-        ContaminationAction::RevokeDependent => RepairOperationKind::OwnerDirectedReview,
-        ContaminationAction::RestrictScope => RepairOperationKind::OwnerDirectedReview,
+        ContaminationAction::RevokeDependent | ContaminationAction::RestrictScope => {
+            RepairOperationKind::OwnerDirectedReview
+        }
         ContaminationAction::RevalidateWithNewEvidence => {
             RepairOperationKind::QuarantineForRevalidation
         }
@@ -1750,6 +1793,42 @@ fn evaluate_contamination(
         note: "complete closure over every affected branch; record kept, no silent axis change"
             .to_owned(),
     })
+}
+
+fn false_relation_partial_denominator(
+    request: &MemoryRepairRequest,
+    spec: &FalseRelationSpec,
+) -> KindVerdict {
+    let scope = request.projection.scope_id.clone();
+    let partial_op = match &spec.proposal {
+        FalseRelationProposal::Invalidate => Some(RepairOperationKind::RelationInvalidate),
+        FalseRelationProposal::QuarantineReverify => {
+            Some(RepairOperationKind::QuarantineForRevalidation)
+        }
+        FalseRelationProposal::Reclassify { .. } | FalseRelationProposal::Replace { .. } => None,
+    };
+    if let Some(kind) = partial_op {
+        // Invalidate and quarantine stay safe under partial dependent
+        // coverage; reclassify and replace need the full denominator.
+        return KindVerdict::Partial {
+            operations: vec![operation(
+                kind,
+                &spec.registry_owner,
+                &spec.verifier,
+                &spec.inverse_note,
+                request.policy.expiry_ms,
+                &scope,
+            )],
+            hypothesis: "holding the exact relation revision limits the false binding".to_owned(),
+            observable: "the exact relation revision no longer guides covered dependents"
+                .to_owned(),
+            note: "dependent denominator is partial; completeness is blocked".to_owned(),
+        };
+    }
+    KindVerdict::Outcome {
+        outcome: RepairOutcome::Partial,
+        note: "dependent denominator is partial; completeness is blocked".to_owned(),
+    }
 }
 
 fn evaluate_false_relation(
@@ -1794,39 +1873,7 @@ fn evaluate_false_relation(
         });
     }
     if spec.dependent_refs.len() != spec.expected_dependents_total as usize {
-        let scope = request.projection.scope_id.clone();
-        let partial_op = match &spec.proposal {
-            FalseRelationProposal::Invalidate => Some(RepairOperationKind::RelationInvalidate),
-            FalseRelationProposal::QuarantineReverify => {
-                Some(RepairOperationKind::QuarantineForRevalidation)
-            }
-            FalseRelationProposal::Reclassify { .. } | FalseRelationProposal::Replace { .. } => {
-                None
-            }
-        };
-        if let Some(kind) = partial_op {
-            // Invalidate and quarantine stay safe under partial dependent
-            // coverage; reclassify and replace need the full denominator.
-            return Ok(KindVerdict::Partial {
-                operations: vec![operation(
-                    kind,
-                    &spec.registry_owner,
-                    &spec.verifier,
-                    &spec.inverse_note,
-                    request.policy.expiry_ms,
-                    &scope,
-                )],
-                hypothesis: "holding the exact relation revision limits the false binding"
-                    .to_owned(),
-                observable: "the exact relation revision no longer guides covered dependents"
-                    .to_owned(),
-                note: "dependent denominator is partial; completeness is blocked".to_owned(),
-            });
-        }
-        return Ok(KindVerdict::Outcome {
-            outcome: RepairOutcome::Partial,
-            note: "dependent denominator is partial; completeness is blocked".to_owned(),
-        });
+        return Ok(false_relation_partial_denominator(request, spec));
     }
     let kind = match &spec.proposal {
         FalseRelationProposal::Invalidate => RepairOperationKind::RelationInvalidate,
@@ -2044,9 +2091,7 @@ fn evaluate_representation(
 // Member accounting, preservation, digest, and emission.
 // ---------------------------------------------------------------------------
 
-fn check_member_accounting(
-    request: &MemoryRepairRequest,
-) -> Result<Option<KindVerdict>, RepairError> {
+fn check_member_accounting(request: &MemoryRepairRequest) -> Option<KindVerdict> {
     let affected_handles: Vec<String> = request.affected.iter().map(|m| m.handle.clone()).collect();
     let disposition_handles: Vec<String> = request
         .dispositions
@@ -2054,18 +2099,18 @@ fn check_member_accounting(
         .map(|d| d.handle.clone())
         .collect();
     if !sorted_set_eq(&affected_handles, &disposition_handles) {
-        return Ok(Some(KindVerdict::Outcome {
+        return Some(KindVerdict::Outcome {
             outcome: RepairOutcome::Partial,
             note: "every affected member needs exactly one disposition and vice versa".to_owned(),
-        }));
+        });
     }
     let mut denominator = request.closure_denominator.members.clone();
     denominator.sort();
     if !sorted_set_eq(&affected_handles, &denominator) {
-        return Ok(Some(KindVerdict::Outcome {
+        return Some(KindVerdict::Outcome {
             outcome: RepairOutcome::Partial,
             note: "affected denominator does not cover exactly the affected members".to_owned(),
-        }));
+        });
     }
     for member in &request.affected {
         if member.unknown {
@@ -2074,10 +2119,10 @@ fn check_member_accounting(
                     && d.disposition == MemberDispositionKind::BlockedUnavailableUnknown
             });
             if !held {
-                return Ok(Some(KindVerdict::Outcome {
+                return Some(KindVerdict::Outcome {
                     outcome: RepairOutcome::Blocked,
                     note: "unknown members must be held as blocked, never unaffected".to_owned(),
-                }));
+                });
             }
         }
     }
@@ -2087,22 +2132,22 @@ fn check_member_accounting(
             .iter()
             .find(|m| m.handle == disposition.handle)
         else {
-            return Ok(Some(KindVerdict::Outcome {
+            return Some(KindVerdict::Outcome {
                 outcome: RepairOutcome::Partial,
                 note: "a disposition names a member outside the affected set".to_owned(),
-            }));
+            });
         };
         if disposition.owner != member.owner {
-            return Ok(Some(KindVerdict::Outcome {
+            return Some(KindVerdict::Outcome {
                 outcome: RepairOutcome::Rejected,
                 note: "a disposition owner does not bind the member owner".to_owned(),
-            }));
+            });
         }
         if disposition.scope_id != request.projection.scope_id {
-            return Ok(Some(KindVerdict::Outcome {
+            return Some(KindVerdict::Outcome {
                 outcome: RepairOutcome::Stale,
                 note: "a disposition scope moved from the projection scope".to_owned(),
-            }));
+            });
         }
     }
     let any_blocked = request
@@ -2110,12 +2155,12 @@ fn check_member_accounting(
         .iter()
         .any(|d| d.disposition == MemberDispositionKind::BlockedUnavailableUnknown);
     if any_blocked {
-        return Ok(Some(KindVerdict::Outcome {
+        return Some(KindVerdict::Outcome {
             outcome: RepairOutcome::Blocked,
             note: "a blocked member holds the candidate below complete".to_owned(),
-        }));
+        });
     }
-    Ok(None)
+    None
 }
 
 #[derive(Serialize)]
@@ -2164,17 +2209,19 @@ fn operation_spelling(operation: RepairOperationKind) -> &'static str {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn candidate_digest(
-    request: &MemoryRepairRequest,
-    operations: &[TypedRepairOperation],
-    subject_handle: &str,
-    subject_revision: &str,
-    hypothesis: &str,
-    verifier: &str,
-    inverse_note: &str,
+struct CandidateDigestInputs<'a> {
+    request: &'a MemoryRepairRequest,
+    operations: &'a [TypedRepairOperation],
+    subject_handle: &'a str,
+    subject_revision: &'a str,
+    hypothesis: &'a str,
+    verifier: &'a str,
+    inverse_note: &'a str,
     expiry_ms: Option<u64>,
-) -> Result<String, RepairError> {
+}
+
+fn candidate_digest(inputs: &CandidateDigestInputs<'_>) -> Result<String, RepairError> {
+    let request = inputs.request;
     let repair_spelling =
         if let eliot_dreamer_contracts::curation::CurationPayload::Repair(payload) =
             &request.item.payload
@@ -2183,7 +2230,8 @@ fn candidate_digest(
         } else {
             ""
         };
-    let mut operation_kinds: Vec<&str> = operations
+    let mut operation_kinds: Vec<&str> = inputs
+        .operations
         .iter()
         .map(|o| operation_spelling(o.operation))
         .collect();
@@ -2195,8 +2243,8 @@ fn candidate_digest(
         .collect();
     disposition_handles.sort_unstable();
     let view = DigestView {
-        subject_handle,
-        subject_revision,
+        subject_handle: inputs.subject_handle,
+        subject_revision: inputs.subject_revision,
         subject_digest: request.projection.subject_digest.as_str(),
         scope_id: request.projection.scope_id.as_str(),
         task_id: request.projection.task_id.as_str(),
@@ -2205,11 +2253,11 @@ fn candidate_digest(
         repair_spelling,
         operation_kinds,
         disposition_handles,
-        hypothesis,
-        observable: verifier,
-        verifier,
-        inverse_note,
-        expiry_ms,
+        hypothesis: inputs.hypothesis,
+        observable: inputs.verifier,
+        verifier: inputs.verifier,
+        inverse_note: inputs.inverse_note,
+        expiry_ms: inputs.expiry_ms,
     };
     canonical_json_bytes(&view)
         .map(|bytes| sha256_hex(&bytes))
@@ -2219,83 +2267,60 @@ fn candidate_digest(
         })
 }
 
-/// Proposes one bounded typed repair candidate for one closed defect.
-///
-/// The request binds the six canonical families: validated curation item,
-/// frozen bundle digests, grounded draft, current memory and trajectory
-/// projection, affected dependency projection (affected members, one
-/// disposition each, and the closure denominator), and policy. The A-05
-/// receipt is checked intrinsically and never re-executed. Returned
-/// candidates are inert: every operation names the external owner that must
-/// execute or decline it.
-pub fn propose_memory_repair(
-    request: &MemoryRepairRequest,
-) -> Result<MemoryRepairCandidate, RepairError> {
-    preflight_bounds(request)?;
-    if let Err(failure) = validate_shapes(request) {
-        // Preservation dimension shortfalls are semantic, not malformed:
-        // only the deferred marker reroutes here, and the emission stage
-        // re-derives the exact verdict through `overall`.
-        let deferred = matches!(&failure, RepairError::Bounds { phase, .. } if phase == "preservation-deferred");
-        if !deferred {
-            return Err(failure);
-        }
-    }
-    if let Some(early) = intrinsic_checks(request)? {
-        return Ok(early);
-    }
-    let kind_verdict = match request.defect_kind {
+fn select_kind_verdict(request: &MemoryRepairRequest) -> Result<KindVerdict, RepairError> {
+    match request.defect_kind {
         RepairDefectKind::MissingProvenance => {
             let Some(spec) = &request.provenance else {
-                return unchanged_candidate(
-                    request,
-                    RepairOutcome::Rejected,
-                    "provenance spec is absent",
-                );
+                return Ok(KindVerdict::Outcome {
+                    outcome: RepairOutcome::Rejected,
+                    note: "provenance spec is absent".to_owned(),
+                });
             };
-            evaluate_provenance(request, spec)?
+            evaluate_provenance(request, spec)
         }
         RepairDefectKind::ContaminatedInfluence => {
             let Some(spec) = &request.contamination else {
-                return unchanged_candidate(
-                    request,
-                    RepairOutcome::Rejected,
-                    "contamination spec is absent",
-                );
+                return Ok(KindVerdict::Outcome {
+                    outcome: RepairOutcome::Rejected,
+                    note: "contamination spec is absent".to_owned(),
+                });
             };
-            evaluate_contamination(request, spec)?
+            evaluate_contamination(request, spec)
         }
         RepairDefectKind::FalseRelation => {
             let Some(spec) = &request.relation else {
-                return unchanged_candidate(
-                    request,
-                    RepairOutcome::Rejected,
-                    "relation spec is absent",
-                );
+                return Ok(KindVerdict::Outcome {
+                    outcome: RepairOutcome::Rejected,
+                    note: "relation spec is absent".to_owned(),
+                });
             };
-            evaluate_false_relation(request, spec)?
+            evaluate_false_relation(request, spec)
         }
         RepairDefectKind::StaleDerivedView => {
             let Some(spec) = &request.stale_view else {
-                return unchanged_candidate(
-                    request,
-                    RepairOutcome::Rejected,
-                    "stale view spec is absent",
-                );
+                return Ok(KindVerdict::Outcome {
+                    outcome: RepairOutcome::Rejected,
+                    note: "stale view spec is absent".to_owned(),
+                });
             };
-            evaluate_stale_view(request, spec)?
+            evaluate_stale_view(request, spec)
         }
         RepairDefectKind::RepresentationGap => {
             let Some(spec) = &request.representation else {
-                return unchanged_candidate(
-                    request,
-                    RepairOutcome::Rejected,
-                    "representation spec is absent",
-                );
+                return Ok(KindVerdict::Outcome {
+                    outcome: RepairOutcome::Rejected,
+                    note: "representation spec is absent".to_owned(),
+                });
             };
-            evaluate_representation(request, spec)?
+            evaluate_representation(request, spec)
         }
-    };
+    }
+}
+
+fn emit_repair_candidate(
+    request: &MemoryRepairRequest,
+    kind_verdict: KindVerdict,
+) -> Result<MemoryRepairCandidate, RepairError> {
     let (mut outcome, operations, hypothesis, observable, mut note) = match kind_verdict {
         KindVerdict::Complete {
             operations,
@@ -2325,27 +2350,27 @@ pub fn propose_memory_repair(
             return unchanged_candidate(request, outcome, &note);
         }
     };
-    if let Some(accounting) = check_member_accounting(request)? {
-        if let KindVerdict::Outcome { outcome, note } = accounting {
-            return unchanged_candidate(request, outcome, &note);
-        }
+    if let Some(KindVerdict::Outcome { outcome, note }) = check_member_accounting(request) {
+        return unchanged_candidate(request, outcome, &note);
     }
     // A failed or unknown preservation dimension blocks completeness without
     // invoking any further validation: the candidate drops to partial.
     if outcome == RepairOutcome::Complete && request.preservation.overall().is_err() {
         outcome = RepairOutcome::Partial;
-        note = "a preservation dimension failed or is unknown; completeness is blocked".to_owned();
+        "a preservation dimension failed or is unknown; completeness is blocked"
+            .clone_into(&mut note);
     }
-    let digest = candidate_digest(
+    let digest_inputs = CandidateDigestInputs {
         request,
-        &operations,
-        &request.projection.subject_handle,
-        &request.projection.subject_revision,
-        &hypothesis,
-        &request.policy.verifier,
-        &request.policy.inverse_note,
-        request.policy.expiry_ms,
-    )?;
+        operations: &operations,
+        subject_handle: &request.projection.subject_handle,
+        subject_revision: &request.projection.subject_revision,
+        hypothesis: &hypothesis,
+        verifier: &request.policy.verifier,
+        inverse_note: &request.policy.inverse_note,
+        expiry_ms: request.policy.expiry_ms,
+    };
+    let digest = candidate_digest(&digest_inputs)?;
     Ok(MemoryRepairCandidate {
         outcome,
         defect_kind: request.defect_kind,
@@ -2371,22 +2396,51 @@ pub fn propose_memory_repair(
     })
 }
 
+/// Proposes one bounded typed repair candidate for one closed defect.
+///
+/// The request binds the six canonical families: validated curation item,
+/// frozen bundle digests, grounded draft, current memory and trajectory
+/// projection, affected dependency projection (affected members, one
+/// disposition each, and the closure denominator), and policy. The A-05
+/// receipt is checked intrinsically and never re-executed. Returned
+/// candidates are inert: every operation names the external owner that must
+/// execute or decline it.
+pub fn propose_memory_repair(
+    request: &MemoryRepairRequest,
+) -> Result<MemoryRepairCandidate, RepairError> {
+    preflight_bounds(request)?;
+    if let Err(failure) = validate_shapes(request) {
+        // Preservation dimension shortfalls are semantic, not malformed:
+        // only the deferred marker reroutes here, and the emission stage
+        // re-derives the exact verdict through `overall`.
+        let deferred = matches!(&failure, RepairError::Bounds { phase, .. } if phase == "preservation-deferred");
+        if !deferred {
+            return Err(failure);
+        }
+    }
+    if let Some(early) = intrinsic_checks(request)? {
+        return Ok(early);
+    }
+    let kind_verdict = select_kind_verdict(request)?;
+    emit_repair_candidate(request, kind_verdict)
+}
+
 /// Maps a terminal outcome to the closest A-05 rejection hint, if any.
 #[must_use]
 pub fn outcome_rejection_hint(outcome: &RepairOutcome) -> Option<RejectionCode> {
     match outcome {
         RepairOutcome::Complete => None,
-        RepairOutcome::Partial | RepairOutcome::Blocked => Some(RejectionCode::PreservationFailed),
+        RepairOutcome::Partial | RepairOutcome::Blocked | RepairOutcome::Review => {
+            Some(RejectionCode::PreservationFailed)
+        }
         RepairOutcome::Abstention | RepairOutcome::NoSafeRepair => {
             Some(RejectionCode::LineageMismatch)
         }
         RepairOutcome::Stale | RepairOutcome::Rejected => Some(RejectionCode::IdentityMismatch),
-        RepairOutcome::Review => Some(RejectionCode::PreservationFailed),
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
@@ -2749,7 +2803,10 @@ mod tests {
         let mut request = base_request("provenance-link", RepairDefectKind::MissingProvenance);
         request.provenance = Some(provenance_spec());
         request.dispositions = test_disposition(MemberDispositionKind::ProvenanceLink);
-        let candidate = propose_memory_repair(&request).expect("valid provenance request");
+        let candidate = match propose_memory_repair(&request) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("valid provenance request: {err:?}"),
+        };
         assert_eq!(candidate.outcome, RepairOutcome::Complete);
         assert_eq!(candidate.defect_kind, RepairDefectKind::MissingProvenance);
         assert_eq!(candidate.subject_handle, "mem-1");
@@ -2771,7 +2828,10 @@ mod tests {
             RepairDefectKind::ContaminatedInfluence,
         );
         request.contamination = Some(contamination_spec());
-        let candidate = propose_memory_repair(&request).expect("valid contamination request");
+        let candidate = match propose_memory_repair(&request) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("valid contamination request: {err:?}"),
+        };
         assert_eq!(candidate.outcome, RepairOutcome::Complete);
         assert_eq!(
             candidate.defect_kind,
@@ -2793,7 +2853,10 @@ mod tests {
         let mut request = base_request("relation-invalidate", RepairDefectKind::FalseRelation);
         request.relation = Some(relation_spec());
         request.dispositions = test_disposition(MemberDispositionKind::RelationChange);
-        let candidate = propose_memory_repair(&request).expect("valid relation request");
+        let candidate = match propose_memory_repair(&request) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("valid relation request: {err:?}"),
+        };
         assert_eq!(candidate.outcome, RepairOutcome::Complete);
         assert_eq!(candidate.defect_kind, RepairDefectKind::FalseRelation);
         assert_eq!(candidate.operations.len(), 1);
@@ -2811,7 +2874,10 @@ mod tests {
         let mut request = base_request("view-rebuild", RepairDefectKind::StaleDerivedView);
         request.stale_view = Some(stale_view_spec());
         request.dispositions = test_disposition(MemberDispositionKind::Rebuild);
-        let candidate = propose_memory_repair(&request).expect("valid stale view request");
+        let candidate = match propose_memory_repair(&request) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("valid stale view request: {err:?}"),
+        };
         assert_eq!(candidate.outcome, RepairOutcome::Complete);
         assert_eq!(candidate.defect_kind, RepairDefectKind::StaleDerivedView);
         assert_eq!(candidate.operations.len(), 3);
@@ -2829,7 +2895,10 @@ mod tests {
         let mut request = base_request("representation-add", RepairDefectKind::RepresentationGap);
         request.representation = Some(representation_spec());
         request.dispositions = test_disposition(MemberDispositionKind::RepresentationChange);
-        let candidate = propose_memory_repair(&request).expect("valid representation request");
+        let candidate = match propose_memory_repair(&request) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("valid representation request: {err:?}"),
+        };
         assert_eq!(candidate.outcome, RepairOutcome::Complete);
         assert_eq!(candidate.defect_kind, RepairDefectKind::RepresentationGap);
         assert_eq!(candidate.operations.len(), 1);
@@ -2846,13 +2915,22 @@ mod tests {
         let mut request = base_request("provenance-link", RepairDefectKind::MissingProvenance);
         request.provenance = Some(provenance_spec());
         request.dispositions = test_disposition(MemberDispositionKind::ProvenanceLink);
-        let first = propose_memory_repair(&request).expect("first replay");
-        let second = propose_memory_repair(&request).expect("second replay");
+        let first = match propose_memory_repair(&request) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("first replay: {err:?}"),
+        };
+        let second = match propose_memory_repair(&request) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("second replay: {err:?}"),
+        };
         assert_eq!(first.outcome, RepairOutcome::Complete);
         assert_eq!(first.candidate_digest, second.candidate_digest);
         let mut moved = request.clone();
         moved.projection.subject_revision = "rev-3".to_owned();
-        let rebound = propose_memory_repair(&moved).expect("moved revision");
+        let rebound = match propose_memory_repair(&moved) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("moved revision: {err:?}"),
+        };
         assert_eq!(rebound.outcome, RepairOutcome::Complete);
         assert_ne!(first.candidate_digest, rebound.candidate_digest);
     }
