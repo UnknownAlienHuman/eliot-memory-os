@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+use eliot_contracts::EpochId;
 use eliot_instrument_api::{
     ExecutionStatus, InstrumentInvocation, InstrumentKind, VerificationRun,
 };
@@ -117,7 +118,7 @@ pub struct ProcessAdmission {
     pub operation_id: String,
     pub process_tree_id: String,
     pub generation: u64,
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub invocation_digest: String,
 }
 
@@ -128,7 +129,7 @@ impl ProcessAdmission {
             operation_id: request.operation_id().as_str().to_owned(),
             process_tree_id: request.process_tree_id().as_str().to_owned(),
             generation: request.generation().get(),
-            authority_epoch: request.fence().authority_epoch(),
+            authority_epoch: request.fence().authority_epoch().clone(),
             invocation_digest: request.invocation_digest().to_owned(),
         }
     }
@@ -218,7 +219,12 @@ pub fn issue_process_admission(
             .non_secret()
             .get("CARGO_HOME")
             != Some(&request.cache_root)
-        || evidence.process.fence().authority_epoch()
+        // Scalar-sequence staleness join against the instrument scalar contour:
+        // the process fence carries the full EpochId pair (lineage proven at
+        // admission), while the invocation retains only the scalar contour, so
+        // the contour join is on the sequence component. Lineage itself is
+        // never re-derived from this scalar.
+        || evidence.process.fence().authority_epoch().sequence.get()
             != request
                 .invocation
                 .request
@@ -258,7 +264,7 @@ pub struct ExecutionContourGrant {
     invocation_id: String,
     operation_id: String,
     process_tree_id: String,
-    authority_epoch: u64,
+    authority_epoch: EpochId,
     resource_generation: u64,
     grant_id: String,
     grant_digest: String,
@@ -284,7 +290,7 @@ impl ExecutionContourGrant {
             invocation_id: invocation_id.into(),
             operation_id: process.operation_id().as_str().to_owned(),
             process_tree_id: process.process_tree_id().as_str().to_owned(),
-            authority_epoch: process.fence().authority_epoch(),
+            authority_epoch: process.fence().authority_epoch().clone(),
             resource_generation: process.generation().get(),
             grant_id: grant_id.into(),
             grant_digest: String::new(),
@@ -324,7 +330,9 @@ impl ExecutionContourGrant {
             || self.invocation_id != invocation_id
             || self.operation_id != process.operation_id().as_str()
             || self.process_tree_id != process.process_tree_id().as_str()
-            || self.authority_epoch != process.fence().authority_epoch()
+            || !self
+                .authority_epoch
+                .is_same_authority(process.fence().authority_epoch())
             || self.resource_generation != process.generation().get()
         {
             return Err(TestdError::InvalidBinding);
@@ -396,7 +404,7 @@ fn contour_grant_digest(grant: &ExecutionContourGrant) -> Result<String, TestdEr
         &grant.invocation_id,
         &grant.operation_id,
         &grant.process_tree_id,
-        grant.authority_epoch,
+        &grant.authority_epoch,
         grant.resource_generation,
         &grant.grant_id,
     ))
@@ -533,7 +541,7 @@ pub struct ReceiptBinding {
     pub operation_id: String,
     pub process_tree_id: String,
     pub generation: u64,
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub invocation_id: String,
     pub invocation_digest: String,
     pub allowed_contour_root: String,
@@ -615,7 +623,7 @@ pub struct VerificationReceipt {
     pub operation_id: String,
     pub process_tree_id: String,
     pub generation: u64,
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub invocation_id: String,
     pub invocation_digest: String,
     pub allowed_contour_root: String,
@@ -635,7 +643,7 @@ impl VerificationReceipt {
             operation_id: self.operation_id.clone(),
             process_tree_id: self.process_tree_id.clone(),
             generation: self.generation,
-            authority_epoch: self.authority_epoch,
+            authority_epoch: self.authority_epoch.clone(),
             invocation_id: self.invocation_id.clone(),
             invocation_digest: self.invocation_digest.clone(),
             allowed_contour_root: self.allowed_contour_root.clone(),
@@ -757,7 +765,7 @@ impl EvidenceCollector {
             operation_id: job.process.operation_id.clone(),
             process_tree_id: job.process.process_tree_id.clone(),
             generation: job.process.generation,
-            authority_epoch: job.process.authority_epoch,
+            authority_epoch: job.process.authority_epoch.clone(),
             invocation_id: job.invocation.request.request_id.as_str().to_owned(),
             invocation_digest: job.process.invocation_digest.clone(),
             allowed_contour_root: job.target_roots.allowed_contour_root.clone(),
@@ -1012,8 +1020,13 @@ impl TestdStore {
         if invocation.request.request_id.as_str() != process.operation_id().as_str() {
             return Err(TestdError::InvalidBinding);
         }
+        // Scalar-sequence staleness join against the instrument scalar contour:
+        // the process fence carries the full EpochId pair (lineage proven at
+        // admission), while the invocation retains only the scalar contour, so
+        // the contour join is on the sequence component. Lineage itself is
+        // never re-derived from this scalar.
         if invocation.request.state_fence.authority_epoch.value()
-            != process.fence().authority_epoch()
+            != process.fence().authority_epoch().sequence.get()
             || invocation.request.state_fence.resource_generation.value()
                 != process.generation().get()
         {
@@ -1635,6 +1648,18 @@ pub fn sha256_artifact(length: u64, bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn lease() -> Lease {
         Lease {
@@ -1652,7 +1677,7 @@ mod tests {
             invocation_id: "invocation".to_owned(),
             operation_id: "operation".to_owned(),
             process_tree_id: "tree".to_owned(),
-            authority_epoch: 7,
+            authority_epoch: test_epoch(7),
             resource_generation: 3,
             grant_id: "grant-1".to_owned(),
             grant_digest: String::new(),
@@ -1726,7 +1751,7 @@ mod tests {
             operation_id: "operation".to_owned(),
             process_tree_id: "tree".to_owned(),
             generation: 1,
-            authority_epoch: 1,
+            authority_epoch: test_epoch(1),
             invocation_id: "invocation-a".to_owned(),
             invocation_digest: "digest".to_owned(),
             allowed_contour_root: "contour".to_owned(),

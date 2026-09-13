@@ -13,6 +13,7 @@ eliot-process.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+eliot-contracts.workspace = true
 eliot-platform.workspace = true
 
 [lints]

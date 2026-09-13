@@ -589,7 +589,13 @@ fn validate_process_binding(
     if process.operation_id().as_str() != envelope.invocation_id.as_str()
         || process.process_tree_id().as_str() != envelope.work_scope.work_scope.to_string()
         || process.generation().get() != envelope.generation.generation.value()
-        || process.fence().authority_epoch() != envelope.lease.state_fence.authority_epoch.value()
+        // Scalar-sequence staleness join against the runtime scalar contour:
+        // the process fence carries the full EpochId pair (lineage proven at
+        // admission), while the envelope lease retains only the scalar contour,
+        // so the contour join is on the sequence component. Lineage itself is
+        // never re-derived from this scalar.
+        || process.fence().authority_epoch().sequence.get()
+            != envelope.lease.state_fence.authority_epoch.value()
         || process.fence().generation().get() != envelope.generation.generation.value()
     {
         return Err(RuntimeError::InvalidProcessBinding);

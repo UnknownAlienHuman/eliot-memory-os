@@ -31,6 +31,16 @@ fn must_some<T>(value: Option<T>) -> T {
     }
 }
 
+const TEST_LINEAGE_A: &str = "11111111-1111-4111-8111-111111111111";
+
+fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
+    eliot_contracts::EpochId::new(
+        eliot_contracts::EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
 fn lock_state(state: &Mutex<MockState>) -> std::sync::MutexGuard<'_, MockState> {
     match state.lock() {
         Ok(guard) => guard,
@@ -461,7 +471,7 @@ impl P03ProcessPort for ProcessMock {
                         envelope.invocation_id.as_str()
                     ))),
                     must(FencingToken::new(
-                        envelope.lease.state_fence.authority_epoch.value(),
+                        test_epoch(envelope.lease.state_fence.authority_epoch.value()),
                         generation,
                         format!("fence-{}", envelope.invocation_id.as_str()),
                     )),
@@ -503,7 +513,7 @@ impl P03ProcessPort for ProcessMock {
         let context = DispatchValidationContext::new(
             clock,
             request.fence().clone(),
-            request.fence().authority_epoch(),
+            request.fence().authority_epoch().clone(),
             process_revision_heads(),
             1,
         )
@@ -622,7 +632,9 @@ impl P03ReceiptVerifierPort for ReceiptVerifierMock {
             || receipt.operation_id() != binding.operation_id()
             || receipt.request_digest() != binding.request_digest()
             || !receipt.binding().state_fence().matches(binding.fence())
-            || binding.fence().authority_epoch()
+            // Sequence-component join: envelope lease is the scalar contour,
+            // fence lineage proven at admission.
+            || binding.fence().authority_epoch().sequence.get()
                 != envelope.lease.state_fence.authority_epoch.value()
         {
             Err(PortError::Denied)
@@ -642,7 +654,9 @@ impl P03ReceiptVerifierPort for ReceiptVerifierMock {
             && receipt_binding.process_tree_id() == binding.process_tree_id()
             && receipt_binding.request_digest() == binding.request_digest()
             && receipt_binding.state_fence().matches(binding.fence())
-            && binding.fence().authority_epoch()
+            // Sequence-component join: envelope lease is the scalar contour,
+            // fence lineage proven at admission.
+            && binding.fence().authority_epoch().sequence.get()
                 == envelope.lease.state_fence.authority_epoch.value();
         if self.config.cancel_receipt_mismatch || self.config.reject_cancel_receipt || !exact {
             Err(PortError::Denied)
@@ -662,7 +676,9 @@ impl P03ReceiptVerifierPort for ReceiptVerifierMock {
             && evidence_binding.process_tree_id() == binding.process_tree_id()
             && evidence_binding.request_digest() == binding.request_digest()
             && evidence_binding.state_fence().matches(binding.fence())
-            && binding.fence().authority_epoch()
+            // Sequence-component join: envelope lease is the scalar contour,
+            // fence lineage proven at admission.
+            && binding.fence().authority_epoch().sequence.get()
                 == envelope.lease.state_fence.authority_epoch.value();
         if self.config.reject_reconcile_evidence || !exact {
             Err(PortError::Denied)

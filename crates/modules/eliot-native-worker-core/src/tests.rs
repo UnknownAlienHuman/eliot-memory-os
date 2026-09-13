@@ -28,6 +28,16 @@ use eliot_process::{
 
 use super::*;
 
+const TEST_LINEAGE_A: &str = "11111111-1111-4111-8111-111111111111";
+
+fn test_epoch_a(sequence: u64) -> eliot_contracts::EpochId {
+    eliot_contracts::EpochId::new(
+        eliot_contracts::EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
 type TestCore = WorkerCore<FakeExecutor, FakeAdmission, FakeReplay, FakeReplay>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -566,8 +576,12 @@ fn process_request_with(operation: &str, tree: &str, generation: u64) -> Process
         ResourceLimits::new(5_000, Some(1_000), Some(1_048_576), 4_096, 4_096, 2).expect("limits"),
     )
     .expect("process intent");
-    let fence =
-        FencingToken::new(1, generation, format!("process-fence-{generation:?}")).expect("fence");
+    let fence = FencingToken::new(
+        test_epoch_a(1),
+        generation,
+        format!("process-fence-{generation:?}"),
+    )
+    .expect("fence");
     let mut authority = DispatchPermitAuthority::activate(
         DispatchAuthorityId::new("native-worker-authority").expect("authority"),
         KernelDispatchKey::from_secret_bytes([0x5a; 32]).expect("key"),
@@ -652,7 +666,7 @@ fn validated_process_state(request: ProcessRequest) -> Result<ProcessState, Proc
         "monotonic_ns": 1
     }))
     .expect("clock observation");
-    let context = DispatchValidationContext::new(clock, fence, 1, revisions(), 41)?;
+    let context = DispatchValidationContext::new(clock, fence, test_epoch_a(1), revisions(), 41)?;
     let validated = authority.validate_and_consume(request, observed, &context)?;
     let mut state = ProcessState::from_validated(&validated);
     state.mark_resumed(

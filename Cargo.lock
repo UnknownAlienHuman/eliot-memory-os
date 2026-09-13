@@ -1782,6 +1782,7 @@ dependencies = [
 name = "eliot-process-executor"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-instrument-api",
  "eliot-platform",
  "eliot-platform-windows",
@@ -2205,6 +2206,7 @@ name = "eliot-testd-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-contracts",
  "eliot-instrument-api",
  "eliot-process",
  "redb",
@@ -2265,6 +2267,7 @@ dependencies = [
 name = "eliot-user-broker-core"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-platform",
  "eliot-process",
  "eliot-protocol",
@@ -2305,6 +2308,7 @@ dependencies = [
 name = "eliot-wasm-runtime"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-observation-contracts",
  "eliot-process",
  "eliot-runtime-contracts",

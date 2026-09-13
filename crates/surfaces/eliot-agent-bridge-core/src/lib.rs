@@ -1163,8 +1163,13 @@ impl AgentBridgeCore {
         event: &EventEnvelope,
     ) -> Result<(), BridgeError> {
         let fence = binding.state_fence();
-        if event.authority_epoch.value() != fence.authority_epoch()
-            || event.state_fence.authority_epoch.value() != fence.authority_epoch()
+        // Scalar-sequence staleness join against the event scalar contour: the
+        // fence carries the full EpochId pair (lineage proven at admission),
+        // while the event retains only the scalar contour, so the contour join
+        // is on the sequence component. Lineage itself is never re-derived
+        // from this scalar.
+        if event.authority_epoch.value() != fence.authority_epoch().sequence.get()
+            || event.state_fence.authority_epoch.value() != fence.authority_epoch().sequence.get()
             || event.producer_generation.value() != fence.generation().get()
             || event.state_fence.resource_generation.value() != fence.generation().get()
         {
@@ -1213,10 +1218,10 @@ fn validate_authority_binding(
     state_fence: &FencingToken,
 ) -> Result<(), BridgeError> {
     validate_text(session_id.as_str(), "session_id")?;
-    if activation_generation.get() == 0
-        || state_fence.authority_epoch() == 0
-        || state_fence.generation().get() == 0
-    {
+    // `authority_epoch` non-zero is enforced by the canonical `EpochId` type
+    // itself (validated lineage plus non-zero sequence); only the scalar
+    // generation needs a zero-check here.
+    if activation_generation.get() == 0 || state_fence.generation().get() == 0 {
         return Err(BridgeError::InvalidContract {
             field: "authority_binding",
             reason: "session generation and authority epoch must be non-zero",

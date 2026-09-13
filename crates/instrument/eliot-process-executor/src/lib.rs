@@ -648,8 +648,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
             let view = guard.state.view();
             let sink = Arc::clone(&guard.sink);
             drop(guard);
-            let evidence =
-                ProcessEvidence::new_typed(view, None, None, EvidenceAxes::observed());
+            let evidence = ProcessEvidence::new_typed(view, None, None, EvidenceAxes::observed());
             let published = match evidence {
                 Ok(evidence) => sink.record(evidence).is_ok(),
                 Err(_) => false,
@@ -1294,6 +1293,18 @@ mod tests {
         ])
     }
 
+    // T2-S02 (issue #100) mechanical migration only: S01 test fixtures now
+    // carry the canonical EpochId pair; no S01 semantics change.
+    const TEST_LINEAGE_A: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn test_epoch_a(sequence: u64) -> eliot_contracts::EpochId {
+        eliot_contracts::EpochId::new(
+            eliot_contracts::EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
     #[derive(Default)]
     struct RecordingSink {
         evidence: Mutex<Vec<ProcessEvidence>>,
@@ -1406,7 +1417,7 @@ mod tests {
             EnvironmentProjection::default(),
             ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
         )?;
-        let fence = FencingToken::new(1, generation, "fence-t2-s01-ok")?;
+        let fence = FencingToken::new(test_epoch_a(1), generation, "fence-t2-s01-ok")?;
         let mut authority = DispatchPermitAuthority::activate(
             DispatchAuthorityId::new("auth-t2-s01")?,
             KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
@@ -1431,7 +1442,7 @@ mod tests {
                 monotonic_ns: Some(1),
             },
             fence,
-            1,
+            test_epoch_a(1),
             revisions(),
             41,
         )?;
@@ -1483,7 +1494,7 @@ mod tests {
             EnvironmentProjection::default(),
             ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
         )?;
-        let fence = FencingToken::new(1, generation, "fence-t2-s01-sink-fail")?;
+        let fence = FencingToken::new(test_epoch_a(1), generation, "fence-t2-s01-sink-fail")?;
         let mut authority = DispatchPermitAuthority::activate(
             DispatchAuthorityId::new("auth-t2-s01")?,
             KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
@@ -1508,7 +1519,7 @@ mod tests {
                 monotonic_ns: Some(1),
             },
             fence,
-            1,
+            test_epoch_a(1),
             revisions(),
             41,
         )?;
@@ -1519,10 +1530,7 @@ mod tests {
         let executor = WindowsProcessExecutor::new(Arc::new(port));
         let sink_dyn: Arc<dyn ProcessEvidenceSink> = Arc::new(FailingSink);
         let result = block_on(executor.start(request, sink_dyn));
-        assert!(matches!(
-            result,
-            Err(ProcessExecutionError::UnknownOutcome)
-        ));
+        assert!(matches!(result, Err(ProcessExecutionError::UnknownOutcome)));
         let inspected = block_on(executor.inspect(operation_id))?;
         assert_eq!(inspected.lifecycle(), ProcessLifecycle::UnknownOutcome);
         Ok(())
@@ -1533,7 +1541,7 @@ mod tests {
         let executable = r"C:\Windows\System32\cmd.exe";
         let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
         let generation = Generation::new(1)?;
-        let fence = FencingToken::new(1, generation, "fence-t2-s01-bad")?;
+        let fence = FencingToken::new(test_epoch_a(1), generation, "fence-t2-s01-bad")?;
         let mut authority = DispatchPermitAuthority::activate(
             DispatchAuthorityId::new("auth-t2-s01")?,
             KernelDispatchKey::from_secret_bytes([0x5a; 32])?,

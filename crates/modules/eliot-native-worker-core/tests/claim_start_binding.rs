@@ -254,6 +254,18 @@ fn epoch() -> AuthorityEpoch {
     load(AuthorityEpoch::new(1))
 }
 
+// T2-S02 (issue #100) mechanical migration only: T5-01 process fence now
+// carries the canonical EpochId pair; no T5-01 semantics change.
+const TEST_PROCESS_LINEAGE_A: &str = "11111111-1111-4111-8111-111111111111";
+
+fn test_process_epoch(sequence: u64) -> eliot_contracts::EpochId {
+    eliot_contracts::EpochId::new(
+        eliot_contracts::EpochLineageId::new(TEST_PROCESS_LINEAGE_A).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
 fn fence() -> StateFence {
     StateFence::new(epoch(), load(ResourceGeneration::new(1)))
 }
@@ -310,7 +322,7 @@ fn process_request() -> ProcessRequest {
         limits(),
     ));
     let fence = load(FencingToken::new(
-        1,
+        test_process_epoch(1),
         generation,
         "process-fence-1".to_owned(),
     ));

@@ -1360,10 +1360,15 @@ fn verify_cursor_lineage(
     view: &ProcessExecutionView,
 ) -> Result<(), BrokerError> {
     let identity = view.identity().ok_or(BrokerError::ProcessLineageMismatch)?;
+    // Scalar-sequence staleness join against the durable scalar cursor: the
+    // view fence carries the full EpochId pair (lineage proven at admission),
+    // while the cursor retains only the scalar contour, so the contour join is
+    // on the sequence component. Lineage itself is never re-derived from this
+    // scalar.
     if view.lifecycle() != ProcessLifecycle::Running
         || view.operation_id() != &cursor.operation_id
         || view.request_digest() != cursor.process_request_digest
-        || view.fence().authority_epoch() != cursor.authority_epoch
+        || view.fence().authority_epoch().sequence.get() != cursor.authority_epoch
         || view.fence().nonce() != cursor.process_fence_nonce
         || identity.process_tree_id() != &cursor.process_tree_id
         || identity.generation() != cursor.generation
@@ -1430,6 +1435,16 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     };
+
+    const TEST_LINEAGE_A: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
+        eliot_contracts::EpochId::new(
+            eliot_contracts::EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     #[test]
     fn operator_endpoint_is_role_filtered_and_credential_free() {
@@ -1993,7 +2008,7 @@ mod tests {
 
     fn test_context(grant: &LaunchGrant, now: i64) -> Result<DispatchValidationContext, PortError> {
         let fence = FencingToken::new(
-            grant.authority_epoch,
+            test_epoch(grant.authority_epoch),
             grant.approved.generation,
             grant.approved.process_fence_nonce.clone(),
         )
@@ -2006,7 +2021,7 @@ mod tests {
                 monotonic_ns: Some(1),
             },
             fence,
-            grant.authority_epoch,
+            test_epoch(grant.authority_epoch),
             BTreeMap::from([("broker".to_owned(), "a".repeat(64))]),
             1,
         )
@@ -2039,7 +2054,7 @@ mod tests {
         )
         .map_err(|error| PortError::Invalid(error.to_string()))?;
         let fence = FencingToken::new(
-            grant.authority_epoch,
+            test_epoch(grant.authority_epoch),
             grant.approved.generation,
             grant.approved.process_fence_nonce.clone(),
         )
