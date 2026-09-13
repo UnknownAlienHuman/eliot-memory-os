@@ -32,7 +32,10 @@ use eliot_runtime_contracts::{
     RuntimeLiveStoreIdentity,
 };
 use eliot_store_surreal::{StoreLaunchConfig, launch_config_digest};
-use eliot_types::GovernorConfig;
+#[cfg(windows)]
+mod legacy_governor_config;
+#[cfg(windows)]
+use legacy_governor_config::GovernorConfig;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
