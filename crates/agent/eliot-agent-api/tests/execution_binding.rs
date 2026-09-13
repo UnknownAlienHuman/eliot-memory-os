@@ -1,7 +1,7 @@
 //! S1 provider-execution binding tests for issue #361 (freeze
 //! `A01_PROVIDER_EXECUTION_BINDING_V1`).
 //!
-//! Unit-level only: no live runtime, no network, no SurrealDB, no daemon.
+//! Unit-level only: no live runtime, no network, no `SurrealDB`, no daemon.
 //! Deferred to later slices (see PR body "Deferred cases"): wrong generation,
 //! route drift, multi-rebind, resume/fork lineage, session-spoof.
 
@@ -208,11 +208,11 @@ fn session_only_observation_carries_no_attempt_authority() -> TestResult {
     let admitted = admitted_attempt()?;
     let binding = bound_binding(&admitted)?;
     let unit_observation =
-        ProviderObservationLineage::ExecutionUnitObservation(ExecutionUnitObservation {
+        ProviderObservationLineage::ExecutionUnitObservation(Box::new(ExecutionUnitObservation {
             binding: binding.clone(),
             cursor: EventCursor::new("cursor-1")?,
             sequence: 1,
-        });
+        }));
     assert_eq!(unit_observation.attributable_binding()?, &binding);
     Ok(())
 }

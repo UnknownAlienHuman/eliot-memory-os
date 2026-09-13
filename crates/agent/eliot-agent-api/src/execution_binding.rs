@@ -268,7 +268,7 @@ impl ExecutionUnitObservation {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub enum ProviderObservationLineage {
     SessionObservation(SessionObservation),
-    ExecutionUnitObservation(ExecutionUnitObservation),
+    ExecutionUnitObservation(Box<ExecutionUnitObservation>),
 }
 
 impl ProviderObservationLineage {
