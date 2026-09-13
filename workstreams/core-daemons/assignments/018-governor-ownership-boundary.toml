@@ -20,12 +20,12 @@ architecture = [
   "docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
 ]
 implementation = [
-  "docs/architecture/I04-04-task-lifecycle.md#i44-task-lifecycle",
-  "docs/architecture/I05-01-store-boundary.md#i51-store-boundary",
+  "docs/architecture/I04-04-progressive-onboarding.md#i44-progressive-onboarding",
+  "docs/architecture/I05-01-storage-boundary.md#i51-storage-boundary",
   "docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
   "docs/architecture/I05-20-read-model-consistency-and-cache.md#i520-read-model-consistency-and-cache",
-  "docs/architecture/I06-04-kernel.md#i64-kernel",
-  "docs/architecture/I06-05-governor.md#i65-governor",
+  "docs/architecture/I06-04-module-contract.md#i64-module-contract",
+  "docs/architecture/I06-05-bridge-contract.md#i65-bridge-contract",
   "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
   "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
 ]
