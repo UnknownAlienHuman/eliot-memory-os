@@ -63,6 +63,11 @@ mod readiness_projection;
 pub use readiness_projection::ReadinessContour;
 use readiness_projection::inspect_readiness_from_host_state;
 
+mod capability_cell_readback;
+pub use capability_cell_readback::{
+    CellReadbackError, GenerationCellResolution, resolve_generation_via_registry,
+};
+
 const WATCHDOG_PUBLICATION_CHILD_LIMIT: u64 = 1024 * 1024;
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 const WIN32_ERROR_FILE_NOT_FOUND: u32 = 2;
