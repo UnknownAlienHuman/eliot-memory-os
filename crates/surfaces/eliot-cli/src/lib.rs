@@ -2066,7 +2066,7 @@ mod tests {
 
     #[test]
     fn provider_identity_comes_from_actual_contract_shapes() -> Result<(), CatalogueError> {
-        assert_eq!(MCP_SURFACE_CONTRACT_REVISION, "1.0.0");
+        assert_eq!(MCP_SURFACE_CONTRACT_REVISION, eliot_mcp::CONTRACT_REVISION);
         let providers = CommandCatalogue::current().providers()?;
         assert_eq!(providers.len(), 4);
         assert!(
