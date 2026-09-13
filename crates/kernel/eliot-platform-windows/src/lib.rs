@@ -249,7 +249,7 @@ pub use secret_store::{
     InstallerSecretObservation, ProtectedSecret, WindowsInstallerSecretProvider,
 };
 pub use service_registration::{
-    ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME,
+    ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME,
     ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK, ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
     ELIOT_WATCHDOG_SERVICE_NAME, ServiceAbsentProof, ServiceAccount, ServiceBootstrapArguments,
     ServiceControlGrantReadback, ServiceRegistrationCurrent, ServiceRegistrationInspection,
@@ -2144,6 +2144,22 @@ impl OwnedSecurityDescriptor {
         ))
     }
 
+    /// Exact protected installer DACL for the Host's own service object.
+    /// SYSTEM and Administrators retain installer/OS authority; the resolved
+    /// `EliotHost` service SID receives only the concrete minimal Host mask
+    /// (query-config, query-status, demand-start, `READ_CONTROL`).
+    /// Mirrors the Watchdog installer pattern per I03-01:23; `SERVICE_STOP`
+    /// is excluded (SCM stop is recovery-only) and the authorized-user SID
+    /// set remains an open doc gap (see Host mask doc).
+    fn for_host_service_control(host_service_sid: &str) -> Result<Self, WindowsAdapterError> {
+        if !valid_service_sid_text(host_service_sid) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Self::from_sddl(&format!(
+            "D:P(A;;0x000F01FF;;;SY)(A;;0x000F01FF;;;BA)(A;;0x{ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK:08X};;;{host_service_sid})"
+        ))
+    }
+
     fn for_user_owned_storage(sid: &str, directory: bool) -> Result<Self, WindowsAdapterError> {
         if !valid_sid_text(sid) {
             return Err(WindowsAdapterError::InvalidInput);
@@ -3920,6 +3936,32 @@ pub fn watchdog_service_security_descriptor_digest(
     ))
 }
 
+/// Computes the canonical digest of the exact protected Host service DACL
+/// for one resolved `EliotHost` service SID.
+///
+/// Mirrors the Watchdog digest contour with the Host-specific mask and
+/// `eliot-host-service-dacl:v1` prefix; the Watchdog digest above remains
+/// byte-identical. See `ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK` and
+/// I03-01:23 for the STOP exclusion and user-SID gap.
+///
+/// # Errors
+///
+/// Returns [`WindowsAdapterError::InvalidInput`] unless `host_service_sid` is
+/// an exact service-SID string.
+pub fn host_service_security_descriptor_digest(
+    host_service_sid: &str,
+) -> Result<String, WindowsAdapterError> {
+    if !valid_service_sid_text(host_service_sid) {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    Ok(sha256_hex(
+        format!(
+            "eliot-host-service-dacl:v1\0protected\0SY:000F01FF\0BA:000F01FF\0{host_service_sid}:{ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK:08X}"
+        )
+        .as_bytes(),
+    ))
+}
+
 #[cfg(windows)]
 fn service_registration_mutation_access(request: &ServiceRegistrationRequest) -> u32 {
     use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
@@ -3939,6 +3981,142 @@ fn service_registration_mutation_access(request: &ServiceRegistrationRequest) ->
 }
 
 #[cfg(windows)]
+fn read_host_service_control_grant(
+    service: windows_sys::Win32::Foundation::HANDLE,
+    request: &ServiceRegistrationRequest,
+) -> Result<Option<ServiceControlGrantReadback>, WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_SERVICE};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, PSECURITY_DESCRIPTOR,
+        SE_DACL_PROTECTED,
+    };
+
+    // Host self-grant path: the installer-owned protected Host DACL with the
+    // Host service-SID ACE. Same GetSecurityInfo/protection/byte-compare
+    // mechanism as the Watchdog grant; Host-specific descriptor, mask and
+    // digest. A default (unprotected, no service-SID) DACL yields
+    // `AclMismatch` so inspect classifies it as `Mismatched`, never
+    // `Matching`.
+    if request.service_name() != ELIOT_HOST_SERVICE_NAME {
+        return Ok(None);
+    }
+    let host_service_sid = resolve_service_sid(ELIOT_HOST_SERVICE_NAME)?;
+    let expected = OwnedSecurityDescriptor::for_host_service_control(&host_service_sid)?;
+    let expected_dacl = expected.dacl()?;
+    let mut actual_dacl = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // `PROTECTED_DACL_SECURITY_INFORMATION` is a SetSecurityInfo-only flag.
+    // Query the DACL under READ_CONTROL, then prove protection from the
+    // returned descriptor's `SE_DACL_PROTECTED` control bit below.
+    // SAFETY: GetSecurityInfo reads the file/service DACL through a live handle with READ_CONTROL;
+    // descriptor and DACL out-pointers are valid writable locals; handle outlives the call; return
+    // checked with LocalFree pairing below; no unwinding across the extern boundary.
+    let status = unsafe {
+        GetSecurityInfo(
+            service,
+            SE_SERVICE,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut actual_dacl,
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() || actual_dacl.is_null() {
+        if !descriptor.is_null() {
+            // SAFETY: LocalFree releases a descriptor/text buffer allocated by GetSecurityInfo or the SDDL/SID
+            // converter; pointer came from a successful call and is freed exactly once; no use after free; no
+            // null free on failure paths.
+            unsafe { LocalFree(descriptor.cast()) };
+        }
+        return Err(if status == ERROR_ACCESS_DENIED {
+            WindowsAdapterError::PermissionDenied
+        } else {
+            WindowsAdapterError::Failed
+        });
+    }
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    // SAFETY: GetSecurityDescriptorControl borrows the validated descriptor; control/revision are valid
+    // writable out-pointers; descriptor outlives the call; SE_DACL_PROTECTED bit read only on success.
+    let protected = unsafe {
+        GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
+            && control & SE_DACL_PROTECTED != 0
+    };
+    // SAFETY: ACL byte compare dereferences actual/expected DACL pointers validated by GetSecurityInfo
+    // with AclSize bytes each; pointers non-null after the present check; from_raw_parts borrows both
+    // ACLs for exactly AclSize bytes with no mutation during the compare; layout is the documented ACL
+    // ABI.
+    let dacl_matches = unsafe {
+        (*actual_dacl).AclSize == (*expected_dacl).AclSize
+            && std::slice::from_raw_parts(
+                actual_dacl.cast::<u8>(),
+                usize::from((*actual_dacl).AclSize),
+            ) == std::slice::from_raw_parts(
+                expected_dacl.cast::<u8>(),
+                usize::from((*expected_dacl).AclSize),
+            )
+    };
+    let digest = host_service_security_descriptor_digest(&host_service_sid);
+    // SAFETY: LocalFree releases a descriptor/text buffer allocated by GetSecurityInfo or the SDDL/SID
+    // converter; pointer came from a successful call and is freed exactly once; no use after free; no
+    // null free on failure paths.
+    unsafe { LocalFree(descriptor.cast()) };
+    if !protected || !dacl_matches {
+        return Err(WindowsAdapterError::AclMismatch);
+    }
+    ServiceControlGrantReadback::new(
+        ELIOT_HOST_SERVICE_NAME,
+        host_service_sid,
+        crate::service_registration::ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+        digest?,
+    )
+    .map(Some)
+}
+
+#[cfg(windows)]
+fn install_host_service_control_grant(
+    service: windows_sys::Win32::Foundation::HANDLE,
+    request: &ServiceRegistrationRequest,
+) -> Result<Option<ServiceControlGrantReadback>, WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{SE_SERVICE, SetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    // Host self-grant install: same SetSecurityInfo mechanism as Watchdog
+    // (protected DACL via live handle with WRITE_DAC), Host-specific
+    // descriptor. Genuinely reports success/failure so the update path's
+    // `!grant_changed → EffectUnknown` logic observes a real install.
+    if request.service_name() != ELIOT_HOST_SERVICE_NAME {
+        return Ok(None);
+    }
+    let host_service_sid = resolve_service_sid(ELIOT_HOST_SERVICE_NAME)?;
+    let expected = OwnedSecurityDescriptor::for_host_service_control(&host_service_sid)?;
+    // SAFETY: SetSecurityInfo writes the service DACL through a live handle with WRITE_DAC; descriptor
+    // pointer refers to the validated in-memory DACL that outlives the call; SE_SERVICE with DACL plus
+    // PROTECTED flag; return checked with readback below.
+    let status = unsafe {
+        SetSecurityInfo(
+            service,
+            SE_SERVICE,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            expected.dacl()?,
+            std::ptr::null(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(WindowsAdapterError::PermissionDenied);
+    }
+    read_host_service_control_grant(service, request)
+}
+
+#[cfg(windows)]
 fn read_watchdog_host_control_grant(
     service: windows_sys::Win32::Foundation::HANDLE,
     request: &ServiceRegistrationRequest,
@@ -3952,6 +4130,9 @@ fn read_watchdog_host_control_grant(
 
     if !request.requires_host_service_control_grant() {
         return Ok(None);
+    }
+    if request.service_name() == ELIOT_HOST_SERVICE_NAME {
+        return read_host_service_control_grant(service, request);
     }
     let host_service_sid = resolve_service_sid(ELIOT_HOST_SERVICE_NAME)?;
     let expected = OwnedSecurityDescriptor::for_watchdog_host_control(&host_service_sid)?;
@@ -4041,6 +4222,9 @@ fn install_watchdog_host_control_grant(
 
     if !request.requires_host_service_control_grant() {
         return Ok(None);
+    }
+    if request.service_name() == ELIOT_HOST_SERVICE_NAME {
+        return install_host_service_control_grant(service, request);
     }
     let host_service_sid = resolve_service_sid(ELIOT_HOST_SERVICE_NAME)?;
     let expected = OwnedSecurityDescriptor::for_watchdog_host_control(&host_service_sid)?;

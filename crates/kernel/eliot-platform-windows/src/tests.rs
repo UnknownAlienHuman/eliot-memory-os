@@ -1535,7 +1535,11 @@ fn service_registration_plan_accepts_local_service_account() {
     )
     .unwrap_or_else(|error| panic!("Watchdog LocalService plan failed: {error}"));
     assert_eq!(watchdog.service_sid_type(), ServiceSidType::None);
-    assert!(!request.requires_host_service_control_grant());
+    // Issue #1345: both canonical services require the protected installer
+    // DACL (Host self-grant + Host-to-Watchdog grant) via the single
+    // `requires_host_service_control_grant` predicate. Host SID type stays
+    // UNRESTRICTED (load-bearing for the Watchdog grant reference).
+    assert!(request.requires_host_service_control_grant());
     assert!(watchdog.requires_host_service_control_grant());
 }
 
@@ -1616,7 +1620,9 @@ fn watchdog_installer_mutation_handle_retains_exact_dacl_readback_authority() {
     let host_access = service_registration_mutation_access(&host);
     assert_eq!(host_access & readback, readback);
     assert_ne!(host_access & SERVICE_CHANGE_CONFIG, 0);
-    assert_eq!(host_access & WRITE_DAC, 0);
+    // Issue #1345: Host handles require WRITE_DAC for the protected
+    // installer DACL install (SetSecurityInfo, same mechanism as Watchdog).
+    assert_eq!(host_access & WRITE_DAC, WRITE_DAC);
 
     let watchdog_access = service_registration_mutation_access(&watchdog);
     assert_eq!(watchdog_access & readback, readback);
@@ -1665,6 +1671,116 @@ fn watchdog_service_dacl_is_protected_exact_and_sid_bound_without_scm_mutation()
         digest,
         watchdog_service_security_descriptor_digest("S-1-5-80-6-7-8-9-10")
             .unwrap_or_else(|error| panic!("substituted digest failed: {error}"))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn host_service_dacl_is_protected_exact_and_sid_bound_without_scm_mutation() {
+    use windows_sys::Win32::Security::{ACCESS_ALLOWED_ACE, GetAce};
+    use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
+    use windows_sys::Win32::System::Services::SERVICE_ALL_ACCESS;
+
+    // Issue #1345 (s38 item 1 + item 4 platform half): the Host service
+    // registration must carry the documented protected installer DACL via
+    // SetSecurityInfo with a service-SID ACE, mirroring the Watchdog pattern
+    // per docs/architecture/I03-01-installation-form.md:23. This test proves
+    // the DACL shape without SCM mutation (same harness as the Watchdog DACL
+    // test); live SCM registration is not exercised here (requires admin +
+    // real service creation, out of scope for this unit).
+    let required = 0x0000_0001 | 0x0000_0004 | 0x0000_0010 | 0x0002_0000;
+    let forbidden = 0x0000_0002 | 0x0000_0020 | 0x0000_0040 | 0x0000_0100 | 0x0001_0000 | 0x000C_0000;
+    assert_eq!(ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, required);
+    assert_eq!(ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK & forbidden, 0);
+
+    let host_sid = "S-1-5-80-1-2-3-4-5";
+    let descriptor = OwnedSecurityDescriptor::for_host_service_control(host_sid)
+        .unwrap_or_else(|error| panic!("Host descriptor failed: {error}"));
+    let dacl = descriptor
+        .dacl()
+        .unwrap_or_else(|error| panic!("Host DACL failed: {error}"));
+    assert_eq!(unsafe { (*dacl).AceCount }, 3);
+    let mut observed = Vec::new();
+    for index in 0..3_u32 {
+        let mut ace = std::ptr::null_mut();
+        assert_ne!(unsafe { GetAce(dacl, index, &raw mut ace) }, 0);
+        let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+        let sid = (&raw const allowed.SidStart).cast_mut().cast();
+        observed.push((
+            sid_to_string(sid).unwrap_or_else(|error| panic!("Host SID failed: {error}")),
+            allowed.Mask,
+        ));
+    }
+    assert_eq!(
+        observed,
+        vec![
+            ("S-1-5-18".to_owned(), SERVICE_ALL_ACCESS),
+            ("S-1-5-32-544".to_owned(), SERVICE_ALL_ACCESS),
+            (host_sid.to_owned(), ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,),
+        ]
+    );
+    let digest = host_service_security_descriptor_digest(host_sid)
+        .unwrap_or_else(|error| panic!("Host digest failed: {error}"));
+    assert_ne!(
+        digest,
+        host_service_security_descriptor_digest("S-1-5-80-6-7-8-9-10")
+            .unwrap_or_else(|error| panic!("substituted Host digest failed: {error}"))
+    );
+    // Host and Watchdog contours share the Host SID but differ in mask/digest;
+    // Watchdog bytes stay identical (existing Watchdog tests prove it).
+    assert_ne!(
+        digest,
+        watchdog_service_security_descriptor_digest(host_sid)
+            .unwrap_or_else(|error| panic!("Watchdog digest failed: {error}"))
+    );
+    let host_grant = ServiceControlGrantReadback::new(
+        ELIOT_HOST_SERVICE_NAME,
+        host_sid,
+        ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+        digest.clone(),
+    )
+    .unwrap_or_else(|error| panic!("Host grant receipt failed: {error}"));
+    assert!(host_grant.validate().is_ok());
+    // Cross-substitution must fail: Host mask with Watchdog digest, and
+    // Watchdog mask with Host digest, are both rejected.
+    let watchdog_digest = watchdog_service_security_descriptor_digest(host_sid)
+        .unwrap_or_else(|error| panic!("Watchdog digest failed: {error}"));
+    assert!(ServiceControlGrantReadback::new(
+        ELIOT_HOST_SERVICE_NAME,
+        host_sid,
+        ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+        watchdog_digest,
+    )
+    .is_err());
+    assert!(ServiceControlGrantReadback::new(
+        ELIOT_HOST_SERVICE_NAME,
+        host_sid,
+        ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+        digest,
+    )
+    .is_err());
+
+    // Registration wiring: Host keeps UNRESTRICTED SID type (load-bearing for
+    // the Watchdog grant reference), requires the grant predicate, and its
+    // mutation handle carries WRITE_DAC for the SetSecurityInfo install step.
+    let image = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("missing"));
+    let host_request = ServiceRegistrationRequest::new(
+        ELIOT_HOST_SERVICE_NAME,
+        ELIOT_HOST_SERVICE_DISPLAY_NAME,
+        image,
+        ServiceStartMode::Automatic,
+        ServiceAccount::LocalService,
+    )
+    .unwrap_or_else(|error| panic!("Host request failed: {error}"));
+    assert_eq!(host_request.service_sid_type(), ServiceSidType::Unrestricted);
+    assert!(host_request.requires_host_service_control_grant());
+    assert_ne!(
+        service_registration_mutation_access(&host_request) & WRITE_DAC,
+        0
+    );
+    assert_ne!(
+        service_registration_mutation_access(&host_request) & READ_CONTROL,
+        0
     );
 }
 
