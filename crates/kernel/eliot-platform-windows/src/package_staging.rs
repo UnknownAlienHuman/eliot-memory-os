@@ -64,6 +64,41 @@ pub const MAX_PACKAGE_FILE_BYTES: u64 = 512 * 1024 * 1024;
 /// Maximum aggregate bytes copied by one default stager call.
 pub const MAX_PACKAGE_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Distinct `CreateFileW` operation sites along the `StagePackage` create path,
+/// in sequence order.
+///
+/// Every site names the exact path-open that failed so a sharing violation
+/// (`ERROR_SHARING_VIOLATION`, 32) attributes its operation instead of
+/// collapsing all ~15 opens to the same `CreateFileW` stage. The
+/// `PackageStagingStage` wire enum is intentionally left unchanged: it is a
+/// `SCREAMING_SNAKE_CASE` + `JsonSchema` wire surface with exhaustive matches
+/// in crates this change does not own, so the site travels as a kebab-case
+/// side-channel string on the additive `Win32At` error variant (old `Win32`
+/// payloads still deserialize) and into the `stage-package-win32-v1` pending
+/// reference as `create-file-w:<site>:<code>`.
+const STAGING_SITE_OPEN: &str = "open";
+const STAGING_SITE_MARKER_PROBE: &str = "marker-probe";
+const STAGING_SITE_MARKER_READ: &str = "marker-read";
+const STAGING_SITE_MARKER_CREATE: &str = "marker-create";
+const STAGING_SITE_RETAIN_GENERATION_PARENT: &str = "retain-generation-parent";
+const STAGING_SITE_TRUSTED_SOURCE_ROOT: &str = "trusted-source-root";
+const STAGING_SITE_TRUSTED_SOURCE_READ_DIR: &str = "trusted-source-read-dir";
+const STAGING_SITE_TRUSTED_SOURCE_ENTRY: &str = "trusted-source-entry";
+const STAGING_SITE_TRUSTED_SOURCE_METADATA: &str = "trusted-source-metadata";
+const STAGING_SITE_TRUSTED_SOURCE_CHILD_DIR: &str = "trusted-source-child-dir";
+const STAGING_SITE_TRUSTED_SOURCE_CHILD_FILE: &str = "trusted-source-child-file";
+const STAGING_SITE_GENERATION_ROOT_PROBE: &str = "generation-root-probe";
+const STAGING_SITE_GENERATION_ROOT_CREATE: &str = "generation-root-create";
+const STAGING_SITE_DESTINATION_DIRECTORY_CREATE: &str = "destination-directory-create";
+const STAGING_SITE_SOURCE_OPEN: &str = "source-open";
+const STAGING_SITE_DESTINATION_FILE_CREATE: &str = "destination-file-create";
+const STAGING_SITE_DESTINATION_WALK_ROOT: &str = "destination-walk-root";
+const STAGING_SITE_DESTINATION_WALK_READ_DIR: &str = "destination-walk-read-dir";
+const STAGING_SITE_DESTINATION_WALK_ENTRY: &str = "destination-walk-entry";
+const STAGING_SITE_DESTINATION_WALK_METADATA: &str = "destination-walk-metadata";
+const STAGING_SITE_DESTINATION_WALK_CHILD_DIR: &str = "destination-walk-child-dir";
+const STAGING_SITE_DESTINATION_WALK_CHILD_FILE: &str = "destination-walk-child-file";
 #[cfg(test)]
 const AGENT_BRIDGE_FAIL_FINAL_PATH: u8 = 1;
 #[cfg(test)]
@@ -503,6 +538,16 @@ pub enum PackageStagingError {
         stage: PackageStagingStage,
         code: u32,
     },
+    /// Same as [`Self::Win32`] but with the distinct `CreateFileW` operation
+    /// site attached (see the `STAGING_SITE_*` constants). The stage and code
+    /// are preserved verbatim; the site only attributes which path-open along
+    /// the `StagePackage` sequence failed. Additive so existing `Win32`
+    /// payloads and matches keep compiling and deserializing.
+    Win32At {
+        stage: PackageStagingStage,
+        site: String,
+        code: u32,
+    },
 }
 
 impl fmt::Display for PackageStagingError {
@@ -515,6 +560,12 @@ impl fmt::Display for PackageStagingError {
             }
             Self::Win32 { stage, code } => {
                 write!(formatter, "{stage:?} failed with Win32 status {code:#010x}")
+            }
+            Self::Win32At { stage, site, code } => {
+                write!(
+                    formatter,
+                    "{stage:?} failed with Win32 status {code:#010x} at operation site '{site}'"
+                )
             }
             other => formatter.write_str(match other {
                 Self::InvalidRelativePath => "invalid package-relative path",
@@ -536,7 +587,8 @@ impl fmt::Display for PackageStagingError {
                 Self::PeParse(_)
                 | Self::Authenticode(_)
                 | Self::AuthenticodeRejected(_)
-                | Self::Win32 { .. } => {
+                | Self::Win32 { .. }
+                | Self::Win32At { .. } => {
                     unreachable!()
                 }
             }),
@@ -545,6 +597,26 @@ impl fmt::Display for PackageStagingError {
 }
 
 impl std::error::Error for PackageStagingError {}
+
+impl PackageStagingError {
+    /// Attach a distinct `CreateFileW` operation site to a native staging error.
+    ///
+    /// A bare [`Self::Win32`] becomes [`Self::Win32At`] with the stage and code
+    /// preserved verbatim; an already-sited error keeps its original site so a
+    /// single failure cannot be relabeled while propagating through nested
+    /// staging calls. Non-Win32 errors pass through unchanged.
+    #[must_use]
+    fn with_site(self, site: &'static str) -> Self {
+        match self {
+            Self::Win32 { stage, code } => Self::Win32At {
+                stage,
+                site: site.to_owned(),
+                code,
+            },
+            other => other,
+        }
+    }
+}
 
 /// One retained trusted source bundle contour.
 ///
@@ -984,6 +1056,15 @@ fn map_package_open_error(error: std::io::Error) -> PackageStagingError {
     map_package_io_error(error, PackageStagingStage::CreateFileW)
 }
 
+/// Same as [`map_package_open_error`] but with the distinct `StagePackage`
+/// operation site attached, so the pending reference names the exact failing
+/// open (`create-file-w:<site>:<code>`) instead of collapsing every site to
+/// bare `create-file-w`. `NotFound` still classifies as `RootUnavailable` and
+/// unmapped I/O still reports bare `Io`; only the Win32 case gains a site.
+fn map_package_open_error_at(error: std::io::Error, site: &'static str) -> PackageStagingError {
+    map_package_open_error(error).with_site(site)
+}
+
 #[allow(
     clippy::needless_pass_by_value,
     reason = "std::io::Error is consumed by each map_err boundary"
@@ -1019,6 +1100,16 @@ fn map_restore_privilege_error(error: super::InstallerRootError) -> PackageStagi
     }
 }
 
+/// Map a handle-relative directory-publication failure into staging errors.
+///
+/// `DirectoryPublicationError::Win32` originates only in
+/// `apply_owned_directory_security` (`SetSecurityInfo`), so it keeps the
+/// `SetSecurityInfo` stage here: relabeling it `CreateFileW` would erase the
+/// real failing call. Native `NtCreateFile` failures arrive as bare `Io`
+/// (the publication error carries no NT status), which this mapper preserves
+/// as `Io` rather than inventing a code. Callers attach their distinct
+/// `StagePackage` operation site on top via [`PackageStagingError::with_site`],
+/// keeping the `NtCreateFile` vs `SetSecurityInfo` distinction intact.
 fn map_directory_publication_error(error: super::DirectoryPublicationError) -> PackageStagingError {
     match error {
         super::DirectoryPublicationError::AlreadyExists => PackageStagingError::GenerationExists,
@@ -1921,7 +2012,9 @@ fn write_or_validate_prepared_marker(
     ownership_key: &[u8],
 ) -> Result<(), PackageStagingError> {
     let marker_path = authorization.marker_path();
-    if path_exists(&marker_path)? {
+    if path_exists(&marker_path)
+        .map_err(|error| error.with_site(STAGING_SITE_MARKER_PROBE))?
+    {
         let marker = read_prepared_marker(&marker_path, ownership_key)?;
         let mut expected = authorization.clone();
         let mut observed = marker.authorization;
@@ -1942,7 +2035,9 @@ fn write_or_validate_prepared_marker(
         mac,
     };
     let bytes = serde_json::to_vec(&marker).map_err(|_| PackageStagingError::Io)?;
-    let (mut file, _) = match create_destination_file(&marker_path) {
+    let (mut file, _) = match create_destination_file(&marker_path)
+        .map_err(|error| error.with_site(STAGING_SITE_MARKER_CREATE))
+    {
         Ok(file) => file,
         Err(PackageStagingError::GenerationExists) => {
             let marker = read_prepared_marker(&marker_path, ownership_key)?;
@@ -1973,7 +2068,8 @@ fn read_prepared_marker(
     if ownership_key.is_empty() {
         return Err(PackageStagingError::IdentityMismatch);
     }
-    let file = open_existing_file(path)?;
+    let file =
+        open_existing_file(path).map_err(|error| error.with_site(STAGING_SITE_MARKER_READ))?;
     #[cfg(windows)]
     {
         let canonical = final_path_from_handle(&file)?;
@@ -2018,7 +2114,8 @@ impl PackageStager {
         #[cfg(windows)]
         {
             let lease = super::ProtectedRootLease::open_existing(installation_root)
-                .map_err(map_protected_path_error)?;
+                .map_err(map_protected_path_error)
+                .map_err(|error| error.with_site(STAGING_SITE_OPEN))?;
             let canonical = lease.canonical_path().map_err(map_protected_path_error)?;
             verify_system_directory_at(&canonical)?;
             Ok(Self {
@@ -2143,7 +2240,9 @@ impl PackageStager {
         let source_tree = enumerate_trusted_source_tree(self.source.path(), &manifest)?;
         ensure_tree_matches_manifest(&source_tree, &manifest)?;
         let generation_root = generation.join_to(&parent.path);
-        if path_exists(&generation_root)? {
+        if path_exists(&generation_root)
+            .map_err(|error| error.with_site(STAGING_SITE_GENERATION_ROOT_PROBE))?
+        {
             return Err(PackageStagingError::GenerationExists);
         }
         // Create the generation root relative to the just-retained parent
@@ -2156,7 +2255,8 @@ impl PackageStager {
                     .contour
                     .last()
                     .ok_or(PackageStagingError::Io)?;
-                create_generation_root_at(retained, &generation_root)?
+                create_generation_root_at(retained, &generation_root)
+                    .map_err(|error| error.with_site(STAGING_SITE_GENERATION_ROOT_CREATE))?
             }
             #[cfg(not(windows))]
             {
@@ -2486,6 +2586,7 @@ impl PackageStager {
             path.push(component);
         }
         retain_destination_parent(&self.installation_root, &path)
+            .map_err(|error| error.with_site(STAGING_SITE_RETAIN_GENERATION_PARENT))
     }
 
     fn read_current_directories(
@@ -2597,7 +2698,9 @@ impl PackageStager {
                 {
                     let retained = created_parent_handle(created, destination_root, &path)
                         .ok_or(PackageStagingError::IdentityMismatch)?;
-                    create_destination_directory_at(retained, &path)?
+                    create_destination_directory_at(retained, &path).map_err(|error| {
+                        error.with_site(STAGING_SITE_DESTINATION_DIRECTORY_CREATE)
+                    })?
                 }
                 #[cfg(not(windows))]
                 {
@@ -2650,7 +2753,8 @@ impl PackageStager {
                 None
             }
         };
-        let source_snapshot = snapshot_source_file(&source, spec.expected_size)?;
+        let source_snapshot = snapshot_source_file(&source, spec.expected_size)
+            .map_err(|error| error.with_site(STAGING_SITE_SOURCE_OPEN))?;
         if !expected_sources.is_empty() {
             let expected = expected_sources
                 .iter()
@@ -2737,7 +2841,8 @@ fn copy_destination_bytes(
     // fail with a sharing violation while the retained handle is live. `None`
     // keeps the create-only proof for callers with no retained contour.
     let (mut destination_file, destination_identity) = match parent {
-        Some(handle) => create_destination_file_at(handle, destination)?,
+        Some(handle) => create_destination_file_at(handle, destination)
+            .map_err(|error| error.with_site(STAGING_SITE_DESTINATION_FILE_CREATE))?,
         None => create_destination_file(destination)?,
     };
     let copy_hash =
@@ -2970,7 +3075,8 @@ where
         FileIdentity,
     ) -> Result<(), PackageStagingError>,
 {
-    let root_handle = open_existing_directory(root)?;
+    let root_handle = open_existing_directory(root)
+        .map_err(|error| error.with_site(STAGING_SITE_DESTINATION_WALK_ROOT))?;
     let root_final = final_path_from_handle(&root_handle)?;
     if !super::windows_paths_equal(&root_final, root) {
         return Err(PackageStagingError::IdentityMismatch);
@@ -2987,9 +3093,11 @@ where
             return Err(PackageStagingError::BoundExceeded);
         }
         let mut pending = Vec::new();
-        let read_dir = std::fs::read_dir(&directory).map_err(map_package_open_error)?;
+        let read_dir = std::fs::read_dir(&directory)
+            .map_err(|error| map_package_open_error_at(error, STAGING_SITE_DESTINATION_WALK_READ_DIR))?;
         for entry in read_dir {
-            let entry = entry.map_err(map_package_open_error)?;
+            let entry = entry
+                .map_err(|error| map_package_open_error_at(error, STAGING_SITE_DESTINATION_WALK_ENTRY))?;
             let name = entry
                 .file_name()
                 .to_str()
@@ -3017,12 +3125,14 @@ where
             if entries.len() >= MAX_ENUMERATED_ENTRIES {
                 return Err(PackageStagingError::BoundExceeded);
             }
-            let metadata = std::fs::symlink_metadata(&path).map_err(map_package_open_error)?;
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| map_package_open_error_at(error, STAGING_SITE_DESTINATION_WALK_METADATA))?;
             if is_reparse_metadata(&metadata) {
                 return Err(PackageStagingError::ReparsePoint);
             }
             if metadata.is_dir() {
-                let child = open_existing_directory(&path)?;
+                let child = open_existing_directory(&path)
+                    .map_err(|error| error.with_site(STAGING_SITE_DESTINATION_WALK_CHILD_DIR))?;
                 let final_path = final_path_from_handle(&child)?;
                 if !super::windows_paths_equal(&final_path, &path) {
                     return Err(PackageStagingError::IdentityMismatch);
@@ -3038,7 +3148,8 @@ where
                     child,
                 ));
             } else if metadata.is_file() {
-                let file = open_existing_file(&path)?;
+                let file = open_existing_file(&path)
+                    .map_err(|error| error.with_site(STAGING_SITE_DESTINATION_WALK_CHILD_FILE))?;
                 let identity = file_identity_from_open_handle(&file)?;
                 let final_path = final_path_from_handle(&file)?;
                 if !super::windows_paths_equal(&final_path, &path) {
@@ -3093,7 +3204,8 @@ where
         Some(root) => root
             .try_clone()
             .map_err(|error| map_package_io_error(error, PackageStagingStage::DuplicateHandle))?,
-        None => open_existing_directory(root)?,
+        None => open_existing_directory(root)
+            .map_err(|error| error.with_site(STAGING_SITE_TRUSTED_SOURCE_ROOT))?,
     };
     let root_final = final_path_from_handle(&root_handle)?;
     if !super::windows_paths_equal(&root_final, root) {
@@ -3111,9 +3223,11 @@ where
             return Err(PackageStagingError::BoundExceeded);
         }
         let mut pending = Vec::new();
-        let read_dir = std::fs::read_dir(&directory).map_err(map_package_open_error)?;
+        let read_dir = std::fs::read_dir(&directory)
+            .map_err(|error| map_package_open_error_at(error, STAGING_SITE_TRUSTED_SOURCE_READ_DIR))?;
         for entry in read_dir {
-            let entry = entry.map_err(map_package_open_error)?;
+            let entry = entry
+                .map_err(|error| map_package_open_error_at(error, STAGING_SITE_TRUSTED_SOURCE_ENTRY))?;
             let name = entry
                 .file_name()
                 .to_str()
@@ -3141,12 +3255,14 @@ where
             if entries.len() >= MAX_ENUMERATED_ENTRIES {
                 return Err(PackageStagingError::BoundExceeded);
             }
-            let metadata = std::fs::symlink_metadata(&path).map_err(map_package_open_error)?;
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| map_package_open_error_at(error, STAGING_SITE_TRUSTED_SOURCE_METADATA))?;
             if is_reparse_metadata(&metadata) {
                 return Err(PackageStagingError::ReparsePoint);
             }
             if metadata.is_dir() {
-                let child = open_existing_directory(&path)?;
+                let child = open_existing_directory(&path)
+                    .map_err(|error| error.with_site(STAGING_SITE_TRUSTED_SOURCE_CHILD_DIR))?;
                 let final_path = final_path_from_handle(&child)?;
                 if !super::windows_paths_equal(&final_path, &path) {
                     return Err(PackageStagingError::IdentityMismatch);
@@ -3162,7 +3278,8 @@ where
                     child,
                 ));
             } else if metadata.is_file() {
-                let file = open_trusted_source_file(&path)?;
+                let file = open_trusted_source_file(&path)
+                    .map_err(|error| error.with_site(STAGING_SITE_TRUSTED_SOURCE_CHILD_FILE))?;
                 let identity = file_identity_from_open_handle(&file)?;
                 let final_path = final_path_from_handle(&file)?;
                 if !super::windows_paths_equal(&final_path, &path) {
