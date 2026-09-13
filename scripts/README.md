@@ -37,6 +37,7 @@ committed as repository authority.
 | `verify-agent-bridge-protocol.py` | Reject raw canonical Frame ingress, host-minted authority fields, validation bypass, correlation loss, and mandatory cancellation prose | Static protocol/source-policy evidence only |
 | `verify-wasm-toolchain.py` | Check the declared WASI component target without installing or executing external binaries | Offline toolchain declaration evidence only |
 | `verify-workstream-routing.py` | Verify workstream routing, assignment boundaries, non-overlapping mutable scopes, and owner projections | Static workstream routing and control-plane evidence only |
+| `verify-github-workflows.py` | Verify GitHub workflows, action SHA pinning, minimal permissions, hash-locked dependencies, and test execution | Static workflow and dependency-input evidence only |
 | `verify-lint-policy.ps1` | Verify the Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
 | `requirements-verification.txt` | Python dependency manifest for repository verification scripts | Verification dependency manifest |
 
