@@ -541,7 +541,7 @@ pub fn request_frame(
 /// the named operation at the same index of an `Apply` transition: it is
 /// revalidated and its decoded parameters must equal the operation's
 /// queryable parameters byte-for-byte at the `Value` level. A mismatch is a
-/// corrupt or substituted payload and fails closed here, before the JsonV1
+/// corrupt or substituted payload and fails closed here, before the `JsonV1`
 /// codec can collapse anything. The frame codec itself is unchanged; the
 /// authority travels with the caller and is persisted opaquely by the store.
 /// Any other request shape must carry no authorities.
@@ -584,8 +584,7 @@ fn bind_payload_authorities(
                 if expected != operation.parameters {
                     let shape = authority
                         .projection_value()
-                        .map(|value| json_shape_name(&value))
-                        .unwrap_or("undecodable");
+                        .map_or("undecodable", |value| json_shape_name(&value));
                     return Err(StoreWireError::Payload(format!(
                         "payload authority ({shape}) does not match named-operation parameters"
                     )));

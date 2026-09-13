@@ -1,6 +1,6 @@
 //! Authoritative lossless representation for arbitrary JSON payloads.
 //!
-//! Issue #10: vendor and RPC layers below this boundary (notably SurrealDB
+//! Issue #10: vendor and RPC layers below this boundary (notably `SurrealDB`
 //! record coercion and JSON-RPC `Value` variables) can silently narrow or
 //! reinterpret JSON that has already collapsed into
 //! [`serde_json::Value`]. This module provides the single authoritative
@@ -516,7 +516,7 @@ impl<'a> KeyCursor<'a> {
         self.pos += 1;
     }
 
-    fn fail(&self) -> StoreError {
+    fn fail() -> StoreError {
         StoreError::InvalidField {
             field: "payload.bytes",
             reason: "payload authority bytes are not a single JSON value",
@@ -534,7 +534,7 @@ impl<'a> KeyCursor<'a> {
             self.bump();
             Ok(())
         } else {
-            Err(self.fail())
+            Err(Self::fail())
         }
     }
 
@@ -557,7 +557,7 @@ impl<'a> KeyCursor<'a> {
             Some(b'[') => self.parse_array(),
             Some(b'"') => self.parse_string().map(|_| ()),
             Some(_) => self.parse_scalar(),
-            None => Err(self.fail()),
+            None => Err(Self::fail()),
         }
     }
 
@@ -574,7 +574,7 @@ impl<'a> KeyCursor<'a> {
         loop {
             self.skip_ws();
             if self.peek() != Some(b'"') {
-                return Err(self.fail());
+                return Err(Self::fail());
             }
             let key = self.parse_string()?;
             if !keys.insert(key) {
@@ -593,7 +593,7 @@ impl<'a> KeyCursor<'a> {
                     self.exit();
                     return Ok(());
                 }
-                _ => return Err(self.fail()),
+                _ => return Err(Self::fail()),
             }
         }
     }
@@ -617,7 +617,7 @@ impl<'a> KeyCursor<'a> {
                     self.exit();
                     return Ok(());
                 }
-                _ => return Err(self.fail()),
+                _ => return Err(Self::fail()),
             }
         }
     }
@@ -627,8 +627,8 @@ impl<'a> KeyCursor<'a> {
             Some(b't') => self.parse_keyword("true"),
             Some(b'f') => self.parse_keyword("false"),
             Some(b'n') => self.parse_keyword("null"),
-            Some(b'-') | Some(b'0'..=b'9') => self.parse_number(),
-            _ => Err(self.fail()),
+            Some(b'-' | b'0'..=b'9') => self.parse_number(),
+            _ => Err(Self::fail()),
         }
     }
 
@@ -637,7 +637,7 @@ impl<'a> KeyCursor<'a> {
             self.pos += keyword.len();
             Ok(())
         } else {
-            Err(self.fail())
+            Err(Self::fail())
         }
     }
 
@@ -651,7 +651,7 @@ impl<'a> KeyCursor<'a> {
             }
         }
         if self.pos == start {
-            return Err(self.fail());
+            return Err(Self::fail());
         }
         Ok(())
     }
@@ -662,7 +662,7 @@ impl<'a> KeyCursor<'a> {
         let mut run_start = self.pos;
         loop {
             match self.peek() {
-                None => return Err(self.fail()),
+                None => return Err(Self::fail()),
                 Some(b'"') => {
                     decoded.push_str(&self.text[run_start..self.pos]);
                     self.bump();
@@ -671,7 +671,7 @@ impl<'a> KeyCursor<'a> {
                 Some(b'\\') => {
                     decoded.push_str(&self.text[run_start..self.pos]);
                     self.bump();
-                    let escape = self.peek().ok_or_else(|| self.fail())?;
+                    let escape = self.peek().ok_or_else(Self::fail)?;
                     self.bump();
                     match escape {
                         b'"' => decoded.push('"'),
@@ -683,7 +683,7 @@ impl<'a> KeyCursor<'a> {
                         b'r' => decoded.push('\r'),
                         b't' => decoded.push('\t'),
                         b'u' => decoded.push(self.parse_unicode_escape()?),
-                        _ => return Err(self.fail()),
+                        _ => return Err(Self::fail()),
                     }
                     run_start = self.pos;
                 }
@@ -694,7 +694,7 @@ impl<'a> KeyCursor<'a> {
     }
 
     fn advance_char(&mut self) -> Result<(), StoreError> {
-        let lead = self.peek().ok_or_else(|| self.fail())?;
+        let lead = self.peek().ok_or_else(Self::fail)?;
         let width = if lead >= 0xF0 {
             4
         } else if lead >= 0xE0 {
@@ -702,10 +702,10 @@ impl<'a> KeyCursor<'a> {
         } else if lead >= 0xC0 {
             2
         } else {
-            return Err(self.fail());
+            return Err(Self::fail());
         };
         if self.pos + width > self.bytes.len() {
-            return Err(self.fail());
+            return Err(Self::fail());
         }
         self.pos += width;
         Ok(())
@@ -722,27 +722,27 @@ impl<'a> KeyCursor<'a> {
                     if (0xDC00..0xE000).contains(&low) {
                         let scalar =
                             0x1_0000 + (u32::from(high - 0xD800) << 10) + u32::from(low - 0xDC00);
-                        return char::from_u32(scalar).ok_or_else(|| self.fail());
+                        return char::from_u32(scalar).ok_or_else(Self::fail);
                     }
                 }
             }
-            return Err(self.fail());
+            return Err(Self::fail());
         }
         if (0xDC00..0xE000).contains(&high) {
-            return Err(self.fail());
+            return Err(Self::fail());
         }
-        char::from_u32(u32::from(high)).ok_or_else(|| self.fail())
+        char::from_u32(u32::from(high)).ok_or_else(Self::fail)
     }
 
     fn parse_hex4(&mut self) -> Result<u16, StoreError> {
         let mut value: u16 = 0;
         for _ in 0..4 {
-            let byte = self.peek().ok_or_else(|| self.fail())?;
+            let byte = self.peek().ok_or_else(Self::fail)?;
             let nibble = match byte {
                 b'0'..=b'9' => u16::from(byte - b'0'),
                 b'a'..=b'f' => u16::from(byte - b'a') + 10,
                 b'A'..=b'F' => u16::from(byte - b'A') + 10,
-                _ => return Err(self.fail()),
+                _ => return Err(Self::fail()),
             };
             value = value.saturating_mul(16).saturating_add(nibble);
             self.bump();
