@@ -628,9 +628,21 @@ fn current_unix_ms() -> Result<u64, SpoolError> {
 mod tests {
     use super::registry_fixture::RegistryFixture;
     use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId};
     use eliot_runtime_contracts::{SupervisionLeaseSigner, SupervisionLeaseVerifier};
     use std::collections::VecDeque;
+    use std::num::NonZeroU64;
     use std::sync::atomic::AtomicUsize;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     static FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -1854,7 +1866,7 @@ mod tests {
                 process_generation: eliot_contracts::ResourceGeneration::new(1)?,
             },
             state_fence: eliot_contracts::StateFence::new(
-                AuthorityEpoch::new(2)?,
+                test_epoch(2),
                 eliot_contracts::ResourceGeneration::new(1)?,
             ),
             issued_at_ms,

@@ -53,7 +53,7 @@ pub use eliot_canonical::CanonicalWriteEnvelope;
 
 use std::collections::BTreeMap;
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+use eliot_contracts::{EpochId, ResourceGeneration};
 use eliot_runtime_contracts::{HealthDimension, HealthVector, ServiceProcessState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -216,7 +216,7 @@ impl QueueLimits {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GovernorConfig {
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub resource_generation: ResourceGeneration,
     pub queues: QueueLimits,
     pub background_pause_interactive_depth: usize,
@@ -244,7 +244,7 @@ pub struct ServiceObservation {
     pub state: ServiceProcessState,
     pub health: HealthVector,
     pub generation: ResourceGeneration,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
 }
 
 impl ServiceObservation {
@@ -252,7 +252,10 @@ impl ServiceObservation {
         if self.generation != config.resource_generation {
             return Err(GovernorError::GenerationMismatch);
         }
-        if self.authority_epoch != config.authority_epoch {
+        if !self
+            .authority_epoch
+            .is_same_authority(&config.authority_epoch)
+        {
             return Err(GovernorError::AuthorityEpochMismatch);
         }
         Ok(())

@@ -83,7 +83,14 @@ impl RedbRecoveryStore {
             .validate()
             .map_err(|error| OrsError::Contract(error.to_string()))?;
         self.evidence.verify_receipt(active_receipt)?;
-        let active_epoch = active_receipt.core.authority.authority_epoch.value();
+        // Exact-tuple authority comparison (Implements #64): the receipt carries
+        // the canonical `EpochId`; the persisted `EpochLineage` contour keeps
+        // its shape and both tuple halves must agree. Equal sequences from
+        // different lineages are unrelated. The `EpochLineage` contour cannot
+        // name a canonical `EpochLineageId` (non-UUID contour labels), so the
+        // comparison is spelled across the contour boundary instead of calling
+        // `is_same_authority` directly.
+        let active_epoch = active_receipt.core.authority.authority_epoch.clone();
         let read = self.database.begin_read().map_err(storage)?;
         let operational = read
             .open_table(super::OPERATIONAL_CURRENT)
@@ -95,7 +102,9 @@ impl RedbRecoveryStore {
                 decode_named(value.value(), "operational_current")?;
             if record.kind == OperationalKind::AuthoritySnapshot
                 && record.phase == OperationalPhase::Active
-                && record.input.authority_epoch.current.epoch == active_epoch
+                && record.input.authority_epoch.current.epoch == active_epoch.sequence.get()
+                && record.input.authority_epoch.current.lineage_id.as_str()
+                    == active_epoch.lineage_id.as_str()
             {
                 authority_snapshot_found = true;
                 break;
@@ -129,7 +138,11 @@ impl RedbRecoveryStore {
         let projection = OperationalRecoveryState {
             ors_revision: format!("eliot.kernel.ors/v{}", crate::CONTRACT_VERSION),
             integrity: HealthDimension::Healthy,
-            authority_epoch: active_receipt.core.authority.authority_epoch,
+            // Residual (Implements #64): `OperationalRecoveryState::authority_epoch`
+            // still declares the scalar contour (`eliot-runtime-contracts`), so this
+            // canonical `EpochId` cannot land until that contract migrates; cloning
+            // (never scalar-coercing) keeps the post-migration form exact.
+            authority_epoch: active_receipt.core.authority.authority_epoch.clone(),
             pending_operation_refs,
             active_generation_refs,
             recovery_intent_refs,

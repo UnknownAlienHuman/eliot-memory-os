@@ -656,12 +656,26 @@ pub fn contract_identity() -> Result<ContractIdentity, FinishError> {
 mod tests {
     use super::*;
     use eliot_canonical::{AcceptanceCoverage, FinishAttemptDraft, FinishEvidence};
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn attempt() -> FinishAttempt {
         FinishAttempt {
             attempt_id: "attempt-1".to_owned(),
-            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            state_fence: StateFence::new(
+                test_epoch(TEST_LINEAGE_A, 1),
+                ResourceGeneration::genesis(),
+            ),
             draft: FinishAttemptDraft {
                 task_id: "task-1".to_owned(),
                 expected_task_revision: 1,
@@ -695,7 +709,7 @@ mod tests {
             task_id: "task-1".to_owned(),
             current_task_revision: 1,
             current_state_fence: StateFence::new(
-                AuthorityEpoch::genesis(),
+                test_epoch(TEST_LINEAGE_A, 1),
                 ResourceGeneration::genesis(),
             ),
             lifecycle: TaskLifecycleState::Open,
@@ -722,7 +736,7 @@ mod tests {
         let changed_context = FinishContext {
             current_task_revision: 2,
             current_state_fence: StateFence::new(
-                AuthorityEpoch::new(2).expect("non-zero authority epoch"),
+                test_epoch(TEST_LINEAGE_A, 2),
                 ResourceGeneration::new(2).expect("non-zero resource generation"),
             ),
             lifecycle: TaskLifecycleState::Closed,

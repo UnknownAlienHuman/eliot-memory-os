@@ -50,9 +50,11 @@ fn is_sha256(value: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 fn genesis_operation_id(state_fence: &StateFence) -> Result<OperationId, CompositionError> {
+    let epoch_digest = StateFence::canonical_epoch_digest(&state_fence.authority_epoch)
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
     OperationId::new(format!(
         "eliotd:governor-genesis:{}:{}",
-        state_fence.authority_epoch.value(),
+        epoch_digest.as_str(),
         state_fence.resource_generation.value()
     ))
     .map_err(|e| CompositionError::Recovery(e.to_string()))

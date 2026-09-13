@@ -15,10 +15,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
 use eliot_agent_api::{
-    AttemptId, AuthorityEnvelope, AuthorityEpoch, BudgetEnvelope, EffectCeiling, EffectKind,
-    ResourceGeneration, StateFence, WorkLeaseId,
+    AttemptId, AuthorityEnvelope, BudgetEnvelope, EffectCeiling, EffectKind, ResourceGeneration,
+    StateFence, WorkLeaseId,
 };
-use eliot_contracts::{DecisionId, SessionId, TaskId};
+use eliot_contracts::{DecisionId, EpochId, EpochLineageId, SessionId, TaskId};
 use eliot_native_worker_core::{
     AdmissionLivenessOutcome, CapabilityAdmissionFacts, CapabilityAdmissionOutcome,
     CapabilityAdmissionPort, CapabilityAdmissionRequest, CapabilityLivenessRequest,
@@ -250,8 +250,11 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-fn epoch() -> AuthorityEpoch {
-    load(AuthorityEpoch::new(1))
+fn epoch() -> EpochId {
+    load(EpochId::new(
+        load(EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")),
+        load(std::num::NonZeroU64::new(1)),
+    ))
 }
 
 fn fence() -> StateFence {
@@ -310,7 +313,7 @@ fn process_request() -> ProcessRequest {
         limits(),
     ));
     let fence = load(FencingToken::new(
-        1,
+        epoch(),
         generation,
         "process-fence-1".to_owned(),
     ));
@@ -476,11 +479,16 @@ fn tamper_epoch(
     registration: NativeWorkerRegistration,
     claim: NativeWorkerClaim,
 ) -> (NativeWorkerRegistration, NativeWorkerClaim) {
-    let other = load(AuthorityEpoch::new(2));
-    let other_fence = StateFence::new(other, load(ResourceGeneration::new(1)));
+    let other = load(EpochId::new(
+        load(EpochLineageId::new(
+            "550e8400-e29b-41d4-a716-446655440000",
+        )),
+        load(std::num::NonZeroU64::new(2)),
+    ));
+    let other_fence = StateFence::new(other.clone(), load(ResourceGeneration::new(1)));
     let mut registration = registration;
     let mut claim = claim;
-    registration.authority_epoch = other;
+    registration.authority_epoch = other.clone();
     registration.state_fence = other_fence.clone();
     claim.authority_epoch = other;
     claim.state_fence = other_fence;

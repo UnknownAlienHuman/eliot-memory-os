@@ -189,12 +189,23 @@ pub fn compile_controlboard_snapshot(
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
     use eliot_store_api::ScopeId;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn fence() -> StateFence {
         StateFence::new(
-            AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(TEST_LINEAGE_A, 1),
             ResourceGeneration::new(1).expect("generation"),
         )
     }
@@ -238,7 +249,7 @@ mod tests {
     fn empty_owners_assemble_a_deterministic_empty_projection() {
         let fence = fence();
         let coordination = CoordinationOwner::new();
-        let task = TaskLifecycleOwner::new(AuthorityEpoch::new(1).expect("epoch"), fence.clone())
+        let task = TaskLifecycleOwner::new(test_epoch(TEST_LINEAGE_A, 1), fence.clone())
             .expect("task owner");
         let observation = ObservationJournal::default();
         let problems = BTreeMap::new();
@@ -272,7 +283,7 @@ mod tests {
     fn owner_bytes_are_load_bearing_not_canned() {
         let fence = fence();
         let coordination = CoordinationOwner::new();
-        let task = TaskLifecycleOwner::new(AuthorityEpoch::new(1).expect("epoch"), fence.clone())
+        let task = TaskLifecycleOwner::new(test_epoch(TEST_LINEAGE_A, 1), fence.clone())
             .expect("task owner");
         let observation = ObservationJournal::default();
         let read_scope = scope(&fence);
@@ -314,7 +325,7 @@ mod tests {
     fn zero_revision_and_malformed_receipts_fail_closed() {
         let fence = fence();
         let coordination = CoordinationOwner::new();
-        let task = TaskLifecycleOwner::new(AuthorityEpoch::new(1).expect("epoch"), fence.clone())
+        let task = TaskLifecycleOwner::new(test_epoch(TEST_LINEAGE_A, 1), fence.clone())
             .expect("task owner");
         let observation = ObservationJournal::default();
         let problems = BTreeMap::new();

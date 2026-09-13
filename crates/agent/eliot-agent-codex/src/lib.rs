@@ -1245,9 +1245,21 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use eliot_agent_api::{
-        AuthorityEpoch, BudgetEnvelope, EffectKind, LaunchRequestId, QuotaKnowledge,
-        ResourceGeneration, StateFence, WorkUnitId,
+        BudgetEnvelope, EffectKind, EpochId, LaunchRequestId, QuotaKnowledge, ResourceGeneration,
+        StateFence, WorkUnitId,
     };
+    use eliot_contracts::{EpochLineageId};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
     use eliot_process::{
         ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
         EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation, ImageId, JobId,
@@ -1392,7 +1404,7 @@ mod tests {
             EnvironmentProjection::new(BTreeMap::new(), Vec::new(), EnvironmentInheritance::None)?,
             ResourceLimits::new(1_000, None, None, 10_000, 10_000, 1)?,
         )?;
-        let fence = FencingToken::new(1, generation, "nonce")?;
+        let fence = FencingToken::new(test_epoch(TEST_LINEAGE_A, 1), generation, "nonce")?;
         let mut authority = DispatchPermitAuthority::activate(
             DispatchAuthorityId::new("codex-authority")?,
             KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
@@ -1456,7 +1468,13 @@ mod tests {
             "monotonic_ns": 1
         }))
         .map_err(|_| ProcessExecutionError::Unavailable("fixture clock".to_owned()))?;
-        let context = DispatchValidationContext::new(clock, fence, 1, revisions(), 41)?;
+        let context = DispatchValidationContext::new(
+            clock,
+            fence,
+            test_epoch(TEST_LINEAGE_A, 1),
+            revisions(),
+            41,
+        )?;
         let validated = authority.validate_and_consume(request, observed, &context)?;
         let mut state = ProcessState::from_validated(&validated);
         state.mark_resumed(
@@ -1508,13 +1526,16 @@ mod tests {
         Ok(attach(CodexAttachInput {
             launch: launch()?,
             authority: AuthorityEnvelope {
-                epoch: AuthorityEpoch::new(1)?,
+                epoch: test_epoch(TEST_LINEAGE_A, 1),
                 scope_ref: "scope-1".into(),
                 effect_ceiling: ceiling(),
                 lease: serde_json::from_value::<WorkLeaseId>(
                     serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
                 )?,
-                state_fence: StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
+                state_fence: StateFence::new(
+                    test_epoch(TEST_LINEAGE_A, 1),
+                    ResourceGeneration::new(1)?,
+                ),
                 valid_until: "never".into(),
             },
             route: route(),
@@ -1770,7 +1791,7 @@ mod tests {
                 serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
             )?,
             state_fence: eliot_contracts::StateFence::new(
-                eliot_contracts::AuthorityEpoch::new(1)?,
+                test_epoch(TEST_LINEAGE_A, 1),
                 eliot_contracts::ResourceGeneration::new(1)?,
             ),
             runtime_generation: eliot_contracts::ResourceGeneration::new(1)?,
@@ -2525,14 +2546,14 @@ mod tests {
             fixture_digest("features"),
         );
         let authority = eliot_agent_api::AuthorityEnvelope {
-            epoch: eliot_agent_api::AuthorityEpoch::new(1)?,
+            epoch: test_epoch(TEST_LINEAGE_A, 1),
             scope_ref: "scope-1".into(),
             effect_ceiling: ceiling(),
             lease: serde_json::from_value::<WorkLeaseId>(
                 serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
             )?,
             state_fence: eliot_agent_api::StateFence::new(
-                eliot_agent_api::AuthorityEpoch::new(1)?,
+                test_epoch(TEST_LINEAGE_A, 1),
                 eliot_agent_api::ResourceGeneration::new(1)?,
             ),
             valid_until: "never".into(),

@@ -9,6 +9,7 @@ use eliot_agent_bridge_core::{
     AttachRequest, BridgeError, ConnectionId, FencingToken, Generation, HostEventEnvelope,
     ReconnectRequest, SessionId,
 };
+use eliot_contracts::EpochId;
 #[cfg(test)]
 use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome, PortFailure};
 use eliot_mcp::{
@@ -61,7 +62,7 @@ enum Request {
         new_connection_id: ConnectionId,
         session_id: String,
         activation_generation: u64,
-        authority_epoch: u64,
+        authority_epoch: EpochId,
         fence_nonce: String,
     },
     Status,
@@ -78,7 +79,7 @@ enum Response {
         connection_id: Option<String>,
         session_id: Option<String>,
         activation_generation: Option<u64>,
-        authority_epoch: Option<u64>,
+        authority_epoch: Option<EpochId>,
         reconciliation_required: bool,
         activation_port: &'static str,
         host_request_port: &'static str,
@@ -91,7 +92,7 @@ enum Response {
         connection_id: String,
         session_id: String,
         activation_generation: u64,
-        authority_epoch: u64,
+        authority_epoch: EpochId,
     },
     Invocation {
         result: HostInvocationResult,
@@ -448,7 +449,7 @@ fn handle_reconnect(
     new_connection_id: &ConnectionId,
     session_id: &str,
     activation_generation: u64,
-    authority_epoch: u64,
+    authority_epoch: EpochId,
     fence_nonce: &str,
 ) -> Response {
     let Some(live) = runner.attach_view() else {
@@ -509,7 +510,7 @@ fn handle_reconnect(
             connection_id: view.binding().connection_id().as_str().to_owned(),
             session_id: view.binding().session_id().as_str().to_owned(),
             activation_generation: view.binding().activation_generation().get(),
-            authority_epoch: view.binding().state_fence().authority_epoch(),
+            authority_epoch: view.binding().state_fence().authority_epoch().clone(),
         },
         Err(BridgeError::StaleAuthority) => Response::Error {
             code: "RECONNECT_STALE_AUTHORITY",
@@ -560,7 +561,7 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             connection_id: Some(view.binding().connection_id().as_str().to_owned()),
             session_id: Some(view.binding().session_id().as_str().to_owned()),
             activation_generation: Some(view.binding().activation_generation().get()),
-            authority_epoch: Some(view.binding().state_fence().authority_epoch()),
+            authority_epoch: Some(view.binding().state_fence().authority_epoch().clone()),
             reconciliation_required: view.reconciliation_required(),
             activation_port: "attached",
             host_request_port: "session-bound: dispatch joins the admitted Kernel session",

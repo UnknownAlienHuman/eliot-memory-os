@@ -8,8 +8,8 @@
 use std::path::{Component, Path};
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ContractId, ContractVersion, ResourceGeneration, StateFence,
-    canonical_json_bytes, sha256_hex,
+    ArtifactId, ContractId, ContractVersion, EpochId, EpochLineageId, ResourceGeneration,
+    StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_platform_windows::{
     FileIdentity, ProtectedPathLease, TrustedSourceBundle, TrustedSourceFileLease,
@@ -41,6 +41,19 @@ const AGENT_BRIDGE_ACTIVATION_CAPABILITY: &str = "agent.bridge.activate";
 const AGENT_BRIDGE_MODULE_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 const AGENT_BRIDGE_MODULE_GENERATION: u64 = 1;
 const AGENT_BRIDGE_AUTHORITY_EPOCH: u64 = 1;
+// Canonical lineage-A for the static installation profile epoch (Implements
+// #64): the profile carries no runtime lineage minting authority; the exact
+// tuple uses the fixed canonical lineage with the profile sequence.
+const INSTALLATION_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn installation_epoch(sequence: u64) -> EpochId {
+    use std::num::NonZeroU64;
+    EpochId::new(
+        EpochLineageId::new(INSTALLATION_LINEAGE_A).expect("canonical installation lineage-A"),
+        NonZeroU64::new(sequence).expect("non-zero installation sequence"),
+    )
+    .expect("valid installation epoch")
+}
 
 /// Maximum source bridge executable bytes observed by the installation seam.
 pub const AGENT_BRIDGE_SOURCE_MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -327,12 +340,7 @@ pub fn agent_bridge_source_plan_from_observed_kernel(
                 reason: error.to_string(),
             }
         })?;
-    let authority_epoch = AuthorityEpoch::new(AGENT_BRIDGE_AUTHORITY_EPOCH).map_err(|error| {
-        InstallationError::InvalidField {
-            field: "agent_bridge.module_generation.state_fence.authority_epoch".to_owned(),
-            reason: error.to_string(),
-        }
-    })?;
+    let authority_epoch = installation_epoch(AGENT_BRIDGE_AUTHORITY_EPOCH);
     let contract = ModuleContract {
         module_id: module_id.clone(),
         version: AGENT_BRIDGE_MODULE_VERSION,
@@ -357,7 +365,10 @@ pub fn agent_bridge_source_plan_from_observed_kernel(
         "service": "eliot-kernel",
         "protocol": "eliot.kernel.v1",
         "generation": AGENT_BRIDGE_AUTHORITY_EPOCH,
-        "authority_epoch": AGENT_BRIDGE_AUTHORITY_EPOCH,
+        "authority_epoch": {
+            "lineage_id": INSTALLATION_LINEAGE_A,
+            "sequence": AGENT_BRIDGE_AUTHORITY_EPOCH
+        },
         "artifact_digest": kernel_artifact_sha256,
         "protected_snapshot_digest": protected_snapshot_digest,
     });
@@ -385,11 +396,7 @@ pub fn agent_bridge_source_plan_from_observed_kernel(
         expected_kernel_sid: crate::LOCAL_SERVICE_SID.to_owned(),
         expected_kernel_session_id: 0,
         expected_kernel_principal_binding: format!("sid={};session=0", crate::LOCAL_SERVICE_SID),
-        expected_kernel_authority_epoch: AuthorityEpoch::new(AGENT_BRIDGE_AUTHORITY_EPOCH)
-            .map_err(|error| InstallationError::InvalidField {
-                field: "agent_bridge.expected_kernel_authority_epoch".to_owned(),
-                reason: error.to_string(),
-            })?,
+        expected_kernel_authority_epoch: installation_epoch(AGENT_BRIDGE_AUTHORITY_EPOCH),
         expected_kernel_generation: ResourceGeneration::new(AGENT_BRIDGE_MODULE_GENERATION)
             .map_err(|error| InstallationError::InvalidField {
                 field: "agent_bridge.expected_kernel_generation".to_owned(),
@@ -1171,7 +1178,7 @@ fn is_lowercase_sha256(value: &str) -> bool {
 )]
 mod tests {
     use super::*;
-    use eliot_contracts::{ArtifactId, AuthorityEpoch, ContractId, ContractVersion, StateFence};
+    use eliot_contracts::{ArtifactId, ContractId, ContractVersion, StateFence};
     use eliot_protocol::{
         AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION, ProtocolRange, ProtocolVersion,
     };
@@ -1180,7 +1187,7 @@ mod tests {
 
     fn declaration() -> AgentBridgeClientDeclaration {
         let fence = StateFence::new(
-            AuthorityEpoch::new(3).unwrap(),
+            installation_epoch(3),
             ResourceGeneration::new(7).unwrap(),
         );
         let artifact = ArtifactId::new("a".repeat(64)).unwrap();
@@ -1222,7 +1229,7 @@ mod tests {
             expected_kernel_sid: "S-1-5-18".to_owned(),
             expected_kernel_session_id: 0,
             expected_kernel_principal_binding: "kernel:eliot-agent-bridge".to_owned(),
-            expected_kernel_authority_epoch: AuthorityEpoch::new(3).unwrap(),
+            expected_kernel_authority_epoch: installation_epoch(3),
             expected_kernel_generation: ResourceGeneration::new(7).unwrap(),
             expected_kernel_artifact_sha256: "b".repeat(64),
             expected_kernel_config_snapshot_sha256: "c".repeat(64),

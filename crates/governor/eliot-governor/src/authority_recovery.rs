@@ -18,7 +18,7 @@ use eliot_authority::{
     GrantGraphRecoverySnapshot, GrantRevocationRequest, GrantStatus, IntroductionActivationRequest,
     IntroductionRevocationRequest, IntroductionStatus, P07PortError, SnapshotId,
 };
-use eliot_contracts::{AuthorityEpoch, StateFence};
+use eliot_contracts::{EpochId, StateFence};
 use eliot_receipts::AuthorityBinding;
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 use schemars::JsonSchema;
@@ -393,12 +393,12 @@ impl RetainedAuthorityRequest {
     fn check_receipt_binding(
         &self,
         receipt_snapshot_id: &str,
-        receipt_epoch: &AuthorityEpoch,
+        receipt_epoch: &EpochId,
     ) -> Result<(), CompositionError> {
         if receipt_snapshot_id != self.request.snapshot_id().as_str() {
             return Err(CompositionError::Authority(P07PortError::InvalidBinding));
         }
-        if receipt_epoch != &self.snapshot.state_fence.authority_epoch {
+        if !receipt_epoch.is_same_authority(&self.snapshot.state_fence.authority_epoch) {
             return Err(CompositionError::Authority(P07PortError::InvalidBinding));
         }
         Ok(())

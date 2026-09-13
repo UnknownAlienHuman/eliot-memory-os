@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use eliot_agent_api::{
     AttemptId, AuthorityEnvelope, AuthorizedEffect, ProposedEffect, WorkLeaseId,
 };
-use eliot_contracts::{AuthorityEpoch, StateFence};
+use eliot_contracts::{EpochId, StateFence};
 use eliot_process::{
     FencingToken, Generation, OperationId, ProcessRequest, ProcessTreeId, ResourceLimits,
 };
@@ -151,7 +151,9 @@ impl CapabilityAdmissionRequest {
         if presented.worker_generation != registration.worker_generation {
             return Err(WorkerError::InvalidRequest("generation_binding"));
         }
-        if presented.authority_epoch != registration.authority_epoch {
+        if !presented
+            .authority_epoch
+            .is_same_authority(&registration.authority_epoch) {
             return Err(WorkerError::StaleEpoch);
         }
         if presented.state_fence != registration.state_fence {
@@ -162,7 +164,7 @@ impl CapabilityAdmissionRequest {
         {
             return Err(WorkerError::InvalidRequest("generation_binding"));
         }
-        if presented.authority_epoch != hello.authority_epoch {
+        if !presented.authority_epoch.is_same_authority(&hello.authority_epoch) {
             return Err(WorkerError::StaleEpoch);
         }
         if presented.state_fence != hello.state_fence {
@@ -489,7 +491,7 @@ pub struct AdmissionLivenessFacts {
     admission_revision: String,
     revocation_revision: u64,
     lease: WorkLeaseId,
-    authority_epoch: AuthorityEpoch,
+    authority_epoch: EpochId,
     state_fence: StateFence,
     observed_at_unix_ms: u64,
     expires_at_unix_ms: u64,
@@ -503,7 +505,7 @@ impl AdmissionLivenessFacts {
         admission_revision: impl Into<String>,
         revocation_revision: u64,
         lease: WorkLeaseId,
-        authority_epoch: AuthorityEpoch,
+        authority_epoch: EpochId,
         state_fence: StateFence,
         observed_at_unix_ms: u64,
         expires_at_unix_ms: u64,
@@ -539,7 +541,7 @@ impl AdmissionLivenessFacts {
         &self.lease
     }
     #[must_use]
-    pub const fn authority_epoch(&self) -> &AuthorityEpoch {
+    pub const fn authority_epoch(&self) -> &EpochId {
         &self.authority_epoch
     }
     #[must_use]
@@ -598,7 +600,7 @@ pub struct CapabilityLivenessRequest {
     admission_revision: String,
     revocation_revision: u64,
     lease: WorkLeaseId,
-    authority_epoch: AuthorityEpoch,
+    authority_epoch: EpochId,
     state_fence: StateFence,
 }
 
@@ -631,7 +633,7 @@ impl CapabilityLivenessRequest {
         &self.lease
     }
     #[must_use]
-    pub const fn authority_epoch(&self) -> &AuthorityEpoch {
+    pub const fn authority_epoch(&self) -> &EpochId {
         &self.authority_epoch
     }
     #[must_use]
@@ -650,7 +652,7 @@ pub struct EffectAdmissionRequest {
     admission_revision: String,
     revocation_revision: u64,
     lease: WorkLeaseId,
-    authority_epoch: AuthorityEpoch,
+    authority_epoch: EpochId,
     state_fence: StateFence,
 }
 
@@ -703,7 +705,7 @@ impl EffectAdmissionRequest {
     }
 
     #[must_use]
-    pub const fn authority_epoch(&self) -> &AuthorityEpoch {
+    pub const fn authority_epoch(&self) -> &EpochId {
         &self.authority_epoch
     }
 
@@ -841,7 +843,7 @@ pub struct DurableCheckpointRequest {
     request_id: String,
     stream_id: String,
     producer_generation: u64,
-    authority_epoch: AuthorityEpoch,
+    authority_epoch: EpochId,
     state_fence: StateFence,
     admission_revision: String,
     operation_id: OperationId,
@@ -886,7 +888,7 @@ impl DurableCheckpointRequest {
         self.producer_generation
     }
     #[must_use]
-    pub const fn authority_epoch(&self) -> &AuthorityEpoch {
+    pub const fn authority_epoch(&self) -> &EpochId {
         &self.authority_epoch
     }
     #[must_use]
@@ -916,7 +918,7 @@ pub struct CheckpointReceiptFacts {
     request_id: String,
     stream_id: String,
     producer_generation: u64,
-    authority_epoch: AuthorityEpoch,
+    authority_epoch: EpochId,
     state_fence: StateFence,
     admission_revision: String,
     operation_id: OperationId,
@@ -932,7 +934,7 @@ impl CheckpointReceiptFacts {
         request_id: impl Into<String>,
         stream_id: impl Into<String>,
         producer_generation: u64,
-        authority_epoch: AuthorityEpoch,
+        authority_epoch: EpochId,
         state_fence: StateFence,
         admission_revision: impl Into<String>,
         operation_id: OperationId,
@@ -975,7 +977,7 @@ impl CheckpointReceiptFacts {
         self.producer_generation
     }
     #[must_use]
-    pub const fn authority_epoch(&self) -> &AuthorityEpoch {
+    pub const fn authority_epoch(&self) -> &EpochId {
         &self.authority_epoch
     }
     #[must_use]
@@ -1119,7 +1121,10 @@ impl ClaimAdmissionRequest {
         if self.claim.worker_generation != self.registration.worker_generation {
             return Err(WorkerError::InvalidRequest("generation_binding"));
         }
-        if self.claim.authority_epoch != self.registration.authority_epoch {
+        if !self
+            .claim
+            .authority_epoch
+            .is_same_authority(&self.registration.authority_epoch) {
             return Err(WorkerError::StaleEpoch);
         }
         if self.claim.state_fence != self.registration.state_fence {
