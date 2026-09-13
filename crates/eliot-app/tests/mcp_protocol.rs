@@ -6630,10 +6630,10 @@ fn recall_l0_mcp_matches_cli() -> TestResult {
     let config_path = test_config_path();
     let config_str = config_path.to_string_lossy().into_owned();
     let cli_args = [
-        "memory",
-        "recall-l0",
         "--config",
         config_str.as_str(),
+        "memory",
+        "recall-l0",
         "--project",
         &project_id,
         "--query",
