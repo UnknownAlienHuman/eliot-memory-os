@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
 use blake3::Hasher;
+use eliot_contracts::{
+    AuthorityEpoch, EpochId, ResourceGeneration, StateFence as CanonicalStateFence,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use thiserror::Error;
@@ -88,14 +91,39 @@ impl StateFence {
         Ok(fence)
     }
     pub fn validate(&self) -> Result<(), DoctorError> {
-        if self.authority_epoch == 0 {
-            return Err(DoctorError::InvalidFence);
-        }
-        if self.generation == 0 {
-            return Err(DoctorError::InvalidFence);
-        }
+        let authority =
+            AuthorityEpoch::new(self.authority_epoch).map_err(|_| DoctorError::InvalidFence)?;
+        let generation =
+            ResourceGeneration::new(self.generation).map_err(|_| DoctorError::InvalidFence)?;
+        CanonicalStateFence::new(authority, generation)
+            .validate()
+            .map_err(|_| DoctorError::InvalidFence)?;
         hex_digest(&self.digest, "state fence digest")
     }
+}
+
+/// Thin Doctor-side adapter echoing the Kernel-supplied fence through the
+/// canonical owner. Doctor never mints authority and never widens
+/// visibility: this only validates the echo via `eliot-contracts` and
+/// returns the canonical view for evaluation.
+pub fn canonical_fence(fence: &StateFence) -> Result<CanonicalStateFence, DoctorError> {
+    fence.validate()?;
+    let authority =
+        AuthorityEpoch::new(fence.authority_epoch).map_err(|_| DoctorError::InvalidFence)?;
+    let generation =
+        ResourceGeneration::new(fence.generation).map_err(|_| DoctorError::InvalidFence)?;
+    Ok(CanonicalStateFence::new(authority, generation))
+}
+
+/// Lineage-aware fence evaluation against the canonical epoch owner.
+/// Proves the echo is canonically valid and bound to the exact lineaged
+/// sequence. Doctor never mints the epoch, it only echoes and checks.
+pub fn check_fence_against_epoch(fence: &StateFence, epoch: &EpochId) -> Result<(), DoctorError> {
+    let canonical = canonical_fence(fence)?;
+    if canonical.authority_epoch.value() != epoch.sequence.get() {
+        return Err(DoctorError::InvalidFence);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -824,10 +852,12 @@ pub struct RepairAttemptIdentity {
 
 /// Borrowed load-bearing fields bound into one `RepairAttemptIdentity`.
 ///
-/// The local `StateFence` is echoed by value (epoch, generation, digest);
-/// Doctor never mints fence authority, it only binds the exact fence the
-/// Kernel admission carried. The canonical lineaged fence owner stays in
-/// `eliot-contracts`; this digest echo is a reference, not a second owner.
+/// The fence echo is validated through the canonical `eliot-contracts`
+/// owner (`canonical_fence`); the optional lineaged `EpochId` binds the
+/// exact lineage where the fence is evaluated. Doctor never mints fence
+/// authority, it only binds the exact fence the Kernel admission carried.
+/// `None` preserves the Wave-A echo path for admissions that do not yet
+/// carry lineage; `Some` additionally proves sequence binding.
 #[derive(Clone, Copy, Debug)]
 pub struct AttemptIdentityBinding<'a> {
     pub attempt_id: &'a str,
@@ -835,6 +865,7 @@ pub struct AttemptIdentityBinding<'a> {
     pub recipe: &'a RepairRecipeIdentity,
     pub operation: &'a RepairOperationRef,
     pub fence: &'a StateFence,
+    pub epoch: Option<&'a EpochId>,
     pub approval: Option<&'a str>,
     pub budget_units: u64,
     pub deadline: OffsetDateTime,
@@ -847,7 +878,10 @@ impl RepairAttemptIdentity {
         binding.brief.validate()?;
         binding.recipe.validate()?;
         binding.operation.validate()?;
-        binding.fence.validate()?;
+        canonical_fence(binding.fence)?;
+        if let Some(epoch) = binding.epoch {
+            check_fence_against_epoch(binding.fence, epoch)?;
+        }
         if let Some(approval) = binding.approval {
             text(approval, "approval")?;
         }
@@ -1342,7 +1376,7 @@ impl ClosedRepairRequest {
         text(&self.escalation_target, "escalation target")?;
         self.brief.validate()?;
         self.recipe.validate()?;
-        self.fence.validate()?;
+        canonical_fence(&self.fence)?;
         self.lease.validate_at(now)?;
         manifest.validate()?;
         if RepairRecipeIdentity::bind(&self.recipe)? != self.recipe_identity {
@@ -1403,6 +1437,7 @@ impl ClosedRepairRequest {
             recipe: &self.recipe_identity,
             operation,
             fence: &self.fence,
+            epoch: None,
             approval: self.approval.as_deref(),
             budget_units: self.budget_units,
             deadline: self.deadline,
@@ -1673,7 +1708,7 @@ impl VerificationReport {
     /// instead of becoming a verified repair.
     pub fn endorse(&self, fence: &StateFence) -> Result<IndependentVerification, DoctorError> {
         self.validate()?;
-        fence.validate()?;
+        canonical_fence(fence)?;
         let evidence = &self.evidence;
         if !matches!(
             evidence.verification_execution,
@@ -1759,6 +1794,7 @@ impl VerifiedAttempt {
         fence: &StateFence,
     ) -> Result<IndependentVerification, DoctorError> {
         self.validate()?;
+        canonical_fence(fence)?;
         self.verification.endorse(fence)
     }
 }
@@ -2044,7 +2080,7 @@ pub fn disposition_for_verified_attempt(
     fence: &StateFence,
 ) -> Result<DoctorDisposition, DoctorError> {
     receipt.validate()?;
-    fence.validate()?;
+    canonical_fence(fence)?;
     match receipt.effect_disposition {
         EffectDisposition::Succeeded => match receipt.endorse_verification(fence) {
             Ok(proof) => Ok(DoctorDisposition::repaired_verified(proof)),
